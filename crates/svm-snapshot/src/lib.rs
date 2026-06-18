@@ -39,7 +39,10 @@
 #![forbid(unsafe_code)]
 
 use svm_encode::encode_module;
-use svm_interp::{DurableBinding, DurableHandle, FrozenFiber, Host, NonDurableHandle, StreamRole};
+use svm_interp::{
+    DurableBinding, DurableHandle, FrozenFiber, FrozenVCpu, Host, NonDurableHandle, StreamRole,
+    SHADOW_BASE,
+};
 use svm_ir::Module;
 
 /// Container magic (§12.2): "SVM-Durable".
@@ -158,6 +161,12 @@ pub fn freeze_with_prots(
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
     fibers.sort_by_key(|f| f.slot);
+    // The freeze/thaw spawned-vCPU residue (§12.4 / slice 3.2.1), canonical = ascending task. The
+    // root's extent rides alongside (its continuation is in the window image like everyone's, but the
+    // shared active-SP word holds only the last child's extent at freeze end).
+    let mut vcpus = host.frozen_vcpus().to_vec();
+    vcpus.sort_by_key(|v| v.task);
+    let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
     let digest = digest256(&encode_module(module));
     let reserved_log2 = window.len().trailing_zeros() as u8;
 
@@ -171,7 +180,7 @@ pub fn freeze_with_prots(
         b.push(reserved_log2);
         write_uleb(b, window.len() as u64); // mapped
         write_uleb(b, PAGE as u64); // host page size at capture
-        write_uleb(b, 1); // vcpu_count (single-vCPU Phase 1)
+        write_uleb(b, 1 + vcpus.len() as u64); // vcpu_count = root + spawned (§12.4 / slice 3.2.1)
         write_uleb(b, fibers.len() as u64); // fiber_count (§12.4)
     });
 
@@ -204,11 +213,12 @@ pub fn freeze_with_prots(
         }
     });
 
-    // Section 2 — Control state (§12.4): the frozen-fiber residue. Each fiber's continuation lives
-    // in its in-window shadow region (already in the window image); this records the small
-    // host-side residue needed to re-enter it on thaw. Emitted only when there are fibers, so a
-    // no-fiber artifact is byte-identical to the pre-fiber format.
-    if !fibers.is_empty() {
+    // Section 2 — Control state (§12.4): the frozen-fiber residue, plus (slice 3.2.1) the spawned-vCPU
+    // residue. Each continuation lives in its in-window shadow region (already in the window image);
+    // this records the small host-side residue needed to re-enter it on thaw. Emitted only when there
+    // are fibers or spawned vCPUs. The vCPU residue is **appended** after the fiber residue and only
+    // when present, so a fiber-only (or single-vCPU no-fiber) artifact is byte-identical to before.
+    if !fibers.is_empty() || !vcpus.is_empty() {
         section(&mut out, TAG_CONTROL, |b| {
             write_uleb(b, fibers.len() as u64);
             for f in &fibers {
@@ -216,6 +226,19 @@ pub fn freeze_with_prots(
                 write_uleb(b, f.func as u32 as u64);
                 write_uleb(b, f.sp as u64);
                 write_uleb(b, f.shadow_sp);
+            }
+            if !vcpus.is_empty() {
+                write_uleb(b, vcpus.len() as u64);
+                for v in &vcpus {
+                    write_uleb(b, v.task as u64);
+                    write_uleb(b, v.func as u32 as u64);
+                    write_uleb(b, v.args.len() as u64);
+                    for &a in &v.args {
+                        write_uleb(b, a as u64);
+                    }
+                    write_uleb(b, v.shadow_sp);
+                }
+                write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
             }
         });
     }
@@ -283,8 +306,10 @@ pub fn restore_with_prots(
     let reserved_log2 = h.u8()?;
     let mapped = h.uleb()? as usize;
     let page_size = h.uleb()? as usize;
-    let _vcpu_count = h.uleb()?;
+    let vcpu_count = h.uleb()?;
     let fiber_count = h.uleb()?;
+    // Spawned (`thread.spawn`) vCPUs = total − the always-present root (slice 3.2.1).
+    let spawned_count = vcpu_count.checked_sub(1).ok_or(RestoreError::Malformed)?;
     if digest != digest256(&encode_module(module)) {
         return Err(RestoreError::ModuleMismatch);
     }
@@ -354,22 +379,33 @@ pub fn restore_with_prots(
     }
     host.restore_durable_handles(&handles);
 
-    // ---- Control state (§12.4): decode the frozen-fiber residue and seed it for the thaw. The
-    // section is present iff the header's fiber_count is non-zero (canonical); restore re-seeds the
-    // Host so the next (REWINDING) run re-creates the fibers in the registry. ----
-    let fibers = decode_control(control_body, fiber_count)?;
+    // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
+    // thaw. The section is present iff there are fibers or spawned vCPUs (canonical); restore re-seeds
+    // the Host so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
+    let (fibers, vcpus, root_sp) = decode_control(control_body, fiber_count, spawned_count)?;
     host.set_frozen_fibers(fibers);
+    if !vcpus.is_empty() {
+        host.set_frozen_vcpus(vcpus);
+        host.set_frozen_root_sp(root_sp);
+    }
 
     Ok((window, prots))
 }
 
-/// Decode Section 2's frozen-fiber residue, enforcing the header's `fiber_count` and canonical
-/// ascending-slot order. `None` body is valid only for zero fibers (the section is elided then).
-fn decode_control(body: Option<&[u8]>, fiber_count: u64) -> Result<Vec<FrozenFiber>, RestoreError> {
-    let body = match (body, fiber_count) {
-        (None, 0) => return Ok(Vec::new()), // no fibers ⇒ no section (canonical)
-        (None, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
-        (Some(b), _) => b,
+/// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when
+/// `spawned_count > 0` (slice 3.2.1) — the spawned-vCPU residue (canonical ascending task) and the
+/// root's extent. Enforces the header's counts. A `None` body is valid only when both counts are zero
+/// (the section is elided then). Returns `(fibers, vcpus, root_sp)`.
+#[allow(clippy::type_complexity)]
+fn decode_control(
+    body: Option<&[u8]>,
+    fiber_count: u64,
+    spawned_count: u64,
+) -> Result<(Vec<FrozenFiber>, Vec<FrozenVCpu>, u64), RestoreError> {
+    let body = match (body, fiber_count, spawned_count) {
+        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), SHADOW_BASE)), // no residue ⇒ no section
+        (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
+        (Some(b), _, _) => b,
     };
     let mut cr = Reader::new(body);
     let n = cr.uleb()?;
@@ -394,10 +430,41 @@ fn decode_control(body: Option<&[u8]>, fiber_count: u64) -> Result<Vec<FrozenFib
             shadow_sp,
         });
     }
+    // Spawned-vCPU residue (slice 3.2.1): present iff the header declares spawned vCPUs.
+    let mut vcpus = Vec::with_capacity(spawned_count as usize);
+    let mut root_sp = SHADOW_BASE;
+    if spawned_count > 0 {
+        let nv = cr.uleb()?;
+        if nv != spawned_count {
+            return Err(RestoreError::Malformed); // header and section must agree
+        }
+        let mut last: Option<u64> = None;
+        for _ in 0..nv {
+            let task = cr.uleb()?;
+            if last.is_some_and(|p| task <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: tasks must ascend
+            }
+            last = Some(task);
+            let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
+            let nargs = cr.uleb()?;
+            let mut args = Vec::with_capacity(nargs as usize);
+            for _ in 0..nargs {
+                args.push(cr.uleb()? as i64);
+            }
+            let shadow_sp = cr.uleb()?;
+            vcpus.push(FrozenVCpu {
+                task: usize::try_from(task).map_err(|_| RestoreError::Malformed)?,
+                func,
+                args,
+                shadow_sp,
+            });
+        }
+        root_sp = cr.uleb()?;
+    }
     if !cr.at_end() {
         return Err(RestoreError::Malformed);
     }
-    Ok(fibers)
+    Ok((fibers, vcpus, root_sp))
 }
 
 // ---- Binding (de)serialization (§12.5) ----

@@ -4,7 +4,7 @@
 //! hand-computed result. This is the chibicc-as-oracle differential (LLVM.md §5) plus the §18
 //! interp↔JIT differential, applied to the LLVM on-ramp.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use svm_interp::Value;
@@ -22,6 +22,49 @@ fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let status = Command::new("clang")
         .args([
             "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Compile a C snippet to legalized bitcode **with debug info** (`-g`). Uses `-Og` (optimize for
+/// debugging): mem2reg/SROA still run — so scalars arrive promoted, the legalized shape the on-ramp
+/// needs — while the per-statement line table is preserved (`-O2` collapses a tiny function's lines
+/// onto one). So the §6 source-line ingest can be exercised against real, multi-line clang debug
+/// metadata. `None` (skip) if clang is unavailable.
+fn compile_to_bc_g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-Og")
+}
+
+/// Compile at `-O0 -g`: every C local stays an `alloca` + `llvm.dbg.declare`, the shape the §6
+/// **variable** ingest reads (a `dbg.declare` → a `Window` frame slot). `None` (skip) if clang is
+/// unavailable.
+fn compile_to_bc_o0g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-O0")
+}
+
+fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_g_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_g_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args([
+            opt,
+            "-g",
             "-emit-llvm",
             "-c",
             "-fno-vectorize",
@@ -2111,6 +2154,16 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
             "opt-level=2",
             "-C",
             "overflow-checks=off",
+            // Keep `-O2` codegen in the on-ramp's **scalar** subset: disable LLVM auto-vectorization
+            // so a loop/slice reduction stays scalar instead of becoming an `<N x iM>` vector the
+            // on-ramp's SIMD support (slice Y: `<4 x float>`/`v128`) doesn't cover for integers.
+            // Whether `-O2` vectorizes is host-CPU-sensitive, so without this the Rust breadth tests
+            // are flaky (e.g. a `&[i32]` sum becoming `<4 x i32>` → `Unsupported("v128")`). The Rust
+            // tests target *core/scalar* Rust, not SIMD (the SIMD path is covered by the C tests).
+            "-C",
+            "llvm-args=-vectorize-loops=false",
+            "-C",
+            "llvm-args=-vectorize-slp=false",
         ])
         .arg(&rs)
         .arg("-o")
@@ -2226,4 +2279,1389 @@ fn rust_no_std_matches_native() {
             "compute({n}): on-ramp {svm} vs native rustc {native} (i33 wrap mismatch?)"
         );
     }
+}
+
+// ---- §6 / D-DBG-7: the debug-info waist (LLVM as the third producer) -------------------------
+
+/// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from
+/// each instruction's `!DILocation` — the third independent frontend (after chibicc and the wasm
+/// DWARF producer) to feed the *same* neutral core, the cross-check that the waist isn't coupled to
+/// any one frontend (DEBUGGING.md §6). (The variable/type half is covered by the `_o0_`/`_og_`
+/// tests; here `n` rides in as an argument var, asserted minimally.)
+#[test]
+fn llvm_dilocation_maps_into_the_debug_info_waist() {
+    // A chain of dependent statements over a runtime input: each keeps its own source line and
+    // lowers to a real (non-terminator) arithmetic op, so several distinct lines reach the IR pcs
+    // (clang can't constant-fold the chain away, and nothing collapses onto one line).
+    let src = "\
+int chain(int n) {
+  int a = n + 1;
+  int b = a * 3;
+  int c = b - 2;
+  int d = c * c;
+  return d + a;
+}
+";
+    let Some(bc) = compile_to_bc_g("dilocation", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // The debug section is strippable / untrusted-for-escape — it must not affect verification.
+    svm_verify::verify_module(&t.module).expect("verify");
+
+    let di = t
+        .module
+        .debug_info
+        .as_ref()
+        .expect("debug info populated from !DILocation");
+
+    // The file table names the C source (clang records its compile path).
+    assert!(
+        di.files.iter().any(|f| f.ends_with(".c")),
+        "file table names the C source: {:?}",
+        di.files
+    );
+    // Source lines are mapped onto IR pcs.
+    assert!(!di.locs.is_empty(), "some source locations were mapped");
+    // The parameter `n` is ingested via `dbg.value` (the variable half — exercised in depth by the
+    // `_o0_`/`_og_` tests).
+    assert!(
+        di.vars.iter().any(|v| v.name == "n"),
+        "the parameter is ingested"
+    );
+
+    // Every loc resolves to an in-range IR `(func, block, inst)` — the cross-check that the
+    // LLVM-instruction → SVM-op mapping is self-consistent.
+    for l in &di.locs {
+        assert!((l.file as usize) < di.files.len(), "loc file in range");
+        let f = l.func as usize;
+        assert!(f < t.module.funcs.len(), "loc func {f} in range");
+        let b = l.block as usize;
+        assert!(b < t.module.funcs[f].blocks.len(), "loc block in range");
+        assert!(
+            (l.inst as usize) < t.module.funcs[f].blocks[b].insts.len(),
+            "loc inst in range"
+        );
+        assert!(l.line >= 1, "a real source line");
+    }
+
+    // The body spans several source lines (the multiply/add at line 4, the return at line 5) — not
+    // everything collapsed onto the function's opening line.
+    let lines: std::collections::BTreeSet<u32> = di.locs.iter().map(|l| l.line).collect();
+    assert!(
+        lines.len() >= 3,
+        "the statement chain maps several distinct source lines: {lines:?}"
+    );
+}
+
+/// A non-`-g` build carries **no** debug section — the waist is absent (zero cost), byte-identical
+/// to before this producer existed.
+#[test]
+fn llvm_without_g_has_no_debug_info() {
+    let Some((m, _)) = translate_verified("no_g", "int id(int x) { return x; }") else {
+        return;
+    };
+    assert!(m.debug_info.is_none(), "no -g ⇒ no debug section");
+}
+
+/// The §6 **variable/type half** for LLVM: a direct `llvm-sys` walk of the `-O0 -g` DI metadata
+/// recovers each source local's name + structured type and correlates it to the IR by alloca
+/// ordinal, landing it in the waist as a `Window` var — the LLVM analog of the wasm DWARF
+/// aggregate/pointer/array ingest (DEBUGGING.md slice 25). Mirrors the wasm
+/// `wasm_dwarf_ingests_aggregate_pointer_and_array_types` test over the same struct/array/pointer
+/// shapes, the cross-frontend cross-check that the structured-type waist is genuinely neutral.
+#[test]
+fn llvm_o0_ingests_aggregate_pointer_and_array_variables() {
+    use svm_ir::{TypeDef, VarLoc};
+
+    // `pp = &p` forces the struct to stay in memory (a real dbg.declare/alloca, not a dbg.value).
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("llvm_vars", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify"); // debug info is escape-irrelevant
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let var = |n: &str| {
+        di.vars.iter().find(|v| v.name == n).unwrap_or_else(|| {
+            panic!(
+                "var {n}: {:?}",
+                di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+            )
+        })
+    };
+    let var_type = |n: &str| &di.types[var(n).type_id.expect("typed") as usize];
+
+    // Every local is a `Window` frame slot (the alloca's data-stack offset); offsets are distinct.
+    let mut offs = Vec::new();
+    for n in ["p", "row", "pp"] {
+        let VarLoc::Window { off } = var(n).loc else {
+            panic!("{n} is a Window var, got {:?}", var(n).loc);
+        };
+        assert!(off >= 0 && (off as u64) < t.module.funcs[0].blocks.len() as u64 * 4096);
+        offs.push(off);
+    }
+    offs.sort();
+    offs.dedup();
+    assert_eq!(offs.len(), 3, "p/row/pp occupy distinct frame slots");
+
+    // `struct Point p` — aggregate x@0, y@4, both 4-byte ints, size 8.
+    let TypeDef::Aggregate { name, size, fields } = var_type("p") else {
+        panic!("p is a struct, got {:?}", var_type("p"));
+    };
+    assert_eq!(name, "struct Point");
+    assert_eq!(*size, 8);
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.offset))
+            .collect::<Vec<_>>(),
+        vec![("x", 0), ("y", 4)]
+    );
+    assert!(matches!(
+        &di.types[fields[0].ty as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `int row[3]` — array of 3 ints.
+    let TypeDef::Array { elem, count, .. } = var_type("row") else {
+        panic!("row is an array, got {:?}", var_type("row"));
+    };
+    assert_eq!(*count, 3);
+    assert!(matches!(
+        &di.types[*elem as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point *pp` — pointer whose pointee is the same aggregate as `p`.
+    let TypeDef::Pointer { pointee, name, .. } = var_type("pp") else {
+        panic!("pp is a pointer, got {:?}", var_type("pp"));
+    };
+    assert_eq!(name, "struct Point *");
+    assert!(matches!(
+        &di.types[*pointee as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct Point"
+    ));
+}
+
+/// Runtime proof that the alloca-ordinal correlation lands on the **right** frame slots: stop the
+/// interpreter just before `dist` returns and read each source variable back through the §6 waist
+/// (`Window` reads at the resolved data-stack offset). Locks that the `dbg.declare` address →
+/// alloca ordinal → frame offset chain is correct, not merely structurally plausible.
+#[test]
+fn llvm_o0_variables_read_at_runtime() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("llvm_vars_rt", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+
+    // Break at the last instruction of the last block — `dist` is branch-free at -O0, so by here
+    // every store (p.x=n, p.y=n+1, row[0]=n) has executed.
+    let lb = t.module.funcs[0].blocks.len() - 1;
+    let li = t.module.funcs[0].blocks[lb].insts.len() - 1;
+    let n = 5i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: lb,
+        inst: li,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at the return"
+    );
+
+    let i32_at = |vv: Option<VarValue>, off: usize| -> i32 {
+        match vv {
+            Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[off..off + 4].try_into().unwrap()),
+            other => panic!("expected window bytes, got {other:?}"),
+        }
+    };
+    // `struct Point p` reads x = n, y = n + 1 (8 bytes: x then y).
+    let p = insp.read_var(0, "p", 8);
+    assert_eq!(i32_at(p.clone(), 0), n, "p.x");
+    assert_eq!(i32_at(p, 4), n + 1, "p.y");
+    // `int row[3]` — element 0 was set to n.
+    assert_eq!(i32_at(insp.read_var(0, "row", 4), 0), n, "row[0]");
+}
+
+/// The §6 variable half at **`-O2`/`-Og`**: `llvm.dbg.value` binds a source variable to an SSA
+/// value rather than memory (mem2reg/SROA promoted it). The `di` reader recovers `dbg.value`
+/// bindings to a function **argument** and the translator emits a `VarLoc::SsaList` over the
+/// argument's live range (its block-local index per block) — the LLVM frontend exercising the same
+/// location-list machinery chibicc and wasm use, the case where LLVM's debug intrinsics surviving
+/// optimization make the parameter inspectable for free (DEBUGGING.md slice 26).
+#[test]
+fn llvm_og_ingests_argument_via_dbg_value_ssalist() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::{Encoding, TypeDef, VarLoc};
+
+    // A loop keeps `n` live across multiple blocks, so the SsaList spans more than the entry block.
+    let src = "\
+int scaled(int n) {
+  int total = 0;
+  for (int k = 0; k < 4; k++)
+    total += n;
+  return total;
+}
+";
+    let Some(bc) = compile_to_bc_g("og_arg", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // `n` (the argument) is ingested as a typed SSA-located var with at least one location-list
+    // entry (no `Window` slot — it was promoted to a register).
+    let n_var = di.vars.iter().find(|v| v.name == "n").unwrap_or_else(|| {
+        panic!(
+            "n ingested: {:?}",
+            di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+        )
+    });
+    let VarLoc::SsaList(locs) = &n_var.loc else {
+        panic!("n is an SsaList var, got {:?}", n_var.loc);
+    };
+    assert!(!locs.is_empty(), "n has location-list entries");
+    for l in locs {
+        assert!(
+            (l.block as usize) < t.module.funcs[0].blocks.len(),
+            "entry block in range"
+        );
+    }
+    assert!(matches!(
+        &di.types[n_var.type_id.expect("typed") as usize],
+        TypeDef::Base {
+            encoding: Encoding::Signed,
+            size: 4,
+            ..
+        }
+    ));
+
+    // Runtime: stop in the entry block and read `n` back through the SsaList → the argument value.
+    let n = 7i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    // The first entry-block instruction is a step point with the argument already live.
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped in entry"
+    );
+    assert_eq!(
+        insp.read_var(0, "n", 4),
+        Some(VarValue::Value(Value::I32(n))),
+        "n reads the arg"
+    );
+}
+
+/// The §6 **module-scoped global** half (DEBUGGING.md slice 28): a source-level global variable is
+/// ingested from its `!dbg` `DIGlobalVariableExpression` as a `GLOBAL_SCOPE` `VarLoc::Fixed` var at
+/// the global's window address (correlated by symbol name to the globals layout) — visible in every
+/// frame, with its structured type. Reads back its data-segment value at runtime.
+#[test]
+fn llvm_ingests_source_globals_as_fixed_vars() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::{TypeDef, VarLoc};
+
+    let src = "\
+int counter = 7;
+struct P { int a; int b; } origin = { 3, 4 };
+int bump(int n) { counter = counter + n; return counter + origin.a; }
+";
+    let Some(bc) = compile_to_bc_o0g("globals", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let g = |n: &str| {
+        di.vars
+            .iter()
+            .find(|v| v.name == n && v.func == svm_ir::GLOBAL_SCOPE)
+            .unwrap_or_else(|| panic!("global {n} ingested"))
+    };
+    // `counter` is a fixed-address int global; `origin` a fixed-address struct (expandable).
+    let counter = g("counter");
+    let VarLoc::Fixed { addr: counter_addr } = counter.loc else {
+        panic!("counter is Fixed, got {:?}", counter.loc);
+    };
+    assert!(matches!(
+        &di.types[counter.type_id.expect("typed") as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+    let origin = g("origin");
+    assert!(matches!(origin.loc, VarLoc::Fixed { .. }));
+    assert!(matches!(
+        &di.types[origin.type_id.expect("typed") as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct P"
+    ));
+    assert_ne!(counter_addr, 0, "a real window address");
+
+    // Runtime: at `bump`'s entry the data segment holds counter = 7; read it through the global.
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(10)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at entry"
+    );
+    let read_i32 = |insp: &Inspector| match insp.read_var(0, "counter", 4) {
+        Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+        other => panic!("expected window bytes, got {other:?}"),
+    };
+    assert_eq!(
+        read_i32(&insp),
+        7,
+        "counter's initial value, read globally at entry"
+    );
+}
+
+// --- Rust breadth, deeper: `core`-using programs (enums/`match`, slices, iterators, `Option`) ----
+
+/// Translate a `no_std` Rust crate whose `items` define `#[no_mangle] pub extern "C" fn
+/// run(n: i32) -> i32` (+ any types/helpers), run `run(n)` on both backends (interp == JIT), and
+/// return the result. `None` if the toolchain is unavailable.
+fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n{items}\n"
+    );
+    let bc = compile_rust_to_bc(name, &src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    let idx = module
+        .funcs
+        .iter()
+        .position(|f| f.params == [ValType::I64, ValType::I32] && f.results == [ValType::I32])
+        .expect("run present") as u32;
+    let mut fuel = 200_000_000u64;
+    let interp = match svm_interp::run(
+        &module,
+        idx,
+        &[Value::I64(t.entry_sp as i64), Value::I32(n)],
+        &mut fuel,
+    )
+    .expect("interp run")
+    .as_slice()
+    {
+        [Value::I32(x)] => *x,
+        other => panic!("run: expected one i32, got {other:?}"),
+    };
+    let jit = match svm_jit::compile_and_run(&module, idx, &[t.entry_sp as i64, n as i64])
+        .expect("jit run")
+    {
+        JitOutcome::Returned(s) => s[0] as i32,
+        other => panic!("unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, jit, "run({n}): interp {interp} vs JIT {jit}");
+    Some(interp)
+}
+
+/// Native oracle: the same `items` (with `run`) compiled by `rustc 1.81` into a std binary printing
+/// `run(n)`, run natively.
+fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
+    let dir = std::env::temp_dir();
+    // Per-test unique paths (`name`) — tests run in parallel, so a shared path would race.
+    let rs = dir.join(format!("svm_llvm_{}_{}_rsrun.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_rsrun", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ println!(\"{{}}\", run({n})); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args([
+            "+1.81.0",
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let out = Command::new(&exe).output().expect("run native rust");
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("parse native run"),
+    )
+}
+
+/// Drive `items` (which define `run(i32)->i32`) through both lanes for each `n`, asserting the on-ramp
+/// matches native `rustc`.
+fn check_rust_run_vs_native(name: &str, items: &str, ns: &[i32]) {
+    for &n in ns {
+        let (Some(svm), Some(native)) = (
+            rust_run_onramp(name, items, n),
+            rust_run_native(name, items, n),
+        ) else {
+            return; // toolchain unavailable — skip
+        };
+        assert_eq!(
+            svm, native,
+            "{name}: run({n}) on-ramp {svm} vs native {native}"
+        );
+    }
+}
+
+/// **Real Rust** — idiomatic `core` (a `#[repr(u8)]` enum dispatched by `match`, fixed arrays +
+/// slice iteration, `Option` + `match`, an iterator `find` with a closure) through the on-ramp,
+/// byte-identical to native `rustc`. A bytecode-style fold over a data array, then an `Option`-typed
+/// search — the shapes a real `no_std` Rust program is built from. Exercises enum discriminants →
+/// `switch`/`br_table`, slice indexing, niche-optimized `Option<i32>`, and `-O2` iterator lowering.
+#[test]
+fn rust_core_enum_slice_option() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    enum Op { Add, Mul, Xor, Sub }
+    fn apply(op: Op, a: i32, x: i32) -> i32 {
+        match op {
+            Op::Add => a.wrapping_add(x),
+            Op::Mul => a.wrapping_mul(x),
+            Op::Xor => a ^ x,
+            Op::Sub => a.wrapping_sub(x),
+        }
+    }
+    let prog = [Op::Add, Op::Mul, Op::Xor, Op::Sub, Op::Add];
+    let data = [3i32, 1, 4, 1, 5, 9, 2, 6];
+    let mut acc = n;
+    let mut k = 0usize;
+    for &x in data.iter() {
+        acc = apply(prog[k % prog.len()], acc, x);
+        k += 1;
+    }
+    acc = acc.wrapping_add(match data.iter().copied().find(|&v| v > n) {
+        Some(v) => v,
+        None => -1,
+    });
+    acc
+}
+"#;
+    check_rust_run_vs_native("rs_core", items, &[0, 1, 5, 100, -3, 1000]);
+}
+
+/// **Real Rust** — by-value `struct`s, an array-of-struct with slice iteration + field access, a
+/// by-value struct argument, signed `/`+`%`, and an iterator `map().max()` yielding `Option<i32>`.
+/// The aggregate/by-value-struct shapes (clang's small-struct coercion, slice J) and `-O2` iterator
+/// lowering, from the Rust frontend — byte-identical to native `rustc`.
+#[test]
+fn rust_core_structs_and_iterators() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    struct Pt { x: i32, y: i32 }
+    fn norm(p: Pt) -> i32 { p.x.wrapping_mul(p.x).wrapping_add(p.y.wrapping_mul(p.y)) }
+    let pts = [
+        Pt { x: 1, y: 2 },
+        Pt { x: n, y: 3 },
+        Pt { x: 4, y: n / 2 },
+        Pt { x: n % 5, y: 7 },
+    ];
+    let mut s = 0i32;
+    for p in pts.iter() {
+        s = s.wrapping_add(norm(*p));
+    }
+    let best = pts.iter().map(|p| norm(*p)).max();
+    s.wrapping_add(match best { Some(m) => m, None => 0 })
+}
+"#;
+    check_rust_run_vs_native("rs_structs", items, &[0, 3, 10, -8, 100]);
+}
+
+/// **Real Rust panic paths** — a runtime division emits non-elidable div-by-zero + overflow checks
+/// whose panic branches call `core::panicking::panic_const_*` (external libcore). Under `panic=abort`
+/// the on-ramp lowers those to a trap (drop + the trailing `unreachable`), so the program *translates*
+/// — the gap that blocks essentially all real Rust. The divisor here is `(n & 7) + 1` through
+/// `black_box` (always ≥ 1, but opaque so the panic paths stay in the IR), so the non-panic path runs
+/// and `n / d` matches native `rustc` exactly. Without the fix, translation fails on the undefined
+/// `panic_const_div_by_zero` reference.
+#[test]
+fn rust_panic_path_div_traps_and_runs() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let tmp = (n & 7) + 1;                      // [1, 8] — never zero…
+    let d = unsafe { core::ptr::read_volatile(&tmp) }; // …but opaque (a volatile load), so the
+                                                // div-by-zero + overflow panic checks stay in the IR
+    (n / d).wrapping_add(n % d)
+}
+"#;
+    check_rust_run_vs_native("rs_panic", items, &[0, 1, 7, 100, -50, 1234]);
+}
+
+/// **Rust trait objects** — `&dyn Trait` dynamic dispatch through the on-ramp. Two types implement a
+/// trait; an array of `&dyn Shape` (each a `{data, vtable}` fat pointer) is iterated and the method is
+/// called dynamically — a vtable load + `call_indirect` per element, the Rust analog of the C++ vtable
+/// path (slice AG). Exercises Rust vtable globals (function-pointer initializers, slice K), fat-pointer
+/// aggregates, and dynamic dispatch — byte-identical to native `rustc`.
+#[test]
+fn rust_trait_object_dispatch() {
+    let items = r#"
+trait Shape {
+    fn area(&self) -> i32;
+}
+struct Sq(i32);
+struct Rect(i32, i32);
+impl Shape for Sq {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.0) }
+}
+impl Shape for Rect {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.1) }
+}
+
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let sq = Sq(n);
+    let rect = Rect(n, 3);
+    let shapes: [&dyn Shape; 2] = [&sq, &rect];
+    let mut total = 0i32;
+    for s in shapes.iter() {
+        total = total.wrapping_add(s.area()); // dynamic dispatch via the vtable
+    }
+    total
+}
+"#;
+    check_rust_run_vs_native("rs_traits", items, &[0, 2, 7, -4, 100]);
+}
+
+/// **Rust slices as arguments** — `&[i32]` (a `{ptr, len}` fat pointer) passed across a real
+/// (`#[inline(never)]`) call boundary, plus a sub-slice (`&data[1..4]`). Exercises the slice-arg ABI
+/// and bounds-checked range indexing (provably in-bounds → elided), vs native `rustc`.
+#[test]
+fn rust_slice_argument() {
+    let items = r#"
+#[inline(never)]
+fn sum(s: &[i32]) -> i32 {
+    let mut t = 0i32;
+    for &x in s { t = t.wrapping_add(x); }
+    t
+}
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let data = [n, n.wrapping_add(1), n.wrapping_add(2), 7, 5, 6];
+    sum(&data).wrapping_add(sum(&data[1..4]))
+}
+"#;
+    check_rust_run_vs_native("rs_slice", items, &[0, 10, -3]);
+}
+
+/// **Rust `Option::unwrap`** — the unwrap panic path (`core::panicking::panic` / `unwrap_failed`) is
+/// in the IR; under `panic=abort` it lowers to a trap (slice AI's recognizer). The value is always
+/// `Some` at runtime, so the non-panic path runs and matches native `rustc`.
+#[test]
+fn rust_option_unwrap() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let v: Option<i32> = if (n & 1) == 0 { Some(n.wrapping_mul(3)) } else { Some(n.wrapping_sub(1)) };
+    v.unwrap().wrapping_add(7) // always Some at runtime; the None panic path traps
+}
+"#;
+    check_rust_run_vs_native("rs_unwrap", items, &[0, 1, 8, -5]);
+}
+
+/// Run a `no_std` + `alloc` Rust crate (whose `items` define `fn compute() -> i32`) **through the
+/// powerbox**: the on-ramp synthesizes `#[no_mangle] extern "C" fn main` calling `compute`, so it gets
+/// a powerbox `_start` that grants the `Memory` handle and seeds the heap (the `vm_map`-growing bump
+/// allocator the program's `#[global_allocator]` reaches via `malloc`). Returns `compute()`'s value as
+/// the program's `u8` exit/return code, run on the JIT. `None` if the toolchain is unavailable.
+fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         {items}\n\
+         #[no_mangle] pub extern \"C\" fn main() -> i32 {{ compute() }}\n"
+    );
+    let bc = compile_rust_to_bc(name, &src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: an alloc program must produce a powerbox entry (Memory granted)"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    Some(match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    })
+}
+
+/// Native oracle: the same `items` (with `compute`) built as a std binary that `process::exit`s with
+/// `compute()`, run natively; its `u8` exit code is the ground truth.
+fn rust_alloc_native(name: &str, items: &str) -> Option<u8> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("svm_llvm_{}_{}_alloc.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_alloc", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ std::process::exit(compute()); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args([
+            "+1.81.0",
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    Some(
+        Command::new(&exe)
+            .status()
+            .expect("run native")
+            .code()
+            .unwrap_or(-1) as u8,
+    )
+}
+
+/// **Rust `alloc` / heap — `Vec` via a guest `#[global_allocator]`.** The headline for *real* Rust: a
+/// `no_std` + `alloc` crate whose global allocator routes to the guest `malloc`/`free`. Run through the
+/// powerbox (the on-ramp synthesizes `main` → `_start`, granting the `Memory` handle and the
+/// `vm_map`-growing bump allocator), `Vec::push` grows the heap (alloc + `memcpy` + free) and the sum
+/// is returned as the exit code — heap data structures from Rust, byte-identical to native `rustc`.
+#[test]
+fn rust_alloc_vec_via_global_allocator() {
+    let items = r#"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { malloc(layout.size()) }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) { free(ptr); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+fn compute() -> i32 {
+    let mut v: alloc::vec::Vec<i32> = Vec::new();
+    let mut i = 0i32;
+    while i < 64 {
+        v.push(i.wrapping_mul(i)); // grows the heap several times
+        i = i.wrapping_add(1);
+    }
+    let mut s: i32 = 0;
+    for &x in v.iter() {
+        s = s.wrapping_add(x);
+    }
+    s.rem_euclid(251) // a deterministic value in [0, 250] — fits the u8 exit code
+}
+"#;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_alloc", items),
+        rust_alloc_native("rs_alloc", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "rust alloc/Vec: on-ramp exit {svm} vs native {native}"
+    );
+    // Pin the value so the differential can't pass vacuously: Σ i² for i in 0..64 = 85344; % 251 = 4.
+    assert_eq!(svm, 4, "rust alloc/Vec: expected 4, got {svm}");
+}
+
+/// **Rust `Box` + `String` — a mini expression evaluator (the heap capstone).** A recursive-descent
+/// parser over a byte slice builds a `Box`ed recursive AST (`enum Expr { Num, Add(Box,Box), … }` — the
+/// canonical use of `Box`), `eval` walks it recursively, and `render` serializes it back into a
+/// `String` (heap text via the guest allocator). The result + the rendered length is returned — `Box`,
+/// `String`, recursive enums, slice parsing, and the panic paths (a malformed parse would trap) all at
+/// once, byte-identical to native `rustc`. A tiny interpreter, right at home next to the guest-JIT demo.
+#[test]
+fn rust_box_string_expr_evaluator() {
+    let items = r#"
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+}
+
+fn eval(e: &Expr) -> i64 {
+    match e {
+        Expr::Num(n) => *n,
+        Expr::Add(a, b) => eval(a).wrapping_add(eval(b)),
+        Expr::Sub(a, b) => eval(a).wrapping_sub(eval(b)),
+        Expr::Mul(a, b) => eval(a).wrapping_mul(eval(b)),
+    }
+}
+
+fn render(e: &Expr, out: &mut String) {
+    match e {
+        Expr::Num(n) => {
+            let mut v = *n;
+            if v == 0 { out.push('0'); }
+            let mut tmp = [0u8; 20];
+            let mut k = 0;
+            while v > 0 { tmp[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+            while k > 0 { k -= 1; out.push(tmp[k] as char); }
+        }
+        Expr::Add(a, b) => { out.push('('); render(a, out); out.push('+'); render(b, out); out.push(')'); }
+        Expr::Sub(a, b) => { out.push('('); render(a, out); out.push('-'); render(b, out); out.push(')'); }
+        Expr::Mul(a, b) => { out.push('('); render(a, out); out.push('*'); render(b, out); out.push(')'); }
+    }
+}
+
+struct Parser<'a> { s: &'a [u8], pos: usize }
+impl<'a> Parser<'a> {
+    fn peek(&self) -> u8 { if self.pos < self.s.len() { self.s[self.pos] } else { 0 } }
+    fn bump(&mut self) -> u8 { let c = self.peek(); self.pos += 1; c }
+    fn number(&mut self) -> Box<Expr> {
+        let mut n: i64 = 0;
+        while self.peek().is_ascii_digit() {
+            n = n.wrapping_mul(10).wrapping_add((self.bump() - b'0') as i64);
+        }
+        Box::new(Expr::Num(n))
+    }
+    fn factor(&mut self) -> Box<Expr> {
+        if self.peek() == b'(' {
+            self.bump();
+            let e = self.expr();
+            self.bump(); // ')'
+            e
+        } else {
+            self.number()
+        }
+    }
+    fn term(&mut self) -> Box<Expr> {
+        let mut left = self.factor();
+        while self.peek() == b'*' {
+            self.bump();
+            let right = self.factor();
+            left = Box::new(Expr::Mul(left, right));
+        }
+        left
+    }
+    fn expr(&mut self) -> Box<Expr> {
+        let mut left = self.term();
+        loop {
+            match self.peek() {
+                b'+' => { self.bump(); let r = self.term(); left = Box::new(Expr::Add(left, r)); }
+                b'-' => { self.bump(); let r = self.term(); left = Box::new(Expr::Sub(left, r)); }
+                _ => break,
+            }
+        }
+        left
+    }
+}
+
+fn compute() -> i32 {
+    let input = b"2+3*4-(5-1)*2+10";          // = 2 + 12 - 8 + 10 = 16
+    let mut p = Parser { s: input, pos: 0 };
+    let ast = p.expr();
+    let result = eval(&ast);
+    let mut s = String::new();
+    render(&ast, &mut s);                       // a fully-parenthesized rendering
+    result.wrapping_add(s.len() as i64).rem_euclid(251) as i32
+}
+"#;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_expr", items),
+        rust_alloc_native("rs_expr", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "expr evaluator: on-ramp {svm} vs native {native}"
+    );
+    // Pin it (non-vacuous): eval = 16, render = `(((2+(3*4))-((5-1)*2))+10)` (26 chars); 42 % 251 = 42.
+    assert_eq!(svm, 42, "expr evaluator: expected 42, got {svm}");
+}
+
+// ============================================================================================
+// SIMD — ingesting `-O2` **auto-vectorized** output (§17/D58 `v128`). The C/C++/Rust breadth lanes
+// disable vectorization (`-fno-*-vectorize`); these tests *enable* it, so the on-ramp consumes the
+// `<4 x i32>` lane ops + horizontal `llvm.vector.reduce.*` a real `-O2` reduction loop emits.
+// ============================================================================================
+
+/// Like [`compile_to_bc`] but with **auto-vectorization enabled** (no `-fno-*-vectorize`), so a
+/// reduction loop lowers to `<4 x i32>` SIMD + `llvm.vector.reduce.*`.
+fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_simd_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-c"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Like [`compile_to_bc_vectorized`] but targeting **AVX2** (`-mavx2`), so the auto-vectorizer emits
+/// wider-than-128-bit vectors (`<8 x i32>`, and `<16 x i32>` under interleave) — the exact shapes
+/// the I2 legalization pass splits into `v128` chunks. The bitcode only *names* AVX vectors; the SVM
+/// JIT still lowers each chunk to SSE2/NEON, so no AVX2 hardware is needed to run the result.
+fn compile_to_bc_avx(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_simd_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-mavx2", "-emit-llvm", "-c"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Run `run(seed)` (function 0) from **vectorized** bitcode on both backends and assert it equals a
+/// native `cc` build's exit code (the on-ramp's SIMD lowering vs the scalar native result — they
+/// compute the same value).
+fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc_vectorized(name, src) else {
+        return;
+    };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Like [`check_vectorized_vs_native`] but ingests **AVX2** auto-vectorized bitcode (wider-than-128
+/// shapes), which the I2 legalization pass splits into `v128` chunks. The native oracle is a plain
+/// scalar `cc` build of the same loop (gcc needs no `-mavx2`), so SVM-chunked == native-scalar.
+fn check_avx_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc_avx(name, src) else {
+        return;
+    };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Shared body: build the source's `.c` natively with `cc`, run it, then translate `bc`, verify, and
+/// run `run(seed)` (function 0) on both backends — asserting interp == JIT == native exit code.
+fn check_simd_bc_vs_native(name: &str, bc: &Path, seed: i32) {
+    let exe =
+        std::env::temp_dir().join(format!("svm_llvm_simdnat_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => return,
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(bc).expect("translate vectorized bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    let jit = match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => Value::I32(s[0] as i32),
+        other => panic!("{name}: unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, vec![jit], "{name}: interp vs JIT");
+    let svm = match jit {
+        Value::I32(x) => x as u8,
+        _ => panic!("expected i32"),
+    };
+    assert_eq!(svm, native, "{name}: svm={svm} vs native cc={native}");
+}
+
+/// **SIMD first light — an auto-vectorized integer reduction.** A `noinline` `sum` over an opaque
+/// pointer vectorizes at `-O2` to an `<4 x i32>` accumulator + `llvm.vector.reduce.add.v4i32`; the
+/// on-ramp ingests the vector lane add (`VIntBin i32x4`) and unrolls the reduce. `run(7)` fills a
+/// global with `7 + i²` (i in 0..20) and sums it = 140 + 2470 = 2610 (exit `2610 & 0xff = 50`), vs
+/// native — proving the on-ramp consumes real `-O2` vectorized output.
+#[test]
+fn simd_int_reduction_first_light() {
+    let src = "int sum(const int *a, int n);\n\
+        static int data[20];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 20; i++) data[i] = seed + i * i;\n\
+        \x20 return sum(data, 20);\n\
+        }\n\
+        __attribute__((noinline)) int sum(const int *a, int n) {\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < n; i++) s += a[i];\n\
+        \x20 return s;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vectorized_vs_native("simd_reduce", src, 7);
+}
+
+/// SIMD — an auto-vectorized **max reduction** (`llvm.vector.reduce.smax.v4i32`, + any `<4 x i32>`
+/// lane `smax`). `run(seed)` fills a global with a wave of values and takes the max, vs native —
+/// exercising the min/max reduce fold (`cmp`+`select`).
+#[test]
+fn simd_int_max_reduction() {
+    let src = "int amax(const int *a, int n);\n\
+        static int data[24];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 24; i++) data[i] = ((i * 7 + seed) & 31) - 13;\n\
+        \x20 return amax(data, 24) + 20;\n\
+        }\n\
+        __attribute__((noinline)) int amax(const int *a, int n) {\n\
+        \x20 int m = a[0];\n\
+        \x20 for (int i = 1; i < n; i++) if (a[i] > m) m = a[i];\n\
+        \x20 return m;\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check_vectorized_vs_native("simd_max", src, 3);
+}
+
+/// **Capstone — ingesting *real* `-O2 -mavx2` auto-vectorized output.** The motivating I2 case: the
+/// same reduction loop, vectorized for AVX2, emits a wider-than-128 `<8 x i32>` accumulator +
+/// `llvm.vector.reduce.add.v8i32` (and `<16 x i32>` under interleave). The legalization pass splits
+/// each into `v128` chunks, so the on-ramp now ingests it (previously a fail-closed `Unsupported`),
+/// running byte-identical to the native scalar oracle on both backends.
+#[test]
+fn simd_autovec_avx2_reduction() {
+    let src = "int sum(const int *a, int n);\n\
+        static int data[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) data[i] = seed + i * i;\n\
+        \x20 return sum(data, 64);\n\
+        }\n\
+        __attribute__((noinline)) int sum(const int *a, int n) {\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < n; i++) s += a[i];\n\
+        \x20 return s;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_avx_vs_native("simd_avx2_reduce", src, 7);
+}
+
+/// `-O2 -mavx2` auto-vectorized **elementwise** kernel (`c[i] = a[i]*b[i] + a[i]`) — wide `<8 x i32>`
+/// lane multiply/add across `v128` chunks (no horizontal reduce), vs the native scalar oracle.
+#[test]
+fn simd_autovec_avx2_elementwise() {
+    let src = "void mul(const int *a, const int *b, int *c, int n);\n\
+        static int A[64], B[64], C[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) { A[i] = seed + i; B[i] = i * 2 + 1; }\n\
+        \x20 mul(A, B, C, 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += C[i];\n\
+        \x20 return s;\n\
+        }\n\
+        __attribute__((noinline)) void mul(const int *a, const int *b, int *c, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) c[i] = a[i] * b[i] + a[i];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_avx_vs_native("simd_avx2_elem", src, 4);
+}
+
+// ============================================================================================
+// SIMD — the **other 128-bit lane shapes** (`i8x16`/`i16x8`/`i64x2`/`f64x2`), beyond the original
+// `i32x4`/`f32x4`. These use explicit `vector_size(16)` types compiled with vectorization *off*
+// (`compile_to_bc` / `check_vs_native`), so the on-ramp sees exactly the declared 128-bit shape —
+// no auto-vectorizer widening. A `noinline` helper takes opaque pointers so clang must emit real
+// `<N x T>` loads/ops, not scalarize them. Each `vec128_shape` op (load/store, `VIntBin`,
+// `VFloatBin`, `ExtractLane`) is exercised against the native oracle on both backends.
+// ============================================================================================
+
+/// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
+/// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
+#[test]
+fn simd_i64x2_mul_add_extract() {
+    let src = "long long vdot(const long long *A, const long long *B);\n\
+        static long long A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 2; B[0] = 3; B[1] = 5;\n\
+        \x20 return (int)(vdot(A, B) & 0xff);\n\
+        }\n\
+        typedef long long i64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) long long vdot(const long long *A, const long long *B) {\n\
+        \x20 i64x2 a = *(const i64x2 *)A;\n\
+        \x20 i64x2 b = *(const i64x2 *)B;\n\
+        \x20 i64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("simd_i64x2", src, 7);
+}
+
+/// `<16 x i8>` lane add through a `v128` load → add → store (`i8x16` load/`VIntBin` Add/store).
+/// Two distinct input arrays so `a + b` stays a real lane add (a self-add would strength-reduce to
+/// a vector shift, which is a separate unsupported op). The scalar tail-sum reads the stored bytes
+/// back from memory (stays scalar under `-fno-vectorize`).
+#[test]
+fn simd_i8x16_add_load_store() {
+    let src = "void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[16], F[16], E[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 16; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char u8x16 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 u8x16 a = *(const u8x16 *)P;\n\
+        \x20 u8x16 b = *(const u8x16 *)Q;\n\
+        \x20 *(u8x16 *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x16", src, 5);
+}
+
+/// `<8 x i16>` lane multiply through a `v128` load → mul → store (`i16x8` `VIntBin` Mul). Wraps
+/// mod 2^16 per lane; the scalar read-back truncates to the lane width.
+#[test]
+fn simd_i16x8_mul_load_store() {
+    let src = "void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O);\n\
+        static unsigned short D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned short)(seed + i); F[i] = (unsigned short)(i + 1); }\n\
+        \x20 vmul(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned short u16x8 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O) {\n\
+        \x20 u16x8 a = *(const u16x8 *)P;\n\
+        \x20 u16x8 b = *(const u16x8 *)Q;\n\
+        \x20 *(u16x8 *)O = a * b;\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check_vs_native("simd_i16x8", src, 2);
+}
+
+/// `<2 x double>` lane multiply + add (`f64x2` `VFloatBin` Mul/Add). Finite values only, so the
+/// per-lane-NaN differential caveat (§17) doesn't apply; the derived integer result is exact.
+#[test]
+fn simd_f64x2_mul_add() {
+    let src = "double vfma(const double *A, const double *B);\n\
+        static double A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 1; B[0] = 2.0; B[1] = 3.0;\n\
+        \x20 return (int)vfma(A, B);\n\
+        }\n\
+        typedef double f64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) double vfma(const double *A, const double *B) {\n\
+        \x20 f64x2 a = *(const f64x2 *)A;\n\
+        \x20 f64x2 b = *(const f64x2 *)B;\n\
+        \x20 f64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("simd_f64x2", src, 4);
+}
+
+// ============================================================================================
+// SIMD — **wider-than-128-bit** vectors legalized to fixed-128 `v128` chunks + a scalar tail (I2
+// fix-sketch step 1). These use explicit `vector_size` types (compiled with vectorization off) so
+// the on-ramp sees an exact wide shape, and `noinline` helpers with opaque pointers force real wide
+// loads/ops — all *within a single block* (no control flow), exercising the in-block splitter. The
+// `<8 x i32>` / `<4 x i64>` cases split into 2 clean `v128` chunks (no tail); the `<8 x i8>` case is
+// sub-128 and fully scalarized into the tail (0 chunks, 8 lane scalars).
+// ============================================================================================
+
+/// `<8 x i32>` (256-bit) elementwise add → split into **2 `i32x4` chunks** (load/`VIntBin`/store).
+#[test]
+fn simd_i32x8_add_store() {
+    let src = "void vadd8(const int *P, const int *Q, int *O);\n\
+        static int D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = seed + i; F[i] = 2 * i + 1; }\n\
+        \x20 vadd8(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) void vadd8(const int *P, const int *Q, int *O) {\n\
+        \x20 v8si a = *(const v8si *)P, b = *(const v8si *)Q;\n\
+        \x20 *(v8si *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i32x8", src, 5);
+}
+
+/// `<8 x i32>` horizontal `llvm.vector.reduce.add.v8i32` (via `__builtin_reduce_add`) over 2 chunks
+/// — the wide-reduce fold (extract every lane of both chunks, sum). `__builtin_reduce_*` is a clang
+/// builtin (`cc`/gcc lacks it), so this uses `check` with a computed expected value (interp == JIT)
+/// rather than the native oracle. `run(3)`: Σ(3 + i²) for i in 0..8 = 24 + 140 = 164.
+#[test]
+fn simd_i32x8_reduce_add() {
+    let src = "int vred8(const int *P);\n\
+        static int D[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) D[i] = seed + i * i;\n\
+        \x20 return vred8(D);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vred8(const int *P) {\n\
+        \x20 v8si a = *(const v8si *)P;\n\
+        \x20 return __builtin_reduce_add(a);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_red", src, &[Value::I32(3)], &[Value::I32(164)]);
+}
+
+/// `<4 x i64>` (256-bit) lane multiply + horizontal `reduce.add.v4i64` over **2 `i64x2` chunks**.
+/// `run(2)`: Σ (2+i)·(i+1) for i in 0..4 = 2 + 6 + 12 + 20 = 40.
+#[test]
+fn simd_i64x4_mul_reduce() {
+    let src = "long long vred4(const long long *P, const long long *Q);\n\
+        static long long D[4], F[4];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 4; i++) { D[i] = seed + i; F[i] = i + 1; }\n\
+        \x20 return (int)vred4(D, F);\n\
+        }\n\
+        typedef long long v4di __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) long long vred4(const long long *P, const long long *Q) {\n\
+        \x20 v4di a = *(const v4di *)P, b = *(const v4di *)Q;\n\
+        \x20 v4di c = a * b;\n\
+        \x20 return __builtin_reduce_add(c);\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check("simd_i64x4", src, &[Value::I32(2)], &[Value::I32(40)]);
+}
+
+/// `<8 x i8>` (64-bit, sub-128) elementwise add — **fully scalarized into the tail** (0 chunks, 8
+/// lane scalars: a 16-byte `v128.load` would overrun its 8-byte image, so each lane is a byte op).
+#[test]
+fn simd_i8x8_add_tail() {
+    let src = "void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd8b(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char v8qi __attribute__((vector_size(8)));\n\
+        __attribute__((noinline)) void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 v8qi a = *(const v8qi *)P, b = *(const v8qi *)Q;\n\
+        \x20 *(v8qi *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x8", src, 5);
+}
+
+/// **Cross-block wide vector.** A reduction loop carries an `<8 x i32>` accumulator across the loop
+/// backedge as a *wide phi* — the case the legalization fan-out exists for: one wide LLVM value
+/// becomes `K` block params (2 `i32x4` chunks here) supplied as `K` branch args on every edge into
+/// the loop header. `n` is opaque (a `noinline` param), so the loop is a real backedge, not unrolled.
+/// `run(3)`: Σ(3 + i) for i in 0..16 = 48 + 120 = 168.
+#[test]
+fn simd_i32x8_loop_accumulator() {
+    let src = "int vsum(const int *P, int n);\n\
+        static int D[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) D[i] = seed + i;\n\
+        \x20 return vsum(D, 16);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vsum(const int *P, int n) {\n\
+        \x20 v8si acc = {0, 0, 0, 0, 0, 0, 0, 0};\n\
+        \x20 for (int i = 0; i < n; i += 8) {\n\
+        \x20   v8si a = *(const v8si *)(P + i);\n\
+        \x20   acc += a;\n\
+        \x20 }\n\
+        \x20 return __builtin_reduce_add(acc);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_loop", src, &[Value::I32(3)], &[Value::I32(168)]);
+}
+
+/// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
+/// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
+/// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and
+/// bare primitives, then fold a deterministic digest over the tokens. Exercises enums, `Vec<struct>`
+/// (heap, growth via the guest allocator), `&[u8]` scanning, `match` on bytes, and an enum-to-int
+/// cast — a recognizable real Rust library end to end, byte-identical to native `rustc`.
+#[test]
+fn rust_json_tokenizer_capstone() {
+    let items = r##"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+#[derive(Clone, Copy)]
+enum Kind { Obj, Arr, Str, Prim }
+
+#[derive(Clone, Copy)]
+struct Tok { kind: Kind, start: usize, end: usize }
+
+fn is_ws(c: u8) -> bool { matches!(c, b' ' | b'\t' | b'\n' | b'\r') }
+
+fn tokenize(js: &[u8]) -> Vec<Tok> {
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut i = 0usize;
+    while i < js.len() {
+        let c = js[i];
+        if c == b'{' {
+            toks.push(Tok { kind: Kind::Obj, start: i, end: i });
+            i += 1;
+        } else if c == b'[' {
+            toks.push(Tok { kind: Kind::Arr, start: i, end: i });
+            i += 1;
+        } else if c == b'"' {
+            let start = i + 1;
+            i += 1;
+            while i < js.len() && js[i] != b'"' {
+                if js[i] == b'\\' { i += 1; } // skip the escaped char
+                i += 1;
+            }
+            toks.push(Tok { kind: Kind::Str, start, end: i });
+            i += 1; // closing quote
+        } else if is_ws(c) || c == b':' || c == b',' || c == b'}' || c == b']' {
+            i += 1;
+        } else {
+            let start = i;
+            while i < js.len()
+                && !is_ws(js[i])
+                && js[i] != b','
+                && js[i] != b'}'
+                && js[i] != b']'
+            {
+                i += 1;
+            }
+            toks.push(Tok { kind: Kind::Prim, start, end: i });
+        }
+    }
+    toks
+}
+
+fn compute() -> i32 {
+    let doc = br#"{ "name": "v\"m", "tags": ["a", "b", "c"], "n": 42, "ok": true, "x": null }"#;
+    let toks = tokenize(doc);
+    let mut acc: i64 = toks.len() as i64;
+    for t in toks.iter() {
+        acc = acc
+            .wrapping_mul(31)
+            .wrapping_add(t.kind as i64)
+            .wrapping_add(t.end.wrapping_sub(t.start) as i64);
+    }
+    acc.rem_euclid(251) as i32
+}
+"##;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_json", items),
+        rust_alloc_native("rs_json", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "json tokenizer: on-ramp {svm} vs native {native}"
+    );
+    // Pin it (non-vacuous): 14 tokens over the doc, folded digest % 251 = 135.
+    assert_eq!(svm, 135, "json tokenizer: expected digest 135, got {svm}");
 }

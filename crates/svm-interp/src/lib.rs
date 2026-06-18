@@ -1389,7 +1389,7 @@ impl Inspector {
             let var = di
                 .vars
                 .iter()
-                .find(|x| x.func == frame.func && x.name == name)?;
+                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
             // Resolve a location list (S2) at the frame's current pc (nearest-preceding within the
             // stopped block). `None` ⇒ no covering entry, the var isn't live here.
             let resolve = |locs: &[SsaLoc]| loclist_value(locs, frame.block, frame.inst);
@@ -1420,6 +1420,8 @@ impl Inspector {
                     let base_val = frame.vals.get(resolve(base)? as usize)?;
                     window_read(base_val.i64() as u64, *off)
                 }
+                // A module-scoped global at a fixed absolute window address (frame-independent).
+                VarLoc::Fixed { addr } => window_read(*addr, 0),
             }
         })
         .flatten()
@@ -1440,13 +1442,14 @@ impl Inspector {
             let var = di
                 .vars
                 .iter()
-                .find(|x| x.func == frame.func && x.name == name)?;
+                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
             let base = match &var.loc {
                 VarLoc::Window { off } => frame.vals.first()?.i64() as u64 + *off as u64,
                 VarLoc::WindowVia { base, off } => {
                     let idx = loclist_value(base, frame.block, frame.inst)?;
                     frame.vals.get(idx as usize)?.i64() as u64 + *off as u64
                 }
+                VarLoc::Fixed { addr } => *addr,
                 VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
             };
             Some(base)
@@ -1532,9 +1535,31 @@ fn drive(
     // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
     // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
     let durable = host.is_durable();
+    // Durable **freeze/thaw** runs (the window's state word is `UNWINDING`/`REWINDING`, not `NORMAL`)
+    // serialize onto a single worker (DURABILITY.md §12.8 slice 3.2.1): the shared active shadow-SP
+    // word is used by one vCPU at a time, so concurrent unwind/rewind can't race it, and the runtime
+    // re-points it per vCPU on each dispatch. Ordinary runs — incl. a `NORMAL` durable run, which never
+    // touches the reserve — keep full multi-worker parallelism.
+    let workers = if durable
+        && mem
+            .as_ref()
+            .map(|m| m.durable_state())
+            .unwrap_or(STATE_NORMAL)
+            != STATE_NORMAL
+    {
+        1
+    } else {
+        workers
+    };
     // Thaw seeding (slice 3.1.5): fibers a freeze flattened, to re-create in the registry before the
     // root re-enters under REWINDING. Taken (cleared) here; empty for a freeze or ordinary run.
     let thaw_fibers = std::mem::take(&mut host.frozen_fibers);
+    // Thaw seeding (slice 3.2.1): spawned vCPUs a freeze flattened, re-attached by the root's rewound
+    // `thread.spawn` (in ascending task order). Taken here; empty for a freeze or ordinary run.
+    let thaw_vcpus = std::mem::take(&mut host.frozen_vcpus);
+    // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
+    // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
+    let thaw_root_sp = host.frozen_root_sp.take();
     let sched = Arc::new(Scheduler::new(quota.max_vcpus, workers));
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
@@ -1573,9 +1598,26 @@ fn drive(
             id,
             SchedRef::Real(Arc::clone(&sched)),
             quota,
-            dt,
+            Arc::clone(&dt),
         ));
         root.durable = durable;
+        // The root's own durable state word is the window's initial phase (NORMAL / UNWINDING freeze /
+        // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1).
+        root.dstate = root
+            .mem
+            .as_ref()
+            .map(|m| m.durable_state())
+            .unwrap_or(STATE_NORMAL);
+        // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
+        // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
+        // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
+        // dispatch (slice 3.2.1).
+        root.root_shadow_sp = thaw_root_sp.unwrap_or_else(|| {
+            root.mem
+                .as_ref()
+                .map(|m| m.durable_get_sp())
+                .unwrap_or(SHADOW_BASE)
+        });
         // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
         // ascending slot order, so the dense handle namespace matches the freeze (the root's
         // re-issued `cont.resume` names handle 0, …). Each fiber's flattened shadow-SP goes back in
@@ -1587,6 +1629,54 @@ fn drive(
                 let got = root.registry.seed_frozen(ff.func, ff.sp, ff.shadow_sp);
                 debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
                 debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
+            }
+        }
+        // Thaw re-spawn (slice 3.2.1): reconstruct the spawned vCPUs a freeze flattened. The root's
+        // rewind *skips* its prologue `thread.spawn` (the REWINDING prologue jumps straight to the
+        // resume ARM), so a child that existed before the freeze point is **not** re-created by the
+        // root — the runtime re-creates it here, under `REWINDING`, with its flattened shadow-SP
+        // restored, so it rewinds from its frozen point and runs forward. Children re-spawn in
+        // ascending task (= spawn) order, landing on the same dense task ids → the same per-context
+        // shadow regions, and the root's `threads` (join) table is rebuilt to map each handle slot to
+        // its child — so the root's re-executed `thread.join` (after its checkpoint) resolves. Only the
+        // root's direct children are handled (the no-fiber, flat 2-vCPU scope of 3.2.1); nested spawns
+        // and the multi-vCPU + fibers combination are follow-ups.
+        {
+            let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
+            vseed.sort_by_key(|f| f.task);
+            for ff in vseed {
+                let cid = s.next_task;
+                s.next_task += 1;
+                s.live += 1;
+                debug_assert_eq!(
+                    cid as usize, ff.task,
+                    "thaw re-spawns children densely by task"
+                );
+                let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
+                let mut child = Box::new(VCpu::new(
+                    Arc::clone(&funcs),
+                    ff.func as FuncIdx,
+                    &[
+                        Value::I64(ff.args.first().copied().unwrap_or(0)),
+                        Value::I64(ff.args.get(1).copied().unwrap_or(0)),
+                    ],
+                    child_mem,
+                    Arc::clone(&host_shared),
+                    *fuel,
+                    0,
+                    cid,
+                    SchedRef::Real(Arc::clone(&sched)),
+                    quota,
+                    Arc::clone(&dt),
+                ));
+                child.registry = Arc::clone(&root.registry);
+                child.durable = true;
+                child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
+                child.root_shadow_sp = ff.shadow_sp;
+                child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
+                // Rebuild the root's join handle → child mapping (handle slot = spawn order = task − 1).
+                root.threads.push(Some(cid));
+                s.runnable.push_back(child);
             }
         }
         s.runnable.push_back(root);
@@ -3040,7 +3130,31 @@ fn worker_loop(sched: &Arc<Scheduler>) {
 /// Run one vCPU until it yields, then route the outcome: publish a result (waking a joiner) and
 /// retire the slot, or park it on a join target / wait address.
 fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
-    match v.run(u64::MAX) {
+    // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
+    // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
+    // shadow-SP ([`SHADOW_SP_OFF`]). The freeze/thaw runs single-worker, so the one shared pair is each
+    // vCPU's own context, swapped per dispatch: the shadow-SP points unwind/rewind at this vCPU's region
+    // (`context = task id`), and the state word is this vCPU's own freeze phase — vital because a
+    // rewinding vCPU flips the word to `NORMAL` after reloading, which must not disturb a sibling still
+    // rewinding. Only at root context — a vCPU parked mid-fiber-resume keeps the fiber swap's own
+    // bookkeeping (a no-op for the no-fiber slice, where `cur` is always `ROOT_FIBER`).
+    if v.durable && v.cur == ROOT_FIBER {
+        if let Some(m) = v.mem.as_mut() {
+            m.durable_set_state(v.dstate);
+            m.durable_set_sp(v.root_shadow_sp);
+        }
+    }
+    let step = v.run(u64::MAX);
+    // Save this vCPU's durable words whenever it parks (it resumes later on this single worker and must
+    // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
+    // from the live words below).
+    if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
+        if let Some(m) = v.mem.as_ref() {
+            v.dstate = m.durable_state();
+            v.root_shadow_sp = m.durable_get_sp();
+        }
+    }
+    match step {
         Step::Done(result) => {
             // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING`
             // has drained the root's native stack into the root's shadow region; now flatten the
@@ -3050,9 +3164,45 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 && result.is_ok()
                 && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
             {
-                let r = v.freeze_drive().and(result);
+                // A **spawned** vCPU (slice 3.2.1) that unwound under a freeze records *itself* as
+                // residue: its continuation now lives in its own region, extent = the live shadow-SP.
+                // (No `freeze_drive` — flattening idle fibers is the root's job, and multi-vCPU + fibers
+                // is out of scope for 3.2.1, guarded at `thread.spawn`.) The root instead flattens its
+                // fibers; children already pushed their residue by the time the root's `drive` returns.
+                let r = if let Some((func, args)) = v.spawn_residue.clone() {
+                    let shadow_sp = v
+                        .mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp())
+                        .unwrap_or(SHADOW_BASE);
+                    v.host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .frozen_vcpus
+                        .push(FrozenVCpu {
+                            task: v.id as usize,
+                            func: func as i32,
+                            args,
+                            shadow_sp,
+                        });
+                    result
+                } else {
+                    // The root: record its own flattened extent (the shared active-SP word will be
+                    // overwritten by a later child, so the root's residue can't ride the window) before
+                    // `freeze_drive` repoints the word to flatten idle fibers.
+                    let root_sp = v
+                        .mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp())
+                        .unwrap_or(SHADOW_BASE);
+                    v.host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .frozen_root_sp = Some(root_sp);
+                    v.freeze_drive().and(result)
+                };
                 // Hand the flattened fibers back to the embedder via the shared host, so a snapshot
-                // can record them (and a thaw re-seed them). The run is single-vCPU here.
+                // can record them (and a thaw re-seed them).
                 if !v.frozen.is_empty() {
                     let frozen = std::mem::take(&mut v.frozen);
                     v.host
@@ -3686,6 +3836,30 @@ pub struct FrozenFiber {
     pub shadow_sp: u64,
 }
 
+/// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
+/// Like [`FrozenFiber`] but for a whole green thread rather than a fiber: under a multi-vCPU freeze the
+/// child unwinds its own native stack into *its* per-context shadow region (`context = task id`), and
+/// this is the host-side residue needed to reconstruct it on thaw. The **root** vCPU needs no residue —
+/// its entry/args are supplied by the thaw caller (it is re-entered directly, like the single-vCPU
+/// case). On thaw the child is re-attached by the runtime: the root's rewind re-executes `thread.spawn`
+/// (not a transform checkpoint), and under `REWINDING` that op re-spawns the next frozen child from this
+/// residue — in deterministic spawn order — instead of creating a fresh one (a reload-not-reissue done
+/// in the runtime, so `svm-durable` is unchanged).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenVCpu {
+    /// The child's task id at freeze = its shadow **context index** (`shadow_region_base(task)`), and
+    /// its position in the deterministic spawn order. Thaw re-spawns densely in this order, so the
+    /// re-attached child lands on the same task id → the same region → its restored bytes line up.
+    pub task: usize,
+    /// The child's entry function (the `thread.spawn` target), re-entered on thaw.
+    pub func: i32,
+    /// The child's spawn args (`[sp, arg]`, the fiber-style thread entry), replayed on re-spawn.
+    pub args: Vec<i64>,
+    /// Window offset of the child's flattened shadow-SP — the extent of its frozen continuation in its
+    /// region; restored as the child's shadow-SP so its thaw re-entry rewinds from the right point.
+    pub shadow_sp: u64,
+}
+
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
 /// continuation is exactly its reified call stack. `cont.new` makes one (`Pending`);
 /// `cont.resume` claims and switches into it; `suspend` parks it back, claimable again
@@ -3985,6 +4159,18 @@ struct VCpu {
     /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
     /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
     frozen: Vec<FrozenFiber>,
+    /// `Some` on a **spawned** (`thread.spawn`) vCPU: its `(entry, [sp, arg])`, retained so that when
+    /// it unwinds under a freeze it can emit its [`FrozenVCpu`] residue (its frames are gone by then).
+    /// `None` on the root (whose entry/args the thaw caller supplies) and on every non-durable vCPU.
+    /// (slice 3.2.1)
+    spawn_residue: Option<(FuncIdx, Vec<i64>)>,
+    /// This vCPU's **saved durable state word** (`NORMAL | UNWINDING | REWINDING`), swapped into the
+    /// shared window word ([`STATE_OFF`]) by the runtime when this vCPU runs and saved back when it
+    /// parks (slice 3.2.1). Multi-vCPU freeze/thaw run single-worker, so the one shared state word is
+    /// each vCPU's *own* context, swapped per dispatch — essential because a rewinding vCPU flips the
+    /// word to `NORMAL` after reloading, which must not disturb siblings still rewinding. A non-durable
+    /// run leaves it `NORMAL` and never touches the word.
+    dstate: i32,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
     /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
@@ -4080,6 +4266,8 @@ impl VCpu {
             durable: false,
             root_shadow_sp: SHADOW_BASE,
             frozen: Vec::new(),
+            spawn_residue: None,
+            dstate: STATE_NORMAL,
             mem,
             host,
             fuel,
@@ -4138,6 +4326,8 @@ impl VCpu {
             durable: false,
             root_shadow_sp: SHADOW_BASE,
             frozen: Vec::new(),
+            spawn_residue: None,
+            dstate: STATE_NORMAL,
             mem,
             host,
             fuel,
@@ -4409,6 +4599,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         durable,
         root_shadow_sp,
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
+        spawn_residue: _,
+        dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
         fuel,
@@ -5315,6 +5507,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let entry = *func;
                     let spv = get_i64(&frames[top].vals, *sp)?; // the thread's data-stack base
                     let av = get_i64(&frames[top].vals, *arg)?;
+                    // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): a child inherits the *current*
+                    // state word — under a freeze it spawns into `UNWINDING` so it too unwinds at its next
+                    // safepoint. (A child existing *before* the freeze point is reconstructed by the
+                    // runtime at thaw, not re-spawned here — the root's rewind skips the prologue
+                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.)
+                    let child_state = mem
+                        .as_ref()
+                        .map(|m| m.durable_state())
+                        .unwrap_or(STATE_NORMAL);
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_host = Arc::clone(host); // inherit the domain powerbox
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
@@ -5345,6 +5546,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         child.durable = durable; // durability is a domain property (shared window/registry)
+                                                 // Durable multi-vCPU (slice 3.2.1): this child is context `task id`, so its shadow
+                                                 // stack lives in its own region; it carries its own state word (swapped in by the
+                                                 // runtime when it runs). Retain `(entry, [sp, arg])` so a freeze emits its residue.
+                        child.root_shadow_sp = shadow_region_base(id as usize);
+                        child.dstate = child_state;
+                        child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         Box::new(child)
                     });
@@ -7669,6 +7876,17 @@ pub struct Host {
     /// each parked fiber and records it here for the snapshot) and **in** to a thaw run (`drive`
     /// re-seeds the registry from it before re-entering under `REWINDING`). Empty for an ordinary run.
     frozen_fibers: Vec<FrozenFiber>,
+    /// The freeze/thaw **spawned-vCPU** residue (slice 3.2.1): **out** of a multi-vCPU freeze (each
+    /// `thread.spawn` child that unwinds records itself here for the snapshot) and **in** to a thaw
+    /// (the root's re-executed `thread.spawn` re-attaches these, in spawn order, under `REWINDING`).
+    /// Empty for a single-vCPU or ordinary run.
+    frozen_vcpus: Vec<FrozenVCpu>,
+    /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
+    /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
+    /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
+    /// recorded here instead. `None` ⇒ a single-vCPU thaw, which reads the extent from the window's
+    /// active-SP word as before. Set by the freeze driver; consumed by `drive` on thaw.
+    frozen_root_sp: Option<u64>,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -7773,6 +7991,8 @@ impl Host {
             cap_replay: None,
             durable: false,
             frozen_fibers: Vec::new(),
+            frozen_vcpus: Vec::new(),
+            frozen_root_sp: None,
         }
     }
 
@@ -7800,6 +8020,33 @@ impl Host {
     /// the restored (REWINDING) window and [`Host::set_durable`].
     pub fn set_frozen_fibers(&mut self, frozen: Vec<FrozenFiber>) {
         self.frozen_fibers = frozen;
+    }
+
+    /// The spawned vCPUs a multi-vCPU freeze flattened on the last freeze run (slice 3.2.1) — the
+    /// host-side residue a snapshot records (their continuations are in the captured window, each in
+    /// its own per-context region). Empty for a single-vCPU or ordinary run.
+    pub fn frozen_vcpus(&self) -> &[FrozenVCpu] {
+        &self.frozen_vcpus
+    }
+
+    /// Seed the spawned vCPUs a **thaw** must reconstruct (from a snapshot's control section). The
+    /// root's re-executed `thread.spawn` re-attaches these (in spawn order) under `REWINDING`. Set
+    /// alongside the restored (REWINDING) window and [`Host::set_durable`].
+    pub fn set_frozen_vcpus(&mut self, frozen: Vec<FrozenVCpu>) {
+        self.frozen_vcpus = frozen;
+    }
+
+    /// The root vCPU's flattened shadow-SP extent from the last multi-vCPU freeze (slice 3.2.1), or
+    /// `None` for a single-vCPU freeze (its extent is the window's active-SP word). A snapshot records
+    /// it alongside [`Host::frozen_vcpus`].
+    pub fn frozen_root_sp(&self) -> Option<u64> {
+        self.frozen_root_sp
+    }
+
+    /// Seed the root vCPU's flattened shadow-SP extent a **thaw** must restore (slice 3.2.1). Set only
+    /// for a multi-vCPU thaw, alongside [`Host::set_frozen_vcpus`].
+    pub fn set_frozen_root_sp(&mut self, sp: u64) {
+        self.frozen_root_sp = Some(sp);
     }
 
     /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a
@@ -9937,6 +10184,12 @@ impl Mem {
             .unwrap_or(STATE_NORMAL)
     }
 
+    /// Set the durable state word at [`STATE_OFF`] — the runtime's per-vCPU state swap (slice 3.2.1),
+    /// so the single shared word reflects the running vCPU's own freeze phase.
+    fn durable_set_state(&mut self, state: i32) {
+        let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
+    }
+
     fn read_le(&self, base: u64, width: u32) -> u64 {
         let mut raw = 0u64;
         for k in 0..width as u64 {
@@ -10607,6 +10860,12 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
             Value::V128(b)
         }
     }
+}
+
+/// Whether a variable scoped to `var_func` is visible in a frame of function `frame_func`: its own
+/// function, or a [`svm_ir::GLOBAL_SCOPE`] module-scoped global (visible in every frame).
+fn var_in_scope(var_func: u32, frame_func: u32) -> bool {
+    var_func == frame_func || var_func == svm_ir::GLOBAL_SCOPE
 }
 
 /// Resolve a debug-info location list (`SsaList` / `WindowVia` base) at pc `(block, inst)`: the

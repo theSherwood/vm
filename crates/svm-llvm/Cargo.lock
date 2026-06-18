@@ -615,6 +615,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "svm-dap"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-text",
+]
+
+[[package]]
 name = "svm-encode"
 version = "0.0.0"
 dependencies = [
@@ -666,6 +675,7 @@ version = "0.0.0"
 dependencies = [
  "llvm-ir",
  "llvm-sys",
+ "svm-dap",
  "svm-interp",
  "svm-ir",
  "svm-jit",

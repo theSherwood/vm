@@ -2706,6 +2706,47 @@ int compute(int a, int b) {
 }
 
 #[test]
+fn chibicc_g_emits_module_scoped_globals_read_in_any_frame() {
+    // chibicc as a *second* producer of the §6 module-scoped-global primitive (slice 28): a source
+    // global lives at a fixed window address and is inspectable by name in every frame.
+    let src = r#"
+int counter = 7;
+struct P { int a; int b; } origin = { 3, 4 };
+int bump(int n) { counter = counter + n; return counter + origin.a; }
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(
+        ir.contains("debug.var global \"counter\" fixed"),
+        "emits a fixed-address global debug.var for `counter`:\n{ir}"
+    );
+    assert!(
+        ir.contains("debug.var global \"origin\" fixed"),
+        "emits a fixed-address global for the struct `origin`:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+
+    // `bump` is function 0 (no `main` ⇒ no `_start`). At entry the data segment holds counter = 7;
+    // read it by name through the global scope (frame-independent `Fixed` address).
+    let sp = 1i64 << 20;
+    let mut insp = Inspector::attach(&m, 0, &[Value::I64(sp), Value::I32(10)], 1_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
+    assert_eq!(
+        as_i32_var(insp.read_var(0, "counter", 4)),
+        7,
+        "global read in bump's frame"
+    );
+}
+
+#[test]
 fn chibicc_g_maps_breakpoints_to_source_lines() {
     // Raw string starts with a newline, so: line 2 = signature, 3 = `int s`, 4 = `int t`,
     // 5 = `return t + s` (its add is the block's last op, so it's a real step point on line 5).

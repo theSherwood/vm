@@ -33,3 +33,6 @@ svm-jit = { path = "../svm-jit" }
 # The reference host/powerbox — drives a capability-using program (`_start`) end-to-end (the Lane C
 # demo: real stdout + exit code vs native), and resolves §7 named imports to concrete capabilities.
 svm-run = { path = "../svm-run" }
+# The W5 DAP server — drives a *real* LLVM-translated module (its §6 debug info, serialized to text)
+# through the Debug Adapter Protocol end-to-end, proving the LLVM producer feeds the DAP consumer.
+svm-dap = { path = "../svm-dap" }

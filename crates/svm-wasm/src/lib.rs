@@ -822,6 +822,24 @@ fn ingest_variables(
             });
         }
     }
+
+    // Module-scoped globals (a CU-level `DW_TAG_variable` at a fixed `DW_OP_addr`): a wasm linear
+    // address is the window address directly, so emit a `GLOBAL_SCOPE` `VarLoc::Fixed` var (visible
+    // in every frame) — the §6 global primitive driven by the wasm DWARF producer.
+    for g in &dw.globals {
+        let type_id = intern_type(&dw, g.type_ref, &mut types, &mut type_ids);
+        let ty = type_id
+            .and_then(|id| types.get(id as usize))
+            .map(type_render_name)
+            .unwrap_or_else(|| "?".to_string());
+        vars.push(VarInfo {
+            func: svm_ir::GLOBAL_SCOPE,
+            name: g.name.clone(),
+            ty,
+            loc: VarLoc::Fixed { addr: g.addr },
+            type_id,
+        });
+    }
     (types, vars)
 }
 
