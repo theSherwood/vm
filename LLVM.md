@@ -774,16 +774,116 @@ including **virtual destructors** (the deleting-dtor chain through the vtable). 
   the `i33` intermediate **overflows 33 bits and wraps**, which only the native differential validates
   (interp == JIT alone would agree even on a wrong mask). 93 translate tests green, fmt + clippy clean.
 
+**Slice AI (DONE) — real `core` Rust + panic-path lowering.** Idiomatic `no_std` Rust runs
+byte-identical to native `rustc` with **no translator change** beyond the C corpus — a `#[repr(u8)]`
+enum dispatched by `match` (→ `switch`/`br_table`), fixed arrays + slice iteration, `Option` + `match`
+(niche-optimized), iterator `find`/`map`/`max` with closures, by-value `struct`s + array-of-struct +
+field access, and signed `/`/`%`. The one real gap closed:
+- **Panic-path lowering (`-C panic=abort`).** A real Rust program is littered with non-elidable panic
+  branches (div-by-zero, bounds, overflow) that call `core::panicking::*` — **external** (precompiled
+  libcore), which the on-ramp's undefined-call path rejected, blocking essentially all real Rust. Now
+  `is_rust_abort_call` recognizes those entry points (`panicking`/`unwrap_failed`/`expect_failed`/
+  `slice_index`/`panic_cannot_unwind`) and, since they are `-> !` and always followed by `unreachable`,
+  lowers the call to a **trap** (drop it; the trailing `unreachable` already traps — §3b/§5/totality).
+  Gated on the name being an *undefined external*, so a guest-defined function of a matching name is a
+  real call.
+- *Out of scope:* `core::hint::black_box` is an empty inline-`asm!` optimization barrier → inline asm
+  stays a clean `Unsupported` (a non-goal); use `read_volatile` to make a value opaque.
+- Tests: `rust_core_enum_slice_option`, `rust_core_structs_and_iterators` (idiomatic `core` vs native),
+  `rust_panic_path_div_traps_and_runs` (a runtime division whose div-by-zero/overflow panic branches
+  now trap, taking the non-panic path to match native). 96 translate tests green, fmt + clippy clean.
+
+**Slice AJ (DONE) — Rust trait objects, slices, `unwrap`.** More idiomatic Rust, byte-identical to
+native: **`&dyn Trait` dynamic dispatch** (a vtable load + `call_indirect` per call — the Rust analog
+of the C++ vtable path, slice AG: fat pointers + per-type vtable globals + funcref dispatch, all
+already covered), **`&[T]` slice arguments** ({ptr,len} across an `#[inline(never)]` call + a
+sub-slice), and **`Option::unwrap`** (its panic path traps via slice AI's recognizer). The one gap:
+- **Auto-vectorization → SIMD.** `rustc -O2` vectorizes a reduction loop (the slice `sum`) into
+  `<N x i32>` + a horizontal reduce — out of the MVP (§17/D58 is the SIMD lane). The Rust bitcode
+  helper now disables it (`-C llvm-args=-vectorize-loops=false -vectorize-slp=false`), matching the
+  C/C++ lanes' `-fno-*-vectorize`. The native oracle keeps vectorizing — an integer reduction is
+  associative, so scalar (on-ramp) and vectorized (native) agree.
+- Tests: `rust_trait_object_dispatch`, `rust_slice_argument`, `rust_option_unwrap`. 99 translate tests
+  green, fmt + clippy clean.
+
+**Slice AK (DONE) — Rust `alloc` / heap (`Vec` via a guest `#[global_allocator]`).** The headline for
+*real* Rust: a `no_std` + `alloc` crate whose `#[global_allocator]` routes to the guest `malloc`/`free`
+runs byte-identical to native `rustc`, with `Vec::push` growing the heap (alloc + `memcpy` + free)
+through the on-ramp's `vm_map`-growing bump allocator. Because the allocator + `Memory` grant live in
+the powerbox `_start` (gated on `main`), the test runs **through the powerbox**: the on-ramp synthesizes
+`#[no_mangle] extern "C" fn main` calling `compute()`, the differential compares the `u8` exit/return
+code, and a pinned expected value keeps it non-vacuous. Three gaps closed:
+- **`alloc` abort lang items.** `alloc::raw_vec::handle_error` / `alloc::alloc::handle_alloc_error`
+  (OOM / capacity-overflow, `-> !`, external) join the panic recognizer (slice AI) → trap.
+- **Constant `inttoptr`/`ptrtoint` operands.** Rust's `NonNull::dangling()` (an empty `Vec`'s pointer =
+  its alignment, e.g. `inttoptr(i64 4)`) folds to its `i64` window value in `operand` (via `const_eval`,
+  like the constexpr-GEP path) — not just in global initializers.
+- **rustc edition.** The Rust lanes pin `--edition 2021` (the default 2015 mis-resolves `core::`/
+  `alloc::` paths in the std oracle).
+- Test: `rust_alloc_vec_via_global_allocator` (Σ i² for i in 0..64 = 85344, % 251 = **4**, vs native).
+  100 translate tests green, fmt + clippy clean.
+
+**Slice AL (DONE) — `Box` + `String`: a mini expression evaluator (the heap capstone demo).** A
+recursive-descent parser over a byte slice builds a **`Box`ed recursive AST** (`enum Expr { Num,
+Add(Box,Box), … }` — the canonical use of `Box`), `eval` walks it recursively, and `render` serializes
+it back into a heap **`String`** — a tiny interpreter, right at home next to the guest-JIT demo, running
+byte-identical to native `rustc` (through the powerbox/alloc harness). Two real gaps closed, both
+generally useful (any frontend's `-O2` hits them):
+- **`llvm.{u,s}{add,sub,mul}.with.overflow.iN`** (`lower_overflow_intrinsic`) → the wrapping op + a
+  computed overflow flag, recorded as a 2-field aggregate `{result, overflow}` (consumed by
+  `extractvalue`). Rust's checked capacity/index arithmetic (`Vec`/`String`/`Layout::array`) emits
+  these; the flag feeds a branch to `handle_error`/`panicking` (→ trap). Exact formulas (`add`: wrapped
+  sum below an operand; `sub`: borrow; signed: sign-disagreement; `mul`: zero-guarded `r/a != b`).
+- **`switch` on `i64`** (Rust enum discriminants). `translate_switch` now lowers an `i64` operand to a
+  `br_table` by biasing with `min` (`i64`) and **folding the high 32 bits into the index** — an
+  out-of-`[0,2^32)` value forces the default — sound for any `i64` (a bare low-32 `br_table` would
+  alias far-apart values onto a case). `i128` switches stay `Unsupported`.
+- Test: `rust_box_string_expr_evaluator` — `eval("2+3*4-(5-1)*2+10") = 16`, rendered string is 26
+  chars, `(16+26) % 251 = 42`, on-ramp == native. 101 translate tests green, fmt + clippy clean.
+
+**Slice AM (DONE) — the Rust capstone: a `jsmn`-style JSON tokenizer (a real `no_std` program).** The
+Rust analog of the C corpus's `jsmn` demo: scan a JSON document (`&[u8]`) into a heap `Vec` of typed
+tokens (`enum Kind { Obj, Arr, Str, Prim }` + span), handling `\`-escaped strings, whitespace, and bare
+primitives, then fold a deterministic digest over the tokens. **Needed zero translator changes** — a
+real Rust library runs end to end on the slices already in place (`Vec<struct>` heap + growth, enums,
+`&[u8]` scanning, `match` on bytes, enum→int cast), byte-identical to native `rustc`. This is the
+breadth-proof capstone: not a unit test of a feature, but a recognizable program, the way `jsmn`/
+`sha256`/`clay` validated C beyond the per-feature slices.
+- Test: `rust_json_tokenizer_capstone` — 14 tokens over the doc, folded digest `% 251 = 135`, on-ramp
+  == native. 102 translate tests green, fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
       inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
-- [x] **Rust** (`no_std`/panic=abort) — runs vs native (slice AH), via the pinned Rust 1.81 (LLVM 18)
-      toolchain + `iN` support. Broaden (`core` data structures, `Option`/`Result`, traits → vtables)
-      as gaps surface.
+- [x] **Rust** (`no_std`/panic=abort) — runs vs native: `iN` (slice AH), real `core` (enums/slices/
+      `Option`/iterators/structs) + panic-path → trap (slice AI), trait objects / `&[T]` args / `unwrap`
+      (slice AJ), `alloc`/heap `Vec` (slice AK), **`Box` recursive AST + `String`** via a mini expr
+      evaluator (slice AL — + `*.with.overflow` intrinsics and `i64` switches). Auto-vectorization is
+      disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `BTreeMap`, generics with
+      bounds, `&mut` aliasing) as gaps surface.
+- [~] **SIMD / auto-vectorization — `i32x4` lands; full ingestion is blocked on vector legalization**
+      (slices AN/AO). The on-ramp ingests `-O2`-auto-vectorized **`i32x4`** code: a `<4 x i32>` lane op →
+      `v128` (`VIntBin` for `add`/`sub`/`mul`/`smax`/`smin`/`umax`/`umin`, whole-vector `VBitBin` for
+      `and`/`or`/`xor`; `bin_ty` yields a harmless `I32` so the pre-`bin` width probe doesn't choke on
+      `v128`), and `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}.v4i32` unrolls to a lane
+      fold (extract + scalar combine / `cmp`+`select`). Tests (a `check_vectorized_vs_native` harness,
+      vectorization *enabled*): `simd_int_reduction_first_light` (sum → `reduce.add`, `2610`/exit `50`),
+      `simd_int_max_reduction` (max → `reduce.smax`), both vs native.
+      - **Blocker — fixed-128 `v128` vs LLVM's arbitrary-width vectors.** Enabling vectorization on the
+        breadth lanes shows the corpus emits vectors **wider than 128 bits** (`<16 x i32>` = 512-bit,
+        `<16 x i64>`, `<4 x i64>`) plus assorted shapes (`<8 x i8>`, `<2 x i64>`, `<16 x i8>`). LLVM's
+        `-O2` vectorizer produces these "virtual" wide vectors expecting the backend's **type-
+        legalization** to split them into legal-width chunks; svm-ir's `v128` is fixed-128, so ingesting
+        them needs a legalization/splitting pass — a large separate effort (the SelectionDAG analog). So
+        the C/C++/Rust breadth lanes **keep `-fno-*-vectorize`** (the correct fail-closed posture), and
+        full auto-vec ingestion is deferred behind that pass. Bounded follow-ups within 128 bits: the
+        other shapes (`i8x16`/`i16x8`/`i64x2`, via a general `is_vec128` + shape-aware lowering), `fadd`/
+        `fmul` reductions (need `-ffast-math`; not emitted by plain `-O2`), vector `icmp`/`select`.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
-- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand.
+- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`
+      uses `i64` for signed div/rem-by-constant, not `iN`).
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
 - [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
@@ -814,6 +914,27 @@ metadata (we drop `llvm.dbg.*` regardless) and a few C-API-only getters (which c
 `inkwell` equally — both are LLVM-C-API-bound), neither of which touches the scalar+memory+
 call MVP. No mature *pure-Rust* bitcode reader exists, so any programmatic read links
 libLLVM; D54 sanctions that as a build/dev-time dep (Q4 keeps it off the runtime path).
+
+**Debug-info nuance (the §6/D-DBG-7 waist).** The "debug metadata gap" above is *one-sided*:
+`llvm-ir` **does** expose per-instruction `!DILocation` (line/col/file, via `HasDebugLoc`), so the
+on-ramp populates the §6 neutral core's **source-line half** from it (`DebugAcc` in
+`crates/svm-llvm/src/lib.rs` → `DebugInfo.locs`; DEBUGGING.md slice 24) — making LLVM the *third*
+producer to feed the frontend-neutral waist. The **structured DI graph**
+(`DILocalVariable`/`DIType`/`llvm.dbg.value`) is missing from `llvm-ir` (`Metadata::from_llvm_ref` is
+`unimplemented!`, `MetadataOperand` is payloadless), so the **fallback-reader** decision above is now
+realized concretely: `crates/svm-llvm/src/di.rs` walks the DI nodes **directly through `llvm-sys`**
+(the LLVM-C debug-info API), re-parsing the `.bc` into its own context. Slice 25 lands the `-O0 -g`
+case — every C local is an `alloca` + `dbg.declare`, recovered as a `TypeDef`-typed `VarLoc::Window`
+correlated to the IR by *alloca ordinal* (stable across the two parses). The LLVM-C DI API has no
+getters for the `baseType`/`elements` edges or the base-type `encoding`, so the type graph is walked
+via the generic MDNode-operand bridge at the positional indices LLVM 18 uses (pinned + tested), and
+`encoding` is inferred from the C name. Slice 26 adds the `-O2`/`-Og` `dbg.value` case (promoted
+scalars, which LLVM solves for free — its intrinsics survive mem2reg/SROA): a `dbg.value` bound to a
+function **argument** becomes a `VarLoc::SsaList` over the arg's live range (the arg is ValueId `k`,
+threaded as a block parameter, so its block-local index is its position in each block's param list).
+At `-Og`/`-O2` most *other* locals are optimized to `poison`/constants, so parameters are the main
+recoverable variable; `dbg.value` bindings to instruction-result / φ values (needing a value→ValueId
+ordinal correlation and per-pc `SsaLoc.inst`) are a follow-up of limited yield.
 **Fallback order if `llvm-ir` bites:** `inkwell` (maintained, version-tracking wrapper) →
 hand-rolled `.ll` parser over `opt -S` (zero libLLVM link, but a rot-prone parser we own).
 

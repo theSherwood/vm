@@ -17,7 +17,7 @@
 //! is the separate hard problem (§18).
 #![forbid(unsafe_code)]
 
-use svm_ir::{BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
+use svm_ir::{Block, BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
 
 /// Why verification rejected a module. Carries enough location to debug, never
 /// enough to be load-bearing for safety (the boolean accept/reject is the contract).
@@ -311,6 +311,57 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
         check_terminator(fi, bi, &b.term, &types, nblocks, f, funcs)?;
     }
     Ok(())
+}
+
+/// Per-block SSA value **types** for a function: each block's declared params followed by every
+/// instruction's result type(s) — exactly the assignment [`verify_func`] performs while checking.
+/// Indexing `func_value_types(..)[block][value_idx]` gives the type of block-local value
+/// `value_idx`, which the interpreter's debugger uses to reconstruct a typed value from its
+/// (untyped) storage slot. Assumes `f` is **verified** (it shares the single-result type rules via
+/// [`check_inst`] and re-lists only the few multi-result appends `verify_func` special-cases — keep
+/// the two in sync); on an unverified function it degrades gracefully (a value whose type can't be
+/// derived is simply absent from the vector) rather than erroring.
+pub fn func_value_types(f: &Func, funcs: &[Func], has_memory: bool) -> Vec<Vec<ValType>> {
+    f.blocks
+        .iter()
+        .map(|b| block_value_types(b, funcs, has_memory))
+        .collect()
+}
+
+fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType> {
+    let mut types: Vec<ValType> = b.params.clone();
+    for inst in &b.insts {
+        // Multi-result / non-`check_inst` ops: mirror the inline appends in `verify_func`.
+        match inst {
+            Inst::Call { func, .. } => {
+                if let Some(callee) = funcs.get(*func as usize) {
+                    types.extend_from_slice(&callee.results);
+                }
+            }
+            Inst::CallIndirect { ty, .. } => types.extend_from_slice(&ty.results),
+            Inst::CapCall { sig, .. } => types.extend_from_slice(&sig.results),
+            Inst::ContResume { .. } => {
+                types.push(ValType::I32); // status
+                types.push(ValType::I64); // value
+            }
+            Inst::CapSelfCount => types.push(ValType::I32),
+            Inst::CapSelfGet { .. } => {
+                types.push(ValType::I32); // handle
+                types.push(ValType::I32); // type_id
+            }
+            Inst::ThreadSpawn { .. } => types.push(ValType::I32),
+            Inst::RefFunc { .. } => types.push(ValType::I32),
+            Inst::CallImport { .. } => {} // unreachable in a verified module
+            // Everything else (single result, or `Store`/no result) goes through the shared
+            // `check_inst` rules — the single source of truth for those types.
+            _ => {
+                if let Ok(Some(t)) = check_inst(0, 0, inst, &types, has_memory) {
+                    types.push(t);
+                }
+            }
+        }
+    }
+    types
 }
 
 /// Check one instruction's operands against the running type vector and return the

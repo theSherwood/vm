@@ -53,7 +53,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF `.debug_line` → `debug.loc`** (2nd producer); DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types via `llvm-sys`** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm`, `svm-llvm` |
 | DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
@@ -1177,11 +1177,120 @@ Variables pane the same as chibicc's. Test (`debug_line.rs`, new `agg_clang.wasm
 Point p` ingests as an `Aggregate{x@0,y@4,size 8}`, `int row[3]` as `Array{count 3}`, and `struct
 Point *pp` as a `Pointer` whose pointee is the same aggregate — all `WindowVia` into the C frame.
 
-**Not yet:** the LLVM `!DILocation`/`dbg.value` bitcode path (its own frontend effort). (The chibicc
-producer (incl. optimized-build location lists), both DAP consumers — over `Window` *and*
-`WindowVia` — binary serialization, and a second producer's **source lines, DWARF pass-through, named
-variables, and now aggregate/pointer/array types** are all built; the W4 debug-info waist is
-exercised end-to-end by two independent frontends.)
+**Slice 24 — LLVM `!DILocation` → the waist (a *third* producer feeds the source-line half).** The
+AOT LLVM-bitcode on-ramp (`svm-llvm`) now populates the §6 neutral core's **source-line half**: each
+LLVM instruction's `!DILocation` (via `llvm-ir`'s `HasDebugLoc`) is keyed onto the SVM `(func,
+block, inst)` pc it lowered to, with a deduped `files` table — a `DebugAcc` threaded through
+`translate_func`/`translate_block` (each defined function's final index is `base + i`, accounting
+for the synthesized `_start`). A non-`-g` build carries no debug section (byte-identical to before).
+So **three independent frontends** — chibicc tokens, wasm DWARF, and now LLVM DI — feed the *same*
+frontend-neutral core, the decisive cross-check that the waist isn't coupled to any one frontend.
+Tests (`translate.rs`): a clang `-Og -g` statement chain maps several distinct source lines, each to
+an in-range IR pc, and module verification is unaffected (debug info is escape-irrelevant); a
+non-`-g` build has `debug_info: None`.
+
+**Slice 25 — LLVM *variable / type* ingest via a direct `llvm-sys` DI walk (`dbg.declare` →
+`Window`).** The pinned `llvm-ir` 0.11.3 leaves the structured metadata graph unimplemented
+(`Metadata::from_llvm_ref` is `unimplemented!`, `MetadataOperand` is payloadless), so a new
+[`svm-llvm::di`] module reads the DI graph **directly through `llvm-sys`** (the fallback reader
+`LLVM.md` §8 sanctioned), re-parsing the same `.bc` into its own context and walking it. At `-O0
+-g` every C local is an `alloca` + `llvm.dbg.declare(addr, !DILocalVariable, !DIExpression)`; the
+reader recovers each variable's **name + structured type** (a recursive, cycle-safe `intern_type`
+over `DIBasicType`/`DICompositeType`/`DIDerivedType` → the §6 `TypeDef` graph — `Base`/`Aggregate`/
+`Array`/`Pointer`, transparent typedef/const/volatile, array `count = size/elem_size`, base
+`encoding` inferred from the C name since the LLVM-C API exposes no getter) and **correlates it to
+the IR by alloca *ordinal*** — the Nth alloca in textual order is stable across the `llvm-sys` parse
+and the translator's own walk, so it resolves to the alloca's data-stack frame slot → a
+`VarLoc::Window`. So a `-O0 -g` LLVM guest's `struct`/array/pointer locals are now ingested with
+full structured types, the LLVM analog of the wasm slice-23 ingest. Tests (`translate.rs`): a
+`struct Point`/`int[3]`/`struct Point *` fixture ingests with the right field offsets and pointee,
+verifies, and — the correlation lock — its values **read back correctly at runtime** (`p.x`, `p.y`,
+`row[0]` through the interpreter's `Window` reads at a breakpoint).
+
+**Slice 26 — LLVM `-O2`/`-Og` `llvm.dbg.value` → `SsaList` (promoted variables, the optimized
+case).** At higher opt levels mem2reg/SROA promote scalars, so their debug locations are
+`llvm.dbg.value(ssavalue, var, expr)` bindings rather than `dbg.declare`+alloca — the case where
+**LLVM solves S2's promotion-vs-inspectability for free** (its intrinsics survive optimization). The
+`di` reader now also recovers `dbg.value` bindings to a function **argument** (the stable-SSA case);
+the translator emits a `VarLoc::SsaList` over the argument's live range — the argument is ValueId
+`k`, threaded as a block parameter wherever it's live, so its block-local value index is simply its
+position in that block's param list (one `SsaLoc` per such block, effective from block entry — no
+per-pc instruction plumbing needed). So an optimized LLVM build's **function parameters** are named,
+typed, and inspectable via the same location-list machinery chibicc and wasm use. The honest reality
+of `-Og`/`-O2` is that most *other* locals are optimized to `poison`/constants (no recoverable
+location — the reader skips those); a clang loop accumulator, e.g., is folded to closed form. Tests
+(`translate.rs`): a `-Og` argument ingests as a multi-entry `SsaList` with the `int` type, verifies,
+and **reads back its value at runtime** through the list at a breakpoint. *Not yet:* `dbg.value`
+bindings to non-argument SSA values (instruction results / φ / loop-carried), which need the
+value→ValueId ordinal correlation and the per-pc `SsaLoc.inst` position — a follow-up, of limited
+yield at `-Og` since those values are often optimized away anyway.
+
+(Everything else is built: the chibicc producer incl. optimized-build location lists; both DAP
+consumers over `Window` *and* `WindowVia`; binary serialization; the wasm producer's source lines,
+DWARF pass-through, named variables, and aggregate/pointer/array types; and the LLVM producer's
+source lines, `-O0` `dbg.declare` variable/type ingest, and `-O2`/`-Og` `dbg.value` argument
+location lists. The W4 debug-info waist is exercised end-to-end by **three** independent frontends —
+all three on the source-line half, all three on the variable+type half.)
+
+**Slice 27 — the LLVM producer driven through the *DAP server* end-to-end.** The prior LLVM slices
+proved the waist at the interpreter-`Inspector` level; this one closes the loop through the **actual
+W5 DAP consumer**. A real LLVM-bitcode → SVM-IR translation (with its §6 debug info) is serialized to
+text (`print_module` — the debug info survives the round-trip the DAP server launches from) and
+driven over the Debug Adapter Protocol: a source breakpoint **binds by line** to the recorded clang
+path, the Variables pane **expands the LLVM-ingested `struct`** (a nonzero `variablesReference` →
+`x`/`y` members), and **`evaluate("p.x + p.y")`** reads members over the structured type. So the LLVM
+frontend's debug output is fully DAP-inspectable, the same as chibicc's and wasm's — the §6 waist is
+*frontend-neutral all the way to the debugger UI*, not just at ingest. Test (`dap_over_llvm.rs`, a
+new `svm-dap` dev-dep on the LLVM-only lane): a `-O0 -g` `struct Point` guest stops at its `return`
+line and expands to `x=5, y=6`, with `evaluate` yielding `11`.
+
+**Slice 28 — module-scoped globals (a schema-level waist extension across all consumers).** Source
+**global** variables don't fit the function-scoped, data-SP-relative local model, so the §6 waist
+gains two small, frontend-neutral primitives: a `VarLoc::Fixed { addr }` (an *absolute* window
+address, not `data-SP + off`) and a `GLOBAL_SCOPE` sentinel `VarInfo::func` (`u32::MAX`, visible in
+*every* frame). These thread through the whole stack — `svm-ir` (the variant + sentinel), `svm-encode`
+(tag 4), `svm-text` (`debug.var global "<n>" fixed <addr>`, in both the parser **and** the
+header-prescan), `svm-interp` (`read_var`/`var_addr` resolve `Fixed`; a `var_in_scope` helper ORs the
+sentinel into every lookup), and `svm-dap` (globals show in each frame's Variables pane and resolve in
+`evaluate`). The LLVM producer then reads each global's `!dbg` `DIGlobalVariableExpression` (via a
+direct `llvm-sys` walk — `LLVMGlobalCopyAllMetadata` → `DIGlobalVariable`, op 1 = name / op 3 = type)
+and correlates it by **symbol name** to `globals_layout`'s window address → a `Fixed` global with its
+structured type. So a C guest's `int counter`/`struct P origin` are inspectable by name in any frame.
+Because the primitives live in the neutral core, **chibicc and wasm get globals for free** the moment
+they emit them. Tests: the schema round-trips a `Fixed`/`global` var through text **and** binary; an
+LLVM `-O0 -g` guest ingests `counter` (a `Fixed` int reading its data-segment `7`) and `origin` (a
+`Fixed` `struct P`), and over DAP a global **appears in the Variables pane** and **`evaluate("total")`
+reads `42`**. *Not yet:* lexical-scope narrowing (globals are whole-module; a header `static` shadowed
+by a local would need scope ranges — the §6 design's deferred `IrPc`-range scopes).
+
+**Slice 29 — chibicc emits globals (the second producer of the slice-28 primitive).** Slice 28 put
+the global primitives (`VarLoc::Fixed` + `GLOBAL_SCOPE`) in the *neutral core* precisely so every
+frontend gets them; this cashes that in for **chibicc**, the project's primary C frontend. Under
+`-g`, `codegen_ir.c` now emits a `debug.var global "<name>" fixed <addr>` for each source global —
+a named, non-function definition (skipping `extern` decls and anonymous `.L` string literals) at the
+fixed window offset `layout_globals` already assigned it, with its structured type interned
+alongside the per-function locals. So a C guest's globals are inspectable by name **in every frame**,
+exactly as the LLVM path's are — the *same* §6 `Fixed`/`GLOBAL_SCOPE` machinery driven by a second,
+independent producer (no consumer changes: the interpreter/DAP already resolve it from slice 28).
+Test (`c_frontend.rs`, the chibicc lane): an `int counter`/`struct P origin` guest emits the
+`global … fixed` lines and `counter` reads its data-segment `7` at a breakpoint inside `bump`. (The
+wasm DWARF producer emitting globals — `DW_TAG_variable` at module scope with a `DW_OP_addr`
+location — is the natural third-producer follow-up.)
+
+**Slice 30 — the wasm DWARF producer emits globals (the third producer, completing the trifecta).**
+The `dwarf_info` reader now also recovers a **CU-level `DW_TAG_variable` located by `DW_OP_addr`** (a
+fixed linear-memory address, no frame base) as a `DwarfGlobal { name, addr, type_ref }`, distinct
+from the in-subprogram `DW_OP_fbreg` locals. Since the wasm→IR model maps **linear memory directly
+to the window**, that `DW_OP_addr` *is* the window address, so the producer emits a `GLOBAL_SCOPE`
+`VarLoc::Fixed` var (visible in every frame) with its structured type — again with **no consumer
+changes** (the slice-28 interpreter/DAP path already resolves it). So all **three** frontends —
+chibicc, LLVM, and the wasm DWARF on-ramp — now emit module-scoped globals through the *same* §6
+`Fixed`/`GLOBAL_SCOPE` machinery, the strongest possible demonstration that the waist's global
+support is genuinely frontend-neutral. Tests (`debug_line.rs`, new `global_clang.wasm` fixture): a
+clang wasm guest's `int counter` / `struct Point origin` ingest as `Fixed` globals with their types,
+and `counter` **reads its data-segment `7` at runtime** at a breakpoint inside `bump` (confirming the
+`DW_OP_addr` → window-address mapping). The `Fixed`/`GLOBAL_SCOPE` primitive is now exercised
+end-to-end by every producer and both consumers.
 
 ### Open questions (S4/S5/S2)
 

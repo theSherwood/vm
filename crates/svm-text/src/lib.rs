@@ -152,10 +152,16 @@ fn print_debug_info(s: &mut String, m: &Module) {
         }
     }
     for v in &di.vars {
-        // `debug.var <fn> "<name>" <loc> "<ty>" [<type_id>]`, where `<loc>` is `win <off>`,
-        // `ssa <value>`, `ssalist <n> <b0> <i0> <v0> …` (the location list, S2), or
-        // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset).
-        let _ = write!(s, "debug.var {} \"{}\" ", v.func, v.name);
+        // `debug.var <fn> "<name>" <loc> "<ty>" [<type_id>]`, where `<fn>` is a function index or
+        // `global` (a module-scoped global, visible in every frame) and `<loc>` is `win <off>`,
+        // `ssa <value>`, `ssalist <n> <b0> <i0> <v0> …` (the location list, S2),
+        // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset), or
+        // `fixed <addr>` (a global's absolute window address).
+        if v.func == svm_ir::GLOBAL_SCOPE {
+            let _ = write!(s, "debug.var global \"{}\" ", v.name);
+        } else {
+            let _ = write!(s, "debug.var {} \"{}\" ", v.func, v.name);
+        }
         match &v.loc {
             VarLoc::Window { off } => {
                 let _ = write!(s, "win {off}");
@@ -175,6 +181,9 @@ fn print_debug_info(s: &mut String, m: &Module) {
                     let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
                 }
                 let _ = write!(s, " {off}");
+            }
+            VarLoc::Fixed { addr } => {
+                let _ = write!(s, "fixed {addr}");
             }
         }
         let _ = write!(s, " \"{}\"", v.ty);
@@ -913,7 +922,14 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             }
             Some(Tok::Ident(s)) if s == "debug.var" => {
                 p.next()?;
-                let func = p.parse_u32()?;
+                // `<fn>` is a function index, or `global` for a module-scoped global.
+                let func = match p.peek() {
+                    Some(Tok::Ident(s)) if s == "global" => {
+                        p.next()?;
+                        svm_ir::GLOBAL_SCOPE
+                    }
+                    _ => p.parse_u32()?,
+                };
                 let name = String::from_utf8(p.parse_str()?)
                     .map_err(|_| ParseError("debug.var name is not valid UTF-8".into()))?;
                 let loc = match p.parse_ident()?.as_str() {
@@ -950,9 +966,12 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                             off: p.parse_int()?,
                         }
                     }
+                    "fixed" => VarLoc::Fixed {
+                        addr: p.parse_u64()?,
+                    },
                     k => {
                         return err(format!(
-                            "debug.var location kind must be win, ssa, ssalist, or winvia, got {k}"
+                            "debug.var location kind must be win, ssa, ssalist, winvia, or fixed, got {k}"
                         ))
                     }
                 };
@@ -1144,9 +1163,15 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
             }
             Some(Tok::Ident(s)) if s == "debug.var" => {
                 p.next()?;
-                p.parse_int()?; // func
+                // func: a numeric index or the `global` keyword.
+                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "global") {
+                    p.next()?;
+                } else {
+                    p.parse_int()?;
+                }
                 p.parse_str()?; // name
-                                // Location: `win <off>` / `ssa <value>` (one int), or `ssalist <n>` + 3n ints.
+                                // Location: `win <off>` / `ssa <value>` / `fixed <addr>` (one int),
+                                // or `ssalist <n>` / `winvia <n>` + 3n ints (+ a trailing offset).
                 let kind = p.parse_ident()?;
                 if kind == "ssalist" || kind == "winvia" {
                     let n = p.parse_int()?;
@@ -1157,7 +1182,7 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                         p.parse_int()?; // the trailing offset
                     }
                 } else {
-                    p.parse_int()?; // win off / ssa value
+                    p.parse_int()?; // win off / ssa value / fixed addr
                 }
                 p.parse_str()?; // type
                 if matches!(p.peek(), Some(Tok::Int(_))) {
@@ -2249,6 +2274,13 @@ impl<'a> Parser<'a> {
     fn parse_u32(&mut self) -> Result<u32, ParseError> {
         let v = self.parse_int()?;
         u32::try_from(v).map_err(|_| ParseError(format!("expected a u32, found {v}")))
+    }
+
+    /// Parse a non-negative integer as `u64` (a global's fixed window address).
+    fn parse_u64(&mut self) -> Result<u64, ParseError> {
+        let v = self.parse_int()?;
+        u64::try_from(v)
+            .map_err(|_| ParseError(format!("expected a non-negative address, found {v}")))
     }
 
     /// Parse a bare identifier token (e.g. a `debug.var` location kind).
