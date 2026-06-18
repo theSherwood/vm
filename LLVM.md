@@ -665,7 +665,8 @@ mirrors the chibicc lowering exactly:
 - **§12 threads** — `__vm_thread_spawn` (a *direct* funcref → the static `thread.spawn` funcidx) /
   `__vm_thread_join`; **atomics** — `__vm_atomic_{add,load,store}`(`32`)/`cas32` → the `iN.atomic.*`
   ops (seq-cst); **futex** — `__vm_wait32`/`__vm_notify` → `i32.atomic.wait`/`atomic.notify`.
-- **§GC** — `__vm_gc_roots(lo, hi, buf, cap)` → `gc.roots` (conservative root enumeration).
+- **§GC** — `__vm_gc_roots(lo, hi, mask, buf, cap)` → `gc.roots` (conservative root enumeration; `mask`
+  is the §GC tagged-pointer payload mask, top-byte-strip only — pass `~0UL` for untagged).
 - **§7 reflection** — `__vm_cap(i)` reads the handle stash (`i32.load` at `i*4`); `__vm_cap_count`/
   `__vm_cap_at` → `cap.self.count`/`cap.self.get`.
 Tests (`translate.rs`): `vm_memory_map_and_page_size` (map a page at 256 MiB + page-size, end-to-end
