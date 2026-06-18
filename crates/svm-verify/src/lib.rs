@@ -258,7 +258,7 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                     bi,
                     types: &types,
                 };
-                cx.expect(*k, ValType::I32)?; // forgeable fiber handle
+                cx.expect(*k, ValType::I64)?; // forgeable fiber handle (i64: 16-bit slot + 48-bit generation)
                 cx.expect(*arg, ValType::I64)?;
                 types.push(ValType::I32); // status
                 types.push(ValType::I64); // value
@@ -526,6 +526,14 @@ fn check_inst(
             cx.expect(*a, ty.val())?;
             ty.val()
         }
+        // Scalar fused multiply-add: all three operands and the result are `ty`.
+        Inst::Fma { ty, a, b, c } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            cx.expect(*c, t)?;
+            t
+        }
         Inst::FCmp { ty, a, b, .. } => {
             let t = ty.val();
             cx.expect(*a, t)?;
@@ -615,13 +623,13 @@ fn check_inst(
             cx.expect(*replacement, ty.val())?;
             ty.val()
         }
-        // §12 fibers. `cont.new` takes an i32 funcref, yields an i32 handle; `suspend`
-        // takes an i64, yields the i64 of the next resume. (`cont.resume` is multi-result
-        // and handled in the main loop.)
+        // §12 fibers. `cont.new` takes an i32 funcref, yields an i64 handle (16-bit slot +
+        // 48-bit generation); `suspend` takes an i64, yields the i64 of the next resume.
+        // (`cont.resume` is multi-result and handled in the main loop.)
         Inst::ContNew { func, sp } => {
             cx.expect(*func, ValType::I32)?;
             cx.expect(*sp, ValType::I64)?; // the fiber's data-stack base
-            ValType::I32
+            ValType::I64
         }
         Inst::Suspend { value } => {
             cx.expect(*value, ValType::I64)?;
@@ -777,6 +785,19 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        // Fused multiply-add (`relaxed_madd`/`nmadd`): a ternary float-lane op.
+        Inst::VFma { shape, a, b, c, .. } => {
+            if !shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            cx.expect(*c, ValType::V128)?;
+            ValType::V128
+        }
         Inst::VFloatUn { shape, a, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {
@@ -827,7 +848,7 @@ fn check_inst(
             ValType::V128
         }
         // Dot product: fixed shapes (i16x8 → i32x4), so there is no lane rule to enforce.
-        Inst::VDot { a, b } => {
+        Inst::VDot { a, b } | Inst::VDotI8 { a, b } => {
             cx.expect(*a, ValType::V128)?;
             cx.expect(*b, ValType::V128)?;
             ValType::V128

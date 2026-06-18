@@ -8,6 +8,7 @@ members = [
     "crates/svm-durable",
     "crates/svm-encode",
     "crates/svm-verify",
+    "crates/svm-peval",
     "crates/svm-interp",
     "crates/svm-dap",
     "crates/svm-snapshot",
@@ -39,6 +40,7 @@ svm-text = { path = "crates/svm-text" }
 svm-durable = { path = "crates/svm-durable" }
 svm-encode = { path = "crates/svm-encode" }
 svm-verify = { path = "crates/svm-verify" }
+svm-peval = { path = "crates/svm-peval" }
 svm-interp = { path = "crates/svm-interp" }
 svm-snapshot = { path = "crates/svm-snapshot" }
 svm-fiber = { path = "crates/svm-fiber" }
