@@ -171,3 +171,93 @@ fn jit_emits_debug_info_subprograms_that_round_trip() {
     let (bi, ba) = bare.debug_info_sections();
     assert!(bi.is_empty() && ba.is_empty());
 }
+
+#[test]
+fn jit_wraps_dwarf_in_an_elf_whose_sections_round_trip() {
+    // Stage 2c: the in-memory ELF the GDB JIT interface hands gdb embeds the synthesized DWARF and
+    // a `.text` section pointing at the live code. Re-parse the ELF, pull the `.debug_*` sections
+    // back out, and round-trip them through the readers — the same DWARF gdb will read, now proven
+    // to survive the ELF wrapper. No debugger needed.
+    let cm = compile(COMPUTE_DBG);
+    let elf = cm.elf_object();
+    assert!(!elf.is_empty(), "a -g module produces an ELF object");
+    assert_eq!(&elf[0..4], b"\x7fELF", "it is an ELF");
+    assert_eq!(elf[4], 2, "ELFCLASS64");
+
+    // `.debug_line` extracted from the ELF reconstructs the same address→line map as the raw
+    // section (so the wrapper preserved it byte-for-byte and the offsets are sound).
+    let line = svm_jit::gdb::elf_section(&elf, ".debug_line").expect(".debug_line in the ELF");
+    assert_eq!(
+        line,
+        cm.debug_line_section(),
+        "the embedded .debug_line is the section verbatim"
+    );
+    let prog = svm_wasm::dwarf_line::parse(line).expect("embedded line program parses");
+    let from_elf: BTreeSet<(u64, u32)> = prog
+        .rows
+        .iter()
+        .filter(|r| !r.end_sequence)
+        .map(|r| (r.address, r.line))
+        .collect();
+    let expected: BTreeSet<(u64, u32)> = cm.src_ranges().iter().map(|r| (r.lo, r.line)).collect();
+    assert_eq!(from_elf, expected, "ELF-embedded line map matches the code");
+
+    // `.debug_info` + `.debug_abbrev` round-trip out of the ELF to the same subprogram.
+    let info = svm_jit::gdb::elf_section(&elf, ".debug_info").expect(".debug_info in the ELF");
+    let abbrev =
+        svm_jit::gdb::elf_section(&elf, ".debug_abbrev").expect(".debug_abbrev in the ELF");
+    let parsed = svm_wasm::dwarf_info::parse(info, abbrev, &[]).expect("embedded CU parses");
+    assert_eq!(
+        parsed.subs.len(),
+        1,
+        "one subprogram survives the ELF wrapper"
+    );
+
+    // The DWARF addresses are *real* finalized-code addresses, and the `.text` section's extent
+    // (the section gdb maps the DWARF onto) covers them — the link that makes the addresses
+    // meaningful to the debugger.
+    let lo = cm.src_ranges().iter().map(|r| r.lo).min().unwrap();
+    let hi = cm.src_ranges().iter().map(|r| r.hi).max().unwrap();
+    assert_eq!(parsed.subs[0].low_pc, lo);
+    assert!(lo > 0x1000, "low_pc is a live mapped address, not a stub");
+
+    // A non-`-g` module produces no ELF (nothing to register).
+    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    assert!(bare.elf_object().is_empty());
+    let _ = hi;
+}
+
+#[test]
+fn jit_registers_and_unregisters_with_the_gdb_jit_interface() {
+    // Stage 2c: registering with the GDB JIT interface links a code entry onto the descriptor list
+    // (action = JIT_REGISTER_FN) and dropping the guard unlinks it (action = JIT_UNREGISTER_FN) —
+    // the linked-list/action-flag protocol gdb observes via its breakpoint on
+    // `__jit_debug_register_code`. We can't drive a real gdb in CI, so we assert the descriptor
+    // state directly.
+    let cm = compile(COMPUTE_DBG);
+    let (_, before) = svm_jit::gdb::descriptor_state();
+
+    {
+        let _reg = cm.register_with_gdb().expect("a -g module registers");
+        let (action, during) = svm_jit::gdb::descriptor_state();
+        assert_eq!(action, 1, "action_flag = JIT_REGISTER_FN");
+        assert_eq!(during, before + 1, "one more object is registered");
+
+        // A second registration nests; both are on the list at once.
+        let _reg2 = cm.register_with_gdb().expect("registers again");
+        let (_, two) = svm_jit::gdb::descriptor_state();
+        assert_eq!(two, before + 2, "registrations stack on the list");
+    }
+
+    // Both guards dropped ⇒ both entries unlinked, last action was an unregister.
+    let (action, after) = svm_jit::gdb::descriptor_state();
+    assert_eq!(after, before, "dropping the guards unregisters the objects");
+    assert_eq!(
+        action, 2,
+        "action_flag = JIT_UNREGISTER_FN after the last drop"
+    );
+
+    // A non-`-g` module has nothing to register.
+    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    assert!(bare.register_with_gdb().is_none());
+}

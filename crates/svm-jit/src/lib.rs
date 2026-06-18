@@ -77,6 +77,7 @@ use svm_ir::{
 };
 
 mod dwarf;
+pub mod gdb; // W5 JIT/DWARF tier (Stage 2c): in-memory ELF wrapper + the GDB JIT registration interface
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler // W5 JIT/DWARF tier: synthesize DWARF from the Stage 1 machine-address → source map
 
 // JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
@@ -1285,7 +1286,13 @@ impl CompiledModule {
         if self.src_ranges.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        // Per-function machine extent = the span of its source-mapped ranges.
+        dwarf::debug_info(&self.func_extents())
+    }
+
+    /// Each function's machine `[low_pc, high_pc)` extent, derived as the span (min `lo`, max `hi`)
+    /// of its source-mapped ranges, sorted by start address. The basis for both the `.debug_info`
+    /// subprograms (Stage 2b) and the ELF `.symtab`/`.text` extent (Stage 2c). Empty without `-g`.
+    fn func_extents(&self) -> Vec<(u32, u64, u64)> {
         let mut per_fn: std::collections::BTreeMap<u32, (u64, u64)> =
             std::collections::BTreeMap::new();
         for r in &self.src_ranges {
@@ -1298,7 +1305,43 @@ impl CompiledModule {
             .map(|(f, (lo, hi))| (f, lo, hi))
             .collect();
         funcs.sort_by_key(|&(_, lo, _)| lo);
-        dwarf::debug_info(&funcs)
+        funcs
+    }
+
+    /// The in-memory ELF object that wraps this module's finalized code + synthesized DWARF for the
+    /// GDB JIT interface (W5 JIT/DWARF Stage 2c): an `SHT_NOBITS` `.text` at the live code address,
+    /// the `.debug_line`/`.debug_info`/`.debug_abbrev` sections, and a `.symtab` naming each
+    /// function. This is the `symfile` [`Self::register_with_gdb`] hands to gdb. Empty without `-g`.
+    pub fn elf_object(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        let funcs = self.func_extents();
+        let code_base = funcs.iter().map(|f| f.1).min().unwrap_or(0);
+        let code_end = funcs.iter().map(|f| f.2).max().unwrap_or(0);
+        let (info, abbrev) = self.debug_info_sections();
+        let line = self.debug_line_section();
+        gdb::build_elf(
+            code_base,
+            code_end.saturating_sub(code_base),
+            &funcs,
+            &info,
+            &abbrev,
+            &line,
+        )
+    }
+
+    /// Register this module's code with a live gdb/lldb via the GDB JIT interface (W5 JIT/DWARF
+    /// Stage 2c) — the **headline milestone**: with the returned guard held, gdb can bind a
+    /// source-line breakpoint inside the JIT'd code and show the guest source frame. The returned
+    /// [`gdb::GdbRegistration`] **unregisters on drop**; hold it as long as the code is debuggable.
+    /// `None` for a non-`-g` module (nothing to register). Host-side tooling, off the runtime path.
+    pub fn register_with_gdb(&self) -> Option<gdb::GdbRegistration> {
+        let elf = self.elf_object();
+        if elf.is_empty() {
+            return None;
+        }
+        Some(gdb::GdbRegistration::register(elf))
     }
 
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
