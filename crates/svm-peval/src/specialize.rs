@@ -1,13 +1,14 @@
 //! Stage 1–2 — the **first Futamura projection** over the IR (see `PEVAL.md`).
 //!
-//! [`specialize`] / [`specialize_with`] take a function (an *interpreter*) and a list of which
-//! parameters are **static** (a known constant at specialization time) versus **dynamic** (a
-//! runtime value), and produce a residual function specialized to the static inputs. Combined
-//! with a **readonly data segment** holding a guest program — the IR's existing notion of
-//! immutable "constant memory" — specializing the interpreter against that program folds the
-//! opcode loads to constants, resolves the dispatch `br_table` to a single edge, and unrolls the
-//! interpreter loop following the program. The dispatch loop disappears; what's left is the
-//! *compiled* program. `spec(interp, program)(input) ≡ interp(program, input)`.
+//! [`specialize`] / [`specialize_with`] / [`specialize_with_config`] take a function (an
+//! *interpreter*) and a list of which parameters are **static** (a known constant at
+//! specialization time) versus **dynamic** (a runtime value), and produce a residual function
+//! specialized to the static inputs. Combined with a **program the caller declares constant** —
+//! a readonly data segment, a caller-promised constant region, or explicit overlay bytes
+//! ([`SpecConfig`]) — specializing the interpreter against that program folds the opcode loads to
+//! constants, resolves the dispatch `br_table` to a single edge, and unrolls the interpreter loop
+//! following the program. The dispatch loop disappears; what's left is the *compiled* program.
+//! `spec(interp, program)(input) ≡ interp(program, input)`.
 //!
 //! The engine is **online polyvariant symbolic execution**, weval's shape:
 //!
@@ -16,9 +17,12 @@
 //!   the Stage-0 arithmetic, so it matches the interpreter exactly); a trapping fold (div/rem
 //!   by zero) is emitted residually so it still traps. Anything with a dynamic operand is
 //!   emitted into the residual.
-//! - A **load from a constant address inside a readonly data segment** folds to the bytes
-//!   there ([`read_const_mem`]) — the "constant memory" read. Any other load is emitted
-//!   residually (faithful), so mutable memory is never wrongly folded.
+//! - A **load from a constant address the caller declared constant** folds to those bytes
+//!   ([`read_const_mem`]) — the "constant memory" read. By default that means a readonly data
+//!   segment; a caller can also promise an arbitrary region or supply overlay bytes
+//!   ([`SpecConfig`]). Constancy is a *caller contract*, not enforced here — a false promise is a
+//!   miscompile, never an escape (the residual is re-verified). Any other load is emitted
+//!   residually (faithful), so unpromised mutable memory is never folded.
 //! - **Value-stack renaming (Stage 2).** A caller may designate a private byte range (the
 //!   interpreter's operand stack / locals) as *renameable* ([`specialize_with`]). Stores into it
 //!   at constant, full-width (`i32`/`i64`) addresses update an **abstract memory** instead of
@@ -100,24 +104,61 @@ struct Task {
 /// The default ceiling on residual blocks before we declare likely divergence.
 const DEFAULT_BUDGET: usize = 1 << 16;
 
-/// Specialize with no renameable memory region (Stage 1 behavior).
-pub fn specialize(module: &Module, func: u32, args: &[SpecArg]) -> Result<Module, SpecError> {
-    specialize_with(module, func, args, None)
+/// What the caller promises about memory, to steer specialization. All fields default to empty,
+/// which reproduces the plain Stage-1 behavior (readonly data segments still fold).
+///
+/// **These are caller contracts, not enforced invariants.** Declaring a region constant — or an
+/// overlay's bytes — is a promise that those bytes do not change between specialization time and
+/// every execution of the residual. If the promise is false (self-modifying code, a racing
+/// thread, …) the residual computes the wrong answer. It is still *safe*: the residual is meant to
+/// be re-verified, so confinement and capability checks hold regardless — a broken promise is a
+/// miscompile, never an escape. (This mirrors weval's `assume_const_memory`.)
+#[derive(Clone, Debug, Default)]
+pub struct SpecConfig {
+    /// A private, zero-initialized scratch range `[lo, hi)` (the interpreter's operand stack /
+    /// locals) whose stores/loads are renamed into SSA and elided from the residual (Stage 2).
+    pub rename: Option<(u64, u64)>,
+    /// Window ranges `[lo, hi)` the caller promises are constant at specialization time. Loads from
+    /// them fold to the module's initial data image (readonly **or not**); bytes not covered by any
+    /// data segment read as zero (the demand-zeroed window).
+    pub const_regions: Vec<(u64, u64)>,
+    /// Explicit constant bytes at a base window address, for a program not described by a data
+    /// segment (e.g. one written into the window before the call). Loads fully inside an overlay
+    /// fold to its bytes. Overlays take precedence over data segments.
+    pub const_overlays: Vec<(u64, Vec<u8>)>,
 }
 
-/// Specialize `module.funcs[func]` against the static/dynamic binding in `args`, optionally with
-/// a renameable memory region `[lo, hi)` (Stage 2 value-stack renaming). Produces a module with a
-/// single residual function (index 0); the original memory and data segments are carried through,
-/// so any residual loads still resolve.
-///
-/// The renameable region must be **private** to the function and **zero-initialized** (no data
-/// segment overlapping it): the engine elides its stores and reads, so it assumes nothing else
-/// observes or mutates those bytes.
+/// Specialize with no caller memory hints (only readonly data segments fold).
+pub fn specialize(module: &Module, func: u32, args: &[SpecArg]) -> Result<Module, SpecError> {
+    specialize_with_config(module, func, args, &SpecConfig::default())
+}
+
+/// Specialize with a renameable memory region (Stage 2 value-stack renaming), no other hints.
 pub fn specialize_with(
     module: &Module,
     func: u32,
     args: &[SpecArg],
     rename: Option<(u64, u64)>,
+) -> Result<Module, SpecError> {
+    specialize_with_config(
+        module,
+        func,
+        args,
+        &SpecConfig {
+            rename,
+            ..SpecConfig::default()
+        },
+    )
+}
+
+/// Specialize `module.funcs[func]` against the static/dynamic binding in `args`, steered by
+/// `config`. Produces a module with a single residual function (index 0); the original memory and
+/// data segments are carried through, so any residual loads still resolve.
+pub fn specialize_with_config(
+    module: &Module,
+    func: u32,
+    args: &[SpecArg],
+    config: &SpecConfig,
 ) -> Result<Module, SpecError> {
     let f = module.funcs.get(func as usize).ok_or(SpecError::BadFunc)?;
     if args.len() != f.params.len() {
@@ -141,7 +182,7 @@ pub fn specialize_with(
     let mut spec = Spec {
         module,
         f,
-        rename,
+        config,
         memo: HashMap::new(),
         queue: VecDeque::new(),
         next_id: 0,
@@ -173,7 +214,7 @@ pub fn specialize_with(
 struct Spec<'a> {
     module: &'a Module,
     f: &'a Func,
-    rename: Option<(u64, u64)>,
+    config: &'a SpecConfig,
     /// `(source block, param pattern, memory pattern) → residual block id`. The memo that makes
     /// the loop terminate and that closes residual loops.
     memo: HashMap<(u32, ParamPattern, MemPattern), u32>,
@@ -385,7 +426,7 @@ impl Spec<'_> {
         if let Abs::Const(Known::I64(base)) = env[addr as usize] {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
-            if within_region(self.rename, eff, width) {
+            if within_region(self.config.rename, eff, width) {
                 // The renameable region must be resolved entirely abstractly.
                 let rw = match renameable_load_width(op) {
                     Some(w) => w as u64,
@@ -414,7 +455,7 @@ impl Spec<'_> {
                 return Err(SpecError::Unsupported);
             }
             // Outside the region: a readonly constant-memory read folds; otherwise residual.
-            if let Some(k) = read_const_mem(self.module, base, offset, op) {
+            if let Some(k) = read_const_mem(self.config, self.module, base, offset, op) {
                 return Ok(Some(Abs::Const(k)));
             }
             let addr = materialize(env[addr as usize], out, rnext);
@@ -427,7 +468,7 @@ impl Spec<'_> {
             return Ok(Some(Abs::Dyn(bump(rnext))));
         }
         // Dynamic address: with a region active it might alias the renamed stack — refuse.
-        if self.rename.is_some() {
+        if self.config.rename.is_some() {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
@@ -458,7 +499,7 @@ impl Spec<'_> {
         if let Abs::Const(Known::I64(base)) = env[addr as usize] {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
-            if within_region(self.rename, eff, width) {
+            if within_region(self.config.rename, eff, width) {
                 let rw = match renameable_store_width(op) {
                     Some(w) => w as u64,
                     None => return Err(SpecError::Unsupported),
@@ -471,7 +512,7 @@ impl Spec<'_> {
                 mem.insert(eff, (width as u32, env[value as usize]));
                 return Ok(None);
             }
-            if disjoint_from_region(self.rename, eff, width) {
+            if disjoint_from_region(self.config.rename, eff, width) {
                 let addr = materialize(env[addr as usize], out, rnext);
                 let value = materialize(env[value as usize], out, rnext);
                 out.push(Inst::Store {
@@ -486,7 +527,7 @@ impl Spec<'_> {
             return Err(SpecError::Unsupported); // straddles the region boundary
         }
         // Dynamic address: with a region active it might alias the renamed stack — refuse.
-        if self.rename.is_some() {
+        if self.config.rename.is_some() {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
@@ -692,12 +733,18 @@ fn renameable_store_width(op: StoreOp) -> Option<u32> {
     }
 }
 
-/// Read an integer load from constant memory: the effective address `base + offset` must lie
-/// fully in range (so the interpreter would not fault) and inside a single **readonly** data
+/// Read an integer load from constant memory. The effective address `base + offset` must lie
+/// fully in range (so the interpreter would not fault) and resolve to bytes the caller has
+/// promised constant — a `const_overlay`, a `const_region`, or (the default) a **readonly** data
 /// segment. Returns the loaded value, sign/zero-extended per `op`, matching the interpreter's
-/// little-endian load exactly. Returns `None` (⇒ emit a residual load) for any non-integer load,
-/// a possibly-faulting range, or an address not covered by readonly data.
-fn read_const_mem(module: &Module, base: u64, offset: u64, op: LoadOp) -> Option<Known> {
+/// little-endian load exactly. Returns `None` (⇒ emit a residual load) otherwise.
+fn read_const_mem(
+    config: &SpecConfig,
+    module: &Module,
+    base: u64,
+    offset: u64,
+    op: LoadOp,
+) -> Option<Known> {
     let (_, vt, width, signed) = op.info();
     if !matches!(vt, ValType::I32 | ValType::I64) {
         return None;
@@ -708,13 +755,9 @@ fn read_const_mem(module: &Module, base: u64, offset: u64, op: LoadOp) -> Option
     if end > mem.size() {
         return None; // could fault at the window top — let the residual load reproduce it
     }
-    let seg = module
-        .data
-        .iter()
-        .find(|d| d.readonly && eff >= d.offset && end <= d.offset + d.bytes.len() as u64)?;
-    let start = (eff - seg.offset) as usize;
+    let bytes = const_bytes(config, module, eff, width)?;
     let mut raw: u64 = 0;
-    for (i, &byte) in seg.bytes[start..start + width as usize].iter().enumerate() {
+    for (i, &byte) in bytes.iter().enumerate() {
         raw |= (byte as u64) << (8 * i);
     }
     Some(match (vt, width, signed) {
@@ -732,4 +775,43 @@ fn read_const_mem(module: &Module, base: u64, offset: u64, op: LoadOp) -> Option
         (ValType::I64, 8, _) => Known::I64(raw as i64),
         _ => return None,
     })
+}
+
+/// Resolve `width` constant bytes at window address `eff`, if the caller has promised that range
+/// constant. Precedence: an explicit overlay; then a caller `const_region` or a readonly data
+/// segment, both read from the module's initial data image (uncovered bytes are zero).
+fn const_bytes(config: &SpecConfig, module: &Module, eff: u64, width: u32) -> Option<Vec<u8>> {
+    let width = width as u64;
+    for (obase, bytes) in &config.const_overlays {
+        if eff >= *obase {
+            let rel = eff - *obase;
+            if rel + width <= bytes.len() as u64 {
+                let s = rel as usize;
+                return Some(bytes[s..s + width as usize].to_vec());
+            }
+        }
+    }
+    let promised = config
+        .const_regions
+        .iter()
+        .any(|&(lo, hi)| eff >= lo && eff + width <= hi)
+        || module.data.iter().any(|d| {
+            d.readonly && eff >= d.offset && eff + width <= d.offset + d.bytes.len() as u64
+        });
+    if !promised {
+        return None;
+    }
+    Some((0..width).map(|i| image_byte(module, eff + i)).collect())
+}
+
+/// The byte at window address `addr` in the module's initial data image: the last data segment
+/// covering it wins (segments are applied in order at instantiation), else the window is zero.
+fn image_byte(module: &Module, addr: u64) -> u8 {
+    let mut byte = 0u8;
+    for d in &module.data {
+        if addr >= d.offset && addr < d.offset + d.bytes.len() as u64 {
+            byte = d.bytes[(addr - d.offset) as usize];
+        }
+    }
+    byte
 }

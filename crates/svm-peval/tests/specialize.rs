@@ -11,7 +11,9 @@ use svm_ir::{
     BinOp, Block, CmpOp, Data, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator,
     ValType,
 };
-use svm_peval::{optimize_module, specialize, specialize_with, SpecArg};
+use svm_peval::{
+    optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
+};
 use svm_verify::verify_module;
 
 fn run(m: &Module, args: &[Value]) -> Result<Vec<Value>, Trap> {
@@ -612,4 +614,97 @@ fn renamed_cell_flows_across_a_dynamic_branch() {
             Ok(vec![Value::I64(expect)])
         );
     }
+}
+
+// ===========================================================================================
+// Caller-declared constant memory: the program need not be in readonly memory — the caller can
+// promise an arbitrary region (or supply overlay bytes) is constant at specialization time.
+// ===========================================================================================
+
+#[test]
+fn specializes_program_in_mutable_memory_via_const_region() {
+    // The same accumulator program, but in a *writable* data segment. The caller promises the
+    // program bytes are constant via a const_region; specialization folds exactly as if readonly.
+    let program = [(SETI, 10), (ADDI, 5), (ADDIN, 0), (MULI, 3), (HALT, 0)];
+    let mut interp = build_interpreter(&program);
+    interp.data[0].readonly = false; // an arbitrary mutable buffer now
+    verify_module(&interp).expect("interpreter verifies");
+
+    let len = (program.len() * 9) as u64;
+    let cfg = SpecConfig {
+        const_regions: vec![(0, len)],
+        ..SpecConfig::default()
+    };
+    let residual =
+        specialize_with_config(&interp, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_dispatch_left(&residual); // folded just like the readonly case
+
+    for input in [0i64, 1, 2, -5, 100] {
+        let expect = (15i64.wrapping_add(input)).wrapping_mul(3);
+        assert_eq!(
+            run(&interp, &[Value::I64(input)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&residual, &[Value::I64(input)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn overlay_bytes_drive_folding() {
+    // A function that loads an i64 from a writable window location. Without a promise the load
+    // stays in the residual; with a matching const_overlay it folds to the constant.
+    let value: i64 = 0x0102_0304_0506_0708;
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![
+                    Inst::ConstI64(16), // 0: addr
+                    Inst::Load {
+                        op: LoadOp::I64,
+                        addr: 0,
+                        offset: 0,
+                        align: 0,
+                    }, // 1
+                ],
+                term: Terminator::Return(vec![1]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        // The bytes are actually present in the window (so the unspecialized run reads them), but
+        // in a *writable* segment the engine won't fold on its own.
+        data: vec![Data {
+            offset: 16,
+            readonly: false,
+            bytes: value.to_le_bytes().to_vec(),
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    // No promise: the load is preserved (the engine won't fold writable memory).
+    let plain = specialize(&m, 0, &[]).expect("specializes");
+    assert!(plain.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Load { .. }))));
+    assert_eq!(run(&plain, &[]), Ok(vec![Value::I64(value)]));
+
+    // With an overlay promising those bytes, the load folds away to the constant.
+    let cfg = SpecConfig {
+        const_overlays: vec![(16, value.to_le_bytes().to_vec())],
+        ..SpecConfig::default()
+    };
+    let folded = specialize_with_config(&m, 0, &[], &cfg).expect("specializes");
+    assert!(!folded.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Load { .. }))));
+    assert_eq!(run(&folded, &[]), Ok(vec![Value::I64(value)]));
 }

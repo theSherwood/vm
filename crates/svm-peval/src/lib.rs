@@ -58,7 +58,9 @@ use svm_ir::{
 };
 
 mod specialize;
-pub use specialize::{specialize, specialize_with, SpecArg, SpecError};
+pub use specialize::{
+    specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig, SpecError,
+};
 
 /// A value known to be a constant at optimization time. Tracks integers only (the only types
 /// folded); floats/v128 are recorded as "unknown". Shared with the [`specialize`] engine.
