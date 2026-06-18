@@ -4896,11 +4896,29 @@ fn translate_block(
     helpers: &Helpers,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
-    // The data-SP (`SP` sentinel) types as `i64`; every other param reads its scanned type.
-    let params: Vec<ValType> = param_ids
-        .iter()
-        .map(|&v| if v == SP { ValType::I64 } else { s.ty[v] })
-        .collect();
+    // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
+    // one slot; a **wide-vector** value fans out into `K = full_chunks + tail_lanes` consecutive
+    // slots — `C` `v128` chunks then `T` lane scalars — matching the order its parts are supplied in
+    // `branch_args` and held in `wide_vals` (I2 step 1 cross-block).
+    let mut params: Vec<ValType> = Vec::with_capacity(param_ids.len());
+    let mut scalar_seed: Vec<(ValueId, ValIdx)> = Vec::new();
+    let mut wide_seed: Vec<(ValueId, Vec<ValIdx>)> = Vec::new();
+    for &vid in param_ids {
+        let start = params.len() as ValIdx;
+        if let Some(&layout) = s.wide.get(&vid) {
+            for _ in 0..layout.full_chunks {
+                params.push(ValType::V128);
+            }
+            let lane = layout.shape.lane_val();
+            for _ in 0..layout.tail_lanes {
+                params.push(lane);
+            }
+            wide_seed.push((vid, (start..params.len() as ValIdx).collect()));
+        } else {
+            params.push(if vid == SP { ValType::I64 } else { s.ty[vid] });
+            scalar_seed.push((vid, start));
+        }
+    }
     let mut ctx = BlockCtx {
         s,
         frame,
@@ -4918,15 +4936,13 @@ fn translate_block(
         wide_vals: HashMap::new(),
         next_val: 0,
     };
-    for (pos, &vid) in param_ids.iter().enumerate() {
-        // A wide-vector value carried across a block edge needs the chunk/tail param fan-out
-        // (not yet wired here) — fail-closed until that lands.
-        if vid != SP && s.wide.contains_key(&vid) {
-            return unsup("wide vector live across a block boundary (legalization fan-out pending)");
-        }
-        ctx.idx_of.insert(vid, pos as ValIdx);
+    for (vid, pos) in scalar_seed {
+        ctx.idx_of.insert(vid, pos);
     }
-    ctx.next_val = param_ids.len() as ValIdx;
+    for (vid, parts) in wide_seed {
+        ctx.wide_vals.insert(vid, parts);
+    }
+    ctx.next_val = params.len() as ValIdx;
 
     for instr in &bb.instrs {
         if matches!(instr, Instruction::Phi(_)) {
@@ -6602,7 +6618,19 @@ fn branch_args(
     }
     let mut args = Vec::with_capacity(block_params[target].len());
     for &pv in &block_params[target] {
-        if let Some(op) = phi_incoming.get(&pv) {
+        // A wide-vector param takes `K` args — its incoming value's chunk/tail parts, in the same
+        // order the target block's param fan-out expects (I2 step 1 cross-block).
+        if let Some(&layout) = s.wide.get(&pv) {
+            let parts = if let Some(op) = phi_incoming.get(&pv) {
+                ctx.wide_operand(op, layout)?
+            } else {
+                // A threaded wide live-in: its parts are live-out of `from`, available here.
+                ctx.wide_vals.get(&pv).cloned().ok_or_else(|| {
+                    Error::Unsupported(format!("wide value {pv} not available across edge"))
+                })?
+            };
+            args.extend(parts);
+        } else if let Some(op) = phi_incoming.get(&pv) {
             args.push(ctx.operand(op)?);
         } else {
             // A threaded live-in: it is live-out of `from`, so available in this block.

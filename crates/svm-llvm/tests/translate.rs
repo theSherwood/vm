@@ -3050,6 +3050,32 @@ fn simd_i8x8_add_tail() {
     check_vs_native("simd_i8x8", src, 5);
 }
 
+/// **Cross-block wide vector.** A reduction loop carries an `<8 x i32>` accumulator across the loop
+/// backedge as a *wide phi* — the case the legalization fan-out exists for: one wide LLVM value
+/// becomes `K` block params (2 `i32x4` chunks here) supplied as `K` branch args on every edge into
+/// the loop header. `n` is opaque (a `noinline` param), so the loop is a real backedge, not unrolled.
+/// `run(3)`: Σ(3 + i) for i in 0..16 = 48 + 120 = 168.
+#[test]
+fn simd_i32x8_loop_accumulator() {
+    let src = "int vsum(const int *P, int n);\n\
+        static int D[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) D[i] = seed + i;\n\
+        \x20 return vsum(D, 16);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vsum(const int *P, int n) {\n\
+        \x20 v8si acc = {0, 0, 0, 0, 0, 0, 0, 0};\n\
+        \x20 for (int i = 0; i < n; i += 8) {\n\
+        \x20   v8si a = *(const v8si *)(P + i);\n\
+        \x20   acc += a;\n\
+        \x20 }\n\
+        \x20 return __builtin_reduce_add(acc);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_loop", src, &[Value::I32(3)], &[Value::I32(168)]);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and
