@@ -1457,6 +1457,9 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // A small by-value struct (a call/`insertvalue` result) is tracked field-wise via
                     // the aggregate side-table, never used as a scalar — record a placeholder type.
                     Err(_) if struct_field_vtypes(ty.as_ref(), types).is_some() => ValType::I64,
+                    // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
+                    // `mask_lanes`, never used as a scalar — record a placeholder type.
+                    Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
                     Err(e) => return Err(e),
                 };
                 s.ty.push(vt);
@@ -3744,6 +3747,37 @@ fn lower_int_intrinsic(
     // the operand's shape; the other bit intrinsics have no vector form here. (Float vector min/max
     // go through the float path.)
     if let Some(shape) = vec128_shape(args[0].get_type(types).as_ref()) {
+        // A vector funnel shift (`llvm.fshl`/`fshr`) in the **rotate idiom** (`a == b`). svm-ir's
+        // `VShift` takes only a *scalar* amount, but the auto-vectorizer emits per-lane-varying
+        // constant amounts (e.g. xxHash's `<1,7,12,18>`), so scalarize: rotate each lane by its own
+        // amount, then repack into the `v128` (the lane `Rotl`/`Rotr` masks the count mod width, so
+        // there is no shift-by-width edge case, mirroring the scalar rotate path).
+        if matches!(base, "llvm.fshl" | "llvm.fshr") {
+            if shape.is_float() {
+                return unsup("vector funnel shift on a float shape");
+            }
+            if args[0] != args[1] {
+                return unsup(format!("general vector funnel shift `{name}` (non-rotate)"));
+            }
+            let lane_ty = int_ty(shape.lane_val())?;
+            let data = vec_explode(ctx, args[0], types, false)?;
+            let amts = vec_explode(ctx, args[2], types, false)?;
+            let op = if base == "llvm.fshl" {
+                BinOp::Rotl
+            } else {
+                BinOp::Rotr
+            };
+            let mut out = Vec::with_capacity(data.len());
+            for (&d, &s) in data.iter().zip(amts.iter()) {
+                out.push(ctx.push(Inst::IntBin {
+                    ty: lane_ty,
+                    op,
+                    a: d,
+                    b: s,
+                }));
+            }
+            return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
+        }
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
             "llvm.smin" => svm_ir::VIntBinOp::MinS,
@@ -4332,6 +4366,69 @@ fn lower_float_intrinsic(
         };
         return Ok(Some(idx));
     }
+    // A `<2 x float>` float intrinsic (the auto-vectorizer's `fmuladd.v2f32` etc.) has no native
+    // svm-ir op — scalarize: explode the two `f32` lanes, apply the scalar float op per lane, repack
+    // the packed-`i64` vec2 (`vec_pack`). The single packed result is returned for `c.dest` to bind.
+    if is_vec2f(args[0].get_type(types).as_ref()) {
+        let lane_ty = FloatTy::F32;
+        let la = vec_explode(ctx, args[0], types, false)?;
+        let lane = |ctx: &mut BlockCtx, op: FUnOp, k: usize| {
+            ctx.push(Inst::FUn {
+                ty: lane_ty,
+                op,
+                a: la[k],
+            })
+        };
+        let (r0, r1) = match base {
+            "llvm.sqrt" => (lane(ctx, FUnOp::Sqrt, 0), lane(ctx, FUnOp::Sqrt, 1)),
+            "llvm.fabs" => (lane(ctx, FUnOp::Abs, 0), lane(ctx, FUnOp::Abs, 1)),
+            "llvm.floor" => (lane(ctx, FUnOp::Floor, 0), lane(ctx, FUnOp::Floor, 1)),
+            "llvm.ceil" => (lane(ctx, FUnOp::Ceil, 0), lane(ctx, FUnOp::Ceil, 1)),
+            "llvm.trunc" => (lane(ctx, FUnOp::Trunc, 0), lane(ctx, FUnOp::Trunc, 1)),
+            "llvm.rint" | "llvm.nearbyint" | "llvm.roundeven" => {
+                (lane(ctx, FUnOp::Nearest, 0), lane(ctx, FUnOp::Nearest, 1))
+            }
+            "llvm.minnum" | "llvm.minimum" | "llvm.maxnum" | "llvm.maximum" | "llvm.copysign" => {
+                let lb = vec_explode(ctx, args[1], types, false)?;
+                let op = match base {
+                    "llvm.minnum" | "llvm.minimum" => FBinOp::Min,
+                    "llvm.maxnum" | "llvm.maximum" => FBinOp::Max,
+                    _ => FBinOp::Copysign,
+                };
+                let bin = |ctx: &mut BlockCtx, k: usize| {
+                    ctx.push(Inst::FBin {
+                        ty: lane_ty,
+                        op,
+                        a: la[k],
+                        b: lb[k],
+                    })
+                };
+                (bin(ctx, 0), bin(ctx, 1))
+            }
+            // fmuladd(a,b,c) = a*b + c, lowered unfused (per lane).
+            "llvm.fmuladd" | "llvm.fma" => {
+                let lb = vec_explode(ctx, args[1], types, false)?;
+                let lc = vec_explode(ctx, args[2], types, false)?;
+                let fma = |ctx: &mut BlockCtx, k: usize| {
+                    let prod = ctx.push(Inst::FBin {
+                        ty: lane_ty,
+                        op: FBinOp::Mul,
+                        a: la[k],
+                        b: lb[k],
+                    });
+                    ctx.push(Inst::FBin {
+                        ty: lane_ty,
+                        op: FBinOp::Add,
+                        a: prod,
+                        b: lc[k],
+                    })
+                };
+                (fma(ctx, 0), fma(ctx, 1))
+            }
+            _ => return unsup(format!("vec2 float intrinsic `{base}`")),
+        };
+        return Ok(Some(ctx.vec_pack(r0, r1, ValType::F32)));
+    }
     let ty = match args.first() {
         Some(a) => float_ty(val_type(a.get_type(types).as_ref())?)?,
         None => return Ok(None),
@@ -4633,6 +4730,12 @@ struct BlockCtx<'a> {
     /// several IR values — but, unlike `agg`, these *do* cross block boundaries (a vectorized loop's
     /// wide accumulator), fanned out into per-part block params by `block_params`/`branch_args`.
     wide_vals: HashMap<ValueId, Vec<ValIdx>>,
+    /// Scalarized boolean-mask SSA values (`<N x i1>`, from a vector `icmp`/`fcmp`): value-id → its
+    /// `N` per-lane `i1` scalars (each `0`/`1` in an `i32` container). svm-ir has no first-class
+    /// `<N x i1>` type, so a mask is held lane-wise — `select` selects per lane, `extractelement`
+    /// reads a lane, `bitcast … to iN` ORs the lanes into a bitmap. Like `agg`, assumed not to cross
+    /// block boundaries (clang produces and consumes a mask in one block).
+    mask_lanes: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
 }
 
@@ -5160,6 +5263,7 @@ fn translate_block(
         idx_of: HashMap::new(),
         agg: HashMap::new(),
         wide_vals: HashMap::new(),
+        mask_lanes: HashMap::new(),
         next_val: 0,
     };
     for (vid, pos) in scalar_seed {
@@ -5207,6 +5311,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     // Wider-than-128 / sub-128 vector ops legalize to fixed-128 `v128` chunks + a scalar tail (I2
     // step 1), handled entirely here. `Ok(false)` means no wide vector is involved — fall through.
     if lower_wide(ctx, instr, types)? {
+        return Ok(());
+    }
+
+    // `<N x i1>` boolean masks (vector `icmp`/`fcmp`/`select`/movemask) have no first-class svm-ir
+    // type; they are held lane-wise and scalarized here. `Ok(false)` ⇒ not a mask op — fall through.
+    if lower_mask(ctx, instr, types)? {
         return Ok(());
     }
 
@@ -5603,6 +5713,18 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, ctx.push(Inst::Select { cond, a, b }))
         }
         I::Trunc(x) => {
+            // A lane-wise vector `trunc` scalarizes through the unified converter (svm-ir has no
+            // vector-convert op); a scalar `trunc` keeps the direct width-adjust path.
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                return lower_vec_int_convert(
+                    ctx,
+                    &x.dest,
+                    &x.operand,
+                    x.to_type.as_ref(),
+                    VConv::Trunc,
+                    types,
+                );
+            }
             let from = src_bits(&x.operand, types)?;
             let to = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("trunc to non-int".into()))?;
@@ -5610,6 +5732,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, emit_trunc(ctx, v, from, to))
         }
         I::ZExt(x) => {
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                return lower_vec_int_convert(
+                    ctx,
+                    &x.dest,
+                    &x.operand,
+                    x.to_type.as_ref(),
+                    VConv::ZExt,
+                    types,
+                );
+            }
             let from = src_bits(&x.operand, types)?;
             let to = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("zext to non-int".into()))?;
@@ -5617,6 +5749,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, emit_ext(ctx, v, from, to, false))
         }
         I::SExt(x) => {
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                return lower_vec_int_convert(
+                    ctx,
+                    &x.dest,
+                    &x.operand,
+                    x.to_type.as_ref(),
+                    VConv::SExt,
+                    types,
+                );
+            }
             let from = src_bits(&x.operand, types)?;
             let to = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("sext to non-int".into()))?;
@@ -5647,6 +5789,68 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             let a = ctx.operand(&x.operand0)?;
             let b = ctx.operand(&x.operand1)?;
             (&x.dest, ctx.push(Inst::FCmp { ty, op, a, b }))
+        }
+        // A lane-wise vector int↔float / float↔float conversion scalarizes through the unified
+        // float-vector converter; a scalar one keeps the direct path.
+        I::FPToSI(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FToSI,
+                types,
+            )
+        }
+        I::FPToUI(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FToUI,
+                types,
+            )
+        }
+        I::SIToFP(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::SIToF,
+                types,
+            )
+        }
+        I::UIToFP(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::UIToF,
+                types,
+            )
+        }
+        I::FPExt(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FpExt,
+                types,
+            )
+        }
+        I::FPTrunc(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FpTrunc,
+                types,
+            )
         }
         I::FPToSI(x) => (&x.dest, ftoi(ctx, &x.operand, &x.to_type, types, true)?),
         I::FPToUI(x) => (&x.dest, ftoi(ctx, &x.operand, &x.to_type, types, false)?),
@@ -5812,13 +6016,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         b: v1,
                     }),
                 )
-            } else {
-                let lane_ty = vec2_lane_ty(vty.as_ref()).ok_or_else(|| {
-                    Error::Unsupported("shufflevector: unsupported vector".into())
-                })?;
-                if mask.len() != 2 {
-                    return unsup("shufflevector: result is not 2-lane");
-                }
+            } else if let Some(lane_ty) = vec2_lane_ty(vty.as_ref()).filter(|_| mask.len() == 2) {
+                // vec2 → vec2: pick + repack the two scalarized lanes.
                 let pick = |ctx: &mut BlockCtx, m: u64| {
                     if m < 2 {
                         ctx.vec_lane(v0, m, lane_ty)
@@ -5829,6 +6028,28 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 let l0 = pick(ctx, mask[0]);
                 let l1 = pick(ctx, mask[1]);
                 (&sv.dest, ctx.vec_pack(l0, l1, lane_ty))
+            } else {
+                // A shuffle whose operands and result use **different representations** (e.g. two
+                // `<2 x float>`s concatenated into a `<4 x float>` `v128`). Scalarize generically:
+                // explode both operands' lanes, gather per the mask, repack into the result's shape.
+                let Some(elem) = vec_lane_shape(vty.as_ref()) else {
+                    return unsup("shufflevector: unsupported vector");
+                };
+                let a = vec_explode(ctx, &sv.operand0, types, false)?;
+                let b = vec_explode(ctx, &sv.operand1, types, false)?;
+                let n = a.len();
+                let mut res = Vec::with_capacity(mask.len());
+                for &mr in &mask {
+                    let idx = mr as usize;
+                    res.push(if idx < n {
+                        a[idx]
+                    } else if idx < 2 * n {
+                        b[idx - n]
+                    } else {
+                        a[0]
+                    });
+                }
+                return bind_shuffle_result(ctx, &sv.dest, &res, elem);
             }
         }
         // `extractvalue` reads a field of a small by-value struct — alias the field's value (§3a).
@@ -6228,57 +6449,42 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             let Some(src) = wide_vec_layout(sv.operand0.get_type(types).as_ref()) else {
                 return Ok(false);
             };
-            // The result lanes (the mask length); a wide shuffle is only supported in its **splat**
-            // (broadcast) form — every mask lane the same source lane, what an `insertelement`+
-            // `shufflevector zeroinitializer` idiom (a scalar broadcast) emits. A general cross-chunk
-            // shuffle stays `Unsupported` (fail-closed).
+            // A **general constant-mask** wide shuffle: each result lane picks a source lane from the
+            // `operand0 ++ operand1` concatenation (a `<8 x i8>` byte-reverse `<7,6,…,0>`, a broadcast
+            // `zeroinitializer`, …). Scalarize: explode both operands' lanes, gather per the mask,
+            // repack into the result's representation. svm-ir's in-block `Inst::Shuffle` covers the
+            // single-`v128` case; this is its legalized analog for wider/sub-128 (chunk+tail) vectors.
+            let total = src.total_lanes();
             let mask: Vec<i64> = match sv.mask.as_ref() {
-                Constant::AggregateZero(_) => vec![0; src.total_lanes()],
+                Constant::AggregateZero(_) => vec![0; total],
                 Constant::Vector(m) => m
                     .iter()
                     .map(|e| match e.as_ref() {
                         Constant::Int { value, .. } => *value as i64,
-                        _ => 0,
+                        _ => 0, // undef/poison mask lane → source lane 0
                     })
                     .collect(),
                 _ => return unsup("wide shufflevector: non-constant mask"),
             };
-            let j = mask.first().copied().unwrap_or(0);
-            if mask.is_empty()
-                || mask.iter().any(|&m| m != j)
-                || j < 0
-                || j as usize >= src.total_lanes()
-            {
-                return unsup("wide shufflevector: only a broadcast (splat) of one source lane");
+            let a_parts = ctx.wide_operand(&sv.operand0, src)?;
+            let a_lanes = wide_explode_lanes(ctx, &a_parts, src);
+            let b_parts = ctx.wide_operand(&sv.operand1, src)?;
+            let b_lanes = wide_explode_lanes(ctx, &b_parts, src);
+            let mut res = Vec::with_capacity(mask.len());
+            for &mr in &mask {
+                let idx = if mr < 0 { 0 } else { mr as usize };
+                // `idx` in `0..total` selects `operand0`, `total..2*total` selects `operand1`; an
+                // out-of-range (undef) lane reads `operand0` lane 0 (a defined value, §3c).
+                let pick = if idx < total {
+                    a_lanes[idx]
+                } else if idx < 2 * total {
+                    b_lanes[idx - total]
+                } else {
+                    a_lanes[0]
+                };
+                res.push(pick);
             }
-            let parts = ctx.wide_operand(&sv.operand0, src)?;
-            let lpc = src.shape.lanes() as usize;
-            let chunked = src.full_chunks * lpc;
-            let j = j as usize;
-            let scalar = if j < chunked {
-                ctx.push(Inst::ExtractLane {
-                    shape: src.shape,
-                    lane: (j % lpc) as u8,
-                    signed: false,
-                    a: parts[j / lpc],
-                })
-            } else {
-                parts[src.full_chunks + (j - chunked)]
-            };
-            // Build the result by its own layout (result lane count = mask length).
-            let m = mask.len();
-            let (rc, rt) = (m / lpc, m % lpc);
-            let mut out = Vec::with_capacity(rc + rt);
-            for _ in 0..rc {
-                out.push(ctx.push(Inst::Splat {
-                    shape: src.shape,
-                    a: scalar,
-                }));
-            }
-            for _ in 0..rt {
-                out.push(scalar);
-            }
-            ctx.bind_wide(&sv.dest, out);
+            bind_lanes_as_vector(ctx, &sv.dest, &res, src.shape);
             Ok(true)
         }
         I::Call(c) => {
@@ -6324,6 +6530,255 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+/// `Some(N)` if `ty` is an `<N x i1>` boolean-mask vector (the type a vector `icmp`/`fcmp` produces).
+fn i1_vector_lanes(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::VectorType {
+            element_type,
+            num_elements,
+            scalable: false,
+        } => {
+            matches!(element_type.as_ref(), Type::IntegerType { bits: 1 }).then_some(*num_elements)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a `<N x i1>` mask operand to its `N` scalarized lane values (each `0`/`1` in an `i32`). A
+/// local reads its recorded `mask_lanes`; a constant mask materializes per-lane `0`/`1` consts.
+fn mask_operand(ctx: &mut BlockCtx, op: &Operand, n: usize) -> Result<Vec<ValIdx>, Error> {
+    match op {
+        Operand::LocalOperand { name, .. } => {
+            let vid = *ctx
+                .s
+                .name2id
+                .get(name)
+                .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
+            ctx.mask_lanes.get(&vid).cloned().ok_or_else(|| {
+                Error::Unsupported(format!("mask value {vid} not available in block"))
+            })
+        }
+        // `poison`/`undef` (the base of an `insertelement` mask build) and `zeroinitializer` are all
+        // false; an explicit constant mask is its per-lane `i1` values.
+        Operand::ConstantOperand(c) => {
+            let bit = |e: &Constant| -> i32 { matches!(e, Constant::Int { value: 1, .. }) as i32 };
+            let lanes: Vec<i32> = match c.as_ref() {
+                Constant::Vector(elems) => elems.iter().map(|e| bit(e.as_ref())).collect(),
+                _ => vec![0; n], // AggregateZero / Undef / Poison / Null
+            };
+            Ok(lanes
+                .into_iter()
+                .take(n)
+                .chain(std::iter::repeat(0))
+                .take(n)
+                .map(|b| ctx.push(Inst::ConstI32(b)))
+                .collect())
+        }
+        Operand::MetadataOperand => unsup("metadata mask operand"),
+    }
+}
+
+/// Lower the **`<N x i1>` boolean-mask** instructions a vectorized program produces. svm-ir has no
+/// first-class `<N x i1>` type, so a mask is held lane-wise (`mask_lanes`: `N` scalar `0`/`1`s) and
+/// every producer/consumer is scalarized: vector `icmp`/`fcmp` → per-lane scalar compare; `select`
+/// (mask condition) → per-lane scalar `select` over the exploded data; `extractelement` → the lane;
+/// `insertelement`/`shufflevector` → build/permute the lanes; `bitcast … to iN` (the SIMD movemask)
+/// → OR the lanes into a bitmap; `freeze` → identity. Returns `true` if handled (dispatched after
+/// [`lower_wide`], before the scalar match). Each form re-verifies under `svm-verify`.
+fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<bool, Error> {
+    use Instruction as I;
+    match instr {
+        // Vector integer compare → `N` scalar `IntCmp`s (narrow lanes extended per the predicate's
+        // signedness so the `i32` compare orders them correctly, §3b).
+        I::ICmp(x) if vec_lane_shape(x.operand0.get_type(types).as_ref()).is_some() => {
+            let Some(shape) = vec_lane_shape(x.operand0.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let op = icmp_op(x.predicate);
+            let signed = matches!(
+                x.predicate,
+                IntPredicate::SLT | IntPredicate::SLE | IntPredicate::SGT | IntPredicate::SGE
+            );
+            let lane_ty = int_ty(shape.lane_val())?;
+            let a = vec_explode(ctx, &x.operand0, types, signed)?;
+            let b = vec_explode(ctx, &x.operand1, types, signed)?;
+            let mut m = Vec::with_capacity(a.len());
+            for (&av, &bv) in a.iter().zip(b.iter()) {
+                m.push(ctx.push(Inst::IntCmp {
+                    ty: lane_ty,
+                    op,
+                    a: av,
+                    b: bv,
+                }));
+            }
+            bind_mask(ctx, &x.dest, m);
+            Ok(true)
+        }
+        // Vector float compare → `N` scalar `FCmp`s.
+        I::FCmp(x) if vec_lane_shape(x.operand0.get_type(types).as_ref()).is_some() => {
+            let Some(shape) = vec_lane_shape(x.operand0.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let op = fcmp_op(x.predicate)?;
+            let lane_ty = float_ty(shape.lane_val())?;
+            let a = vec_explode(ctx, &x.operand0, types, false)?;
+            let b = vec_explode(ctx, &x.operand1, types, false)?;
+            let mut m = Vec::with_capacity(a.len());
+            for (&av, &bv) in a.iter().zip(b.iter()) {
+                m.push(ctx.push(Inst::FCmp {
+                    ty: lane_ty,
+                    op,
+                    a: av,
+                    b: bv,
+                }));
+            }
+            bind_mask(ctx, &x.dest, m);
+            Ok(true)
+        }
+        // `select <N x i1> mask, a, b` → a per-lane scalar `select` over the exploded data, repacked.
+        I::Select(x) if i1_vector_lanes(x.condition.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(x.condition.get_type(types).as_ref()).unwrap();
+            let mask = mask_operand(ctx, &x.condition, n)?;
+            let a = vec_explode(ctx, &x.true_value, types, false)?;
+            let b = vec_explode(ctx, &x.false_value, types, false)?;
+            let mut out = Vec::with_capacity(n);
+            for k in 0..n {
+                out.push(ctx.push(Inst::Select {
+                    cond: mask[k],
+                    a: a[k],
+                    b: b[k],
+                }));
+            }
+            let res_ty = x.true_value.get_type(types);
+            vec_implode(ctx, &x.dest, &out, res_ty.as_ref(), types)?;
+            Ok(true)
+        }
+        // `extractelement <N x i1> mask, k` → lane `k` (a clean `0`/`1`).
+        I::ExtractElement(ee) if i1_vector_lanes(ee.vector.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(ee.vector.get_type(types).as_ref()).unwrap();
+            let k = const_int(&ee.index)
+                .ok_or_else(|| Error::Unsupported("mask extractelement: dynamic lane".into()))?
+                as usize;
+            if k >= n {
+                return unsup("mask extractelement: lane out of range");
+            }
+            let mask = mask_operand(ctx, &ee.vector, n)?;
+            finish(ctx, &ee.dest, mask[k])?;
+            Ok(true)
+        }
+        // `insertelement <N x i1> base, i1 x, k` → the base lanes with lane `k` replaced by `x`.
+        I::InsertElement(ie) if i1_vector_lanes(ie.vector.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(ie.vector.get_type(types).as_ref()).unwrap();
+            let k = const_int(&ie.index)
+                .ok_or_else(|| Error::Unsupported("mask insertelement: dynamic lane".into()))?
+                as usize;
+            if k >= n {
+                return unsup("mask insertelement: lane out of range");
+            }
+            let mut lanes = mask_operand(ctx, &ie.vector, n)?;
+            lanes[k] = ctx.operand(&ie.element)?;
+            bind_mask(ctx, &ie.dest, lanes);
+            Ok(true)
+        }
+        // `shufflevector` of masks: gather result lanes from the `a ++ b` concat per the constant mask
+        // (the splat `zeroinitializer` form broadcasts lane 0 — what an `insertelement`+`shuffle`
+        // mask-splat emits).
+        I::ShuffleVector(sv) if i1_vector_lanes(sv.operand0.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(sv.operand0.get_type(types).as_ref()).unwrap();
+            let a = mask_operand(ctx, &sv.operand0, n)?;
+            let b = mask_operand(ctx, &sv.operand1, n)?;
+            let mask: Vec<i64> = match sv.mask.as_ref() {
+                Constant::AggregateZero(_) => vec![0; n],
+                Constant::Vector(m) => m
+                    .iter()
+                    .map(|e| match e.as_ref() {
+                        Constant::Int { value, .. } => *value as i64,
+                        _ => 0,
+                    })
+                    .collect(),
+                _ => return unsup("mask shufflevector: non-constant mask"),
+            };
+            let mut out = Vec::with_capacity(mask.len());
+            for &mr in &mask {
+                let idx = if mr < 0 { 0 } else { mr as usize };
+                out.push(if idx < n {
+                    a[idx]
+                } else if idx < 2 * n {
+                    b[idx - n]
+                } else {
+                    a[0]
+                });
+            }
+            bind_mask(ctx, &sv.dest, out);
+            Ok(true)
+        }
+        // `bitcast <N x i1> to iN` — the SIMD **movemask**: gather lane `i` into bit `i` of an integer.
+        I::BitCast(x) if i1_vector_lanes(x.operand.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(x.operand.get_type(types).as_ref()).unwrap();
+            let lanes = mask_operand(ctx, &x.operand, n)?;
+            let to_bits = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("mask bitcast to non-int".into()))?;
+            // Lanes are `0`/`1` in `i32`; OR each into its bit position. `iN` with `N ≤ 32` builds in
+            // an `i32` container, wider in `i64` (extend each lane first).
+            let wide = to_bits > 32;
+            let lane_ty = if wide { IntTy::I64 } else { IntTy::I32 };
+            let mut acc = ctx.push(if wide {
+                Inst::ConstI64(0)
+            } else {
+                Inst::ConstI32(0)
+            });
+            for (i, &l) in lanes.iter().enumerate() {
+                let lw = if wide {
+                    ctx.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: l,
+                    })
+                } else {
+                    l
+                };
+                let shifted = if i == 0 {
+                    lw
+                } else {
+                    let sh = ctx.push(if wide {
+                        Inst::ConstI64(i as i64)
+                    } else {
+                        Inst::ConstI32(i as i32)
+                    });
+                    ctx.push(Inst::IntBin {
+                        ty: lane_ty,
+                        op: BinOp::Shl,
+                        a: lw,
+                        b: sh,
+                    })
+                };
+                acc = ctx.push(Inst::IntBin {
+                    ty: lane_ty,
+                    op: BinOp::Or,
+                    a: acc,
+                    b: shifted,
+                });
+            }
+            finish(ctx, &x.dest, acc)?;
+            Ok(true)
+        }
+        // `freeze` of a mask is the identity (the lanes are already defined `0`/`1`, §3c).
+        I::Freeze(f) if i1_vector_lanes(f.operand.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(f.operand.get_type(types).as_ref()).unwrap();
+            let lanes = mask_operand(ctx, &f.operand, n)?;
+            bind_mask(ctx, &f.dest, lanes);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Record `dest`'s scalarized mask lanes (the `<N x i1>` analog of [`BlockCtx::bind_wide`]).
+fn bind_mask(ctx: &mut BlockCtx, dest: &Name, lanes: Vec<ValIdx>) {
+    if let Some(&vid) = ctx.s.name2id.get(dest) {
+        ctx.mask_lanes.insert(vid, lanes);
     }
 }
 
@@ -6740,6 +7195,374 @@ fn sext_in_i32(ctx: &mut BlockCtx, v: ValIdx, from: u32) -> ValIdx {
         a: up,
         b: sh2,
     })
+}
+
+/// Which integer-widening/narrowing conversion a vector `zext`/`sext`/`trunc` applies per lane.
+#[derive(Clone, Copy)]
+enum VConv {
+    ZExt,
+    SExt,
+    Trunc,
+}
+
+/// The integer lane width of a vector whose elements are integers (`<N x iB>` → `B`). `None` if
+/// `ty` is not a vector or its lanes are not integers (a float-lane vector conversion stays
+/// `Unsupported` for now — a later slice).
+fn vec_int_lane_bits(ty: &Type) -> Option<u32> {
+    match ty {
+        Type::VectorType { element_type, .. } => match element_type.as_ref() {
+            Type::IntegerType { bits } => Some(*bits),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Explode a vector operand into its `N` per-lane scalars, each the lane's value in its natural
+/// `i32`/`i64`/`f32`/`f64` container (integer lanes zero-extended — a per-lane conversion
+/// re-canonicalizes from the known source width; float lanes are the lane's value). Covers all three
+/// vector representations: a `<2 x {i32,float}>` packed in an `i64` (lane 0 = low half), a single
+/// `v128` (one `ExtractLane` per lane), and a legalized wide value (`ExtractLane` per chunk lane, then
+/// the already-scalar tail lanes).
+fn vec_explode(
+    ctx: &mut BlockCtx,
+    op: &Operand,
+    types: &Types,
+    signed: bool,
+) -> Result<Vec<ValIdx>, Error> {
+    let ty = op.get_type(types);
+    let ty = ty.as_ref();
+    if let Some(lane) = vec2_lane_ty(ty) {
+        let v = ctx.operand(op)?; // the packed i64
+        let lo = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: v,
+        });
+        let sh = ctx.const_i64(32);
+        let hi64 = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::ShrU,
+            a: v,
+            b: sh,
+        });
+        let hi = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: hi64,
+        });
+        // A `<2 x float>`'s lanes are the two 32-bit halves reinterpreted as `f32`.
+        if lane == ValType::F32 {
+            let f0 = ctx.push(Inst::Cast {
+                op: CastOp::ReinterpI32F32,
+                a: lo,
+            });
+            let f1 = ctx.push(Inst::Cast {
+                op: CastOp::ReinterpI32F32,
+                a: hi,
+            });
+            return Ok(vec![f0, f1]);
+        }
+        return Ok(vec![lo, hi]);
+    }
+    if let Some(shape) = vec128_shape(ty) {
+        let v = ctx.operand(op)?;
+        return Ok((0..shape.lanes())
+            .map(|l| {
+                ctx.push(Inst::ExtractLane {
+                    shape,
+                    lane: l,
+                    signed,
+                    a: v,
+                })
+            })
+            .collect());
+    }
+    if let Some(layout) = wide_vec_layout(ty) {
+        let parts = ctx.wide_operand(op, layout)?;
+        let lpc = layout.shape.lanes() as usize;
+        let mut out = Vec::with_capacity(layout.total_lanes());
+        for &chunk in parts.iter().take(layout.full_chunks) {
+            for l in 0..lpc {
+                out.push(ctx.push(Inst::ExtractLane {
+                    shape: layout.shape,
+                    lane: l as u8,
+                    signed,
+                    a: chunk,
+                }));
+            }
+        }
+        for t in 0..layout.tail_lanes {
+            out.push(parts[layout.full_chunks + t]);
+        }
+        return Ok(out);
+    }
+    unsup("vector explode: unsupported source vector shape")
+}
+
+/// Explode a legalized **wide** value (its `parts` = chunk `v128`s + tail scalars, per `layout`) into
+/// its `total_lanes` per-lane scalars — `ExtractLane` for each chunk lane, then the already-scalar
+/// tail lanes. Shape-generic (integer or float lanes); the inverse is [`bind_lanes_as_vector`].
+fn wide_explode_lanes(ctx: &mut BlockCtx, parts: &[ValIdx], layout: WideLayout) -> Vec<ValIdx> {
+    let lpc = layout.shape.lanes() as usize;
+    let mut out = Vec::with_capacity(layout.total_lanes());
+    for &chunk in parts.iter().take(layout.full_chunks) {
+        for l in 0..lpc {
+            out.push(ctx.push(Inst::ExtractLane {
+                shape: layout.shape,
+                lane: l as u8,
+                signed: false,
+                a: chunk,
+            }));
+        }
+    }
+    for t in 0..layout.tail_lanes {
+        out.push(parts[layout.full_chunks + t]);
+    }
+    out
+}
+
+/// Bind `dest` to a vector built from `lanes` (of lane type `shape`), choosing the representation by
+/// the lane count: exactly one `v128`'s worth → a single `v128` ([`finish`]); otherwise a legalized
+/// wide value (`full_chunks` `v128`s + a scalar tail, [`BlockCtx::bind_wide`]). Used to land a wide
+/// shuffle's gathered result lanes.
+fn bind_lanes_as_vector(ctx: &mut BlockCtx, dest: &Name, lanes: &[ValIdx], shape: svm_ir::VShape) {
+    let lpc = shape.lanes() as usize;
+    if lanes.len() == lpc {
+        let v = build_v128_from_lanes(ctx, shape, lanes);
+        let _ = finish(ctx, dest, v);
+        return;
+    }
+    let full_chunks = lanes.len() / lpc;
+    let mut parts = Vec::with_capacity(full_chunks + lanes.len() % lpc);
+    for ci in 0..full_chunks {
+        parts.push(build_v128_from_lanes(
+            ctx,
+            shape,
+            &lanes[ci * lpc..ci * lpc + lpc],
+        ));
+    }
+    for &l in &lanes[full_chunks * lpc..] {
+        parts.push(l);
+    }
+    ctx.bind_wide(dest, parts);
+}
+
+/// Bind `dest` to a shuffle's gathered `lanes` (of element shape `elem`), choosing the result
+/// representation by lane count: a single `v128` (one `v128`'s worth of lanes), a packed-`i64` vec2
+/// (2 lanes of a 32-bit element), or a legalized wide value otherwise.
+fn bind_shuffle_result(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    lanes: &[ValIdx],
+    elem: svm_ir::VShape,
+) -> Result<(), Error> {
+    let m = lanes.len();
+    if m == elem.lanes() as usize {
+        let v = build_v128_from_lanes(ctx, elem, lanes);
+        return finish(ctx, dest, v);
+    }
+    if m == 2 && elem.lane_bytes() == 4 {
+        let packed = ctx.vec_pack(lanes[0], lanes[1], elem.lane_val());
+        return finish(ctx, dest, packed);
+    }
+    bind_lanes_as_vector(ctx, dest, lanes, elem);
+    Ok(())
+}
+
+/// Build a single `v128` of `shape` from its `lane scalars` (`Splat` lane 0, then `ReplaceLane` the
+/// rest). `lanes.len()` must equal `shape.lanes()`.
+fn build_v128_from_lanes(ctx: &mut BlockCtx, shape: svm_ir::VShape, lanes: &[ValIdx]) -> ValIdx {
+    let mut v = ctx.push(Inst::Splat { shape, a: lanes[0] });
+    for (i, &l) in lanes.iter().enumerate().skip(1) {
+        v = ctx.push(Inst::ReplaceLane {
+            shape,
+            lane: i as u8,
+            a: v,
+            b: l,
+        });
+    }
+    v
+}
+
+/// Repack `N` lane scalars into the destination vector `to_type`, binding `dest` in whichever
+/// representation that type uses (a `<2 x {i32,float}>` packed `i64`, a single `v128`, or a
+/// legalized wide value). The inverse of [`vec_explode`].
+fn vec_implode(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    lanes: &[ValIdx],
+    to_type: &Type,
+    _types: &Types,
+) -> Result<(), Error> {
+    if let Some(lane) = vec2_lane_ty(to_type) {
+        // Each lane's 32-bit image: an `i32` directly, or a `<2 x float>` lane reinterpreted from `f32`.
+        let as_i32 = |ctx: &mut BlockCtx, l: ValIdx| {
+            if lane == ValType::F32 {
+                ctx.push(Inst::Cast {
+                    op: CastOp::ReinterpF32I32,
+                    a: l,
+                })
+            } else {
+                l
+            }
+        };
+        let l0 = as_i32(ctx, lanes[0]);
+        let l1 = as_i32(ctx, lanes[1]);
+        // Pack lane 0 into the low 32 bits, lane 1 into the high 32 bits of an `i64`.
+        let lo = ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: l0,
+        });
+        let hi = ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: l1,
+        });
+        let sh = ctx.const_i64(32);
+        let hishift = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Shl,
+            a: hi,
+            b: sh,
+        });
+        let packed = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Or,
+            a: lo,
+            b: hishift,
+        });
+        return finish(ctx, dest, packed);
+    }
+    if let Some(shape) = vec128_shape(to_type) {
+        let v = build_v128_from_lanes(ctx, shape, lanes);
+        return finish(ctx, dest, v);
+    }
+    if let Some(layout) = wide_vec_layout(to_type) {
+        let lpc = layout.shape.lanes() as usize;
+        let mut parts = Vec::with_capacity(layout.nparts());
+        for ci in 0..layout.full_chunks {
+            parts.push(build_v128_from_lanes(
+                ctx,
+                layout.shape,
+                &lanes[ci * lpc..ci * lpc + lpc],
+            ));
+        }
+        let tail_start = layout.full_chunks * lpc;
+        for t in 0..layout.tail_lanes {
+            parts.push(lanes[tail_start + t]);
+        }
+        ctx.bind_wide(dest, parts);
+        return Ok(());
+    }
+    unsup("vector convert: unsupported destination vector shape")
+}
+
+/// Lower a lane-wise **integer** vector conversion (`zext`/`sext`/`trunc`, `<N x iA> → <N x iB>`) —
+/// the auto-vectorizer's widen/narrow. svm-ir has no vector-convert op, so we scalarize: explode the
+/// source to `N` lane scalars, convert each in its `i32`/`i64` container via the same `emit_ext`/
+/// `emit_trunc` used for scalars, then repack into the destination representation. The result re-
+/// verifies under `svm-verify` exactly as the hand-written scalar form would.
+fn lower_vec_int_convert(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    operand: &Operand,
+    to_type: &Type,
+    kind: VConv,
+    types: &Types,
+) -> Result<(), Error> {
+    let from_ty = operand.get_type(types);
+    let from_bits = vec_int_lane_bits(from_ty.as_ref())
+        .ok_or_else(|| Error::Unsupported("vector conversion of non-integer lanes".into()))?;
+    let to_bits = vec_int_lane_bits(to_type)
+        .ok_or_else(|| Error::Unsupported("vector conversion to non-integer lanes".into()))?;
+    let lanes_in = vec_explode(ctx, operand, types, false)?;
+    let mut out = Vec::with_capacity(lanes_in.len());
+    for v in lanes_in {
+        out.push(match kind {
+            VConv::ZExt => emit_ext(ctx, v, from_bits, to_bits, false),
+            VConv::SExt => emit_ext(ctx, v, from_bits, to_bits, true),
+            VConv::Trunc => emit_trunc(ctx, v, from_bits, to_bits),
+        });
+    }
+    vec_implode(ctx, dest, &out, to_type, types)
+}
+
+/// Which int↔float / float↔float conversion a vector `fptosi`/`fptoui`/`sitofp`/`uitofp`/`fpext`/
+/// `fptrunc` applies per lane.
+#[derive(Clone, Copy)]
+enum FpConv {
+    FToSI,
+    FToUI,
+    SIToF,
+    UIToF,
+    FpExt,
+    FpTrunc,
+}
+
+/// Lower a lane-wise **int↔float / float↔float** vector conversion (the float analog of
+/// [`lower_vec_int_convert`]) — scalarize: explode the source lanes, apply the scalar `FToISat`/
+/// `IToFConv`/`Cast` per lane, repack. Lands the auto-vectorizer's `<2 x float>`↔`<2 x i32>`
+/// (perlin's gradient math) and the 128-bit float-vector convdersions. The lane types come from the
+/// source / destination vector shapes.
+fn lower_vec_fp_convert(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    operand: &Operand,
+    to_type: &Type,
+    kind: FpConv,
+    types: &Types,
+) -> Result<(), Error> {
+    let from_ty = operand.get_type(types);
+    let from_shape = vec_lane_shape(from_ty.as_ref())
+        .ok_or_else(|| Error::Unsupported("vector fp-convert: bad source shape".into()))?;
+    let to_shape = vec_lane_shape(to_type)
+        .ok_or_else(|| Error::Unsupported("vector fp-convert: bad dest shape".into()))?;
+    let lanes = vec_explode(ctx, operand, types, false)?;
+    let mut out = Vec::with_capacity(lanes.len());
+    for v in lanes {
+        let inst = match kind {
+            FpConv::FToSI => Inst::FToISat {
+                op: ftoi_op(
+                    float_ty(from_shape.lane_val())?,
+                    int_ty(to_shape.lane_val())?,
+                    true,
+                ),
+                a: v,
+            },
+            FpConv::FToUI => Inst::FToISat {
+                op: ftoi_op(
+                    float_ty(from_shape.lane_val())?,
+                    int_ty(to_shape.lane_val())?,
+                    false,
+                ),
+                a: v,
+            },
+            FpConv::SIToF => Inst::IToFConv {
+                op: itof_op(
+                    int_ty(from_shape.lane_val())?,
+                    float_ty(to_shape.lane_val())?,
+                    true,
+                ),
+                a: v,
+            },
+            FpConv::UIToF => Inst::IToFConv {
+                op: itof_op(
+                    int_ty(from_shape.lane_val())?,
+                    float_ty(to_shape.lane_val())?,
+                    false,
+                ),
+                a: v,
+            },
+            FpConv::FpExt => Inst::Cast {
+                op: CastOp::Promote,
+                a: v,
+            },
+            FpConv::FpTrunc => Inst::Cast {
+                op: CastOp::Demote,
+                a: v,
+            },
+        };
+        out.push(ctx.push(inst));
+    }
+    vec_implode(ctx, dest, &out, to_type, types)
 }
 
 fn translate_term(
