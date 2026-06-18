@@ -1503,14 +1503,19 @@ fn drive(
         // resume ARM), so a child that existed before the freeze point is **not** re-created by the
         // root — the runtime re-creates it here, under `REWINDING`, with its flattened shadow-SP
         // restored, so it rewinds from its frozen point and runs forward. Children re-spawn in
-        // ascending task (= spawn) order, landing on the same dense task ids → the same per-context
-        // shadow regions, and the root's `threads` (join) table is rebuilt to map each handle slot to
-        // its child — so the root's re-executed `thread.join` (after its checkpoint) resolves. Only the
-        // root's direct children are handled (the no-fiber, flat 2-vCPU scope of 3.2.1); nested spawns
-        // and the multi-vCPU + fibers combination are follow-ups.
+        // ascending task (= spawn) order; their regions return via the restored shadow-SP, and the
+        // root's `threads` (join) table is rebuilt to map each handle slot to its child — so the root's
+        // re-executed `thread.join` (after its checkpoint) resolves. As of slice 3.2.2 the root may
+        // also own fibers (top-down vCPU contexts vs. up-growing fiber contexts no longer collide).
+        // Only the root's *direct* children are handled (flat spawns); nested spawns and a *spawned*
+        // child owning fibers (per-child freeze_drive) are follow-ups.
         {
             let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
             vseed.sort_by_key(|f| f.task);
+            // Re-establish the durable vCPU-context count (slice 3.2.2): the re-spawned children
+            // reclaim the top `n` contexts (their regions return via the restored shadow-SP below), so
+            // a post-thaw spawn allocates below them.
+            root.registry.seed_vcpu_count(vseed.len());
             for ff in vseed {
                 let cid = s.next_task;
                 s.next_task += 1;
@@ -3641,6 +3646,22 @@ fn shadow_region_fits(ctx_idx: usize) -> bool {
     shadow_region_base(ctx_idx) + SHADOW_STRIDE <= DURABLE_RESERVE
 }
 
+/// The highest usable shadow-context index: the reserve holds `DURABLE_RESERVE / SHADOW_STRIDE`
+/// contexts and index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root regions.
+const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
+
+/// A spawned vCPU's shadow-context index (DURABILITY.md §12.8 slice 3.2.2): the `n`-th spawned vCPU
+/// (0-based, in spawn order) owns context `MAX_SHADOW_CTX - n`. Fibers grow **up** from context 1
+/// (`slot + 1`) and vCPUs grow **down** from the top, so the two pools share the reserve without
+/// colliding until `fibers + vcpus` would exhaust it (a clean capacity refusal) — unifying the
+/// per-context layout that slice 3.2.1 could only use no-fiber. Keeping fibers at `slot + 1`
+/// preserves cross-backend artifact parity (the JIT mirrors that formula). `None` if no region is
+/// free (it would underflow to the root or collide with a fiber).
+fn vcpu_shadow_context(nth: usize, fibers: usize) -> Option<usize> {
+    let ctx = MAX_SHADOW_CTX.checked_sub(nth)?;
+    (ctx >= 1 && ctx > fibers).then_some(ctx)
+}
+
 /// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
 /// on a fiber switch (D-fiber-cont option A). A no-op unless the run is `durable` and has a
 /// window. The saved-SP of each *non-running* context lives host-side (the root's in
@@ -3790,6 +3811,10 @@ struct FiberRegistry {
 struct RegState {
     fibers: Vec<RegFiber>,
     shadow: Vec<u64>,
+    /// Count of durable vCPU contexts handed out (slice 3.2.2): the root spawns children that grow
+    /// **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1, so this counter (with
+    /// `fibers.len()`) bounds the shared reserve — `fibers.len() + vcpus <= MAX_SHADOW_CTX`.
+    vcpus: usize,
 }
 
 impl FiberRegistry {
@@ -3798,6 +3823,7 @@ impl FiberRegistry {
             mx: Mutex::new(RegState {
                 fibers: Vec::new(),
                 shadow: Vec::new(),
+                vcpus: 0,
             }),
         }
     }
@@ -3821,6 +3847,24 @@ impl FiberRegistry {
         }
     }
 
+    /// Reserve the next durable vCPU shadow-context (slice 3.2.2): the `thread.spawn` path calls this
+    /// to claim a top-down region (`MAX_SHADOW_CTX`, `−1`, …) for a freshly spawned child. `None` if
+    /// the reserve is full (the vCPU pool growing down would meet the fiber pool growing up) — a clean
+    /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
+    fn reserve_vcpu_context(&self) -> Option<usize> {
+        let mut t = self.lock();
+        let ctx = vcpu_shadow_context(t.vcpus, t.fibers.len())?;
+        t.vcpus += 1;
+        Some(ctx)
+    }
+
+    /// Seed the durable vCPU-context count a **thaw** re-establishes (slice 3.2.2): the re-spawned
+    /// children occupy the top `n` contexts (their regions come back via the restored shadow-SP), so a
+    /// post-thaw spawn allocates below them. Set once after re-seeding, before forward execution.
+    fn seed_vcpu_count(&self, n: usize) {
+        self.lock().vcpus = n;
+    }
+
     /// `cont.new`: allocate the next slot — the guest handle — under the §15 quota, which is
     /// **per run** now that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the
     /// off-table root computation, so a quota value admits exactly the creations the JIT's
@@ -3833,8 +3877,10 @@ impl FiberRegistry {
         let slot = t.fibers.len();
         // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
         // clean `FiberFault`, like exhausting the quota — never an overflow into another
-        // context's region). The fiber's context index is `slot + 1` (the root is context 0).
-        if durable && !shadow_region_fits(slot + 1) {
+        // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
+        // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
+        // (slice 3.2.2), so this fiber also mustn't meet the vCPUs: `(slot+1) + vcpus <= MAX`.
+        if durable && (!shadow_region_fits(slot + 1) || slot + 1 + t.vcpus > MAX_SHADOW_CTX) {
             return Err(Trap::FiberFault);
         }
         t.fibers.push(RegFiber::Pending { func, sp });
@@ -5368,6 +5414,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .as_ref()
                         .map(|m| m.durable_state())
                         .unwrap_or(STATE_NORMAL);
+                    // Durable multi-vCPU (slice 3.2.2): reserve this child's shadow context top-down
+                    // (`MAX_SHADOW_CTX`, −1, …) so it can't collide with a fiber's `slot+1` region.
+                    // Fail closed (`ThreadFault`) if the reserve is full — the vCPU pool growing down
+                    // would meet the fiber pool growing up. (Non-durable runs never touch the reserve.)
+                    let child_ctx = if durable {
+                        match registry.reserve_vcpu_context() {
+                            Some(c) => c,
+                            None => return Err(Trap::ThreadFault),
+                        }
+                    } else {
+                        0
+                    };
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_host = Arc::clone(host); // inherit the domain powerbox
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
@@ -5398,10 +5456,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         child.durable = durable; // durability is a domain property (shared window/registry)
-                                                 // Durable multi-vCPU (slice 3.2.1): this child is context `task id`, so its shadow
-                                                 // stack lives in its own region; it carries its own state word (swapped in by the
-                                                 // runtime when it runs). Retain `(entry, [sp, arg])` so a freeze emits its residue.
-                        child.root_shadow_sp = shadow_region_base(id as usize);
+                                                 // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
+                                                 // above, so its shadow stack lives in its own region; it carries its own state word
+                                                 // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
+                        child.root_shadow_sp = shadow_region_base(child_ctx);
                         child.dstate = child_state;
                         child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));

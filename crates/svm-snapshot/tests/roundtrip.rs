@@ -388,3 +388,139 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
         "saved clock reads reloaded, not re-issued"
     );
 }
+
+// Slice 3.2.2 — vCPU + fiber coexistence through the codec. The root spawns a child vCPU and owns a
+// fiber (which parks); the artifact's control section must carry BOTH the fiber residue and the
+// spawned-vCPU residue (+ root extent), and the thaw must reconstruct both into non-colliding regions.
+const SRC_FIBER_AND_VCPU: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 65536
+  i32.store v1 v0
+  v2 = i64.const 0
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v2 v3
+  v5 = ref.func 2
+  v6 = i64.const 4096
+  v7 = cont.new v5 v6
+  v8 = i64.const 0
+  v9, v10 = cont.resume v7 v8
+  v13 = thread.join v4
+  v14 = i64.add v10 v13
+  return v14
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65536
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 10
+  v7 = i64.add v5 v6
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+
+#[test]
+fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
+    let mut m = svm_text::parse_module(SRC_FIBER_AND_VCPU).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = svm_durable::transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Baseline: fiber yields 5; child reads clock (42) + 10; result = 5 + 52 = 57.
+    let baseline = {
+        let mut host = Host::new();
+        host.set_durable(true);
+        host.clock_ns = 42;
+        let clk = host.grant_clock();
+        let mut fuel = 100_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut host,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(
+        baseline,
+        vec![Value::I64(57)],
+        "uninterrupted: 5 + (42 + 10)"
+    );
+
+    // Freeze run.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    fhost.clock_ns = 42;
+    let clk = fhost.grant_clock();
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(frozen.is_ok(), "freeze returns a placeholder: {frozen:?}");
+    assert_eq!(fhost.frozen_fibers().len(), 1, "fiber flattened");
+    assert_eq!(fhost.frozen_vcpus().len(), 1, "spawned vCPU captured");
+
+    // Serialize: the control section now carries BOTH a fiber record and a vCPU record.
+    let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
+
+    // Restore on a fresh host whose clock advanced.
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.clock_ns = 1000;
+    let window = restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(thost.frozen_fibers().len(), 1, "fiber residue re-seeded");
+    assert_eq!(thost.frozen_vcpus().len(), 1, "vCPU residue re-seeded");
+
+    // §12.6 invariant 1 — canonical re-serialize is byte-identical (both residues included).
+    assert_eq!(
+        freeze(&inst, &window, &thost).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored vCPU+fiber domain is byte-identical"
+    );
+
+    // Thaw: the fiber re-seeds and re-parks, the child re-spawns and reloads its clock; result == 57.
+    let mut win = window;
+    write_state(&mut win, STATE_REWINDING);
+    let clk = {
+        let caps = thost.capture_durable_handles().expect("durable");
+        ((caps[0].generation << 8) | caps[0].slot) as i32
+    };
+    let mut fuel = 100_000u64;
+    let (thawed, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        thawed,
+        Ok(baseline),
+        "thawed vCPU+fiber run reloads its clock read (57), not re-issues it"
+    );
+}
