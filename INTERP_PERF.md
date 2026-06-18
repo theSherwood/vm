@@ -273,8 +273,24 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
           (58 binaries incl. `jit_diff`/`fiber_fuzz`/`concurrent_fuzz`/`dynlink`) green. Production
           guest execution is the JIT; the interpreter's role is oracle / escape-TCB checker, so this
           speeds the interpreter-only and differential paths without touching the oracle.
-    - [ ] **1c-5** — remaining op set + cross-module units (tail calls, `install`/`invoke` indirect
-          calls, host/fiber/thread/cap ops) on the reified machine.
+    - [ ] **1c-5** — **the seam rewrite** (decision 2026-06-18): re-express `run_inner`'s seam layer
+          against the `Vm` so capability / fiber / thread / cross-module guests run on bytecode too,
+          not just fall back. Driven **TDD-style** — each seam slice builds its verification harness
+          *first* (the random corpus doesn't emit these ops, so we author targeted modules + the
+          ordering/state-shape oracle the seam needs, then make bytecode match the tree-walker). The
+          `Vm` becomes a first-class schedulable/parkable continuation alongside `VCpu`. Planned
+          slices, in dependency order (refined once the seam inventory lands):
+        - [ ] **1c-5a** — synchronous host/capability seam (generic `cap.call` powerbox dispatch:
+              guest suspended, host computes, same activation continues — no scheduler). Harness:
+              hand-authored cap modules diffed bytecode-vs-tree-walker.
+        - [ ] **1c-5b** — `Vm` as a schedulable task in the executor (`drive`/`Scheduler`): the
+              foundation threads/fibers ride on. Harness: schedule/interleaving equality.
+        - [ ] **1c-5c** — threads (`thread.spawn`/`join`) + `memory.wait`/`notify`. Harness:
+              concurrent-outcome equality (DPOR-style).
+        - [ ] **1c-5d** — fibers/coroutines (`cont.new`/`resume`/`suspend`, yielder, shared_region).
+        - [ ] **1c-5e** — cross-module units (`install`/`invoke` indirect calls; tail calls).
+    - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
+          stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:
           snapshot equality.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
