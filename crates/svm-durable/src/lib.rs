@@ -65,6 +65,15 @@ pub const STATE_NORMAL: i32 = 0;
 pub const STATE_UNWINDING: i32 = 1;
 /// Thaw in progress: every prologue rebuilds its frame from the shadow stack.
 pub const STATE_REWINDING: i32 = 2;
+/// Freeze **armed** (the deterministic mid-run trigger): the run executes normally, but the runtime
+/// counts down [`ARM_COUNTDOWN_OFF`] at each safepoint (leaf may-suspend op) and, on reaching 0,
+/// promotes the word to [`STATE_UNWINDING`] so that op's trailing poll begins the freeze. Transparent
+/// to the instrumented IR — every emitted poll/prologue tests only `UNWINDING`/`REWINDING`, so an
+/// `ARMED` run reads as `NORMAL` until the runtime promotes it. Lets a single-threaded test freeze
+/// *after N safepoints of forward progress* (e.g. after a fiber has been recycled), which the
+/// freeze-before-start harness cannot; it also models an async controller flipping `UNWINDING` from
+/// another thread, which the existing mechanism already picks up at the next poll.
+pub const STATE_ARMED: i32 = 3;
 
 // ---- Durable runtime region layout ----
 //
@@ -87,6 +96,11 @@ pub const STATE_REWINDING: i32 = 2;
 pub const STATE_OFF: u64 = 0;
 /// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
 pub const SHADOW_SP_OFF: u64 = 8;
+/// Window byte offset of the `i64` **arm countdown** — the number of safepoints still to pass before
+/// an [`STATE_ARMED`] run promotes itself to [`STATE_UNWINDING`]. Decremented by the runtime at each
+/// safepoint; inert unless the state word is `ARMED`. Lives in the reserve's previously-unused
+/// `[16, 64)` gap, so it is byte-identical to before for any run that never arms (countdown stays 0).
+pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
 pub const SHADOW_BASE: u64 = 64;
 /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
@@ -848,6 +862,18 @@ pub fn init_durable_window(size: usize) -> Vec<u8> {
 /// Overwrite the state word in a window image (used to drive freeze/thaw).
 pub fn write_state(window: &mut [u8], state: i32) {
     window[STATE_OFF as usize..STATE_OFF as usize + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+/// Arm a window to **freeze after `safepoints` further safepoints** (the deterministic mid-run
+/// trigger): the run proceeds normally, and the runtime promotes the state word to `UNWINDING` at the
+/// `safepoints`-th leaf may-suspend op so that op's trailing poll begins the freeze. `safepoints == 1`
+/// freezes at the first safepoint (equivalent to pre-setting `UNWINDING`, but reached *during* the
+/// run); larger values let the run make forward progress first. A non-positive count is clamped to 1.
+pub fn arm_freeze_after(window: &mut [u8], safepoints: i64) {
+    let n = safepoints.max(1);
+    window[ARM_COUNTDOWN_OFF as usize..ARM_COUNTDOWN_OFF as usize + 8]
+        .copy_from_slice(&n.to_le_bytes());
+    write_state(window, STATE_ARMED);
 }
 
 /// Read the state word from a window image.

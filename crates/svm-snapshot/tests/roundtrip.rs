@@ -3,7 +3,8 @@
 //! (canonical re-serialize; identity-gated refusal) and the non-durable freeze refusal.
 
 use svm_durable::{
-    init_durable_window, transform_module, write_state, STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after, init_durable_window, transform_module, write_state, STATE_REWINDING,
+    STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -567,4 +568,118 @@ fn fiber_residue_generation_round_trips_through_the_codec() {
         back[0].generation, 7,
         "the fiber residue's generation round-trips through the codec"
     );
+}
+
+// A fiber'd module that **recycles a slot before freezing** (recycling step 2/3 + the mid-run freeze
+// trigger, end to end). The root first runs fiber A (func 2) to completion — that *frees* registry
+// slot 0 and bumps its generation to 1 — then creates the real fiber B (func 1) which reuses slot 0
+// at **generation 1**, resumes B once (it suspends/parks), and resumes it again to completion (7 +
+// 100). Freezing while B is parked must flatten B carrying generation 1, and the thaw must re-seed it
+// there so B's guest handle ((1 << 16) | 0) still resolves. This is the case the freeze-before-start
+// harness can't reach: a recycled parked fiber needs a prior fiber-finish (a prior safepoint), so the
+// freeze has to land *mid-run* — which `arm_freeze_after` makes deterministic.
+const SRC_RECYCLE: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 2
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6 = ref.func 1
+  v7 = i64.const 4096
+  v8 = cont.new v6 v7
+  v9 = i64.const 0
+  v10, v11 = cont.resume v8 v9
+  v12 = i64.const 7
+  v13, v14 = cont.resume v8 v12
+  return v14
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 42
+  v3 = suspend v2
+  v4 = i64.const 100
+  v5 = i64.add v3 v4
+  return v5
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  return v2
+}
+"#;
+
+#[test]
+fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
+    let inst = instrument(SRC_RECYCLE);
+
+    // Baseline: uninterrupted → 107 (A recycles slot 0, B reuses it and completes 7 + 100).
+    let mut host = Host::new();
+    let mut fuel = 100_000u64;
+    let (baseline, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        baseline,
+        Ok(vec![Value::I64(107)]),
+        "uninterrupted: 7 + 100"
+    );
+
+    // Freeze run: arm so the freeze lands mid-run, once slot 0 has been recycled and B is parked.
+    // The trigger fires at the third safepoint (resume A; resume B #1; B's suspend), so B is parked
+    // and slot 0 is at generation 1 when the root unwinds.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let mut win = init_durable_window(WINDOW);
+    arm_freeze_after(&mut win, 3);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
+    assert!(frozen.is_ok(), "freeze returns a placeholder: {frozen:?}");
+    let residue = fhost.frozen_fibers();
+    assert_eq!(residue.len(), 1, "exactly the parked fiber B flattened");
+    assert_eq!(residue[0].slot, 0, "B reused the recycled slot 0");
+    assert_eq!(
+        residue[0].generation, 1,
+        "the recycled slot's generation (1) is recorded in the residue"
+    );
+
+    // Serialize → restore: the recycled generation survives the codec and re-seeds the fiber.
+    let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(thost.frozen_fibers().len(), 1, "restore re-seeded fiber B");
+    assert_eq!(
+        thost.frozen_fibers()[0].generation,
+        1,
+        "the re-seeded fiber is at generation 1 (its handle is (1 << 16) | 0)"
+    );
+
+    // §12.6 invariant 1 — canonical re-serialize is byte-identical.
+    assert_eq!(
+        freeze(&inst, &window, &thost).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored recycled-fiber domain is byte-identical"
+    );
+
+    // Thaw: the root rewinds and re-issues resume B; the gen-1 handle resolves to the re-seeded
+    // fiber, which re-parks, and forward execution then resumes it to completion → 107.
+    let mut win = window;
+    write_state(&mut win, STATE_REWINDING);
+    let mut fuel = 100_000u64;
+    let (thawed, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut thost);
+    assert_eq!(
+        thawed, baseline,
+        "thawed recycled-fiber run equals the uninterrupted run"
+    );
+    assert_eq!(thawed, Ok(vec![Value::I64(107)]));
 }

@@ -3615,6 +3615,14 @@ pub const STATE_OFF: u64 = 0;
 pub const STATE_NORMAL: i32 = 0;
 pub const STATE_UNWINDING: i32 = 1;
 pub const STATE_REWINDING: i32 = 2;
+/// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
+/// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
+/// the instrumented IR (which tests only `UNWINDING`/`REWINDING`). Must equal `svm_durable::STATE_ARMED`.
+pub const STATE_ARMED: i32 = 3;
+/// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
+/// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
+/// `svm_durable::ARM_COUNTDOWN_OFF`.
+pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
 /// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
 /// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
@@ -4672,6 +4680,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let inst = &block.insts[frames[top].inst];
             step(fuel)?;
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
+
+            // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
+            // armed via `STATE_ARMED`, count down at each safepoint (leaf may-suspend op — the ops the
+            // transform follows with a poll) and promote to `UNWINDING` at 0, so *this* op's trailing
+            // poll begins the freeze. Inert unless armed; gated on `durable` so an ordinary run is
+            // untouched. Lets a run freeze after forward progress (e.g. once a fiber is recycled),
+            // which the freeze-before-start harness cannot reach.
+            if durable
+                && matches!(
+                    inst,
+                    Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                )
+            {
+                if let Some(m) = mem.as_mut() {
+                    m.durable_tick_arm();
+                }
+            }
 
             match inst {
                 // Non-tail calls push a new frame and switch to it; the callee's results
@@ -10046,6 +10071,27 @@ impl Mem {
     /// so the single shared word reflects the running vCPU's own freeze phase.
     fn durable_set_state(&mut self, state: i32) {
         let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
+    }
+
+    /// Tick the **mid-run freeze trigger** at a safepoint: if the run is `STATE_ARMED`, decrement the
+    /// arm countdown at [`ARM_COUNTDOWN_OFF`] and, when it reaches 0, promote the state word to
+    /// `UNWINDING` — so the safepoint's trailing poll begins the freeze. A no-op unless armed (the
+    /// common case: one `i32` read per safepoint, no write), so an unarmed run is byte-identical. Call
+    /// once per safepoint (leaf may-suspend op) — see the `run_inner` dispatch.
+    fn durable_tick_arm(&mut self) {
+        if self.durable_state() != STATE_ARMED {
+            return;
+        }
+        let n = self
+            .read_bytes_impl(ARM_COUNTDOWN_OFF, 8)
+            .and_then(|b| b.try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(0)
+            - 1;
+        let _ = self.write_bytes_impl(ARM_COUNTDOWN_OFF, &n.to_le_bytes());
+        if n <= 0 {
+            self.durable_set_state(STATE_UNWINDING);
+        }
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {
