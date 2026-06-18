@@ -3137,11 +3137,11 @@ fn lower_vm_builtin(
             });
             let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the fiber's own data-stack base
             let r = ctx.push(Inst::ContNew { func, sp });
-            ctx.bind_dest(&c.dest, r); // i32 fiber handle
+            ctx.bind_dest(&c.dest, r); // i64 fiber handle (16-bit slot + 48-bit generation)
             Ok(true)
         }
         "__vm_fiber_resume" => {
-            let k = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let k = ctx.operand_i64(vm_arg(c, 0)?)?; // i64 fiber handle
             let arg = ctx.operand_i64(vm_arg(c, 1)?)?;
             let done = ctx.operand_i64(vm_arg(c, 2)?)?; // `int *done`
             let rs = ctx.push_multi(Inst::ContResume { k, arg }, 2); // (status, value)

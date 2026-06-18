@@ -334,8 +334,9 @@ pub struct FrozenFiber {
     pub sp: i64,
     pub shadow_sp: u64,
     /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
-    /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `svm_interp::FrozenFiber`.
-    pub generation: u32,
+    /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `svm_interp::FrozenFiber`
+    /// (48-bit field — the `i64` handle's generation bits).
+    pub generation: u64,
 }
 
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
@@ -3310,7 +3311,7 @@ fn lower_block(
             for t in [I64, I64, I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
-            tsig.returns.push(AbiParam::new(I32));
+            tsig.returns.push(AbiParam::new(I64)); // i64 fiber handle (16-bit slot + 48-bit generation)
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
             let call = b
@@ -3322,7 +3323,7 @@ fn lower_block(
             continue;
         }
         if let Inst::ContResume { k, arg } = inst {
-            // fiber_resume(handle:i32, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
+            // fiber_resume(handle:i64, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
             // Results are appended (status:i32, value:i64) to match the IR's two-result shape.
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
@@ -3331,7 +3332,7 @@ fn lower_block(
             let av = get(&vals, *arg)?;
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I32, I64, I64, I64] {
+            for t in [I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));

@@ -91,7 +91,7 @@ fn fiber_generator_loop() {
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 0\n\
         \x20 br block1(v2, v3)\n\
-        block1(v4: i32, v5: i64):\n\
+        block1(v4: i64, v5: i64):\n\
         \x20 v6 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v4 v6\n\
         \x20 v9 = i64.add v5 v8\n\
@@ -197,9 +197,7 @@ fn fiber_handle_values_match_across_backends() {
         \x20 v3 = cont.new v0 v1\n\
         \x20 v4 = i64.const 3\n\
         \x20 v5, v6 = cont.resume v3 v4\n\
-        \x20 v7 = i64.extend_i32_u v2\n\
-        \x20 v8 = i64.extend_i32_u v3\n\
-        \x20 return v7 v8 v5 v6\n\
+        \x20 return v2 v3 v5 v6\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
         block0(v0: i64, v1: i64):\n\
@@ -308,7 +306,7 @@ fn fiber_forged_generation_faults_identically() {
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
-        \x20 v3 = i32.const 65536\n\
+        \x20 v3 = i64.const 65536\n\
         \x20 v4 = i64.const 0\n\
         \x20 v5, v6 = cont.resume v3 v4\n\
         \x20 return v6\n\
@@ -329,7 +327,7 @@ fn recycled_slot_generation_guard_agrees() {
     // Fiber A (slot 0, gen 0) finishes; the next cont.new reuses slot 0 at gen 1 — returning the i32
     // handle makes the reuse observable (65536). Both backends must produce the same handle.
     assert_jit_matches_interp(
-        "func () -> (i32) {\n\
+        "func () -> (i64) {\n\
         block0():\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
@@ -345,7 +343,7 @@ fn recycled_slot_generation_guard_agrees() {
         \x20 return v2\n\
         }\n",
     );
-    // After slot 0 is recycled (now gen 1), resuming A's stale gen-0 handle (i32 0) must fault on
+    // After slot 0 is recycled (now gen 1), resuming A's stale gen-0 handle (i64 0) must fault on
     // both backends — even though slot 0 is live — because the generation no longer matches.
     assert_jit_matches_interp(
         "func () -> (i64) {\n\
@@ -356,7 +354,7 @@ fn recycled_slot_generation_guard_agrees() {
         \x20 v3 = i64.const 0\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6 = cont.new v0 v1\n\
-        \x20 v9 = i32.const 0\n\
+        \x20 v9 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v9 v3\n\
         \x20 return v8\n\
         }\n\

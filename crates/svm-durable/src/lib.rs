@@ -1034,8 +1034,8 @@ fn result_types(
         CallIndirect { ty, .. } => ty.results.clone(),
         PtrAdd { .. } | PtrCast { .. } => vec![ValType::I64],
         RefFunc { .. } => vec![ValType::I32],
-        // Fiber control ops (§12 / Phase 3): a handle, a `(status, value)` pair, a resume arg.
-        ContNew { .. } => vec![ValType::I32],
+        // Fiber control ops (§12 / Phase 3): an i64 handle, a `(status, value)` pair, a resume arg.
+        ContNew { .. } => vec![ValType::I64],
         ContResume { .. } => vec![ValType::I32, ValType::I64],
         Suspend { .. } => vec![ValType::I64],
         // §12 thread ops (Phase 3.2): `thread.spawn` yields an `i32` handle, `thread.join` an `i64`
