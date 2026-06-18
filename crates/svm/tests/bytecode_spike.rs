@@ -80,6 +80,12 @@ enum Op {
     Ret {
         src: u32,
     },
+    // Direct call: gather arg slots, run `callee`, write its single result to `dst`.
+    Call {
+        callee: u32,
+        args: Vec<u32>,
+        dst: u32,
+    },
 }
 
 struct Program {
@@ -87,9 +93,10 @@ struct Program {
     nslots: u32,
 }
 
-/// Lower an all-i64 straight-line+branches function to the flat bytecode. Panics on any op outside
-/// the ALU subset — this is a measurement spike, not the real compiler.
-fn compile(f: &Func) -> Program {
+/// Lower an all-i64 (straight-line + branches + direct calls) function to the flat bytecode.
+/// `arities[f]` is each function's result count (for `Call` slot sizing). Panics on any op outside
+/// the supported subset — this is a measurement spike, not the real compiler.
+fn compile(f: &Func, arities: &[usize]) -> Program {
     // Global slot assignment: each block's params then its value-producing insts, in order.
     let mut base = Vec::with_capacity(f.blocks.len());
     let mut nslots = 0u32;
@@ -97,7 +104,7 @@ fn compile(f: &Func) -> Program {
         base.push(nslots);
         nslots += b.params.len() as u32;
         for inst in &b.insts {
-            nslots += inst.result_count(&[]) as u32; // ALU ops all produce exactly one
+            nslots += inst.result_count(arities) as u32;
         }
     }
     // First op index of each block (its entry pc), for branch targets.
@@ -109,9 +116,14 @@ fn compile(f: &Func) -> Program {
         let g = |local_idx: u32| base[bi] + local_idx; // operand: block-local -> global slot
         for inst in &b.insts {
             let dst = base[bi] + local;
-            local += 1;
+            local += inst.result_count(arities) as u32;
             match inst {
                 Inst::ConstI64(c) => ops.push(Op::Const { dst, c: *c }),
+                Inst::Call { func, args } => ops.push(Op::Call {
+                    callee: *func,
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    dst,
+                }),
                 Inst::IntBin {
                     ty: IntTy::I64,
                     op,
@@ -242,6 +254,96 @@ fn run_program(p: &Program, arg: i64, fuel: &mut u64) -> i64 {
                 }
             }
             Op::Ret { src } => return regs[*src as usize],
+            Op::Call { .. } => unreachable!("single-program ALU executor has no calls"),
+        }
+    }
+}
+
+/// Register-window executor for multi-function modules: one big `regs` file, each call activation
+/// occupying `[base, base + nslots)`; a `Call` opens the next window (copying args into the callee's
+/// param slots) with no per-call allocation, and `Ret` writes the result back into the caller's
+/// window and restores it. Measures the flat model's *call* path.
+fn run_module(progs: &[Program], entry: usize, arg: i64, fuel: &mut u64) -> i64 {
+    let mut regs = vec![0i64; progs[entry].nslots as usize];
+    regs[0] = arg; // entry block0 param v0
+                   // Current activation:
+    let mut cur = entry;
+    let mut base = 0usize;
+    let mut pc = 0usize;
+    // Resume stack of suspended callers: (prog, base, pc, absolute result slot in caller window).
+    let mut stack: Vec<(usize, usize, usize, usize)> = Vec::new();
+    loop {
+        *fuel = fuel.checked_sub(1).expect("fuel");
+        match &progs[cur].ops[pc] {
+            Op::Const { dst, c } => {
+                regs[base + *dst as usize] = *c;
+                pc += 1;
+            }
+            Op::Add { dst, a, b } => {
+                regs[base + *dst as usize] =
+                    regs[base + *a as usize].wrapping_add(regs[base + *b as usize]);
+                pc += 1;
+            }
+            Op::Mul { dst, a, b } => {
+                regs[base + *dst as usize] =
+                    regs[base + *a as usize].wrapping_mul(regs[base + *b as usize]);
+                pc += 1;
+            }
+            Op::LtS { dst, a, b } => {
+                regs[base + *dst as usize] =
+                    (regs[base + *a as usize] < regs[base + *b as usize]) as i64;
+                pc += 1;
+            }
+            Op::Br { copies, target } => {
+                for &(s, d) in copies {
+                    regs[base + d as usize] = regs[base + s as usize];
+                }
+                pc = *target as usize;
+            }
+            Op::BrIf {
+                cond,
+                then_copies,
+                then_pc,
+                else_copies,
+                else_pc,
+            } => {
+                let (copies, next) = if regs[base + *cond as usize] != 0 {
+                    (then_copies, *then_pc)
+                } else {
+                    (else_copies, *else_pc)
+                };
+                for &(s, d) in copies {
+                    regs[base + d as usize] = regs[base + s as usize];
+                }
+                pc = next as usize;
+            }
+            Op::Call { callee, args, dst } => {
+                let callee = *callee as usize;
+                let new_base = base + progs[cur].nslots as usize;
+                let need = new_base + progs[callee].nslots as usize;
+                if regs.len() < need {
+                    regs.resize(need, 0);
+                }
+                for (i, a) in args.iter().enumerate() {
+                    regs[new_base + i] = regs[base + *a as usize];
+                }
+                stack.push((cur, base, pc + 1, base + *dst as usize));
+                cur = callee;
+                base = new_base;
+                pc = 0;
+            }
+            Op::Ret { src } => {
+                let result = regs[base + *src as usize];
+                match stack.pop() {
+                    None => return result,
+                    Some((cprog, cbase, cpc, ret_abs)) => {
+                        regs[ret_abs] = result;
+                        cur = cprog;
+                        base = cbase;
+                        pc = cpc;
+                    }
+                }
+            }
         }
     }
 }
@@ -286,7 +388,8 @@ fn ns_per_iter(reps: u32, big: i64, small: i64, mut call: impl FnMut(i64) -> i64
 fn bytecode_spike_alu() {
     let m = svm::text::parse_module(ALU).expect("parse");
     svm::verify::verify_module(&m).expect("verify");
-    let prog = compile(&m.funcs[0]);
+    let arities: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let prog = compile(&m.funcs[0], &arities);
 
     // Correctness: the flat executor must agree with the reference interpreter.
     for n in [0i64, 1, 7, 1000, 123_456] {
@@ -300,6 +403,54 @@ fn bytecode_spike_alu() {
         run_program(&prog, n, &mut fuel)
     });
     println!("\nbytecode spike (alu recurrence, ns/iter):");
+    println!("  tree-walk interp : {i:>9.3}");
+    println!("  flat bytecode    : {b:>9.3}   ({:.2}x faster)", i / b);
+}
+
+// acc += leaf(acc, i) per iteration, leaf(a,b) = a + b — a direct call + return each step.
+const CALL: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = call 1 (v8, v9)
+  v11 = i64.const 1
+  v12 = i64.add v9 v11
+  br block1(v7, v10, v12)
+block3(v13: i64):
+  return v13
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.add v0 v1
+  return v2
+}
+"#;
+
+#[test]
+#[ignore = "ROI spike; run explicitly with --nocapture --ignored"]
+fn bytecode_spike_call() {
+    let m = svm::text::parse_module(CALL).expect("parse");
+    svm::verify::verify_module(&m).expect("verify");
+    let arities: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let progs: Vec<Program> = m.funcs.iter().map(|f| compile(f, &arities)).collect();
+
+    for n in [0i64, 1, 7, 1000, 123_456] {
+        let mut fuel = u64::MAX;
+        assert_eq!(run_module(&progs, 0, n, &mut fuel), interp(&m, n), "n={n}");
+    }
+
+    let i = ns_per_iter(5, 200_000, 1_000, |n| interp(&m, n));
+    let b = ns_per_iter(5, 2_000_000, 1_000, |n| {
+        let mut fuel = u64::MAX;
+        run_module(&progs, 0, n, &mut fuel)
+    });
+    println!("\nbytecode spike (call/return loop, ns/iter):");
     println!("  tree-walk interp : {i:>9.3}");
     println!("  flat bytecode    : {b:>9.3}   ({:.2}x faster)", i / b);
 }

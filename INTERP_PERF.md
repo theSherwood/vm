@@ -136,8 +136,12 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 ### Phase 1 — compile pass + per-block bytecode (shape A)
 
 > **ROI spike (done — `crates/svm/tests/bytecode_spike.rs`):** a self-contained flat-bytecode
-> compiler+executor for the ALU kernel measured **~3.5× faster** than the tree-walker (62.5 → 17.9
-> ns/iter), *keeping the per-op fuel check, under `forbid(unsafe)`*. The win comes from a flat op
+> compiler+executor measured **~3.5× faster** on the ALU kernel (62.5 → 17.8 ns/iter) and **~3.0×**
+> on the call/return kernel (78.7 → 26.0 ns/iter) than the tree-walker, *keeping the per-op fuel
+> check, under `forbid(unsafe)`*. The call path uses **register windows** (one big register file, each
+> activation a `[base, base+nslots)` window — no per-call allocation, no `Arc` clone, no `frames[top]`
+> indexing); at 26 ns it would be ~2× faster than CPython on calls (vs ~1.4× slower today). The win
+> comes from a flat op
 > array (no `frames[top]` indexing, no per-block re-resolution), a preallocated **global-slot**
 > register file (each SSA value a function-wide slot → no per-edge `Vec`/swap, no `push`), branches
 > copying straight into the target block's param slots, and a small dispatch enum. The integrated
