@@ -261,8 +261,9 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
           (slice = 1/3/17) is bit-identical to running straight through, across the generated corpus.
           This is the machinery the scheduler/blocking-op/debug-stop seams drive; wiring it to an
           actual scheduler is 1c-4.
-    - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
-          stepping report tree-walker-identical locations. New harness: debug-trace equality.
+    - [x] **1c-3** — debug seam: `pc → {block, inst}` reverse map (`Program::src`) so `IrPc`,
+          breakpoints, and stepping report tree-walker-identical locations. Harness
+          `bytecode_debug.rs` (location trace == tree-walker `Inspector` `seek` sequence).
     - [x] **1c-4** — wire as a fast path: new `run_fast` / `run_with_host_fast` route eligible
           modules through the bytecode engine (`compile_and_run` returns `None` for any
           seam-requiring op, so eligibility is automatic) and fall back to the tree-walker `run`
@@ -431,8 +432,18 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               `bytecode_demand_coroutine.rs` (op-4 fault→supply→read round-trip → 2_001_123, fault
               address → 65536, op-7 lazy module data supply → 2_101_086) bit-identical to
               `run_with_host`. **§14 is now fully covered on the bytecode engine.**
-    - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
-          stepping report tree-walker-identical locations. New harness: debug-trace equality.
+        - [x] **1c-3** — debug seam: a `pc → {block, inst}` reverse map (`Program::src`) so the engine
+              reports tree-walker-identical [`IrPc`] locations for stepping/breakpoints. Built at
+              compile time parallel to the op stream: each instruction op carries its `(block, inst)`;
+              the one terminator op per block is `None` (non-steppable — the tree-walker's `before_op`
+              stops only at instructions, never terminators, and its logical clock ticks once per
+              instruction). `Vm::cur_ir_pc` reads it; `bytecode::ir_trace` single-steps (`budget = 1`,
+              one op per `resume`) recording each instruction location. New harness `bytecode_debug.rs`
+              asserts the bytecode location trace is **identical** to driving the tree-walker
+              `Inspector` with `seek(0), seek(1), …` (which enumerates executed-instruction locations) —
+              across straight line, branches, loops (back-edges revisit `IrPc`s), cross-frame calls,
+              and a trap — plus result equality. (Full Inspector parity — watchpoints, backtrace,
+              cap-call stops, time-travel — is follow-on; this lands the location model.)
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:
           snapshot equality.
 - [~] **Phase 2** — memory-op specialization + software fast-path.

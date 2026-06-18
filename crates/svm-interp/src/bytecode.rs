@@ -32,7 +32,7 @@
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
 //! tree-walker (`bytecode_diff.rs`, `bytecode_{caps,fibers,threads,coroutines,instantiate,
-//! separate_module,demand_coroutine,tailcall,dynlink}.rs`).
+//! separate_module,demand_coroutine,tailcall,debug,dynlink}.rs`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -428,6 +428,12 @@ enum Op {
 struct Program {
     ops: Vec<Op>,
     nslots: u32,
+    /// Debug reverse map (Slice 1c-3): the source `(block, inst)` of each op, or `None` for a
+    /// terminator op. The tree-walker's debug seam (`run_inner`'s `before_op`) stops only at
+    /// **instructions** (`inst < insts.len()`), never terminators, so `None` ops are non-steppable —
+    /// `Vm::cur_ir_pc` skips them, making the bytecode engine's location trace match the tree-walker's
+    /// [`crate::IrPc`] sequence op-for-op (breakpoints / stepping then report identical locations).
+    src: Box<[Option<(u32, u32)>]>,
 }
 
 /// A whole compiled module: one [`Program`] per function plus each function's result types (for
@@ -653,6 +659,19 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
             }),
         }
     }
+    // Debug reverse map (Slice 1c-3): each block lays out `insts.len()` instruction ops at
+    // `[block_pc[bi], +insts.len())` then exactly one terminator op. Instruction ops map to their
+    // `(block, inst)`; the terminator op is left `None` (non-steppable — the tree-walker never stops
+    // at a terminator). The later target-patch only rewrites jump fields, not the op order, so this
+    // index stays valid.
+    let mut src: Vec<Option<(u32, u32)>> = vec![None; ops.len()];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let base_pc = block_pc[bi] as usize;
+        for i in 0..b.insts.len() {
+            src[base_pc + i] = Some((bi as u32, i as u32));
+        }
+    }
+
     // Patch branch targets from block index to entry pc.
     let patch = |t: &mut u32| *t = block_pc[*t as usize];
     for op in &mut ops {
@@ -673,7 +692,11 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
             _ => {}
         }
     }
-    Some(Program { ops, nslots })
+    Some(Program {
+        ops,
+        nslots,
+        src: src.into_boxed_slice(),
+    })
 }
 
 fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32) -> Option<Op> {
@@ -1088,6 +1111,46 @@ pub fn compile_and_run_with_host(
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
     Some(run(dom, func, args, fuel, &mut mem, host))
+}
+
+/// An [`ir_trace`] result: the executed instruction-location sequence plus the run's result.
+pub type IrTrace = (Vec<super::IrPc>, Result<Vec<Value>, Trap>);
+
+/// Debug seam (Slice 1c-3): single-step `m`'s `func(args)` and record the [`crate::IrPc`] of each
+/// **instruction** executed (terminators are skipped, matching the tree-walker's `before_op`, which
+/// only stops at instructions), returning the location trace plus the result. `None` if the module is
+/// outside the engine's subset, or if a step hits a concurrency/coroutine seam (debug is single-vCPU,
+/// seam-free — DEBUGGING.md S4). Stepping uses `budget = 1` so each `resume` runs exactly one op.
+///
+/// The resulting trace is **identical** to driving the tree-walker [`crate::Inspector`] with
+/// `seek(0), seek(1), …` — that equality (checked by `bytecode_debug.rs`) is what proves the engine
+/// reports tree-walker-identical locations, so breakpoints/stepping at [`crate::IrPc`] granularity
+/// land at the same program points on both backends.
+pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Option<IrTrace> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Vec::new(), Err(Trap::Malformed)));
+    }
+    let mods = [c];
+    let table = build_table(mods[0].progs.len(), 0);
+    let mut mem = build_mem(m);
+    let mut host = Host::new();
+    let mut vm = match Vm::new(&mods[0], func as usize, args) {
+        Ok(v) => v,
+        Err(e) => return Some((Vec::new(), Err(e))),
+    };
+    let mut trace = Vec::new();
+    loop {
+        if let Some(pc) = vm.cur_ir_pc(&mods) {
+            trace.push(pc);
+        }
+        match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
+            Ok(Outcome::Suspended) => continue, // one op done; keep stepping
+            Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
+            Ok(_) => return None, // a seam — out of single-vCPU debug scope
+            Err(t) => return Some((trace, Err(t))),
+        }
+    }
 }
 
 /// Like [`compile_and_run`], but drives the reified [`Vm`] in slices of at most `slice` ops,
@@ -2630,6 +2693,23 @@ impl Vm {
     /// last `resume` persisted, so this targets the same window the op's `dst` was resolved against.
     fn set(&mut self, slot: u32, v: Reg) {
         self.regs[self.base + slot as usize] = v;
+    }
+
+    /// The [`crate::IrPc`] of the op the cursor is on, or `None` if that op is a terminator (which the
+    /// debug seam never stops at — see [`Program::src`]). Used by [`ir_trace`] to record the same
+    /// instruction-location sequence the tree-walker's `Inspector` reports.
+    fn cur_ir_pc(&self, mods: &[Compiled]) -> Option<super::IrPc> {
+        let (block, inst) = mods[self.module].progs[self.cur]
+            .src
+            .get(self.pc)
+            .copied()
+            .flatten()?;
+        Some(super::IrPc {
+            module: self.module as u32,
+            func: self.cur as FuncIdx,
+            block: block as usize,
+            inst: inst as usize,
+        })
     }
 
     /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
