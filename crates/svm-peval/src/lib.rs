@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
-//! `svm-peval` — Stage-0 of the partial-evaluation / Futamura on-ramp (see `PEVAL.md`).
+//! `svm-peval` — the partial-evaluation / Futamura on-ramp (see `PEVAL.md`).
 //!
-//! This is the **generic IR→IR optimizer**: a closed-module, semantics-preserving pass
-//! that proves the `rewrite → re-verify → run` loop end to end before any
-//! interpreter-specialization machinery (constant memory, contexts, value-stack renaming)
-//! is built on top. It does four things:
+//! Two layers:
+//!
+//! - **The generic IR→IR optimizer** ([`optimize_module`]) — Stages 0/0.x below.
+//! - **The specializer** ([`specialize`]) — Stage 1, the first Futamura projection: turn an
+//!   interpreter + a fixed program (in readonly "constant memory") into a compiled residual.
+//!   See [`mod@specialize`].
+//!
+//! The optimizer is a closed-module, semantics-preserving pass that proves the
+//! `rewrite → re-verify → run` loop end to end. It does four things:
 //!
 //! 1. **Constant folding.** A pure, single-result integer op whose operands are all known
 //!    constants is replaced *in place* with the equivalent `const`. Because the
@@ -39,35 +44,39 @@
 //! renumbering/remapper.
 //!
 //! **Still out of scope** (later increments): float constant folding (NaN/rounding
-//! fidelity), value forwarding through `select`/copies, dead **block-parameter**
-//! elimination (a cross-edge transform — it must rewrite every predecessor's branch args),
-//! and anything that reads or rewrites memory (the "constant memory" analysis is Stage 1).
+//! fidelity); dead **block-parameter** elimination and **block merging** (collapsing a block
+//! into its single unconditional predecessor) — both cross-edge transforms; and lifting an
+//! interpreter's value stack out of memory into SSA so memory-backed interpreters specialize
+//! too (the specializer's Stage 2).
 
 use svm_ir::{BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx};
 
-/// A value known to be a constant at optimization time. Stage 0 tracks integers only
-/// (the only types it folds); floats/v128 are recorded as "unknown".
-#[derive(Clone, Copy)]
-enum Known {
+mod specialize;
+pub use specialize::{specialize, SpecArg, SpecError};
+
+/// A value known to be a constant at optimization time. Tracks integers only (the only types
+/// folded); floats/v128 are recorded as "unknown". Shared with the [`specialize`] engine.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Known {
     I32(i32),
     I64(i64),
 }
 
 impl Known {
     /// The `const` instruction that materializes this value (the in-place fold result).
-    fn to_const_inst(self) -> Inst {
+    pub(crate) fn to_const_inst(self) -> Inst {
         match self {
             Known::I32(v) => Inst::ConstI32(v),
             Known::I64(v) => Inst::ConstI64(v),
         }
     }
-    fn as_i32(self) -> Option<i32> {
+    pub(crate) fn as_i32(self) -> Option<i32> {
         match self {
             Known::I32(v) => Some(v),
             Known::I64(_) => None,
         }
     }
-    fn as_i64(self) -> Option<i64> {
+    pub(crate) fn as_i64(self) -> Option<i64> {
         match self {
             Known::I64(v) => Some(v),
             Known::I32(_) => None,
@@ -190,7 +199,7 @@ fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
 /// Constant-fold an integer binary op, mirroring the interpreter's `bin32`/`bin64` exactly
 /// (wrapping arithmetic; shifts/rotates mod bitwidth). Returns `None` for the trapping cases
 /// so the op is preserved and traps at runtime as the source would.
-fn fold_int_bin(ty: IntTy, op: BinOp, a: Known, b: Known) -> Option<Known> {
+pub(crate) fn fold_int_bin(ty: IntTy, op: BinOp, a: Known, b: Known) -> Option<Known> {
     match ty {
         IntTy::I32 => {
             let (a, b) = (a.as_i32()?, b.as_i32()?);
@@ -278,7 +287,7 @@ fn fold_int_bin(ty: IntTy, op: BinOp, a: Known, b: Known) -> Option<Known> {
 }
 
 /// Constant-fold an integer comparison (result is `i32` 0/1), mirroring `cmp32`/`cmp64`.
-fn fold_int_cmp(ty: IntTy, op: CmpOp, a: Known, b: Known) -> Option<Known> {
+pub(crate) fn fold_int_cmp(ty: IntTy, op: CmpOp, a: Known, b: Known) -> Option<Known> {
     let r = match ty {
         IntTy::I32 => {
             let (a, b) = (a.as_i32()?, b.as_i32()?);
@@ -315,7 +324,7 @@ fn fold_int_cmp(ty: IntTy, op: CmpOp, a: Known, b: Known) -> Option<Known> {
 }
 
 /// Constant-fold a unary integer op, mirroring `intun32`/`intun64`.
-fn fold_int_un(ty: IntTy, op: IntUnOp, a: Known) -> Option<Known> {
+pub(crate) fn fold_int_un(ty: IntTy, op: IntUnOp, a: Known) -> Option<Known> {
     match ty {
         IntTy::I32 => {
             let a = a.as_i32()?;
