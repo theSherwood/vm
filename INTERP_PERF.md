@@ -187,11 +187,24 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   not just the compiled path. Measured on the tree-walker memory kernel: ~176 → ~147 ns (~17%).
   All oracle suites byte-identical (jit_diff, escape_oracle, shared_region, address_space,
   durable_prot_capture, concurrent_escape_fuzz, dpor, coroutine, threads, simd).
-- Width-specialized load/store handlers in the compiled form; drop the `Value`↔slot round-trip at
-  the `Mem` boundary (store raw slot bits; load returns slot bits directly).
-- Inline the common-case confinement: a single mask + a mapped/writable bit-test, falling back to
-  the full `confine_checked`/`check_prot` path on the cold/edge cases (RO pages, unmapped tail,
-  aliased/§13 regions, atomics alignment). Keep the exact trap semantics.
+- **[done] Width-specialized scalar load/store + inlined common-case confinement (bytecode).**
+  `Mem::load_scalar`/`store_scalar` (used only by the bytecode `Op::Load`/`Store`) take a fast path
+  when `!prot_dirty` (the common case — no syscalls/coroutines/§13 regions, so every prefix page is
+  plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies wholly in the backed
+  prefix (`Window::checked`, one mask + bound): they read/write through new **non-atomic
+  width-specialized** `svm_mem::Region::read_word`/`write_word` (one possibly-unaligned machine
+  load/store, not `width` per-byte atomic ops), bypassing `confine_checked`'s per-op `last_fault`
+  atomic store and the `check_prot` page scan, and drop the `Value`↔slot round-trip on store. The
+  word ops are sound here because the bytecode engine is **cooperative single-threaded** (exactly one
+  vCPU touches the backing at a time — no race); the genuinely concurrent tree-walker + §12 atomics
+  keep the per-byte Relaxed paths. Any non-common case (RO/unmapped/reserved-tail/regions, or a
+  recoverable demand fault) falls to the cold `Mem::load`/`store`, preserving exact trap + `last_fault`
+  semantics. Measured (same box, `svm-bench` A/B): mem kernel **~82 → ~71 ns** bytecode (~13%), ratio
+  ~1.31× → ~1.38×; other kernels within noise. Full `svm` suite (73 binaries incl. `bytecode_diff`,
+  `escape_oracle`, `jit_diff`, `simd`) + `svm-mem` green; fmt/clippy clean.
+  - *Finding:* the residual mem cost is **per-op interpreter overhead** (per-op fuel + budget check),
+    not the memory access itself — that is Phase-3 territory (move fuel to back-edges), which would
+    lift *all* kernels including `mem`.
 - **Success:** memory kernel drops toward the software floor; escape_oracle + shared_region +
   address_space still byte-identical.
 
