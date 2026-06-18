@@ -1514,6 +1514,15 @@ pub enum Inst {
         op: FUnOp,
         a: ValIdx,
     },
+    /// Scalar **fused multiply-add** `a·b + c` with a single rounding (IEEE-754 FMA) — the scalar
+    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` / Rust
+    /// `f*::mul_add` are both correctly-rounded, so interp and JIT agree. Operands/result are `ty`.
+    Fma {
+        ty: FloatTy,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
+    },
     /// Float compare; operands are `ty`, result is `i32` 0/1.
     FCmp {
         ty: FloatTy,
@@ -1935,6 +1944,14 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// Signed `i8` dot product of adjacent pairs into `i16` lanes — `result[j] = a[2j]·b[2j] +
+    /// a[2j+1]·b[2j+1]` (wrapping at `i16`), both operands read as signed `i8`. Source `i8x16`,
+    /// result `i16x8`. The **deterministic** lowering of the relaxed `relaxed_dot_i8x16_i7x16_s`
+    /// (the spec-allowed signed-×-signed behavior, not the x86 `pmaddubsw` unsigned-×-signed one).
+    VDotI8 {
+        a: ValIdx,
+        b: ValIdx,
+    },
     /// Extended (widening) multiply: widen the low/high half of both `i8x16`/`i16x8`/`i32x4`
     /// operands (sign- or zero-, per [`VWidenOp`]) to the next wider shape, then multiply lane-wise.
     /// `shape` is the **wide result** (`i16x8`/`i32x4`/`i64x2`); `a`/`b`/result are `v128`.
@@ -1958,6 +1975,18 @@ pub enum Inst {
     VQ15MulrSat {
         a: ValIdx,
         b: ValIdx,
+    },
+    /// Lane-wise **fused multiply-add** (the relaxed-SIMD `relaxed_madd`/`relaxed_nmadd`): each lane
+    /// is `a·b + c` (`neg == false`) or `−a·b + c` (`neg == true`), computed with a **single rounding**
+    /// (IEEE-754 FMA). Float shapes (`f32x4`/`f64x2`); `a`/`b`/`c`/result are `v128`. SVM picks the
+    /// fused behavior (one of the two the relaxed proposal permits) consistently in both backends —
+    /// Cranelift `fma` and Rust `f*::mul_add` are both correctly-rounded, so the differential holds.
+    VFma {
+        shape: VShape,
+        neg: bool,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.

@@ -28,9 +28,10 @@
 //! **function imports** (a wasm `call` to an import → a `cap.call` on a threaded capability handle;
 //! the host-ABI convention binds each import's `module`/`name` to a capability `type_id`/`op` — see
 //! [`transpile`]) · **§17/D58 SIMD** (`v128` → the IR's first-class fixed-128 vector type: const,
-//! masked load/store, splat, extract/replace_lane, integer-/float-lane arithmetic, bitwise +
-//! `bitselect`, `shuffle`/`swizzle` — a real `clang -msimd128 -O2` saxpy transpiles to verified
-//! SIMD IR, `tests/simd.rs`) · **§12 wasm threads**: the full-width (i32/i64) `*.atomic.*` ops map
+//! masked load/store + the memory variants (splat-load/load-extend/load-zero/load+store-lane), splat,
+//! extract/replace_lane, the full integer-/float-lane op set, bitwise + `bitselect`,
+//! `shuffle`/`swizzle`, and **relaxed SIMD** — a real `clang -msimd128 -O2` saxpy transpiles to
+//! verified SIMD IR, `tests/simd.rs`) · **§12 wasm threads**: the full-width (i32/i64) `*.atomic.*` ops map
 //! 1:1 onto SVM's IR atomics (`tests/atomics.rs`), the **narrow** (8/16-bit) `*.atomic.*` forms
 //! emulate via a 32-bit word-CAS loop (the i64 32-bit forms are word-sized natives), **shared** +
 //! **imported** memory are accepted, and the **wasi-threads** ABI lowers to SVM's *native*
@@ -1788,6 +1789,35 @@ fn v_dot(lo: &mut Lower) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+/// `i16x8.relaxed_dot_i8x16_i7x16_s` — the deterministic signed-i8 dot (`Inst::VDotI8`).
+fn v_dot_i8(lo: &mut Lower) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VDotI8 { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+/// `i32x4.relaxed_dot_i8x16_i7x16_add_s` = `extadd_pairwise_s(dot_i8(a, b)) + c` — composed from the
+/// i8 dot, the existing widening pairwise add, and an i32x4 add (the deterministic recipe).
+fn v_dot_i8_add(lo: &mut Lower) -> Result<(), Error> {
+    let (c, _) = lo.pop()?;
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let dot = lo.emit(Inst::VDotI8 { a, b });
+    let wide = lo.emit(Inst::VExtAddPairwise {
+        shape: VShape::I32x4,
+        signed: true,
+        a: dot,
+    });
+    let v = lo.emit(Inst::VIntBin {
+        shape: VShape::I32x4,
+        op: VIntBinOp::Add,
+        a: wide,
+        b: c,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_extmul(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
@@ -1805,6 +1835,21 @@ fn v_q15mulr(lo: &mut Lower) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VQ15MulrSat { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+/// `<f>.relaxed_madd`/`relaxed_nmadd` (a ternary `[a, b, c]` op): a fused `±a·b + c`.
+fn v_fma(lo: &mut Lower, shape: VShape, neg: bool) -> Result<(), Error> {
+    let (c, _) = lo.pop()?;
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VFma {
+        shape,
+        neg,
+        a,
+        b,
+        c,
+    });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -1896,6 +1941,123 @@ fn v128_store(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
         value,
         offset: m.offset,
         align: m.align,
+    });
+    Ok(())
+}
+
+// ---- SIMD memory variants (splat-load / load-extend / load-zero / load+store-lane) ----
+// None need new IR: each composes a scalar `Load`/`Store` with `Splat`/`ReplaceLane`/`ExtractLane`/
+// `VWiden` (the lane immediates are wasm-validated `< lanes`). Synthesized scalar accesses carry
+// `align: 0` (advisory only; SVM masks rather than trapping on misalignment).
+
+/// `v128.loadN_splat`: load a scalar of width N and broadcast it across every lane of `shape`.
+fn v_load_splat(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::Load {
+        op,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let v = lo.emit(Inst::Splat { shape, a: s });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.loadN_zero`: load a scalar into lane 0 of a zero vector (`load32_zero`/`load64_zero`).
+fn v_load_zero(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::Load {
+        op,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let zero = lo.emit(Inst::ConstV128([0u8; 16]));
+    let v = lo.emit(Inst::ReplaceLane {
+        shape,
+        lane: 0,
+        a: zero,
+        b: s,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.loadAxB_{s,u}`: load 8 bytes into the low half of a v128, then widen-extend the low lanes to
+/// the result `shape` (`op` picks sign/zero extension). The high 8 bytes are zeroed (unused by widen).
+fn v_load_extend(lo: &mut Lower, shape: VShape, op: VWidenOp, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let bytes = lo.emit(Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let zero = lo.emit(Inst::ConstV128([0u8; 16]));
+    let packed = lo.emit(Inst::ReplaceLane {
+        shape: VShape::I64x2,
+        lane: 0,
+        a: zero,
+        b: bytes,
+    });
+    let v = lo.emit(Inst::VWiden {
+        shape,
+        op,
+        a: packed,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.loadN_lane`: load a scalar of width N and splice it into lane `lane` of the vector operand.
+fn v_load_lane(
+    lo: &mut Lower,
+    shape: VShape,
+    op: LoadOp,
+    lane: u8,
+    m: MemArg,
+) -> Result<(), Error> {
+    let (vec, _) = lo.pop()?; // the v128 (stack top), then the address below it
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::Load {
+        op,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let v = lo.emit(Inst::ReplaceLane {
+        shape,
+        lane,
+        a: vec,
+        b: s,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.storeN_lane`: extract lane `lane` of the vector operand and store it as a width-N scalar.
+fn v_store_lane(
+    lo: &mut Lower,
+    shape: VShape,
+    op: StoreOp,
+    lane: u8,
+    m: MemArg,
+) -> Result<(), Error> {
+    let (vec, _) = lo.pop()?;
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::ExtractLane {
+        shape,
+        lane,
+        signed: false,
+        a: vec,
+    });
+    lo.emit_void(Inst::Store {
+        op,
+        addr,
+        value: s,
+        offset: m.offset,
+        align: 0,
     });
     Ok(())
 }
@@ -3835,6 +3997,43 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         }
         O::V128Load { memarg } => v128_load(lo, memarg)?,
         O::V128Store { memarg } => v128_store(lo, memarg)?,
+        // SIMD memory variants — splat-load, load-extend, load-zero, load/store-lane.
+        O::V128Load8Splat { memarg } => v_load_splat(lo, VShape::I8x16, LoadOp::I32_8U, memarg)?,
+        O::V128Load16Splat { memarg } => v_load_splat(lo, VShape::I16x8, LoadOp::I32_16U, memarg)?,
+        O::V128Load32Splat { memarg } => v_load_splat(lo, VShape::I32x4, LoadOp::I32, memarg)?,
+        O::V128Load64Splat { memarg } => v_load_splat(lo, VShape::I64x2, LoadOp::I64, memarg)?,
+        O::V128Load32Zero { memarg } => v_load_zero(lo, VShape::I32x4, LoadOp::I32, memarg)?,
+        O::V128Load64Zero { memarg } => v_load_zero(lo, VShape::I64x2, LoadOp::I64, memarg)?,
+        O::V128Load8x8S { memarg } => v_load_extend(lo, VShape::I16x8, VWidenOp::LowS, memarg)?,
+        O::V128Load8x8U { memarg } => v_load_extend(lo, VShape::I16x8, VWidenOp::LowU, memarg)?,
+        O::V128Load16x4S { memarg } => v_load_extend(lo, VShape::I32x4, VWidenOp::LowS, memarg)?,
+        O::V128Load16x4U { memarg } => v_load_extend(lo, VShape::I32x4, VWidenOp::LowU, memarg)?,
+        O::V128Load32x2S { memarg } => v_load_extend(lo, VShape::I64x2, VWidenOp::LowS, memarg)?,
+        O::V128Load32x2U { memarg } => v_load_extend(lo, VShape::I64x2, VWidenOp::LowU, memarg)?,
+        O::V128Load8Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I8x16, LoadOp::I32_8U, lane, memarg)?
+        }
+        O::V128Load16Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I16x8, LoadOp::I32_16U, lane, memarg)?
+        }
+        O::V128Load32Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I32x4, LoadOp::I32, lane, memarg)?
+        }
+        O::V128Load64Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I64x2, LoadOp::I64, lane, memarg)?
+        }
+        O::V128Store8Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I8x16, StoreOp::I32_8, lane, memarg)?
+        }
+        O::V128Store16Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I16x8, StoreOp::I32_16, lane, memarg)?
+        }
+        O::V128Store32Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I32x4, StoreOp::I32, lane, memarg)?
+        }
+        O::V128Store64Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I64x2, StoreOp::I64, lane, memarg)?
+        }
         // splat
         O::I8x16Splat => v_splat(lo, VShape::I8x16)?,
         O::I16x8Splat => v_splat(lo, VShape::I16x8)?,
@@ -4079,6 +4278,44 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             let v = lo.emit(Inst::Swizzle { a, b });
             lo.push(v, ValType::V128);
         }
+
+        // ---- relaxed SIMD: each op lowers to one spec-allowed deterministic behavior, computed
+        // identically in both backends (so the interp↔JIT differential holds). `relaxed_madd`/`nmadd`
+        // get a genuine fused FMA; the rest alias to the deterministic op SVM already has. The two
+        // `relaxed_dot_i8x16_i7x16` ops (pmaddubsw-shaped) are not yet lowered → clean `Unsupported`.
+        O::F32x4RelaxedMadd => v_fma(lo, VShape::F32x4, false)?,
+        O::F32x4RelaxedNmadd => v_fma(lo, VShape::F32x4, true)?,
+        O::F64x2RelaxedMadd => v_fma(lo, VShape::F64x2, false)?,
+        O::F64x2RelaxedNmadd => v_fma(lo, VShape::F64x2, true)?,
+        O::F32x4RelaxedMin => v_fbin(lo, VShape::F32x4, VFloatBinOp::Min)?,
+        O::F32x4RelaxedMax => v_fbin(lo, VShape::F32x4, VFloatBinOp::Max)?,
+        O::F64x2RelaxedMin => v_fbin(lo, VShape::F64x2, VFloatBinOp::Min)?,
+        O::F64x2RelaxedMax => v_fbin(lo, VShape::F64x2, VFloatBinOp::Max)?,
+        O::I32x4RelaxedTruncF32x4S => v_convert(lo, VCvtOp::I32x4TruncSatF32x4S)?,
+        O::I32x4RelaxedTruncF32x4U => v_convert(lo, VCvtOp::I32x4TruncSatF32x4U)?,
+        O::I32x4RelaxedTruncF64x2SZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2SZero)?,
+        O::I32x4RelaxedTruncF64x2UZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2UZero)?,
+        O::I16x8RelaxedQ15mulrS => v_q15mulr(lo)?,
+        // relaxed_laneselect(a, b, mask) = mask ? a : b for a valid (all-0/all-1) mask — exactly
+        // `bitselect`, the deterministic behavior the proposal permits.
+        O::I8x16RelaxedLaneselect
+        | O::I16x8RelaxedLaneselect
+        | O::I32x4RelaxedLaneselect
+        | O::I64x2RelaxedLaneselect => {
+            let (mask, _) = lo.pop()?;
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Bitselect { a, b, mask });
+            lo.push(v, ValType::V128);
+        }
+        O::I8x16RelaxedSwizzle => {
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Swizzle { a, b });
+            lo.push(v, ValType::V128);
+        }
+        O::I16x8RelaxedDotI8x16I7x16S => v_dot_i8(lo)?,
+        O::I32x4RelaxedDotI8x16I7x16AddS => v_dot_i8_add(lo)?,
 
         other => return unsup(format!("operator {other:?}")),
     }

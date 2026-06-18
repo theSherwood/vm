@@ -2644,6 +2644,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Eqz { .. }
                 | Inst::FBin { .. }
                 | Inst::FUn { .. }
+                | Inst::Fma { .. }
                 | Inst::FCmp { .. }
                 | Inst::FToISat { .. }
                 | Inst::FToITrap { .. }
@@ -2708,8 +2709,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VPopcnt { .. } => {}
                 // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
                 Inst::VAvgr { .. } => {}
-                // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
-                Inst::VDot { .. } => {}
+                // `i32x4.dot_i16x8_s` / `i16x8.dot_i8x16_s` → `swiden_low/high` + `imul` +
+                // `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } | Inst::VDotI8 { .. } => {}
                 // Extended multiply → widen low/high both operands + `imul` on the wide shape.
                 // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
                 Inst::VExtMul { .. } => {}
@@ -2717,6 +2719,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VExtAddPairwise { .. } => {}
                 // Q15 rounding multiply → native `sqmul_round_sat`.
                 Inst::VQ15MulrSat { .. } => {}
+                // Fused multiply-add (relaxed_madd/nmadd) → vector `fma` (one rounding; the same
+                // correctly-rounded result the interp's `mul_add` gives, so the differential holds).
+                Inst::VFma { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -3586,6 +3591,11 @@ fn lower_block(
                 let x = get(&vals, *a)?;
                 float_un(b, *op, x)
             }
+            Inst::Fma { a, b: rb, c, .. } => {
+                // Scalar fused multiply-add — `a·b + c`, one rounding (matches the interp's `mul_add`).
+                let (x, y, z) = (get(&vals, *a)?, get(&vals, *rb)?, get(&vals, *c)?);
+                b.ins().fma(x, y, z)
+            }
             Inst::FCmp { op, a, b: rb, .. } => {
                 let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
                 let c = b.ins().fcmp(float_cc(*op), x, y);
@@ -3808,6 +3818,20 @@ fn lower_block(
                 let r = b.ins().iadd_pairwise(pl, ph);
                 vcast(b, r, I8X16)
             }
+            Inst::VDotI8 { a, b: rb } => {
+                // The i8→i16 signed dot, same shape as `VDot` one width down: widen each i8x16 to
+                // two i16x8 halves, multiply, pairwise-add. (Deterministic relaxed_dot_i8x16_i7x16_s.)
+                let x = vcast(b, get(&vals, *a)?, I8X16);
+                let y = vcast(b, get(&vals, *rb)?, I8X16);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
             Inst::VExtMul {
                 shape,
                 op,
@@ -3854,6 +3878,22 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, I16X8);
                 let y = vcast(b, get(&vals, *rb)?, I16X8);
                 let r = b.ins().sqmul_round_sat(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VFma {
+                shape,
+                neg,
+                a,
+                b: rb,
+                c,
+            } => {
+                let ty = vec_ty(*shape);
+                let xa = vcast(b, get(&vals, *a)?, ty);
+                // `nmadd` is `−a·b + c`: negate the product by negating `a`.
+                let x = if *neg { b.ins().fneg(xa) } else { xa };
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let z = vcast(b, get(&vals, *c)?, ty);
+                let r = b.ins().fma(x, y, z);
                 vcast(b, r, I8X16)
             }
             Inst::VSatBin {

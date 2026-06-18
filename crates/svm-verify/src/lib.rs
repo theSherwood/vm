@@ -526,6 +526,14 @@ fn check_inst(
             cx.expect(*a, ty.val())?;
             ty.val()
         }
+        // Scalar fused multiply-add: all three operands and the result are `ty`.
+        Inst::Fma { ty, a, b, c } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            cx.expect(*c, t)?;
+            t
+        }
         Inst::FCmp { ty, a, b, .. } => {
             let t = ty.val();
             cx.expect(*a, t)?;
@@ -777,6 +785,19 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        // Fused multiply-add (`relaxed_madd`/`nmadd`): a ternary float-lane op.
+        Inst::VFma { shape, a, b, c, .. } => {
+            if !shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            cx.expect(*c, ValType::V128)?;
+            ValType::V128
+        }
         Inst::VFloatUn { shape, a, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {
@@ -827,7 +848,7 @@ fn check_inst(
             ValType::V128
         }
         // Dot product: fixed shapes (i16x8 → i32x4), so there is no lane rule to enforce.
-        Inst::VDot { a, b } => {
+        Inst::VDot { a, b } | Inst::VDotI8 { a, b } => {
             cx.expect(*a, ValType::V128)?;
             cx.expect(*b, ValType::V128)?;
             ValType::V128
