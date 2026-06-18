@@ -31,6 +31,7 @@ mod tag {
     pub const SUBPROGRAM: u64 = 0x2e;
     pub const VARIABLE: u64 = 0x34;
     pub const BASE_TYPE: u64 = 0x24;
+    pub const LEXICAL_BLOCK: u64 = 0x0b;
 }
 mod at {
     pub const NAME: u64 = 0x03;
@@ -44,6 +45,7 @@ mod at {
     pub const DATA_MEMBER_LOCATION: u64 = 0x38;
     pub const COUNT: u64 = 0x37;
     pub const UPPER_BOUND: u64 = 0x2f;
+    pub const DECL_LINE: u64 = 0x3b;
 }
 mod form {
     pub const ADDR: u64 = 0x01;
@@ -83,6 +85,12 @@ pub struct DwarfVar {
     pub fbreg: i64,
     /// CU-relative DIE offset of the variable's `DW_AT_type` (resolve via [`DwarfInfo::types`]).
     pub type_ref: u32,
+    /// `DW_AT_decl_line` — the source line the variable is declared on (its lexical scope start).
+    pub decl_line: u32,
+    /// The enclosing `DW_TAG_lexical_block`'s code range `[low_pc, high_pc)` when the variable lives
+    /// in an inner block (the §6 shadowing case); `None` ⇒ directly in the subprogram (function-wide).
+    /// The consumer maps this code range to a source-line scope via the line table.
+    pub scope_pc: Option<(u64, u64)>,
 }
 
 /// A function's debug info: its PC range, frame-base wasm local, and variables.
@@ -346,6 +354,9 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
         Sub(usize),
         Agg(u32),
         Array(u32),
+        /// A `DW_TAG_lexical_block` with its `[low_pc, high_pc)` code range (the §6 scope of vars
+        /// nested in it).
+        Block(u64, u64),
         Other,
     }
     let mut stack: Vec<Open> = Vec::new();
@@ -362,7 +373,7 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
         // Read every attribute (to advance), capturing the ones we care about.
         let (mut name, mut ty, mut byte_size, mut encoding) = (None, None, None, None);
         let (mut low_pc, mut high_pc, mut frame_base, mut location) = (None, None, None, None);
-        let (mut member_loc, mut count, mut upper_bound) = (None, None, None);
+        let (mut member_loc, mut count, mut upper_bound, mut decl_line) = (None, None, None, None);
         for &(attr, f) in &ab.attrs {
             let v = read_form(&mut c, str_sec, f, addr_size)?;
             match (attr, v) {
@@ -377,6 +388,7 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
                 (at::DATA_MEMBER_LOCATION, Val::U(n)) => member_loc = Some(n as u32),
                 (at::COUNT, Val::U(n)) => count = Some(n as u32),
                 (at::UPPER_BOUND, Val::U(n)) => upper_bound = Some(n as u32),
+                (at::DECL_LINE, Val::U(n)) => decl_line = Some(n as u32),
                 _ => {}
             }
         }
@@ -395,16 +407,43 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
                     stack.push(Open::Sub(subs.len() - 1));
                 }
             }
+            tag::LEXICAL_BLOCK => {
+                if ab.has_children {
+                    // The §6 lexical scope of vars nested here — its `[low_pc, high_pc)` code range
+                    // (DWARF4 `high_pc` is an offset). A block without a PC range can't be scoped, so
+                    // its vars fall back to function-wide.
+                    match (low_pc, high_pc) {
+                        (Some(lo), Some(off)) => stack.push(Open::Block(lo, lo + off)),
+                        _ => stack.push(Open::Other),
+                    }
+                }
+            }
             tag::FORMAL_PARAMETER | tag::VARIABLE => {
                 if let (Some(name), Some(loc), Some(ty)) = (name, location, ty) {
                     if let Some(fbreg) = fbreg_offset(&loc) {
-                        if let Some(Open::Sub(si)) =
-                            stack.iter().rev().find(|o| matches!(o, Open::Sub(_)))
-                        {
-                            subs[*si].vars.push(DwarfVar {
+                        // The variable's lexical scope: the nearest enclosing `DW_TAG_lexical_block`
+                        // *within* its subprogram (a block found before the subprogram on the stack);
+                        // directly in the subprogram ⇒ function-wide (`None`).
+                        let scope_pc = stack
+                            .iter()
+                            .rev()
+                            .find_map(|o| match o {
+                                Open::Block(lo, hi) => Some(Some((*lo, *hi))),
+                                Open::Sub(_) => Some(None),
+                                _ => None,
+                            })
+                            .flatten();
+                        let sub = stack.iter().rev().find_map(|o| match o {
+                            Open::Sub(si) => Some(*si),
+                            _ => None,
+                        });
+                        if let Some(si) = sub {
+                            subs[si].vars.push(DwarfVar {
                                 name,
                                 fbreg,
                                 type_ref: ty,
+                                decl_line: decl_line.unwrap_or(0),
+                                scope_pc,
                             });
                         }
                     } else if ab.tag == tag::VARIABLE {

@@ -1302,7 +1302,7 @@ fn translate_func(
                 ty: v.ty.clone(),
                 loc,
                 type_id: v.type_id,
-                scope: None,
+                scope: v.scope,
             });
         }
     }

@@ -635,9 +635,18 @@ shadow). chibicc emits it: each local's declaration line plus its enclosing bloc
 threads the field through text (`debug.var … scope <s> <e>`), binary, and the schema. Source-line
 ranges (not `IrPc` ranges) because a frontend knows source spans at parse time and the consumer
 already maps a pc to a line. Test (`c_frontend.rs`): a C function with an inner-block `int x`
-shadowing an outer `int x` reads `x = 105` inside the block and `x = 6` after it. *Not yet:* the
-wasm/LLVM producers emitting scopes (DWARF `DW_TAG_lexical_block` PC ranges → line ranges) — they
-stay function-wide for now (back-compat); the JIT/DWARF tier for gdb/lldb on native code.
+shadowing an outer `int x` reads `x = 105` inside the block and `x = 6` after it.
+
+**All three producers now emit scopes.** The **wasm** DWARF reader recovers a variable's enclosing
+`DW_TAG_lexical_block` `[low_pc, high_pc)` and maps it — via the line table the source-line half
+already parses — to a `(decl_line, block_last_line)` scope; the **LLVM** DI reader reads each
+`DILocalVariable`'s `DILexicalBlock` scope and, since `DILexicalBlock` carries no end line, derives
+it from the `!dbg` `DILocation`s of the instructions in the block (walking the location's scope
+chain). Both correlate by the same source-line `scope` field the consumer resolves — so a clang
+guest (wasm or `-O0` LLVM) with an inner-block `int x` shadowing an outer one resolves to the inner
+shadow inside the block and the outer after it, exactly as chibicc does (the LLVM lane verifies it at
+runtime; the wasm lane structurally, since a bare `WindowVia` frame read needs `__stack_pointer`
+setup the direct call doesn't do). *Not yet:* the JIT/DWARF tier for gdb/lldb on native code.
 
 ---
 

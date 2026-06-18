@@ -3665,3 +3665,80 @@ fn compute() -> i32 {
     // Pin it (non-vacuous): 14 tokens over the doc, folded digest % 251 = 135.
     assert_eq!(svm, 135, "json tokenizer: expected digest 135, got {svm}");
 }
+
+/// §6 lexical-scope ingest from LLVM DI: an inner-block redeclaration (`DILexicalBlock`) is scoped
+/// to its block (decl line → the block's last instruction line, since `DILexicalBlock` has no end
+/// line), so reading `x` resolves to the in-scope shadow at the stopped pc — the LLVM producer
+/// driving the same shadowing resolution as chibicc/wasm.
+#[test]
+fn llvm_o0_resolves_shadowed_locals_by_lexical_scope() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::VarLoc;
+
+    let src = "\
+int f(int n) {
+  int x = n + 1;
+  {
+    int x = n + 100;
+    n = n + x;
+  }
+  return x + n;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("shadow", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // Two `x` vars; exactly one carries a lexical scope (the inner block), the other function-wide.
+    let xs: Vec<_> = di.vars.iter().filter(|v| v.name == "x").collect();
+    assert_eq!(xs.len(), 2, "both shadows ingested");
+    for x in &xs {
+        assert!(
+            matches!(x.loc, VarLoc::Window { .. }),
+            "x is a -O0 Window var"
+        );
+    }
+    let scoped: Vec<_> = xs.iter().filter_map(|v| v.scope).collect();
+    assert_eq!(
+        scoped.len(),
+        1,
+        "one inner-block scope; the outer is function-wide"
+    );
+    let (start, _end) = scoped[0];
+    assert_eq!(start, 4, "inner x scope starts at its declaration line");
+
+    // Runtime: read `x` resolves the right shadow at the stopped pc.
+    let pc_for_line = |line: u32| {
+        let l = di.locs.iter().find(|l| l.line == line)?;
+        Some(IrPc {
+            module: 0,
+            func: l.func,
+            block: l.block as usize,
+            inst: l.inst as usize,
+        })
+    };
+    let read_x_at = |line: u32| {
+        let mut insp = Inspector::attach(
+            &t.module,
+            0,
+            &[Value::I64(t.entry_sp as i64), Value::I32(5)],
+            5_000_000,
+        );
+        insp.set_breakpoint(pc_for_line(line).unwrap_or_else(|| panic!("no pc for line {line}")));
+        assert!(
+            matches!(insp.run_until_stop(), Stop::Break { .. }),
+            "stop at line {line}"
+        );
+        match insp.read_var(0, "x", 4) {
+            Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+            other => panic!("expected window bytes for x, got {other:?}"),
+        }
+    };
+    // Line 5 = `n = n + x` (inside the block): inner x = n + 100 = 105.
+    assert_eq!(read_x_at(5), 105, "inner shadow resolved inside the block");
+    // Line 7 = `return x + n` (after the block): outer x = n + 1 = 6.
+    assert_eq!(read_x_at(7), 6, "outer x resolved after the block");
+}
