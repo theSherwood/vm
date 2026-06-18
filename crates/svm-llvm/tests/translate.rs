@@ -4,7 +4,7 @@
 //! hand-computed result. This is the chibicc-as-oracle differential (LLVM.md §5) plus the §18
 //! interp↔JIT differential, applied to the LLVM on-ramp.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use svm_interp::Value;
@@ -2777,6 +2777,30 @@ fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
     }
 }
 
+/// Like [`compile_to_bc_vectorized`] but targeting **AVX2** (`-mavx2`), so the auto-vectorizer emits
+/// wider-than-128-bit vectors (`<8 x i32>`, and `<16 x i32>` under interleave) — the exact shapes
+/// the I2 legalization pass splits into `v128` chunks. The bitcode only *names* AVX vectors; the SVM
+/// JIT still lowers each chunk to SSE2/NEON, so no AVX2 hardware is needed to run the result.
+fn compile_to_bc_avx(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_simd_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-mavx2", "-emit-llvm", "-c"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
 /// Run `run(seed)` (function 0) from **vectorized** bitcode on both backends and assert it equals a
 /// native `cc` build's exit code (the on-ramp's SIMD lowering vs the scalar native result — they
 /// compute the same value).
@@ -2784,6 +2808,22 @@ fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
     let Some(bc) = compile_to_bc_vectorized(name, src) else {
         return;
     };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Like [`check_vectorized_vs_native`] but ingests **AVX2** auto-vectorized bitcode (wider-than-128
+/// shapes), which the I2 legalization pass splits into `v128` chunks. The native oracle is a plain
+/// scalar `cc` build of the same loop (gcc needs no `-mavx2`), so SVM-chunked == native-scalar.
+fn check_avx_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc_avx(name, src) else {
+        return;
+    };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Shared body: build the source's `.c` natively with `cc`, run it, then translate `bc`, verify, and
+/// run `run(seed)` (function 0) on both backends — asserting interp == JIT == native exit code.
+fn check_simd_bc_vs_native(name: &str, bc: &Path, seed: i32) {
     let exe =
         std::env::temp_dir().join(format!("svm_llvm_simdnat_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
@@ -2797,7 +2837,7 @@ fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
         .code()
         .unwrap() as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate vectorized bitcode");
+    let t = svm_llvm::translate_bc_path(bc).expect("translate vectorized bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
@@ -2856,6 +2896,48 @@ fn simd_int_max_reduction() {
         }\n\
         int main(void) { return run(3); }\n";
     check_vectorized_vs_native("simd_max", src, 3);
+}
+
+/// **Capstone — ingesting *real* `-O2 -mavx2` auto-vectorized output.** The motivating I2 case: the
+/// same reduction loop, vectorized for AVX2, emits a wider-than-128 `<8 x i32>` accumulator +
+/// `llvm.vector.reduce.add.v8i32` (and `<16 x i32>` under interleave). The legalization pass splits
+/// each into `v128` chunks, so the on-ramp now ingests it (previously a fail-closed `Unsupported`),
+/// running byte-identical to the native scalar oracle on both backends.
+#[test]
+fn simd_autovec_avx2_reduction() {
+    let src = "int sum(const int *a, int n);\n\
+        static int data[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) data[i] = seed + i * i;\n\
+        \x20 return sum(data, 64);\n\
+        }\n\
+        __attribute__((noinline)) int sum(const int *a, int n) {\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < n; i++) s += a[i];\n\
+        \x20 return s;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_avx_vs_native("simd_avx2_reduce", src, 7);
+}
+
+/// `-O2 -mavx2` auto-vectorized **elementwise** kernel (`c[i] = a[i]*b[i] + a[i]`) — wide `<8 x i32>`
+/// lane multiply/add across `v128` chunks (no horizontal reduce), vs the native scalar oracle.
+#[test]
+fn simd_autovec_avx2_elementwise() {
+    let src = "void mul(const int *a, const int *b, int *c, int n);\n\
+        static int A[64], B[64], C[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) { A[i] = seed + i; B[i] = i * 2 + 1; }\n\
+        \x20 mul(A, B, C, 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += C[i];\n\
+        \x20 return s;\n\
+        }\n\
+        __attribute__((noinline)) void mul(const int *a, const int *b, int *c, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) c[i] = a[i] * b[i] + a[i];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_avx_vs_native("simd_avx2_elem", src, 4);
 }
 
 // ============================================================================================

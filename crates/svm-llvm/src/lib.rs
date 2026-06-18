@@ -998,12 +998,16 @@ fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
             let (fields, packed) = resolve_struct(ty, types)?;
             Ok(struct_layout(&fields, packed, types)?.2)
         }
-        _ if is_vec2(ty) => Ok(8),                  // a 2-lane 32-bit vector is 8-aligned
-        _ if vec128_shape(ty).is_some() => Ok(16),  // a v128 is 16-aligned
+        _ if is_vec2(ty) => Ok(8), // a 2-lane 32-bit vector is 8-aligned
+        _ if vec128_shape(ty).is_some() => Ok(16), // a v128 is 16-aligned
         // A wider/sub-128 vector — 16-aligned when it has full chunks, else its (smaller) byte size.
         _ if wide_vec_layout(ty).is_some() => {
             let l = wide_vec_layout(ty).unwrap();
-            Ok(if l.full_chunks > 0 { 16 } else { l.byte_size().max(1) })
+            Ok(if l.full_chunks > 0 {
+                16
+            } else {
+                l.byte_size().max(1)
+            })
         }
         other => unsup(format!("align of type {other} (Milestone 1+)")),
     }
@@ -5804,11 +5808,36 @@ fn wide_reduce(
     let mut acc = lanes[0];
     for &l in &lanes[1..] {
         acc = match kind {
-            "add" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Add, a: acc, b: l }),
-            "mul" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Mul, a: acc, b: l }),
-            "and" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::And, a: acc, b: l }),
-            "or" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Or, a: acc, b: l }),
-            "xor" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Xor, a: acc, b: l }),
+            "add" => ctx.push(Inst::IntBin {
+                ty: lane_ty,
+                op: BinOp::Add,
+                a: acc,
+                b: l,
+            }),
+            "mul" => ctx.push(Inst::IntBin {
+                ty: lane_ty,
+                op: BinOp::Mul,
+                a: acc,
+                b: l,
+            }),
+            "and" => ctx.push(Inst::IntBin {
+                ty: lane_ty,
+                op: BinOp::And,
+                a: acc,
+                b: l,
+            }),
+            "or" => ctx.push(Inst::IntBin {
+                ty: lane_ty,
+                op: BinOp::Or,
+                a: acc,
+                b: l,
+            }),
+            "xor" => ctx.push(Inst::IntBin {
+                ty: lane_ty,
+                op: BinOp::Xor,
+                a: acc,
+                b: l,
+            }),
             "smax" | "umax" | "smin" | "umin" => {
                 let cmp = match kind {
                     "smax" => CmpOp::GtS,
@@ -5816,7 +5845,12 @@ fn wide_reduce(
                     "smin" => CmpOp::LtS,
                     _ => CmpOp::LtU,
                 };
-                let cond = ctx.push(Inst::IntCmp { ty: lane_ty, op: cmp, a: acc, b: l });
+                let cond = ctx.push(Inst::IntCmp {
+                    ty: lane_ty,
+                    op: cmp,
+                    a: acc,
+                    b: l,
+                });
                 ctx.push(Inst::Select { cond, a: acc, b: l })
             }
             other => return unsup(format!("wide vector.reduce.{other}")),
@@ -5852,12 +5886,60 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             ctx.bind_wide(&l.dest, parts);
             Ok(true)
         }
-        I::Add(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Arith(VI::Add), BinOp::Add),
-        I::Sub(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Arith(VI::Sub), BinOp::Sub),
-        I::Mul(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Arith(VI::Mul), BinOp::Mul),
-        I::And(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Bit(Bit::And), BinOp::And),
-        I::Or(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Bit(Bit::Or), BinOp::Or),
-        I::Xor(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Bit(Bit::Xor), BinOp::Xor),
+        I::Add(x) => wide_int_binop(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            WIntChunk::Arith(VI::Add),
+            BinOp::Add,
+        ),
+        I::Sub(x) => wide_int_binop(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            WIntChunk::Arith(VI::Sub),
+            BinOp::Sub,
+        ),
+        I::Mul(x) => wide_int_binop(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            WIntChunk::Arith(VI::Mul),
+            BinOp::Mul,
+        ),
+        I::And(x) => wide_int_binop(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            WIntChunk::Bit(Bit::And),
+            BinOp::And,
+        ),
+        I::Or(x) => wide_int_binop(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            WIntChunk::Bit(Bit::Or),
+            BinOp::Or,
+        ),
+        I::Xor(x) => wide_int_binop(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            WIntChunk::Bit(Bit::Xor),
+            BinOp::Xor,
+        ),
         I::FAdd(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Add),
         I::FSub(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Sub),
         I::FMul(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Mul),
@@ -5913,6 +5995,63 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
                 parts[layout.full_chunks + (i - chunked)] = x;
             }
             ctx.bind_wide(&ie.dest, parts);
+            Ok(true)
+        }
+        I::ShuffleVector(sv) => {
+            let Some(src) = wide_vec_layout(sv.operand0.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            // The result lanes (the mask length); a wide shuffle is only supported in its **splat**
+            // (broadcast) form — every mask lane the same source lane, what an `insertelement`+
+            // `shufflevector zeroinitializer` idiom (a scalar broadcast) emits. A general cross-chunk
+            // shuffle stays `Unsupported` (fail-closed).
+            let mask: Vec<i64> = match sv.mask.as_ref() {
+                Constant::AggregateZero(_) => vec![0; src.total_lanes()],
+                Constant::Vector(m) => m
+                    .iter()
+                    .map(|e| match e.as_ref() {
+                        Constant::Int { value, .. } => *value as i64,
+                        _ => 0,
+                    })
+                    .collect(),
+                _ => return unsup("wide shufflevector: non-constant mask"),
+            };
+            let j = mask.first().copied().unwrap_or(0);
+            if mask.is_empty()
+                || mask.iter().any(|&m| m != j)
+                || j < 0
+                || j as usize >= src.total_lanes()
+            {
+                return unsup("wide shufflevector: only a broadcast (splat) of one source lane");
+            }
+            let parts = ctx.wide_operand(&sv.operand0, src)?;
+            let lpc = src.shape.lanes() as usize;
+            let chunked = src.full_chunks * lpc;
+            let j = j as usize;
+            let scalar = if j < chunked {
+                ctx.push(Inst::ExtractLane {
+                    shape: src.shape,
+                    lane: (j % lpc) as u8,
+                    signed: false,
+                    a: parts[j / lpc],
+                })
+            } else {
+                parts[src.full_chunks + (j - chunked)]
+            };
+            // Build the result by its own layout (result lane count = mask length).
+            let m = mask.len();
+            let (rc, rt) = (m / lpc, m % lpc);
+            let mut out = Vec::with_capacity(rc + rt);
+            for _ in 0..rc {
+                out.push(ctx.push(Inst::Splat {
+                    shape: src.shape,
+                    a: scalar,
+                }));
+            }
+            for _ in 0..rt {
+                out.push(scalar);
+            }
+            ctx.bind_wide(&sv.dest, out);
             Ok(true)
         }
         I::Call(c) => {
