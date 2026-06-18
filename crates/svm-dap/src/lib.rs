@@ -488,12 +488,33 @@ impl DapServer {
         session.inspector.select_task(tid);
         let frames = session.inspector.backtrace();
         let frame = frames.get(frame_idx)?;
-        // Snapshot (name, ty, loc, type_id) so the `debug` borrow ends before we read/allocate.
+        // The stopped source line drives lexical-scope resolution of shadowed names (§6).
+        let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
+        let in_scope = |v: &VarInfo| {
+            (v.func == frame.pc.func || v.func == svm_ir::GLOBAL_SCOPE)
+                && scope_covers(v.scope, line)
+        };
+        // The innermost (largest scope start) in-scope declaration of `name` — the one to show.
+        let best_for = |name: &str| {
+            debug
+                .vars
+                .iter()
+                .filter(|v| in_scope(v) && v.name == name)
+                .max_by_key(|v| v.scope.map_or(0u32, |(s, _)| s))
+        };
+        // Snapshot the in-scope locals, one per name (a shadowed name shows only its innermost
+        // visible declaration). `debug` borrow ends before we read/allocate.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let vars: Vec<(String, String, VarLoc, Option<TypeId>)> = debug
             .vars
             .iter()
-            .filter(|v| v.func == frame.pc.func || v.func == svm_ir::GLOBAL_SCOPE)
-            .map(|v| (v.name.clone(), v.ty.clone(), v.loc.clone(), v.type_id))
+            .filter(|v| in_scope(v))
+            .filter_map(|v| {
+                if !seen.insert(v.name.clone()) {
+                    return None;
+                }
+                best_for(&v.name).map(|b| (b.name.clone(), b.ty.clone(), b.loc.clone(), b.type_id))
+            })
             .collect();
         let mut out = Vec::new();
         for (name, ty, loc, type_id) in vars {
@@ -993,6 +1014,16 @@ fn scalar_width(types: &[TypeDef], type_id: Option<TypeId>, ty_name: &str) -> us
     match type_id.map(|t| type_size(types, t)) {
         Some(n) if n > 0 => n as usize,
         _ => ty_width(ty_name),
+    }
+}
+
+/// Whether a variable's lexical `scope` (a `(start_line, end_line)` source-line range, or `None` for
+/// function-wide) covers `line` — the §6 shadowing filter for the Variables pane. An absent line
+/// (no source mapping at the pc) covers everything (the function-wide back-compat behavior).
+fn scope_covers(scope: Option<(u32, u32)>, line: Option<u32>) -> bool {
+    match (scope, line) {
+        (None, _) | (_, None) => true,
+        (Some((s, e)), Some(l)) => s <= l && l <= e,
     }
 }
 

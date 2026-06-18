@@ -2740,10 +2740,16 @@ static void emit_debug_vars(Obj *fn, int func_idx) {
       for (int i = 0; i < n_promo; i++)
         if (promo_buf[i].func == func_idx && promo_buf[i].slot == s)
           cg(" %d %d %d", promo_buf[i].block, promo_buf[i].inst, promo_buf[i].value);
-      cg(" \"%s\" %d\n", ty, tid);
+      cg(" \"%s\" %d", ty, tid);
     } else {
-      cg("debug.var %d \"%s\" win %d \"%s\" %d\n", func_idx, v->name, v->offset, ty, tid);
+      cg("debug.var %d \"%s\" win %d \"%s\" %d", func_idx, v->name, v->offset, ty, tid);
     }
+    // §6 lexical scope (shadowing): a block-scoped local carries its source-line range; a
+    // function-wide local (`scope_end_line == 0`, e.g. a top-level declaration or a parameter)
+    // omits it (the consumer treats absent scope as function-wide).
+    if (v->scope_end_line)
+      cg(" scope %d %d", v->scope_start_line, v->scope_end_line);
+    cg("\n");
   }
 }
 

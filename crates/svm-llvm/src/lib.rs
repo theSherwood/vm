@@ -387,6 +387,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
                     ty: gv.ty.clone(),
                     loc: VarLoc::Fixed { addr },
                     type_id: gv.type_id,
+                    scope: None,
                 });
             }
         }
@@ -1301,6 +1302,7 @@ fn translate_func(
                 ty: v.ty.clone(),
                 loc,
                 type_id: v.type_id,
+                scope: None,
             });
         }
     }

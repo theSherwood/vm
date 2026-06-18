@@ -19,7 +19,7 @@ use svm_ir::{
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SsaLoc,
     StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
     VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
-    VarLoc, DEFAULT_RESERVED_LOG2,
+    VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -1252,10 +1252,7 @@ impl Inspector {
             if frame.module != 0 {
                 return None;
             }
-            let var = di
-                .vars
-                .iter()
-                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
+            let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
             // Resolve a location list (S2) at the frame's current pc (nearest-preceding within the
             // stopped block). `None` ⇒ no covering entry, the var isn't live here.
             let resolve = |locs: &[SsaLoc]| loclist_value(locs, frame.block, frame.inst);
@@ -1308,10 +1305,7 @@ impl Inspector {
             if frame.module != 0 {
                 return None;
             }
-            let var = di
-                .vars
-                .iter()
-                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
+            let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
             let base = match &var.loc {
                 VarLoc::Window { off } => as_i64(*frame.vals.first()?).ok()? as u64 + *off as u64,
                 VarLoc::WindowVia { base, off } => {
@@ -10593,6 +10587,52 @@ fn as_i64(v: Value) -> Result<i64, Trap> {
 /// function, or a [`svm_ir::GLOBAL_SCOPE`] module-scoped global (visible in every frame).
 fn var_in_scope(var_func: u32, frame_func: u32) -> bool {
     var_func == frame_func || var_func == svm_ir::GLOBAL_SCOPE
+}
+
+/// The source line at pc `(func, block, inst)` — the nearest-preceding `debug.loc` within the block
+/// (the same semantics as [`Inspector::source_loc`]). `None` ⇒ no source mapping at this pc.
+fn source_line_at(di: &DebugInfo, func: u32, block: usize, inst: usize) -> Option<u32> {
+    di.locs
+        .iter()
+        .filter(|l| l.func == func && l.block as usize == block && l.inst as usize <= inst)
+        .max_by_key(|l| l.inst)
+        .map(|l| l.line)
+}
+
+/// Whether a variable's lexical `scope` covers source line `line`. A function-wide var (`None`)
+/// always covers; a `Some((start, end))` covers `line ∈ [start, end]`. When the pc has no source
+/// line (`line == None`), scopes can't be evaluated, so every var is treated as covering (the
+/// function-wide back-compat behavior).
+fn scope_covers(scope: Option<(u32, u32)>, line: Option<u32>) -> bool {
+    match (scope, line) {
+        (None, _) | (_, None) => true,
+        (Some((s, e)), Some(l)) => s <= l && l <= e,
+    }
+}
+
+/// Pick the source variable named `name` that is **innermost in scope** at the stopped pc, resolving
+/// C shadowing (an inner-block redeclaration, or a local shadowing a global): among same-name
+/// candidates visible in `frame_func`, keep those whose lexical scope covers the stopped source
+/// line, and choose the most deeply nested (largest `start_line`; a function-wide `None` is the
+/// outermost). Ties keep the first (declaration order).
+fn pick_var<'a>(
+    di: &'a DebugInfo,
+    frame_func: u32,
+    name: &str,
+    block: usize,
+    inst: usize,
+) -> Option<&'a VarInfo> {
+    let line = source_line_at(di, frame_func, block, inst);
+    let depth = |x: &VarInfo| x.scope.map_or(0, |(s, _)| s);
+    let mut best: Option<&VarInfo> = None;
+    for x in di.vars.iter().filter(|x| {
+        var_in_scope(x.func, frame_func) && x.name == name && scope_covers(x.scope, line)
+    }) {
+        if best.is_none_or(|b| depth(x) > depth(b)) {
+            best = Some(x);
+        }
+    }
+    best
 }
 
 /// Resolve a debug-info location list (`SsaList` / `WindowVia` base) at pc `(block, inst)`: the

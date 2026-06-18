@@ -819,6 +819,7 @@ fn ingest_variables(
                     off: v.fbreg,
                 },
                 type_id,
+                scope: None,
             });
         }
     }
@@ -838,6 +839,7 @@ fn ingest_variables(
             ty,
             loc: VarLoc::Fixed { addr: g.addr },
             type_id,
+            scope: None,
         });
     }
     (types, vars)

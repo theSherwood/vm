@@ -2304,9 +2304,8 @@ pub struct Loc {
 
 /// A source variable and its value location (`DEBUGGING.md` §6 / S2). Carries a neutral render
 /// name (`ty`) and, when known, a [`TypeId`] into [`DebugInfo::types`] for its structured layout
-/// (`type_id`). Function-scoped for slice 1; lexical `IrPc`-range scopes are a later refinement.
-/// A **module-scoped global** (source-level `static`/global variable) uses `func == `[`GLOBAL_SCOPE`]
-/// — visible in every frame — and a [`VarLoc::Fixed`] absolute window address.
+/// (`type_id`). A **module-scoped global** (source-level `static`/global variable) uses `func ==
+/// `[`GLOBAL_SCOPE`] — visible in every frame — and a [`VarLoc::Fixed`] absolute window address.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct VarInfo {
     pub func: u32,
@@ -2318,6 +2317,13 @@ pub struct VarInfo {
     /// The structured type ([`DebugInfo::types`] index) when this var's layout is carried — set for
     /// aggregates (and, when emitted, scalars). `None` ⇒ render via `ty` only (no expansion).
     pub type_id: Option<TypeId>,
+    /// The variable's **lexical scope** as an inclusive source-line range `(start_line, end_line)`,
+    /// for resolving C shadowing (an inner-block redeclaration, or a local shadowing a global):
+    /// among same-name variables, the consumer picks the one whose scope covers the stopped source
+    /// line, innermost (largest `start_line`) winning. `None` ⇒ function-wide (the outermost scope;
+    /// the back-compatible default). Line-based rather than `IrPc`-based because a frontend knows
+    /// source spans at parse time and the consumer already maps a stopped pc to a source line.
+    pub scope: Option<(u32, u32)>,
 }
 
 /// Where a source variable's value lives at runtime (the S2 value-location model, IR form). The
