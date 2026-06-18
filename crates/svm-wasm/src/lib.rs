@@ -58,7 +58,7 @@ use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 /// DWARF `.debug_info` reader for source-variable ingest (DEBUGGING.md W4 — wasm producer). Public
 /// so it is testable against a real fixture; the transpiler wiring lands in a follow-up slice.
 pub mod dwarf_info;
-mod dwarf_line;
+pub mod dwarf_line;
 
 /// Per-operator debug records from lowering: `(code-relative offset, block, inst index)` for the
 /// first IR instruction each wasm operator emits (DEBUGGING.md §6/W4 — mapped onto DWARF line rows).

@@ -269,6 +269,89 @@ fn fiber_uses_data_stack_and_memory() {
     assert_jit_matches_interp(src);
 }
 
+/// W5 JIT/DWARF Stage 4c — the fiber-rooted backtrace. A fiber entry `func 1` calls helper `func 2`,
+/// which `suspend`s; the root resumes the fiber once and **returns without completing it**, leaving it
+/// parked. The host then walks the suspended fiber's control stack and symbolizes its guest frames.
+#[test]
+fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
+    use svm_ir::DEFAULT_RESERVED_LOG2;
+    use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+
+    // `func 1` (entry) calls `func 2` (helper) at fib.c:5; the helper `suspend`s at fib.c:9.
+    let src = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 5
+  v4, v5 = cont.resume v2 v3
+  return v5
+}
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = call 2(v0, v1)
+  return v2
+}
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = suspend v1
+  return v2
+}
+
+debug.file 0 "fib.c"
+debug.loc 1 0 0 0 5 3
+debug.loc 2 0 0 0 9 3
+"#;
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut cm = CompiledModule::compile(
+        &m,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )
+    .expect("compile");
+
+    // Before the run no fiber has been created, so there is nothing to walk.
+    assert!(
+        cm.fiber_backtrace(0).is_empty(),
+        "no parked fiber before the run"
+    );
+
+    // The root resumes the fiber (it suspends) and returns its yielded value, leaving fiber 0 parked.
+    let (outcome, _) = cm.run(&[], None, None, None).expect("run");
+    let JitOutcome::Returned(ref v) = outcome else {
+        panic!("expected the root to return, got {outcome:?}");
+    };
+    assert_eq!(
+        v.as_slice(),
+        &[5i64],
+        "root returned the fiber's suspended value, leaving it parked"
+    );
+
+    // The fiber-rooted walk: the parked fiber's guest call stack, innermost frame first.
+    let bt = cm.fiber_backtrace(0);
+    let frames: Vec<(u32, &str, u32)> = bt
+        .iter()
+        .map(|f| (f.func, f.file.as_str(), f.line))
+        .collect();
+    assert_eq!(
+        frames,
+        vec![(2, "fib.c", 9), (1, "fib.c", 5)],
+        "backtrace is [helper (suspended, innermost), entry (its caller)]"
+    );
+}
+
 // ---- Recycling ABA guard, cross-backend (DURABILITY.md §12.8 steps 1/3) ----
 //
 // A fiber guest handle carries a generation in its high bits (`FIBER_GEN_SHIFT == 16`), and

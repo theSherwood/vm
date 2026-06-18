@@ -646,7 +646,204 @@ chain). Both correlate by the same source-line `scope` field the consumer resolv
 guest (wasm or `-O0` LLVM) with an inner-block `int x` shadowing an outer one resolves to the inner
 shadow inside the block and the outer after it, exactly as chibicc does (the LLVM lane verifies it at
 runtime; the wasm lane structurally, since a bare `WindowVia` frame read needs `__stack_pointer`
-setup the direct call doesn't do). *Not yet:* the JIT/DWARF tier for gdb/lldb on native code.
+setup the direct call doesn't do). *Not yet:* the JIT/DWARF tier for gdb/lldb on native code — scoped
+below.
+
+### Scoping — the JIT/DWARF tier (gdb/lldb on native JIT'd code)
+
+**This is the W5 "real work" the interpreter-backed tiers above deliberately deferred** — a
+cross-session workstream tracked here. Goal: a developer attaches **gdb or lldb** (or VS Code via
+DAP) to a process running JIT'd guest code, sets a breakpoint on a `.c`/source line, it binds, and
+hitting it shows the source frame, a backtrace, and inspectable source variables — at native speed.
+
+**Why now / what changed.** The §6 waist is complete across all three frontends (source lines,
+structured types, variables incl. `SsaList`/`WindowVia`/`Fixed`, lexical scopes, globals). That is
+the **load-bearing simplification for this tier**: the JIT/DWARF emitter has *one* uniform input —
+the neutral `DebugInfo` — to **synthesize** DWARF from, rather than transforming three different
+native blobs (the original §7 sketch's "prefer the native blob, relocate addresses" is moot because
+the JIT's addresses are *machine* pcs, so even a carried blob's line program and location
+expressions must be rewritten anyway). So: synthesize DWARF from the §6 core uniformly; the native
+DWARF blobs become an optional later fidelity enhancement, not a prerequisite.
+
+**Current substrate (what exists).** `svm-jit` compiles IR → machine code via `cranelift-jit`
+(`JITModule`), one `cranelift_frontend::FunctionBuilder` per function. Cranelift already provides the
+two hooks this tier needs: `func.set_srcloc(inst, SourceLoc)` (an opaque `u32` we own, attached per
+instruction → carried into the compiled address map) and `ValueLabelsRanges = HashMap<ValueLabel,
+Vec<ValueLocRange>>` (value-location lists — *the* W6-JIT substrate, a value's
+register/stack-slot over a machine-pc range). It does **not** yet set srclocs, label values, emit
+unwind info, or produce any DWARF. The project **hand-rolls DWARF parsing** (`svm-wasm`'s
+`dwarf_line.rs`/`dwarf_info.rs`), so the ethos is to **hand-roll the writer** (the inverse) rather
+than add `gimli`; revisit only if loclist encoding gets heavy. No `gimli`/`object` deps today.
+
+**Dependencies pulled in.** This tier *is* where the long-deferred **W3-JIT** (Cranelift unwind info
++ fiber-rooted stack walk for backtraces, §5/§23) and **W6-JIT** (Cranelift value-location lists →
+DWARF variable locations) finally land — they are stages here, not separate workstreams.
+
+**Staged plan (slices — update status as they land):**
+
+- [x] **Stage 0 — SourceLoc threading (foundation). — Built.** `svm-jit`'s `lower_block` stamps each
+  emitted op with a `cranelift SourceLoc` = its `debug_info.locs` index, via a `(func,block,inst) →
+  index` map (`SrcLocMap`) built in `compile` only when the module carries `-g` (threaded through
+  the `Lower` struct, so the non-debug path is byte-identical). No debugger yet.
+- [x] **Stage 1 — JIT address→source map + `symbolize`. — Built.** After `finalize`, each function's
+  captured `MachSrcLoc` ranges (relative offsets, filtered to non-default) resolve against its
+  `get_finalized_function` base into a sorted, disjoint `Vec<SrcRange>` (`[lo,hi)` machine address →
+  `func`/`file`/`line`/`col`); `CompiledModule::symbolize(pc) -> Option<JitFrameLoc>` binary-searches
+  it. Test (`jit_srcloc.rs`): a `-g` compute module's three body lines all map to non-empty machine
+  ranges, `symbolize(range.lo)` round-trips line+file, an unmapped pc → `None`, and a non-`-g` build
+  has an empty map. *Trap symbolization* (mapping a live trap pc, which the explicit-check traps
+  don't capture today, vs the memory-fault signal pc) folds into Stage 4 / W3-JIT — the map and
+  `symbolize` are the substrate.
+- [x] **Stage 2 — `.debug_line` + `.debug_info` synthesis + GDB JIT registration (line-level
+  gdb/lldb). — built.**
+  - [x] **2a — `.debug_line` synthesis.** A hand-rolled DWARF v4/DWARF32 line-program emitter
+    (`svm-jit`'s `dwarf` module, the inverse of `dwarf_line`) turns the Stage 1 `SrcRange` map into a
+    `.debug_line` section — one self-contained sequence per range (`set_address(lo)` → set
+    file/col/line → `copy` → `set_address(hi)` → `end_sequence`), so gaps never bleed a line into
+    the next. `CompiledModule::debug_line_section()` exposes it. Test (`jit_srcloc.rs`): the emitted
+    bytes **round-trip through `svm_wasm::dwarf_line::parse`** and reconstruct the exact
+    machine-address → (file, line) map; a non-`-g` module emits nothing.
+  - [x] **2b — `.debug_info`.** `dwarf::debug_info` emits a CU DIE + a `DW_TAG_subprogram` per
+    function (synthesized `fnN` name, `DW_AT_low_pc` + `DW_AT_high_pc` offset form) with a matching
+    `.debug_abbrev`; `CompiledModule::debug_info_sections()` derives each function's `[low_pc,
+    high_pc)` as the span of its source-mapped ranges. Test (`jit_srcloc.rs`): the pair
+    **round-trips through `svm_wasm::dwarf_info::parse`** to one subprogram whose `low_pc`/`high_pc`
+    match the function's machine extent.
+  - [x] **2c — in-memory ELF + GDB JIT registration.** `svm-jit`'s `gdb` module hand-rolls a minimal
+    ELF64 (`build_elf`): an `SHT_NOBITS` `.text` whose `sh_addr` is the *live* code address (gdb
+    reads the bytes from the inferior), the three `.debug_*` sections, and a `.symtab`/`.strtab`
+    naming one `STT_FUNC` per function at its real `[lo, hi)`. `CompiledModule::elf_object()` builds
+    it; `register_with_gdb()` wraps it in a `jit_code_entry`, links it onto `__jit_debug_descriptor`,
+    and calls the `#[no_mangle]` `__jit_debug_register_code` hook (the symbols gdb knows by name),
+    returning an RAII `GdbRegistration` that **unregisters on drop**. *Acceptance:* gdb/lldb binds a
+    source-line breakpoint and shows the source frame — **the headline milestone** (the gdb-attach
+    step is manual, not CI). CI-testable parts done (`jit_srcloc.rs`): the ELF re-parses and its
+    embedded `.debug_line`/`.debug_info` **round-trip through the readers** out of the wrapper, the
+    DWARF carries real finalized-code addresses, and register/drop drive the descriptor
+    linked-list + `action_flag` (`JIT_REGISTER_FN` → `JIT_UNREGISTER_FN`) as gdb expects. The CU
+    DIE carries `DW_AT_stmt_list` (→ `.debug_line` offset 0) — without it gdb loads the function but
+    no source lines, so a `break file.c:N` never binds. ✅ **Manual acceptance confirmed:** under gdb
+    15.1, `break compute.c:3` binds to the live JIT'd address (`fn0+3`) and stops there when the code
+    runs (`Breakpoint 1, fn0 () at compute.c:3`); see the `gdb_attach` example
+    (`crates/svm/examples/gdb_attach.rs`) for the repro harness + the exact `gdb --batch` invocation.
+    *Effort: high.*
+- [~] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars). — register vars
+  done; memory/CFA forms pending Stage 4.** The §6 core already carries the inputs (`DebugInfo::vars:
+  Vec<VarInfo>` with a neutral `VarLoc`, and `DebugInfo::types: Vec<TypeDef>`), so this is purely a
+  JIT-side *emit* problem — no IR/text change. ✅ **`print x` confirmed under gdb 15.1** (a JIT'd
+  register-resident local reads back with its value + type).
+  - [x] **3a — value-location substrate (W6-JIT core). — built.** Gated on `-g` vars: `compile`
+    assigns each SSA-resident source var (`VarLoc::{Ssa, SsaList}`) a `ValueLabel`, calls Cranelift's
+    `func.collect_debug_info()` per function, and `lower_block` `set_val_label`s the CLIF value backing
+    it (block-local `SsaLoc{block,value}` indexes the JIT's per-block value map directly). After
+    `define_function` it reads `CompiledCode::value_labels_ranges`, translates each `LabelValueLoc`
+    (`Reg` → DWARF regnum via `isa.map_regalloc_reg_to_dwarf`, `CFAOffset` kept) and, post-finalize,
+    resolves the offsets to absolute machine pcs — exposed as `CompiledModule::var_locations() ->
+    [VarMachineInfo{func, name, ranges:[VarRange{lo,hi,VarMachineLoc}]}]`. Non-`-g` codegen stays
+    byte-identical (no `collect_debug_info`, no labels). Tests (`jit_srcloc.rs`): a tracked local lives
+    in a register over the expected code span, a folded var has empty ranges (the faithful
+    `<optimized out>`), and a module without `debug.var` tracks nothing; the JIT/fiber/SIMD/c_frontend
+    differential suites confirm the non-`-g` path is unchanged. (Memory forms `Window`/`WindowVia`/
+    `Fixed` carry no value label — they're a DWARF memory expression in 3c.)
+  - [x] **3b — `DW_TAG_*_type` DIEs. — built.** `dwarf::debug_info` now also emits the §6 `TypeDef`
+    graph as type DIEs in the CU (the inverse of `dwarf_info`'s type reader): `Base` →
+    `DW_TAG_base_type` (`DW_ATE_*` encoding + byte_size), `Pointer` → `DW_TAG_pointer_type`, `Array` →
+    `DW_TAG_array_type` + a `DW_TAG_subrange_type` child carrying the count, `Aggregate` →
+    `DW_TAG_structure_type` + `DW_TAG_member` children, `Opaque` → an empty `structure_type`.
+    Inter-type references (`pointee`/`elem`/field `ty`) are CU-relative `DW_FORM_ref4`s resolved by a
+    fixup pass once each type DIE's offset is known. `CompiledModule` carries the `TypeDef`s;
+    `debug_info_sections()` emits them ahead of the subprograms. Tests (`jit_srcloc.rs`): the base/
+    pointer/array/struct graph **round-trips through `svm_wasm::dwarf_info::parse`** with every
+    `DW_AT_type` ref resolving to the right DIE, and binutils `readelf --debug-dump=info` parses it
+    cleanly (refs shown as `<0x18>` → the `int` DIE). The 2b subprogram round-trip is unchanged.
+  - [x] **3c — `DW_TAG_variable` DIEs + register locations. — built.** `dwarf::debug_info` now emits
+    each tracked source variable as a `DW_TAG_variable` child of its subprogram (with proper
+    per-subprogram null termination): `DW_AT_name`, `DW_AT_type` (a `DW_FORM_ref4` into the 3b type
+    DIEs) and, for register-resident ranges, a `DW_AT_location` → a DWARF v4 `.debug_loc` location
+    list (a base-address-selection entry pinning base 0 so the `[lo, hi)` are absolute, then one
+    `DW_OP_reg{N}` entry per Stage-3a range). Four abbrev variants cover `{type?} × {location?}` (a
+    folded var with no live range omits `DW_AT_location` ⇒ gdb shows `<optimized out>`). The ELF
+    gains a `.debug_loc` section. Tests (`jit_srcloc.rs`): the loclist encodes exactly what
+    `var_locations()` resolved and the DIE tree still parses; `readelf --debug-dump=loc` shows
+    `DW_OP_reg4 (rsi)` over the right range. **CFA-relative ranges and the `Window`/`WindowVia`/
+    `Fixed` memory forms are deferred** — they need a frame base (`DW_AT_frame_base =
+    DW_OP_call_frame_cfa`) and the window-base register, which arrive with Stage 4's unwind/CFI.
+  - [x] **3d — gdb acceptance. — confirmed.** Under gdb 15.1, breaking in JIT'd code and
+    `print t` yields `$1 = 11` with `whatis t` → `int` (and `info locals` shows it) — gdb reads the
+    source variable straight from its register location. Repro: the `gdb_attach` example (now carries
+    a `debug.var`). Vars the optimizer dropped correctly show `<optimized out>` (faithful native
+    behavior — the interpreter tier stays the always-faithful inspection fallback). *Effort (whole
+    stage): high.*
+- [x] **Stage 4 — W3-JIT unwind / backtrace. — built.** DWARF CFI (`.debug_frame`) so gdb unwinds
+  JIT'd frames (`bt`) and computes the CFA (4a); spilled variables as `DW_OP_fbreg` against that CFA
+  (4b); and a host-side fiber-rooted backtrace of a suspended fiber's guest stack (4c). ✅ **`bt`
+  across guest frames with source and `print` of a spilled variable both confirmed under gdb 15.1;
+  the per-fiber walk is CI-tested.**
+  - [x] **4a — `.debug_frame` CFI + `DW_AT_frame_base`. — built.** `dwarf::debug_frame` hand-rolls a
+    `.debug_frame` (one DWARF v4 CIE with the steady-state frame-pointer rules — CFA = `rbp+16`,
+    return address at CFA−8, saved `rbp` at CFA−16, valid because `preserve_frame_pointers=true` gives
+    every function a uniform `rbp` frame — plus one FDE per function over its `[lo, hi)`); the GDB-JIT
+    ELF gains a `.debug_loc`+`.debug_frame` (now 10 sections), and every subprogram carries
+    `DW_AT_frame_base = DW_OP_call_frame_cfa`. ✅ **Confirmed under gdb 15.1:** breaking in a callee
+    `fn1` and running `bt` walks the **guest call stack with source** — `#0 fn1 () at two.c:9` /
+    `#1 … in fn0 () at two.c:3` — across a real guest `call`. CI (`jit_srcloc.rs`): the CIE rules +
+    one-FDE-per-function structure validated byte-wise; `readelf --debug-dump=frames` parses it
+    (`DW_CFA_def_cfa: r6 (rbp) ofs 16`, FDE over the function). (The steady-state CIE is inexact only
+    in the 1–2-instruction prologue window — fine for body breakpoints; precise per-prologue CFI would
+    need Cranelift's private instruction list or `gimli`. The unwind stops at the host boundary: the
+    buffer-ABI trampoline has no FDE, which is expected — the *guest* stack is what unwinds.)
+  - [x] **4b — spilled (CFA-relative) variables as `DW_OP_fbreg`. — built.** With a frame base now
+    defined (4a), `emit_loclist` turns a `VarMachineLoc::CfaOffset(off)` range into a `DW_OP_fbreg
+    <off>` location-list entry — `frame_base + off = CFA + off`, the spill slot Cranelift stored the
+    value to — while register ranges stay `DW_OP_reg`. ✅ **Confirmed under gdb 15.1:** a variable the
+    regalloc spilled to the stack `print`s its value (`$1 = 30`, `whatis` → `int`) by reading the
+    CFA-relative slot. Test (`jit_srcloc.rs`): a fixture of many `call` results kept live across a
+    final call deterministically forces spills, and every variable range — register *and* spill — is
+    reconstructed verbatim in `.debug_loc` (`DW_OP_fbreg` for the `CfaOffset` ranges). **The guest
+    *window*-memory forms (`Window`/`WindowVia`/`Fixed`) remain deferred:** guest memory has no
+    compile-time/frame-independent address (the window base is a per-run pointer; globals have no
+    frame), so they need a different mechanism (a runtime base registered with gdb, or a JIT reader
+    plugin) rather than static DWARF.
+  - [x] **4c — fiber-rooted backtrace. — built.** `CompiledModule::fiber_backtrace(handle)` walks a
+    **suspended fiber's** out-of-band control stack — rooted at the fiber *handle* (§23/D57 migratable
+    fibers), not the OS thread. The fiber runtime exposes the parked stack via
+    `SharedFiberTable::with_parked_stack` (the slot lock held, only for a fiber not running on a vCPU;
+    `Fiber::ctx` is the saved SP, `parked_extent()` gives `[ctx, top)`); the walk conservatively scans
+    that region low→high (innermost first) and symbolizes every word that lands in this module's guest
+    code — robust to the host runtime glue between the guest frames and the suspend switch (the
+    GC-root-scan precedent), no fragile frame-pointer chase. Test (`jit_fibers.rs`): a fiber entry
+    calls a helper that `suspend`s; the root resumes once and returns, leaving it parked; the
+    backtrace is exactly `[helper @ fib.c:9 (innermost), entry @ fib.c:5]`, and a module with no
+    created fiber yields an empty walk. *Effort (whole stage): med–high.*
+- [ ] **Stage 5 — DAP-over-JIT (optional; editor parity at native speed).** Either drive the JIT
+  under `svm-dap` (breakpoints via software `int3` patching or single-step over DWARF line
+  boundaries) so VS Code debugs native-speed code, **or** keep the interpreter as the DAP stepping
+  engine and use the JIT only for speed (the two-engine question below). *Effort: high.*
+
+**Key decisions / open questions (to resolve as stages land):**
+- *DWARF writer:* hand-roll (ethos; reuses the `dwarf_line`/`dwarf_info` shapes) vs `gimli` write
+  (standard but a new dep). Lean hand-roll for `.debug_line`/`.debug_info`; reconsider for
+  `.debug_loclists` if the encoding gets heavy.
+- *ELF builder:* a minimal hand-rolled in-memory ELF (a handful of section headers) vs the `object`
+  crate. Lean minimal-hand-rolled — only `.text` + a few `.debug_*` sections are needed.
+- *Registration target:* the **GDB JIT interface** (gdb + lldb, full source/DWARF) is the goal;
+  `/tmp/perf-<pid>.map` (symbols only) and `perf` jitdump are cheaper symbol-only side options if a
+  quick win is wanted before Stage 2.
+- *Two-engine DAP (Stage 5):* interpreter-for-stepping + JIT-for-speed (cheap, already have the
+  interpreter tier, sidesteps optimized-debug) vs JIT-only DWARF/DAP. The original §7 recommendation
+  was interpreter-first (done); Stage 5 is where JIT-native stepping is decided.
+- *Trust/TCB:* DWARF and the JIT registration are **host-side tooling**, untrusted-for-escape (§2a)
+  like the rest of the waist — a malformed DWARF mis-renders, never escapes. Keep it off the
+  verifier/runtime hot path.
+
+**Progress:** Stages 0–1 **built** (source-loc threading + `symbolize`); **Stage 2 built** — 2a/2b
+(the `.debug_line` and `.debug_info`/`.debug_abbrev` emitters) plus 2c (the in-memory ELF wrapper +
+GDB JIT registration: `gdb::build_elf` / `CompiledModule::{elf_object, register_with_gdb}` and the
+`__jit_debug_descriptor`/`__jit_debug_register_code` interface), all round-tripped through the
+readers / asserted against the descriptor state in CI. The "set a breakpoint on a `.c` line in gdb"
+milestone is **confirmed** — a real gdb 15.1 binds `break compute.c:3` to the live JIT'd address and
+stops there (repro: the `gdb_attach` example). **Next: Stage 3** — W6-JIT value locations +
+`DW_TAG_variable` DIEs (inspect source vars in gdb). Each stage is independently shippable.
 
 ---
 
