@@ -52,7 +52,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
-| Backtrace *materialization* (unwind tables → frames) | **Partially built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber are built (W5 JIT/DWARF Stage 4); the always-on **trap-time** backtrace (symbolize the stack at a JIT trap into the kill message) is the W3 slice in progress | §5, `svm-jit` `dwarf`/`fiber_backtrace` |
+| Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `svm-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types via `llvm-sys`** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm`, `svm-llvm` |
 | DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `svm-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
@@ -424,24 +424,27 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   the line is precise for ops that carry a `debug.loc` (div/rem, `unreachable`); `OutOfFuel`/the
   back-edge checks attribute the right *function* but an approximate line. *Tests:* a div-by-zero
   names the div line; a callee div-by-zero walks the caller chain `[func1@div, func0@call]`.
-- [ ] **Stage 3 — fiber attribution + the kill message.** Root the walk at the trapping **fiber**
-  (not the OS thread — §23/D57), and fold the backtrace into the `Trap`/kill report the host already
-  surfaces. *Acceptance:* the trace names the right fiber under work-stealing migration. (The capture
-  is thread-local today, so a trap on a spawned vCPU/worker thread isn't yet seen by the run thread —
-  this stage threads it through.)
-- [ ] **Stage 3 — fiber attribution + the kill message.** Root the walk at the trapping **fiber**
-  (not the OS thread — §23/D57), and fold the backtrace into the `Trap`/kill report the host already
-  surfaces. *Acceptance:* the trace names the right fiber under work-stealing migration.
+- [x] **Stage 3 — vCPU attribution + the kill message.** Two halves: *(a)* a trap on a **spawned
+  vCPU** captured into that worker's `trap_shim.c` thread-local, which dies with the worker — so the
+  dying worker now hands its capture to the run-scoped `Domain` (last-wins, matching the last-wins
+  trap cell), and the run thread reconciles it with its own capture after `join_all` (the root's own
+  trap takes precedence, the common single-vCPU case). *(b)* the host's kill message now carries the
+  backtrace: `powerbox_compile_run` plumbs `last_trap_backtrace()` out and `run_powerbox*` appends a
+  `file:line:col (fn N)` block to the `guest trapped (…)` error. *Tests:* a `thread.spawn`ed worker's
+  div-by-zero is attributed to the worker's div line; a powerbox div-by-zero's kill message names the
+  source. *Remaining:* per-**fiber** naming under work-stealing migration (§23/D57) — the capture is
+  vCPU-thread-rooted, not yet fiber-rooted; and matching the *exact* killing trap under racing
+  concurrent traps (today: last-wins, any trapping frame's chain is a valid kill backtrace).
 
 **Trust/TCB.** Pure host-side observability, off the runtime hot path and the escape-TCB: a wrong
 backtrace mis-renders a kill message, never affects confinement. The capture stays async-signal-safe
 in the fault handler (no allocation — a fixed thread-local buffer; symbolization is deferred to the
 host in normal context).
 
-**Progress:** Stages 0–2 **done** (trap-time backtraces for both memory faults *and* explicit-check
-traps are live, unix; Windows degrades to empty pending a VEH-side capture). Next: Stage 3 — fiber
-attribution (the capture is thread-local, so a trap on a spawned vCPU/worker thread isn't yet seen by
-the run thread) + folding the backtrace into the host's kill/`Trap` report.
+**Progress:** Stages 0–3 **done** — the JIT trap-time backtrace is live for both memory faults *and*
+explicit-check traps, attributed across spawned vCPUs, and folded into the host's kill message (unix;
+Windows degrades to empty pending a VEH-side capture). This closes Pillar 2 (W3) on the JIT. Possible
+follow-ups: per-fiber naming under work-stealing migration, and a Windows VEH-side capture.
 
 ---
 

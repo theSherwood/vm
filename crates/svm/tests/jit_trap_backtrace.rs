@@ -203,6 +203,47 @@ fn explicit_trap_backtrace_walks_the_caller_chain() {
     );
 }
 
+/// A **spawned-vCPU** trap (§5 W3 Stage 3): the root spawns function 1 on its own OS thread and
+/// joins it; the worker divides by zero, trapping `DivByZero` *off the run thread*. Its capture lives
+/// in the worker's thread-local, so the worker hands it to the domain for the run thread to surface.
+/// The div is func1 block0 instruction 2, mapped to line 50.
+const SPAWN_THEN_DIV_DBG: &str = "\
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = thread.spawn 1 v0 v0
+  v2 = thread.join v1
+  return v2
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i32.const 5
+  v3 = i32.const 0
+  v4 = i32.div_s v2 v3
+  v5 = i64.const 0
+  return v5
+}
+debug.file 0 \"thr.c\"
+debug.loc 1 0 2 0 50 3
+";
+
+#[test]
+fn trap_backtrace_attributes_a_spawned_vcpu_trap() {
+    if !svm_jit::fiber_supported() {
+        return; // no OS-thread vCPU runtime here — thread.spawn is inert, nothing to attribute
+    }
+    let mut cm = compile(SPAWN_THEN_DIV_DBG);
+    let (outcome, _) = cm.run(&[0], None, None, None).expect("run");
+    assert!(
+        matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)),
+        "the spawned worker's div-by-zero must propagate as DivByZero, got {outcome:?}"
+    );
+    let bt = cm.last_trap_backtrace();
+    assert!(
+        bt.iter().any(|f| f.func == 1 && f.line == 50),
+        "the trap that originated on the spawned vCPU is symbolized to func1's div line, got {bt:?}"
+    );
+}
+
 #[test]
 fn no_trap_leaves_an_empty_backtrace() {
     // A run that returns normally must not leave a stale backtrace behind.

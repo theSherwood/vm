@@ -2525,17 +2525,12 @@ impl CompiledModule {
             )
         };
 
-        // §5 W3 — build a trap-time backtrace from the stack a trap already walked + captured during
-        // the run: the SIGSEGV/SIGBUS handler for a memory fault (Stage 1), or the explicit-trap
-        // helper at the trap site for a div-by-zero / `unreachable` / `OutOfFuel` / indirect-call-type
-        // trap (Stage 2). Either way the frames had to be walked while live (a trap unwinds the guest
-        // stack — by `siglongjmp` onto the reused stack, or by ordinary returns), so the capture is a
-        // thread-local the host only symbolizes here (pure; no `*this` ref outlives this statement).
-        // Taken unconditionally so it also clears any capture and stays empty on a non-trapping run.
-        let trap_backtrace = match mem::take_trap_frame() {
-            Some((pc, rets)) => (*this).trap_backtrace(pc, &rets),
-            None => Vec::new(),
-        };
+        // §5 W3 — the **root vCPU's** trap-time backtrace capture (this run thread's thread-local): a
+        // memory fault's SIGSEGV/SIGBUS-handler walk (Stage 1) or an explicit trap's helper walk
+        // (Stage 2). Taken raw now (and cleared, so a clean run stays empty); symbolized after
+        // `join_all` below, where it is reconciled with any **spawned vCPU's** capture (Stage 3 —
+        // collected into the domain because a worker's thread-local dies with the worker).
+        let root_trap_cap = mem::take_trap_frame();
 
         // Durable freeze driver (DURABILITY.md §12.8 slice 3.3.2): on a durable **freeze** run
         // (state word UNWINDING) the root has now unwound into context 0's shadow region; flatten
@@ -2565,6 +2560,15 @@ impl CompiledModule {
         if let Some(d) = &(*this).domain {
             d.join_all();
         }
+        // §5 W3 Stage 3 — a trap that originated on a *spawned* vCPU stashed its backtrace capture in
+        // that worker's thread-local, which dies with the worker; the worker handed it to the domain
+        // before finishing, so collect it now (all vCPUs are joined). Used only when the root vCPU
+        // itself didn't trap (`root_trap_cap` below takes precedence — the entry's own trap is the
+        // primary one in the common single-vCPU case).
+        #[cfg(fiber_rt)]
+        let worker_trap_cap = (*this).domain.as_ref().and_then(|d| d.take_trap_capture());
+        #[cfg(not(fiber_rt))]
+        let worker_trap_cap: Option<(usize, Vec<usize>)> = None;
         // §9/§12 async ring: now that every vCPU is joined, drain the offload pool and drop the futex hook
         // (which holds the `Domain` pointer) before the window is freed below — so no worker
         // can still write the window counter or call into a dead `Domain`.
@@ -2597,9 +2601,13 @@ impl CompiledModule {
         // `*this` for the next `run` / `define_extra` / drop.
         drop(window);
 
-        // Publish the trap-time backtrace captured above for `last_trap_backtrace` (empty on a
-        // non-trapping run — every successful run resets it).
-        (*this).last_trap_backtrace = trap_backtrace;
+        // Publish the trap-time backtrace for `last_trap_backtrace`: the root vCPU's own capture if it
+        // trapped, else a spawned vCPU's (Stage 3). Symbolizing is pure (reads the address map), so it
+        // is fine here after teardown. Empty on a clean run (every successful run resets it).
+        (*this).last_trap_backtrace = match root_trap_cap.or(worker_trap_cap) {
+            Some((pc, rets)) => (*this).trap_backtrace(pc, &rets),
+            None => Vec::new(),
+        };
 
         // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
         // synchronization point); Relaxed suffices.

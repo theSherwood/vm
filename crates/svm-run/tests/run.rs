@@ -325,6 +325,29 @@ fn deadline_kills_runaway_powerbox_guest() {
     );
 }
 
+/// §5 W3 — a trap's kill message carries the **source backtrace** when the module was built with
+/// `-g`: a powerbox guest that divides by zero is detect-and-killed, and the error names the div's
+/// `file:line` (the `debug.loc` the module carries, threaded through the JIT trap-time backtrace).
+#[test]
+fn trap_kill_message_carries_a_source_backtrace() {
+    let m = load(
+        "func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i32.const 0\n\
+         \x20 v4 = i32.div_s v0 v3\n\
+         \x20 return v4\n\
+         }\n\
+         debug.file 0 \"guest.c\"\n\
+         debug.loc 0 0 1 0 7 5\n",
+    );
+    let err = run_powerbox_with_deadline(&m, b"", None).expect_err("div-by-zero must be killed");
+    assert!(err.contains("DivByZero"), "names the trap kind: {err}");
+    assert!(
+        err.contains("guest.c:7"),
+        "the kill message carries the trap-time source backtrace: {err}"
+    );
+}
+
 /// Arming the kill-path must not penalize a well-behaved guest: a fast program finishes normally —
 /// and *quickly* — because the watchdog wakes the instant the run completes (it never blocks the
 /// full deadline).
