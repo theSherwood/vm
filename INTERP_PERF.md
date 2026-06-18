@@ -280,9 +280,15 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
           ordering/state-shape oracle the seam needs, then make bytecode match the tree-walker). The
           `Vm` becomes a first-class schedulable/parkable continuation alongside `VCpu`. Planned
           slices, in dependency order (refined once the seam inventory lands):
-        - [ ] **1c-5a** — synchronous host/capability seam (generic `cap.call` powerbox dispatch:
-              guest suspended, host computes, same activation continues — no scheduler). Harness:
-              hand-authored cap modules diffed bytecode-vs-tree-walker.
+        - [x] **1c-5a** — synchronous host/capability seam. `Op::CapCall` drives the generic
+              powerbox path via the *same* reusable `host.cap_dispatch_slots` the tree-walker's
+              generic `CapCall` arm uses (handle i32, args/results i64 slots, results re-typed by
+              `sig.results`); `host` is threaded through `Vm::resume` / `run`, and a new
+              `compile_and_run_with_host` is what `run_with_host_fast` now calls. The executor/fiber
+              capability variants (`Instantiator`/`Yielder`/`JIT`/`SharedRegion` op 4) are rejected by
+              the compiler → tree-walker fallback. New TDD harness `bytecode_caps.rs` (hand-authored
+              host-fn modules: sum-args, op-selector, chained, in-loop, forged-handle-traps) — all
+              bit-identical to `run_with_host`; `.expect(Some)` gates that bytecode actually drove it.
         - [ ] **1c-5b** — `Vm` as a schedulable task in the executor (`drive`/`Scheduler`): the
               foundation threads/fibers ride on. Harness: schedule/interleaving equality.
         - [ ] **1c-5c** — threads (`thread.spawn`/`join`) + `memory.wait`/`notify`. Harness:

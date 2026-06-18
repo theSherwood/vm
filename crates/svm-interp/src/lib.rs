@@ -1548,7 +1548,7 @@ pub fn run_with_host_fast(
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
     if !host.is_durable() {
-        if let Some(result) = bytecode::compile_and_run(m, func, args, fuel) {
+        if let Some(result) = bytecode::compile_and_run_with_host(m, func, args, fuel, host) {
             return result;
         }
     }

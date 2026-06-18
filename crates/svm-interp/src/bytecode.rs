@@ -28,7 +28,8 @@ use svm_ir::{
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, step, trunc_trap, Mem, Reg, Trap, Value, DEFAULT_RESERVED_LOG2,
+    intun32, intun64, slot_to_val, step, trunc_trap, GuestMem, Host, Mem, Reg, Trap, Value,
+    DEFAULT_RESERVED_LOG2,
 };
 
 /// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative).
@@ -204,6 +205,21 @@ enum Op {
         dst: u32,
         want_params: Box<[ValType]>,
         want_results: Box<[ValType]>,
+    },
+    /// Synchronous capability call (§3c) through the host powerbox — the guest is suspended, the
+    /// host computes a result, and execution continues in the same activation (no scheduler/fiber).
+    /// Only the **generic** powerbox path is lowered here; the executor/fiber capability variants
+    /// (`Instantiator`, `Yielder`, `JIT`, `SharedRegion` op 4) are rejected by [`compile_inst`] and
+    /// fall back to the tree-walker. Args/results cross as `i64` slots (the host-dispatch ABI);
+    /// `results` carries `sig.results` so each returned slot is re-typed exactly as the tree-walker
+    /// does.
+    CapCall {
+        type_id: u32,
+        op: u32,
+        handle: u32,
+        args: Box<[u32]>,
+        dst: u32,
+        results: Box<[ValType]>,
     },
     Ret {
         srcs: Box<[u32]>,
@@ -539,10 +555,38 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             want_params: ty.params.clone().into(),
             want_results: ty.results.clone().into(),
         },
+        // Synchronous capability call: the generic powerbox path (guest suspended, host computes,
+        // same activation continues) is driven here via `host.cap_dispatch_slots`. The
+        // executor/fiber capability variants — `Instantiator` (child vCPUs), `Yielder` (co-fiber
+        // yield), `JIT` (install/uninstall/invoke), and `SharedRegion` op 4 (`grant` into a child) —
+        // need seams a later slice drives, so reject those (fall back to the tree-walker). These are
+        // exactly the `type_id`/`op` combinations `run_inner` matches in dedicated arms ahead of its
+        // generic `CapCall` arm.
+        Inst::CapCall {
+            type_id,
+            op,
+            sig,
+            handle,
+            args,
+        } => {
+            use super::iface;
+            if matches!(*type_id, iface::INSTANTIATOR | iface::YIELDER | iface::JIT)
+                || (*type_id == iface::SHARED_REGION && *op == 4)
+            {
+                return None;
+            }
+            Op::CapCall {
+                type_id: *type_id,
+                op: *op,
+                handle: g(*handle),
+                args: args.iter().map(|a| g(*a)).collect(),
+                dst,
+                results: sig.results.clone().into(),
+            }
+        }
         // Control / host / cross-module ops this slice doesn't drive (they need the scheduler,
-        // host powerbox, fiber registry, or dispatch table) — fall back to the tree-walker.
-        Inst::CapCall { .. }
-        | Inst::CapSelfCount
+        // fiber registry, or dispatch table) — fall back to the tree-walker.
+        Inst::CapSelfCount
         | Inst::CapSelfGet { .. }
         | Inst::CallImport { .. }
         | Inst::ContNew { .. }
@@ -584,12 +628,29 @@ pub fn compile_and_run(
     args: &[Value],
     fuel: &mut u64,
 ) -> Option<Result<Vec<Value>, Trap>> {
+    // No capabilities granted: an empty powerbox (any `cap.call` is inert → `CapFault`), exactly
+    // like [`crate::run`], so this stays a faithful mirror for the equality harness.
+    let mut host = Host::new();
+    compile_and_run_with_host(m, func, args, fuel, &mut host)
+}
+
+/// Host-carrying [`compile_and_run`]: the powerbox is live, so synchronous capability calls
+/// (`cap.call` through the generic dispatch) execute against it. `None` if the module uses an op
+/// outside this slice's subset (including the executor/fiber capability variants) — the caller
+/// (`crate::run_with_host_fast`) then falls back to the tree-walker.
+pub fn compile_and_run_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> Option<Result<Vec<Value>, Trap>> {
     let c = compile_module(&m.funcs)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
     let mut mem = build_mem(m);
-    Some(run(&c, func, args, fuel, &mut mem))
+    Some(run(&c, func, args, fuel, &mut mem, host))
 }
 
 /// Like [`compile_and_run`], but drives the reified [`Vm`] in slices of at most `slice` ops,
@@ -609,12 +670,13 @@ pub fn compile_and_run_sliced(
         return Some(Err(Trap::Malformed));
     }
     let mut mem = build_mem(m);
+    let mut host = Host::new();
     let mut vm = match Vm::new(&c, func as usize, args) {
         Ok(v) => v,
         Err(t) => return Some(Err(t)),
     };
     loop {
-        match vm.resume(&c, fuel, &mut mem, slice.max(1)) {
+        match vm.resume(&c, fuel, &mut mem, &mut host, slice.max(1)) {
             Ok(Outcome::Done(vals)) => return Some(Ok(vals)),
             Ok(Outcome::Suspended) => continue,
             Err(t) => return Some(Err(t)),
@@ -628,12 +690,13 @@ fn run(
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
+    host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
     let mut vm = Vm::new(c, entry as usize, args)?;
     // The production path never preempts itself: an unlimited budget makes `resume` run straight to
     // completion, with the per-op budget branch perfectly predicted (so the hot loop is unchanged).
     loop {
-        match vm.resume(c, fuel, mem, u64::MAX)? {
+        match vm.resume(c, fuel, mem, host, u64::MAX)? {
             Outcome::Done(vals) => return Ok(vals),
             Outcome::Suspended => continue,
         }
@@ -705,6 +768,7 @@ impl Vm {
         c: &Compiled,
         fuel: &mut u64,
         mem: &mut Option<Mem>,
+        host: &mut Host,
         mut budget: u64,
     ) -> Result<Outcome, Trap> {
         let mut cur = self.cur;
@@ -1012,6 +1076,31 @@ impl Vm {
                         pc = cpc;
                     }
                 },
+                Op::CapCall {
+                    type_id,
+                    op,
+                    handle,
+                    args,
+                    dst,
+                    results,
+                } => {
+                    // Generic synchronous powerbox dispatch — the same path and ABI the tree-walker's
+                    // generic `CapCall` arm uses (`cap_dispatch_slots`): handle as an i32, args/results
+                    // as i64 slots, results re-typed by the call's `sig.results`. The host is borrowed
+                    // exclusively here (single-threaded, no `thread.spawn` in a compiled module), so no
+                    // lock is needed.
+                    let h = r!(*handle).i32();
+                    let mut argv: Vec<i64> = Vec::with_capacity(args.len());
+                    for a in args.iter() {
+                        argv.push(r!(*a).i64());
+                    }
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let res = host.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
+                        self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
+                    }
+                    pc += 1;
+                }
                 Op::Unreachable => return Err(Trap::Unreachable),
                 Op::Eval {
                     inst,
