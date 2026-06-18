@@ -66,6 +66,10 @@ pub struct DiVar {
     /// The neutral render name (e.g. `"int"`, `"struct Point"`) — always present, even when the
     /// structured `type_id` could not be built.
     pub ty: String,
+    /// The §6 lexical scope `(start_line, end_line)` when the variable lives in a `DILexicalBlock`
+    /// (the shadowing case); `None` ⇒ scoped to the subprogram (function-wide). `end_line` is the
+    /// last source line of instructions in the block (`DILexicalBlock` carries no end line).
+    pub scope: Option<(u32, u32)>,
 }
 
 /// A module-scoped source global recovered from a global's `!dbg` `DIGlobalVariableExpression`:
@@ -164,9 +168,37 @@ unsafe fn read_function_vars(
     for i in 0..nparams {
         param_index.insert(LLVMGetParam(f, i) as usize, i);
     }
+    // §6 lexical scopes: a `DILexicalBlock` carries a start line but no end, so derive each block's
+    // last source line from the `!dbg` `DILocation`s of the instructions inside it (walking the
+    // location's scope chain so an instruction extends every enclosing block).
+    let mut block_end: HashMap<usize, u32> = HashMap::new();
+    for_each_inst(f, |inst| {
+        let loc = LLVMInstructionGetDebugLoc(inst);
+        if loc.is_null() {
+            return;
+        }
+        let line = LLVMDILocationGetLine(loc);
+        let mut scope = LLVMDILocationGetScope(loc);
+        let mut depth = 0;
+        while !scope.is_null()
+            && depth < 32
+            && matches!(
+                LLVMGetMetadataKind(scope),
+                LLVMMetadataKind::LLVMDILexicalBlockMetadataKind
+            )
+        {
+            let e = block_end.entry(scope as usize).or_insert(0);
+            *e = (*e).max(line);
+            scope = op_md(ctx, scope, 0).unwrap_or(std::ptr::null_mut()); // op 0 = parent scope
+            depth += 1;
+        }
+    });
 
-    // Shared: pull (name, type_id, ty) out of the `!DILocalVariable` at call operand 1.
-    let mut seen: HashMap<String, ()> = HashMap::new();
+    // Shared: pull (name, type_id, ty) out of the `!DILocalVariable` at call operand 1. Dedup by the
+    // `DILocalVariable` *identity* (its metadata node), not name — so a variable with several
+    // `dbg.value`s keeps its first binding, while two shadowed same-name declarations (distinct DI
+    // nodes, the §6 case) are both recorded.
+    let mut seen: HashMap<usize, ()> = HashMap::new();
     let mut vars = Vec::new();
     for_each_inst(f, |inst| {
         if LLVMIsACallInst(inst) != inst {
@@ -211,18 +243,34 @@ unsafe fn read_function_vars(
             return;
         }
         let name = op_string(ctx, var_md, 1).unwrap_or_default();
-        if name.is_empty() || seen.insert(name.clone(), ()).is_some() {
-            return; // unnamed, or already recorded (first binding wins)
+        if name.is_empty() || seen.insert(var_md as usize, ()).is_some() {
+            return; // unnamed, or this DI variable already recorded (first binding wins)
         }
         let type_id = op_md(ctx, var_md, 3).and_then(|t| intern_type(ctx, t, types, interner));
         let ty = type_id
             .map(|id| render_name(&types[id as usize]))
             .unwrap_or_else(|| "void".to_string());
+        // §6 lexical scope: a `DILocalVariable` scoped to a `DILexicalBlock` (op 0) is block-scoped
+        // from its declaration line to the block's last instruction line; a subprogram scope ⇒
+        // function-wide (`None`).
+        let scope = op_md(ctx, var_md, 0).and_then(|s| {
+            matches!(
+                LLVMGetMetadataKind(s),
+                LLVMMetadataKind::LLVMDILexicalBlockMetadataKind
+            )
+            .then(|| {
+                block_end
+                    .get(&(s as usize))
+                    .map(|&e| (LLVMDIVariableGetLine(var_md), e))
+            })
+            .flatten()
+        });
         vars.push(DiVar {
             name,
             loc,
             type_id,
             ty,
+            scope,
         });
     });
     vars

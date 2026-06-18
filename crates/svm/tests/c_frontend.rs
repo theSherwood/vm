@@ -2747,6 +2747,68 @@ int bump(int n) { counter = counter + n; return counter + origin.a; }
 }
 
 #[test]
+fn chibicc_g_resolves_shadowed_locals_by_scope() {
+    // C shadowing: an inner block redeclares `x`. chibicc emits two `debug.var 0 "x"` lines, each
+    // with a `scope <start> <end>` source-line range; reading `x` by name resolves to the one **in
+    // scope at the stopped pc** (the inner shadow inside the block, the outer one after it) — not
+    // just the first declared (DEBUGGING.md §6 lexical-scope resolution).
+    let src = r#"
+int f(int n) {
+  int x = n + 1;
+  {
+    int x = n + 100;
+    n = n + x;
+  }
+  return x + n;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    // Both shadows emitted under the same name+func, each carrying a distinct lexical scope.
+    assert_eq!(
+        ir.matches("debug.var 0 \"x\"").count(),
+        2,
+        "both shadows emitted:\n{ir}"
+    );
+    assert!(
+        ir.contains(" scope "),
+        "shadows carry source-line scopes:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+
+    let pc_for_line = |line: u32| {
+        let l = m
+            .debug_info
+            .as_ref()
+            .unwrap()
+            .locs
+            .iter()
+            .find(|l| l.line == line)
+            .unwrap_or_else(|| panic!("no loc for line {line}"));
+        IrPc {
+            module: 0,
+            func: l.func,
+            block: l.block as usize,
+            inst: l.inst as usize,
+        }
+    };
+    let sp = 32768i64;
+    let read_x_at = |line: u32| {
+        let mut insp = Inspector::attach(&m, 0, &[Value::I64(sp), Value::I32(5)], 1_000_000);
+        insp.set_breakpoint(pc_for_line(line));
+        assert!(matches!(
+            insp.run_until_stop(),
+            svm_interp::Stop::Break { .. }
+        ));
+        as_i32_var(insp.read_var(0, "x", 4))
+    };
+
+    // Inside the inner block (line 6, `n = n + x`): the inner `x = n + 100 = 105` is in scope.
+    assert_eq!(read_x_at(6), 105, "inner shadow resolved inside the block");
+    // After the block (line 8, `return x + n`): the outer `x = n + 1 = 6` is back in scope.
+    assert_eq!(read_x_at(8), 6, "outer x resolved after the block");
+}
+
+#[test]
 fn chibicc_g_maps_breakpoints_to_source_lines() {
     // Raw string starts with a newline, so: line 2 = signature, 3 = `int s`, 4 = `int t`,
     // 5 = `return t + s` (its add is the block's last op, so it's a real step point on line 5).

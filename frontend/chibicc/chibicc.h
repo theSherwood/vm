@@ -159,6 +159,12 @@ struct Obj {
   bool is_live;
   bool is_root;
   StringArray refs;
+
+  // Lexical scope for `-g` shadowing resolution (DEBUGGING.md §6): the source-line range over which
+  // a local is in scope. `scope_start_line` is its declaration line; `scope_end_line` is the closing
+  // `}` line of its enclosing block (0 ⇒ function-wide, e.g. a parameter — emitted as no `scope`).
+  int scope_start_line;
+  int scope_end_line;
 };
 
 // Global variable can be initialized either by a constant expression
