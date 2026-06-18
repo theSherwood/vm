@@ -19,8 +19,8 @@
 #![allow(dead_code)] // not every helper is used by both includers
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, SHADOW_BASE, SHADOW_SP_OFF,
-    STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after, init_durable_window, read_state, transform_module, write_state, SHADOW_BASE,
+    SHADOW_SP_OFF, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use svm_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, ValType};
@@ -511,6 +511,209 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
         r_thaw,
         Ok(base),
         "thawed fiber run must equal the uninterrupted run"
+    );
+    assert_eq!(
+        read_state(&final_win),
+        STATE_NORMAL,
+        "thaw must flip the state word back to NORMAL"
+    );
+}
+
+// ---- Recycling churn generator + freeze/thaw property (recycling step 4) ----
+//
+// A fiber'd module that **recycles a slot before freezing**: the root creates + finishes
+// `throwaways` (1..=3) fibers — each reuses the lowest free slot (slot 0) and returns without
+// suspending, bumping that slot's generation — so the *next* `cont.new` lands the real fiber B in
+// slot 0 at generation `throwaways`. The freeze is then armed (`arm_freeze_after`) to land with B
+// parked after its first suspend, so the residue carries a **recycled** (generation > 0) fiber. This
+// is the path the freeze-before-start harness can't reach (a recycled parked fiber needs a prior
+// fiber-finish, i.e. a prior safepoint). A = func 2 (finishes), B = func 1 (the §12.8 fiber).
+
+/// A generated recycling-churn module plus the freeze arming the generator computed for it.
+pub struct RecycleModule {
+    pub module: Module,
+    /// `arm_freeze_after` count that lands the freeze with B parked after its first suspend:
+    /// `throwaways` resume safepoints (the throwaways finish, no suspend) + B's resume#1 + B's
+    /// suspend#1.
+    pub arm: i64,
+    /// B's slot generation at the freeze (== `throwaways`): slot 0 was recycled that many times.
+    pub generation: u64,
+}
+
+/// The root for a recycling-churn module `() -> (i64)` (see the section comment): create+finish
+/// `throwaways` fibers (func 2), then create + resume the real fiber B (func 1) `suspends + 1`
+/// times, summing every delivered value (the throwaways' returns + B's), all live across the
+/// resumes so the freeze/thaw must reload them.
+fn gen_recycle_root(g: &mut Gen, throwaways: u32, suspends: u32) -> Func {
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut next = 0u32;
+    insts.push(Inst::RefFunc { func: 2 }); // A: finishes immediately (recycles its slot)
+    let v_fa = next;
+    next += 1;
+    insts.push(Inst::RefFunc { func: 1 }); // B: the real fiber
+    let v_fb = next;
+    next += 1;
+    insts.push(Inst::ConstI64(4096)); // shared data-stack base (unused by the interp)
+    let v_sp = next;
+    next += 1;
+
+    let mut vals: Vec<u32> = Vec::new();
+    // Throwaway cycles: each creates A in the lowest free slot (slot 0) and resumes it once; A
+    // returns without suspending, so the slot frees and its generation bumps before the next cycle.
+    for _ in 0..throwaways {
+        insts.push(Inst::ContNew {
+            func: v_fa,
+            sp: v_sp,
+        });
+        let k = next;
+        next += 1;
+        insts.push(Inst::ConstI64(g.u64v() as i64));
+        let a = next;
+        next += 1;
+        insts.push(Inst::ContResume { k, arg: a });
+        next += 1; // status (i32)
+        let val = next; // delivered value (A's return)
+        next += 1;
+        vals.push(val);
+    }
+    // The real fiber B reuses slot 0 at generation `throwaways`; resume it `suspends + 1` times.
+    insts.push(Inst::ContNew {
+        func: v_fb,
+        sp: v_sp,
+    });
+    let kb = next;
+    next += 1;
+    for _ in 0..(suspends + 1) {
+        insts.push(Inst::ConstI64(g.u64v() as i64));
+        let a = next;
+        next += 1;
+        insts.push(Inst::ContResume { k: kb, arg: a });
+        next += 1; // status (i32)
+        let val = next; // delivered value (i64)
+        next += 1;
+        vals.push(val);
+    }
+    // Sum every delivered value (kept live across all the resumes).
+    let mut acc = vals[0];
+    for &v in &vals[1..] {
+        insts.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: total_binop(g),
+            a: acc,
+            b: v,
+        });
+        acc = next;
+        next += 1;
+    }
+    Func {
+        params: vec![],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![],
+            insts,
+            term: Terminator::Return(vec![acc]),
+        }],
+    }
+}
+
+/// A recycling-churn module `[root, fiberB, fiberA]` (B suspends `1..=3` times; the slot is
+/// recycled `1..=3` times first), with the freeze arming + expected generation the driver needs.
+pub fn gen_recycle_fiber_module(g: &mut Gen) -> RecycleModule {
+    let throwaways = 1 + g.below(3); // 1..=3 recycle cycles → B lands at generation `throwaways`
+    let suspends = 1 + g.below(3); // 1..=3 (B's suspend count)
+    let root = gen_recycle_root(g, throwaways, suspends);
+    let fiber_b = gen_fiber_func(g, suspends); // func 1
+    let fiber_a = gen_fiber_func(g, 0); // func 2: zero suspends ⇒ finishes immediately
+    RecycleModule {
+        module: Module {
+            funcs: vec![root, fiber_b, fiber_a],
+            memory: Some(Memory {
+                size_log2: SIZE_LOG2,
+            }),
+            data: Vec::new(),
+            imports: Vec::new(),
+            debug_info: None,
+        },
+        arm: throwaways as i64 + 2,
+        generation: throwaways as u64,
+    }
+}
+
+/// The recycling freeze/thaw property (recycling step 4, interpreter): a slot is recycled to
+/// generation `throwaways`, the real fiber reuses it, and the **mid-run** armed freeze flattens that
+/// recycled (generation > 0) parked fiber; the residue carries the generation, and the thaw re-seeds
+/// + re-enters to reproduce the uninterrupted run.
+pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
+    let RecycleModule {
+        module: m,
+        arm,
+        generation,
+    } = gen_recycle_fiber_module(g);
+    let inst = transform_module(&m).expect("an in-scope recycling fiber module must transform");
+    svm_verify::verify_module(&inst).expect("instrumented recycling IR must verify");
+
+    // (1) inert in NORMAL: un-instrumented == instrumented (NORMAL).
+    let r_orig = {
+        let mut h = Host::new();
+        let mut fuel = 1_000_000u64;
+        run_with_host(&m, 0, &[], &mut fuel, &mut h)
+    };
+    let r_base = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r
+    };
+    assert_eq!(r_orig, r_base, "instrumentation must be inert in NORMAL");
+    let base = r_base.expect("generated recycling programs are trap-free");
+
+    // (2) freeze, armed mid-run so the recycled fiber B is parked when the root unwinds.
+    let (r_freeze, snap, frozen) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut win = init_durable_window(WINDOW);
+        arm_freeze_after(&mut win, arm);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        (r, snap, h.frozen_fibers().to_vec())
+    };
+    assert!(r_freeze.is_ok(), "freeze returns a placeholder, not a trap");
+    assert_eq!(
+        read_state(&snap),
+        STATE_UNWINDING,
+        "the armed run promoted itself to UNWINDING at the recycled fiber's suspend"
+    );
+    assert_eq!(frozen.len(), 1, "the recycled fiber B was flattened");
+    assert_eq!(
+        (frozen[0].slot, frozen[0].generation),
+        (0, generation),
+        "B = recycled slot 0 at the bumped generation"
+    );
+
+    // (3) thaw: re-seed the residue (at its generation), re-enter under REWINDING; equals baseline.
+    let (r_thaw, final_win) = {
+        let mut win = snap.clone();
+        write_state(&mut win, STATE_REWINDING);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_frozen_fibers(frozen);
+        let mut fuel = 1_000_000u64;
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h)
+    };
+    assert_eq!(
+        r_thaw,
+        Ok(base),
+        "thawed recycled-fiber run must equal the uninterrupted run"
     );
     assert_eq!(
         read_state(&final_win),

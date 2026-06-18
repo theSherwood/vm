@@ -33,7 +33,7 @@
 //!   rather than corrupting globals. Int/array/string/zero initializers serialize to bytes.
 //! - **F — floats.** `f32`/`f64` arithmetic/`fneg`/`fcmp`/`select`, the int↔float and f32↔f64
 //!   conversions (`fptosi`/`sitofp`/`fpext`/`fptrunc`, float→int saturating per §3b), `bitcast`,
-//!   and the common float math intrinsics (`fmuladd`/`fma` unfused, `sqrt`/`fabs`/`floor`/…) lowered
+//!   and the common float math intrinsics (`fma` → the shared fused-FMA op, `fmuladd` unfused, `sqrt`/`fabs`/`floor`/…) lowered
 //!   inline. (Ordered/unordered fcmp collapse — the NaN corner is a documented fidelity gap.)
 //! - **G — indirect calls.** Taking a function's address yields its §3c funcref index (widened to
 //!   the `i64` pointer rep); an indirect `call` truncates the function-pointer value to the `i32`
@@ -133,7 +133,7 @@
 //!   `v128`: `load`/`store` → `v128.load`/`store`; `fadd`/`fmul`/… → `f32x4` `VFloatBin`;
 //!   `extractelement`/`insertelement` → extract/replace lane; `shufflevector` → an `i8x16.shuffle`
 //!   byte mask (the all-equal mask is a splat); vector constants → `ConstV128`; `llvm.fmuladd.v4f32`
-//!   → `f32x4` mul+add (unfused). (2-lane vectors stay scalarized to `i64` — they're 8 bytes.) Lands
+//!   → `f32x4` mul+add (unfused; `llvm.fma.v4f32` → the shared `Inst::VFma`). (2-lane vectors stay scalarized to `i64` — they're 8 bytes.) Lands
 //!   the **`mat4`** demo (a 4×4 × vec4 transform) byte-identical to native.
 //! - **Z — `llvm.bswap`.** Byte-reverse synthesized inline (no SVM op): each source byte `i` →
 //!   destination byte `nbytes-1-i` via shift/mask/or (`i16`/`i32`/`i64`). Lands the **`crc32`** demo
@@ -149,7 +149,7 @@
 //!   approximations) — no new lowering, and no host math capability (the on-ramp keeps math in the
 //!   sandbox). This is the key to a clean differential: native `cc` compiles the same guest `libm`,
 //!   so every value is bit-identical (the only machine ops in play — `sqrt`/`floor` (slices F/L),
-//!   `fmuladd` (unfused), `+−*∕` — are IEEE on both sides). Lands the **`raytrace`** demo (an ASCII
+//!   `fmuladd` (unfused), `fma` (fused, shared `Inst::VFma`/`Fma`), `+−*∕` — are IEEE on both sides). Lands the **`raytrace`** demo (an ASCII
 //!   sphere raytracer: `sqrt` intersection + guest `g_sin`/`g_exp` shading) byte-identical to native.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): `printf` `%s`/`%f`, zero-padded `%d`,
@@ -3137,11 +3137,11 @@ fn lower_vm_builtin(
             });
             let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the fiber's own data-stack base
             let r = ctx.push(Inst::ContNew { func, sp });
-            ctx.bind_dest(&c.dest, r); // i32 fiber handle
+            ctx.bind_dest(&c.dest, r); // i64 fiber handle (16-bit slot + 48-bit generation)
             Ok(true)
         }
         "__vm_fiber_resume" => {
-            let k = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let k = ctx.operand_i64(vm_arg(c, 0)?)?; // i64 fiber handle
             let arg = ctx.operand_i64(vm_arg(c, 1)?)?;
             let done = ctx.operand_i64(vm_arg(c, 2)?)?; // `int *done`
             let rs = ctx.push_multi(Inst::ContResume { k, arg }, 2); // (status, value)
@@ -4293,8 +4293,10 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Re
     Ok(true)
 }
 
-/// Lower a float math intrinsic call to inline float ops, returning its result index. `fmuladd`/
-/// `fma` lower to `fmul`+`fadd` (unfused — a defined IEEE approximation; both backends agree).
+/// Lower a float math intrinsic call to inline float ops, returning its result index. `llvm.fma`
+/// (IEEE-required fused) lowers to the shared fused-FMA op (`Inst::Fma`/`VFma`, the same op the wasm
+/// `relaxed_madd` emits — interp `mul_add` == JIT `fma`, and bit-equal to native libm `fma()`);
+/// `llvm.fmuladd` (contractible) stays unfused `fmul`+`fadd`, bit-equal to baseline native (no HW FMA).
 /// Returns `Ok(None)` if the call is not a recognized float intrinsic.
 fn lower_float_intrinsic(
     ctx: &mut BlockCtx,
@@ -4331,7 +4333,7 @@ fn lower_float_intrinsic(
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
     // A 128-bit float vector (`<4 x float>`/`<2 x double>`) → native `v128` lane-wise ops (§17) in
-    // the operand's shape. `fmuladd`/`fma` lower unfused.
+    // the operand's shape. `llvm.fma` → the shared fused `Inst::VFma`; `llvm.fmuladd` → unfused mul+add.
     if let Some(shape) = args
         .first()
         .and_then(|a| vec128_shape(a.get_type(types).as_ref()))
@@ -4352,7 +4354,24 @@ fn lower_float_intrinsic(
             "llvm.fabs" => un(ctx, VU::Abs)?,
             "llvm.minnum" | "llvm.minimum" => bin(ctx, VB::Min)?,
             "llvm.maxnum" | "llvm.maximum" => bin(ctx, VB::Max)?,
-            "llvm.fmuladd" | "llvm.fma" => {
+            // `llvm.fma` is IEEE-required fused → the shared fused-FMA primitive (`Inst::VFma`; the
+            // same op the wasm frontend's `relaxed_madd` emits, interp `mul_add` == JIT `fma`). This
+            // also matches native's libm `fma()`. `llvm.fmuladd` is *contractible*: on a baseline
+            // target (no hardware FMA) native lowers it to mul+add, so we keep it unfused to stay
+            // bit-equal to the native oracle.
+            "llvm.fma" => {
+                let a = ctx.operand(args[0])?;
+                let bb = ctx.operand(args[1])?;
+                let cc = ctx.operand(args[2])?;
+                ctx.push(Inst::VFma {
+                    shape,
+                    neg: false,
+                    a,
+                    b: bb,
+                    c: cc,
+                })
+            }
+            "llvm.fmuladd" => {
                 let prod = bin(ctx, VB::Mul)?;
                 let cc = ctx.operand(args[2])?;
                 ctx.push(Inst::VFloatBin {
@@ -4405,11 +4424,25 @@ fn lower_float_intrinsic(
                 };
                 (bin(ctx, 0), bin(ctx, 1))
             }
-            // fmuladd(a,b,c) = a*b + c, lowered unfused (per lane).
-            "llvm.fmuladd" | "llvm.fma" => {
+            // `llvm.fma` → fused per lane (`Inst::Fma`, matches native libm); `llvm.fmuladd` → unfused
+            // mul+add per lane (matches baseline native, no hardware FMA). See the vec128 path.
+            "llvm.fma" => {
                 let lb = vec_explode(ctx, args[1], types, false)?;
                 let lc = vec_explode(ctx, args[2], types, false)?;
                 let fma = |ctx: &mut BlockCtx, k: usize| {
+                    ctx.push(Inst::Fma {
+                        ty: lane_ty,
+                        a: la[k],
+                        b: lb[k],
+                        c: lc[k],
+                    })
+                };
+                (fma(ctx, 0), fma(ctx, 1))
+            }
+            "llvm.fmuladd" => {
+                let lb = vec_explode(ctx, args[1], types, false)?;
+                let lc = vec_explode(ctx, args[2], types, false)?;
+                let madd = |ctx: &mut BlockCtx, k: usize| {
                     let prod = ctx.push(Inst::FBin {
                         ty: lane_ty,
                         op: FBinOp::Mul,
@@ -4423,7 +4456,7 @@ fn lower_float_intrinsic(
                         b: lc[k],
                     })
                 };
-                (fma(ctx, 0), fma(ctx, 1))
+                (madd(ctx, 0), madd(ctx, 1))
             }
             _ => return unsup(format!("vec2 float intrinsic `{base}`")),
         };
@@ -4452,8 +4485,15 @@ fn lower_float_intrinsic(
         "llvm.minnum" | "llvm.minimum" => bin2(ctx, FBinOp::Min)?,
         "llvm.maxnum" | "llvm.maximum" => bin2(ctx, FBinOp::Max)?,
         "llvm.copysign" => bin2(ctx, FBinOp::Copysign)?,
-        // fmuladd(a,b,c) = a*b + c, lowered unfused.
-        "llvm.fmuladd" | "llvm.fma" => {
+        // `llvm.fma` → the shared fused-FMA primitive (`Inst::Fma`, matches native libm `fma()`).
+        "llvm.fma" => {
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let c = ctx.operand(args[2])?;
+            ctx.push(Inst::Fma { ty, a, b, c })
+        }
+        // `llvm.fmuladd` is contractible → unfused mul+add, bit-equal to baseline native (no HW FMA).
+        "llvm.fmuladd" => {
             let a = ctx.operand(args[0])?;
             let b = ctx.operand(args[1])?;
             let prod = ctx.push(Inst::FBin {
@@ -4462,12 +4502,12 @@ fn lower_float_intrinsic(
                 a,
                 b,
             });
-            let cc = ctx.operand(args[2])?;
+            let c = ctx.operand(args[2])?;
             ctx.push(Inst::FBin {
                 ty,
                 op: FBinOp::Add,
                 a: prod,
-                b: cc,
+                b: c,
             })
         }
         _ => return Ok(None),

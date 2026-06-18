@@ -775,8 +775,150 @@ need per-parent join-table residue); shallow stacks (the unwind guard is reserve
 capping is unenforced); and `context = task id` bounds a durable domain to ~15 *lifetime* spawns (a dense
 live-context allocator is the fix). JIT parity is 3.3's multi-vCPU follow-up.
 
-Remaining: **multi-vCPU proper** (3.2.2 — the fiber/vCPU context unification, nested spawns, dense
-context allocation; JIT parity) and **Phase 4** back-edge polls for bounded-latency (async) freeze.
+**[~] Slice 3.2.2 — vCPU + fiber context unification (collision fix; interp).** A durable domain may
+now have spawned vCPUs **and** live fibers at once. Fibers keep growing **up** from context 1
+(`slot+1`, untouched — preserves cross-backend artifact parity, since the JIT mirrors that formula),
+and spawned vCPUs grow **down** from `MAX_SHADOW_CTX`; the two pools share the reserve and a capacity
+guard (`fibers + vcpus <= MAX_SHADOW_CTX`) refuses cleanly (`FiberFault`/`ThreadFault`) before they
+meet — never an overlap. Contexts stay *derived* from slot/task (reproduced deterministically on thaw),
+so no snapshot-format change and no new residue fields. The `FiberRegistry` gained a vCPU-context
+counter (`reserve_vcpu_context` hands out the next top-down region under the lock; `cont.new`
+cross-checks the combined bound; thaw re-seeds the count). Tested: a root that owns a fiber **and**
+spawns a vCPU freezes/thaws correctly, in-memory (`svm-durable/tests/multivcpu.rs`) and through the
+codec (the control section carries both fiber and vCPU residue; canonical re-freeze stays
+byte-identical — `svm-snapshot/tests/roundtrip.rs`). Cross-backend parity unaffected (fibers unchanged;
+the JIT has no multi-vCPU durable path yet).
+
+Remaining for 3.2: **context recycling** (the next sub-slice — lifts the `MAX_SHADOW_CTX` lifetime cap),
+**nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and **JIT multi-vCPU
+parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze.
+
+##### Context recycling plan (next sub-slice)
+
+Today neither backend recycles fiber slots or vCPU contexts (they grow monotonically), so a long-lived
+durable domain that churns fibers/threads eventually exhausts the `MAX_SHADOW_CTX` (~15) reserve. Lifting
+that needs recycling, which is **only safe with generation-carrying handles** — a freed slot/context can
+be reused, so a stale or forged handle to the old occupant must be rejected, not silently aliased to the
+new one. This is a **cross-backend** change (both registries + the snapshot format), best done in its own
+sequenced slice:
+
+1. **Generation-carrying fiber handles (both backends).** Make a fiber handle `(generation, slot)` and
+   validate the generation on `cont.resume`/`thread.join`-style use; bump the generation when a slot is
+   freed. Carry the generation in the handle namespace (matching the loom-checked `Ownership` protocol).
+   *Behavior-preserving until step 3.*
+   - **[~] Interp side done.** The interp registry carries a per-slot generation (`RegState::gens`); a
+     guest handle is `(generation << FIBER_GEN_SHIFT) | slot` (slot in the low 16 bits, since
+     `MAX_FIBERS = 1<<16`); `cont.resume`'s `claim` rejects a generation mismatch. All generations are 0
+     until step 3, so a handle is exactly its slot — byte-identical to before and to the JIT. Pinned by
+     `svm-durable/tests/fiber.rs::forged_fiber_generation_is_rejected`. Cross-backend parity unaffected.
+   - **[~] JIT side done.** `svm-jit`'s `fiber_rt` `cont.new` now emits `(generation << FIBER_GEN_SHIFT)
+     | slot` (`generation()` of the fresh slot — 0) and `cont.resume` claims via the new generation-
+     checked `Ownership::claim_gen(handle_gen)` instead of `claim` (which read the generation from the
+     current word and so couldn't reject a stale handle). Behavior-preserving at generation 0
+     (handle == slot); cross-backend parity verified (`durable_jit`/`durable_fibers_jit` byte-identical).
+     Loom re-checked: `loom_claim_gen_is_exclusive_across_threads` (single-owner still holds — the
+     generation check only *adds* a reject), plus `claim_gen_rejects_a_stale_generation` /
+     `claim_gen_matches_claim_at_generation_zero`. `claim` is retained (`#[allow(dead_code)]`) as the
+     ungated primitive + ABA characterization.
+
+   With step 1 complete on both backends, **step 3** (recycle-on-finish) can wire `recycle_owned` on the
+   live path: a finished slot's generation is already bumped, the handle carries it, and the claim
+   rejects stale handles — so reuse is now ABA-safe. *(Resolved in step 3: the JIT freeze driver's
+   `runnable_handles()` now encodes the generation and `fiber_region_base` is only ever passed a real
+   resolved slot — never a raw handle — so the freeze/thaw path is generation-correct on both backends.
+   The wired JIT `cont.resume` → `resolve` + `claim_gen` ABA guard is pinned end-to-end against the
+   interpreter oracle by `jit_fibers.rs::{fiber_forged_generation_faults_identically,
+   recycled_slot_generation_guard_agrees}`, and the recycled freeze/thaw path by the step-4 fuzz.)*
+2. **[x] Snapshot format: carry generations — done, end-to-end (interp).** `FrozenFiber` (both backends)
+   gains a `generation`; the freeze records it (interp `registry.generation(slot)`, JIT
+   `slot.own.generation()` read before `finish` bumps it), the control section carries it (format **v2**,
+   one uleb per fiber), and `seed_frozen` re-seeds at it (interp `gens[slot]`, JIT
+   `Ownership::new_owned_at`) — so a thaw of a recycled fiber re-establishes the generation its guest
+   handle expects. With the **mid-run freeze trigger** now in place (below), this is exercised end-to-end:
+   `svm-snapshot/tests/roundtrip.rs::recycled_fiber_freeze_serialize_restore_thaw_through_the_codec`
+   recycles slot 0 (fiber A finishes → generation 1), parks fiber B there, freezes mid-run, and confirms
+   B is flattened + re-seeded at generation 1 and the thaw round-trips (also pinned at the codec leg by
+   `fiber_residue_generation_round_trips_through_the_codec`). The JIT leg now matches (step 4): both
+   backends armed-freeze the recycled fiber to a byte-identical artifact that thaws on either.
+3. **[~] Recycle on finish — done, both backends.** A finished fiber's slot returns to a per-registry
+   **min-heap** free list (`free`), and `cont.new` reuses the lowest free slot before growing — so the
+   table is bounded by *peak concurrent* fibers, not the lifetime total, lifting the `MAX_SHADOW_CTX`
+   cap to *concurrent* fibers. The reused slot keeps its bumped generation (interp keeps `gens[slot]`;
+   the JIT replaces the slot's `Ownership` via `new_owned_at(gen)`), so a stale handle to the former
+   occupant fails `claim`/`claim_gen` — the ABA guard from step 1. The JIT freeze driver's
+   `runnable_handles()` now encodes the generation and `resolve` returns the slot index (so
+   `fiber_region_base` uses the real slot, not the raw handle). Pinned by
+   `recycling_reuses_a_freed_slot_with_a_bumped_generation` (interp) and the cross-backend `fiber_fuzz`
+   churn differential. Two shadow-routing tests were updated so their fibers `suspend` (stay
+   concurrently live) rather than return — otherwise the second fiber would reuse the first's freed
+   region. *(vCPU-context recycling — a joined `thread.spawn` child's top-down context — is a smaller
+   follow-up; the durable cap that bites is fibers, handled here.)*
+4. **[x] Cross-backend parity + fuzz — done.** The recycled freeze/thaw leg is exercised on both
+   backends, both hand-written and **fuzzed**:
+   - *Pinned:* `svm/tests/durable_fibers_jit.rs::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
+     arms both backends to freeze a recycled (generation 1) parked fiber at the same safepoint,
+     confirms a **byte-identical durable reserve + residue**, and **thaws the artifact on the JIT**.
+   - *Fuzzed:* a recycling-churn generator (`durgen::gen_recycle_fiber_module` — recycle a slot 1..=3
+     times → the real fiber lands at generation 1..=3, parked, frozen mid-run via `arm_freeze_after`)
+     drives two properties: `durgen::fuzz_recycle_fiber_one` (interpreter freeze→thaw equals the
+     uninterrupted run, residue carries the bumped generation) over 400 seeds in
+     `durable_fuzz.rs`, and `durjit::fuzz_recycle_fiber_one_xbackend` (interp/JIT armed-freeze to a
+     byte-identical reserve + §12 artifact, then thaw on the JIT) over 64 seeds in `durable_jit.rs`.
+     LibFuzzer targets `durable_recycle` / `durable_recycle_jit` do the heavy continuous run.
+
+### Mid-run freeze trigger ("freeze after N safepoints") — DONE (both backends)
+
+The freeze mechanism unwinds at the first poll that observes `UNWINDING`. The before-start harness sets
+that word *before* the run, so it can only freeze at the very **first** safepoint — too early to ever
+hold a recycled (generation > 0) parked fiber, which needs a prior fiber-finish (a prior safepoint).
+
+A new **`STATE_ARMED`** state value + an **`ARM_COUNTDOWN_OFF`** window word (in the reserve's unused
+`[16, 64)` gap) make the freeze land *mid-run*, deterministically: `arm_freeze_after(win, N)` writes
+`ARMED` + countdown `N`; the runtime decrements the countdown at each **fiber safepoint**
+(`cont.resume`/`suspend`) and, at 0, promotes the word to `UNWINDING` so that op's trailing poll begins
+the freeze. `ARMED` is **transparent** to the instrumented IR — every emitted poll/prologue tests only
+`UNWINDING`/`REWINDING`, so an armed run reads as `NORMAL` until promotion, and an *unarmed* run never
+touches the countdown (byte-identical to before). The interpreter ticks at its per-op dispatch; the JIT
+ticks in the `fiber_resume`/`fiber_suspend` thunks (`window_tick_arm`, gated on `FiberRuntime::durable`).
+**Both backends count the same set — the fiber ops, routed through runtime thunks** — so an armed freeze
+lands at the same safepoint on each (cross-backend parity, which the recycled round-trip test pins).
+`cap.call` is deliberately **not** counted: the JIT's cap.call thunk is host-supplied (no cross-backend
+choke), a cap.call freeze is already reachable at the first safepoint, and the production async trigger
+covers general mid-run freeze. This also models that production path (an async controller flipping
+`UNWINDING` from another OS thread, picked up at the next poll — the existing mechanism already handles
+that; what was missing was a *deterministic single-threaded* way to test it). Constants are cross-checked
+in `layout_abi.rs`; placement is pinned by `svm-durable/tests/freeze_trigger.rs` (arm-after-N freezes
+after exactly N fiber safepoints; arming past the last runs to completion; an unarmed run is untouched).
+Note this is the **deterministic test trigger**, not the bounded-latency STW story (Phase 4's back-edge
+polls + `Blocking.work` cancellation — see the latency caveat); a poll-free compute loop still won't
+reach a safepoint.
+
+**Recycling status — DONE (all four steps, both backends).** Steps 1 + 3 give complete **non-durable**
+slot recycling (table bounded by peak concurrent fibers, ABA-guarded by generation-carrying handles);
+step 2 carries the generation through the snapshot format; the mid-run freeze trigger makes a recycled
+*durable* freeze/thaw round-trip reachable; and step 4 exercises it on both backends, hand-written and
+fuzzed (byte-identical artifacts). The arc is complete — no recycling follow-ups remain.
+
+### Fiber handles are `i64` (48-bit generation) — DONE (both backends)
+
+The fiber guest handle widened from `i32` to **`i64`**: 16-bit slot (`MAX_FIBERS = 1<<16`) + **48-bit
+generation**. The ABA guard's generation field was only 16 bits while the handle was an `i32`, so a
+stale handle to a slot recycled exactly a multiple of 2¹⁶ times could falsely re-match (memory-safe and
+domain-local — the wrong *own* continuation — but a real violation of the "stale handles fault"
+invariant, and 65536 is small for a forever-running durable service). 48 bits moves wraparound to 2⁴⁸
+recycles — unreachable in practice (centuries even at 10⁶ finishes/s).
+
+The change is a type-system change anchored at the verifier (`cont.new` yields `i64`; `cont.resume`'s
+handle operand is `i64`; the `status` result stays `i32`), mirrored through **three** value-type
+copies — `svm-verify`, the `svm-durable` transform's own `result_types` (used to spill/reload the
+handle across suspends), and both backends' runtime/codegen — plus the `FIBER_GEN_MASK` /
+`FIBER_HANDLE_GEN_MASK` widening (interp + JIT), the `FrozenFiber.generation` field (`u32`→`u64`), and
+the C/LLVM on-ramps (`int64_t` handle; chibicc widens the resume handle, mirroring svm-llvm
+`operand_i64`). **Snapshot format bumped to v3:** the residue generation alone is wire-compatible
+(`uleb`), but a handle held live across a suspend now spills **8** bytes in the shadow stack instead of
+4 — the window-image layout changed, so a v2 artifact would mis-thaw and is rejected. Covered by the
+existing fiber/recycling suites (all migrated to `i64` handles): `jit_fibers`, `fiber_fuzz`,
+`fiber_migrate`, `durable`/`durable_jit` recycle fuzz, the C-frontend fiber demos, and the LLVM on-ramp.
 
 #### 3.1 implementation plan (next-session pickup)
 

@@ -18,8 +18,8 @@
 #include <stdlib.h>
 
 /* VM fiber primitive (cont.* — a stackful coroutine; see DESIGN.md §23). */
-int  __vm_fiber_new(long (*f)(long), void *stack);
-long __vm_fiber_resume(int k, long arg, int *done);
+long __vm_fiber_new(long (*f)(long), void *stack);
+long __vm_fiber_resume(long k, long arg, int *done);
 long __vm_fiber_suspend(long value);
 /* VM atomic primitive (the `<stdatomic.h>` macros are non-atomic stand-ins; this is the real one). */
 long __vm_atomic_add(void *p, long v); /* lock-free fetch-add over the shared window; returns old */
@@ -46,7 +46,7 @@ static long task(long arg) {
 
 /* One worker's cooperative scheduler: round-robin every runnable fiber until all have returned. */
 static void run_scheduler(char **stacks, int ntasks) {
-  int handles[TASKS_PER_WORKER];
+  long handles[TASKS_PER_WORKER];
   char done[TASKS_PER_WORKER];
   for (int i = 0; i < ntasks; i++) {
     done[i] = 0;
