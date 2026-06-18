@@ -8,8 +8,8 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{
-    BinOp, Block, CmpOp, Data, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator,
-    ValType,
+    BinOp, Block, CmpOp, Data, FBinOp, FloatTy, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp,
+    Terminator, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -707,4 +707,146 @@ fn overlay_bytes_drive_folding() {
         .iter()
         .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Load { .. }))));
     assert_eq!(run(&folded, &[]), Ok(vec![Value::I64(value)]));
+}
+
+// ===========================================================================================
+// Widened coverage: a *float* bytecode interpreter. The float arithmetic isn't constant-folded
+// (the engine tracks integer constants only), but it passes through to the residual faithfully,
+// so dispatch is still eliminated — the residual is the compiled float computation.
+// ===========================================================================================
+
+// 9 bytes/instruction (opcode + ignored i64 immediate). State: an f64 accumulator `facc`.
+const F_HALT: u8 = 0; //      return facc
+const F_ADDSELF: u8 = 1; //   facc = facc + facc
+const F_SQ: u8 = 2; //        facc = facc * facc
+
+fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
+    let f64t = || ValType::F64;
+    let i64t = || ValType::I64;
+    let iadd = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let fbin = |op, a, b| Inst::FBin {
+        ty: FloatTy::F64,
+        op,
+        a,
+        b,
+    };
+
+    // 0 — entry(finput): facc = finput, pc = 0.
+    let entry = Block {
+        params: vec![f64t()],           // 0: finput
+        insts: vec![Inst::ConstI64(0)], // 1: pc
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 0], // header(facc = finput, pc, finput)
+        },
+    };
+    // 1 — header(facc, pc, finput): decode the opcode and dispatch.
+    let header = Block {
+        params: vec![f64t(), i64t(), f64t()], // 0: facc, 1: pc, 2: finput
+        insts: vec![
+            Inst::ConstI64(0), // 3: base
+            iadd(3, 1),        // 4: addr = base + pc
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 4,
+                offset: 0,
+                align: 0,
+            }, // 5: op
+        ],
+        term: Terminator::BrTable {
+            idx: 5,
+            targets: vec![
+                (2, vec![0]),       // HALT     -> halt(facc)
+                (3, vec![0, 1, 2]), // ADDSELF  -> addself(facc, pc, finput)
+                (4, vec![0, 1, 2]), // SQ       -> sq(facc, pc, finput)
+            ],
+            default: (2, vec![0]),
+        },
+    };
+    // 2 — halt(facc).
+    let halt = Block {
+        params: vec![f64t()],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    // A float op then pc += 9: params (facc, pc, finput).
+    let fstep = |op: FBinOp| Block {
+        params: vec![f64t(), i64t(), f64t()],
+        insts: vec![
+            fbin(op, 0, 0),    // 3: nfacc = facc `op` facc
+            Inst::ConstI64(9), // 4
+            iadd(1, 4),        // 5: npc = pc + 9
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![3, 5, 2],
+        },
+    };
+    let addself = fstep(FBinOp::Add);
+    let sq = fstep(FBinOp::Mul);
+
+    Module {
+        funcs: vec![Func {
+            params: vec![f64t()],
+            results: vec![f64t()],
+            blocks: vec![entry, header, halt, addself, sq],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: true,
+            bytes: encode(program),
+        }],
+        ..Default::default()
+    }
+}
+
+fn run_f64(m: &Module, x: f64) -> f64 {
+    let mut fuel = 10_000_000u64;
+    match svm_interp::run(m, 0, &[Value::F64(x)], &mut fuel) {
+        Ok(v) => match v.as_slice() {
+            [Value::F64(r)] => *r,
+            o => panic!("unexpected float result {o:?}"),
+        },
+        Err(t) => panic!("interp trapped: {t:?}"),
+    }
+}
+
+#[test]
+fn specializes_float_interpreter() {
+    // facc = finput; ADDSELF -> 2*finput; SQ -> (2*finput)^2 = 4*finput^2.
+    let program = [(F_ADDSELF, 0), (F_SQ, 0), (F_HALT, 0)];
+    let interp = build_float_interpreter(&program);
+    verify_module(&interp).expect("interpreter verifies");
+
+    let residual = specialize(&interp, 0, &[SpecArg::Dynamic]).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+
+    // Dispatch is gone (no opcode loads, no br_table), but the float ops remain — the residual
+    // *is* the compiled float computation.
+    assert_no_dispatch_left(&residual);
+    assert!(
+        residual.funcs[0]
+            .blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::FBin { .. }))),
+        "the residual should carry the float arithmetic"
+    );
+
+    for x in [0.0f64, 0.5, 1.5, 2.5, 3.0, -4.0] {
+        let expect = (2.0 * x) * (2.0 * x);
+        assert_eq!(run_f64(&interp, x), expect, "interp at {x}");
+        assert_eq!(run_f64(&residual, x), expect, "residual at {x}");
+        // The float residual also JIT-compiles to native (f64 passed/returned as raw bits).
+        let jit = match svm_jit::compile_and_run(&residual, 0, &[x.to_bits() as i64]) {
+            Ok(svm_jit::JitOutcome::Returned(v)) => f64::from_bits(v[0] as u64),
+            o => panic!("unexpected jit outcome {o:?}"),
+        };
+        assert_eq!(jit, expect, "jit residual at {x}");
+    }
 }

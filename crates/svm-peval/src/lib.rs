@@ -49,9 +49,10 @@
 //! traps — including a randomized fuzz over dead-heavy arithmetic DAGs that stresses the
 //! renumbering/remapper.
 //!
-//! **Still out of scope** (later increments): float constant folding (NaN/rounding fidelity),
-//! and broadening the specializer's instruction coverage (calls, SIMD, atomics). Value-stack
-//! renaming for memory-backed interpreters is done — see [`mod@specialize`] (Stage 2).
+//! **Still out of scope** (later increments): float/SIMD *constant folding* (they pass through to
+//! the residual but aren't folded — NaN/rounding fidelity), narrow (`i8`/`i16`) renameable cells,
+//! and cross-function specialization (`call`). Value-stack renaming for memory-backed interpreters
+//! is done — see [`mod@specialize`] (Stage 2).
 
 use svm_ir::{
     BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,

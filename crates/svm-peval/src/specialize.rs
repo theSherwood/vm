@@ -43,10 +43,13 @@
 //! re-verified before it runs. The differential harness (`tests/specialize.rs`) is the spec —
 //! the residual must equal the interpreter on the reference interpreter for every input.
 //!
-//! **Scope.** The engine specializes the integer / const / load / store / branch subset a
-//! stack- or accumulator-style interpreter needs; an instruction outside that subset (calls,
-//! floats, SIMD, atomics, fibers, …), or a memory access it can't resolve, returns
-//! [`SpecError::Unsupported`] rather than guessing.
+//! **Scope.** Integer / const / load / store / branch ops are specialized (folded where the
+//! operands are constant). Other **pure, single-result** value ops — float and SIMD arithmetic,
+//! casts, conversions, pointer ops — are emitted faithfully into the residual even though they are
+//! not constant-folded (the engine tracks integer constants only), so dispatch is still eliminated
+//! around them. Effectful, multi-result, or cross-function ops (calls, atomics, fibers/threads),
+//! and memory accesses the engine can't resolve, return [`SpecError::Unsupported`] rather than
+//! guessing.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -404,7 +407,15 @@ impl Spec<'_> {
                 align,
             } => return self.eval_store(op, addr, value, offset, align, env, mem, out, rnext),
 
-            _ => return Err(SpecError::Unsupported),
+            // Any other pure, single-result value op (float arithmetic, casts, conversions, SIMD,
+            // pointer ops, …) is emitted faithfully into the residual — folded constants flow in as
+            // operands, dynamics pass through. Effectful / multi-result / memory / call ops are not
+            // handled here and fall through to Unsupported.
+            _ => {
+                let abs =
+                    emit_residual_pure(inst, env, out, rnext).ok_or(SpecError::Unsupported)?;
+                return Ok(Some(abs));
+            }
         };
         Ok(Some(abs))
     }
@@ -659,6 +670,31 @@ impl Spec<'_> {
         let id = self.intern(target, params, mem_pat);
         (id, dyn_args)
     }
+}
+
+/// Emit a pure, single-result value op faithfully into the residual: materialize each operand
+/// (a constant becomes a `const`; a dynamic reuses its residual value), then clone the op with its
+/// operands rewritten. Returns `None` for anything not a pure value op (memory / call / effectful /
+/// multi-result), which the caller turns into [`SpecError::Unsupported`].
+///
+/// "Pure value op" reuses the optimizer's [`crate::is_removable_if_dead`] whitelist (all such ops
+/// are single-result and side-effect-free), plus the trapping-but-deterministic float→int
+/// conversion, which is safe to emit residually (it traps at run time exactly as the source would).
+fn emit_residual_pure(
+    inst: &Inst,
+    env: &[Abs],
+    out: &mut Vec<Inst>,
+    rnext: &mut u32,
+) -> Option<Abs> {
+    if !(crate::is_removable_if_dead(inst) || matches!(inst, Inst::FToITrap { .. })) {
+        return None;
+    }
+    let mut clone = inst.clone();
+    crate::map_operands(&mut clone, &mut |old| {
+        materialize(env[old as usize], out, rnext)
+    });
+    out.push(clone);
+    Some(Abs::Dyn(bump(rnext)))
 }
 
 /// Turn an abstract value into a concrete residual SSA index, emitting a `const` for a constant.
