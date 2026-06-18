@@ -4332,6 +4332,36 @@ fn is_visible(inst: &Inst) -> bool {
 /// Drive a vCPU until it finishes (`Inner::Done`) or parks on a blocking op (`Inner::Park`). On
 /// re-entry it first completes the parked op recorded in `pending`. The owned `funcs` is borrowed
 /// locally as `fs` so the loop can mutate the other fields.
+/// Finish a memory-op result in the eval loop. Pushes the loaded value (if any). For a
+/// coroutine child's *recoverable* in-window page fault (`fault_yields`), it rewinds the op and
+/// returns `Some(Inner::CoFault)` so the loop suspends to the parent (which supplies the page)
+/// instead of trapping; any other fault propagates. `Ok(None)` means "handled, keep going". This
+/// is the one home for the §14 fault-driven-yield decision, shared by the fast-pathed memory ops
+/// and the `eval_inst` fallback so the logic isn't repeated per arm.
+#[inline]
+fn handle_mem(
+    r: Result<Option<Reg>, Trap>,
+    frame: &mut Frame,
+    fault_yields: bool,
+    mem: &Option<Mem>,
+) -> Result<Option<Inner>, Trap> {
+    match r {
+        Ok(Some(v)) => {
+            frame.vals.push(v);
+            Ok(None)
+        }
+        Ok(None) => Ok(None),
+        Err(Trap::MemoryFault) if fault_yields => match mem.as_ref().and_then(|m| m.take_fault()) {
+            Some(addr) => {
+                frame.inst -= 1; // re-execute the access on resume
+                Ok(Some(Inner::CoFault(addr)))
+            }
+            None => Err(Trap::MemoryFault),
+        },
+        Err(t) => Err(t),
+    }
+}
+
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
                               // Resuming from a park: finish the op the scheduler woke us for.
@@ -5500,24 +5530,47 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 Inst::RefFunc { func } => frames[top].vals.push(Reg::from_i32(*func as i32)),
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
+                // Fast-path the two common scalar memory ops out of the `eval_inst` call; the
+                // §14 fault-driven-yield handling is shared via `handle_mem`. The expensive part
+                // (confinement + page-protection in `Mem`) is unchanged — only the dispatch call
+                // is removed.
+                Inst::Load {
+                    op, addr, offset, ..
+                } => {
+                    let r = (|| -> Result<Option<Reg>, Trap> {
+                        let a = get_i64(&frames[top].vals, *addr)? as u64;
+                        let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                        Ok(Some(Reg::from_value(m.load(a, *offset, *op)?)))
+                    })();
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
+                    }
+                }
+                Inst::Store {
+                    op,
+                    addr,
+                    value,
+                    offset,
+                    ..
+                } => {
+                    let r = (|| -> Result<Option<Reg>, Trap> {
+                        let a = get_i64(&frames[top].vals, *addr)? as u64;
+                        let v = Value::I64(get(&frames[top].vals, *value)?.i64());
+                        mem.as_mut()
+                            .ok_or(Trap::Malformed)?
+                            .store(a, *offset, *op, v)?;
+                        Ok(None)
+                    })();
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
+                    }
+                }
+                // Everything else (other memory ops, SIMD, no-result/control): one `eval_inst`
+                // call, through the same fault-yield handling.
                 other => {
-                    match eval_inst(other, &frames[top].vals, mem) {
-                        Ok(Some(v)) => frames[top].vals.push(v),
-                        Ok(None) => {}
-                        // §14 fault-driven yield: a coroutine child's access to an unmapped page in its
-                        // window suspends to the parent (which supplies the page) instead of trapping.
-                        // `take_fault` is `Some` only for a *recoverable* in-window page fault (not an
-                        // out-of-window fault, which traps). Rewind to re-execute the access on resume.
-                        Err(Trap::MemoryFault) if fault_yields => {
-                            match mem.as_ref().and_then(|m| m.take_fault()) {
-                                Some(addr) => {
-                                    frames[top].inst -= 1;
-                                    return Ok(Inner::CoFault(addr));
-                                }
-                                None => return Err(Trap::MemoryFault),
-                            }
-                        }
-                        Err(t) => return Err(t),
+                    let r = eval_inst(other, &frames[top].vals, mem);
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
                     }
                 }
             }

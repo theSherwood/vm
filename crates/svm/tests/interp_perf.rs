@@ -125,9 +125,36 @@ fn bench(name: &str, src: &str, interp_big: i64, jit_big: i64) {
     println!("  ratio  : {:>9.1}x  (interp / jit)", i / j);
 }
 
+// acc = load(load(acc) stored at a fixed address) + i, for i in 0..n. Each iteration does an
+// i64 store + i64 load against linear memory, so this kernel exercises the memory-op path
+// (confinement + page-protection check + the `Mem` wrappers) rather than pure ALU dispatch.
+const MEM: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 8
+  i64.store v10 v8
+  v11 = i64.load v10
+  v12 = i64.add v11 v9
+  v13 = i64.const 1
+  v14 = i64.add v9 v13
+  br block1(v7, v12, v14)
+block3(v15: i64):
+  return v15
+}
+"#;
+
 #[test]
 #[ignore = "benchmark; run explicitly with --nocapture --ignored"]
 fn interp_vs_jit_throughput() {
     bench("alu recurrence", ALU, 200_000, 5_000_000);
     bench("call/return loop", CALL, 100_000, 5_000_000);
+    bench("memory load/store loop", MEM, 100_000, 5_000_000);
 }
