@@ -34,7 +34,14 @@ it is dropped once the actionable slices (1–2 below) close.
   from the command line (`--arg`, `--const-region`, `--rename[-private]`, `--no-optimize`, and
   `-o`/`--emit-text`/`--run-args`) — usable without writing Rust. `svm_run::specialize_module` is the
   reusable library entry. `crates/svm-run/tests/specialize_cli.rs`.
-- **AOT pipeline** (`tests/aot.rs`) and **ROI** (`tests/bench.rs`, `#[ignore]`).
+- **AOT pipeline** (`tests/aot.rs`).
+- **Benchmarking** (`tests/bench.rs`): `size_corpus` (a normal test, also a size-regression guard)
+  reports blocks / insts / encoded `.svmb` bytes for interpreter → residual → optimized across four
+  shapes (register machine: constant / straight-line / runtime-loop, plus a renamed stack machine) —
+  e.g. the constant program shrinks 236→44 bytes, the runtime-loop residual drops the whole dispatch
+  table (272→131 bytes) while keeping a compiled loop. `roi_futamura_loop` (`#[ignore]`) reports
+  speed + size: ~3.6× (interp backend) / ~3.3× (JIT) specialization win, ~2780× end-to-end
+  interpreted→compiled-native on the sum-loop. Print with `--nocapture` (`--ignored` for the timing).
 
 ## Remaining slices (ranked by ROI)
 
@@ -50,12 +57,12 @@ it is dropped once the actionable slices (1–2 below) close.
    dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
    effort (on-device re-verify, determinism/TCB review) — a project, not a slice.
 
-## Benchmarking (planned)
+## Benchmarking
 
-`tests/bench.rs` (`#[ignore]`) already reports specialization speedups (~5–6× dispatch removal;
-~470× interpreted→compiled-native on a lean register machine). **TODO:** broaden it to report
-**residual program size** (block/inst counts, encoded `.svmb` bytes) alongside speed, across a small
-corpus of interpreter shapes — so each new slice's size/speed effect is measured, not assumed.
+Built — see the `tests/bench.rs` bullet under **Done**: `size_corpus` reports residual program size
+(blocks / insts / `.svmb` bytes) across a corpus of interpreter shapes and guards against size
+regressions; `roi_futamura_loop` reports size + speed on the runtime-loop workload. Extend the corpus
+with new shapes as slices land, so each one's size/speed effect is measured, not assumed.
 
 **Non-goals** (the engine correctly bails, not pending work): effectful / multi-result ops — atomics,
 fibers/threads, host `cap.call` / imports — cannot be folded soundly.
