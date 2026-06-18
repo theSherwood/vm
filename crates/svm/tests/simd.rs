@@ -469,8 +469,16 @@ fn diff_scalar_fma() {
         block0(v0: f32, v1: f64):\n\
           v2 = f32.fma v0 v0 v0\n  v3 = f64.fma v1 v1 v1\n  return v2\n}\n",
     );
-    assert_eq!(parse_module(&print_module(&m)).expect("reparse"), m, "text round-trip");
-    assert_eq!(decode_module(&encode_module(&m)).expect("decode"), m, "binary round-trip");
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
 }
 
 // `i8x16.popcnt` — per-byte population count (`Inst::VPopcnt`, fixed i8x16 shape). Splat a byte
