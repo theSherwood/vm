@@ -207,6 +207,23 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     run_with_host(m, func, args, fuel, &mut host)
 }
 
+/// The **fast** interpreter entry (INTERP_PERF.md Slice 1c): run on the [`bytecode`] engine when the
+/// module is eligible, else fall back to the tree-walker [`run`]. The two are bit-for-bit equivalent
+/// on the eligible set (the `bytecode_diff` harness gates this), so this is a transparent speedup.
+///
+/// `run` itself stays the tree-walker — it is the reference **oracle** the JIT (and the bytecode
+/// engine) are differentially checked against, so it must not change. Speed-sensitive callers that
+/// are *not* themselves the oracle use `run_fast`.
+pub fn run_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> Result<Vec<Value>, Trap> {
+    let mut host = Host::new();
+    run_with_host_fast(m, func, args, fuel, &mut host)
+}
+
 // ===========================================================================================
 // Debugging — interpreter-rooted stepping/breakpoints (DEBUGGING.md W2/W8, Milestone A slice 1).
 // Designs: S1 (location model = `IrPc`), S3 (logical-time = the probe's op count), S4 (the per-op
@@ -1510,6 +1527,32 @@ pub fn run_with_host(
         mm
     });
     drive(&m.funcs, func, args, fuel, &mut mem, host)
+}
+
+/// Host-carrying counterpart of [`run_fast`]: try the [`bytecode`] engine first, fall back to the
+/// tree-walker [`run_with_host`]. The bytecode engine drives no runtime seams yet (no scheduler,
+/// powerbox, fibers, threads, durability), so it is used only when the run needs none of them:
+///
+/// * the host is **not durable** (durability needs the shadow-stack swap in [`drive`]), and
+/// * [`bytecode::compile_and_run`] accepts the module — it returns `None` for any op that needs a
+///   seam (capability / thread / fiber / continuation / `memory.wait` ops), so an accepted module is
+///   pure compute + memory + (direct/indirect) calls, which a granted-capability host never affects.
+///
+/// On the `None` fallback path `compile_and_run` rejects the module *before* executing, so `fuel` is
+/// untouched and the tree-walker runs with the full budget.
+pub fn run_with_host_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    if !host.is_durable() {
+        if let Some(result) = bytecode::compile_and_run(m, func, args, fuel) {
+            return result;
+        }
+    }
+    run_with_host(m, func, args, fuel, host)
 }
 
 /// Run the entry vCPU on the M:N executor: submit the root, become a worker on the calling thread,

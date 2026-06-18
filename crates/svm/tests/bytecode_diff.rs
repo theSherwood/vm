@@ -16,7 +16,7 @@ mod irgen;
 use irgen::{gen_args, gen_module, Gen};
 use std::hint::black_box;
 use std::time::Instant;
-use svm_interp::{bytecode, run, Trap, Value};
+use svm_interp::{bytecode, run, run_fast, Trap, Value};
 
 /// Bit-wise value equality — `Value`'s derived `PartialEq` uses IEEE float `==`, where `NaN != NaN`,
 /// so two bit-identical NaN results would compare unequal. Both engines share exact semantics
@@ -129,6 +129,36 @@ fn bytecode_suspend_resume_preserves_result() {
     }
     println!("suspend/resume equality verified on {checked} modules");
     assert!(checked > 10, "too few modules exercised ({checked})");
+}
+
+#[test]
+fn run_fast_matches_run_on_generated_modules() {
+    // Slice 1c-4: `run_fast` routes eligible modules through the bytecode engine and falls back to
+    // the tree-walker `run` otherwise; either way it must equal `run`. (Equivalence on the eligible
+    // set is already gated above; this also covers the fallback path and the routing wrapper.)
+    let total = 4000u64;
+    for seed in 0..total {
+        let mut g = Gen::from_seed(seed);
+        let m = gen_module(&mut g);
+        if m.funcs.is_empty() {
+            continue;
+        }
+        let args = gen_args(&mut g, &m.funcs[0].params);
+        let mut f1 = 2_000_000u64;
+        let slow = run(&m, 0, &args, &mut f1);
+        let mut f2 = 2_000_000u64;
+        let fast = run_fast(&m, 0, &args, &mut f2);
+        // Near the fuel limit the two engines' per-op accounting can differ by a hair (not a
+        // semantic divergence) — skip those, like the main harness.
+        if matches!(slow, Err(Trap::OutOfFuel)) || matches!(fast, Err(Trap::OutOfFuel)) {
+            continue;
+        }
+        assert!(
+            results_eq(&fast, &slow),
+            "run_fast disagrees with run\n seed={seed}\n slow={slow:?}\n fast={fast:?}\n module:\n{}",
+            svm::text::print_module(&m)
+        );
+    }
 }
 
 // ---- kernels: equality + perf (production counterpart of bytecode_spike) -----------------------

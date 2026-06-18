@@ -263,8 +263,16 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
           actual scheduler is 1c-4.
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
-    - [ ] **1c-4** — wire as the default execution path behind the existing entry points (fall back
-          to the tree-walker for not-yet-covered modules), making bytecode the JIT diff oracle.
+    - [x] **1c-4** — wire as a fast path: new `run_fast` / `run_with_host_fast` route eligible
+          modules through the bytecode engine (`compile_and_run` returns `None` for any
+          seam-requiring op, so eligibility is automatic) and fall back to the tree-walker `run`
+          otherwise. **`run` itself is unchanged** — it stays the reference oracle the JIT and the
+          bytecode engine are both diffed against (the refined strategy: tree-walker = test-only
+          oracle, *kept not retired*). The umbrella `svm::run_text` now uses `run_fast`. New harness
+          `run_fast_matches_run_on_generated_modules` (covers routing + fallback); full `svm` suite
+          (58 binaries incl. `jit_diff`/`fiber_fuzz`/`concurrent_fuzz`/`dynlink`) green. Production
+          guest execution is the JIT; the interpreter's role is oracle / escape-TCB checker, so this
+          speeds the interpreter-only and differential paths without touching the oracle.
     - [ ] **1c-5** — remaining op set + cross-module units (tail calls, `install`/`invoke` indirect
           calls, host/fiber/thread/cap ops) on the reified machine.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:
