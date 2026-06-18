@@ -1,9 +1,11 @@
 //! The **mid-run freeze trigger** (DURABILITY.md §12, "freeze after N safepoints"). The freeze
 //! mechanism unwinds at the first poll that sees `UNWINDING`; the *before-start* harness sets that
 //! word before the run, so it freezes at the very first safepoint. `arm_freeze_after` instead lets
-//! the run make forward progress and promotes the word to `UNWINDING` at the N-th safepoint, so the
-//! freeze lands *mid-run* — deterministically, in a single-threaded test. This pins where the freeze
-//! lands by counting a host-fn's invocations (one per `cap.call` safepoint executed before the freeze).
+//! the run make forward progress and promotes the word to `UNWINDING` at the N-th **fiber safepoint**
+//! (`cont.resume`/`suspend`), so the freeze lands *mid-run* — deterministically, in a single-threaded
+//! test. Here the root makes an observable host-fn call before each fiber interaction, so the number
+//! of calls that fired before the freeze pins where it landed. (cap.call is *not* a counted safepoint
+//! — only the fiber ops are, so the trigger point is identical on the interpreter and the JIT.)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,17 +18,33 @@ use svm_ir::{Memory, Module};
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
-// Three back-to-back cap.calls (three safepoints); the result is unobservable here — we only count
-// how many executed before the freeze, via the host fn.
+// Root (v0 = host-fn handle): a host-fn call (observable, *not* a safepoint) before each fiber
+// interaction, around three resumes of a fiber that suspends twice then returns. The five fiber
+// safepoints, in order, are: resume#1, suspend#1, resume#2, suspend#2, resume#3.
 const SRC: &str = "memory 18\n\
     func (i32) -> (i64) {\n\
     block0(v0: i32):\n\
-    \x20 v1 = cap.call 13 0 () -> (i64) v0 ()\n\
-    \x20 v2 = cap.call 13 0 () -> (i64) v0 ()\n\
-    \x20 v3 = cap.call 13 0 () -> (i64) v0 ()\n\
-    \x20 v4 = i64.add v1 v2\n\
-    \x20 v5 = i64.add v4 v3\n\
-    \x20 return v5\n\
+    \x20 v1 = ref.func 1\n\
+    \x20 v2 = i64.const 4096\n\
+    \x20 v3 = cont.new v1 v2\n\
+    \x20 v4 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 v5 = i64.const 0\n\
+    \x20 v6, v7 = cont.resume v3 v5\n\
+    \x20 v8 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 v9, v10 = cont.resume v3 v5\n\
+    \x20 v11 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 v12, v13 = cont.resume v3 v5\n\
+    \x20 v14 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 return v14\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block0(v0: i64, v1: i64):\n\
+    \x20 v2 = i64.const 1\n\
+    \x20 v3 = suspend v2\n\
+    \x20 v4 = i64.const 2\n\
+    \x20 v5 = suspend v4\n\
+    \x20 v6 = i64.const 0\n\
+    \x20 return v6\n\
     }\n";
 
 fn instrument() -> Module {
@@ -39,7 +57,7 @@ fn instrument() -> Module {
     inst
 }
 
-// Run armed to freeze after `n` safepoints; returns (host-fn calls executed, froze?).
+// Run armed to freeze after `n` fiber safepoints; returns (observable host-fn calls, froze?).
 fn run_armed(n: i64) -> (u64, bool) {
     let inst = instrument();
     let calls = Arc::new(AtomicU64::new(0));
@@ -71,35 +89,27 @@ fn run_armed(n: i64) -> (u64, bool) {
 }
 
 #[test]
-fn arming_freezes_after_exactly_n_safepoints() {
-    // Arm-after-1 is the first-safepoint freeze (one cap.call executes, then its poll unwinds) —
-    // the before-start harness reached *only* this; arming reaches it during the run.
-    let (calls1, froze1) = run_armed(1);
-    assert!(froze1, "armed run froze (state left UNWINDING)");
-    assert_eq!(calls1, 1, "arm-after-1 freezes at the first safepoint");
-
-    // Arm-after-2 makes real forward progress first: two cap.calls run before the freeze — the
-    // capability the freeze-before-start harness could never reach.
-    let (calls2, froze2) = run_armed(2);
-    assert!(froze2, "armed run froze");
+fn arming_freezes_mid_run_after_n_fiber_safepoints() {
+    // Each resume cycle is two fiber safepoints (resume + suspend), so progress steps every two
+    // counts; the host-fn the *root* runs between resumes is the observable. Arm-after-1 freezes at
+    // the very first fiber safepoint (only the first host-fn, before resume#1, has fired).
+    assert_eq!(run_armed(1), (1, true), "freeze at the 1st fiber safepoint");
+    // Arming deeper lets the run make real forward progress before freezing — exactly what the
+    // freeze-before-start harness cannot reach.
     assert_eq!(
-        calls2, 2,
-        "arm-after-2 freezes only at the second safepoint"
+        run_armed(3),
+        (2, true),
+        "freeze at the 3rd (one more cycle)"
     );
-
-    // Arm-after-3 freezes at the last safepoint.
-    let (calls3, froze3) = run_armed(3);
-    assert!(froze3, "armed run froze");
-    assert_eq!(calls3, 3, "arm-after-3 freezes at the third safepoint");
+    assert_eq!(run_armed(5), (3, true), "freeze at the 5th (last resume)");
 }
 
 #[test]
 fn arming_past_the_last_safepoint_runs_to_completion() {
-    // More safepoints requested than the program has: the countdown never reaches 0, the state word
-    // stays ARMED (which every poll reads as NORMAL), and the run completes normally — no freeze.
-    let (calls, froze) = run_armed(99);
-    assert!(!froze, "the run completed (never promoted to UNWINDING)");
-    assert_eq!(calls, 3, "all three safepoints executed");
+    // More fiber safepoints requested than the program has (5): the countdown never reaches 0, the
+    // state word stays ARMED (which every poll reads as NORMAL), and the run completes — no freeze,
+    // all four host-fn calls fire.
+    assert_eq!(run_armed(99), (4, false), "no freeze; ran to completion");
 }
 
 #[test]
@@ -127,7 +137,7 @@ fn an_unarmed_durable_run_is_untouched() {
         &mut host,
     );
     assert!(res.is_ok(), "unarmed durable run trapped: {res:?}");
-    assert_eq!(calls.load(Ordering::Relaxed), 3, "ran to completion");
+    assert_eq!(calls.load(Ordering::Relaxed), 4, "ran to completion");
     assert_ne!(
         read_state(&snap),
         STATE_UNWINDING,

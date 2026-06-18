@@ -4682,17 +4682,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
 
             // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
-            // armed via `STATE_ARMED`, count down at each safepoint (leaf may-suspend op — the ops the
-            // transform follows with a poll) and promote to `UNWINDING` at 0, so *this* op's trailing
-            // poll begins the freeze. Inert unless armed; gated on `durable` so an ordinary run is
-            // untouched. Lets a run freeze after forward progress (e.g. once a fiber is recycled),
-            // which the freeze-before-start harness cannot reach.
-            if durable
-                && matches!(
-                    inst,
-                    Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
-                )
-            {
+            // armed via `STATE_ARMED`, count down at each **fiber safepoint** (`cont.resume`/`suspend`)
+            // and promote to `UNWINDING` at 0, so *this* op's trailing poll begins the freeze. Inert
+            // unless armed; gated on `durable` so an ordinary run is untouched. Lets a run freeze after
+            // forward progress (e.g. once a fiber is recycled), which the freeze-before-start harness
+            // cannot reach. Counting only the fiber ops (routed through runtime thunks on both backends)
+            // keeps the trigger point identical interp↔JIT — cap.call is *not* counted (the JIT's
+            // cap.call thunk is host-supplied, so there is no cross-backend choke for it); a cap.call
+            // freeze is already reachable at the first safepoint, and a production async trigger handles
+            // general mid-run freeze.
+            if durable && matches!(inst, Inst::ContResume { .. } | Inst::Suspend { .. }) {
                 if let Some(m) = mem.as_mut() {
                     m.durable_tick_arm();
                 }
@@ -10073,11 +10072,11 @@ impl Mem {
         let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
     }
 
-    /// Tick the **mid-run freeze trigger** at a safepoint: if the run is `STATE_ARMED`, decrement the
-    /// arm countdown at [`ARM_COUNTDOWN_OFF`] and, when it reaches 0, promote the state word to
-    /// `UNWINDING` — so the safepoint's trailing poll begins the freeze. A no-op unless armed (the
-    /// common case: one `i32` read per safepoint, no write), so an unarmed run is byte-identical. Call
-    /// once per safepoint (leaf may-suspend op) — see the `run_inner` dispatch.
+    /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`): if the run
+    /// is `STATE_ARMED`, decrement the arm countdown at [`ARM_COUNTDOWN_OFF`] and, when it reaches 0,
+    /// promote the state word to `UNWINDING` — so the safepoint's trailing poll begins the freeze. A
+    /// no-op unless armed (the common case: one `i32` read per safepoint, no write), so an unarmed run
+    /// is byte-identical. Call once per fiber safepoint — see the `run_inner` dispatch.
     fn durable_tick_arm(&mut self) {
         if self.durable_state() != STATE_ARMED {
             return;

@@ -19,8 +19,8 @@
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use svm_durable::{
-    init_durable_window, transform_module, transform_module_assume_confined, write_state,
-    STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after, init_durable_window, transform_module, transform_module_assume_confined,
+    write_state, STATE_REWINDING, STATE_UNWINDING,
 };
 use svm_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,
@@ -457,5 +457,150 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
             "JIT thaw reloads the saved clock (47), not a re-issued one (104)"
         ),
         other => panic!("JIT thaw: expected Returned([47]), got {other:?}"),
+    }
+}
+
+/// A churn module that **recycles a fiber slot before freezing** (recycling step 2/3 + the mid-run
+/// freeze trigger, cross-backend). Fiber A (func 2) runs to completion — freeing registry slot 0 and
+/// bumping its generation to 1 — then fiber B (func 1) reuses slot 0 at **generation 1**, is parked
+/// once, and would resume to completion (7 + 100). Arming the freeze at the 3rd fiber safepoint
+/// (resume A; resume B; B's suspend) lands it with B parked at generation 1.
+const RECYCLE_SRC: &str = "memory 17\n\
+    func () -> (i64) {\n\
+    block0():\n\
+    \x20 v0 = ref.func 2\n\
+    \x20 v1 = i64.const 4096\n\
+    \x20 v2 = cont.new v0 v1\n\
+    \x20 v3 = i64.const 0\n\
+    \x20 v4, v5 = cont.resume v2 v3\n\
+    \x20 v6 = ref.func 1\n\
+    \x20 v7 = i64.const 4096\n\
+    \x20 v8 = cont.new v6 v7\n\
+    \x20 v9 = i64.const 0\n\
+    \x20 v10, v11 = cont.resume v8 v9\n\
+    \x20 v12 = i64.const 7\n\
+    \x20 v13, v14 = cont.resume v8 v12\n\
+    \x20 return v14\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block0(v0: i64, v1: i64):\n\
+    \x20 v2 = i64.const 42\n\
+    \x20 v3 = suspend v2\n\
+    \x20 v4 = i64.const 100\n\
+    \x20 v5 = i64.add v3 v4\n\
+    \x20 return v5\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block0(v0: i64, v1: i64):\n\
+    \x20 v2 = i64.const 0\n\
+    \x20 return v2\n\
+    }\n";
+
+/// Recycling step 4 (cross-backend): with the **mid-run freeze trigger** (`arm_freeze_after`) the JIT
+/// and the interpreter freeze a *recycled* parked fiber (generation 1) at the same armed safepoint, to
+/// a **byte-identical** durable reserve + residue; and the artifact **thaws on the JIT** to the
+/// uninterrupted result. This is the recycled durable round-trip the freeze-before-start harness could
+/// not reach — both backends count the same fiber safepoints, so the armed freeze lands identically.
+#[test]
+fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
+    let m = parse_module(RECYCLE_SRC).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    // Uninterrupted baseline: 107 (A recycles slot 0, B reuses it and completes 7 + 100).
+    let mut bhost = Host::new();
+    let mut bfuel = 1_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut bfuel,
+        &init_durable_window(WINDOW),
+        WINDOW_LOG2,
+        &mut bhost,
+    );
+    assert_eq!(base, Ok(vec![Value::I64(107)]), "uninterrupted: 7 + 100");
+
+    // Interp freeze, armed to fire at the 3rd fiber safepoint (B parked, slot 0 recycled to gen 1).
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW);
+    arm_freeze_after(&mut iwin, 3);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok(), "interp armed freeze: {ires:?}");
+    let ir = ihost.frozen_fibers();
+    assert_eq!(ir.len(), 1, "interp flattened the parked fiber B");
+    assert_eq!(
+        (ir[0].slot, ir[0].generation),
+        (0, 1),
+        "B = recycled slot 0, gen 1 (interp)"
+    );
+
+    // JIT freeze, identically armed: the JIT's per-thunk trigger must promote at the same safepoint.
+    let mut jhost = Host::new();
+    let mut jwin = init_durable_window(WINDOW);
+    arm_freeze_after(&mut jwin, 3);
+    let (jout, jsnap, jr) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &jwin,
+        &[],
+        &[], // freeze: no seed
+        WINDOW_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+    )
+    .expect("JIT armed freeze compiles + runs");
+    assert!(
+        matches!(jout, JitOutcome::Returned(_)),
+        "JIT freeze placeholder, got {jout:?}"
+    );
+    assert_eq!(jr.len(), 1, "JIT flattened the parked fiber B");
+    assert_eq!(
+        (jr[0].slot, jr[0].generation),
+        (0, 1),
+        "B = recycled slot 0, gen 1 (JIT)"
+    );
+
+    // Byte-identical durable reserve (control words + both contexts' flattened shadow regions): the
+    // two backends armed-freeze the recycled fiber into the same image.
+    let reserve = DURABLE_RESERVE as usize;
+    assert_eq!(
+        &isnap[..reserve],
+        &jsnap[..reserve],
+        "interp/JIT armed-freeze the recycled fiber into a byte-identical durable reserve"
+    );
+
+    // Serialize the interp artifact, restore, and thaw on the JIT: the gen-1 handle resolves to the
+    // re-seeded fiber, which re-parks, and forward execution resumes it to completion → 107.
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    write_state(&mut thaw_win, STATE_REWINDING);
+    let seed = jit_seed(thost.frozen_fibers());
+    assert_eq!(seed.len(), 1, "the artifact carried the recycled fiber");
+    assert_eq!(seed[0].generation, 1, "re-seeded at generation 1");
+
+    let mut jhost2 = Host::new();
+    let (jout2, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &thaw_win,
+        &[],
+        &seed,
+        WINDOW_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost2 as *mut Host as *mut c_void,
+    )
+    .expect("JIT thaw");
+    match jout2 {
+        JitOutcome::Returned(slots) => {
+            assert_eq!(slots, vec![107], "JIT thaw of the recycled fiber → 107")
+        }
+        other => panic!("JIT thaw: expected Returned([107]), got {other:?}"),
     }
 }

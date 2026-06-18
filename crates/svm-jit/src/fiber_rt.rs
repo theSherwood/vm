@@ -99,6 +99,34 @@ const SHADOW_STRIDE: u64 = 1 << 12;
 const STATE_OFF: u64 = 0;
 /// State-word value meaning "freeze in progress" (must match `svm-interp`'s `STATE_UNWINDING`).
 const STATE_UNWINDING: i32 = 1;
+/// State-word value meaning "freeze armed" — the mid-run freeze trigger (must match
+/// `svm-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down
+/// [`ARM_COUNTDOWN_OFF`] at each fiber safepoint and promotes the word to `UNWINDING` at 0.
+const STATE_ARMED: i32 = 3;
+/// Window byte offset of the `i64` arm countdown (must match `svm-interp`'s `ARM_COUNTDOWN_OFF`).
+const ARM_COUNTDOWN_OFF: u64 = 16;
+
+/// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`), the JIT mirror
+/// of `svm_interp::Mem::durable_tick_arm`: if the run is `STATE_ARMED`, decrement the arm countdown
+/// and, when it reaches 0, promote the state word to `UNWINDING` so the safepoint's trailing poll
+/// begins the freeze. A no-op unless armed (one `i32` read in the common case), so an unarmed run is
+/// byte-identical. Both backends count the same set — `cont.resume`/`suspend` (the ops routed through
+/// runtime thunks) — so an armed freeze lands at the same safepoint on each (cross-backend parity).
+///
+/// # Safety
+/// `mem_base` is a durable run's committed window base (`[STATE_OFF, ARM_COUNTDOWN_OFF + 8)` is RW
+/// reserve). Only called on a durable run (the caller gates on `FiberRuntime::durable`).
+unsafe fn window_tick_arm(mem_base: u64) {
+    if *((mem_base + STATE_OFF) as *const i32) != STATE_ARMED {
+        return;
+    }
+    let cd = (mem_base + ARM_COUNTDOWN_OFF) as *mut i64;
+    let n = *cd - 1;
+    *cd = n;
+    if n <= 0 {
+        *((mem_base + STATE_OFF) as *mut i32) = STATE_UNWINDING;
+    }
+}
 
 /// The shadow-region base (window offset) of the fiber in registry `slot` (context `slot+1`).
 fn fiber_region_base(slot: usize) -> u64 {
@@ -563,6 +591,12 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         *status_out = 1;
         return 0;
     }
+    // Mid-run freeze trigger: count this `cont.resume` safepoint before the switch (mirroring the
+    // interpreter's per-op tick) — on an armed durable run it may promote the window to UNWINDING, so
+    // the resume's trailing poll begins the freeze.
+    if (*rt).durable {
+        window_tick_arm((*rt).mem_base);
+    }
     // Phase 1: resolve + **claim** (D57): the slot must be this vCPU's (affinity, 3b-ii) and
     // `OWNED` — the `begin_owned` claim takes it to `RUNNING`, so a re-entrant resume (the fiber is
     // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
@@ -708,6 +742,12 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
     if rt.is_null() {
         fault(trap_out);
         return 0;
+    }
+    // Mid-run freeze trigger: count this `suspend` safepoint before the switch (mirroring the
+    // interpreter's per-op tick). The promotion takes effect for the *resumer's* poll after this
+    // fiber parks (suspend's own trailing poll is deferred to the fiber's next resume).
+    if (*rt).durable {
+        window_tick_arm((*rt).mem_base);
     }
     // pop-before-switch / push-after keeps the yielder stack consistent so a resumer reached by the
     // switch sees *its* yielder on top.

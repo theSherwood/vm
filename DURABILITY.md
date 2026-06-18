@@ -835,8 +835,8 @@ sequenced slice:
    `svm-snapshot/tests/roundtrip.rs::recycled_fiber_freeze_serialize_restore_thaw_through_the_codec`
    recycles slot 0 (fiber A finishes → generation 1), parks fiber B there, freezes mid-run, and confirms
    B is flattened + re-seeded at generation 1 and the thaw round-trips (also pinned at the codec leg by
-   `fiber_residue_generation_round_trips_through_the_codec`). *Remaining: the JIT leg of the trigger
-   (step 4) for cross-backend parity.*
+   `fiber_residue_generation_round_trips_through_the_codec`). The JIT leg now matches (step 4): both
+   backends armed-freeze the recycled fiber to a byte-identical artifact that thaws on either.
 3. **[~] Recycle on finish — done, both backends.** A finished fiber's slot returns to a per-registry
    **min-heap** free list (`free`), and `cont.new` reuses the lowest free slot before growing — so the
    table is bounded by *peak concurrent* fibers, not the lifetime total, lifting the `MAX_SHADOW_CTX`
@@ -850,15 +850,16 @@ sequenced slice:
    concurrently live) rather than return — otherwise the second fiber would reuse the first's freed
    region. *(vCPU-context recycling — a joined `thread.spawn` child's top-down context — is a smaller
    follow-up; the durable cap that bites is fibers, handled here.)*
-4. **[~] Cross-backend parity + fuzz.** The recycled freeze/thaw leg is exercised end-to-end on the
-   **interpreter** (step 2's `recycled_fiber_…` test, via the mid-run trigger). Remaining: mirror the
-   trigger to the **JIT** (the `arm_freeze_after` countdown — promote `ARMED`→`UNWINDING` at the
-   `fiber_resume`/`fiber_suspend`/`cap.call` thunks, minding the deferred post-`suspend` poll), then
-   extend the durable generators (`durgen`) / the interp↔JIT `fiber_fuzz` churn differential to cover
-   the freeze/thaw leg on both backends with byte-identical artifacts. (`fiber_fuzz` already churns and
-   agrees on the *run*; this adds freeze/thaw.)
+4. **[~] Cross-backend parity + fuzz.** The recycled freeze/thaw leg is now exercised **on both
+   backends**: with the mid-run trigger mirrored to the JIT,
+   `svm/tests/durable_fibers_jit.rs::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
+   arms both the interp and the JIT to freeze a recycled (generation 1) parked fiber at the same
+   safepoint, confirms a **byte-identical durable reserve + residue**, and **thaws the artifact on the
+   JIT** to the uninterrupted result. *Remaining (smaller):* fold fiber churn into the randomized
+   `durgen`/`fiber_fuzz` generators so the recycled freeze/thaw path is fuzzed, not just pinned by these
+   hand-written end-to-end tests.
 
-### Mid-run freeze trigger ("freeze after N safepoints") — DONE (interp)
+### Mid-run freeze trigger ("freeze after N safepoints") — DONE (both backends)
 
 The freeze mechanism unwinds at the first poll that observes `UNWINDING`. The before-start harness sets
 that word *before* the run, so it can only freeze at the very **first** safepoint — too early to ever
@@ -866,24 +867,30 @@ hold a recycled (generation > 0) parked fiber, which needs a prior fiber-finish 
 
 A new **`STATE_ARMED`** state value + an **`ARM_COUNTDOWN_OFF`** window word (in the reserve's unused
 `[16, 64)` gap) make the freeze land *mid-run*, deterministically: `arm_freeze_after(win, N)` writes
-`ARMED` + countdown `N`; the runtime decrements the countdown at each **safepoint** (leaf may-suspend
-op: `cap.call`/`cont.resume`/`suspend`) and, at 0, promotes the word to `UNWINDING` so that op's
-trailing poll begins the freeze. `ARMED` is **transparent** to the instrumented IR — every emitted
-poll/prologue tests only `UNWINDING`/`REWINDING`, so an armed run reads as `NORMAL` until promotion, and
-an *unarmed* run never touches the countdown (byte-identical to before). This also models the production
-path (an async controller flipping `UNWINDING` from another OS thread, picked up at the next poll — the
-existing mechanism already handles that; what was missing was a *deterministic single-threaded* way to
-test it). Constants are cross-checked in `layout_abi.rs`; placement is pinned by
-`svm-durable/tests/freeze_trigger.rs` (arm-after-N freezes after exactly N safepoints; arming past the
-last runs to completion; an unarmed run is untouched). *Still interpreter-only — the JIT mirror is
-step 4.* Note this is the **deterministic test trigger**, not the bounded-latency STW story (Phase 4's
-back-edge polls + `Blocking.work` cancellation — see the latency caveat); a poll-free compute loop still
-won't reach a safepoint.
+`ARMED` + countdown `N`; the runtime decrements the countdown at each **fiber safepoint**
+(`cont.resume`/`suspend`) and, at 0, promotes the word to `UNWINDING` so that op's trailing poll begins
+the freeze. `ARMED` is **transparent** to the instrumented IR — every emitted poll/prologue tests only
+`UNWINDING`/`REWINDING`, so an armed run reads as `NORMAL` until promotion, and an *unarmed* run never
+touches the countdown (byte-identical to before). The interpreter ticks at its per-op dispatch; the JIT
+ticks in the `fiber_resume`/`fiber_suspend` thunks (`window_tick_arm`, gated on `FiberRuntime::durable`).
+**Both backends count the same set — the fiber ops, routed through runtime thunks** — so an armed freeze
+lands at the same safepoint on each (cross-backend parity, which the recycled round-trip test pins).
+`cap.call` is deliberately **not** counted: the JIT's cap.call thunk is host-supplied (no cross-backend
+choke), a cap.call freeze is already reachable at the first safepoint, and the production async trigger
+covers general mid-run freeze. This also models that production path (an async controller flipping
+`UNWINDING` from another OS thread, picked up at the next poll — the existing mechanism already handles
+that; what was missing was a *deterministic single-threaded* way to test it). Constants are cross-checked
+in `layout_abi.rs`; placement is pinned by `svm-durable/tests/freeze_trigger.rs` (arm-after-N freezes
+after exactly N fiber safepoints; arming past the last runs to completion; an unarmed run is untouched).
+Note this is the **deterministic test trigger**, not the bounded-latency STW story (Phase 4's back-edge
+polls + `Blocking.work` cancellation — see the latency caveat); a poll-free compute loop still won't
+reach a safepoint.
 
 **Recycling status:** steps 1 + 3 give complete **non-durable** slot recycling on both backends (table
 bounded by peak concurrent fibers, ABA-guarded by generation-carrying handles); step 2 is **end-to-end on
-the interpreter** (recycled durable freeze/thaw round-trip), unblocked by the mid-run trigger above. The
-one remaining gap is **cross-backend** (step 4): the JIT trigger + the churn freeze/thaw fuzz leg.
+both backends** (recycled durable freeze/thaw round-trip, byte-identical artifacts), unblocked by the
+mid-run trigger above. The recycling arc is functionally complete; the only follow-up is folding fiber
+churn into the randomized fuzz generators (step 4's remaining bullet).
 
 #### 3.1 implementation plan (next-session pickup)
 
