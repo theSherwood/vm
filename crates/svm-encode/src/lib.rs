@@ -93,6 +93,7 @@ mod op {
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
     pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, sig, handle, arg idx-list
+    pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -505,6 +506,16 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::FUn { ty, op: o, a } => {
             out.push(fun_base(*ty) + o.index());
             write_uleb(out, *a as u64);
+        }
+        Inst::Fma { ty, a, b, c } => {
+            out.push(op::FMA);
+            out.push(match ty {
+                FloatTy::F32 => 0,
+                FloatTy::F64 => 1,
+            });
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+            write_uleb(out, *c as u64);
         }
         Inst::FCmp { ty, op: o, a, b } => {
             out.push(fcmp_base(*ty) + o.index());
@@ -1681,6 +1692,19 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
+        op::FMA => {
+            let ty = match c.byte()? {
+                0 => FloatTy::F32,
+                1 => FloatTy::F64,
+                other => return Err(DecodeError::BadOpcode(other)),
+            };
+            Inst::Fma {
+                ty,
+                a: c.idx()?,
+                b: c.idx()?,
+                c: c.idx()?,
+            }
+        }
         op::FTOI_TRAP..=op::FTOI_TRAP_END => Inst::FToITrap {
             op: FToI::from_index(b - op::FTOI_TRAP).ok_or(DecodeError::BadOpcode(b))?,
             a: c.idx()?,

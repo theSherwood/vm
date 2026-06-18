@@ -2641,6 +2641,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Eqz { .. }
                 | Inst::FBin { .. }
                 | Inst::FUn { .. }
+                | Inst::Fma { .. }
                 | Inst::FCmp { .. }
                 | Inst::FToISat { .. }
                 | Inst::FToITrap { .. }
@@ -3585,6 +3586,11 @@ fn lower_block(
             Inst::FUn { op, a, .. } => {
                 let x = get(&vals, *a)?;
                 float_un(b, *op, x)
+            }
+            Inst::Fma { a, b: rb, c, .. } => {
+                // Scalar fused multiply-add — `a·b + c`, one rounding (matches the interp's `mul_add`).
+                let (x, y, z) = (get(&vals, *a)?, get(&vals, *rb)?, get(&vals, *c)?);
+                b.ins().fma(x, y, z)
             }
             Inst::FCmp { op, a, b: rb, .. } => {
                 let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);

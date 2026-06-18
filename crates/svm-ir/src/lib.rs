@@ -1514,6 +1514,15 @@ pub enum Inst {
         op: FUnOp,
         a: ValIdx,
     },
+    /// Scalar **fused multiply-add** `a·b + c` with a single rounding (IEEE-754 FMA) — the scalar
+    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` / Rust
+    /// `f*::mul_add` are both correctly-rounded, so interp and JIT agree. Operands/result are `ty`.
+    Fma {
+        ty: FloatTy,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
+    },
     /// Float compare; operands are `ty`, result is `i32` 0/1.
     FCmp {
         ty: FloatTy,

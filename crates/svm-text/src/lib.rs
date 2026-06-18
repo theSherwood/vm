@@ -274,6 +274,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ConstF64(bits) => format!("f64.const {:?}", f64::from_bits(*bits)),
         Inst::FBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
+        Inst::Fma { ty, a, b, c } => format!("{}.fma v{a} v{b} v{c}", ty.prefix()),
         Inst::FCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
         Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
@@ -2202,6 +2203,12 @@ impl<'a> Parser<'a> {
                 op: o,
                 a: self.value(names)?,
             });
+        }
+        if suffix == "fma" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            let c = self.value(names)?;
+            return Ok(Inst::Fma { ty, a, b, c });
         }
         if let Some(o) = FCmpOp::from_name(suffix) {
             let a = self.value(names)?;

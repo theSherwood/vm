@@ -432,6 +432,47 @@ fn diff_f64x2_fma() {
     }
 }
 
+// Scalar fused multiply-add (`Inst::Fma`, the shared primitive svm-llvm's `llvm.fma`/`fmuladd` emit):
+// `a·b + c`, one rounding. Oracle = Rust's `mul_add`; `diff1` pins interp == JIT (Cranelift scalar
+// `fma` == `mul_add`). Covers both f32 and f64.
+#[test]
+fn diff_scalar_fma() {
+    let f32fma = |a: f32, b: f32, c: f32| -> f32 {
+        let s = "func (f32, f32, f32) -> (f32) {\n\
+            block0(v0: f32, v1: f32, v2: f32):\n\
+              v3 = f32.fma v0 v1 v2\n  return v3\n}\n";
+        f32::from_bits(diff1(s, &[Value::F32(a), Value::F32(b), Value::F32(c)]) as u32)
+    };
+    let f64fma = |a: f64, b: f64, c: f64| -> f64 {
+        let s = "func (f64, f64, f64) -> (f64) {\n\
+            block0(v0: f64, v1: f64, v2: f64):\n\
+              v3 = f64.fma v0 v1 v2\n  return v3\n}\n";
+        f64::from_bits(diff1(s, &[Value::F64(a), Value::F64(b), Value::F64(c)]) as u64)
+    };
+    for (a, b, c) in [(2.0f32, 3.0, 4.0), (1e20, 1e20, -1e30), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            f32fma(a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "f32.fma {a} {b} {c}"
+        );
+    }
+    for (a, b, c) in [(2.0f64, 3.0, 4.0), (1e300, 1e300, -1e308), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            f64fma(a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "f64.fma {a} {b} {c}"
+        );
+    }
+    // Text + binary round-trip of the scalar `Fma` op (both widths).
+    let m = build(
+        "func (f32, f64) -> (f32) {\n\
+        block0(v0: f32, v1: f64):\n\
+          v2 = f32.fma v0 v0 v0\n  v3 = f64.fma v1 v1 v1\n  return v2\n}\n",
+    );
+    assert_eq!(parse_module(&print_module(&m)).expect("reparse"), m, "text round-trip");
+    assert_eq!(decode_module(&encode_module(&m)).expect("decode"), m, "binary round-trip");
+}
+
 // `i8x16.popcnt` — per-byte population count (`Inst::VPopcnt`, fixed i8x16 shape). Splat a byte
 // pattern across all 16 lanes, read lane 0 back; the oracle is Rust's `count_ones`. `diff1`
 // pins interp == JIT.

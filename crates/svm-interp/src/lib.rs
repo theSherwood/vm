@@ -6049,6 +6049,15 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
             FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
         },
+        Inst::Fma { ty, a, b, c } => match ty {
+            // `mul_add` is the correctly-rounded fused FMA — bit-identical to Cranelift's `fma`.
+            FloatTy::F32 => {
+                Reg::from_f32(get_f32(vals, *a)?.mul_add(get_f32(vals, *b)?, get_f32(vals, *c)?))
+            }
+            FloatTy::F64 => {
+                Reg::from_f64(get_f64(vals, *a)?.mul_add(get_f64(vals, *b)?, get_f64(vals, *c)?))
+            }
+        },
         Inst::FCmp { ty, op, a, b } => {
             let r = match ty {
                 FloatTy::F32 => fcmp32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?),

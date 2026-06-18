@@ -526,6 +526,14 @@ fn check_inst(
             cx.expect(*a, ty.val())?;
             ty.val()
         }
+        // Scalar fused multiply-add: all three operands and the result are `ty`.
+        Inst::Fma { ty, a, b, c } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            cx.expect(*c, t)?;
+            t
+        }
         Inst::FCmp { ty, a, b, .. } => {
             let t = ty.val();
             cx.expect(*a, t)?;
