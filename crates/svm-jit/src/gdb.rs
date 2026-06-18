@@ -82,6 +82,7 @@ pub fn build_elf(
     debug_info: &[u8],
     debug_abbrev: &[u8],
     debug_line: &[u8],
+    debug_loc: &[u8],
 ) -> Vec<u8> {
     // Section name string table (`.shstrtab`): a leading NUL, then each name NUL-terminated. Record
     // each name's offset for the headers.
@@ -90,12 +91,13 @@ pub fn build_elf(
         ".debug_abbrev",
         ".debug_info",
         ".debug_line",
+        ".debug_loc",
         ".symtab",
         ".strtab",
         ".shstrtab",
     ];
     let mut shstrtab = vec![0u8];
-    let mut name_off = [0u32; 7];
+    let mut name_off = [0u32; 8];
     for (i, n) in names.iter().enumerate() {
         name_off[i] = shstrtab.len() as u32;
         shstrtab.extend_from_slice(n.as_bytes());
@@ -132,6 +134,7 @@ pub fn build_elf(
     let (abbrev_off, abbrev_sz) = off(&mut body, debug_abbrev);
     let (info_off, info_sz) = off(&mut body, debug_info);
     let (line_off, line_sz) = off(&mut body, debug_line);
+    let (loc_off, loc_sz) = off(&mut body, debug_loc);
     let (sym_off, sym_sz) = off(&mut body, &symtab);
     let (str_off, str_sz) = off(&mut body, &strtab);
     let (shstr_off, shstr_sz) = off(&mut body, &shstrtab);
@@ -141,8 +144,8 @@ pub fn build_elf(
         body.push(0);
     }
     let shoff = (EHDR_LEN + body.len()) as u64;
-    let shnum: u16 = 8; // NULL + .text + 3×debug + symtab + strtab + shstrtab
-    let shstrndx: u16 = 7;
+    let shnum: u16 = 9; // NULL + .text + 4×debug + symtab + strtab + shstrtab
+    let shstrndx: u16 = 8;
 
     // --- ELF header ---
     let mut out = Vec::with_capacity(EHDR_LEN + body.len() + shnum as usize * SHDR_LEN);
@@ -225,19 +228,32 @@ pub fn build_elf(
     push_shdr(
         &mut out,
         name_off[4],
+        SHT_PROGBITS,
+        0,
+        0,
+        loc_off,
+        loc_sz,
+        0,
+        0,
+        1,
+        0,
+    ); // [5] .debug_loc
+    push_shdr(
+        &mut out,
+        name_off[5],
         SHT_SYMTAB,
         0,
         0,
         sym_off,
         sym_sz,
-        6,                                                     // sh_link → .strtab (section 6)
+        7,                                                     // sh_link → .strtab (section 7)
         (sym_sz / SYM_LEN as u64) as u32 - funcs.len() as u32, // sh_info: first global = local count (just the null symbol)
         8,
         SYM_LEN as u64,
-    ); // [5] .symtab
+    ); // [6] .symtab
     push_shdr(
         &mut out,
-        name_off[5],
+        name_off[6],
         SHT_STRTAB,
         0,
         0,
@@ -247,10 +263,10 @@ pub fn build_elf(
         0,
         1,
         0,
-    ); // [6] .strtab
+    ); // [7] .strtab
     push_shdr(
         &mut out,
-        name_off[6],
+        name_off[7],
         SHT_STRTAB,
         0,
         0,
@@ -260,7 +276,7 @@ pub fn build_elf(
         0,
         1,
         0,
-    ); // [7] .shstrtab
+    ); // [8] .shstrtab
 
     out
 }

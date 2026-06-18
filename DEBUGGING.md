@@ -727,9 +727,11 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     runs (`Breakpoint 1, fn0 () at compute.c:3`); see the `gdb_attach` example
     (`crates/svm/examples/gdb_attach.rs`) for the repro harness + the exact `gdb --batch` invocation.
     *Effort: high.*
-- [~] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars). — in progress.**
-  The §6 core already carries the inputs (`DebugInfo::vars: Vec<VarInfo>` with a neutral `VarLoc`, and
-  `DebugInfo::types: Vec<TypeDef>`), so this is purely a JIT-side *emit* problem — no IR/text change.
+- [~] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars). — register vars
+  done; memory/CFA forms pending Stage 4.** The §6 core already carries the inputs (`DebugInfo::vars:
+  Vec<VarInfo>` with a neutral `VarLoc`, and `DebugInfo::types: Vec<TypeDef>`), so this is purely a
+  JIT-side *emit* problem — no IR/text change. ✅ **`print x` confirmed under gdb 15.1** (a JIT'd
+  register-resident local reads back with its value + type).
   - [x] **3a — value-location substrate (W6-JIT core). — built.** Gated on `-g` vars: `compile`
     assigns each SSA-resident source var (`VarLoc::{Ssa, SsaList}`) a `ValueLabel`, calls Cranelift's
     `func.collect_debug_info()` per function, and `lower_block` `set_val_label`s the CLIF value backing
@@ -754,13 +756,24 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     pointer/array/struct graph **round-trips through `svm_wasm::dwarf_info::parse`** with every
     `DW_AT_type` ref resolving to the right DIE, and binutils `readelf --debug-dump=info` parses it
     cleanly (refs shown as `<0x18>` → the `int` DIE). The 2b subprogram round-trip is unchanged.
-  - [ ] **3c — `DW_TAG_variable` DIEs + locations.** Variable DIEs as subprogram children:
-    `DW_AT_name`, `DW_AT_type` (→ 3b), and `DW_AT_location` — a `.debug_loclists` list of
-    `DW_OP_reg`/`DW_OP_breg`(CFA) ranges from 3a for SSA vars, `DW_OP_addr`/`DW_OP_fbreg` for the
-    `Fixed`/`Window` memory forms. Round-trip through the reader.
-  - [ ] **3d — gdb manual acceptance.** `print x` works on JIT'd code; vars the optimizer dropped show
-    `<optimized out>` (faithful native behavior — the interpreter tier stays the always-faithful
-    inspection fallback). *Effort (whole stage): high.*
+  - [x] **3c — `DW_TAG_variable` DIEs + register locations. — built.** `dwarf::debug_info` now emits
+    each tracked source variable as a `DW_TAG_variable` child of its subprogram (with proper
+    per-subprogram null termination): `DW_AT_name`, `DW_AT_type` (a `DW_FORM_ref4` into the 3b type
+    DIEs) and, for register-resident ranges, a `DW_AT_location` → a DWARF v4 `.debug_loc` location
+    list (a base-address-selection entry pinning base 0 so the `[lo, hi)` are absolute, then one
+    `DW_OP_reg{N}` entry per Stage-3a range). Four abbrev variants cover `{type?} × {location?}` (a
+    folded var with no live range omits `DW_AT_location` ⇒ gdb shows `<optimized out>`). The ELF
+    gains a `.debug_loc` section. Tests (`jit_srcloc.rs`): the loclist encodes exactly what
+    `var_locations()` resolved and the DIE tree still parses; `readelf --debug-dump=loc` shows
+    `DW_OP_reg4 (rsi)` over the right range. **CFA-relative ranges and the `Window`/`WindowVia`/
+    `Fixed` memory forms are deferred** — they need a frame base (`DW_AT_frame_base =
+    DW_OP_call_frame_cfa`) and the window-base register, which arrive with Stage 4's unwind/CFI.
+  - [x] **3d — gdb acceptance. — confirmed.** Under gdb 15.1, breaking in JIT'd code and
+    `print t` yields `$1 = 11` with `whatis t` → `int` (and `info locals` shows it) — gdb reads the
+    source variable straight from its register location. Repro: the `gdb_attach` example (now carries
+    a `debug.var`). Vars the optimizer dropped correctly show `<optimized out>` (faithful native
+    behavior — the interpreter tier stays the always-faithful inspection fallback). *Effort (whole
+    stage): high.*
 - [ ] **Stage 4 — W3-JIT unwind / backtrace.** Emit Cranelift unwind info; walk the out-of-band
   control stack rooted at a **fiber handle** (not the OS thread — §23/D57 migratable fibers) to
   materialize a per-fiber call stack with source frames. *Acceptance:* `bt` in gdb shows the guest

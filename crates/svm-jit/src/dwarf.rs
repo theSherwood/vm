@@ -7,7 +7,7 @@
 //! debugger, never affects the running guest. Hand-rolled (no `gimli`) to match the parsers' ethos
 //! and because only a tiny, fixed subset of the format is needed.
 
-use crate::SrcRange;
+use crate::{SrcRange, VarMachineInfo, VarMachineLoc, VarRange};
 use svm_ir::{Encoding, TypeDef};
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
@@ -107,6 +107,8 @@ const DW_TAG_STRUCTURE_TYPE: u64 = 0x13;
 const DW_TAG_SUBRANGE_TYPE: u64 = 0x21;
 const DW_TAG_BASE_TYPE: u64 = 0x24;
 const DW_TAG_SUBPROGRAM: u64 = 0x2e;
+const DW_TAG_VARIABLE: u64 = 0x34;
+const DW_AT_LOCATION: u64 = 0x02;
 const DW_AT_NAME: u64 = 0x03;
 const DW_AT_BYTE_SIZE: u64 = 0x0b;
 const DW_AT_STMT_LIST: u64 = 0x10;
@@ -129,6 +131,22 @@ const DW_ATE_BOOLEAN: u8 = 0x02;
 const DW_ATE_FLOAT: u8 = 0x04;
 const DW_ATE_SIGNED: u8 = 0x05;
 const DW_ATE_UNSIGNED: u8 = 0x07;
+
+// DWARF location-expression opcodes (Stage 3c variable locations).
+const DW_OP_REG0: u8 = 0x50; // `DW_OP_reg0`..`DW_OP_reg31` name registers 0..31 directly
+const DW_OP_REGX: u8 = 0x90; // `DW_OP_regx <uleb>` for register numbers ≥ 32
+
+/// The single-opcode location expression naming DWARF register `reg` (where a value currently
+/// lives) — `DW_OP_reg{N}` for the low registers, else `DW_OP_regx <reg>`.
+fn dw_op_reg(reg: u16) -> Vec<u8> {
+    if reg < 32 {
+        vec![DW_OP_REG0 + reg as u8]
+    } else {
+        let mut e = vec![DW_OP_REGX];
+        uleb(&mut e, reg as u64);
+        e
+    }
+}
 
 /// The CU header length (DWARF32 v4): `unit_length(4) + version(2) + debug_abbrev_offset(4) +
 /// address_size(1)`. A DIE at byte `p` in the DIE buffer is at CU/section offset `CU_HEADER_LEN + p`
@@ -161,6 +179,11 @@ const ABBR_ARRAY_TYPE: u64 = 5;
 const ABBR_SUBRANGE_TYPE: u64 = 6;
 const ABBR_STRUCTURE_TYPE: u64 = 7;
 const ABBR_MEMBER: u64 = 8;
+// Stage 3c variable DIEs, by which optional attributes they carry ({type?} × {location?}).
+const ABBR_VAR_TYPE_LOC: u64 = 9;
+const ABBR_VAR_TYPE: u64 = 10;
+const ABBR_VAR_LOC: u64 = 11;
+const ABBR_VAR: u64 = 12;
 
 /// Build the `.debug_abbrev` table shared by [`debug_info`]: the CU + subprogram entries (Stage 2b)
 /// and the type-DIE entries (Stage 3b). The DIE forms here fix the byte layout `debug_info` writes.
@@ -245,18 +268,61 @@ fn abbrev_table() -> Vec<u8> {
             (DW_AT_DATA_MEMBER_LOCATION, DW_FORM_UDATA),
         ],
     );
+    // Variable DIEs (subprogram children). `DW_AT_location` is a `DW_FORM_sec_offset` into
+    // `.debug_loc` (a location list); a variable with no live machine range omits it (gdb then shows
+    // `<optimized out>`), and one without a structured type omits `DW_AT_type`.
+    entry(
+        ABBR_VAR_TYPE_LOC,
+        DW_TAG_VARIABLE,
+        false,
+        &[
+            (DW_AT_NAME, DW_FORM_STRING),
+            (DW_AT_TYPE, DW_FORM_REF4),
+            (DW_AT_LOCATION, DW_FORM_SEC_OFFSET),
+        ],
+    );
+    entry(
+        ABBR_VAR_TYPE,
+        DW_TAG_VARIABLE,
+        false,
+        &[(DW_AT_NAME, DW_FORM_STRING), (DW_AT_TYPE, DW_FORM_REF4)],
+    );
+    entry(
+        ABBR_VAR_LOC,
+        DW_TAG_VARIABLE,
+        false,
+        &[
+            (DW_AT_NAME, DW_FORM_STRING),
+            (DW_AT_LOCATION, DW_FORM_SEC_OFFSET),
+        ],
+    );
+    entry(
+        ABBR_VAR,
+        DW_TAG_VARIABLE,
+        false,
+        &[(DW_AT_NAME, DW_FORM_STRING)],
+    );
     a.push(0); // end of the abbrev table
     a
 }
 
-/// Emit `.debug_info` + `.debug_abbrev`: one compile-unit DIE whose children are the §6 `types`
-/// graph as `DW_TAG_*_type` DIEs (Stage 3b — the inverse of `dwarf_info`'s type reader) followed by
-/// a `DW_TAG_subprogram` per function (Stage 2b: `(name, low_pc, high_pc)`, `high_pc` the DWARF4
-/// offset form). `funcs` is `(func index, lo, hi)` machine ranges; `types` is indexed by `TypeId`,
-/// and inter-type references (`pointee`/`elem`/field `ty`) become CU-relative `DW_FORM_ref4`s
-/// resolved by a fixup pass once every type DIE's offset is known.
-pub fn debug_info(funcs: &[(u32, u64, u64)], types: &[TypeDef]) -> (Vec<u8>, Vec<u8>) {
+/// Emit `.debug_info` + `.debug_abbrev` + `.debug_loc`: one compile-unit DIE whose children are the
+/// §6 `types` graph as `DW_TAG_*_type` DIEs (Stage 3b — the inverse of `dwarf_info`'s type reader),
+/// then a `DW_TAG_subprogram` per function (Stage 2b: `(name, low_pc, high_pc)`) carrying the source
+/// variables that live in it as `DW_TAG_variable` children (Stage 3c). `funcs` is `(func index, lo,
+/// hi)` machine ranges; `types` is indexed by `TypeId`; `vars` are the tracked source variables
+/// ([`VarMachineInfo`]), each emitted with `DW_AT_name`, `DW_AT_type` (a `DW_FORM_ref4` into the type
+/// DIEs) and — for register-resident ranges — a `DW_AT_location` location list in `.debug_loc`.
+///
+/// Inter-type references and a variable's `DW_AT_type` are CU-relative `DW_FORM_ref4`s resolved by a
+/// fixup pass once every type DIE's offset is known (a type may reference one defined later).
+pub fn debug_info(
+    funcs: &[(u32, u64, u64)],
+    types: &[TypeDef],
+    vars: &[VarMachineInfo],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let abbrev = abbrev_table();
+    let mut loc = Vec::new(); // the `.debug_loc` section, grown per variable location list
 
     let mut dies = Vec::new();
     uleb(&mut dies, ABBR_CU); // CU DIE
@@ -319,12 +385,36 @@ pub fn debug_info(funcs: &[(u32, u64, u64)], types: &[TypeDef]) -> (Vec<u8>, Vec
         }
     }
 
-    // Subprogram DIEs.
+    // Subprogram DIEs, each followed by its source variables as `DW_TAG_variable` children and a
+    // null DIE closing the subprogram's children.
     for &(func, lo, hi) in funcs {
         uleb(&mut dies, ABBR_SUBPROGRAM);
         dw_str(&mut dies, &format!("fn{func}")); // DW_AT_name (synthesized)
         dies.extend_from_slice(&lo.to_le_bytes()); // DW_AT_low_pc (8-byte address)
         dies.extend_from_slice(&hi.saturating_sub(lo).to_le_bytes()); // DW_AT_high_pc (offset)
+
+        for v in vars.iter().filter(|v| v.func == func) {
+            // A location list for the register-resident ranges (the only kind expressible without
+            // frame-base/CFI — `CfaOffset` ranges await Stage 4). `None` ⇒ no usable location.
+            let loc_off = emit_loclist(&mut loc, &v.ranges);
+            let code = match (v.type_id.is_some(), loc_off.is_some()) {
+                (true, true) => ABBR_VAR_TYPE_LOC,
+                (true, false) => ABBR_VAR_TYPE,
+                (false, true) => ABBR_VAR_LOC,
+                (false, false) => ABBR_VAR,
+            };
+            uleb(&mut dies, code);
+            dw_str(&mut dies, &v.name); // DW_AT_name
+            if let Some(tid) = v.type_id {
+                // Types precede subprograms, so the offset is already known — no fixup needed.
+                let off = type_off.get(tid as usize).copied().unwrap_or(0);
+                dies.extend_from_slice(&off.to_le_bytes());
+            }
+            if let Some(off) = loc_off {
+                dies.extend_from_slice(&off.to_le_bytes()); // DW_AT_location → .debug_loc offset
+            }
+        }
+        uleb(&mut dies, 0); // close this subprogram's children
     }
     uleb(&mut dies, 0); // end the CU's children
 
@@ -343,5 +433,38 @@ pub fn debug_info(funcs: &[(u32, u64, u64)], types: &[TypeDef]) -> (Vec<u8>, Vec
     info.extend_from_slice(&0u32.to_le_bytes()); // debug_abbrev_offset (table starts at 0)
     info.push(8); // address_size
     info.extend_from_slice(&dies);
-    (info, abbrev)
+    (info, abbrev, loc)
+}
+
+/// Append a DWARF v4 `.debug_loc` location list for the register-resident ranges of `ranges`,
+/// returning its section offset (for the variable's `DW_AT_location`), or `None` if there are none.
+/// A leading base-address-selection entry pins the base to 0 so the per-range `[lo, hi)` are the
+/// absolute machine addresses (the JIT objfile loads with a zero bias, like `.debug_line`); each
+/// entry's expression is the single `DW_OP_reg{N}` naming where the value lives there.
+fn emit_loclist(loc: &mut Vec<u8>, ranges: &[VarRange]) -> Option<u32> {
+    let reg_ranges: Vec<(u64, u64, u16)> = ranges
+        .iter()
+        .filter_map(|r| match r.loc {
+            VarMachineLoc::Reg(d) => Some((r.lo, r.hi, d)),
+            VarMachineLoc::CfaOffset(_) => None, // needs frame-base/CFI (Stage 4)
+        })
+        .collect();
+    if reg_ranges.is_empty() {
+        return None;
+    }
+    let off = loc.len() as u32;
+    // Base-address selection: largest-target sentinel, then base = 0 ⇒ absolute begin/end below.
+    loc.extend_from_slice(&u64::MAX.to_le_bytes());
+    loc.extend_from_slice(&0u64.to_le_bytes());
+    for (lo, hi, reg) in reg_ranges {
+        loc.extend_from_slice(&lo.to_le_bytes());
+        loc.extend_from_slice(&hi.to_le_bytes());
+        let expr = dw_op_reg(reg);
+        loc.extend_from_slice(&(expr.len() as u16).to_le_bytes());
+        loc.extend_from_slice(&expr);
+    }
+    // End-of-list: a (0, 0) pair.
+    loc.extend_from_slice(&0u64.to_le_bytes());
+    loc.extend_from_slice(&0u64.to_le_bytes());
+    Some(off)
 }

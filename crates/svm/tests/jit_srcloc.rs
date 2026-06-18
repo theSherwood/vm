@@ -446,3 +446,80 @@ fn jit_emits_type_dies_that_round_trip() {
     let (bi, ba) = bare.debug_info_sections();
     assert!(bi.is_empty() && ba.is_empty());
 }
+
+#[test]
+fn jit_emits_variable_loclists_matching_the_value_locations() {
+    // Stage 3c: each tracked source variable becomes a `DW_TAG_variable` whose `DW_AT_location` is a
+    // `.debug_loc` list of `DW_OP_reg{N}` entries built from the Stage 3a machine ranges. The reader
+    // is clang/wasm-shaped (fbreg/addr only), so we validate the loclist bytes directly — that they
+    // encode exactly what `var_locations()` resolved — and confirm the DIE tree still parses. The
+    // real `print x` check is the `gdb_attach` example under gdb (DEBUGGING.md §7, 3d).
+    let cm = compile(VAR_DBG);
+    let loc = cm.debug_loc_section();
+    assert!(
+        !loc.is_empty(),
+        "a register-resident var produces a .debug_loc list"
+    );
+
+    // Exactly one location list — only `t` is register-resident; `a` was optimized out (empty
+    // ranges ⇒ no list, gdb shows `<optimized out>`). Count the base-address-selection sentinels.
+    let base_sel = u64::MAX.to_le_bytes();
+    let lists = loc.windows(8).filter(|w| *w == base_sel).count();
+    assert_eq!(lists, 1, "one loclist for `t`, none for the folded `a`");
+
+    // The loclist carries `t`'s register range verbatim: `lo | hi | exprlen | DW_OP_reg{d}`.
+    let t = cm
+        .var_locations()
+        .iter()
+        .find(|v| v.name == "t")
+        .expect("t is tracked");
+    let r = *t
+        .ranges
+        .iter()
+        .find(|r| matches!(r.loc, VarMachineLoc::Reg(_)))
+        .expect("t has a register range");
+    let VarMachineLoc::Reg(d) = r.loc else {
+        unreachable!()
+    };
+    let expr: Vec<u8> = if d < 32 {
+        vec![0x50 + d as u8] // DW_OP_reg0 + d
+    } else {
+        let mut e = vec![0x90u8]; // DW_OP_regx <uleb>
+        let mut v = d as u64;
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            e.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+        e
+    };
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&r.lo.to_le_bytes());
+    entry.extend_from_slice(&r.hi.to_le_bytes());
+    entry.extend_from_slice(&(expr.len() as u16).to_le_bytes());
+    entry.extend_from_slice(&expr);
+    assert!(
+        loc.windows(entry.len()).any(|w| w == entry.as_slice()),
+        "the loclist encodes t's [lo,hi) DW_OP_reg{d} entry from the value-location map"
+    );
+
+    // The `.debug_info` still parses with the variable DIE as a subprogram child (the per-subprogram
+    // null termination is intact).
+    let (info, abbrev) = cm.debug_info_sections();
+    let parsed = svm_wasm::dwarf_info::parse(&info, &abbrev, &[]).expect("the CU parses");
+    assert_eq!(
+        parsed.subs.len(),
+        1,
+        "the subprogram survives the var children"
+    );
+
+    // A `-g` module with no register-resident vars (COMPUTE_DBG has lines but no `debug.var`)
+    // produces no location lists.
+    assert!(compile(COMPUTE_DBG).debug_loc_section().is_empty());
+}

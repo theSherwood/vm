@@ -39,6 +39,8 @@ debug.file 0 "compute.c"
 debug.loc 0 0 1 0 2 7
 debug.loc 0 0 3 0 3 7
 debug.loc 0 0 5 0 4 3
+debug.type 0 base "int" signed 4
+debug.var 0 "t" ssalist 1 0 1 2 "int" 0
 "#;
 
 fn main() {

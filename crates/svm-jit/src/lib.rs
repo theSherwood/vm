@@ -1191,6 +1191,9 @@ pub struct VarRange {
 pub struct VarMachineInfo {
     pub func: u32,
     pub name: String,
+    /// The variable's structured type as a `debug_info.types` index (Stage 3b), or `None` when the
+    /// module carried only a render-name. The Stage 3c `DW_TAG_variable` points `DW_AT_type` at it.
+    pub type_id: Option<u32>,
     pub ranges: Vec<VarRange>,
 }
 
@@ -1340,16 +1343,31 @@ impl CompiledModule {
         dwarf::debug_line(&self.src_ranges, &self.src_files)
     }
 
-    /// The synthesized DWARF `(.debug_info, .debug_abbrev)` for this module's finalized code (W5
-    /// JIT/DWARF Stages 2b + 3b): a compile unit holding the §6 `TypeDef` graph as `DW_TAG_*_type`
-    /// DIEs (3b) and one `DW_TAG_subprogram` per function (2b: its machine `[low_pc, high_pc)`
-    /// extent), so gdb/lldb map a stopped address to its function and resolve source-variable types.
-    /// Both empty without `-g`.
-    pub fn debug_info_sections(&self) -> (Vec<u8>, Vec<u8>) {
+    /// The synthesized `(.debug_info, .debug_abbrev, .debug_loc)` for this module's finalized code (W5
+    /// JIT/DWARF Stages 2b/3b/3c): a compile unit holding the §6 `TypeDef` graph as `DW_TAG_*_type`
+    /// DIEs (3b) and one `DW_TAG_subprogram` per function (2b), each carrying its source variables as
+    /// `DW_TAG_variable` children with `.debug_loc` location lists (3c). All empty without `-g`.
+    fn synth_debug_info(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         if self.src_ranges.is_empty() {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
-        dwarf::debug_info(&self.func_extents(), &self.debug_types)
+        dwarf::debug_info(&self.func_extents(), &self.debug_types, &self.var_locs)
+    }
+
+    /// The synthesized DWARF `(.debug_info, .debug_abbrev)` (W5 JIT/DWARF Stages 2b/3b/3c) — a compile
+    /// unit with the §6 type DIEs, one `DW_TAG_subprogram` per function, and a `DW_TAG_variable` per
+    /// tracked source variable (its `DW_AT_location` referring into [`Self::debug_loc_section`]). Both
+    /// empty without `-g`.
+    pub fn debug_info_sections(&self) -> (Vec<u8>, Vec<u8>) {
+        let (info, abbrev, _) = self.synth_debug_info();
+        (info, abbrev)
+    }
+
+    /// The synthesized DWARF `.debug_loc` (W5 JIT/DWARF Stage 3c): the variable location lists the
+    /// `DW_TAG_variable` DIEs' `DW_AT_location`s point into — one `DW_OP_reg{N}` entry per
+    /// register-resident machine range. Empty without `-g` (or when no variable is register-resident).
+    pub fn debug_loc_section(&self) -> Vec<u8> {
+        self.synth_debug_info().2
     }
 
     /// Each function's machine `[low_pc, high_pc)` extent, derived as the span (min `lo`, max `hi`)
@@ -1382,7 +1400,7 @@ impl CompiledModule {
         let funcs = self.func_extents();
         let code_base = funcs.iter().map(|f| f.1).min().unwrap_or(0);
         let code_end = funcs.iter().map(|f| f.2).max().unwrap_or(0);
-        let (info, abbrev) = self.debug_info_sections();
+        let (info, abbrev, loc) = self.synth_debug_info();
         let line = self.debug_line_section();
         gdb::build_elf(
             code_base,
@@ -1391,6 +1409,7 @@ impl CompiledModule {
             &info,
             &abbrev,
             &line,
+            &loc,
         )
     }
 
@@ -1696,7 +1715,7 @@ impl CompiledModule {
         // SSA forms (`Ssa`/`SsaList`) map to a Cranelift value-location; the window/fixed *memory*
         // forms are left to Stage 3c (a DWARF memory expression, not a value label). `var_meta[label]`
         // names the variable a label belongs to. Empty unless the module carries `-g` vars.
-        let mut var_meta: Vec<(u32, String)> = Vec::new();
+        let mut var_meta: Vec<(u32, String, Option<u32>)> = Vec::new();
         let mut var_label_map: VarLabelMap = std::collections::HashMap::new();
         if let Some(di) = m.debug_info.as_ref() {
             for v in &di.vars {
@@ -1711,7 +1730,7 @@ impl CompiledModule {
                     _ => continue,
                 };
                 let label = var_meta.len() as u32;
-                var_meta.push((v.func, v.name.clone()));
+                var_meta.push((v.func, v.name.clone(), v.type_id));
                 for (block, value) in points {
                     var_label_map
                         .entry((v.func, block))
@@ -1888,12 +1907,13 @@ impl CompiledModule {
             var_meta
                 .iter()
                 .enumerate()
-                .map(|(label, (func, name))| {
+                .map(|(label, (func, name, type_id))| {
                     let mut ranges = by_label.remove(&(label as u32)).unwrap_or_default();
                     ranges.sort_by_key(|r| r.lo);
                     VarMachineInfo {
                         func: *func,
                         name: name.clone(),
+                        type_id: *type_id,
                         ranges,
                     }
                 })
