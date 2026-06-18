@@ -318,8 +318,19 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               8×500 atomic counter=4000, futex handoff=987654 exercising wait/notify, forged-join
               fault) — bit-identical to `run`. **Fiber migration** (run-shared registry) is deferred:
               modules using *both* threads and fibers are compile-rejected (→ fallback) for now.
-        - [ ] **1c-5d** — coroutines via `Instantiator` (`spawn_coroutine`/`resume`, `Yielder`,
-              `SharedRegion` grant) — inline-driven like fibers, reuses the `step_vcpu` switch logic.
+        - [x] **1c-5d** — §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume` + `Yielder.yield`),
+              the cooperative nesting round-trip. `spawn_coroutine` carves a confined child window via
+              `Mem::nested_view(abs_base, size_log2)` (shared backing, fresh page-protection) and gives
+              the child a Yielder-only powerbox; `resume` drives that child **inline** (`resume_coro`,
+              like `run_inner`'s recursion) over the child's own `mem`/`host` until `CoYield`/`Done`;
+              `yield` escapes as `Outcome::CoYield`. Cap authority (`resolve_instantiator` /
+              `resolve_yielder`) is checked in `Vm::resume`, so a forged/ungranted handle is an inert
+              `CapFault` in place; because a coroutine child holds only a Yielder, its own
+              spawn/resume CapFault (no recursion needed). New TDD harness `bytecode_coroutines.rs`
+              (the coroutine.rs round-trip = 1_001_329, forged-resume fault) bit-identical to
+              `run_with_host`. Deferred (rare, complex, ~0 corpus): `instantiate`/`join` executor
+              children, demand-paging / fault-yield (`CoFault`), and the module-spawning variants
+              (ops 5/6/7). Coroutine modules are single-vCPU (no fibers/threads) by compile-rejection.
         - [ ] **1c-5e** — cross-module units (`install`/`invoke` indirect calls; tail calls).
         - [x] **1c-5f** — fiber **migration**: the fiber registry moved out of `VTask` into a
               **run-shared** `Vec<FiberState>` owned by `drive` (one domain-wide handle namespace),

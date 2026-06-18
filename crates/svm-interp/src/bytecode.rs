@@ -12,13 +12,14 @@
 //! capability seam (generic `cap.call` + `cap.self.*`, via `host.cap_dispatch_slots`); §12 **fibers**
 //! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
-//! ([`drive`]) over one shared `Mem` — faithful for the interleaving-invariant programs the oracle
-//! uses. Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long tail is delegated to the
-//! reference [`super::eval_inst`] (same semantics, no re-implementation). Threads and fibers compose
-//! (the fiber registry is run-shared, so fibers migrate across vCPUs). [`compile_module`] returns
-//! `None` when a function needs a seam not yet driven here — `Instantiator`/`Yielder` coroutines,
-//! cross-module `install`/`invoke`, tail calls, or durability — so callers
-//! (`super::run_with_host_fast`) fall back to the tree-walker for those.
+//! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
+//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window). Faithful for the
+//! interleaving-invariant programs the oracle uses. Hot scalar/memory ops dispatch inline; the
+//! SIMD/`v128`/fence long tail is delegated to the reference [`super::eval_inst`]. Threads and fibers
+//! compose (the fiber registry is run-shared, so fibers migrate across vCPUs). [`compile_module`]
+//! returns `None` when a function needs a seam not yet driven here — `Instantiator` executor children
+//! (`instantiate`/`join`) and demand/module variants, cross-module `install`/`invoke`, tail calls,
+//! or durability — so callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
@@ -285,6 +286,31 @@ enum Op {
         count: u32,
         dst: u32,
     },
+    /// §14 `Instantiator.spawn_coroutine(entry, off, size_log2, fuel)` (op 2): spawn a cooperative
+    /// coroutine child confined to `[off, off+2^size_log2)` of the holder's range, with a Yielder-only
+    /// powerbox; its handle (or `EINVAL`) lands at `dst`. `handle` is the Instantiator cap (authority).
+    SpawnCoroutine {
+        handle: u32,
+        entry: u32,
+        off: u32,
+        size_log2: u32,
+        dst: u32,
+    },
+    /// §14 `Instantiator.resume(ch, value)` (op 3): drive coroutine `ch` inline until it yields or
+    /// returns; `(status, value)` land at `dst`/`dst+1`. `handle` is the Instantiator cap.
+    CoResume {
+        handle: u32,
+        ch: u32,
+        value: u32,
+        dst: u32,
+    },
+    /// §14 `Yielder.yield(value)` (op 0): suspend this coroutine, hand `value` to the resumer; the
+    /// next resume's value lands at `dst`. `handle` is the Yielder cap (authority).
+    CoYield {
+        handle: u32,
+        value: u32,
+        dst: u32,
+    },
     Ret {
         srcs: Box<[u32]>,
     },
@@ -319,6 +345,37 @@ pub struct Compiled {
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
+    // Coroutines (§14) are driven inline as single-vCPU children with a Yielder-only powerbox. A
+    // coroutine module that *also* uses fibers or threads would need the child to participate in
+    // those seams (a coroutine child can use `cont.*`/`thread.*` in the tree-walker), which the
+    // inline coroutine driver here doesn't service — so reject the combination (→ tree-walker
+    // fallback). Plain coroutine, plain fiber, and plain thread modules are each fine.
+    let mut has_coro = false;
+    let mut has_fiber_or_thread = false;
+    for f in funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::CapCall {
+                        type_id: super::iface::INSTANTIATOR | super::iface::YIELDER,
+                        ..
+                    } => has_coro = true,
+                    Inst::ContNew { .. }
+                    | Inst::ContResume { .. }
+                    | Inst::Suspend { .. }
+                    | Inst::ThreadSpawn { .. }
+                    | Inst::ThreadJoin { .. }
+                    | Inst::MemoryWait { .. }
+                    | Inst::MemoryNotify { .. } => has_fiber_or_thread = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if has_coro && has_fiber_or_thread {
+        return None;
+    }
+
     let arities: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     let mut progs = Vec::with_capacity(funcs.len());
     for f in funcs {
@@ -634,18 +691,39 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             args,
         } => {
             use super::iface;
-            if matches!(*type_id, iface::INSTANTIATOR | iface::YIELDER | iface::JIT)
-                || (*type_id == iface::SHARED_REGION && *op == 4)
-            {
-                return None;
-            }
-            Op::CapCall {
-                type_id: *type_id,
-                op: *op,
-                handle: g(*handle),
-                args: args.iter().map(|a| g(*a)).collect(),
-                dst,
-                results: sig.results.clone().into(),
+            match (*type_id, *op) {
+                // §14 cooperative coroutine round-trip — spawn_coroutine / resume / yield. (The other
+                // Instantiator ops — instantiate/join executor children, demand/module variants — and
+                // the JIT / SharedRegion-grant variants need seams this slice doesn't drive: reject.)
+                (iface::INSTANTIATOR, 2) if args.len() >= 3 => Op::SpawnCoroutine {
+                    handle: g(*handle),
+                    entry: g(args[0]),
+                    off: g(args[1]),
+                    size_log2: g(args[2]),
+                    dst,
+                },
+                (iface::INSTANTIATOR, 3) if args.len() >= 2 => Op::CoResume {
+                    handle: g(*handle),
+                    ch: g(args[0]),
+                    value: g(args[1]),
+                    dst,
+                },
+                (iface::YIELDER, 0) if !args.is_empty() => Op::CoYield {
+                    handle: g(*handle),
+                    value: g(args[0]),
+                    dst,
+                },
+                (iface::INSTANTIATOR, _) | (iface::YIELDER, _) | (iface::JIT, _) => return None,
+                (iface::SHARED_REGION, 4) => return None,
+                // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/…).
+                _ => Op::CapCall {
+                    type_id: *type_id,
+                    op: *op,
+                    handle: g(*handle),
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    dst,
+                    results: sig.results.clone().into(),
+                },
             }
         }
         // §7 reflection — synchronous self-powerbox queries (no scheduler/fiber); reuse the host's
@@ -850,6 +928,27 @@ enum Outcome {
         count: i32,
         dst: u32,
     },
+    /// §14 `spawn_coroutine`: the Instantiator authority `(ibase, isize)` is resolved; build a child
+    /// confined to `[ibase+off, +2^size_log2)` (`dst` ← handle or `EINVAL`).
+    SpawnCoroutine {
+        ibase: u64,
+        isize: u64,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        dst: u32,
+    },
+    /// §14 `resume`: drive coroutine `ch` (authority already checked); `(status, value)` → `dst`.
+    CoResume {
+        ch: i32,
+        value: i64,
+        dst: u32,
+    },
+    /// §14 `yield`: this coroutine hands `value` to its resumer; the next resume's value → `dst`.
+    CoYield {
+        value: i64,
+        dst: u32,
+    },
 }
 
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). Non-durable only — a
@@ -880,6 +979,11 @@ struct VTask {
     active_id: usize,
     /// Parked resumers: `(fiber id, its Vm, the `cont.resume` result slot awaiting (status, value))`.
     chain: Vec<(usize, Vm, u32)>,
+    /// §14 coroutine children this vCPU spawned (handle = index). `None` once finished. A coroutine
+    /// is cooperative and driven *inline* by `resume` — never via the thread scheduler — so it lives
+    /// here, not in the task set. (Coroutine modules are single-vCPU, no fibers/threads — see
+    /// `compile_module` — so this and `chain` are never both non-empty.)
+    coroutines: Vec<Option<Coro>>,
 }
 
 impl VTask {
@@ -888,7 +992,46 @@ impl VTask {
             active: Vm::new(c, entry, args)?,
             active_id: ROOT_FIBER,
             chain: Vec::new(),
+            coroutines: Vec::new(),
         })
+    }
+}
+
+/// A §14 coroutine child: its own `Vm` continuation over a **confined** window (`nested_view`) and a
+/// Yielder-only powerbox. Driven inline by `resume_coro` until it yields or returns. `awaiting` is the
+/// `yield`'s result slot, set while suspended — the next `resume` writes the delivered value there.
+struct Coro {
+    vm: Vm,
+    mem: Option<Mem>,
+    host: Host,
+    awaiting: Option<u32>,
+}
+
+/// Why [`resume_coro`] returned: the coroutine yielded a value, or its function returned.
+enum CoStop {
+    Yield(i64),
+    Done(Vec<Value>),
+}
+
+/// Drive a coroutine child inline until it yields (`Yielder.yield` → [`Outcome::CoYield`]) or its
+/// function returns. The child runs over its **own** confined `mem` and Yielder-only `host`; since it
+/// holds no Instantiator, its own `spawn_coroutine`/`resume` resolve to `CapFault` inside
+/// [`Vm::resume`] (never reaching here), and coroutine modules carry no fibers/threads — so the only
+/// outcomes possible are `Done`/`Suspended`/`CoYield`. A child trap propagates to the resumer.
+fn resume_coro(coro: &mut Coro, c: &Compiled, fuel: &mut u64) -> Result<CoStop, Trap> {
+    loop {
+        match coro
+            .vm
+            .resume(c, fuel, &mut coro.mem, &mut coro.host, u64::MAX)?
+        {
+            Outcome::Done(vals) => return Ok(CoStop::Done(vals)),
+            Outcome::Suspended => {}
+            Outcome::CoYield { value, dst } => {
+                coro.awaiting = Some(dst);
+                return Ok(CoStop::Yield(value));
+            }
+            _ => return Err(Trap::FiberFault),
+        }
     }
 }
 
@@ -1037,8 +1180,106 @@ fn step_vcpu(
             Outcome::MemoryNotify { base, count, dst } => {
                 return Ok(VcpuStop::Notify { base, count, dst })
             }
+            // §14 coroutines are cooperative and driven **inline** here (never via the thread
+            // scheduler), exactly as `run_inner` recurses for `resume`.
+            Outcome::SpawnCoroutine {
+                ibase,
+                isize: isz,
+                entry,
+                off,
+                size_log2,
+                dst,
+            } => {
+                let h = spawn_coroutine(
+                    &mut vt.coroutines,
+                    mem,
+                    c,
+                    entry,
+                    (ibase, isz, off, size_log2),
+                );
+                vt.active.set(dst, Reg::from_i32(h));
+            }
+            Outcome::CoResume { ch, value, dst } => {
+                // Take the coroutine; a forged/finished slot is an inert CapFault (propagates).
+                let mut coro = vt
+                    .coroutines
+                    .get_mut(ch as usize)
+                    .and_then(|c| c.take())
+                    .ok_or(Trap::CapFault)?;
+                if let Some(yd) = coro.awaiting.take() {
+                    coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
+                }
+                match resume_coro(&mut coro, c, fuel)? {
+                    CoStop::Yield(yv) => {
+                        vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
+                        vt.active.set(dst + 1, Reg::from_i64(yv));
+                    }
+                    CoStop::Done(vals) => {
+                        // Finished — the slot stays `None` (a later resume is inert/CapFault).
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_RETURNED));
+                        let v = vals.first().copied().unwrap_or(Value::I64(0));
+                        vt.active.set(dst + 1, Reg::from_value(v));
+                    }
+                }
+            }
+            // A `Yielder.yield` only resolves (and thus only reaches a driver) inside an inline
+            // coroutine child — `resume_coro` consumes it. At the top level the yielder handle is
+            // ungranted, so `resume` CapFaults before producing this; treat any leak as a fault.
+            Outcome::CoYield { .. } => return Err(Trap::FiberFault),
         }
     }
+}
+
+/// Build a §14 coroutine child confined to `[ibase+off, ibase+off+2^size_log2)` of the parent's
+/// window, with a Yielder-only powerbox, and register it. Returns its handle, or `EINVAL` if the
+/// entry signature / size / alignment is invalid (mirrors the tree-walker's validation).
+fn spawn_coroutine(
+    coroutines: &mut Vec<Option<Coro>>,
+    mem: &Option<Mem>,
+    c: &Compiled,
+    entry: i64,
+    // The Instantiator-relative carve geometry: `(holder base, holder size, offset, size_log2)`.
+    carve: (u64, u64, i64, i64),
+) -> i32 {
+    let (ibase, isz, off, size_log2) = carve;
+    // Coroutine entry is a fixed `(i64 yielder) -> (i64)`.
+    let ok_entry = c
+        .sigs
+        .get(entry as u64 as usize)
+        .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let off = off as u64;
+    let fits = child_size != 0
+        && child_size <= isz
+        && off & (child_size - 1) == 0
+        && off.checked_add(child_size).is_some_and(|e| e <= isz);
+    if !ok_entry || !fits {
+        return super::EINVAL as i32;
+    }
+    // Holder-relative `ibase`/`off` → backing-absolute base (adds the holder's own window base, so
+    // nesting composes); the child sees a zero-based `[0, child_size)` confined view.
+    let abs_base = mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
+    let child_mem = mem
+        .as_ref()
+        .map(|m| m.nested_view(abs_base, size_log2 as u8));
+    let mut child_host = Host::new();
+    let cy = child_host.grant_yielder(); // the child's handle to suspend back to us
+    let child_vm = match Vm::new(c, entry as u64 as usize, &[Value::I64(cy as i64)]) {
+        Ok(v) => v,
+        Err(_) => return super::EINVAL as i32,
+    };
+    coroutines.push(Some(Coro {
+        vm: child_vm,
+        mem: child_mem,
+        host: child_host,
+        awaiting: None,
+    }));
+    (coroutines.len() - 1) as i32
 }
 
 /// `fiber_sig` params/results, inlined so the driver can compare without allocating a `FuncType`.
@@ -1773,6 +2014,56 @@ impl Vm {
                         count,
                         dst,
                     });
+                }
+                // §14 coroutine ops — the cap authority is resolved here (a forged/ungranted handle
+                // is an inert CapFault in place), then the switch is handed to the driver.
+                Op::SpawnCoroutine {
+                    handle,
+                    entry,
+                    off,
+                    size_log2,
+                    dst,
+                } => {
+                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let entry = r!(*entry).i64();
+                    let off = r!(*off).i64();
+                    let size_log2 = r!(*size_log2).i64();
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::SpawnCoroutine {
+                        ibase,
+                        isize: isz,
+                        entry,
+                        off,
+                        size_log2,
+                        dst,
+                    });
+                }
+                Op::CoResume {
+                    handle,
+                    ch,
+                    value,
+                    dst,
+                } => {
+                    host.resolve_instantiator(r!(*handle).i32())?; // authority
+                    let ch = r!(*ch).i32();
+                    let value = r!(*value).i64();
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::CoResume { ch, value, dst });
+                }
+                Op::CoYield { handle, value, dst } => {
+                    host.resolve_yielder(r!(*handle).i32())?; // authority
+                    let value = r!(*value).i64();
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::CoYield { value, dst });
                 }
                 Op::Unreachable => return Err(Trap::Unreachable),
                 Op::Eval {
