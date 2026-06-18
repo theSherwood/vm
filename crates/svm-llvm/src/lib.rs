@@ -5582,6 +5582,18 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, ctx.push(Inst::Select { cond, a, b }))
         }
         I::Trunc(x) => {
+            // A lane-wise vector `trunc` scalarizes through the unified converter (svm-ir has no
+            // vector-convert op); a scalar `trunc` keeps the direct width-adjust path.
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                return lower_vec_int_convert(
+                    ctx,
+                    &x.dest,
+                    &x.operand,
+                    x.to_type.as_ref(),
+                    VConv::Trunc,
+                    types,
+                );
+            }
             let from = src_bits(&x.operand, types)?;
             let to = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("trunc to non-int".into()))?;
@@ -5589,6 +5601,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, emit_trunc(ctx, v, from, to))
         }
         I::ZExt(x) => {
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                return lower_vec_int_convert(
+                    ctx,
+                    &x.dest,
+                    &x.operand,
+                    x.to_type.as_ref(),
+                    VConv::ZExt,
+                    types,
+                );
+            }
             let from = src_bits(&x.operand, types)?;
             let to = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("zext to non-int".into()))?;
@@ -5596,6 +5618,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, emit_ext(ctx, v, from, to, false))
         }
         I::SExt(x) => {
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                return lower_vec_int_convert(
+                    ctx,
+                    &x.dest,
+                    &x.operand,
+                    x.to_type.as_ref(),
+                    VConv::SExt,
+                    types,
+                );
+            }
             let from = src_bits(&x.operand, types)?;
             let to = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("sext to non-int".into()))?;
@@ -6719,6 +6751,199 @@ fn sext_in_i32(ctx: &mut BlockCtx, v: ValIdx, from: u32) -> ValIdx {
         a: up,
         b: sh2,
     })
+}
+
+/// Which integer-widening/narrowing conversion a vector `zext`/`sext`/`trunc` applies per lane.
+#[derive(Clone, Copy)]
+enum VConv {
+    ZExt,
+    SExt,
+    Trunc,
+}
+
+/// The integer lane width of a vector whose elements are integers (`<N x iB>` → `B`). `None` if
+/// `ty` is not a vector or its lanes are not integers (a float-lane vector conversion stays
+/// `Unsupported` for now — a later slice).
+fn vec_int_lane_bits(ty: &Type) -> Option<u32> {
+    match ty {
+        Type::VectorType { element_type, .. } => match element_type.as_ref() {
+            Type::IntegerType { bits } => Some(*bits),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Explode an **integer** vector operand into its `N` per-lane scalars, each the lane's raw value in
+/// its natural `i32`/`i64` container (zero-extended — the per-lane conversion re-canonicalizes from
+/// the known source width). Covers all three integer-vector representations: a `<2 x i32>` packed in
+/// an `i64` (lane 0 = low half), a single `v128` (one `ExtractLane` per lane), and a legalized wide
+/// value (`ExtractLane` per chunk lane, then the already-scalar tail lanes).
+fn vec_explode_int(ctx: &mut BlockCtx, op: &Operand, types: &Types) -> Result<Vec<ValIdx>, Error> {
+    let ty = op.get_type(types);
+    let ty = ty.as_ref();
+    if let Some(lane) = vec2_lane_ty(ty) {
+        if lane != ValType::I32 {
+            return unsup("vector convert of a <2 x float> (later slice)");
+        }
+        let v = ctx.operand(op)?; // the packed i64
+        let lo = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: v,
+        });
+        let sh = ctx.const_i64(32);
+        let hi64 = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::ShrU,
+            a: v,
+            b: sh,
+        });
+        let hi = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: hi64,
+        });
+        return Ok(vec![lo, hi]);
+    }
+    if let Some(shape) = vec128_shape(ty) {
+        let v = ctx.operand(op)?;
+        return Ok((0..shape.lanes())
+            .map(|l| {
+                ctx.push(Inst::ExtractLane {
+                    shape,
+                    lane: l,
+                    signed: false,
+                    a: v,
+                })
+            })
+            .collect());
+    }
+    if let Some(layout) = wide_vec_layout(ty) {
+        let parts = ctx.wide_operand(op, layout)?;
+        let lpc = layout.shape.lanes() as usize;
+        let mut out = Vec::with_capacity(layout.total_lanes());
+        for &chunk in parts.iter().take(layout.full_chunks) {
+            for l in 0..lpc {
+                out.push(ctx.push(Inst::ExtractLane {
+                    shape: layout.shape,
+                    lane: l as u8,
+                    signed: false,
+                    a: chunk,
+                }));
+            }
+        }
+        for t in 0..layout.tail_lanes {
+            out.push(parts[layout.full_chunks + t]);
+        }
+        return Ok(out);
+    }
+    unsup("vector convert: unsupported source vector shape")
+}
+
+/// Build a single `v128` of `shape` from its `lane scalars` (`Splat` lane 0, then `ReplaceLane` the
+/// rest). `lanes.len()` must equal `shape.lanes()`.
+fn build_v128_from_lanes(ctx: &mut BlockCtx, shape: svm_ir::VShape, lanes: &[ValIdx]) -> ValIdx {
+    let mut v = ctx.push(Inst::Splat { shape, a: lanes[0] });
+    for (i, &l) in lanes.iter().enumerate().skip(1) {
+        v = ctx.push(Inst::ReplaceLane {
+            shape,
+            lane: i as u8,
+            a: v,
+            b: l,
+        });
+    }
+    v
+}
+
+/// Repack `N` converted lane scalars into the destination integer vector `to_type`, binding `dest`
+/// in whichever representation that type uses (a `<2 x i32>` packed `i64`, a single `v128`, or a
+/// legalized wide value). The inverse of [`vec_explode_int`].
+fn vec_implode_int(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    lanes: &[ValIdx],
+    to_type: &Type,
+    _types: &Types,
+) -> Result<(), Error> {
+    if let Some(lane) = vec2_lane_ty(to_type) {
+        if lane != ValType::I32 {
+            return unsup("vector convert to a <2 x float> (later slice)");
+        }
+        // Pack lane 0 into the low 32 bits, lane 1 into the high 32 bits of an `i64`.
+        let lo = ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: lanes[0],
+        });
+        let hi = ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: lanes[1],
+        });
+        let sh = ctx.const_i64(32);
+        let hishift = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Shl,
+            a: hi,
+            b: sh,
+        });
+        let packed = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Or,
+            a: lo,
+            b: hishift,
+        });
+        return finish(ctx, dest, packed);
+    }
+    if let Some(shape) = vec128_shape(to_type) {
+        let v = build_v128_from_lanes(ctx, shape, lanes);
+        return finish(ctx, dest, v);
+    }
+    if let Some(layout) = wide_vec_layout(to_type) {
+        let lpc = layout.shape.lanes() as usize;
+        let mut parts = Vec::with_capacity(layout.nparts());
+        for ci in 0..layout.full_chunks {
+            parts.push(build_v128_from_lanes(
+                ctx,
+                layout.shape,
+                &lanes[ci * lpc..ci * lpc + lpc],
+            ));
+        }
+        let tail_start = layout.full_chunks * lpc;
+        for t in 0..layout.tail_lanes {
+            parts.push(lanes[tail_start + t]);
+        }
+        ctx.bind_wide(dest, parts);
+        return Ok(());
+    }
+    unsup("vector convert: unsupported destination vector shape")
+}
+
+/// Lower a lane-wise **integer** vector conversion (`zext`/`sext`/`trunc`, `<N x iA> → <N x iB>`) —
+/// the auto-vectorizer's widen/narrow. svm-ir has no vector-convert op, so we scalarize: explode the
+/// source to `N` lane scalars, convert each in its `i32`/`i64` container via the same `emit_ext`/
+/// `emit_trunc` used for scalars, then repack into the destination representation. The result re-
+/// verifies under `svm-verify` exactly as the hand-written scalar form would.
+fn lower_vec_int_convert(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    operand: &Operand,
+    to_type: &Type,
+    kind: VConv,
+    types: &Types,
+) -> Result<(), Error> {
+    let from_ty = operand.get_type(types);
+    let from_bits = vec_int_lane_bits(from_ty.as_ref())
+        .ok_or_else(|| Error::Unsupported("vector conversion of non-integer lanes".into()))?;
+    let to_bits = vec_int_lane_bits(to_type)
+        .ok_or_else(|| Error::Unsupported("vector conversion to non-integer lanes".into()))?;
+    let lanes_in = vec_explode_int(ctx, operand, types)?;
+    let mut out = Vec::with_capacity(lanes_in.len());
+    for v in lanes_in {
+        out.push(match kind {
+            VConv::ZExt => emit_ext(ctx, v, from_bits, to_bits, false),
+            VConv::SExt => emit_ext(ctx, v, from_bits, to_bits, true),
+            VConv::Trunc => emit_trunc(ctx, v, from_bits, to_bits),
+        });
+    }
+    vec_implode_int(ctx, dest, &out, to_type, types)
 }
 
 fn translate_term(

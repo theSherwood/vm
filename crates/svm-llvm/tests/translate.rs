@@ -3568,6 +3568,66 @@ fn simd_i32x8_loop_accumulator() {
     check("simd_i32x8_loop", src, &[Value::I32(3)], &[Value::I32(168)]);
 }
 
+// ── Auto-vectorized lane-wise integer conversions (`zext`/`sext`/`trunc`) ──────────────────────
+// svm-ir has no vector-convert op, so the on-ramp scalarizes a `<N x iA> → <N x iB>` widen/narrow:
+// explode the source to lane scalars, convert each in its `i32`/`i64` container, repack into the
+// destination representation (packed-`i64` `<2 x i32>`, a single `v128`, or legalized wide chunks +
+// tail). These `check_vectorized_vs_native` tests ingest **real `clang -O2`** output that emits the
+// conversion (verified to vectorize), covering every source↔dest representation pairing: a wide-tail
+// source widening to a `v128` (`zext <4 x i8> → <4 x i32>`), a `v128` narrowing to a wide tail
+// (`trunc <8 x i32> → <8 x i8>`), a wide source narrowing to a `v128` (`trunc <2 x i64> → <2 x i32>`),
+// and a packed-`i64` `<2 x i32>` widening to a `v128` (`sext <2 x i32> → <2 x i64>`).
+
+/// `zext <4 x i8> → <4 x i32>` (a `u8 → int` widening store loop: wide-tail source widened to a
+/// `v128`), plus the seeding store's `trunc <16 x i32> → <16 x i8>`. A fixed-index read-back (no
+/// horizontal reduction) keeps the conversion the only vector op under test.
+#[test]
+fn simd_conv_zext_u8_to_i32() {
+    let src = "static unsigned char b[128]; static int out[128]; \
+               int run(int seed){ for(int i=0;i<128;i++) b[i]=(unsigned char)(seed+i); \
+               for(int i=0;i<128;i++) out[i]=b[i]; \
+               return (out[0]+out[63]+out[127]) & 0xff; } \
+               int main(void){ return run(7); }";
+    check_vectorized_vs_native("simd_conv_zext", src, 7);
+}
+
+/// `sext <2 x i32> → <2 x i64>` — a sign-extending `int → long long` store loop (the packed-`i64`
+/// `<2 x i32>` representation widened to an `i64x2` `v128`), the exact shape `heapgrow` emits.
+#[test]
+fn simd_conv_sext_i32_to_i64() {
+    let src = "int run(int seed){ int in[64]; long long out[64]; \
+               for(int i=0;i<64;i++) in[i]=seed-i; \
+               for(int i=0;i<64;i++) out[i]=(long long)in[i]; \
+               long long s=0; for(int i=0;i<64;i++) s+=out[i]; return (int)(s & 0xff); } \
+               int main(void){ return run(9); }";
+    check_vectorized_vs_native("simd_conv_sext", src, 9);
+}
+
+/// `trunc <2 x i64> → <2 x i32>` — a narrowing `long long → int` store loop (a wide `i64x2` source
+/// narrowed to a `v128`), the shape `revsum`/`heapgrow` emit.
+#[test]
+fn simd_conv_trunc_i64_to_i32() {
+    let src = "int run(int seed){ long long in[64]; int out[64]; \
+               for(int i=0;i<64;i++) in[i]=(long long)seed*1000+i; \
+               for(int i=0;i<64;i++) out[i]=(int)in[i]; \
+               int s=0; for(int i=0;i<64;i++) s+=out[i]; return s & 0xff; } \
+               int main(void){ return run(4); }";
+    check_vectorized_vs_native("simd_conv_trunc64", src, 4);
+}
+
+/// `trunc <8 x i16> → <8 x i8>` and `trunc <8 x i32> → <8 x i16>` (a `u16 → u8` narrowing store
+/// loop: `v128`/wide sources narrowed to a wide all-tail / `v128` destination). Fixed-index read-back
+/// keeps the conversions the only vector ops under test.
+#[test]
+fn simd_conv_trunc_to_u8() {
+    let src = "static unsigned short in[128]; static unsigned char out[128]; \
+               int run(int seed){ for(int i=0;i<128;i++) in[i]=(unsigned short)(seed*7+i); \
+               for(int i=0;i<128;i++) out[i]=(unsigned char)in[i]; \
+               return (out[0]+out[63]+out[127]) & 0xff; } \
+               int main(void){ return run(5); }";
+    check_vectorized_vs_native("simd_conv_trunc8", src, 5);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and

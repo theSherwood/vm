@@ -852,6 +852,27 @@ breadth-proof capstone: not a unit test of a feature, but a recognizable program
 - Test: `rust_json_tokenizer_capstone` — 14 tokens over the doc, folded digest `% 251 = 135`, on-ramp
   == native. 102 translate tests green, fmt + clippy clean.
 
+**Slice AP (DONE) — lane-wise vector integer conversions (`zext`/`sext`/`trunc`).** With the vector
+legalization landed (I2 / PR #56), the first of the four vector-op classes that block re-enabling
+auto-vectorization on the breadth lanes. svm-ir has **no vector-convert op**, so a `<N x iA> → <N x iB>`
+widen/narrow **scalarizes**: explode the source into `N` per-lane scalars, convert each in its `i32`/
+`i64` container via the same `emit_ext`/`emit_trunc` the scalar path uses, then repack into the
+destination representation. The converter (`lower_vec_int_convert` + `vec_explode_int`/`vec_implode_int`/
+`build_v128_from_lanes`, dispatched from the `Trunc`/`ZExt`/`SExt` arms when the operand is a vector)
+handles **every source↔dest representation pairing**: the packed-`i64` `<2 x i32>`, a single `v128`,
+and a legalized wide value (chunks via `ExtractLane`/`Splat`+`ReplaceLane`, tail lanes already scalar).
+This lands the 4 conversion-blocked demos (`var_memset`, `revsum`, `heapgrow`, `simd_i16x8`) when
+vectorization is on — confirmed by flipping the lanes (9 fails → 5). Float-lane vector conversions stay
+`Unsupported` (fail-closed; a later slice with the `<N x i1>` mask work).
+- Tests: `simd_conv_{zext_u8_to_i32,sext_i32_to_i64,trunc_i64_to_i32,trunc_to_u8}` — `check_vectorized_vs_native`
+  (vectorization *enabled*), each a real `clang -O2` loop verified to emit the conversion, vs native.
+  Covers `zext <4 x i8>→<4 x i32>`, `sext <2 x i32>→<2 x i64>`, `trunc <2 x i64>→<2 x i32>`, and
+  `trunc <8 x i16>→<8 x i8>` / `<8 x i32>→<8 x i16>`. 125 translate tests green, fmt + clippy clean.
+- **Remaining before the breadth-lane flip (3 classes, 5 demos):** `<N x i1>` masks (vector `icmp`/
+  `select` → `perlin`/`crc32`/`clay`), vector rotate (`llvm.fshl`/`fshr` → `xxhash`), non-splat
+  cross-chunk shuffle (→ `vm_async_io_runtime`). The lanes are **all-or-nothing** (a lane flips only
+  when every demo on it passes), so they stay `-fno-*-vectorize` until all four classes land.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
@@ -870,16 +891,15 @@ breadth-proof capstone: not a unit test of a feature, but a recognizable program
       fold (extract + scalar combine / `cmp`+`select`). Tests (a `check_vectorized_vs_native` harness,
       vectorization *enabled*): `simd_int_reduction_first_light` (sum → `reduce.add`, `2610`/exit `50`),
       `simd_int_max_reduction` (max → `reduce.smax`), both vs native.
-      - **Blocker — fixed-128 `v128` vs LLVM's arbitrary-width vectors.** Enabling vectorization on the
-        breadth lanes shows the corpus emits vectors **wider than 128 bits** (`<16 x i32>` = 512-bit,
-        `<16 x i64>`, `<4 x i64>`) plus assorted shapes (`<8 x i8>`, `<2 x i64>`, `<16 x i8>`). LLVM's
-        `-O2` vectorizer produces these "virtual" wide vectors expecting the backend's **type-
-        legalization** to split them into legal-width chunks; svm-ir's `v128` is fixed-128, so ingesting
-        them needs a legalization/splitting pass — a large separate effort (the SelectionDAG analog). So
-        the C/C++/Rust breadth lanes **keep `-fno-*-vectorize`** (the correct fail-closed posture), and
-        full auto-vec ingestion is deferred behind that pass. Bounded follow-ups within 128 bits: the
-        other shapes (`i8x16`/`i16x8`/`i64x2`, via a general `is_vec128` + shape-aware lowering), `fadd`/
-        `fmul` reductions (need `-ffast-math`; not emitted by plain `-O2`), vector `icmp`/`select`.
+      - **Vector legalization landed (I2 / PR #56).** The fixed-128 SelectionDAG-`LegalizeTypes` analog
+        (`wide_vec_layout`/`lower_wide`) splits wider-than-128 / sub-128 vectors into `v128` chunks + a
+        scalar tail, and all six 128-bit shapes (`i8x16`/`i16x8`/`i32x4`/`i64x2`/`f32x4`/`f64x2`) lower.
+        **Vector integer conversions** (`zext`/`sext`/`trunc`, slice AP) now scalarize lane-wise across
+        every representation. So the breadth lanes can begin re-enabling vectorization; what remains
+        before flipping them (all-or-nothing per lane): **`<N x i1>` masks** (vector `icmp`/`select`),
+        **vector rotate** (`llvm.fshl`/`fshr`), and **non-splat cross-chunk shuffles**. Until all land,
+        the C/C++/Rust lanes keep `-fno-*-vectorize` (the correct fail-closed posture); targeted
+        `check_vectorized_vs_native` tests prove each capability with vectorization enabled.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`
