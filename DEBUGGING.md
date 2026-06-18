@@ -52,10 +52,10 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
-| Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
+| Backtrace *materialization* (unwind tables → frames) | **Partially built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber are built (W5 JIT/DWARF Stage 4); the always-on **trap-time** backtrace (symbolize the stack at a JIT trap into the kill message) is the W3 slice in progress | §5, `svm-jit` `dwarf`/`fiber_backtrace` |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types via `llvm-sys`** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm`, `svm-llvm` |
 | DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
-| DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
+| DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `svm-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
 
@@ -365,6 +365,55 @@ fiber-rooted JIT unwinding from an arbitrary inspection point: **moderate-high.*
 
 **Acceptance.** A guest that corrupts its data stack still produces a correct per-fiber
 backtrace; the trace names the right fibers under work-stealing migration.
+
+### Scoping — JIT trap-time backtrace (always-on source frames on a kill)
+
+**Goal.** When a JIT'd guest **traps** (memory fault, div/rem-by-zero, `unreachable`, indirect-call
+type, …), capture and symbolize the guest call stack into the kill/`Trapped` report — so *every*
+trap message carries a `file:line` backtrace, with **no debugger and no `-g`-only gate** (the §6
+debug info enriches it but symbolization works from the Stage 1 address map regardless).
+
+**Why this, why now.** It is the host-facing complement to the gdb tooling just shipped: it reuses
+the exact primitives that tier built — `CompiledModule::symbolize(pc)` (the machine-pc → source map,
+Stage 1) and the frame-pointer-chain walk (the `preserve_frame_pointers` rbp frames the
+`.debug_frame` CFI / `fiber_backtrace` already rely on) — pointed at a trap site instead of a parked
+fiber. It closes Pillar 2 (W3) on the JIT, and it has a **built-in oracle**: the interpreter
+reifies its call stack as `Vec<Frame>`, so the JIT trap backtrace is differential-testable against it.
+
+**Substrate / the wrinkle.** Two trap families capture differently:
+- **Memory faults** (§4/§5 guard page → `trap_shim.c`'s SIGSEGV/SIGBUS handler): at the fault the
+  guest stack is **fully intact**, and the handler's `ucontext` carries the faulting `rip`/`rbp`. The
+  capture point is *in the handler, before `siglongjmp`* — async-signal-safe (stack reads + a
+  thread-local buffer write); symbolize later in normal context.
+- **Explicit-check traps** (div/rem/`unreachable`/indirect-call-type): the lowered check stores a
+  `TrapKind` and `return`s, **unwinding the native stack** via the trap-propagate path — so the
+  frames are gone by the time the host observes the trap. These need the PC/frames captured *at* the
+  check (or accumulated along the propagate path), a harder, separate step.
+
+**Stages (each independently shippable, differential-tested vs the interpreter):**
+- [ ] **Stage 0 — the frame-pointer walker.** A reusable `walk_frames(rip, rbp, bounds) -> Vec<pc>`
+  that, given a starting machine pc + frame pointer, walks the `rbp` chain (`[rbp+8]` = return addr,
+  `rbp = [rbp]`) bounded to the active stack region, returning the pcs innermost-first. Factor the
+  existing `fiber_backtrace` scan toward sharing this. Test: a synthetic frame chain walks correctly.
+- [ ] **Stage 1 — memory-fault backtrace.** Capture `(rip, rbp)` in `svm_handler` into a thread-local
+  before `siglongjmp`; after the guarded call returns a fault, walk + `symbolize` into a
+  `Vec<JitFrameLoc>` attached to the `MemoryFault` outcome (a `CompiledModule::last_trap_backtrace()`
+  or an enriched outcome). *Acceptance:* an out-of-bounds store reports a backtrace naming the
+  faulting function + line; it matches the interpreter's frames for the same guest.
+- [ ] **Stage 2 — explicit-check trap backtrace.** Capture the trap pc + frame chain at the
+  explicit-check sites (div-by-zero et al.) — likely snapshotting `rbp` at the check, or accumulating
+  return addresses as the trap propagates up `emit_trap_propagate`. *Acceptance:* a div-by-zero trap
+  carries the same source backtrace shape as the memory-fault path.
+- [ ] **Stage 3 — fiber attribution + the kill message.** Root the walk at the trapping **fiber**
+  (not the OS thread — §23/D57), and fold the backtrace into the `Trap`/kill report the host already
+  surfaces. *Acceptance:* the trace names the right fiber under work-stealing migration.
+
+**Trust/TCB.** Pure host-side observability, off the runtime hot path and the escape-TCB: a wrong
+backtrace mis-renders a kill message, never affects confinement. The capture must stay
+async-signal-safe in the fault handler (no allocation; symbolization is deferred).
+
+**Progress:** *scoping.* Next: Stage 0 (the shared frame walker) → Stage 1 (the memory-fault
+backtrace, the highest-value tractable first win).
 
 ---
 
