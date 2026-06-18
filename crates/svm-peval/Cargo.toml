@@ -15,3 +15,7 @@ svm-ir.workspace = true
 # optimized through the reference interpreter and assert byte-identical results/traps.
 svm-verify.workspace = true
 svm-interp.workspace = true
+# The AOT pipeline proof (tests/aot.rs): serialize a residual to bytes and back, and
+# compile it to native code — the "ship a specialized artifact" path.
+svm-encode.workspace = true
+svm-jit.workspace = true
