@@ -793,6 +793,37 @@ Remaining for 3.2: **context recycling** (the next sub-slice — lifts the `MAX_
 **nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and **JIT multi-vCPU
 parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze.
 
+##### Slice 3.3 — JIT multi-vCPU durable parity (design)
+
+The interpreter freezes/thaws a domain whose root has `thread.spawn`-ed children; the JIT freezes/thaws
+only single-vCPU (fiber) domains today. The gap is **not** a concurrency-model barrier: the interp's
+multi-vCPU durable run is itself **single-worker** (it forces `workers = 1` whenever the window state ≠
+`NORMAL`), so "multi-vCPU durable" means *a domain with several vCPUs*, frozen/thawed serially — not
+vCPUs running concurrently mid-freeze. The JIT just needs the **same serialization**, which it lacks
+because it runs `thread.spawn` children as concurrent 1:1 OS threads (`os_thread_rt::run_child`) with no
+cooperative dispatch boundary.
+
+**Mechanism (mirror the interp, inline):** when the window state ≠ `NORMAL`, the JIT's `thread_spawn`
+thunk runs the child **inline on the spawning thread** (single-worker) instead of spawning an OS thread:
+reserve the child a top-down shadow context (a `vcpu` occupancy allocator on `SharedFiberTable`,
+mirroring the interp's `vcpu_mask`), save the running shadow-SP and point `SHADOW_SP_OFF` at the child's
+region, run the child entry via the existing guarded-range path, capture its flattened extent as a
+**`FrozenVCpu`** residue (a JIT mirror of `svm_interp::FrozenVCpu`) when it unwinds under `UNWINDING`,
+then restore the shadow-SP and publish the child's result to its `Done` cell synchronously (so the
+trailing `thread_join` resolves immediately). `NORMAL` durable runs keep concurrent OS threads (matching
+the interp's multi-worker `NORMAL`).
+
+**Decomposition:**
+- **PR-1 (freeze side):** the inline single-worker path + `FrozenVCpu` residue + vCPU-context allocator;
+  pinned by a byte-identical durable-reserve + artifact parity test for a root+child domain (the
+  multi-vCPU analog of `jit_freeze_driver_flattens_a_fiber_matching_interp`).
+- **PR-2 (thaw side):** runtime re-attach of frozen children before the root re-enters under
+  `REWINDING` (the root's rewind skips its prologue `thread.spawn`), rebuilding the join table — the
+  analog of the interp `drive` thaw re-spawn; pinned by an interp-frozen multi-vCPU artifact thawing on
+  the JIT to the uninterrupted result.
+
+Scope mirrors the interp's: flat (root-spawned) children, no nested spawns, no child-owned fibers.
+
 ##### Context recycling plan (next sub-slice)
 
 Today neither backend recycles fiber slots or vCPU contexts (they grow monotonically), so a long-lived
