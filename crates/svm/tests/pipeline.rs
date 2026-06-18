@@ -347,7 +347,7 @@ fn fiber_generator_loop_sums_a_sequence() {
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 0\n\
         \x20 br block1(v2, v3)\n\
-        block1(v4: i32, v5: i64):\n\
+        block1(v4: i64, v5: i64):\n\
         \x20 v6 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v4 v6\n\
         \x20 v9 = i64.add v5 v8\n\
@@ -461,7 +461,7 @@ fn fiber_forged_handle_is_inert() {
     // running root, which is in the resume chain -> inert (`FiberFault`), never an escape.
     let src = "func () -> (i64) {\n\
         block0():\n\
-        \x20 v0 = i32.const 999\n\
+        \x20 v0 = i64.const 999\n\
         \x20 v1 = i64.const 0\n\
         \x20 v2, v3 = cont.resume v0 v1\n\
         \x20 return v3\n\

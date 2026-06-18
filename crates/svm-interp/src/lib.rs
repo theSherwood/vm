@@ -3801,26 +3801,27 @@ fn vcpu_shadow_context(nth: usize, fibers: usize) -> Option<usize> {
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
-/// low 16 bits and the generation occupies bits 16.. of the `i32` handle. A handle is
+/// low 16 bits and the generation occupies bits 16.. of the **`i64`** handle. A handle is
 /// `(generation << FIBER_GEN_SHIFT) | slot` — and since a fresh slot's generation is 0, a non-recycled
-/// run's handle is exactly its slot (byte-identical to before this slice, and to the JIT, which
-/// likewise hands out `slot`). The generation lets a later **recycled** slot reject a stale handle to
-/// its former occupant (the ABA guard the JIT's `Ownership` word already carries internally).
+/// run's handle is exactly its slot (byte-identical to before, and to the JIT, which likewise hands out
+/// `slot`). The generation lets a later **recycled** slot reject a stale handle to its former occupant
+/// (the ABA guard the JIT's `Ownership` word already carries internally).
 const FIBER_GEN_SHIFT: u32 = 16;
 
-/// The generation bits a fiber guest handle carries (the field above the slot): the handle conveys
-/// only the low 16 bits of a slot's full generation, so a stale handle is rejected modulo `2^16` (a
-/// vast ABA window — recycling step 3). Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
-const FIBER_GEN_MASK: u32 = (1 << 16) - 1;
+/// The generation bits a fiber guest handle carries (the field above the slot): an `i64` handle leaves
+/// **48 bits** for the generation, so a stale handle is rejected modulo `2^48` — an ABA window so vast
+/// (≈ centuries of recycling even at 10⁶ finishes/s) that wraparound is unreachable in practice.
+/// Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
+const FIBER_GEN_MASK: u64 = (1 << 48) - 1;
 
-/// Encode a fiber guest handle from its registry `slot` and `generation` (low 16 bits).
-fn fiber_handle(slot: usize, generation: u32) -> i32 {
-    (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u32) as i32
+/// Encode a fiber guest handle from its registry `slot` and `generation` (low 48 bits).
+fn fiber_handle(slot: usize, generation: u64) -> i64 {
+    (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
 }
 
 /// The generation field a guest fiber handle carries (the high bits above the slot).
-fn fiber_handle_generation(handle: i32) -> u32 {
-    (handle as u32) >> FIBER_GEN_SHIFT
+fn fiber_handle_generation(handle: i64) -> u64 {
+    (handle as u64) >> FIBER_GEN_SHIFT
 }
 
 /// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
@@ -3885,9 +3886,9 @@ pub struct FrozenFiber {
     pub shadow_sp: u64,
     /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
     /// *recycled* (generation > 0) fiber still resolves (`(generation << 16) | slot`). 0 for a
-    /// non-recycled fiber — then the handle is exactly its slot, and the artifact is unchanged in
-    /// meaning (see the snapshot codec, which is format v2).
-    pub generation: u32,
+    /// non-recycled fiber — then the handle is exactly its slot. 48-bit field (the `i64` handle's
+    /// generation bits); serialized as `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
+    pub generation: u64,
 }
 
 /// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
@@ -3980,7 +3981,7 @@ struct RegState {
     /// Per-slot **generation** (recycling step 1): bumped when a slot is freed for reuse, and carried
     /// in the guest handle's high bits ([`FIBER_GEN_SHIFT`]) so a stale handle to a slot's former
     /// occupant is rejected on `claim`. Grows with `fibers`/`shadow` (same index).
-    gens: Vec<u32>,
+    gens: Vec<u64>,
     /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
     /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
@@ -4018,7 +4019,7 @@ impl FiberRegistry {
 
     /// The `slot`'s current generation (recycling step 2) — recorded in its [`FrozenFiber`] residue at
     /// freeze so a thaw re-seeds it at the same generation. 0 for an out-of-range slot.
-    fn generation(&self, slot: usize) -> u32 {
+    fn generation(&self, slot: usize) -> u64 {
         self.lock().gens.get(slot).copied().unwrap_or(0)
     }
 
@@ -4055,7 +4056,7 @@ impl FiberRegistry {
     /// does the table grow. So the table is bounded by the *peak concurrent* fiber count, not the
     /// lifetime total — and the quota / durable-reserve checks (on the grow path / the allocated
     /// context) likewise bound concurrency rather than lifetime.
-    fn create(&self, func: i32, sp: i64, max_fibers: usize, durable: bool) -> Result<i32, Trap> {
+    fn create(&self, func: i32, sp: i64, max_fibers: usize, durable: bool) -> Result<i64, Trap> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
         // Growing (no free slot ⇒ every existing slot is live) must honor the concurrency quota.
@@ -4092,16 +4093,16 @@ impl FiberRegistry {
     /// ⇒ inert [`Trap::FiberFault`]. On a win the slot is `Running(None)` — if the *caller* then
     /// traps before running it (a bad `Pending` funcref), the slot stays claimed forever, which a
     /// later resume sees as an ordinary lost claim.
-    fn claim(&self, handle: i32) -> Result<(usize, Claimed), Trap> {
+    fn claim(&self, handle: i64) -> Result<(usize, Claimed), Trap> {
         let mut t = self.lock();
         let mask = t.fibers.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
-        let slot = (handle as u32 as usize) & mask;
+        let slot = (handle as u64 as usize) & mask; // the generation bits are above the slot mask
         if slot >= t.fibers.len() {
             return Err(Trap::FiberFault);
         }
         // Generation check (recycling step 1/3): reject a handle whose generation doesn't match the
         // slot's current one — a stale handle to a slot's former occupant after the slot was recycled
-        // (`finish` bumped the generation). Compared modulo `2^16` (the handle's field width); a forged
+        // (`finish` bumped the generation). Compared modulo `2^48` (the handle's field width); a forged
         // non-zero generation is rejected, exactly as a forged slot is masked-and-lost.
         if fiber_handle_generation(handle) != (t.gens[slot] & FIBER_GEN_MASK) {
             return Err(Trap::FiberFault);
@@ -4188,7 +4189,7 @@ impl FiberRegistry {
     /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
     /// dense handle namespace; returns the slot, which must equal the recorded one.
-    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64, generation: u32) -> usize {
+    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64, generation: u64) -> usize {
         let mut t = self.lock();
         let slot = t.fibers.len();
         t.fibers.push(RegFiber::Pending { func, sp });
@@ -5518,7 +5519,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // the reserve is full); a non-durable run ignores the region bookkeeping.
                     let handle =
                         registry.create(funcref, stack_base, spawn_quota.max_fibers, durable)?;
-                    frames[top].vals.push(Reg::from_i32(handle));
+                    frames[top].vals.push(Reg::from_i64(handle));
                 }
                 // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
                 // one vCPU migrates to whichever claims it next; exactly one racing claimant wins
@@ -5526,7 +5527,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
                 Inst::ContResume { k, arg } => {
-                    let kh = get_i32(&frames[top].vals, *k)?;
+                    let kh = get_i64(&frames[top].vals, *k)?;
                     let av = get_i64(&frames[top].vals, *arg)?;
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
                     // parked one (delivering `arg` as the result of its `suspend`).

@@ -49,8 +49,12 @@ use svm_ir::Module;
 const MAGIC: &[u8; 4] = b"SVMD";
 /// Format version; bump on an incompatible change (§12.2). v2 (recycling step 2): each fiber residue
 /// record carries its **generation** (the high bits of a recycled-slot guest handle), so a thaw
-/// re-seeds a recycled fiber at the generation its handle expects.
-const FORMAT_VERSION: u16 = 2;
+/// re-seeds a recycled fiber at the generation its handle expects. v3 (i64 fiber handles): the handle
+/// widened from `i32` to `i64` (16-bit slot + 48-bit generation), so a handle held live across a
+/// suspend now spills **8** bytes in the shadow stack instead of 4 — the window image layout changed,
+/// so a v2 artifact would mis-thaw and is rejected. (The residue generation is still `uleb`, so that
+/// field alone stays wire-compatible; the version gate is for the shadow-image shift.)
+const FORMAT_VERSION: u16 = 3;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -228,7 +232,7 @@ pub fn freeze_with_prots(
                 write_uleb(b, f.func as u32 as u64);
                 write_uleb(b, f.sp as u64);
                 write_uleb(b, f.shadow_sp);
-                write_uleb(b, f.generation as u64); // recycling step 2 (format v2)
+                write_uleb(b, f.generation); // 48-bit fiber generation (recycling step 2)
             }
             if !vcpus.is_empty() {
                 write_uleb(b, vcpus.len() as u64);
@@ -426,7 +430,8 @@ fn decode_control(
         let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
         let sp = cr.uleb()? as i64;
         let shadow_sp = cr.uleb()?;
-        let generation = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let generation = cr.uleb()?; // 48-bit fiber generation (u64); a pre-widening artifact's
+                                     // small value decodes identically (wire-compatible).
         fibers.push(FrozenFiber {
             slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
             func,

@@ -663,6 +663,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-peval"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-verify",
+]
+
+[[package]]
 name = "svm-run"
 version = "0.0.0"
 dependencies = [

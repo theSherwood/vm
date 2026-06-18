@@ -1373,13 +1373,13 @@ int main(void) {
 #[cfg(unix)]
 fn vm_fibers_generator() {
     let src = r#"
-int  __vm_fiber_new(long (*f)(long), void *stack);
-long __vm_fiber_resume(int k, long arg, int *done);
+long __vm_fiber_new(long (*f)(long), void *stack);
+long __vm_fiber_resume(long k, long arg, int *done);
 long __vm_fiber_suspend(long value);
 long counter(long start);
 static char stack0[8192];
 int driver(void) {
-  int k = __vm_fiber_new(counter, stack0);
+  long k = __vm_fiber_new(counter, stack0); // i64 fiber handle (16-bit slot + 48-bit generation)
   int done = 0;
   long sum = 0;
   long v = __vm_fiber_resume(k, 100, &done);

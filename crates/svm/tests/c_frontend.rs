@@ -1818,8 +1818,8 @@ fn c_ssa_promotion_eliminates_loop_body_memory_ops() {
 // Prototypes for the three intercepted fiber builtins, shared by the C tests below. A fiber
 // body is an ordinary `long f(long)`; the guest hands each fiber its own data stack.
 const FIBER_DECLS: &str = "\
-int  __vm_fiber_new(long (*f)(long), void *stack);\n\
-long __vm_fiber_resume(int k, long arg, int *done);\n\
+long __vm_fiber_new(long (*f)(long), void *stack);\n\
+long __vm_fiber_resume(long k, long arg, int *done);\n\
 long __vm_fiber_suspend(long value);\n";
 
 #[cfg(unix)]
@@ -1837,7 +1837,7 @@ fn c_fiber_generator_yields_then_returns() {
         \x20 return start + 3;\n\
         }}\n\
         int main() {{\n\
-        \x20 int k = __vm_fiber_new(counter, stack0);\n\
+        \x20 long k = __vm_fiber_new(counter, stack0);\n\
         \x20 int done = 0;\n\
         \x20 long sum = 0;\n\
         \x20 long v = __vm_fiber_resume(k, 100, &done);\n\
@@ -1865,7 +1865,7 @@ fn c_fiber_round_trips_resume_arguments() {
         \x20 return got * 2;\n\
         }}\n\
         int main() {{\n\
-        \x20 int k = __vm_fiber_new(echo, st);\n\
+        \x20 long k = __vm_fiber_new(echo, st);\n\
         \x20 int done = 0;\n\
         \x20 __vm_fiber_resume(k, 0, &done);\n\
         \x20 long r = __vm_fiber_resume(k, 77, &done);\n\
@@ -1893,8 +1893,8 @@ fn c_two_fibers_are_independent() {
         }}\n\
         int main() {{\n\
         \x20 int da = 0, db = 0;\n\
-        \x20 int a = __vm_fiber_new(acc, sa);\n\
-        \x20 int b = __vm_fiber_new(acc, sb);\n\
+        \x20 long a = __vm_fiber_new(acc, sa);\n\
+        \x20 long b = __vm_fiber_new(acc, sb);\n\
         \x20 long s = 0;\n\
         \x20 s += __vm_fiber_resume(a, 10, &da);\n\
         \x20 s += __vm_fiber_resume(b, 3, &db);\n\
@@ -1920,7 +1920,7 @@ fn c_cooperative_threads_round_robin() {
         "{FIBER_DECLS}\
         #define NT 3\n\
         static char stacks[NT][4096];\n\
-        static int  handles[NT];\n\
+        static long handles[NT];\n\
         static int  finished[NT];\n\
         static int  started[NT];\n\
         static long results[NT];\n\

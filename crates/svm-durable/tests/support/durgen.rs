@@ -537,7 +537,7 @@ pub struct RecycleModule {
     /// suspend#1.
     pub arm: i64,
     /// B's slot generation at the freeze (== `throwaways`): slot 0 was recycled that many times.
-    pub generation: u32,
+    pub generation: u64,
 }
 
 /// The root for a recycling-churn module `() -> (i64)` (see the section comment): create+finish
@@ -635,7 +635,7 @@ pub fn gen_recycle_fiber_module(g: &mut Gen) -> RecycleModule {
             debug_info: None,
         },
         arm: throwaways as i64 + 2,
-        generation: throwaways,
+        generation: throwaways as u64,
     }
 }
 

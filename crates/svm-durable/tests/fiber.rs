@@ -464,7 +464,7 @@ block0():
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
-  v3 = i32.const 65536
+  v3 = i64.const 65536
   v4 = i64.const 0
   v5, v6 = cont.resume v3 v4
   return v6
@@ -503,9 +503,9 @@ block0(v0: i64, v1: i64):
 #[test]
 fn recycling_reuses_a_freed_slot_with_a_bumped_generation() {
     // Fiber A (handle slot 0, gen 0) runs to completion; the next cont.new reuses slot 0 at gen 1, so
-    // its handle is `(1 << 16) | 0 == 65536`. Returning the i32 handle makes the reuse observable.
+    // its handle is `(1 << 16) | 0 == 65536`. Returning the i64 handle makes the reuse observable.
     const REUSE: &str = r#"
-func () -> (i32) {
+func () -> (i64) {
 block0():
   v0 = ref.func 1
   v1 = i64.const 4096
@@ -527,11 +527,11 @@ block0(v0: i64, v1: i64):
     });
     assert_eq!(
         run_normal(&reuse),
-        Ok(vec![Value::I32(65536)]),
+        Ok(vec![Value::I64(65536)]),
         "the freed slot 0 is reused at generation 1 ⇒ handle (1<<16)|0"
     );
 
-    // After slot 0 is recycled (now holds fiber B at gen 1), resuming A's stale gen-0 handle (i32 0)
+    // After slot 0 is recycled (now holds fiber B at gen 1), resuming A's stale gen-0 handle (i64 0)
     // must fault — even though slot 0 is live — because the generation no longer matches.
     const STALE: &str = r#"
 func () -> (i64) {
@@ -542,7 +542,7 @@ block0():
   v3 = i64.const 0
   v4, v5 = cont.resume v2 v3
   v6 = cont.new v0 v1
-  v9 = i32.const 0
+  v9 = i64.const 0
   v7, v8 = cont.resume v9 v3
   return v8
 }

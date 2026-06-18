@@ -1251,8 +1251,8 @@ static int gen_builtin_region_page_size(Node *node) {
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
 //
-//   int  __vm_fiber_new(fiber_fn f, void *stack);  // f : long(*)(long); -> handle
-//   long __vm_fiber_resume(int k, long arg, int *done);  // -> yielded/returned value
+//   int64_t __vm_fiber_new(fiber_fn f, void *stack);  // f : long(*)(long); -> i64 handle
+//   long __vm_fiber_resume(int64_t k, long arg, int *done);  // -> yielded/returned value
 //   long __vm_fiber_suspend(long value);                 // -> next resume's arg
 //
 // The fiber body is an ordinary C function `long f(long)`, which lowers to the IR entry
@@ -1270,14 +1270,14 @@ static int gen_builtin_fiber_new(Node *node) {
   cg("  v%d = i32.wrap_i64 v%d\n", fn32, fnv); // cont.new wants the i32 funcref
   int r = nv++;
   cg("  v%d = cont.new v%d v%d\n", r, fn32, sp);
-  return r; // i32 fiber handle
+  return r; // i64 fiber handle (16-bit slot + 48-bit generation)
 }
 
 static int gen_builtin_fiber_resume(Node *node) {
   Node *a = node->args;
   if (!a || !a->next || !a->next->next || a->next->next->next)
     error_tok(node->tok, "codegen_ir: __vm_fiber_resume(k, arg, done) expects 3 arguments");
-  int k = gen_expr(a);                                   // handle (i32)
+  int k = widen_i64(gen_expr(a), a->ty);                 // handle (i64; widened if narrower)
   int arg = widen_i64(gen_expr(a->next), a->next->ty);   // resume value (i64)
   int done = gen_expr(a->next->next);                    // int* — where to store the status
   int status = nv++;
