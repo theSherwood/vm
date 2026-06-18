@@ -13,6 +13,10 @@ svm-mask.workspace = true
 # hardware atomics. All the `unsafe` lives there, so this crate stays `#![forbid(unsafe_code)]` while
 # gaining the shareable backing parallel vCPUs will run over.
 svm-mem.workspace = true
+# The verifier's type assignment, reused (single source of truth) so the debugger can give an
+# interpreter value slot its source-level type — slots are untyped on the hot path (§ the `Reg`
+# value model), so typed reads (`backtrace`/`read_ir_value`/`read_var`) reconstruct via this.
+svm-verify.workspace = true
 # Host page size for the protection model — a tiny *safe* wrapper (keeps `#![forbid(unsafe_code)]`),
 # so the interpreter's RO/unmap granularity matches the JIT's real `mprotect` on the same host
 # (§4 "pin page size" → host-page default; both backends query the same value, so they agree
