@@ -162,6 +162,22 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 - **Success:** full oracle green; measurable drop on alu/call kernels; no API change.
 
 ### Phase 2 — memory-op specialization + software fast-path
+- **[done] A/B baseline ("benchmark first").** Extended `crates/svm/src/bin/bench.rs` with an
+  interpreter A/B: the same four loop kernels run through the **tree-walker** (`run`) and the
+  **bytecode engine** (`bytecode::compile_and_run`), per-iteration compute isolated by large/small-`n`
+  subtraction (cancels the bytecode engine's per-run compile + each engine's frame setup), min over
+  reps. Run with `cargo run --release --bin svm-bench`. Baseline (one dev box, ns/iter, tw → bc):
+
+  | kernel          | tree-walker | bytecode | tw/bc |
+  |-----------------|------------:|---------:|------:|
+  | alu             | ~32         | ~18.6    | ~1.7× |
+  | call            | ~77         | ~33      | ~2.3× |
+  | call_indirect   | ~88         | ~43      | ~2.1× |
+  | mem (load+store)| ~107        | ~82      | **~1.3×** |
+
+  The headline: `mem` has by far the **smallest** bytecode advantage (~1.3× vs ~2× elsewhere) — the
+  scalar load/store path is where the bytecode engine leaves the most on the table, so the
+  width-specialization + inlined-confinement work below has the clearest ROI and a number to beat.
 - **[done] Lock-free `check_prot` fast path.** `check_prot` took a `RwLock` *read* guard on **every**
   access just to test `prot.is_empty()`. Added a monotonic `Mem::prot_dirty` flag, set once at the
   `space_write` choke point (the only path that mutates the address space — `map`/`unmap`/`protect`,
