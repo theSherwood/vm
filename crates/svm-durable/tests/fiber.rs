@@ -432,3 +432,66 @@ block0(v0: i64, v1: i64):
         "thawed active-chain fiber reloads the saved clock (47), not a re-issued one"
     );
 }
+
+// Recycling step 1 (DURABILITY.md §12.8): a fiber **guest handle** carries a generation in its high
+// bits (`FIBER_GEN_SHIFT`), and `cont.resume` rejects a handle whose generation doesn't match the
+// slot's current one — the ABA guard a recycled slot will rely on. All live generations are 0 until
+// recycling is wired, so the genuine handle (== slot) resumes, while a forged generation-1 handle for
+// the same slot faults. (Non-durable run — the check lives in the registry, independent of freeze.)
+#[test]
+fn forged_fiber_generation_is_rejected() {
+    // Genuine handle (slot 0, generation 0 == 0): the fiber runs and returns 99.
+    const OK: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v4 = i64.const 0
+  v5, v6 = cont.resume v2 v4
+  return v6
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 99
+  return v2
+}
+"#;
+    // Forged handle `(1 << 16) | 0`: same slot 0 (the mask clamps it), generation 1 ≠ 0 ⇒ FiberFault.
+    const FORGED: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i32.const 65536
+  v4 = i64.const 0
+  v5, v6 = cont.resume v3 v4
+  return v6
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 99
+  return v2
+}
+"#;
+    let mut ok = svm_text::parse_module(OK).expect("parse OK");
+    ok.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    assert_eq!(
+        run_normal(&ok),
+        Ok(vec![Value::I64(99)]),
+        "genuine handle (generation 0) resumes"
+    );
+
+    let mut forged = svm_text::parse_module(FORGED).expect("parse FORGED");
+    forged.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    assert_eq!(
+        run_normal(&forged),
+        Err(Trap::FiberFault),
+        "a forged generation is rejected (the recycled-slot ABA guard)"
+    );
+}

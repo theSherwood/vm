@@ -3662,6 +3662,25 @@ fn vcpu_shadow_context(nth: usize, fibers: usize) -> Option<usize> {
     (ctx >= 1 && ctx > fibers).then_some(ctx)
 }
 
+/// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
+/// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
+/// low 16 bits and the generation occupies bits 16.. of the `i32` handle. A handle is
+/// `(generation << FIBER_GEN_SHIFT) | slot` — and since a fresh slot's generation is 0, a non-recycled
+/// run's handle is exactly its slot (byte-identical to before this slice, and to the JIT, which
+/// likewise hands out `slot`). The generation lets a later **recycled** slot reject a stale handle to
+/// its former occupant (the ABA guard the JIT's `Ownership` word already carries internally).
+const FIBER_GEN_SHIFT: u32 = 16;
+
+/// Encode a fiber guest handle from its registry `slot` and `generation`.
+fn fiber_handle(slot: usize, generation: u32) -> i32 {
+    ((generation << FIBER_GEN_SHIFT) | slot as u32) as i32
+}
+
+/// The generation field a guest fiber handle carries (the high bits above the slot).
+fn fiber_handle_generation(handle: i32) -> u32 {
+    (handle as u32) >> FIBER_GEN_SHIFT
+}
+
 /// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
 /// on a fiber switch (D-fiber-cont option A). A no-op unless the run is `durable` and has a
 /// window. The saved-SP of each *non-running* context lives host-side (the root's in
@@ -3811,6 +3830,11 @@ struct FiberRegistry {
 struct RegState {
     fibers: Vec<RegFiber>,
     shadow: Vec<u64>,
+    /// Per-slot **generation** (recycling step 1): bumped when a slot is freed for reuse, and carried
+    /// in the guest handle's high bits ([`FIBER_GEN_SHIFT`]) so a stale handle to a slot's former
+    /// occupant is rejected on `claim`. Grows with `fibers`/`shadow` (same index). All 0 until slot
+    /// recycling is wired (step 3), so a handle is exactly its slot — unchanged behavior.
+    gens: Vec<u32>,
     /// Count of durable vCPU contexts handed out (slice 3.2.2): the root spawns children that grow
     /// **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1, so this counter (with
     /// `fibers.len()`) bounds the shared reserve — `fibers.len() + vcpus <= MAX_SHADOW_CTX`.
@@ -3823,6 +3847,7 @@ impl FiberRegistry {
             mx: Mutex::new(RegState {
                 fibers: Vec::new(),
                 shadow: Vec::new(),
+                gens: Vec::new(),
                 vcpus: 0,
             }),
         }
@@ -3885,7 +3910,8 @@ impl FiberRegistry {
         }
         t.fibers.push(RegFiber::Pending { func, sp });
         t.shadow.push(shadow_region_base(slot + 1)); // fresh region: empty stack at its base
-        Ok(slot as i32)
+        t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot (recycling step 1)
+        Ok(fiber_handle(slot, 0))
     }
 
     /// `cont.resume`: resolve the (forgeable) handle — **masked** into the power-of-two-padded
@@ -3900,6 +3926,13 @@ impl FiberRegistry {
         let mask = t.fibers.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
         let slot = (handle as u32 as usize) & mask;
         if slot >= t.fibers.len() {
+            return Err(Trap::FiberFault);
+        }
+        // Generation check (recycling step 1): reject a handle whose generation doesn't match the
+        // slot's current one — a stale handle to a slot's former occupant after the slot was recycled.
+        // All generations are 0 until recycling is wired, so this is inert for a non-recycled run (a
+        // forged non-zero generation is rejected, exactly as a forged slot is masked-and-lost).
+        if fiber_handle_generation(handle) != t.gens[slot] {
             return Err(Trap::FiberFault);
         }
         match std::mem::replace(&mut t.fibers[slot], RegFiber::Running(None)) {
@@ -3984,6 +4017,7 @@ impl FiberRegistry {
         let slot = t.fibers.len();
         t.fibers.push(RegFiber::Pending { func, sp });
         t.shadow.push(shadow_sp);
+        t.gens.push(0); // re-seeded fibers restart at generation 0 (recycling step 1)
         slot
     }
 }

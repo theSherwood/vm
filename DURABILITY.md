@@ -804,9 +804,17 @@ sequenced slice:
 
 1. **Generation-carrying fiber handles (both backends).** Make a fiber handle `(generation, slot)` and
    validate the generation on `cont.resume`/`thread.join`-style use; bump the generation when a slot is
-   freed. The interp registry and `svm-jit/src/fiber_registry.rs` already bump a generation on finish
-   (`recycle_owned` is staged but unwired) — wire it, in lockstep, and carry the generation in the
-   handle namespace (matching the loom-checked `Ownership` protocol). *Behavior-preserving until step 3.*
+   freed. Carry the generation in the handle namespace (matching the loom-checked `Ownership` protocol).
+   *Behavior-preserving until step 3.*
+   - **[~] Interp side done.** The interp registry carries a per-slot generation (`RegState::gens`); a
+     guest handle is `(generation << FIBER_GEN_SHIFT) | slot` (slot in the low 16 bits, since
+     `MAX_FIBERS = 1<<16`); `cont.resume`'s `claim` rejects a generation mismatch. All generations are 0
+     until step 3, so a handle is exactly its slot — byte-identical to before and to the JIT. Pinned by
+     `svm-durable/tests/fiber.rs::forged_fiber_generation_is_rejected`. Cross-backend parity unaffected.
+   - **[ ] JIT side remaining.** `svm-jit/src/fiber_registry.rs` already bumps a generation on `finish`
+     (`recycle_owned` staged/unwired) but `claim` takes the generation from the *current* word — switch
+     resume-by-handle to a generation-checked claim (`try_steal`-style) using the handle's generation,
+     and have `cont.new` emit `(generation << FIBER_GEN_SHIFT) | slot`. Needs a loom re-check.
 2. **Snapshot format: carry generations.** The control-section fiber/vCPU residue records each entity's
    generation so a thaw re-establishes the same handle namespace. Bump `FORMAT_VERSION` (or gate behind
    "any recycled slot") to keep pre-recycling artifacts byte-identical.
