@@ -6,8 +6,11 @@
 //!
 //! Without a real freeze driver yet (slices 3.1.3–4), the swap is observed directly: a host-fn
 //! capability reads the active shadow-SP each time it is called, and we drive a root that probes,
-//! runs two fibers (each probes), and probes again — proving each context sees a distinct region
-//! base and control is restored to the root's region.
+//! runs two fibers (each probes, then **suspends** so both stay concurrently live in their own
+//! slots), and probes again — proving each context sees a distinct region base and control is
+//! restored to the root's region. (The fibers suspend rather than return so neither slot is recycled
+//! mid-run — §12.8 recycling step 3 reuses a *finished* fiber's slot, which would otherwise route the
+//! second fiber into the first's freed region.)
 
 use std::sync::{Arc, Mutex};
 use svm_interp::{
@@ -43,7 +46,8 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
         block0(v0: i64, v1: i64):\n\
         \x20 v2 = i32.wrap_i64 v1\n\
         \x20 v3 = cap.call 13 0 () -> (i64) v2 ()\n\
-        \x20 return v3\n\
+        \x20 v4 = suspend v3\n\
+        \x20 return v4\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");

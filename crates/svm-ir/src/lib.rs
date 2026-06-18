@@ -636,15 +636,32 @@ pub enum VFloatUnOp {
     Abs,
     Neg,
     Sqrt,
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
 }
 
 impl VFloatUnOp {
-    pub const ALL: [VFloatUnOp; 3] = [VFloatUnOp::Abs, VFloatUnOp::Neg, VFloatUnOp::Sqrt];
+    // Appended (not reordered) so the binary `index` of Abs/Neg/Sqrt stays stable.
+    pub const ALL: [VFloatUnOp; 7] = [
+        VFloatUnOp::Abs,
+        VFloatUnOp::Neg,
+        VFloatUnOp::Sqrt,
+        VFloatUnOp::Ceil,
+        VFloatUnOp::Floor,
+        VFloatUnOp::Trunc,
+        VFloatUnOp::Nearest,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             VFloatUnOp::Abs => "abs",
             VFloatUnOp::Neg => "neg",
             VFloatUnOp::Sqrt => "sqrt",
+            VFloatUnOp::Ceil => "ceil",
+            VFloatUnOp::Floor => "floor",
+            VFloatUnOp::Trunc => "trunc",
+            VFloatUnOp::Nearest => "nearest",
         }
     }
     pub fn index(self) -> u8 {
@@ -1514,6 +1531,15 @@ pub enum Inst {
         op: FUnOp,
         a: ValIdx,
     },
+    /// Scalar **fused multiply-add** `a·b + c` with a single rounding (IEEE-754 FMA) — the scalar
+    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` / Rust
+    /// `f*::mul_add` are both correctly-rounded, so interp and JIT agree. Operands/result are `ty`.
+    Fma {
+        ty: FloatTy,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
+    },
     /// Float compare; operands are `ty`, result is `i32` 0/1.
     FCmp {
         ty: FloatTy,
@@ -1720,14 +1746,22 @@ pub enum Inst {
     /// domain — parked fibers, resume-chain ancestors, and the calling computation's own live
     /// frames (the op is **call-clobbering**, so the caller's roots are already spilled to its
     /// control stack, exactly like `cont.resume`/`suspend`) — for candidate pointer words that
-    /// fall in the half-open guest-window range `[heap_lo, heap_hi)` (`i64` window offsets).
-    /// Writes up to `cap` **distinct (deduplicated)** `i64`-width candidate words, ascending,
-    /// into guest memory at byte offset `buf`, and yields the **total** number found (`i64`); if
-    /// that exceeds `cap` the guest retries with a larger buffer (only the first `cap` are
-    /// written). An **ambient introspection op** — authority-neutral like `cap.self` reflection:
+    /// — after masking each scanned word `w` with `mask` (`m = w & mask`) — fall in the half-open
+    /// guest-window range `[heap_lo, heap_hi)` (`i64` window offsets). The **masked** value `m` is
+    /// what's tested and emitted, letting a guest with **tagged** pointers (e.g. a tag in the high
+    /// byte, `(tag << 56) | offset`) recover the bare offset; `mask = !0` reproduces the untagged
+    /// behavior. Writes up to `cap` **distinct (deduplicated)** `i64`-width candidate words,
+    /// ascending, into guest memory at byte offset `buf`, and yields the **total** number found
+    /// (`i64`); if that exceeds `cap` the guest retries with a larger buffer (only the first `cap`
+    /// are written). An **ambient introspection op** — authority-neutral like `cap.self` reflection:
     /// every candidate is an in-window word the guest's own heap already encodes, while
     /// out-of-window words (host return addresses, frame pointers, host pointers) are filtered
     /// *inside* the VM and never cross the boundary, so no host layout leaks (GC.md §3, §6).
+    /// **Security — `mask` may only clear the top byte** (the low 56 bits must be all-ones:
+    /// `mask | 0xFF00_0000_0000_0000 == !0`): a mask that cleared lower bits could fold a host
+    /// pointer (canonical, `< 2^56`) down into the guest window and leak host-address bits past the
+    /// range filter (ASLR). The constraint keeps any host word large → excluded; it's enforced
+    /// statically by the verifier (constant masks) and defensively at runtime on both backends.
     /// Implemented on **both backends**: the interpreter scans its reified `Value` frames; the JIT
     /// conservatively walks the live native control stacks of its fibers (parked fibers' saved
     /// extents `[ctx, top)`, the running resume chain, and the root computation's frames). The two
@@ -1737,6 +1771,9 @@ pub enum Inst {
     GcRoots {
         heap_lo: ValIdx,
         heap_hi: ValIdx,
+        /// `i64` payload mask AND-ed with each scanned word before the range test (and emitted).
+        /// Constrained to top-byte-strip only (`mask | 0xFF00_0000_0000_0000 == !0`); see above.
+        mask: ValIdx,
         buf: ValIdx,
         cap: ValIdx,
     },
@@ -1924,6 +1961,14 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// Signed `i8` dot product of adjacent pairs into `i16` lanes — `result[j] = a[2j]·b[2j] +
+    /// a[2j+1]·b[2j+1]` (wrapping at `i16`), both operands read as signed `i8`. Source `i8x16`,
+    /// result `i16x8`. The **deterministic** lowering of the relaxed `relaxed_dot_i8x16_i7x16_s`
+    /// (the spec-allowed signed-×-signed behavior, not the x86 `pmaddubsw` unsigned-×-signed one).
+    VDotI8 {
+        a: ValIdx,
+        b: ValIdx,
+    },
     /// Extended (widening) multiply: widen the low/high half of both `i8x16`/`i16x8`/`i32x4`
     /// operands (sign- or zero-, per [`VWidenOp`]) to the next wider shape, then multiply lane-wise.
     /// `shape` is the **wide result** (`i16x8`/`i32x4`/`i64x2`); `a`/`b`/result are `v128`.
@@ -1947,6 +1992,18 @@ pub enum Inst {
     VQ15MulrSat {
         a: ValIdx,
         b: ValIdx,
+    },
+    /// Lane-wise **fused multiply-add** (the relaxed-SIMD `relaxed_madd`/`relaxed_nmadd`): each lane
+    /// is `a·b + c` (`neg == false`) or `−a·b + c` (`neg == true`), computed with a **single rounding**
+    /// (IEEE-754 FMA). Float shapes (`f32x4`/`f64x2`); `a`/`b`/`c`/result are `v128`. SVM picks the
+    /// fused behavior (one of the two the relaxed proposal permits) consistently in both backends —
+    /// Cranelift `fma` and Rust `f*::mul_add` are both correctly-rounded, so the differential holds.
+    VFma {
+        shape: VShape,
+        neg: bool,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
@@ -2304,9 +2361,8 @@ pub struct Loc {
 
 /// A source variable and its value location (`DEBUGGING.md` §6 / S2). Carries a neutral render
 /// name (`ty`) and, when known, a [`TypeId`] into [`DebugInfo::types`] for its structured layout
-/// (`type_id`). Function-scoped for slice 1; lexical `IrPc`-range scopes are a later refinement.
-/// A **module-scoped global** (source-level `static`/global variable) uses `func == `[`GLOBAL_SCOPE`]
-/// — visible in every frame — and a [`VarLoc::Fixed`] absolute window address.
+/// (`type_id`). A **module-scoped global** (source-level `static`/global variable) uses `func ==
+/// `[`GLOBAL_SCOPE`] — visible in every frame — and a [`VarLoc::Fixed`] absolute window address.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct VarInfo {
     pub func: u32,
@@ -2318,6 +2374,13 @@ pub struct VarInfo {
     /// The structured type ([`DebugInfo::types`] index) when this var's layout is carried — set for
     /// aggregates (and, when emitted, scalars). `None` ⇒ render via `ty` only (no expansion).
     pub type_id: Option<TypeId>,
+    /// The variable's **lexical scope** as an inclusive source-line range `(start_line, end_line)`,
+    /// for resolving C shadowing (an inner-block redeclaration, or a local shadowing a global):
+    /// among same-name variables, the consumer picks the one whose scope covers the stopped source
+    /// line, innermost (largest `start_line`) winning. `None` ⇒ function-wide (the outermost scope;
+    /// the back-compatible default). Line-based rather than `IrPc`-based because a frontend knows
+    /// source spans at parse time and the consumer already maps a stopped pc to a source line.
+    pub scope: Option<(u32, u32)>,
 }
 
 /// Where a source variable's value lives at runtime (the S2 value-location model, IR form). The

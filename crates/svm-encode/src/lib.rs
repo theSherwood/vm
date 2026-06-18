@@ -93,6 +93,7 @@ mod op {
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
     pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, sig, handle, arg idx-list
+    pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -139,7 +140,7 @@ mod op {
     pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
 
     // §GC (GC.md) conservative root enumeration.
-    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, buf, cap -> i64 count
+    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -175,9 +176,11 @@ mod op {
         pub const VPOPCNT: u8 = 0x1B; // a (i8x16 implicit)
         pub const VAVGR: u8 = 0x1C; // shape, a, b
         pub const VDOT: u8 = 0x1D; // a, b (i16x8 -> i32x4 implicit)
+        pub const VDOT_I8: u8 = 0x22; // a, b (i8x16 -> i16x8 implicit)
         pub const VEXTMUL: u8 = 0x1E; // shape (wide), op (VWidenOp), a, b
         pub const VEXTADD: u8 = 0x1F; // shape (wide), signed (u8), a
         pub const VQ15MULR: u8 = 0x20; // a, b (i16x8 implicit)
+        pub const VFMA: u8 = 0x21; // shape, neg (u8), a, b, c
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -388,6 +391,15 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
                 write_uleb(out, t as u64);
             }
         }
+        // Optional lexical scope `(start_line, end_line)` (§6 shadowing resolution).
+        match v.scope {
+            None => out.push(0),
+            Some((s, e)) => {
+                out.push(1);
+                write_uleb(out, s as u64);
+                write_uleb(out, e as u64);
+            }
+        }
     }
     // Opaque per-producer rich blobs (§6): count, then each `(producer, length-prefixed bytes)`.
     write_uleb(out, di.blobs.len() as u64);
@@ -495,6 +507,16 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::FUn { ty, op: o, a } => {
             out.push(fun_base(*ty) + o.index());
             write_uleb(out, *a as u64);
+        }
+        Inst::Fma { ty, a, b, c } => {
+            out.push(op::FMA);
+            out.push(match ty {
+                FloatTy::F32 => 0,
+                FloatTy::F64 => 1,
+            });
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+            write_uleb(out, *c as u64);
         }
         Inst::FCmp { ty, op: o, a, b } => {
             out.push(fcmp_base(*ty) + o.index());
@@ -660,12 +682,14 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
         } => {
             out.push(op::GC_ROOTS);
             write_uleb(out, *heap_lo as u64);
             write_uleb(out, *heap_hi as u64);
+            write_uleb(out, *mask as u64);
             write_uleb(out, *buf as u64);
             write_uleb(out, *cap as u64);
         }
@@ -872,6 +896,12 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::VDotI8 { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VDOT_I8);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VExtMul { shape, op: o, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::VEXTMUL);
@@ -892,6 +922,21 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::simd::VQ15MULR);
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
+        }
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFMA);
+            out.push(shape.index());
+            out.push(*neg as u8);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+            write_uleb(out, *c as u64);
         }
         Inst::VAnyTrue { a } => {
             out.push(op::SIMD);
@@ -1119,6 +1164,10 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
+        op::simd::VDOT_I8 => Inst::VDotI8 {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
         op::simd::VEXTMUL => {
             let shape = dec_shape(c)?;
             let ob = c.byte()?;
@@ -1142,6 +1191,17 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
+        op::simd::VFMA => {
+            let shape = dec_shape(c)?;
+            let neg = c.byte()? != 0;
+            Inst::VFma {
+                shape,
+                neg,
+                a: c.idx()?,
+                b: c.idx()?,
+                c: c.idx()?,
+            }
+        }
         op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },
         op::simd::VALL_TRUE => Inst::VAllTrue {
             shape: dec_shape(c)?,
@@ -1521,12 +1581,18 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
             1 => Some(c.idx()?),
             b => return Err(DecodeError::BadOptionFlag(b)),
         };
+        let scope = match c.byte()? {
+            0 => None,
+            1 => Some((c.idx()?, c.idx()?)),
+            b => return Err(DecodeError::BadOptionFlag(b)),
+        };
         vars.push(VarInfo {
             func,
             name,
             ty,
             loc,
             type_id,
+            scope,
         });
     }
     // Opaque per-producer rich blobs (§6): bounded count, then producer + length-prefixed bytes.
@@ -1637,6 +1703,19 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
+        op::FMA => {
+            let ty = match c.byte()? {
+                0 => FloatTy::F32,
+                1 => FloatTy::F64,
+                other => return Err(DecodeError::BadOpcode(other)),
+            };
+            Inst::Fma {
+                ty,
+                a: c.idx()?,
+                b: c.idx()?,
+                c: c.idx()?,
+            }
+        }
         op::FTOI_TRAP..=op::FTOI_TRAP_END => Inst::FToITrap {
             op: FToI::from_index(b - op::FTOI_TRAP).ok_or(DecodeError::BadOpcode(b))?,
             a: c.idx()?,
@@ -1750,6 +1829,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::GC_ROOTS => Inst::GcRoots {
             heap_lo: c.idx()?,
             heap_hi: c.idx()?,
+            mask: c.idx()?,
             buf: c.idx()?,
             cap: c.idx()?,
         },
@@ -2131,6 +2211,7 @@ mod debug_tests {
                     ty: "struct Point".into(),
                     loc: VarLoc::Window { off: 24 },
                     type_id: Some(4),
+                    scope: Some((4, 9)),
                 },
                 VarInfo {
                     func: 0,
@@ -2138,6 +2219,7 @@ mod debug_tests {
                     ty: "int".into(),
                     loc: VarLoc::Ssa { value: 3 },
                     type_id: None,
+                    scope: None,
                 },
                 VarInfo {
                     func: 0,
@@ -2145,6 +2227,7 @@ mod debug_tests {
                     ty: "int".into(),
                     loc: VarLoc::Window { off: -8 },
                     type_id: Some(0),
+                    scope: None,
                 },
                 // A location list (S2): the holding SSA value varies by pc.
                 VarInfo {
@@ -2164,6 +2247,7 @@ mod debug_tests {
                         },
                     ]),
                     type_id: Some(0),
+                    scope: None,
                 },
                 // A runtime-base window var (wasm/DWARF fbreg case): base loclist + a negative off.
                 VarInfo {
@@ -2186,6 +2270,7 @@ mod debug_tests {
                         off: -8,
                     },
                     type_id: Some(0),
+                    scope: None,
                 },
                 // A module-scoped global at a fixed absolute window address (the GLOBAL_SCOPE
                 // sentinel func + Fixed loc).
@@ -2195,6 +2280,7 @@ mod debug_tests {
                     ty: "int".into(),
                     loc: VarLoc::Fixed { addr: 64 },
                     type_id: Some(0),
+                    scope: None,
                 },
             ],
             // An opaque per-producer rich blob (incl. non-UTF-8 / NUL bytes — verbatim DWARF).

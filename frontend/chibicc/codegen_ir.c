@@ -1251,8 +1251,8 @@ static int gen_builtin_region_page_size(Node *node) {
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
 //
-//   int  __vm_fiber_new(fiber_fn f, void *stack);  // f : long(*)(long); -> handle
-//   long __vm_fiber_resume(int k, long arg, int *done);  // -> yielded/returned value
+//   int64_t __vm_fiber_new(fiber_fn f, void *stack);  // f : long(*)(long); -> i64 handle
+//   long __vm_fiber_resume(int64_t k, long arg, int *done);  // -> yielded/returned value
 //   long __vm_fiber_suspend(long value);                 // -> next resume's arg
 //
 // The fiber body is an ordinary C function `long f(long)`, which lowers to the IR entry
@@ -1270,14 +1270,14 @@ static int gen_builtin_fiber_new(Node *node) {
   cg("  v%d = i32.wrap_i64 v%d\n", fn32, fnv); // cont.new wants the i32 funcref
   int r = nv++;
   cg("  v%d = cont.new v%d v%d\n", r, fn32, sp);
-  return r; // i32 fiber handle
+  return r; // i64 fiber handle (16-bit slot + 48-bit generation)
 }
 
 static int gen_builtin_fiber_resume(Node *node) {
   Node *a = node->args;
   if (!a || !a->next || !a->next->next || a->next->next->next)
     error_tok(node->tok, "codegen_ir: __vm_fiber_resume(k, arg, done) expects 3 arguments");
-  int k = gen_expr(a);                                   // handle (i32)
+  int k = widen_i64(gen_expr(a), a->ty);                 // handle (i64; widened if narrower)
   int arg = widen_i64(gen_expr(a->next), a->next->ty);   // resume value (i64)
   int done = gen_expr(a->next->next);                    // int* — where to store the status
   int status = nv++;
@@ -2740,10 +2740,16 @@ static void emit_debug_vars(Obj *fn, int func_idx) {
       for (int i = 0; i < n_promo; i++)
         if (promo_buf[i].func == func_idx && promo_buf[i].slot == s)
           cg(" %d %d %d", promo_buf[i].block, promo_buf[i].inst, promo_buf[i].value);
-      cg(" \"%s\" %d\n", ty, tid);
+      cg(" \"%s\" %d", ty, tid);
     } else {
-      cg("debug.var %d \"%s\" win %d \"%s\" %d\n", func_idx, v->name, v->offset, ty, tid);
+      cg("debug.var %d \"%s\" win %d \"%s\" %d", func_idx, v->name, v->offset, ty, tid);
     }
+    // §6 lexical scope (shadowing): a block-scoped local carries its source-line range; a
+    // function-wide local (`scope_end_line == 0`, e.g. a top-level declaration or a parameter)
+    // omits it (the consumer treats absent scope as function-wide).
+    if (v->scope_end_line)
+      cg(" scope %d %d", v->scope_start_line, v->scope_end_line);
+    cg("\n");
   }
 }
 

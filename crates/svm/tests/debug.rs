@@ -455,7 +455,7 @@ debug.field 3 "y" 4 0
 debug.var 0 "x" ssa 0 "int"
 debug.var 0 "buf" win 16 "char"
 debug.var 0 "p" win 24 "struct" 3
-debug.var 0 "k" ssalist 2 0 0 0 1 1 2 "int"
+debug.var 0 "k" ssalist 2 0 0 0 1 1 2 "int" scope 4 9
 debug.var 0 "w" winvia 2 0 0 1 1 3 5 -8 "int"
 debug.var global "g" fixed 64 "int" 0
 debug.blob "x.dw" "ab\x00\xffcd"
@@ -491,6 +491,9 @@ debug.blob "x.dw" "ab\x00\xffcd"
     };
     assert_eq!(locs.len(), 2);
     assert_eq!((locs[1].block, locs[1].inst, locs[1].value), (1, 1, 2));
+    // `k` carries a lexical scope (§6 shadowing); the others are function-wide.
+    assert_eq!(di.vars[3].scope, Some((4, 9)));
+    assert_eq!(di.vars[0].scope, None);
 
     // The aggregate's fields parsed with their offsets.
     let svm_ir::TypeDef::Aggregate { fields, size, .. } = &di.types[3] else {

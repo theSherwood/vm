@@ -73,6 +73,25 @@ impl Session {
         let width = scalar_width(&debug.types, var.type_id, &var.ty);
         var_to_i64(&self.inspector.read_var(frame_idx, name, width)?)
     }
+
+    /// Whether a breakpoint stop at `pc` should fire: `true` for an unconditional breakpoint, or a
+    /// `condition` that evaluates nonzero in the stopped (innermost) frame. A malformed/unresolvable
+    /// condition also fires (so the user notices rather than silently skipping). Shared by forward
+    /// `continue` and reverse `reverseContinue` so both honor conditional breakpoints identically.
+    fn condition_holds(&self, pc: IrPc) -> bool {
+        let Some(cond) = self.conditions.get(&pc) else {
+            return true; // unconditional
+        };
+        let func = match self.inspector.backtrace().first() {
+            Some(f) => f.pc.func,
+            None => return true,
+        };
+        let resolve = |name: &str| self.resolve_var(0, func, name);
+        match expr::eval_int(cond, &resolve) {
+            Some(v) => v != 0,
+            None => true,
+        }
+    }
 }
 
 /// An event to emit after a response: `(event-name, body)`.
@@ -469,12 +488,33 @@ impl DapServer {
         session.inspector.select_task(tid);
         let frames = session.inspector.backtrace();
         let frame = frames.get(frame_idx)?;
-        // Snapshot (name, ty, loc, type_id) so the `debug` borrow ends before we read/allocate.
+        // The stopped source line drives lexical-scope resolution of shadowed names (§6).
+        let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
+        let in_scope = |v: &VarInfo| {
+            (v.func == frame.pc.func || v.func == svm_ir::GLOBAL_SCOPE)
+                && scope_covers(v.scope, line)
+        };
+        // The innermost (largest scope start) in-scope declaration of `name` — the one to show.
+        let best_for = |name: &str| {
+            debug
+                .vars
+                .iter()
+                .filter(|v| in_scope(v) && v.name == name)
+                .max_by_key(|v| v.scope.map_or(0u32, |(s, _)| s))
+        };
+        // Snapshot the in-scope locals, one per name (a shadowed name shows only its innermost
+        // visible declaration). `debug` borrow ends before we read/allocate.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let vars: Vec<(String, String, VarLoc, Option<TypeId>)> = debug
             .vars
             .iter()
-            .filter(|v| v.func == frame.pc.func || v.func == svm_ir::GLOBAL_SCOPE)
-            .map(|v| (v.name.clone(), v.ty.clone(), v.loc.clone(), v.type_id))
+            .filter(|v| in_scope(v))
+            .filter_map(|v| {
+                if !seen.insert(v.name.clone()) {
+                    return None;
+                }
+                best_for(&v.name).map(|b| (b.name.clone(), b.ty.clone(), b.loc.clone(), b.type_id))
+            })
             .collect();
         let mut out = Vec::new();
         for (name, ty, loc, type_id) in vars {
@@ -640,25 +680,9 @@ impl DapServer {
         }
     }
 
-    /// Whether a stop at `pc` should surface: `true` for an unconditional breakpoint or a condition
-    /// that evaluates nonzero in the stopped (innermost) frame. A malformed/unresolvable condition
-    /// also stops (so the user notices rather than silently skipping).
+    /// Whether a stop at `pc` should surface (delegates to [`Session::condition_holds`]).
     fn condition_holds(&self, pc: IrPc) -> bool {
-        let Some(session) = self.session.as_ref() else {
-            return true;
-        };
-        let Some(cond) = session.conditions.get(&pc) else {
-            return true; // unconditional
-        };
-        let func = match session.inspector.backtrace().first() {
-            Some(f) => f.pc.func,
-            None => return true,
-        };
-        let resolve = |name: &str| session.resolve_var(0, func, name);
-        match expr::eval_int(cond, &resolve) {
-            Some(v) => v != 0,
-            None => true,
-        }
+        self.session.as_ref().is_none_or(|s| s.condition_holds(pc))
     }
 
     fn on_step(&mut self, kind: StepKind) -> (bool, Json, Vec<Event>) {
@@ -748,12 +772,17 @@ impl DapServer {
         let target = pos(&session.inspector);
         session.inspector.seek(0);
         let mut prev: Option<u64> = None;
-        while let Stop::Break { .. } = session.inspector.run_until_stop() {
+        while let Stop::Break { reason, pc } = session.inspector.run_until_stop() {
             let t = pos(&session.inspector);
-            if t < target {
-                prev = Some(t);
-            } else {
+            if t >= target {
                 break; // reached (or passed) where we started
+            }
+            // Honor conditional breakpoints, like forward `continue`: a breakpoint whose condition is
+            // false is not a real stop, so don't treat it as the previous breakpoint. Other stop
+            // reasons (watchpoints, cap.call) always count.
+            let fires = !matches!(reason, StopReason::Breakpoint) || session.condition_holds(pc);
+            if fires {
+                prev = Some(t);
             }
         }
         let (landed, reason) = match prev {
@@ -985,6 +1014,16 @@ fn scalar_width(types: &[TypeDef], type_id: Option<TypeId>, ty_name: &str) -> us
     match type_id.map(|t| type_size(types, t)) {
         Some(n) if n > 0 => n as usize,
         _ => ty_width(ty_name),
+    }
+}
+
+/// Whether a variable's lexical `scope` (a `(start_line, end_line)` source-line range, or `None` for
+/// function-wide) covers `line` — the §6 shadowing filter for the Variables pane. An absent line
+/// (no source mapping at the pc) covers everything (the function-wide back-compat behavior).
+fn scope_covers(scope: Option<(u32, u32)>, line: Option<u32>) -> bool {
+    match (scope, line) {
+        (None, _) | (_, None) => true,
+        (Some((s, e)), Some(l)) => s <= l && l <= e,
     }
 }
 

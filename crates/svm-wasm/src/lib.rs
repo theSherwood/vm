@@ -28,18 +28,20 @@
 //! **function imports** (a wasm `call` to an import → a `cap.call` on a threaded capability handle;
 //! the host-ABI convention binds each import's `module`/`name` to a capability `type_id`/`op` — see
 //! [`transpile`]) · **§17/D58 SIMD** (`v128` → the IR's first-class fixed-128 vector type: const,
-//! masked load/store, splat, extract/replace_lane, integer-/float-lane arithmetic, bitwise +
-//! `bitselect`, `shuffle`/`swizzle` — a real `clang -msimd128 -O2` saxpy transpiles to verified
-//! SIMD IR, `tests/simd.rs`) · **§12 wasm threads**: the full-width (i32/i64) `*.atomic.*` ops map
+//! masked load/store + the memory variants (splat-load/load-extend/load-zero/load+store-lane), splat,
+//! extract/replace_lane, the full integer-/float-lane op set, bitwise + `bitselect`,
+//! `shuffle`/`swizzle`, and **relaxed SIMD** — a real `clang -msimd128 -O2` saxpy transpiles to
+//! verified SIMD IR, `tests/simd.rs`) · **§12 wasm threads**: the full-width (i32/i64) `*.atomic.*` ops map
 //! 1:1 onto SVM's IR atomics (`tests/atomics.rs`), the **narrow** (8/16-bit) `*.atomic.*` forms
 //! emulate via a 32-bit word-CAS loop (the i64 32-bit forms are word-sized natives), **shared** +
 //! **imported** memory are accepted, and the **wasi-threads** ABI lowers to SVM's *native*
 //! `thread.spawn` — a `wasi:thread/spawn` import becomes a real OS-thread vCPU over the shared window
 //! via a synthesized shim (concurrency in the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads`
 //! runs — `tests/threads.rs`). Imports spanning multiple capability interfaces bind (one handle per
-//! interface). Still a clean [`Error::Unsupported`] (the niche features typical clang output doesn't
-//! emit): the `table.*` bulk ops and passive *element* segments; imported table/global/tag;
-//! wasi:thread/spawn *alongside* capability imports (the per-thread handle stash); reference types;
+//! interface), and capabilities reach spawned threads via a window handle stash (so
+//! `wasi:thread/spawn` works *alongside* capability imports). Still a clean [`Error::Unsupported`]
+//! (the niche features typical clang output doesn't emit): the `table.*` bulk ops and passive
+//! *element* segments; imported table/global/tag; reference types;
 //! multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
 //! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
@@ -56,7 +58,7 @@ use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 /// DWARF `.debug_info` reader for source-variable ingest (DEBUGGING.md W4 — wasm producer). Public
 /// so it is testable against a real fixture; the transpiler wiring lands in a follow-up slice.
 pub mod dwarf_info;
-mod dwarf_line;
+pub mod dwarf_line;
 
 /// Per-operator debug records from lowering: `(code-relative offset, block, inst index)` for the
 /// first IR instruction each wasm operator emits (DEBUGGING.md §6/W4 — mapped onto DWARF line rows).
@@ -549,15 +551,16 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // functions, so its index is `bodies.len()`). The shim adapts SVM's thread-entry ABI to the
     // `wasi_thread_start` export.
     let spawn_shim = bodies.len() as u32;
+    // The capability-handle stash sits just past the tid counter: `n_handles` i32 slots. A spawning
+    // thread writes its handle prefix here before `thread.spawn`; the shim reads it on the new thread
+    // (§12 — capability imports *alongside* spawn). Empty (offset unreferenced) for a cap-free module.
+    let n_handles = handle_modules.len() as u32;
+    let stash_base = tid_slot + 4;
     if spawn_import.is_some() {
-        if imports.iter().any(|(t, _, _, _)| *t != u32::MAX) {
-            return unsup(
-                "wasi:thread/spawn alongside capability imports — needs the per-thread handle stash \
-                 (threads-only modules are supported in this slice)",
-            );
-        }
         // The host calls `wasi_thread_start(tid, start_arg)` on each spawned thread; require the export
-        // and that it is `(i32, i32) -> ()` (with no capability handle, since threads-only).
+        // and that its **wasm** type is `(i32, i32) -> ()`. (When the module also has capability
+        // imports it carries the N-handle IR prefix like every defined function — the shim supplies
+        // those handles from the stash; the wasm-level type the host sees is unchanged.)
         let wts = exports
             .iter()
             .find(|(n, _)| n == WASI_THREAD_START_EXPORT)
@@ -576,6 +579,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         spawn_import,
         spawn_shim,
         tid_slot,
+        stash_base,
+        n_handles,
     };
 
     let func_sigs: Vec<(Vec<ValType>, Vec<ValType>)> = func_type_idx
@@ -633,7 +638,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             .find(|(n, _)| n == WASI_THREAD_START_EXPORT)
             .map(|(_, i)| *i)
             .expect("validated above");
-        funcs.push(build_spawn_shim(wts));
+        funcs.push(build_spawn_shim(wts, threads.stash_base, threads.n_handles));
     }
 
     // `(start $f)`: run the start function once before any export. SVM has no instantiation hook (a
@@ -673,7 +678,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         .max(after_mem)
         .max(mem_bytes)
         .max(if spawn_import.is_some() {
-            tid_slot + 4
+            // tid counter + the capability-handle stash (`n_handles` i32 slots after it).
+            stash_base + (n_handles as u64) * 4
         } else {
             0
         });
@@ -713,7 +719,16 @@ fn build_debug_info(
     op_locs.sort_by_key(|e| e.0);
     let mut files: Vec<String> = Vec::new();
     let mut locs: Vec<Loc> = Vec::new();
+    // `(code address → source line)` rows, used to map a DWARF lexical block's PC range to a
+    // source-line scope (§6 shadowing).
+    let mut line_rows: Vec<(u64, u32)> = Vec::new();
     if let Some(prog) = debug_line.and_then(dwarf_line::parse) {
+        line_rows = prog
+            .rows
+            .iter()
+            .filter(|r| !r.end_sequence)
+            .map(|r| (r.address, r.line))
+            .collect();
         if prog.files.len() > 1 {
             // DWARF file indices are 1-based; flatten to a 0-based table for `Loc::file`.
             files = prog.files[1..].to_vec();
@@ -747,7 +762,7 @@ fn build_debug_info(
         }
     }
     // Source variables from `.debug_info` (DEBUGGING.md W4 — wasm variable ingest).
-    let (types, vars) = ingest_variables(&blobs, &op_locs, &local_locs);
+    let (types, vars) = ingest_variables(&blobs, &op_locs, &local_locs, &line_rows);
 
     if locs.is_empty() && vars.is_empty() && blobs.is_empty() {
         return None;
@@ -770,6 +785,7 @@ fn ingest_variables(
     blobs: &[svm_ir::ProducerBlob],
     op_locs: &[(u32, u32, u32, u32)],
     local_locs: &[(u32, u32, u32, u32, u32)],
+    line_rows: &[(u64, u32)],
 ) -> (Vec<TypeDef>, Vec<VarInfo>) {
     let sec = |name: &str| {
         blobs
@@ -810,6 +826,17 @@ fn ingest_variables(
                 .and_then(|id| types.get(id as usize))
                 .map(type_render_name)
                 .unwrap_or_else(|| "?".to_string());
+            // §6 lexical scope: a var nested in a `DW_TAG_lexical_block` is in scope from its
+            // declaration line to the block's last source line (mapped from the block's code range
+            // via the line table). Directly in the subprogram ⇒ function-wide (`None`).
+            let scope = v.scope_pc.and_then(|(lo, hi)| {
+                let end = line_rows
+                    .iter()
+                    .filter(|&&(a, _)| a >= lo && a < hi)
+                    .map(|&(_, l)| l)
+                    .max()?;
+                Some((v.decl_line, end))
+            });
             vars.push(VarInfo {
                 func,
                 name: v.name.clone(),
@@ -819,6 +846,7 @@ fn ingest_variables(
                     off: v.fbreg,
                 },
                 type_id,
+                scope,
             });
         }
     }
@@ -838,6 +866,7 @@ fn ingest_variables(
             ty,
             loc: VarLoc::Fixed { addr: g.addr },
             type_id,
+            scope: None,
         });
     }
     (types, vars)
@@ -1065,6 +1094,13 @@ struct ThreadCfg {
     /// each thread gets a unique positive tid (avoiding the spawn-handle circularity). Reads 0 in a
     /// fresh window, so the first tid is 1.
     tid_slot: u64,
+    /// Window byte offset of the **capability-handle stash**: `n_handles` consecutive i32 slots a
+    /// spawning thread writes its handles into (it has them as its multi-handle prefix) so a spawned
+    /// thread's shim can read them back and thread them into `wasi_thread_start`. Unused (and the
+    /// region unreserved) when `n_handles == 0`.
+    stash_base: u64,
+    /// Number of capability-handle slots in the stash (= the module's distinct import interfaces).
+    n_handles: u32,
 }
 
 struct Lower<'a> {
@@ -1330,40 +1366,72 @@ impl Lower<'_> {
 
 /// Synthesize the §12 spawn shim: a `(i64 sp, i64 arg) -> (i64)` IR function (the `thread.spawn`
 /// entry ABI) that unpacks `(tid, start_arg)` from its packed `arg` and calls the module's
-/// `wasi_thread_start(tid, start_arg)` export (IR index `wts`), then returns 0. The data-SP `sp` is
-/// unused (svm-wasm keeps the C stack in linear memory). `wasi_thread_start` is `(i32, i32) -> ()`
-/// here — threads-only modules thread no capability handle, so it carries no leading handle param.
-fn build_spawn_shim(wts: u32) -> Func {
+/// `wasi_thread_start` export (IR index `wts`), then returns 0. The data-SP `sp` is unused (svm-wasm
+/// keeps the C stack in linear memory).
+///
+/// When the module also has capability imports (`n_handles > 0`), `wasi_thread_start` carries the
+/// N-handle prefix like every defined function, so the shim first **reads the N capability handles
+/// from the window stash** (`stash_base + i*4`, written by the spawning thread in [`spawn_op`]) and
+/// passes them ahead of `(tid, start_arg)`. With `n_handles == 0` this is byte-identical to the old
+/// threads-only shim.
+fn build_spawn_shim(wts: u32, stash_base: u64, n_handles: u32) -> Func {
     // values: v0=sp v1=arg | v2..  (a 0-result `call` appends no value)
-    let insts = vec![
-        Inst::ConstI64(32), // v2
-        Inst::IntBin {
-            ty: IntTy::I64,
-            op: BinOp::ShrU,
-            a: 1, // arg
-            b: 2, // 32
-        }, // v3 = arg >> 32
-        Inst::Convert {
-            op: ConvOp::WrapI64,
-            a: 3,
-        }, // v4 = tid (i32)
-        Inst::Convert {
-            op: ConvOp::WrapI64,
-            a: 1,
-        }, // v5 = start_arg (i32, low 32 of arg)
-        Inst::Call {
-            func: wts,
-            args: vec![4, 5],
-        }, // no result
-        Inst::ConstI64(0),  // v6
-    ];
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut next: u32 = 2;
+    // Load each capability handle from the stash (an i32 per slot). The host's capability table is
+    // shared across vCPUs, so a handle written by the spawning thread is valid on this one.
+    let mut handle_vals: Vec<u32> = Vec::with_capacity(n_handles as usize);
+    for i in 0..n_handles as u64 {
+        insts.push(Inst::ConstI64((stash_base + i * 4) as i64));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Load {
+            op: LoadOp::I32,
+            addr,
+            offset: 0,
+            align: 2,
+        });
+        handle_vals.push(next);
+        next += 1;
+    }
+    // tid = arg >> 32 (i32); start_arg = arg's low 32 (i32).
+    insts.push(Inst::ConstI64(32));
+    let c32 = next;
+    next += 1;
+    insts.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::ShrU,
+        a: 1, // arg
+        b: c32,
+    });
+    let arg_hi = next;
+    next += 1;
+    insts.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: arg_hi,
+    });
+    let tid = next;
+    next += 1;
+    insts.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: 1, // arg
+    });
+    let start_arg = next;
+    next += 1;
+    // call wasi_thread_start(handles.., tid, start_arg) — a 0-result call (appends no value).
+    let mut args = handle_vals;
+    args.push(tid);
+    args.push(start_arg);
+    insts.push(Inst::Call { func: wts, args });
+    insts.push(Inst::ConstI64(0));
+    let ret = next;
     Func {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
             params: vec![ValType::I64, ValType::I64],
             insts,
-            term: Terminator::Return(vec![6]),
+            term: Terminator::Return(vec![ret]),
         }],
     }
 }
@@ -1721,6 +1789,35 @@ fn v_dot(lo: &mut Lower) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+/// `i16x8.relaxed_dot_i8x16_i7x16_s` — the deterministic signed-i8 dot (`Inst::VDotI8`).
+fn v_dot_i8(lo: &mut Lower) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VDotI8 { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+/// `i32x4.relaxed_dot_i8x16_i7x16_add_s` = `extadd_pairwise_s(dot_i8(a, b)) + c` — composed from the
+/// i8 dot, the existing widening pairwise add, and an i32x4 add (the deterministic recipe).
+fn v_dot_i8_add(lo: &mut Lower) -> Result<(), Error> {
+    let (c, _) = lo.pop()?;
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let dot = lo.emit(Inst::VDotI8 { a, b });
+    let wide = lo.emit(Inst::VExtAddPairwise {
+        shape: VShape::I32x4,
+        signed: true,
+        a: dot,
+    });
+    let v = lo.emit(Inst::VIntBin {
+        shape: VShape::I32x4,
+        op: VIntBinOp::Add,
+        a: wide,
+        b: c,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_extmul(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
@@ -1738,6 +1835,21 @@ fn v_q15mulr(lo: &mut Lower) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VQ15MulrSat { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+/// `<f>.relaxed_madd`/`relaxed_nmadd` (a ternary `[a, b, c]` op): a fused `±a·b + c`.
+fn v_fma(lo: &mut Lower, shape: VShape, neg: bool) -> Result<(), Error> {
+    let (c, _) = lo.pop()?;
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VFma {
+        shape,
+        neg,
+        a,
+        b,
+        c,
+    });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -1829,6 +1941,123 @@ fn v128_store(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
         value,
         offset: m.offset,
         align: m.align,
+    });
+    Ok(())
+}
+
+// ---- SIMD memory variants (splat-load / load-extend / load-zero / load+store-lane) ----
+// None need new IR: each composes a scalar `Load`/`Store` with `Splat`/`ReplaceLane`/`ExtractLane`/
+// `VWiden` (the lane immediates are wasm-validated `< lanes`). Synthesized scalar accesses carry
+// `align: 0` (advisory only; SVM masks rather than trapping on misalignment).
+
+/// `v128.loadN_splat`: load a scalar of width N and broadcast it across every lane of `shape`.
+fn v_load_splat(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::Load {
+        op,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let v = lo.emit(Inst::Splat { shape, a: s });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.loadN_zero`: load a scalar into lane 0 of a zero vector (`load32_zero`/`load64_zero`).
+fn v_load_zero(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::Load {
+        op,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let zero = lo.emit(Inst::ConstV128([0u8; 16]));
+    let v = lo.emit(Inst::ReplaceLane {
+        shape,
+        lane: 0,
+        a: zero,
+        b: s,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.loadAxB_{s,u}`: load 8 bytes into the low half of a v128, then widen-extend the low lanes to
+/// the result `shape` (`op` picks sign/zero extension). The high 8 bytes are zeroed (unused by widen).
+fn v_load_extend(lo: &mut Lower, shape: VShape, op: VWidenOp, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let bytes = lo.emit(Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let zero = lo.emit(Inst::ConstV128([0u8; 16]));
+    let packed = lo.emit(Inst::ReplaceLane {
+        shape: VShape::I64x2,
+        lane: 0,
+        a: zero,
+        b: bytes,
+    });
+    let v = lo.emit(Inst::VWiden {
+        shape,
+        op,
+        a: packed,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.loadN_lane`: load a scalar of width N and splice it into lane `lane` of the vector operand.
+fn v_load_lane(
+    lo: &mut Lower,
+    shape: VShape,
+    op: LoadOp,
+    lane: u8,
+    m: MemArg,
+) -> Result<(), Error> {
+    let (vec, _) = lo.pop()?; // the v128 (stack top), then the address below it
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::Load {
+        op,
+        addr,
+        offset: m.offset,
+        align: 0,
+    });
+    let v = lo.emit(Inst::ReplaceLane {
+        shape,
+        lane,
+        a: vec,
+        b: s,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+
+/// `v128.storeN_lane`: extract lane `lane` of the vector operand and store it as a width-N scalar.
+fn v_store_lane(
+    lo: &mut Lower,
+    shape: VShape,
+    op: StoreOp,
+    lane: u8,
+    m: MemArg,
+) -> Result<(), Error> {
+    let (vec, _) = lo.pop()?;
+    let addr = pop_addr(lo)?;
+    let s = lo.emit(Inst::ExtractLane {
+        shape,
+        lane,
+        signed: false,
+        a: vec,
+    });
+    lo.emit_void(Inst::Store {
+        op,
+        addr,
+        value: s,
+        offset: m.offset,
+        align: 0,
     });
     Ok(())
 }
@@ -1996,6 +2225,24 @@ fn spawn_op(lo: &mut Lower) -> Result<(), Error> {
         a: hi,
         b: lo64,
     });
+    // Stash this thread's capability handles so the spawned thread's shim can thread them into
+    // `wasi_thread_start`. The spawning function holds them as its multi-handle prefix (`lo.handles`),
+    // and the host's capability table is shared across vCPUs, so the same i32 handle is valid there.
+    // The stores precede `thread.spawn` in program order, which establishes the happens-before to the
+    // new thread. (No-op for a cap-free module, where `handles` is empty.)
+    let handles = lo.handles.clone();
+    for (i, &h) in handles.iter().enumerate() {
+        let addr = lo.emit(Inst::ConstI64(
+            (lo.threads.stash_base + i as u64 * 4) as i64,
+        ));
+        lo.emit_void(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: h,
+            offset: 0,
+            align: 2,
+        });
+    }
     // The shim ignores its data-SP (svm-wasm keeps the C stack in linear memory via `__stack_pointer`),
     // so any constant works.
     let sp0 = lo.emit(Inst::ConstI64(0));
@@ -3750,6 +3997,43 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         }
         O::V128Load { memarg } => v128_load(lo, memarg)?,
         O::V128Store { memarg } => v128_store(lo, memarg)?,
+        // SIMD memory variants — splat-load, load-extend, load-zero, load/store-lane.
+        O::V128Load8Splat { memarg } => v_load_splat(lo, VShape::I8x16, LoadOp::I32_8U, memarg)?,
+        O::V128Load16Splat { memarg } => v_load_splat(lo, VShape::I16x8, LoadOp::I32_16U, memarg)?,
+        O::V128Load32Splat { memarg } => v_load_splat(lo, VShape::I32x4, LoadOp::I32, memarg)?,
+        O::V128Load64Splat { memarg } => v_load_splat(lo, VShape::I64x2, LoadOp::I64, memarg)?,
+        O::V128Load32Zero { memarg } => v_load_zero(lo, VShape::I32x4, LoadOp::I32, memarg)?,
+        O::V128Load64Zero { memarg } => v_load_zero(lo, VShape::I64x2, LoadOp::I64, memarg)?,
+        O::V128Load8x8S { memarg } => v_load_extend(lo, VShape::I16x8, VWidenOp::LowS, memarg)?,
+        O::V128Load8x8U { memarg } => v_load_extend(lo, VShape::I16x8, VWidenOp::LowU, memarg)?,
+        O::V128Load16x4S { memarg } => v_load_extend(lo, VShape::I32x4, VWidenOp::LowS, memarg)?,
+        O::V128Load16x4U { memarg } => v_load_extend(lo, VShape::I32x4, VWidenOp::LowU, memarg)?,
+        O::V128Load32x2S { memarg } => v_load_extend(lo, VShape::I64x2, VWidenOp::LowS, memarg)?,
+        O::V128Load32x2U { memarg } => v_load_extend(lo, VShape::I64x2, VWidenOp::LowU, memarg)?,
+        O::V128Load8Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I8x16, LoadOp::I32_8U, lane, memarg)?
+        }
+        O::V128Load16Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I16x8, LoadOp::I32_16U, lane, memarg)?
+        }
+        O::V128Load32Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I32x4, LoadOp::I32, lane, memarg)?
+        }
+        O::V128Load64Lane { memarg, lane } => {
+            v_load_lane(lo, VShape::I64x2, LoadOp::I64, lane, memarg)?
+        }
+        O::V128Store8Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I8x16, StoreOp::I32_8, lane, memarg)?
+        }
+        O::V128Store16Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I16x8, StoreOp::I32_16, lane, memarg)?
+        }
+        O::V128Store32Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I32x4, StoreOp::I32, lane, memarg)?
+        }
+        O::V128Store64Lane { memarg, lane } => {
+            v_store_lane(lo, VShape::I64x2, StoreOp::I64, lane, memarg)?
+        }
         // splat
         O::I8x16Splat => v_splat(lo, VShape::I8x16)?,
         O::I16x8Splat => v_splat(lo, VShape::I16x8)?,
@@ -3950,6 +4234,15 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::F64x2Abs => v_fun(lo, VShape::F64x2, VFloatUnOp::Abs)?,
         O::F64x2Neg => v_fun(lo, VShape::F64x2, VFloatUnOp::Neg)?,
         O::F64x2Sqrt => v_fun(lo, VShape::F64x2, VFloatUnOp::Sqrt)?,
+        // SIMD float rounding (the rounding `FUnOp`s applied lane-wise).
+        O::F32x4Ceil => v_fun(lo, VShape::F32x4, VFloatUnOp::Ceil)?,
+        O::F32x4Floor => v_fun(lo, VShape::F32x4, VFloatUnOp::Floor)?,
+        O::F32x4Trunc => v_fun(lo, VShape::F32x4, VFloatUnOp::Trunc)?,
+        O::F32x4Nearest => v_fun(lo, VShape::F32x4, VFloatUnOp::Nearest)?,
+        O::F64x2Ceil => v_fun(lo, VShape::F64x2, VFloatUnOp::Ceil)?,
+        O::F64x2Floor => v_fun(lo, VShape::F64x2, VFloatUnOp::Floor)?,
+        O::F64x2Trunc => v_fun(lo, VShape::F64x2, VFloatUnOp::Trunc)?,
+        O::F64x2Nearest => v_fun(lo, VShape::F64x2, VFloatUnOp::Nearest)?,
         // float lane comparisons → a per-lane all-ones/all-zeros mask (ordered; `ne` unordered).
         O::F32x4Eq => v_fcmp(lo, VShape::F32x4, VFCmpOp::Eq)?,
         O::F32x4Ne => v_fcmp(lo, VShape::F32x4, VFCmpOp::Ne)?,
@@ -3994,6 +4287,44 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             let v = lo.emit(Inst::Swizzle { a, b });
             lo.push(v, ValType::V128);
         }
+
+        // ---- relaxed SIMD: each op lowers to one spec-allowed deterministic behavior, computed
+        // identically in both backends (so the interp↔JIT differential holds). `relaxed_madd`/`nmadd`
+        // get a genuine fused FMA; the rest alias to the deterministic op SVM already has. The two
+        // `relaxed_dot_i8x16_i7x16` ops (pmaddubsw-shaped) are not yet lowered → clean `Unsupported`.
+        O::F32x4RelaxedMadd => v_fma(lo, VShape::F32x4, false)?,
+        O::F32x4RelaxedNmadd => v_fma(lo, VShape::F32x4, true)?,
+        O::F64x2RelaxedMadd => v_fma(lo, VShape::F64x2, false)?,
+        O::F64x2RelaxedNmadd => v_fma(lo, VShape::F64x2, true)?,
+        O::F32x4RelaxedMin => v_fbin(lo, VShape::F32x4, VFloatBinOp::Min)?,
+        O::F32x4RelaxedMax => v_fbin(lo, VShape::F32x4, VFloatBinOp::Max)?,
+        O::F64x2RelaxedMin => v_fbin(lo, VShape::F64x2, VFloatBinOp::Min)?,
+        O::F64x2RelaxedMax => v_fbin(lo, VShape::F64x2, VFloatBinOp::Max)?,
+        O::I32x4RelaxedTruncF32x4S => v_convert(lo, VCvtOp::I32x4TruncSatF32x4S)?,
+        O::I32x4RelaxedTruncF32x4U => v_convert(lo, VCvtOp::I32x4TruncSatF32x4U)?,
+        O::I32x4RelaxedTruncF64x2SZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2SZero)?,
+        O::I32x4RelaxedTruncF64x2UZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2UZero)?,
+        O::I16x8RelaxedQ15mulrS => v_q15mulr(lo)?,
+        // relaxed_laneselect(a, b, mask) = mask ? a : b for a valid (all-0/all-1) mask — exactly
+        // `bitselect`, the deterministic behavior the proposal permits.
+        O::I8x16RelaxedLaneselect
+        | O::I16x8RelaxedLaneselect
+        | O::I32x4RelaxedLaneselect
+        | O::I64x2RelaxedLaneselect => {
+            let (mask, _) = lo.pop()?;
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Bitselect { a, b, mask });
+            lo.push(v, ValType::V128);
+        }
+        O::I8x16RelaxedSwizzle => {
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Swizzle { a, b });
+            lo.push(v, ValType::V128);
+        }
+        O::I16x8RelaxedDotI8x16I7x16S => v_dot_i8(lo)?,
+        O::I32x4RelaxedDotI8x16I7x16AddS => v_dot_i8_add(lo)?,
 
         other => return unsup(format!("operator {other:?}")),
     }

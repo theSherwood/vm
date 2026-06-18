@@ -315,3 +315,41 @@ fn wasm_global_reads_its_value_at_runtime() {
     };
     assert_eq!(got, 7, "counter's initializer read through the global");
 }
+
+// f(n): outer `int x` (line 2), an inner block redeclaring `int x` (line 4) — exercises the §6
+// lexical-scope (shadowing) ingest from DWARF `DW_TAG_lexical_block`.
+const SHADOW: &[u8] = include_bytes!("fixtures/shadow_clang.wasm");
+
+#[test]
+fn wasm_dwarf_ingests_lexical_scopes_for_shadowed_vars() {
+    use svm_ir::VarLoc;
+
+    let t = svm_wasm::transpile(SHADOW).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // Two `x` vars (outer + inner shadow), both WindowVia into the C frame.
+    let xs: Vec<_> = di.vars.iter().filter(|v| v.name == "x").collect();
+    assert_eq!(xs.len(), 2, "both shadows ingested");
+    for x in &xs {
+        assert!(matches!(x.loc, VarLoc::WindowVia { .. }), "x is WindowVia");
+    }
+
+    // Exactly one carries a lexical scope (the inner block's var); the other is function-wide.
+    let scoped: Vec<_> = xs.iter().filter_map(|v| v.scope).collect();
+    assert_eq!(
+        scoped.len(),
+        1,
+        "the inner shadow carries a scope, the outer is function-wide"
+    );
+    let (start, end) = scoped[0];
+    // The inner `x` is declared on line 4; its block ends within the source (start <= end, both in
+    // the body's line range, and it does not extend to the `return` line).
+    assert_eq!(start, 4, "inner x scope starts at its declaration line");
+    assert!(
+        start <= end && end < 7,
+        "scope stays within the inner block: ({start}, {end})"
+    );
+    // The scope drives the consumer's innermost-wins resolution (the interpreter `pick_var` is
+    // exercised end-to-end by the chibicc lane); here the wasm producer feeds it the same shape.
+}

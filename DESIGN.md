@@ -1979,7 +1979,58 @@ the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
 
 ---
 
-## 21. Host/guest boundary: synchrony & nesting cost  [SETTLED — clarification]
+### 20c. The partial-evaluation on-ramp (`crates/svm-peval`)  [BUILT — first Futamura projection, Stages 0–2 + AOT]
+
+A guest that wants to run JS/Python/Lisp/a DSL ships an **interpreter** (compiled to our IR
+via the C or LLVM on-ramp) and pays interpreter overhead forever, or hand-writes a per-language
+JIT on the §22 `Jit` capability. `svm-peval` adds a third option — the **first Futamura
+projection**: partial-evaluate the interpreter against a fixed program and get the *compiled*
+program out. `spec(interp, program)(input) ≡ interp(program, input)`, with the dispatch loop,
+opcode decode, and program-walking folded away. **Write only the interpreter, get the compiler
+for free** (weval's value proposition for SpiderMonkey, applied here).
+
+- **Posture — untrusted-for-escape, identical to the LLVM on-ramp (§20a).** The engine is a
+  pure host-side `Module → Module` transform (depends only on `svm-ir`). Its output is
+  re-verified (`svm_verify::verify_module`) before it runs, so a specializer bug is a clean
+  verify error, **never an escape**. The correctness spec is the differential oracle: the
+  residual must equal the interpreter on **both** backends (interp and JIT) for every input.
+- **Why SVM is a good substrate.** SSA-on-the-wire (§3, §3a) skips weval's hardest first step
+  (SSA reconstruction from a stack machine); total/deterministic semantics (§3b — div/`INT_MIN`
+  trap, shifts mod width, wrapping) make folding sound with no UB to reason around.
+- **Engine — online polyvariant symbolic execution** (weval's shape). Each SSA value is
+  abstractly a constant or a residual value; pure integer ops with constant operands fold
+  (matching the interpreter's arithmetic exactly), the rest is emitted into the residual. The
+  **context** threaded through the CFG is `(block, constant valuation of its block params +
+  live abstract-memory cells)`; one residual block per context, memoized — so a constant PC
+  drives loop unrolling and repeated contexts reconnect (bounded by a block budget).
+  - **Constant memory** is a *caller contract*, not a runtime-enforced invariant: a load from a
+    caller-declared-constant address folds to those bytes (a readonly data segment by default,
+    or an arbitrary region / explicit overlay via `SpecConfig`). A false promise is a miscompile,
+    never an escape (cf. weval's `assume_const_memory`).
+  - **Value-stack renaming (Stage 2):** a caller-designated private window range (the
+    interpreter's operand stack/locals) is modeled as abstract memory — its constant-address
+    full-width stores/loads are lifted into SSA and elided, so the in-memory stack vanishes from
+    the residual. `rename_is_private` additionally lets a pointer-addressed heap coexist with it.
+  - **CFG cleanup** (shared with the generic optimizer): constant folding, branch resolution,
+    dead-block / dead-value elimination, block merging, dead block-param elimination — so
+    residuals come out as tight straight-line/looped code, not `br`-chains.
+- **AOT, by construction.** Nothing is runtime-coupled: `specialize → verify → encode_module`
+  produces a shippable artifact; load it with `decode_module` and run or `svm_jit::compile_and_run`
+  it with zero specialization cost at run time (the host-side/offline architecture). The
+  guest-side variant (ship the engine inside the sandbox on the §22 `Jit` capability, for
+  dynamic-language IC-style recompilation) is the deferred higher-ceiling option; the residual IR
+  and the back half are shared.
+- **Measured ROI** (register-machine bytecode, runtime-controlled loop, release): removing
+  dispatch by specialization is **~5–6×** on either backend (apples-to-apples, same backend); the
+  end-to-end software-interpreted → compiled-native path is **~470×**. Lean-ISA dispatch-overhead
+  fraction, not a universal constant — a heavier decode shows more.
+- **Coverage today:** integer/long/float/SIMD arithmetic, casts, comparisons, static + dynamic
+  branches, any-width constant-memory reads, word-width renamed stack/locals, and a dynamic heap.
+  **Open (tracked in `PEVAL.md`):** cross-function `call` specialization, narrow (`i8`/`i16`)
+  renamed cells, and float/SIMD *constant folding* (they pass through unfolded today).
+
+---
+
 
 Consolidates what §9/§12/§14 imply but never state in one place: **how synchronous the
 host/guest (and guest/guest-as-host) boundary is.**

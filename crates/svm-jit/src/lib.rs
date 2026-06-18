@@ -62,9 +62,11 @@ use cranelift_codegen::ir::types::{
 };
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
-    InstBuilder, JumpTableData, MemFlags, StackSlotData, StackSlotKind, Type, UserFuncName, Value,
+    InstBuilder, JumpTableData, MemFlags, SourceLoc, StackSlotData, StackSlotKind, Type,
+    UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::LabelValueLoc;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -75,7 +77,9 @@ use svm_ir::{
     VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
-mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
+mod dwarf;
+pub mod gdb; // W5 JIT/DWARF tier (Stage 2c): in-memory ELF wrapper + the GDB JIT registration interface
+mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler // W5 JIT/DWARF tier: synthesize DWARF from the Stage 1 machine-address → source map
 
 // JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
 // `suspend`, on top of the `svm-fiber` stack-switch substrate. Available where `svm_fiber::supported()`.
@@ -333,6 +337,10 @@ pub struct FrozenFiber {
     pub func: i32,
     pub sp: i64,
     pub shadow_sp: u64,
+    /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
+    /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `svm_interp::FrozenFiber`
+    /// (48-bit field — the `i64` handle's generation bits).
+    pub generation: u64,
 }
 
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
@@ -1110,6 +1118,89 @@ pub struct DefinedFn {
     pub type_id: u32,
 }
 
+/// `(func, block, inst) → index into the module's `debug_info.locs`` — the source-loc lookup the
+/// JIT codegen consults to stamp each emitted op with a `cranelift SourceLoc` (W5 JIT/DWARF tier,
+/// Stage 0). Built once per compile only when the module carries `-g` debug info.
+type SrcLocMap = std::collections::HashMap<(u32, u32, u32), u32>;
+
+/// Per-function captured `MachSrcLoc` ranges before address resolution: `(func index, [(start
+/// offset, end offset, `debug_info.locs` index)])`, relative to the function's start until
+/// `finalize` resolves the base address (W5 JIT/DWARF Stage 1).
+type RawSrcLocs = Vec<(u32, Vec<(u32, u32, u32)>)>;
+
+/// One source variable's machine-location ranges before address resolution (W5 JIT/DWARF Stage 3a):
+/// `[(start offset, end offset, location)]`, relative to its function's start until `finalize`.
+type VarLocRanges = Vec<(u32, u32, VarMachineLoc)>;
+
+/// Per-function captured value-label ranges before address resolution (Stage 3a): `(func index,
+/// [(value-label id, ranges)])`.
+type RawVarLocs = Vec<(u32, Vec<(u32, VarLocRanges)>)>;
+
+/// A machine-address → source range in finalized JIT code (W5 JIT/DWARF tier, Stage 1): the absolute
+/// `[lo, hi)` code range a source position covers, resolved after `finalize` from Cranelift's
+/// per-function `MachSrcLoc` ranges (relative offsets) + the function's finalized base address.
+/// Strippable host-side tooling, untrusted-for-escape (§2a) — never read by running guest code.
+#[derive(Clone, Copy, Debug)]
+pub struct SrcRange {
+    pub lo: u64,
+    pub hi: u64,
+    pub func: u32,
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// A symbolized JIT code address (W5 JIT/DWARF tier): the source position [`CompiledModule::
+/// symbolize`] resolves a machine `pc` to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JitFrameLoc {
+    pub func: u32,
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// `(func, block) → [(block-local value index, value-label id)]` — the source variables to stamp
+/// with a Cranelift `ValueLabel` during lowering (W5 JIT/DWARF Stage 3a). Built once per compile from
+/// the §6 `debug_info.vars`' SSA-resident `VarLoc`s, only when the module carries `-g`. The label id
+/// is the variable's index into [`CompiledModule::var_locs`]; the block-local value index maps onto
+/// the JIT's per-block value map (see [`lower_block`]).
+type VarLabelMap = std::collections::HashMap<(u32, u32), Vec<(u32, u32)>>;
+
+/// Where a source variable's value physically lives over a machine-code range (W5 JIT/DWARF Stage
+/// 3a) — Cranelift's `LabelValueLoc` translated to DWARF terms, the bridge to a `DW_AT_location`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VarMachineLoc {
+    /// In machine register `dwarf_reg` (a DWARF register number, via `map_regalloc_reg_to_dwarf`) —
+    /// emits `DW_OP_regN` (Stage 3c).
+    Reg(u16),
+    /// At canonical-frame-address + `off` — emits `DW_OP_call_frame_cfa` + offset / `DW_OP_fbreg`.
+    CfaOffset(i64),
+}
+
+/// One `[lo, hi)` absolute machine-code range over which a source variable lives in [`VarMachineLoc`]
+/// (W5 JIT/DWARF Stage 3a) — one entry of a DWARF location list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarRange {
+    pub lo: u64,
+    pub hi: u64,
+    pub loc: VarMachineLoc,
+}
+
+/// A source variable's machine-location list in finalized JIT code (W5 JIT/DWARF Stage 3a): the
+/// `value_labels_ranges` Cranelift produced for the CLIF value that backs it, resolved to absolute
+/// pcs. Empty `ranges` ⇒ the optimizer dropped the value everywhere (gdb will show `<optimized
+/// out>`). Host-side tooling, off the runtime path (§2a).
+#[derive(Clone, Debug)]
+pub struct VarMachineInfo {
+    pub func: u32,
+    pub name: String,
+    /// The variable's structured type as a `debug_info.types` index (Stage 3b), or `None` when the
+    /// module carried only a render-name. The Stage 3c `DW_TAG_variable` points `DW_AT_type` at it.
+    pub type_id: Option<u32>,
+    pub ranges: Vec<VarRange>,
+}
+
 pub struct CompiledModule {
     /// The padded function table `call_indirect` dispatches through. Its address is threaded as
     /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
@@ -1194,12 +1285,193 @@ pub struct CompiledModule {
     /// vCPU's runtime are built over — one handle namespace + one §15 fiber quota per domain.
     #[cfg(fiber_rt)]
     fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>>,
+    /// Machine-address → source map for finalized code (W5 JIT/DWARF Stage 1), sorted by `lo`.
+    /// Empty unless the module carried `-g` debug info. Host-side tooling, off the runtime path.
+    src_ranges: Vec<SrcRange>,
+    /// Source file paths (from `debug_info.files`), indexed by [`SrcRange::file`].
+    src_files: Vec<String>,
+    /// Per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a), resolved from Cranelift's
+    /// `value_labels_ranges` after finalize. Empty unless the module carried `-g` vars. Host-side
+    /// tooling, off the runtime path.
+    var_locs: Vec<VarMachineInfo>,
+    /// The §6 structured type graph (`debug_info.types`), emitted as `DW_TAG_*_type` DIEs (W5
+    /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
+    debug_types: Vec<svm_ir::TypeDef>,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it.
     module: JITModule,
 }
 
 impl CompiledModule {
+    /// Symbolize a finalized-code machine address to its source position (W5 JIT/DWARF Stage 1), or
+    /// `None` if `pc` is outside any source-mapped op (a non-`-g` build, a trampoline, a prologue
+    /// gap). The [`SrcRange`] map is sorted and disjoint, so this is a binary search. Host-side
+    /// tooling, off the running guest's path (§2a) — the seed for trap symbolization + DWARF emit.
+    pub fn symbolize(&self, pc: usize) -> Option<JitFrameLoc> {
+        let pc = pc as u64;
+        let i = self.src_ranges.partition_point(|r| r.lo <= pc);
+        let r = self.src_ranges[..i].last().filter(|r| pc < r.hi)?;
+        Some(JitFrameLoc {
+            func: r.func,
+            file: self
+                .src_files
+                .get(r.file as usize)
+                .cloned()
+                .unwrap_or_default(),
+            line: r.line,
+            col: r.col,
+        })
+    }
+
+    /// The finalized machine-address → source map (W5 JIT/DWARF Stage 1), sorted by address. Empty
+    /// unless the module carried `-g`. For tooling/tests and the forthcoming DWARF line-program emit.
+    pub fn src_ranges(&self) -> &[SrcRange] {
+        &self.src_ranges
+    }
+
+    /// A backtrace of a **suspended fiber** (W5 JIT/DWARF Stage 4c — the W3-JIT fiber-rooted stack
+    /// walk). Rooted at a fiber *handle* (§23/D57 migratable fibers, not the OS thread), it scans the
+    /// parked fiber's live control stack `[ctx, top)` low→high (innermost frame first) and symbolizes
+    /// every word that lands in this module's JIT'd guest code — each is a return address, i.e. a
+    /// guest call frame. A conservative scan (like the GC-root walk) rather than a frame-pointer
+    /// chase, so it is robust to the host runtime glue sitting between the guest frames and the
+    /// suspend switch. Adjacent duplicate positions are collapsed. Empty if `handle` names no parked
+    /// fiber or the module carried no `-g`. Host-side tooling, off the running guest's path (§2a).
+    #[cfg(fiber_rt)]
+    pub fn fiber_backtrace(&self, handle: i64) -> Vec<JitFrameLoc> {
+        let Some(table) = self.fiber_table.as_ref() else {
+            return Vec::new();
+        };
+        table
+            .with_parked_stack(handle, |stack| {
+                let mut frames: Vec<JitFrameLoc> = Vec::new();
+                for w in stack.chunks_exact(8) {
+                    let pc = u64::from_le_bytes(w.try_into().unwrap()) as usize;
+                    if let Some(loc) = self.symbolize(pc) {
+                        if frames.last() != Some(&loc) {
+                            frames.push(loc);
+                        }
+                    }
+                }
+                frames
+            })
+            .unwrap_or_default()
+    }
+
+    /// The per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a): for each `-g` source
+    /// variable whose value the JIT could track, the `[lo, hi)` machine ranges over which it lives in
+    /// a register or CFA-relative slot. The seed for the Stage 3c `DW_AT_location` loclists. Empty
+    /// without `-g`; a variable with empty `ranges` was optimized out everywhere.
+    pub fn var_locations(&self) -> &[VarMachineInfo] {
+        &self.var_locs
+    }
+
+    /// The synthesized DWARF `.debug_line` section for this module's finalized code (W5 JIT/DWARF
+    /// Stage 2): a line-number program over the JIT'd machine addresses, for gdb/lldb (via the
+    /// forthcoming GDB JIT registration) to resolve addresses to source lines. Empty without `-g`.
+    pub fn debug_line_section(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        dwarf::debug_line(&self.src_ranges, &self.src_files)
+    }
+
+    /// The synthesized `(.debug_info, .debug_abbrev, .debug_loc)` for this module's finalized code (W5
+    /// JIT/DWARF Stages 2b/3b/3c): a compile unit holding the §6 `TypeDef` graph as `DW_TAG_*_type`
+    /// DIEs (3b) and one `DW_TAG_subprogram` per function (2b), each carrying its source variables as
+    /// `DW_TAG_variable` children with `.debug_loc` location lists (3c). All empty without `-g`.
+    fn synth_debug_info(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        if self.src_ranges.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        dwarf::debug_info(&self.func_extents(), &self.debug_types, &self.var_locs)
+    }
+
+    /// The synthesized DWARF `(.debug_info, .debug_abbrev)` (W5 JIT/DWARF Stages 2b/3b/3c) — a compile
+    /// unit with the §6 type DIEs, one `DW_TAG_subprogram` per function, and a `DW_TAG_variable` per
+    /// tracked source variable (its `DW_AT_location` referring into [`Self::debug_loc_section`]). Both
+    /// empty without `-g`.
+    pub fn debug_info_sections(&self) -> (Vec<u8>, Vec<u8>) {
+        let (info, abbrev, _) = self.synth_debug_info();
+        (info, abbrev)
+    }
+
+    /// The synthesized DWARF `.debug_loc` (W5 JIT/DWARF Stage 3c): the variable location lists the
+    /// `DW_TAG_variable` DIEs' `DW_AT_location`s point into — one `DW_OP_reg{N}` entry per
+    /// register-resident machine range. Empty without `-g` (or when no variable is register-resident).
+    pub fn debug_loc_section(&self) -> Vec<u8> {
+        self.synth_debug_info().2
+    }
+
+    /// The synthesized DWARF `.debug_frame` CFI (W5 JIT/DWARF Stage 4a): one CIE with the JIT's
+    /// uniform frame-pointer unwind rules + one FDE per function, so gdb can unwind a stopped JIT
+    /// frame (`bt`) and compute the CFA the subprograms' `DW_AT_frame_base` refers to. Empty without
+    /// `-g`.
+    pub fn debug_frame_section(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        dwarf::debug_frame(&self.func_extents())
+    }
+
+    /// Each function's machine `[low_pc, high_pc)` extent, derived as the span (min `lo`, max `hi`)
+    /// of its source-mapped ranges, sorted by start address. The basis for both the `.debug_info`
+    /// subprograms (Stage 2b) and the ELF `.symtab`/`.text` extent (Stage 2c). Empty without `-g`.
+    fn func_extents(&self) -> Vec<(u32, u64, u64)> {
+        let mut per_fn: std::collections::BTreeMap<u32, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for r in &self.src_ranges {
+            let e = per_fn.entry(r.func).or_insert((r.lo, r.hi));
+            e.0 = e.0.min(r.lo);
+            e.1 = e.1.max(r.hi);
+        }
+        let mut funcs: Vec<(u32, u64, u64)> = per_fn
+            .into_iter()
+            .map(|(f, (lo, hi))| (f, lo, hi))
+            .collect();
+        funcs.sort_by_key(|&(_, lo, _)| lo);
+        funcs
+    }
+
+    /// The in-memory ELF object that wraps this module's finalized code + synthesized DWARF for the
+    /// GDB JIT interface (W5 JIT/DWARF Stage 2c): an `SHT_NOBITS` `.text` at the live code address,
+    /// the `.debug_line`/`.debug_info`/`.debug_abbrev` sections, and a `.symtab` naming each
+    /// function. This is the `symfile` [`Self::register_with_gdb`] hands to gdb. Empty without `-g`.
+    pub fn elf_object(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        let funcs = self.func_extents();
+        let code_base = funcs.iter().map(|f| f.1).min().unwrap_or(0);
+        let code_end = funcs.iter().map(|f| f.2).max().unwrap_or(0);
+        let (info, abbrev, loc) = self.synth_debug_info();
+        let line = self.debug_line_section();
+        let frame = self.debug_frame_section();
+        gdb::build_elf(
+            code_base,
+            code_end.saturating_sub(code_base),
+            &funcs,
+            &info,
+            &abbrev,
+            &line,
+            &loc,
+            &frame,
+        )
+    }
+
+    /// Register this module's code with a live gdb/lldb via the GDB JIT interface (W5 JIT/DWARF
+    /// Stage 2c) — the **headline milestone**: with the returned guard held, gdb can bind a
+    /// source-line breakpoint inside the JIT'd code and show the guest source frame. The returned
+    /// [`gdb::GdbRegistration`] **unregisters on drop**; hold it as long as the code is debuggable.
+    /// `None` for a non-`-g` module (nothing to register). Host-side tooling, off the runtime path.
+    pub fn register_with_gdb(&self) -> Option<gdb::GdbRegistration> {
+        let elf = self.elf_object();
+        if elf.is_empty() {
+            return None;
+        }
+        Some(gdb::GdbRegistration::register(elf))
+    }
+
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
     /// declare + define every function, the entry's buffer-ABI trampoline, finalize once, and
     /// build the function table. Everything *baked into code* — the confinement mask, the
@@ -1471,10 +1743,61 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let inst = InstEnv::null();
 
+        // W5 JIT/DWARF tier (Stages 0–1): when the module carries `-g` debug info, build the
+        // `(func,block,inst) → debug_info.locs` index lookup that stamps each op with a `SourceLoc`,
+        // and capture each function's `MachSrcLoc` ranges (relative offsets) to resolve to a
+        // machine-address → source map after finalize. Off the runtime path; absent ⇒ no-op.
+        let srcloc_map: Option<SrcLocMap> = m.debug_info.as_ref().map(|di| {
+            di.locs
+                .iter()
+                .enumerate()
+                .map(|(i, l)| ((l.func, l.block, l.inst), i as u32))
+                .collect()
+        });
+        let mut raw_srclocs: RawSrcLocs = Vec::new();
+
+        // W5 JIT/DWARF Stage 3a: assign each SSA-resident source variable a `ValueLabel` and record
+        // the `(func, block) → [(block-local value, label)]` points `lower_block` stamps. Only the
+        // SSA forms (`Ssa`/`SsaList`) map to a Cranelift value-location; the window/fixed *memory*
+        // forms are left to Stage 3c (a DWARF memory expression, not a value label). `var_meta[label]`
+        // names the variable a label belongs to. Empty unless the module carries `-g` vars.
+        let mut var_meta: Vec<(u32, String, Option<u32>)> = Vec::new();
+        let mut var_label_map: VarLabelMap = std::collections::HashMap::new();
+        if let Some(di) = m.debug_info.as_ref() {
+            for v in &di.vars {
+                let points: Vec<(u32, u32)> = match &v.loc {
+                    // A function-wide SSA index ≈ the block-0 local index (parameters, single-block
+                    // promoted scalars — the cases where the two numberings coincide).
+                    svm_ir::VarLoc::Ssa { value } => vec![(0, *value)],
+                    svm_ir::VarLoc::SsaList(locs) => {
+                        locs.iter().map(|l| (l.block, l.value)).collect()
+                    }
+                    // `Window`/`WindowVia`/`Fixed` are memory locations — no value label here.
+                    _ => continue,
+                };
+                let label = var_meta.len() as u32;
+                var_meta.push((v.func, v.name.clone(), v.type_id));
+                for (block, value) in points {
+                    var_label_map
+                        .entry((v.func, block))
+                        .or_default()
+                        .push((value, label));
+                }
+            }
+        }
+        let var_labels = (!var_label_map.is_empty()).then_some(&var_label_map);
+        let mut raw_var_locs: RawVarLocs = Vec::new();
+
         // Define each function body. `clear_context` after each define resets the cached
         // CFG/domtree so the next function never compiles against a stale CFG.
         let mut ctx = module.make_context();
-        for (f, id) in m.funcs.iter().zip(&ids) {
+        for (fi, (f, id)) in m.funcs.iter().zip(&ids).enumerate() {
+            // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in `lower_block`)
+            // takes effect and `value_labels_ranges` is populated. Gated on `-g` vars ⇒ no effect on
+            // an ordinary build. Must be set on the fresh `ctx.func` before lowering populates it.
+            if var_labels.is_some() {
+                ctx.func.collect_debug_info();
+            }
             build_clif(
                 &mut module,
                 &ids,
@@ -1491,10 +1814,59 @@ impl CompiledModule {
                 sub_base,
                 epoch_addr,
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
+                fi as u32,
+                srcloc_map.as_ref(),
+                var_labels,
             )?;
             module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            if srcloc_map.is_some() {
+                if let Some(cc) = ctx.compiled_code() {
+                    let ranges: Vec<(u32, u32, u32)> = cc
+                        .buffer
+                        .get_srclocs_sorted()
+                        .iter()
+                        .filter(|s| !s.loc.is_default())
+                        .map(|s| (s.start, s.end, s.loc.bits()))
+                        .collect();
+                    if !ranges.is_empty() {
+                        raw_srclocs.push((fi as u32, ranges));
+                    }
+                }
+            }
+            // Stage 3a: capture this function's value-label ranges, translating each Cranelift
+            // `LabelValueLoc` to DWARF terms now (the ISA is in hand; a `Reg` we cannot map is
+            // dropped — that sub-range simply has no location, like an optimized-out gap).
+            if var_labels.is_some() {
+                if let Some(cc) = ctx.compiled_code() {
+                    let isa = module.isa();
+                    let mut per_label: Vec<(u32, VarLocRanges)> = Vec::new();
+                    for (label, ranges) in &cc.value_labels_ranges {
+                        let mut out: VarLocRanges = Vec::new();
+                        for r in ranges {
+                            if r.end <= r.start {
+                                continue;
+                            }
+                            let loc = match r.loc {
+                                LabelValueLoc::Reg(reg) => match isa.map_regalloc_reg_to_dwarf(reg)
+                                {
+                                    Ok(d) => VarMachineLoc::Reg(d),
+                                    Err(_) => continue,
+                                },
+                                LabelValueLoc::CFAOffset(off) => VarMachineLoc::CfaOffset(off),
+                            };
+                            out.push((r.start, r.end, loc));
+                        }
+                        if !out.is_empty() {
+                            per_label.push((label.as_u32(), out));
+                        }
+                    }
+                    if !per_label.is_empty() {
+                        raw_var_locs.push((fi as u32, per_label));
+                    }
+                }
+            }
             module.clear_context(&mut ctx);
         }
 
@@ -1528,6 +1900,71 @@ impl CompiledModule {
         module
             .finalize_definitions()
             .map_err(|e| JitError::Backend(e.to_string()))?;
+
+        // W5 JIT/DWARF Stage 1: now that code is finalized, resolve each captured `MachSrcLoc` range
+        // (relative to its function's start) to an absolute machine address, building the sorted
+        // `machine-pc → source` map `symbolize` consults. Empty without `-g`.
+        let (src_ranges, src_files) = match m.debug_info.as_ref() {
+            Some(di) => {
+                let mut ranges = Vec::new();
+                for (fi, rs) in &raw_srclocs {
+                    let base = module.get_finalized_function(ids[*fi as usize]) as u64;
+                    for &(start, end, loc) in rs {
+                        if let Some(l) = di.locs.get(loc as usize) {
+                            ranges.push(SrcRange {
+                                lo: base + start as u64,
+                                hi: base + end as u64,
+                                func: l.func,
+                                file: l.file,
+                                line: l.line,
+                                col: l.col,
+                            });
+                        }
+                    }
+                }
+                ranges.sort_by_key(|r| r.lo);
+                (ranges, di.files.clone())
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
+        // W5 JIT/DWARF Stage 3a: resolve the captured value-label ranges (relative offsets) to
+        // absolute machine pcs and group them per source variable. A variable whose label produced
+        // no range (the optimizer dropped its value everywhere) still gets a `VarMachineInfo` with
+        // empty `ranges` — Stage 3c emits that as a `<optimized out>` location.
+        let var_locs: Vec<VarMachineInfo> = if var_meta.is_empty() {
+            Vec::new()
+        } else {
+            let mut by_label: std::collections::HashMap<u32, Vec<VarRange>> =
+                std::collections::HashMap::new();
+            for (fi, per_label) in &raw_var_locs {
+                let base = module.get_finalized_function(ids[*fi as usize]) as u64;
+                for (label, ranges) in per_label {
+                    let entry = by_label.entry(*label).or_default();
+                    for &(s, e, loc) in ranges {
+                        entry.push(VarRange {
+                            lo: base + s as u64,
+                            hi: base + e as u64,
+                            loc,
+                        });
+                    }
+                }
+            }
+            var_meta
+                .iter()
+                .enumerate()
+                .map(|(label, (func, name, type_id))| {
+                    let mut ranges = by_label.remove(&(label as u32)).unwrap_or_default();
+                    ranges.sort_by_key(|r| r.lo);
+                    VarMachineInfo {
+                        func: *func,
+                        name: name.clone(),
+                        type_id: *type_id,
+                        ranges,
+                    }
+                })
+                .collect()
+        };
 
         // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
         // to seed the thread `Domain`'s `Env`, which spawned vCPUs use to call their entry).
@@ -1611,6 +2048,14 @@ impl CompiledModule {
             },
             #[cfg(fiber_rt)]
             fiber_table,
+            src_ranges,
+            src_files,
+            var_locs,
+            debug_types: m
+                .debug_info
+                .as_ref()
+                .map(|di| di.types.clone())
+                .unwrap_or_default(),
             module,
         })
     }
@@ -2119,6 +2564,9 @@ impl CompiledModule {
                 self.sub_base,
                 self.epoch_addr,
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+                0,
+                None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
+                None, // …nor value-label points (Stage 3a)
             )?;
             self.module
                 .define_function(*id, &mut ctx)
@@ -2492,6 +2940,9 @@ fn compile_child(
             0,                 // top-level confinement over the child's own window
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
+            0,
+            None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
+            None, // …nor value-label points (Stage 3a)
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -2641,6 +3092,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Eqz { .. }
                 | Inst::FBin { .. }
                 | Inst::FUn { .. }
+                | Inst::Fma { .. }
                 | Inst::FCmp { .. }
                 | Inst::FToISat { .. }
                 | Inst::FToITrap { .. }
@@ -2705,8 +3157,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VPopcnt { .. } => {}
                 // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
                 Inst::VAvgr { .. } => {}
-                // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
-                Inst::VDot { .. } => {}
+                // `i32x4.dot_i16x8_s` / `i16x8.dot_i8x16_s` → `swiden_low/high` + `imul` +
+                // `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } | Inst::VDotI8 { .. } => {}
                 // Extended multiply → widen low/high both operands + `imul` on the wide shape.
                 // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
                 Inst::VExtMul { .. } => {}
@@ -2714,6 +3167,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VExtAddPairwise { .. } => {}
                 // Q15 rounding multiply → native `sqmul_round_sat`.
                 Inst::VQ15MulrSat { .. } => {}
+                // Fused multiply-add (relaxed_madd/nmadd) → vector `fma` (one rounding; the same
+                // correctly-rounded result the interp's `mul_add` gives, so the differential holds).
+                Inst::VFma { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -2895,6 +3351,16 @@ struct Lower<'a> {
     /// ([`uses_sret`] of its results), else `None`. A `Return` stores results through it; a tail
     /// call forwards it (the tail callee shares the caller's result type, so its sret-ness matches).
     sret_var: Option<Variable>,
+    /// `-g` source-loc lookup (W5 JIT/DWARF Stage 0): `(func, block, inst) → debug_info.locs` index.
+    /// `None` ⇒ no debug info, so no `SourceLoc`s are stamped (codegen is byte-identical to before).
+    srclocs: Option<&'a SrcLocMap>,
+    /// This function's index, the `func` half of the [`Self::srclocs`] key.
+    func_idx: u32,
+    /// `-g` value-label points (W5 JIT/DWARF Stage 3a): `(func, block) → [(block-local value, label)]`
+    /// — the source variables whose backing CLIF value `lower_block` stamps with a `ValueLabel`, so
+    /// Cranelift records its machine-location ranges. `None` ⇒ no `-g` vars (no labels, codegen
+    /// unchanged).
+    var_labels: Option<&'a VarLabelMap>,
 }
 
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
@@ -2924,6 +3390,9 @@ fn build_clif(
     sub_base: u64,
     epoch_addr: i64,
     fn_table_mask: u64,
+    func_idx: u32,
+    srclocs: Option<&SrcLocMap>,
+    var_labels: Option<&VarLabelMap>,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -2992,6 +3461,9 @@ fn build_clif(
         epoch_addr,
         ids,
         distinct,
+        srclocs,
+        func_idx,
+        var_labels,
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -3008,7 +3480,7 @@ fn build_clif(
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, blocks[i], &blocks, &lower)?;
+        lower_block(module, &mut b, blk, i, blocks[i], &blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -3175,6 +3647,7 @@ fn lower_block(
     module: &mut JITModule,
     b: &mut FunctionBuilder,
     blk: &Block,
+    block_idx: usize,
     cb: cranelift_codegen::ir::Block,
     blocks: &[cranelift_codegen::ir::Block],
     lower: &Lower,
@@ -3188,7 +3661,15 @@ fn lower_block(
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
     let size = lower.mask.wrapping_add(1);
 
-    for inst in &blk.insts {
+    for (inst_idx, inst) in blk.insts.iter().enumerate() {
+        // W5 JIT/DWARF Stage 0: stamp the ops this IR instruction lowers to with a `SourceLoc`
+        // (= its `debug_info.locs` index), so the finalized code's address map carries source
+        // positions. Only when the module has `-g` debug info; otherwise codegen is unchanged.
+        if let Some(map) = lower.srclocs {
+            if let Some(&loc) = map.get(&(lower.func_idx, block_idx as u32, inst_idx as u32)) {
+                b.set_srcloc(SourceLoc::new(loc));
+            }
+        }
         // `call`/`call_indirect` append 0..N results — handle before the single-value
         // match (which produces exactly one value).
         if let Inst::Call { func, args } = inst {
@@ -3307,7 +3788,7 @@ fn lower_block(
             for t in [I64, I64, I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
-            tsig.returns.push(AbiParam::new(I32));
+            tsig.returns.push(AbiParam::new(I64)); // i64 fiber handle (16-bit slot + 48-bit generation)
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
             let call = b
@@ -3319,7 +3800,7 @@ fn lower_block(
             continue;
         }
         if let Inst::ContResume { k, arg } = inst {
-            // fiber_resume(handle:i32, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
+            // fiber_resume(handle:i64, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
             // Results are appended (status:i32, value:i64) to match the IR's two-result shape.
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
@@ -3328,7 +3809,7 @@ fn lower_block(
             let av = get(&vals, *arg)?;
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I32, I64, I64, I64] {
+            for t in [I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -3366,17 +3847,20 @@ fn lower_block(
         if let Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
         } = inst
         {
-            // gc_roots(heap_lo, heap_hi, buf, cap, mem_base, mask, mapped, sub_base, trap_out) -> i64
-            // count. The thunk walks the live fiber stacks (runtime via the thread-local), filters
-            // to `[heap_lo, heap_hi)`, and writes the first `cap` deduped words to guest `buf` —
-            // confining/bounds-checking it with the same `mask`/`mapped`/`sub_base` as `mask_addr`,
-            // so a forged/out-of-window buffer faults (propagated below).
+            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base,
+            // trap_out) -> i64 count. The thunk walks the live fiber stacks (runtime via the
+            // thread-local), masks each word with `payload_mask` (§GC tagged pointers; distinct from
+            // the window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
+            // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it with
+            // the same `mask`/`mapped`/`sub_base` as `mask_addr`, so a forged buffer faults (below).
             let lo = get(&vals, *heap_lo)?;
             let hi = get(&vals, *heap_hi)?;
+            let payload_mask = get(&vals, *mask)?;
             let dst = get(&vals, *buf)?;
             let cap_v = get(&vals, *cap)?;
             let mem_base = b.use_var(lower.mem_var);
@@ -3385,7 +3869,7 @@ fn lower_block(
             let subv = b.ins().iconst(I64, lower.sub_base as i64);
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for _ in 0..9 {
+            for _ in 0..10 {
                 tsig.params.push(AbiParam::new(I64));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -3394,7 +3878,18 @@ fn lower_block(
             let call = b.ins().call_indirect(
                 tref,
                 thunk,
-                &[lo, hi, dst, cap_v, mem_base, maskv, mappedv, subv, trap_out],
+                &[
+                    lo,
+                    hi,
+                    payload_mask,
+                    dst,
+                    cap_v,
+                    mem_base,
+                    maskv,
+                    mappedv,
+                    subv,
+                    trap_out,
+                ],
             );
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
@@ -3568,6 +4063,11 @@ fn lower_block(
             Inst::FUn { op, a, .. } => {
                 let x = get(&vals, *a)?;
                 float_un(b, *op, x)
+            }
+            Inst::Fma { a, b: rb, c, .. } => {
+                // Scalar fused multiply-add — `a·b + c`, one rounding (matches the interp's `mul_add`).
+                let (x, y, z) = (get(&vals, *a)?, get(&vals, *rb)?, get(&vals, *c)?);
+                b.ins().fma(x, y, z)
             }
             Inst::FCmp { op, a, b: rb, .. } => {
                 let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
@@ -3791,6 +4291,20 @@ fn lower_block(
                 let r = b.ins().iadd_pairwise(pl, ph);
                 vcast(b, r, I8X16)
             }
+            Inst::VDotI8 { a, b: rb } => {
+                // The i8→i16 signed dot, same shape as `VDot` one width down: widen each i8x16 to
+                // two i16x8 halves, multiply, pairwise-add. (Deterministic relaxed_dot_i8x16_i7x16_s.)
+                let x = vcast(b, get(&vals, *a)?, I8X16);
+                let y = vcast(b, get(&vals, *rb)?, I8X16);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
             Inst::VExtMul {
                 shape,
                 op,
@@ -3837,6 +4351,22 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, I16X8);
                 let y = vcast(b, get(&vals, *rb)?, I16X8);
                 let r = b.ins().sqmul_round_sat(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VFma {
+                shape,
+                neg,
+                a,
+                b: rb,
+                c,
+            } => {
+                let ty = vec_ty(*shape);
+                let xa = vcast(b, get(&vals, *a)?, ty);
+                // `nmadd` is `−a·b + c`: negate the product by negating `a`.
+                let x = if *neg { b.ins().fneg(xa) } else { xa };
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let z = vcast(b, get(&vals, *c)?, ty);
+                let r = b.ins().fma(x, y, z);
                 vcast(b, r, I8X16)
             }
             Inst::VSatBin {
@@ -4166,6 +4696,22 @@ fn lower_block(
         let u = ub_of(inst, &ubs);
         vals.push(v);
         ubs.push(u);
+    }
+
+    // W5 JIT/DWARF Stage 3a: now that this block's value map is fully populated, stamp the CLIF
+    // values backing source variables with their `ValueLabel`, so Cranelift records the
+    // machine-location ranges (`value_labels_ranges`) `compile` reads back. `set_val_label` is inert
+    // unless `collect_debug_info` was enabled (it is, exactly when `var_labels` is `Some`), so
+    // non-`-g` codegen is untouched. The label association drives liveness-based range computation;
+    // the block-local `value` index maps straight onto `vals`.
+    if let Some(map) = lower.var_labels {
+        if let Some(points) = map.get(&(lower.func_idx, block_idx as u32)) {
+            for &(value, label) in points {
+                if let Some(&v) = vals.get(value as usize) {
+                    b.set_val_label(v, ValueLabel::from_u32(label));
+                }
+            }
+        }
     }
 
     match &blk.term {
@@ -5026,6 +5572,10 @@ fn vf_un(op: VFloatUnOp) -> FUnOp {
         VFloatUnOp::Abs => FUnOp::Abs,
         VFloatUnOp::Neg => FUnOp::Neg,
         VFloatUnOp::Sqrt => FUnOp::Sqrt,
+        VFloatUnOp::Ceil => FUnOp::Ceil,
+        VFloatUnOp::Floor => FUnOp::Floor,
+        VFloatUnOp::Trunc => FUnOp::Trunc,
+        VFloatUnOp::Nearest => FUnOp::Nearest,
     }
 }
 

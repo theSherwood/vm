@@ -11,8 +11,11 @@ A guest (the motivating case is JACL) runs a **non-moving, conservative mark-swe
 collector over a heap it owns in its linear window (grown via the existing `Memory`
 capability, §4/§3e). The guest keeps its own block/line maps for object-start and
 interior-pointer resolution. Roots are **conservative**: the guest exposes raw C
-pointers, so no value is tag-filterable — svm must report candidate root words as
-raw data and let the guest decide what is a pointer.
+pointers, so by default svm reports candidate root words as raw data and lets the guest
+decide what is a pointer (`mask = ~0`, §3). For a guest that tags pointers in the **high
+byte** (`(tag << 56) | offset`), `gc.roots` takes an optional **payload mask** — constrained
+to clear only the top byte — that strips the tag to the bare offset before the range test, so
+tagged roots are recovered without the guest re-scanning (§3).
 
 svm contributes exactly one thing the guest cannot do itself: enumerate the roots
 that live on **control stacks + saved-register blocks**. Everything else is guest
@@ -57,7 +60,50 @@ per-fiber handshake.
    the parked vCPUs to resume.
 
 **No new svm world-stop primitive is required.** At most an optional thin `quiesce`
-helper wrapping the futex barrier; it is a convenience, not a mechanism.
+helper wrapping the futex barrier; it is a convenience, not a mechanism — and it is **pure
+guest code over existing ops** (`i32.atomic.load.acquire` / `store.release` /
+`i32.atomic.wait` / `atomic.notify`), so svm ships it only as a **tested reference**, not an
+API. svm can wrap only the collector↔vCPU barrier; the safepoint poll + `suspend` (step 2)
+lives in the guest scheduler. svm exposes **no vCPU-count intrinsic**, so the guest passes `N`.
+
+### 2.1. Reference barrier (the optional `quiesce` helper)
+
+The reference below is exercised end-to-end on both backends in
+`crates/svm/tests/gc_quiesce.rs` (parametric in `N`, run for N=2 and N=4) — one STW cycle; a
+long-lived guest wraps the mutator body in its scheduler loop and re-arms `EPOCH` per cycle.
+Window slots are i32 at fixed offsets; each flag has a **single writer**, so no atomic
+read-modify-write is needed. `EPOCH`/`RELEASE`/`STOPPED`/`VIOLATION` are scalars;
+`parked[i]`/`work[i]` are per-mutator.
+
+```
+// mutator vCPU i (the guest scheduler's safepoint + park path):
+loop {                                 // bounded work; the loop top is a safepoint
+  // … run guest work; work[i]++ …
+  if load.acquire(STOPPED) == 1: store.release(VIOLATION, 1);   // must never fire
+  if load.acquire(EPOCH) != 0 { break; }                        // a stop was requested
+}
+store.release(parked[i], 1);           // publish "parked"
+notify(parked[i], 1);                  // wake the collector's wait
+while load.acquire(RELEASE) != 1:      // block until released
+  wait(RELEASE, <last value seen != 1>, timeout);
+// resumed → return (or, in a long-lived guest, loop back to the work phase)
+
+// collector vCPU (after spawning the N-1 mutators):
+store.release(EPOCH, 1); notify(EPOCH, N);         // request stop, wake early waiters
+for i in mutators:                                 // barrier: parked == N-1
+  while load.acquire(parked[i]) != 1: wait(parked[i], 0, timeout);
+store.release(STOPPED, 1);                          // — world is stopped —
+// … call gc.roots(…) (§3), mark, sweep …
+store.release(STOPPED, 0);
+store.release(RELEASE, 1); notify(RELEASE, N);     // resume everyone
+join(mutators);
+```
+
+Soundness rests on the §2 invariant: a mutator only reaches its park path *after* its current
+fiber suspended, so `parked == N-1` ⟹ no fiber is running ⟹ every fiber is scannable. The
+test additionally proves **mutual exclusion**: a mutator sets `VIOLATION` if it ever observes
+`STOPPED == 1`, and because all mutators are blocked in `wait(RELEASE, …)` before the collector
+raises `STOPPED`, `VIOLATION` stays 0.
 
 ## 3. The one new svm primitive: range-filtered root enumeration
 
@@ -65,15 +111,19 @@ An **ambient introspection op** (not a capability — see §3.0) the GC calls du
 writes the candidate words into a guest-provided buffer and returns the total count:
 
 ```
-gc.roots(heap_lo, heap_hi, buf, cap) -> count   // count = total candidates found
-//   writes min(count, cap) distinct words, ascending, as u64 at byte offset `buf`;
-//   count > cap ⇒ retry with a larger buffer
+gc.roots(heap_lo, heap_hi, mask, buf, cap) -> count   // count = total candidates found
+//   masks each scanned word (m = w & mask), then writes min(count, cap) distinct masked
+//   words, ascending, as u64 at byte offset `buf`; count > cap ⇒ retry with a larger buffer
 ```
 
 `heap_lo`/`heap_hi` are **window offsets** bounding the guest heap; svm walks every
 fiber's live control-stack extent (incl. the saved-register block the switch routine
-writes on suspend, §3d) plus the caller's own live frames (§3.1), and returns the
-deduplicated words that fall inside `[heap_lo, heap_hi)`.
+writes on suspend, §3d) plus the caller's own live frames (§3.1). Each scanned word `w` is
+**masked** (`m = w & mask`), and the masked value `m` is what is range-tested and emitted; svm
+returns the deduplicated `m` that fall inside `[heap_lo, heap_hi)`. `mask = ~0` is the untagged
+case (emit raw words); a guest tagging pointers in the high byte passes `0x00FF_FFFF_FFFF_FFFF`
+to strip the tag and recover the bare offset. **`mask` is constrained to clear only the top
+byte** (`mask | 0xFF00_0000_0000_0000 == ~0`); see property 1.
 
 ### 3.0. Why ambient, not a capability (decision)
 
@@ -93,16 +143,25 @@ the same family as `cont.*`/`suspend`, and authority-neutral like `cap.self` ref
   capability would add `Binding`/grant/handle-validation plumbing for no security gain.
 
 The one honest caveat: unlike `cap.self`, `gc.roots` does read *control-stack* words the guest
-cannot otherwise name — but filtered to the guest's own heap range, so no host/ASLR leak and no
-cross-principal boundary is crossed.
+cannot otherwise name — but filtered to the guest's own heap range (and the payload `mask` is
+top-byte-only so it cannot fold a host word into that range — property 1), so no host/ASLR leak
+and no cross-principal boundary is crossed.
 
 ### Required properties
 
-1. **Range-filtered.** Return only in-window candidate words. Out-of-window words —
-   host JIT return addresses (code arena), saved frame pointers, host pointers — are
-   filtered **inside svm** and never cross the boundary. No host ASLR/layout leaks.
-   This is what keeps the control-stack *read* inside svm's TCB and makes option-B
-   ("let the GC read control stacks") safe.
+1. **Range-filtered (and mask-constrained against host leaks).** Return only in-window
+   *masked* candidate words. Out-of-window words — host JIT return addresses (code arena),
+   saved frame pointers, host pointers — are filtered **inside svm** and never cross the
+   boundary. No host ASLR/layout leaks. This is what keeps the control-stack *read* inside
+   svm's TCB and makes option-B ("let the GC read control stacks") safe.
+   The payload `mask` must not weaken this: an unconstrained mask could fold a host pointer
+   *into* the window (e.g. keep only low bits, so a return address's low 24 bits land in
+   `[heap_lo, heap_hi)`), leaking host-address bits past the filter. So svm **constrains the
+   mask to clear only the top byte** — the low 56 bits must be all-ones,
+   `mask | 0xFF00_0000_0000_0000 == ~0`. A canonical host pointer (`< 2^56`, true for the
+   user-space VAs the high-byte tag scheme assumes) is then never reduced → it stays large and
+   is excluded by the range filter. The constraint is enforced **statically by the verifier**
+   for a constant mask and **defensively at runtime** (a trap) on both backends for any mask.
 2. **Value-only, deduplicated.** A non-moving collector needs *reachability, not
    positions*. Return a deduped list of candidate values; **never expose a raw
    control-stack view** and never expose word locations. This collapses "enumerate"
@@ -212,6 +271,12 @@ general (the interp has no spill words to match).
    spill, so its own roots are covered. Scanning a running fiber's / another vCPU's stack assumes
    a stop-the-world safepoint, exactly as the interpreter scans the shared registry. Backend-uniform
    *semantics* per §3.2 (a sound superset of the live roots, not bit-identical candidate sets).
+5. **`gc.roots` tagged-pointer payload mask** — a 5th operand `mask` (top-byte-strip only) so a guest
+   tagging pointers in the high byte recovers bare offsets; `mask = ~0` is the untagged default
+   (§1, §3 property 1). *(done — threaded through ir/encode/text/verify/interp/jit/llvm; verifier +
+   runtime reject a fold-down mask.)*
+6. **Reference STW `quiesce` barrier** (§2.1) — pure-guest futex barrier, shipped only as a both-backends
+   test (`crates/svm/tests/gc_quiesce.rs`), not an svm API. *(done.)*
 
 No world-stop primitive, no register capture, no stack-map work.
 
