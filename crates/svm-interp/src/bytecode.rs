@@ -24,15 +24,17 @@
 //! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
-//! `return_call_indirect`, reusing the current window — O(1) deep tail recursion). [`compile_module`]
-//! returns `None` when a function needs a seam not yet driven here — instantiate-mixed-with-fibers,
-//! `gc.roots`, `call.import`, or durability — so callers (`super::run_with_host_fast`) fall back to
-//! the tree-walker for those.
+//! `return_call_indirect`, reusing the current window — O(1) deep tail recursion); and §GC
+//! **`gc.roots`** (conservative root enumeration over the whole vCPU continuation — sound, not
+//! bit-identical, per GC.md §3.2). [`compile_module`] returns `None` when a function needs a seam not
+//! yet driven here — instantiate-mixed-with-fibers, `gc.roots`-mixed-with-threads, or durability — so
+//! callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
 //! tree-walker (`bytecode_diff.rs`, `bytecode_{caps,fibers,threads,coroutines,instantiate,
-//! separate_module,demand_coroutine,tailcall,debug,dynlink}.rs`).
+//! separate_module,demand_coroutine,tailcall,debug,gc_roots,dynlink}.rs`; `gc_roots` checks soundness
+//! rather than equality).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -396,6 +398,20 @@ enum Op {
         params: Box<[ValType]>,
         results: Box<[ValType]>,
     },
+    /// §GC `gc.roots(heap_lo, heap_hi, mask, buf, cap)`: conservative root enumeration. Escapes to
+    /// the driver, which scans every live activation of the vCPU's continuation (the active window,
+    /// its call stack, its resume-chain ancestors, parked fibers, and coroutines) for words that —
+    /// masked — land in `[lo, hi)`, writes the first `cap` (ascending, deduplicated) to guest memory
+    /// at `buf`, and writes the total found to `dst`. Sound (a superset of the genuine roots), not
+    /// bit-identical to the tree-walker — the backends over-approximate differently (GC.md §3.2).
+    GcRoots {
+        lo: u32,
+        hi: u32,
+        mask: u32,
+        buf: u32,
+        cap: u32,
+        dst: u32,
+    },
     Ret {
         srcs: Box<[u32]>,
     },
@@ -527,6 +543,7 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     let mut has_fiber = false;
     let mut has_thread = false;
     let mut has_instantiate = false;
+    let mut has_gc = false;
     for f in funcs {
         for b in &f.blocks {
             for inst in &b.insts {
@@ -549,12 +566,20 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
                     | Inst::ThreadJoin { .. }
                     | Inst::MemoryWait { .. }
                     | Inst::MemoryNotify { .. } => has_thread = true,
+                    Inst::GcRoots { .. } => has_gc = true,
                     _ => {}
                 }
             }
         }
     }
-    if (has_coro && (has_fiber || has_thread)) || (has_instantiate && has_fiber) {
+    // `gc.roots` scans only the **calling vCPU's** continuation (its stack, fibers, coroutines), so a
+    // module that also spawns threads could hold roots in a sibling vCPU we wouldn't scan — reject
+    // that combination (fall back) to stay sound. `gc.roots` + fibers / coroutines is fine (those
+    // continuations *are* scanned).
+    if (has_coro && (has_fiber || has_thread))
+        || (has_instantiate && has_fiber)
+        || (has_gc && has_thread)
+    {
         return None;
     }
 
@@ -1053,7 +1078,24 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             dst,
         },
         // Cross-module / GC ops this slice doesn't drive (dispatch table / root scan) — fall back.
-        Inst::CallImport { .. } | Inst::GcRoots { .. } => return None,
+        // §GC conservative root enumeration — driven by the scheduler (it scans the whole vCPU
+        // continuation). `call.import` must already be resolved to a `cap.call`, so it never reaches
+        // a backend (a leftover is a fall-back).
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } => Op::GcRoots {
+            lo: g(*heap_lo),
+            hi: g(*heap_hi),
+            mask: g(*mask),
+            buf: g(*buf),
+            cap: g(*cap),
+            dst,
+        },
+        Inst::CallImport { .. } => return None,
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
         // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
         // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
@@ -1111,6 +1153,40 @@ pub fn compile_and_run_with_host(
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
     Some(run(dom, func, args, fuel, &mut mem, host))
+}
+
+/// A run result paired with the final window snapshot (the low `init_mem.len()` bytes).
+pub type Capture = (Result<Vec<Value>, Trap>, Vec<u8>);
+
+/// Like [`compile_and_run`], but **seeds** the window with `init_mem` first and returns the final
+/// window snapshot (the low `init_mem.len()` bytes) alongside the result — the bytecode mirror of
+/// [`crate::run_capture_reserved`]. Used by `bytecode_gc_roots.rs` to read back the roots buffer for
+/// the §GC soundness check. `None` if the module is outside the engine's subset.
+pub fn compile_and_run_capture(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+) -> Option<Capture> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Err(Trap::Malformed), Vec::new()));
+    }
+    let mut host = Host::new();
+    let dom = Domain::new(c, host.jit_table_log2());
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        mm
+    });
+    let r = run(dom, func, args, fuel, &mut mem, &mut host);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .unwrap_or_default();
+    Some((r, snap))
 }
 
 /// An [`ir_trace`] result: the executed instruction-location sequence plus the run's result.
@@ -1330,6 +1406,17 @@ enum Outcome {
         params: Box<[ValType]>,
         results: Box<[ValType]>,
     },
+    /// §GC `gc.roots`: operands already resolved + the `mask` validated. The driver does the scan
+    /// (it owns the resume chain / fiber registry / coroutines), writes the buffer, and delivers the
+    /// total to `dst`.
+    GcRoots {
+        lo: u64,
+        hi: u64,
+        mask: u64,
+        buf: u64,
+        cap: usize,
+        dst: u32,
+    },
 }
 
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). Non-durable only — a
@@ -1438,6 +1525,29 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
                 coro.awaiting = Some(dst);
                 return Ok(CoStop::Yield(value));
             }
+            // A coroutine child is its own confined domain (no fibers/threads, holds no Instantiator),
+            // so its `gc.roots` scans just its own continuation. Handle it inline and keep stepping.
+            Ok(Outcome::GcRoots {
+                lo,
+                hi,
+                mask,
+                buf,
+                cap,
+                dst,
+            }) => {
+                let mut roots = std::collections::BTreeSet::new();
+                {
+                    let mut consider = |w: u64| {
+                        let m = w & mask;
+                        if m >= lo && m < hi {
+                            roots.insert(m);
+                        }
+                    };
+                    scan_vm_roots(&coro.vm, mods, &mut consider);
+                }
+                let total = gc_write(&mut coro.mem, buf, cap, roots)?;
+                coro.vm.set(dst, Reg::from_i64(total));
+            }
             Ok(_) => return Err(Trap::FiberFault),
             // A demand child's *recoverable* in-window page fault suspends to the parent; an
             // out-of-window fault (`take_fault` → `None`) is a real trap that propagates.
@@ -1450,6 +1560,49 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
             Err(t) => return Err(t),
         }
     }
+}
+
+/// Scan every live activation of `vm`'s continuation — the active window plus each suspended caller
+/// on the call stack — for §GC `gc.roots` candidate words, feeding each 64-bit half (`lo`/`hi`, so a
+/// `v128` contributes both) to `consider`. Each activation occupies `regs[base .. base + nslots)` of
+/// the function-wide register file (the window model), so this covers exactly that function's live
+/// slots — a **sound superset** of the tree-walker's per-block `frame.vals` (it also retains
+/// already-dead values from other blocks of the same function, a conservative over-approximation, as
+/// the JIT's native-stack scan does — the backends legitimately differ, GC.md §3.2). The register
+/// file only ever holds guest words (or default `0`), so `consider`'s mask+range filter keeps any
+/// host data out by construction.
+fn scan_vm_roots(vm: &Vm, mods: &[Compiled], consider: &mut impl FnMut(u64)) {
+    let frames = std::iter::once((vm.module, vm.cur, vm.base))
+        .chain(vm.stack.iter().map(|&(m, p, b, _, _)| (m, p, b)));
+    for (module, prog, base) in frames {
+        let n = mods[module].progs[prog].nslots as usize;
+        let end = (base + n).min(vm.regs.len());
+        for r in &vm.regs[base..end] {
+            consider(r.lo);
+            consider(r.hi);
+        }
+    }
+}
+
+/// Emit a §GC `gc.roots` result: write the first `cap` roots (ascending, already deduplicated by the
+/// `BTreeSet`) as little-endian `i64`s into guest memory at `buf` — reusing the confined buffer-write
+/// path (a forged/unmapped/RO buffer is a `MemoryFault`) — and return the **total** found.
+fn gc_write(
+    mem: &mut Option<Mem>,
+    buf: u64,
+    cap: usize,
+    roots: std::collections::BTreeSet<u64>,
+) -> Result<i64, Trap> {
+    let total = roots.len() as i64;
+    let mut bytes = Vec::with_capacity(roots.len().min(cap) * 8);
+    for w in roots.into_iter().take(cap) {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    mem.as_mut()
+        .ok_or(Trap::Malformed)?
+        .write_bytes_impl(buf, &bytes)
+        .ok_or(Trap::MemoryFault)?;
+    Ok(total)
 }
 
 /// Run an invoked §22 unit (`Jit.invoke`) synchronously: a fresh `Vm` for `module`'s entry (func 0)
@@ -1846,6 +1999,42 @@ fn step_vcpu(
             // coroutine child — `resume_coro` consumes it. At the top level the yielder handle is
             // ungranted, so `resume` CapFaults before producing this; treat any leak as a fault.
             Outcome::CoYield { .. } => return Err(Trap::FiberFault),
+            // §GC `gc.roots`: scan the whole vCPU continuation — the active window, its call stack
+            // (covered by `scan_vm_roots`), every resume-chain ancestor, every parked fiber, and every
+            // suspended coroutine — for words that (masked) land in `[lo, hi)`. A **sound superset**
+            // of the genuine roots, kept in-window by the range filter (GC.md §3.2).
+            Outcome::GcRoots {
+                lo,
+                hi,
+                mask,
+                buf,
+                cap,
+                dst,
+            } => {
+                let mut roots = std::collections::BTreeSet::new();
+                {
+                    let mut consider = |w: u64| {
+                        let m = w & mask;
+                        if m >= lo && m < hi {
+                            roots.insert(m);
+                        }
+                    };
+                    scan_vm_roots(&vt.active, &dom.mods, &mut consider);
+                    for (_, vm, _) in &vt.chain {
+                        scan_vm_roots(vm, &dom.mods, &mut consider);
+                    }
+                    for fib in fibers.iter() {
+                        if let FiberState::Parked { vm, .. } = fib {
+                            scan_vm_roots(vm, &dom.mods, &mut consider);
+                        }
+                    }
+                    for coro in vt.coroutines.iter().flatten() {
+                        scan_vm_roots(&coro.vm, &dom.mods, &mut consider);
+                    }
+                }
+                let total = gc_write(ctx.mem, buf, cap, roots)?;
+                vt.active.set(dst, Reg::from_i64(total));
+            }
         }
     }
 }
@@ -3459,6 +3648,39 @@ impl Vm {
                         dst,
                         params,
                         results,
+                    });
+                }
+                Op::GcRoots {
+                    lo,
+                    hi,
+                    mask,
+                    buf,
+                    cap,
+                    dst,
+                } => {
+                    let lo = r!(*lo).i64() as u64;
+                    let hi = r!(*hi).i64() as u64;
+                    let mask = r!(*mask).i64() as u64;
+                    // Security (GC.md §3/§6): the payload mask may only clear the top byte, else a host
+                    // word could be folded into the guest window past the range filter. (The verifier
+                    // rejects a constant fold-down mask; this defends an unverified / non-constant mask.)
+                    if mask | 0xFF00_0000_0000_0000 != u64::MAX {
+                        return Err(Trap::Malformed);
+                    }
+                    let buf = r!(*buf).i64() as u64;
+                    let cap = r!(*cap).i64().max(0) as usize;
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::GcRoots {
+                        lo,
+                        hi,
+                        mask,
+                        buf,
+                        cap,
+                        dst,
                     });
                 }
                 Op::Unreachable => return Err(Trap::Unreachable),

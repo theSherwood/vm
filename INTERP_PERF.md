@@ -444,6 +444,24 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               across straight line, branches, loops (back-edges revisit `IrPc`s), cross-frame calls,
               and a trap — plus result equality. (Full Inspector parity — watchpoints, backtrace,
               cap-call stops, time-travel — is follow-on; this lands the location model.)
+        - [x] **1c-7** — §GC `gc.roots` (conservative root enumeration). **Correctness criterion is
+              soundness, not bit-identity**: GC.md §3.2 says the backends legitimately over-approximate
+              differently (the JIT scans raw native control-stack words, the tree-walker per-block
+              `frame.vals`), so result-equality is the *wrong* gate — the one op the oracle itself
+              doesn't pin uniquely. The bytecode engine scans each live activation's whole register
+              window (`scan_vm_roots`) across the vCPU's full continuation — the active window + call
+              stack, resume-chain ancestors, parked fibers, and coroutines — masks + range-filters each
+              64-bit half, and writes the ascending dedup set (first `cap`) with the total, matching the
+              output *format*. The op escapes to the driver (it owns chain/fibers/coroutines); a
+              coroutine child's own `gc.roots` is handled inline in `resume_coro`. Rejected with threads
+              (the scan covers only the calling vCPU). New harness `bytecode_gc_roots.rs` checks
+              **soundness**: `tw ⊆ bc` (never misses a root the tree-walker found — so a guest GC can't
+              free a reachable object), every reported word is in-window (no host leak), planted roots
+              all found, and `total == |set|`. Cases: baseline (sets equal), a cross-block dead value
+              (`tw = {4096} ⊊ bc = {4096,5000}` — proves it's a sound *superset*, the JIT-style
+              over-approximation), tagged-pointer mask, caller-frame-across-call, parked-fiber root, and
+              fold-down-mask rejection (`Malformed`, the §6 host-leak guard). Window memory is read back
+              via a new `bytecode::compile_and_run_capture` (mirrors `run_capture_reserved`).
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:
           snapshot equality.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
