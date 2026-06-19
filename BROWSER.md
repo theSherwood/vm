@@ -111,6 +111,10 @@ wasmtime run --invoke run_powerbox  -W memory64=y "$W"   # 17 (stream write + ca
 # Differential (compute + powerbox), wasm32 vs native ground truth — 42/42, zero host imports
 cargo run --bin gencorpus                                # native ground truth → corpus.json
 node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
+
+# Live host imports — guest console/clock bound to real wasm imports (default build is import-free)
+cargo build --release --lib --target wasm32-unknown-unknown --features live
+node live.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm corpus/live.svmbc
 ```
 
 `browser/` (`svm-browser`) is a detached `[workspace]` crate (kept out of the main workspace because
@@ -134,9 +138,13 @@ are git-ignored.
   The `Host` powerbox is already **deterministic and self-contained** (stream writes accumulate in
   `Host::stdout`/`stderr`, `read` draws from `Host::stdin`, `Clock.now` is a strictly-increasing
   counter), so I/O crosses the wasm boundary the *same way the module does* — through fixed scratch
-  buffers (`svm_stdin_buf` in; `svm_stdout_ptr`/`svm_stderr_ptr`/`svm_exit_code` out). **The cdylib
-  stays import-free** (verified: `imports: 0`). Binding a stream to the live JS console / a real
-  clock (i.e. actual wasm *imports*) is a follow-up; the capability model and ABI are now in place.
+  buffers (`svm_stdin_buf` in; `svm_stdout_ptr`/`svm_stderr_ptr`/`svm_exit_code` out). **The default
+  cdylib stays import-free** (verified: `imports: 0`).
+- **Live capabilities → a feature-gated variant.** Real host imports are mandatory at instantiation
+  for *every* entry, so binding a capability to the live host (`svm_run_live`, bridging guest
+  `cap.call`s to `svm_host.host_write`/`host_now_ns` via `grant_host_fn`) lives behind
+  `--features live` — the default build stays import-free for the compute/buffered-powerbox path,
+  and the live build adds exactly the two `svm_host` imports.
 
 ---
 
@@ -190,10 +198,18 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `powerbox_exec` (the crate is `cdylib`+`rlib`), so the check isolates wasm effects, not logic
   drift. Remaining: extend to the memory-**snapshot** check via
   `compile_and_run_capture_reserved_with_host`.
-- [x] **Host powerbox (console + clock).** `svm_run_pb` grants streams/clock/exit, marshalling I/O
-  through scratch buffers so the cdylib stays import-free; validated on wasm32 (5-case differential
-  above) and wasm64 (`run_powerbox() == 17`). Follow-up: bind a stream to the live JS console / a real
-  clock (actual wasm imports), and an `alloc`/`dealloc` ABI to replace the fixed buffers.
+- [x] **Host powerbox (console + clock), buffer-marshalled.** `svm_run_pb` grants streams/clock/exit,
+  marshalling I/O through scratch buffers so the cdylib stays import-free; validated on wasm32 (5-case
+  differential above) and wasm64 (`run_powerbox() == 17`).
+- [x] **Live host imports (`--features live`).** `svm_run_live` bridges guest capabilities to **real
+  wasm imports** via `Host::grant_host_fn` (iface 13): a `(console, clock)` powerbox where
+  `console.write` forwards the guest's bytes to the imported `svm_host.host_write` (live host console,
+  *during* the run) and `clock.now` reads `svm_host.host_now_ns` (real host time). Feature-gated so
+  the default artifact stays import-free; the live build declares exactly those two imports (verified
+  on wasm32 **and** wasm64). `live.mjs` supplies the imports and asserts the round-trip — the host
+  received `"live from wasm!\n"` and the guest returned the host clock value. wasm64 *runtime* of the
+  live path needs a Wasmtime embedding to supply imports (the CLI can't); Node/wasm32 is the real
+  browser path and passes. Follow-up: an `alloc`/`dealloc` ABI to replace the fixed scratch buffers.
 
 ## Verification
 

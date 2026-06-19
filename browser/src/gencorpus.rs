@@ -235,6 +235,24 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32):
 }
 "#;
 
+// Live-import guest (encoded for `live.mjs`, not part of the deterministic corpus): `(console,
+// clock)` are host-fn caps (iface 13) the live cdylib bridges to real wasm imports. Writes a 16-byte
+// line to stdout via `console.write(stream=0, ptr, len)`, then returns `clock.now()` — so `live.mjs`
+// asserts the bytes reached the host import and the host clock value flowed back to the guest.
+const LIVE_GUEST: &str = r#"
+memory 16
+data 0 "live from wasm!\n"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 0
+  v3 = i64.const 0
+  v4 = i64.const 16
+  v5 = cap.call 13 1 (i64, i64, i64) -> (i64) v0(v2, v3, v4)
+  v6 = cap.call 13 0 () -> (i64) v1()
+  return v6
+}
+"#;
+
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -329,4 +347,8 @@ fn main() {
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
     eprintln!("wrote corpus.json ({} compute, {} powerbox)", compute.len(), powerbox.len());
+
+    // The live-import guest is validated by `live.mjs` (host-backed, non-deterministic), not the
+    // corpus — just encode it so the harness has a module to run.
+    emit("live", LIVE_GUEST);
 }

@@ -13,6 +13,8 @@
 //! can't disambiguate an error from a guest result of the same value).
 
 use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
+#[cfg(feature = "live")]
+use svm_interp::HostFn;
 
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
 
@@ -459,5 +461,119 @@ block0(v0: i32, v1: i32, v2: i32):
         h.stdout.len() as i64
     } else {
         -1
+    }
+}
+
+// ---- live host imports: bind capabilities to real host functions ----------------------------
+//
+// Everything above keeps the cdylib import-free by buffering I/O. This (feature-gated) entry instead
+// bridges guest capabilities to **real wasm imports**, so a guest's writes reach the live host
+// console *as they happen* and the clock reads real host time. The seam is `Host::grant_host_fn`
+// (iface 13) — the designed extension point: a closure supplies the capability's semantics, here by
+// calling out to the imported host function. The guest sees only a masked, type-checked handle.
+
+#[cfg(feature = "live")]
+pub mod live {
+    use super::*;
+
+    // The host functions the embedder must supply (module `svm_host`). `host_write` receives a
+    // pointer into *this module's* linear memory (the bytes the guest wrote, copied out of its
+    // window into a Rust buffer that lives on the wasm heap), so JS reads them as
+    // `new Uint8Array(memory.buffer, ptr, len)`. `host_now_ns` returns real host time.
+    #[link(wasm_import_module = "svm_host")]
+    extern "C" {
+        /// `host_write(stream, ptr, len)` — `stream` 0 = stdout, 1 = stderr.
+        fn host_write(stream: i32, ptr: *const u8, len: usize);
+        /// `host_now_ns() -> i64` — host wall/monotonic clock, nanoseconds.
+        fn host_now_ns() -> i64;
+    }
+
+    const EFAULT: i64 = -14;
+    const EINVAL: i64 = -22;
+
+    /// Decode the module at [`svm_buf`] and run function 0 with a **host-backed** powerbox:
+    /// `(console, clock)` capabilities (both iface `HOST_FN` = 13) bridged to the imports above.
+    /// The guest calls `cap.call 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
+    /// live, and `cap.call 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
+    /// `i64` result; sets [`LAST_STATUS`].
+    #[no_mangle]
+    pub extern "C" fn svm_run_live(len: usize) -> i64 {
+        // SAFETY: single-threaded wasm; `len` host-bounded to `<= svm_buf_cap()`.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BUF) as *const u8, len) };
+        let set = |s: i32| unsafe { LAST_STATUS = s };
+        let m = match svm_encode::decode_module(bytes) {
+            Ok(m) => m,
+            Err(_) => {
+                set(STATUS_DECODE_ERR);
+                return 0;
+            }
+        };
+        let mut host = Host::new();
+        // console (param 1): op 1 = write(stream, ptr, len) → reads the guest window, forwards live.
+        let console: HostFn = Box::new(|op, args, mem| {
+            if op != 1 {
+                return Ok(vec![EINVAL]);
+            }
+            let (Some(&stream), Some(&ptr), Some(&n)) =
+                (args.first(), args.get(1), args.get(2))
+            else {
+                return Ok(vec![EINVAL]);
+            };
+            let Some(m) = mem else { return Ok(vec![EFAULT]) };
+            match m.read_bytes(ptr as u64, n as u64) {
+                // The copied bytes live on this module's wasm heap; hand their pointer to the host.
+                Some(buf) => {
+                    unsafe { host_write(stream as i32, buf.as_ptr(), buf.len()) };
+                    Ok(vec![n])
+                }
+                None => Ok(vec![EFAULT]),
+            }
+        });
+        // clock (param 2): op 0 = now() → real host time.
+        let clock: HostFn = Box::new(|op, _args, _mem| {
+            if op != 0 {
+                return Ok(vec![EINVAL]);
+            }
+            Ok(vec![unsafe { host_now_ns() }])
+        });
+        let arity = m.funcs.first().map_or(0, |f| f.params.len());
+        let mut slots: Vec<Value> = Vec::new();
+        if arity >= 1 {
+            slots.push(Value::I32(host.grant_host_fn(console)));
+        }
+        if arity >= 2 {
+            slots.push(Value::I32(host.grant_host_fn(clock)));
+        }
+        let mut fuel = u64::MAX;
+        match bytecode::compile_and_run_with_host(&m, 0, &slots, &mut fuel, &mut host) {
+            None => {
+                set(STATUS_UNSUPPORTED);
+                0
+            }
+            Some(Err(Trap::Exit(code))) => {
+                set(STATUS_EXIT);
+                unsafe { EXIT_CODE = code };
+                0
+            }
+            Some(Err(_)) => {
+                set(STATUS_TRAP);
+                0
+            }
+            Some(Ok(vals)) => match vals.first() {
+                Some(Value::I64(x)) => {
+                    set(STATUS_OK);
+                    *x
+                }
+                Some(Value::I32(x)) => {
+                    set(STATUS_OK);
+                    *x as i64
+                }
+                _ => {
+                    set(STATUS_BAD_RESULT);
+                    0
+                }
+            },
+        }
     }
 }

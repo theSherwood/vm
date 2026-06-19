@@ -21,6 +21,13 @@ path = "src/genfixture.rs"
 name = "gencorpus"
 path = "src/gencorpus.rs"
 
+# `live` adds the host-backed powerbox entry `svm_run_live`, which declares real wasm **imports**
+# (`svm_host.host_write` / `host_now_ns`). Off by default so the standard artifact stays import-free
+# (`svm_run`/`run_guest`/`svm_run_pb` need no host functions); build `--features live` for the
+# console/clock-bound variant. See BROWSER.md.
+[features]
+live = []
+
 [dependencies]
 svm-interp = { path = "../crates/svm-interp" }
 svm-encode = { path = "../crates/svm-encode" }
