@@ -472,9 +472,12 @@ every backtrace renderer — `JitFrameLoc::func_name`, the interpreter's free `f
 kill message (`#0 file:line:col in compute`), and gdb's DWARF `DW_AT_name` + ELF `.symtab` — so frames
 read `in compute` instead of `(fn 0)`/`fn0`. Empty ⇒ the `fn{N}` fallback.
 
-Remaining: **Windows explicit-check** traps still lack a backtrace (ISSUES I5 — no signal to capture
-from + MSVC has no `__builtin_frame_address`; fix via Cranelift `get_frame_pointer`); and per-fiber
-naming under work-stealing migration (ISSUES I6).
+Trap-time backtraces are now **fully cross-platform**: the capture state + frame-pointer walk +
+explicit-trap helper live in a shared `trap_capture.c`, and `emit_trap` threads the trapping frame
+pointer in via Cranelift `get_frame_pointer` (sidestepping MSVC's missing `__builtin_frame_address`),
+so div-by-zero / `unreachable` / `OutOfFuel` / indirect-call-type traps capture on **unix and Windows**
+(ISSUES I5 — landed, pending `windows-latest` CI confirmation). Remaining: per-fiber naming under
+work-stealing migration (ISSUES I6, S4 cosmetic).
 
 ---
 

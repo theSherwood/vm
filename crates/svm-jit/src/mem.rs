@@ -939,20 +939,29 @@ mod pal {
         });
     }
 
-    /// Read and clear the trap stack the VEH captured at the most recent caught **memory fault**
-    /// (§5/W3): the faulting `pc` + the frame-pointer chain's return addresses. `None` if none was
-    /// captured. (Explicit-check traps — div-by-zero etc. — are not yet captured on Windows: that
-    /// path needs the trap-site frame pointer, and MSVC has no `__builtin_frame_address`; see ISSUES
-    /// I3. So a Windows explicit trap still yields an empty backtrace.)
+    /// Read and clear the most recent caught trap's stack (§5/W3): the faulting `pc` + the
+    /// frame-pointer chain's return addresses. Two capture paths feed it on Windows — a **memory
+    /// fault** lands in the VEH (Rust thread-local, above), and an **explicit-check trap** (div-by-zero
+    /// etc.) lands in the shared `trap_capture.c` helper (its C thread-local, `svm_take_trap_frame`).
+    /// A run trips at most one, so check the Rust capture first and fall back to the C one. `None` if
+    /// neither captured.
     pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
-        if !TRAP_VALID.with(|c| c.get()) {
-            return None;
+        if TRAP_VALID.with(|c| c.get()) {
+            TRAP_VALID.with(|c| c.set(false));
+            let pc = TRAP_PC.with(|c| c.get());
+            let n = TRAP_N.with(|c| c.get());
+            let rets = TRAP_RETS.with(|c| c.get());
+            return Some((pc, rets[..n].to_vec()));
         }
-        TRAP_VALID.with(|c| c.set(false));
-        let pc = TRAP_PC.with(|c| c.get());
-        let n = TRAP_N.with(|c| c.get());
-        let rets = TRAP_RETS.with(|c| c.get());
-        Some((pc, rets[..n].to_vec()))
+        // Explicit-check trap: the C helper (`trap_capture.c`) stashed it in its own thread-local.
+        extern "C" {
+            fn svm_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
+        }
+        const MAX: usize = 64;
+        let (mut pc, mut rets) = (0usize, [0usize; MAX]);
+        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot buffer.
+        let n = unsafe { svm_take_trap_frame(&mut pc, rets.as_mut_ptr(), MAX as i32) };
+        (n >= 0).then(|| (pc, rets[..n as usize].to_vec()))
     }
 
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.

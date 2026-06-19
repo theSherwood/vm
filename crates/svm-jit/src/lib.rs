@@ -3675,22 +3675,24 @@ struct Lower<'a> {
     /// trap-capture helper (`svm_capture_explicit_trap`) into every [`emit_trap`] site, so an
     /// explicit trap (div-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) records a source
     /// backtrace before it unwinds — the way memory faults do via the signal handler. `None` without
-    /// `-g` (the backtrace would be empty) or where the helper isn't linked (non-unix), leaving the
-    /// trap path byte-identical to before.
+    /// `-g` (the backtrace would be empty) or where the helper isn't linked (a target with no trap
+    /// runtime), leaving the trap path byte-identical to before.
     trap_capture: Option<(SigRef, i64)>,
 }
 
-/// The address of the §5 W3 Stage 2 explicit-trap capture helper (`svm_capture_explicit_trap` in
-/// `trap_shim.c`): baked into each [`emit_trap`] site under `-g`. `0` where the helper isn't linked
-/// (the shim is unix-only), which disables the explicit-trap backtrace there.
-#[cfg(unix)]
+/// The address of the §5 W3 explicit-trap capture helper (`svm_capture_explicit_trap` in
+/// `trap_capture.c`): baked into each [`emit_trap`] site under `-g`. The helper takes the trapping
+/// frame pointer as an argument (the JIT threads it in via Cranelift `get_frame_pointer`), so it works
+/// on every target the shim compiles for — **unix and windows** (MSVC has no `__builtin_frame_address`,
+/// but the passed `fp` + `_ReturnAddress` sidestep it). `0` on a target with no trap runtime.
+#[cfg(any(unix, windows))]
 fn trap_capture_addr() -> i64 {
     extern "C" {
-        fn svm_capture_explicit_trap();
+        fn svm_capture_explicit_trap(fp: usize);
     }
-    svm_capture_explicit_trap as unsafe extern "C" fn() as usize as i64
+    svm_capture_explicit_trap as unsafe extern "C" fn(usize) as usize as i64
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn trap_capture_addr() -> i64 {
     0
 }
@@ -3775,12 +3777,14 @@ fn build_clif(
     } else {
         None
     };
-    // §5 W3 Stage 2: under `-g`, import the trap-capture helper's `() -> ()` host-C signature and bake
-    // its address, so `emit_trap` can record an explicit trap's source backtrace before unwinding.
-    // Disabled without `-g` (the backtrace would be empty) or where the helper isn't linked.
+    // §5 W3 Stage 2: under `-g`, import the trap-capture helper's `(i64) -> ()` host-C signature (it
+    // takes the trapping frame pointer) and bake its address, so `emit_trap` can record an explicit
+    // trap's source backtrace before unwinding. Disabled without `-g` or where the helper isn't linked.
     let trap_capture = match trap_capture_addr() {
         addr if srclocs.is_some() && addr != 0 => {
-            Some((b.import_signature(module.make_signature()), addr))
+            let mut sig = module.make_signature(); // host C ABI
+            sig.params.push(AbiParam::new(I64)); // the trapping frame pointer
+            Some((b.import_signature(sig), addr))
         }
         _ => None,
     };
@@ -5252,8 +5256,12 @@ fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     // Only present under `-g` (else the backtrace would be empty); the trap path is otherwise
     // unchanged.
     if let Some((sigref, addr)) = lower.trap_capture {
+        // Pass the trapping function's frame pointer so the helper can walk the caller chain without
+        // `__builtin_frame_address` (which MSVC lacks); it pairs `fp` with its own return address (the
+        // trap site) for the innermost frame.
+        let fp = b.ins().get_frame_pointer(I64);
         let helper = b.ins().iconst(I64, addr);
-        b.ins().call_indirect(sigref, helper, &[]);
+        b.ins().call_indirect(sigref, helper, &[fp]);
     }
     let cell = b.use_var(lower.trap_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
