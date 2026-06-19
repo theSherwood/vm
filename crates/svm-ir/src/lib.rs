@@ -2235,6 +2235,23 @@ impl Memory {
 /// costs virtual address space, not committed memory.
 pub const DEFAULT_RESERVED_LOG2: u8 = 40;
 
+/// The §3e powerbox **args-buffer** window offset: where a host seeds the program-arguments blob so
+/// the frontend's `_start` can hand `argc`/`argv` to a C `main(int, char**)`. This is the
+/// "borrowed buffer at a known window offset" of DESIGN §3e / D44, realized as a *fixed* offset (not
+/// an extra entry parameter) so the powerbox entry signature stays the language-neutral handle
+/// vector — the C-specific `argv[]` marshalling lives entirely in the on-ramp's `_start`.
+///
+/// Layout at `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)`:
+/// `{ argc: u32-LE, envc: u32-LE }` then `argc` + `envc` NUL-terminated UTF-8 strings, packed
+/// (the argv strings first, then the envp strings). A guest that never reads it (e.g. `main(void)`)
+/// is unaffected. The region sits below the frontend's globals base, so it never overlaps a data
+/// segment; a host must reject a blob that would reach `POWERBOX_ARGS_END`.
+pub const POWERBOX_ARGS_BASE: u64 = 128;
+/// The end of the powerbox args-buffer region (exclusive) — the frontend's globals/data-stack base
+/// for a powerbox program (`svm-llvm`'s `STACK_PAGE`). The args blob must fit in
+/// `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)` so it never collides with a data segment.
+pub const POWERBOX_ARGS_END: u64 = 16384;
+
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {

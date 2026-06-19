@@ -1983,10 +1983,12 @@ the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
   libraries — SHA-256, xxHash, stb_perlin, tiny-regex-c, jsmn, heapgrow, miniz/tinfl, clay — run
   **byte-identical to a native `clang` build**, on **both** the interpreter and the JIT (the §18
   differential). Every translation test is interp == JIT == native/hand-computed.
-- **Pending (general-C breadth, beyond the corpus; tracked in `LLVM.md`).** Varargs
-  `printf`/`fprintf` (a guest-side format engine), `realloc`, wider/other SIMD (`<4 x float>`,
-  `<2 x double>`), transcendental libm (a guest `libm`), `argc`/`argv`, `bswap`/`bitreverse`,
-  overlapping `memmove`, and the deferred-hard items (C++ EH, `setjmp`/`longjmp`).
+- **Pending (general-C breadth, beyond the corpus; tracked in `LLVM.md`).** Wider/other SIMD
+  (`<2 x double>`, `<8 x i16>`), `llvm.bitreverse`, transcendental libm (a guest `libm`),
+  `envp`/`getenv`, and the deferred-hard items (C++ EH, `setjmp`/`longjmp`, byte-exact float
+  `printf` — needs a bignum formatter). *(Done since: varargs `printf`/`fprintf` with `%s`/flags/
+  precision, `realloc`, overlapping `memmove`, `bswap`, and `argc`/`argv` — the §3e args buffer at
+  the fixed offset `POWERBOX_ARGS_BASE`, D44.)*
 
 ---
 
