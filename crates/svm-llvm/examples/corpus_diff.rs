@@ -23,7 +23,7 @@ const KERNELS: &[(&str, i64, &str)] = &[
         2_000_000,
         r#"
 static unsigned char buf[256];
-long run(long n){ NOVEC for(int i=0;i<256;i++) buf[i]=(unsigned char)(i*31+7);
+long run(long n){ for(int i=0;i<256;i++) buf[i]=(unsigned char)(i*31+7);
   unsigned h=2166136261u; for(long k=0;k<n;k++) h=(h^buf[k&255])*16777619u; return (long)h; }"#,
     ),
     (
@@ -31,7 +31,7 @@ long run(long n){ NOVEC for(int i=0;i<256;i++) buf[i]=(unsigned char)(i*31+7);
         1_000_000,
         r#"
 static unsigned tab[256];
-long run(long n){ NOVEC for(unsigned i=0;i<256;i++){unsigned c=i;for(int j=0;j<8;j++)c=(c&1)?(0xEDB88320u^(c>>1)):(c>>1);tab[i]=c;}
+long run(long n){ for(unsigned i=0;i<256;i++){unsigned c=i;for(int j=0;j<8;j++)c=(c&1)?(0xEDB88320u^(c>>1)):(c>>1);tab[i]=c;}
   unsigned crc=0xffffffffu; for(long k=0;k<n;k++) crc=tab[(crc^(unsigned)(k&0xff))&0xff]^(crc>>8); return (long)(crc^0xffffffffu); }"#,
     ),
     (
