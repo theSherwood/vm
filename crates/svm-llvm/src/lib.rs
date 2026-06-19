@@ -5949,6 +5949,194 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
     }
 }
 
+/// `__svm_big_shr1(a) -> i64` — shift the big integer at `a` right by 1 bit, returning the bit shifted
+/// out (its old bit 0). Low limb first (so each limb reads its not-yet-shifted higher neighbor).
+#[allow(dead_code)]
+fn synth_big_shr1() -> Func {
+    use BinOp::{Add, And, Or, Shl, ShrU};
+    use CmpOp::GeS;
+    let i64t = ValType::I64;
+    let mask32: i64 = 0xFFFF_FFFF;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const RET: u32 = 3;
+    // 0: entry(a) — out = a[0] & 1 → LOOP(a, 0, out)
+    let b0 = {
+        let mut b = Bdr::new(1);
+        let v0 = b.load32u(0);
+        let out = b.bini(And, v0, 1);
+        let z = b.k(0);
+        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, z, out] })
+    };
+    // 1: LOOP(a, i, out)
+    let b1 = {
+        let mut b = Bdr::new(3);
+        let done = b.cmpi(GeS, 1, BIG_NLIMBS);
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: RET,
+                then_args: vec![2],
+                else_blk: BODY,
+                else_args: vec![0, 1, 2],
+            },
+        )
+    };
+    // 2: BODY(a, i, out) — a[i] = (a[i]>>1) | (a[i+1]<<31)
+    let b2 = {
+        let mut b = Bdr::new(3); // a=0, i=1, out=2
+        let off = b.bini(Shl, 1, 2);
+        let addr = b.bin(Add, 0, off);
+        let cur = b.load32u(addr);
+        // next limb (0 if i+1 == N)
+        let ip1 = b.bini(Add, 1, 1);
+        let last = b.cmpi(GeS, ip1, BIG_NLIMBS);
+        let zero = b.k(0);
+        let noff = b.bini(Shl, ip1, 2);
+        let naddr = b.bin(Add, 0, noff);
+        let nraw = b.load32u(naddr);
+        let nxt = b.sel(last, zero, nraw);
+        let rsh = b.bini(ShrU, cur, 1);
+        let lsh = b.bini(Shl, nxt, 31);
+        let orr = b.bin(Or, rsh, lsh);
+        let mask = b.k(mask32);
+        let new = b.bin(And, orr, mask);
+        b.store32(addr, new);
+        let ni = b.bini(Add, 1, 1);
+        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, ni, 2] })
+    };
+    let b3 = {
+        let mut b = Bdr::new(1);
+        b.block(vec![i64t], Terminator::Return(vec![0]))
+    };
+    Func {
+        params: vec![i64t],
+        results: vec![i64t],
+        blocks: vec![b0, b1, b2, b3],
+    }
+}
+
+/// `__svm_big_divmod10(a) -> i64` — divide the big integer at `a` by 10 in place, returning the
+/// remainder (`0..9`). High limb first.
+#[allow(dead_code)]
+fn synth_big_divmod10() -> Func {
+    use BinOp::{Add, DivU, Or, RemU, Shl, Sub};
+    use CmpOp::LtS;
+    let i64t = ValType::I64;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const RET: u32 = 3;
+    // 0: entry(a) → LOOP(a, N-1, rem=0)
+    let b0 = {
+        let mut b = Bdr::new(1);
+        let top = b.k(BIG_NLIMBS - 1);
+        let z = b.k(0);
+        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, top, z] })
+    };
+    // 1: LOOP(a, i, rem)
+    let b1 = {
+        let mut b = Bdr::new(3);
+        let done = b.cmpi(LtS, 1, 0);
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: RET,
+                then_args: vec![2],
+                else_blk: BODY,
+                else_args: vec![0, 1, 2],
+            },
+        )
+    };
+    // 2: BODY(a, i, rem) — cur = (rem<<32)|a[i]; a[i]=cur/10; rem=cur%10
+    let b2 = {
+        let mut b = Bdr::new(3); // a=0, i=1, rem=2
+        let off = b.bini(Shl, 1, 2);
+        let addr = b.bin(Add, 0, off);
+        let v = b.load32u(addr);
+        let hi = b.bini(Shl, 2, 32);
+        let cur = b.bin(Or, hi, v);
+        let q = b.bini(DivU, cur, 10);
+        let r = b.bini(RemU, cur, 10);
+        b.store32(addr, q);
+        let ni = b.bini(Sub, 1, 1);
+        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, ni, r] })
+    };
+    let b3 = {
+        let mut b = Bdr::new(1);
+        b.block(vec![i64t], Terminator::Return(vec![0]))
+    };
+    Func {
+        params: vec![i64t],
+        results: vec![i64t],
+        blocks: vec![b0, b1, b2, b3],
+    }
+}
+
+/// `__svm_big_inc(a)` — add 1 to the big integer at `a` in place (carry-propagating).
+#[allow(dead_code)]
+fn synth_big_inc() -> Func {
+    use BinOp::{Add, And, ShrU};
+    use CmpOp::{Eq, GeS};
+    let i64t = ValType::I64;
+    let mask32: i64 = 0xFFFF_FFFF;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const RET: u32 = 3;
+    // 0: entry(a) → LOOP(a, 0, carry=1)
+    let b0 = {
+        let mut b = Bdr::new(1);
+        let one = b.k(1);
+        let z = b.k(0);
+        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, z, one] })
+    };
+    // 1: LOOP(a, i, carry) — stop at end or when carry is 0
+    let b1 = {
+        let mut b = Bdr::new(3);
+        let end = b.cmpi(GeS, 1, BIG_NLIMBS);
+        let noc = b.cmpi(Eq, 2, 0);
+        let ende = b.ext(end);
+        let noce = b.ext(noc);
+        let stop = b.bin(BinOp::Or, ende, noce);
+        let stopb = b.cmpi(CmpOp::Ne, stop, 0);
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: stopb,
+                then_blk: RET,
+                then_args: vec![],
+                else_blk: BODY,
+                else_args: vec![0, 1, 2],
+            },
+        )
+    };
+    // 2: BODY(a, i, carry) — t = a[i]+carry; a[i]=t&mask; carry'=t>>32
+    let b2 = {
+        let mut b = Bdr::new(3);
+        let off = b.bini(BinOp::Shl, 1, 2);
+        let addr = b.bin(Add, 0, off);
+        let v = b.load32u(addr);
+        let t = b.bin(Add, v, 2);
+        let mask = b.k(mask32);
+        let new = b.bin(And, t, mask);
+        b.store32(addr, new);
+        let c32 = b.k(32);
+        let nc = b.bin(ShrU, t, c32);
+        let ni = b.bini(Add, 1, 1);
+        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, ni, nc] })
+    };
+    let b3 = {
+        let b = Bdr::new(0);
+        b.block(vec![], Terminator::Return(vec![]))
+    };
+    Func {
+        params: vec![i64t],
+        results: vec![],
+        blocks: vec![b0, b1, b2, b3],
+    }
+}
+
 // Scratch byte offsets shared by the bignum formatters (`%e`/`%g`/big `%f`): the `dtoa_digits` region
 // [0,496) (three 40-limb big integers + the nsig/E scalars), then the digit buffer, the assembled
 // content, the padded output field, and the formatter's scalar locals.
@@ -12735,6 +12923,42 @@ mod bigint_tests {
         let got = limbs(&w, a, 3);
         let exp = [prod as u32, (prod >> 32) as u32, (prod >> 64) as u32];
         assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn big_shr1_works() {
+        let a = 256usize;
+        let (r, w) = run(synth_big_shr1(), &[a as i64], &[(a, &[0b1011])]);
+        assert_eq!(ret_i64(&r), 1); // out bit = old bit 0
+        assert_eq!(limbs(&w, a, 1), vec![0b101]);
+        // borrow across a limb boundary: bit 0 of limb1 falls into limb0's top
+        let (r, w) = run(synth_big_shr1(), &[a as i64], &[(a, &[0, 1])]);
+        assert_eq!(ret_i64(&r), 0);
+        assert_eq!(limbs(&w, a, 2), vec![0x8000_0000, 0]);
+    }
+
+    #[test]
+    fn big_divmod10_works() {
+        let a = 256usize;
+        let (r, w) = run(synth_big_divmod10(), &[a as i64], &[(a, &[123])]);
+        assert_eq!(ret_i64(&r), 3);
+        assert_eq!(limbs(&w, a, 1), vec![12]);
+        // multi-limb: (3*2^32 + 7) / 10
+        let val: u128 = 3 * (1u128 << 32) + 7;
+        let (r, w) = run(synth_big_divmod10(), &[a as i64], &[(a, &[7, 3])]);
+        assert_eq!(ret_i64(&r) as u128, val % 10);
+        let q = val / 10;
+        assert_eq!(limbs(&w, a, 2), vec![q as u32, (q >> 32) as u32]);
+    }
+
+    #[test]
+    fn big_inc_works() {
+        let a = 256usize;
+        let (_, w) = run(synth_big_inc(), &[a as i64], &[(a, &[41])]);
+        assert_eq!(limbs(&w, a, 1), vec![42]);
+        // carry across two limbs: (2^64 - 1) + 1 = 2^64
+        let (_, w) = run(synth_big_inc(), &[a as i64], &[(a, &[0xFFFF_FFFF, 0xFFFF_FFFF])]);
+        assert_eq!(limbs(&w, a, 3), vec![0, 0, 1]);
     }
 
     #[test]
