@@ -69,6 +69,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "durable_loop"
+path = "fuzz_targets/durable_loop.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "durable_loop_jit"
+path = "fuzz_targets/durable_loop_jit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "durable_jit"
 path = "fuzz_targets/durable_jit.rs"
 test = false

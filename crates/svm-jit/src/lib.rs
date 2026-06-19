@@ -55,7 +55,7 @@
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
 //! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
@@ -70,6 +70,7 @@ use cranelift_codegen::LabelValueLoc;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
+use std::sync::Arc;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
@@ -992,6 +993,67 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
     cm.run(args, Some(init_mem), Some(SNAP_CAP), None)
 }
 
+/// An async **freeze controller** (DURABILITY.md Phase-4 Slice A, 4A.3): a caller-owned handle a
+/// *controller thread* uses to request a stop-the-world freeze of an in-flight durable JIT run. The
+/// run publishes its live window base here once the window is mapped ([`CompiledModule::run`]);
+/// [`Self::request_freeze`] then stores `UNWINDING` into the window's state word, which the guest's
+/// loop-header back-edge poll (4A.1) observes at its next iteration and begins unwinding — closing
+/// the R6 latency caveat for a poll-free compute loop with no deterministic countdown.
+///
+/// This is the real async trigger (vs. the deterministic `arm_freeze_after_backedges` test oracle,
+/// which the interpreter keeps because its window is private/synchronous). The interpreter has no
+/// equivalent — only the JIT's window is a shared mmap a second thread can reach.
+///
+/// # Lifetime contract
+/// [`Self::request_freeze`] may be called **at most once**, concurrently with an in-flight run whose
+/// loop does not terminate on its own before the request lands — so the window the published base
+/// points at is provably still mapped when the store happens (the store is what ends the run). After
+/// the run returns, the base is retired to a sentinel and `request_freeze` becomes a no-op. A request
+/// that races a run which finishes first is therefore a safe no-op, not a use-after-free.
+pub struct FreezeController {
+    /// `0` = window not live yet (spin); `usize::MAX` = run ended (no-op); else the live window base.
+    base: AtomicUsize,
+}
+
+impl FreezeController {
+    /// A fresh controller, shareable with a run and a controller thread.
+    pub fn new() -> Arc<Self> {
+        Arc::new(FreezeController {
+            base: AtomicUsize::new(0),
+        })
+    }
+
+    /// Request a freeze: spin until the run publishes its window base, then store `UNWINDING` into the
+    /// state word. A no-op if the run already ended (the base was retired). At most one call.
+    pub fn request_freeze(&self) {
+        loop {
+            match self.base.load(Ordering::Acquire) {
+                0 => std::hint::spin_loop(), // window not mapped yet
+                usize::MAX => return,        // run ended before the request landed
+                base => {
+                    // STATE_OFF = 0, STATE_UNWINDING = 1 (must match `svm-interp`/`svm-durable`). An
+                    // aligned atomic i32 store the guest's back-edge poll loads (defined under §12
+                    // races); release-ordered after the run's acquire-published base.
+                    // SAFETY: per the lifetime contract the window at `base` is mapped here (the run
+                    // is blocked in its non-terminating loop until this store lands).
+                    unsafe { (*(base as *const AtomicI32)).store(1, Ordering::Release) };
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Run-side: publish the live window base (the run is now blocked in the guest).
+    fn publish(&self, base: usize) {
+        self.base.store(base, Ordering::Release);
+    }
+
+    /// Run-side: retire the base once the guest returns, so a late `request_freeze` is a no-op.
+    fn retire(&self) {
+        self.base.store(usize::MAX, Ordering::Release);
+    }
+}
+
 /// [`compile_and_run_capture_reserved_with_host_prots`] for a **durable** run (DURABILITY.md §12.8):
 /// arms the per-fiber shadow-SP swap so a freeze that lands while a fiber runs spills into that
 /// fiber's own shadow region (D-fiber-cont option A), drives the freeze (flattening parked fibers),
@@ -1032,6 +1094,51 @@ pub fn compile_and_run_capture_reserved_with_host_durable(
     cm.restore_prots = init_prots.to_vec();
     cm.frozen_seed = seed.to_vec();
     cm.durable = true;
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
+}
+
+/// [`compile_and_run_capture_reserved_with_host_durable`] wired for an **async freeze** (Phase-4
+/// Slice A, 4A.3): publishes the live window base into `freeze` so a controller thread can
+/// [`FreezeController::request_freeze`] mid-run — the real bounded-latency stop-the-world trigger for
+/// a poll-free compute loop (vs. the deterministic `arm_freeze_after_backedges` test oracle). The
+/// guest observes the controller's `UNWINDING` write at its next loop-header back-edge poll and
+/// unwinds, exactly as a freeze-from-start or armed freeze does — so the artifact round-trips
+/// identically; only the *trigger* differs.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable`]; additionally `freeze`'s lifetime
+/// contract (call `request_freeze` at most once, concurrently with this run) must hold.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_interruptible(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    freeze: Arc<FreezeController>,
+) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.durable = true;
+    cm.freeze_ctl = Some(freeze);
     let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
     Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
 }
@@ -1457,6 +1564,10 @@ pub struct CompiledModule {
     /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
     /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
     thaw_root_sp: u64,
+    /// Async freeze controller (Phase-4 Slice A, 4A.3): if set, the run publishes its live window base
+    /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
+    /// can write `UNWINDING` into the running window. `None` for every non-interruptible run.
+    freeze_ctl: Option<Arc<FreezeController>>,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -2282,6 +2393,7 @@ impl CompiledModule {
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
             thaw_root_sp: DURABLE_SHADOW_BASE, // empty extent (context 0's region base)
+            freeze_ctl: None,
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -2675,6 +2787,12 @@ impl CompiledModule {
         // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
         // worker thread carries from a prior run before guest code can `vcpu.tls.get` it.
         vcpu_tls::seed(0);
+        // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
+        // guarded call (the guest is about to block in its loop), and retire it right after — so a
+        // `request_freeze` can only ever store into the window while it is mapped (freed below).
+        if let Some(fc) = &(*this).freeze_ctl {
+            fc.publish(mem_base as usize);
+        }
         let faulted = if seed_faulted {
             // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
             false
@@ -2689,6 +2807,9 @@ impl CompiledModule {
                 trap_cell.as_ptr(),
             )
         };
+        if let Some(fc) = &(*this).freeze_ctl {
+            fc.retire();
+        }
 
         // §5 W3 — the **root vCPU's** trap-time backtrace capture (this run thread's thread-local): a
         // memory fault's SIGSEGV/SIGBUS-handler walk (Stage 1) or an explicit trap's helper walk

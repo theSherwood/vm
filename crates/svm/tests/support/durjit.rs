@@ -26,7 +26,9 @@
 pub mod durgen;
 
 use core::ffi::c_void;
-use durgen::{gen_module, gen_recycle_fiber_module, Gen, RecycleModule, SIZE_LOG2, WINDOW};
+use durgen::{
+    gen_loop_module, gen_module, gen_recycle_fiber_module, Gen, RecycleModule, SIZE_LOG2, WINDOW,
+};
 use svm_durable::{
     arm_freeze_after, init_durable_window, read_state, transform_module, write_state,
     DURABLE_RESERVE, SHADOW_SP_OFF, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
@@ -143,13 +145,25 @@ fn assert_returned_eq(inst: &Module, want: &[Value], got: JitOutcome, phase: &st
     }
 }
 
-/// Check the cross-backend property on one generated in-scope module.
+/// Check the cross-backend property on one generated in-scope **call-chain** module.
 pub fn fuzz_one_xbackend(g: &mut Gen) {
     let m = gen_module(g);
-    let inst = transform_module(&m).expect("an in-scope module must transform");
-    svm_verify::verify_module(&inst).expect("instrumented IR must verify");
-
     let clock_v = g.u64v() as i64;
+    check_xbackend(&m, clock_v);
+}
+
+/// Check the cross-backend property on one generated **poll-free-loop** module (Phase-4 Slice A):
+/// the loop-header back-edge poll must freeze byte-identically on both backends and thaw across the
+/// backend boundary, like any other resume point.
+pub fn fuzz_loop_one_xbackend(g: &mut Gen) {
+    let m = gen_loop_module(g);
+    let clock_v = g.u64v() as i64;
+    check_xbackend(&m, clock_v);
+}
+
+fn check_xbackend(m: &Module, clock_v: i64) {
+    let inst = transform_module(m).expect("an in-scope module must transform");
+    svm_verify::verify_module(&inst).expect("instrumented IR must verify");
 
     // Interpreter reference: the uninterrupted result and the frozen artifact. `clock_after`
     // is how far the clock advanced during freeze — the thaw host continues from there

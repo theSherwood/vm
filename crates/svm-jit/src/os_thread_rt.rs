@@ -26,7 +26,7 @@
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime, SharedFiberTable};
 use crate::{mem, FnEntry, TrapKind};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // loom swaps the synchronization primitives for its model-checked versions; `Arc` and `JoinHandle`
@@ -174,6 +174,17 @@ pub(crate) struct Domain {
     /// addresses)`; last-wins (matching the last-wins trap cell — any trapping frame's chain is a
     /// valid kill backtrace). `None` until a spawned vCPU traps. Host-side observability (§2a).
     trap_capture: Mutex<Option<(usize, Vec<usize>)>>,
+    /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4): the quiesce barrier for a multi-worker
+    /// async freeze. `quiesce` holds the count of vCPUs still to reach a quiescent (unwound) state;
+    /// the coordinator waits on `quiesce_cv` until it hits 0, then runs the existing single-worker
+    /// freeze-drive. The *same* `quiesce` lock guards the active shadow-SP scratch during each worker's
+    /// unwind, so that single shared word has one owner at a time (the R10 seam). Engaged only when
+    /// `concurrent_durable` is set — by the 4A.5 concurrent multi-vCPU entry alone. On every existing
+    /// path (single-worker freeze defer, thaw, ordinary runs) the lock is never taken and the flag is
+    /// false, so behavior is byte-identical. See [`Domain::quiesce_arrive`] / [`Domain::quiesce_wait_all`].
+    quiesce: Mutex<usize>,
+    quiesce_cv: Condvar,
+    concurrent_durable: AtomicBool,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -231,6 +242,9 @@ impl Domain {
             futex_cv: Condvar::new(),
             max_vcpus: max_vcpus.clamp(1, MAX_VCPUS),
             trap_capture: Mutex::new(None),
+            quiesce: Mutex::new(0),
+            quiesce_cv: Condvar::new(),
+            concurrent_durable: AtomicBool::new(false),
         }
     }
 
@@ -283,6 +297,55 @@ impl Domain {
 
     fn env(&self) -> Env {
         lock(&self.env).expect("Domain::set_env before any thread op")
+    }
+
+    /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4). Arm the quiesce barrier for `runners`
+    /// concurrently-unwinding vCPUs and engage the concurrent path. Called once by the 4A.5 concurrent
+    /// entry before the workers can observe a freeze; never on a single-worker path (where `quiesce`
+    /// stays 0 and the lock is untouched, so the run is byte-identical).
+    #[cfg_attr(not(loom), allow(dead_code))] // wired live by 4A.5
+    pub(crate) fn arm_quiesce(&self, runners: usize) {
+        *lock(&self.quiesce) = runners;
+        self.concurrent_durable.store(true, Ordering::Release);
+    }
+
+    /// True on a concurrent multi-worker durable run (4A.5). A worker observing a freeze takes the
+    /// quiesce path ([`Self::quiesce_arrive`]) only when this holds; otherwise it unwinds directly on
+    /// the (uncontended) active-SP word exactly as today.
+    #[allow(dead_code)] // wired live by 4A.5
+    pub(crate) fn is_concurrent_durable(&self) -> bool {
+        self.concurrent_durable.load(Ordering::Acquire)
+    }
+
+    /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4) — a worker reaches the quiesce barrier. Runs
+    /// `unwind` while holding the `quiesce` lock, so the single shared active shadow-SP scratch has
+    /// exactly one owner for the whole set-SP → unwind → read-SP → record sequence (O-A4.1/.2/.3 — no
+    /// torn SP write, each context unwinds against its own region). Then decrements the runner count
+    /// and, when the last worker arrives, wakes the coordinator. The notify can't be lost: both the
+    /// decrement-to-zero and the coordinator's wait hold `quiesce`, so the coordinator either sees
+    /// `runners == 0` before parking or is woken after (O-A4.4 — the same invariant as the futex).
+    #[cfg_attr(not(loom), allow(dead_code))]
+    pub(crate) fn quiesce_arrive(&self, unwind: impl FnOnce()) {
+        let mut runners = lock(&self.quiesce);
+        unwind(); // single-owner critical section: the active-SP scratch
+        *runners -= 1;
+        if *runners == 0 {
+            self.quiesce_cv.notify_all();
+        }
+    }
+
+    /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4) — the coordinator waits until every worker
+    /// has quiesced (unwound to base), then it alone runs the existing single-worker freeze-drive.
+    /// Never hangs (O-A4.4): the wait re-checks `runners` under `quiesce`.
+    #[cfg_attr(not(loom), allow(dead_code))]
+    pub(crate) fn quiesce_wait_all(&self) {
+        let mut runners = lock(&self.quiesce);
+        while *runners > 0 {
+            runners = self
+                .quiesce_cv
+                .wait(runners)
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     /// Drain the durable freeze residue collected by inline children (slice 3.3) — called by
@@ -1187,6 +1250,65 @@ mod loom_tests {
             );
             producer.join().unwrap();
             assert!(status == WAIT_WOKEN || status == WAIT_NOT_EQUAL);
+        });
+    }
+
+    /// O-A4 (Phase-4 Slice A, 4A.4): the multi-worker quiesce barrier — the R10 seam. `N` workers each
+    /// unwind under the `quiesce` lock (the single shared active shadow-SP scratch must have one owner
+    /// at a time) and arrive at the barrier; the coordinator waits for all of them. Under every
+    /// interleaving:
+    ///   * O-A4.1 — no two workers are inside the SP critical section at once (the `occupied` flag is
+    ///     never observed already set);
+    ///   * O-A4.2/.3 — each worker reads back exactly the extent it wrote (no torn/lost SP update; it
+    ///     never picks up a sibling's region);
+    ///   * O-A4.4 — the coordinator never hangs (the last-arriver notify can't be lost — same property
+    ///     as `loom_wait_notify_never_hangs`, here for the barrier).
+    /// The single-vCPU async-request ordering (O-A3) is the degenerate `N = 1` case.
+    #[test]
+    fn loom_quiesce_barrier_never_hangs_and_sp_swap_is_exclusive() {
+        loom::model(|| {
+            const N: usize = 2;
+            let dom = Arc::new(Domain::new(MAX_VCPUS));
+            dom.arm_quiesce(N);
+            // The single shared active shadow-SP scratch + an "occupied" flag to catch any overlap of
+            // two unwind critical sections.
+            let sp = Arc::new(AtomicU64::new(0));
+            let occupied = Arc::new(AtomicU64::new(0));
+
+            let workers: Vec<_> = (0..N)
+                .map(|i| {
+                    let (d, sp, occ) = (Arc::clone(&dom), Arc::clone(&sp), Arc::clone(&occupied));
+                    loom::thread::spawn(move || {
+                        let my_extent = (i as u64) + 1; // a distinct per-context extent
+                        d.quiesce_arrive(|| {
+                            // O-A4.1: exactly one worker in the SP critical section at a time.
+                            assert_eq!(
+                                occ.swap(1, Ordering::AcqRel),
+                                0,
+                                "active-SP scratch double-owned"
+                            );
+                            sp.store(my_extent, Ordering::Release); // set own SP + "unwind"
+                            let read = sp.load(Ordering::Acquire); // read the extent back to record
+                            assert_eq!(
+                                read, my_extent,
+                                "SP write torn/lost (read a sibling's extent)"
+                            );
+                            occ.store(0, Ordering::Release);
+                        });
+                    })
+                })
+                .collect();
+
+            // The coordinator waits for every worker to quiesce — must not hang under any interleaving.
+            dom.quiesce_wait_all();
+            for w in workers {
+                w.join().unwrap();
+            }
+            assert_eq!(
+                occupied.load(Ordering::Acquire),
+                0,
+                "scratch released after all quiesced"
+            );
         });
     }
 }

@@ -3964,6 +3964,11 @@ pub const STATE_ARMED: i32 = 3;
 /// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
 /// `svm_durable::ARM_COUNTDOWN_OFF`.
 pub const ARM_COUNTDOWN_OFF: u64 = 16;
+/// Window byte offset of the `i64` **back-edge arm countdown** (loop back-edges left before an
+/// `ARMED` run promotes to `UNWINDING`, so a loop-header poll begins the freeze). Decremented at each
+/// branch terminator; inert unless `ARMED` and the slot is positive. Must equal
+/// `svm_durable::ARM_BACKEDGE_OFF`.
+pub const ARM_BACKEDGE_OFF: u64 = 24;
 /// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
 /// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
 /// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
@@ -6224,6 +6229,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         }
 
         step(fuel)?;
+        // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
+        // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
+        // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
+        // compute loop that the fiber-safepoint countdown cannot. Inert unless armed; gated on
+        // `durable` so an ordinary run is untouched (byte-identical).
+        if durable
+            && matches!(
+                &block.term,
+                Terminator::Br { .. } | Terminator::BrIf { .. } | Terminator::BrTable { .. }
+            )
+        {
+            if let Some(m) = mem.as_mut() {
+                m.durable_tick_arm_backedge();
+            }
+        }
         match &block.term {
             Terminator::Br { target, args } => {
                 collect_into(&mut edge_buf, &frames[top].vals, args)?;
@@ -10775,16 +10795,35 @@ impl Mem {
     /// no-op unless armed (the common case: one `i32` read per safepoint, no write), so an unarmed run
     /// is byte-identical. Call once per fiber safepoint — see the `run_inner` dispatch.
     fn durable_tick_arm(&mut self) {
+        self.durable_tick_countdown(ARM_COUNTDOWN_OFF);
+    }
+
+    /// Back-edge variant (Phase-4 Slice A): on an `ARMED` run, count down [`ARM_BACKEDGE_OFF`] at
+    /// each branch terminator and promote to `UNWINDING` at 0, so the next loop-header poll begins
+    /// the freeze — reaching a poll-free compute loop. Inert unless armed for back-edges (the slot
+    /// is positive), so a fiber-armed or ordinary run is byte-identical. Call at branch terminators.
+    fn durable_tick_arm_backedge(&mut self) {
+        self.durable_tick_countdown(ARM_BACKEDGE_OFF);
+    }
+
+    /// Decrement the countdown at `off` on an `ARMED` run and promote to `UNWINDING` at 0. Guarded
+    /// on the slot being **positive**, so the two countdowns (fiber-safepoint / back-edge) never
+    /// interfere: arming one leaves the other at 0, where this is a no-op. An unarmed run is one
+    /// `i32` state read, no write.
+    fn durable_tick_countdown(&mut self, off: u64) {
         if self.durable_state() != STATE_ARMED {
             return;
         }
-        let n = self
-            .read_bytes_impl(ARM_COUNTDOWN_OFF, 8)
+        let cur = self
+            .read_bytes_impl(off, 8)
             .and_then(|b| b.try_into().ok())
             .map(i64::from_le_bytes)
-            .unwrap_or(0)
-            - 1;
-        let _ = self.write_bytes_impl(ARM_COUNTDOWN_OFF, &n.to_le_bytes());
+            .unwrap_or(0);
+        if cur <= 0 {
+            return; // not armed for this countdown
+        }
+        let n = cur - 1;
+        let _ = self.write_bytes_impl(off, &n.to_le_bytes());
         if n <= 0 {
             self.durable_set_state(STATE_UNWINDING);
         }

@@ -17,6 +17,16 @@ fn freeze_thaw_cross_backend_over_generated_modules() {
     }
 }
 
+#[test]
+fn loop_freeze_thaw_cross_backend_over_generated_modules() {
+    // Phase-4 Slice A: the loop-header back-edge poll is ordinary IR, so the JIT must freeze a
+    // poll-free-loop module byte-identically to the interpreter and thaw across the backend boundary.
+    for seed in 0..64u64 {
+        let mut g = durjit::durgen::Gen::from_seed(seed);
+        durjit::fuzz_loop_one_xbackend(&mut g);
+    }
+}
+
 // Not on Windows: this fuzz compiles the JIT twice per seed (freeze + thaw), and running alongside
 // `freeze_thaw_cross_backend_over_generated_modules` in the same test binary pushes the process's
 // cumulative JIT allocations far enough from the statically-linked runtime thunks that a PC-relative
