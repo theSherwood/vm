@@ -882,3 +882,256 @@ fn outline_rename_threads_operand_stack_through_helpers() {
         optimize_module(&outlined).funcs.len()
     );
 }
+
+// ===========================================================================================
+// Differential fuzzer: throw many *random guest programs* at the specializer and assert the
+// partial-evaluation correctness property — the reference interpreter running the interpreter, the
+// reference interpreter running the residual, and the JIT running the residual all agree:
+//
+//     interp(interpreter, in) == interp(residual, in) == jit(residual, in)
+//
+// This is the literal "throw more programs at it": it catches miscompiles the curated corpus misses,
+// and the distribution of Budget / Unsupported / non-terminating outcomes maps the specializer's
+// bail surface. Deterministic (fixed seed) so it doubles as a regression guard.
+//
+//   cargo test -p svm-peval --test bench fuzz -- --nocapture
+// ===========================================================================================
+
+/// SplitMix64 — a tiny deterministic PRNG (the workspace is dependency-free, so no `rand`).
+struct Rng(u64);
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+    /// A small immediate in `[-9, 10]` — keeps results readable; magnitude doesn't change behavior.
+    fn imm(&mut self) -> i64 {
+        self.below(20) as i64 - 9
+    }
+}
+
+/// A random register-machine program (SETACC / SETI_INPUT / ADD_I / DEC_I / JNZ, then HALT). JNZ
+/// targets any instruction, so programs may loop — including statically (→ the specializer's Budget
+/// bail) or input-dependently (→ a compiled residual loop). Termination is handled by the oracle.
+fn gen_reg_program(rng: &mut Rng) -> Vec<(u8, i64)> {
+    let body = 1 + rng.below(8) as usize;
+    let total = body + 1; // + HALT
+    let mut prog = Vec::with_capacity(total);
+    for _ in 0..body {
+        prog.push(match rng.below(5) {
+            0 => (SETACC, rng.imm()),
+            1 => (SETI_INPUT, 0),
+            2 => (ADD_I, 0),
+            3 => (DEC_I, 0),
+            _ => (JNZ, 9 * rng.below(total as u64) as i64), // jump to a valid instruction boundary
+        });
+    }
+    prog.push((HALT, 0));
+    prog
+}
+
+/// A random, stack-valid program for the helper-calling stack machine (PUSH / PUSHIN / COMBINE, then
+/// HALT). Generation tracks depth so COMBINE always has two operands and the stack never overflows
+/// the renamed region; the program always terminates (no loops) and fully unrolls.
+fn gen_stack_calls_program(rng: &mut Rng) -> Vec<(u8, i64)> {
+    let steps = 2 + rng.below(10) as usize;
+    let mut prog = Vec::new();
+    let mut depth = 0u32;
+    for _ in 0..steps {
+        let can_combine = depth >= 2;
+        let push_only = !(2..50).contains(&depth); // <2 has no operands; ≥50 keeps the 64-cell region
+        match if push_only {
+            rng.below(2)
+        } else {
+            rng.below(3)
+        } {
+            0 => {
+                prog.push((H_PUSH, rng.imm()));
+                depth += 1;
+            }
+            1 => {
+                prog.push((H_PUSHIN, 0));
+                depth += 1;
+            }
+            _ if can_combine => {
+                prog.push((H_COMBINE, 0));
+                depth -= 1;
+            }
+            _ => unreachable!(),
+        }
+    }
+    if depth == 0 {
+        prog.push((H_PUSHIN, 0));
+    }
+    prog.push((H_HALT, 0));
+    prog
+}
+
+/// Run `entry`(`input`) on the reference interpreter under a fuel cap. `None` ⇒ it did not finish
+/// (a non-terminating program / fuel exhausted) — the only `Err` our trap-free op sets can produce.
+fn interp_try(m: &Module, input: i64, fuel: u64) -> Option<i64> {
+    let mut f = fuel;
+    match svm_interp::run(m, 0, &[Value::I64(input)], &mut f) {
+        Ok(v) => match v.as_slice() {
+            [Value::I64(x)] => Some(*x),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+#[derive(Default)]
+struct Tally {
+    programs: usize,
+    succeeded: usize,      // specialized and the oracle held on ≥1 terminating input
+    budget: usize,         // SpecError::Budget (unbounded specialization)
+    unsupported: usize,    // SpecError::Unsupported
+    nonterminating: usize, // specialized, but no chosen input terminated (nothing to check)
+    oracle_checks: usize,  // total interp==interp==jit comparisons that passed
+}
+
+/// Specialize `interp` against each generated program and assert the PE oracle. `specialize` is the
+/// per-shape entry (plain, or rename+outline). Returns the outcome tally.
+fn fuzz_shape(
+    label: &str,
+    n: usize,
+    seed: u64,
+    mut gen: impl FnMut(&mut Rng) -> Vec<(u8, i64)>,
+    build: impl Fn(&[(u8, i64)]) -> Module,
+    specialize: impl Fn(&Module) -> Result<Module, svm_peval::SpecError>,
+) -> Tally {
+    const FUEL: u64 = 200_000;
+    let inputs = [0i64, 1, 2, 5, 11]; // non-negative + small ⇒ most legitimate loops terminate fast
+    let mut rng = Rng(seed);
+    let mut t = Tally::default();
+    for _ in 0..n {
+        t.programs += 1;
+        let prog = gen(&mut rng);
+        let interp = build(&prog);
+        verify_module(&interp).expect("generated interpreter must verify");
+
+        let residual = match specialize(&interp) {
+            Ok(r) => r,
+            Err(svm_peval::SpecError::Budget) => {
+                t.budget += 1;
+                continue;
+            }
+            Err(svm_peval::SpecError::Unsupported) => {
+                t.unsupported += 1;
+                continue;
+            }
+            Err(e) => panic!("{label}: unexpected specialize error {e:?} on {prog:?}"),
+        };
+        // A residual that fails verification is always a bug, regardless of semantics.
+        verify_module(&residual)
+            .unwrap_or_else(|e| panic!("{label}: residual failed to verify ({e:?}) on {prog:?}"));
+
+        let mut terminated = false;
+        let mut jit_checked = false;
+        for &input in &inputs {
+            let Some(want) = interp_try(&interp, input, FUEL) else {
+                continue; // interpreter didn't finish on this input; nothing to compare
+            };
+            // The residual must reproduce the interpreter exactly. A divergence here (different value,
+            // or the residual fails to terminate where the interpreter did) is a real miscompile.
+            let got = interp_try(&residual, input, FUEL);
+            assert_eq!(
+                got,
+                Some(want),
+                "{label}: interp(residual) diverged from interp(interpreter) at input {input} on {prog:?}"
+            );
+            t.oracle_checks += 1;
+            terminated = true;
+            // The residual is proven terminating (above), so the JIT can't hang. Check it once.
+            if !jit_checked {
+                assert_eq!(
+                    jit_run(&residual, input),
+                    want,
+                    "{label}: jit(residual) diverged at input {input} on {prog:?}"
+                );
+                t.oracle_checks += 1;
+                jit_checked = true;
+            }
+        }
+        if terminated {
+            t.succeeded += 1;
+        } else {
+            t.nonterminating += 1;
+        }
+    }
+    println!(
+        "{label:<26} {:>5} programs | {:>4} ok, {:>3} budget, {:>3} unsupported, {:>3} nonterm | {:>5} oracle checks",
+        t.programs, t.succeeded, t.budget, t.unsupported, t.nonterminating, t.oracle_checks
+    );
+    t
+}
+
+fn run_fuzz(n: usize) {
+    let region = Some((STACK_LO, STACK_HI));
+    println!("\n=== differential fuzz: interp(interp) == interp(residual) == jit(residual) ===");
+
+    // (1) Register machine, no rename: branches and loops exercise dispatch folding and the Budget
+    // bail on statically unbounded loops.
+    let reg = fuzz_shape(
+        "regmachine (plain)",
+        n,
+        0xC0FFEE,
+        gen_reg_program,
+        build_interpreter,
+        |m| specialize(m, 0, &[SpecArg::Dynamic]),
+    );
+
+    // (2) Helper-calling stack machine, rename + outline: fuzzes the PR-#82 path (region cells
+    // threaded across outlined calls).
+    let stk = fuzz_shape(
+        "stackmachine+helpers (#82)",
+        n,
+        0x1234_5678,
+        gen_stack_calls_program,
+        build_stack_interpreter_calls,
+        move |m| {
+            specialize_with_config(
+                m,
+                0,
+                &[SpecArg::Dynamic],
+                &SpecConfig {
+                    rename: region,
+                    outline_calls: true,
+                    ..SpecConfig::default()
+                },
+            )
+        },
+    );
+
+    // The real value is the assertions inside `fuzz_shape`; here we just guard that the fuzzer
+    // actually exercised the engine (didn't generate only non-terminating or only-bailing programs).
+    assert!(
+        reg.succeeded > 0 && reg.oracle_checks > 0,
+        "register fuzz did no useful work"
+    );
+    assert!(
+        stk.succeeded > 0 && stk.oracle_checks > 0,
+        "stack fuzz did no useful work"
+    );
+}
+
+/// A fast, deterministic smoke that runs by default — a cheap regression guard on the PE oracle.
+#[test]
+fn fuzz_specialization_smoke() {
+    run_fuzz(16);
+}
+
+/// The thorough run (hundreds of programs per shape; JIT-compiles each residual, so it's slow). Run
+/// it to map the bail surface: `cargo test -p svm-peval --test bench fuzz_specialization_thorough --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "thorough fuzz — run with --ignored --nocapture"]
+fn fuzz_specialization_thorough() {
+    run_fuzz(400);
+}
