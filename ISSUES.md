@@ -85,8 +85,6 @@ path — distinct from the now-removed root-runtime delta and from the resolved 
 
 ---
 
----
-
 ### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — **FIX LANDED** on `claude/dap-function-names` (pending `windows-latest` CI confirmation)
 
 **Fix (landed, the refined-fix design below):** the trap-time capture state + frame-pointer walk +
@@ -165,8 +163,6 @@ handle" thread-local that the capture sites can cheaply read is the work.
 **Fix sketch:** maintain a per-thread "current fiber handle" cell (set on each `cont.resume`/suspend
 switch in `fiber_rt`), read it at capture time into the trap-frame thread-local alongside `pc`/`rets`,
 and surface it (e.g. `JitFrameLoc`-adjacent or a `last_trap_fiber()` accessor) for the kill message.
-
----
 
 ---
 

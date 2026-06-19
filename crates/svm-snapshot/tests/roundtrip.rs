@@ -683,3 +683,148 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     );
     assert_eq!(thawed, Ok(vec![Value::I64(107)]));
 }
+
+// Slice 3.4 (v4): a **nested** vCPU tree (root → child → grandchild) through the §12 codec — proves a
+// non-zero `parent_task` round-trips (a grandchild's parent is its child, not the root) and the
+// per-parent join table rebuilds on thaw.
+const SRC_NESTED: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 65536
+  i32.store v1 v0
+  v2 = i64.const 0
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v2 v3
+  v5 = i32.const 0
+  v6 = cap.call 2 0 (i32) -> (i64) v0 (v5)
+  v7 = thread.join v4
+  v8 = i64.add v6 v7
+  return v8
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65536
+  v3 = i32.load v2
+  v4 = i64.const 0
+  v5 = i64.const 0
+  v6 = thread.spawn 2 v4 v5
+  v7 = i32.const 0
+  v8 = cap.call 2 0 (i32) -> (i64) v3 (v7)
+  v9 = thread.join v6
+  v10 = i64.add v8 v9
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65536
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  return v5
+}
+"#;
+
+#[test]
+fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
+    let mut m = svm_text::parse_module(SRC_NESTED).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = svm_durable::transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Baseline: clock 42 → reads {42,43,44} sum to 129 (order-invariant).
+    let baseline = {
+        let mut host = Host::new();
+        host.set_durable(true);
+        host.clock_ns = 42;
+        let clk = host.grant_clock();
+        let mut fuel = 100_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut host,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(
+        baseline,
+        vec![Value::I64(129)],
+        "uninterrupted: 42 + 43 + 44"
+    );
+
+    // Freeze run.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    fhost.clock_ns = 42;
+    let clk = fhost.grant_clock();
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(frozen.is_ok(), "freeze placeholder: {frozen:?}");
+    assert_eq!(
+        fhost.frozen_vcpus().len(),
+        2,
+        "child + grandchild flattened"
+    );
+
+    let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
+
+    // Restore into a fresh host with an advanced clock.
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.clock_ns = 1000;
+    let window = restore(&artifact, &inst, &mut thost).expect("restore");
+    // The grandchild's non-zero `parent_task` survived the v4 codec (parent = the child, task 1).
+    let mut seeded = thost.frozen_vcpus().to_vec();
+    seeded.sort_by_key(|f| f.task);
+    assert_eq!(seeded.len(), 2, "both vCPUs re-seeded");
+    assert_eq!(
+        (seeded[1].task, seeded[1].parent_task),
+        (2, 1),
+        "grandchild restores with parent_task = child (not root)"
+    );
+
+    // §12.6 canonical: re-serialize is byte-identical (parent_task included).
+    assert_eq!(
+        freeze(&inst, &window, &thost).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored nested tree is byte-identical"
+    );
+
+    // Thaw: the grandchild's handle resolves in the child's rebuilt table; all reads reload → 129.
+    let mut win = window;
+    write_state(&mut win, STATE_REWINDING);
+    let clk = {
+        let caps = thost.capture_durable_handles().expect("durable");
+        ((caps[0].generation << 8) | caps[0].slot) as i32
+    };
+    let mut fuel = 100_000u64;
+    let (thawed, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        thawed,
+        Ok(baseline),
+        "thawed nested tree equals the uninterrupted run (reload, not re-issue)"
+    );
+}

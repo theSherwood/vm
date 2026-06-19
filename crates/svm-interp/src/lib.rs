@@ -1750,18 +1750,24 @@ fn drive(
         // child owning fibers (per-child freeze_drive) are follow-ups.
         {
             let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
+            // Ascending task = ascending spawn order across the whole tree, and a parent's id is always
+            // < its children's (it was spawned first), so this order re-attaches **parents before
+            // children** — essential for nested spawns (slice 3.4): a grandchild's handle is rebuilt
+            // into its *parent child's* table, which must already exist.
             vseed.sort_by_key(|f| f.task);
-            // Context recycling makes the live children's contexts (and task ids / join slots)
-            // **non-dense** — a child that finished before the freeze left gaps. So rebuild each piece
-            // explicitly rather than assuming "top `n`, densely":
+            // Per-piece rebuild (none of "top `n`, densely" holds with recycling / nesting):
             //   • context — *derived* from the restored shadow-SP (`(sp − SHADOW_BASE) / STRIDE`), since
             //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
             //     post-thaw spawn lands in a genuinely-free context.
-            //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze records the
-            //     same task and the artifact stays byte-identical.
-            //   • join handle — the slot is `task − 1` (flat root-spawned), so `threads[]` is rebuilt
-            //     *sparsely* (a finished child's slot stays `None`), keeping the guest's held handle valid.
+            //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze is byte-identical.
+            //   • join handle — appended into the **parent's** `threads` in ascending-task (= spawn)
+            //     order, so the guest's reloaded handle resolves in the table of whoever spawned it
+            //     (the root for a direct child, a re-spawned child for a grandchild).
             let mut vcpu_mask: u16 = 0;
+            // Re-spawned children held by task id so a grandchild can attach to its (already re-spawned)
+            // parent; the root is mutated directly. `BTreeMap` keeps the enqueue order ascending-task.
+            let mut children: std::collections::BTreeMap<TaskId, Box<VCpu>> =
+                std::collections::BTreeMap::new();
             for ff in vseed {
                 let cid = ff.task as TaskId;
                 s.next_task = s.next_task.max(cid + 1);
@@ -1790,18 +1796,25 @@ fn drive(
                 child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
                 child.root_shadow_sp = ff.shadow_sp;
                 child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
+                child.parent_task = ff.parent_task as TaskId;
                 child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
-                // Rebuild the root's join handle → child mapping at the child's own slot (= task − 1),
-                // padding finished/joined slots with `None` so the guest's held handle still resolves.
-                let slot = ff.task - 1;
-                while root.threads.len() < slot {
-                    root.threads.push(None);
+                // Append the handle into the spawning vCPU's join table (root, or a re-spawned child).
+                let parent = ff.parent_task as TaskId;
+                if parent == id {
+                    root.threads.push(Some(cid));
+                } else if let Some(p) = children.get_mut(&parent) {
+                    p.threads.push(Some(cid));
                 }
-                root.threads.push(Some(cid));
-                s.runnable.push_back(child);
+                // (A parent not in the set can't happen on a dense freeze — every live ancestor unwinds
+                // too; a missing handle would surface as a clean `ThreadFault`, not a mis-attach.)
+                children.insert(cid, child);
             }
             // Seed the registry's vCPU-context occupancy from the re-spawned children (recycling).
             root.registry.seed_vcpu_mask(vcpu_mask);
+            // Enqueue every re-spawned child, parents first (ascending task via the `BTreeMap`).
+            for (_, child) in children {
+                s.runnable.push_back(child);
+            }
         }
         s.runnable.push_back(root);
         id
@@ -3306,56 +3319,55 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             let froze = v.durable
                 && result.is_ok()
                 && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
-            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING`
-            // has drained the root's native stack into the root's shadow region; now flatten the
-            // still-parked fibers into theirs, while the registry is alive, before the window is
-            // snapshotted. A drive trap (out-of-scope module) surfaces as the run's result.
+            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
+            // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
+            // parked into theirs, while the registry is alive, before the window is snapshotted. **Every**
+            // vCPU drives its own (slice 3.4: a spawned child that owns fibers must flatten them too — the
+            // root's drive runs before the children exist, so it can't see a child's fiber). `freeze_drive`
+            // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
+            // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
+            // drive trap (out-of-scope module) surfaces as the run's result.
             let result = if froze {
-                // A **spawned** vCPU (slice 3.2.1) that unwound under a freeze records *itself* as
-                // residue: its continuation now lives in its own region, extent = the live shadow-SP.
-                // (No `freeze_drive` — flattening idle fibers is the root's job, and multi-vCPU + fibers
-                // is out of scope for 3.2.1, guarded at `thread.spawn`.) The root instead flattens its
-                // fibers; children already pushed their residue by the time the root's `drive` returns.
-                let r = if let Some((func, args)) = v.spawn_residue.clone() {
-                    let shadow_sp = v
-                        .mem
-                        .as_ref()
-                        .map(|m| m.durable_get_sp())
-                        .unwrap_or(SHADOW_BASE);
+                // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
+                // repoints the active-SP word to flatten idle fibers and restores it to this extent.
+                let self_sp = v
+                    .mem
+                    .as_ref()
+                    .map(|m| m.durable_get_sp())
+                    .unwrap_or(SHADOW_BASE);
+                if let Some((func, args)) = v.spawn_residue.clone() {
+                    // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
+                    // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .frozen_vcpus
                         .push(FrozenVCpu {
                             task: v.id as usize,
+                            parent_task: v.parent_task as usize,
                             func: func as i32,
                             args,
-                            shadow_sp,
+                            shadow_sp: self_sp,
                         });
-                    result
                 } else {
-                    // The root: record its own flattened extent (the shared active-SP word will be
-                    // overwritten by a later child, so the root's residue can't ride the window) before
-                    // `freeze_drive` repoints the word to flatten idle fibers.
-                    let root_sp = v
-                        .mem
-                        .as_ref()
-                        .map(|m| m.durable_get_sp())
-                        .unwrap_or(SHADOW_BASE);
+                    // The root: record its extent (the shared active-SP word will be overwritten by a
+                    // later child, so the root's residue can't ride the window).
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .frozen_root_sp = Some(root_sp);
-                    v.freeze_drive().and(result)
-                };
-                // Hand the flattened fibers back to the embedder via the shared host, so a snapshot
-                // can record them (and a thaw re-seed them).
+                        .frozen_root_sp = Some(self_sp);
+                }
+                let r = v.freeze_drive().and(result);
+                // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
+                // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
+                // makes the accumulation order irrelevant to the artifact.
                 if !v.frozen.is_empty() {
                     let frozen = std::mem::take(&mut v.frozen);
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .frozen_fibers = frozen;
+                        .frozen_fibers
+                        .extend(frozen);
                 }
                 r
             } else {
@@ -4055,10 +4067,14 @@ pub struct FrozenFiber {
 /// in the runtime, so `svm-durable` is unchanged).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrozenVCpu {
-    /// The child's task id at freeze = its shadow **context index** (`shadow_region_base(task)`), and
-    /// its position in the deterministic spawn order. Thaw re-spawns densely in this order, so the
-    /// re-attached child lands on the same task id → the same region → its restored bytes line up.
+    /// The child's task id at freeze — globally unique + monotonic in spawn order across the whole vCPU
+    /// tree. Preserved on thaw so the §12.6 canonical re-freeze records the same task.
     pub task: usize,
+    /// The task id of the vCPU that **spawned** this child (slice 3.4: nested spawns). The root's direct
+    /// children carry the root's id (`0`); a grandchild carries its parent child's task. Thaw groups the
+    /// residue by this, re-attaches parents before children, and rebuilds each parent's join table so a
+    /// grandchild's reloaded handle resolves in its *parent's* table, not the root's.
+    pub parent_task: usize,
     /// The child's entry function (the `thread.spawn` target), re-entered on thaw.
     pub func: i32,
     /// The child's spawn args (`[sp, arg]`, the fiber-style thread entry), replayed on re-spawn.
@@ -4507,6 +4523,10 @@ struct VCpu {
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
     id: TaskId,
+    /// The id of the vCPU that spawned this one (slice 3.4: nested spawns) — `0` for the root and every
+    /// non-durable vCPU. Stamped at `thread.spawn` and on a thaw re-attach so a freeze records each
+    /// child's parent in its [`FrozenVCpu`], letting thaw rebuild the per-parent join-table topology.
+    parent_task: TaskId,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
     /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
@@ -4592,6 +4612,7 @@ impl VCpu {
             fault_yields: false,
             depth,
             id,
+            parent_task: 0,
             tls: id as i64, // §12 seed the per-vCPU TLS register to the dense vCPU id (root = 0)
             pending: None,
             sched,
@@ -4653,7 +4674,8 @@ impl VCpu {
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
-            id: 0,  // unused: driven inline, never via the executor
+            id: 0, // unused: driven inline, never via the executor
+            parent_task: 0,
             tls: 0, // §12 per-vCPU TLS seed (id 0)
             pending: None,
             sched,
@@ -4932,7 +4954,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         pending,
         sched,
         funcs: _,
-        id: _,
+        id,
+        parent_task: _, // a spawned child stamps *its own* id as the grandchild's parent below
         tls,
         memop,
         acc,
@@ -5901,6 +5924,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                               // **Share** the fiber registry (D57 3b-i): one handle namespace per domain, so
                                               // the child can resume fibers the parent (or a sibling) created and suspended.
                     let creg = Arc::clone(registry);
+                    let parent_id = *id; // the spawning vCPU's task — the child's `parent_task`
                     let csched = sched.clone();
                     // A debugged run shares one breakpoint/watchpoint set across all threads
                     // (DEBUGGING.md Milestone B): the child gets its own per-vCPU `DebugCtx` (fresh
@@ -5929,6 +5953,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.root_shadow_sp = shadow_region_base(child_ctx);
                         child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
+                        child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
                         child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         Box::new(child)
