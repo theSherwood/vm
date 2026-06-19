@@ -10,8 +10,13 @@ const CN=4096, RN=1<<20;
 const carr=new Int32Array(CN), rarr=new Int32Array(RN);
 function chase(n){ for(let i=0;i<CN;i++) carr[i]=(i+1789)&(CN-1); let idx=0,hops=0; while(n){idx=carr[idx]>>>0;hops+=idx;n-=1;} return hops; }
 function chase_rand(n){ for(let i=0;i<RN;i++) rarr[i]=(Math.imul(i,1103515245)+12345)&(RN-1); let idx=0,hops=0; while(n){idx=rarr[idx]>>>0;hops+=idx;n-=1;} return hops; }
+const FBUF=4096; const fbuf=new Uint8Array(FBUF);
+function fnv(n){ for(let i=0;i<FBUF;i++) fbuf[i]=(i*7+1)&0xff; let h=2166136261>>>0; for(let k=0;k<n;k++){ h=Math.imul(h^fbuf[k&(FBUF-1)],16777619)>>>0; } return h|0; }
+function fma(n){ let acc=1.0; for(let k=0;k<n;k++) acc=acc*0.9999999+1.0; return acc|0; }
+const VBUF=262144; const vbuf=new Int32Array(VBUF);
+function vsum(n){ for(let i=0;i<VBUF;i++) vbuf[i]=i+1; let s=0; for(let k=0;k<n;k++) s=(s+vbuf[k])|0; return s; }
 function minRun(k,n){for(let w=0;w<50;w++)k(n);let best=1e18;for(let r=0;r<25;r++){let a=now();k(n);let b=now();if(b-a<best)best=b-a;}return best;}
-for(const [name,k] of [["alu",alu],["call",call],["call_indirect",call_indirect],["mem",mem],["chase",chase],["chase_rand",chase_rand]]){
+for(const [name,k] of [["alu",alu],["call",call],["call_indirect",call_indirect],["mem",mem],["chase",chase],["chase_rand",chase_rand],["fnv",fnv],["fma",fma],["vsum",vsum]]){
   const s=minRun(k,1000),l=minRun(k,201000);
   console.log(`js(v8),${name},${((l-s)/200000).toFixed(4)}`);
 }

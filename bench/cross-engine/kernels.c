@@ -55,3 +55,40 @@ int64_t chase_rand(int32_t n){
   while(n){ idx=(uint32_t)rarr[idx]; hops+=idx; n-=1; DNO(idx); DNO(n); }
   return hops;
 }
+
+// --- realistic composite + float/SIMD kernels -------------------------------------------------
+// FNV-1a-32 over a 4 KiB byte buffer, hashing n bytes (wrapping). The hash chain is serial (h feeds
+// the next iteration) so it can't be vectorized or closed-form-folded — a realistic byte-processing
+// inner loop (byte-load + xor + mul + branch). Buffer rebuilt inside (cancels in the subtraction).
+#define FBUF 4096u
+static uint8_t fbuf[FBUF];
+EXPORT("fnv")
+int32_t fnv(int32_t n){
+  for(uint32_t i=0;i<FBUF;i++) fbuf[i]=(uint8_t)((i*7u+1u)&0xffu);
+  uint32_t h=2166136261u;                                  // FNV offset basis
+  for(int32_t k=0;k<n;k++){ h=(h ^ fbuf[(uint32_t)k&(FBUF-1u)])*16777619u; DNO(h); }
+  return (int32_t)h;
+}
+
+// Scalar f64 FMA recurrence: acc = acc*C + D. A serial floating-point dependency (latency-bound);
+// clang neither closed-form-folds FP recurrences nor vectorizes a serial chain, so no barrier needed.
+EXPORT("fma")
+int32_t fmar(int32_t n){
+  double acc=1.0;
+  for(int32_t k=0;k<n;k++) acc=acc*0.9999999+1.0;
+  return (int32_t)acc;
+}
+
+// Contiguous i32 reduction — a *vectorizable* sum (integer add is associative). `DNO(p)` makes the
+// base pointer opaque (no closed-form) while the loads stay contiguous, so clang -O2 emits SIMD
+// (and wasm SIMD with -msimd128); a scalar backend (Cranelift / the interpreters) stays scalar.
+#define VBUF 262144u
+static int32_t vbuf[VBUF];
+EXPORT("vsum")
+int32_t vsum(int32_t n){
+  for(uint32_t i=0;i<VBUF;i++) vbuf[i]=(int32_t)(i+1u);
+  int32_t *p=vbuf; DNO(p);
+  int32_t s=0;
+  for(int32_t k=0;k<n;k++) s+=p[k];
+  return s;
+}

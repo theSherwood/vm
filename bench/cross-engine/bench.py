@@ -30,6 +30,22 @@ def chase_rand(n):
     idx=0; hops=0
     while n: idx=rarr[idx]; hops+=idx; n-=1
     return hops
+FBUF=4096
+def fnv(n):
+    fbuf=bytearray((i*7+1)&0xff for i in range(FBUF))
+    h=2166136261
+    for k in range(n): h=((h ^ fbuf[k&(FBUF-1)])*16777619)&0xffffffff
+    return h
+def fma(n):
+    acc=1.0
+    for _ in range(n): acc=acc*0.9999999+1.0
+    return int(acc)
+VBUF=262144
+def vsum(n):
+    vbuf=[i+1 for i in range(VBUF)]
+    s=0
+    for k in range(n): s+=vbuf[k]
+    return s
 def min_run(k,n):
     k(n)
     best=float('inf')
@@ -37,6 +53,6 @@ def min_run(k,n):
         a=now(); k(n); b=now()
         if b-a<best: best=b-a
     return best
-for name,k in [("alu",alu),("call",call),("call_indirect",call_indirect),("mem",mem),("chase",chase),("chase_rand",chase_rand)]:
+for name,k in [("alu",alu),("call",call),("call_indirect",call_indirect),("mem",mem),("chase",chase),("chase_rand",chase_rand),("fnv",fnv),("fma",fma),("vsum",vsum)]:
     s=min_run(k,1000); l=min_run(k,201000)
     print(f"python,{name},{(l-s)/200000.0:.4f}")

@@ -23,8 +23,8 @@ echo "engine,kernel,ns_per_iter"
 clang -O2 -c kernels.c -o kernels.o
 clang -O2 native_bench.c kernels.o -o native_bench
 ./native_bench
-clang --target=wasm32 -O2 -nostdlib -Wl,--no-entry -Wl,--export-all -o k32.wasm kernels.c
-clang --target=wasm64 -O2 -nostdlib -Wl,--no-entry -Wl,--export-all -o k64.wasm kernels.c
+clang --target=wasm32 -O2 -msimd128 -nostdlib -Wl,--no-entry -Wl,--export-all -o k32.wasm kernels.c
+clang --target=wasm64 -O2 -msimd128 -nostdlib -Wl,--no-entry -Wl,--export-all -o k64.wasm kernels.c
 node wasmrun.mjs k32.wasm k64.wasm
 node js.mjs
 

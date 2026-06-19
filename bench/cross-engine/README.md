@@ -39,6 +39,21 @@ Each loops `n` times in **int32** arithmetic (matching the SVM kernels' i32 ops)
 The chase chains are rebuilt **inside** the timed function — a fixed `O(size)` prelude that cancels in the
 large/small-`n` subtraction — so no reliance on language-specific init / wasm start functions.
 
+Three more kernels go beyond the synthetic micros:
+
+- `fnv` — **FNV-1a-32** over a 4 KiB byte buffer, hashing `n` bytes (wrapping). A realistic
+  byte-processing inner loop (byte-load + xor + mul + branch) whose hash chain is **serial** (so it
+  can't be vectorized or folded). A fairer "composite" workload than the single-op micros.
+- `fma` — a scalar **f64 FMA recurrence** `acc = acc*C + D`. Covers the floating-point path (everything
+  else is integer); the serial FP dependency is latency-bound and not vectorizable. Returns `trunc(acc)`
+  so every engine still returns an `i32`.
+- `vsum` — a contiguous **i32 reduction** `sum += arr[k]` over a 1 MiB array. A *vectorizable* loop:
+  auto-vectorizing backends (native AVX, wasm SIMD via `-msimd128`) collapse it to vector adds, while a
+  scalar backend (the SVM JIT's Cranelift, and the interpreters) stays scalar — exposing the
+  vectorization gap. Valid only for `n ≤ 262144` (the array isn't wrapped, so the loads stay a clean
+  affine sweep the vectorizer can analyze); the in-process drivers use `n = 201000`, and the Wasmtime
+  CLI driver omits `vsum` (its ~7 ms process overhead can't resolve a sub-0.1 ns/iter kernel anyway).
+
 ## Methodology
 
 - **Per-iteration isolation:** `(time(n=201000) − time(n=1000)) / 200000`, cancelling fixed per-run
