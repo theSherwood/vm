@@ -1239,6 +1239,185 @@ fn printf_signed_formats() {
 }
 
 #[test]
+fn tail_call_mutual_recursion() {
+    // `musttail` tail calls lower to the `return_call` terminator, so an unbounded tail/mutual
+    // recursion runs in **constant native-stack space**. `even`/`odd` tail-call each other 2,000,000
+    // deep — without tail-call lowering the JIT would recurse that far and blow the native stack;
+    // with `return_call` the frame is replaced, not nested. `noinline` stops clang from collapsing
+    // the pair, `musttail` forces a real tail call (not a rewritten loop). Both functions have no
+    // allocas (`frame_size == 0`), so the linear-memory data stack is constant too. vs native (which
+    // also TCOs `musttail`), byte-identical.
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    check_powerbox_vs_native("tail_mutual", src, b"");
+}
+
+// Narrow (i8/i16) atomics — emulated via the 32-bit CAS-loop helpers. rmw add (with wrap-around),
+// or/and/xor, exchange, load, store, and cmpxchg (success + failure) on a byte and a halfword.
+const ATOMICS_NARROW_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_uchar c = 0;\n\
+        atomic_fetch_add(&c, 200); atomic_fetch_add(&c, 100);\n\
+        atomic_fetch_or(&c, 0x80); atomic_fetch_and(&c, 0xF0); atomic_fetch_xor(&c, 0x0F);\n\
+        unsigned char oc = atomic_exchange(&c, 50);\n\
+        unsigned char lc = atomic_load(&c);\n\
+        atomic_store(&c, 99);\n\
+        unsigned char e1 = 99; int ok1 = atomic_compare_exchange_strong(&c, &e1, 123);\n\
+        unsigned char e2 = 7;  int ok2 = atomic_compare_exchange_strong(&c, &e2, 0);\n\
+        atomic_ushort s = 1000; atomic_fetch_add(&s, 70000);\n\
+        printf(\"%d %d %d %d %d %d\\n\", oc, lc, ok1, ok2, atomic_load(&c), atomic_load(&s));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_narrow() {
+    check_powerbox_vs_native("atomics_narrow", ATOMICS_NARROW_SRC, b"");
+}
+
+#[test]
+fn atomics_narrow_lowers_and_runs() {
+    // Local validation (no native cc). c: 0→200→44(wrap)→172→160→175; oc=175, store 99, cas(99→123)
+    // ok, cas(7) fail, c=123. s: 1000+70000 ≡ 5464 (mod 2^16).
+    let Some(bc) = compile_to_bc("atomics_n", ATOMICS_NARROW_SRC) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // The narrow CAS-loop helpers were synthesized (each contains an AtomicCmpxchg).
+    let cas_loops = t
+        .module
+        .funcs
+        .iter()
+        .filter(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, svm_ir::Inst::AtomicCmpxchg { .. }))
+            })
+        })
+        .count();
+    assert!(
+        cas_loops >= 2,
+        "expected the rmw + cas narrow helpers, got {cas_loops}"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"175 50 1 0 123 5464\n");
+}
+
+// C11 `<stdatomic.h>` exercising every native atomic instruction the on-ramp now lowers: rmw
+// add/sub/and/or/xor and exchange, load, store, and compare-exchange (success + failure) on `i32`
+// and `i64`. Single-threaded, so seq-cst is trivially observable.
+const ATOMICS_WIDE_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_int a = 0;\n\
+        atomic_fetch_add(&a, 5); atomic_fetch_sub(&a, 2);\n\
+        atomic_fetch_or(&a, 8); atomic_fetch_and(&a, 0xFF); atomic_fetch_xor(&a, 1);\n\
+        int old = atomic_exchange(&a, 100);\n\
+        int loaded = atomic_load(&a);\n\
+        atomic_store(&a, 42);\n\
+        int e1 = 42; int ok1 = atomic_compare_exchange_strong(&a, &e1, 99);\n\
+        int e2 = 7;  int ok2 = atomic_compare_exchange_strong(&a, &e2, 0);\n\
+        atomic_long b = 1000000000000L; atomic_fetch_add(&b, 1);\n\
+        printf(\"%d %d %d %d %d %ld\\n\", old, loaded, ok1, ok2, atomic_load(&a), atomic_load(&b));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_wide() {
+    check_powerbox_vs_native("atomics_wide", ATOMICS_WIDE_SRC, b"");
+}
+
+#[test]
+fn atomics_wide_lowers_and_runs() {
+    // Local validation (no native cc): the native atomics lower, verify, and run to the
+    // hand-computed result. a: 0→5→3→11→11→10; old=10, store 42, cas(42→99) ok, cas(7) fail, a=99;
+    // b: 1e12 + 1.
+    let Some(bc) = compile_to_bc("atomics_w", ATOMICS_WIDE_SRC) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let has_atomic = t.module.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                svm_ir::Inst::AtomicRmw { .. }
+                    | svm_ir::Inst::AtomicCmpxchg { .. }
+                    | svm_ir::Inst::AtomicLoad { .. }
+                    | svm_ir::Inst::AtomicStore { .. }
+            )
+        })
+    });
+    assert!(
+        has_atomic,
+        "expected native atomic ops in the lowered module"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"10 100 1 0 99 1000000000001\n");
+}
+
+#[test]
+fn tail_call_lowers_and_runs() {
+    // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
+    // `return_call` terminators, verifies, and runs to completion at 2,000,000 depth — which only
+    // works because the frame is replaced, not nested (a plain-`call` lowering would recurse 2M deep
+    // and overflow the native stack). `even(2e6)=1`, `odd(1999999)=even(1999998)=1` ⇒ "1 1\n".
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    let Some(bc) = compile_to_bc("tail_lower", src) else {
+        return; // clang unavailable
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let n_tail = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .filter(|b| {
+            matches!(
+                b.term,
+                svm_ir::Terminator::ReturnCall { .. }
+                    | svm_ir::Terminator::ReturnCallIndirect { .. }
+            )
+        })
+        .count();
+    assert!(
+        n_tail >= 2,
+        "expected ≥2 return_call terminators (even/odd tail calls), got {n_tail}"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR"); // checks return_call shape
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run"); // 2M-deep, constant stack
+    assert_eq!(run.stdout, b"1 1\n", "mutual tail recursion result");
+}
+
+#[test]
 fn printf_float_scientific() {
     // `%e`/`%E` via the bignum Dragon4 formatter (`__svm_dtoa_sci`) — exact, correctly-rounded across
     // the whole double range (no magnitude cap). Covers default/explicit precision, the exponent sign
