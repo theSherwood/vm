@@ -2886,6 +2886,134 @@ fn outlining_shares_a_callee_across_call_sites() {
 }
 
 #[test]
+fn outlining_threads_a_renamed_cell_across_a_call() {
+    // main(x) = { [R] = x; helper(); [R] + [R2] }, with helper() = { t = [R]; [R2] = t*3; [R] = t+10 }.
+    // Two renamed cells live across the call: R flows IN (x) and back OUT (x+10), and R2 is CREATED by
+    // the callee and read back by the caller (x*3). Outlining must thread both as call arguments /
+    // results so the region never touches real memory — the whole point of combining outlining with a
+    // rename region. Result: (x+10) + (x*3).
+    let region = (STACK_LO, STACK_LO + 16);
+    let r2 = (STACK_LO + 8) as i64;
+    let st = |addr, value| Inst::Store {
+        op: StoreOp::I64,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |addr| Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::ConstI64(STACK_LO as i64), // 1: R
+                        st(1, 0),                        // [R] = x
+                        Inst::Call {
+                            func: 1,
+                            args: vec![],
+                        }, // helper()
+                        Inst::ConstI64(STACK_LO as i64), // 2: R
+                        ld(2),                           // 3: a = [R]   (x + 10)
+                        Inst::ConstI64(r2),              // 4: R2
+                        ld(4),                           // 5: b = [R2]  (x * 3)
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 3,
+                            b: 5,
+                        }, // 6: a + b
+                    ],
+                    term: Terminator::Return(vec![6]),
+                }],
+            },
+            Func {
+                params: vec![],
+                results: vec![],
+                blocks: vec![Block {
+                    params: vec![],
+                    insts: vec![
+                        Inst::ConstI64(STACK_LO as i64), // 0: R
+                        ld(0),                           // 1: t = [R]
+                        Inst::ConstI64(r2),              // 2: R2
+                        Inst::ConstI64(3),               // 3
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Mul,
+                            a: 1,
+                            b: 3,
+                        }, // 4: t*3
+                        st(2, 4),                        // [R2] = t*3
+                        Inst::ConstI64(10),              // 5
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 1,
+                            b: 5,
+                        }, // 6: t+10
+                        st(0, 6),                        // [R] = t+10
+                    ],
+                    term: Terminator::Return(vec![]),
+                }],
+            },
+        ],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize_with_config(
+        &m,
+        0,
+        &[SpecArg::Dynamic],
+        &SpecConfig {
+            outline_calls: true,
+            rename: Some(region),
+            ..SpecConfig::default()
+        },
+    )
+    .expect("outlines with a rename region");
+    verify_module(&residual).expect("residual verifies");
+    // The region never hits real memory: every cell access became an SSA value, even across the call.
+    assert_no_memory_ops(&residual);
+    // Entry + one shared residual helper, and the call survives (not inlined).
+    assert_eq!(residual.funcs.len(), 2, "entry + outlined helper");
+    assert!(residual.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Call { .. }))));
+    // Threaded signature: helper gains the one incoming cell (R) as a parameter and returns the two
+    // live-out cells (R, R2) as results — the cells crossed the boundary as data, not memory.
+    assert_eq!(
+        residual.funcs[1].params.len(),
+        1,
+        "incoming cell R threaded in"
+    );
+    assert_eq!(
+        residual.funcs[1].results.len(),
+        2,
+        "live-out cells R and R2 threaded back"
+    );
+
+    for x in [0i64, 1, -3, 7, 1000, i64::MIN] {
+        let expect = x.wrapping_add(10).wrapping_add(x.wrapping_mul(3));
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
 fn outlining_specializes_dynamic_depth_recursion() {
     // sum(n) = if n == 0 { 0 } else { n + sum(n - 1) }, with n DYNAMIC. The recursion depth is a
     // runtime value, so inlining would diverge (unbounded contexts → Budget); outlining produces a
