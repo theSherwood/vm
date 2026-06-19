@@ -1208,24 +1208,39 @@ pub fn compile_and_run_capture_reserved_with_host(
     reserved_log2: u8,
     host: &mut Host,
 ) -> Option<Capture> {
-    // Durable freeze/thaw is established here only for **single-fiber** vCPUs: a freeze of a
-    // multi-fiber run needs the per-fiber shadow-SP swap + the freeze driver that flattens idle fibers
-    // (DURABILITY.md §12.8), which this engine doesn't drive — so refuse a module using `cont.*` /
-    // `thread.*` (the caller falls back to the tree-walker), lest it write a silently-wrong artifact.
-    let fiberish = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+    // Multi-vCPU durability (`thread.*`) is out of scope: a durable thread spawn needs the
+    // multi-worker freeze the engine doesn't drive, so always refuse it (the caller falls back to the
+    // tree-walker), lest it write a silently-wrong artifact.
+    let threadish = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. }))
+    });
+    if threadish {
+        return None;
+    }
+    // `cont.*` durability needs the per-fiber shadow-SP swap (commit 1, now wired) plus, for a
+    // freeze/thaw, the freeze driver that flattens idle fibers + thaw seeding (DURABILITY.md §12.8).
+    // The shadow-SP swap is live, so a **NORMAL** multi-fiber run (no transform-driven unwind/rewind in
+    // flight) routes correctly and is safe to drive here; refuse `cont.*` only when the window is mid
+    // freeze/thaw (state ≠ NORMAL), where the freeze driver — a later commit — is required.
+    let contish = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
         b.insts.iter().any(|i| {
             matches!(
                 i,
-                Inst::ContNew { .. }
-                    | Inst::ContResume { .. }
-                    | Inst::Suspend { .. }
-                    | Inst::ThreadSpawn { .. }
-                    | Inst::ThreadJoin { .. }
+                Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
             )
         })
     });
-    if fiberish {
-        return None;
+    if contish {
+        let off = super::STATE_OFF as usize;
+        let state = init_mem
+            .get(off..off + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(super::STATE_NORMAL);
+        if state != super::STATE_NORMAL {
+            return None;
+        }
     }
     let c = compile_module(&m.funcs)?;
     if func as usize >= c.progs.len() {
@@ -1509,6 +1524,11 @@ struct VTask {
     /// here, not in the task set. (Coroutine modules are single-vCPU, no fibers/threads — see
     /// `compile_module` — so this and `chain` are never both non-empty.)
     coroutines: Vec<Option<Coro>>,
+    /// DURABILITY.md §12.8 (D-fiber-cont option A): the root computation's (context 0's) saved durable
+    /// shadow-stack pointer, swapped with the in-window active word ([`super::SHADOW_SP_OFF`]) on each
+    /// fiber switch so a freeze poll spills into the *running* context's region. Only meaningful on a
+    /// durable run; `super::SHADOW_BASE` (context 0's region base) otherwise.
+    root_shadow_sp: u64,
 }
 
 impl VTask {
@@ -1518,8 +1538,41 @@ impl VTask {
             active_id: ROOT_FIBER,
             chain: Vec::new(),
             coroutines: Vec::new(),
+            root_shadow_sp: super::SHADOW_BASE,
         })
     }
+}
+
+/// Re-point the durable active shadow-SP word from the outgoing context's region to the incoming
+/// one's, on a fiber switch (DURABILITY.md §12.8, D-fiber-cont option A) — the bytecode-engine mirror
+/// of the tree-walker's `shadow_switch`. The running context's live SP is the in-window word the
+/// instrumented IR maintains; each *non-running* context's SP lives host-side (the root's in
+/// `VTask::root_shadow_sp`, a fiber's in `fiber_sp[slot]`). A no-op unless the run is `durable` with a
+/// window. `ctx` is `ROOT_FIBER` for the root or a fiber's registry slot.
+fn shadow_switch(
+    mem: &mut Option<Mem>,
+    fiber_sp: &mut [u64],
+    root_shadow_sp: &mut u64,
+    durable: bool,
+    out_ctx: usize,
+    in_ctx: usize,
+) {
+    if !durable {
+        return;
+    }
+    let Some(m) = mem.as_mut() else { return };
+    let sp = m.durable_get_sp();
+    if out_ctx == ROOT_FIBER {
+        *root_shadow_sp = sp;
+    } else {
+        fiber_sp[out_ctx] = sp;
+    }
+    let in_sp = if in_ctx == ROOT_FIBER {
+        *root_shadow_sp
+    } else {
+        fiber_sp[in_ctx]
+    };
+    m.durable_set_sp(in_sp);
 }
 
 /// A §14 coroutine child: its own `Vm` continuation over a **confined** window (`nested_view`) and a
@@ -1782,6 +1835,9 @@ struct RunCtx<'a> {
     fuel: &'a mut u64,
     mem: &'a mut Option<Mem>,
     host: &'a mut Host,
+    /// DURABILITY.md §12.8: the domain is durable, so each fiber switch maintains the per-context
+    /// shadow-SP word ([`shadow_switch`]). Read once from `Host::is_durable` by [`drive`].
+    durable: bool,
 }
 
 /// Run one vCPU (its active `Vm` and any fibers it switches among) until it finishes or hits a
@@ -1791,6 +1847,7 @@ struct RunCtx<'a> {
 fn step_vcpu(
     vt: &mut VTask,
     fibers: &mut Vec<FiberState>,
+    fiber_sp: &mut Vec<u64>,
     dom: &Domain,
     ctx: &mut RunCtx,
     budget: u64,
@@ -1813,6 +1870,15 @@ fn step_vcpu(
                 // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer.
                 Some((rid, resumer, rdst)) => {
                     fibers[vt.active_id] = FiberState::Done;
+                    // Fiber switch (returning fiber → its resumer): re-point the durable shadow-SP.
+                    shadow_switch(
+                        ctx.mem,
+                        fiber_sp,
+                        &mut vt.root_shadow_sp,
+                        ctx.durable,
+                        vt.active_id,
+                        rid,
+                    );
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
                     vt.active = resumer;
                     vt.active_id = rid;
@@ -1826,6 +1892,10 @@ fn step_vcpu(
                 }
                 let h = fibers.len() as i32;
                 fibers.push(FiberState::Pending { funcref, sp });
+                // A fresh fiber (registry slot `h`) is shadow context `h + 1`; its saved shadow-SP
+                // starts at its region base (empty shadow stack) — so a later switch into it points
+                // the active word there (DURABILITY.md §12.8).
+                fiber_sp.push(super::shadow_region_base(h as usize + 1));
                 vt.active.set(dst, Reg::from_i32(h));
             }
             Outcome::ContResume { kh, arg, dst } => {
@@ -1868,6 +1938,15 @@ fn step_vcpu(
                     }
                     _ => return Err(Trap::FiberFault), // forged / Running / Done
                 };
+                // Fiber switch (resumer → fiber `k`): re-point the durable shadow-SP before the swap.
+                shadow_switch(
+                    ctx.mem,
+                    fiber_sp,
+                    &mut vt.root_shadow_sp,
+                    ctx.durable,
+                    vt.active_id,
+                    k,
+                );
                 let resumer = std::mem::replace(&mut vt.active, target);
                 vt.chain.push((vt.active_id, resumer, dst));
                 vt.active_id = k;
@@ -1876,6 +1955,15 @@ fn step_vcpu(
                 // Pop the resumer to switch back to; an empty chain means the root tried to
                 // `suspend`, which is a `FiberFault` (the root has no resumer).
                 let (rid, resumer, rdst) = vt.chain.pop().ok_or(Trap::FiberFault)?;
+                // Fiber switch (suspending fiber → its resumer): re-point the durable shadow-SP.
+                shadow_switch(
+                    ctx.mem,
+                    fiber_sp,
+                    &mut vt.root_shadow_sp,
+                    ctx.durable,
+                    vt.active_id,
+                    rid,
+                );
                 let suspended = std::mem::replace(&mut vt.active, resumer);
                 fibers[vt.active_id] = FiberState::Parked {
                     vm: suspended,
@@ -2231,6 +2319,9 @@ fn drive(
     // The §12 fiber registry is **run-shared** (one handle namespace per domain) so a fiber created
     // or suspended on one vCPU can be resumed on another (D57 migration).
     let mut fibers: Vec<FiberState> = Vec::new();
+    // DURABILITY.md §12.8: each fiber's saved durable shadow-SP (run-shared, parallel to `fibers`;
+    // slot `s` is shadow context `s + 1`). Inert on a non-durable run.
+    let mut fiber_sp: Vec<u64> = Vec::new();
     let mut clock: u64 = 0;
 
     loop {
@@ -2275,6 +2366,7 @@ fn drive(
                 table: &dom.table,
                 fuel: &mut *fuel,
                 mem: &mut *mem,
+                durable: host.is_durable(),
                 host: &mut *host,
             },
             Some(k) => {
@@ -2283,11 +2375,19 @@ fn drive(
                     table: &e.table,
                     fuel: &mut e.fuel,
                     mem: &mut e.mem,
+                    durable: e.host.is_durable(),
                     host: &mut e.host,
                 }
             }
         };
-        let stop = step_vcpu(&mut tasks[ti].vt, &mut fibers, &dom, &mut ctx, budget);
+        let stop = step_vcpu(
+            &mut tasks[ti].vt,
+            &mut fibers,
+            &mut fiber_sp,
+            &dom,
+            &mut ctx,
+            budget,
+        );
         match stop {
             Err(trap) => complete(&mut tasks, ti, Err(trap)),
             Ok(VcpuStop::Done(vals)) => complete(&mut tasks, ti, Ok(vals)),

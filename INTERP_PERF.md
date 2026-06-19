@@ -530,6 +530,28 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               uninterrupted result and ends NORMAL. Cases: two clock reads (one value spilled across
               the suspend) and multiple live values spilled. Deferred: **multi-fiber** freeze/thaw
               (shadow-SP swap + freeze driver + fiber residue) and multi-vCPU.
+        - [~] **1c-7** — **multi-fiber** durability. The last functional gap: a durable run with live
+              fibers must keep the active shadow-SP word pointing at the *running* context's per-fiber
+              shadow region (root = context 0, fiber registry slot `s` = context `s+1`), so a freeze
+              that fires while a fiber runs spills into that fiber's own region, never a sibling's.
+            - [x] **commit 1** — the per-fiber **shadow-SP swap** (DURABILITY.md §12.8, D-fiber-cont
+                  **option A**): the swap lives in the engine's `cont.*` execution (where the resume
+                  chain is known), not in emitted IR. Added `VTask::root_shadow_sp` + a `fiber_sp`
+                  table (the non-running contexts' saved SPs, host-side), seeded per `cont.new` to the
+                  fiber's region base; a `shadow_switch` helper saves the outgoing context's live SP
+                  (the in-window `SHADOW_SP_OFF` word) and loads the incoming one's, wired at all three
+                  fiber-switch points (fiber return, `cont.resume`, `suspend`). The durable entry guard
+                  now **admits** `cont.*` when the window state is **NORMAL** (the swap routes
+                  correctly), still refusing `cont.*` mid freeze/thaw (state ≠ NORMAL — needs the
+                  freeze driver) and `thread.*` always (multi-vCPU durable out of scope). New harness
+                  `bytecode_durable_fibers.rs` (the bytecode mirror of `durable_fibers.rs`) drives a
+                  root that probes, runs two fibers that each probe then suspend, and probes again,
+                  asserting the four probes route root→A→B→root to distinct region bases — matching the
+                  tree-walker; a non-durable run leaves the reserve untouched.
+            - [ ] **commit 2** — the **freeze driver** (drive each idle/parked fiber under `UNWINDING`
+                  to flatten it into its region + record its residue) + **thaw seeding** (rebuild
+                  Pending fibers from the artifact's residue) + relax the guard for non-NORMAL, proven
+                  by a multi-fiber freeze/thaw byte-identical harness vs the tree-walker.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
   - [x] Lock-free `check_prot` fast path (`prot_dirty` flag) + `read_le`/`write_le` `has_regions`
         hoist. Tree-walker memory kernel ~176 → ~147 ns (~17%); all oracle suites byte-identical.
