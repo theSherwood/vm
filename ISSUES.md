@@ -224,11 +224,24 @@ start timing — a strong hint for a park/unpark or steal-loop wakeup race.
 `lower_wide`, the §17 fixed-128 `LegalizeTypes` analog) → svm-ir's fixed-128-bit `v128` (§17/D58) →
 `svm-jit` lowering each `v128` to one SSE/NEON 128-bit op.
 
-**Symptom.** A reduction (`vsum`-style) compiled `clang -O2 -mavx2` runs ~2× slower on svm-jit than
-the native binary, because the on-ramp splits LLVM's wide `<8 x i32>`/`<16 x i32>` vectors into
-**128-bit chunks** (4×i32) and svm-jit emits 128-bit `paddd`/etc., while native uses 256-bit `ymm`
+**Symptom.** A reduction (`vadd`: `s += k ^ seed`) compiled `clang -O2 -mavx2` runs ~2× slower on
+svm-jit than the native binary, because the on-ramp splits LLVM's wide `<8 x i32>`/`<16 x i32>` vectors
+into **128-bit chunks** (4×i32) and svm-jit emits 128-bit `paddd`/etc., while native uses 256-bit `ymm`
 (AVX2) or 512-bit `zmm` (AVX-512). So the SVM stack *does* vectorize (contrary to my earlier bench
 claim — see below), but at SSE width.
+
+**Measured, across the wasm comparison columns (ns/iter, the same C kernels):**
+
+| kernel | native AVX2 | wasm32 V8 | wasm32 Wasmtime | **svm-jit** | bytecode |
+|---|---|---|---|---|---|
+| `xorshift` (scalar serial) | 1.73 | 1.99 | 2.04 | **1.59** | 58.3 |
+| `vadd` (vectorizable)      | 0.042 | 0.098 | 0.147 | **0.083** | 37.6 |
+
+The key context: **wasm SIMD is itself fixed at 128 bits** (the spec's `v128`), so V8 and Wasmtime are
+*also* ~2–3.5× behind native AVX2 on `vadd` — the exact same cap svm-jit has. **svm-jit is not behind
+wasm; it is ahead** (0.083 vs V8 0.098 / Wasmtime 0.147), and on the representative *scalar* kernel it
+is the fastest engine measured, beating native. So relative to the VM's actual peer (wasm), there is no
+SIMD deficit — only native AVX2/AVX-512 leads, by the determinism-bound 128→256/512 margin.
 
 **Root cause — deliberate, not a miss.** The chunk width is fixed at 128 bits and **never
 host-detected**, to preserve the interp↔JIT↔durable-fiber **determinism contract** (a frozen vector
