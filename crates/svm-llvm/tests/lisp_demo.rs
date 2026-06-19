@@ -8,9 +8,10 @@
 //!    recursive `ev` fully **unrolls** (plain inlining). The dispatch `switch`, the node decode, and
 //!    the whole AST collapse to a straight-line/branchy arithmetic kernel — the *compiled formula*.
 //!  * **Recursive program** (`fib` defined *in the Lisp AST*): the guest recursion has dynamic depth,
-//!    so inlining would diverge. With **outlining** (`SpecConfig::outline_calls`) each AST node the
-//!    evaluator reaches becomes a specialized residual function and the self-call folds into a
-//!    **finite self-recursive residual** — the *compiled function*. This is exactly weval's trick.
+//!    so inlining would diverge. With **selective outlining** (`SpecConfig::selective_outline`) the
+//!    leaves and structure inline as usual and *only* the recursive self-call outlines, folding into a
+//!    **tight self-recursive residual** — the *compiled function* (a 2-function fib, not one tiny
+//!    function per AST node). This is exactly weval's trick.
 //!
 //! As in the BF demo, the program is an **opaque pointer parameter** clang can't fold (so `-O2` emits
 //! a *generic* evaluator), while *we* declare that pointer constant and its bytes readonly — the
@@ -289,10 +290,11 @@ fn fib_specializes_and_matches_interpreter() {
     verify_module(&m).expect("interpreter verifies");
     let pa = prog_addr(&m, &node_bytes(9, 1, 2, 0)); // fib_ast
 
-    // Guest recursion has dynamic depth -> outline (sp must be dynamic so the residual threads the
-    // data stack at runtime; a baked-constant sp would grow per recursion level and diverge).
+    // Guest recursion has dynamic depth -> selective outlining: inline the leaves/structure, outline
+    // only the recursive self-call (sp must be dynamic so the residual threads the data stack at
+    // runtime; a baked-constant sp would grow per recursion level and diverge).
     let cfg = SpecConfig {
-        outline_calls: true,
+        selective_outline: true,
         ..SpecConfig::default()
     };
     let residual = specialize_with_config(
@@ -369,10 +371,10 @@ fn lisp_futamura_roi() {
     );
     verify_module(&expr_res).expect("expr residual verifies");
 
-    // --- fib: a compiled recursive function (outlined) -------------------------------------------
+    // --- fib: a compiled recursive function (selective outlining) --------------------------------
     let fpa = prog_addr(&m, &node_bytes(9, 1, 2, 0));
     let cfg = SpecConfig {
-        outline_calls: true,
+        selective_outline: true,
         ..SpecConfig::default()
     };
     let fib_res = optimize_module(
