@@ -1239,6 +1239,79 @@ fn printf_signed_formats() {
 }
 
 #[test]
+fn tail_call_mutual_recursion() {
+    // `musttail` tail calls lower to the `return_call` terminator, so an unbounded tail/mutual
+    // recursion runs in **constant native-stack space**. `even`/`odd` tail-call each other 2,000,000
+    // deep — without tail-call lowering the JIT would recurse that far and blow the native stack;
+    // with `return_call` the frame is replaced, not nested. `noinline` stops clang from collapsing
+    // the pair, `musttail` forces a real tail call (not a rewritten loop). Both functions have no
+    // allocas (`frame_size == 0`), so the linear-memory data stack is constant too. vs native (which
+    // also TCOs `musttail`), byte-identical.
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    check_powerbox_vs_native("tail_mutual", src, b"");
+}
+
+#[test]
+fn tail_call_lowers_and_runs() {
+    // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
+    // `return_call` terminators, verifies, and runs to completion at 2,000,000 depth — which only
+    // works because the frame is replaced, not nested (a plain-`call` lowering would recurse 2M deep
+    // and overflow the native stack). `even(2e6)=1`, `odd(1999999)=even(1999998)=1` ⇒ "1 1\n".
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    let Some(bc) = compile_to_bc("tail_lower", src) else {
+        return; // clang unavailable
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let n_tail = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .filter(|b| {
+            matches!(
+                b.term,
+                svm_ir::Terminator::ReturnCall { .. }
+                    | svm_ir::Terminator::ReturnCallIndirect { .. }
+            )
+        })
+        .count();
+    assert!(
+        n_tail >= 2,
+        "expected ≥2 return_call terminators (even/odd tail calls), got {n_tail}"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR"); // checks return_call shape
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run"); // 2M-deep, constant stack
+    assert_eq!(run.stdout, b"1 1\n", "mutual tail recursion result");
+}
+
+#[test]
 fn printf_float_scientific() {
     // `%e`/`%E` via the bignum Dragon4 formatter (`__svm_dtoa_sci`) — exact, correctly-rounded across
     // the whole double range (no magnitude cap). Covers default/explicit precision, the exponent sign

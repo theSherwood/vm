@@ -9595,6 +9595,14 @@ struct BlockCtx<'a> {
     /// block boundaries (clang produces and consumes a mask in one block).
     mask_lanes: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
+    /// Set true only while lowering a block's final instruction when it is a tail-position call
+    /// (`tail`/`musttail` + the block's `ret` returns exactly its result). The direct/indirect call
+    /// lowering then emits a `ReturnCall`/`ReturnCallIndirect` *terminator* into `pending_tail`
+    /// instead of a body `call` + result bind.
+    tail_return: bool,
+    /// A `ReturnCall(Indirect)` terminator produced by the tail-position call above; consumed by
+    /// `translate_block` in place of lowering the `ret`.
+    pending_tail: Option<Terminator>,
 }
 
 impl<'a> BlockCtx<'a> {
@@ -10063,6 +10071,27 @@ impl<'a> BlockCtx<'a> {
     }
 }
 
+/// The index of `bb`'s final instruction if it is a **tail-position call** — a `tail`/`musttail`
+/// `call` whose result the block's `ret` returns directly (or a void tail call before `ret void`).
+/// Such a call lowers to a `return_call` terminator (constant native-stack space for unbounded
+/// tail/mutual recursion). A call that turns out to route to a capability import/builtin is filtered
+/// at the user-call emit site, so a false positive here is harmless — it simply isn't converted.
+fn tail_call_index(bb: &BasicBlock) -> Option<usize> {
+    let LTerm::Ret(r) = &bb.term else { return None };
+    let idx = bb.instrs.len().checked_sub(1)?;
+    let Instruction::Call(c) = &bb.instrs[idx] else {
+        return None;
+    };
+    if !c.is_tail_call {
+        return None;
+    }
+    match (&c.dest, &r.return_operand) {
+        (None, None) => Some(idx), // void tail call + `ret void`
+        (Some(d), Some(Operand::LocalOperand { name, .. })) if name == d => Some(idx),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn translate_block(
     bb: &BasicBlock,
@@ -10123,6 +10152,8 @@ fn translate_block(
         wide_vals: HashMap::new(),
         mask_lanes: HashMap::new(),
         next_val: 0,
+        tail_return: false,
+        pending_tail: None,
     };
     for (vid, pos) in scalar_seed {
         ctx.idx_of.insert(vid, pos);
@@ -10132,18 +10163,29 @@ fn translate_block(
     }
     ctx.next_val = params.len() as ValIdx;
 
-    for instr in &bb.instrs {
+    // A tail-position call in this block (final instruction is a `tail`/`musttail` call whose result
+    // the `ret` returns) lowers to a `return_call` terminator instead of a `call` + `ret`.
+    let tail_idx = tail_call_index(bb);
+    for (idx, instr) in bb.instrs.iter().enumerate() {
         if matches!(instr, Instruction::Phi(_)) {
             continue; // φ-results are block parameters, supplied by predecessors
         }
         // §6 source map: the SVM ops this LLVM instruction lowers to inherit its `!DILocation`.
         let start = ctx.insts.len();
+        ctx.tail_return = tail_idx == Some(idx);
         translate_inst(&mut ctx, instr, types)?;
+        ctx.tail_return = false;
         if let Some(dl) = instr.get_debug_loc() {
             dbg.map_range(func_idx, bi as u32, start, ctx.insts.len(), dl);
         }
     }
-    let term = translate_term(&mut ctx, &bb.term, bi, f, s, block_params)?;
+    // If the tail call produced a `return_call` terminator, use it; otherwise lower the real
+    // terminator. (A `tail`-marked call that routes to an import/builtin leaves `pending_tail` unset
+    // and falls through to the ordinary `ret` here.)
+    let term = match ctx.pending_tail.take() {
+        Some(t) => t,
+        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params)?,
+    };
     Ok(Block {
         params,
         insts: ctx.insts,
@@ -10323,6 +10365,24 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 Inst::CallIndirect { ty, idx, args }
             }
         };
+        // A tail-position call (`tail`/`musttail`, the block's `ret` returns exactly this result)
+        // becomes a `return_call` terminator: the IR frame is replaced rather than nested, so an
+        // unbounded tail-recursion / mutual-recursion chain runs in constant native-stack space.
+        // The callee still gets `sp + frame_size` (frame strictly above ours), so this is correct
+        // even if a pointer into our frame escaped — and is data-stack-constant for the common
+        // leaf-frame (`frame_size == 0`) case. (Reclaiming a non-empty caller frame would need
+        // `musttail` detection, which the LLVM-C binding doesn't expose.)
+        if ctx.tail_return {
+            let term = match inst {
+                Inst::Call { func, args } => Terminator::ReturnCall { func, args },
+                Inst::CallIndirect { ty, idx, args } => {
+                    Terminator::ReturnCallIndirect { ty, idx, args }
+                }
+                _ => unreachable!("tail call lowered to a non-call inst"),
+            };
+            ctx.pending_tail = Some(term);
+            return Ok(());
+        }
         // The result: a small by-value struct return is a **multi-result** (§3a) recorded field-wise
         // in the aggregate table; a scalar is one value; `void` is none.
         let result_ty = match c.function_ty.as_ref() {
