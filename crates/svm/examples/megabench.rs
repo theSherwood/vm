@@ -13,11 +13,18 @@ use svm::{ir, text};
 use svm_interp::{bytecode, Value};
 
 fn main() {
-    let kernels = [
-        ("alu", ALU, 1_000i32, 201_000i32),
+    // `chase` (16 KiB, L1, constant-stride) and `chase_rand` (4 MiB, LCG permutation) are
+    // dependent-load pointer chases — each load's address is the previous load's value, so the
+    // access can't be forwarded/hoisted/vectorized (unlike `mem`, which every compiler deletes).
+    let chase = chase_src(16, 4096, false); // memory 2^16 = 64 KiB window holds the 16 KiB array
+    let chase_rand = chase_src(22, 1 << 20, true); // memory 2^22 = 4 MiB window holds the 4 MiB array
+    let kernels: [(&str, &str, i32, i32); 6] = [
+        ("alu", ALU, 1_000, 201_000),
         ("call", CALL, 1_000, 201_000),
         ("call_indirect", CALL_INDIRECT, 1_000, 201_000),
         ("mem", MEM, 1_000, 201_000),
+        ("chase", &chase, 1_000, 201_000),
+        ("chase_rand", &chase_rand, 1_000, 201_000),
     ];
     for (name, src, small, large) in kernels {
         let m = text::parse_module(src).expect("kernel parses");
@@ -148,6 +155,60 @@ block2(v10: i32):
   return v10
 }
 "#;
+
+/// Generate a dependent-load **pointer-chase** kernel (`func (i32 n) -> (i64)`): rebuild a chain of
+/// `size` i32 slots in linear memory (a fixed prelude that cancels in the large/small-`n` subtraction),
+/// then chase it `n` times — `idx = mem[idx*4]` — accumulating the visited indices. Because each load's
+/// address is the previous load's value, the access can't be forwarded, hoisted, or vectorized (mirrors
+/// `bench/cross-engine/kernels.c`). `lcg=false` builds a constant-stride cycle (prefetcher-friendly →
+/// load-issue path); `lcg=true` builds a full-period LCG permutation (prefetcher-defeating → cache
+/// latency). `mem_log2` sizes the window to hold the `size*4`-byte array.
+fn chase_src(mem_log2: u32, size: u32, lcg: bool) -> String {
+    let mask = size - 1;
+    // next = the value stored at slot `vi` (the slot it points to).
+    let next = if lcg {
+        // (vi * 1103515245 + 12345) & mask  — Hull-Dobell full-period permutation mod 2^k.
+        "  vmul = i32.const 1103515245\n  vinc = i32.const 12345\n  \
+         vm = i32.mul vi vmul\n  va = i32.add vm vinc\n  vnext = i32.and va vmaskc\n"
+    } else {
+        // (vi + 1789) & mask  — a constant-stride cycle.
+        "  vstride = i32.const 1789\n  va = i32.add vi vstride\n  vnext = i32.and va vmaskc\n"
+    };
+    format!(
+        "memory {mem_log2}
+func (i32) -> (i64) {{
+block0(v0: i32):
+  vi0 = i32.const 0
+  vrem0 = i32.const {size}
+  br binit(vi0, vrem0, v0)
+binit(vi: i32, vrem: i32, vn: i32):
+  vfour = i64.const 4
+  vidx64 = i64.extend_i32_u vi
+  vaddr = i64.mul vidx64 vfour
+  vmaskc = i32.const {mask}
+{next}  i32.store vaddr vnext
+  vone = i32.const 1
+  vi2 = i32.add vi vone
+  vrem2 = i32.sub vrem vone
+  vzero = i32.const 0
+  vhops0 = i64.const 0
+  br_if vrem2 binit(vi2, vrem2, vn) bchase(vzero, vhops0, vn)
+bchase(vidx: i32, vhops: i64, vk: i32):
+  vfour2 = i64.const 4
+  vc64 = i64.extend_i32_u vidx
+  vcaddr = i64.mul vc64 vfour2
+  vloaded = i32.load vcaddr
+  vle = i64.extend_i32_u vloaded
+  vhops2 = i64.add vhops vle
+  vkone = i32.const 1
+  vk2 = i32.sub vk vkone
+  br_if vk2 bchase(vloaded, vhops2, vk2) bret(vhops2)
+bret(vh: i64):
+  return vh
+}}
+"
+    )
+}
 
 // Keep `ir` referenced (the parser returns `ir::Module`) without an unused-import warning if the
 // signature ever changes — a no-op the optimizer drops.

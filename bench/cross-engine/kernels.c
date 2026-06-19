@@ -30,3 +30,28 @@ static int32_t cell;  // plain: matches SVM mem IR (optimizers may forward store
 
 EXPORT("mem")
 int32_t mem(int32_t n){ int32_t acc=0; while(n){ cell=acc; acc=cell+1; n-=1; DNO(acc); DNO(n); } return acc; }
+
+// --- memory kernels that genuinely execute (a dependent-load pointer chase) -------------------
+// Each load's ADDRESS is the previous load's VALUE, so the access is strictly serial: it can't be
+// forwarded, hoisted, vectorized, or unrolled-for-ILP. The chain is rebuilt inside the function (a
+// fixed O(size) prelude that cancels in the large/small-n subtraction), matching the SVM IR.
+#define CN 4096u            // `chase`: 16 KiB → L1; constant stride (prefetcher-friendly: load-issue path)
+#define RN (1u<<20)         // `chase_rand`: 4 MiB → L3; LCG permutation (prefetcher-defeating: cache latency)
+static int32_t carr[CN];
+static int32_t rarr[RN];
+
+EXPORT("chase")
+int64_t chase(int32_t n){
+  for(uint32_t i=0;i<CN;i++) carr[i]=(int32_t)((i+1789u)&(CN-1u));   // constant-stride cycle
+  uint32_t idx=0; int64_t hops=0;
+  while(n){ idx=(uint32_t)carr[idx]; hops+=idx; n-=1; DNO(idx); DNO(n); }
+  return hops;
+}
+
+EXPORT("chase_rand")
+int64_t chase_rand(int32_t n){
+  for(uint32_t i=0;i<RN;i++) rarr[i]=(int32_t)((i*1103515245u+12345u)&(RN-1u)); // full-period LCG perm
+  uint32_t idx=0; int64_t hops=0;
+  while(n){ idx=(uint32_t)rarr[idx]; hops+=idx; n-=1; DNO(idx); DNO(n); }
+  return hops;
+}
