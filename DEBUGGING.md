@@ -464,10 +464,13 @@ Exception Handler (it walks the faulting `CONTEXT`'s `Rbp` chain in `mem.rs`, va
 2 (W3) on the JIT.
 
 **Function names** (the readability finish-up): the §6 debug-info waist gained a `func → name` table
-(`debug_info.func_names`, text `debug.fname <func> "<name>"`, binary-encoded; chibicc emits it under
-`-g`). Threaded through every backtrace renderer — `JitFrameLoc::func_name`, the interpreter's free
-`func_name(m, func)`, the kill message (`#0 file:line:col in compute`), and gdb's DWARF `DW_AT_name` +
-ELF `.symtab` — so frames read `in compute` instead of `(fn 0)`/`fn0`. Empty ⇒ the `fn{N}` fallback.
+(`debug_info.func_names`, text `debug.fname <func> "<name>"`, binary-encoded). **All three frontends
+populate it under `-g`** — chibicc emits `debug.fname` per function; svm-wasm reads each
+`DW_TAG_subprogram` `DW_AT_name` (mapped to its IR function by PC range); svm-llvm reads each
+`DISubprogram` source name (correlated to the IR function index by linkage name). Threaded through
+every backtrace renderer — `JitFrameLoc::func_name`, the interpreter's free `func_name(m, func)`, the
+kill message (`#0 file:line:col in compute`), and gdb's DWARF `DW_AT_name` + ELF `.symtab` — so frames
+read `in compute` instead of `(fn 0)`/`fn0`. Empty ⇒ the `fn{N}` fallback.
 
 Remaining (ISSUES I4): **Windows explicit-check** traps still lack a backtrace (no signal to capture
 from + MSVC has no `__builtin_frame_address` — fix via Cranelift `get_frame_pointer`); and per-fiber
