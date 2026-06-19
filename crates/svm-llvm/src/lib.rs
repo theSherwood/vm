@@ -170,8 +170,8 @@ use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    IToF, Inst, IntTy, IntUnOp, Loc, Module, SsaLoc, Terminator, TypeDef, ValIdx, ValType, VarInfo,
-    VarLoc,
+    FuncName, IToF, Inst, IntTy, IntUnOp, Loc, Module, SsaLoc, Terminator, TypeDef, ValIdx,
+    ValType, VarInfo, VarLoc,
 };
 
 pub mod di;
@@ -524,6 +524,9 @@ struct DebugAcc {
     /// Source variables (the `dbg.declare` → `Window` half; empty without `-g` / on the `translate`
     /// entry, which has no bitcode path to walk).
     vars: Vec<VarInfo>,
+    /// Source function names (`DISubprogram` `DW_AT_name` → IR function index): the §6 function-name
+    /// table, so an LLVM-frontend backtrace reads `compute` instead of `fn{N}`.
+    func_names: Vec<FuncName>,
 }
 
 impl DebugAcc {
@@ -564,7 +567,7 @@ impl DebugAcc {
     /// The populated waist, or `None` when nothing was recorded (a non-`-g` build) — so a debug-free
     /// module stays `debug_info: None`, byte-identical to before.
     fn finish(self) -> Option<DebugInfo> {
-        if self.locs.is_empty() && self.vars.is_empty() {
+        if self.locs.is_empty() && self.vars.is_empty() && self.func_names.is_empty() {
             None
         } else {
             Some(DebugInfo {
@@ -572,6 +575,7 @@ impl DebugAcc {
                 locs: self.locs,
                 types: self.types,
                 vars: self.vars,
+                func_names: self.func_names,
                 ..Default::default()
             })
         }
@@ -1285,6 +1289,13 @@ fn translate_func(
     //     a block parameter wherever it is live; its block-local value index is its position in that
     //     block's param list, so one `SsaLoc` per such block (effective from block entry) gives an
     //     `SsaList` covering the argument's whole live range.
+    // §6 function name: the `DISubprogram` source name → this IR function index.
+    if let Some(src) = di.and_then(|d| d.func_names.get(&f.name)) {
+        dbg.func_names.push(FuncName {
+            func: func_idx,
+            name: src.clone(),
+        });
+    }
     if let Some(vars) = di.and_then(|d| d.vars.get(&f.name)) {
         let alloca_offsets = alloca_order_offsets(f, &scan, &frame);
         for v in vars {

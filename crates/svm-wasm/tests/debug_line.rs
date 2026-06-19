@@ -110,6 +110,24 @@ fn wasm_dwarf_info_extracts_source_variables() {
     };
     assert_eq!(name, "int");
     assert_eq!((*encoding, *size), (5, 4));
+
+    // §6 function names: the subprogram's `DW_AT_name` is captured, and the high-level ingest folds
+    // it into `debug_info.func_names` (mapped to the IR function by PC range), so a wasm-frontend
+    // backtrace reads `add` instead of `fn{N}` — the same as the chibicc `debug.fname` path.
+    assert_eq!(add.name, "add", "the subprogram's DW_AT_name is captured");
+    let names: Vec<&str> = t
+        .module
+        .debug_info
+        .as_ref()
+        .unwrap()
+        .func_names
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"add"),
+        "func_names carries the DWARF subprogram name, got {names:?}"
+    );
 }
 
 // dist(n): struct Point{int x,y} p; int row[3]; struct Point *pp; — exercises aggregate/array/

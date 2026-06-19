@@ -2467,6 +2467,18 @@ int chain(int n) {
         lines.len() >= 3,
         "the statement chain maps several distinct source lines: {lines:?}"
     );
+
+    // §6 function names: the `DISubprogram` source name is ingested into `func_names` (mapped to its
+    // IR function index), so an LLVM-frontend backtrace reads `chain` instead of `fn{N}`.
+    let chain = di
+        .func_names
+        .iter()
+        .find(|fnm| fnm.name == "chain")
+        .expect("the chain() function name is ingested");
+    assert!(
+        (chain.func as usize) < t.module.funcs.len(),
+        "func_names index in range"
+    );
 }
 
 /// A non-`-g` build carries **no** debug section — the waist is absent (zero cost), byte-identical

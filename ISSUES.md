@@ -85,6 +85,79 @@ path — distinct from the now-removed root-runtime delta and from the resolved 
 
 ---
 
+---
+
+### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — on `claude/debug-jit-backtrace`
+
+**Where:** `crates/svm-jit/src/lib.rs` (`trap_capture_addr()` returns `0` on non-unix, so `emit_trap`
+bakes no explicit-trap capture call), `crates/svm-jit/src/trap_shim.c` (the unix-only
+`svm_capture_explicit_trap`).
+
+**Update (memory faults: fixed on Windows).** The Windows Vectored Exception Handler now captures the
+trap-time backtrace for **memory faults**, mirroring the unix SIGSEGV/SIGBUS path: `mem.rs`'s windows
+`pal::veh` reads the faulting `Rip`/`Rbp` from `EXCEPTION_POINTERS->ContextRecord` and walks the
+frame-pointer chain (a Rust `walk_fp_chain`) into a thread-local before restoring the recovery context;
+the windows `pal::take_trap_frame` reads it. So `last_trap_backtrace()` + the kill message now carry
+source frames for a Windows guard fault (covered cross-platform by
+`memfault_kill_message_carries_a_source_backtrace` in `svm-run`'s `run.rs`).
+
+**Still open: explicit-check traps on Windows.** Div/rem-by-zero, `unreachable`, `OutOfFuel`, and
+indirect-call-type traps store a `TrapKind` and return — there is no signal/exception to capture from, so
+on unix the lowering bakes a `call svm_capture_explicit_trap` at the trap site (`trap_capture_addr()`).
+On Windows that address is `0`, so these still produce an **empty** backtrace (correct `TrapKind` + kill,
+no frames). Not a correctness or escape hazard. (The `trap_kill_message_carries_a_source_backtrace` test —
+div-by-zero — keeps its source-line assertion under `#[cfg(unix)]` for this reason.)
+
+**Why it isn't a quick patch (two concrete blockers, found on attempt):**
+1. **Recovering the innermost frame without `__builtin_frame_address`.** The unix helper uses
+   `__builtin_frame_address(0)` to find its own frame → the trapping fn's `rbp` *and* the trap-site
+   return address (`[my_fp+8]`). **MSVC has no `__builtin_frame_address`.** Cranelift's
+   `get_frame_pointer` (confirmed present in cranelift-codegen 0.132 x64) can hand the helper the guest
+   fn's `rbp` as an argument — but walking from *that* yields only the **caller** chain; the trapping
+   function's own line is lost. Recovering it needs the helper's return address (`_ReturnAddress()` on
+   MSVC / `__builtin_return_address(0)` on GCC), which pulls the helper back into C.
+2. **Cross-language capture state.** Windows memory faults capture into **Rust** thread-locals (the VEH
+   is Rust, `mem.rs` windows `pal`); the unix explicit helper writes **C** thread-locals (`trap_shim.c`).
+   A C explicit-trap helper on Windows would write a location the Windows `take_trap_frame` (which reads
+   the Rust thread-locals) never sees. Unifying them is a capture-state refactor, not a patch.
+
+**Refined fix (a proper slice, not a quick win):** unify the capture state in Rust (one thread-local set
+read by `take_trap_frame` on both platforms; the unix C signal handler stores via a small async-signal-
+safe `extern "C"` Rust shim), and make the explicit-trap helper take the frame pointer from
+`get_frame_pointer` + the trap site from `_ReturnAddress`/`__builtin_return_address`. Then `emit_trap`
+bakes `call <helper>(get_frame_pointer())` on **all** targets (de-special-casing unix too). **Test:**
+un-gate `trap_kill_message_carries_a_source_backtrace` on Windows; validate on the `windows-latest` CI
+job.
+
+---
+
+### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
+
+**Where:** the trap-time backtrace capture sites — `crates/svm-jit/src/trap_shim.c` (the SIGSEGV/BUS
+handler + `svm_capture_explicit_trap`), `crates/svm-jit/src/mem.rs` (the windows VEH), and the §14
+coroutine/fiber runtime (`fiber_rt.rs`).
+
+**Is:** a trap-time backtrace (`last_trap_backtrace` / `run_traced`) gives the correct guest **frames**
+regardless of which fiber/coroutine was running when the trap fired — the frame-pointer walk works on
+whatever stack the trap is on, and Stage 3 already collects a spawned vCPU's capture into the `Domain`.
+What's missing is a **fiber-id label** (DEBUGGING.md §5 W3 Stage 3 "names the right fiber under
+work-stealing migration"): the backtrace doesn't say *which* §23/D57 migratable fiber the frames belong
+to. Pure cosmetics — the frames themselves are right.
+
+**Why it isn't a quick patch:** the capture runs in the low-level handlers (C signal handler, Rust VEH,
+the explicit-trap helper), none of which have the running fiber's identity to hand. `fiber_rt::current()`
+returns the thread-local `*mut FiberRuntime` but not a stable handle, and a fiber migrates across worker
+threads, so the id must be read at capture time, not reconstructed after. Threading a "current fiber
+handle" thread-local that the capture sites can cheaply read is the work.
+
+**Fix sketch:** maintain a per-thread "current fiber handle" cell (set on each `cont.resume`/suspend
+switch in `fiber_rt`), read it at capture time into the trap-frame thread-local alongside `pc`/`rets`,
+and surface it (e.g. `JitFrameLoc`-adjacent or a `last_trap_fiber()` accessor) for the kill message.
+
+---
+
+---
+
 _(I1 below is open-adjacent — its abort mechanism is fixed, but I3/I4 are residual same-family CI-abort
 flakes. I2 resolved below.)_
 

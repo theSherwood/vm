@@ -26,6 +26,7 @@ block0(v0: i32):
 }
 
 debug.file 0 "compute.c"
+debug.fname 0 "compute"
 debug.loc 0 0 1 0 2 7
 debug.loc 0 0 3 0 3 7
 debug.loc 0 0 5 0 4 3
@@ -211,6 +212,12 @@ fn jit_wraps_dwarf_in_an_elf_whose_sections_round_trip() {
         parsed.subs.len(),
         1,
         "one subprogram survives the ELF wrapper"
+    );
+    // §6 function name: the subprogram's `DW_AT_name` is the real source name (`debug.fname`), so
+    // gdb's `bt` / `info functions` reads `compute`, not the synthesized `fn0`.
+    assert_eq!(
+        parsed.subs[0].name, "compute",
+        "the DWARF subprogram carries the source function name"
     );
 
     // The DWARF addresses are *real* finalized-code addresses, and the `.text` section's extent

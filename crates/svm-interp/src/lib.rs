@@ -207,6 +207,18 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     run_with_host(m, func, args, fuel, &mut host)
 }
 
+/// Like [`run`], but also return the guest's **trap-time backtrace** (innermost frame first, as
+/// `IrPc`s; empty on a clean finish) — see [`run_with_host_traced`].
+pub fn run_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+    let mut host = Host::new();
+    run_with_host_traced(m, func, args, fuel, &mut host)
+}
+
 /// The **fast** interpreter entry (INTERP_PERF.md Slice 1c): run on the [`bytecode`] engine when the
 /// module is eligible, else fall back to the tree-walker [`run`]. The two are bit-for-bit equivalent
 /// on the eligible set (the `bytecode_diff` harness gates this), so this is a transparent speedup.
@@ -589,6 +601,45 @@ pub struct SourceLoc {
     pub line: u32,
     /// 0 means "no column".
     pub col: u32,
+}
+
+/// Resolve an [`IrPc`] to its source position using `m`'s `-g` debug info (nearest-preceding `loc`
+/// within the block), or `None` without debug info / for an installed §22 unit (`pc.module != 0`).
+/// The free counterpart of [`Inspector::source_loc`]; pairs with [`run_with_host_traced`] to render
+/// an interpreter trap-time backtrace to source (the symmetric analog of the JIT's `JitFrameLoc`).
+pub fn source_loc(m: &Module, pc: IrPc) -> Option<SourceLoc> {
+    source_loc_in(m.debug_info.as_ref()?, pc)
+}
+
+/// The `-g` source name of function `func` in module 0 (`debug_info.func_names`), or `None` when the
+/// module carried no name for it — renderers fall back to `fn{func}`. Pairs with [`source_loc`] to
+/// render an interpreter trap-time backtrace with function names (the analog of the JIT's
+/// `JitFrameLoc::func_name`).
+pub fn func_name(m: &Module, func: FuncIdx) -> Option<&str> {
+    let di = m.debug_info.as_ref()?;
+    di.func_names
+        .iter()
+        .find(|f| f.func == func)
+        .map(|f| f.name.as_str())
+}
+
+/// The nearest-preceding-`loc` resolution shared by [`source_loc`] and [`Inspector::source_loc`]
+/// (DEBUGGING.md §6/W4 S2): the latest `loc` in `pc`'s block at or before `pc.inst`.
+fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
+    if pc.module != 0 {
+        return None;
+    }
+    let l = di
+        .locs
+        .iter()
+        .filter(|l| l.func == pc.func && l.block as usize == pc.block && l.inst as usize <= pc.inst)
+        .max_by_key(|l| l.inst)?;
+    let file = di.files.get(l.file as usize)?.clone();
+    Some(SourceLoc {
+        file,
+        line: l.line,
+        col: l.col,
+    })
 }
 
 /// The value of a source variable ([`Inspector::read_var`]). A promoted scalar resolves to a live
@@ -1373,23 +1424,7 @@ impl Inspector {
     /// semantics). Only the guest's own program (module 0) has source; installed §22 units return
     /// `None`.
     pub fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
-        if pc.module != 0 {
-            return None;
-        }
-        let di = self.debug_info.as_ref()?;
-        let l = di
-            .locs
-            .iter()
-            .filter(|l| {
-                l.func == pc.func && l.block as usize == pc.block && l.inst as usize <= pc.inst
-            })
-            .max_by_key(|l| l.inst)?;
-        let file = di.files.get(l.file as usize)?.clone();
-        Some(SourceLoc {
-            file,
-            line: l.line,
-            col: l.col,
-        })
+        source_loc_in(self.debug_info.as_ref()?, pc)
     }
 
     /// Resolve a source variable by `name` in the frame `frame_from_top` levels up (0 = innermost)
@@ -1509,8 +1544,24 @@ pub fn run_with_host(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
+    run_with_host_traced(m, func, args, fuel, host).0
+}
+
+/// Like [`run_with_host`], but also return the guest's **trap-time backtrace** — the call stack
+/// (innermost frame first, as `IrPc`s) at the point a trap was raised, or empty if the run finished
+/// cleanly (DEBUGGING.md §5 / W3; the interpreter counterpart to the JIT's `last_trap_backtrace`).
+/// The interpreter reifies its call stack and doesn't unwind it on a trap, so this is the exact frame
+/// chain. Resolve each `IrPc` to source with [`source_loc`]. Useful for kill diagnostics and for the
+/// interp↔JIT differential fuzzer to report *where* a divergence/trap occurred.
+pub fn run_with_host_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
     if m.funcs.get(func as usize).is_none() {
-        return Err(Trap::Malformed);
+        return (Err(Trap::Malformed), Vec::new());
     }
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
@@ -1561,7 +1612,7 @@ fn drive(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
-) -> Result<Vec<Value>, Trap> {
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
     let funcs: Arc<[Func]> = funcs.to_vec().into();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1770,7 +1821,7 @@ fn drive(
         .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    out.result
+    (out.result, out.trap_bt)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -1815,7 +1866,7 @@ pub fn run_capture_reserved(
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -1852,7 +1903,7 @@ pub fn run_capture_reserved_with_host(
         mm.init_data(&m.data);
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -1914,7 +1965,7 @@ pub fn run_capture_reserved_with_host_prots(
         }
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
         .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
@@ -1949,7 +2000,7 @@ pub fn run_capture_sub(
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_parent(parent_bytes))
@@ -2958,6 +3009,25 @@ struct Outcome {
     result: Result<Vec<Value>, Trap>,
     mem: Option<Mem>,
     fuel: u64,
+    /// The vCPU's **trap-time call stack** (innermost frame first), as `IrPc`s — captured from the
+    /// live frames when (and only when) `result` is a trap, before the vCPU is dropped (DEBUGGING.md
+    /// §5 / W3, the interpreter counterpart to the JIT's `last_trap_backtrace`). Empty on a clean
+    /// finish. Resolved to source by the run wrapper via [`source_loc`]; host-side, off the hot path.
+    trap_bt: Vec<IrPc>,
+}
+
+/// The `IrPc`s of `frames`, innermost frame first — the shape [`Outcome::trap_bt`] captures at a trap.
+fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
+    frames
+        .iter()
+        .rev()
+        .map(|f| IrPc {
+            module: f.module,
+            func: f.func,
+            block: f.block,
+            inst: f.inst,
+        })
+        .collect()
 }
 
 /// Why a vCPU yielded its worker (returned by [`VCpu::run`]).
@@ -3285,10 +3355,17 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 v.registry.free_vcpu_context(v.vcpu_ctx);
             }
             let id = v.id;
+            // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (only on a trap).
+            let trap_bt = if result.is_err() {
+                frames_to_pcs(&v.frames)
+            } else {
+                Vec::new()
+            };
             let outcome = Outcome {
                 result,
                 mem: v.mem.take(),
                 fuel: v.fuel,
+                trap_bt,
             };
             drop(v);
             let mut s = sched.lock();
@@ -3721,10 +3798,17 @@ impl SchedDriver {
             match step {
                 Step::Done(result) => {
                     let id = v.id;
+                    // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (trap only).
+                    let trap_bt = if result.is_err() {
+                        frames_to_pcs(&v.frames)
+                    } else {
+                        Vec::new()
+                    };
                     let outcome = Outcome {
                         result,
                         mem: v.mem.take(),
                         fuel: v.fuel,
+                        trap_bt,
                     };
                     drop(v);
                     let mut s = det.lock();

@@ -23,9 +23,9 @@ use std::fmt::Write as _;
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, FBinOp, FCmpOp,
-    FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc,
-    Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy, IntUnOp,
+    LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef, VBitBinOp,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
     VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
@@ -105,6 +105,9 @@ fn print_debug_info(s: &mut String, m: &Module) {
     s.push('\n');
     for (i, f) in di.files.iter().enumerate() {
         let _ = writeln!(s, "debug.file {i} \"{f}\"");
+    }
+    for fname in &di.func_names {
+        let _ = writeln!(s, "debug.fname {} \"{}\"", fname.func, fname.name);
     }
     for l in &di.locs {
         let _ = writeln!(
@@ -847,6 +850,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let mut dbg_types: Vec<TypeDef> = Vec::new();
     let mut dbg_vars: Vec<VarInfo> = Vec::new();
     let mut dbg_blobs: Vec<ProducerBlob> = Vec::new();
+    let mut dbg_func_names: Vec<FuncName> = Vec::new();
     while !p.at_end() {
         match p.peek() {
             // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
@@ -861,6 +865,14 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                 let path = String::from_utf8(p.parse_str()?)
                     .map_err(|_| ParseError("debug.file path is not valid UTF-8".into()))?;
                 dbg_files.push(path);
+            }
+            // `debug.fname <func> "<name>"` — the §6 function-name table (sparse `func → name`).
+            Some(Tok::Ident(s)) if s == "debug.fname" => {
+                p.next()?;
+                let func = p.parse_u32()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.fname name is not valid UTF-8".into()))?;
+                dbg_func_names.push(FuncName { func, name });
             }
             Some(Tok::Ident(s)) if s == "debug.loc" => {
                 p.next()?;
@@ -1078,6 +1090,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         && dbg_types.is_empty()
         && dbg_vars.is_empty()
         && dbg_blobs.is_empty()
+        && dbg_func_names.is_empty()
     {
         None
     } else {
@@ -1087,6 +1100,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             types: dbg_types,
             vars: dbg_vars,
             blobs: dbg_blobs,
+            func_names: dbg_func_names,
         })
     };
     Ok(Module {
@@ -1153,6 +1167,11 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.next()?;
                 p.parse_int()?;
                 p.parse_str()?;
+            }
+            Some(Tok::Ident(s)) if s == "debug.fname" => {
+                p.next()?;
+                p.parse_int()?; // func index
+                p.parse_str()?; // name
             }
             Some(Tok::Ident(s)) if s == "debug.loc" => {
                 p.next()?;
@@ -2498,5 +2517,41 @@ block0(v0: i32):
         assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
         // Canonical print → re-parse is identity (printer emits the indexed form + decls).
         assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
+    }
+
+    #[test]
+    fn debug_fnames_round_trip() {
+        // The §6 function-name table parses, populates `debug_info.func_names`, and survives a
+        // print → re-parse round trip (the `debug.fname <func> "<name>"` directive).
+        let src = "\
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+debug.file 0 \"a.c\"
+debug.fname 0 \"compute\"
+debug.fname 1 \"helper\"
+debug.loc 0 0 0 0 7 5
+";
+        let m = parse_module(src).expect("parse debug.fname");
+        let di = m.debug_info.as_ref().expect("module carries debug info");
+        assert_eq!(di.func_names.len(), 2);
+        assert_eq!(
+            (di.func_names[0].func, di.func_names[0].name.as_str()),
+            (0, "compute")
+        );
+        assert_eq!(
+            (di.func_names[1].func, di.func_names[1].name.as_str()),
+            (1, "helper")
+        );
+        assert_eq!(
+            parse_module(&print_module(&m)).unwrap(),
+            m,
+            "print → re-parse is identity"
+        );
     }
 }

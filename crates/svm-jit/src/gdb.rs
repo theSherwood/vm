@@ -80,6 +80,7 @@ pub fn build_elf(
     code_base: u64,
     code_size: u64,
     funcs: &[(u32, u64, u64)],
+    func_names: &std::collections::HashMap<u32, String>,
     debug_info: &[u8],
     debug_abbrev: &[u8],
     debug_line: &[u8],
@@ -113,7 +114,11 @@ pub fn build_elf(
     let mut symtab = vec![0u8; SYM_LEN]; // null symbol
     for &(func, lo, hi) in funcs {
         let st_name = strtab.len() as u32;
-        strtab.extend_from_slice(format!("fn{func}").as_bytes());
+        // The §6 source name when present, else the synthesized `fn{func}` (matches the DWARF
+        // `DW_AT_name`), so `info functions` / a symbol-level `bt` reads the C name.
+        let synth = format!("fn{func}");
+        let name = func_names.get(&func).map(String::as_str).unwrap_or(&synth);
+        strtab.extend_from_slice(name.as_bytes());
         strtab.push(0);
         symtab.extend_from_slice(&st_name.to_le_bytes()); // st_name
         symtab.push((STB_GLOBAL << 4) | STT_FUNC); // st_info
