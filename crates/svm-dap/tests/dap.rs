@@ -21,6 +21,7 @@ block2(v7: i32):
 }
 
 debug.file 0 "sum.c"
+debug.fname 0 "sum"
 debug.loc 0 1 0 0 7 5
 debug.var 0 "i" ssa 0 "int"
 debug.var 0 "acc" ssa 1 "int"
@@ -128,6 +129,8 @@ fn dap_breakpoint_hit_shows_source_frame_and_locals() {
         top.get("source").unwrap().get("name"),
         Some(&Json::s("sum.c"))
     );
+    // The frame carries the `-g` function name, so the VS Code call stack reads `#0 sum`, not `func0`.
+    assert_eq!(top.get("name"), Some(&Json::s("#0 sum")));
 
     // scopes → a Locals scope; variables on it shows i = 3 and acc = 0 (first iteration).
     let frame_id = top.get("id").unwrap().as_i64().unwrap();

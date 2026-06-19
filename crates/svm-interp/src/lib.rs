@@ -1427,6 +1427,18 @@ impl Inspector {
         source_loc_in(self.debug_info.as_ref()?, pc)
     }
 
+    /// The `-g` source name of function `func` (`debug_info.func_names`), or `None` when the module
+    /// carried no name for it — renderers (the DAP stack trace) fall back to `func{N}`. The method
+    /// counterpart of the free [`func_name`], for callers that hold an `Inspector` (DEBUGGING.md §6).
+    pub fn func_name(&self, func: FuncIdx) -> Option<&str> {
+        self.debug_info
+            .as_ref()?
+            .func_names
+            .iter()
+            .find(|f| f.func == func)
+            .map(|f| f.name.as_str())
+    }
+
     /// Resolve a source variable by `name` in the frame `frame_from_top` levels up (0 = innermost)
     /// and read its current value — the W4→S2 bridge: `Ssa` reads the frame's value table, `Window`
     /// reads `width` bytes from `data-SP + off`. Returns `None` if there is no debug info, no such
