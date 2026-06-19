@@ -39,10 +39,11 @@
 //! via a synthesized shim (concurrency in the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads`
 //! runs — `tests/threads.rs`). Imports spanning multiple capability interfaces bind (one handle per
 //! interface), and capabilities reach spawned threads via a window handle stash (so
-//! `wasi:thread/spawn` works *alongside* capability imports). Still a clean [`Error::Unsupported`]
-//! (the niche features typical clang output doesn't emit): the `table.*` bulk ops and passive
-//! *element* segments; imported table/global/tag; reference types;
-//! multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
+//! `wasi:thread/spawn` works *alongside* capability imports), and **reference types** core
+//! (`funcref`/`externref` as i32 values, `ref.null`/`is_null`/`func`, typed `select`,
+//! `table.get`/`set`/`size`/`fill`). Still a clean [`Error::Unsupported`] (the niche features typical
+//! clang output doesn't emit): `table.copy`/`init`/`grow` + passive *element* segments; imported
+//! table/global/tag; multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
 //! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
 use std::collections::BTreeMap;
@@ -143,9 +144,19 @@ fn val_type(w: W) -> Result<ValType, Error> {
         W::F64 => Ok(ValType::F64),
         // §17/D58: wasm v128 maps directly to our fixed-128 vector type.
         W::V128 => Ok(ValType::V128),
-        W::Ref(_) => unsup("reference type"),
+        // §RT reference types: both `funcref` and `externref` are an opaque **i32 index** in SVM — a
+        // `funcref` is the §3c function-table index (= the IR function index), an `externref` is a §7
+        // capability handle (a host-table index). The wasm validator keeps the two from being mixed;
+        // SVM only needs the bit representation, so both lower to `i32`.
+        W::Ref(_) => Ok(ValType::I32),
     }
 }
+
+/// The null reference sentinel (both `funcref` and `externref`). Matches the `0xFFFF_FFFF` the
+/// function table already uses for an empty slot, so a null `funcref` fed to `call_indirect` fails
+/// the §3c index/type check (≈ wasm's null-funcref trap), and a null `externref` fed to `cap.call`
+/// indexes no granted capability (a cap fault). `ref.is_null` is a compare against this.
+const REF_NULL: i32 = -1;
 
 /// Transpile a core-wasm binary into a verifier-checkable [`Module`].
 ///
@@ -389,7 +400,14 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                                 }
                             }
                         }
-                        _ => return unsup("passive/declared element segment"),
+                        // A *declarative* element segment (`elem declare`) only marks functions as
+                        // referenceable by `ref.func` (the validation rule); it has no runtime effect,
+                        // so it's a no-op here. *Passive* element segments (`table.init` sources) are a
+                        // follow-up — still rejected.
+                        wasmparser::ElementKind::Declared => {}
+                        wasmparser::ElementKind::Passive => {
+                            return unsup("passive element segment")
+                        }
                     }
                 }
             }
@@ -608,6 +626,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             &globals_types,
             globals_base,
             table_base,
+            tsize as u32,
             &body,
             mem64,
             &imports,
@@ -1126,8 +1145,11 @@ struct Lower<'a> {
     global_types: &'a [ValType],
     globals_base: u64,
     /// Window byte address of function-table slot 0 (each slot an i32 funcref index). `call_indirect`
-    /// loads the slot and feeds it to our `CallIndirect`.
+    /// loads the slot and feeds it to our `CallIndirect`; the §RT `table.*` ops read/write it.
     table_base: u64,
+    /// The (fixed) table size in slots — what `table.size` returns. Tables aren't growable yet, so
+    /// the current size equals the declared initial size.
+    table_size: u32,
     /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
     /// that must be zero-extended before our (i64-addressed) `load`/`store`.
     mem64: bool,
@@ -1499,6 +1521,7 @@ fn lower_func(
     global_types: &[ValType],
     globals_base: u64,
     table_base: u64,
+    table_size: u32,
     body: &wasmparser::FunctionBody,
     mem64: bool,
     imports: &[(u32, u32, FuncType, u32)],
@@ -1552,6 +1575,7 @@ fn lower_func(
         global_types,
         globals_base,
         table_base,
+        table_size,
         mem64,
         mg,
         handles: (0..n_handles as ValIdx).collect(),
@@ -3466,6 +3490,156 @@ fn copy_one(lo: &mut Lower, d: ValIdx, s: ValIdx, idx: ValIdx) {
     });
 }
 
+// ---- §RT table access ops — the table is i32-granular window memory at `table_base`, so these are
+// the i32-slot twins of the memory ops. OOB indices mask into the window (the §1a model, like memory).
+
+/// The window byte offset of table slot `index` (an i32 on the stack): `index*4`. The caller passes
+/// `lo.table_base` as the Load/Store `offset`.
+fn table_elem_off(lo: &mut Lower, index: ValIdx) -> ValIdx {
+    let idx64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: index,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: idx64,
+        b: four,
+    })
+}
+
+/// `table.get $t`: load the i32 ref at `table_base + index*4`.
+fn table_get_op(lo: &mut Lower) -> Result<(), Error> {
+    let (index, _) = lo.pop()?;
+    let off = table_elem_off(lo, index);
+    let base = lo.table_base;
+    let v = lo.emit(Inst::Load {
+        op: LoadOp::I32,
+        addr: off,
+        offset: base,
+        align: 2,
+    });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+
+/// `table.set $t`: store an i32 ref at `table_base + index*4`. Stack: `[index, value]`.
+fn table_set_op(lo: &mut Lower) -> Result<(), Error> {
+    let (value, _) = lo.pop()?;
+    let (index, _) = lo.pop()?;
+    let off = table_elem_off(lo, index);
+    let base = lo.table_base;
+    lo.emit_void(Inst::Store {
+        op: StoreOp::I32,
+        addr: off,
+        value,
+        offset: base,
+        align: 2,
+    });
+    Ok(())
+}
+
+/// `table.size $t`: the current size in slots. Fixed (no `table.grow` yet), so a constant.
+fn table_size_op(lo: &mut Lower) -> Result<(), Error> {
+    let v = lo.emit(Inst::ConstI32(lo.table_size as i32));
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+
+/// `table.fill $t`: `for (i=0; i<n; i++) store_i32(table_base + (dest+i)*4, val)` — the i32-slot twin
+/// of `memory.fill`, as a synthesized header/body/exit loop. Stack: `[dest, val, count]`.
+fn table_fill_op(lo: &mut Lower) -> Result<(), Error> {
+    let (count, _) = lo.pop()?;
+    let (val, _) = lo.pop()?;
+    let (dest, _) = lo.pop()?;
+    let dest64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: dest,
+    });
+    let n = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: count,
+    });
+    let base = lo.table_base;
+
+    let below_t: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
+    let below_v = lo.stack_vals();
+    let extra = [ValType::I64, ValType::I32, ValType::I64, ValType::I64]; // dest, val, n, i
+    let hsig = lo.synth_sig(&below_t, &extra);
+    let header = lo.new_block(hsig.clone());
+    let body = lo.new_block(hsig);
+    let exit_sig = lo.synth_sig(&below_t, &[]);
+    let exit = lo.new_block(exit_sig);
+
+    let zero = lo.emit(Inst::ConstI64(0));
+    let args = lo.synth_args(&below_v, &[dest64, val, n, zero]);
+    lo.set_term(Terminator::Br {
+        target: header as u32,
+        args,
+    });
+
+    // header: while i < n → body, else → exit.
+    let hx = lo.enter_synth(header, &below_t, 4);
+    let (d, v, nn, i) = (hx[0], hx[1], hx[2], hx[3]);
+    let cond = lo.emit(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LtU,
+        a: i,
+        b: nn,
+    });
+    let bv = lo.stack_vals();
+    let then_args = lo.synth_args(&bv, &[d, v, nn, i]);
+    let else_args = lo.synth_args(&bv, &[]);
+    lo.set_term(Terminator::BrIf {
+        cond,
+        then_blk: body as u32,
+        then_args,
+        else_blk: exit as u32,
+        else_args,
+    });
+
+    // body: store_i32(base + (d+i)*4, v); i += 1; back to header.
+    let bx = lo.enter_synth(body, &below_t, 4);
+    let (d, v, nn, i) = (bx[0], bx[1], bx[2], bx[3]);
+    let slot = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: d,
+        b: i,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    let off = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: slot,
+        b: four,
+    });
+    lo.emit_void(Inst::Store {
+        op: StoreOp::I32,
+        addr: off,
+        value: v,
+        offset: base,
+        align: 2,
+    });
+    let one = lo.emit(Inst::ConstI64(1));
+    let i1 = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: i,
+        b: one,
+    });
+    let bv = lo.stack_vals();
+    let back = lo.synth_args(&bv, &[d, v, nn, i1]);
+    lo.set_term(Terminator::Br {
+        target: header as u32,
+        args: back,
+    });
+
+    lo.enter(exit, &below_t);
+    Ok(())
+}
+
 fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), Error> {
     use Operator as O;
     // Dead code after a branch/return/unreachable: track structure (block depth) but emit nothing
@@ -3510,6 +3684,44 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             let (a, t) = lo.pop()?;
             let v = lo.emit(Inst::Select { cond: c, a, b });
             lo.push(v, t);
+        }
+        // §RT typed select `select (result t)` — the reference-types-era form that names its type.
+        // Operationally identical to plain `select`; the named type is just what the operands carry.
+        O::TypedSelect { ty } => {
+            let t = val_type(ty)?;
+            let (c, _) = lo.pop()?;
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Select { cond: c, a, b });
+            lo.push(v, t);
+        }
+        // ---- §RT reference instructions (both ref types are an i32 index in SVM) ----
+        O::RefNull { .. } => {
+            let v = lo.emit(Inst::ConstI32(REF_NULL));
+            lo.consts.insert(v, REF_NULL as i64);
+            lo.push(v, ValType::I32);
+        }
+        O::RefIsNull => {
+            let (a, _) = lo.pop()?;
+            let null = lo.emit(Inst::ConstI32(REF_NULL));
+            let v = lo.emit(Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a,
+                b: null,
+            });
+            lo.push(v, ValType::I32);
+        }
+        // `ref.func $f` → the function's §3c index (the IR function index). A funcref to an *import*
+        // has no IR index (imports lower to `cap.call`, not a defined function), so it is rejected —
+        // the same limit as a funcref element segment.
+        O::RefFunc { function_index } => {
+            let ir = function_index
+                .checked_sub(lo.n_imp as u32)
+                .ok_or_else(|| Error::Unsupported("ref.func to an imported function".into()))?;
+            let v = lo.emit(Inst::ConstI32(ir as i32));
+            lo.consts.insert(v, ir as i64);
+            lo.push(v, ValType::I32);
         }
         // ---- integer arithmetic / bitwise / shifts ----
         O::I32Add => int_bin(lo, IntTy::I32, BinOp::Add)?,
@@ -3898,6 +4110,31 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             type_index,
             table_index,
         } => call_indirect_op(lo, type_index, table_index)?,
+        // ---- §RT table access ops (table 0 only; multiple tables are a follow-up) ----
+        O::TableGet { table } => {
+            if table != 0 {
+                return unsup("table.get on a non-zero table");
+            }
+            table_get_op(lo)?;
+        }
+        O::TableSet { table } => {
+            if table != 0 {
+                return unsup("table.set on a non-zero table");
+            }
+            table_set_op(lo)?;
+        }
+        O::TableSize { table } => {
+            if table != 0 {
+                return unsup("table.size on a non-zero table");
+            }
+            table_size_op(lo)?;
+        }
+        O::TableFill { table } => {
+            if table != 0 {
+                return unsup("table.fill on a non-zero table");
+            }
+            table_fill_op(lo)?;
+        }
         // ---- tail calls (the tail-call proposal): a block-terminating call ----
         O::ReturnCall { function_index } => return_call_op(lo, function_index, fn_results)?,
         O::ReturnCallIndirect {
