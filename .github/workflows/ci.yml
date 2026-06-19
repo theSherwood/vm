@@ -26,6 +26,9 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: rustup target add x86_64-pc-windows-gnu
+      # The §5 W3 trap-capture C shim (trap_capture.c) is compiled for windows targets too, so the
+      # windows-gnu cross-check needs the mingw cross-compiler. (The MSVC build runs on windows-latest.)
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
   cross-os:
