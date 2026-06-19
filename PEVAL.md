@@ -11,7 +11,9 @@ it is dropped once the actionable slices (1–2 below) close.
 ## Done
 
 - **Generic IR→IR optimizer** — constant folding (integer **and scalar float**), branch resolution,
-  dead-block / dead-value elim, block merging, dead block-param elim, to a fixpoint. `tests/optimize.rs`.
+  dead-block / dead-value elim, block merging, dead block-param elim, and **copy propagation +
+  algebraic identities** (constant-condition `select`, `x+0`/`x*1`/`x<<0`/`x&-1`/…, and absorbing
+  forms `x*0`/`x&0`/`x|-1`/`x-x`/`x^x`/`x%1`), iterated to a fixpoint. `tests/optimize.rs`.
 - **Stage 1 — specialize**: online polyvariant symbolic execution; constant-memory reads fold, the
   dispatch `br_table` resolves, the interpreter loop unrolls. `tests/specialize.rs`.
 - **Constant memory = caller contract** (`SpecConfig`): readonly data segment (default), arbitrary
@@ -45,15 +47,12 @@ it is dropped once the actionable slices (1–2 below) close.
 
 ## Remaining slices (ranked by ROI)
 
-1. **Optimizer copy-forwarding + light algebraic identities** — add a value-forward/copy op (Stage 0
-   has none today), tightening `select`/param folding and residual width; cheap identities (`x+0`,
-   `x*1`, `x*2→shl`). Low effort, incremental (partly redundant with the JIT/LLVM backend).
-2. **Residual-call mode (bounded interprocedural, shared)** — specialize a callee once and emit a
+1. **Residual-call mode (bounded interprocedural, shared)** — specialize a callee once and emit a
    shared residual *call* (live memory cells threaded as params) instead of always inlining, to bound
    code growth / avoid the block budget on large programs. Medium–large effort; matters at scale.
-3. **v128 (SIMD) constant folding** — fold the 128-bit lane ops (a separate, larger lane/shape/shuffle
+2. **v128 (SIMD) constant folding** — fold the 128-bit lane ops (a separate, larger lane/shape/shuffle
    surface with its own `Known` representation). Medium–large effort.
-4. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
+3. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
    dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
    effort (on-device re-verify, determinism/TCB review) — a project, not a slice.
 

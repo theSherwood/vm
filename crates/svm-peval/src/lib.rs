@@ -40,6 +40,11 @@
 //! 6. **Dead block-parameter elimination.** A block parameter never referenced in its block is
 //!    dropped, along with the matching argument in every predecessor edge — a cross-edge
 //!    transform, paired with merging so residuals don't carry threaded-through dead state.
+//! 7. **Copy propagation + algebraic identities.** Within a block, a value that is a *copy* of an
+//!    earlier value — a constant-condition `select`, or an identity (`x+0`/`x-0`/`x*1`/`x<<0`,
+//!    `x|0`/`x&-1`/`x^0`, `x&x`/`x|x`) — has its uses rewritten to that earlier value, so the copy
+//!    becomes dead for step 4. Absorbing / self-cancelling forms that yield a *constant* even with
+//!    one operand unknown (`x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0) fold in step 1.
 //!
 //! **Untrusted for escape (§2a / §20a posture).** Like the LLVM on-ramp, this pass is
 //! *not* in the escape-TCB: its output is meant to be re-verified with
@@ -142,6 +147,13 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
         blocks = prune_unreachable(blocks);
         blocks = merge_blocks(blocks, fn_results);
         blocks = drop_dead_params(blocks, fn_results);
+        // Copy propagation + identity forwarding: rewrite uses of a value that is a copy of an
+        // earlier one (a constant-condition `select`, or an algebraic identity like `x+0`/`x*1`)
+        // to that earlier value, so the copy instruction becomes dead for the DCE pass below.
+        blocks = blocks
+            .iter()
+            .map(|b| copy_propagate(b, fn_results))
+            .collect();
         blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
         // Re-fold: merging brings a constant's definition into the same block as its use, and
         // dropping params can expose new constants — both newly foldable here.
@@ -211,7 +223,17 @@ fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
 /// traps identically to the source.
 fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
     match *inst {
-        Inst::IntBin { ty, op, a, b } => fold_int_bin(ty, op, get(known, a)?, get(known, b)?),
+        Inst::IntBin { ty, op, a, b } => {
+            // Both operands known: the exact arithmetic fold.
+            if let (Some(x), Some(y)) = (get(known, a), get(known, b)) {
+                if let Some(k) = fold_int_bin(ty, op, x, y) {
+                    return Some(k);
+                }
+            }
+            // Absorbing-element / self-cancelling identities that yield a *constant* with only one
+            // operand known (or `a == b`): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0.
+            fold_absorbing(ty, op, a, b, known)
+        }
         Inst::IntCmp { ty, op, a, b } => fold_int_cmp(ty, op, get(known, a)?, get(known, b)?),
         Inst::IntUn { ty, op, a } => fold_int_un(ty, op, get(known, a)?),
         Inst::Eqz { ty, a } => {
@@ -630,6 +652,116 @@ pub(crate) fn fold_int_un(ty: IntTy, op: IntUnOp, a: Known) -> Option<Known> {
             };
             Some(Known::I64(r))
         }
+    }
+}
+
+/// Whether known value `i` equals the signed constant `v` (width-agnostic for `0`/`1`/`-1`).
+fn known_is(known: &[Option<Known>], i: ValIdx, v: i64) -> bool {
+    match get(known, i) {
+        Some(Known::I32(x)) => x as i64 == v,
+        Some(Known::I64(x)) => x == v,
+        _ => false,
+    }
+}
+
+/// Identities that fold to a *constant* even with one operand unknown (absorbing elements and
+/// self-cancellation): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0. Sound for any `x`
+/// (none of these traps on these operands), so they need only one known operand — or `a == b`.
+fn fold_absorbing(
+    ty: IntTy,
+    op: BinOp,
+    a: ValIdx,
+    b: ValIdx,
+    known: &[Option<Known>],
+) -> Option<Known> {
+    let zero = match ty {
+        IntTy::I32 => Known::I32(0),
+        IntTy::I64 => Known::I64(0),
+    };
+    let is = |i, v| known_is(known, i, v);
+    match op {
+        BinOp::Mul | BinOp::And if is(a, 0) || is(b, 0) => Some(zero),
+        BinOp::Or if is(a, -1) || is(b, -1) => Some(match ty {
+            IntTy::I32 => Known::I32(-1),
+            IntTy::I64 => Known::I64(-1),
+        }),
+        BinOp::Sub | BinOp::Xor if a == b => Some(zero),
+        BinOp::RemS | BinOp::RemU if is(b, 1) => Some(zero),
+        _ => None,
+    }
+}
+
+/// If a single-result instruction is a *copy* of an earlier value — a constant-condition `select`,
+/// or an algebraic identity (`x+0`/`x-0`/`x*1`/`x<<0`/`x/1`, `x|0`/`x&-1`/`x^0`, `x&x`/`x|x`) —
+/// return the source value its result should forward to. (Identities that fold to a *constant* go
+/// through [`fold_absorbing`] instead.)
+fn forward_to_operand(inst: &Inst, known: &[Option<Known>]) -> Option<ValIdx> {
+    let is = |i, v| known_is(known, i, v);
+    match *inst {
+        Inst::Select { cond, a, b } => {
+            let c = get(known, cond)?.as_i32()?;
+            Some(if c != 0 { a } else { b })
+        }
+        Inst::IntBin { op, a, b, .. } => match op {
+            BinOp::Add if is(a, 0) => Some(b),
+            BinOp::Add if is(b, 0) => Some(a),
+            BinOp::Sub if is(b, 0) => Some(a),
+            BinOp::Mul if is(a, 1) => Some(b),
+            BinOp::Mul if is(b, 1) => Some(a),
+            BinOp::Or if is(a, 0) => Some(b),
+            BinOp::Or if is(b, 0) || a == b => Some(a),
+            BinOp::And if is(a, -1) => Some(b),
+            BinOp::And if is(b, -1) || a == b => Some(a),
+            BinOp::Xor if is(a, 0) => Some(b),
+            BinOp::Xor if is(b, 0) => Some(a),
+            BinOp::Shl | BinOp::ShrS | BinOp::ShrU | BinOp::Rotl | BinOp::Rotr if is(b, 0) => {
+                Some(a)
+            }
+            // `x / 1` is deliberately *not* forwarded: division is not removable-if-dead (DCE keeps
+            // it conservatively, as a possible trap), so forwarding would leave a dead `div` behind
+            // rather than shrinking. `x % 1 → 0` is handled by `fold_absorbing` (an in-place const).
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Intra-block copy propagation. Rewrites every use of a value that is a copy of an earlier value
+/// (see [`forward_to_operand`]) to that earlier value; the now-unused copy instruction is removed by
+/// the following DCE pass. Index-stable (no instruction is removed here). Sound because an operand
+/// only references an earlier value in the same block, which dominates the use.
+fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
+    let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
+    // `repl[v]` is the value `v` forwards to (its root); params and non-copies map to themselves.
+    let mut repl: Vec<ValIdx> = (0..b.params.len() as u32).collect();
+    let mut insts = b.insts.clone();
+    let mut next = b.params.len() as u32;
+    for inst in insts.iter_mut() {
+        // Compose with prior forwarding first, so an operand always names its root.
+        map_operands(inst, &mut |o| repl[o as usize]);
+        let rc = inst.result_count(fn_results);
+        if rc == 1 {
+            let root = match forward_to_operand(inst, &known) {
+                Some(src) => repl[src as usize],
+                None => next,
+            };
+            repl.push(root);
+            known.push(const_value(inst));
+            next += 1;
+        } else {
+            for _ in 0..rc {
+                repl.push(next);
+                known.push(None);
+                next += 1;
+            }
+        }
+    }
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |o| repl[o as usize]);
+    Block {
+        params: b.params.clone(),
+        insts,
+        term,
     }
 }
 
