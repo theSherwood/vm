@@ -21,7 +21,9 @@ use svm_ir::{
     ValType,
 };
 use svm_jit::JitOutcome;
-use svm_peval::{optimize_module, specialize, specialize_with, SpecArg};
+use svm_peval::{
+    optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
+};
 use svm_verify::verify_module;
 
 /// Static size of a module: total blocks, total instructions (terminators excluded), and the
@@ -544,4 +546,339 @@ fn size_corpus() {
             "expected the residual to be smaller than the interpreter"
         );
     }
+}
+
+// ===========================================================================================
+// Outlining + renaming TOGETHER (the PR-#82 capability): a stack-machine interpreter whose binary
+// op dispatches to a *helper function*. The operand stack lives in a renamed region (Stage-2 SSA),
+// and with `outline_calls` the helper becomes a shared residual function — so the renamed operand
+// cells that are live across the call must thread across the residual call boundary (in as extra
+// args, out as extra results). Before PR #82 this combination was rejected (outline required
+// rename=None); this exercises it on an interpreter shape and reports what it buys.
+//
+//   cargo test -p svm-peval --test bench outline_rename -- --nocapture
+// ===========================================================================================
+
+const H_HALT: u8 = 0; //      pop and return top of stack
+const H_PUSH: u8 = 1; // imm  push imm
+const H_PUSHIN: u8 = 2; //    push the runtime input
+const H_COMBINE: u8 = 3; //   pop b, pop a, push combine(a, b)  (a CALL to the helper)
+
+const COMB_K1: i64 = 2654435761;
+const COMB_K2: i64 = 40503;
+/// The helper's pure kernel — chunky enough that inlining it at every call site visibly costs code.
+fn combine_ref(a: i64, b: i64) -> i64 {
+    a.wrapping_add(b)
+        .wrapping_mul(COMB_K1)
+        .wrapping_add(a)
+        .wrapping_mul(COMB_K2)
+}
+
+/// A stack machine (operand stack in `[STACK_LO, STACK_HI)`, renamed to SSA) whose `COMBINE` opcode
+/// calls a separate `combine(a, b)` helper (func 1) instead of inlining the arithmetic. Program is in
+/// a readonly segment; `run(input)` returns the final top of stack.
+fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
+    let t = || ValType::I64;
+    let load = |op, addr, offset| Inst::Load {
+        op,
+        addr,
+        offset,
+        align: 0,
+    };
+    let store = |addr, value| Inst::Store {
+        op: StoreOp::I64,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let bin = |op, a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+
+    let entry = Block {
+        params: vec![t()],                                               // 0: input
+        insts: vec![Inst::ConstI64(0), Inst::ConstI64(STACK_LO as i64)], // 1: pc, 2: sp
+        term: Terminator::Br {
+            target: 1,
+            args: vec![1, 2, 0],
+        },
+    };
+    let header = Block {
+        params: vec![t(), t(), t()], // 0: pc, 1: sp, 2: input
+        insts: vec![
+            Inst::ConstI64(0),
+            bin(BinOp::Add, 3, 0),      // 4: addr = base + pc
+            load(LoadOp::I32_8U, 4, 0), // 5: op
+            load(LoadOp::I64, 4, 1),    // 6: imm
+        ],
+        term: Terminator::BrTable {
+            idx: 5,
+            targets: vec![
+                (2, vec![1]),          // HALT    -> halt(sp)
+                (3, vec![0, 1, 6, 2]), // PUSH
+                (4, vec![0, 1, 6, 2]), // PUSHIN
+                (5, vec![0, 1, 6, 2]), // COMBINE
+            ],
+            default: (2, vec![1]),
+        },
+    };
+    let halt = Block {
+        params: vec![t()], // 0: sp
+        insts: vec![
+            Inst::ConstI64(8),
+            bin(BinOp::Sub, 0, 1),
+            load(LoadOp::I64, 2, 0),
+        ],
+        term: Terminator::Return(vec![3]),
+    };
+    let push_body = |value_idx: u32| Block {
+        params: vec![t(), t(), t(), t()], // 0: pc, 1: sp, 2: imm, 3: input
+        insts: vec![
+            store(1, value_idx),
+            Inst::ConstI64(8),
+            bin(BinOp::Add, 1, 4), // 5: nsp
+            Inst::ConstI64(9),
+            bin(BinOp::Add, 0, 6), // 7: npc
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![7, 5, 3],
+        },
+    };
+    // COMBINE: b = stk[sp-8]; a = stk[sp-16]; stk[sp-16] = combine(a, b); sp -= 8. The CALL happens
+    // while cells below the two operands are still live in the renamed region — those must thread.
+    let combine_body = Block {
+        params: vec![t(), t(), t(), t()], // 0: pc, 1: sp, 2: imm, 3: input
+        insts: vec![
+            Inst::ConstI64(8),
+            bin(BinOp::Sub, 1, 4),   // 5: sp1 = sp - 8
+            load(LoadOp::I64, 5, 0), // 6: b = stk[sp1]
+            bin(BinOp::Sub, 5, 4),   // 7: sp2 = sp1 - 8
+            load(LoadOp::I64, 7, 0), // 8: a = stk[sp2]
+            Inst::Call {
+                func: 1,
+                args: vec![8, 6],
+            }, // 9: r = combine(a, b)
+            store(7, 9),             // stk[sp2] = r
+            Inst::ConstI64(9),
+            bin(BinOp::Add, 0, 10), // 11: npc
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![11, 5, 3],
+        }, // sp = sp1 (net -8)
+    };
+    // combine(a, b) = ((a + b) * K1 + a) * K2 — a few ops, no memory.
+    let combine = Func {
+        params: vec![t(), t()], // 0: a, 1: b
+        results: vec![t()],
+        blocks: vec![Block {
+            params: vec![t(), t()],
+            insts: vec![
+                bin(BinOp::Add, 0, 1), // 2: a+b
+                Inst::ConstI64(COMB_K1),
+                bin(BinOp::Mul, 2, 3), // 4: *K1
+                bin(BinOp::Add, 4, 0), // 5: +a
+                Inst::ConstI64(COMB_K2),
+                bin(BinOp::Mul, 5, 6), // 7: *K2
+            ],
+            term: Terminator::Return(vec![7]),
+        }],
+    };
+
+    Module {
+        funcs: vec![
+            Func {
+                params: vec![t()],
+                results: vec![t()],
+                blocks: vec![
+                    entry,
+                    header,
+                    halt,
+                    push_body(2),
+                    push_body(3),
+                    combine_body,
+                ],
+            },
+            combine,
+        ],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: true,
+            bytes: encode_program(program),
+        }],
+        ..Default::default()
+    }
+}
+
+/// The reference result of running `program` over `input` (mirrors the interpreter's semantics).
+fn run_stack_calls_ref(program: &[(u8, i64)], input: i64) -> i64 {
+    let mut stk = Vec::new();
+    let mut pc = 0;
+    loop {
+        let (op, imm) = program[pc];
+        match op {
+            H_HALT => return *stk.last().unwrap(),
+            H_PUSH => stk.push(imm),
+            H_PUSHIN => stk.push(input),
+            H_COMBINE => {
+                let b = stk.pop().unwrap();
+                let a = stk.pop().unwrap();
+                stk.push(combine_ref(a, b));
+            }
+            _ => unreachable!(),
+        }
+        pc += 1;
+    }
+}
+
+/// Count surviving memory ops (loads + stores) across all functions.
+fn memory_ops(m: &Module) -> usize {
+    m.funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i, Inst::Load { .. } | Inst::Store { .. }))
+        .count()
+}
+
+#[test]
+fn outline_rename_threads_operand_stack_through_helpers() {
+    // A left fold: acc starts at 0; each step combines the running acc with combine(input, c_i). At the
+    // inner COMBINE the acc cell is live below the two operands, so it must thread across the call.
+    let cs = [3i64, 5, 7, 11, 13, 17];
+    let mut prog = vec![(H_PUSH, 0)]; // acc = 0
+    for &c in &cs {
+        prog.push((H_PUSHIN, 0)); // input
+        prog.push((H_PUSH, c)); // c_i
+        prog.push((H_COMBINE, 0)); // t = combine(input, c_i)   -- acc live below
+        prog.push((H_COMBINE, 0)); // acc = combine(acc, t)
+    }
+    prog.push((H_HALT, 0));
+
+    let interp = build_stack_interpreter_calls(&prog);
+    verify_module(&interp).expect("interpreter verifies");
+    let region = Some((STACK_LO, STACK_HI));
+
+    // (1) OLD fallback: rename only. Outlining was rejected with a region, so the helper inlines —
+    // one function, its body duplicated at every COMBINE.
+    let inline = specialize_with(&interp, 0, &[SpecArg::Dynamic], region).expect("inline+rename");
+    // (2) Outline WITHOUT rename: the helper is shared, but the operand stack stays in *real memory*
+    // (loads/stores survive) — the only way to outline this interpreter before #82.
+    let outline_mem = specialize_with_config(
+        &interp,
+        0,
+        &[SpecArg::Dynamic],
+        &SpecConfig {
+            outline_calls: true,
+            ..SpecConfig::default()
+        },
+    )
+    .expect("outline, no rename");
+    // (3) NEW (#82): rename + outline together. Shared residual helper AND the operand stack stays in
+    // SSA — the live renamed cells thread across each residual call.
+    let outlined = specialize_with_config(
+        &interp,
+        0,
+        &[SpecArg::Dynamic],
+        &SpecConfig {
+            rename: region,
+            outline_calls: true,
+            ..SpecConfig::default()
+        },
+    )
+    .expect("outline+rename");
+    for m in [&inline, &outline_mem, &outlined] {
+        verify_module(m).expect("residual verifies");
+    }
+
+    // The payoff of #82: outlining no longer forces the operand stack into memory. (2) outlines but
+    // leaves real memory traffic; (3) outlines AND keeps the stack in SSA — zero memory ops, even
+    // across the call (cells crossed as args/results). The old fallback (1) is also SSA but can't
+    // share the helper.
+    assert!(
+        memory_ops(&outline_mem) > 0,
+        "outline-no-rename should keep stack in memory"
+    );
+    assert_eq!(
+        memory_ops(&outlined),
+        0,
+        "outline+rename must keep the stack in SSA"
+    );
+    assert_eq!(memory_ops(&inline), 0, "inline+rename is SSA");
+    // Dispatch folds away in every config.
+    assert!(!has_dispatch(&inline) && !has_dispatch(&outlined));
+    // (1) is a single inlined function; (2)/(3) share the outlined helper as separate functions.
+    assert_eq!(
+        inline.funcs.len(),
+        1,
+        "inline+rename should be a single function"
+    );
+    assert!(
+        outlined.funcs.len() > 1,
+        "outline+rename should emit a shared residual helper"
+    );
+
+    // Correctness: interpreter, all three residuals, and the Rust reference agree.
+    for input in [0i64, 1, -3, 7, 1000, i64::MIN] {
+        let want = run_stack_calls_ref(&prog, input);
+        assert_eq!(
+            interp_run(&interp, input),
+            want,
+            "interpreter wrong at {input}"
+        );
+        assert_eq!(
+            jit_run(&inline, input),
+            want,
+            "inline+rename wrong at {input}"
+        );
+        assert_eq!(
+            jit_run(&outline_mem, input),
+            want,
+            "outline-no-rename wrong at {input}"
+        );
+        assert_eq!(
+            jit_run(&outlined, input),
+            want,
+            "outline+rename wrong at {input}"
+        );
+    }
+
+    let row = |label: &str, m: &Module| {
+        let o = optimize_module(m);
+        let s = sizes(&o);
+        println!(
+            "{label:<22} {:>3} fns {:>4} blocks {:>4} insts {:>5} bytes {:>4} mem-ops",
+            o.funcs.len(),
+            s.blocks,
+            s.insts,
+            s.bytes,
+            memory_ops(&o)
+        );
+    };
+    println!(
+        "\n=== outline + rename together (stack machine, {} COMBINE calls) ===",
+        2 * cs.len()
+    );
+    println!(
+        "interpreter:           {:>3} fns ... {:>4} bytes",
+        interp.funcs.len(),
+        sizes(&interp).bytes
+    );
+    row("inline+rename (old)", &inline);
+    row("outline, no-rename", &outline_mem);
+    row("outline+rename (#82)", &outlined);
+    println!(
+        "\n#82 buys: outlining WITHOUT spilling the operand stack — {} -> 0 memory ops vs outline-no-rename.",
+        memory_ops(&optimize_module(&outline_mem))
+    );
+    println!(
+        "note: helper sharing is fragmented ({} fns) because dead operand cells above sp pollute the\n      outline key — pruning them would restore sharing (a follow-up).",
+        optimize_module(&outlined).funcs.len()
+    );
 }
