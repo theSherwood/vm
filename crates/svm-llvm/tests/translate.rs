@@ -1264,6 +1264,59 @@ fn tail_call_mutual_recursion() {
     check_powerbox_vs_native("tail_mutual", src, b"");
 }
 
+// Narrow (i8/i16) atomics — emulated via the 32-bit CAS-loop helpers. rmw add (with wrap-around),
+// or/and/xor, exchange, load, store, and cmpxchg (success + failure) on a byte and a halfword.
+const ATOMICS_NARROW_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_uchar c = 0;\n\
+        atomic_fetch_add(&c, 200); atomic_fetch_add(&c, 100);\n\
+        atomic_fetch_or(&c, 0x80); atomic_fetch_and(&c, 0xF0); atomic_fetch_xor(&c, 0x0F);\n\
+        unsigned char oc = atomic_exchange(&c, 50);\n\
+        unsigned char lc = atomic_load(&c);\n\
+        atomic_store(&c, 99);\n\
+        unsigned char e1 = 99; int ok1 = atomic_compare_exchange_strong(&c, &e1, 123);\n\
+        unsigned char e2 = 7;  int ok2 = atomic_compare_exchange_strong(&c, &e2, 0);\n\
+        atomic_ushort s = 1000; atomic_fetch_add(&s, 70000);\n\
+        printf(\"%d %d %d %d %d %d\\n\", oc, lc, ok1, ok2, atomic_load(&c), atomic_load(&s));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_narrow() {
+    check_powerbox_vs_native("atomics_narrow", ATOMICS_NARROW_SRC, b"");
+}
+
+#[test]
+fn atomics_narrow_lowers_and_runs() {
+    // Local validation (no native cc). c: 0→200→44(wrap)→172→160→175; oc=175, store 99, cas(99→123)
+    // ok, cas(7) fail, c=123. s: 1000+70000 ≡ 5464 (mod 2^16).
+    let Some(bc) = compile_to_bc("atomics_n", ATOMICS_NARROW_SRC) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // The narrow CAS-loop helpers were synthesized (each contains an AtomicCmpxchg).
+    let cas_loops = t
+        .module
+        .funcs
+        .iter()
+        .filter(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, svm_ir::Inst::AtomicCmpxchg { .. }))
+            })
+        })
+        .count();
+    assert!(
+        cas_loops >= 2,
+        "expected the rmw + cas narrow helpers, got {cas_loops}"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"175 50 1 0 123 5464\n");
+}
+
 // C11 `<stdatomic.h>` exercising every native atomic instruction the on-ramp now lowers: rmw
 // add/sub/and/or/xor and exchange, load, store, and compare-exchange (success + failure) on `i32`
 // and `i64`. Single-threaded, so seq-cst is trivially observable.

@@ -277,6 +277,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // stashed stdout handle. Synthesized for any `printf` program (dead if no `%f` appears — scanning
     // the formats to tighten this is a later refinement).
     let need_dtoa = need_printf;
+    let need_narrow_atomic = uses_narrow_atomic(m);
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
     // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, ioring(5)
@@ -381,6 +382,8 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         dtoa_sci: take(need_dtoa),
         dtoa_gen: take(need_dtoa),
         dtoa_fix: take(need_dtoa),
+        atomic_rmw_narrow: take(need_narrow_atomic),
+        atomic_cas_narrow: take(need_narrow_atomic),
         float_scratch: float_scratch_base,
     };
 
@@ -564,6 +567,12 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
             helpers.big_divmod.unwrap(),
             helpers.big_iszero.unwrap(),
         ));
+    }
+    // Narrow-atomic CAS-loop helpers (appended after the bignum family — matches the `take` order so
+    // the recorded indices line up). Self-contained: they touch only the passed window addresses.
+    if need_narrow_atomic {
+        funcs.push(synth_atomic_rmw_narrow());
+        funcs.push(synth_atomic_cas_narrow());
     }
     Ok(Translated {
         module: Module {
@@ -2861,12 +2870,31 @@ struct Helpers {
     dtoa_gen: Option<u32>,
     /// `__svm_dtoa_fix_big(bits, prec, width, flags, scratch) -> i64` — the `%f`/`%F` formatter.
     dtoa_fix: Option<u32>,
+    /// Narrow (i8/i16) atomic CAS-loop helpers: `__svm_atomic_rmw_narrow` and
+    /// `__svm_atomic_cas_narrow`. Present only when the module uses a narrow atomic rmw/store/cmpxchg.
+    atomic_rmw_narrow: Option<u32>,
+    atomic_cas_narrow: Option<u32>,
     /// Base window address of the reserved float scratch (`= float_scratch_base`), so the printf
     /// lowering can `emit_write` the field a bignum formatter fills at `+FMT_OUT_O`.
     float_scratch: Option<u64>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
+/// Does the module use a **narrow** (i8/i16) atomic that needs the CAS-loop helpers — an `atomicrmw`,
+/// a `cmpxchg`, or an atomic `store` on an i8/i16? (A narrow atomic *load* is emulated inline, so it
+/// doesn't pull in a helper.) Wide (i32/i64) atomics lower directly and need no helper.
+fn uses_narrow_atomic(m: &LModule) -> bool {
+    let narrow = |o: &Operand| matches!(o.get_type(&m.types).as_ref(), Type::IntegerType { bits } if *bits == 8 || *bits == 16);
+    m.functions.iter().flat_map(|f| &f.basic_blocks).any(|bb| {
+        bb.instrs.iter().any(|i| match i {
+            Instruction::AtomicRMW(r) => narrow(&r.value),
+            Instruction::CmpXchg(cx) => narrow(&cx.expected),
+            Instruction::Store(st) => st.atomicity.is_some() && narrow(&st.value),
+            _ => false,
+        })
+    })
+}
+
 fn calls_external(m: &LModule, defined: &HashMap<String, u32>, want: &str) -> bool {
     m.functions.iter().flat_map(|f| &f.basic_blocks).any(|bb| {
         bb.instrs.iter().any(|i| {
@@ -3863,6 +3891,33 @@ impl Bdr {
         self.push(Inst::Convert {
             op: ConvOp::ExtendI32U,
             a,
+        })
+    }
+    /// Truncate an i64 to i32 (for an `i32.atomic.*` operand / the enclosing-word value).
+    fn wrap32(&mut self, a: ValIdx) -> u32 {
+        self.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a,
+        })
+    }
+    /// Seq-cst `i32.atomic.load` of the enclosing word (yields i32).
+    fn atomic_load32(&mut self, addr: ValIdx) -> u32 {
+        self.push(Inst::AtomicLoad {
+            ty: IntTy::I32,
+            addr,
+            offset: 0,
+            order: Ordering::SeqCst,
+        })
+    }
+    /// Seq-cst `i32.atomic.cmpxchg` of the enclosing word; yields the old (i32) word value.
+    fn atomic_cas32(&mut self, addr: ValIdx, expected: ValIdx, replacement: ValIdx) -> u32 {
+        self.push(Inst::AtomicCmpxchg {
+            ty: IntTy::I32,
+            addr,
+            expected,
+            replacement,
+            offset: 0,
+            order: Ordering::SeqCst,
         })
     }
     /// Call a synth helper that returns one i64 (`big_cmp`); yields its result value.
@@ -7194,6 +7249,160 @@ fn synth_dtoa_fix_big(
     }
 }
 
+/// `__svm_atomic_rmw_narrow(word_addr, shift, width_mask, value, opcode) -> i64` — emulate a narrow
+/// (i8/i16) `atomicrmw` via a seq-cst 32-bit CAS loop over the enclosing aligned word. `shift` is the
+/// field's bit offset within the word, `width_mask` its unshifted mask (0xFF / 0xFFFF). Returns the
+/// **old** field value (zero-extended). `opcode`: 0=xchg 1=add 2=sub 3=and 4=or 5=xor.
+fn synth_atomic_rmw_narrow() -> Func {
+    use BinOp::{Add, And, Or, Shl, ShrU, Sub, Xor};
+    use CmpOp::Eq;
+    let i64t = ValType::I64;
+    const LOOP: u32 = 1;
+    const RET: u32 = 2;
+    // 0: ENTRY → LOOP(word_addr, shift, width_mask, value, opcode)
+    let b0 = {
+        let b = Bdr::new(5);
+        b.block(
+            vec![i64t, i64t, i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, 2, 3, 4],
+            },
+        )
+    };
+    // 1: LOOP — load word, splice the new field, CAS; retry on contention.
+    let b1 = {
+        let mut b = Bdr::new(5); // word_addr=0, shift=1, width_mask=2, value=3, opcode=4
+        let w32 = b.atomic_load32(0);
+        let w = b.ext(w32);
+        let sh = b.bin(ShrU, w, 1);
+        let old = b.bin(And, sh, 2);
+        // new field = op(old, value), masked to the field width
+        let addv = b.bin(Add, old, 3);
+        let subv = b.bin(Sub, old, 3);
+        let andv = b.bin(And, old, 3);
+        let orv = b.bin(Or, old, 3);
+        let xorv = b.bin(Xor, old, 3);
+        let is0 = b.cmpi(Eq, 4, 0);
+        let is1 = b.cmpi(Eq, 4, 1);
+        let is2 = b.cmpi(Eq, 4, 2);
+        let is3 = b.cmpi(Eq, 4, 3);
+        let is4 = b.cmpi(Eq, 4, 4);
+        let t = b.sel(is4, orv, xorv);
+        let t = b.sel(is3, andv, t);
+        let t = b.sel(is2, subv, t);
+        let t = b.sel(is1, addv, t);
+        let nf = b.sel(is0, 3, t); // opcode 0 = xchg ⇒ the raw value
+        let newfield = b.bin(And, nf, 2);
+        let fieldmask = b.bin(Shl, 2, 1);
+        let notmask = b.bini(BinOp::Xor, fieldmask, -1);
+        let clr = b.bin(And, w, notmask);
+        let shifted = b.bin(Shl, newfield, 1);
+        let neww = b.bin(Or, clr, shifted);
+        let neww32 = b.wrap32(neww);
+        let got32 = b.atomic_cas32(0, w32, neww32);
+        let gotw = b.ext(got32);
+        let ok = b.cmp(Eq, gotw, w);
+        b.block(
+            vec![i64t, i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: ok,
+                then_blk: RET,
+                then_args: vec![old],
+                else_blk: LOOP,
+                else_args: vec![0, 1, 2, 3, 4],
+            },
+        )
+    };
+    let b2 = {
+        let b = Bdr::new(1);
+        b.block(vec![i64t], Terminator::Return(vec![0]))
+    };
+    Func {
+        params: vec![i64t, i64t, i64t, i64t, i64t],
+        results: vec![i64t],
+        blocks: vec![b0, b1, b2],
+    }
+}
+
+/// `__svm_atomic_cas_narrow(word_addr, shift, width_mask, expected, replacement) -> i64` — emulate a
+/// narrow (i8/i16) `cmpxchg` via a seq-cst 32-bit CAS loop. `expected`/`replacement` are pre-masked
+/// by the caller. Returns the **old** field value; the caller derives success from `old == expected`.
+fn synth_atomic_cas_narrow() -> Func {
+    use BinOp::{And, Or, Shl, ShrU};
+    use CmpOp::{Eq, Ne};
+    let i64t = ValType::I64;
+    const LOOP: u32 = 1;
+    const TRY: u32 = 2;
+    const RET: u32 = 3;
+    // 0: ENTRY → LOOP
+    let b0 = {
+        let b = Bdr::new(5);
+        b.block(
+            vec![i64t, i64t, i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, 2, 3, 4],
+            },
+        )
+    };
+    // 1: LOOP(word_addr, shift, width_mask, expected, replacement) — load + mismatch check.
+    let b1 = {
+        let mut b = Bdr::new(5);
+        let w32 = b.atomic_load32(0);
+        let w = b.ext(w32);
+        let sh = b.bin(ShrU, w, 1);
+        let old = b.bin(And, sh, 2);
+        let ne = b.cmp(Ne, old, 3); // old != expected ⇒ cmpxchg fails, return old
+        b.block(
+            vec![i64t, i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: ne,
+                then_blk: RET,
+                then_args: vec![old],
+                else_blk: TRY,
+                else_args: vec![0, 1, 2, 3, 4, w32, w],
+            },
+        )
+    };
+    // 2: TRY(word_addr, shift, width_mask, expected, replacement, w32:i32, w:i64) — splice, CAS.
+    let i32t = ValType::I32;
+    let b2 = {
+        let mut b = Bdr::new(7);
+        let newfield = b.bin(And, 4, 2); // replacement & width_mask
+        let fieldmask = b.bin(Shl, 2, 1);
+        let notmask = b.bini(BinOp::Xor, fieldmask, -1);
+        let clr = b.bin(And, 6, notmask); // w & ~fieldmask
+        let shifted = b.bin(Shl, newfield, 1);
+        let neww = b.bin(Or, clr, shifted);
+        let neww32 = b.wrap32(neww);
+        let got32 = b.atomic_cas32(0, 5, neww32); // expected = w32 (param 5)
+        let gotw = b.ext(got32);
+        let ok = b.cmp(Eq, gotw, 6); // gotw == w
+        let sh = b.bin(ShrU, 6, 1);
+        let old = b.bin(And, sh, 2); // == expected (we got here only on a match)
+        b.block(
+            vec![i64t, i64t, i64t, i64t, i64t, i32t, i64t],
+            Terminator::BrIf {
+                cond: ok,
+                then_blk: RET,
+                then_args: vec![old],
+                else_blk: LOOP,
+                else_args: vec![0, 1, 2, 3, 4],
+            },
+        )
+    };
+    let b3 = {
+        let b = Bdr::new(1);
+        b.block(vec![i64t], Terminator::Return(vec![0]))
+    };
+    Func {
+        params: vec![i64t, i64t, i64t, i64t, i64t],
+        results: vec![i64t],
+        blocks: vec![b0, b1, b2, b3],
+    }
+}
+
 /// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
@@ -10257,28 +10466,153 @@ fn narrow_rmw_opcode(op: llvm_ir::instruction::RMWBinOp) -> Option<i64> {
     })
 }
 
-// Narrow (i8/i16) atomic lowering — emulated via a 32-bit CAS loop over the enclosing aligned word
-// in a synthesized helper. (Implemented in the next commit; fail-closed until then.)
-fn lower_narrow_atomic_load(_ctx: &mut BlockCtx, _addr: ValIdx, _w: u8) -> Result<ValIdx, Error> {
-    unsup("narrow (i8/i16) atomic load — CAS-loop slice (next commit)")
+// Narrow (i8/i16) atomic lowering — emulated via a seq-cst 32-bit CAS loop over the enclosing
+// aligned word (DESIGN §3b note 2): keep the IR i32/i64-only and splice the field in `__svm_atomic_*`
+// helpers. `narrow_word_and_shift` gives the aligned word address and the field's bit offset.
+
+/// `(addr & ~3, (addr & 3) * 8)` — the enclosing aligned 32-bit word and the field's bit offset
+/// within it. A naturally-aligned i8/i16 lies wholly inside its enclosing 4-byte word.
+fn narrow_word_and_shift(ctx: &mut BlockCtx, addr: ValIdx) -> (ValIdx, ValIdx) {
+    let not3 = ctx.const_i64(!3i64);
+    let word = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a: addr,
+        b: not3,
+    });
+    let k3 = ctx.const_i64(3);
+    let low = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a: addr,
+        b: k3,
+    });
+    let k8 = ctx.const_i64(8);
+    let shift = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: low,
+        b: k8,
+    });
+    (word, shift)
 }
+
+fn narrow_mask(w: u8) -> i64 {
+    if w == 1 {
+        0xFF
+    } else {
+        0xFFFF
+    }
+}
+
+/// Narrow atomic load: an atomic load of the enclosing word, then extract the field. A single aligned
+/// word read is atomic for the byte/halfword within it — no CAS needed.
+fn lower_narrow_atomic_load(ctx: &mut BlockCtx, addr: ValIdx, w: u8) -> Result<ValIdx, Error> {
+    let (word, shift) = narrow_word_and_shift(ctx, addr);
+    let mask = ctx.const_i64(narrow_mask(w));
+    let w32 = ctx.push(Inst::AtomicLoad {
+        ty: IntTy::I32,
+        addr: word,
+        offset: 0,
+        order: Ordering::SeqCst,
+    });
+    let w64 = ctx.push(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: w32,
+    });
+    let sh = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::ShrU,
+        a: w64,
+        b: shift,
+    });
+    let field = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a: sh,
+        b: mask,
+    });
+    Ok(ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: field,
+    }))
+}
+
+/// Narrow `atomicrmw` (and atomic store, as an `xchg`): call the CAS-loop helper, return the old
+/// field (i32 container).
 fn lower_narrow_atomic_rmw(
-    _ctx: &mut BlockCtx,
-    _addr: ValIdx,
-    _value: ValIdx,
-    _w: u8,
-    _opcode: i64,
+    ctx: &mut BlockCtx,
+    addr: ValIdx,
+    value: ValIdx,
+    w: u8,
+    opcode: i64,
 ) -> Result<ValIdx, Error> {
-    unsup("narrow (i8/i16) atomicrmw — CAS-loop slice (next commit)")
+    let h = ctx
+        .helpers
+        .atomic_rmw_narrow
+        .ok_or_else(|| Error::Unsupported("narrow atomic rmw helper missing".into()))?;
+    let (word, shift) = narrow_word_and_shift(ctx, addr);
+    let mask = ctx.const_i64(narrow_mask(w));
+    let value64 = ctx.push(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: value,
+    });
+    let opc = ctx.const_i64(opcode);
+    let old64 = ctx.push(Inst::Call {
+        func: h,
+        args: vec![word, shift, mask, value64, opc],
+    });
+    Ok(ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: old64,
+    }))
 }
+
+/// Narrow `cmpxchg`: call the CAS-loop helper with a pre-masked `expected`/`replacement`; return the
+/// old field and the masked `expected` (the caller compares them for the success flag).
 fn lower_narrow_atomic_cas(
-    _ctx: &mut BlockCtx,
-    _addr: ValIdx,
-    _expected: ValIdx,
-    _replacement: ValIdx,
-    _w: u8,
+    ctx: &mut BlockCtx,
+    addr: ValIdx,
+    expected: ValIdx,
+    replacement: ValIdx,
+    w: u8,
 ) -> Result<(ValIdx, ValIdx), Error> {
-    unsup("narrow (i8/i16) cmpxchg — CAS-loop slice (next commit)")
+    let h = ctx
+        .helpers
+        .atomic_cas_narrow
+        .ok_or_else(|| Error::Unsupported("narrow atomic cas helper missing".into()))?;
+    let (word, shift) = narrow_word_and_shift(ctx, addr);
+    let mask = ctx.const_i64(narrow_mask(w));
+    let ext = |ctx: &mut BlockCtx, a| {
+        ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a,
+        })
+    };
+    let and_mask = |ctx: &mut BlockCtx, a| {
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::And,
+            a,
+            b: mask,
+        })
+    };
+    let exp64 = ext(ctx, expected);
+    let masked_exp64 = and_mask(ctx, exp64);
+    let masked_exp32 = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: masked_exp64,
+    });
+    let repl64 = ext(ctx, replacement);
+    let old64 = ctx.push(Inst::Call {
+        func: h,
+        args: vec![word, shift, mask, masked_exp64, repl64],
+    });
+    let old32 = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: old64,
+    });
+    Ok((old32, masked_exp32))
 }
 
 fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<(), Error> {
