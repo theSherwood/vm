@@ -14,7 +14,7 @@ kernels, to place the bytecode engine and JIT on an absolute scale.
 | `svm-bytecode` | this repo's bytecode engine (`bytecode::compile_and_run`) |
 | `svm-tree-walk` | this repo's tree-walking oracle (`svm_interp::run`) |
 | `python` | CPython 3 |
-| `wasm32/64(wasmtime)` | optional: the same wasm on Wasmtime (Cranelift) — see `wasmtime_bench.py` |
+| `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `svm-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
 
 ## Kernels
 
@@ -74,10 +74,16 @@ bench/cross-engine/run.sh        # prints engine,kernel,ns_per_iter CSV
 Needs `clang`, `node`, `python3`. The SVM rows come from the `megabench` example
 (`crates/svm/examples/megabench.rs`), built in release.
 
-To also compare against **Wasmtime** (Cranelift, like `svm-jit`), install the `wasmtime` CLI and run the
-optional driver against the wasm modules `run.sh` built — it times via the CLI with the same large/small-`n`
-subtraction (process spawn + compile are fixed per invocation and cancel):
+To also compare against **Wasmtime** (Cranelift, like `svm-jit`), run it against the wasm modules
+`run.sh` built. Two drivers:
 
 ```sh
+# accurate, in-process (covers every kernel incl. vsum; directly comparable to the in-process V8 rows):
+( cd bench/cross-engine/wasmtime-rs && cargo build --release )   # one-time: fetches + builds Wasmtime
+bench/cross-engine/wasmtime-rs/target/release/wasmtime-bench bench/cross-engine/k{32,64}.wasm
+
+# lightweight, via the wasmtime CLI (no crate build), large/small-n subtraction over subprocess spawns.
+# Omits vsum: the ~7 ms process overhead can't resolve a sub-0.1 ns/iter kernel, and the large n it
+# needs would read past vsum's (unwrapped) array. Use the in-process driver for vsum.
 WASMTIME=/path/to/wasmtime python3 bench/cross-engine/wasmtime_bench.py
 ```
