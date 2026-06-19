@@ -2557,10 +2557,11 @@ impl CompiledModule {
         // every still-parked fiber into its own region before the window is snapshotted, so the
         // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
         // flattening fiber touches only the committed reserve, so it's sound outside the guard.
-        // (The root's *own* fibers; a spawned child's fibers are out of scope, slice 3.3.) Skipped on a
-        // fault or a non-freeze run. The residue (incl. any fiber unwound mid-resume-chain during the
-        // root run, slice 3.2) is accumulated in the runtime by each fiber's `Complete` arm; drain it
-        // after driving — then the deferred children run (`drive_frozen_spawns`).
+        // This drives the **root's** own fibers; a spawned child flattens *its* fibers in
+        // `run_child_inline` (slice 3.4), merged below. Skipped on a fault or a non-freeze run. The
+        // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
+        // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving — then the
+        // deferred children run (`drive_frozen_spawns`).
         #[cfg(fiber_rt)]
         if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
             if let Some(rt) = (*this).fiber_rt.as_mut() {
@@ -2583,6 +2584,11 @@ impl CompiledModule {
             if let Some(d) = &(*this).domain {
                 d.drive_frozen_spawns();
                 (*this).frozen_vcpus_out = d.take_frozen_vcpus();
+                // Slice 3.4: a spawned child that owns fibers flattened them with its own
+                // `freeze_drive` (in `run_child_inline`) into the domain accumulator; merge that into
+                // the run residue alongside the root's. Sort-by-slot at serialize is canonical, so the
+                // append order doesn't affect the artifact.
+                (*this).frozen_out.extend(d.take_frozen_fibers());
             }
         }
 

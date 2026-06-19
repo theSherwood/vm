@@ -144,6 +144,11 @@ pub(crate) struct Domain {
     /// by [`Domain::drive_frozen_spawns`]; `run_inner` drains it into the run's residue so a snapshot
     /// records the children (a thaw re-attaches them). Empty on a non-durable run.
     frozen_vcpus: Mutex<Vec<crate::FrozenVCpu>>,
+    /// **Durable** (slice 3.4): residue of the fibers a *spawned child* flattened with its own
+    /// `freeze_drive` (a child that owns `cont.*` fibers). Accumulated by [`Domain::run_child_inline`];
+    /// `run_inner` merges it into the run's `frozen_out` (the root's own fibers are flattened directly
+    /// there). Empty on a non-durable run or a thread-only domain.
+    frozen_fibers: Mutex<Vec<crate::FrozenFiber>>,
     futex: Mutex<HashMap<u64, FutexEntry>>,
     futex_cv: Condvar,
     /// §15 spawn quota: max **concurrently-live** vCPUs (incl. the root) this domain may have, clamped
@@ -190,6 +195,7 @@ impl Domain {
             }),
             pending_spawns: Mutex::new(Vec::new()),
             frozen_vcpus: Mutex::new(Vec::new()),
+            frozen_fibers: Mutex::new(Vec::new()),
             futex: Mutex::new(HashMap::new()),
             futex_cv: Condvar::new(),
             max_vcpus: max_vcpus.clamp(1, MAX_VCPUS),
@@ -239,6 +245,12 @@ impl Domain {
     /// snapshot. Empty on a non-durable / non-freeze run.
     pub(crate) fn take_frozen_vcpus(&self) -> Vec<crate::FrozenVCpu> {
         std::mem::take(&mut lock(&self.frozen_vcpus))
+    }
+
+    /// Drain the child-owned fiber residue (slice 3.4) — the fibers spawned children flattened with
+    /// their own `freeze_drive`. `run_inner` merges this into the run's `frozen_out`.
+    pub(crate) fn take_frozen_fibers(&self) -> Vec<crate::FrozenFiber> {
+        std::mem::take(&mut lock(&self.frozen_fibers))
     }
 
     /// Join every spawned OS thread (run teardown). After this returns no vCPU is still touching the
@@ -562,6 +574,12 @@ impl Domain {
                 .expect("fiber_cfg set ⇒ the domain fiber table is set");
             let mut rt = FiberRuntime::new(table, tid, mask);
             rt.set_call_tramp(env.call_tramp);
+            // Arm the durable fiber-switch swap for this child (slice 3.4): a child that owns fibers
+            // needs `mem_base` + the `durable` flag on its own runtime so its `cont.resume` swap points
+            // the active shadow-SP at the fiber's region, and so the freeze driver's `Complete` arm
+            // records the flattened fiber as residue (it gates on the runtime's `durable`). The root's
+            // runtime is armed in `run_inner`; a child's is built here, so arm it here.
+            rt.set_durable_env(env.mem_base, env.durable);
             Box::new(rt)
         });
         let prev = frt
@@ -587,6 +605,24 @@ impl Domain {
             env.fault_lo,
             env.fault_hi,
         );
+        // Slice 3.4: a child that **owns fibers** must flatten the ones it parked into their shadow
+        // regions — the JIT mirror of the interp's per-vCPU `freeze_drive`. The root's drive (in
+        // `run_inner`) ran before this child existed, so it never saw these. Run it while the child's
+        // runtime is still `CURRENT_RT` and the window is `UNWINDING`; `freeze_drive` resumes each
+        // parked fiber to zero-progress completion, leaving its flattened extent in its slot and the
+        // active shadow-SP restored to the child's region. Drain the child's residue into the domain
+        // accumulator (`run_inner` merges it into the run's `frozen_out`; canonical sort-by-slot at
+        // serialize keeps the artifact order-independent).
+        if !faulted && fiber_rt::window_is_unwinding(env.mem_base) {
+            if let Some(b) = frt.as_mut() {
+                let rt = &mut **b as *mut FiberRuntime;
+                fiber_rt::freeze_drive(rt, env.trap_out as u64);
+                let child_frozen = fiber_rt::take_frozen(rt);
+                if !child_frozen.is_empty() {
+                    lock(&self.frozen_fibers).extend(child_frozen);
+                }
+            }
+        }
         if let Some(pr) = prev {
             fiber_rt::set_current(pr);
         }

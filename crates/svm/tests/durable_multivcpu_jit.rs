@@ -14,6 +14,9 @@
 //!     equivalence, multi-vCPU, on the JIT.
 //!   - **cross-backend thaw** (`interp_frozen_multivcpu_thaws_on_the_jit`): an interpreter-frozen
 //!     domain thaws on the JIT to the uninterrupted result.
+//!   - **child-owned fibers** (`jit_freezes_and_thaws_a_child_owned_fiber_matching_interp`, slice 3.4):
+//!     a spawned child that owns a fiber flattens it with the child's *own* `freeze_drive`,
+//!     byte-identical to the interp, and thaws it back.
 //!
 //! Native stack switching (for the inline child's guarded run) exists on x86-64 unix, aarch64 unix,
 //! and x86-64 Windows; elsewhere the JIT bails `Unsupported` on `thread.*`/`cont.*`, so this is gated.
@@ -31,8 +34,8 @@ use svm_durable::{
 use svm_interp::{run_capture_reserved_with_host, Host, Value, DURABLE_RESERVE, SHADOW_BASE};
 use svm_ir::{Memory, Module};
 use svm_jit::{
-    compile_and_run_capture_reserved_with_host_durable_mv, FrozenVCpu as JitVCpu, JitError,
-    JitOutcome,
+    compile_and_run_capture_reserved_with_host_durable_mv, FrozenFiber as JitFiber,
+    FrozenVCpu as JitVCpu, JitError, JitOutcome,
 };
 
 const SIZE_LOG2: u8 = 17;
@@ -347,5 +350,201 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
             "interp-frozen multi-vCPU domain thaws on the JIT to the uninterrupted result (95)"
         ),
         other => panic!("cross-backend thaw did not return cleanly: {other:?}"),
+    }
+}
+
+// Slice 3.4 — a spawned **child that owns a fiber**. The root reads the clock + spawns/joins; the
+// child's first may-suspend op is its own `cont.resume`, so its fiber parks (yielding 5) before the
+// child unwinds. The JIT must flatten the child's fiber with the child's own `freeze_drive` (its root
+// drive ran before the child existed) → byte-identical durable reserve + residue vs the interp, and a
+// thaw that re-seeds the child's fiber and reproduces the uninterrupted result. (Mirrors the interp's
+// `svm-durable/tests/multivcpu.rs::child_owns_fiber_through_freeze_thaw`.)
+const SRC_CHILD_FIBER: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  v3 = thread.spawn 1 v1 v2
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v0 (v4)
+  v6 = thread.join v3
+  v7 = i64.add v5 v6
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = ref.func 2
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  v8 = i64.const 100
+  v9 = i64.add v7 v8
+  return v9
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+
+fn instrument_child_fiber() -> Module {
+    let mut m = svm_text::parse_module(SRC_CHILD_FIBER).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("instrumented child-fiber IR verifies");
+    inst
+}
+
+/// The JIT flattens a **child-owned** fiber on freeze (the child's own `freeze_drive`), byte-identical
+/// to the interp, and thaws it back to the uninterrupted result.
+#[test]
+fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
+    let inst = instrument_child_fiber();
+
+    // Uninterrupted baseline: root clock 42 + child (fiber 5 + 100) = 42 + 105 = 147.
+    let want = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(want, vec![Value::I64(147)], "uninterrupted: 42 + (5 + 100)");
+
+    // Interp freeze: capture window + residues (the child's fiber must be flattened).
+    let (ifibers, ivcpus, iroot_sp, isnap) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut win = init_durable_window(WINDOW);
+        write_state(&mut win, STATE_UNWINDING);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "interp freeze placeholder: {r:?}");
+        (
+            h.frozen_fibers().to_vec(),
+            h.frozen_vcpus().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            snap,
+        )
+    };
+    assert_eq!(ifibers.len(), 1, "interp flattened the child's fiber");
+    assert_eq!(ivcpus.len(), 1, "interp captured the child vCPU");
+
+    // JIT freeze.
+    let mut jhost = Host::new();
+    jhost.set_durable(true);
+    jhost.clock_ns = 42;
+    let clk = jhost.grant_clock();
+    let mut jwin = init_durable_window(WINDOW);
+    write_state(&mut jwin, STATE_UNWINDING);
+    let (jout, jsnap, jfibers, jvcpus, jroot_sp) =
+        match compile_and_run_capture_reserved_with_host_durable_mv(
+            &inst,
+            0,
+            &[clk as i64],
+            &jwin,
+            &[],
+            &[],
+            &[],
+            SHADOW_BASE,
+            SIZE_LOG2,
+            svm_run::cap_thunk,
+            &mut jhost as *mut Host as *mut c_void,
+        ) {
+            Ok(t) => t,
+            Err(JitError::Unsupported(_)) => return,
+            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+            Err(e) => panic!("JIT freeze of child-owned fiber failed: {e:?}\n{inst:#?}"),
+        };
+    assert!(
+        matches!(jout, JitOutcome::Returned(_)),
+        "freeze placeholder"
+    );
+
+    // (1) Byte-identical durable reserve (control words + every context's flattened region): the
+    // child's fiber (ctx 1) + the child vCPU (top-down ctx) flatten to the same bytes on both backends.
+    let reserve = DURABLE_RESERVE as usize;
+    assert_eq!(
+        &isnap[..reserve],
+        &jsnap[..reserve],
+        "interp/JIT flatten the child-owned fiber into a byte-identical durable reserve"
+    );
+    // (2) The JIT exported the child's fiber + the child vCPU, matching the interp field-for-field.
+    assert_eq!(jfibers.len(), 1, "JIT flattened the child's fiber");
+    assert_eq!(jvcpus.len(), 1, "JIT captured the child vCPU");
+    assert_eq!(jfibers[0].slot, ifibers[0].slot, "same fiber slot");
+    assert_eq!(jfibers[0].func, ifibers[0].func, "same fiber func");
+    assert_eq!(
+        jfibers[0].shadow_sp, ifibers[0].shadow_sp,
+        "same fiber extent"
+    );
+    assert_eq!(jvcpus[0].task, ivcpus[0].task, "same child task");
+    assert_eq!(
+        jvcpus[0].shadow_sp, ivcpus[0].shadow_sp,
+        "same child extent"
+    );
+
+    // (3) Thaw on the JIT with an advanced clock: re-seed the child's fiber + the child, restore the
+    // root extent, re-enter under REWINDING → reload (147), not re-issue.
+    let seed_fibers: Vec<JitFiber> = jfibers.clone();
+    let seed_vcpus: Vec<JitVCpu> = jvcpus.clone();
+    let mut twin = jsnap.clone();
+    write_state(&mut twin, STATE_REWINDING);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.clock_ns = 99;
+    let tclk = thost.grant_clock();
+    let (tout, ..) = match compile_and_run_capture_reserved_with_host_durable_mv(
+        &inst,
+        0,
+        &[tclk as i64],
+        &twin,
+        &[],
+        &seed_fibers,
+        &seed_vcpus,
+        jroot_sp,
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut thost as *mut Host as *mut c_void,
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT thaw of child-owned fiber failed: {e:?}\n{inst:#?}"),
+    };
+    match tout {
+        JitOutcome::Returned(rs) => assert_eq!(
+            rs,
+            vec![147],
+            "thawed child-owned-fiber domain reloads (147), not a re-issued clock"
+        ),
+        other => panic!("child-fiber thaw did not return cleanly: {other:?}"),
     }
 }

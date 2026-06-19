@@ -407,7 +407,10 @@ fn child_owns_fiber_through_freeze_thaw() {
     );
     assert_eq!(frozen_vcpus.len(), 1, "the spawned vCPU was captured");
     assert_eq!(frozen_vcpus[0].task, 1, "child is task 1");
-    assert!(clock_after > 42, "the freeze ran the child's clock read once");
+    assert!(
+        clock_after > 42,
+        "the freeze ran the child's clock read once"
+    );
 
     // Thaw on a host whose clock has advanced: the root reloads 42, not re-issues. The child's fiber
     // re-seeds and the child re-spawns; forward execution reproduces the uninterrupted 147.
