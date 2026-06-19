@@ -48,10 +48,10 @@
 use std::collections::BTreeMap;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    Field, FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering,
-    SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp,
-    VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp,
-    ValIdx, ValType, VarInfo, VarLoc,
+    Field, FloatTy, Func, FuncName, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module,
+    Ordering, SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp,
+    VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp,
+    VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -761,8 +761,8 @@ fn build_debug_info(
             }
         }
     }
-    // Source variables from `.debug_info` (DEBUGGING.md W4 — wasm variable ingest).
-    let (types, vars) = ingest_variables(&blobs, &op_locs, &local_locs, &line_rows);
+    // Source variables + function names from `.debug_info` (DEBUGGING.md W4/§6 — wasm ingest).
+    let (types, vars, func_names) = ingest_variables(&blobs, &op_locs, &local_locs, &line_rows);
 
     if locs.is_empty() && vars.is_empty() && blobs.is_empty() {
         return None;
@@ -773,8 +773,7 @@ fn build_debug_info(
         types,
         vars,
         blobs,
-        // TODO(§6): extract function names from DWARF `DW_TAG_subprogram` `DW_AT_name` (a follow-up).
-        func_names: Vec::new(),
+        func_names,
     })
 }
 
@@ -788,7 +787,7 @@ fn ingest_variables(
     op_locs: &[(u32, u32, u32, u32)],
     local_locs: &[(u32, u32, u32, u32, u32)],
     line_rows: &[(u64, u32)],
-) -> (Vec<TypeDef>, Vec<VarInfo>) {
+) -> (Vec<TypeDef>, Vec<VarInfo>, Vec<FuncName>) {
     let sec = |name: &str| {
         blobs
             .iter()
@@ -796,15 +795,32 @@ fn ingest_variables(
             .map(|b| b.bytes.as_slice())
     };
     let (Some(info), Some(abbrev)) = (sec(".debug_info"), sec(".debug_abbrev")) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
     let Some(dw) = dwarf_info::parse(info, abbrev, sec(".debug_str").unwrap_or(&[])) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
 
     let mut types: Vec<TypeDef> = Vec::new();
     let mut type_ids: BTreeMap<u32, u32> = BTreeMap::new(); // DWARF type-DIE offset → svm TypeId
     let mut vars: Vec<VarInfo> = Vec::new();
+
+    // §6 function names: each named `DW_TAG_subprogram` matched to its IR function by PC range. Not
+    // gated on a frame base (unlike the var loop below) — a name is useful even without locals.
+    let mut func_names: Vec<FuncName> = Vec::new();
+    for sub in &dw.subs {
+        if sub.name.is_empty() {
+            continue;
+        }
+        if let Some(func) = func_for_pc_range(op_locs, sub.low_pc as u32, sub.high_pc as u32) {
+            if !func_names.iter().any(|f: &FuncName| f.func == func) {
+                func_names.push(FuncName {
+                    func,
+                    name: sub.name.clone(),
+                });
+            }
+        }
+    }
 
     for sub in &dw.subs {
         let Some(fb_local) = sub.frame_base_local else {
@@ -871,7 +887,7 @@ fn ingest_variables(
             scope: None,
         });
     }
-    (types, vars)
+    (types, vars, func_names)
 }
 
 /// The IR function whose code spans `[low, high)` (a DWARF subprogram's PC range), found via the
