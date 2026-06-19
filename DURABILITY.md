@@ -916,6 +916,55 @@ mid-compute on its own OS thread (the trigger flips only the running vCPU's word
 nested freeze; and a child blocked in a host `Blocking.work` at the freeze instant. This slice targets
 the deterministic single-worker paths (freeze-from-start and `arm_freeze_after` at a fiber safepoint).
 
+##### Phase 4 Slice A — back-edge polls + bounded-latency async STW freeze (design)
+
+Closes the R6 latency caveat and the R10 control-word concurrency seam: today a freeze only lands at
+*may-suspend* safepoints (`cap.call`/`cont.resume`/`suspend`), so a vCPU in a **poll-free compute loop**
+never reaches a safepoint and the freeze hangs; and the freeze run is only safe because it is forced
+**single-worker**. This slice adds polls a compute loop can't skip, plus the multi-worker→single-worker
+quiesce handshake for a true async stop-the-world.
+
+**Poll mechanism (in the IR transform, not codegen).** `svm-durable`'s `transform_func` emits a
+state-word check at every **loop back-edge** (target block id ≤ source — the reducible back-edge
+heuristic; irreducible CFGs fall back to all branch terminators) + extends the function-entry prologue
+to unwind on `UNWINDING` (not just `REWINDING`). This is the same observe-and-unwind it already emits
+after a may-suspend op, at a new site. **IR-level, not per-backend codegen** — so both backends compile
+the *same* poll and the byte-identical-artifact invariant (R11) holds automatically, and it stays +0
+TCB (vs. putting freeze-relevant control flow into Cranelift lowering). It reads the **per-context state
+word** at `STATE_OFF` (already in-window, per-context, snapshot-captured) — *not* the §5 epoch cell
+(that traps rather than unwinds and isn't per-context); the epoch cell stays the *promptness* nudge. A
+back-edge poll has no in-flight call to reload, so each instrumented back-edge gets a **new resume id**
+whose live set is the target block's edge-args (spilled on unwind, reloaded on rewind → jump to the
+loop header). Frame format unchanged ⇒ **no `FORMAT_VERSION` bump**. NORMAL-inert: a not-taken,
+perfectly-predicted branch whose only cost is the state-word load.
+
+**STW protocol (the R10 loom seam).** A new `request_freeze` controller writes `UNWINDING` to **every**
+live per-context state word (vs. `arm_freeze_after`, which flips only the running vCPU's) + sets the
+epoch cell so busy JIT OS threads reach their next poll and parked vCPUs re-check. Each worker observes
+it at a back-edge, unwinds its native stack into its own in-window shadow region, and parks at base.
+The only truly-shared control word is the active shadow-SP (`SHADOW_SP_OFF`); during a multi-worker
+quiesce, concurrent workers swapping their context's SP in/out of it need a **lock/atomic** (the new
+loom obligation) — strictly **gated to `workers > 1`**, a no-op fast path at `workers == 1` so every
+existing deterministic path stays byte-identical. After all vCPUs quiesce (join barrier), a single
+coordinator runs the **existing** freeze-drive/residue/flatten machinery (untouched — it already
+assumes single-worker). Residue is **canonically sorted** (ascending context/task) before serialize, so
+the quiesce *order* (which races) can't change the artifact (§12.6 canonical invariant preserved).
+
+**Payoff — activates already-shipped future-proofing:** a mid-run async STW after some children have
+finished + recycled their contexts produces the first **sparse** residue (exercising the gap-tolerant
+thaw / `seed_vcpu_mask`), and freezing a root whose children are **genuinely concurrent OS threads**
+mid-compute is the first real concurrent multi-vCPU freeze (vs. the deferred single-worker emulation).
+
+**Staging (interp-oracle-first):** 4A.1 single-vCPU compute-loop freeze via a back-edge poll (interp,
+ticked deterministically like `arm_freeze_after`) — *proves the core*; 4A.2 JIT parity (the IR poll
+compiles for free → byte-identical artifact); 4A.3 async `request_freeze` (single-vCPU); **4A.4
+multi-worker quiesce + active-SP swap sync (LOOM)**; 4A.5 concurrent multi-vCPU STW freeze, JIT (LOOM);
+4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 parked-vCPU / `Blocking.work` latency
+(narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
+
+**Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
+full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
+
 ##### Context recycling plan (next sub-slice)
 
 Today neither backend recycles fiber slots or vCPU contexts (they grow monotonically), so a long-lived
