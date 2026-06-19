@@ -1115,6 +1115,148 @@ fn demo_clay_vs_native() {
 }
 
 #[test]
+fn demo_calc_vs_native() {
+    // The chibicc `calc` demo (a recursive-descent arithmetic calculator) through the LLVM on-ramp.
+    // Exercises a **global array of string pointers** + a **global struct array holding function
+    // pointers** (both relocations, slice K), **indirect calls** through that dispatch table (slice G
+    // → `call_indirect`), and **recursion** (expr → term → factor). It drives itself from a global
+    // expression table and writes `"<expr> = <result>"` rows — byte-identical to native `cc`. The
+    // first of the two non-corpus chibicc demos the on-ramp now covers (LLVM is the main frontend).
+    check_demo_vs_native("calc", "calc.c", b"");
+}
+
+#[test]
+fn demo_rational_vs_native() {
+    // The chibicc `rational` demo (exact-rational arithmetic) through the LLVM on-ramp. Where `calc`
+    // stresses the function-pointer table, this hammers the **by-value aggregate ABI** (D39 / slice
+    // J): every op takes two `struct Rat` *by value* and returns one *by value* (the hidden-`sret`
+    // path), composed with recursion (Euclid's `gcd`) and an **indirect call that both passes and
+    // returns a struct by value** through a global dispatch table — sret + a function-pointer
+    // relocation + a struct-valued `call_indirect`, all at once. Byte-identical to native `cc`.
+    check_demo_vs_native("rational", "rational.c", b"");
+}
+
+/// Build a **guest-concurrency** corpus demo (`crates/svm-run/demos/<rel>`) that pulls in chibicc's
+/// bundled guest libc — `<pthread.h>` (a 1:1 threading layer over the `__vm_thread_spawn`/`join` +
+/// futex + atomic builtins) and `<stdlib.h>` (`malloc`). clang compiles the demo with the chibicc
+/// include dir on the path, so `pthread_create`/`pthread_mutex_*`/etc. resolve to that guest shim,
+/// which the on-ramp lowers to the §12 primitives (`thread.spawn`, `i32.atomic.wait`/`notify`, the
+/// `iN.atomic.*` ops). The same source built with native `cc` would instead use the platform pthreads
+/// — but these demos call `__vm_*` builtins / guest fibers with no native symbol, so they have no
+/// native oracle; the assertion is the **interleaving-invariant total** (the chibicc `c_guest_*`
+/// contract, now via the LLVM frontend). `None` (skip) if clang is unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn compile_demo_libc_to_bc(name: &str, rel: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos")
+        .join(rel);
+    let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
+    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.bc", std::process::id(), name));
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-c"])
+        .arg("-I")
+        .arg(&inc)
+        .arg(&path)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Run a guest-built concurrency scheduler demo (threads / stackful fibers / futex over the `__vm_*`
+/// primitives + the guest pthread shim) through the on-ramp on the **real powerbox** and assert its
+/// stdout. The printed total is interleaving-invariant — deterministic regardless of which worker ran
+/// each unit — so it is the same fixed value the chibicc `c_guest_*` tests check (the LLVM frontend
+/// must reach the same answer). A generous deadline guards against a hang (a livelocked scheduler is a
+/// failure, not an infinite test). Skips silently if clang is unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
+    let Some(bc) = compile_demo_libc_to_bc(name, rel) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a threads/libc program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run =
+        svm_run::run_powerbox_with_deadline(&module, b"", Some(std::time::Duration::from_secs(60)))
+            .expect("powerbox run");
+    assert_eq!(
+        run.stdout, expect,
+        "{name}: stdout {:?} vs expected {:?}",
+        run.stdout, expect
+    );
+    let code = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(code, 0, "{name}: exit/return code {code} (expected 0)");
+}
+
+/// The chibicc `work_stealing` demo through the LLVM on-ramp: a guest-built **work-stealing M:N
+/// scheduler** over *stackless* tasks (a global injector + per-worker deques + stealing, the tokio
+/// shape). Four vCPUs (`thread.spawn`) drain 16 tasks of 16 steps each, coordinating only through
+/// `pthread_mutex` (the futex) + C11 atomics — no fibers, no scheduler in the VM (D56). The grand
+/// total `NTASKS * STEPS = 256` is interleaving-invariant. Mirrors `c_frontend::c_guest_work_stealing`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_work_stealing_vs_chibicc() {
+    check_guest_concurrency_demo("work_stealing", "work_stealing/work_stealing.c", b"256\n");
+}
+
+/// The chibicc `mn_sched` demo through the LLVM on-ramp: a guest-built **sharded M:N green-thread
+/// scheduler** — `NWORKERS` OS threads (`thread.spawn`), each running a cooperative round-robin over
+/// `TASKS_PER_WORKER` **stackful fibers** (`__vm_fiber_new`/`resume`/`suspend` → `cont.*`), pinned
+/// per worker (fibers are thread-affine, D57). Coordinates through one shared atomic counter. The
+/// total `NWORKERS * TASKS_PER_WORKER * STEPS = 1024` is interleaving-invariant. Mirrors
+/// `c_frontend::c_guest_mn_scheduler`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_mn_sched_vs_chibicc() {
+    check_guest_concurrency_demo("mn_sched", "mn_sched/mn_sched.c", b"1024\n");
+}
+
+/// The chibicc `steal_fibers` demo through the LLVM on-ramp: a work-stealing scheduler over
+/// **stackful, migratable fibers** (D57) — suspended fibers are stolen across real OS threads and
+/// resumed inside nested call frames. Prints both interleaving-invariant totals: `256` work units and
+/// `121920`, the sum of returns whose values depend on locals carried across **every migration** (the
+/// stack-integrity check that a stackless state machine cannot express). Mirrors
+/// `c_frontend::c_guest_steal_fibers`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_steal_fibers_vs_chibicc() {
+    check_guest_concurrency_demo(
+        "steal_fibers",
+        "steal_fibers/steal_fibers.c",
+        b"256\n121920\n",
+    );
+}
+
+/// The chibicc `malloc_threads` demo through the LLVM on-ramp: concurrent `malloc` from `NWORKERS`
+/// vCPUs, exercising the **thread-safe** guest allocator. Each worker `malloc`s 64 disjoint blocks
+/// and fills every byte with a `(worker, block, offset)`-unique pattern; after join, main re-checks
+/// every byte — a clobber from an overlapping allocation (the race a non-thread-safe bump allocator
+/// would allow) would show as a corrupt block. Prints `0` (no corruption). Mirrors
+/// `c_frontend::c_guest_malloc_threads`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_malloc_threads_vs_chibicc() {
+    check_guest_concurrency_demo("malloc_threads", "malloc_threads/malloc_threads.c", b"0\n");
+}
+
+#[test]
 fn demo_hexdump_vs_native() {
     // A `hexdump -C`-style tool: read stdin in 16-byte rows, print `%08lx  HH×16  |ascii|` via the
     // guest-side `printf` format engine (parsed at translate time → `__svm_utoa` + width/zero-pad →
@@ -2289,6 +2431,57 @@ fn vm_async_io_runtime() {
         h.stdout,
         format!("{total}\n").into_bytes(),
         "async total Σ mix(0..8)"
+    );
+}
+
+/// The chibicc `async_work_stealing` demo through the LLVM on-ramp: the async **work-stealing M:N
+/// runtime** (the union of the stackless work-stealing scheduler and the async submit/complete ring).
+/// `NWORKERS` vCPUs cooperatively drain `NTASKS = 16` I/O-bound tasks, each issuing a `Blocking` op
+/// through the ring; a worker **never blocks on an I/O** — it `submit_async`s and moves on, parking on
+/// the completion counter only when nothing is runnable, woken by a pool worker's `notify`. Combines
+/// the guest pthread shim (`thread.spawn` + futex), the async ring (`__vm_io_*` → 7-handle powerbox),
+/// and the offload pool. Interpreter-only (the M:N executor + offload-pool oracle; the JIT async path
+/// needs the separate `HostAsyncHooks` harness), exactly like `vm_async_io_runtime`. The total is
+/// completion-order- *and* interleaving-invariant: Σ mix(i) for i in 0..16. Mirrors
+/// `c_frontend::c_guest_async_work_stealing`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn vm_async_work_stealing_runtime() {
+    let Some(bc) = compile_demo_libc_to_bc(
+        "async_work_stealing",
+        "async_work_stealing/async_work_stealing.c",
+    ) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
+        "expected async-ring imports, got {import_names:?}"
+    );
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let nparams = module.funcs[0].params.len();
+    assert_eq!(
+        nparams, 7,
+        "async program must declare the 7-handle powerbox entry"
+    );
+
+    let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut h = svm_interp::Host::new();
+    let args = grant_powerbox(&mut h, win, nparams, std::time::Duration::from_millis(10));
+    let mut fuel = 1_000_000_000u64;
+    let out =
+        svm_interp::run_with_host(&module, 0, &args, &mut fuel, &mut h).expect("interp async run");
+    assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
+    // NTASKS = 16 (see the demo); the total is Σ of the host's deterministic per-op results.
+    let total: u64 = (0..16).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
+    assert_eq!(
+        h.stdout,
+        format!("{total}\n").into_bytes(),
+        "async total Σ mix(0..16)"
     );
 }
 

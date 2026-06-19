@@ -996,6 +996,35 @@ lanes re-enable vectorization (the capstone).** The remaining gaps that blocked 
   corpus (`sha256`/`xxhash`/`perlin`/`crc32`/`clay`/`regex`/`jsmn`/`heapgrow`/…), C++, Rust, the
   powerbox/async/JIT demos, and the focused `simd_*` shape/op-class tests. fmt + clippy clean.
 
+**Slice AU (DONE) — full chibicc-demo parity: every program the C frontend runs now runs through the
+on-ramp.** LLVM is the main frontend, so the on-ramp must cover *everything* chibicc does. The corpus
+demos already crossed (slices A–AT); this closes the remaining chibicc demos — the two compute demos
+and the **five concurrency demos** — with **no translator change** (the `__vm_*` capability/concurrency
+surface from slices AC–AF already lowers them):
+- **`calc` / `rational`** (`demos/calc.c`, `demos/rational.c`) — added to the native differential
+  (`check_demo_vs_native`, byte-identical to `cc`). `calc` is a recursive-descent calculator over a
+  **global function-pointer dispatch table** (relocations + `call_indirect`, slices K/G) with
+  recursion; `rational` hammers the **by-value-aggregate sret ABI** (D39/slice J) — every op passes
+  *and* returns a `struct Rat` by value, including an **indirect struct-returning call** through a
+  dispatch table (sret + funcref relocation + struct-valued `call_indirect`, all at once).
+- **The concurrency demos** (`work_stealing`, `mn_sched`, `steal_fibers`, `malloc_threads`,
+  `async_work_stealing`) — these `#include <pthread.h>`, which is **chibicc's bundled guest libc** (a
+  1:1 threading layer over `thread.spawn`/`join` + the futex + atomics). clang compiles them with the
+  chibicc include dir on the path (`-I frontend/chibicc/include`), so the pthread shim resolves to the
+  `__vm_*` builtins the on-ramp lowers — i.e. **the guest brings its own libc** (the on-ramp's model),
+  here reusing chibicc's. They have no native oracle (`__vm_*` / guest fibers have no native symbol),
+  so each asserts its **interleaving-invariant total** (the chibicc `c_guest_*` contract, via the LLVM
+  frontend): `work_stealing` → 256, `mn_sched` → 1024 (stackful fibers, `cont.*`), `steal_fibers` →
+  256 + 121920 (migratable fibers + stack-integrity), `malloc_threads` → 0 (thread-safe allocator, no
+  overlap), `async_work_stealing` → Σ mix(0..16). The first four run on the **real powerbox**
+  (`run_powerbox_with_deadline`, M:N executor); `async_work_stealing` is interpreter-only (the M:N +
+  offload-pool oracle, like `vm_async_io_runtime` — the JIT async path needs the `HostAsyncHooks`
+  harness). Tests (`translate.rs`): `demo_calc_vs_native`, `demo_rational_vs_native`,
+  `demo_{work_stealing,mn_sched,steal_fibers,malloc_threads}_vs_chibicc`,
+  `vm_async_work_stealing_runtime`. **156 translate tests green, fmt + clippy clean.** The on-ramp now
+  runs every demo the chibicc frontend does — the breadth frontier is now *bigger* real-world programs
+  (and other-language runtimes), not chibicc parity.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
