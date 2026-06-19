@@ -472,9 +472,9 @@ every backtrace renderer — `JitFrameLoc::func_name`, the interpreter's free `f
 kill message (`#0 file:line:col in compute`), and gdb's DWARF `DW_AT_name` + ELF `.symtab` — so frames
 read `in compute` instead of `(fn 0)`/`fn0`. Empty ⇒ the `fn{N}` fallback.
 
-Remaining (ISSUES I4): **Windows explicit-check** traps still lack a backtrace (no signal to capture
-from + MSVC has no `__builtin_frame_address` — fix via Cranelift `get_frame_pointer`); and per-fiber
-naming under work-stealing migration.
+Remaining: **Windows explicit-check** traps still lack a backtrace (ISSUES I5 — no signal to capture
+from + MSVC has no `__builtin_frame_address`; fix via Cranelift `get_frame_pointer`); and per-fiber
+naming under work-stealing migration (ISSUES I6).
 
 ---
 

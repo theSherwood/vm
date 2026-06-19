@@ -343,11 +343,31 @@ pub struct FrozenFiber {
     pub generation: u64,
 }
 
+/// The host-side residue of a **spawned vCPU** (a `thread.spawn` child) flattened by a multi-vCPU
+/// durable freeze (DURABILITY.md §12.8 slice 3.3) — the JIT mirror of `svm_interp::FrozenVCpu`. Its
+/// continuation lives in its own in-window shadow region (`shadow_region_base(task)`); this carries
+/// what a thaw must re-attach: its task id (= shadow context index + spawn order), entry function +
+/// spawn args (to re-enter it), and the flattened shadow-SP extent. A multi-vCPU **freeze** returns
+/// one per flattened child; a **thaw** is handed them back to re-create the children.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FrozenVCpu {
+    pub task: usize,
+    pub func: i32,
+    pub args: Vec<i64>,
+    pub shadow_sp: u64,
+}
+
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
 /// `svm-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
 /// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host
 /// page, so protecting it protects (at most) its host page — exact on a 4 KiB-page host.
 pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
+
+/// Window offset of durable shadow **context 0** (the root vCPU's region base) — an *empty* shadow-SP
+/// extent. Must match `svm-interp`'s / `fiber_rt`'s `SHADOW_BASE`; duplicated here (not under
+/// `cfg(fiber_rt)`) for the durable run-state defaults. The cross-backend artifact-equality property
+/// catches any drift.
+const DURABLE_SHADOW_BASE: u64 = 64;
 
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
@@ -1008,6 +1028,67 @@ pub fn compile_and_run_capture_reserved_with_host_durable(
     Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
 }
 
+/// The result of a **multi-vCPU** durable freeze/thaw run (slice 3.3): `(outcome, window image,
+/// flattened-fiber residue, spawned-vCPU residue, root vCPU's flattened shadow-SP extent)`. On a thaw
+/// the two residue vectors are empty and the extent is inert.
+pub type DurableMvOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64);
+
+/// [`compile_and_run_capture_reserved_with_host_durable`] for a **multi-vCPU** durable domain
+/// (DURABILITY.md §12.8 slice 3.3) — the full freeze + thaw of a domain whose root has `thread.spawn`ed
+/// children. A durable run is single-worker, so children run **inline** (deferred during a freeze until
+/// the root unwinds; re-attached + run before the root re-enters on a thaw).
+///
+/// - **Freeze** (`vcpu_seed` empty): returns the flattened fibers, the spawned-vCPU residue (each
+///   [`FrozenVCpu`]: entry func, `(sp, arg)` operands, flattened shadow-SP), **and the root vCPU's
+///   flattened extent** (`root_sp`, reported separately because the shared active-SP word ends at the
+///   last child's extent) — everything a snapshot needs to record the whole multi-vCPU domain.
+/// - **Thaw** (`vcpu_seed` = the frozen children, `root_sp` = the root's restored extent): re-attaches
+///   and runs the children, then re-enters the root under `REWINDING`. Returns empty residue.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_mv(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    vcpu_seed: &[FrozenVCpu],
+    root_sp: u64,
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<DurableMvOutcome, JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.frozen_vcpu_seed = vcpu_seed.to_vec();
+    cm.thaw_root_sp = root_sp;
+    cm.durable = true;
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((
+        outcome,
+        win,
+        std::mem::take(&mut cm.frozen_out),
+        std::mem::take(&mut cm.frozen_vcpus_out),
+        cm.frozen_root_sp_out,
+    ))
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
 /// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
 /// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
@@ -1352,6 +1433,22 @@ pub struct CompiledModule {
     /// Durable **freeze** residue (slice 3.3.3): the fibers the freeze driver flattened this run,
     /// read back by the durable entry point. Empty unless a freeze flattened fibers.
     frozen_out: Vec<FrozenFiber>,
+    /// Durable **freeze** residue (slice 3.3): the spawned vCPUs that unwound under the freeze (each
+    /// run inline single-worker by `thread.spawn`). Drained from the `Domain` after the root unwinds,
+    /// read back by the durable entry point. Empty unless a freeze caught a live child.
+    frozen_vcpus_out: Vec<FrozenVCpu>,
+    /// Durable **freeze** residue (slice 3.3): the **root** vCPU's flattened shadow-SP extent, captured
+    /// after the freeze driver (before the children overwrite the shared active-SP word). The root's
+    /// continuation rides in the window image like everyone's, but the active-SP word ends at the last
+    /// child's extent, so the root's own extent is reported separately for a thaw to restore. `0` on a
+    /// non-freeze run.
+    frozen_root_sp_out: u64,
+    /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
+    /// under `REWINDING`. Empty for a freeze / ordinary run.
+    frozen_vcpu_seed: Vec<FrozenVCpu>,
+    /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
+    /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
+    thaw_root_sp: u64,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -1772,23 +1869,38 @@ impl CompiledModule {
         // namespace + a per-domain §15 quota, matching the interpreter's run-shared registry). This is
         // the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
         // builds its own over the same table from `fiber_cfg` (`os_thread_rt`). Created whenever the
-        // module uses `cont.*`.
+        // module uses `cont.*` **or** `thread.spawn` — a threaded module needs the table for the
+        // durable vCPU-context allocator (slice 3.3), even when it uses no fibers (the table is then
+        // dormant: a fiber-free module never resumes a fiber, so the root's runtime just routes the
+        // durable shadow-SP swap).
         #[cfg(fiber_rt)]
-        let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> = if uses_fibers {
-            Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
-                quota.max_fibers,
-            )))
+        let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> =
+            if uses_fibers || uses_threads {
+                Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
+                    quota.max_fibers,
+                )))
+            } else {
+                None
+            };
+        // The *root* vCPU's fiber runtime is built only when the module actually uses `cont.*` — a
+        // fiber-free module (even a threaded one) never resumes a fiber, so it needs no execution
+        // context, and the durable shadow-SP word it does use is driven by the instrumented IR
+        // directly (the multi-vCPU deferred/thaw spawn paths go through the `Domain`, not this
+        // runtime). The *table* is still created for `uses_threads` above (the durable vCPU-context
+        // allocator); only the per-vCPU runtime is fiber-gated, so a thread-only run publishes no
+        // `CURRENT_RT` and allocates no idle runtime (matching the pre-slice-3.3 behavior).
+        #[cfg(fiber_rt)]
+        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
+            fiber_table.as_ref().map(|t| {
+                Box::new(fiber_rt::FiberRuntime::new(
+                    std::sync::Arc::clone(t),
+                    fiber_type_id,
+                    fiber_mask,
+                ))
+            })
         } else {
             None
         };
-        #[cfg(fiber_rt)]
-        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = fiber_table.as_ref().map(|t| {
-            Box::new(fiber_rt::FiberRuntime::new(
-                std::sync::Arc::clone(t),
-                fiber_type_id,
-                fiber_mask,
-            ))
-        });
         // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
         #[cfg(fiber_rt)]
         let fiber = if uses_fibers {
@@ -2158,6 +2270,10 @@ impl CompiledModule {
             durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
+            frozen_vcpus_out: Vec::new(),
+            frozen_root_sp_out: 0,
+            frozen_vcpu_seed: Vec::new(),
+            thaw_root_sp: DURABLE_SHADOW_BASE, // empty extent (context 0's region base)
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -2452,6 +2568,7 @@ impl CompiledModule {
                     t.fiber_cfg,
                     t.fiber_table.clone(), // the domain-shared table spawned vCPUs build over
                     t.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
+                    t.durable, // slice 3.3: run spawned children inline (single-worker) under a freeze/thaw
                 );
             }
             // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
@@ -2521,6 +2638,21 @@ impl CompiledModule {
             })
         };
 
+        // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach + run the spawned children a
+        // freeze flattened, *before* the root re-enters — the JIT's single-worker thaw (the root's
+        // rewind skips its prologue `thread.spawn`, so the runtime reconstructs the children). Each
+        // child rewinds from its restored extent, runs forward to completion, and publishes its result
+        // so the root's re-executed `thread.join` resolves; the root's active shadow-SP is then set to
+        // its restored extent. Done after the fiber seed (the table is live) and `set_env`.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !(*this).frozen_vcpu_seed.is_empty() {
+            let seed = std::mem::take(&mut (*this).frozen_vcpu_seed);
+            let root_sp = (*this).thaw_root_sp;
+            if let Some(d) = &(*this).domain {
+                d.thaw_reattach_and_run(&seed, root_sp);
+            }
+        }
+
         // Publish the live window's fault range so a mid-run `invoke_extra` (from a cap.call
         // handler) can arm its nested recovery against this run's window.
         (*this).live_fault_range = Some(window.fault_range());
@@ -2559,15 +2691,32 @@ impl CompiledModule {
         // every still-parked fiber into its own region before the window is snapshotted, so the
         // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
         // flattening fiber touches only the committed reserve, so it's sound outside the guard.
-        // Single-vCPU (Phase 3.2 for multi-vCPU). Skipped on a fault or a non-freeze run. The
-        // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
-        // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving.
+        // (The root's *own* fibers; a spawned child's fibers are out of scope, slice 3.3.) Skipped on a
+        // fault or a non-freeze run. The residue (incl. any fiber unwound mid-resume-chain during the
+        // root run, slice 3.2) is accumulated in the runtime by each fiber's `Complete` arm; drain it
+        // after driving — then the deferred children run (`drive_frozen_spawns`).
         #[cfg(fiber_rt)]
         if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
             if let Some(rt) = (*this).fiber_rt.as_mut() {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
                 fiber_rt::freeze_drive(rt, trap_cell.as_ptr() as u64);
                 (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
+            }
+            // Slice 3.3: capture the **root's** flattened extent now — the freeze driver restored the
+            // active shadow-SP to context 0's region (root rewinds first on thaw), but the children
+            // below overwrite the shared word with their own extents, so the root's must be read here
+            // (its implicit residue, reported separately for a thaw to restore).
+            (*this).frozen_root_sp_out = fiber_rt::read_shadow_sp(mem_base as u64);
+            // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
+            // request, returning the handle) so the root could unwind first — matching the interp,
+            // which enqueues a child and runs it only after the spawning vCPU yields. Now that the
+            // root has unwound and its fibers are flattened, run the deferred children **inline**
+            // (single-worker) in spawn order: each unwinds into its own top-down context and records a
+            // `FrozenVCpu`. This reproduces the interp's dispatch order (root → root's fibers →
+            // children), so the side-effect interleaving — and the frozen window — is byte-identical.
+            if let Some(d) = &(*this).domain {
+                d.drive_frozen_spawns();
+                (*this).frozen_vcpus_out = d.take_frozen_vcpus();
             }
         }
 

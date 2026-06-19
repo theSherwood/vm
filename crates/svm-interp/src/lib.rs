@@ -1739,18 +1739,23 @@ fn drive(
         {
             let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
             vseed.sort_by_key(|f| f.task);
-            // Re-establish the durable vCPU-context count (slice 3.2.2): the re-spawned children
-            // reclaim the top `n` contexts (their regions return via the restored shadow-SP below), so
-            // a post-thaw spawn allocates below them.
-            root.registry.seed_vcpu_count(vseed.len());
+            // Context recycling makes the live children's contexts (and task ids / join slots)
+            // **non-dense** — a child that finished before the freeze left gaps. So rebuild each piece
+            // explicitly rather than assuming "top `n`, densely":
+            //   • context — *derived* from the restored shadow-SP (`(sp − SHADOW_BASE) / STRIDE`), since
+            //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
+            //     post-thaw spawn lands in a genuinely-free context.
+            //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze records the
+            //     same task and the artifact stays byte-identical.
+            //   • join handle — the slot is `task − 1` (flat root-spawned), so `threads[]` is rebuilt
+            //     *sparsely* (a finished child's slot stays `None`), keeping the guest's held handle valid.
+            let mut vcpu_mask: u16 = 0;
             for ff in vseed {
-                let cid = s.next_task;
-                s.next_task += 1;
+                let cid = ff.task as TaskId;
+                s.next_task = s.next_task.max(cid + 1);
                 s.live += 1;
-                debug_assert_eq!(
-                    cid as usize, ff.task,
-                    "thaw re-spawns children densely by task"
-                );
+                let ctx = ((ff.shadow_sp - SHADOW_BASE) / SHADOW_STRIDE) as usize;
+                vcpu_mask |= 1 << ctx;
                 let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&funcs),
@@ -1772,11 +1777,19 @@ fn drive(
                 child.durable = true;
                 child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
                 child.root_shadow_sp = ff.shadow_sp;
+                child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
                 child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
-                // Rebuild the root's join handle → child mapping (handle slot = spawn order = task − 1).
+                // Rebuild the root's join handle → child mapping at the child's own slot (= task − 1),
+                // padding finished/joined slots with `None` so the guest's held handle still resolves.
+                let slot = ff.task - 1;
+                while root.threads.len() < slot {
+                    root.threads.push(None);
+                }
                 root.threads.push(Some(cid));
                 s.runnable.push_back(child);
             }
+            // Seed the registry's vCPU-context occupancy from the re-spawned children (recycling).
+            root.registry.seed_vcpu_mask(vcpu_mask);
         }
         s.runnable.push_back(root);
         id
@@ -3274,14 +3287,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     }
     match step {
         Step::Done(result) => {
+            // `froze` distinguishes a **freeze-unwind** (the run is `UNWINDING`; a spawned child
+            // records `FrozenVCpu` residue and its region is kept for thaw) from a **genuine finish**
+            // (NORMAL completion). Context recycling frees a finished child's shadow context back to
+            // the registry, but a frozen child must keep it (it is re-spawned there on thaw).
+            let froze = v.durable
+                && result.is_ok()
+                && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
             // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING`
             // has drained the root's native stack into the root's shadow region; now flatten the
             // still-parked fibers into theirs, while the registry is alive, before the window is
             // snapshotted. A drive trap (out-of-scope module) surfaces as the run's result.
-            let result = if v.durable
-                && result.is_ok()
-                && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
-            {
+            let result = if froze {
                 // A **spawned** vCPU (slice 3.2.1) that unwound under a freeze records *itself* as
                 // residue: its continuation now lives in its own region, extent = the live shadow-SP.
                 // (No `freeze_drive` — flattening idle fibers is the root's job, and multi-vCPU + fibers
@@ -3332,6 +3349,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             } else {
                 result
             };
+            // Context recycling: a spawned vCPU that genuinely finished frees its shadow context for a
+            // later spawn to reuse (a freeze-unwound child keeps it — it's re-spawned there on thaw).
+            if v.vcpu_ctx > 0 && !froze {
+                v.registry.free_vcpu_context(v.vcpu_ctx);
+            }
             let id = v.id;
             // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (only on a trap).
             let trap_bt = if result.is_err() {
@@ -3918,18 +3940,6 @@ fn shadow_region_fits(ctx_idx: usize) -> bool {
 /// contexts and index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root regions.
 const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
 
-/// A spawned vCPU's shadow-context index (DURABILITY.md §12.8 slice 3.2.2): the `n`-th spawned vCPU
-/// (0-based, in spawn order) owns context `MAX_SHADOW_CTX - n`. Fibers grow **up** from context 1
-/// (`slot + 1`) and vCPUs grow **down** from the top, so the two pools share the reserve without
-/// colliding until `fibers + vcpus` would exhaust it (a clean capacity refusal) — unifying the
-/// per-context layout that slice 3.2.1 could only use no-fiber. Keeping fibers at `slot + 1`
-/// preserves cross-backend artifact parity (the JIT mirrors that formula). `None` if no region is
-/// free (it would underflow to the root or collide with a fiber).
-fn vcpu_shadow_context(nth: usize, fibers: usize) -> Option<usize> {
-    let ctx = MAX_SHADOW_CTX.checked_sub(nth)?;
-    (ctx >= 1 && ctx > fibers).then_some(ctx)
-}
-
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
 /// low 16 bits and the generation occupies bits 16.. of the **`i64`** handle. A handle is
@@ -4118,10 +4128,12 @@ struct RegState {
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
     /// lifetime total. A finished slot's generation is already bumped, so reuse is ABA-safe.
     free: BinaryHeap<Reverse<usize>>,
-    /// Count of durable vCPU contexts handed out (slice 3.2.2): the root spawns children that grow
-    /// **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1, so this counter (with
-    /// `fibers.len()`) bounds the shared reserve — `fibers.len() + vcpus <= MAX_SHADOW_CTX`.
-    vcpus: usize,
+    /// **Occupied** durable vCPU shadow contexts (slice 3.2.2 + context recycling): a bitmask over
+    /// contexts `1..=MAX_SHADOW_CTX` (bit `c` set ⇒ context `c` is live). The root spawns children that
+    /// grow **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1; a child's context is
+    /// *freed* (its bit cleared) when it genuinely finishes, so the bound is now *peak concurrent* vCPUs
+    /// rather than the lifetime total. `MAX_SHADOW_CTX` is 15, so a `u16` holds every context bit.
+    vcpu_mask: u16,
 }
 
 impl FiberRegistry {
@@ -4132,7 +4144,7 @@ impl FiberRegistry {
                 shadow: Vec::new(),
                 gens: Vec::new(),
                 free: BinaryHeap::new(),
-                vcpus: 0,
+                vcpu_mask: 0,
             }),
         }
     }
@@ -4168,16 +4180,36 @@ impl FiberRegistry {
     /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
     fn reserve_vcpu_context(&self) -> Option<usize> {
         let mut t = self.lock();
-        let ctx = vcpu_shadow_context(t.vcpus, t.fibers.len())?;
-        t.vcpus += 1;
-        Some(ctx)
+        // Hand out the **highest free** context above the fiber pool (`fibers.len()` occupies contexts
+        // `1..=fibers.len()`). Top-down keeps the vCPU pool clear of the upward-growing fibers; reusing
+        // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
+        let floor = t.fibers.len();
+        let mut c = MAX_SHADOW_CTX;
+        while c > floor {
+            if t.vcpu_mask & (1 << c) == 0 {
+                t.vcpu_mask |= 1 << c;
+                return Some(c);
+            }
+            c -= 1;
+        }
+        None // the reserve is full (the vCPU pool growing down would meet the fibers growing up)
     }
 
-    /// Seed the durable vCPU-context count a **thaw** re-establishes (slice 3.2.2): the re-spawned
-    /// children occupy the top `n` contexts (their regions come back via the restored shadow-SP), so a
-    /// post-thaw spawn allocates below them. Set once after re-seeding, before forward execution.
-    fn seed_vcpu_count(&self, n: usize) {
-        self.lock().vcpus = n;
+    /// Free a spawned vCPU's shadow context for reuse (context recycling): called when the child
+    /// **genuinely finishes** (not a freeze-unwind, which keeps the region for thaw). A no-op for the
+    /// root / a non-durable child (context 0).
+    fn free_vcpu_context(&self, ctx: usize) {
+        if (1..=MAX_SHADOW_CTX).contains(&ctx) {
+            self.lock().vcpu_mask &= !(1 << ctx);
+        }
+    }
+
+    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (context recycling): the
+    /// re-spawned children reclaim *exactly* the contexts they held at freeze (derived from their
+    /// restored shadow-SPs — recycling means these need not be the top `n`), so a post-thaw spawn
+    /// allocates into a genuinely-free context. Set once after re-seeding, before forward execution.
+    fn seed_vcpu_mask(&self, mask: u16) {
+        self.lock().vcpu_mask = mask;
     }
 
     /// `cont.new`: allocate a slot — the guest handle — under the §15 quota, which is **per run** now
@@ -4199,8 +4231,16 @@ impl FiberRegistry {
         // clean `FiberFault`, like exhausting the quota — never an overflow into another
         // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
         // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
-        // (slice 3.2.2), so this fiber also mustn't meet the vCPUs: `(slot+1) + vcpus <= MAX`.
-        if durable && (!shadow_region_fits(slot + 1) || slot + 1 + t.vcpus > MAX_SHADOW_CTX) {
+        // (slice 3.2.2), so this fiber must stay strictly below the lowest live vCPU context (which,
+        // with recycling, need not be a simple count from the top).
+        let lowest_vcpu = {
+            if t.vcpu_mask == 0 {
+                MAX_SHADOW_CTX + 1
+            } else {
+                t.vcpu_mask.trailing_zeros() as usize
+            }
+        };
+        if durable && (!shadow_region_fits(slot + 1) || slot + 1 >= lowest_vcpu) {
             return Err(Trap::FiberFault);
         }
         let generation = if reuse.is_some() {
@@ -4419,6 +4459,10 @@ struct VCpu {
     /// `None` on the root (whose entry/args the thaw caller supplies) and on every non-durable vCPU.
     /// (slice 3.2.1)
     spawn_residue: Option<(FuncIdx, Vec<i64>)>,
+    /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at
+    /// `thread.spawn` and freed back to the registry when the vCPU genuinely finishes (context
+    /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
+    vcpu_ctx: usize,
     /// This vCPU's **saved durable state word** (`NORMAL | UNWINDING | REWINDING`), swapped into the
     /// shared window word ([`STATE_OFF`]) by the runtime when this vCPU runs and saved back when it
     /// parks (slice 3.2.1). Multi-vCPU freeze/thaw run single-worker, so the one shared state word is
@@ -4522,6 +4566,7 @@ impl VCpu {
             root_shadow_sp: SHADOW_BASE,
             frozen: Vec::new(),
             spawn_residue: None,
+            vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             mem,
             host,
@@ -4582,6 +4627,7 @@ impl VCpu {
             root_shadow_sp: SHADOW_BASE,
             frozen: Vec::new(),
             spawn_residue: None,
+            vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             mem,
             host,
@@ -4856,6 +4902,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         root_shadow_sp,
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
+        vcpu_ctx: _,
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
@@ -5853,6 +5900,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                  // above, so its shadow stack lives in its own region; it carries its own state word
                                                  // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
                         child.root_shadow_sp = shadow_region_base(child_ctx);
+                        child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
@@ -10260,6 +10308,46 @@ impl Mem {
         self.write_le(base, width, store_bits(v));
         self.writes += 1;
         Ok(())
+    }
+
+    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When no protection has
+    /// ever been mutated (`!prot_dirty` — the common case: no syscalls / coroutines / §13 regions, so
+    /// every prefix page is plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies
+    /// wholly in the backed prefix ([`Window::checked`]), read straight through — skipping the per-op
+    /// `last_fault` atomic store in `confine_checked` and the `check_prot` page scan. **Semantically
+    /// identical** to the cold [`Mem::load`] for this case (the escape-oracle byte-compares it); any
+    /// other case (RO/unmapped/reserved-tail/regions, or a recoverable demand fault) falls to the cold
+    /// path, which keeps the exact trap + `last_fault` semantics. Returns the [`Reg`] slot directly,
+    /// dropping the `Value` round-trip the bytecode engine paid via `Reg::from_value(load(..))`.
+    #[inline]
+    fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
+        let (_, rty, width, signed) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                // `!prot_dirty ⟹ !has_regions`, so the bytes live in `back` (no §13 redirect); the
+                // cooperative bytecode engine is the sole accessor, so a single non-atomic word read
+                // is sound (and one instruction, not `width` atomic byte loads).
+                let raw = self.back.read_word(abs, width);
+                return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
+            }
+        }
+        Ok(Reg::from_value(self.load(addr, offset, op)?))
+    }
+
+    /// Bytecode-engine scalar store (Phase 2): the fast path of [`Mem::store`], taking the value as
+    /// raw slot `lo` bits (no `Value` wrap). Same fast-path gate + cold fallback as
+    /// [`Mem::load_scalar`]; `write_le` truncates to the op width.
+    #[inline]
+    fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
+        let (_, _, width) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                self.back.write_word(abs, width, lo);
+                self.writes += 1;
+                return Ok(());
+            }
+        }
+        self.store(addr, offset, op, Value::I64(lo as i64))
     }
 
     /// §17 `v128.load`: the **16-byte** masked access — the sole escape-TCB delta SIMD adds

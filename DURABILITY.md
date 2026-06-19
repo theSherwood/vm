@@ -1,7 +1,8 @@
 # Durable Domains — Snapshot / Restore / Clone
 
 > **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the interpreter
-> + Phase 3.3 (JIT parity) complete single-vCPU; 3.2 (multi-vCPU) ahead.** This file is the single source of truth for the *design and
+> + Phase 3.3 (JIT parity) complete single-vCPU and **multi-vCPU freeze + thaw** (deferred single-worker
+> `thread.spawn` + `FrozenVCpu` residue + thaw re-attach).** This file is the single source of truth for the *design and
 > implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
 > (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
 > durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
@@ -789,9 +790,73 @@ codec (the control section carries both fiber and vCPU residue; canonical re-fre
 byte-identical — `svm-snapshot/tests/roundtrip.rs`). Cross-backend parity unaffected (fibers unchanged;
 the JIT has no multi-vCPU durable path yet).
 
-Remaining for 3.2: **context recycling** (the next sub-slice — lifts the `MAX_SHADOW_CTX` lifetime cap),
-**nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and **JIT multi-vCPU
-parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze.
+**[~] vCPU-context recycling (interp) — done.** A spawned vCPU's shadow context is now **freed when
+the child genuinely finishes** (not a freeze-unwind, which keeps the region for thaw), so a durable
+domain is bounded by *peak concurrent* vCPUs rather than ~15 *lifetime* spawns. The registry tracks
+occupancy as a `u16` mask (contexts `1..=MAX_SHADOW_CTX`); `reserve` hands out the highest free context
+above the fiber pool, the fiber/vCPU collision guard checks the lowest occupied vCPU context, and a
+child's `VCpu.vcpu_ctx` is freed in the scheduler's `Done` path. The thaw is made **gap-tolerant**
+(derives each re-spawned child's context from its restored shadow-SP to seed the mask; preserves task
+ids for the §12.6 canonical re-freeze; rebuilds `threads[]` sparsely) — but note a *recycled-context
+child at freeze* is **not reachable yet**: a freeze-from-start drives every vCPU to `UNWINDING` at t=0
+(residue stays dense), and a *mid-run* multi-vCPU freeze needs a true stop-the-world (the
+`arm_freeze_after` trigger flips only the running vCPU's per-context state word), which is Phase 4. So
+the gap-tolerance is exercised only on the dense path today; the cap-lifting is pinned by
+`svm-durable/tests/vcpu_recycle.rs` (20 sequential and 8×2 concurrent spawn/join cycles, both of which
+would `ThreadFault` at the 16th lifetime spawn without recycling).
+
+Remaining for 3.2: **nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and
+**JIT multi-vCPU parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze —
+which also unlocks the mid-run multi-vCPU STW that would make recycled-context freeze/thaw reachable.
+
+##### Slice 3.3 — JIT multi-vCPU durable parity (design)
+
+The interpreter freezes/thaws a domain whose root has `thread.spawn`-ed children; the JIT freezes/thaws
+only single-vCPU (fiber) domains today. The gap is **not** a concurrency-model barrier: the interp's
+multi-vCPU durable run is itself **single-worker** (it forces `workers = 1` whenever the window state ≠
+`NORMAL`), so "multi-vCPU durable" means *a domain with several vCPUs*, frozen/thawed serially — not
+vCPUs running concurrently mid-freeze. The JIT just needs the **same serialization**, which it lacks
+because it runs `thread.spawn` children as concurrent 1:1 OS threads (`os_thread_rt::run_child`) with no
+cooperative dispatch boundary.
+
+**Mechanism (mirror the interp, deferred single-worker):** when the window state ≠ `NORMAL`, the JIT's
+`thread_spawn` thunk does **not** start an OS thread. It reserves the child a top-down shadow context (a
+`vcpu` occupancy allocator on `SharedFiberTable`, mirroring the interp's `vcpu_mask`) and a completion
+cell, *records* the spawn request, and returns the handle — then the child runs **inline after the
+spawning vCPU yields** (`Domain::drive_frozen_spawns`, called from `run_inner` once the root has unwound
+and its fibers are flattened). This **deferral is load-bearing for byte-identity**: both backends run the
+same instrumented IR, so the root unwinds at its first checkpoint *before* it reaches `thread.join`;
+running each child only after the root yields reproduces the interp's exact dispatch order (root → root's
+fibers → children, in spawn order) and therefore the same side-effect interleaving (e.g. which vCPU reads
+the clock first). Running the child *immediately* at the spawn point instead reverses that interleaving
+and diverges the frozen window. Each deferred child runs in its own context (point `SHADOW_SP_OFF` at its
+region, run the child entry via the existing guarded-range path), captures its flattened extent as a
+**`FrozenVCpu`** residue (a JIT mirror of `svm_interp::FrozenVCpu`) when it unwinds under `UNWINDING`, and
+publishes its result to its `Done` cell; the last child leaves the active shadow-SP at its own extent,
+matching the interp's dispatch-last convention. `NORMAL` durable runs keep concurrent OS threads (matching
+the interp's multi-worker `NORMAL`).
+
+**Decomposition:**
+- **PR-1 (freeze side) — DONE:** the deferred single-worker path (`defer_spawn` /
+  `Domain::drive_frozen_spawns`) + `FrozenVCpu` residue + vCPU-context allocator, exported through
+  `compile_and_run_capture_reserved_with_host_durable_mv`. Pinned by `durable_multivcpu_jit`'s
+  `jit_freezes_a_spawned_vcpu_matching_interp`: a root+child domain freezes to a **byte-identical durable
+  reserve** and a **field-identical `FrozenVCpu` residue** vs the interpreter (the multi-vCPU analog of
+  `jit_freeze_driver_flattens_a_fiber_matching_interp`).
+- **PR-2 (thaw side) — DONE:** `Domain::thaw_reattach_and_run` re-attaches the frozen children **before**
+  the root re-enters under `REWINDING` (the root's rewind skips its prologue `thread.spawn`, reloading
+  the recorded handle), rebuilds the join table at each child's handle slot (`task − 1`, padding
+  finished/joined gaps), and runs each child inline from its restored extent (rewind → `NORMAL` → run
+  forward → publish its result so the root's re-executed `thread.join` resolves); the root's extent +
+  `REWINDING` are then restored for its re-entry. The freeze side exports the **root's extent** (`root_sp`,
+  separate because the shared active-SP word ends at the last child's). The children run *before* the root
+  (rather than the interp's root-parks-on-join dispatch); this is sound because a `REWINDING` vCPU
+  **reloads** its recorded side effects, so the serialization order can't change the result (§12.6).
+  Pinned by `durable_multivcpu_jit`'s `jit_thaws_its_own_multivcpu_freeze` (JIT freeze → JIT thaw on an
+  advanced clock reproduces the uninterrupted result — reloads, not re-issues) and
+  `interp_frozen_multivcpu_thaws_on_the_jit` (cross-backend: an interp-frozen domain thaws on the JIT).
+
+Scope mirrors the interp's: flat (root-spawned) children, no nested spawns, no child-owned fibers.
 
 ##### Context recycling plan (next sub-slice)
 
@@ -851,8 +916,8 @@ sequenced slice:
    `recycling_reuses_a_freed_slot_with_a_bumped_generation` (interp) and the cross-backend `fiber_fuzz`
    churn differential. Two shadow-routing tests were updated so their fibers `suspend` (stay
    concurrently live) rather than return — otherwise the second fiber would reuse the first's freed
-   region. *(vCPU-context recycling — a joined `thread.spawn` child's top-down context — is a smaller
-   follow-up; the durable cap that bites is fibers, handled here.)*
+   region. *(vCPU-context recycling — a joined `thread.spawn` child's top-down context — is the sibling
+   slice, now done; see "vCPU-context recycling" under slice 3.2.2 above.)*
 4. **[x] Cross-backend parity + fuzz — done.** The recycled freeze/thaw leg is exercised on both
    backends, both hand-written and **fuzzed**:
    - *Pinned:* `svm/tests/durable_fibers_jit.rs::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
