@@ -295,6 +295,43 @@ hot loops are rare in real code, so this is low priority.
 
 ---
 
+### I10 — ordinary `clang -O2` auto-vectorized loops hit two narrow holes in the vector breadth (S3) — `claude/bench-alu-hygiene`
+
+**Where:** `crates/svm-jit/src/lib.rs` (v128 lane-arith lowering) and `crates/svm-llvm/src/lib.rs`
+(`lower_wide` / vector integer-op translation).
+
+**Symptom.** A plain `clang -O2` program (vectorization on — *not* hand-written SIMD) fails fail-closed
+when the loop vectorizer turns a common scalar loop into vector ops the I2 breadth doesn't cover:
+
+1. **`i8x16.mul` — svm-jit `Unsupported("instruction")`.** A byte-array fill like
+   `for (i) buf[i] = i*31 + 7;` (`unsigned char buf[256]`) vectorizes to a `<16 x i8>` body whose
+   multiply becomes `i8x16.mul`. svm-jit lowers `v128.load/store/const`, `i8x16.add/extract_lane`, and
+   `i32x4`/`i64x2` multiply — but **not the 8-bit packed multiply** (x86 has no `PMULLB`; it needs a
+   widen→`i16x8.mul`→narrow sequence). So the i8x16 mul has no lowering. (Translation *succeeds* — the
+   SVM IR is emitted; only the JIT lowering is missing. The interpreters likely hit the same hole.)
+2. **vector integer shifts — on-ramp `Unsupported("vector integer op ShrU (only add/sub/mul/and/or/xor)")`.**
+   A bit-twiddling loop like a table-driven CRC (`c = (c & 1) ? P ^ (c >> 1) : (c >> 1)`) vectorizes to
+   `lshr <4 x i32>`, and the on-ramp's vector lane-arith set omits **`shl`/`lshr`/`ashr`**, so it
+   fail-closes at *translate*.
+
+**Impact.** Common `-O2` shapes (memset-ish byte fills, shift-based hashes/CRC) can't run on svm-jit
+unless vectorization is disabled for that loop. Discovered via `crates/svm-llvm/examples/corpus_diff.rs`
+(`fnv` = case 1, `crc32` = case 2) and worked around there + in `bench/cross-engine/kernels.c` with a
+`NOVEC` (`#pragma clang loop vectorize(disable)`) on the offending preludes, or `-fno-vectorize`. This
+is a clean compile-time error, **not** a miscompile/soundness issue — hence S3. It is the I2 breadth's
+remaining tail: I2 enabled vectorized programs broadly, these are two lane/op shapes it didn't reach.
+
+**Fix sketch (both bounded, mechanical, in the I2 style):**
+1. Add `i8x16.mul` (and `i16x8` where relevant) lowering to svm-jit — the standard
+   widen-to-`i16x8`, multiply, narrow-back lane sequence (and mirror it in the interpreters for parity).
+2. Add `shl`/`lshr`/`ashr` to the on-ramp's vector integer-op translation, lowering to the svm-ir v128
+   shift ops if they exist, else scalarizing per lane like the other `lower_wide` arith.
+
+Until then, `corpus_diff.rs` (and the cross-engine bench) keep such *preludes* scalar with `NOVEC`; the
+timed loops are unaffected.
+
+---
+
 
 ## Resolved
 
