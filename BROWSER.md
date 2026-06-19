@@ -47,8 +47,9 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
   returns a `Capture` (results **and** the final memory snapshot). This is the browser entry point;
   no new public API is required.
 - **Clean deps** — `svm-ir`, `svm-mask` (`#![no_std]`), `svm-mem` (non-unix `Paged` fallback),
-  `svm-verify` (pure), `page_size`. No `svm-fiber` (asm stack-switch — fibers here are
-  continuation-based) and no `svm-jit` (Cranelift). Nothing architecture-specific is dragged in.
+  `svm-verify` (pure). `page_size` is native-only (wasm hard-codes the 64 KiB page), so it's not in
+  the wasm dep graph. No `svm-fiber` (asm stack-switch — fibers here are continuation-based) and no
+  `svm-jit` (Cranelift). Nothing architecture-specific is dragged in.
 
 ---
 
@@ -127,14 +128,21 @@ are git-ignored.
 
 ## Non-portable surface (all in `lib.rs`; bytecode path uses none of it)
 
-Compile-clean today; gate behind `cfg(not(target_family = "wasm"))` for a clean production build:
+Empirically, the linker already handles most of this. The `cdylib`'s exports (`run_guest`,
+`run_threads`, `run_roundtrip`, `svm_run`/`svm_run0`) reach only `bytecode::*` + `Host`; none reach
+the tree-walker, so `--gc-sections` strips the whole cluster from the `.wasm`. Confirmed on the
+built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSched` /
+`available_parallelism`, and **zero** imports (no host, no threads).
 
-1. **Tree-walker production `Scheduler`** — `available_parallelism`, `JoinHandle`/`thread::spawn`,
-   and its `Instant` timer uses.
-2. **Blocking-offload host pool** — `OffloadPool`/`AsyncState` (a `std::thread` pool +
-   `thread::sleep`); stub to run inline on wasm (`AsyncState::mix` is already deterministic).
-3. **`page_size` crate** — `host_page_size()` / `region_page_granularity()`; gate to a constant
-   (65536) under wasm.
+1. **Tree-walker production `Scheduler`** (`available_parallelism`, `JoinHandle`/`thread::spawn`,
+   `Instant`) and **blocking-offload pool** (`OffloadPool` + `thread::sleep`) — *already absent from
+   the binary via dead-code elimination*. Source-level `cfg` would not shrink the artifact; it'd only
+   document the wasm boundary, at the cost of entangled surgery (`SchedRef`'s `Real` variant + match
+   arms, `fresh_single_root`'s debug-attach use of `Real`). Deferred as not worth the churn.
+2. **`page_size` crate** — *done.* `host_page_size()` / `host_region_granularity()` are gated to
+   `cfg(not(target_family = "wasm"))`; wasm hard-codes the 64 KiB linear-memory page. The crate is
+   now a `[target.'cfg(not(target_family = "wasm"))'.dependencies]` entry, so it is no longer
+   compiled into the wasm dependency graph (verified via `cargo tree --target wasm32-...`).
 
 (`svm-mem`/`svm-mask`/`svm-verify` need no work: Paged fallback; `#![no_std]`; pure logic.)
 
@@ -152,9 +160,12 @@ Compile-clean today; gate behind `cfg(not(target_family = "wasm"))` for a clean 
   table64 (above) — browser path stays wasm32 until then. Optional follow-up: reproduce the full
   `svm_run` byte-feeding differential on wasm64 via a Wasmtime embedding (the CLI `--invoke` can't
   write the scratch buffer; the embedded probes already exercise the whole engine on wasm64).
-- [ ] **cfg-gate `lib.rs` for wasm** — `Scheduler`, `OffloadPool`, `std::thread`/`Instant` imports;
-  `page_size` → constant. Hygiene/binary-size (compiles today; the entry never calls these), not a
-  correctness blocker under fail-closed.
+- [x] **cfg-gate `lib.rs` for wasm.** `page_size` is now native-only (`target.'cfg(not(wasm))'`)
+  with a 64 KiB wasm fallback in `host_page_size()`/`host_region_granularity()` — dropped from the
+  wasm dep graph; native unchanged (full `svm-interp`/`svm-mem` suite green, workspace builds). The
+  OS-thread machinery (`Scheduler`/`OffloadPool`/`std::thread`) needed no gating: it's unreachable
+  from the `cdylib` exports and already stripped by `--gc-sections` (zero symbols, zero imports in
+  the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
 - [x] **Differential check (compute + concurrency, wasm32).** `gencorpus` (host) encodes a corpus +
   computes the **native** bytecode-engine result per case; `corpus.mjs` runs the same modules through
   the wasm `svm_run`/`svm_run0` and compares. **37/37 match**, zero host imports, across i64
