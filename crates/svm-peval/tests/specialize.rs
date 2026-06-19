@@ -2801,6 +2801,18 @@ fn outline(m: &Module, func: u32, args: &[SpecArg]) -> Result<Module, svm_peval:
     )
 }
 
+fn selective(m: &Module, func: u32, args: &[SpecArg]) -> Result<Module, svm_peval::SpecError> {
+    specialize_with_config(
+        m,
+        func,
+        args,
+        &SpecConfig {
+            selective_outline: true,
+            ..SpecConfig::default()
+        },
+    )
+}
+
 #[test]
 fn outlining_shares_a_callee_across_call_sites() {
     // main(x) = double(x) + double(x) ; double(a) = a * 2. Both calls have the same (dynamic) arg
@@ -3047,6 +3059,141 @@ fn outlining_makes_one_function_per_static_pattern() {
         assert_eq!(
             run(&inlined, &[Value::I64(b)]),
             Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn selective_outlining_inlines_leaves_and_outlines_recursion() {
+    // f(n) = if n == 0 { 0 } else { g(n) + f(n - 1) } ; g(a) = a * a (a non-recursive helper).
+    // Full outlining makes a function per call → f + g (2 functions). Selective outlining inlines
+    // the helper g and only outlines f's recursive back-edge → a single self-recursive residual.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64], // f(n)
+                results: vec![ValType::I64],
+                blocks: vec![
+                    Block {
+                        params: vec![ValType::I64], // 0: n
+                        insts: vec![
+                            Inst::ConstI64(0), // 1
+                            Inst::IntCmp {
+                                ty: IntTy::I64,
+                                op: CmpOp::Eq,
+                                a: 0,
+                                b: 1,
+                            }, // 2: n == 0
+                        ],
+                        term: Terminator::BrIf {
+                            cond: 2,
+                            then_blk: 1,
+                            then_args: vec![],
+                            else_blk: 2,
+                            else_args: vec![0],
+                        },
+                    },
+                    Block {
+                        params: vec![],
+                        insts: vec![Inst::ConstI64(0)],
+                        term: Terminator::Return(vec![0]),
+                    },
+                    Block {
+                        params: vec![ValType::I64], // 0: n
+                        insts: vec![
+                            Inst::Call {
+                                func: 1,
+                                args: vec![0],
+                            }, // 1: g(n)
+                            Inst::ConstI64(1), // 2
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Sub,
+                                a: 0,
+                                b: 2,
+                            }, // 3: n - 1
+                            Inst::Call {
+                                func: 0,
+                                args: vec![3],
+                            }, // 4: f(n - 1)
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Add,
+                                a: 1,
+                                b: 4,
+                            }, // 5: g(n) + f(n-1)
+                        ],
+                        term: Terminator::Return(vec![5]),
+                    },
+                ],
+            },
+            Func {
+                params: vec![ValType::I64], // g(a) = a * a
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: a
+                    insts: vec![Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Mul,
+                        a: 0,
+                        b: 0,
+                    }], // 1
+                    term: Terminator::Return(vec![1]),
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let full = outline(&m, 0, &[SpecArg::Dynamic]).expect("full-outlines");
+    verify_module(&full).expect("re-verifies");
+    assert_eq!(
+        full.funcs.len(),
+        2,
+        "full outlining keeps the helper as a function"
+    );
+
+    let sel = selective(&m, 0, &[SpecArg::Dynamic]).expect("selectively outlines");
+    verify_module(&sel).expect("re-verifies");
+    assert_eq!(
+        sel.funcs.len(),
+        1,
+        "selective: helper inlined, only the recursion outlined"
+    );
+    // The single residual is self-recursive (the recursion survives as a call to itself), and the
+    // helper g is gone (no call to func 1) — it was inlined as `n * n`.
+    let calls: Vec<u32> = sel.funcs[0]
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match i {
+            Inst::Call { func, .. } => Some(*func),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        calls.iter().all(|&f| f == 0),
+        "only self-calls remain: {calls:?}"
+    );
+    assert!(
+        calls.contains(&0),
+        "the recursion is preserved as a self-call"
+    );
+
+    // f(n) = sum_{k=1..n} k^2. Both residuals match the interpreter.
+    for n in [0i64, 1, 2, 3, 5, 10, 30] {
+        let expect: i64 = (1..=n).map(|k| k * k).sum();
+        assert_eq!(run(&m, &[Value::I64(n)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&full, &[Value::I64(n)]),
+            Ok(vec![Value::I64(expect)]),
+            "full-outlined diverged at n={n}"
+        );
+        assert_eq!(
+            run(&sel, &[Value::I64(n)]),
+            Ok(vec![Value::I64(expect)]),
+            "selective diverged at n={n}"
         );
     }
 }

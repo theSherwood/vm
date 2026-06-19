@@ -148,6 +148,13 @@ struct Frame {
     block: u32,
     ip: usize,
     env: ParamPattern,
+    /// The argument pattern this activation was *entered* with — its recursion signature. Used by
+    /// selective outlining to recognize an unbounded-recursion back-edge (a call whose `(func, entry)`
+    /// equals an ancestor activation's): bounded recursion has a different `entry` each level (a
+    /// decreasing constant) and keeps inlining, unbounded recursion repeats its `entry` and is cut by
+    /// outlining. **Empty outside selective mode**, so it doesn't change the memo key for the inline /
+    /// full-outline paths.
+    entry: ParamPattern,
 }
 
 /// One residual block still to be generated: the symbolic call stack (innermost/active frame last)
@@ -165,6 +172,8 @@ struct FrameAbs {
     block: u32,
     ip: usize,
     env: Vec<Abs>,
+    /// This activation's recursion signature — see [`Frame::entry`]. Empty outside selective mode.
+    entry: ParamPattern,
 }
 
 /// What executing the active frame's straight-line body produced.
@@ -235,6 +244,14 @@ pub struct SpecConfig {
     /// real call boundary isn't implemented, so with a rename region set this is ignored and calls
     /// inline as usual. Off by default (the residual is a single inlined function).
     pub outline_calls: bool,
+    /// **Selective outlining**: outline *only* the calls that need it for termination — an unbounded-
+    /// recursion back-edge (a call re-entering an activation already on the stack with the same
+    /// argument pattern) — and **inline everything else** (straight-line and bounded recursion via the
+    /// usual CFG inlining). The residual is then a *tight* recursive function with its leaves and
+    /// structure folded in, instead of one tiny function per call site (full [`outline_calls`]). Like
+    /// `outline_calls` it requires [`rename`](Self::rename) to be `None`, and it implies outlining is
+    /// enabled (no need to also set `outline_calls`). Off by default.
+    pub selective_outline: bool,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -297,7 +314,7 @@ pub fn specialize_with_config(
     // Threading the renamed region's abstract cells across a real call boundary isn't implemented,
     // so outlining only applies when there is no rename region (then the abstract memory is empty
     // and the callee shares the real window directly).
-    let funcs = if config.outline_calls && config.rename.is_none() {
+    let funcs = if (config.outline_calls || config.selective_outline) && config.rename.is_none() {
         outline_funcs(module, config, &value_types, func, entry_pattern)?
     } else {
         vec![build_func(
@@ -341,14 +358,23 @@ fn build_func(
         .filter_map(|(slot, ty)| slot.is_none().then_some(*ty))
         .collect();
 
+    // Selective outlining only makes sense when outlining is enabled; when it is, populate the
+    // per-frame recursion signatures (otherwise they stay empty, leaving the memo key unchanged).
+    let selective = outline.is_some() && config.selective_outline;
     let mut spec = Spec {
         module,
         config,
         value_types,
         outline,
+        selective,
         memo: HashMap::new(),
         queue: VecDeque::new(),
         next_id: 0,
+    };
+    let entry = if selective {
+        pattern.clone()
+    } else {
+        Vec::new()
     };
     spec.intern(
         vec![Frame {
@@ -356,6 +382,7 @@ fn build_func(
             block: 0,
             ip: 0,
             env: pattern.clone(),
+            entry,
         }],
         Vec::new(),
     );
@@ -432,6 +459,18 @@ impl OutlineState {
     }
 }
 
+/// A call's specialization pattern: the constant arguments baked (`Some`), the dynamic ones marked
+/// `None`. This is both the outlining key's pattern and a frame's recursion signature.
+fn arg_pattern(args_abs: &[Abs]) -> ParamPattern {
+    args_abs
+        .iter()
+        .map(|a| match a {
+            Abs::Const(k) => Some(*k),
+            Abs::Dyn(_) => None,
+        })
+        .collect()
+}
+
 /// Split a call's abstract arguments into the callee's specialization pattern (constants baked,
 /// dynamics marked `None`) and the residual `call`'s argument list (the dynamic operands, in order),
 /// and intern the residual function index for `(callee, pattern)`.
@@ -459,6 +498,9 @@ struct Spec<'a> {
     value_types: &'a [Vec<Vec<ValType>>],
     /// `Some` ⇒ outline calls into shared residual functions via this state; `None` ⇒ inline them.
     outline: Option<&'a RefCell<OutlineState>>,
+    /// Selective outlining: inline calls, outlining only unbounded-recursion back-edges. Implies
+    /// `outline.is_some()`; when set, frames carry their recursion signature ([`Frame::entry`]).
+    selective: bool,
     /// `(call stack, memory pattern) → residual block id`. The memo that makes the loop terminate
     /// and that closes residual loops.
     memo: HashMap<(Vec<Frame>, MemPattern), u32>,
@@ -483,6 +525,35 @@ impl Spec<'_> {
         });
         self.memo.insert(key, id);
         id
+    }
+
+    /// The recursion signature to stamp on a freshly-entered activation: the call's argument pattern
+    /// in selective mode, empty otherwise (so non-selective memo keys are unchanged).
+    fn entry_sig(&self, args: &[Abs]) -> ParamPattern {
+        if self.selective {
+            arg_pattern(args)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether a call to `(callee, pattern)` is an **unbounded-recursion back-edge**: in selective
+    /// mode, the same `(func, entry)` is already live on the call stack (the active activation or a
+    /// suspended ancestor). Such a call must outline to terminate; everything else inlines. Bounded
+    /// recursion has a *different* `entry` each level (a decreasing constant), so it never matches and
+    /// keeps unrolling.
+    fn is_recursion(
+        &self,
+        callee: u32,
+        pattern: &ParamPattern,
+        ancestors: &[FrameAbs],
+        active: (u32, &ParamPattern),
+    ) -> bool {
+        self.selective
+            && ((active.0 == callee && active.1 == pattern)
+                || ancestors
+                    .iter()
+                    .any(|f| f.func == callee && &f.entry == pattern))
     }
 
     fn build_block(&mut self, task: Task) -> Result<svm_ir::Block, SpecError> {
@@ -514,6 +585,7 @@ impl Spec<'_> {
                 block: fr.block,
                 ip: fr.ip,
                 env,
+                entry: fr.entry.clone(),
             });
         }
         let mut mem: BTreeMap<u64, (u32, Abs)> = BTreeMap::new();
@@ -532,13 +604,29 @@ impl Spec<'_> {
 
         // Execute the active (innermost) frame's block from its resume point. `fuel` bounds any
         // straight-line call inlining within this block.
-        let active = frames.pop().expect("a context has at least one frame");
-        let src = &module.funcs[active.func as usize].blocks[active.block as usize];
-        let mut env = active.env;
+        let FrameAbs {
+            func: active_func,
+            block: active_block,
+            ip: active_ip,
+            mut env,
+            entry: active_entry,
+        } = frames.pop().expect("a context has at least one frame");
+        let src = &module.funcs[active_func as usize].blocks[active_block as usize];
         let mut out: Vec<Inst> = Vec::new();
         let mut fuel = INLINE_FUEL;
+        // `frames` is now exactly the suspended ancestors; together with `(active_func, active_entry)`
+        // it is the call stack selective outlining checks for a recursion back-edge.
         let exec = self.exec_insts(
-            &src.insts, active.ip, &mut env, &mut mem, &mut out, &mut rnext, &mut fuel,
+            &src.insts,
+            active_ip,
+            &mut env,
+            &mut mem,
+            &mut out,
+            &mut rnext,
+            &mut fuel,
+            &frames,
+            active_func,
+            &active_entry,
         )?;
 
         let term = match exec {
@@ -550,17 +638,20 @@ impl Spec<'_> {
                 args,
                 resume_ip,
             } => {
+                let callee_entry = self.entry_sig(&args);
                 frames.push(FrameAbs {
-                    func: active.func,
-                    block: active.block,
+                    func: active_func,
+                    block: active_block,
                     ip: resume_ip,
                     env,
+                    entry: active_entry,
                 });
                 frames.push(FrameAbs {
                     func: callee,
                     block: 0,
                     ip: 0,
                     env: args,
+                    entry: callee_entry,
                 });
                 let (target, args) = self.branch_to(&frames, &mem);
                 Terminator::Br { target, args }
@@ -568,7 +659,8 @@ impl Spec<'_> {
             Exec::Done => self.finish_term(
                 &src.term,
                 frames,
-                active.func,
+                active_func,
+                &active_entry,
                 &env,
                 &mut mem,
                 &mut out,
@@ -599,22 +691,57 @@ impl Spec<'_> {
         out: &mut Vec<Inst>,
         rnext: &mut u32,
         fuel: &mut usize,
+        // The current call stack, for selective outlining's recursion check: the suspended ancestors
+        // plus the active activation's `(func, entry)`.
+        ancestors: &[FrameAbs],
+        active_func: u32,
+        active_entry: &ParamPattern,
     ) -> Result<Exec, SpecError> {
         for (k, inst) in insts.iter().enumerate().skip(start_ip) {
             if let Some((callee, args_abs)) = self.callee_of(inst, env)? {
-                if let Some(state) = self.outline {
-                    // Outline: emit a residual call to the (shared) specialized callee.
-                    let results = self.outline_call(state, callee, &args_abs, out, rnext);
-                    env.extend(results);
-                } else {
-                    match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
-                        Some(results) => env.extend(results),
-                        None => {
-                            return Ok(Exec::Suspend {
-                                callee,
-                                args: args_abs,
-                                resume_ip: k + 1,
-                            })
+                match self.outline {
+                    // Full outline: every call becomes a residual call to the shared specialized callee.
+                    Some(state) if !self.selective => {
+                        let results = self.outline_call(state, callee, &args_abs, out, rnext);
+                        env.extend(results);
+                    }
+                    // Selective: inline if we can (straight-line / bounded recursion); on dynamic
+                    // control flow, outline only a recursion back-edge, else fall back to CFG inlining.
+                    Some(state) => {
+                        match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
+                            Some(results) => env.extend(results),
+                            None => {
+                                let pat = arg_pattern(&args_abs);
+                                if self.is_recursion(
+                                    callee,
+                                    &pat,
+                                    ancestors,
+                                    (active_func, active_entry),
+                                ) {
+                                    let results =
+                                        self.outline_call(state, callee, &args_abs, out, rnext);
+                                    env.extend(results);
+                                } else {
+                                    return Ok(Exec::Suspend {
+                                        callee,
+                                        args: args_abs,
+                                        resume_ip: k + 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // Inline mode: straight-line if we can, else CFG inlining.
+                    None => {
+                        match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
+                            Some(results) => env.extend(results),
+                            None => {
+                                return Ok(Exec::Suspend {
+                                    callee,
+                                    args: args_abs,
+                                    resume_ip: k + 1,
+                                })
+                            }
                         }
                     }
                 }
@@ -1132,6 +1259,7 @@ impl Spec<'_> {
         term: &Terminator,
         outer: Vec<FrameAbs>,
         func: u32,
+        active_entry: &ParamPattern,
         env: &[Abs],
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
@@ -1144,7 +1272,7 @@ impl Spec<'_> {
                 self.return_from(outer, &results, mem, out, rnext)
             }
             Terminator::Br { target, args } => {
-                let stack = succ_stack(&outer, func, *target, args, env);
+                let stack = succ_stack(&outer, func, *target, args, env, active_entry.clone());
                 let (target, args) = self.branch_to(&stack, mem);
                 Terminator::Br { target, args }
             }
@@ -1163,15 +1291,29 @@ impl Spec<'_> {
                     } else {
                         (*else_blk, else_args)
                     };
-                    let stack = succ_stack(&outer, func, blk, args, env);
+                    let stack = succ_stack(&outer, func, blk, args, env, active_entry.clone());
                     let (target, args) = self.branch_to(&stack, mem);
                     Terminator::Br { target, args }
                 }
                 // Dynamic condition: specialize both successors and keep the branch.
                 Abs::Dyn(cond) => {
-                    let then_stack = succ_stack(&outer, func, *then_blk, then_args, env);
+                    let then_stack = succ_stack(
+                        &outer,
+                        func,
+                        *then_blk,
+                        then_args,
+                        env,
+                        active_entry.clone(),
+                    );
                     let (then_blk, then_args) = self.branch_to(&then_stack, mem);
-                    let else_stack = succ_stack(&outer, func, *else_blk, else_args, env);
+                    let else_stack = succ_stack(
+                        &outer,
+                        func,
+                        *else_blk,
+                        else_args,
+                        env,
+                        active_entry.clone(),
+                    );
                     let (else_blk, else_args) = self.branch_to(&else_stack, mem);
                     Terminator::BrIf {
                         cond,
@@ -1190,7 +1332,7 @@ impl Spec<'_> {
                 Abs::Const(c) => {
                     let i = c.as_i32().ok_or(SpecError::Unsupported)? as u32 as usize;
                     let (blk, args) = targets.get(i).unwrap_or(default);
-                    let stack = succ_stack(&outer, func, *blk, args, env);
+                    let stack = succ_stack(&outer, func, *blk, args, env, active_entry.clone());
                     let (target, args) = self.branch_to(&stack, mem);
                     Terminator::Br { target, args }
                 }
@@ -1198,11 +1340,19 @@ impl Spec<'_> {
                     let targets = targets
                         .iter()
                         .map(|(blk, args)| {
-                            let stack = succ_stack(&outer, func, *blk, args, env);
+                            let stack =
+                                succ_stack(&outer, func, *blk, args, env, active_entry.clone());
                             self.branch_to(&stack, mem)
                         })
                         .collect();
-                    let default_stack = succ_stack(&outer, func, default.0, &default.1, env);
+                    let default_stack = succ_stack(
+                        &outer,
+                        func,
+                        default.0,
+                        &default.1,
+                        env,
+                        active_entry.clone(),
+                    );
                     let default = self.branch_to(&default_stack, mem);
                     Terminator::BrTable {
                         idx,
@@ -1215,7 +1365,17 @@ impl Spec<'_> {
             // A direct tail call.
             Terminator::ReturnCall { func: callee, args } => {
                 let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
-                self.tail_call(*callee, args_abs, outer, mem, out, rnext, fuel)?
+                self.tail_call(
+                    *callee,
+                    args_abs,
+                    outer,
+                    func,
+                    active_entry,
+                    mem,
+                    out,
+                    rnext,
+                    fuel,
+                )?
             }
             // An indirect tail call whose index resolves to a constant callee.
             Terminator::ReturnCallIndirect { ty, idx, args } => {
@@ -1223,28 +1383,66 @@ impl Spec<'_> {
                     .resolve_indirect(ty, env[*idx as usize])
                     .ok_or(SpecError::Unsupported)?;
                 let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
-                self.tail_call(callee, args_abs, outer, mem, out, rnext, fuel)?
+                self.tail_call(
+                    callee,
+                    args_abs,
+                    outer,
+                    func,
+                    active_entry,
+                    mem,
+                    out,
+                    rnext,
+                    fuel,
+                )?
             }
         })
     }
 
-    /// Specialize a tail call to `callee` (a `return_call`). In outline mode it becomes a residual
-    /// `return_call` to the shared specialized callee; otherwise it is inlined (straight-line if it
-    /// can, else the active frame is replaced by the callee, keeping this frame's continuation).
+    /// Specialize a tail call to `callee` (a `return_call`). In full-outline mode it becomes a
+    /// residual `return_call` to the shared specialized callee. In selective mode it inlines unless it
+    /// is a recursion back-edge (then the residual `return_call`). Otherwise (inline mode) it is
+    /// straight-line-inlined or, failing that, replaces the active frame (a tail call keeps this
+    /// frame's return continuation). `active_func`/`active_entry` identify the activation being
+    /// replaced, for the recursion check.
     #[allow(clippy::too_many_arguments)]
     fn tail_call(
         &mut self,
         callee: u32,
         args_abs: Vec<Abs>,
         outer: Vec<FrameAbs>,
+        active_func: u32,
+        active_entry: &ParamPattern,
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
         rnext: &mut u32,
         fuel: &mut usize,
     ) -> Result<Terminator, SpecError> {
         if let Some(state) = self.outline {
-            let (ridx, args) = outline_ref(state, callee, &args_abs);
-            return Ok(Terminator::ReturnCall { func: ridx, args });
+            if !self.selective {
+                let (ridx, args) = outline_ref(state, callee, &args_abs);
+                return Ok(Terminator::ReturnCall { func: ridx, args });
+            }
+            // Selective: try to inline; outline only a recursion back-edge.
+            if let Some(results) =
+                self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)?
+            {
+                return Ok(self.return_from(outer, &results, mem, out, rnext));
+            }
+            let pat = arg_pattern(&args_abs);
+            if self.is_recursion(callee, &pat, &outer, (active_func, active_entry)) {
+                let (ridx, args) = outline_ref(state, callee, &args_abs);
+                return Ok(Terminator::ReturnCall { func: ridx, args });
+            }
+            let mut stack = outer;
+            stack.push(FrameAbs {
+                func: callee,
+                block: 0,
+                ip: 0,
+                env: args_abs,
+                entry: pat,
+            });
+            let (target, args) = self.branch_to(&stack, mem);
+            return Ok(Terminator::Br { target, args });
         }
         Ok(
             match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
@@ -1256,6 +1454,7 @@ impl Spec<'_> {
                         block: 0,
                         ip: 0,
                         env: args_abs,
+                        entry: Vec::new(),
                     });
                     let (target, args) = self.branch_to(&stack, mem);
                     Terminator::Br { target, args }
@@ -1320,6 +1519,7 @@ impl Spec<'_> {
                 block: fr.block,
                 ip: fr.ip,
                 env,
+                entry: fr.entry.clone(),
             });
         }
         let mut mem_pat = Vec::with_capacity(mem.len());
@@ -1339,13 +1539,15 @@ impl Spec<'_> {
 
 /// Build the successor call stack for an intra-function branch: the suspended `outer` frames
 /// unchanged, with a fresh active frame entering `block` of `func` whose env is the edge's `args`
-/// mapped through the current `env`.
+/// mapped through the current `env`. The branch stays inside the *same* activation, so it carries the
+/// active frame's recursion signature (`entry`) forward unchanged.
 fn succ_stack(
     outer: &[FrameAbs],
     func: u32,
     block: u32,
     args: &[u32],
     env: &[Abs],
+    entry: ParamPattern,
 ) -> Vec<FrameAbs> {
     let mut stack = outer.to_vec();
     let tenv = args.iter().map(|&a| env[a as usize]).collect();
@@ -1354,6 +1556,7 @@ fn succ_stack(
         block,
         ip: 0,
         env: tenv,
+        entry,
     });
     stack
 }
