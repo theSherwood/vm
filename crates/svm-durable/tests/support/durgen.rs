@@ -23,7 +23,9 @@ use svm_durable::{
     SHADOW_SP_OFF, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
-use svm_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, ValType};
+use svm_ir::{
+    BinOp, Block, CmpOp, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, ValType,
+};
 
 // 128 KiB: the durable region needs `DURABLE_RESERVE` (64 KiB), and a smaller window keeps the
 // per-run commit footprint modest — the JIT commits a window per compile, and on a memory-tight
@@ -308,6 +310,109 @@ pub fn gen_module(g: &mut Gen) -> Module {
 
     Module {
         funcs,
+        memory: Some(Memory {
+            size_log2: SIZE_LOG2,
+        }),
+        data: Vec::new(),
+        imports: Vec::new(),
+        debug_info: None,
+    }
+}
+
+/// Build an in-scope module with a **poll-free loop ahead of the `cap.call`** — exercising the
+/// Phase-4 Slice A loop-header back-edge poll (`SuspendKind::LoopHeader`). `block1` is a loop header
+/// (a back-edge target) whose body is pure compute (consts + total binops + an `i+1 < trip`
+/// counter), so the only freeze site inside it is the inserted header poll; the `cap.call` lands in
+/// `block2` *after* the loop, so a freeze-from-start lands on the header poll first. The handle is a
+/// loop-carried block param (an `i32` spilled/reloaded across the header), so this also covers
+/// mixed-type header-param spilling. Oracle: `seed (op step)×trip`, then folded with the clock.
+pub fn gen_loop_module(g: &mut Gen) -> Module {
+    let trip = 1 + g.below(8) as i64; // 1..=8 bounded iterations (poll-free, always terminates)
+    let seed = g.u64v() as i64;
+    let step = g.u64v() as i64;
+    let body_op = total_binop(g);
+    let fold_op = total_binop(g);
+    let clock_arg = g.u64v() as i32;
+
+    // block0(v0: i32 handle): seed the accumulator + counter, enter the loop carrying the handle.
+    let b0 = Block {
+        params: vec![ValType::I32],
+        insts: vec![
+            Inst::ConstI64(seed), // v1 = acc
+            Inst::ConstI64(0),    // v2 = i
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2], // [handle, acc, i]
+        },
+    };
+
+    // block1(v0: i32, v1: i64 acc, v2: i64 i): poll-free body; back-edge to self or exit.
+    let b1 = Block {
+        params: vec![ValType::I32, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(step), // v3
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: body_op,
+                a: 1,
+                b: 3,
+            }, // v4 = acc `op` step
+            Inst::ConstI64(1),    // v5
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 2,
+                b: 5,
+            }, // v6 = i + 1
+            Inst::ConstI64(trip), // v7
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::LtS,
+                a: 6,
+                b: 7,
+            }, // v8 = (i+1) < trip
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 1,
+            then_args: vec![0, 4, 6], // continue: [handle, acc', i']
+            else_blk: 2,
+            else_args: vec![0, 4], // exit: [handle, acc']
+        },
+    };
+
+    // block2(v0: i32 handle, v1: i64 acc): the `cap.call` after the loop, folded into the result.
+    let b2 = Block {
+        params: vec![ValType::I32, ValType::I64],
+        insts: vec![
+            Inst::ConstI32(clock_arg), // v2 = the i32 clock arg
+            Inst::CapCall {
+                type_id: CLOCK_TYPE_ID,
+                op: CLOCK_OP,
+                sig: FuncType {
+                    params: vec![ValType::I32],
+                    results: vec![ValType::I64],
+                },
+                handle: 0, // v0
+                args: vec![2],
+            }, // v3 = clock
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: fold_op,
+                a: 1,
+                b: 3,
+            }, // v4 = acc `op` clock
+        ],
+        term: Terminator::Return(vec![4]),
+    };
+
+    Module {
+        funcs: vec![Func {
+            params: vec![ValType::I32],
+            results: vec![ValType::I64],
+            blocks: vec![b0, b1, b2],
+        }],
         memory: Some(Memory {
             size_log2: SIZE_LOG2,
         }),
@@ -723,12 +828,27 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
 }
 
 /// Check the two properties on one generated module.
+/// `gen_module` call-chain round-trip property.
 pub fn fuzz_one(g: &mut Gen) {
     let m = gen_module(g);
-    let inst = transform_module(&m).expect("an in-scope module must transform");
-    svm_verify::verify_module(&inst).expect("instrumented IR must verify");
-
     let clock_v = g.u64v() as i64;
+    check_roundtrip(&m, clock_v);
+}
+
+/// `gen_loop_module` poll-free-loop round-trip property (Phase-4 Slice A back-edge poll): the
+/// freeze-from-start lands on the inserted loop-header poll, and the thaw re-enters the loop body.
+pub fn fuzz_loop_one(g: &mut Gen) {
+    let m = gen_loop_module(g);
+    let clock_v = g.u64v() as i64;
+    check_roundtrip(&m, clock_v);
+}
+
+/// The shared freeze/thaw round-trip property over an in-scope durable module: inert in NORMAL,
+/// freeze-from-start unwinds out to the host, and thaw on a continued-clock host equals the
+/// uninterrupted run (a buggy re-issue instead of reload/redeliver would diverge).
+fn check_roundtrip(m: &Module, clock_v: i64) {
+    let inst = transform_module(m).expect("an in-scope module must transform");
+    svm_verify::verify_module(&inst).expect("instrumented IR must verify");
 
     // --- (1) inert in NORMAL: instrumented (NORMAL) == un-instrumented ---
     let r_orig = {
@@ -736,7 +856,7 @@ pub fn fuzz_one(g: &mut Gen) {
         h.clock_ns = clock_v;
         let clk = h.grant_clock();
         let mut fuel = 1_000_000u64;
-        run_with_host(&m, 0, &[Value::I32(clk)], &mut fuel, &mut h)
+        run_with_host(m, 0, &[Value::I32(clk)], &mut fuel, &mut h)
     };
     let (r_base, _) = {
         let mut h = Host::new();

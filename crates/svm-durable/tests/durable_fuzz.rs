@@ -17,6 +17,18 @@ fn freeze_thaw_equivalence_over_generated_modules() {
 }
 
 #[test]
+fn loop_freeze_thaw_equivalence_over_generated_modules() {
+    // Phase-4 Slice A: poll-free-loop modules (a back-edge-target loop header ahead of the cap.call)
+    // exercise the loop-header back-edge poll across random trip counts, seeds, binops, and a
+    // mixed-type (i32 handle + i64 acc/counter) loop-carried spill. Freeze-from-start lands on the
+    // header poll; thaw re-enters the loop body and runs to the uninterrupted result.
+    for seed in 0..400u64 {
+        let mut g = durgen::Gen::from_seed(seed);
+        durgen::fuzz_loop_one(&mut g);
+    }
+}
+
+#[test]
 fn fiber_freeze_thaw_equivalence_over_generated_modules() {
     // The §12.8 single-fiber freeze/thaw property over generated root+fiber modules (varying
     // suspend counts, live-across-suspend values, multi-point resume/suspend). The libFuzzer
