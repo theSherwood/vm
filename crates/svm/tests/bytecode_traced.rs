@@ -264,9 +264,14 @@ fn clean_run_has_empty_backtrace() {
     // belt-and-braces: the rendered backtrace really is empty (not just equal-and-nonempty)
     let m = parse_module(CLEAN).expect("parse");
     let mut fuel = u64::MAX;
-    let (res, bt) =
-        bytecode::compile_and_run_with_host_traced(&m, 0, &[Value::I32(41)], &mut fuel, &mut Host::new())
-            .expect("drove");
+    let (res, bt) = bytecode::compile_and_run_with_host_traced(
+        &m,
+        0,
+        &[Value::I32(41)],
+        &mut fuel,
+        &mut Host::new(),
+    )
+    .expect("drove");
     assert_eq!(res, Ok(vec![Value::I32(42)]));
     assert!(bt.is_empty(), "clean run ⇒ empty backtrace");
 }

@@ -1629,7 +1629,8 @@ pub fn run_with_host_fast_traced(
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
     if !host.is_durable() {
-        if let Some(result) = bytecode::compile_and_run_with_host_traced(m, func, args, fuel, host) {
+        if let Some(result) = bytecode::compile_and_run_with_host_traced(m, func, args, fuel, host)
+        {
             return result;
         }
     }

@@ -1236,7 +1236,12 @@ pub fn compile_and_run_with_host_traced(
 /// ops (terminators) are skipped, matching [`Program::src`] / [`Vm::cur_ir_pc`].
 fn vm_trap_bt(vm: &Vm, mods: &[Compiled], trap: &Trap) -> Vec<super::IrPc> {
     let mut bt = Vec::new();
-    if let Some((block, inst)) = mods[vm.module].progs[vm.cur].src.get(vm.pc).copied().flatten() {
+    if let Some((block, inst)) = mods[vm.module].progs[vm.cur]
+        .src
+        .get(vm.pc)
+        .copied()
+        .flatten()
+    {
         // An instruction's recorded `inst` advances past the op exactly when the tree-walker's did
         // (it does `inst += 1` before evaluating, so every trap but `OutOfFuel` lands one past); a
         // terminator (`unreachable`, `return_call_indirect`) is already stored as `insts.len()`, the
