@@ -873,7 +873,7 @@ impl Domain {
         // recorded side effects, so this order can't change the result (§12.6). Each runs under
         // `REWINDING` from its restored extent, completes (a basic thaw doesn't re-freeze), frees its
         // context, and publishes its result into its parent's table cell.
-        runs.sort_by(|a, b| b.task.cmp(&a.task));
+        runs.sort_by_key(|r| std::cmp::Reverse(r.task));
         for r in &runs {
             fiber_rt::window_set_rewinding(env.mem_base);
             fiber_rt::write_shadow_sp(env.mem_base, r.shadow_sp);
