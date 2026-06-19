@@ -681,6 +681,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-peval",
  "svm-run",
  "svm-text",
  "svm-verify",
@@ -698,6 +699,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-peval"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+ "svm-verify",
+]
+
+[[package]]
 name = "svm-run"
 version = "0.0.0"
 dependencies = [
@@ -706,6 +715,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-peval",
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",

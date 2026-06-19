@@ -85,10 +85,139 @@ path — distinct from the now-removed root-runtime delta and from the resolved 
 
 ---
 
-_(I1 below is open-adjacent — its abort mechanism is fixed, but I3/I4 are residual same-family CI-abort
-flakes. I2 resolved below.)_
+### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — **FIX LANDED** on `claude/dap-function-names` (pending `windows-latest` CI confirmation)
+
+**Fix (landed, the refined-fix design below):** the trap-time capture state + frame-pointer walk +
+explicit-trap helper moved into a new cross-platform `crates/svm-jit/src/trap_capture.c` (compiled on
+unix **and** windows). `emit_trap` now bakes `call svm_capture_explicit_trap(get_frame_pointer())` on
+every target — the trapping frame pointer is threaded in via Cranelift `get_frame_pointer` (so MSVC's
+missing `__builtin_frame_address` is sidestepped), and the trap-site return address comes from
+`_ReturnAddress()` (MSVC) / `__builtin_return_address(0)` (GCC). The unix signal handler and the windows
+VEH both feed the shared capture (the handler via `svm_store_trap_frame`; the VEH keeps its Rust
+memory-fault capture and the windows `take_trap_frame` falls back to the C `svm_take_trap_frame` for
+explicit traps). The `trap_kill_message_carries_a_source_backtrace` test (div-by-zero) is now un-gated
+on Windows. Unix validated locally; windows-gnu compiles; **MSVC runtime is validated by the
+`windows-latest` CI job** — move this entry to Resolved once that job is green. _Original report below._
+
+**Where:** `crates/svm-jit/src/lib.rs` (`trap_capture_addr()` returns `0` on non-unix, so `emit_trap`
+bakes no explicit-trap capture call), `crates/svm-jit/src/trap_shim.c` (the unix-only
+`svm_capture_explicit_trap`).
+
+**Update (memory faults: fixed on Windows).** The Windows Vectored Exception Handler now captures the
+trap-time backtrace for **memory faults**, mirroring the unix SIGSEGV/SIGBUS path: `mem.rs`'s windows
+`pal::veh` reads the faulting `Rip`/`Rbp` from `EXCEPTION_POINTERS->ContextRecord` and walks the
+frame-pointer chain (a Rust `walk_fp_chain`) into a thread-local before restoring the recovery context;
+the windows `pal::take_trap_frame` reads it. So `last_trap_backtrace()` + the kill message now carry
+source frames for a Windows guard fault (covered cross-platform by
+`memfault_kill_message_carries_a_source_backtrace` in `svm-run`'s `run.rs`).
+
+**Still open: explicit-check traps on Windows.** Div/rem-by-zero, `unreachable`, `OutOfFuel`, and
+indirect-call-type traps store a `TrapKind` and return — there is no signal/exception to capture from, so
+on unix the lowering bakes a `call svm_capture_explicit_trap` at the trap site (`trap_capture_addr()`).
+On Windows that address is `0`, so these still produce an **empty** backtrace (correct `TrapKind` + kill,
+no frames). Not a correctness or escape hazard. (The `trap_kill_message_carries_a_source_backtrace` test —
+div-by-zero — keeps its source-line assertion under `#[cfg(unix)]` for this reason.)
+
+**Why it isn't a quick patch (two concrete blockers, found on attempt):**
+1. **Recovering the innermost frame without `__builtin_frame_address`.** The unix helper uses
+   `__builtin_frame_address(0)` to find its own frame → the trapping fn's `rbp` *and* the trap-site
+   return address (`[my_fp+8]`). **MSVC has no `__builtin_frame_address`.** Cranelift's
+   `get_frame_pointer` (confirmed present in cranelift-codegen 0.132 x64) can hand the helper the guest
+   fn's `rbp` as an argument — but walking from *that* yields only the **caller** chain; the trapping
+   function's own line is lost. Recovering it needs the helper's return address (`_ReturnAddress()` on
+   MSVC / `__builtin_return_address(0)` on GCC), which pulls the helper back into C.
+2. **Cross-language capture state.** Windows memory faults capture into **Rust** thread-locals (the VEH
+   is Rust, `mem.rs` windows `pal`); the unix explicit helper writes **C** thread-locals (`trap_shim.c`).
+   A C explicit-trap helper on Windows would write a location the Windows `take_trap_frame` (which reads
+   the Rust thread-locals) never sees. Unifying them is a capture-state refactor, not a patch.
+
+**Refined fix (a proper slice, not a quick win):** unify the capture state in Rust (one thread-local set
+read by `take_trap_frame` on both platforms; the unix C signal handler stores via a small async-signal-
+safe `extern "C"` Rust shim), and make the explicit-trap helper take the frame pointer from
+`get_frame_pointer` + the trap site from `_ReturnAddress`/`__builtin_return_address`. Then `emit_trap`
+bakes `call <helper>(get_frame_pointer())` on **all** targets (de-special-casing unix too). **Test:**
+un-gate `trap_kill_message_carries_a_source_backtrace` on Windows; validate on the `windows-latest` CI
+job.
 
 ---
+
+### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
+
+**Where:** the trap-time backtrace capture sites — `crates/svm-jit/src/trap_shim.c` (the SIGSEGV/BUS
+handler + `svm_capture_explicit_trap`), `crates/svm-jit/src/mem.rs` (the windows VEH), and the §14
+coroutine/fiber runtime (`fiber_rt.rs`).
+
+**Is:** a trap-time backtrace (`last_trap_backtrace` / `run_traced`) gives the correct guest **frames**
+regardless of which fiber/coroutine was running when the trap fired — the frame-pointer walk works on
+whatever stack the trap is on, and Stage 3 already collects a spawned vCPU's capture into the `Domain`.
+What's missing is a **fiber-id label** (DEBUGGING.md §5 W3 Stage 3 "names the right fiber under
+work-stealing migration"): the backtrace doesn't say *which* §23/D57 migratable fiber the frames belong
+to. Pure cosmetics — the frames themselves are right.
+
+**Why it isn't a quick patch:** the capture runs in the low-level handlers (C signal handler, Rust VEH,
+the explicit-trap helper), none of which have the running fiber's identity to hand. `fiber_rt::current()`
+returns the thread-local `*mut FiberRuntime` but not a stable handle, and a fiber migrates across worker
+threads, so the id must be read at capture time, not reconstructed after. Threading a "current fiber
+handle" thread-local that the capture sites can cheaply read is the work.
+
+**Fix sketch:** maintain a per-thread "current fiber handle" cell (set on each `cont.resume`/suspend
+switch in `fiber_rt`), read it at capture time into the trap-frame thread-local alongside `pc`/`rets`,
+and surface it (e.g. `JitFrameLoc`-adjacent or a `last_trap_fiber()` accessor) for the kill message.
+
+---
+
+_(I1 below is open-adjacent — its abort mechanism is fixed, but I3/I4 are residual same-family CI-abort
+flakes. I2 resolved below.)_
+### I7 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3)
+
+**Where:** the guest-built work-stealing schedulers run end-to-end through the `svm-run` binary —
+`crates/svm-run/demos/work_stealing/work_stealing.c` (stackless tasks) and
+`crates/svm-run/demos/steal_fibers/steal_fibers.c` (D57 stackful, migratable fibers stolen across
+real OS threads) — and their product-path smoke tests `demo_work_stealing_runs` /
+`demo_steal_fibers_runs` in `crates/svm-run/tests/run.rs`. The deadlock is in the
+scheduler/fiber-stealing path (guest scheduler logic and/or the host `os_thread_rt` + fiber-steal
+runtime), not in the demos' I/O.
+
+**Symptom:** the demo process occasionally **never terminates** — the guest's worker threads wedge
+with no forward progress, so the test's `Command::…output()` blocks indefinitely. Observed once on
+the **Linux x86_64** CI `check` job (run 27778162761, the `cargo test --workspace` step), which hung
+>1 h until the run was cancelled. It is **rare**: 0 hangs in 48 local back-to-back runs of both
+demos, and the suite passed cleanly on other runs.
+
+**Why only Linux CI sees it:** both tests are gated `#[cfg(all(unix, target_arch = "x86_64"))]`.
+`macos-latest` is arm64 and `windows-latest` is non-unix, so **both skip these demos** — the Linux
+x86_64 `check` job is the only CI lane that runs them, so a hang there shows up as a single stuck
+job while every other job is green.
+
+**Root cause (hypothesis, not yet confirmed):** a timing-dependent liveness bug — most likely a
+lost-wakeup / missed-notification race between the steal path and the park/unpark of idle worker
+threads (or in the guest scheduler's termination detection), exposed only under a particular
+interleaving. Needs root-causing from a stuck instance (attach `gdb`/`lldb` and dump all thread
+backtraces, or add steal/park tracing). The fiber/work-stealing **runtime is not modified** by the
+argc/argv work (PR #66).
+
+**Sensitivity clue (PR #66):** the race is sharp enough that a *tiny startup perturbation* flips it
+from rare to frequent. PR #66 originally had the `svm-run` CLI seed the §3e args buffer (a few-byte
+`init_mem` memcpy during window setup, before the guest runs) for **every** program, including these
+`main(void)` demos. That harmless, never-read seeding — only a few microseconds of extra setup —
+took the hang from "0 in ~50 sequential runs" to **reliable on the first iteration** under
+`cargo test --test run --test-threads=8` (parallel load). Reverting to *not* seeding when there are
+no actual program args (so a bare run is byte-identical to before) restored the rare baseline (≥6
+clean parallel iterations). So whatever the root cause, it is acutely sensitive to worker-thread
+start timing — a strong hint for a park/unpark or steal-loop wakeup race.
+
+**Fix sketch:**
+1. Root-cause via thread backtraces of a hung process (reproduce by looping the `svm-run` binary on
+   the demo until it wedges, then attach a debugger) — confirm whether the stall is in the host
+   steal/park runtime or the guest scheduler, and fix the wakeup race.
+2. Interim blast-radius mitigation (independent of the root cause): the runner already honours
+   `SVM_DEADLINE_MS` (§5 detect-and-kill); have the demo smoke tests run the `svm-run` subprocess
+   under a deadline / `timeout` so a hang **fails fast** instead of blocking CI for hours, and add a
+   `timeout-minutes:` to the CI `check` job (it currently has none, so a wedged job sits until
+   GitHub's 6 h default).
+
+---
+
 
 ## Resolved
 

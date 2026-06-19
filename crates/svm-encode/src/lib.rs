@@ -16,10 +16,10 @@
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, FBinOp,
-    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp,
-    LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp, Terminator, TypeDef,
-    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
-    VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
+    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy,
+    IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp, Terminator,
+    TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
+    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -141,6 +141,8 @@ mod op {
 
     // §GC (GC.md) conservative root enumeration.
     pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
+    pub const VCPU_TLS_GET: u8 = 0xEB; // §12 per-vCPU TLS register: () -> i64
+    pub const VCPU_TLS_SET: u8 = 0xEC; // §12 per-vCPU TLS register: val -> ()
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -408,6 +410,12 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
         write_uleb(out, b.bytes.len() as u64);
         out.extend_from_slice(&b.bytes);
     }
+    // Function names (§6, last so an older decoder stops cleanly at the blobs): `(func, name)`.
+    write_uleb(out, di.func_names.len() as u64);
+    for fname in &di.func_names {
+        write_uleb(out, fname.func as u64);
+        write_str(out, &fname.name);
+    }
 }
 
 fn encode_func(out: &mut Vec<u8>, f: &Func) {
@@ -447,6 +455,11 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::CapSelfGet { idx } => {
             out.push(op::CAP_SELF_GET);
             write_uleb(out, *idx as u64);
+        }
+        Inst::VcpuTlsGet => out.push(op::VCPU_TLS_GET),
+        Inst::VcpuTlsSet { val } => {
+            out.push(op::VCPU_TLS_SET);
+            write_uleb(out, *val as u64);
         }
         Inst::ConstI32(c) => {
             out.push(op::CONST_I32);
@@ -1604,12 +1617,25 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
         let bytes = c.take(len)?.to_vec();
         blobs.push(ProducerBlob { producer, bytes });
     }
+    // Function names (§6) — a trailing section: an artifact from before they existed ends right after
+    // the blobs, so `at_end` ⇒ none (the field was appended last, after `blobs`, for this compat).
+    let mut func_names = Vec::new();
+    if !c.at_end() {
+        let n = c.count()?;
+        for _ in 0..n {
+            func_names.push(FuncName {
+                func: c.idx()?,
+                name: c.str()?,
+            });
+        }
+    }
     Ok(DebugInfo {
         files,
         locs,
         types,
         vars,
         blobs,
+        func_names,
     })
 }
 
@@ -1749,6 +1775,8 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         },
         op::CAP_SELF_COUNT => Inst::CapSelfCount,
         op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
+        op::VCPU_TLS_GET => Inst::VcpuTlsGet,
+        op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
 
         op::CONST_F32 => Inst::ConstF32(c.u32_le()?),
         op::CONST_F64 => Inst::ConstF64(c.u64_le()?),
@@ -2288,6 +2316,16 @@ mod debug_tests {
                 producer: ".debug_info".into(),
                 bytes: vec![0x00, 0x01, 0xff, 0x7f, 0x80, b'd', b'w'],
             }],
+            func_names: vec![
+                FuncName {
+                    func: 0,
+                    name: "compute".into(),
+                },
+                FuncName {
+                    func: 2,
+                    name: "main".into(),
+                },
+            ],
         }
     }
 

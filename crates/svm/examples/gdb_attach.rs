@@ -16,7 +16,8 @@
 //!
 //! gdb plants its internal breakpoint on `__jit_debug_register_code`; when this program registers,
 //! gdb reads the in-memory ELF symfile, resolves `compute.c:3` to the live machine address, and
-//! stops there when the JIT'd function executes.
+//! stops there when the JIT'd function executes. With the §6 function-name table (`debug.fname`) the
+//! `bt` frame reads `compute (...) at compute.c:3`, not the synthesized `fn0`.
 
 use svm_ir::DEFAULT_RESERVED_LOG2;
 use svm_jit::{CompiledModule, Quota, INERT_CAP_THUNK};
@@ -36,6 +37,7 @@ block0(v0: i32):
 }
 
 debug.file 0 "compute.c"
+debug.fname 0 "compute"
 debug.loc 0 0 1 0 2 7
 debug.loc 0 0 3 0 3 7
 debug.loc 0 0 5 0 4 3

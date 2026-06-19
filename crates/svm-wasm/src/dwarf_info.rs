@@ -93,10 +93,12 @@ pub struct DwarfVar {
     pub scope_pc: Option<(u64, u64)>,
 }
 
-/// A function's debug info: its PC range, frame-base wasm local, and variables.
+/// A function's debug info: its PC range, name, frame-base wasm local, and variables.
 pub struct DwarfSub {
     pub low_pc: u64,
     pub high_pc: u64,
+    /// The subprogram's `DW_AT_name` (the §6 function name), or empty if unnamed.
+    pub name: String,
     /// The wasm local index holding the frame base (`DW_OP_WASM_location 0x0 <n>`), if expressed so.
     pub frame_base_local: Option<u32>,
     pub vars: Vec<DwarfVar>,
@@ -400,6 +402,7 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
                     low_pc: low,
                     // `DW_AT_high_pc` is an offset from low_pc when it's a constant (DWARF4).
                     high_pc: low + high_pc.unwrap_or(0),
+                    name: name.clone().unwrap_or_default(),
                     frame_base_local: frame_base.as_deref().and_then(frame_base_local),
                     vars: Vec::new(),
                 });

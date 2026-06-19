@@ -583,8 +583,7 @@ Notes:
 - **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
   `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
   already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
-- **`argc`/`argv`**: needs a powerbox/runner change (pass argv to `_start`), not just the frontend —
-  schedule alongside a CLI-style demo once the above land.
+- **`argc`/`argv`**: **DONE** — see *Slice BE* below. `envp`/`getenv`: **DONE** — see *Slice BF*.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
@@ -596,7 +595,71 @@ modifiers (the LLVM arg carries the real width — `%lx` ⇒ an `i64` arg). All 
 code**; only the bytes cross the boundary. Tests: `demo_hexdump_vs_native` (a `hexdump -C` clone, vs
 native, with stdin) + `printf_unsigned_formats` (mixed widths/pads/`%lx`/`%c`/`%%`).
 - *Deferred:* `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`,
-  non-constant format strings.
+  non-constant format strings. **(`%s`, the flags, and precision landed — slices BA–BD below; float
+  stays fail-closed, needing exact-decimal/bignum formatting.)**
+
+**Slices BA–BD (DONE) — the `printf` breadth batch (no new demo; the format engine widened, each
+checked byte-for-byte vs native `printf`).**
+- **BA — `%s`** (runtime `strlen`): a synthesized `__svm_strlen` (counted forward scan) + a
+  right-justified field-width pad; the string bytes are written straight from the argument pointer.
+  Test: `printf_string_formats`.
+- **BB — flags `-`/`+`/space/`#` + zero-padded signed `%d`** (the previously fail-closed sign+pad
+  combo): the int formatter is rebuilt as a flag-aware `emit_printf_int_field` — left-justify, forced
+  sign, the `0x` alternate-form prefix (suppressed for zero), with the justify/pad *layout* decided at
+  translate time and only digit/pad lengths runtime. Test: `printf_flag_formats`.
+- **BD — precision**: `.N` parsing; integer **min-digit** precision (`%.Nd`/`%.Nx` — zero-extend the
+  digit region; precision disables the `0` flag per C; `%.0` of `0` prints no digits) and string
+  **truncating** precision (`%.Ns` → `min(strlen, N)`). Shared `pf_*` helpers (`pf_sign_prefix`/
+  `pf_field_layout`/`pf_prefill_pad`). Test: `printf_precision_formats`.
+- **Float (`%f`/`%e`/`%g`) — deliberately fail-closed `Unsupported`.** A first `%f` cut (exact-looking
+  `f*=10; d=⌊f⌋; f-=d` digit extraction) was **reverted**: `f*10` rounds for full-mantissa fractions,
+  so it diverges from glibc at the rounding boundary (e.g. `%.17f` of `0.1` → on-ramp
+  `0.10000000000000000` vs native `...001`). Matching glibc byte-for-byte requires *correctly-rounded
+  exact decimal conversion* (Dragon4/Ryū-class **big-integer** arithmetic — the fraction numerator
+  alone needs > 64 bits for small magnitudes), which an `f64`-arithmetic approximation cannot give
+  without silently breaking the on-ramp's byte-exact contract. Deferred to a bignum-backed formatter.
+- *Also still deferred:* `*` (dynamic width/precision) and non-constant format strings.
+
+**Slice BE (DONE) — `argc`/`argv` (the §3e powerbox args buffer).** A `main(int argc, char** argv)`
+now works end-to-end. The decision was to keep the powerbox ABI **language-neutral**: the host
+delivers arguments as a flat byte blob at a *fixed, known window offset* (`svm_ir::POWERBOX_ARGS_BASE
+= 128`, below the globals base), layout `{ argc:u32-LE, envc:u32-LE }` + packed NUL-terminated
+strings — exactly DESIGN §3e / D44's "args_buffer at a known window offset". *No* entry-signature
+change (`is_powerbox_entry` and handle granting are untouched), so nothing C-specific leaks into the
+VM. All `char**` construction lives in the on-ramp:
+- **Frontend** (`svm-llvm`): when `main`'s arity is `(sp, argc, argv)`, `synth_start_argv` replaces
+  the straight-line `_start` with a 6-block one — same handle-stash/heap-seed prologue, then it reads
+  `argc`, walks the `argc` packed strings building `argv[]` (each entry points *into* the blob — no
+  copy) with the `argv[argc] == NULL` terminator at the entry SP, parks `main`'s frame a page above,
+  and calls `main(main_sp, argc, argv)`. The window now reserves stack whenever this entry is used
+  (it dereferences the SP, unlike the no-arg `_start`). `main(void)` is unchanged; a `main(int)` is
+  fail-closed. (`main(…, envp)` and `getenv` are now supported — *Slice BF*.)
+- **Runner** (`svm-run`): `run_powerbox_with_args` builds the blob from `(args, env)`, seeds it into
+  the window's low bytes via the JIT's `init_mem` (applied *before* data segments, which sit at/above
+  `POWERBOX_ARGS_END`, so they never overlap), and rejects an over-large or NUL-bearing arg vector.
+  The CLI forwards its post-`--` arguments (`svm-run prog.svmb -- a b c`; `argv[0]` = the file name).
+  When *no* `-- args` are given it seeds **nothing** (`init_mem` stays `None`, byte-identical to a
+  bare run) — both to avoid perturbing the guest's initial state and because the blob is unused by a
+  `main(void)`; a program wanting `argc>=1` must be invoked with `--`. The environment is always empty
+  unless explicitly supplied — no ambient host env leaks in. Test: `main_argc_argv` (byte-for-byte vs
+  native with a controlled `argv`, via the new `check_powerbox_vs_native_args`).
+
+**Slice BF (DONE) — `envp` + `getenv` (the env half of the §3e blob).** The blob already packs the
+environment (`{argc, envc}` then the `argc` argv strings followed by the `envc` env strings, each
+`KEY=VALUE`), so this slice is **frontend-only** — the runner/blob/test plumbing was built in BE.
+- **`main(int, char**, char** envp)`** (arity 4): `synth_start_argv` (now an 11-block CFG when
+  `wants_envp`) finishes `argv[]` as before, then runs a mirror loop over the `envc` env strings —
+  packed right where the argv walk ended — building a second NULL-terminated `char**` parked just
+  above `argv[]`, and calls `main(main_sp, argc, argv, envp)` with the frame a page above *both*
+  arrays. A 2-param `main` is still fail-closed. Test: `main_argc_argv_envp` (empty + multi-entry env,
+  passed key-sorted to match `std::process::Command`'s `BTreeMap` ordering).
+- **`getenv(name)`**: a synthesized `__svm_getenv` helper (gated on `calls_external("getenv")`, which
+  also forces a powerbox `_start` since it has no import of its own). It reads the blob in the reserved
+  low scratch directly — no `environ` global, no `_start` coupling — so it works at any `main` arity
+  and returns `NULL` when the host seeded no env (the window reads `argc==envc==0`). It skips the
+  `argc` argv strings, then compares each env key against `name` char-by-char, returning the value
+  pointer just past the `=` on a full match landing on `=` (so `"F"` does not match `"FOO=…"`). Test:
+  `getenv_lookup` (hit, miss, prefix guard, and the no-env case).
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
@@ -665,6 +728,8 @@ mirrors the chibicc lowering exactly:
 - **§12 threads** — `__vm_thread_spawn` (a *direct* funcref → the static `thread.spawn` funcidx) /
   `__vm_thread_join`; **atomics** — `__vm_atomic_{add,load,store}`(`32`)/`cas32` → the `iN.atomic.*`
   ops (seq-cst); **futex** — `__vm_wait32`/`__vm_notify` → `i32.atomic.wait`/`atomic.notify`.
+- **§12 per-vCPU TLS** — `__vm_vcpu_tls_get()` / `__vm_vcpu_tls_set(x)` → `vcpu.tls.get`/`vcpu.tls.set`
+  (the current vCPU's i64 register, seeded to the dense vCPU id — so `get` doubles as `vcpu.id`).
 - **§GC** — `__vm_gc_roots(lo, hi, mask, buf, cap)` → `gc.roots` (conservative root enumeration; `mask`
   is the §GC tagged-pointer payload mask, top-byte-strip only — pass `~0UL` for untagged).
 - **§7 reflection** — `__vm_cap(i)` reads the handle stash (`i32.load` at `i*4`); `__vm_cap_count`/

@@ -167,6 +167,13 @@ pub(crate) struct Domain {
     /// to [`MAX_VCPUS`]. Exceeding it is a clean `ThreadFault`. Bounds `Threads::live` (concurrent),
     /// matching the interpreter's `s.live` — a spawn-join loop is fine (a finished vCPU frees its slot).
     max_vcpus: usize,
+    /// §5 W3 Stage 3: a trap-time backtrace capture handed up by a **spawned** vCPU when it trapped.
+    /// The per-thread capture lives in `trap_shim.c`'s thread-local (filled by the SIGSEGV/SIGBUS
+    /// handler or the explicit-trap helper) and would be lost when the worker thread ends, so the
+    /// dying worker publishes it here for the run thread to symbolize after `join_all`. `(pc, return
+    /// addresses)`; last-wins (matching the last-wins trap cell — any trapping frame's chain is a
+    /// valid kill backtrace). `None` until a spawned vCPU traps. Host-side observability (§2a).
+    trap_capture: Mutex<Option<(usize, Vec<usize>)>>,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -223,7 +230,21 @@ impl Domain {
             futex: Mutex::new(HashMap::new()),
             futex_cv: Condvar::new(),
             max_vcpus: max_vcpus.clamp(1, MAX_VCPUS),
+            trap_capture: Mutex::new(None),
         }
+    }
+
+    /// Publish a **spawned** vCPU's raw trap-time backtrace capture (§5 W3 Stage 3), last-wins. Called
+    /// from a dying worker ([`run_child`]) when it trapped, so the run thread can symbolize a trap that
+    /// originated off the run thread (whose own thread-local capture it can't see).
+    pub(crate) fn publish_trap_capture(&self, cap: (usize, Vec<usize>)) {
+        *lock(&self.trap_capture) = Some(cap);
+    }
+
+    /// Take the trap-time backtrace capture a spawned vCPU published (§5 W3 Stage 3), if any. Called
+    /// on the run thread after [`Self::join_all`], so the publishing worker has finished.
+    pub(crate) fn take_trap_capture(&self) -> Option<(usize, Vec<usize>)> {
+        lock(&self.trap_capture).take()
     }
 
     /// Supply the per-run [`Env`] once the call-trampoline / window addresses are known (post-finalize,
@@ -342,6 +363,9 @@ struct SpawnArgs {
     code: u64,
     sp: u64,
     arg: u64,
+    /// §12 dense vCPU id seeded into this child's per-vCPU TLS register (`vcpu.tls`). Root is 0, so a
+    /// spawned vCPU takes `handle + 1` (handles are 0-based, cumulative spawn order).
+    vcpu_id: i64,
     done: std::sync::Arc<Done>,
     /// The owning [`Domain`] — so this vCPU can drop its §15 concurrent-live count when it finishes.
     /// The domain outlives every spawned thread (`run_inner` joins them at run end), so the pointer
@@ -374,6 +398,8 @@ struct PendingSpawn {
 
 fn run_child(a: SpawnArgs) {
     let env = a.env;
+    // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
+    crate::vcpu_tls::seed(a.vcpu_id);
     // Arm this OS thread's detect-and-kill recovery (idempotent; handler is process-wide, recovery is
     // thread-local — §5 / `mem::install_guard`).
     mem::install_guard();
@@ -427,6 +453,15 @@ fn run_child(a: SpawnArgs) {
         let t = unsafe { load_trap(env.trap_out) };
         (call.ret, t)
     };
+    // §5 W3 Stage 3: if this spawned vCPU trapped, hand its trap-time backtrace capture (the SIGSEGV
+    // handler's, or the explicit-trap helper's — both in this thread's `trap_shim.c` thread-local) to
+    // the domain before this worker ends, else it would be lost and the run thread couldn't symbolize
+    // a trap that originated here. SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
+    if trap != 0 {
+        if let Some(cap) = mem::take_trap_frame() {
+            unsafe { (*a.dom).publish_trap_capture(cap) };
+        }
+    }
     // §15: this vCPU's computation has ended — free its concurrent-live slot *before* publishing the
     // result, so a `thread.join` that then observes completion already sees the quota slot freed (a
     // spawn-join loop can't transiently false-trap). The domain outlives all spawned threads, so the
@@ -490,6 +525,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             code,
             sp,
             arg,
+            vcpu_id: idx as i64 + 1, // dense id seed (root 0; children 1, 2, …)
             done,
             dom: sched,
         };
@@ -608,7 +644,18 @@ impl Domain {
     /// # Safety
     /// `env` is the live run's env; `code` is a guest entry trampoline; called with no other guest code
     /// on this thread (the root returned / is parked in a join), the durable reserve committed RW.
-    unsafe fn run_child_inline(&self, env: Env, code: u64, sp: u64, arg: u64) -> (i64, i64, bool) {
+    unsafe fn run_child_inline(
+        &self,
+        env: Env,
+        code: u64,
+        sp: u64,
+        arg: u64,
+        vcpu_id: i64,
+    ) -> (i64, i64, bool) {
+        // §12 this inline child runs on *this* (the root's) OS thread, so seed its per-vCPU TLS id and
+        // restore the caller's afterward — a real OS-thread child gets its own thread-local in `run_child`.
+        let prev_tls = crate::vcpu_tls::get();
+        crate::vcpu_tls::seed(vcpu_id);
         // A child that uses `cont.*` gets its own fiber execution context over the domain-shared table
         // (D57 3b-ii), like `run_child`; publish it as the current runtime for the run.
         let mut frt = env.fiber_cfg.map(|(tid, mask)| {
@@ -669,6 +716,7 @@ impl Domain {
         if let Some(pr) = prev {
             fiber_rt::set_current(pr);
         }
+        crate::vcpu_tls::seed(prev_tls); // restore the caller (root) vCPU's TLS id
 
         let (result, trap) = if faulted {
             // SAFETY: live trap cell.
@@ -714,7 +762,9 @@ impl Domain {
                 fiber_rt::write_shadow_sp(env.mem_base, fiber_rt::shadow_region_base(p.ctx));
                 // Attribute any grandchild this child spawns to it (its `parent_task` + per-vCPU table).
                 *lock(&self.cur_task) = p.task;
-                let (result, trap, faulted) = self.run_child_inline(env, p.code, p.sp, p.arg);
+                // §12: seed the child's per-vCPU TLS register to its (global) task id, matching the interp.
+                let (result, trap, faulted) =
+                    self.run_child_inline(env, p.code, p.sp, p.arg, p.task as i64);
                 *lock(&self.cur_task) = 0; // back to the root between children
 
                 // The child's flattened extent and whether it unwound under the freeze.
@@ -828,7 +878,9 @@ impl Domain {
             fiber_rt::window_set_rewinding(env.mem_base);
             fiber_rt::write_shadow_sp(env.mem_base, r.shadow_sp);
             *lock(&self.cur_task) = r.task; // route its own grandchild joins to its table
-            let (result, trap, _faulted) = self.run_child_inline(env, r.code, r.sp, r.arg);
+                                            // §12: seed the child's per-vCPU TLS register to its task id (matching the interp).
+            let (result, trap, _faulted) =
+                self.run_child_inline(env, r.code, r.sp, r.arg, r.task as i64);
             *lock(&self.cur_task) = 0;
             if let Some(table) = self.fiber_table() {
                 table.free_vcpu_context(r.ctx);

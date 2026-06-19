@@ -325,6 +325,62 @@ fn deadline_kills_runaway_powerbox_guest() {
     );
 }
 
+/// §5 W3 — a trap's kill message carries the **source backtrace** when the module was built with
+/// `-g`: a powerbox guest that divides by zero is detect-and-killed, and the error names the div's
+/// `file:line:col in <fn>`. Cross-platform: the explicit-trap capture (`trap_capture.c`'s
+/// `svm_capture_explicit_trap`, threaded the trapping frame pointer via `get_frame_pointer`) runs on
+/// unix **and** windows, so the source frame is present on every target.
+#[test]
+fn trap_kill_message_carries_a_source_backtrace() {
+    let m = load(
+        "func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i32.const 0\n\
+         \x20 v4 = i32.div_s v0 v3\n\
+         \x20 return v4\n\
+         }\n\
+         debug.file 0 \"guest.c\"\n\
+         debug.fname 0 \"divide\"\n\
+         debug.loc 0 0 1 0 7 5\n",
+    );
+    let err = run_powerbox_with_deadline(&m, b"", None).expect_err("div-by-zero must be killed");
+    assert!(err.contains("DivByZero"), "names the trap kind: {err}");
+    assert!(
+        err.contains("guest.c:7:5 in divide"),
+        "the kill message carries the trap-time source backtrace + function name: {err}"
+    );
+}
+
+/// §5 W3 — a **memory-fault** kill message carries the source backtrace on **every** platform: the
+/// capture is the SIGSEGV/SIGBUS handler on unix and the Vectored Exception Handler on Windows, so an
+/// out-of-bounds store that the §5 guard catches names the store's `file:line` cross-platform. (The
+/// explicit-check-trap path — `trap_kill_message_carries_a_source_backtrace`, div-by-zero — is
+/// unix-only; see ISSUES I3.) An 8-byte store at 65532 in a 64 KiB window overruns into the guard.
+#[test]
+fn memfault_kill_message_carries_a_source_backtrace() {
+    let m = load(
+        "memory 16\n\
+         func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i64.const 65532\n\
+         \x20 v4 = i64.const 0\n\
+         \x20 i64.store v3 v4\n\
+         \x20 v5 = i32.const 0\n\
+         \x20 return v5\n\
+         }\n\
+         debug.file 0 \"mem.c\"\n\
+         debug.fname 0 \"store_oob\"\n\
+         debug.loc 0 0 2 0 9 5\n",
+    );
+    let err = run_powerbox_with_deadline(&m, b"", None)
+        .expect_err("the overrun must be detect-and-killed");
+    assert!(err.contains("MemoryFault"), "names the trap kind: {err}");
+    assert!(
+        err.contains("mem.c:9:5 in store_oob"),
+        "the kill message carries the trap-time source backtrace + function name: {err}"
+    );
+}
+
 /// Arming the kill-path must not penalize a well-behaved guest: a fast program finishes normally —
 /// and *quickly* — because the watchdog wakes the instant the run completes (it never blocks the
 /// full deadline).
