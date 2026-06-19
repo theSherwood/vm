@@ -3339,6 +3339,19 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, rs[0]); // the capability handle
             Ok(true)
         }
+        // §12 per-vCPU TLS register: `__vm_vcpu_tls_get()` reads the current vCPU's word (seeded to the
+        // dense vCPU id, so it doubles as a vCPU id); `__vm_vcpu_tls_set(x)` overwrites it (e.g. a
+        // pointer to the guest's per-CPU block, for full __thread-style TLS).
+        "__vm_vcpu_tls_get" => {
+            let r = ctx.push(Inst::VcpuTlsGet);
+            ctx.bind_dest(&c.dest, r); // i64 TLS word
+            Ok(true)
+        }
+        "__vm_vcpu_tls_set" => {
+            let val = ctx.operand_i64(vm_arg(c, 0)?)?;
+            ctx.push_effect(Inst::VcpuTlsSet { val });
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }

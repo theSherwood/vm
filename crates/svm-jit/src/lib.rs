@@ -93,6 +93,10 @@ mod fiber_rt;
 #[cfg(fiber_rt)]
 mod os_thread_rt;
 
+// §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
+// (substrate-independent), so a plain non-fiber root has a TLS word too.
+mod vcpu_tls;
+
 // Migratable-fiber ownership protocol (D57 / DESIGN.md §23): the loom-verified single-owner atomic
 // state machine that guarantees a stolen fiber is resumed by exactly one thread — the gating safety
 // core of stackful work-stealing, proven in isolation before the runtime integration + cross-thread
@@ -2664,6 +2668,9 @@ impl CompiledModule {
         // the guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call;
         // the module owns the executable pages until `*this` drops (after every spawned vCPU is
         // joined below).
+        // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
+        // worker thread carries from a prior run before guest code can `vcpu.tls.get` it.
+        vcpu_tls::seed(0);
         let faulted = if seed_faulted {
             // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
             false
@@ -3430,6 +3437,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
                 Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
+                // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
+                // (works for a plain non-fiber root), so supported on every target.
+                Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
                 // `i8x16.mul` and `i64x2` min/max have no single-instruction lowering on the target
                 // ISAs, so Cranelift can't legalize them; bail to `Unsupported` (the interp oracle
                 // still covers them, and wasm never emits them — `i64x2` has no min/max op).
@@ -4174,6 +4184,28 @@ fn lower_block(
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §12 per-vCPU TLS register: baked thunks over a per-OS-thread word (no window/trap context —
+        // a pure thread-local access that cannot fault). `get` reads the *current* vCPU's word, so it
+        // is correct after a fiber migrates here.
+        if let Inst::VcpuTlsGet = inst {
+            let mut tsig = module.make_signature();
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, vcpu_tls::get as *const () as i64);
+            let call = b.ins().call_indirect(tref, thunk, &[]);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::VcpuTlsSet { val } = inst {
+            let v = get(&vals, *val)?;
+            let mut tsig = module.make_signature();
+            tsig.params.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, vcpu_tls::set as *const () as i64);
+            b.ins().call_indirect(tref, thunk, &[v]);
             continue;
         }
         if let Inst::GcRoots {

@@ -482,6 +482,13 @@ fn check_inst(
         Inst::CapSelfCount | Inst::CapSelfGet { .. } => {
             unreachable!("cap.self.* handled before check_inst's value match")
         }
+        // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
+        // `set` consumes an i64 and yields nothing (handled like `store`).
+        Inst::VcpuTlsGet => ValType::I64,
+        Inst::VcpuTlsSet { val } => {
+            cx.expect(*val, ValType::I64)?;
+            return Ok(None);
+        }
         Inst::IntBin { ty, a, b, .. } => {
             let t = ty.val();
             cx.expect(*a, t)?;

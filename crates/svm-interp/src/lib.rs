@@ -4495,6 +4495,10 @@ struct VCpu {
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
     id: TaskId,
+    /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
+    /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
+    /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
+    tls: i64,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
@@ -4576,6 +4580,7 @@ impl VCpu {
             fault_yields: false,
             depth,
             id,
+            tls: id as i64, // §12 seed the per-vCPU TLS register to the dense vCPU id (root = 0)
             pending: None,
             sched,
             memop: false,
@@ -4636,7 +4641,8 @@ impl VCpu {
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
-            id: 0, // unused: driven inline, never via the executor
+            id: 0,  // unused: driven inline, never via the executor
+            tls: 0, // §12 per-vCPU TLS seed (id 0)
             pending: None,
             sched,
             memop: false,
@@ -4915,6 +4921,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         sched,
         funcs: _,
         id: _,
+        tls,
         memop,
         acc,
         quota: _,
@@ -5687,6 +5694,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                     frames[top].vals.push(Reg::from_i32(r[1] as i32));
                 }
+                // §12 per-vCPU TLS register: read/write **this** vCPU's word (`tls`, destructured from
+                // `v` above), so a fiber that migrated here sees the current vCPU's value.
+                Inst::VcpuTlsGet => {
+                    frames[top].vals.push(Reg::from_i64(*tls));
+                }
+                Inst::VcpuTlsSet { val } => {
+                    *tls = get_i64(&frames[top].vals, *val)?;
+                }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
@@ -6344,6 +6359,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
         Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
+        // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
+        // loop (`run_inner`), never here.
+        Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
             IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?),
             IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?),

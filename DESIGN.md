@@ -1451,6 +1451,17 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   independent-op reorderings and busy-wait retries, sound vs an unreduced
   enumerator, §18), against which the real-thread JIT is differential-tested; the
   futex glue is loom-checked.
+- **Per-vCPU TLS register (`vcpu.tls.get`/`vcpu.tls.set`).** One ambient i64 of
+  per-vCPU state, **read at the execution point** — so a fiber that migrated to
+  another vCPU reads the *current* vCPU's word, the value only the runtime knows
+  (the `thread.spawn` handle is the parent's view, not "which vCPU am I on now").
+  Seeded at vCPU creation to a **dense id** (root = 0, children sequential), so a
+  bare `get` doubles as a `vcpu.id`; the guest may overwrite it with a pointer to
+  its per-CPU block for full `__thread`-style TLS. The natural primitive for a
+  guest M:N runtime / GC's per-CPU state (mark stacks, allocator magazines). Not a
+  cross-vCPU channel (each vCPU touches only its own word — no new visible op for
+  the DPOR oracle); program *output* must not depend on *which* vCPU runs you,
+  only on per-CPU state being self-consistent (the GC.md §3.2 framing).
 
 ### Host-call ABI: async-first
 - Blocking-capable host calls are **submit/complete** (io_uring-shaped). The
