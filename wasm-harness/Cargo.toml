@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "wasm-harness"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+svm-interp = { path = "../crates/svm-interp" }
+svm-text = { path = "../crates/svm-text" }
+
+[profile.release]
+panic = "abort"
