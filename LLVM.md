@@ -1033,6 +1033,114 @@ surface from slices AC–AF already lowers them):
   frontend does** — the breadth frontier is now *bigger* real-world programs (and other-language
   runtimes), not chibicc parity.
 
+### Next frontier — real-world programs as correctness indicators
+
+chibicc parity is done (slice AU). The on-ramp ingests *any* LLVM frontend's `-O2` bitcode, so the
+next proof is **whole real-world programs** — not feature unit-tests but recognizable software whose
+own test suites/known-answers validate the translation. This section is the standing plan for that
+push: the selection criteria, the concrete translator gaps these programs force, the target ladder,
+and the **SQLite** north star (in-memory *and* disk-backed via the powerbox).
+
+### What makes a strong indicator (selection criteria)
+1. **Self-validating** — ships known-answer vectors or its own test suite, so "correct" is a
+   differential (native build vs on-ramp, or built-in KAT) rather than a hand-computed guess.
+2. **Feature-dense in bug-finding ways** — hits translator corners toy demos don't: irregular control
+   flow, the by-value-aggregate/varargs ABI, float formatting, wide integer math.
+3. **Low OS surface** — can run in-memory / over embedded inputs. The on-ramp supplies
+   `malloc`/string/`printf` (synthesized helpers) and the `__vm_*` capability surface, but **no
+   ambient filesystem or sockets** — real I/O must come through a granted powerbox capability (below).
+
+### Translator gaps these programs force (the real value of picking them)
+Picking a target is really picking the *gap* it drives to completion. Current status:
+- **Computed `goto` → `indirectbr` / `blockaddress`** — **not handled** (fail-closed `Unsupported`,
+  confirmed by grep). This is the linchpin: SQLite's VDBE, Lua, QuickJS, and essentially every
+  bytecode interpreter dispatch on it. Lowering it (a jump table over `blockaddress` operands → an
+  SVM `br_table`, with address-taken blocks assigned dense labels) unlocks the entire interpreter
+  category at once. **Highest-leverage single feature.**
+- **`setjmp` / `longjmp`** — **not handled** (deferred-hard, §8). Lua's error model, many parsers.
+  Lowers onto the §6 stack-switching machinery (same substrate as C++ EH). A real program is what
+  justifies building it.
+- **`%f` / `%g` / `%e` float formatting** — deliberately **fail-closed** (LLVM.md printf notes): an
+  `f64`-arithmetic approximation diverges from glibc at the rounding boundary; matching byte-for-byte
+  needs a **correctly-rounded exact-decimal (Ryū / Dragon4, big-integer)** formatter. SQLite,
+  `printf`-heavy programs, and any numeric output force this.
+- **`qsort` + comparator function pointers** — the libc callback ABI (an indirect call from synthesized
+  libc into guest code); confirm it lands cleanly when a target needs it.
+- **`__int128` / `long double` (`x86_fp80`/`fp128`)** — rejected (§7 deferred). SQLite has a few `i128`
+  paths; add on demand.
+- **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
+  synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
+
+### SQLite — the north star (in-memory, then disk via the powerbox)
+SQLite is the gold-standard target (≈600:1 test-to-code ratio, ships as one amalgamation `.c`). Two
+phases, both worth doing:
+- **Phase A — in-memory (`:memory:` / `memdb` VFS).** Build `SQLITE_THREADSAFE=0`,
+  `SQLITE_OMIT_LOAD_EXTENSION`, run its SQL logic scripts; the differential is native-SQLite vs
+  on-ramp-SQLite over the same script. **No filesystem needed** — SQLite's built-in in-memory VFS
+  keeps the whole DB in `malloc`'d pages. This phase is gated by *computed goto* (VDBE) + *float
+  formatting* above, not by any I/O capability.
+- **Phase B — disk-backed (real persistence through a powerbox capability).** In-memory proves the SQL
+  engine; **disk proves the capability story** — that a sandboxed guest can do real, durable I/O
+  *only* through explicitly granted authority. SQLite is built for exactly this: its **VFS** (`sqlite3_vfs`)
+  is a narrow, swappable I/O shim (`xOpen`/`xRead`/`xWrite`/`xTruncate`/`xSync`/`xFileSize`/locking).
+  The plan: a **guest VFS shim** (the SQLite analog of the guest `<pthread.h>` shim — ordinary guest C
+  the program brings) that bridges `sqlite3_vfs` to a granted **file/storage capability** delivered
+  through the powerbox handle stash, exactly like `Stream`/`Memory`/`IoRing` are today. Concretely:
+  - **The capability.** Today's powerbox grants are `stream`/`exit`/`memory`/`address_space`/`io_ring`/
+    `blocking`/`jit`/`shared_region`/`clock`/… (`grant_*` on `Host`). There is **no file/storage
+    capability yet** — that is the new host-side piece: a positioned-I/O surface (`read_at`/`write_at`/
+    `truncate`/`sync`/`size`/advisory-lock) over a host-chosen backing file or block store, granted as
+    one more handle in the stash. Two viable shapes: (a) a **dedicated `File`/`Storage` capability**
+    (cleanest semantics), or (b) **ride the existing §9/§12 `IoRing` + `Blocking` path** — a VFS that
+    `submit_async`s `pread`/`pwrite`/`fsync` as blocking ops onto the offload pool (reuses the async
+    machinery slices AD/async demos already exercise; the parked-vCPU completion model is a natural fit
+    for SQLite's synchronous file calls). Recommend prototyping over `IoRing`/`Blocking` first (no new
+    capability type), then promoting to a first-class `File` cap if the ergonomics warrant.
+  - **On-ramp side: already done.** The frontend already lowers `__vm_*` builtins and resolves
+    capability imports to stash handles (slices AC–AF) and grants a contiguous handle prefix in the
+    synthesized `_start`. A new `File`/storage handle slots into that same mechanism — likely **no
+    translator change**, just the host capability + the guest VFS shim + extending `synth_start`'s
+    grant prefix to include it.
+  - **Why it matters.** It is the end-to-end demonstration of the whole thesis: a real database, real
+    durable files, **zero ambient authority** — every byte of disk access flows through a capability the
+    embedder explicitly handed over, auditable at the powerbox boundary.
+
+### Candidate targets, grouped by the dimension they prove
+- **Self-validating interpreters (densest control-flow + ABI stressors):**
+  - **Lua** (reference impl) — runs the *official* `testes/` suite; forces **`setjmp`/`longjmp`** +
+    computed goto. The cleanest "second SQLite."
+  - **QuickJS** (Bellard) — full JS engine with a **test262** runner; extreme density (NaN-boxing,
+    bigint, regex, computed goto). Big lift; little is left unproven if it passes.
+  - **mal / chibi-scheme / a tiny Forth** — cheap stepping stones to the same control-flow features.
+- **Byte-exact, zero-OS-surface known-answer suites (cheapest high-confidence wins — start here):**
+  - **Monocypher** or **fiat-crypto** — modern crypto (ChaCha20/Blake2/X25519/Ed25519) with built-in
+    **KAT vectors**; brutal on 64-bit/carry arithmetic + constant-time bit-twiddling. Extends the
+    existing sha256/crc32/xxhash family, no OS surface at all.
+  - **stb_image** decoding an **embedded** PNG/JPEG → assert exact pixel bytes (real parser + integer
+    math, inputs compiled in).
+  - **zlib/miniz full roundtrip** (have `tinfl` inflate; add deflate→inflate identity).
+- **Deterministic numeric / search (cheap codegen & control-flow bug finders):**
+  - **A chess `perft`** (micro-Max or a clean perft) — known-answer node counts; recursion + arrays +
+    heavy branching. Tiny, catches control-flow/codegen regressions fast.
+  - **musl `libm` vs its test vectors** — IEEE edge cases; pairs with the `%f`/`%g` formatter work.
+- **The "wow" milestone (later):** **Doom** (shareware) — fixed-point-heavy real app; needs a stubbed
+  framebuffer + an in-memory WAD, but "Doom runs sandboxed through the LLVM on-ramp" is a strong
+  external signal.
+- **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust
+  crate (`regex`/`ryu`/`serde_json` `no_std`), a Zig program, a Swift `-enable-experimental-feature
+  Embedded` TU — each is "another frontend, no translator change beyond what the corpus proved."
+
+### Suggested ladder (cheap momentum → the capstone)
+1. **Monocypher KAT** + **stb_image decode** — zero-OS, byte-exact; widen the corpus and shake out
+   64-bit/parser bugs fast.
+2. **A chess `perft`** — cheap control-flow/recursion stressor.
+3. **`indirectbr` / `blockaddress` (computed goto)** — the unlock for every bytecode interpreter; drive
+   it with **Lua** (which also forces `setjmp`/`longjmp`).
+4. **`%f` / `%g` float formatting** (Ryū/Dragon4) — needed by SQLite and broadly.
+5. **SQLite Phase A (in-memory)** — the SQL-engine capstone, now that goto + float-format are in.
+6. **SQLite Phase B (disk via a powerbox `File`/`Storage` capability + guest VFS shim)** — the
+   capability-story capstone: real durable I/O under zero ambient authority.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
@@ -1072,7 +1180,12 @@ surface from slices AC–AF already lowers them):
 - [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
       tables (the §18 open item). Lower onto §6 stack-switching; perf tax + ABI change. Low
       ROI until a real workload needs it (mirrors `WASM.md`'s EH stance).
-- [ ] **`setjmp`/`longjmp`** — onto §6 stack-switching, same machinery as EH.
+- [ ] **Computed `goto` — `indirectbr` / `blockaddress`** — **not handled** (fail-closed). The
+      linchpin for the interpreter category (SQLite VDBE, Lua, QuickJS): a `blockaddress` is an
+      address-taken block's dense label and `indirectbr` a jump-table over it → an SVM `br_table`. See
+      *Next frontier* — highest-leverage single feature; drive with Lua.
+- [ ] **`setjmp`/`longjmp`** — onto §6 stack-switching, same machinery as EH. Lua's error model forces
+      it (see *Next frontier*).
 - [ ] **SIMD** (`<N x T>` vectors) — a later pass mirroring §17/D58 `v128` (the proven
       5-step pattern `svm-wasm` used). Reject cleanly until then.
 - [ ] **Full intrinsic coverage** — expand the table in §4 as real programs demand.
