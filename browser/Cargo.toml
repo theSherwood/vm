@@ -8,8 +8,10 @@ name = "svm-browser"
 version = "0.0.0"
 edition = "2021"
 
+# `cdylib` is the wasm artifact; `rlib` lets the native `gencorpus`/`genfixture` bins call the
+# *same* `powerbox_exec` the wasm entry uses, so the differential compares identical logic.
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "genfixture"
@@ -23,7 +25,7 @@ path = "src/gencorpus.rs"
 svm-interp = { path = "../crates/svm-interp" }
 svm-encode = { path = "../crates/svm-encode" }
 svm-text   = { path = "../crates/svm-text" }
-# Only the host fixture/corpus bins name `Module` directly; the wasm cdylib doesn't use it.
+# `Module` is named by the fixture/corpus bins and by `powerbox_exec` (shared with the cdylib).
 svm-ir     = { path = "../crates/svm-ir" }
 
 [profile.release]

@@ -11,6 +11,7 @@
 
 use std::io::Write;
 
+use svm_browser::powerbox_exec;
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -160,6 +161,89 @@ block2():
 }
 "#;
 
+// ---- powerbox guests: exercise the real capability set (streams / clock / exit) ----------------
+// Granted by entry arity (see `powerbox_exec`): 1 Stream(Out) · 2 Stream(In) · 3 Exit ·
+// 4 Stream(Err) · 5 Clock. I/O is deterministic (stdout/stderr buffers, monotonic clock), so the
+// native result here is an exact ground truth for the wasm `svm_run_pb`.
+
+// `(out, in, exit)`: write a fixed 17-byte greeting to stdout via Stream.write (type 0, op 1).
+const PB_HELLO: &str = r#"
+memory 16
+data 0 "hello, powerbox!\n"
+func (i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i64.const 0
+  v4 = i64.const 17
+  v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)
+  v6 = i32.const 0
+  return v6
+}
+"#;
+
+// `(out, in, exit)`: read up to 256 bytes of stdin (type 0, op 0) into the window, echo them back to
+// stdout (type 0, op 1) — a full host→guest→host roundtrip through the buffers.
+const PB_ECHO: &str = r#"
+memory 16
+func (i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i64.const 0
+  v4 = i64.const 256
+  v5 = cap.call 0 0 (i64, i64) -> (i64) v1(v3, v4)
+  v6 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v5)
+  v7 = i32.const 0
+  return v7
+}
+"#;
+
+// `(out, in, exit, err, clock)`: read the monotonic clock twice (type 2, op 0) and return the delta
+// — exactly 1, proving the deterministic strictly-increasing counter works under wasm.
+const PB_CLOCK: &str = r#"
+func (i32, i32, i32, i32, i32) -> (i64) {
+block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):
+  v5 = i32.const 0
+  v6 = cap.call 2 0 (i32) -> (i64) v4(v5)
+  v7 = cap.call 2 0 (i32) -> (i64) v4(v5)
+  v8 = i64.sub v7 v6
+  return v8
+}
+"#;
+
+// `(out, in, exit)`: call Exit.exit(42) (type 1, op 0) — a non-error trap surfaced as STATUS_EXIT
+// with exit code 42; the trailing return is unreachable.
+const PB_EXIT: &str = r#"
+func (i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i32.const 42
+  cap.call 1 0 (i32) -> () v2(v3)
+  v4 = i32.const 0
+  return v4
+}
+"#;
+
+// `(out, in, exit, err)`: write a 9-byte message to **stderr** (type 0, op 1, on the Err handle) —
+// proving role routing (Out → stdout, Err → stderr).
+const PB_STDERR: &str = r#"
+memory 16
+data 0 "warning!\n"
+func (i32, i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32, v3: i32):
+  v4 = i64.const 0
+  v5 = i64.const 9
+  v6 = cap.call 0 1 (i64, i64) -> (i64) v3(v4, v5)
+  v7 = i32.const 0
+  return v7
+}
+"#;
+
+/// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// Args fed to each kernel (all `(i64) -> (i64)`), incl. negatives and a large value.
 const ARGS: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000];
 
@@ -175,26 +259,40 @@ fn native(m: &svm_ir::Module, args: &[Value]) -> (i32, i64) {
     }
 }
 
+/// Encode a text module to `corpus/<name>.svmbc` and return the parsed module + file path.
+fn emit(name: &str, src: &str) -> (svm_ir::Module, String) {
+    let m = svm_text::parse_module(src).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+    let bytes = svm_encode::encode_module(&m);
+    let file = format!("corpus/{name}.svmbc");
+    std::fs::File::create(&file)
+        .and_then(|mut f| f.write_all(&bytes))
+        .expect("write module");
+    eprintln!("{name}: {} bytes", bytes.len());
+    (m, file)
+}
+
 fn main() {
-    // (name, source, nargs): nargs==1 sweeps `ARGS`; nargs==0 runs once with no argument.
-    let modules = [
+    // Compute corpus — (name, source, nargs): nargs==1 sweeps `ARGS`; nargs==0 runs once, no arg.
+    let compute = [
         ("alu", ALU, 1u32),
         ("call", CALL, 1),
         ("mem", MEM, 1),
         ("divtrap", DIVTRAP, 1),
         ("threads", THREADS, 0),
     ];
+    // Powerbox corpus — (name, source, stdin): each runs once under the real capability set.
+    let powerbox = [
+        ("pb_hello", PB_HELLO, &b""[..]),
+        ("pb_echo", PB_ECHO, &b"ping\n"[..]),
+        ("pb_clock", PB_CLOCK, &b""[..]),
+        ("pb_exit", PB_EXIT, &b""[..]),
+        ("pb_stderr", PB_STDERR, &b""[..]),
+    ];
     std::fs::create_dir_all("corpus").expect("mkdir corpus");
 
-    let mut json = String::from("[\n");
-    for (i, (name, src, nargs)) in modules.iter().enumerate() {
-        let m = svm_text::parse_module(src).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
-        let bytes = svm_encode::encode_module(&m);
-        let file = format!("corpus/{name}.svmbc");
-        std::fs::File::create(&file)
-            .and_then(|mut f| f.write_all(&bytes))
-            .expect("write module");
-
+    let mut json = String::from("{\n\"compute\":[\n");
+    for (i, (name, src, nargs)) in compute.iter().enumerate() {
+        let (m, file) = emit(name, src);
         // args sweep for 1-arg kernels; a single no-arg case otherwise.
         let args: &[i64] = if *nargs == 1 { ARGS } else { &[0] };
         json.push_str(&format!(
@@ -209,10 +307,26 @@ fn main() {
                 if j == 0 { "" } else { "," }
             ));
         }
-        json.push_str(if i + 1 == modules.len() { "]}\n" } else { "]},\n" });
-        eprintln!("{name}: {} bytes, {} cases", bytes.len(), args.len());
+        json.push_str(if i + 1 == compute.len() { "]}\n" } else { "]},\n" });
     }
-    json.push_str("]\n");
+    json.push_str("],\n\"powerbox\":[\n");
+    for (i, (name, src, stdin)) in powerbox.iter().enumerate() {
+        let (m, file) = emit(name, src);
+        // Native ground truth via the *same* `powerbox_exec` the wasm `svm_run_pb` calls.
+        let out = powerbox_exec(&m, stdin);
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"stdin\":\"{}\",\"status\":{},\
+             \"value\":\"{}\",\"exit\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}{}",
+            hex(stdin),
+            out.status,
+            out.value,
+            out.exit_code,
+            hex(&out.stdout),
+            hex(&out.stderr),
+            if i + 1 == powerbox.len() { "\n" } else { ",\n" },
+        ));
+    }
+    json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
-    eprintln!("wrote corpus.json");
+    eprintln!("wrote corpus.json ({} compute, {} powerbox)", compute.len(), powerbox.len());
 }

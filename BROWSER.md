@@ -76,10 +76,11 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
 3. **`wasm64` executes correctly at runtime (Wasmtime).** On Wasmtime 45 (`-W memory64=y`), the
    `wasm64` `cdylib` runs the compute probe (`run_guest(1) == 1442695040888963407`, and `0` /
    `-1097658151202642380` for `0` / `1000` — matching native + wasm32), the concurrency probe
-   (`run_threads() == 4000` — the cooperative `drive` + `thread.spawn` + atomics on memory64), **and**
-   the full encode/decode/execute roundtrip (`run_roundtrip() == 1442695040888963407`, exercising the
-   production `svm-encode` decode path `svm_run` depends on). So the full stack runs on the real
-   production target.
+   (`run_threads() == 4000` — the cooperative `drive` + `thread.spawn` + atomics on memory64), the
+   full encode/decode/execute roundtrip (`run_roundtrip() == 1442695040888963407`, exercising the
+   production `svm-encode` decode path `svm_run` depends on), **and** the host powerbox
+   (`run_powerbox() == 17` — `Stream.write` + capture and `Exit.exit(42)` on memory64). So the full
+   stack — compute, concurrency, codec, *and* capabilities — runs on the real production target.
    *Node/V8 22.x cannot yet load it:* Rust's `wasm64` target emits **64-bit tables** (`table64` —
    table limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but
    not 64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
@@ -105,6 +106,11 @@ W=target/wasm64-unknown-unknown/release/svm_browser.wasm
 wasmtime run --invoke run_guest     -W memory64=y "$W" 1 # 1442695040888963407 (compute)
 wasmtime run --invoke run_threads   -W memory64=y "$W"   # 4000 (8 vCPUs, cooperative drive)
 wasmtime run --invoke run_roundtrip -W memory64=y "$W"   # 1442695040888963407 (encode→decode→run)
+wasmtime run --invoke run_powerbox  -W memory64=y "$W"   # 17 (stream write + capture + exit(42))
+
+# Differential (compute + powerbox), wasm32 vs native ground truth — 42/42, zero host imports
+cargo run --bin gencorpus                                # native ground truth → corpus.json
+node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
 ```
 
 `browser/` (`svm-browser`) is a detached `[workspace]` crate (kept out of the main workspace because
@@ -121,8 +127,16 @@ are git-ignored.
   tree-walker `Scheduler` is purely cfg-gated *out* of wasm — no cooperative-fallback porting.
   (Non-durable guest threads still run on the engine's cooperative `drive`; only *durable* `thread.*`
   is refused, by `compile_and_run_capture_reserved_with_host` itself.)
-- **Host capabilities → compute-only first.** v1 supplies a deny-all `Host` (empty powerbox, any
-  `cap.call` is inert). Browser-backed capabilities (console/IO/clock bound to JS) are deferred.
+- **Host capabilities → compute-only first, then a buffer-marshalled powerbox.** `svm_run` still
+  supplies a deny-all `Host`. `svm_run_pb` adds a real capability set — **stdin/stdout/stderr
+  streams, a monotonic clock, and exit** — granted by entry arity (1 `Stream(Out)` · 2 `Stream(In)` ·
+  3 `Exit` · 4 `Stream(Err)` · 5 `Clock`), so `hello.svm`'s `(out, in, exit)` shape works unchanged.
+  The `Host` powerbox is already **deterministic and self-contained** (stream writes accumulate in
+  `Host::stdout`/`stderr`, `read` draws from `Host::stdin`, `Clock.now` is a strictly-increasing
+  counter), so I/O crosses the wasm boundary the *same way the module does* — through fixed scratch
+  buffers (`svm_stdin_buf` in; `svm_stdout_ptr`/`svm_stderr_ptr`/`svm_exit_code` out). **The cdylib
+  stays import-free** (verified: `imports: 0`). Binding a stream to the live JS console / a real
+  clock (i.e. actual wasm *imports*) is a follow-up; the capability model and ABI are now in place.
 
 ---
 
@@ -166,14 +180,20 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   OS-thread machinery (`Scheduler`/`OffloadPool`/`std::thread`) needed no gating: it's unreachable
   from the `cdylib` exports and already stripped by `--gc-sections` (zero symbols, zero imports in
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
-- [x] **Differential check (compute + concurrency, wasm32).** `gencorpus` (host) encodes a corpus +
-  computes the **native** bytecode-engine result per case; `corpus.mjs` runs the same modules through
-  the wasm `svm_run`/`svm_run0` and compares. **37/37 match**, zero host imports, across i64
-  arith+branches, multi-function `call`, memory store/load, divide-by-zero → `STATUS_TRAP`, **and a
-  `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` = **4000** on the cooperative `drive`) —
-  i.e. SVM's M:N green-thread concurrency runs inside a single-threaded wasm sandbox. Remaining:
-  extend to the memory-**snapshot** check via `compile_and_run_capture_reserved_with_host`.
-- [ ] **Host powerbox (follow-up)** — design the browser-backed capability set (console/IO/clock).
+- [x] **Differential check (compute + concurrency + powerbox, wasm32).** `gencorpus` (host) encodes a
+  corpus + computes the **native** result per case; `corpus.mjs` runs the same modules through the
+  wasm exports and compares. **42/42 match**, zero host imports. *Compute/concurrency* (37):
+  i64 arith+branches, multi-function `call`, memory store/load, divide-by-zero → `STATUS_TRAP`, **and a
+  `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` = **4000** on the cooperative `drive`).
+  *Powerbox* (5): stdout greeting, stdin→stdout echo, monotonic-clock delta, `exit(42)` →
+  `STATUS_EXIT`, and stderr role-routing — `gencorpus` and `svm_run_pb` share the *same*
+  `powerbox_exec` (the crate is `cdylib`+`rlib`), so the check isolates wasm effects, not logic
+  drift. Remaining: extend to the memory-**snapshot** check via
+  `compile_and_run_capture_reserved_with_host`.
+- [x] **Host powerbox (console + clock).** `svm_run_pb` grants streams/clock/exit, marshalling I/O
+  through scratch buffers so the cdylib stays import-free; validated on wasm32 (5-case differential
+  above) and wasm64 (`run_powerbox() == 17`). Follow-up: bind a stream to the live JS console / a real
+  clock (actual wasm imports), and an `alloc`/`dealloc` ABI to replace the fixed buffers.
 
 ## Verification
 
