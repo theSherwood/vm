@@ -1169,6 +1169,33 @@ fn compile_demo_libc_to_bc(name: &str, rel: &str) -> Option<PathBuf> {
     }
 }
 
+/// Compile an inline C **source string** with chibicc's guest-libc include dir on the path (the
+/// `<pthread.h>`/`<svm.h>` shims) → bitcode. The text variant of [`compile_demo_libc_to_bc`], for a
+/// demo that must be *patched* before compiling (the guest-JIT blob descriptor). `None` if clang is
+/// unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn compile_libc_src_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+    let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
+    let c = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.c", std::process::id(), name));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-c"])
+        .arg("-I")
+        .arg(&inc)
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
 /// Run a guest-built concurrency scheduler demo (threads / stackful fibers / futex over the `__vm_*`
 /// primitives + the guest pthread shim) through the on-ramp on the **real powerbox** and assert its
 /// stdout. The printed total is interleaving-invariant — deterministic regardless of which worker ran
@@ -2628,6 +2655,60 @@ long __vm_jit_uninstall(long slot);\n";
     assert!(
         out.contains("98 inputs agree (invoke + installed call_indirect)"),
         "guest self-JIT (invoke + installed call_indirect) must agree on every input:\n{out}"
+    );
+}
+
+/// End-to-end: the **threaded** guest-driven JIT (`demos/jit/jit_threads.c`, DESIGN §22) through the
+/// LLVM on-ramp — the threaded sibling of `vm_jit_guest_self_jit_demo`. `NWORKERS` pthreads each build
+/// serialized SVM IR for a *distinct* unit at runtime and `__vm_jit_compile` it — so several
+/// `Jit.compile`s are in flight at once — then `__vm_jit_invoke2` the freshly-native code and check it
+/// against a C reference on a grid of inputs. Combines the guest pthread shim (`thread.spawn`) with the
+/// `Jit` capability + the **8-handle powerbox**; the host serializes the concurrent compiles through
+/// the per-domain `Mutex<Host>` (engaged automatically for a `thread.spawn`ing guest) while execution
+/// stays parallel. Prints `0` — no worker's concurrently-JITed unit disagreed.
+///
+/// Like the single-threaded demo, the blob's memory descriptor must match the parent window's
+/// `size_log2` (the validator's exact-match precondition); the demo hardcodes chibicc's `16`, so we
+/// probe svm-llvm's window and patch `eb(&e, 16);` to it before the real translate+run.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn vm_jit_threads_demo() {
+    let src0 = include_str!("../../svm-run/demos/jit/jit_threads.c");
+    let Some(bc0) = compile_libc_src_to_bc("jit_threads_probe", src0) else {
+        return;
+    };
+    // Probe svm-llvm's parent window size, then patch the blob descriptor to it (no magic constant —
+    // it tracks svm-llvm's sizing, exactly as `vm_jit_guest_self_jit_demo` does).
+    let s = svm_llvm::translate_bc_path(&bc0)
+        .expect("translate probe")
+        .module
+        .memory
+        .expect("powerbox program declares a window")
+        .size_log2;
+    let src = src0.replace("eb(&e, 16);", &format!("eb(&e, {s});"));
+    assert_ne!(
+        src, src0,
+        "expected to patch the blob memory descriptor `eb(&e, 16);`"
+    );
+
+    let Some(bc) = compile_libc_src_to_bc("jit_threads", &src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    assert_eq!(
+        t.module.funcs[0].params.len(),
+        8,
+        "a Jit-using program declares the full 8-handle powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let run =
+        svm_run::run_powerbox_with_deadline(&module, b"", Some(std::time::Duration::from_secs(60)))
+            .expect("powerbox run");
+    assert_eq!(
+        run.stdout, b"0\n",
+        "every worker's concurrently-JITed unit must agree with the reference (got {:?})",
+        String::from_utf8_lossy(&run.stdout)
     );
 }
 

@@ -1021,9 +1021,17 @@ surface from slices AC–AF already lowers them):
   offload-pool oracle, like `vm_async_io_runtime` — the JIT async path needs the `HostAsyncHooks`
   harness). Tests (`translate.rs`): `demo_calc_vs_native`, `demo_rational_vs_native`,
   `demo_{work_stealing,mn_sched,steal_fibers,malloc_threads}_vs_chibicc`,
-  `vm_async_work_stealing_runtime`. **156 translate tests green, fmt + clippy clean.** The on-ramp now
-  runs every demo the chibicc frontend does — the breadth frontier is now *bigger* real-world programs
-  (and other-language runtimes), not chibicc parity.
+  `vm_async_work_stealing_runtime`.
+- **`jit_threads`** (`demos/jit/jit_threads.c`) — the **threaded** guest-driven JIT (the threaded
+  sibling of the `jit_demo` capstone): `NWORKERS` pthreads each build + `__vm_jit_compile` a distinct
+  unit concurrently (several `Jit.compile`s in flight, serialized through the per-domain `Mutex<Host>`
+  the powerbox engages for a `thread.spawn`ing guest) and check the native code against a C reference.
+  Combines the guest pthread shim with the `Jit` capability + the 8-handle powerbox; prints `0`. Like
+  the single-threaded demo it probes svm-llvm's window `size_log2` and patches the blob descriptor.
+  Test: `vm_jit_threads_demo`.
+- **157 translate tests green, fmt + clippy clean.** The on-ramp now runs **every demo the chibicc
+  frontend does** — the breadth frontier is now *bigger* real-world programs (and other-language
+  runtimes), not chibicc parity.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
