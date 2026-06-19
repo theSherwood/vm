@@ -1262,6 +1262,30 @@ fn printf_float_scientific() {
 }
 
 #[test]
+fn printf_float_general() {
+    // `%g`/`%G` via the bignum formatter (`__svm_dtoa_gen`): rounds to P significant digits, picks
+    // `%e` vs `%f` by exponent (`E < -4 || E >= P`), and strips trailing zeros. Covers both layout
+    // branches, the e/f boundary with a carry (999999.9 → 1e+06), trailing-zero stripping (100000,
+    // 42.0), tiny/huge magnitudes, `%G`, precision 0 (⇒ 1 sig digit), sign + width, and inf/nan.
+    // Byte-for-byte vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"%g %g\\n\", 3.14159, 100000.0); \
+                 printf(\"%g %g\\n\", 1000000.0, 0.0001); \
+                 printf(\"%g %g\\n\", 0.00001, 1.0/3.0); \
+                 printf(\"%.10g\\n\", 1.0/3.0); \
+                 printf(\"%g %g\\n\", 999999.9, 42.0); \
+                 printf(\"%g %g\\n\", 1e300, 1e-300); \
+                 printf(\"%G %.0g\\n\", 6.022e23, 1234.0); \
+                 printf(\"[%12g][%-12g]\\n\", -2.5, -2.5); \
+                 printf(\"%g %g\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"%g %g %G\\n\", inf, -inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_g", src, b"");
+}
+
+#[test]
 fn printf_float_fixed() {
     // `%f` via the synthesized exact-decimal helper (`__svm_dtoa_fixed`, fixed 128-bit integer
     // arithmetic — no host float formatting). Covers: default precision (6), explicit precision,
