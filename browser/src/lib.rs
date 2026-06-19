@@ -16,6 +16,29 @@ use svm_interp::{bytecode, Value};
 
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
 
+/// In-wasm roundtrip probe: parse → **encode** → **decode** → run, entirely inside the sandbox, so
+/// the production `svm-encode` decode path (which `svm_run` relies on) is exercised on whatever
+/// target this is built for — incl. wasm64 via `wasmtime --invoke run_roundtrip`. Returns the ALU
+/// result for `arg = 1` (`1442695040888963407`), or `i64::MIN` on any failure.
+#[no_mangle]
+pub extern "C" fn run_roundtrip() -> i64 {
+    let Ok(m) = svm_text::parse_module(ALU) else {
+        return i64::MIN;
+    };
+    let bytes = svm_encode::encode_module(&m);
+    let Ok(m2) = svm_encode::decode_module(&bytes) else {
+        return i64::MIN;
+    };
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run(&m2, 0, &[Value::I64(1)], &mut fuel) {
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            _ => i64::MIN,
+        },
+        _ => i64::MIN,
+    }
+}
+
 /// The §ROI-spike "alu" hash recurrence: loops `n` times mixing an LCG, returns the accumulator.
 const ALU: &str = r#"
 func (i64) -> (i64) {

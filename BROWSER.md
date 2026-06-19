@@ -73,10 +73,12 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
    `STATUS_DECODE_ERR` (no crash). The embedded `run_guest` smoke probe agrees.
 
 3. **`wasm64` executes correctly at runtime (Wasmtime).** On Wasmtime 45 (`-W memory64=y`), the
-   `wasm64` `cdylib` runs both the compute probe (`run_guest(1) == 1442695040888963407`, and `0` /
-   `-1097658151202642380` for `0` / `1000` — matching native + wasm32) **and** the concurrency probe
-   (`run_threads() == 4000` — the cooperative `drive` + `thread.spawn` + atomics on memory64). So the
-   full stack runs on the real production target.
+   `wasm64` `cdylib` runs the compute probe (`run_guest(1) == 1442695040888963407`, and `0` /
+   `-1097658151202642380` for `0` / `1000` — matching native + wasm32), the concurrency probe
+   (`run_threads() == 4000` — the cooperative `drive` + `thread.spawn` + atomics on memory64), **and**
+   the full encode/decode/execute roundtrip (`run_roundtrip() == 1442695040888963407`, exercising the
+   production `svm-encode` decode path `svm_run` depends on). So the full stack runs on the real
+   production target.
    *Node/V8 22.x cannot yet load it:* Rust's `wasm64` target emits **64-bit tables** (`table64` —
    table limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but
    not 64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
@@ -99,8 +101,9 @@ node run.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm alu.svmbc
 cargo +nightly build -Z build-std=std,panic_abort --release --lib \
   --target wasm64-unknown-unknown
 W=target/wasm64-unknown-unknown/release/svm_browser.wasm
-wasmtime run --invoke run_guest   -W memory64=y "$W" 1   # 1442695040888963407 (compute)
-wasmtime run --invoke run_threads -W memory64=y "$W"     # 4000 (8 vCPUs, cooperative drive)
+wasmtime run --invoke run_guest     -W memory64=y "$W" 1 # 1442695040888963407 (compute)
+wasmtime run --invoke run_threads   -W memory64=y "$W"   # 4000 (8 vCPUs, cooperative drive)
+wasmtime run --invoke run_roundtrip -W memory64=y "$W"   # 1442695040888963407 (encode→decode→run)
 ```
 
 `browser/` (`svm-browser`) is a detached `[workspace]` crate (kept out of the main workspace because
