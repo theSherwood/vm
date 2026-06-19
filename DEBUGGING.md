@@ -427,6 +427,22 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   a guest trapped from their ordinary run entry, which also lets the interp↔JIT differential fuzzer
   pinpoint divergences. *Tests (`interp_trap_backtrace.rs`, all platforms):* a store fault names the
   store; a callee div-by-zero walks the caller chain; a clean run is empty.
+- [x] **Bytecode-engine symmetry (the third backend).** The Phase-1b bytecode engine (`run_fast` /
+  `run_with_host_fast`, the production interpreter path) previously produced *no* backtrace on a trap —
+  the one engine of three (tree-walker, bytecode, JIT) without one. `run_with_host_fast_traced` /
+  `run_fast_traced` close that: the engine reifies its continuation as data (the flat register-window
+  call stack), so on a trap `vm_trap_bt` walks the active `Vm` cursor + suspended caller windows into
+  the *same* `Vec<IrPc>` (innermost first) the tree-walker snapshots from `Vec<Frame>` — driven one op
+  at a time (the single-vCPU debug seam, bit-identical to run-to-completion) so the cursor still points
+  at the faulting op. Single-vCPU, seam-free scope (S4); a durable host / out-of-subset op / concurrency
+  seam falls back to `run_with_host_traced`, so a backtrace is never dropped. The `IrPc`s are
+  **bit-identical** to the tree-walker's, including its quirks: the live frame's `inst` advances past
+  the op for every trap but `OutOfFuel` (the tree-walker does `inst += 1` before eval), a caller's
+  `inst` sits past its call, and a terminator trap (`unreachable`) reports the block's instruction
+  count. *Tests:* `bytecode_traced.rs` (memory fault, single/multi-frame div, `unreachable` incl. an
+  empty block, `OutOfFuel`, clean run); and `bytecode_diff.rs` asserts `IrPc`-equality with
+  `run_traced` on **every trapping generated module** — the standard randomized oracle, now guarding
+  backtrace parity going forward.
 - [x] **Stage 2 — explicit-check trap backtrace.** An explicit trap has no signal — the lowered check
   stores its kind and `return`s, unwinding the guest frames — so the capture happens *at the trap
   site*: `emit_trap` (the single origin every explicit trap routes through — div/rem, `unreachable`,
