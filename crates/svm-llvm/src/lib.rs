@@ -4805,7 +4805,392 @@ fn synth_dtoa_fixed(write_import: u32, scratch: u64) -> Func {
     }
 }
 
-/// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
+// The bignum formatter foundation: these big-integer primitives are validated by `bigint_tests`
+// and consumed by the Dragon4 `%e`/`%g` orchestrator (the next slice); allow until it lands.
+#[allow(dead_code)]
+/// Fixed limb count for the bignum float formatter (`%e`/`%g`, and later full-range `%f`). A double's
+/// exact value `f·2^e` needs a denominator up to `2^1074` (≈ 34 u32 limbs) plus decimal scaling
+/// headroom; 40 limbs (1280 bits) covers every finite double with margin. Each big integer is a
+/// little-endian array of `BIG_NLIMBS` u32 limbs at a byte address passed to these helpers.
+const BIG_NLIMBS: i64 = 40;
+
+/// `__svm_big_is_zero(a) -> i64` — 1 if every limb of the big integer at `a` is zero, else 0.
+#[allow(dead_code)]
+fn synth_big_is_zero() -> Func {
+    use BinOp::{Add, Shl};
+    use CmpOp::{GeS, Ne};
+    let i64t = ValType::I64;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const RET1: u32 = 3;
+    const RET0: u32 = 4;
+    // 0: entry(a) → LOOP(a, 0)
+    let b0 = {
+        let mut b = Bdr::new(1);
+        let z = b.k(0);
+        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, z] })
+    };
+    // 1: LOOP(a, i) — i ≥ N ⇒ all-zero, else test limb i
+    let b1 = {
+        let mut b = Bdr::new(2);
+        let done = b.cmpi(GeS, 1, BIG_NLIMBS);
+        b.block(
+            vec![i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: RET1,
+                then_args: vec![],
+                else_blk: BODY,
+                else_args: vec![0, 1],
+            },
+        )
+    };
+    // 2: BODY(a, i) — limb != 0 ⇒ not zero, else advance
+    let b2 = {
+        let mut b = Bdr::new(2);
+        let c2 = b.k(2);
+        let off = b.bin(Shl, 1, c2);
+        let addr = b.bin(Add, 0, off);
+        let la = b.load32u(addr);
+        let nz = b.cmpi(Ne, la, 0);
+        let c1 = b.k(1);
+        let ni = b.bin(Add, 1, c1);
+        b.block(
+            vec![i64t, i64t],
+            Terminator::BrIf {
+                cond: nz,
+                then_blk: RET0,
+                then_args: vec![],
+                else_blk: LOOP,
+                else_args: vec![0, ni],
+            },
+        )
+    };
+    let b3 = {
+        let mut b = Bdr::new(0);
+        let one = b.k(1);
+        b.block(vec![], Terminator::Return(vec![one]))
+    };
+    let b4 = {
+        let mut b = Bdr::new(0);
+        let zero = b.k(0);
+        b.block(vec![], Terminator::Return(vec![zero]))
+    };
+    Func {
+        params: vec![i64t],
+        results: vec![i64t],
+        blocks: vec![b0, b1, b2, b3, b4],
+    }
+}
+
+/// `__svm_big_cmp(a, b) -> i64` — `-1`/`0`/`1` for `a < b` / `a == b` / `a > b` (unsigned, high limb
+/// first).
+#[allow(dead_code)]
+fn synth_big_cmp() -> Func {
+    use BinOp::{Add, Shl, Sub};
+    use CmpOp::{GtU, LtS, LtU};
+    let i64t = ValType::I64;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const BODY2: u32 = 3;
+    const RETM1: u32 = 4;
+    const RETP1: u32 = 5;
+    const RET0: u32 = 6;
+    // 0: entry(a, b) → LOOP(a, b, N-1)
+    let b0 = {
+        let mut b = Bdr::new(2);
+        let top = b.k(BIG_NLIMBS - 1);
+        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, top] })
+    };
+    // 1: LOOP(a, b, i) — i < 0 ⇒ equal, else compare limb i
+    let b1 = {
+        let mut b = Bdr::new(3);
+        let done = b.cmpi(LtS, 2, 0);
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: RET0,
+                then_args: vec![],
+                else_blk: BODY,
+                else_args: vec![0, 1, 2],
+            },
+        )
+    };
+    // 2: BODY(a, b, i) — la < lb ⇒ -1, else check greater
+    let b2 = {
+        let mut b = Bdr::new(3);
+        let c2 = b.k(2);
+        let off = b.bin(Shl, 2, c2);
+        let aa = b.bin(Add, 0, off);
+        let la = b.load32u(aa);
+        let ba = b.bin(Add, 1, off);
+        let lb = b.load32u(ba);
+        let lt = b.cmp(LtU, la, lb);
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: lt,
+                then_blk: RETM1,
+                then_args: vec![],
+                else_blk: BODY2,
+                else_args: vec![0, 1, 2, la, lb],
+            },
+        )
+    };
+    // 3: BODY2(a, b, i, la, lb) — la > lb ⇒ 1, else next limb
+    let b3 = {
+        let mut b = Bdr::new(5);
+        let gt = b.cmp(GtU, 3, 4);
+        let c1 = b.k(1);
+        let ni = b.bin(Sub, 2, c1);
+        b.block(
+            vec![i64t, i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: gt,
+                then_blk: RETP1,
+                then_args: vec![],
+                else_blk: LOOP,
+                else_args: vec![0, 1, ni],
+            },
+        )
+    };
+    let bm1 = {
+        let mut b = Bdr::new(0);
+        let v = b.k(-1);
+        b.block(vec![], Terminator::Return(vec![v]))
+    };
+    let bp1 = {
+        let mut b = Bdr::new(0);
+        let v = b.k(1);
+        b.block(vec![], Terminator::Return(vec![v]))
+    };
+    let b0e = {
+        let mut b = Bdr::new(0);
+        let v = b.k(0);
+        b.block(vec![], Terminator::Return(vec![v]))
+    };
+    Func {
+        params: vec![i64t, i64t],
+        results: vec![i64t],
+        blocks: vec![b0, b1, b2, b3, bm1, bp1, b0e],
+    }
+}
+
+/// `__svm_big_sub(a, b)` — `a -= b` in place (assumes `a ≥ b`); borrow-propagating, low limb first.
+#[allow(dead_code)]
+fn synth_big_sub() -> Func {
+    use BinOp::{Add, And, Shl, ShrS, Sub};
+    use CmpOp::GeS;
+    let i64t = ValType::I64;
+    let mask32: i64 = 0xFFFF_FFFF;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const RET: u32 = 3;
+    // 0: entry(a, b) → LOOP(a, b, 0, 0)
+    let b0 = {
+        let mut b = Bdr::new(2);
+        let z0 = b.k(0);
+        let z1 = b.k(0);
+        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, z0, z1] })
+    };
+    // 1: LOOP(a, b, i, borrow)
+    let b1 = {
+        let mut b = Bdr::new(4);
+        let done = b.cmpi(GeS, 2, BIG_NLIMBS);
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: RET,
+                then_args: vec![],
+                else_blk: BODY,
+                else_args: vec![0, 1, 2, 3],
+            },
+        )
+    };
+    // 2: BODY(a, b, i, borrow) — t = la - lb - borrow; store low 32; borrow' = (t < 0)
+    let b2 = {
+        let mut b = Bdr::new(4);
+        let c2 = b.k(2);
+        let off = b.bin(Shl, 2, c2);
+        let aa = b.bin(Add, 0, off);
+        let la = b.load32u(aa);
+        let ba = b.bin(Add, 1, off);
+        let lb = b.load32u(ba);
+        let d = b.bin(Sub, la, lb);
+        let t = b.bin(Sub, d, 3);
+        let mask = b.k(mask32);
+        let new = b.bin(And, t, mask);
+        b.store32(aa, new);
+        let c63 = b.k(63);
+        let sgn = b.bin(ShrS, t, c63);
+        let one = b.k(1);
+        let nb = b.bin(And, sgn, one);
+        let c1 = b.k(1);
+        let ni = b.bin(Add, 2, c1);
+        b.block(vec![i64t, i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, ni, nb] })
+    };
+    let b3 = {
+        let b = Bdr::new(0);
+        b.block(vec![], Terminator::Return(vec![]))
+    };
+    Func {
+        params: vec![i64t, i64t],
+        results: vec![],
+        blocks: vec![b0, b1, b2, b3],
+    }
+}
+
+/// `__svm_big_mul_small(a, c)` — `a *= c` in place (small `c`; result must fit `BIG_NLIMBS` limbs);
+/// carry-propagating, low limb first.
+#[allow(dead_code)]
+fn synth_big_mul_small() -> Func {
+    use BinOp::{Add, And, Mul, Shl, ShrU};
+    use CmpOp::GeS;
+    let i64t = ValType::I64;
+    let mask32: i64 = 0xFFFF_FFFF;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const RET: u32 = 3;
+    // 0: entry(a, c) → LOOP(a, c, 0, 0)
+    let b0 = {
+        let mut b = Bdr::new(2);
+        let i0 = b.k(0);
+        let cy0 = b.k(0);
+        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, i0, cy0] })
+    };
+    // 1: LOOP(a, c, i, carry)
+    let b1 = {
+        let mut b = Bdr::new(4);
+        let done = b.cmpi(GeS, 2, BIG_NLIMBS);
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: RET,
+                then_args: vec![],
+                else_blk: BODY,
+                else_args: vec![0, 1, 2, 3],
+            },
+        )
+    };
+    // 2: BODY(a, c, i, carry) — t = la*c + carry; store low 32; carry' = t >> 32
+    let b2 = {
+        let mut b = Bdr::new(4);
+        let c2 = b.k(2);
+        let off = b.bin(Shl, 2, c2);
+        let aa = b.bin(Add, 0, off);
+        let la = b.load32u(aa);
+        let prod = b.bin(Mul, la, 1);
+        let t = b.bin(Add, prod, 3);
+        let mask = b.k(mask32);
+        let new = b.bin(And, t, mask);
+        b.store32(aa, new);
+        let c32 = b.k(32);
+        let ncy = b.bin(ShrU, t, c32);
+        let c1 = b.k(1);
+        let ni = b.bin(Add, 2, c1);
+        b.block(vec![i64t, i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, ni, ncy] })
+    };
+    let b3 = {
+        let b = Bdr::new(0);
+        b.block(vec![], Terminator::Return(vec![]))
+    };
+    Func {
+        params: vec![i64t, i64t],
+        results: vec![],
+        blocks: vec![b0, b1, b2, b3],
+    }
+}
+
+/// `__svm_big_shl_bits(a, n)` — `a <<= n` bits in place. Processes high limb first (so the in-place
+/// reads see pre-shift limbs); a shift past the top simply zero-fills.
+#[allow(dead_code)]
+fn synth_big_shl_bits() -> Func {
+    use BinOp::{Add, And, Or, Shl, ShrU, Sub};
+    use CmpOp::LtS;
+    let i64t = ValType::I64;
+    let mask32: i64 = 0xFFFF_FFFF;
+    const LOOP: u32 = 1;
+    const BODY: u32 = 2;
+    const RET: u32 = 3;
+    // 0: entry(a, n) — word = n>>5, bit = n&31 → LOOP(a, word, bit, N-1)
+    let b0 = {
+        let mut b = Bdr::new(2);
+        let c5 = b.k(5);
+        let word = b.bin(ShrU, 1, c5);
+        let c31 = b.k(31);
+        let bit = b.bin(And, 1, c31);
+        let top = b.k(BIG_NLIMBS - 1);
+        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, word, bit, top] })
+    };
+    // 1: LOOP(a, word, bit, i) — i < 0 ⇒ done
+    let b1 = {
+        let mut b = Bdr::new(4);
+        let done = b.cmpi(LtS, 3, 0);
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: RET,
+                then_args: vec![],
+                else_blk: BODY,
+                else_args: vec![0, 1, 2, 3],
+            },
+        )
+    };
+    // 2: BODY(a, word, bit, i) — res = (a[i-word] << bit) | (a[i-word-1] >> (32-bit))
+    let b2 = {
+        let mut b = Bdr::new(4); // a=0, word=1, bit=2, i=3
+        let c2 = b.k(2);
+        // src_hi = i - word, src_lo = src_hi - 1
+        let shi = b.bin(Sub, 3, 1);
+        let one = b.k(1);
+        let slo = b.bin(Sub, shi, one);
+        // hi limb (0 when src_hi < 0): clamp address to a, select 0
+        let zero = b.k(0);
+        let hi_ok = b.cmp(CmpOp::GeS, shi, zero);
+        let shc = b.sel(hi_ok, shi, zero);
+        let offh = b.bin(Shl, shc, c2);
+        let addh = b.bin(Add, 0, offh);
+        let vhr = b.load32u(addh);
+        let vhi = b.sel(hi_ok, vhr, zero);
+        // lo limb (0 when src_lo < 0)
+        let zero2 = b.k(0);
+        let lo_ok = b.cmp(CmpOp::GeS, slo, zero2);
+        let slc = b.sel(lo_ok, slo, zero2);
+        let offl = b.bin(Shl, slc, c2);
+        let addl = b.bin(Add, 0, offl);
+        let vlr = b.load32u(addl);
+        let vlo = b.sel(lo_ok, vlr, zero2);
+        // res = ((vhi << bit) | (vlo >> (32 - bit))) & mask  (bit==0 ⇒ vlo>>32 == 0 ⇒ res == vhi)
+        let up = b.bin(Shl, vhi, 2);
+        let c32 = b.k(32);
+        let rsh = b.bin(Sub, c32, 2);
+        let dn = b.bin(ShrU, vlo, rsh);
+        let orr = b.bin(Or, up, dn);
+        let mask = b.k(mask32);
+        let res = b.bin(And, orr, mask);
+        let offi = b.bin(Shl, 3, c2);
+        let addi = b.bin(Add, 0, offi);
+        b.store32(addi, res);
+        let c1 = b.k(1);
+        let ni = b.bin(Sub, 3, c1);
+        b.block(vec![i64t, i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, 2, ni] })
+    };
+    let b3 = {
+        let b = Bdr::new(0);
+        b.block(vec![], Terminator::Return(vec![]))
+    };
+    Func {
+        params: vec![i64t, i64t],
+        results: vec![],
+        blocks: vec![b0, b1, b2, b3],
+    }
+}
+
+
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
     match op {
@@ -10213,4 +10598,133 @@ fn branch_args(
         }
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod bigint_tests {
+    //! Direct unit tests for the synthesized big-integer primitives (`synth_big_*`), the foundation
+    //! of the bignum `%e`/`%g` formatter. Each runs the helper in isolation via `svm_interp::run_capture`
+    //! with the operands placed in the initial window, then inspects the resulting limbs — so a bug in
+    //! one primitive is caught here, not only end-to-end.
+    use super::*;
+    use svm_interp::Value;
+
+    const WIN_LOG2: u8 = 16; // 64 KiB scratch window
+
+    fn run(func: Func, args: &[i64], mem: &[(usize, &[u32])]) -> (Vec<Value>, Vec<u8>) {
+        let mut init = vec![0u8; 1 << WIN_LOG2];
+        for (off, limbs) in mem {
+            for (k, &l) in limbs.iter().enumerate() {
+                init[off + 4 * k..off + 4 * k + 4].copy_from_slice(&l.to_le_bytes());
+            }
+        }
+        let m = Module {
+            funcs: vec![func],
+            memory: Some(svm_ir::Memory { size_log2: WIN_LOG2 }),
+            ..Default::default()
+        };
+        let mut fuel = 1_000_000_000u64;
+        let argv: Vec<Value> = args.iter().map(|&x| Value::I64(x)).collect();
+        let (res, win) = svm_interp::run_capture(&m, 0, &argv, &mut fuel, &init);
+        (res.expect("bigint helper trapped"), win)
+    }
+
+    fn limbs(win: &[u8], off: usize, n: usize) -> Vec<u32> {
+        (0..n)
+            .map(|k| u32::from_le_bytes(win[off + 4 * k..off + 4 * k + 4].try_into().unwrap()))
+            .collect()
+    }
+
+    fn ret_i64(res: &[Value]) -> i64 {
+        match res.first() {
+            Some(Value::I64(v)) => *v,
+            other => panic!("expected i64 result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn big_is_zero_works() {
+        let (r, _) = run(synth_big_is_zero(), &[256], &[]);
+        assert_eq!(ret_i64(&r), 1, "all-zero ⇒ 1");
+        let (r, _) = run(synth_big_is_zero(), &[256], &[(256, &[0, 0, 0, 0, 0, 7])]);
+        assert_eq!(ret_i64(&r), 0, "limb 5 set ⇒ 0");
+        let (r, _) = run(synth_big_is_zero(), &[256], &[(256, &[1])]);
+        assert_eq!(ret_i64(&r), 0, "limb 0 set ⇒ 0");
+    }
+
+    #[test]
+    fn big_cmp_works() {
+        let a = 256usize;
+        let b = 512usize;
+        // low-limb difference
+        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[1]), (b, &[2])]);
+        assert_eq!(ret_i64(&r), -1);
+        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[2]), (b, &[1])]);
+        assert_eq!(ret_i64(&r), 1);
+        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[9, 9, 9]), (b, &[9, 9, 9])]);
+        assert_eq!(ret_i64(&r), 0);
+        // a high limb dominates a larger low limb
+        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[0, 0, 5]), (b, &[9, 9, 4])]);
+        assert_eq!(ret_i64(&r), 1);
+    }
+
+    #[test]
+    fn big_sub_works() {
+        let a = 256usize;
+        let b = 512usize;
+        let (_, w) = run(synth_big_sub(), &[a as i64, b as i64], &[(a, &[5]), (b, &[3])]);
+        assert_eq!(limbs(&w, a, 2), vec![2, 0]);
+        // borrow across a limb: 2^32 - 1
+        let (_, w) = run(synth_big_sub(), &[a as i64, b as i64], &[(a, &[0, 1]), (b, &[1])]);
+        assert_eq!(limbs(&w, a, 2), vec![0xFFFF_FFFF, 0]);
+        // multi-limb borrow chain: 2^64 - 1
+        let (_, w) = run(synth_big_sub(), &[a as i64, b as i64], &[(a, &[0, 0, 1]), (b, &[1])]);
+        assert_eq!(limbs(&w, a, 3), vec![0xFFFF_FFFF, 0xFFFF_FFFF, 0]);
+    }
+
+    #[test]
+    fn big_mul_small_works() {
+        let a = 256usize;
+        let (_, w) = run(synth_big_mul_small(), &[a as i64, 2], &[(a, &[0xFFFF_FFFF])]);
+        assert_eq!(limbs(&w, a, 2), vec![0xFFFF_FFFE, 1]); // 2·(2^32-1) = 2^33-2
+        let (_, w) = run(synth_big_mul_small(), &[a as i64, 10], &[(a, &[123_456_789])]);
+        assert_eq!(limbs(&w, a, 2), vec![1_234_567_890, 0]);
+        // carry chain across two limbs: (2^64-1)·10
+        let prod = (u64::MAX as u128) * 10;
+        let (_, w) = run(synth_big_mul_small(), &[a as i64, 10], &[(a, &[0xFFFF_FFFF, 0xFFFF_FFFF])]);
+        let got = limbs(&w, a, 3);
+        let exp = [prod as u32, (prod >> 32) as u32, (prod >> 64) as u32];
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn big_shl_bits_works() {
+        let a = 256usize;
+        let (_, w) = run(synth_big_shl_bits(), &[a as i64, 1], &[(a, &[1])]);
+        assert_eq!(limbs(&w, a, 2), vec![2, 0]);
+        let (_, w) = run(synth_big_shl_bits(), &[a as i64, 32], &[(a, &[1])]);
+        assert_eq!(limbs(&w, a, 2), vec![0, 1]);
+        let (_, w) = run(synth_big_shl_bits(), &[a as i64, 33], &[(a, &[1])]);
+        assert_eq!(limbs(&w, a, 2), vec![0, 2]);
+        // carry out of bit 31 into the next limb
+        let (_, w) = run(synth_big_shl_bits(), &[a as i64, 1], &[(a, &[0x8000_0000])]);
+        assert_eq!(limbs(&w, a, 2), vec![0, 1]);
+        // word + bit shift: 3 << 40 = 0x300 in limb 1
+        let (_, w) = run(synth_big_shl_bits(), &[a as i64, 40], &[(a, &[3])]);
+        assert_eq!(limbs(&w, a, 3), vec![0, 0x300, 0]);
+        // a 53-bit significand shifted by a large exponent (the %f/%e build path), checked vs u128
+        let f: u128 = 0x1F_FFFF_FFFF_FFFF; // 2^53 - 1
+        let n = 70u32;
+        let exp = f << n;
+        let lo = [f as u32, (f >> 32) as u32];
+        let (_, w) = run(synth_big_shl_bits(), &[a as i64, n as i64], &[(a, &lo)]);
+        let got = limbs(&w, a, 5);
+        let expv: Vec<u32> = (0..5)
+            .map(|k| {
+                let sh = 32 * k;
+                if sh >= 128 { 0 } else { (exp >> sh) as u32 }
+            })
+            .collect();
+        assert_eq!(got, expv);
+    }
 }
