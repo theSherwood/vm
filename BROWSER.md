@@ -143,9 +143,12 @@ Compile-clean today; gate behind `cfg(not(target_family = "wasm"))` for a clean 
 - [ ] **cfg-gate `lib.rs` for wasm** — `Scheduler`, `OffloadPool`, `std::thread`/`Instant` imports;
   `page_size` → constant. Hygiene/binary-size (compiles today; the entry never calls these), not a
   correctness blocker under fail-closed.
-- [ ] **Differential check** — assert byte-identical results/memory vs the native bytecode engine
-  over a corpus (incl. a guest `thread.spawn`, exercising the cooperative `drive`), via the capture
-  entry `compile_and_run_capture_reserved_with_host` (memory snapshot back to the host).
+- [x] **Differential check (compute, wasm32).** `gencorpus` (host) encodes a corpus + computes the
+  **native** bytecode-engine result per arg; `corpus.mjs` runs the same modules through the wasm
+  `svm_run` and compares. **36/36 match** across four op families (i64 arith+branches, multi-function
+  `call`, memory store/load, divide-by-zero → `STATUS_TRAP`), zero host imports. Remaining: extend to
+  the memory-**snapshot** check via `compile_and_run_capture_reserved_with_host`, and a guest
+  `thread.spawn` (exercising the cooperative `drive`).
 - [ ] **Host powerbox (follow-up)** — design the browser-backed capability set (console/IO/clock).
 
 ## Verification

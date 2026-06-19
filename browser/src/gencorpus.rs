@@ -1,0 +1,140 @@
+//! Host-side **differential corpus** generator. For each guest module it (1) encodes the module to
+//! its `svm-encode` binary form under `corpus/`, and (2) computes the **native** bytecode-engine
+//! result for a set of args — the ground truth `corpus.mjs` checks the wasm `svm_run` against.
+//!
+//! The native run here uses the *exact same* `bytecode::compile_and_run` the wasm entry calls, so a
+//! mismatch isolates a wasm-compilation / sandbox effect (not an engine difference). The repo
+//! already gates the bytecode engine against the tree-walker oracle (`bytecode_diff.rs`); this gates
+//! the *wasm build of it* against the native build.
+//!
+//! Status codes mirror `lib.rs`: 0 OK · 2 UNSUPPORTED (`None`) · 3 TRAP (`Err`) · 4 BAD_RESULT.
+
+use std::io::Write;
+
+use svm_interp::{bytecode, Value};
+
+// Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
+// and engine-supported), plus a divide-by-zero trap kernel.
+const ALU: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 6364136223846793005
+  v11 = i64.mul v8 v10
+  v12 = i64.const 1442695040888963407
+  v13 = i64.add v11 v12
+  v14 = i64.add v13 v9
+  v15 = i64.const 1
+  v16 = i64.add v9 v15
+  br block1(v7, v14, v16)
+block3(v17: i64):
+  return v17
+}
+"#;
+
+const CALL: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = call 1 (v8, v9)
+  v11 = i64.const 1
+  v12 = i64.add v9 v11
+  br block1(v7, v10, v12)
+block3(v13: i64):
+  return v13
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.add v0 v1
+  return v2
+}
+"#;
+
+const MEM: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 8
+  i64.store v10 v8
+  v11 = i64.load v10
+  v12 = i64.add v11 v9
+  v13 = i64.const 1
+  v14 = i64.add v9 v13
+  br block1(v7, v12, v14)
+block3(v15: i64):
+  return v15
+}
+"#;
+
+const DIVTRAP: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.div_s v0 v1
+  return v2
+}
+"#;
+
+/// Args fed to each kernel (all `(i64) -> (i64)`), incl. negatives and a large value.
+const ARGS: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000];
+
+fn native(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run(m, 0, &[Value::I64(arg)], &mut fuel) {
+        None => (2, 0),
+        Some(Err(_)) => (3, 0),
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => (0, *x),
+            _ => (4, 0),
+        },
+    }
+}
+
+fn main() {
+    let modules = [("alu", ALU), ("call", CALL), ("mem", MEM), ("divtrap", DIVTRAP)];
+    std::fs::create_dir_all("corpus").expect("mkdir corpus");
+
+    let mut json = String::from("[\n");
+    for (i, (name, src)) in modules.iter().enumerate() {
+        let m = svm_text::parse_module(src).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+        let bytes = svm_encode::encode_module(&m);
+        let file = format!("corpus/{name}.svmbc");
+        std::fs::File::create(&file)
+            .and_then(|mut f| f.write_all(&bytes))
+            .expect("write module");
+
+        json.push_str(&format!("  {{\"name\":\"{name}\",\"file\":\"{file}\",\"cases\":["));
+        for (j, &arg) in ARGS.iter().enumerate() {
+            let (status, value) = native(&m, arg);
+            // i64s as JSON strings so JS keeps full precision (BigInt).
+            json.push_str(&format!(
+                "{}{{\"arg\":\"{arg}\",\"status\":{status},\"value\":\"{value}\"}}",
+                if j == 0 { "" } else { "," }
+            ));
+        }
+        json.push_str(if i + 1 == modules.len() { "]}\n" } else { "]},\n" });
+        eprintln!("{name}: {} bytes, {} cases", bytes.len(), ARGS.len());
+    }
+    json.push_str("]\n");
+    std::fs::write("corpus.json", json).expect("write corpus.json");
+    eprintln!("wrote corpus.json");
+}

@@ -15,10 +15,16 @@ crate-type = ["cdylib"]
 name = "genfixture"
 path = "src/genfixture.rs"
 
+[[bin]]
+name = "gencorpus"
+path = "src/gencorpus.rs"
+
 [dependencies]
 svm-interp = { path = "../crates/svm-interp" }
 svm-encode = { path = "../crates/svm-encode" }
 svm-text   = { path = "../crates/svm-text" }
+# Only the host fixture/corpus bins name `Module` directly; the wasm cdylib doesn't use it.
+svm-ir     = { path = "../crates/svm-ir" }
 
 [profile.release]
 panic = "abort"
