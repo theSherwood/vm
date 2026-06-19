@@ -3898,7 +3898,13 @@ fn synth_big_is_zero() -> Func {
     let b0 = {
         let mut b = Bdr::new(1);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, z] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, z],
+            },
+        )
     };
     // 1: LOOP(a, i) — i ≥ N ⇒ all-zero, else test limb i
     let b1 = {
@@ -3970,7 +3976,13 @@ fn synth_big_cmp() -> Func {
     let b0 = {
         let mut b = Bdr::new(2);
         let top = b.k(BIG_NLIMBS - 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, top] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, top],
+            },
+        )
     };
     // 1: LOOP(a, b, i) — i < 0 ⇒ equal, else compare limb i
     let b1 = {
@@ -4062,7 +4074,13 @@ fn synth_big_sub() -> Func {
         let mut b = Bdr::new(2);
         let z0 = b.k(0);
         let z1 = b.k(0);
-        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, z0, z1] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, z0, z1],
+            },
+        )
     };
     // 1: LOOP(a, b, i, borrow)
     let b1 = {
@@ -4099,7 +4117,13 @@ fn synth_big_sub() -> Func {
         let nb = b.bin(And, sgn, one);
         let c1 = b.k(1);
         let ni = b.bin(Add, 2, c1);
-        b.block(vec![i64t, i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, ni, nb] })
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, ni, nb],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(0);
@@ -4128,7 +4152,13 @@ fn synth_big_mul_small() -> Func {
         let mut b = Bdr::new(2);
         let i0 = b.k(0);
         let cy0 = b.k(0);
-        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, i0, cy0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, i0, cy0],
+            },
+        )
     };
     // 1: LOOP(a, c, i, carry)
     let b1 = {
@@ -4161,7 +4191,13 @@ fn synth_big_mul_small() -> Func {
         let ncy = b.bin(ShrU, t, c32);
         let c1 = b.k(1);
         let ni = b.bin(Add, 2, c1);
-        b.block(vec![i64t, i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, ni, ncy] })
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, ni, ncy],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(0);
@@ -4193,7 +4229,13 @@ fn synth_big_shl_bits() -> Func {
         let c31 = b.k(31);
         let bit = b.bin(And, 1, c31);
         let top = b.k(BIG_NLIMBS - 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, word, bit, top] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, word, bit, top],
+            },
+        )
     };
     // 1: LOOP(a, word, bit, i) — i < 0 ⇒ done
     let b1 = {
@@ -4247,7 +4289,13 @@ fn synth_big_shl_bits() -> Func {
         b.store32(addi, res);
         let c1 = b.k(1);
         let ni = b.bin(Sub, 3, c1);
-        b.block(vec![i64t, i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, 2, ni] })
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, 2, ni],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(0);
@@ -4259,7 +4307,6 @@ fn synth_big_shl_bits() -> Func {
         blocks: vec![b0, b1, b2, b3],
     }
 }
-
 
 /// `__svm_big_zero(a)` — set every limb of the big integer at `a` to 0.
 #[allow(dead_code)]
@@ -4273,7 +4320,13 @@ fn synth_big_zero() -> Func {
     let b0 = {
         let mut b = Bdr::new(1);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, z] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, z],
+            },
+        )
     };
     let b1 = {
         let mut b = Bdr::new(2);
@@ -4298,7 +4351,13 @@ fn synth_big_zero() -> Func {
         b.store32(addr, z);
         let c1 = b.k(1);
         let ni = b.bin(Add, 1, c1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, ni] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, ni],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(0);
@@ -4323,7 +4382,13 @@ fn synth_big_copy() -> Func {
     let b0 = {
         let mut b = Bdr::new(2);
         let z = b.k(0);
-        b.block(vec![i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, z] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, z],
+            },
+        )
     };
     let b1 = {
         let mut b = Bdr::new(3);
@@ -4349,7 +4414,13 @@ fn synth_big_copy() -> Func {
         b.store32(da, v);
         let c1 = b.k(1);
         let ni = b.bin(Add, 2, c1);
-        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, 1, ni] })
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, 1, ni],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(0);
@@ -4449,7 +4520,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let z = b.k(0);
         b.store64(ea, z);
         let z2 = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: ZCASE_LOOP, args: vec![0, z2] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: ZCASE_LOOP,
+                args: vec![0, z2],
+            },
+        )
     };
 
     // 2: ZCASE_LOOP(scratch, i) — dbuf[i]=0 for i in 0..nsig.
@@ -4521,7 +4598,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let kn = b.k(num_o);
         let num = b.bin(Add, 0, kn);
         b.call0(shl, vec![num, 1]);
-        b.block(vec![i64t, i64t], Terminator::Br { target: SCALE, args: vec![0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: SCALE,
+                args: vec![0],
+            },
+        )
     };
 
     // 5: SHLDEN(scratch, ebin) — den <<= -ebin (ebin < 0).
@@ -4532,7 +4615,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let z = b.k(0);
         let neg = b.bin(Sub, z, 1);
         b.call0(shl, vec![den, neg]);
-        b.block(vec![i64t, i64t], Terminator::Br { target: SCALE, args: vec![0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: SCALE,
+                args: vec![0],
+            },
+        )
     };
 
     // 6: SCALE(scratch) — multiply den by 10^E (E≥0) or num by 10^(-E) (E<0).
@@ -4630,7 +4719,7 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
                 cond: ge,
                 then_blk: DIGIT_INNER,
                 then_args: vec![0, z, z], // j = 0, d = 0
-                else_blk: 22, // FIXUP_LO_BODY
+                else_blk: 22,             // FIXUP_LO_BODY
                 else_args: vec![0],
             },
         )
@@ -4752,7 +4841,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let e2 = b.bin(Add, e, c1);
         b.store64(ea, e2);
         let one2 = b.k(1);
-        b.block(vec![i64t], Terminator::Br { target: ZERO_TAIL, args: vec![0, one2] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: ZERO_TAIL,
+                args: vec![0, one2],
+            },
+        )
     };
 
     // 16: ZERO_TAIL(scratch, i) — dbuf[i]=0 for i in 1..nsig (after a carry-out).
@@ -4793,7 +4888,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         b.store8(a, z);
         let c1 = b.k(1);
         let ni = b.bin(Add, 1, c1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: ZCASE_LOOP, args: vec![0, ni] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: ZCASE_LOOP,
+                args: vec![0, ni],
+            },
+        )
     };
 
     // 19: SCALE_DEN_BODY(scratch, cnt) — den *= 10; cnt--.
@@ -4805,7 +4906,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         b.call0(mul, vec![den, c10]);
         let c1 = b.k(1);
         let nc = b.bin(Sub, 1, c1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: SCALE_DEN, args: vec![0, nc] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: SCALE_DEN,
+                args: vec![0, nc],
+            },
+        )
     };
 
     // 20: SCALE_NUM_BODY(scratch, cnt) — num *= 10; cnt--.
@@ -4817,7 +4924,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         b.call0(mul, vec![num, c10]);
         let c1 = b.k(1);
         let nc = b.bin(Sub, 1, c1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: SCALE_NUM, args: vec![0, nc] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: SCALE_NUM,
+                args: vec![0, nc],
+            },
+        )
     };
 
     // 21: FIXUP_HI_BODY(scratch) — den *= 10 (via tmp copy), E++.
@@ -4833,7 +4946,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let c1 = b.k(1);
         let e2 = b.bin(Add, e, c1);
         b.store64(ea, e2);
-        b.block(vec![i64t], Terminator::Br { target: FIXUP_HI, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: FIXUP_HI,
+                args: vec![0],
+            },
+        )
     };
 
     // 22: FIXUP_LO_BODY(scratch) — num *= 10, E--.
@@ -4849,7 +4968,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let c1 = b.k(1);
         let e2 = b.bin(Sub, e, c1);
         b.store64(ea, e2);
-        b.block(vec![i64t], Terminator::Br { target: FIXUP_LO, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: FIXUP_LO,
+                args: vec![0],
+            },
+        )
     };
 
     // 23: DIGIT_SUB(scratch, j, d) — num -= den; d++.
@@ -4862,7 +4987,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         b.call0(sub, vec![num, den]);
         let c1 = b.k(1);
         let d2 = b.bin(Add, 2, c1);
-        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: DIGIT_INNER, args: vec![0, 1, d2] })
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::Br {
+                target: DIGIT_INNER,
+                args: vec![0, 1, d2],
+            },
+        )
     };
 
     // 24: DIGIT_NEXT(scratch, j2) — num *= 10; start digit j2.
@@ -4873,7 +5004,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let c10 = b.k(10);
         b.call0(mul, vec![num, c10]);
         let z = b.k(0);
-        b.block(vec![i64t, i64t], Terminator::Br { target: DIGIT_INNER, args: vec![0, 1, z] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: DIGIT_INNER,
+                args: vec![0, 1, z],
+            },
+        )
     };
 
     // 25: ROUND_CARRY_BODY(scratch, k) — dbuf[k]+1; <10 ⇒ done, else dbuf[k]=0 and carry to k-1.
@@ -4913,7 +5050,13 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         b.store8(a, z);
         let c1 = b.k(1);
         let ni = b.bin(Add, 1, c1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: ZERO_TAIL, args: vec![0, ni] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: ZERO_TAIL,
+                args: vec![0, ni],
+            },
+        )
     };
 
     Func {
@@ -4968,7 +5111,13 @@ fn synth_big_shr1() -> Func {
         let v0 = b.load32u(0);
         let out = b.bini(And, v0, 1);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, z, out] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, z, out],
+            },
+        )
     };
     // 1: LOOP(a, i, out)
     let b1 = {
@@ -5006,7 +5155,13 @@ fn synth_big_shr1() -> Func {
         let new = b.bin(And, orr, mask);
         b.store32(addr, new);
         let ni = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, ni, 2] })
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, ni, 2],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(1);
@@ -5034,7 +5189,13 @@ fn synth_big_divmod10() -> Func {
         let mut b = Bdr::new(1);
         let top = b.k(BIG_NLIMBS - 1);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, top, z] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, top, z],
+            },
+        )
     };
     // 1: LOOP(a, i, rem)
     let b1 = {
@@ -5063,7 +5224,13 @@ fn synth_big_divmod10() -> Func {
         let r = b.bini(RemU, cur, 10);
         b.store32(addr, q);
         let ni = b.bini(Sub, 1, 1);
-        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, ni, r] })
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, ni, r],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(1);
@@ -5091,7 +5258,13 @@ fn synth_big_inc() -> Func {
         let mut b = Bdr::new(1);
         let one = b.k(1);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: LOOP, args: vec![0, z, one] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, z, one],
+            },
+        )
     };
     // 1: LOOP(a, i, carry) — stop at end or when carry is 0
     let b1 = {
@@ -5126,7 +5299,13 @@ fn synth_big_inc() -> Func {
         let c32 = b.k(32);
         let nc = b.bin(ShrU, t, c32);
         let ni = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: LOOP, args: vec![0, ni, nc] })
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::Br {
+                target: LOOP,
+                args: vec![0, ni, nc],
+            },
+        )
     };
     let b3 = {
         let b = Bdr::new(0);
@@ -5298,7 +5477,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let kcl = b.k(FMT_CLEN_O);
         let cla = b.bin(Add, 0, kcl);
         b.store64(cla, clen);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_START,
+                args: vec![0],
+            },
+        )
     };
 
     // 2: FINITE(scratch, bits, prec) — nsig = prec+1; run the digit engine; stash E.
@@ -5310,7 +5495,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let ke = b.k(FMT_E_O);
         let ea = b.bin(Add, 0, ke);
         b.store64(ea, e);
-        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: ASSEMBLE, args: vec![0] })
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::Br {
+                target: ASSEMBLE,
+                args: vec![0],
+            },
+        )
     };
 
     // 3: ASSEMBLE(scratch) — [sign] d0 ; then '.' + fraction iff prec>0.
@@ -5368,7 +5559,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let cur2 = b.bin(Add, cur, one);
         b.store64(cla, cur2);
         let j = b.k(1);
-        b.block(vec![i64t], Terminator::Br { target: FRAC_LOOP, args: vec![0, j] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: FRAC_LOOP,
+                args: vec![0, j],
+            },
+        )
     };
 
     // 5: FRAC_LOOP(scratch, j) — emit dbuf[1..=prec].
@@ -5410,7 +5607,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let cur2 = b.bin(Add, cur, one);
         b.store64(cla, cur2);
         let j2 = b.bin(Add, 1, one);
-        b.block(vec![i64t, i64t], Terminator::Br { target: FRAC_LOOP, args: vec![0, j2] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: FRAC_LOOP,
+                args: vec![0, j2],
+            },
+        )
     };
 
     // 7: EXPSTART(scratch) — write 'e'/'E', the exponent sign, and set up |E|.
@@ -5450,7 +5653,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let zero = b.k(0);
         let nege = b.bin(Sub, zero, e);
         let abs_e = b.sel(eneg, nege, e);
-        b.block(vec![i64t], Terminator::Br { target: EXPDIGITS, args: vec![0, abs_e] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: EXPDIGITS,
+                args: vec![0, abs_e],
+            },
+        )
     };
 
     // 8: EXPDIGITS(scratch, absE) — |E| as ≥2 digits (3 if ≥100), then pad.
@@ -5485,7 +5694,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         b.store8(ao, och);
         let cur_end = b.bin(Add, cur_o, one);
         b.store64(cla, cur_end);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_START,
+                args: vec![0],
+            },
+        )
     };
 
     // 9: PAD_START(scratch) — total = max(clen,width); lead = left?0:pad; fill the field.
@@ -5515,7 +5730,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let lla = b.bin(Add, 0, kl);
         b.store64(lla, lead);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, z] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![0, z],
+            },
+        )
     };
 
     // 10: PAD_FILL_TEST(scratch, j) — fill out[0..total] with spaces.
@@ -5548,7 +5769,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         b.store8(a, sp);
         let one = b.k(1);
         let nj = b.bin(Add, 1, one);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, nj] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![0, nj],
+            },
+        )
     };
 
     // 12: PAD_COPY_TEST(scratch, k) — copy content[0..clen] into out[lead..].
@@ -5587,7 +5814,13 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         b.store8(oa, ch);
         let one = b.k(1);
         let nk = b.bin(Add, 1, one);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_COPY_TEST, args: vec![0, nk] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_COPY_TEST,
+                args: vec![0, nk],
+            },
+        )
     };
 
     // 14: RET(scratch) — return the padded field length.
@@ -5754,7 +5987,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let clen = b.bini(Add, count, 3);
         let cla = b.bini(Add, 0, FMT_CLEN_O);
         b.store64(cla, clen);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_START,
+                args: vec![0],
+            },
+        )
     };
 
     // 2: FINITE(scratch, bits) — P sig digits + E from the engine; seed sign/cursor; pick e vs f.
@@ -5810,7 +6049,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let dot = b.k(b'.' as i64);
         emit(&mut b, 0, dot);
         let one = b.k(1);
-        b.block(vec![i64t], Terminator::Br { target: EM_FRAC_TEST, args: vec![0, one] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: EM_FRAC_TEST,
+                args: vec![0, one],
+            },
+        )
     };
 
     // 5: EM_FRAC_TEST(scratch, k) — emit dbuf[1..P-1].
@@ -5848,7 +6093,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let newse = b.sel(nz, cur, oldse);
         b.store64(sea, newse);
         let k2 = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: EM_FRAC_TEST, args: vec![0, k2] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: EM_FRAC_TEST,
+                args: vec![0, k2],
+            },
+        )
     };
 
     // 7: EM_STRIP(scratch) — drop trailing zeros (cursor = alt ? cur : sigend), then exponent.
@@ -5864,7 +6115,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let se = b.load64(sea);
         let newcur = b.sel(isalt, cur, se);
         b.store64(cla, newcur);
-        b.block(vec![i64t], Terminator::Br { target: EXPSTART, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: EXPSTART,
+                args: vec![0],
+            },
+        )
     };
 
     // 8: EXPSTART(scratch) — 'e'/'E', exponent sign, set up |E|.
@@ -5888,7 +6145,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let zero = b.k(0);
         let nege = b.bin(Sub, zero, e);
         let abse = b.sel(eneg, nege, e);
-        b.block(vec![i64t], Terminator::Br { target: EXPDIGITS, args: vec![0, abse] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: EXPDIGITS,
+                args: vec![0, abse],
+            },
+        )
     };
 
     // 9: EXPDIGITS(scratch, absE) — ≥2 digits (3 if ≥100), then pad.
@@ -5917,7 +6180,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         b.store8(ao, och);
         let cur_end = b.bini(Add, cur_o, 1);
         b.store64(cla, cur_end);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_START,
+                args: vec![0],
+            },
+        )
     };
 
     // 10: FM_INT(scratch) — f-mode integer part: d[0..E] if E≥0, else '0'.
@@ -5966,7 +6235,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let ch = b.bini(Add, d, b'0' as i64);
         emit(&mut b, 0, ch);
         let j2 = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: FM_INT_TEST, args: vec![0, j2] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: FM_INT_TEST,
+                args: vec![0, j2],
+            },
+        )
     };
 
     // 13: FM_DOT(scratch) — write integer '0' when E<0, then '.', seed sigend.
@@ -5992,7 +6267,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let dot = b.k(b'.' as i64);
         emit(&mut b, 0, dot);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: FM_FRAC_TEST, args: vec![0, z] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: FM_FRAC_TEST,
+                args: vec![0, z],
+            },
+        )
     };
 
     // 14: FM_FRAC_TEST(scratch, k) — L = P-1-E fraction places.
@@ -6042,7 +6323,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let newse = b.sel(nz, cur, oldse);
         b.store64(sea, newse);
         let k2 = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: FM_FRAC_TEST, args: vec![0, k2] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: FM_FRAC_TEST,
+                args: vec![0, k2],
+            },
+        )
     };
 
     // 16: FM_STRIP(scratch) — drop trailing zeros, then pad.
@@ -6058,7 +6345,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let se = b.load64(sea);
         let newcur = b.sel(isalt, cur, se);
         b.store64(cla, newcur);
-        b.block(vec![i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: PAD_START,
+                args: vec![0],
+            },
+        )
     };
 
     // 17: PAD_START(scratch) — total = max(clen,width); lead = left?0:pad; fill.
@@ -6082,7 +6375,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let lla = b.bini(Add, 0, FMT_LEAD_O);
         b.store64(lla, lead);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, z] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![0, z],
+            },
+        )
     };
 
     // 18: PAD_FILL_TEST(scratch, j).
@@ -6112,7 +6411,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let sp = b.k(b' ' as i64);
         b.store8(a, sp);
         let nj = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, nj] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![0, nj],
+            },
+        )
     };
 
     // 20: PAD_COPY_TEST(scratch, k).
@@ -6146,7 +6451,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let oa = b.bin(Add, ob, off);
         b.store8(oa, ch);
         let nk = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_COPY_TEST, args: vec![0, nk] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_COPY_TEST,
+                args: vec![0, nk],
+            },
+        )
     };
 
     // 22: RET(scratch) — return the padded field length.
@@ -6194,7 +6505,15 @@ fn synth_dtoa_gen(dd: u32) -> Func {
 /// `÷10` digit extraction and the `[-]ddd.fff` assembly. Correct for all magnitudes, tiny values, and
 /// ties. Composes the `big_*` primitives by func index. `flags` bit3 = uppercase (`%F` ⇒ `INF`/`NAN`).
 #[allow(dead_code)]
-fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod: u32, iszero: u32) -> Func {
+fn synth_dtoa_fix_big(
+    zero: u32,
+    mul: u32,
+    shl: u32,
+    shr1: u32,
+    inc: u32,
+    divmod: u32,
+    iszero: u32,
+) -> Func {
     use BinOp::{Add, And, Or, ShrU, Sub};
     use CmpOp::{Eq, GeS, GtS, LeS, LtS, Ne};
     let i64t = ValType::I64;
@@ -6327,7 +6646,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let clen = b.bini(Add, count, 3);
         let cla = b.bini(Add, 0, FMT_CLEN_O);
         b.store64(cla, clen);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_START,
+                args: vec![0],
+            },
+        )
     };
 
     // 2: FINITE(scratch, f) — A = f; enter ×5^prec.
@@ -6341,7 +6666,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         b.store32(a4, fhi); // A[1] = f high
         let pa = b.bini(Add, 0, FMT_PREC_O);
         let prec = b.load64(pa);
-        b.block(vec![i64t, i64t], Terminator::Br { target: MUL5_TEST, args: vec![0, prec] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: MUL5_TEST,
+                args: vec![0, prec],
+            },
+        )
     };
 
     // 3: MUL5_TEST(scratch, count).
@@ -6367,7 +6698,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let c5 = b.k(5);
         b.call0(mul, vec![a, c5]);
         let nc = b.bini(Sub, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: MUL5_TEST, args: vec![0, nc] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: MUL5_TEST,
+                args: vec![0, nc],
+            },
+        )
     };
 
     // 5: SHIFT(scratch) — s ≥ 0 ⇒ left shift, else round-shift right.
@@ -6395,7 +6732,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let sa = b.bini(Add, 0, s_o);
         let s = b.load64(sa);
         b.call0(shl, vec![a, s]);
-        b.block(vec![i64t], Terminator::Br { target: DEC_INIT, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: DEC_INIT,
+                args: vec![0],
+            },
+        )
     };
 
     // 7: SHR_SETUP(scratch) — shift = -s; enter the ≫1 round loop.
@@ -6407,7 +6750,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let shift = b.bin(Sub, zero, s);
         let z1 = b.k(0);
         let z2 = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: SHR_LOOP, args: vec![0, shift, z1, z2] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: SHR_LOOP,
+                args: vec![0, shift, z1, z2],
+            },
+        )
     };
 
     // 8: SHR_LOOP(scratch, count, sticky, lastout).
@@ -6433,7 +6782,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let out = b.call1(shr1, vec![a]);
         let nsticky = b.bin(Or, 2, 3);
         let nc = b.bini(Sub, 1, 1);
-        b.block(vec![i64t, i64t, i64t, i64t], Terminator::Br { target: SHR_LOOP, args: vec![0, nc, nsticky, out] })
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::Br {
+                target: SHR_LOOP,
+                args: vec![0, nc, nsticky, out],
+            },
+        )
     };
 
     // 10: SHR_ROUND(scratch, sticky, lastout) — round half-to-even.
@@ -6462,7 +6817,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let mut b = Bdr::new(1);
         let a = b.bini(Add, 0, a_o);
         b.call0(inc, vec![a]);
-        b.block(vec![i64t], Terminator::Br { target: DEC_INIT, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: DEC_INIT,
+                args: vec![0],
+            },
+        )
     };
 
     // 12: DEC_INIT(scratch) — D = 0 (do-while ⇒ ≥1 digit).
@@ -6471,7 +6832,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let z = b.k(0);
         let da = b.bini(Add, 0, dcnt_o);
         b.store64(da, z);
-        b.block(vec![i64t], Terminator::Br { target: DEC_BODY, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: DEC_BODY,
+                args: vec![0],
+            },
+        )
     };
 
     // 13: DEC_BODY(scratch) — digit = N % 10; N /= 10; dbuf[D++] = digit.
@@ -6486,7 +6853,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         b.store8(addr, digit);
         let nd = b.bini(Add, d, 1);
         b.store64(da, nd);
-        b.block(vec![i64t], Terminator::Br { target: DEC_TEST, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: DEC_TEST,
+                args: vec![0],
+            },
+        )
     };
 
     // 14: DEC_TEST(scratch) — all zero ⇒ assemble.
@@ -6519,7 +6892,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let count = b.sel(hassign, one, zero);
         let cla = b.bini(Add, 0, FMT_CLEN_O);
         b.store64(cla, count);
-        b.block(vec![i64t], Terminator::Br { target: ASM_INT, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: ASM_INT,
+                args: vec![0],
+            },
+        )
     };
 
     // 16: ASM_INT(scratch) — integer = D-prec digits, else "0".
@@ -6548,7 +6927,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let mut b = Bdr::new(1);
         let z = b.k(b'0' as i64);
         emit(&mut b, 0, z);
-        b.block(vec![i64t], Terminator::Br { target: ASM_DOT, args: vec![0] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: ASM_DOT,
+                args: vec![0],
+            },
+        )
     };
 
     // 18: ASM_INT_TEST(scratch, i) — i ≥ prec ⇒ emit dbuf[i].
@@ -6578,7 +6963,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let ch = b.bini(Add, dig, b'0' as i64);
         emit(&mut b, 0, ch);
         let ni = b.bini(Sub, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: ASM_INT_TEST, args: vec![0, ni] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: ASM_INT_TEST,
+                args: vec![0, ni],
+            },
+        )
     };
 
     // 20: ASM_DOT(scratch) — '.' iff prec>0, then fraction.
@@ -6639,7 +7030,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let ch = b.bini(Add, dig, b'0' as i64);
         emit(&mut b, 0, ch);
         let ni = b.bini(Sub, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: ASM_FRAC_TEST, args: vec![0, ni] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: ASM_FRAC_TEST,
+                args: vec![0, ni],
+            },
+        )
     };
 
     // 23: PAD_START(scratch).
@@ -6663,7 +7060,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let lla = b.bini(Add, 0, FMT_LEAD_O);
         b.store64(lla, lead);
         let z = b.k(0);
-        b.block(vec![i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, z] })
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![0, z],
+            },
+        )
     };
 
     // 24: PAD_FILL_TEST(scratch, j).
@@ -6693,7 +7096,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let sp = b.k(b' ' as i64);
         b.store8(a, sp);
         let nj = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, nj] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![0, nj],
+            },
+        )
     };
 
     // 26: PAD_COPY_TEST(scratch, k).
@@ -6727,7 +7136,13 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         let oa = b.bin(Add, ob, off);
         b.store8(oa, ch);
         let nk = b.bini(Add, 1, 1);
-        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_COPY_TEST, args: vec![0, nk] })
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: PAD_COPY_TEST,
+                args: vec![0, nk],
+            },
+        )
     };
 
     // 28: RET(scratch) — return padded field length.
@@ -6742,11 +7157,35 @@ fn synth_dtoa_fix_big(zero: u32, mul: u32, shl: u32, shr1: u32, inc: u32, divmod
         params: vec![i64t, i64t, i64t, i64t, i64t],
         results: vec![i64t],
         blocks: vec![
-            b_entry, b_special, b_finite, b_mul5_test, b_mul5_body, b_shift, b_shl_do, b_shr_setup,
-            b_shr_loop, b_shr_body, b_shr_round, b_shr_inc, b_dec_init, b_dec_body, b_dec_test,
-            b_asm_sign, b_asm_int, b_asm_int_zero, b_asm_int_test, b_asm_int_body, b_asm_dot,
-            b_asm_frac_test, b_asm_frac_body, b_pad_start, b_pad_fill_test, b_pad_fill_body,
-            b_pad_copy_test, b_pad_copy_body, b_ret,
+            b_entry,
+            b_special,
+            b_finite,
+            b_mul5_test,
+            b_mul5_body,
+            b_shift,
+            b_shl_do,
+            b_shr_setup,
+            b_shr_loop,
+            b_shr_body,
+            b_shr_round,
+            b_shr_inc,
+            b_dec_init,
+            b_dec_body,
+            b_dec_test,
+            b_asm_sign,
+            b_asm_int,
+            b_asm_int_zero,
+            b_asm_int_test,
+            b_asm_int_body,
+            b_asm_dot,
+            b_asm_frac_test,
+            b_asm_frac_body,
+            b_pad_start,
+            b_pad_fill_test,
+            b_pad_fill_body,
+            b_pad_copy_test,
+            b_pad_copy_body,
+            b_ret,
         ],
     }
 }
@@ -12268,7 +12707,9 @@ mod bigint_tests {
         }
         let m = Module {
             funcs: vec![func],
-            memory: Some(svm_ir::Memory { size_log2: WIN_LOG2 }),
+            memory: Some(svm_ir::Memory {
+                size_log2: WIN_LOG2,
+            }),
             ..Default::default()
         };
         let mut fuel = 1_000_000_000u64;
@@ -12286,7 +12727,9 @@ mod bigint_tests {
         }
         let m = Module {
             funcs,
-            memory: Some(svm_ir::Memory { size_log2: WIN_LOG2 }),
+            memory: Some(svm_ir::Memory {
+                size_log2: WIN_LOG2,
+            }),
             ..Default::default()
         };
         let mut fuel = 5_000_000_000u64;
@@ -12313,7 +12756,11 @@ mod bigint_tests {
         let s = format!("{:.*e}", nsig - 1, v);
         let (m, e) = s.split_once('e').unwrap();
         let exp: i64 = e.parse().unwrap();
-        let digits: Vec<u8> = m.bytes().filter(|c| c.is_ascii_digit()).map(|c| c - b'0').collect();
+        let digits: Vec<u8> = m
+            .bytes()
+            .filter(|c| c.is_ascii_digit())
+            .map(|c| c - b'0')
+            .collect();
         assert_eq!(digits.len(), nsig, "ref `{s}` digit count");
         (digits, exp)
     }
@@ -12370,11 +12817,15 @@ mod bigint_tests {
             s.push(if upper { 'E' } else { 'e' });
             s.push(if e < 0 { '-' } else { '+' });
             let ae = e.unsigned_abs();
-            s.push_str(&if ae >= 100 { format!("{ae:03}") } else { format!("{ae:02}") });
+            s.push_str(&if ae >= 100 {
+                format!("{ae:03}")
+            } else {
+                format!("{ae:02}")
+            });
         } else {
             if e >= 0 {
-                for j in 0..=(e as usize) {
-                    s.push((b'0' + d[j]) as char);
+                for &dig in &d[..=e as usize] {
+                    s.push((b'0' + dig) as char);
                 }
             } else {
                 s.push('0');
@@ -12413,14 +12864,18 @@ mod bigint_tests {
         s.push((b'0' + d[0]) as char);
         if prec > 0 {
             s.push('.');
-            for k in 1..=prec {
-                s.push((b'0' + d[k]) as char);
+            for &dig in &d[1..=prec] {
+                s.push((b'0' + dig) as char);
             }
         }
         s.push(if upper { 'E' } else { 'e' });
         s.push(if e < 0 { '-' } else { '+' });
         let ae = e.unsigned_abs();
-        s.push_str(&if ae >= 100 { format!("{ae:03}") } else { format!("{ae:02}") });
+        s.push_str(&if ae >= 100 {
+            format!("{ae:03}")
+        } else {
+            format!("{ae:02}")
+        });
         s
     }
 
@@ -12452,14 +12907,30 @@ mod bigint_tests {
         let a = 256usize;
         let b = 512usize;
         // low-limb difference
-        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[1]), (b, &[2])]);
+        let (r, _) = run(
+            synth_big_cmp(),
+            &[a as i64, b as i64],
+            &[(a, &[1]), (b, &[2])],
+        );
         assert_eq!(ret_i64(&r), -1);
-        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[2]), (b, &[1])]);
+        let (r, _) = run(
+            synth_big_cmp(),
+            &[a as i64, b as i64],
+            &[(a, &[2]), (b, &[1])],
+        );
         assert_eq!(ret_i64(&r), 1);
-        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[9, 9, 9]), (b, &[9, 9, 9])]);
+        let (r, _) = run(
+            synth_big_cmp(),
+            &[a as i64, b as i64],
+            &[(a, &[9, 9, 9]), (b, &[9, 9, 9])],
+        );
         assert_eq!(ret_i64(&r), 0);
         // a high limb dominates a larger low limb
-        let (r, _) = run(synth_big_cmp(), &[a as i64, b as i64], &[(a, &[0, 0, 5]), (b, &[9, 9, 4])]);
+        let (r, _) = run(
+            synth_big_cmp(),
+            &[a as i64, b as i64],
+            &[(a, &[0, 0, 5]), (b, &[9, 9, 4])],
+        );
         assert_eq!(ret_i64(&r), 1);
     }
 
@@ -12467,26 +12938,50 @@ mod bigint_tests {
     fn big_sub_works() {
         let a = 256usize;
         let b = 512usize;
-        let (_, w) = run(synth_big_sub(), &[a as i64, b as i64], &[(a, &[5]), (b, &[3])]);
+        let (_, w) = run(
+            synth_big_sub(),
+            &[a as i64, b as i64],
+            &[(a, &[5]), (b, &[3])],
+        );
         assert_eq!(limbs(&w, a, 2), vec![2, 0]);
         // borrow across a limb: 2^32 - 1
-        let (_, w) = run(synth_big_sub(), &[a as i64, b as i64], &[(a, &[0, 1]), (b, &[1])]);
+        let (_, w) = run(
+            synth_big_sub(),
+            &[a as i64, b as i64],
+            &[(a, &[0, 1]), (b, &[1])],
+        );
         assert_eq!(limbs(&w, a, 2), vec![0xFFFF_FFFF, 0]);
         // multi-limb borrow chain: 2^64 - 1
-        let (_, w) = run(synth_big_sub(), &[a as i64, b as i64], &[(a, &[0, 0, 1]), (b, &[1])]);
+        let (_, w) = run(
+            synth_big_sub(),
+            &[a as i64, b as i64],
+            &[(a, &[0, 0, 1]), (b, &[1])],
+        );
         assert_eq!(limbs(&w, a, 3), vec![0xFFFF_FFFF, 0xFFFF_FFFF, 0]);
     }
 
     #[test]
     fn big_mul_small_works() {
         let a = 256usize;
-        let (_, w) = run(synth_big_mul_small(), &[a as i64, 2], &[(a, &[0xFFFF_FFFF])]);
+        let (_, w) = run(
+            synth_big_mul_small(),
+            &[a as i64, 2],
+            &[(a, &[0xFFFF_FFFF])],
+        );
         assert_eq!(limbs(&w, a, 2), vec![0xFFFF_FFFE, 1]); // 2·(2^32-1) = 2^33-2
-        let (_, w) = run(synth_big_mul_small(), &[a as i64, 10], &[(a, &[123_456_789])]);
+        let (_, w) = run(
+            synth_big_mul_small(),
+            &[a as i64, 10],
+            &[(a, &[123_456_789])],
+        );
         assert_eq!(limbs(&w, a, 2), vec![1_234_567_890, 0]);
         // carry chain across two limbs: (2^64-1)·10
         let prod = (u64::MAX as u128) * 10;
-        let (_, w) = run(synth_big_mul_small(), &[a as i64, 10], &[(a, &[0xFFFF_FFFF, 0xFFFF_FFFF])]);
+        let (_, w) = run(
+            synth_big_mul_small(),
+            &[a as i64, 10],
+            &[(a, &[0xFFFF_FFFF, 0xFFFF_FFFF])],
+        );
         let got = limbs(&w, a, 3);
         let exp = [prod as u32, (prod >> 32) as u32, (prod >> 64) as u32];
         assert_eq!(got, exp);
@@ -12524,7 +13019,11 @@ mod bigint_tests {
         let (_, w) = run(synth_big_inc(), &[a as i64], &[(a, &[41])]);
         assert_eq!(limbs(&w, a, 1), vec![42]);
         // carry across two limbs: (2^64 - 1) + 1 = 2^64
-        let (_, w) = run(synth_big_inc(), &[a as i64], &[(a, &[0xFFFF_FFFF, 0xFFFF_FFFF])]);
+        let (_, w) = run(
+            synth_big_inc(),
+            &[a as i64],
+            &[(a, &[0xFFFF_FFFF, 0xFFFF_FFFF])],
+        );
         assert_eq!(limbs(&w, a, 3), vec![0, 0, 1]);
     }
 
@@ -12533,17 +13032,17 @@ mod bigint_tests {
         let scratch = 1024usize;
         let dbuf = scratch + 496;
         let cases: &[(f64, usize)] = &[
-            (3.14, 3),
+            (3.25, 3),
             (1.0, 3),
             (2.0 / 3.0, 5),
             (0.1, 17),
-            (9.999, 3),         // round carries into a new leading digit (→ 1.00e1)
+            (9.999, 3), // round carries into a new leading digit (→ 1.00e1)
             (123456.789, 9),
-            (1e30, 5),          // large positive exponent (left-shift build path)
-            (1e-30, 5),         // negative exponent (denominator scaling)
-            (2.5, 1),           // round-half-to-even tie → 2
-            (3.5, 1),           // tie → 4
-            (5e-324, 3),        // smallest subnormal (E_est far off ⇒ many fixup steps)
+            (1e30, 5),                   // large positive exponent (left-shift build path)
+            (1e-30, 5),                  // negative exponent (denominator scaling)
+            (2.5, 1),                    // round-half-to-even tie → 2
+            (3.5, 1),                    // tie → 4
+            (5e-324, 3),                 // smallest subnormal (E_est far off ⇒ many fixup steps)
             (1.7976931348623157e308, 5), // largest finite double
         ];
         for &(v, nsig) in cases {
@@ -12557,7 +13056,10 @@ mod bigint_tests {
         // zero ⇒ all-zero digits, E = 0
         let (res, win) = run_funcs(dtoa_funcs(), &[0i64, 4, scratch as i64], &[]);
         assert_eq!(ret_i64(&res), 0);
-        assert_eq!((0..4).map(|j| win[dbuf + j]).collect::<Vec<_>>(), vec![0, 0, 0, 0]);
+        assert_eq!(
+            (0..4).map(|j| win[dbuf + j]).collect::<Vec<_>>(),
+            vec![0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -12566,7 +13068,7 @@ mod bigint_tests {
         let out = scratch + 1536;
         // (value, prec); no flags, no width
         let cases: &[(f64, usize)] = &[
-            (3.14, 2),
+            (3.25, 2),
             (0.0, 6),
             (2.0 / 3.0, 6),
             (1e30, 3),
@@ -12581,7 +13083,8 @@ mod bigint_tests {
         ];
         for &(v, prec) in cases {
             let bits = v.to_bits() as i64;
-            let (res, win) = run_funcs(sci_funcs(), &[bits, prec as i64, 0, 0, scratch as i64], &[]);
+            let (res, win) =
+                run_funcs(sci_funcs(), &[bits, prec as i64, 0, 0, scratch as i64], &[]);
             let len = ret_i64(&res) as usize;
             let got = String::from_utf8(win[out..out + len].to_vec()).unwrap();
             assert_eq!(got, c_e(v, prec, false), "v={v} prec={prec}");
@@ -12590,25 +13093,69 @@ mod bigint_tests {
         let bits = 6.022e23f64.to_bits() as i64;
         let (res, win) = run_funcs(sci_funcs(), &[bits, 3, 0, 8, scratch as i64], &[]); // flags bit3 = upper
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), c_e(6.022e23, 3, true));
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            c_e(6.022e23, 3, true)
+        );
         // +/space flags
-        let (res, win) = run_funcs(sci_funcs(), &[1.5f64.to_bits() as i64, 2, 0, 2, scratch as i64], &[]);
+        let (res, win) = run_funcs(
+            sci_funcs(),
+            &[1.5f64.to_bits() as i64, 2, 0, 2, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "+1.50e+00");
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "+1.50e+00"
+        );
         // width 14, right-justified
-        let (res, win) = run_funcs(sci_funcs(), &[3.14f64.to_bits() as i64, 2, 14, 0, scratch as i64], &[]);
+        let (res, win) = run_funcs(
+            sci_funcs(),
+            &[3.25f64.to_bits() as i64, 2, 14, 0, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "      3.14e+00");
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "      3.25e+00"
+        );
         // inf / nan, lower and upper
-        let (res, win) = run_funcs(sci_funcs(), &[f64::INFINITY.to_bits() as i64, 6, 0, 0, scratch as i64], &[]);
+        let (res, win) = run_funcs(
+            sci_funcs(),
+            &[f64::INFINITY.to_bits() as i64, 6, 0, 0, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "inf");
-        let (res, win) = run_funcs(sci_funcs(), &[f64::NAN.to_bits() as i64, 6, 0, 8, scratch as i64], &[]);
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "inf"
+        );
+        let (res, win) = run_funcs(
+            sci_funcs(),
+            &[f64::NAN.to_bits() as i64, 6, 0, 8, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "NAN");
-        let (res, win) = run_funcs(sci_funcs(), &[(f64::NEG_INFINITY).to_bits() as i64, 6, 0, 0, scratch as i64], &[]);
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "NAN"
+        );
+        let (res, win) = run_funcs(
+            sci_funcs(),
+            &[
+                (f64::NEG_INFINITY).to_bits() as i64,
+                6,
+                0,
+                0,
+                scratch as i64,
+            ],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "-inf");
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "-inf"
+        );
     }
 
     #[test]
@@ -12628,7 +13175,7 @@ mod bigint_tests {
             ]
         };
         let cases: &[(f64, usize)] = &[
-            (3.14159, 2),
+            (3.375, 2),
             (0.0, 6),
             (0.1, 3),
             (2.5, 0), // tie ⇒ even ⇒ 2
@@ -12639,12 +13186,12 @@ mod bigint_tests {
             (2.0 / 3.0, 4),
             (-2.75, 6),
             (-0.0, 2),
-            (9007199254740992.0, 1),     // 2^53
-            (1e30, 2),                   // 33-digit integer (over the 128-bit ceiling)
-            (1e300, 0),                  // huge — the case the 128-bit path traps on
-            (1e-300, 3),                 // tiny ⇒ 0.000
-            (0.0000006, 6),              // tiny round-up edge ⇒ 0.000001
-            (0.0000004, 6),              // ⇒ 0.000000
+            (9007199254740992.0, 1), // 2^53
+            (1e30, 2),               // 33-digit integer (over the 128-bit ceiling)
+            (1e300, 0),              // huge — the case the 128-bit path traps on
+            (1e-300, 3),             // tiny ⇒ 0.000
+            (0.0000006, 6),          // tiny round-up edge ⇒ 0.000001
+            (0.0000004, 6),          // ⇒ 0.000000
             (1234567890123456.0, 4),
         ];
         for &(v, prec) in cases {
@@ -12655,15 +13202,36 @@ mod bigint_tests {
             assert_eq!(got, format!("{v:.prec$}"), "v={v} prec={prec}");
         }
         // sign flags / width / inf-nan
-        let (res, win) = run_funcs(fns(), &[1.5f64.to_bits() as i64, 2, 0, 2, scratch as i64], &[]);
+        let (res, win) = run_funcs(
+            fns(),
+            &[1.5f64.to_bits() as i64, 2, 0, 2, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "+1.50");
-        let (res, win) = run_funcs(fns(), &[2.5f64.to_bits() as i64, 1, 10, 0, scratch as i64], &[]);
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "+1.50"
+        );
+        let (res, win) = run_funcs(
+            fns(),
+            &[2.5f64.to_bits() as i64, 1, 10, 0, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "       2.5");
-        let (res, win) = run_funcs(fns(), &[f64::INFINITY.to_bits() as i64, 6, 0, 8, scratch as i64], &[]);
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "       2.5"
+        );
+        let (res, win) = run_funcs(
+            fns(),
+            &[f64::INFINITY.to_bits() as i64, 6, 0, 8, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "INF");
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "INF"
+        );
     }
 
     #[test]
@@ -12671,7 +13239,7 @@ mod bigint_tests {
         let scratch = 4096usize;
         let out = scratch + 1536;
         let cases: &[(f64, usize)] = &[
-            (3.14159, 6),
+            (3.375, 6),
             (100000.0, 6),  // E=5 < P ⇒ f-mode "100000"
             (1000000.0, 6), // E=6 ≥ P ⇒ e-mode "1e+06"
             (0.0001, 6),    // E=-4 ⇒ f-mode
@@ -12691,24 +13259,43 @@ mod bigint_tests {
         ];
         for &(v, prec) in cases {
             let bits = v.to_bits() as i64;
-            let (res, win) = run_funcs(gen_funcs(), &[bits, prec as i64, 0, 0, scratch as i64], &[]);
+            let (res, win) =
+                run_funcs(gen_funcs(), &[bits, prec as i64, 0, 0, scratch as i64], &[]);
             let len = ret_i64(&res) as usize;
             let got = String::from_utf8(win[out..out + len].to_vec()).unwrap();
             assert_eq!(got, c_g(v, prec, false), "v={v} prec={prec}");
         }
         // %G uppercase + width + inf/nan
-        let (res, win) = run_funcs(gen_funcs(), &[1e-20f64.to_bits() as i64, 4, 0, 8, scratch as i64], &[]);
+        let (res, win) = run_funcs(
+            gen_funcs(),
+            &[1e-20f64.to_bits() as i64, 4, 0, 8, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), c_g(1e-20, 4, true));
-        let (res, win) = run_funcs(gen_funcs(), &[f64::INFINITY.to_bits() as i64, 6, 0, 0, scratch as i64], &[]);
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            c_g(1e-20, 4, true)
+        );
+        let (res, win) = run_funcs(
+            gen_funcs(),
+            &[f64::INFINITY.to_bits() as i64, 6, 0, 0, scratch as i64],
+            &[],
+        );
         let len = ret_i64(&res) as usize;
-        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "inf");
+        assert_eq!(
+            String::from_utf8(win[out..out + len].to_vec()).unwrap(),
+            "inf"
+        );
     }
 
     #[test]
     fn big_zero_works() {
         let a = 256usize;
-        let (_, w) = run(synth_big_zero(), &[a as i64], &[(a, &[1, 2, 3, 4, 5, 6, 7, 8])]);
+        let (_, w) = run(
+            synth_big_zero(),
+            &[a as i64],
+            &[(a, &[1, 2, 3, 4, 5, 6, 7, 8])],
+        );
         assert_eq!(limbs(&w, a, 8), vec![0; 8]);
     }
 
@@ -12753,7 +13340,11 @@ mod bigint_tests {
         let expv: Vec<u32> = (0..5)
             .map(|k| {
                 let sh = 32 * k;
-                if sh >= 128 { 0 } else { (exp >> sh) as u32 }
+                if sh >= 128 {
+                    0
+                } else {
+                    (exp >> sh) as u32
+                }
             })
             .collect();
         assert_eq!(got, expv);
