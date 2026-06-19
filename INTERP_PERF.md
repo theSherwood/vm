@@ -209,17 +209,36 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   address_space still byte-identical.
 
 ### Phase 3 — per-op seam overhead
-- Move fuel accounting to **back-edges/calls** instead of per op (still bounds every loop, so
-  termination is guaranteed) — *only if* it can be shown not to change verified-module
-  trap-vs-complete outcomes vs the JIT. If that can't be guaranteed cheaply, keep per-op fuel.
-- Hoist/curry the debug-seam and preemption checks out of the inner loop for the common
-  (undebugged, real-pool) case.
-- **Success:** lower fixed per-op cost on all kernels; determinism and debug behavior preserved.
+- **[investigated — not worth it] Per-op control overhead is not the bottleneck.** Measured (A/B
+  bench, removing the *entire* per-op budget+fuel machinery from the bytecode `resume` loop): only
+  **~2–3%** (alu 17.3 → 16.9 ns, call 30.3 → 29.6 ns; mem within noise). Findings:
+  - **Fuel → back-edges is a dead end for the bytecode engine.** The per-op *budget* check **cannot**
+    move off the per-op path: `budget = 1` op-stepping is load-bearing for the debug seam (1c-3,
+    `ir_trace`) and the demand-coroutine rewind (1c-5j). Moving only *fuel* to back-edges saves ~1%
+    and changes the `fuel` unit (ops → back-edges), a caller-visible contract change. (The JIT polls
+    its interrupt cell at back-edges + function entries, not per-op; `bytecode_diff` already skips
+    `OutOfFuel` and tolerates per-op accounting differences, so the differential wouldn't break — but
+    the win doesn't justify the contract change.)
+  - **The real floor is the match dispatch + the `regs` bounds checks**, and those can't be elided:
+    `svm-interp` is `#![forbid(unsafe_code)]` (it is the trusted reference oracle), so every guest op
+    pays 2–3 bounds-checked register accesses. These are *predictable* branches, so a branch predictor
+    makes them ~free — which is why removing them would land in the same ~3–5% range as the budget
+    experiment. The Phase-2 mem win (~13%) was larger precisely because it removed *real work* (a
+    per-byte atomic loop → one machine load via `svm-mem`, which isolates audited `unsafe`), not a
+    predicted branch.
+  - **Decision:** keep per-op fuel/budget. Squeezing the register file would need either an
+    audited-`unsafe` register-file crate (svm-mem-style — a `forbid-unsafe`-principle decision for a
+    ~3–5% expected gain) or Phase 4; neither is justified while the interpreter is the oracle + the
+    JIT-not-viable fallback (the JIT is the production hot path) and the bytecode engine already runs
+    **~1.7–2.5× faster than the tree-walker** across the kernels.
 
 ### Phase 4 — stretch: full flat bytecode (shape B)
 - Single instruction pointer, threaded/tail-call dispatch, value register array with minimized
   bounds checks, PC→`IrPc` table for the debugger.
-- Only if Phases 1–3 leave meaningful headroom and the ROI justifies re-expressing the seams.
+- Only if Phases 1–3 leave meaningful headroom and the ROI justifies re-expressing the seams. **Per
+  the Phase-3 investigation above, the headroom is small (~3–5%, predicted-branch-bound) and capped
+  by `forbid-unsafe`; threaded dispatch is also impractical in safe Rust (no computed goto). Deferred
+  unless the interpreter's absolute speed becomes a priority over its oracle role.**
 
 ---
 
