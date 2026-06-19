@@ -1,8 +1,8 @@
 # Durable Domains — Snapshot / Restore / Clone
 
 > **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the interpreter
-> + Phase 3.3 (JIT parity) complete single-vCPU and **multi-vCPU freeze + thaw** (deferred single-worker
-> `thread.spawn` + `FrozenVCpu` residue + thaw re-attach).** This file is the single source of truth for the *design and
+> + Phase 3.3 (JIT parity) complete single-vCPU and multi-vCPU freeze + thaw + **slice 3.4 (full
+> multi-vCPU scope: nested spawns + child-owned fibers, both backends, snapshot v4)**.** This file is the single source of truth for the *design and
 > implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
 > (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
 > durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
@@ -889,23 +889,29 @@ depth. The genuine gaps are narrow:
   namespaces on the durable single-worker path** to keep handle values byte-identical. Thaw groups the
   seed by `parent_task`, processes parents-before-children, and rebuilds each parent's table.
 
-**Staging (interp-oracle-first per stage, cross-backend byte-identity test at each):**
-- **A — child-owned fibers, interp:** fix the `frozen_fibers` clobber→extend; drive a child's mid-resume
-  chain under its swapped context; confirm the root's shared sweep flattens child *parked* fibers (pin
-  the sweep-vs-park order with a test). No format bump.
-- **B — child-owned fibers, JIT + cross-backend:** per-child `freeze_drive` in `drive_frozen_spawns`,
-  drain each child runtime's residue into the run residue; byte-identical-vs-interp + thaw-on-JIT tests.
-- **C — nested spawns, format v4 + interp:** add `FrozenVCpu.parent_task`, bump `FORMAT_VERSION`,
-  regenerate canonical fixtures; stamp `parent_task` at `thread.spawn`; parent-first per-parent thaw
-  re-attach.
-- **D — nested spawns, JIT + cross-backend:** loop-drain `pending_spawns`, thread parent-task into inline
-  runs, per-vCPU JIT join tables on the durable path, parent-first `thaw_reattach_and_run`. **Highest-risk
-  byte-identity items:** the JIT per-vCPU handle values must equal the interp's, and the freeze-time
-  child-running order (interp scheduler vs JIT drain) must match — both locked by the comparison test
-  before the thaw side is trusted.
+**Staging (interp-oracle-first per stage, cross-backend byte-identity test at each) — ALL DONE:**
+- **A — child-owned fibers, interp (DONE):** every vCPU runs its **own** `freeze_drive` (the root's runs
+  before the children exist, so it can't flatten a child's fiber); the per-vCPU residue now **extends**
+  the shared host list instead of clobbering it. No format bump. (`multivcpu::child_owns_fiber_…`.)
+- **B — child-owned fibers, JIT + cross-backend (DONE):** per-child `freeze_drive` in `run_child_inline`
+  (the child's runtime is `set_durable_env`-armed so the driver's `Complete` arm records residue),
+  drained into the run residue. (`durable_multivcpu_jit::jit_freezes_and_thaws_a_child_owned_fiber_…`.)
+- **C — nested spawns, format v4 + interp (DONE):** `FrozenVCpu.parent_task`; `FORMAT_VERSION` 3→4;
+  stamp `parent_task` at `thread.spawn`; thaw re-attach rebuilt **parent-first** with per-parent join
+  tables (a `BTreeMap<task, VCpu>`, appending each child's handle into its parent's table in spawn
+  order). (`multivcpu::nested_spawn_tree_…` + `roundtrip::nested_spawn_tree_…through_the_codec`.)
+- **D — nested spawns, JIT + cross-backend (DONE):** the JIT durable path gained **per-vCPU join
+  tables** (`Domain::dchildren`, keyed by spawning task, routed by `cur_task`) so a grandchild's guest
+  handle is its index in its *parent's* table — byte-identical to the interp. `drive_frozen_spawns`
+  **loop-drains** `pending_spawns` (a grandchild deferred during a child's inline run is caught on the
+  next BFS batch — matching the interp's runnable order), and a global monotonic `next_task` matches the
+  interp's task ids. **Thaw runs children in *descending* task order (children before parents)** so a
+  parent's re-executed `thread.join` finds an already-completed child — the JIT can't park-and-resume a
+  parent on the single worker (the interp parks it); a `REWINDING` vCPU reloads its effects, so the
+  order can't change the result. (`durable_multivcpu_jit::jit_freezes_and_thaws_a_nested_tree_…`.)
 
 The durable path stays strictly single-worker (writers run inline on one OS thread), so no new loom
-seam. **Out of scope (needs Phase-4 STW):** a *concurrent* mid-run freeze where a grandchild is
+seam (re-verified). **Out of scope (needs Phase-4 STW):** a *concurrent* mid-run freeze where a grandchild is
 mid-compute on its own OS thread (the trigger flips only the running vCPU's word); recycled-context
 nested freeze; and a child blocked in a host `Blocking.work` at the freeze instant. This slice targets
 the deterministic single-worker paths (freeze-from-start and `arm_freeze_after` at a fiber safepoint).

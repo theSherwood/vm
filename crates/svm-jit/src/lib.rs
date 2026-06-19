@@ -352,6 +352,10 @@ pub struct FrozenFiber {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FrozenVCpu {
     pub task: usize,
+    /// The task that **spawned** this child (slice 3.4: nested spawns) — `0` for the root's direct
+    /// children, a child's task for a grandchild. Thaw rebuilds the per-parent join tables from this so
+    /// a grandchild's reloaded handle resolves in its parent's table. Mirror of `svm_interp`'s field.
+    pub parent_task: usize,
     pub func: i32,
     pub args: Vec<i64>,
     pub shadow_sp: u64,
