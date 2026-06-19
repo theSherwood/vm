@@ -1606,11 +1606,12 @@ fn freeze_drive(
         if let Some(m) = ctx.mem.as_mut() {
             m.durable_set_sp(super::shadow_region_base(slot + 1));
         }
+        // Deliver a placeholder resume value (inert; the thaw redelivers), then drive the fiber to its
+        // base return under `UNWINDING` (zero forward progress: the poll fires immediately after the
+        // suspend). `step_vcpu` runs the active `Vm` to completion in one call, and the unwind does no
+        // fiber/thread ops, so the run-shared registries are untouched and the only stop is `Done`.
         let mut vm = vm;
-        vm.set(suspend_dst, Reg::from_i64(0)); // placeholder resume value (inert; the thaw redelivers)
-        // Drive the fiber to its base return under `UNWINDING` (zero forward progress: the poll fires
-        // immediately). `step_vcpu` runs the active `Vm` to completion in one call, and the unwind does
-        // no fiber/thread ops, so the run-shared registries are untouched and the only stop is `Done`.
+        vm.set(suspend_dst, Reg::from_i64(0));
         let mut sub = VTask {
             active: vm,
             active_id: ROOT_FIBER,
