@@ -169,9 +169,9 @@ use llvm_ir::{constant::Constant, constant::Float, BasicBlock, Function, Module 
 use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncName, IToF, Inst, IntTy, IntUnOp, Loc, Module, SsaLoc, Terminator, TypeDef, ValIdx,
-    ValType, VarInfo, VarLoc,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
+    FloatTy, Func, FuncName, IToF, Inst, IntTy, IntUnOp, Loc, Module, Ordering, SsaLoc, Terminator,
+    TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 pub mod di;
@@ -1651,6 +1651,10 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         I::Alloca(a) => locals(&[&a.num_elements]),
         I::Load(l) => locals(&[&l.address]),
         I::Store(st) => locals(&[&st.address, &st.value]),
+        // Atomics (§12): same operand uses as the corresponding load/store, plus the rmw value /
+        // cmpxchg expected+replacement.
+        I::AtomicRMW(r) => locals(&[&r.address, &r.value]),
+        I::CmpXchg(cx) => locals(&[&cx.address, &cx.expected, &cx.replacement]),
         I::GetElementPtr(g) => {
             let mut v = locals(&[&g.address]);
             v.extend(g.indices.iter().filter_map(|o| match o {
@@ -10193,6 +10197,90 @@ fn translate_block(
     })
 }
 
+/// The width class of an atomic operation's value type. `i32`/`i64`/pointer map to a native
+/// `IntTy`; `i8`/`i16` are **narrow** — svm-ir has no sub-word atomic (it keeps only `i32`/`i64`),
+/// so they emulate via a 32-bit CAS loop over the enclosing aligned word (DESIGN §3b note 2).
+enum AtomWidth {
+    Wide(IntTy),
+    Narrow(u8), // byte count: 1 (i8) or 2 (i16)
+}
+
+fn atom_width(ty: &Type) -> Result<AtomWidth, Error> {
+    match ty {
+        Type::IntegerType { bits } => match bits {
+            8 => Ok(AtomWidth::Narrow(1)),
+            16 => Ok(AtomWidth::Narrow(2)),
+            32 => Ok(AtomWidth::Wide(IntTy::I32)),
+            64 => Ok(AtomWidth::Wide(IntTy::I64)),
+            b => unsup(format!("atomic on i{b} (only i8/i16/i32/i64)")),
+        },
+        Type::PointerType { .. } => Ok(AtomWidth::Wide(IntTy::I64)),
+        other => unsup(format!("atomic on non-integer type {other}")),
+    }
+}
+
+/// Map an LLVM `atomicrmw` binop to the svm-ir [`AtomicRmwOp`], if svm-ir has it natively. `nand`,
+/// the min/max family, and the float ops have no native op — `None` ⇒ fail-closed for now (a later
+/// slice can CAS-loop-emulate them, like the narrow path).
+fn rmw_op(op: llvm_ir::instruction::RMWBinOp) -> Option<AtomicRmwOp> {
+    use llvm_ir::instruction::RMWBinOp as L;
+    Some(match op {
+        L::Xchg => AtomicRmwOp::Xchg,
+        L::Add => AtomicRmwOp::Add,
+        L::Sub => AtomicRmwOp::Sub,
+        L::And => AtomicRmwOp::And,
+        L::Or => AtomicRmwOp::Or,
+        L::Xor => AtomicRmwOp::Xor,
+        _ => return None,
+    })
+}
+
+// Narrow-atomic RMW op codes passed to the `__svm_atomic_rmw_narrow` helper.
+const NARROW_RMW_XCHG: i64 = 0;
+const NARROW_RMW_ADD: i64 = 1;
+const NARROW_RMW_SUB: i64 = 2;
+const NARROW_RMW_AND: i64 = 3;
+const NARROW_RMW_OR: i64 = 4;
+const NARROW_RMW_XOR: i64 = 5;
+
+/// LLVM `atomicrmw` binop → narrow-helper opcode (the subset svm-ir/the helper supports).
+fn narrow_rmw_opcode(op: llvm_ir::instruction::RMWBinOp) -> Option<i64> {
+    use llvm_ir::instruction::RMWBinOp as L;
+    Some(match op {
+        L::Xchg => NARROW_RMW_XCHG,
+        L::Add => NARROW_RMW_ADD,
+        L::Sub => NARROW_RMW_SUB,
+        L::And => NARROW_RMW_AND,
+        L::Or => NARROW_RMW_OR,
+        L::Xor => NARROW_RMW_XOR,
+        _ => return None,
+    })
+}
+
+// Narrow (i8/i16) atomic lowering — emulated via a 32-bit CAS loop over the enclosing aligned word
+// in a synthesized helper. (Implemented in the next commit; fail-closed until then.)
+fn lower_narrow_atomic_load(_ctx: &mut BlockCtx, _addr: ValIdx, _w: u8) -> Result<ValIdx, Error> {
+    unsup("narrow (i8/i16) atomic load — CAS-loop slice (next commit)")
+}
+fn lower_narrow_atomic_rmw(
+    _ctx: &mut BlockCtx,
+    _addr: ValIdx,
+    _value: ValIdx,
+    _w: u8,
+    _opcode: i64,
+) -> Result<ValIdx, Error> {
+    unsup("narrow (i8/i16) atomicrmw — CAS-loop slice (next commit)")
+}
+fn lower_narrow_atomic_cas(
+    _ctx: &mut BlockCtx,
+    _addr: ValIdx,
+    _expected: ValIdx,
+    _replacement: ValIdx,
+    _w: u8,
+) -> Result<(ValIdx, ValIdx), Error> {
+    unsup("narrow (i8/i16) cmpxchg — CAS-loop slice (next commit)")
+}
+
 fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<(), Error> {
     use Instruction as I;
     // The op's integer width, from operand0 (both operands share a type in LLVM binops).
@@ -10222,6 +10310,25 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
 
     // No-result instructions (effects only): handle and return early.
     if let I::Store(st) = instr {
+        // A `store atomic` (seq-cst): a native `iN.atomic.store` for i32/i64, or the narrow path for
+        // i8/i16 (an `xchg` CAS loop over the enclosing word, discarding the old value).
+        if st.atomicity.is_some() {
+            let addr = ctx.operand(&st.address)?;
+            let value = ctx.operand(&st.value)?;
+            match atom_width(st.value.get_type(types).as_ref())? {
+                AtomWidth::Wide(ty) => ctx.push_effect(Inst::AtomicStore {
+                    ty,
+                    addr,
+                    value,
+                    offset: 0,
+                    order: Ordering::SeqCst,
+                }),
+                AtomWidth::Narrow(w) => {
+                    lower_narrow_atomic_rmw(ctx, addr, value, w, NARROW_RMW_XCHG)?;
+                }
+            }
+            return Ok(());
+        }
         let addr = ctx.operand(&st.address)?;
         let value = ctx.operand(&st.value)?;
         // A 128-bit vector store is a 16-byte `v128.store`; everything else is a width-tagged `store`.
@@ -10241,6 +10348,42 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 offset: 0,
                 align: 0,
             });
+        }
+        return Ok(());
+    }
+    // `cmpxchg` (seq-cst) yields a `{ iN old, i1 success }` pair (§3a multi-result). The CAS gives the
+    // old value; success is `old == expected`. i32/i64 → `iN.atomic.cmpxchg`; i8/i16 → the narrow CAS.
+    if let I::CmpXchg(cx) = instr {
+        let addr = ctx.operand(&cx.address)?;
+        let expected = ctx.operand(&cx.expected)?;
+        let replacement = ctx.operand(&cx.replacement)?;
+        let (old, exp_cmp, cmp_ty) = match atom_width(cx.expected.get_type(types).as_ref())? {
+            AtomWidth::Wide(ty) => {
+                let old = ctx.push(Inst::AtomicCmpxchg {
+                    ty,
+                    addr,
+                    expected,
+                    replacement,
+                    offset: 0,
+                    order: Ordering::SeqCst,
+                });
+                (old, expected, ty)
+            }
+            // The narrow helper returns the old field and the masked `expected`, both `i32`-width.
+            AtomWidth::Narrow(w) => {
+                let (old, masked_exp) =
+                    lower_narrow_atomic_cas(ctx, addr, expected, replacement, w)?;
+                (old, masked_exp, IntTy::I32)
+            }
+        };
+        let success = ctx.push(Inst::IntCmp {
+            ty: cmp_ty,
+            op: CmpOp::Eq,
+            a: old,
+            b: exp_cmp,
+        });
+        if let Some(&vid) = ctx.s.name2id.get(&cx.dest) {
+            ctx.agg.insert(vid, vec![old, success]);
         }
         return Ok(());
     }
@@ -10455,8 +10598,21 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         I::Load(l) => {
             let addr = ctx.operand(&l.address)?;
-            // A 128-bit vector load is a 16-byte `v128.load`; everything else a width-tagged `load`.
-            if vec128_shape(l.loaded_ty.as_ref()).is_some() {
+            // A `load atomic` (seq-cst): a native `iN.atomic.load` for i32/i64; for i8/i16, an
+            // atomic load of the enclosing aligned 32-bit word then extract the field — atomic for
+            // the narrow value (no CAS needed: a single aligned word read sees a consistent byte).
+            if l.atomicity.is_some() {
+                let v = match atom_width(l.loaded_ty.as_ref())? {
+                    AtomWidth::Wide(ty) => ctx.push(Inst::AtomicLoad {
+                        ty,
+                        addr,
+                        offset: 0,
+                        order: Ordering::SeqCst,
+                    }),
+                    AtomWidth::Narrow(w) => lower_narrow_atomic_load(ctx, addr, w)?,
+                };
+                (&l.dest, v)
+            } else if vec128_shape(l.loaded_ty.as_ref()).is_some() {
                 (
                     &l.dest,
                     ctx.push(Inst::V128Load {
@@ -10477,6 +10633,35 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     }),
                 )
             }
+        }
+        // `atomicrmw <op>` (seq-cst), yielding the old value. i32/i64 with a natively-supported op
+        // → `iN.atomic.rmw`; i8/i16 (or any width via the op map) → the narrow CAS loop. Unsupported
+        // ops (nand/min/max/float) fail-closed for now.
+        I::AtomicRMW(rmw) => {
+            let addr = ctx.operand(&rmw.address)?;
+            let value = ctx.operand(&rmw.value)?;
+            let v = match atom_width(rmw.value.get_type(types).as_ref())? {
+                AtomWidth::Wide(ty) => {
+                    let op = rmw_op(rmw.operation).ok_or_else(|| {
+                        Error::Unsupported(format!("atomicrmw {:?}", rmw.operation))
+                    })?;
+                    ctx.push(Inst::AtomicRmw {
+                        ty,
+                        op,
+                        addr,
+                        value,
+                        offset: 0,
+                        order: Ordering::SeqCst,
+                    })
+                }
+                AtomWidth::Narrow(w) => {
+                    let op = narrow_rmw_opcode(rmw.operation).ok_or_else(|| {
+                        Error::Unsupported(format!("narrow atomicrmw {:?}", rmw.operation))
+                    })?;
+                    lower_narrow_atomic_rmw(ctx, addr, value, w, op)?
+                }
+            };
+            (&rmw.dest, v)
         }
         I::GetElementPtr(g) => {
             let addr = translate_gep(ctx, g, types)?;

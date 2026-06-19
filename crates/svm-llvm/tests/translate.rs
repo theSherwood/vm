@@ -1264,6 +1264,59 @@ fn tail_call_mutual_recursion() {
     check_powerbox_vs_native("tail_mutual", src, b"");
 }
 
+// C11 `<stdatomic.h>` exercising every native atomic instruction the on-ramp now lowers: rmw
+// add/sub/and/or/xor and exchange, load, store, and compare-exchange (success + failure) on `i32`
+// and `i64`. Single-threaded, so seq-cst is trivially observable.
+const ATOMICS_WIDE_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_int a = 0;\n\
+        atomic_fetch_add(&a, 5); atomic_fetch_sub(&a, 2);\n\
+        atomic_fetch_or(&a, 8); atomic_fetch_and(&a, 0xFF); atomic_fetch_xor(&a, 1);\n\
+        int old = atomic_exchange(&a, 100);\n\
+        int loaded = atomic_load(&a);\n\
+        atomic_store(&a, 42);\n\
+        int e1 = 42; int ok1 = atomic_compare_exchange_strong(&a, &e1, 99);\n\
+        int e2 = 7;  int ok2 = atomic_compare_exchange_strong(&a, &e2, 0);\n\
+        atomic_long b = 1000000000000L; atomic_fetch_add(&b, 1);\n\
+        printf(\"%d %d %d %d %d %ld\\n\", old, loaded, ok1, ok2, atomic_load(&a), atomic_load(&b));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_wide() {
+    check_powerbox_vs_native("atomics_wide", ATOMICS_WIDE_SRC, b"");
+}
+
+#[test]
+fn atomics_wide_lowers_and_runs() {
+    // Local validation (no native cc): the native atomics lower, verify, and run to the
+    // hand-computed result. a: 0→5→3→11→11→10; old=10, store 42, cas(42→99) ok, cas(7) fail, a=99;
+    // b: 1e12 + 1.
+    let Some(bc) = compile_to_bc("atomics_w", ATOMICS_WIDE_SRC) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let has_atomic = t.module.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                svm_ir::Inst::AtomicRmw { .. }
+                    | svm_ir::Inst::AtomicCmpxchg { .. }
+                    | svm_ir::Inst::AtomicLoad { .. }
+                    | svm_ir::Inst::AtomicStore { .. }
+            )
+        })
+    });
+    assert!(
+        has_atomic,
+        "expected native atomic ops in the lowered module"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"10 100 1 0 99 1000000000001\n");
+}
+
 #[test]
 fn tail_call_lowers_and_runs() {
     // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
