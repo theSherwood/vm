@@ -34,10 +34,12 @@
 //! tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
-//! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
-//! tree-walker (`bytecode_diff.rs`, `bytecode_{caps,fibers,threads,coroutines,instantiate,
-//! separate_module,demand_coroutine,tailcall,debug,gc_roots,durable,dynlink}.rs`; `gc_roots` checks
-//! soundness rather than equality; `durable` checks freeze/thaw artifact + round-trip equality).
+//! via `run_fast`/`run_with_host_fast` (and, with a trap-time backtrace, `run_with_host_fast_traced`).
+//! Correctness is gated by exact-equality harnesses against the tree-walker (`bytecode_diff.rs` — which
+//! also checks trap-backtrace parity on every trapping generated module, `bytecode_{caps,fibers,threads,
+//! coroutines,instantiate,separate_module,demand_coroutine,tailcall,debug,traced,gc_roots,durable,
+//! dynlink}.rs`; `gc_roots` checks soundness rather than equality; `durable` checks freeze/thaw artifact
+//! + round-trip equality; `traced` checks trap-time backtrace `IrPc`-equality with `run_with_host_traced`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -444,14 +446,24 @@ enum Op {
     },
 }
 
+/// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
+/// Two readers need terminators distinguished from instructions: [`Vm::cur_ir_pc`] (debug stepping)
+/// skips them, while [`vm_trap_bt`] (trap backtrace) *reports* them — a trap at a terminator
+/// (`unreachable`, `return_call_indirect`) is real and the tree-walker names it. The flag is the high
+/// bit, never set by a real block/inst count, so masking it off recovers the stored index.
+const SRC_TERM: u32 = 1 << 31;
+
 struct Program {
     ops: Vec<Op>,
     nslots: u32,
-    /// Debug reverse map (Slice 1c-3): the source `(block, inst)` of each op, or `None` for a
-    /// terminator op. The tree-walker's debug seam (`run_inner`'s `before_op`) stops only at
-    /// **instructions** (`inst < insts.len()`), never terminators, so `None` ops are non-steppable —
-    /// `Vm::cur_ir_pc` skips them, making the bytecode engine's location trace match the tree-walker's
-    /// [`crate::IrPc`] sequence op-for-op (breakpoints / stepping then report identical locations).
+    /// Debug reverse map (Slice 1c-3): the source `(block, inst)` of each op. An instruction op maps
+    /// to its `(block, inst)`; a **terminator** op maps to `(block, insts.len() | `[`SRC_TERM`]`)` —
+    /// the `insts.len()` is the `inst` the tree-walker's `Vec<Frame>` carries for a terminator (it sits
+    /// one past the block's last instruction). The tree-walker's debug seam (`run_inner`'s `before_op`)
+    /// stops only at **instructions**, never terminators, so [`Vm::cur_ir_pc`] reports `None` for a
+    /// [`SRC_TERM`] entry — keeping the engine's step/breakpoint location trace identical to the
+    /// tree-walker's [`crate::IrPc`] sequence op-for-op — while [`vm_trap_bt`] still resolves it for a
+    /// trap-time backtrace.
     src: Box<[Option<(u32, u32)>]>,
 }
 
@@ -689,8 +701,9 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
     }
     // Debug reverse map (Slice 1c-3): each block lays out `insts.len()` instruction ops at
     // `[block_pc[bi], +insts.len())` then exactly one terminator op. Instruction ops map to their
-    // `(block, inst)`; the terminator op is left `None` (non-steppable — the tree-walker never stops
-    // at a terminator). The later target-patch only rewrites jump fields, not the op order, so this
+    // `(block, inst)`; the terminator op maps to `(block, insts.len() | SRC_TERM)` — flagged so
+    // `cur_ir_pc` skips it (non-steppable) while `vm_trap_bt` can still name a terminator-trap site
+    // (`unreachable`). The later target-patch only rewrites jump fields, not the op order, so this
     // index stays valid.
     let mut src: Vec<Option<(u32, u32)>> = vec![None; ops.len()];
     for (bi, b) in f.blocks.iter().enumerate() {
@@ -698,6 +711,7 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
         for i in 0..b.insts.len() {
             src[base_pc + i] = Some((bi as u32, i as u32));
         }
+        src[base_pc + b.insts.len()] = Some((bi as u32, b.insts.len() as u32 | SRC_TERM));
     }
 
     // Patch branch targets from block index to entry pc.
@@ -1156,6 +1170,104 @@ pub fn compile_and_run_with_host(
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
     Some(run(dom, func, args, fuel, &mut mem, host))
+}
+
+/// A run result paired with its trap-time backtrace (innermost frame first, as [`crate::IrPc`]s;
+/// empty on a clean finish) — what [`compile_and_run_with_host_traced`] returns.
+pub type TracedRun = (Result<Vec<Value>, Trap>, Vec<super::IrPc>);
+
+/// Trap-time-backtrace counterpart of [`compile_and_run_with_host`] — the bytecode mirror of the
+/// tree-walker's [`crate::run_with_host_traced`]. Drives the entry **one op at a time** (the proven
+/// single-vCPU debug seam, as [`ir_trace`] does — `budget = 1` is bit-identical to run-to-completion,
+/// INTERP_PERF.md Slice 1c-2) so that on a trap the `Vm`'s reified continuation still points at the
+/// faulting op (the `Err` path never writes the cursor back) and its caller windows are intact; the
+/// backtrace is then read off that continuation by [`vm_trap_bt`] — the flat-window analogue of the
+/// tree-walker snapshotting `v.frames`. Returns `(result, backtrace)` (innermost frame first, as
+/// [`crate::IrPc`]s; empty on a clean finish), resolvable to source with [`crate::source_loc`].
+///
+/// `None` (caller falls back to [`crate::run_with_host_traced`]) when the module is outside the
+/// engine's subset, **or** when a step reaches a concurrency/coroutine seam — backtraces are
+/// single-vCPU, seam-free scope (DEBUGGING.md S4), exactly like [`ir_trace`]. Single-stepping is a
+/// cold diagnostic path, so the per-op suspend/resume overhead never touches the production
+/// `run_fast` loop.
+pub fn compile_and_run_with_host_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> Option<TracedRun> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Err(Trap::Malformed), Vec::new()));
+    }
+    let dom = Domain::new(c, host.jit_table_log2());
+    let mut mem = build_mem(m);
+    let mut vm = match Vm::new(&dom.mods[0], func as usize, args) {
+        Ok(v) => v,
+        Err(e) => return Some((Err(e), Vec::new())),
+    };
+    loop {
+        match vm.resume(&dom.mods, &dom.table, fuel, &mut mem, host, 1) {
+            Ok(Outcome::Suspended) => continue, // one op done; keep stepping
+            Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new())),
+            Ok(_) => return None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
+            Err(t) => {
+                let bt = vm_trap_bt(&vm, &dom.mods, &t);
+                return Some((Err(t), bt));
+            }
+        }
+    }
+}
+
+/// The trap-time backtrace of a `Vm` paused (by an `Err` from [`Vm::resume`]) on a faulting op:
+/// the [`crate::IrPc`] of every live activation, **innermost frame first** — the flat-window analogue
+/// of the tree-walker's [`crate::frames_to_pcs`] over `Vec<Frame>`. The cursor (`module`/`cur`/`pc`)
+/// is the trapping op (the `Err` path leaves it as the prior op-boundary persisted it).
+///
+/// **Cursor-advance parity with the tree-walker** (`run_inner`): the tree-walker charges fuel, then
+/// does `inst += 1`, then evaluates the op — so the live frame's recorded `inst` is one *past* the op
+/// for any trap raised in evaluation (memory fault, div-by-zero, malformed, …), but the op *itself*
+/// for an [`Trap::OutOfFuel`] (caught before the advance). The bytecode loop instead leaves `pc` on
+/// the trapping op for *both*, so to report identical `IrPc`s we add `1` to the innermost frame's
+/// `inst` unless the trap is `OutOfFuel`. Every suspended caller in `stack` already resumes at
+/// `call_pc + 1` (the tree-walker likewise advances a caller's `inst` past the call before
+/// descending), so its call op sits at `resume_pc - 1` and we report `inst + 1` for it. `None`-`src`
+/// ops (terminators) are skipped, matching [`Program::src`] / [`Vm::cur_ir_pc`].
+fn vm_trap_bt(vm: &Vm, mods: &[Compiled], trap: &Trap) -> Vec<super::IrPc> {
+    let mut bt = Vec::new();
+    if let Some((block, inst)) = mods[vm.module].progs[vm.cur].src.get(vm.pc).copied().flatten() {
+        // An instruction's recorded `inst` advances past the op exactly when the tree-walker's did
+        // (it does `inst += 1` before evaluating, so every trap but `OutOfFuel` lands one past); a
+        // terminator (`unreachable`, `return_call_indirect`) is already stored as `insts.len()`, the
+        // exact `inst` the tree-walker's frame carries there, and gets no bump.
+        let inst = if inst & SRC_TERM != 0 {
+            (inst & !SRC_TERM) as usize
+        } else {
+            inst as usize + !matches!(trap, Trap::OutOfFuel) as usize
+        };
+        bt.push(super::IrPc {
+            module: vm.module as u32,
+            func: vm.cur as FuncIdx,
+            block: block as usize,
+            inst,
+        });
+    }
+    // Each suspended caller resumes at `call_pc + 1` (a call is an instruction, never a terminator),
+    // so its call op sits at `resume_pc - 1`; report `inst + 1`, mirroring the tree-walker advancing a
+    // caller's `inst` past the call before descending.
+    for &(module, prog, _base, resume_pc, _ret) in vm.stack.iter().rev() {
+        let call_pc = resume_pc.wrapping_sub(1);
+        if let Some((block, inst)) = mods[module].progs[prog].src.get(call_pc).copied().flatten() {
+            bt.push(super::IrPc {
+                module: module as u32,
+                func: prog as FuncIdx,
+                block: block as usize,
+                inst: (inst & !SRC_TERM) as usize + 1,
+            });
+        }
+    }
+    bt
 }
 
 /// A run result paired with the final window snapshot (the low `init_mem.len()` bytes).
@@ -3186,6 +3298,9 @@ impl Vm {
             .get(self.pc)
             .copied()
             .flatten()?;
+        if inst & SRC_TERM != 0 {
+            return None; // terminator — non-steppable (see `Program::src`)
+        }
         Some(super::IrPc {
             module: self.module as u32,
             func: self.cur as FuncIdx,

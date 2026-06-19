@@ -16,7 +16,7 @@ mod irgen;
 use irgen::{gen_args, gen_module, Gen};
 use std::hint::black_box;
 use std::time::Instant;
-use svm_interp::{bytecode, run, run_fast, Trap, Value};
+use svm_interp::{bytecode, run, run_fast, run_traced, Host, Trap, Value};
 
 /// Bit-wise value equality — `Value`'s derived `PartialEq` uses IEEE float `==`, where `NaN != NaN`,
 /// so two bit-identical NaN results would compare unequal. Both engines share exact semantics
@@ -68,6 +68,27 @@ fn check(m: &svm_ir::Module, args: &[Value], seed: u64) -> bool {
             "bytecode disagrees with interpreter\n seed={seed}\n args={args:?}\n interp={interp:?}\n bc    ={bc:?}\n module:\n{}",
             svm::text::print_module(m)
         );
+    }
+    // Trap-time backtrace parity (the bytecode mirror of `run_traced`): on a trap, both engines must
+    // reify the *same* call stack (innermost frame first, as raw `IrPc`s — no `-g` info needed). The
+    // single-stepping traced path returns `None` only on a concurrency seam (out of its single-vCPU
+    // scope); skip those, the result equality above already covers them.
+    if interp.is_err() {
+        let mut ft = 2_000_000u64;
+        let (tw_res, tw_bt) = run_traced(m, 0, args, &mut ft);
+        let mut fbt = 2_000_000u64;
+        if let Some((bc_res, bc_bt)) =
+            bytecode::compile_and_run_with_host_traced(m, 0, args, &mut fbt, &mut Host::new())
+        {
+            if !matches!(tw_res, Err(Trap::OutOfFuel)) && !matches!(bc_res, Err(Trap::OutOfFuel)) {
+                assert_eq!(
+                    tw_bt,
+                    bc_bt,
+                    "trap backtrace disagrees\n seed={seed}\n args={args:?}\n tw_res={tw_res:?} bc_res={bc_res:?}\n module:\n{}",
+                    svm::text::print_module(m)
+                );
+            }
+        }
     }
     true
 }

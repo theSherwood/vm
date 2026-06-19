@@ -1612,6 +1612,42 @@ pub fn run_with_host_fast(
     run_with_host(m, func, args, fuel, host)
 }
 
+/// Trap-time-backtrace counterpart of [`run_with_host_fast`]: the [`run_with_host_traced`] semantics
+/// (return the guest's trap-time call stack — innermost frame first, as [`IrPc`]s; empty on a clean
+/// finish, resolvable with [`source_loc`]) on whichever backend runs. The [`bytecode`] engine carries
+/// its own backtrace ([`bytecode::compile_and_run_with_host_traced`]); when it declines the module —
+/// a durable host, an out-of-subset op, or a step that reaches a concurrency seam (backtraces are
+/// single-vCPU scope, DEBUGGING.md S4) — this falls back to the tree-walker [`run_with_host_traced`],
+/// so the backtrace is always *some* faithful engine's, never dropped. Both backends resolve to the
+/// same source program points (the bytecode engine reports tree-walker-identical [`IrPc`]s, gated by
+/// `bytecode_traced.rs`), so a kill diagnostic reads the same regardless of which one ran.
+pub fn run_with_host_fast_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+    if !host.is_durable() {
+        if let Some(result) = bytecode::compile_and_run_with_host_traced(m, func, args, fuel, host) {
+            return result;
+        }
+    }
+    run_with_host_traced(m, func, args, fuel, host)
+}
+
+/// Capability-free [`run_with_host_fast_traced`] (an empty powerbox), the traced counterpart of
+/// [`run_fast`] — mirrors [`run_traced`] on the fast path.
+pub fn run_fast_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+    let mut host = Host::new();
+    run_with_host_fast_traced(m, func, args, fuel, &mut host)
+}
+
 /// Run the entry vCPU on the M:N executor: submit the root, become a worker on the calling thread,
 /// and once every vCPU has finished, join any worker threads the executor spawned and read the root's
 /// outcome back. `funcs` is cloned into an `Arc<[Func]>` the vCPUs own, so a spawned vCPU borrows
