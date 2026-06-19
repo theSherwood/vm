@@ -54,8 +54,8 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
 
 ## Status
 
-**Viability: PROVEN. Production entry: landed, runtime-validated on wasm32.** All reproduced
-(not argued):
+**Viability: PROVEN. Production entry: landed; runtime-validated on wasm32 (Node) and wasm64
+(Wasmtime).** All reproduced (not argued):
 
 1. **Compiles to `wasm64`.** Both `svm-interp` and the `svm-browser` entry `cdylib` build clean for
    `wasm64-unknown-unknown` via `-Z build-std`. The `std::thread`/`Instant`/`page_size` references
@@ -72,13 +72,16 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
    exercising loops, i64 wrapping arithmetic, branches, SSA block-arg copies), and garbage bytes →
    `STATUS_DECODE_ERR` (no crash). The embedded `run_guest` smoke probe agrees.
 
-3. **`wasm64` runtime is blocked by a V8 maturity gap, not by SVM.** The `wasm64` `cdylib` builds,
-   but Node/V8 22.x rejects it: Rust's `wasm64` target emits **64-bit tables** (`table64` — table
-   limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but **not**
-   64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
-   flag; patching the table flag just surfaces the i64 element-offset). So `wasm64` is **compile-
-   validated**; full `wasm64` *runtime* validation waits on V8 table64 (or a runtime that has it,
-   e.g. a recent Wasmtime). The entry logic itself is identical across widths and proven on wasm32.
+3. **`wasm64` executes correctly at runtime (Wasmtime).** On Wasmtime 45 (`-W memory64=y`), the
+   `wasm64` `cdylib` runs both the compute probe (`run_guest(1) == 1442695040888963407`, and `0` /
+   `-1097658151202642380` for `0` / `1000` — matching native + wasm32) **and** the concurrency probe
+   (`run_threads() == 4000` — the cooperative `drive` + `thread.spawn` + atomics on memory64). So the
+   full stack runs on the real production target.
+   *Node/V8 22.x cannot yet load it:* Rust's `wasm64` target emits **64-bit tables** (`table64` —
+   table limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but
+   not 64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
+   flag). A V8 maturity gap, external to SVM — `wasm64` runs today on a table64-capable runtime, and
+   the browser path is just compute-only-on-wasm32 (above) until V8 ships table64.
 
 ### Reproduce
 
@@ -92,9 +95,12 @@ cargo run --bin genfixture -- alu.svmbc                 # encode the test guest 
 cargo build --release --lib --target wasm32-unknown-unknown
 node run.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm alu.svmbc
 
-# wasm64 — production target; compiles, runtime pending V8 table64
+# wasm64 — production target; runtime-validated on Wasmtime (memory64 + table64)
 cargo +nightly build -Z build-std=std,panic_abort --release --lib \
   --target wasm64-unknown-unknown
+W=target/wasm64-unknown-unknown/release/svm_browser.wasm
+wasmtime run --invoke run_guest   -W memory64=y "$W" 1   # 1442695040888963407 (compute)
+wasmtime run --invoke run_threads -W memory64=y "$W"     # 4000 (8 vCPUs, cooperative drive)
 ```
 
 `browser/` (`svm-browser`) is a detached `[workspace]` crate (kept out of the main workspace because
@@ -138,8 +144,11 @@ Compile-clean today; gate behind `cfg(not(target_family = "wasm"))` for a clean 
   bytecode engine (decode encoded IR → run → `i64`), deny-all `Host` (compute-only v1), fail-closed
   on `compile_module == None`. Builds for wasm32 **and** wasm64; runtime-validated end-to-end on
   wasm32 in Node (anchors + decode-error path green).
-- [ ] **wasm64 runtime validation.** Blocked on V8 table64 (above). Validate either when V8 ships
-  64-bit tables or via a table64-capable runtime (recent Wasmtime). No SVM-side work expected.
+- [x] **wasm64 runtime validation.** On Wasmtime 45 (`-W memory64=y`): `run_guest` (compute) and
+  `run_threads` (cooperative `drive` → 4000) both correct on memory64/table64. Node/V8 still lacks
+  table64 (above) — browser path stays wasm32 until then. Optional follow-up: reproduce the full
+  `svm_run` byte-feeding differential on wasm64 via a Wasmtime embedding (the CLI `--invoke` can't
+  write the scratch buffer; the embedded probes already exercise the whole engine on wasm64).
 - [ ] **cfg-gate `lib.rs` for wasm** — `Scheduler`, `OffloadPool`, `std::thread`/`Instant` imports;
   `page_size` → constant. Hygiene/binary-size (compiles today; the entry never calls these), not a
   correctness blocker under fail-closed.

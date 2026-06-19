@@ -57,6 +57,88 @@ pub extern "C" fn run_guest(n: i64) -> i64 {
     }
 }
 
+/// A self-contained **concurrency** smoke probe: 8 vCPUs each `atomic.rmw.add` a shared counter
+/// 500× on the bytecode engine's cooperative `drive`, returning `4000` on every interleaving.
+/// No host imports — usable via `wasmtime --invoke run_threads` to exercise the scheduler on wasm64.
+const THREADS: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 block2(v1) block3()
+block2(v4: i64):
+  v5 = i64.const 500
+  v6 = thread.spawn 1 v5 v5
+  v7 = i64.const 4
+  v8 = i64.mul v4 v7
+  v9 = i64.const 16
+  v10 = i64.add v9 v8
+  i32.store v10 v6
+  v11 = i64.const 1
+  v12 = i64.add v4 v11
+  br block1(v12)
+block3():
+  v13 = i64.const 0
+  br block4(v13)
+block4(v14: i64):
+  v15 = i64.const 8
+  v16 = i64.lt_u v14 v15
+  br_if v16 block5(v14) block6()
+block5(v17: i64):
+  v18 = i64.const 4
+  v19 = i64.mul v17 v18
+  v20 = i64.const 16
+  v21 = i64.add v20 v19
+  v22 = i32.load v21
+  v23 = thread.join v22
+  v24 = i64.const 1
+  v25 = i64.add v17 v24
+  br block4(v25)
+block6():
+  v26 = i64.const 0
+  v27 = i64.atomic.load v26
+  return v27
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 0
+  v3 = i64.eq v1 v2
+  br_if v3 block2() block3(v1)
+block3(v4: i64):
+  v5 = i64.const 0
+  v6 = i64.const 1
+  v7 = i64.atomic.rmw.add v5 v6
+  v8 = i64.const -1
+  v9 = i64.add v4 v8
+  br block1(v9)
+block2():
+  v10 = i64.const 0
+  return v10
+}
+"#;
+
+/// Run the embedded concurrency probe; returns `4000`, or `i64::MIN` on any failure.
+#[no_mangle]
+pub extern "C" fn run_threads() -> i64 {
+    let Ok(m) = svm_text::parse_module(THREADS) else {
+        return i64::MIN;
+    };
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run(&m, 0, &[], &mut fuel) {
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            _ => i64::MIN,
+        },
+        _ => i64::MIN,
+    }
+}
+
 // ---- production entry: run an encoded guest module -------------------------------------------
 
 /// `svm_run` completed and returned a guest `i64`.
