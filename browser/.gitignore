@@ -1,0 +1,5 @@
+/target
+# regenerable fixture (see `cargo run --bin genfixture`)
+*.svmbc
+# scratch wasm patches
+patched*.wasm

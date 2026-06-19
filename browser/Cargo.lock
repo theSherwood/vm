@@ -19,6 +19,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-browser"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-interp",
+ "svm-text",
+]
+
+[[package]]
+name = "svm-encode"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+]
+
+[[package]]
 name = "svm-interp"
 version = "0.0.0"
 dependencies = [
@@ -56,14 +72,6 @@ name = "svm-verify"
 version = "0.0.0"
 dependencies = [
  "svm-ir",
-]
-
-[[package]]
-name = "wasm-harness"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-text",
 ]
 
 [[package]]

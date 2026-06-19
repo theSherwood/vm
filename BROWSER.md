@@ -54,37 +54,52 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
 
 ## Status
 
-**Viability: PROVEN.** Two facts, both reproduced (not just argued):
+**Viability: PROVEN. Production entry: landed, runtime-validated on wasm32.** All reproduced
+(not argued):
 
-1. **Compiles to `wasm64` unmodified.** `svm-interp` builds clean for `wasm64-unknown-unknown` via
-   `-Z build-std` (a ~26 MB rlib). The `std::thread`/`Instant`/`page_size` references *compile* on
-   wasm (they exist as symbols); they are a **runtime** concern only, and the bytecode engine's
-   cooperative `drive` never invokes real OS threads — so it sidesteps them. cfg-gating the
-   tree-walker `Scheduler` for wasm is therefore **dead-code cleanup, not a correctness blocker**.
+1. **Compiles to `wasm64`.** Both `svm-interp` and the `svm-browser` entry `cdylib` build clean for
+   `wasm64-unknown-unknown` via `-Z build-std`. The `std::thread`/`Instant`/`page_size` references
+   *compile* on wasm (they exist as symbols); they are a **runtime** concern only, and the bytecode
+   engine's cooperative `drive` never invokes real OS threads — so it sidesteps them. cfg-gating the
+   tree-walker `Scheduler` for wasm is **dead-code cleanup, not a correctness blocker**.
 
-2. **Executes correctly in a wasm sandbox.** The throwaway `wasm-harness/` crate runs a guest
-   through `bytecode::compile_and_run`, compiles to wasm, and runs in Node/V8 with **zero host
-   imports** (`imports required: []` — a fully self-contained sandbox). The hand-derived anchors
-   `run_guest(0) == 0` and `run_guest(1) == 1442695040888963407` pass, exercising loops, i64
-   wrapping arithmetic, conditional branches, and SSA block-arg copies.
+2. **The production entry executes correctly in a wasm sandbox (wasm32).** The `browser/`
+   (`svm-browser`) `cdylib` exports `svm_run`: the host writes an **encoded SVM IR module** into a
+   scratch buffer, `svm_run` **decodes** it (`svm-encode`), runs function 0 on the **bytecode
+   engine** with a **deny-all `Host`**, and returns its `i64` result — **fail-closed** (`None` from
+   `compile_module` → `STATUS_UNSUPPORTED`, no tree-walker fallback). In Node/V8 with **zero host
+   imports**: `svm_run(arg=0) == 0`, `svm_run(arg=1) == 1442695040888963407` (hand-derived anchors,
+   exercising loops, i64 wrapping arithmetic, branches, SSA block-arg copies), and garbage bytes →
+   `STATUS_DECODE_ERR` (no crash). The embedded `run_guest` smoke probe agrees.
+
+3. **`wasm64` runtime is blocked by a V8 maturity gap, not by SVM.** The `wasm64` `cdylib` builds,
+   but Node/V8 22.x rejects it: Rust's `wasm64` target emits **64-bit tables** (`table64` — table
+   limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but **not**
+   64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
+   flag; patching the table flag just surfaces the i64 element-offset). So `wasm64` is **compile-
+   validated**; full `wasm64` *runtime* validation waits on V8 table64 (or a runtime that has it,
+   e.g. a recent Wasmtime). The entry logic itself is identical across widths and proven on wasm32.
 
 ### Reproduce
 
 ```sh
-# (1) wasm64 library compile (nightly + rust-src for build-std)
 rustup toolchain install nightly -c rust-src
-cargo +nightly build -Z build-std=std,panic_abort \
-  -p svm-interp --target wasm64-unknown-unknown
-
-# (2) end-to-end execution in a wasm sandbox (wasm32, Node-runnable without flags)
 rustup target add wasm32-unknown-unknown
-cd wasm-harness
-cargo build --release --target wasm32-unknown-unknown
-node run.mjs        # asserts the correctness anchors above
+cd browser
+cargo run --bin genfixture -- alu.svmbc                 # encode the test guest module
+
+# wasm32 — full end-to-end runtime validation (Node, no flags)
+cargo build --release --lib --target wasm32-unknown-unknown
+node run.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm alu.svmbc
+
+# wasm64 — production target; compiles, runtime pending V8 table64
+cargo +nightly build -Z build-std=std,panic_abort --release --lib \
+  --target wasm64-unknown-unknown
 ```
 
-`wasm-harness/` is a **throwaway** spike (detached `[workspace]`, source committed, build artifacts
-git-ignored) — kept as a reproducible viability artifact, **not** part of the production build.
+`browser/` (`svm-browser`) is a detached `[workspace]` crate (kept out of the main workspace because
+it needs `-Z build-std`, like `fuzz/`/`bench/`); build artifacts + the regenerable `*.svmbc` fixture
+are git-ignored.
 
 ---
 
@@ -119,14 +134,18 @@ Compile-clean today; gate behind `cfg(not(target_family = "wasm"))` for a clean 
 ## Phase tracker
 
 - [x] **Spike — viability.** wasm64 compile + Node execution of a guest, correctness anchors green.
+- [x] **wasm entry crate (`browser/` = `svm-browser`).** A `cdylib` exporting `svm_run` over the
+  bytecode engine (decode encoded IR → run → `i64`), deny-all `Host` (compute-only v1), fail-closed
+  on `compile_module == None`. Builds for wasm32 **and** wasm64; runtime-validated end-to-end on
+  wasm32 in Node (anchors + decode-error path green).
+- [ ] **wasm64 runtime validation.** Blocked on V8 table64 (above). Validate either when V8 ships
+  64-bit tables or via a table64-capable runtime (recent Wasmtime). No SVM-side work expected.
 - [ ] **cfg-gate `lib.rs` for wasm** — `Scheduler`, `OffloadPool`, `std::thread`/`Instant` imports;
-  `page_size` → constant. Native build/tests unaffected.
-- [ ] **wasm64 entry crate** — a `cdylib` exporting an entry over
-  `compile_and_run_capture_reserved_with_host`; on `compile_module == None`, return a clean
-  `Unsupported` trap (fail-closed). Supply a deny-all `Host` (compute-only v1).
-- [ ] **Browser load + differential check** — load the `wasm64` module (memory64) and run a guest —
-  incl. one doing a guest `thread.spawn` (cooperative `drive`) — asserting byte-identical
-  results/memory to the native bytecode engine.
+  `page_size` → constant. Hygiene/binary-size (compiles today; the entry never calls these), not a
+  correctness blocker under fail-closed.
+- [ ] **Differential check** — assert byte-identical results/memory vs the native bytecode engine
+  over a corpus (incl. a guest `thread.spawn`, exercising the cooperative `drive`), via the capture
+  entry `compile_and_run_capture_reserved_with_host` (memory snapshot back to the host).
 - [ ] **Host powerbox (follow-up)** — design the browser-backed capability set (console/IO/clock).
 
 ## Verification
@@ -136,6 +155,7 @@ Compile-clean today; gate behind `cfg(not(target_family = "wasm"))` for a clean 
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node wasm-harness/run.mjs` (compute-only); later, a memory64 load with a
+- **Runs in a wasm host:** `node browser/run.mjs <module.wasm> <fixture.svmbc>` (compute-only;
+  wasm32 today); later, a memory64 load with a
   byte-identical differential check against native.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

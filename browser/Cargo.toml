@@ -1,0 +1,24 @@
+# Detached (`[workspace]`) wasm entry crate — the SVM bytecode interpreter compiled to wasm so a
+# host (browser / any wasm runtime) can run an SVM guest. Kept out of the main workspace because it
+# targets wasm64 via `-Z build-std` (nightly), like `fuzz/`/`bench/`. See BROWSER.md.
+[workspace]
+
+[package]
+name = "svm-browser"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "genfixture"
+path = "src/genfixture.rs"
+
+[dependencies]
+svm-interp = { path = "../crates/svm-interp" }
+svm-encode = { path = "../crates/svm-encode" }
+svm-text   = { path = "../crates/svm-text" }
+
+[profile.release]
+panic = "abort"
