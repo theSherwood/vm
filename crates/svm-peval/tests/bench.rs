@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 use svm_interp::Value;
 use svm_ir::{
     BinOp, Block, CmpOp, Data, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator,
-    ValType,
+    ValType, DEFAULT_RESERVED_LOG2,
 };
-use svm_jit::JitOutcome;
+use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
 };
@@ -1140,4 +1140,177 @@ fn fuzz_specialization_smoke() {
 #[ignore = "thorough fuzz — run with --ignored --nocapture"]
 fn fuzz_specialization_thorough() {
     run_fuzz(400);
+}
+
+// ===========================================================================================
+// Gain spectrum: how specialization performs across a *range* of guest programs, from "folds to a
+// constant" through loops whose per-iteration real work grows. It shows where the win is large and
+// durable (overhead-bound: dispatch dwarfs the work) and where it shrinks (work-bound: the real
+// per-iteration work dwarfs the dispatch we removed). JIT timing uses compile-once / run-many so the
+// numbers are run time, not compile time.
+//
+//   cargo test -p svm-peval --test bench gain_spectrum -- --ignored --nocapture
+// ===========================================================================================
+
+/// A runtime-trip sum loop whose body adds `i` to `acc` `adds_per_iter` times before `i--; jnz`.
+/// More adds per iteration ⇒ more real work relative to the (fixed) dispatch overhead. Result is
+/// `adds_per_iter * sum(1..=input)`.
+fn sum_loop_program(adds_per_iter: usize) -> Vec<(u8, i64)> {
+    let mut p = vec![(SETACC, 0), (SETI_INPUT, 0)]; // acc=0, i=input; loop starts at pc=18
+    let loop_start = 9 * p.len() as i64;
+    for _ in 0..adds_per_iter {
+        p.push((ADD_I, 0));
+    }
+    p.push((DEC_I, 0));
+    p.push((JNZ, loop_start));
+    p.push((HALT, 0));
+    p
+}
+
+fn jit_compile(m: &Module) -> CompiledModule {
+    CompiledModule::compile(
+        m,
+        0,
+        INERT_CAP_THUNK,
+        std::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )
+    .expect("jit compile")
+}
+
+fn jit_call(cm: &mut CompiledModule, input: i64) -> i64 {
+    match cm.run(&[input], None, None, None) {
+        Ok((JitOutcome::Returned(v), _)) => v[0],
+        o => panic!("jit outcome {o:?}"),
+    }
+}
+
+#[test]
+#[ignore = "benchmark — run with --ignored --nocapture"]
+fn gain_spectrum() {
+    // Each row: (label, interpreter, residual, runtime-loop?). The size win shows for all; the JIT
+    // speedup is only meaningful where the program has a runtime loop (otherwise it folds away and run
+    // time is dominated by the fixed per-call floor).
+    let reg = |prog: &[(u8, i64)]| {
+        let i = build_interpreter(prog);
+        let r = optimize_module(&specialize(&i, 0, &[SpecArg::Dynamic]).expect("specializes"));
+        (i, r)
+    };
+    let stk = |prog: &[(u8, i64)]| {
+        let i = build_stack_interpreter(prog);
+        let r = optimize_module(
+            &specialize_with(&i, 0, &[SpecArg::Dynamic], Some((STACK_LO, STACK_HI)))
+                .expect("specializes"),
+        );
+        (i, r)
+    };
+
+    let (const_i, const_r) = reg(&[(SETACC, 7), (HALT, 0)]);
+    let (affine_i, affine_r) = reg(&[(SETACC, 5), (SETI_INPUT, 0), (ADD_I, 0), (HALT, 0)]);
+    let (l1_i, l1_r) = reg(&sum_loop_program(1));
+    let (l2_i, l2_r) = reg(&sum_loop_program(2));
+    let (l4_i, l4_r) = reg(&sum_loop_program(4));
+    let (l8_i, l8_r) = reg(&sum_loop_program(8));
+    // Stack machine (operand stack renamed to SSA): (in+5)*3, and a longer chained expression.
+    let (sx_i, sx_r) = stk(&[
+        (S_PUSHIN, 0),
+        (S_PUSH, 5),
+        (S_ADD, 0),
+        (S_PUSH, 3),
+        (S_MUL, 0),
+        (S_HALT, 0),
+    ]);
+    let mut big = vec![(S_PUSHIN, 0)];
+    for k in 1..=8 {
+        big.push((S_PUSH, k));
+        big.push((S_ADD, 0));
+        big.push((S_PUSHIN, 0));
+        big.push((S_MUL, 0));
+    }
+    big.push((S_HALT, 0));
+    let (bx_i, bx_r) = stk(&big);
+
+    // (label, interp, residual, loop?)
+    let rows: [(&str, &Module, &Module, bool); 8] = [
+        ("reg: constant (acc=7)", &const_i, &const_r, false),
+        ("reg: affine (in+5)", &affine_i, &affine_r, false),
+        ("reg: loop body x1 (light)", &l1_i, &l1_r, true),
+        ("reg: loop body x2", &l2_i, &l2_r, true),
+        ("reg: loop body x4", &l4_i, &l4_r, true),
+        ("reg: loop body x8 (heavy)", &l8_i, &l8_r, true),
+        ("stack: (in+5)*3 [renamed]", &sx_i, &sx_r, false),
+        ("stack: chained expr [renamed]", &bx_i, &bx_r, false),
+    ];
+
+    println!("\n=== gain spectrum (size + runtime-loop JIT speedup) ===");
+    println!(
+        "{:<32} {:>16} {:>7} {:>7} {:>10}",
+        "program", "bytes i/r", "%", "folded", "jit x"
+    );
+    // These sum loops count i down from `input`, so they terminate only for input >= 1 (a floor of 1
+    // is one iteration). The folding rows are fine at any input.
+    let n: i64 = 2_000_000;
+    const FLOOR: i64 = 1;
+    for (label, interp, residual, is_loop) in rows {
+        // Correctness: residual matches the interpreter on a few inputs.
+        for input in [1i64, 2, 7, 50] {
+            assert_eq!(
+                jit_run(residual, input),
+                interp_run(interp, input),
+                "{label}: residual diverged at {input}"
+            );
+        }
+        let (si, sr) = (sizes(interp), sizes(residual));
+        let folded = if has_dispatch(residual) { "no" } else { "yes" };
+
+        let speedup = if is_loop {
+            // Compile once; subtract the 1-iteration floor so the number is per-loop compute.
+            let mut ci = jit_compile(interp);
+            let mut cr = jit_compile(residual);
+            assert_eq!(jit_call(&mut ci, n), jit_call(&mut cr, n), "{label}");
+            let fi = best(5, || {
+                black_box(jit_call(&mut ci, FLOOR));
+            });
+            let fr = best(5, || {
+                black_box(jit_call(&mut cr, FLOOR));
+            });
+            let ti = best(5, || {
+                black_box(jit_call(&mut ci, n));
+            }) - fi;
+            let tr = best(5, || {
+                black_box(jit_call(&mut cr, n));
+            }) - fr;
+            format!("{:.1}x", ti / tr)
+        } else {
+            "—".to_string()
+        };
+        println!(
+            "{label:<32} {:>16} {:>6.0}% {:>7} {:>10}",
+            format!("{}/{}", si.bytes, sr.bytes),
+            100.0 * sr.bytes as f64 / si.bytes as f64,
+            folded,
+            speedup
+        );
+    }
+    println!(
+        "\nlight loop bodies are overhead-bound (dispatch dwarfs the work ⇒ big, durable speedup);\nheavier bodies are work-bound (real work dwarfs the removed dispatch ⇒ the speedup shrinks)."
+    );
+}
+
+/// Best (min) wall time of `reps` runs of `f`, in seconds; warms up once.
+fn best(reps: usize, mut f: impl FnMut()) -> f64 {
+    f();
+    let mut b = f64::INFINITY;
+    for _ in 0..reps {
+        let t = Instant::now();
+        f();
+        b = b.min(t.elapsed().as_secs_f64());
+    }
+    b
 }
