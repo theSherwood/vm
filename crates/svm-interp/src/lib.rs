@@ -10178,6 +10178,46 @@ impl Mem {
         Ok(())
     }
 
+    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When no protection has
+    /// ever been mutated (`!prot_dirty` — the common case: no syscalls / coroutines / §13 regions, so
+    /// every prefix page is plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies
+    /// wholly in the backed prefix ([`Window::checked`]), read straight through — skipping the per-op
+    /// `last_fault` atomic store in `confine_checked` and the `check_prot` page scan. **Semantically
+    /// identical** to the cold [`Mem::load`] for this case (the escape-oracle byte-compares it); any
+    /// other case (RO/unmapped/reserved-tail/regions, or a recoverable demand fault) falls to the cold
+    /// path, which keeps the exact trap + `last_fault` semantics. Returns the [`Reg`] slot directly,
+    /// dropping the `Value` round-trip the bytecode engine paid via `Reg::from_value(load(..))`.
+    #[inline]
+    fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
+        let (_, rty, width, signed) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                // `!prot_dirty ⟹ !has_regions`, so the bytes live in `back` (no §13 redirect); the
+                // cooperative bytecode engine is the sole accessor, so a single non-atomic word read
+                // is sound (and one instruction, not `width` atomic byte loads).
+                let raw = self.back.read_word(abs, width);
+                return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
+            }
+        }
+        Ok(Reg::from_value(self.load(addr, offset, op)?))
+    }
+
+    /// Bytecode-engine scalar store (Phase 2): the fast path of [`Mem::store`], taking the value as
+    /// raw slot `lo` bits (no `Value` wrap). Same fast-path gate + cold fallback as
+    /// [`Mem::load_scalar`]; `write_le` truncates to the op width.
+    #[inline]
+    fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
+        let (_, _, width) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                self.back.write_word(abs, width, lo);
+                self.writes += 1;
+                return Ok(());
+            }
+        }
+        self.store(addr, offset, op, Value::I64(lo as i64))
+    }
+
     /// §17 `v128.load`: the **16-byte** masked access — the sole escape-TCB delta SIMD adds
     /// (D58). Shares the exact confinement + page-protection path as the scalar `load`, just
     /// with `width = 16`, so `svm-mask`'s width-parametric guard covers it unchanged.

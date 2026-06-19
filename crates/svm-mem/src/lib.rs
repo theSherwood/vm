@@ -142,6 +142,32 @@ impl Region {
         }
     }
 
+    /// **Non-atomic** width-specialized (1/2/4/8) little-endian read — one (possibly unaligned)
+    /// machine load instead of `width` per-byte atomic loads. Sound **only for a single-threaded
+    /// caller**: the cooperative bytecode interpreter has exactly one vCPU touching the backing at a
+    /// time (no race), so it can take this path; the genuinely concurrent tree-walker / §12 atomics
+    /// keep the per-byte [`Region::byte`] / [`Region::atomic_load`] paths. The caller must have
+    /// confined `[off, off+width) ⊆ [0, size)` (e.g. via `svm_mask::Window::checked`).
+    #[inline]
+    pub fn read_word(&self, off: u64, width: u32) -> u64 {
+        match self {
+            #[cfg(unix)]
+            Region::Mapped(m) => m.read_word(off, width),
+            Region::Paged(p) => p.read_word(off, width),
+        }
+    }
+
+    /// **Non-atomic** width-specialized little-endian write — the store counterpart of
+    /// [`Region::read_word`] (same single-threaded contract). Keeps only the low `width` bytes.
+    #[inline]
+    pub fn write_word(&self, off: u64, width: u32, val: u64) {
+        match self {
+            #[cfg(unix)]
+            Region::Mapped(m) => m.write_word(off, width, val),
+            Region::Paged(p) => p.write_word(off, width, val),
+        }
+    }
+
     /// `width`-byte (4 or 8) sequentially-consistent atomic load (§12). The caller guarantees
     /// natural alignment and in-window bounds.
     pub fn atomic_load(&self, off: u64, width: u32) -> u64 {
@@ -313,6 +339,36 @@ mod mapped {
             unsafe { AtomicU8::from_ptr(self.ptr(off)).store(b, Relaxed) }
         }
 
+        #[inline]
+        pub(super) fn read_word(&self, off: u64, width: u32) -> u64 {
+            let p = self.ptr(off);
+            // SAFETY: the caller confined `[off, off+width) ⊆ [0, size)` (see `Region::read_word`), so
+            // `p..p+width` is in the mapping; `read_unaligned` needs no alignment. **Non-atomic** —
+            // sound only for the single-threaded bytecode caller (no concurrent access to this range).
+            unsafe {
+                match width {
+                    1 => p.read() as u64,
+                    2 => p.cast::<u16>().read_unaligned() as u64,
+                    4 => p.cast::<u32>().read_unaligned() as u64,
+                    _ => p.cast::<u64>().read_unaligned(),
+                }
+            }
+        }
+
+        #[inline]
+        pub(super) fn write_word(&self, off: u64, width: u32, val: u64) {
+            let p = self.ptr(off);
+            // SAFETY: as `read_word`.
+            unsafe {
+                match width {
+                    1 => p.write(val as u8),
+                    2 => p.cast::<u16>().write_unaligned(val as u16),
+                    4 => p.cast::<u32>().write_unaligned(val as u32),
+                    _ => p.cast::<u64>().write_unaligned(val),
+                }
+            }
+        }
+
         pub(super) fn zero(&self, off: u64, len: u64) {
             // SAFETY: `[off, off+len)` is within `[0, size)` (clamped by the caller). Control-plane:
             // not concurrent with live access to the range.
@@ -469,6 +525,22 @@ impl Paged {
     fn byte(&self, off: u64) -> u8 {
         let idx = (off % self.page) as usize;
         self.lock().get(&(off / self.page)).map_or(0, |p| p[idx])
+    }
+
+    // The non-mmap fallback has no contiguous backing, so the width-specialized word ops just reuse
+    // the per-byte path (this backend is the rare case where `mmap` was unavailable).
+    fn read_word(&self, off: u64, width: u32) -> u64 {
+        let mut raw = 0u64;
+        for k in 0..width as u64 {
+            raw |= (self.byte(off + k) as u64) << (8 * k);
+        }
+        raw
+    }
+
+    fn write_word(&self, off: u64, width: u32, val: u64) {
+        for k in 0..width as u64 {
+            self.set_byte(off + k, (val >> (8 * k)) as u8);
+        }
     }
 
     fn set_byte(&self, off: u64, b: u8) {

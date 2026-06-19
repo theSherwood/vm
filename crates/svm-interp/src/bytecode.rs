@@ -3119,7 +3119,7 @@ impl Vm {
                 } => {
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let a = r!(*addr).i64() as u64;
-                    r!(*dst) = Reg::from_value(m.load(a, *offset, *op)?);
+                    r!(*dst) = m.load_scalar(a, *offset, *op)?;
                     pc += 1;
                 }
                 Op::Store {
@@ -3129,10 +3129,10 @@ impl Vm {
                     offset,
                 } => {
                     let a = r!(*addr).i64() as u64;
-                    let v = Value::I64(r!(*value).i64());
+                    let lo = r!(*value).i64() as u64;
                     mem.as_mut()
                         .ok_or(Trap::Malformed)?
-                        .store(a, *offset, *op, v)?;
+                        .store_scalar(a, *offset, *op, lo)?;
                     pc += 1;
                 }
                 Op::AtomicLoad {
