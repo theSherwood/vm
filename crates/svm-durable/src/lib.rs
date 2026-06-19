@@ -105,6 +105,13 @@ pub const SHADOW_SP_OFF: u64 = 8;
 /// reserve's previously-unused `[16, 64)` gap, so it is byte-identical to before for any run that never
 /// arms (countdown stays 0).
 pub const ARM_COUNTDOWN_OFF: u64 = 16;
+/// Window byte offset of the `i64` **back-edge arm countdown** — the number of loop back-edges
+/// (branch terminators) still to pass before an [`STATE_ARMED`] run promotes itself to
+/// [`STATE_UNWINDING`], so a loop-header poll begins the freeze. The deterministic trigger for the
+/// Phase-4 Slice A back-edge polls, separate from [`ARM_COUNTDOWN_OFF`] (which counts only fiber
+/// safepoints) so an ordinary or fiber-armed run is byte-identical (this slot stays 0). Lives in the
+/// reserve's `[24, 64)` gap.
+pub const ARM_BACKEDGE_OFF: u64 = 24;
 /// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
 pub const SHADOW_BASE: u64 = 64;
 /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
@@ -326,6 +333,27 @@ fn term_operands(t: &Terminator) -> Vec<ValIdx> {
     }
 }
 
+/// The block targets a terminator branches to (a closed set; tail calls / returns carry none).
+fn term_targets(t: &Terminator) -> Vec<BlockIdx> {
+    match t {
+        Terminator::Br { target, .. } => vec![*target],
+        Terminator::BrIf {
+            then_blk, else_blk, ..
+        } => vec![*then_blk, *else_blk],
+        Terminator::BrTable {
+            targets, default, ..
+        } => {
+            let mut v: Vec<BlockIdx> = targets.iter().map(|(t, _)| *t).collect();
+            v.push(default.0);
+            v
+        }
+        Terminator::Return(_)
+        | Terminator::ReturnCall { .. }
+        | Terminator::ReturnCallIndirect { .. }
+        | Terminator::Unreachable => vec![],
+    }
+}
+
 /// Mark each function that can suspend: it contains a `cap.call`, or (transitively) a
 /// direct `Call` to a may-suspend function. A least-fixed-point over the direct-call
 /// graph. `call_indirect` targets are unresolved and treated as non-suspending (see the
@@ -390,6 +418,13 @@ enum SuspendKind {
     /// frozen frame) and re-executes `suspend` so control returns to the resumer awaiting a future
     /// `cont.resume` (slice 3.1.3). `value` is the suspended value's block-local index.
     Yield { value: ValIdx },
+    /// A **loop-header poll** (Phase-4 Slice A): a state-word check prepended to a loop header's
+    /// entry (the header dominates its body, so a poll-free compute loop is caught every iteration
+    /// at bounded latency, closing the R6 latency caveat). It has no in-flight op — it is always
+    /// the globally-deepest frozen frame (any may-suspend op in the body would have unwound at its
+    /// own poll first), so on thaw it behaves like a leaf: flip the state word to `NORMAL`, reload
+    /// the header's block params, and re-enter the header body.
+    LoopHeader,
 }
 
 /// One resume point's metadata across the whole function (global id by vector order).
@@ -466,20 +501,39 @@ fn transform_func(
         });
     }
 
-    let total_points: usize = binfo.iter().map(|bi| bi.scs.len()).sum();
-    if total_points == 0 {
+    let inblock_points: usize = binfo.iter().map(|bi| bi.scs.len()).sum();
+    if inblock_points == 0 {
         return Err(TransformError::UnsupportedShape); // may-suspend, but no in-block op
     }
+
+    // A block is a *loop header* if a back-edge (a branch whose target index ≤ its source block)
+    // targets it. A poll prepended to the header's entry — which dominates the loop body — is hit
+    // every iteration, so a poll-free compute loop freezes at bounded latency (Phase-4 Slice A,
+    // the R6 caveat). Each header adds one resume point (a `LoopHeader` poll) and one segment (the
+    // poll itself, ahead of the header's body segments).
+    let mut is_header = vec![false; nb];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for t in term_targets(&blk.term) {
+            if (t as usize) <= b {
+                is_header[t as usize] = true;
+            }
+        }
+    }
+    let header_count = is_header.iter().filter(|&&h| h).count();
+    let total_points = inblock_points + header_count;
 
     // Block-index layout (see the map near the constants).
     let mut seg_base = Vec::with_capacity(nb);
     let mut acc = 1u32; // segment indices start right after the PROLOGUE
-    for bi in &binfo {
+    for (b, bi) in binfo.iter().enumerate() {
         seg_base.push(acc);
-        acc += bi.scs.len() as u32 + 1; // points + 1 segments
+        // points + 1 segments, + 1 poll segment ahead of the body when this block is a header.
+        acc += bi.scs.len() as u32 + 1 + is_header[b] as u32;
     }
     let s_total = acc - 1;
-    let seg = |b: usize, k: usize| seg_base[b] + k as u32;
+    // Body segment `k` of block `b`. A header's poll segment sits at `seg_base[b]` (= `seg0(b)`,
+    // the branch-entry target), so body segments start one past it.
+    let seg = |b: usize, k: usize| seg_base[b] + is_header[b] as u32 + k as u32;
     let p_total = total_points as u32;
     let dispatch_blk = 1 + s_total;
     // Each resume point has a UNWIND *pair*: a check block (traps if the push would exceed
@@ -552,6 +606,54 @@ fn transform_func(
                 bi.vend[bi.scs[k - 1]]
             }
         };
+        // Loop-header poll: a state-word check at the header's entry (`seg_base[b]` = `seg0(b)`,
+        // the branch-entry target), ahead of the body segments. On UNWINDING it spills the
+        // header's block params (the loop-carried live set) into a fresh `LoopHeader` resume
+        // point and returns; otherwise it falls through into the body. Built before the in-block
+        // points so its `gid` precedes them (the index layout only requires `points` order to
+        // match the unwind/arm block order, which it does).
+        if is_header[b] {
+            let plen = bi.plen;
+            let slot_types = bi.types[0..plen].to_vec();
+            if slot_types.contains(&ValType::V128) {
+                return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
+            }
+            let spilled: Vec<usize> = (0..plen).collect(); // all params (loop-carried, live)
+            let mut frame_offsets = Vec::with_capacity(plen);
+            let mut off = 0u64;
+            for &i in &spilled {
+                off = align_up(off, vsize(slot_types[i]));
+                frame_offsets.push(off);
+                off += vsize(slot_types[i]);
+            }
+            let frame_size = align_up(off + 4, 16);
+            let gid = points.len() as u32;
+            points.push(PointPlan {
+                kind: SuspendKind::LoopHeader,
+                nres: 0,
+                out: plen,
+                save_end: plen,
+                slot_types: slot_types.clone(),
+                spilled,
+                frame_offsets,
+                rid_off: frame_size - 4,
+                frame_size,
+                cont_seg: seg(b, 0), // re-enter the header body, past the poll
+            });
+            let mut psb = Bb::new(slot_types);
+            let st_a = psb.one(Inst::ConstI64(STATE_OFF as i64));
+            let st = psb.one(load(LoadOp::I32, st_a, 0));
+            let unw = psb.one(Inst::ConstI32(STATE_UNWINDING));
+            let is_unw = psb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
+            let live: Vec<ValIdx> = (0..plen as u32).collect();
+            seg_blocks.push(psb.finish(Terminator::BrIf {
+                cond: is_unw,
+                then_blk: unwind_base + 2 * gid, // the point's UNWIND check block
+                then_args: live.clone(),
+                else_blk: seg(b, 0), // the header body
+                else_args: live,
+            }));
+        }
         for k in 0..=m {
             let mut sb = Bb::new(bi.types[0..in_of(k)].to_vec());
             if k < m {
@@ -605,6 +707,8 @@ fn transform_func(
                     SuspendKind::Propagated { .. }
                     | SuspendKind::Resume { .. }
                     | SuspendKind::Yield { .. } => out - nres,
+                    // Header polls are built separately (above), never from an in-block op.
+                    SuspendKind::LoopHeader => unreachable!("loop-header point not from an op"),
                 };
                 let slot_types = bi.types[0..out].to_vec();
 
@@ -765,7 +869,11 @@ fn transform_func(
         // For a propagated call, re-issue it (its operands were all spilled). For a leaf,
         // flip the state word back to NORMAL.
         let op_results: Vec<ValIdx> = match &pt.kind {
-            SuspendKind::Leaf => {
+            // A leaf cap.call and a loop-header poll are both the globally-deepest frozen frame
+            // with no op to re-issue: flip the state word back to `NORMAL`. The leaf then reloads
+            // its cap.call result; the header reloads its block params and re-enters the body
+            // (`cont_seg`). Neither produces an `op_results` value.
+            SuspendKind::Leaf | SuspendKind::LoopHeader => {
                 let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
                 ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
@@ -876,6 +984,19 @@ pub fn write_state(window: &mut [u8], state: i32) {
 pub fn arm_freeze_after(window: &mut [u8], safepoints: i64) {
     let n = safepoints.max(1);
     window[ARM_COUNTDOWN_OFF as usize..ARM_COUNTDOWN_OFF as usize + 8]
+        .copy_from_slice(&n.to_le_bytes());
+    write_state(window, STATE_ARMED);
+}
+
+/// Arm a window to **freeze after `backedges` further loop back-edges** (the deterministic Phase-4
+/// Slice A trigger for back-edge polls): the run proceeds normally, and the runtime promotes the
+/// state word to `UNWINDING` at the `backedges`-th branch terminator so the next loop-header poll
+/// begins the freeze — reaching a poll-free compute loop that no fiber-safepoint countdown can. Sets
+/// the back-edge countdown ([`ARM_BACKEDGE_OFF`]); the fiber-safepoint countdown stays 0 so the two
+/// triggers never interfere. A non-positive count is clamped to 1.
+pub fn arm_freeze_after_backedges(window: &mut [u8], backedges: i64) {
+    let n = backedges.max(1);
+    window[ARM_BACKEDGE_OFF as usize..ARM_BACKEDGE_OFF as usize + 8]
         .copy_from_slice(&n.to_le_bytes());
     write_state(window, STATE_ARMED);
 }
