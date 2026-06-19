@@ -747,3 +747,154 @@ fn fuzz_arithmetic_dag_equivalence_and_shrinks() {
         "dead-value elimination should fire on random DAGs"
     );
 }
+
+// ----- copy propagation + algebraic identities -----
+
+const XS: [i64; 6] = [0, 1, -1, 7, -123_456, i64::MIN];
+fn x_argsets() -> Vec<Vec<Value>> {
+    XS.iter().map(|&x| vec![Value::I64(x)]).collect()
+}
+
+/// `f(x) = bin(x, k)` (or `bin(k, x)` when `const_first`), one i64 binary op against a constant.
+fn one_bin(op: BinOp, k: i64, const_first: bool) -> Module {
+    let (a, b) = if const_first { (1, 0) } else { (0, 1) };
+    single_block_fn(
+        vec![ValType::I64],
+        vec![ValType::I64],
+        vec![
+            Inst::ConstI64(k),
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op,
+                a,
+                b,
+            },
+        ],
+        2,
+    )
+}
+
+/// The identity forwarded to the parameter: equivalent to the original *and* fully simplified away
+/// (the constant and the op are both dead and removed, so the block just returns the param).
+fn assert_forwards_to_param(m: &Module) {
+    let opt = check_equiv(m, &x_argsets());
+    let b = &opt.funcs[0].blocks[0];
+    assert!(
+        b.insts.is_empty(),
+        "identity should be forwarded away, got {:?}",
+        b.insts
+    );
+    assert_eq!(
+        b.term,
+        Terminator::Return(vec![0]),
+        "should return the param"
+    );
+}
+
+/// The identity folded to a constant: equivalent to the original, with no arithmetic op left.
+fn assert_folds_to_const(m: &Module, expect: i64) {
+    let opt = check_equiv(m, &x_argsets());
+    let b = &opt.funcs[0].blocks[0];
+    assert!(
+        !b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::IntBin { .. } | Inst::Select { .. })),
+        "absorbing identity should leave no arithmetic op, got {:?}",
+        b.insts
+    );
+    assert_eq!(run(&opt, &[Value::I64(0)]), Ok(vec![Value::I64(expect)]));
+}
+
+#[test]
+fn forwards_arithmetic_identities() {
+    use BinOp::*;
+    for (op, k, const_first) in [
+        (Add, 0, false),
+        (Add, 0, true),
+        (Sub, 0, false),
+        (Mul, 1, false),
+        (Mul, 1, true),
+        (Or, 0, false),
+        (Or, 0, true),
+        (And, -1, false),
+        (And, -1, true),
+        (Xor, 0, false),
+        (Xor, 0, true),
+        (Shl, 0, false),
+        (ShrS, 0, false),
+        (ShrU, 0, false),
+        (Rotl, 0, false),
+        (Rotr, 0, false),
+    ] {
+        assert_forwards_to_param(&one_bin(op, k, const_first));
+    }
+}
+
+#[test]
+fn folds_absorbing_identities() {
+    use BinOp::*;
+    assert_folds_to_const(&one_bin(Mul, 0, false), 0); // x * 0
+    assert_folds_to_const(&one_bin(Mul, 0, true), 0); // 0 * x
+    assert_folds_to_const(&one_bin(And, 0, false), 0); // x & 0
+    assert_folds_to_const(&one_bin(Or, -1, false), -1); // x | -1
+    assert_folds_to_const(&one_bin(RemS, 1, false), 0); // x % 1
+    assert_folds_to_const(&one_bin(RemU, 1, false), 0); // x %u 1
+}
+
+#[test]
+fn self_cancelling_identities() {
+    // Both operands are the same value (index 0).
+    let selfop = |op| {
+        single_block_fn(
+            vec![ValType::I64],
+            vec![ValType::I64],
+            vec![Inst::IntBin {
+                ty: IntTy::I64,
+                op,
+                a: 0,
+                b: 0,
+            }],
+            1,
+        )
+    };
+    assert_forwards_to_param(&selfop(BinOp::And)); // x & x -> x
+    assert_forwards_to_param(&selfop(BinOp::Or)); // x | x -> x
+    assert_folds_to_const(&selfop(BinOp::Sub), 0); // x - x -> 0
+    assert_folds_to_const(&selfop(BinOp::Xor), 0); // x ^ x -> 0
+}
+
+#[test]
+fn select_forwards_chosen_dynamic_operand() {
+    // select(const cond, a, b) forwards the chosen operand even when it isn't a constant — the
+    // case the old optimizer (which folded `select` only when the chosen value was constant) missed.
+    let sel = |cond: i32, expect_param: u32| {
+        let m = single_block_fn(
+            vec![ValType::I64, ValType::I64],
+            vec![ValType::I64],
+            vec![
+                Inst::ConstI32(cond),
+                Inst::Select {
+                    cond: 2,
+                    a: 0,
+                    b: 1,
+                },
+            ],
+            3,
+        );
+        let opt = check_equiv(
+            &m,
+            &[
+                vec![Value::I64(11), Value::I64(22)],
+                vec![Value::I64(-1), Value::I64(5)],
+            ],
+        );
+        let b = &opt.funcs[0].blocks[0];
+        assert!(
+            !b.insts.iter().any(|i| matches!(i, Inst::Select { .. })),
+            "select should be forwarded away"
+        );
+        assert_eq!(b.term, Terminator::Return(vec![expect_param]));
+    };
+    sel(1, 0); // true  -> a (param 0)
+    sel(0, 1); // false -> b (param 1)
+}

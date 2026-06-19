@@ -7,8 +7,11 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-# Stage-0 is a pure IR→IR pass: the only dependency is the IR definition itself.
+# The IR definition this pass transforms.
 svm-ir.workspace = true
+# Per-SSA-value types (`func_value_types`): needed to type the caller values threaded across an
+# inlined call boundary when a dynamic-control-flow callee is specialized into residual blocks.
+svm-verify.workspace = true
 
 [dev-dependencies]
 # The differential harness: re-verify the optimized module, then run original vs

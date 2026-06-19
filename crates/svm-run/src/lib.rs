@@ -27,6 +27,7 @@ use svm_ir::{Module, Resolved, ValType};
 // `svm-interp`.
 pub use svm_interp::{Quota, Value};
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
+pub use svm_peval::{SpecArg, SpecConfig};
 
 /// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
 /// per frame, innermost first, where `<name>` is the `-g` function name or the synthesized `fn{N}`.
@@ -48,6 +49,74 @@ fn format_backtrace(frames: &[JitFrameLoc]) -> String {
         ));
     }
     s
+}
+
+/// Options for the CLI `--specialize` path — the §20c first Futamura projection driven from the
+/// command line.
+#[derive(Clone, Debug, Default)]
+pub struct SpecializeOpts {
+    /// Which function to specialize (the residual's entry, index 0). Default `0`.
+    pub func: u32,
+    /// Per-parameter binding (a static constant or `Dynamic`), in parameter order.
+    pub args: Vec<SpecArg>,
+    /// Window ranges `[lo, hi)` the caller promises are constant at specialization time.
+    pub const_regions: Vec<(u64, u64)>,
+    /// A private, zero-initialized rename region (the interpreter's value-stack / locals) to lift
+    /// into SSA and elide (Stage 2).
+    pub rename: Option<(u64, u64)>,
+    /// Promise the rename region is private (lets a dynamic-address heap coexist with it).
+    pub rename_private: bool,
+    /// Run the generic cleanup optimizer (fold / DCE / block-merge) on the residual.
+    pub optimize: bool,
+    /// Outline calls into shared residual functions instead of inlining them (a multi-function
+    /// residual). Bounds code growth and specializes dynamic-depth recursion; requires no rename
+    /// region (see [`svm_peval::SpecConfig::outline_calls`]).
+    pub outline: bool,
+}
+
+/// Specialize `module`'s entry against `opts` and re-verify the residual. The specializer is
+/// untrusted-for-escape (§20c) like any frontend output, so [`svm_verify::verify_module`] is the
+/// gate: a specializer bug is a clean verify error here, never an escape. Returns the residual — a
+/// single function (index 0) whose parameters are the dynamic args, in order.
+pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Module, String> {
+    let nparams = module
+        .funcs
+        .get(opts.func as usize)
+        .ok_or(format!(
+            "func {} is out of range ({} functions)",
+            opts.func,
+            module.funcs.len()
+        ))?
+        .params
+        .len();
+    if opts.args.len() > nparams {
+        return Err(format!(
+            "{} argument binding(s) given for a {nparams}-parameter function",
+            opts.args.len()
+        ));
+    }
+    // Parameters without an explicit binding default to dynamic.
+    let mut args = opts.args.clone();
+    args.resize(nparams, SpecArg::Dynamic);
+
+    let cfg = SpecConfig {
+        rename: opts.rename,
+        const_regions: opts.const_regions.clone(),
+        rename_is_private: opts.rename_private,
+        outline_calls: opts.outline,
+        ..SpecConfig::default()
+    };
+    let residual = svm_peval::specialize_with_config(module, opts.func, &args, &cfg)
+        .map_err(|e| format!("specialization failed: {e:?}"))?;
+    svm_verify::verify_module(&residual)
+        .map_err(|e| format!("specialized residual failed re-verification: {e:?}"))?;
+    if !opts.optimize {
+        return Ok(residual);
+    }
+    let opt = svm_peval::optimize_module(&residual);
+    svm_verify::verify_module(&opt)
+        .map_err(|e| format!("optimized residual failed re-verification: {e:?}"))?;
+    Ok(opt)
 }
 
 /// Default `call_indirect` table reservation for the CLI powerbox (`2^10` = 1024 slots) so a

@@ -8,8 +8,9 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{
-    BinOp, Block, CmpOp, Data, FBinOp, FloatTy, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp,
-    Terminator, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp, VFCmpOp,
+    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape, VShiftOp, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -951,15 +952,22 @@ fn private_rename_allows_dynamic_heap_access() {
 // a callee whose control flow stays dynamic returns `Unsupported`.
 // ===========================================================================================
 
-/// No direct or tail call survives in the residual — every call was inlined.
+/// No call (direct or indirect, body or tail) and no `ref.func` survive in the residual — every
+/// call was inlined and every funcref folded away.
 fn assert_no_calls(residual: &Module) {
     for block in &residual.funcs[0].blocks {
         assert!(
-            !block.insts.iter().any(|i| matches!(i, Inst::Call { .. })),
-            "residual still contains a direct call — not inlined"
+            !block.insts.iter().any(|i| matches!(
+                i,
+                Inst::Call { .. } | Inst::CallIndirect { .. } | Inst::RefFunc { .. }
+            )),
+            "residual still contains a call / ref.func — not inlined"
         );
         assert!(
-            !matches!(block.term, Terminator::ReturnCall { .. }),
+            !matches!(
+                block.term,
+                Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
+            ),
             "residual still contains a tail call — not inlined"
         );
     }
@@ -1186,10 +1194,11 @@ fn inlines_direct_tail_call() {
 }
 
 #[test]
-fn dynamic_branch_in_callee_is_unsupported() {
+fn dynamic_branch_in_callee_inlines_as_cfg() {
     // main(x) = pick(x) ; pick(a) = if a != 0 { a * 2 } else { a + 1 }. With `a` dynamic the
-    // callee's branch can't be traced straight-line, so the inline gives up (Unsupported). With a
-    // *static* argument the branch resolves and the call inlines.
+    // callee's branch can't be traced straight-line, so the engine inlines pick's CFG as residual
+    // blocks (the data-dependent branch survives). With a *static* argument the branch resolves and
+    // the call folds straight-line.
     let m = Module {
         funcs: vec![
             Func {
@@ -1252,12 +1261,33 @@ fn dynamic_branch_in_callee_is_unsupported() {
     };
     verify_module(&m).expect("verifies");
 
-    assert_eq!(
-        specialize(&m, 0, &[SpecArg::Dynamic]),
-        Err(svm_peval::SpecError::Unsupported)
+    // Dynamic argument: pick's CFG is inlined as residual blocks; the call is gone but the
+    // data-dependent branch survives, and the residual matches the interpreter for every input.
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("inlines callee CFG");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    assert!(
+        residual.funcs[0]
+            .blocks
+            .iter()
+            .any(|b| matches!(b.term, Terminator::BrIf { .. })),
+        "the callee's data-dependent branch should survive as a residual branch"
     );
+    for x in [0i64, 1, 5, -3, 1000] {
+        let expect = if x != 0 {
+            x.wrapping_mul(2)
+        } else {
+            x.wrapping_add(1)
+        };
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)]),
+            "residual diverged at x={x}"
+        );
+    }
 
-    // Static argument: a = 5 -> the `a != 0` test resolves true -> 5 * 2 = 10, no call left.
+    // Static argument: a = 5 -> the `a != 0` test resolves true -> 5 * 2 = 10, no branch left.
     let folded = specialize(&m, 0, &[SpecArg::ConstI64(5)]).expect("static arg inlines");
     verify_module(&folded).expect("residual re-verifies");
     assert_no_calls(&folded);
@@ -1415,4 +1445,1910 @@ fn inlines_calls_in_specialized_dispatch_loop() {
             Ok(vec![Value::I64(expect)])
         );
     }
+}
+
+// ===========================================================================================
+// Stage 2 — narrow (i8/i16) renamed cells: sub-word stores/loads into the private region are
+// renamed into SSA like full-width ones. A constant cell keeps its raw bytes and re-extends per
+// the load op (sign/zero); a *dynamic* narrow access (which would need residual masking to read
+// back) and any partial-width overlap stay refused.
+// ===========================================================================================
+
+#[test]
+fn narrow_constant_cells_round_trip_with_extension() {
+    // Store i8/i16/i32/i64 constants into the renamed region and read them back at matching widths
+    // with every sign/zero extension. The interpreter is the oracle for the whole matrix.
+    let region = (STACK_LO, STACK_LO + 64);
+    let (a0, a1, a2, a3) = (
+        STACK_LO as i64,
+        (STACK_LO + 8) as i64,
+        (STACK_LO + 16) as i64,
+        (STACK_LO + 24) as i64,
+    );
+    let st = |op, addr, value| Inst::Store {
+        op,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |op, addr| Inst::Load {
+        op,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let ext = |a| Inst::Convert {
+        op: ConvOp::ExtendI32S,
+        a,
+    };
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+
+    let insts = vec![
+        Inst::ConstI64(a0),                    // 0
+        Inst::ConstI32(0x1FF),                 // 1: low byte 0xFF
+        st(StoreOp::I32_8, 0, 1),              // [a0] = 0xFF
+        Inst::ConstI64(a1),                    // 2
+        Inst::ConstI32(0x12345),               // 3: low half 0x2345
+        st(StoreOp::I32_16, 2, 3),             // [a1] = 0x2345
+        Inst::ConstI64(a2),                    // 4
+        Inst::ConstI32(-7),                    // 5
+        st(StoreOp::I32, 4, 5),                // [a2] = -7
+        Inst::ConstI64(a3),                    // 6
+        Inst::ConstI64(0x1122_3344_5566_7788), // 7
+        st(StoreOp::I64, 6, 7),                // [a3] = big
+        ld(LoadOp::I32_8U, 0),                 // 8  -> 0xFF   (i32)
+        ld(LoadOp::I32_8S, 0),                 // 9  -> -1     (i32)
+        ld(LoadOp::I32_16U, 2),                // 10 -> 0x2345 (i32)
+        ld(LoadOp::I64_16S, 2),                // 11 -> 0x2345 (i64)
+        ld(LoadOp::I32, 4),                    // 12 -> -7     (i32)
+        ld(LoadOp::I64, 6),                    // 13 -> big    (i64)
+        ext(8),                                // 14
+        ext(9),                                // 15
+        ext(10),                               // 16
+        ext(12),                               // 17
+        add(14, 15),                           // 18
+        add(18, 16),                           // 19
+        add(19, 17),                           // 20
+        add(20, 11),                           // 21
+        add(21, 13),                           // 22
+    ];
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![],
+                insts,
+                term: Terminator::Return(vec![22]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize_with(&m, 0, &[], Some(region)).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_memory_ops(&residual); // every narrow cell renamed away
+    let opt = optimize_module(&residual);
+    verify_module(&opt).expect("optimized residual re-verifies");
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
+
+    let expect = run(&m, &[]);
+    assert!(expect.is_ok(), "interpreter ran");
+    assert_eq!(run(&residual, &[]), expect, "residual matches interp");
+    assert_eq!(run(&opt, &[]), expect);
+}
+
+#[test]
+fn narrow_store_overwrites_overlapping_cell() {
+    // A narrow store invalidates the wider cell it overlaps: write i32, then i8 at the same slot,
+    // and the i8 load sees the new byte (matching the interpreter's byte-level memory).
+    let region = (STACK_LO, STACK_LO + 8);
+    let st = |op, addr, value| Inst::Store {
+        op,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |op, addr| Inst::Load {
+        op,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![
+                    Inst::ConstI64(STACK_LO as i64),       // 0
+                    Inst::ConstI32(0x4433_2211u32 as i32), // 1
+                    st(StoreOp::I32, 0, 1),                // [A] = 0x44332211 (cell A,4)
+                    Inst::ConstI32(0xAB),                  // 2
+                    st(StoreOp::I32_8, 0, 2),              // [A] = 0xAB  (invalidates A,4 -> A,1)
+                    ld(LoadOp::I32_8U, 0),                 // 3 -> 0xAB
+                ],
+                term: Terminator::Return(vec![3]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize_with(&m, 0, &[], Some(region)).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_memory_ops(&residual);
+    assert_eq!(run(&residual, &[]), run(&m, &[]));
+    assert_eq!(run(&m, &[]), Ok(vec![Value::I32(0xAB)]));
+}
+
+#[test]
+fn narrow_dynamic_and_overlap_loads_are_unsupported() {
+    let region = (STACK_LO, STACK_LO + 8);
+    let st = |op, addr, value| Inst::Store {
+        op,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |op, addr| Inst::Load {
+        op,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+
+    // A narrow store of a *dynamic* value can't be renamed (reading it back needs residual masking).
+    let dyn_narrow_store = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64], // 0: x
+                insts: vec![
+                    Inst::ConstI64(STACK_LO as i64), // 1
+                    st(StoreOp::I64_8, 1, 0),        // [A] = low byte of x (dynamic)
+                ],
+                term: Terminator::Return(vec![0]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&dyn_narrow_store).expect("verifies");
+    assert_eq!(
+        specialize_with(&dyn_narrow_store, 0, &[SpecArg::Dynamic], Some(region)),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+
+    // A full-width dynamic cell read back at a narrower width is a partial overlap — refused.
+    let narrow_load_of_wide_cell = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64], // 0: x
+                insts: vec![
+                    Inst::ConstI64(STACK_LO as i64), // 1
+                    st(StoreOp::I64, 1, 0),          // [A] = x (cell A,8 dynamic)
+                    ld(LoadOp::I64_8U, 1),           // 2: low byte -> overlap, can't resolve
+                ],
+                term: Terminator::Return(vec![2]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&narrow_load_of_wide_cell).expect("verifies");
+    assert_eq!(
+        specialize_with(
+            &narrow_load_of_wide_cell,
+            0,
+            &[SpecArg::Dynamic],
+            Some(region)
+        ),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+}
+
+// ===========================================================================================
+// Dynamic-control-flow call inlining: when a callee's branch stays dynamic, its CFG is inlined as
+// residual blocks. Caller values live across the call thread through the callee to the continuation;
+// a dynamic loop inside the callee survives as a residual loop. The interpreter is the oracle.
+// ===========================================================================================
+
+#[test]
+fn dynamic_cf_call_threads_caller_values() {
+    // main(x) = (x + 100) + pick(x) ; pick(a) = if a != 0 { a * 2 } else { a + 1 }. The pre-call
+    // value `x + 100` is live across the dynamic-CF call and must be threaded through pick's inlined
+    // CFG to the continuation that adds it.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::ConstI64(100), // 1
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 0,
+                            b: 1,
+                        }, // 2: pre = x + 100
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0],
+                        }, // 3: r = pick(x)
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 2,
+                            b: 3,
+                        }, // 4: pre + r
+                    ],
+                    term: Terminator::Return(vec![4]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    Block {
+                        params: vec![ValType::I64], // 0: a
+                        insts: vec![
+                            Inst::ConstI64(0), // 1
+                            Inst::IntCmp {
+                                ty: IntTy::I64,
+                                op: CmpOp::Ne,
+                                a: 0,
+                                b: 1,
+                            }, // 2: a != 0
+                        ],
+                        term: Terminator::BrIf {
+                            cond: 2,
+                            then_blk: 1,
+                            then_args: vec![0],
+                            else_blk: 2,
+                            else_args: vec![0],
+                        },
+                    },
+                    Block {
+                        params: vec![ValType::I64],                 // 0: a
+                        insts: vec![Inst::ConstI64(2), imul(0, 1)], // a * 2
+                        term: Terminator::Return(vec![2]),
+                    },
+                    Block {
+                        params: vec![ValType::I64], // 0: a
+                        insts: vec![
+                            Inst::ConstI64(1),
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Add,
+                                a: 0,
+                                b: 1,
+                            },
+                        ], // a + 1
+                        term: Terminator::Return(vec![2]),
+                    },
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("inlines callee CFG");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+
+    for x in [0i64, 1, 5, -3, 42, -1000] {
+        let r = if x != 0 {
+            x.wrapping_mul(2)
+        } else {
+            x.wrapping_add(1)
+        };
+        let expect = x.wrapping_add(100).wrapping_add(r);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)]),
+            "residual diverged at x={x}"
+        );
+        let jit = match svm_jit::compile_and_run(&residual, 0, &[x]) {
+            Ok(svm_jit::JitOutcome::Returned(v)) => v[0],
+            o => panic!("unexpected jit outcome {o:?}"),
+        };
+        assert_eq!(jit, expect, "jit residual at x={x}");
+    }
+}
+
+#[test]
+fn dynamic_loop_in_callee_survives_inlined() {
+    // main(n) = sum(n) ; sum(n) = { acc = 0; while n != 0 { acc += n; n -= 1 } acc } — a callee with
+    // a dynamic loop. Inlining it must reproduce the loop as a residual back-edge (memoization closes
+    // it), not diverge.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: n
+                    insts: vec![Inst::Call {
+                        func: 1,
+                        args: vec![0],
+                    }], // 1
+                    term: Terminator::Return(vec![1]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    // 0 — entry(n): acc = 0; loop.
+                    Block {
+                        params: vec![ValType::I64],     // 0: n
+                        insts: vec![Inst::ConstI64(0)], // 1: acc
+                        term: Terminator::Br {
+                            target: 1,
+                            args: vec![0, 1],
+                        },
+                    },
+                    // 1 — header(n, acc): if n == 0 done else step.
+                    Block {
+                        params: vec![ValType::I64, ValType::I64], // 0: n, 1: acc
+                        insts: vec![
+                            Inst::ConstI64(0), // 2
+                            Inst::Eqz {
+                                ty: IntTy::I64,
+                                a: 0,
+                            }, // 3: n == 0
+                        ],
+                        term: Terminator::BrIf {
+                            cond: 3,
+                            then_blk: 2,
+                            then_args: vec![1],
+                            else_blk: 3,
+                            else_args: vec![0, 1],
+                        },
+                    },
+                    // 2 — done(acc): return acc.
+                    Block {
+                        params: vec![ValType::I64],
+                        insts: vec![],
+                        term: Terminator::Return(vec![0]),
+                    },
+                    // 3 — step(n, acc): acc += n; n -= 1; loop.
+                    Block {
+                        params: vec![ValType::I64, ValType::I64], // 0: n, 1: acc
+                        insts: vec![
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Add,
+                                a: 1,
+                                b: 0,
+                            }, // 2: acc + n
+                            Inst::ConstI64(1), // 3
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Sub,
+                                a: 0,
+                                b: 3,
+                            }, // 4: n - 1
+                        ],
+                        term: Terminator::Br {
+                            target: 1,
+                            args: vec![4, 2],
+                        },
+                    },
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("inlines callee CFG");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    // The loop survived: some residual block branches back to an earlier one (a back-edge).
+    assert!(
+        residual.funcs[0].blocks.iter().enumerate().any(|(i, b)| {
+            match &b.term {
+                Terminator::Br { target, .. } => (*target as usize) <= i,
+                Terminator::BrIf {
+                    then_blk, else_blk, ..
+                } => (*then_blk as usize) <= i || (*else_blk as usize) <= i,
+                _ => false,
+            }
+        }),
+        "the callee's dynamic loop should survive as a residual back-edge"
+    );
+
+    for n in [0i64, 1, 2, 5, 10, 100] {
+        let expect: i64 = (1..=n).sum();
+        assert_eq!(run(&m, &[Value::I64(n)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(n)]),
+            Ok(vec![Value::I64(expect)]),
+            "residual diverged at n={n}"
+        );
+    }
+}
+
+#[test]
+fn nested_dynamic_cf_calls_inline() {
+    // main(x) = outer(x) ; outer(a) = if a > 0 { inner(a) + 1 } else { inner(a) - 1 } ;
+    // inner(b) = if b != 0 { b * 2 } else { 7 }. Specializing main inlines outer's CFG, and from two
+    // different call sites inside it inlines inner's CFG too — a three-deep frame stack.
+    let cmp = |op, a, b| Inst::IntCmp {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+    let m = Module {
+        funcs: vec![
+            // 0: main(x)
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64],
+                    insts: vec![Inst::Call {
+                        func: 1,
+                        args: vec![0],
+                    }],
+                    term: Terminator::Return(vec![1]),
+                }],
+            },
+            // 1: outer(a)
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    Block {
+                        params: vec![ValType::I64],                            // 0: a
+                        insts: vec![Inst::ConstI64(0), cmp(CmpOp::GtS, 0, 1)], // 1, 2: a > 0
+                        term: Terminator::BrIf {
+                            cond: 2,
+                            then_blk: 1,
+                            then_args: vec![0],
+                            else_blk: 2,
+                            else_args: vec![0],
+                        },
+                    },
+                    Block {
+                        params: vec![ValType::I64], // 0: a  (then: inner(a) + 1)
+                        insts: vec![
+                            Inst::Call {
+                                func: 2,
+                                args: vec![0],
+                            }, // 1
+                            Inst::ConstI64(1), // 2
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Add,
+                                a: 1,
+                                b: 2,
+                            }, // 3
+                        ],
+                        term: Terminator::Return(vec![3]),
+                    },
+                    Block {
+                        params: vec![ValType::I64], // 0: a  (else: inner(a) - 1)
+                        insts: vec![
+                            Inst::Call {
+                                func: 2,
+                                args: vec![0],
+                            }, // 1
+                            Inst::ConstI64(1), // 2
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Sub,
+                                a: 1,
+                                b: 2,
+                            }, // 3
+                        ],
+                        term: Terminator::Return(vec![3]),
+                    },
+                ],
+            },
+            // 2: inner(b)
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    Block {
+                        params: vec![ValType::I64],                           // 0: b
+                        insts: vec![Inst::ConstI64(0), cmp(CmpOp::Ne, 0, 1)], // 1, 2: b != 0
+                        term: Terminator::BrIf {
+                            cond: 2,
+                            then_blk: 1,
+                            then_args: vec![0],
+                            else_blk: 2,
+                            else_args: vec![],
+                        },
+                    },
+                    Block {
+                        params: vec![ValType::I64],                 // 0: b
+                        insts: vec![Inst::ConstI64(2), imul(0, 1)], // b * 2
+                        term: Terminator::Return(vec![2]),
+                    },
+                    Block {
+                        params: vec![],
+                        insts: vec![Inst::ConstI64(7)],
+                        term: Terminator::Return(vec![0]),
+                    },
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("inlines nested callee CFGs");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+
+    for x in [0i64, 1, 5, -3, -1, 42] {
+        let inner = |b: i64| if b != 0 { b.wrapping_mul(2) } else { 7 };
+        let expect = if x > 0 {
+            inner(x).wrapping_add(1)
+        } else {
+            inner(x).wrapping_sub(1)
+        };
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)]),
+            "residual diverged at x={x}"
+        );
+    }
+}
+
+// ===========================================================================================
+// Scalar float constant folding: f32/f64 arithmetic, compares, fused multiply-add, float↔int
+// conversions, and reinterpret/demote/promote casts fold to constants bit-for-bit the interpreter
+// (NaN payloads, ±0, ±inf, ties-to-even). Results are reinterpreted to integers before return so the
+// differential comparison is exact (NaN-safe). The interpreter is the oracle.
+// ===========================================================================================
+
+// Edge-case operand matrices: signed zeros, inf, NaN, subnormals, ties.
+const F64S: [f64; 12] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    2.5,
+    -3.5,
+    0.1,
+    1e308,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::NAN,
+    4.5, // a tie for round-to-even (nearest -> 4)
+];
+const F32S: [f32; 12] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    2.5,
+    -3.5,
+    0.1,
+    1e38,
+    f32::INFINITY,
+    f32::NEG_INFINITY,
+    f32::NAN,
+    4.5,
+];
+
+fn ret(results: Vec<ValType>, insts: Vec<Inst>, ret_idx: u32) -> Module {
+    Module {
+        funcs: vec![Func {
+            params: vec![],
+            results,
+            blocks: vec![Block {
+                params: vec![],
+                insts,
+                term: Terminator::Return(vec![ret_idx]),
+            }],
+        }],
+        memory: None,
+        ..Default::default()
+    }
+}
+
+fn assert_no_residual_float(r: &Module) {
+    for b in &r.funcs[0].blocks {
+        assert!(
+            !b.insts.iter().any(|i| matches!(
+                i,
+                Inst::FBin { .. }
+                    | Inst::FUn { .. }
+                    | Inst::FCmp { .. }
+                    | Inst::Fma { .. }
+                    | Inst::FToISat { .. }
+                    | Inst::FToITrap { .. }
+                    | Inst::IToFConv { .. }
+                    | Inst::Cast { .. }
+            )),
+            "a float op survived folding: {:?}",
+            b.insts
+        );
+    }
+}
+
+/// Verify the module, specialize it (no args), check the residual fully folded away its float ops,
+/// and assert the residual matches the interpreter exactly (results reinterpreted to ints upstream).
+fn check_fold(m: &Module) {
+    verify_module(m).expect("verifies");
+    let r = specialize(m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("residual re-verifies");
+    assert_no_residual_float(&r);
+    assert_eq!(run(m, &[]), run(&r, &[]), "residual diverged from interp");
+}
+
+#[test]
+fn folds_f64_binops() {
+    for op in FBinOp::ALL {
+        for &a in &F64S {
+            for &b in &F64S {
+                let m = ret(
+                    vec![ValType::I64],
+                    vec![
+                        Inst::ConstF64(a.to_bits()),
+                        Inst::ConstF64(b.to_bits()),
+                        Inst::FBin {
+                            ty: FloatTy::F64,
+                            op,
+                            a: 0,
+                            b: 1,
+                        },
+                        Inst::Cast {
+                            op: CastOp::ReinterpF64I64,
+                            a: 2,
+                        },
+                    ],
+                    3,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_f32_binops() {
+    for op in FBinOp::ALL {
+        for &a in &F32S {
+            for &b in &F32S {
+                let m = ret(
+                    vec![ValType::I32],
+                    vec![
+                        Inst::ConstF32(a.to_bits()),
+                        Inst::ConstF32(b.to_bits()),
+                        Inst::FBin {
+                            ty: FloatTy::F32,
+                            op,
+                            a: 0,
+                            b: 1,
+                        },
+                        Inst::Cast {
+                            op: CastOp::ReinterpF32I32,
+                            a: 2,
+                        },
+                    ],
+                    3,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_float_unops() {
+    for op in FUnOp::ALL {
+        for &a in &F64S {
+            let m = ret(
+                vec![ValType::I64],
+                vec![
+                    Inst::ConstF64(a.to_bits()),
+                    Inst::FUn {
+                        ty: FloatTy::F64,
+                        op,
+                        a: 0,
+                    },
+                    Inst::Cast {
+                        op: CastOp::ReinterpF64I64,
+                        a: 1,
+                    },
+                ],
+                2,
+            );
+            check_fold(&m);
+        }
+        for &a in &F32S {
+            let m = ret(
+                vec![ValType::I32],
+                vec![
+                    Inst::ConstF32(a.to_bits()),
+                    Inst::FUn {
+                        ty: FloatTy::F32,
+                        op,
+                        a: 0,
+                    },
+                    Inst::Cast {
+                        op: CastOp::ReinterpF32I32,
+                        a: 1,
+                    },
+                ],
+                2,
+            );
+            check_fold(&m);
+        }
+    }
+}
+
+#[test]
+fn folds_float_compares() {
+    // FCmp result is i32 0/1 directly — no reinterpret needed.
+    for op in FCmpOp::ALL {
+        for &a in &F64S {
+            for &b in &F64S {
+                let m = ret(
+                    vec![ValType::I32],
+                    vec![
+                        Inst::ConstF64(a.to_bits()),
+                        Inst::ConstF64(b.to_bits()),
+                        Inst::FCmp {
+                            ty: FloatTy::F64,
+                            op,
+                            a: 0,
+                            b: 1,
+                        },
+                    ],
+                    2,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_fma() {
+    for &a in &F64S {
+        for &b in &[1.0f64, -2.0, 0.5, f64::NAN, f64::INFINITY] {
+            for &c in &[0.0f64, 3.5, -1e9, f64::NAN] {
+                let m = ret(
+                    vec![ValType::I64],
+                    vec![
+                        Inst::ConstF64(a.to_bits()),
+                        Inst::ConstF64(b.to_bits()),
+                        Inst::ConstF64(c.to_bits()),
+                        Inst::Fma {
+                            ty: FloatTy::F64,
+                            a: 0,
+                            b: 1,
+                            c: 2,
+                        },
+                        Inst::Cast {
+                            op: CastOp::ReinterpF64I64,
+                            a: 3,
+                        },
+                    ],
+                    4,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_int_float_conversions() {
+    // Saturating float→int (total: NaN -> 0, out-of-range saturates).
+    for op in FToI::ALL {
+        let (from, to, _) = op.parts();
+        let result_ty = match to {
+            IntTy::I32 => ValType::I32,
+            IntTy::I64 => ValType::I64,
+        };
+        for &f in &[0.0f64, 3.9, -3.9, 1e30, -1e30, f64::NAN, f64::INFINITY] {
+            let konst = match from {
+                FloatTy::F32 => Inst::ConstF32((f as f32).to_bits()),
+                FloatTy::F64 => Inst::ConstF64(f.to_bits()),
+            };
+            check_fold(&ret(
+                vec![result_ty],
+                vec![konst, Inst::FToISat { op, a: 0 }],
+                1,
+            ));
+        }
+    }
+    // Int→float.
+    for op in IToF::ALL {
+        for &i in &[0i64, 1, -1, 123_456_789, -987, i64::MAX, i64::MIN] {
+            let konst = match op {
+                IToF::I32F32S | IToF::I32F32U | IToF::I32F64S | IToF::I32F64U => {
+                    Inst::ConstI32(i as i32)
+                }
+                _ => Inst::ConstI64(i),
+            };
+            // Result is f32 or f64; reinterpret to its int width for an exact compare.
+            let (reinterp, res_ty) = match op {
+                IToF::I32F32S | IToF::I32F32U | IToF::I64F32S | IToF::I64F32U => {
+                    (CastOp::ReinterpF32I32, ValType::I32)
+                }
+                _ => (CastOp::ReinterpF64I64, ValType::I64),
+            };
+            check_fold(&ret(
+                vec![res_ty],
+                vec![
+                    konst,
+                    Inst::IToFConv { op, a: 0 },
+                    Inst::Cast { op: reinterp, a: 1 },
+                ],
+                2,
+            ));
+        }
+    }
+}
+
+#[test]
+fn folds_demote_promote_and_reinterpret() {
+    for &f in &F64S {
+        // demote f64 -> f32 -> reinterpret to i32.
+        check_fold(&ret(
+            vec![ValType::I32],
+            vec![
+                Inst::ConstF64(f.to_bits()),
+                Inst::Cast {
+                    op: CastOp::Demote,
+                    a: 0,
+                },
+                Inst::Cast {
+                    op: CastOp::ReinterpF32I32,
+                    a: 1,
+                },
+            ],
+            2,
+        ));
+    }
+    for &f in &F32S {
+        // promote f32 -> f64 -> reinterpret to i64.
+        check_fold(&ret(
+            vec![ValType::I64],
+            vec![
+                Inst::ConstF32(f.to_bits()),
+                Inst::Cast {
+                    op: CastOp::Promote,
+                    a: 0,
+                },
+                Inst::Cast {
+                    op: CastOp::ReinterpF64I64,
+                    a: 1,
+                },
+            ],
+            2,
+        ));
+    }
+    // Integer reinterpret both ways round-trips a bit pattern.
+    check_fold(&ret(
+        vec![ValType::I32],
+        vec![
+            Inst::ConstI32(0x3f80_0000u32 as i32), // 1.0f32 bits
+            Inst::Cast {
+                op: CastOp::ReinterpI32F32,
+                a: 0,
+            },
+            Inst::Cast {
+                op: CastOp::ReinterpF32I32,
+                a: 1,
+            },
+        ],
+        2,
+    ));
+}
+
+#[test]
+fn trapping_ftoi_folds_in_range_but_preserves_out_of_range_trap() {
+    let trap_mod = |a: f64| {
+        ret(
+            vec![ValType::I32],
+            vec![
+                Inst::ConstF64(a.to_bits()),
+                Inst::FToITrap {
+                    op: FToI::F64I32S,
+                    a: 0,
+                },
+            ],
+            1,
+        )
+    };
+
+    // In range: folds to the truncated constant, no trapping op left.
+    let m = trap_mod(3.9);
+    verify_module(&m).expect("verifies");
+    let r = specialize(&m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("re-verifies");
+    assert_no_residual_float(&r);
+    assert_eq!(run(&m, &[]), Ok(vec![Value::I32(3)]));
+    assert_eq!(run(&r, &[]), Ok(vec![Value::I32(3)]));
+
+    // Out of range / NaN: NOT folded — the trapping op survives and traps identically.
+    for &a in &[1e30f64, -1e30, f64::NAN, f64::INFINITY] {
+        let m = trap_mod(a);
+        verify_module(&m).expect("verifies");
+        let r = specialize(&m, 0, &[]).expect("specializes");
+        verify_module(&r).expect("re-verifies");
+        assert!(
+            r.funcs[0]
+                .blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::FToITrap { .. }))),
+            "out-of-range trapping conversion must be preserved, not folded"
+        );
+        assert_eq!(run(&m, &[]), run(&r, &[]), "trap behavior diverged");
+        assert!(run(&r, &[]).is_err(), "should trap at a={a}");
+    }
+}
+
+#[test]
+fn optimizer_folds_float_constants() {
+    // The generic optimizer shares the fold helpers: (2.0 * 3.0) + 1.0 = 7.0 collapses to a const.
+    let m = ret(
+        vec![ValType::I64],
+        vec![
+            Inst::ConstF64(2.0f64.to_bits()),
+            Inst::ConstF64(3.0f64.to_bits()),
+            Inst::FBin {
+                ty: FloatTy::F64,
+                op: FBinOp::Mul,
+                a: 0,
+                b: 1,
+            },
+            Inst::ConstF64(1.0f64.to_bits()),
+            Inst::FBin {
+                ty: FloatTy::F64,
+                op: FBinOp::Add,
+                a: 2,
+                b: 3,
+            },
+            Inst::Cast {
+                op: CastOp::ReinterpF64I64,
+                a: 4,
+            },
+        ],
+        5,
+    );
+    verify_module(&m).expect("verifies");
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    assert_no_residual_float(&opt);
+    assert_eq!(
+        run(&opt, &[]),
+        Ok(vec![Value::I64((7.0f64).to_bits() as i64)])
+    );
+    assert_eq!(run(&m, &[]), run(&opt, &[]));
+}
+
+// ===========================================================================================
+// Indirect-call specialization: a `call_indirect` / `return_call_indirect` (or `ref.func`) whose
+// table index resolves to a constant, in-range, signature-matching function is resolved to that
+// callee and inlined like a direct call. A dynamic / out-of-range / mismatched index can't be
+// specialized (the single-function residual carries no table) and returns Unsupported.
+// ===========================================================================================
+
+fn i64_to_i64() -> FuncType {
+    FuncType {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+    }
+}
+
+// double(a) = a * 2 — the usual indirect callee (function index 1 in these modules).
+fn double_func() -> Func {
+    Func {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64],
+            insts: vec![Inst::ConstI64(2), imul(0, 1)],
+            term: Terminator::Return(vec![2]),
+        }],
+    }
+}
+
+#[test]
+fn const_indirect_call_via_ref_func_inlines() {
+    // main(x) = (ref.func double)(x) through call_indirect -> x * 2.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::RefFunc { func: 1 }, // 1: funcref double (folds to const 1)
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(),
+                            idx: 1,
+                            args: vec![0],
+                        }, // 2
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            double_func(),
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+
+    for x in [0i64, 1, -3, 21, i64::MIN] {
+        let expect = x.wrapping_mul(2);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        let jit = match svm_jit::compile_and_run(&residual, 0, &[x]) {
+            Ok(svm_jit::JitOutcome::Returned(v)) => v[0],
+            o => panic!("unexpected jit outcome {o:?}"),
+        };
+        assert_eq!(jit, expect, "jit at x={x}");
+    }
+}
+
+#[test]
+fn indirect_call_through_constant_memory_table_inlines() {
+    // A handler-table interpreter shape: the function index lives in a readonly data segment; loading
+    // it folds to a constant funcref, so the call_indirect resolves and the dispatch disappears.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::ConstI64(0), // 1: table address
+                        Inst::Load {
+                            op: LoadOp::I32,
+                            addr: 1,
+                            offset: 0,
+                            align: 0,
+                        }, // 2: funcref (folds to 1)
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(),
+                            idx: 2,
+                            args: vec![0],
+                        }, // 3
+                    ],
+                    term: Terminator::Return(vec![3]),
+                }],
+            },
+            double_func(),
+        ],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: true,
+            bytes: 1i32.to_le_bytes().to_vec(), // the table holds func index 1 (double)
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    // The table load folded away too.
+    assert!(!residual.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Load { .. }))));
+
+    for x in [0i64, 7, -5, 100] {
+        let expect = x.wrapping_mul(2);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn const_indirect_tail_call_inlines() {
+    // main(x) = return_call_indirect (ref.func double)(x).
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64],             // 0: x
+                    insts: vec![Inst::RefFunc { func: 1 }], // 1
+                    term: Terminator::ReturnCallIndirect {
+                        ty: i64_to_i64(),
+                        idx: 1,
+                        args: vec![0],
+                    },
+                }],
+            },
+            double_func(),
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    for x in [0i64, 3, -9, 50] {
+        let expect = x.wrapping_mul(2);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
+    // The resolved callee itself has dynamic control flow — resolution + CFG inlining compose.
+    // main(x) = (ref.func pick)(x) ; pick(a) = if a != 0 { a * 2 } else { a + 1 }.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::RefFunc { func: 1 },
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(),
+                            idx: 1,
+                            args: vec![0],
+                        },
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    Block {
+                        params: vec![ValType::I64], // 0: a
+                        insts: vec![
+                            Inst::ConstI64(0),
+                            Inst::IntCmp {
+                                ty: IntTy::I64,
+                                op: CmpOp::Ne,
+                                a: 0,
+                                b: 1,
+                            },
+                        ],
+                        term: Terminator::BrIf {
+                            cond: 2,
+                            then_blk: 1,
+                            then_args: vec![0],
+                            else_blk: 2,
+                            else_args: vec![0],
+                        },
+                    },
+                    Block {
+                        params: vec![ValType::I64],
+                        insts: vec![Inst::ConstI64(2), imul(0, 1)],
+                        term: Terminator::Return(vec![2]),
+                    },
+                    Block {
+                        params: vec![ValType::I64],
+                        insts: vec![
+                            Inst::ConstI64(1),
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Add,
+                                a: 0,
+                                b: 1,
+                            },
+                        ],
+                        term: Terminator::Return(vec![2]),
+                    },
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + CFG-inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    assert!(residual.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| matches!(b.term, Terminator::BrIf { .. })));
+    for x in [0i64, 1, 5, -3, 1000] {
+        let expect = if x != 0 {
+            x.wrapping_mul(2)
+        } else {
+            x.wrapping_add(1)
+        };
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn unresolvable_indirect_calls_are_unsupported() {
+    // A *dynamic* index can't be specialized.
+    let dynamic_idx = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64, ValType::I32], // 0: x, 1: sel (dynamic funcref)
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64, ValType::I32],
+                    insts: vec![Inst::CallIndirect {
+                        ty: i64_to_i64(),
+                        idx: 1,
+                        args: vec![0],
+                    }],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            double_func(),
+        ],
+        ..Default::default()
+    };
+    verify_module(&dynamic_idx).expect("verifies");
+    assert_eq!(
+        specialize(&dynamic_idx, 0, &[SpecArg::Dynamic, SpecArg::Dynamic]),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+
+    // A constant index whose resolved function has the wrong signature also can't be specialized
+    // (it would trap `IndirectCallType` at runtime through a table the residual doesn't carry).
+    let bad_sig = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::RefFunc { func: 1 }, // points at a (i64,i64)->i64 function
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(), // but the call signature is (i64)->i64
+                            idx: 1,
+                            args: vec![0],
+                        },
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64, ValType::I64],
+                    insts: vec![Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Add,
+                        a: 0,
+                        b: 1,
+                    }],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&bad_sig).expect("verifies");
+    assert_eq!(
+        specialize(&bad_sig, 0, &[SpecArg::Dynamic]),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+}
+
+// ===========================================================================================
+// Residual-call mode (outlining): instead of inlining, a call is specialized to a separate residual
+// function, memoized per (callee, arg pattern) so call sites with the same static binding share it.
+// Bounds code growth and — the capability win — specializes dynamic-depth recursion (a finite
+// self-recursive residual) that inlining would diverge on.
+// ===========================================================================================
+
+fn outline(m: &Module, func: u32, args: &[SpecArg]) -> Result<Module, svm_peval::SpecError> {
+    specialize_with_config(
+        m,
+        func,
+        args,
+        &SpecConfig {
+            outline_calls: true,
+            ..SpecConfig::default()
+        },
+    )
+}
+
+#[test]
+fn outlining_shares_a_callee_across_call_sites() {
+    // main(x) = double(x) + double(x) ; double(a) = a * 2. Both calls have the same (dynamic) arg
+    // pattern, so outlining emits ONE shared residual `double`, called twice — vs inlining, which
+    // duplicates the body.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0],
+                        }, // 1
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0],
+                        }, // 2
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 1,
+                            b: 2,
+                        }, // 3
+                    ],
+                    term: Terminator::Return(vec![3]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64],
+                    insts: vec![Inst::ConstI64(2), imul(0, 1)],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let outlined = outline(&m, 0, &[SpecArg::Dynamic]).expect("outlines");
+    verify_module(&outlined).expect("outlined residual re-verifies");
+    assert_eq!(outlined.funcs.len(), 2, "entry + one shared double");
+    // The shared callee is actually called (a residual call survives, not inlined).
+    assert!(outlined.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Call { .. }))));
+
+    // Inlining (the default) folds it into a single function.
+    let inlined = specialize(&m, 0, &[SpecArg::Dynamic]).expect("inlines");
+    assert_eq!(inlined.funcs.len(), 1);
+
+    for x in [0i64, 1, -3, 21, i64::MIN] {
+        let expect = x.wrapping_mul(2).wrapping_add(x.wrapping_mul(2));
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&outlined, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&inlined, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn outlining_specializes_dynamic_depth_recursion() {
+    // sum(n) = if n == 0 { 0 } else { n + sum(n - 1) }, with n DYNAMIC. The recursion depth is a
+    // runtime value, so inlining would diverge (unbounded contexts → Budget); outlining produces a
+    // single finite self-recursive residual function.
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    params: vec![ValType::I64], // 0: n
+                    insts: vec![
+                        Inst::ConstI64(0), // 1
+                        Inst::IntCmp {
+                            ty: IntTy::I64,
+                            op: CmpOp::Eq,
+                            a: 0,
+                            b: 1,
+                        }, // 2: n == 0
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 2,
+                        then_blk: 1,
+                        then_args: vec![],
+                        else_blk: 2,
+                        else_args: vec![0],
+                    },
+                },
+                Block {
+                    params: vec![],
+                    insts: vec![Inst::ConstI64(0)],
+                    term: Terminator::Return(vec![0]),
+                },
+                Block {
+                    params: vec![ValType::I64], // 0: n
+                    insts: vec![
+                        Inst::ConstI64(1), // 1
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Sub,
+                            a: 0,
+                            b: 1,
+                        }, // 2: n - 1
+                        Inst::Call {
+                            func: 0,
+                            args: vec![2],
+                        }, // 3: sum(n - 1)
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 0,
+                            b: 3,
+                        }, // 4: n + sum(n-1)
+                    ],
+                    term: Terminator::Return(vec![4]),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let outlined = outline(&m, 0, &[SpecArg::Dynamic]).expect("outlines dynamic recursion");
+    verify_module(&outlined).expect("re-verifies");
+    assert_eq!(
+        outlined.funcs.len(),
+        1,
+        "one finite self-recursive residual"
+    );
+    // It calls itself (the recursive residual call survives).
+    assert!(outlined.funcs[0].blocks.iter().any(|b| b
+        .insts
+        .iter()
+        .any(|i| matches!(i, Inst::Call { func: 0, .. }))));
+
+    for n in [0i64, 1, 2, 5, 10, 50] {
+        let expect: i64 = (1..=n).sum();
+        assert_eq!(run(&m, &[Value::I64(n)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&outlined, &[Value::I64(n)]),
+            Ok(vec![Value::I64(expect)]),
+            "outlined sum diverged at n={n}"
+        );
+    }
+}
+
+#[test]
+fn outlining_makes_one_function_per_static_pattern() {
+    // pow(b, e) = if e == 0 { 1 } else { b * pow(b, e - 1) }, specialized with b dynamic and e = 3
+    // static. Each distinct static e is its own residual: pow_3 → pow_2 → pow_1 → pow_0 (4 funcs),
+    // where inlining unrolls to a single function. Both are finite (the depth is static).
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64, ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
+                    insts: vec![
+                        Inst::ConstI64(0),
+                        Inst::IntCmp {
+                            ty: IntTy::I64,
+                            op: CmpOp::Eq,
+                            a: 1,
+                            b: 2,
+                        }, // 3: e == 0
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 3,
+                        then_blk: 1,
+                        then_args: vec![],
+                        else_blk: 2,
+                        else_args: vec![0, 1],
+                    },
+                },
+                Block {
+                    params: vec![],
+                    insts: vec![Inst::ConstI64(1)],
+                    term: Terminator::Return(vec![0]),
+                },
+                Block {
+                    params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
+                    insts: vec![
+                        Inst::ConstI64(1),
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Sub,
+                            a: 1,
+                            b: 2,
+                        }, // 3: e - 1
+                        Inst::Call {
+                            func: 0,
+                            args: vec![0, 3],
+                        }, // 4: pow(b, e-1)
+                        imul(0, 4), // 5: b * rec
+                    ],
+                    term: Terminator::Return(vec![5]),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let outlined = outline(&m, 0, &[SpecArg::Dynamic, SpecArg::ConstI64(3)])
+        .expect("outlines static recursion");
+    verify_module(&outlined).expect("re-verifies");
+    assert_eq!(
+        outlined.funcs.len(),
+        4,
+        "one residual per static exponent 3..=0"
+    );
+
+    let inlined = specialize(&m, 0, &[SpecArg::Dynamic, SpecArg::ConstI64(3)]).expect("inlines");
+    assert_eq!(
+        inlined.funcs.len(),
+        1,
+        "inlining unrolls to a single function"
+    );
+
+    for b in [0i64, 1, 2, -3, 5] {
+        let expect = b.wrapping_mul(b).wrapping_mul(b);
+        assert_eq!(
+            run(&m, &[Value::I64(b), Value::I64(3)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&outlined, &[Value::I64(b)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&inlined, &[Value::I64(b)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+// ===========================================================================================
+// v128 (SIMD) constant folding: lane ops with all-constant operands fold to a `ConstV128` (or a
+// scalar for extract_lane), bit-for-bit the interpreter. Float lanes reuse the scalar float folds,
+// so NaN/rounding fidelity carries over. The interpreter is the oracle (Value::V128 compares bytes,
+// so the check is exact/NaN-safe). Exotic ops (sat, widen/narrow, convert, dot, …) pass through.
+// ===========================================================================================
+
+const VA: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0xFF];
+const VB: [u8; 16] = [
+    16, 17, 200, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+];
+
+/// Specialize a no-arg module, assert the residual is fully folded to constants, and assert it
+/// matches the interpreter exactly.
+fn check_v128_fold(m: &Module) {
+    verify_module(m).expect("verifies");
+    let r = specialize(m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("residual re-verifies");
+    for b in &r.funcs[0].blocks {
+        assert!(
+            b.insts.iter().all(|i| matches!(
+                i,
+                Inst::ConstI32(_)
+                    | Inst::ConstI64(_)
+                    | Inst::ConstF32(_)
+                    | Inst::ConstF64(_)
+                    | Inst::ConstV128(_)
+            )),
+            "a v128 op survived folding: {:?}",
+            b.insts
+        );
+    }
+    assert_eq!(run(m, &[]), run(&r, &[]), "residual diverged from interp");
+}
+
+#[test]
+fn folds_v128_bitwise_shuffle_and_movement() {
+    let insts = vec![
+        Inst::ConstI32(0x0A0B_0C0D), // 0
+        Inst::Splat {
+            shape: VShape::I32x4,
+            a: 0,
+        }, // 1
+        Inst::ConstI32(42),          // 2
+        Inst::ReplaceLane {
+            shape: VShape::I32x4,
+            lane: 2,
+            a: 1,
+            b: 2,
+        }, // 3
+        Inst::ConstV128(VA),         // 4
+        Inst::ConstV128(VB),         // 5
+        Inst::VBitBin {
+            op: VBitBinOp::And,
+            a: 3,
+            b: 4,
+        }, // 6
+        Inst::VBitBin {
+            op: VBitBinOp::Or,
+            a: 5,
+            b: 6,
+        }, // 7
+        Inst::VBitBin {
+            op: VBitBinOp::Xor,
+            a: 6,
+            b: 7,
+        }, // 8
+        Inst::VBitBin {
+            op: VBitBinOp::AndNot,
+            a: 8,
+            b: 4,
+        }, // 9
+        Inst::VNot { a: 9 },         // 10
+        Inst::Bitselect {
+            a: 4,
+            b: 5,
+            mask: 10,
+        }, // 11
+        Inst::Shuffle {
+            lanes: [0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30],
+            a: 11,
+            b: 4,
+        }, // 12
+        Inst::Swizzle { a: 12, b: 5 }, // 13
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 13));
+}
+
+#[test]
+fn folds_v128_integer_lanes() {
+    let insts = vec![
+        Inst::ConstI32(5), // 0
+        Inst::Splat {
+            shape: VShape::I16x8,
+            a: 0,
+        }, // 1
+        Inst::ConstV128(VA), // 2
+        Inst::VIntBin {
+            shape: VShape::I16x8,
+            op: VIntBinOp::Add,
+            a: 1,
+            b: 2,
+        }, // 3
+        Inst::VIntBin {
+            shape: VShape::I16x8,
+            op: VIntBinOp::MaxS,
+            a: 3,
+            b: 2,
+        }, // 4
+        Inst::VIntBin {
+            shape: VShape::I8x16,
+            op: VIntBinOp::Mul,
+            a: 4,
+            b: 2,
+        }, // 5
+        Inst::ConstI32(3), // 6
+        Inst::VShift {
+            shape: VShape::I32x4,
+            op: VShiftOp::Shl,
+            a: 5,
+            amt: 6,
+        }, // 7
+        Inst::VIntUn {
+            shape: VShape::I32x4,
+            op: VIntUnOp::Neg,
+            a: 7,
+        }, // 8
+        Inst::VIntCmp {
+            shape: VShape::I8x16,
+            op: VICmpOp::GtS,
+            a: 8,
+            b: 2,
+        }, // 9
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 9));
+}
+
+#[test]
+fn folds_v128_float_lanes_including_nan() {
+    let f = |x: f32| Inst::ConstF32(x.to_bits());
+    let insts = vec![
+        f(1.5), // 0
+        Inst::Splat {
+            shape: VShape::F32x4,
+            a: 0,
+        }, // 1: [1.5; 4]
+        f(f32::NAN), // 2
+        Inst::ReplaceLane {
+            shape: VShape::F32x4,
+            lane: 0,
+            a: 1,
+            b: 2,
+        }, // 3: [NaN,1.5,1.5,1.5]
+        f(2.0), // 4
+        Inst::Splat {
+            shape: VShape::F32x4,
+            a: 4,
+        }, // 5: [2; 4]
+        Inst::VFloatBin {
+            shape: VShape::F32x4,
+            op: VFloatBinOp::Mul,
+            a: 3,
+            b: 5,
+        }, // 6
+        Inst::VFloatUn {
+            shape: VShape::F32x4,
+            op: VFloatUnOp::Sqrt,
+            a: 6,
+        }, // 7
+        Inst::VFloatBin {
+            shape: VShape::F32x4,
+            op: VFloatBinOp::Min,
+            a: 7,
+            b: 5,
+        }, // 8: Min with NaN propagation
+        Inst::VFma {
+            shape: VShape::F32x4,
+            neg: false,
+            a: 8,
+            b: 5,
+            c: 1,
+        }, // 9
+        Inst::VFloatCmp {
+            shape: VShape::F32x4,
+            op: VFCmpOp::Eq,
+            a: 9,
+            b: 9,
+        }, // 10: NaN lane -> false mask
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 10));
+
+    // f64x2 too, with ±inf.
+    let g = |x: f64| Inst::ConstF64(x.to_bits());
+    let insts = vec![
+        g(f64::INFINITY), // 0
+        Inst::Splat {
+            shape: VShape::F64x2,
+            a: 0,
+        }, // 1
+        g(-3.25),         // 2
+        Inst::ReplaceLane {
+            shape: VShape::F64x2,
+            lane: 1,
+            a: 1,
+            b: 2,
+        }, // 3: [inf, -3.25]
+        Inst::VFloatUn {
+            shape: VShape::F64x2,
+            op: VFloatUnOp::Neg,
+            a: 3,
+        }, // 4
+        Inst::VFloatBin {
+            shape: VShape::F64x2,
+            op: VFloatBinOp::Div,
+            a: 3,
+            b: 4,
+        }, // 5
+        Inst::VFloatCmp {
+            shape: VShape::F64x2,
+            op: VFCmpOp::Le,
+            a: 5,
+            b: 3,
+        }, // 6
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 6));
+}
+
+#[test]
+fn folds_v128_extract_lane_to_scalar() {
+    // Signed extract of byte 0xFF (lane 15) -> -1; unsigned -> 255.
+    check_v128_fold(&ret(
+        vec![ValType::I32],
+        vec![
+            Inst::ConstV128(VA),
+            Inst::ExtractLane {
+                shape: VShape::I8x16,
+                lane: 15,
+                signed: true,
+                a: 0,
+            },
+        ],
+        1,
+    ));
+    check_v128_fold(&ret(
+        vec![ValType::I32],
+        vec![
+            Inst::ConstV128(VA),
+            Inst::ExtractLane {
+                shape: VShape::I8x16,
+                lane: 15,
+                signed: false,
+                a: 0,
+            },
+        ],
+        1,
+    ));
+    // i64x2 lane.
+    check_v128_fold(&ret(
+        vec![ValType::I64],
+        vec![
+            Inst::ConstV128(VB),
+            Inst::ExtractLane {
+                shape: VShape::I64x2,
+                lane: 1,
+                signed: false,
+                a: 0,
+            },
+        ],
+        1,
+    ));
+}
+
+#[test]
+fn unfolded_v128_op_passes_through() {
+    // A saturating add isn't folded yet — it survives in the residual and still runs correctly.
+    let m = ret(
+        vec![ValType::V128],
+        vec![
+            Inst::ConstV128(VA),
+            Inst::ConstV128(VB),
+            Inst::VSatBin {
+                shape: VShape::I8x16,
+                op: VSatBinOp::AddS,
+                a: 0,
+                b: 1,
+            },
+        ],
+        2,
+    );
+    verify_module(&m).expect("verifies");
+    let r = specialize(&m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("re-verifies");
+    assert!(
+        r.funcs[0]
+            .blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::VSatBin { .. }))),
+        "an unsupported v128 op should pass through unfolded"
+    );
+    assert_eq!(run(&m, &[]), run(&r, &[]));
 }
