@@ -1,16 +1,19 @@
-//! Phase-3 slice 3.3 (DURABILITY.md §12.8): the **JIT** freezes a *multi-vCPU* durable domain
-//! exactly as the interpreter does. A durable freeze runs **single-worker** — the interp serializes
+//! Phase-3 slice 3.3 (DURABILITY.md §12.8): the **JIT** freezes *and thaws* a *multi-vCPU* durable
+//! domain exactly as the interpreter does. A durable run is **single-worker** — the interp serializes
 //! onto one cooperative worker, and the JIT (whose vCPUs are 1:1 OS threads) instead runs each
-//! `thread.spawn`ed child **inline** on the spawning thread while the window state ≠ NORMAL. The one
-//! shared set of durable control words (state + active shadow-SP) is never raced; each child unwinds
-//! into its own top-down shadow context and records a `FrozenVCpu` residue.
+//! `thread.spawn`ed child **inline** (deferred during a freeze until the root unwinds; re-attached +
+//! run before the root re-enters on a thaw). The one shared set of durable control words (state +
+//! active shadow-SP) is never raced; each child unwinds into its own top-down shadow context.
 //!
-//! Pinned here (freeze side): freezing the *same* instrumented two-vCPU module (UNWINDING from the
-//! start) on both backends must (1) flatten the child into a **byte-identical durable reserve**, and
-//! (2) export the **same `FrozenVCpu` residue** (task id, entry func, spawn args, flattened
-//! shadow-SP) — the cross-backend §7 property extended to spawned vCPUs. The thaw side (runtime
-//! re-attach under REWINDING) is a follow-up; the interpreter already pins the full freeze→thaw
-//! round-trip in `svm-durable/tests/multivcpu.rs`.
+//! Pinned here:
+//!   - **freeze** (`jit_freezes_a_spawned_vcpu_matching_interp`): freezing the *same* instrumented
+//!     two-vCPU module on both backends flattens the child into a **byte-identical durable reserve**
+//!     and exports the **same `FrozenVCpu` residue** — the cross-backend §7 property, extended to vCPUs.
+//!   - **thaw** (`jit_thaws_its_own_multivcpu_freeze`): a JIT freeze → JIT thaw on an *advanced* clock
+//!     reproduces the uninterrupted result (reloads the saved reads, never re-issues) — the §12.6
+//!     equivalence, multi-vCPU, on the JIT.
+//!   - **cross-backend thaw** (`interp_frozen_multivcpu_thaws_on_the_jit`): an interpreter-frozen
+//!     domain thaws on the JIT to the uninterrupted result.
 //!
 //! Native stack switching (for the inline child's guarded run) exists on x86-64 unix, aarch64 unix,
 //! and x86-64 Windows; elsewhere the JIT bails `Unsupported` on `thread.*`/`cont.*`, so this is gated.
@@ -129,11 +132,13 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
             svm_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
         ) {
-        Ok(t) => t,
-        Err(JitError::Unsupported(_)) => return,
-        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
-        Err(e) => panic!("JIT failed to compile a verified multi-vCPU module: {e:?}\n{inst:#?}"),
-    };
+            Ok(t) => t,
+            Err(JitError::Unsupported(_)) => return,
+            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+            Err(e) => {
+                panic!("JIT failed to compile a verified multi-vCPU module: {e:?}\n{inst:#?}")
+            }
+        };
     assert!(
         matches!(jout, JitOutcome::Returned(_)),
         "JIT freeze returns a placeholder, got {jout:?}"
@@ -217,7 +222,10 @@ fn jit_thaws_its_own_multivcpu_freeze() {
             Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
             Err(e) => panic!("JIT freeze failed: {e:?}\n{inst:#?}"),
         };
-    assert!(matches!(fout, JitOutcome::Returned(_)), "freeze placeholder");
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder"
+    );
     assert_eq!(fvcpus.len(), 1, "the freeze captured the spawned child");
     assert_eq!(
         fhost.clock_ns, 44,
@@ -240,9 +248,9 @@ fn jit_thaws_its_own_multivcpu_freeze() {
             &[tclk as i64],
             &twin,
             &[],
-            &[],        // no fibers
-            &fvcpus,    // re-attach the frozen child
-            froot_sp,   // restore the root's extent
+            &[],      // no fibers
+            &fvcpus,  // re-attach the frozen child
+            froot_sp, // restore the root's extent
             SIZE_LOG2,
             svm_run::cap_thunk,
             &mut thost as *mut Host as *mut c_void,

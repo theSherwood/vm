@@ -1028,6 +1028,11 @@ pub fn compile_and_run_capture_reserved_with_host_durable(
     Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
 }
 
+/// The result of a **multi-vCPU** durable freeze/thaw run (slice 3.3): `(outcome, window image,
+/// flattened-fiber residue, spawned-vCPU residue, root vCPU's flattened shadow-SP extent)`. On a thaw
+/// the two residue vectors are empty and the extent is inert.
+pub type DurableMvOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64);
+
 /// [`compile_and_run_capture_reserved_with_host_durable`] for a **multi-vCPU** durable domain
 /// (DURABILITY.md §12.8 slice 3.3) — the full freeze + thaw of a domain whose root has `thread.spawn`ed
 /// children. A durable run is single-worker, so children run **inline** (deferred during a freeze until
@@ -1055,7 +1060,7 @@ pub fn compile_and_run_capture_reserved_with_host_durable_mv(
     reserved_log2: u8,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64), JitError> {
+) -> Result<DurableMvOutcome, JitError> {
     let mut cm = CompiledModule::compile(
         m,
         func,
