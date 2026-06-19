@@ -36,6 +36,10 @@ it is dropped once the actionable slices (1–2 below) close.
   from the command line (`--arg`, `--const-region`, `--rename[-private]`, `--no-optimize`, and
   `-o`/`--emit-text`/`--run-args`) — usable without writing Rust. `svm_run::specialize_module` is the
   reusable library entry. `crates/svm-run/tests/specialize_cli.rs`.
+- **Residual-call mode (outlining)** (`SpecConfig::outline_calls`, `svm-run --outline`): instead of
+  inlining, each `(callee, arg pattern)` is specialized to a shared residual function and called — a
+  multi-function residual that bounds code growth and specializes **dynamic-depth recursion** (a
+  finite self-recursive residual where inlining would diverge). Requires no rename region.
 - **AOT pipeline** (`tests/aot.rs`).
 - **Benchmarking** (`tests/bench.rs`): `size_corpus` (a normal test, also a size-regression guard)
   reports blocks / insts / encoded `.svmb` bytes for interpreter → residual → optimized across four
@@ -47,11 +51,11 @@ it is dropped once the actionable slices (1–2 below) close.
 
 ## Remaining slices (ranked by ROI)
 
-1. **Residual-call mode (bounded interprocedural, shared)** — specialize a callee once and emit a
-   shared residual *call* (live memory cells threaded as params) instead of always inlining, to bound
-   code growth / avoid the block budget on large programs. Medium–large effort; matters at scale.
-2. **v128 (SIMD) constant folding** — fold the 128-bit lane ops (a separate, larger lane/shape/shuffle
+1. **v128 (SIMD) constant folding** — fold the 128-bit lane ops (a separate, larger lane/shape/shuffle
    surface with its own `Known` representation). Medium–large effort.
+2. **Outlining + renaming together** — thread the renamed region's live abstract cells across a
+   residual call (as extra params/results), so outlining works even with a rename region (today it
+   requires `rename = None`). Medium effort; only needed for very large renamed interpreters.
 3. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
    dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
    effort (on-device re-verify, determinism/TCB review) — a project, not a slice.

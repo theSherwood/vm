@@ -2018,7 +2018,13 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
     stays dynamic has its **CFG inlined as residual blocks** — the context's call stack carries the
     caller's live values through the callee (dead ones cleaned by the optimizer) and each `return`
     becomes a branch to the continuation. Loops and `unreachable` in the callee work; one residual
-    function still comes out. (Indirect/host calls are not inlined.)
+    function still comes out. A constant-index `call_indirect`/`ref.func` resolves through the
+    identity table and inlines too. (Indirect-dynamic/host calls are not inlined.)
+  - **Outlining (residual-call mode, opt-in).** Instead of inlining, each `(callee, arg pattern)`
+    can be specialized to its own residual function (memoized/shared) and called — a multi-function
+    residual that bounds code growth and specializes **dynamic-depth recursion** (a finite
+    self-recursive residual where inlining would diverge). Requires no rename region (no abstract
+    cells to thread across the call).
   - **CFG cleanup** (shared with the generic optimizer): constant folding, branch resolution,
     dead-block / dead-value elimination, block merging, dead block-param elimination — so
     residuals come out as tight straight-line/looped code, not `br`-chains.

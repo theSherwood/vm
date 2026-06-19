@@ -46,6 +46,10 @@ pub struct SpecializeOpts {
     pub rename_private: bool,
     /// Run the generic cleanup optimizer (fold / DCE / block-merge) on the residual.
     pub optimize: bool,
+    /// Outline calls into shared residual functions instead of inlining them (a multi-function
+    /// residual). Bounds code growth and specializes dynamic-depth recursion; requires no rename
+    /// region (see [`svm_peval::SpecConfig::outline_calls`]).
+    pub outline: bool,
 }
 
 /// Specialize `module`'s entry against `opts` and re-verify the residual. The specializer is
@@ -77,6 +81,7 @@ pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Modul
         rename: opts.rename,
         const_regions: opts.const_regions.clone(),
         rename_is_private: opts.rename_private,
+        outline_calls: opts.outline,
         ..SpecConfig::default()
     };
     let residual = svm_peval::specialize_with_config(module, opts.func, &args, &cfg)

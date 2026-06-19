@@ -2780,3 +2780,272 @@ fn unresolvable_indirect_calls_are_unsupported() {
         Err(svm_peval::SpecError::Unsupported)
     );
 }
+
+// ===========================================================================================
+// Residual-call mode (outlining): instead of inlining, a call is specialized to a separate residual
+// function, memoized per (callee, arg pattern) so call sites with the same static binding share it.
+// Bounds code growth and — the capability win — specializes dynamic-depth recursion (a finite
+// self-recursive residual) that inlining would diverge on.
+// ===========================================================================================
+
+fn outline(m: &Module, func: u32, args: &[SpecArg]) -> Result<Module, svm_peval::SpecError> {
+    specialize_with_config(
+        m,
+        func,
+        args,
+        &SpecConfig {
+            outline_calls: true,
+            ..SpecConfig::default()
+        },
+    )
+}
+
+#[test]
+fn outlining_shares_a_callee_across_call_sites() {
+    // main(x) = double(x) + double(x) ; double(a) = a * 2. Both calls have the same (dynamic) arg
+    // pattern, so outlining emits ONE shared residual `double`, called twice — vs inlining, which
+    // duplicates the body.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0],
+                        }, // 1
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0],
+                        }, // 2
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 1,
+                            b: 2,
+                        }, // 3
+                    ],
+                    term: Terminator::Return(vec![3]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64],
+                    insts: vec![Inst::ConstI64(2), imul(0, 1)],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let outlined = outline(&m, 0, &[SpecArg::Dynamic]).expect("outlines");
+    verify_module(&outlined).expect("outlined residual re-verifies");
+    assert_eq!(outlined.funcs.len(), 2, "entry + one shared double");
+    // The shared callee is actually called (a residual call survives, not inlined).
+    assert!(outlined.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Call { .. }))));
+
+    // Inlining (the default) folds it into a single function.
+    let inlined = specialize(&m, 0, &[SpecArg::Dynamic]).expect("inlines");
+    assert_eq!(inlined.funcs.len(), 1);
+
+    for x in [0i64, 1, -3, 21, i64::MIN] {
+        let expect = x.wrapping_mul(2).wrapping_add(x.wrapping_mul(2));
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&outlined, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&inlined, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn outlining_specializes_dynamic_depth_recursion() {
+    // sum(n) = if n == 0 { 0 } else { n + sum(n - 1) }, with n DYNAMIC. The recursion depth is a
+    // runtime value, so inlining would diverge (unbounded contexts → Budget); outlining produces a
+    // single finite self-recursive residual function.
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    params: vec![ValType::I64], // 0: n
+                    insts: vec![
+                        Inst::ConstI64(0), // 1
+                        Inst::IntCmp {
+                            ty: IntTy::I64,
+                            op: CmpOp::Eq,
+                            a: 0,
+                            b: 1,
+                        }, // 2: n == 0
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 2,
+                        then_blk: 1,
+                        then_args: vec![],
+                        else_blk: 2,
+                        else_args: vec![0],
+                    },
+                },
+                Block {
+                    params: vec![],
+                    insts: vec![Inst::ConstI64(0)],
+                    term: Terminator::Return(vec![0]),
+                },
+                Block {
+                    params: vec![ValType::I64], // 0: n
+                    insts: vec![
+                        Inst::ConstI64(1), // 1
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Sub,
+                            a: 0,
+                            b: 1,
+                        }, // 2: n - 1
+                        Inst::Call {
+                            func: 0,
+                            args: vec![2],
+                        }, // 3: sum(n - 1)
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 0,
+                            b: 3,
+                        }, // 4: n + sum(n-1)
+                    ],
+                    term: Terminator::Return(vec![4]),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let outlined = outline(&m, 0, &[SpecArg::Dynamic]).expect("outlines dynamic recursion");
+    verify_module(&outlined).expect("re-verifies");
+    assert_eq!(
+        outlined.funcs.len(),
+        1,
+        "one finite self-recursive residual"
+    );
+    // It calls itself (the recursive residual call survives).
+    assert!(outlined.funcs[0].blocks.iter().any(|b| b
+        .insts
+        .iter()
+        .any(|i| matches!(i, Inst::Call { func: 0, .. }))));
+
+    for n in [0i64, 1, 2, 5, 10, 50] {
+        let expect: i64 = (1..=n).sum();
+        assert_eq!(run(&m, &[Value::I64(n)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&outlined, &[Value::I64(n)]),
+            Ok(vec![Value::I64(expect)]),
+            "outlined sum diverged at n={n}"
+        );
+    }
+}
+
+#[test]
+fn outlining_makes_one_function_per_static_pattern() {
+    // pow(b, e) = if e == 0 { 1 } else { b * pow(b, e - 1) }, specialized with b dynamic and e = 3
+    // static. Each distinct static e is its own residual: pow_3 → pow_2 → pow_1 → pow_0 (4 funcs),
+    // where inlining unrolls to a single function. Both are finite (the depth is static).
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64, ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
+                    insts: vec![
+                        Inst::ConstI64(0),
+                        Inst::IntCmp {
+                            ty: IntTy::I64,
+                            op: CmpOp::Eq,
+                            a: 1,
+                            b: 2,
+                        }, // 3: e == 0
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 3,
+                        then_blk: 1,
+                        then_args: vec![],
+                        else_blk: 2,
+                        else_args: vec![0, 1],
+                    },
+                },
+                Block {
+                    params: vec![],
+                    insts: vec![Inst::ConstI64(1)],
+                    term: Terminator::Return(vec![0]),
+                },
+                Block {
+                    params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
+                    insts: vec![
+                        Inst::ConstI64(1),
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Sub,
+                            a: 1,
+                            b: 2,
+                        }, // 3: e - 1
+                        Inst::Call {
+                            func: 0,
+                            args: vec![0, 3],
+                        }, // 4: pow(b, e-1)
+                        imul(0, 4), // 5: b * rec
+                    ],
+                    term: Terminator::Return(vec![5]),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let outlined = outline(&m, 0, &[SpecArg::Dynamic, SpecArg::ConstI64(3)])
+        .expect("outlines static recursion");
+    verify_module(&outlined).expect("re-verifies");
+    assert_eq!(
+        outlined.funcs.len(),
+        4,
+        "one residual per static exponent 3..=0"
+    );
+
+    let inlined = specialize(&m, 0, &[SpecArg::Dynamic, SpecArg::ConstI64(3)]).expect("inlines");
+    assert_eq!(
+        inlined.funcs.len(),
+        1,
+        "inlining unrolls to a single function"
+    );
+
+    for b in [0i64, 1, 2, -3, 5] {
+        let expect = b.wrapping_mul(b).wrapping_mul(b);
+        assert_eq!(
+            run(&m, &[Value::I64(b), Value::I64(3)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&outlined, &[Value::I64(b)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&inlined, &[Value::I64(b)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}

@@ -70,6 +70,14 @@
 //! can't be specialized (the single-function residual carries no table) and returns
 //! [`SpecError::Unsupported`]. Host/capability calls are never inlined.
 //!
+//! **Outlining (residual-call mode).** With [`SpecConfig::outline_calls`] (and no rename region),
+//! calls are *not* inlined: each `(callee, arg pattern)` is specialized to its own residual function
+//! — memoized so call sites with the same static binding share one — and emitted as a residual
+//! `call`, giving a **multi-function** residual. This bounds code growth and specializes
+//! **dynamic-depth recursion** (a recursive callee with a dynamic argument becomes a finite
+//! self-recursive residual where inlining would diverge). Constant arguments are baked in; the
+//! dynamic ones are passed.
+//!
 //! **Scope.** Integer and **scalar float** ops — arithmetic, compares, fused multiply-add,
 //! float↔int conversions, reinterpret/demote/promote casts — are specialized (folded where the
 //! operands are constant, bit-for-bit the interpreter). Remaining **pure, single-result** value ops
@@ -79,6 +87,7 @@
 //! atomics, fibers/threads), and memory accesses the engine can't resolve, return
 //! [`SpecError::Unsupported`] rather than guessing.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use svm_ir::{ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType};
@@ -214,6 +223,16 @@ pub struct SpecConfig {
     /// operand stack *and* a pointer-addressed heap at once. Unsound if violated (a dynamic write
     /// into the region would desync the elided renamed cells), so it is opt-in and off by default.
     pub rename_is_private: bool,
+    /// **Outline calls** instead of inlining them: a direct (or constant-index indirect) call is
+    /// specialized to a *separate* residual function — memoized per `(callee, arg pattern)` so call
+    /// sites with the same static binding share one — and emitted as a residual `call`, producing a
+    /// **multi-function** residual. This bounds code growth (a callee specialized once, called N
+    /// times) and specializes **dynamic-depth recursion** (a recursive callee with a dynamic
+    /// argument becomes a finite self-recursive residual, where inlining would diverge). Requires
+    /// [`rename`](Self::rename) to be `None` — threading the renamed region's abstract cells across a
+    /// real call boundary isn't implemented, so with a rename region set this is ignored and calls
+    /// inline as usual. Off by default (the residual is a single inlined function).
+    pub outline_calls: bool,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -240,8 +259,10 @@ pub fn specialize_with(
 }
 
 /// Specialize `module.funcs[func]` against the static/dynamic binding in `args`, steered by
-/// `config`. Produces a module with a single residual function (index 0); the original memory and
-/// data segments are carried through, so any residual loads still resolve.
+/// `config`. Produces a module whose residual entry is function 0; the original memory and data
+/// segments are carried through, so any residual loads still resolve. With
+/// [`SpecConfig::outline_calls`] the residual is **multi-function** (the entry plus one specialized
+/// function per outlined `(callee, arg pattern)`); otherwise it is a single inlined function.
 pub fn specialize_with_config(
     module: &Module,
     func: u32,
@@ -253,41 +274,86 @@ pub fn specialize_with_config(
         return Err(SpecError::ArityMismatch);
     }
 
-    // The entry context, and the residual function's parameters (the dynamic args, in order).
-    let mut params = Vec::with_capacity(args.len());
-    let mut residual_params = Vec::new();
-    for (i, arg) in args.iter().enumerate() {
-        match arg {
-            SpecArg::ConstI32(v) => params.push(Some(Known::I32(*v))),
-            SpecArg::ConstI64(v) => params.push(Some(Known::I64(*v))),
-            SpecArg::Dynamic => {
-                params.push(None);
-                residual_params.push(f.params[i]);
-            }
-        }
-    }
+    // The entry context: the constant valuation of each parameter (a static const, or `None` for a
+    // dynamic value carried as a residual parameter).
+    let entry_pattern: ParamPattern = args
+        .iter()
+        .map(|arg| match arg {
+            SpecArg::ConstI32(v) => Some(Known::I32(*v)),
+            SpecArg::ConstI64(v) => Some(Known::I64(*v)),
+            SpecArg::Dynamic => None,
+        })
+        .collect();
 
     let has_memory = module.memory.is_some();
-    let value_types = module
+    let value_types: Vec<Vec<Vec<ValType>>> = module
         .funcs
         .iter()
         .map(|f| func_value_types(f, &module.funcs, has_memory))
         .collect();
+
+    // Threading the renamed region's abstract cells across a real call boundary isn't implemented,
+    // so outlining only applies when there is no rename region (then the abstract memory is empty
+    // and the callee shares the real window directly).
+    let funcs = if config.outline_calls && config.rename.is_none() {
+        outline_funcs(module, config, &value_types, func, entry_pattern)?
+    } else {
+        vec![build_func(
+            module,
+            config,
+            &value_types,
+            None,
+            func,
+            &entry_pattern,
+        )?]
+    };
+
+    Ok(Module {
+        funcs,
+        memory: module.memory,
+        data: module.data.clone(),
+        imports: vec![],
+        debug_info: None,
+    })
+}
+
+/// Build one residual function for `(callee, pattern)`: a fresh [`Spec`] symbolically executes the
+/// callee from its entry, with `outline` either `None` (inline every call into this one function) or
+/// `Some` (outline calls into shared residual functions via the shared state). The residual's
+/// parameters are the dynamic entries of `pattern`, in order; its results match the callee's.
+fn build_func(
+    module: &Module,
+    config: &SpecConfig,
+    value_types: &[Vec<Vec<ValType>>],
+    outline: Option<&RefCell<OutlineState>>,
+    callee: u32,
+    pattern: &ParamPattern,
+) -> Result<Func, SpecError> {
+    let cf = module
+        .funcs
+        .get(callee as usize)
+        .ok_or(SpecError::BadFunc)?;
+    let residual_params: Vec<ValType> = pattern
+        .iter()
+        .zip(&cf.params)
+        .filter_map(|(slot, ty)| slot.is_none().then_some(*ty))
+        .collect();
+
     let mut spec = Spec {
         module,
         config,
         value_types,
+        outline,
         memo: HashMap::new(),
         queue: VecDeque::new(),
         next_id: 0,
     };
-    // The entry context is a single frame: the function being specialized, at its entry block.
     spec.intern(
         vec![Frame {
-            func,
+            func: callee,
             block: 0,
             ip: 0,
-            env: params,
+            env: pattern.clone(),
         }],
         Vec::new(),
     );
@@ -297,21 +363,90 @@ pub fn specialize_with_config(
         if blocks.len() >= DEFAULT_BUDGET {
             return Err(SpecError::Budget);
         }
-        let block = spec.build_block(task)?;
-        blocks.push(block);
+        blocks.push(spec.build_block(task)?);
     }
-
-    Ok(Module {
-        funcs: vec![Func {
-            params: residual_params,
-            results: f.results.clone(),
-            blocks,
-        }],
-        memory: module.memory,
-        data: module.data.clone(),
-        imports: vec![],
-        debug_info: None,
+    Ok(Func {
+        params: residual_params,
+        results: cf.results.clone(),
+        blocks,
     })
+}
+
+/// The outlining driver: polyvariant interprocedural specialization. A shared memo maps each
+/// `(callee, arg pattern)` to a residual function index; building one function may request others
+/// (which are queued), and they are built FIFO so an index equals its position in `funcs`.
+fn outline_funcs(
+    module: &Module,
+    config: &SpecConfig,
+    value_types: &[Vec<Vec<ValType>>],
+    entry: u32,
+    entry_pattern: ParamPattern,
+) -> Result<Vec<Func>, SpecError> {
+    let state = RefCell::new(OutlineState {
+        memo: HashMap::new(),
+        queue: VecDeque::new(),
+        next_fn: 0,
+    });
+    state.borrow_mut().intern_fn(entry, entry_pattern); // the entry is residual function 0
+
+    let mut funcs: Vec<Func> = Vec::new();
+    loop {
+        let job = state.borrow_mut().queue.pop_front();
+        let Some((callee, pattern, ridx)) = job else {
+            break;
+        };
+        debug_assert_eq!(ridx as usize, funcs.len());
+        if funcs.len() >= DEFAULT_BUDGET {
+            return Err(SpecError::Budget);
+        }
+        let f = build_func(module, config, value_types, Some(&state), callee, &pattern)?;
+        funcs.push(f);
+    }
+    Ok(funcs)
+}
+
+/// Shared state for outlining: `(callee, arg pattern) → residual function index`, plus the worklist
+/// of functions still to build. Lives behind a `RefCell` so the (`&self`) block executor can mint a
+/// residual callee while emitting the `call`.
+struct OutlineState {
+    memo: HashMap<(u32, ParamPattern), u32>,
+    queue: VecDeque<(u32, ParamPattern, u32)>,
+    next_fn: u32,
+}
+
+impl OutlineState {
+    /// Get (or assign) the residual function index for `(callee, pattern)`, queuing it to be built
+    /// the first time it is seen. Indices are assigned in enqueue order (== build order).
+    fn intern_fn(&mut self, callee: u32, pattern: ParamPattern) -> u32 {
+        let key = (callee, pattern);
+        if let Some(&idx) = self.memo.get(&key) {
+            return idx;
+        }
+        let idx = self.next_fn;
+        self.next_fn += 1;
+        self.queue.push_back((key.0, key.1.clone(), idx));
+        self.memo.insert(key, idx);
+        idx
+    }
+}
+
+/// Split a call's abstract arguments into the callee's specialization pattern (constants baked,
+/// dynamics marked `None`) and the residual `call`'s argument list (the dynamic operands, in order),
+/// and intern the residual function index for `(callee, pattern)`.
+fn outline_ref(state: &RefCell<OutlineState>, callee: u32, args_abs: &[Abs]) -> (u32, Vec<u32>) {
+    let mut pattern = Vec::with_capacity(args_abs.len());
+    let mut args = Vec::new();
+    for &a in args_abs {
+        match a {
+            Abs::Const(k) => pattern.push(Some(k)),
+            Abs::Dyn(i) => {
+                pattern.push(None);
+                args.push(i);
+            }
+        }
+    }
+    let ridx = state.borrow_mut().intern_fn(callee, pattern);
+    (ridx, args)
 }
 
 struct Spec<'a> {
@@ -319,7 +454,9 @@ struct Spec<'a> {
     config: &'a SpecConfig,
     /// Per-function, per-block, per-value source types (`value_types[func][block][value_idx]`) —
     /// used to type the SSA values threaded into a residual block as block parameters.
-    value_types: Vec<Vec<Vec<ValType>>>,
+    value_types: &'a [Vec<Vec<ValType>>],
+    /// `Some` ⇒ outline calls into shared residual functions via this state; `None` ⇒ inline them.
+    outline: Option<&'a RefCell<OutlineState>>,
     /// `(call stack, memory pattern) → residual block id`. The memo that makes the loop terminate
     /// and that closes residual loops.
     memo: HashMap<(Vec<Frame>, MemPattern), u32>,
@@ -463,14 +600,20 @@ impl Spec<'_> {
     ) -> Result<Exec, SpecError> {
         for (k, inst) in insts.iter().enumerate().skip(start_ip) {
             if let Some((callee, args_abs)) = self.callee_of(inst, env)? {
-                match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
-                    Some(results) => env.extend(results),
-                    None => {
-                        return Ok(Exec::Suspend {
-                            callee,
-                            args: args_abs,
-                            resume_ip: k + 1,
-                        })
+                if let Some(state) = self.outline {
+                    // Outline: emit a residual call to the (shared) specialized callee.
+                    let results = self.outline_call(state, callee, &args_abs, out, rnext);
+                    env.extend(results);
+                } else {
+                    match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
+                        Some(results) => env.extend(results),
+                        None => {
+                            return Ok(Exec::Suspend {
+                                callee,
+                                args: args_abs,
+                                resume_ip: k + 1,
+                            })
+                        }
                     }
                 }
             } else if let Some(res) = self.eval_inst(inst, env, mem, out, rnext)? {
@@ -478,6 +621,23 @@ impl Spec<'_> {
             }
         }
         Ok(Exec::Done)
+    }
+
+    /// Emit a residual `call` to the specialized callee for `(callee, arg pattern)` and return its
+    /// results as fresh residual values. Constant arguments are baked into the callee (so call sites
+    /// with the same static binding share it); the dynamic arguments are passed, in order.
+    fn outline_call(
+        &self,
+        state: &RefCell<OutlineState>,
+        callee: u32,
+        args_abs: &[Abs],
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Vec<Abs> {
+        let (ridx, args) = outline_ref(state, callee, args_abs);
+        out.push(Inst::Call { func: ridx, args });
+        let nres = self.module.funcs[callee as usize].results.len();
+        (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect()
     }
 
     /// If `inst` is an inlinable call — a direct [`Inst::Call`], or an [`Inst::CallIndirect`] whose
@@ -1063,9 +1223,9 @@ impl Spec<'_> {
         })
     }
 
-    /// Specialize a tail call to `callee`: straight-line-inline if we can (its results become this
-    /// frame's results — i.e. a return to the caller), else replace the active frame with the callee,
-    /// keeping this frame's return continuation (the suspended callers).
+    /// Specialize a tail call to `callee` (a `return_call`). In outline mode it becomes a residual
+    /// `return_call` to the shared specialized callee; otherwise it is inlined (straight-line if it
+    /// can, else the active frame is replaced by the callee, keeping this frame's continuation).
     #[allow(clippy::too_many_arguments)]
     fn tail_call(
         &mut self,
@@ -1077,6 +1237,10 @@ impl Spec<'_> {
         rnext: &mut u32,
         fuel: &mut usize,
     ) -> Result<Terminator, SpecError> {
+        if let Some(state) = self.outline {
+            let (ridx, args) = outline_ref(state, callee, &args_abs);
+            return Ok(Terminator::ReturnCall { func: ridx, args });
+        }
         Ok(
             match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
                 Some(results) => self.return_from(outer, &results, mem, out, rnext),
