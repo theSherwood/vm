@@ -15,13 +15,18 @@
 //!      point with real loop state and reloads the saved `cap.call` value rather than re-issuing it.
 
 use core::ffi::c_void;
+use std::sync::Arc;
 use svm_durable::{
     arm_freeze_after_backedges, init_durable_window, read_state, transform_module, write_state,
     DURABLE_RESERVE, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
-use svm_jit::{compile_and_run_capture_reserved_with_host, JitError, JitOutcome};
+use svm_jit::{
+    compile_and_run_capture_reserved_with_host, compile_and_run_capture_reserved_with_host_durable,
+    compile_and_run_capture_reserved_with_host_durable_interruptible, FreezeController, JitError,
+    JitOutcome,
+};
 
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -176,6 +181,126 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
         STATE_NORMAL,
         "JIT thaw flips back to NORMAL"
     );
+}
+
+// A long poll-free loop (100M iterations adding 1), the clock folded in after: oracle = 100M + clock.
+// Big enough that an async controller firing at run start reliably catches it mid-loop, yet a thaw
+// from any iteration completes the remainder natively in well under a second.
+const LONG_LOOP: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  br block1(v0, v1)
+block1(v2: i32, v3: i64):
+  v4 = i64.const 1
+  v5 = i64.add v3 v4
+  v6 = i64.const 100000000
+  v7 = i64.lt_s v5 v6
+  br_if v7 block1(v2, v5) block2(v2, v5)
+block2(v8: i32, v9: i64):
+  v10 = i32.const 0
+  v11 = cap.call 2 0 (i32) -> (i64) v8 (v10)
+  v12 = i64.add v9 v11
+  return v12
+}
+"#;
+
+// Run the durable entry with an async freeze controller; returns (result, final window).
+fn jit_async_freeze(
+    inst: &Module,
+    clock: i64,
+    freeze: Arc<FreezeController>,
+) -> (JitOutcome, Vec<u8>) {
+    let mut h = Host::new();
+    h.clock_ns = clock;
+    let clk = h.grant_clock();
+    let slots = [clk as i64];
+    let win = window_with(STATE_NORMAL);
+    let (out, snap, _) = compile_and_run_capture_reserved_with_host_durable_interruptible(
+        inst,
+        0,
+        &slots,
+        &win,
+        &[],
+        &[],
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut h as *mut Host as *mut c_void,
+        freeze,
+    )
+    .expect("durable interruptible run compiles");
+    (out, snap)
+}
+
+// Thaw a frozen window on the JIT via the durable entry (REWINDING); returns (result, final window).
+fn jit_durable_thaw(inst: &Module, clock: i64, snap: &[u8]) -> (JitOutcome, Vec<u8>) {
+    let mut win = snap.to_vec();
+    write_state(&mut win, STATE_REWINDING);
+    let mut h = Host::new();
+    h.clock_ns = clock;
+    let clk = h.grant_clock();
+    let slots = [clk as i64];
+    let (out, final_win, _) = compile_and_run_capture_reserved_with_host_durable(
+        inst,
+        0,
+        &slots,
+        &win,
+        &[],
+        &[],
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut h as *mut Host as *mut c_void,
+    )
+    .expect("durable thaw compiles");
+    (out, final_win)
+}
+
+#[test]
+fn async_controller_freezes_a_running_compute_loop_on_the_jit() {
+    let inst = module(LONG_LOOP);
+
+    // Oracle is the closed form: 100M loop iterations (acc += 1) + clock(42). (Running 100M
+    // iterations on the tree-walk interpreter would blow the fuel budget and be slow; the JIT runs
+    // them natively. The deterministic small-loop round-trip is covered by the tests above.)
+    const ORACLE: i64 = 100_000_000 + 42;
+
+    // A controller thread requests a freeze the instant the run publishes its window base — the real
+    // async stop-the-world trigger, no deterministic countdown. It catches the long loop mid-flight
+    // with overwhelming probability (the loop runs ~100ms; the request lands within microseconds).
+    let freeze = FreezeController::new();
+    let fc = Arc::clone(&freeze);
+    let controller = std::thread::spawn(move || fc.request_freeze());
+    let (out, snap) = jit_async_freeze(&inst, 42, freeze);
+    controller.join().unwrap();
+
+    if read_state(&snap) == STATE_UNWINDING {
+        // Froze mid-loop (the expected path). The window holds the unwound loop-header continuation;
+        // a thaw must reproduce the oracle — the loop state was reloaded and the post-loop cap.call
+        // runs once on thaw. (The clock is folded in only after the loop, so use the baseline clock.)
+        assert!(
+            matches!(out, JitOutcome::Returned(_)),
+            "async freeze returns a placeholder, not a trap"
+        );
+        let (thawed, final_win) = jit_durable_thaw(&inst, 42, &snap);
+        assert_eq!(
+            jit_i64(&thawed),
+            ORACLE,
+            "thaw of an async-frozen compute loop reproduces the oracle"
+        );
+        assert_eq!(
+            read_state(&final_win),
+            STATE_NORMAL,
+            "thaw flips back to NORMAL"
+        );
+    } else {
+        // The loop finished before the request landed (rare): the run is simply the uninterrupted
+        // result. Correctness still holds — the async path never corrupts a completed run.
+        assert_eq!(
+            jit_i64(&out),
+            ORACLE,
+            "uninterrupted async run is still correct"
+        );
+    }
 }
 
 #[test]
