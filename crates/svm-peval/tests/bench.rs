@@ -1000,6 +1000,24 @@ struct Tally {
     unsupported: usize,    // SpecError::Unsupported
     nonterminating: usize, // specialized, but no chosen input terminated (nothing to check)
     oracle_checks: usize,  // total interp==interp==jit comparisons that passed
+    // One example program per bail category, for the report ("where it bails").
+    ex_budget: Option<Vec<(u8, i64)>>,
+    ex_unsupported: Option<Vec<(u8, i64)>>,
+    ex_nonterm: Option<Vec<(u8, i64)>>,
+}
+
+impl Tally {
+    fn merge(&mut self, o: Tally) {
+        self.programs += o.programs;
+        self.succeeded += o.succeeded;
+        self.budget += o.budget;
+        self.unsupported += o.unsupported;
+        self.nonterminating += o.nonterminating;
+        self.oracle_checks += o.oracle_checks;
+        self.ex_budget = self.ex_budget.take().or(o.ex_budget);
+        self.ex_unsupported = self.ex_unsupported.take().or(o.ex_unsupported);
+        self.ex_nonterm = self.ex_nonterm.take().or(o.ex_nonterm);
+    }
 }
 
 /// Specialize `interp` against each generated program and assert the PE oracle. `specialize` is the
@@ -1026,10 +1044,12 @@ fn fuzz_shape(
             Ok(r) => r,
             Err(svm_peval::SpecError::Budget) => {
                 t.budget += 1;
+                t.ex_budget.get_or_insert_with(|| prog.clone());
                 continue;
             }
             Err(svm_peval::SpecError::Unsupported) => {
                 t.unsupported += 1;
+                t.ex_unsupported.get_or_insert_with(|| prog.clone());
                 continue;
             }
             Err(e) => panic!("{label}: unexpected specialize error {e:?} on {prog:?}"),
@@ -1069,54 +1089,98 @@ fn fuzz_shape(
             t.succeeded += 1;
         } else {
             t.nonterminating += 1;
+            t.ex_nonterm.get_or_insert_with(|| prog.clone());
         }
     }
-    println!(
-        "{label:<26} {:>5} programs | {:>4} ok, {:>3} budget, {:>3} unsupported, {:>3} nonterm | {:>5} oracle checks",
-        t.programs, t.succeeded, t.budget, t.unsupported, t.nonterminating, t.oracle_checks
-    );
     t
 }
 
-fn run_fuzz(n: usize) {
+/// Print the merged outcome line for a shape, plus one example program per bail category — so the
+/// report shows *where* the fuzzer hits the engine's limits, not just how often.
+fn report_shape(label: &str, t: &Tally) {
+    println!(
+        "{label:<26} {:>5} programs | {:>5} ok, {:>3} budget, {:>3} unsup, {:>3} nonterm | {:>6} oracle checks",
+        t.programs, t.succeeded, t.budget, t.unsupported, t.nonterminating, t.oracle_checks
+    );
+    if let Some(p) = &t.ex_budget {
+        println!("    budget  e.g. {p:?}");
+    }
+    if let Some(p) = &t.ex_unsupported {
+        println!("    unsup   e.g. {p:?}");
+    }
+    if let Some(p) = &t.ex_nonterm {
+        println!("    nonterm e.g. {p:?}");
+    }
+}
+
+fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
     let region = Some((STACK_LO, STACK_HI));
     println!("\n=== differential fuzz: interp(interp) == interp(residual) == jit(residual) ===");
 
     // (1) Register machine, no rename: branches and loops exercise dispatch folding and the Budget
-    // bail on statically unbounded loops.
-    let reg = fuzz_shape(
-        "regmachine (plain)",
-        n,
-        0xC0FFEE,
-        gen_reg_program,
-        build_interpreter,
-        |m| specialize(m, 0, &[SpecArg::Dynamic]),
-    );
+    // bail on statically unbounded loops. (2) Helper-calling stack machine, rename + outline: fuzzes
+    // the PR-#82 path (region cells threaded across outlined calls). Each shape runs every seed; the
+    // tallies merge so the bail surface is sampled across many program streams.
+    let mut reg = Tally::default();
+    let mut stk = Tally::default();
+    for &seed in seeds {
+        reg.merge(fuzz_shape(
+            "regmachine (plain)",
+            n,
+            seed,
+            gen_reg_program,
+            build_interpreter,
+            |m| specialize(m, 0, &[SpecArg::Dynamic]),
+        ));
+        stk.merge(fuzz_shape(
+            "stackmachine+helpers (#82)",
+            n,
+            seed ^ 0x9999,
+            gen_stack_calls_program,
+            build_stack_interpreter_calls,
+            move |m| {
+                specialize_with_config(
+                    m,
+                    0,
+                    &[SpecArg::Dynamic],
+                    &SpecConfig {
+                        rename: region,
+                        outline_calls: true,
+                        ..SpecConfig::default()
+                    },
+                )
+            },
+        ));
+    }
+    report_shape("regmachine (plain)", &reg);
+    report_shape("stackmachine+helpers (#82)", &stk);
 
-    // (2) Helper-calling stack machine, rename + outline: fuzzes the PR-#82 path (region cells
-    // threaded across outlined calls).
-    let stk = fuzz_shape(
-        "stackmachine+helpers (#82)",
-        n,
-        0x1234_5678,
-        gen_stack_calls_program,
-        build_stack_interpreter_calls,
-        move |m| {
-            specialize_with_config(
-                m,
-                0,
-                &[SpecArg::Dynamic],
-                &SpecConfig {
-                    rename: region,
-                    outline_calls: true,
-                    ..SpecConfig::default()
-                },
-            )
-        },
-    );
+    // Confirm the bails are legitimate, not the engine giving up on tractable programs. A
+    // "nonterminating" example must still not finish with 50x the fuel (genuinely an infinite loop,
+    // not merely slow); a "budget" example must indeed be unspecializable (re-bail) — a static,
+    // unbounded loop. (The oracle assertions inside fuzz_shape already prove no miscompiles.) The
+    // high-fuel re-run is slow, so it is gated to the thorough run.
+    if verify_bails {
+        if let Some(p) = &reg.ex_nonterm {
+            let m = build_interpreter(p);
+            for input in [0i64, 1, 2, 5, 11] {
+                assert!(
+                    interp_try(&m, input, 10_000_000).is_none(),
+                    "nonterm example actually terminated at {input}: {p:?}"
+                );
+            }
+        }
+        if let Some(p) = &reg.ex_budget {
+            assert!(
+                matches!(
+                    specialize(&build_interpreter(p), 0, &[SpecArg::Dynamic]),
+                    Err(svm_peval::SpecError::Budget)
+                ),
+                "budget example did not re-bail: {p:?}"
+            );
+        }
+    }
 
-    // The real value is the assertions inside `fuzz_shape`; here we just guard that the fuzzer
-    // actually exercised the engine (didn't generate only non-terminating or only-bailing programs).
     assert!(
         reg.succeeded > 0 && reg.oracle_checks > 0,
         "register fuzz did no useful work"
@@ -1130,7 +1194,7 @@ fn run_fuzz(n: usize) {
 /// A fast, deterministic smoke that runs by default — a cheap regression guard on the PE oracle.
 #[test]
 fn fuzz_specialization_smoke() {
-    run_fuzz(16);
+    run_fuzz(16, &[0x5EED], false);
 }
 
 /// The thorough run (hundreds of programs per shape; JIT-compiles each residual, so it's slow). Run
@@ -1139,7 +1203,7 @@ fn fuzz_specialization_smoke() {
 #[test]
 #[ignore = "thorough fuzz — run with --ignored --nocapture"]
 fn fuzz_specialization_thorough() {
-    run_fuzz(400);
+    run_fuzz(300, &[0x1111, 0x2222, 0x3333, 0x4444], true); // 4 seeds x 300 = 1200 programs/shape
 }
 
 // ===========================================================================================
