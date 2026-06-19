@@ -72,6 +72,10 @@ pub struct SpecializeOpts {
     /// residual). Bounds code growth and specializes dynamic-depth recursion; requires no rename
     /// region (see [`svm_peval::SpecConfig::outline_calls`]).
     pub outline: bool,
+    /// Selective outlining: inline the leaves/structure and outline **only** unbounded-recursion
+    /// back-edges — a tight recursive residual rather than one function per call site (see
+    /// [`svm_peval::SpecConfig::selective_outline`]). Requires no rename region.
+    pub selective_outline: bool,
 }
 
 /// Specialize `module`'s entry against `opts` and re-verify the residual. The specializer is
@@ -104,6 +108,7 @@ pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Modul
         const_regions: opts.const_regions.clone(),
         rename_is_private: opts.rename_private,
         outline_calls: opts.outline,
+        selective_outline: opts.selective_outline,
         ..SpecConfig::default()
     };
     let residual = svm_peval::specialize_with_config(module, opts.func, &args, &cfg)
@@ -2294,6 +2299,7 @@ unsafe fn powerbox_compile_run(
     slots: &[i64],
     interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
     quota: svm_jit::Quota,
+    init_mem: Option<&[u8]>,
 ) -> Result<(JitOutcome, Vec<JitFrameLoc>), svm_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
     if let Some(m) = locked {
@@ -2314,7 +2320,7 @@ unsafe fn powerbox_compile_run(
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-        let r = CompiledModule::run_raw(&mut cm, slots, None, None, None);
+        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(0);
@@ -2337,7 +2343,7 @@ unsafe fn powerbox_compile_run(
     )?;
     let host = &mut *raw_host;
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-    let r = CompiledModule::run_raw(&mut cm, slots, None, None, None);
+    let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
     host.set_jit_native_ctx(0);
     r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec()))
 }
@@ -2380,6 +2386,83 @@ pub fn run_powerbox_with_deadline_and_quota(
     deadline: Option<std::time::Duration>,
     quota: Quota,
 ) -> Result<Run, String> {
+    run_powerbox_inner(module, stdin, &[], &[], deadline, quota)
+}
+
+/// Build the §3e powerbox **args buffer** from `args` (the `argv` vector — `args[0]` is the program
+/// name) and `env` (the `envp` vector, each `KEY=VALUE`), at the layout
+/// `svm_ir::POWERBOX_ARGS_BASE` documents: `{ argc:u32-LE, envc:u32-LE }` then the packed
+/// NUL-terminated strings. An argument containing an embedded NUL, or a blob that would reach
+/// `POWERBOX_ARGS_END`, is rejected (the C `argv[]` model can't represent the former, and the latter
+/// would collide with the program's data segments).
+fn build_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Result<Vec<u8>, String> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(env.len() as u32).to_le_bytes());
+    for s in args.iter().chain(env.iter()) {
+        if s.contains(&0) {
+            return Err("powerbox arg/env contains an embedded NUL".into());
+        }
+        blob.extend_from_slice(s);
+        blob.push(0);
+    }
+    if svm_ir::POWERBOX_ARGS_BASE + blob.len() as u64 > svm_ir::POWERBOX_ARGS_END {
+        return Err(format!(
+            "powerbox args buffer ({} bytes) does not fit in the args region [{}, {})",
+            blob.len(),
+            svm_ir::POWERBOX_ARGS_BASE,
+            svm_ir::POWERBOX_ARGS_END
+        ));
+    }
+    Ok(blob)
+}
+
+/// Like [`run_powerbox`], but hand the guest a program-arguments vector (and environment): the
+/// frontend's `_start` for a `main(int, char**)` parses these into `argc`/`argv` (§3e / D44). For a
+/// `main(void)` program the buffer is simply unread. `args[0]` is conventionally the program name;
+/// `env` entries are `KEY=VALUE`. See [`build_args_blob`] for the (bounded) layout.
+pub fn run_powerbox_with_args(
+    module: &Module,
+    stdin: &[u8],
+    args: &[&[u8]],
+    env: &[&[u8]],
+) -> Result<Run, String> {
+    run_powerbox_inner(module, stdin, args, env, None, Quota::default())
+}
+
+/// The full powerbox entry: a program-arguments vector + environment (§3e args buffer) *and* the §5
+/// kill-path `deadline` / §15 spawn `quota`. The `svm-run` CLI uses this to forward its post-`--`
+/// arguments to the guest while still bounding a runaway/spawn-bomb guest.
+pub fn run_powerbox_with_args_and_limits(
+    module: &Module,
+    stdin: &[u8],
+    args: &[&[u8]],
+    env: &[&[u8]],
+    deadline: Option<std::time::Duration>,
+    quota: Quota,
+) -> Result<Run, String> {
+    run_powerbox_inner(module, stdin, args, env, deadline, quota)
+}
+
+fn run_powerbox_inner(
+    module: &Module,
+    stdin: &[u8],
+    args: &[&[u8]],
+    env: &[&[u8]],
+    deadline: Option<std::time::Duration>,
+    quota: Quota,
+) -> Result<Run, String> {
+    // Seed the §3e args buffer into the window's low bytes (applied before the module's data
+    // segments, which live at/above `POWERBOX_ARGS_END`, so the two never overlap). Empty `args` ⇒
+    // no seed (identical to the legacy path); the buffer is only read by a `main(int, char**)`.
+    let init_mem = if args.is_empty() && env.is_empty() {
+        None
+    } else {
+        let blob = build_args_blob(args, env)?;
+        let mut buf = vec![0u8; svm_ir::POWERBOX_ARGS_BASE as usize + blob.len()];
+        buf[svm_ir::POWERBOX_ARGS_BASE as usize..].copy_from_slice(&blob);
+        Some(buf)
+    };
     let mut host = Host::new();
     host.set_quota(quota);
     host.stdin = stdin.to_vec();
@@ -2464,12 +2547,23 @@ pub fn run_powerbox_with_deadline_and_quota(
                 &slots,
                 interrupt.as_ref(),
                 quota,
+                init_mem.as_deref(),
             )
         };
         host = m.into_inner().unwrap_or_else(|e| e.into_inner());
         r
     } else {
-        unsafe { powerbox_compile_run(module, None, &mut host, &slots, interrupt.as_ref(), quota) }
+        unsafe {
+            powerbox_compile_run(
+                module,
+                None,
+                &mut host,
+                &slots,
+                interrupt.as_ref(),
+                quota,
+                init_mem.as_deref(),
+            )
+        }
     };
     if let Some((done_tx, handle)) = watchdog {
         let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly

@@ -64,7 +64,10 @@ helper wrapping the futex barrier; it is a convenience, not a mechanism — and 
 guest code over existing ops** (`i32.atomic.load.acquire` / `store.release` /
 `i32.atomic.wait` / `atomic.notify`), so svm ships it only as a **tested reference**, not an
 API. svm can wrap only the collector↔vCPU barrier; the safepoint poll + `suspend` (step 2)
-lives in the guest scheduler. svm exposes **no vCPU-count intrinsic**, so the guest passes `N`.
+lives in the guest scheduler. svm exposes **no vCPU-count intrinsic**, so the guest passes `N`;
+it can, however, read the **current vCPU's id** ambiently via `vcpu.tls.get` (§12 — the per-vCPU
+TLS register, seeded to a dense id), which is what per-CPU GC state (mark stacks, allocator
+caches) indexes by, correct even after a fiber migrates between vCPUs.
 
 ### 2.1. Reference barrier (the optional `quiesce` helper)
 

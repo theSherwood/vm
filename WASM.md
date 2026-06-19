@@ -6,8 +6,8 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (108 tests across
-`transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
+**Status: feature-complete for *typical clang/rustc -O2 output*** (125 tests across
+`transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`/`reftypes.rs`/`debug_line.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
 and a wasi-threads parallel kernel run on both backends. `bench --threads`: SVM ~1.35× faster than
@@ -120,15 +120,24 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   no-op (bytes are inlined at the init site). A non-constant `src`/`len` is fail-closed `Unsupported`
   (no runtime passive-data store); a static source-OOB is a clean transpile error. `tests/bulk.rs`
   (passive + active segments, partial range, runtime dest, multi-segment indexing, dynamic-len reject).
-- [ ] **The *table* bulk ops + passive *element* segments**: `elem.drop`, `table.init`, `table.copy`,
-  `table.fill`, `table.grow`, `table.size`. Need a **mutable runtime table** (a size cell + funcref
-  stores into the table region), unlike the memory side. Lower audience — C/Rust WASI output uses
-  *active* elem segments (already supported); passive elem + `table.init` shows up mainly with
-  reference-types / dynamic linking.
-- [ ] **Reference types**: `externref`/`funcref` as values, `table.get`/`set`/`grow`/`size`/`fill`,
-  `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
-  capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
-  `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
+- [~] **Reference types — single-table feature complete; only multiple tables remain.** Both ref types
+  are an **i32 index** in SVM — `funcref` → the §3c function-table index (already powers
+  `call_indirect`), `externref` → a §7 capability handle (an opaque host-table index). So the whole
+  "reference" half is i32 plumbing over **existing IR** (no new ops, no verifier rules — the table is
+  just i32-granular window memory). **Done:** `funcref`/`externref` as values
+  (params/results/locals/globals); `ref.null`/`ref.is_null`/`ref.func` (null = the `0xFFFF_FFFF`
+  sentinel the table already uses); typed `select (result t)`; the full mutable-table op set —
+  `table.get`/`set`/`size`/`fill`/`copy`/`init`/`grow` (the i32-slot twins of the memory ops:
+  `copy`/`init` reuse `memory.copy`/`init`, `grow` mirrors `memory.grow` with a slot size cell +
+  growable table region); passive **element** segments + `elem.drop`; declarative `elem` segments (a
+  no-op). OOB indices **mask** into the window (the §1a model, like memory — not a trap); the
+  `call_indirect` §3c type-check still guards a forged funcref, and a forged externref faults at
+  `cap.call` (authority lives in the host's grant table, not the handle's bits). `tests/reftypes.rs`
+  (a vtable via `ref.func`+`table.set`+`call_indirect`, get/set round-trip, fill, copy, init from a
+  passive segment, grow + over-max-fails, typed select, externref pass-through — all interp == JIT).
+- [ ] **Reference types — remaining**: **multiple tables** (`table.get`/`set`/`copy`/etc. on a
+  non-zero table) — needs per-table base offsets and N table regions in the window layout. Lower
+  audience (dynamic-linking / GC-language glue; C/C++/Rust compute emits at most one table).
 - [x] **SIMD — DONE (fixed-width v128 *and* relaxed).** The whole wasm SIMD surface transpiles + runs
   on both backends: every arithmetic/lane/convert/shuffle op, the **float rounding** lanes
   (`f32x4`/`f64x2` `.ceil/.floor/.trunc/.nearest`), the **memory variants** (splat-load, load-extend,
@@ -328,7 +337,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
    conversions, pmin/pmax, popcnt, `avgr_u`, dot product, extmul, extadd_pairwise, q15mulr_sat, the
    memory variants (splat-load/load-extend/load-zero/load+store-lane), **and** all 20 relaxed-SIMD ops
    via deterministic lowerings (incl. a fused FMA and the signed-i8 dot).
-6. **Narrow-atomic CAS-loop** 🟢 — **DONE.** Then **reference types** 🟡 (externref→handle, funcref→index).
+6. **Narrow-atomic CAS-loop** 🟢 — **DONE.** **Reference types** 🟢 — single-table feature complete
+   (values, `ref.*`, typed select, `table.get/set/size/fill/copy/init/grow`, passive/declarative
+   `elem` + `elem.drop`); only **multiple tables** remains.
 7. EH, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 
 Code map: the rejection sites are the `unsup(...)` calls in `crates/svm-wasm/src/lib.rs` (section

@@ -93,6 +93,10 @@ mod fiber_rt;
 #[cfg(fiber_rt)]
 mod os_thread_rt;
 
+// §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
+// (substrate-independent), so a plain non-fiber root has a TLS word too.
+mod vcpu_tls;
+
 // Migratable-fiber ownership protocol (D57 / DESIGN.md §23): the loom-verified single-owner atomic
 // state machine that guarantees a stolen fiber is resumed by exactly one thread — the gating safety
 // core of stackful work-stealing, proven in isolation before the runtime integration + cross-thread
@@ -352,6 +356,10 @@ pub struct FrozenFiber {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FrozenVCpu {
     pub task: usize,
+    /// The task that **spawned** this child (slice 3.4: nested spawns) — `0` for the root's direct
+    /// children, a child's task for a grandchild. Thaw rebuilds the per-parent join tables from this so
+    /// a grandchild's reloaded handle resolves in its parent's table. Mirror of `svm_interp`'s field.
+    pub parent_task: usize,
     pub func: i32,
     pub args: Vec<i64>,
     pub shadow_sp: u64,
@@ -2664,6 +2672,9 @@ impl CompiledModule {
         // the guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call;
         // the module owns the executable pages until `*this` drops (after every spawned vCPU is
         // joined below).
+        // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
+        // worker thread carries from a prior run before guest code can `vcpu.tls.get` it.
+        vcpu_tls::seed(0);
         let faulted = if seed_faulted {
             // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
             false
@@ -2691,10 +2702,11 @@ impl CompiledModule {
         // every still-parked fiber into its own region before the window is snapshotted, so the
         // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
         // flattening fiber touches only the committed reserve, so it's sound outside the guard.
-        // (The root's *own* fibers; a spawned child's fibers are out of scope, slice 3.3.) Skipped on a
-        // fault or a non-freeze run. The residue (incl. any fiber unwound mid-resume-chain during the
-        // root run, slice 3.2) is accumulated in the runtime by each fiber's `Complete` arm; drain it
-        // after driving — then the deferred children run (`drive_frozen_spawns`).
+        // This drives the **root's** own fibers; a spawned child flattens *its* fibers in
+        // `run_child_inline` (slice 3.4), merged below. Skipped on a fault or a non-freeze run. The
+        // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
+        // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving — then the
+        // deferred children run (`drive_frozen_spawns`).
         #[cfg(fiber_rt)]
         if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
             if let Some(rt) = (*this).fiber_rt.as_mut() {
@@ -2717,6 +2729,11 @@ impl CompiledModule {
             if let Some(d) = &(*this).domain {
                 d.drive_frozen_spawns();
                 (*this).frozen_vcpus_out = d.take_frozen_vcpus();
+                // Slice 3.4: a spawned child that owns fibers flattened them with its own
+                // `freeze_drive` (in `run_child_inline`) into the domain accumulator; merge that into
+                // the run residue alongside the root's. Sort-by-slot at serialize is canonical, so the
+                // append order doesn't affect the artifact.
+                (*this).frozen_out.extend(d.take_frozen_fibers());
             }
         }
 
@@ -3430,6 +3447,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
                 Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
+                // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
+                // (works for a plain non-fiber root), so supported on every target.
+                Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
                 // `i8x16.mul` and `i64x2` min/max have no single-instruction lowering on the target
                 // ISAs, so Cranelift can't legalize them; bail to `Unsupported` (the interp oracle
                 // still covers them, and wasm never emits them — `i64x2` has no min/max op).
@@ -3665,22 +3685,24 @@ struct Lower<'a> {
     /// trap-capture helper (`svm_capture_explicit_trap`) into every [`emit_trap`] site, so an
     /// explicit trap (div-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) records a source
     /// backtrace before it unwinds — the way memory faults do via the signal handler. `None` without
-    /// `-g` (the backtrace would be empty) or where the helper isn't linked (non-unix), leaving the
-    /// trap path byte-identical to before.
+    /// `-g` (the backtrace would be empty) or where the helper isn't linked (a target with no trap
+    /// runtime), leaving the trap path byte-identical to before.
     trap_capture: Option<(SigRef, i64)>,
 }
 
-/// The address of the §5 W3 Stage 2 explicit-trap capture helper (`svm_capture_explicit_trap` in
-/// `trap_shim.c`): baked into each [`emit_trap`] site under `-g`. `0` where the helper isn't linked
-/// (the shim is unix-only), which disables the explicit-trap backtrace there.
-#[cfg(unix)]
+/// The address of the §5 W3 explicit-trap capture helper (`svm_capture_explicit_trap` in
+/// `trap_capture.c`): baked into each [`emit_trap`] site under `-g`. The helper takes the trapping
+/// frame pointer as an argument (the JIT threads it in via Cranelift `get_frame_pointer`), so it works
+/// on every target the shim compiles for — **unix and windows** (MSVC has no `__builtin_frame_address`,
+/// but the passed `fp` + `_ReturnAddress` sidestep it). `0` on a target with no trap runtime.
+#[cfg(any(unix, windows))]
 fn trap_capture_addr() -> i64 {
     extern "C" {
-        fn svm_capture_explicit_trap();
+        fn svm_capture_explicit_trap(fp: usize);
     }
-    svm_capture_explicit_trap as unsafe extern "C" fn() as usize as i64
+    svm_capture_explicit_trap as unsafe extern "C" fn(usize) as usize as i64
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn trap_capture_addr() -> i64 {
     0
 }
@@ -3765,12 +3787,14 @@ fn build_clif(
     } else {
         None
     };
-    // §5 W3 Stage 2: under `-g`, import the trap-capture helper's `() -> ()` host-C signature and bake
-    // its address, so `emit_trap` can record an explicit trap's source backtrace before unwinding.
-    // Disabled without `-g` (the backtrace would be empty) or where the helper isn't linked.
+    // §5 W3 Stage 2: under `-g`, import the trap-capture helper's `(i64) -> ()` host-C signature (it
+    // takes the trapping frame pointer) and bake its address, so `emit_trap` can record an explicit
+    // trap's source backtrace before unwinding. Disabled without `-g` or where the helper isn't linked.
     let trap_capture = match trap_capture_addr() {
         addr if srclocs.is_some() && addr != 0 => {
-            Some((b.import_signature(module.make_signature()), addr))
+            let mut sig = module.make_signature(); // host C ABI
+            sig.params.push(AbiParam::new(I64)); // the trapping frame pointer
+            Some((b.import_signature(sig), addr))
         }
         _ => None,
     };
@@ -4174,6 +4198,28 @@ fn lower_block(
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §12 per-vCPU TLS register: baked thunks over a per-OS-thread word (no window/trap context —
+        // a pure thread-local access that cannot fault). `get` reads the *current* vCPU's word, so it
+        // is correct after a fiber migrates here.
+        if let Inst::VcpuTlsGet = inst {
+            let mut tsig = module.make_signature();
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, vcpu_tls::get as *const () as i64);
+            let call = b.ins().call_indirect(tref, thunk, &[]);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::VcpuTlsSet { val } = inst {
+            let v = get(&vals, *val)?;
+            let mut tsig = module.make_signature();
+            tsig.params.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, vcpu_tls::set as *const () as i64);
+            b.ins().call_indirect(tref, thunk, &[v]);
             continue;
         }
         if let Inst::GcRoots {
@@ -5220,8 +5266,12 @@ fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     // Only present under `-g` (else the backtrace would be empty); the trap path is otherwise
     // unchanged.
     if let Some((sigref, addr)) = lower.trap_capture {
+        // Pass the trapping function's frame pointer so the helper can walk the caller chain without
+        // `__builtin_frame_address` (which MSVC lacks); it pairs `fp` with its own return address (the
+        // trap site) for the innermost frame.
+        let fp = b.ins().get_frame_pointer(I64);
         let helper = b.ins().iconst(I64, addr);
-        b.ins().call_indirect(sigref, helper, &[]);
+        b.ins().call_indirect(sigref, helper, &[fp]);
     }
     let cell = b.use_var(lower.trap_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)

@@ -44,7 +44,37 @@ it is dropped once the actionable slices (1–2 below) close.
   inlining, each `(callee, arg pattern)` is specialized to a shared residual function and called — a
   multi-function residual that bounds code growth and specializes **dynamic-depth recursion** (a
   finite self-recursive residual where inlining would diverge). Requires no rename region.
+- **Selective outlining** (`SpecConfig::selective_outline`): inline straight-line and *bounded*
+  recursion as usual, and outline **only an unbounded-recursion back-edge** — a call re-entering an
+  activation already live on the stack with the same argument pattern. The residual is then a *tight*
+  recursive function with its leaves and structure folded in, instead of one tiny function per call
+  site (full `outline_calls`). Each frame carries a recursion signature (the entry argument pattern,
+  empty outside selective mode, so the inline / full-outline memo keys are untouched); a back-edge is
+  cut by the function-level outline memo, everything else by ordinary CFG inlining. On the Lisp `fib`
+  demo this takes the residual from 13 functions to **2** and the same-backend JIT win from 2.3× to
+  **~15×**. `tests/specialize.rs` (`selective_outlining_inlines_leaves_and_outlines_recursion`).
 - **AOT pipeline** (`tests/aot.rs`).
+- **End-to-end demo on a real interpreter** (`crates/svm-llvm/tests/peval_demo.rs`): a Brainfuck
+  interpreter **written in C**, compiled `clang -O2 → LLVM → svm-llvm → svm-IR`, then specialized
+  against a fixed BF program (the program is a runtime pointer clang can't fold, declared constant to
+  the specializer — weval's real use case). The generic 21-block interpreter folds to a **5-block**
+  compiled program (1484 → 176 bytes, 8.4× smaller); on a 2M-iteration workload the same-backend
+  specialization win is **~16× (JIT)** and the end-to-end interpreted→compiled-native is **~1600×**.
+  Proves the projection on frontend-emitted IR, not just hand-written toy interpreters.
+- **Second demo — a recursive Lisp/Scheme tree-walker** (`crates/svm-llvm/tests/lisp_demo.rs`): the
+  same on-ramp (C interpreter, `clang -O2 → svm-llvm`, opaque program pointer) on a *recursive*
+  AST-walking evaluator (`let`/`if`/arithmetic/variables + guest functions), exercising **both**
+  residual strategies. An **expression** program (a finite AST) fully **inlines**: the whole
+  3-function/16-block tree-walker collapses to a **single 4-block straight-line formula** — the
+  dispatch `switch`, node decode, and AST all gone. A **recursive** program (`fib` defined in the AST,
+  dynamic depth) uses **selective outlining**: the leaves/structure inline and only the self-call
+  outlines, folding into a **tight 2-function self-recursive residual** — fib(32) is **~145× (JIT)** /
+  **~2100×** end-to-end over the interpreted interpreter. Two practical findings it surfaced: (1)
+  clang's tail-recursion elimination loopifies the evaluator and turns `if` into a `select` of node
+  indices — a *dynamic* index that defeats dispatch folding — so the demo compiles with
+  `-fno-optimize-sibling-calls`; (2) a *counted* host loop (`for i in 0..n`) is unrolled by online PE
+  (its induction variable looks constant each step), so the guest's only foldable looping construct is
+  recursion — which is exactly where outlining earns its keep.
 - **Benchmarking** (`tests/bench.rs`): `size_corpus` (a normal test, also a size-regression guard)
   reports blocks / insts / encoded `.svmb` bytes for interpreter → residual → optimized across four
   shapes (register machine: constant / straight-line / runtime-loop, plus a renamed stack machine) —
@@ -59,8 +89,9 @@ it is dropped once the actionable slices (1–2 below) close.
    int↔float convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15). Each
    mirrors a `svm-interp` `simd_*` helper; low-medium effort, low priority (uncommon in residuals).
 2. **Outlining + renaming together** — thread the renamed region's live abstract cells across a
-   residual call (as extra params/results), so outlining works even with a rename region (today it
-   requires `rename = None`). Medium effort; only needed for very large renamed interpreters.
+   residual call (as extra params/results), so outlining (incl. selective) works even with a rename
+   region (today both require `rename = None`). Medium effort; only needed for very large renamed
+   interpreters.
 3. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
    dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
    effort (on-device re-verify, determinism/TCB review) — a project, not a slice.

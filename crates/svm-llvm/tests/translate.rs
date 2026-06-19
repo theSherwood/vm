@@ -828,6 +828,61 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
     powerbox_diff(name, &bc, &c, stdin);
 }
 
+/// The argv differential: build/run the native binary with a **controlled `argv`** (`args[0]` as the
+/// process name, via `arg0`, so it matches the SVM blob) and a cleared+seeded environment, then run
+/// the SVM translation with the same vectors through [`svm_run::run_powerbox_with_args`], asserting
+/// stdout + exit code match. This is the only way to compare a `main(int, char**)` program: native
+/// `argv[0]` is otherwise the temp path, which the guest can't (and shouldn't) reproduce.
+fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&str]) {
+    use std::os::unix::process::CommandExt;
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    std::fs::write(&c, src).expect("write c source");
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pba_{}_{}", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let mut cmd = Command::new(&exe);
+    cmd.arg0(args[0]).args(&args[1..]).env_clear();
+    for e in env {
+        let (k, v) = e.split_once('=').expect("env entry KEY=VALUE");
+        cmd.env(k, v);
+    }
+    let native = cmd.output().expect("run native");
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+    let envv: Vec<&[u8]> = env.iter().map(|s| s.as_bytes()).collect();
+    let run =
+        svm_run::run_powerbox_with_args(&module, b"", &argv, &envv).expect("powerbox run (args)");
+
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: svm stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let svm_code = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        svm_code, native_code,
+        "{name}: svm exit {svm_code} vs native {native_code}"
+    );
+}
+
 /// Run the powerbox differential on a **real corpus demo** (`crates/svm-run/demos/<rel>`) — a
 /// whole-program, self-contained C file (its own `memset`, `write`-only output). This is the D54
 /// "matches native clang" exit criterion applied to an actual library. The file is compiled *in
@@ -1184,6 +1239,297 @@ fn printf_signed_formats() {
 }
 
 #[test]
+fn tail_call_mutual_recursion() {
+    // `musttail` tail calls lower to the `return_call` terminator, so an unbounded tail/mutual
+    // recursion runs in **constant native-stack space**. `even`/`odd` tail-call each other 2,000,000
+    // deep — without tail-call lowering the JIT would recurse that far and blow the native stack;
+    // with `return_call` the frame is replaced, not nested. `noinline` stops clang from collapsing
+    // the pair, `musttail` forces a real tail call (not a rewritten loop). Both functions have no
+    // allocas (`frame_size == 0`), so the linear-memory data stack is constant too. vs native (which
+    // also TCOs `musttail`), byte-identical.
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    check_powerbox_vs_native("tail_mutual", src, b"");
+}
+
+// Narrow (i8/i16) atomics — emulated via the 32-bit CAS-loop helpers. rmw add (with wrap-around),
+// or/and/xor, exchange, load, store, and cmpxchg (success + failure) on a byte and a halfword.
+const ATOMICS_NARROW_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_uchar c = 0;\n\
+        atomic_fetch_add(&c, 200); atomic_fetch_add(&c, 100);\n\
+        atomic_fetch_or(&c, 0x80); atomic_fetch_and(&c, 0xF0); atomic_fetch_xor(&c, 0x0F);\n\
+        unsigned char oc = atomic_exchange(&c, 50);\n\
+        unsigned char lc = atomic_load(&c);\n\
+        atomic_store(&c, 99);\n\
+        unsigned char e1 = 99; int ok1 = atomic_compare_exchange_strong(&c, &e1, 123);\n\
+        unsigned char e2 = 7;  int ok2 = atomic_compare_exchange_strong(&c, &e2, 0);\n\
+        atomic_ushort s = 1000; atomic_fetch_add(&s, 70000);\n\
+        printf(\"%d %d %d %d %d %d\\n\", oc, lc, ok1, ok2, atomic_load(&c), atomic_load(&s));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_narrow() {
+    check_powerbox_vs_native("atomics_narrow", ATOMICS_NARROW_SRC, b"");
+}
+
+#[test]
+fn atomics_narrow_lowers_and_runs() {
+    // Local validation (no native cc). c: 0→200→44(wrap)→172→160→175; oc=175, store 99, cas(99→123)
+    // ok, cas(7) fail, c=123. s: 1000+70000 ≡ 5464 (mod 2^16).
+    let Some(bc) = compile_to_bc("atomics_n", ATOMICS_NARROW_SRC) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // The narrow CAS-loop helpers were synthesized (each contains an AtomicCmpxchg).
+    let cas_loops = t
+        .module
+        .funcs
+        .iter()
+        .filter(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, svm_ir::Inst::AtomicCmpxchg { .. }))
+            })
+        })
+        .count();
+    assert!(
+        cas_loops >= 2,
+        "expected the rmw + cas narrow helpers, got {cas_loops}"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"175 50 1 0 123 5464\n");
+}
+
+// C11 `<stdatomic.h>` exercising every native atomic instruction the on-ramp now lowers: rmw
+// add/sub/and/or/xor and exchange, load, store, and compare-exchange (success + failure) on `i32`
+// and `i64`. Single-threaded, so seq-cst is trivially observable.
+const ATOMICS_WIDE_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_int a = 0;\n\
+        atomic_fetch_add(&a, 5); atomic_fetch_sub(&a, 2);\n\
+        atomic_fetch_or(&a, 8); atomic_fetch_and(&a, 0xFF); atomic_fetch_xor(&a, 1);\n\
+        int old = atomic_exchange(&a, 100);\n\
+        int loaded = atomic_load(&a);\n\
+        atomic_store(&a, 42);\n\
+        int e1 = 42; int ok1 = atomic_compare_exchange_strong(&a, &e1, 99);\n\
+        int e2 = 7;  int ok2 = atomic_compare_exchange_strong(&a, &e2, 0);\n\
+        atomic_long b = 1000000000000L; atomic_fetch_add(&b, 1);\n\
+        printf(\"%d %d %d %d %d %ld\\n\", old, loaded, ok1, ok2, atomic_load(&a), atomic_load(&b));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_wide() {
+    check_powerbox_vs_native("atomics_wide", ATOMICS_WIDE_SRC, b"");
+}
+
+#[test]
+fn atomics_wide_lowers_and_runs() {
+    // Local validation (no native cc): the native atomics lower, verify, and run to the
+    // hand-computed result. a: 0→5→3→11→11→10; old=10, store 42, cas(42→99) ok, cas(7) fail, a=99;
+    // b: 1e12 + 1.
+    let Some(bc) = compile_to_bc("atomics_w", ATOMICS_WIDE_SRC) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let has_atomic = t.module.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                svm_ir::Inst::AtomicRmw { .. }
+                    | svm_ir::Inst::AtomicCmpxchg { .. }
+                    | svm_ir::Inst::AtomicLoad { .. }
+                    | svm_ir::Inst::AtomicStore { .. }
+            )
+        })
+    });
+    assert!(
+        has_atomic,
+        "expected native atomic ops in the lowered module"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"10 100 1 0 99 1000000000001\n");
+}
+
+#[test]
+fn tail_call_lowers_and_runs() {
+    // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
+    // `return_call` terminators, verifies, and runs to completion at 2,000,000 depth — which only
+    // works because the frame is replaced, not nested (a plain-`call` lowering would recurse 2M deep
+    // and overflow the native stack). `even(2e6)=1`, `odd(1999999)=even(1999998)=1` ⇒ "1 1\n".
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    let Some(bc) = compile_to_bc("tail_lower", src) else {
+        return; // clang unavailable
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let n_tail = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .filter(|b| {
+            matches!(
+                b.term,
+                svm_ir::Terminator::ReturnCall { .. }
+                    | svm_ir::Terminator::ReturnCallIndirect { .. }
+            )
+        })
+        .count();
+    assert!(
+        n_tail >= 2,
+        "expected ≥2 return_call terminators (even/odd tail calls), got {n_tail}"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR"); // checks return_call shape
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run"); // 2M-deep, constant stack
+    assert_eq!(run.stdout, b"1 1\n", "mutual tail recursion result");
+}
+
+#[test]
+fn printf_float_scientific() {
+    // `%e`/`%E` via the bignum Dragon4 formatter (`__svm_dtoa_sci`) — exact, correctly-rounded across
+    // the whole double range (no magnitude cap). Covers default/explicit precision, the exponent sign
+    // and ≥2-digit padding, very large/small magnitudes (1e300, 1e-300 — impossible for the 128-bit
+    // `%f` path), uppercase `%E`, sign flags, width + justification, a carry-on-round, and inf/nan.
+    // Byte-for-byte stdout vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"%e\\n\", 3.14); \
+                 printf(\"%.2e %.0e\\n\", 12345.678, 9.6); \
+                 printf(\"%e %e\\n\", 1e300, 1e-300); \
+                 printf(\"%E\\n\", 6.022e23); \
+                 printf(\"%.3e\\n\", 9.9999); \
+                 printf(\"%+.1e % .1e\\n\", 1.5, 2.5); \
+                 printf(\"[%14.3e][%-14.3e]\\n\", 2.5, 2.5); \
+                 printf(\"%e %e\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"%e %e %E\\n\", inf, -inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_e", src, b"");
+}
+
+#[test]
+fn printf_float_general() {
+    // `%g`/`%G` via the bignum formatter (`__svm_dtoa_gen`): rounds to P significant digits, picks
+    // `%e` vs `%f` by exponent (`E < -4 || E >= P`), and strips trailing zeros. Covers both layout
+    // branches, the e/f boundary with a carry (999999.9 → 1e+06), trailing-zero stripping (100000,
+    // 42.0), tiny/huge magnitudes, `%G`, precision 0 (⇒ 1 sig digit), sign + width, and inf/nan.
+    // Byte-for-byte vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"%g %g\\n\", 3.14159, 100000.0); \
+                 printf(\"%g %g\\n\", 1000000.0, 0.0001); \
+                 printf(\"%g %g\\n\", 0.00001, 1.0/3.0); \
+                 printf(\"%.10g\\n\", 1.0/3.0); \
+                 printf(\"%g %g\\n\", 999999.9, 42.0); \
+                 printf(\"%g %g\\n\", 1e300, 1e-300); \
+                 printf(\"%G %.0g\\n\", 6.022e23, 1234.0); \
+                 printf(\"[%12g][%-12g]\\n\", -2.5, -2.5); \
+                 printf(\"%g %g\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"%g %g %G\\n\", inf, -inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_g", src, b"");
+}
+
+#[test]
+fn printf_float_fixed_bignum() {
+    // `%f` now goes through the exact bignum formatter (`__svm_dtoa_fix_big`), so large magnitudes
+    // that overflowed the old 128-bit path — and used to trap — format correctly, as does `%F` and
+    // higher precision. The integer parts here have 30–300+ digits. Byte-for-byte vs native.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%.2f\\n\", 1e30); \
+                 printf(\"%.0f\\n\", 1e60); \
+                 printf(\"%.1f\\n\", 1.23456789e40); \
+                 printf(\"%f\\n\", 1e300); \
+                 printf(\"%.20f\\n\", 0.1); \
+                 printf(\"%F\\n\", 12345.678); \
+                 printf(\"%.40f\\n\", 1.0/3.0); \
+                 printf(\"[%50.2f]\\n\", 1e20); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f_big", src, b"");
+}
+
+#[test]
+fn printf_float_fixed() {
+    // `%f` via the synthesized exact-decimal helper (`__svm_dtoa_fixed`, fixed 128-bit integer
+    // arithmetic — no host float formatting). Covers: default precision (6), explicit precision,
+    // round-half-to-even ties (2.5→2, 3.5→4), a non-exactly-representable decimal (0.1), field width
+    // with right/left justification, a negative value, the `+`/space sign flags, zero, and a value
+    // with a multi-digit integer part. Byte-for-byte stdout compared to the native clang build.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%f\\n\", 3.14); \
+                 printf(\"%.2f\\n\", 3.14159); \
+                 printf(\"%.0f %.0f\\n\", 2.5, 3.5); \
+                 printf(\"%.3f\\n\", 0.1); \
+                 printf(\"[%8.2f][%-8.2f]\\n\", 3.5, 3.5); \
+                 printf(\"%f\\n\", -2.75); \
+                 printf(\"%+.1f % .1f\\n\", 1.5, 1.5); \
+                 printf(\"%.2f %.2f\\n\", 0.0, 100.0); \
+                 printf(\"%.3f\\n\", 12345.6789); \
+                 printf(\"%.10f\\n\", 0.5); \
+                 printf(\"%.1f\\n\", 9007199254740992.0); \
+                 printf(\"%.0f %.0f %.0f\\n\", 0.5, 1.5, 4.5); \
+                 printf(\"%.4f\\n\", 2.0 / 3.0); \
+                 printf(\"%.2f\\n\", -0.0); \
+                 printf(\"%.2f\\n\", 1e30); \
+                 printf(\"%.1f\\n\", 18014398509481984.0); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f", src, b"");
+}
+
+#[test]
+fn printf_float_nonfinite() {
+    // `%f` of the non-finite doubles: `__svm_dtoa_fixed` writes "inf"/"nan" (lowercase, with the sign
+    // byte / `+`/space flags) just like glibc, rather than trapping. `volatile` keeps clang from
+    // constant-folding the printf away. stdout compared byte-for-byte to native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 volatile double inf = INFINITY, nan = NAN, big = 1e308; \
+                 printf(\"%f %f\\n\", inf, -inf); \
+                 printf(\"%+f % f\\n\", inf, inf); \
+                 printf(\"%f\\n\", nan); \
+                 printf(\"[%8.2f][%-8.2f]\\n\", inf, inf); \
+                 printf(\"%f\\n\", big * 10.0); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f_nonfinite", src, b"");
+}
+
+#[test]
 fn realloc_grow_preserves() {
     // `realloc` must preserve the old contents across a grow (the header gives the copy length). Push
     // 20 ints into a doubling buffer, then sum — exit code compared to native.
@@ -1206,6 +1552,114 @@ fn printf_unsigned_formats() {
                  printf(\"%lx %02x\\n\", 0xdeadbeefcafeUL, 5u); \
                  return 0; }";
     check_powerbox_vs_native("printf_u", src, b"");
+}
+
+#[test]
+fn main_argc_argv() {
+    // `int main(int argc, char** argv)`: the synthesized argv-parsing `_start` reads the §3e args
+    // buffer, builds `argv[]` (with the `argv[argc] == NULL` terminator), and passes `argc`/`argv`
+    // to `main` — checked byte-for-byte vs native with a controlled `argv`. Covers iterating argv,
+    // a NULL-terminator walk (`while (argv[i])`), and `argc` flowing to the exit code.
+    let src = "#include <stdio.h>\n\
+               int main(int argc, char** argv){ \
+                 printf(\"argc=%d\\n\", argc); \
+                 for (int i = 0; argv[i]; i++) printf(\"argv[%d]=%s\\n\", i, argv[i]); \
+                 return argc; }";
+    // The common case (program name only), then a multi-arg vector.
+    check_powerbox_vs_native_args("argv1", src, &["prog"], &[]);
+    check_powerbox_vs_native_args("argvN", src, &["myprog", "hello", "world", "42"], &[]);
+}
+
+#[test]
+fn main_argc_argv_envp() {
+    // `int main(int argc, char** argv, char** envp)`: the synthesized `_start` parses the §3e blob's
+    // `envc` env strings (packed right after the argv strings) into a second NULL-terminated `char**`
+    // parked just above `argv[]`, and passes it as the third parameter — checked byte-for-byte vs
+    // native with a controlled, `env_clear`ed environment. Covers walking `envp` to its NULL
+    // terminator and `argv`/`envp` coexisting at the entry stack base.
+    let src = "#include <stdio.h>\n\
+               int main(int argc, char** argv, char** envp){ \
+                 printf(\"argc=%d\\n\", argc); \
+                 for (int i = 0; argv[i]; i++) printf(\"argv[%d]=%s\\n\", i, argv[i]); \
+                 int n = 0; for (char** e = envp; *e; e++) { printf(\"env[%d]=%s\\n\", n++, *e); } \
+                 return n; }";
+    // Empty env (just the NULL terminator), then a multi-entry environment. The entries are passed in
+    // sorted-by-key order because `std::process::Command` stores its env in a `BTreeMap`, so native's
+    // child `environ` is key-sorted; the SVM blob preserves the order we hand it, so we match by
+    // pre-sorting (`EMPTY` < `FOO` < `PATH`).
+    check_powerbox_vs_native_args("envp0", src, &["prog"], &[]);
+    check_powerbox_vs_native_args(
+        "envpN",
+        src,
+        &["prog", "a"],
+        &["EMPTY=", "FOO=bar", "PATH=/x:/y"],
+    );
+}
+
+#[test]
+fn getenv_lookup() {
+    // `getenv` on a `main(void)` program (so it exercises the synthesized `__svm_getenv` decoupled
+    // from any argv parsing): it scans the §3e blob's env strings for `KEY=`, returning the value
+    // pointer or NULL. Covers a hit, a miss, and the prefix guard (`"F"` must not match `"FOO=..."`),
+    // checked byte-for-byte vs native `getenv` with a controlled, `env_clear`ed environment.
+    let src = "#include <stdio.h>\n#include <stdlib.h>\n\
+               int main(void){ \
+                 char* a = getenv(\"FOO\"); char* b = getenv(\"PATH\"); \
+                 char* c = getenv(\"MISSING\"); char* d = getenv(\"F\"); \
+                 printf(\"FOO=%s\\n\", a ? a : \"(null)\"); \
+                 printf(\"PATH=%s\\n\", b ? b : \"(null)\"); \
+                 printf(\"MISSING=%s\\n\", c ? c : \"(null)\"); \
+                 printf(\"F=%s\\n\", d ? d : \"(null)\"); \
+                 return 0; }";
+    check_powerbox_vs_native_args("getenv1", src, &["prog"], &["FOO=bar", "PATH=/x:/y"]);
+    // No environment at all: every lookup must be NULL (the blob reads envc == 0).
+    check_powerbox_vs_native_args("getenv0", src, &["prog"], &[]);
+}
+
+#[test]
+fn printf_precision_formats() {
+    // Integer min-digit precision (`%.Nd`/`%.Nx`, incl. `%.0` of zero → no digits, and precision
+    // overriding the `0` flag → space field padding) and string truncating precision (`%.Ns`),
+    // checked byte-for-byte vs native `printf`. `s` is a non-literal pointer (runtime strlen).
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 const char* s = \"hello world\"; \
+                 printf(\"|%.4d|%.4d|%.0d|%8.4d|%-8.4d|\\n\", 42, -42, 0, 42, 42); \
+                 printf(\"|%.4x|%#.4x|%08.4d|\\n\", 0xabu, 0xabu, 42); \
+                 printf(\"|%.5s|%.20s|%8.3s|\\n\", s, s, s); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_prec", src, b"");
+}
+
+#[test]
+fn printf_flag_formats() {
+    // The full flag matrix on integer conversions, checked byte-for-byte vs native `printf`:
+    //   `-` left-justify, `+`/space forced sign, `0` zero-pad (incl. the previously-fail-closed
+    //   zero-padded signed), and `#` (the `0x` hex prefix, suppressed for zero).
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"|%-6d|%-6d|\\n\", 42, -42); \
+                 printf(\"|%+d|%+d|% d|% d|\\n\", 42, -42, 42, -42); \
+                 printf(\"|%05d|%05d|%+05d|\\n\", 42, -42, 42); \
+                 printf(\"|%#x|%#x|%#08x|\\n\", 255u, 0u, 0xabcu); \
+                 printf(\"|%-8x|%08x|\\n\", 0xbeefu, 0xbeefu); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_flags", src, b"");
+}
+
+#[test]
+fn printf_string_formats() {
+    // `%s` (runtime `strlen`) plain and right-justified in a field width, mixed with `%d`/`%c` so
+    // clang keeps it a real varargs `printf` (not a `puts` rewrite). A pointer that is *not* a string
+    // literal (the `b+1` tail) exercises the runtime strlen, not a constant length. stdout + exit vs
+    // native.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 const char* a = \"hi\"; const char* b = \"world\"; \
+                 printf(\"[%s] [%8s] n=%d\\n\", a, b, 3); \
+                 printf(\"%s|%s|%c\\n\", b + 1, a, '!'); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_s", src, b"");
 }
 
 #[test]
@@ -1522,6 +1976,35 @@ int f(void) {
     );
     if let Some(r) = run_interp("vm_gc", src, &[]) {
         assert_eq!(r, vec![Value::I32(1)], "gc.roots count out of [0, cap]");
+    }
+}
+
+// ---- §12 per-vCPU TLS register: `__vm_vcpu_tls_get` / `__vm_vcpu_tls_set` -----------------------
+
+/// The per-vCPU TLS register lowers from the `<svm.h>` builtins and round-trips a written value:
+/// `__vm_vcpu_tls_set(99)` then `__vm_vcpu_tls_get()` returns 99 (the root vCPU is seeded to 0, then
+/// overwritten). Asserts the ops lowered and ran on the interpreter.
+#[test]
+#[cfg(unix)]
+fn vm_vcpu_tls_round_trip() {
+    let src = r#"
+long __vm_vcpu_tls_get(void);
+void __vm_vcpu_tls_set(long x);
+int f(void) {
+  __vm_vcpu_tls_set(99);
+  return (int)__vm_vcpu_tls_get();   /* the value we just set */
+}
+"#;
+    let Some((m, _)) = translate_verified("vm_vcpu_tls", src) else {
+        return;
+    };
+    assert!(
+        module_has_inst(&m, |i| matches!(i, svm_ir::Inst::VcpuTlsGet))
+            && module_has_inst(&m, |i| matches!(i, svm_ir::Inst::VcpuTlsSet { .. })),
+        "expected vcpu.tls.get + vcpu.tls.set instructions"
+    );
+    if let Some(r) = run_interp("vm_vcpu_tls", src, &[]) {
+        assert_eq!(r, vec![Value::I32(99)], "vcpu.tls round-trip");
     }
 }
 

@@ -389,9 +389,16 @@ impl DapServer {
             // thread's frame even after the client switches threads.
             let frame_id = session.frame_refs.len();
             session.frame_refs.push((tid, out.len()));
+            // Frame name: the `-g` function name (`compute`) when present, else `func{N}`. So the
+            // VS Code call stack reads `#0 compute`, not `#0 func0`.
+            let fname = session
+                .inspector
+                .func_name(f.pc.func)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("func{}", f.pc.func));
             let mut fields = vec![
                 ("id", Json::i(frame_id as i64)),
-                ("name", Json::s(format!("#{} func{}", out.len(), f.pc.func))),
+                ("name", Json::s(format!("#{} {fname}", out.len()))),
                 (
                     "line",
                     Json::i(f.source.as_ref().map(|s| s.line as i64).unwrap_or(0)),

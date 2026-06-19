@@ -1,7 +1,7 @@
 //! `svm-run` — run a guest program in the sandbox from the command line.
 //!
 //! ```text
-//! svm-run <file> [--stdin FILE]
+//! svm-run <file> [--stdin FILE] [-- <guest args>]
 //! ```
 //!
 //! `<file>` is `.svm` (text IR), `.svmb` (binary), or `.c` (C source — compiled through the
@@ -25,8 +25,8 @@ use std::{env, fs, process};
 
 use svm_ir::Module;
 use svm_run::{
-    is_powerbox_entry, run_kernel, run_powerbox_with_deadline_and_quota, specialize_module,
-    Outcome, Quota, SpecArg, SpecializeOpts, Value,
+    is_powerbox_entry, run_kernel, run_powerbox_with_args_and_limits, specialize_module, Outcome,
+    Quota, SpecArg, SpecializeOpts, Value,
 };
 use svm_verify::verify_module;
 
@@ -45,6 +45,10 @@ fn try_main() -> Result<(), String> {
     }
     let mut file: Option<String> = None;
     let mut stdin_path: Option<String> = None;
+    // Everything after a `--` is the guest's own argument vector (the §3e args buffer): it becomes
+    // `argv[1..]`, with `argv[0]` set to the input file name — so a `main(int, char**)` program sees
+    // them exactly as a native invocation would.
+    let mut guest_args: Vec<String> = Vec::new();
     // `--specialize` (§20c partial evaluation) options.
     let mut specialize = false;
     let mut func: u32 = 0;
@@ -54,6 +58,7 @@ fn try_main() -> Result<(), String> {
     let mut rename_private = false;
     let mut optimize = true;
     let mut outline = false;
+    let mut selective_outline = false;
     let mut out_path: Option<String> = None;
     let mut emit_text = false;
     let mut run_args: Vec<i64> = Vec::new();
@@ -61,6 +66,10 @@ fn try_main() -> Result<(), String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--" => {
+                guest_args.extend(it.by_ref().cloned());
+                break;
+            }
             "--stdin" => {
                 stdin_path = Some(it.next().ok_or("--stdin needs a file argument")?.clone())
             }
@@ -73,6 +82,7 @@ fn try_main() -> Result<(), String> {
             "--rename" => rename = Some(parse_region(it.next().ok_or("--rename needs lo:hi")?)?),
             "--rename-private" => rename_private = true,
             "--outline" => outline = true,
+            "--selective" => selective_outline = true,
             "--no-optimize" => optimize = false,
             "-o" | "--out" => out_path = Some(it.next().ok_or("-o needs a file argument")?.clone()),
             "--emit-text" => emit_text = true,
@@ -117,6 +127,7 @@ fn try_main() -> Result<(), String> {
             rename_private,
             optimize,
             outline,
+            selective_outline,
             out_path,
             emit_text,
             run_args,
@@ -145,7 +156,20 @@ fn try_main() -> Result<(), String> {
             max_fibers: env_usize("SVM_MAX_FIBERS", dq.max_fibers),
             max_vcpus: env_usize("SVM_MAX_VCPUS", dq.max_vcpus),
         };
-        let run = run_powerbox_with_deadline_and_quota(&module, &stdin, deadline, quota)?;
+        // The guest's `argv`: when the user passes `-- <args>`, the input file name is `argv[0]`
+        // and the post-`--` tokens follow. When *no* `--` args are given, pass an empty vector so the
+        // runner seeds **no** args buffer (`init_mem` stays `None`, byte-identical to a bare run) —
+        // a program that wants `argc>=1` must be invoked with `--`. (Seeding the window for every run
+        // is both pointless for `main(void)` programs and an unnecessary perturbation of the guest's
+        // initial state.) The environment is deliberately empty — no ambient host env leaks in (§3e/§7).
+        let argv: Vec<&[u8]> = if guest_args.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once(file.as_bytes())
+                .chain(guest_args.iter().map(|s| s.as_bytes()))
+                .collect()
+        };
+        let run = run_powerbox_with_args_and_limits(&module, &stdin, &argv, &[], deadline, quota)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
         let mut out = std::io::stdout().lock();
@@ -177,6 +201,7 @@ fn run_specialize(
     rename_private: bool,
     optimize: bool,
     outline: bool,
+    selective_outline: bool,
     out_path: Option<String>,
     emit_text: bool,
     mut run_args: Vec<i64>,
@@ -190,6 +215,7 @@ fn run_specialize(
         rename_private,
         optimize,
         outline,
+        selective_outline,
     };
     let residual = specialize_module(module, &opts)?;
 
@@ -274,17 +300,19 @@ fn parse_arg(s: &str) -> Result<SpecArg, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: svm-run <file.svm|.svmb|.c> [--stdin FILE]\n\
+        "usage: svm-run <file.svm|.svmb|.c> [--stdin FILE] [-- <guest args>]\n\
          \n  Verify a module, then run it sandboxed on the JIT under the MVP powerbox\n\
          \n  (stdout/stderr → real streams, exit code = the guest's). `.c` is compiled via\n\
-         \n  the chibicc frontend ($SVM_CHIBICC or the in-repo build).\n\
+         \n  the chibicc frontend ($SVM_CHIBICC or the in-repo build). Arguments after `--`\n\
+         \n  are passed to the guest as argv[1..] (argv[0] = the file name; empty environment).\n\
          \n  env: SVM_DEADLINE_MS (kill a runaway guest after N ms),\n\
          \n       SVM_MAX_FIBERS / SVM_MAX_VCPUS (§15 spawn quotas — kill a fiber/thread bomb).\n\
          \n\
          \nspecialize (§20c first Futamura projection): turn an interpreter + a fixed program into\n\
          \nthe compiled residual.\n\
          \n  svm-run <file> --specialize [--func N] [--arg BIND]... [--const-region lo:hi]...\n\
-         \n                 [--rename lo:hi] [--rename-private] [--outline] [--no-optimize]\n\
+         \n                 [--rename lo:hi] [--rename-private] [--outline] [--selective]\n\
+         \n                 [--no-optimize]\n\
          \n                 [-o OUT.svmb | --emit-text | --run-args v,v,...]\n\
          \n  --arg BIND   per-parameter binding in order: `dyn`, `i32:N`, or `i64:N`\n\
          \n               (parameters without a binding default to `dyn`)\n\
@@ -292,6 +320,8 @@ fn print_usage() {
          \n  --rename lo:hi         lift a private value-stack/locals range into SSA (Stage 2)\n\
          \n  --outline    specialize calls into shared residual functions (multi-function residual)\n\
          \n               instead of inlining — bounds size; specializes dynamic-depth recursion\n\
+         \n  --selective  inline leaves/structure, outline only recursion back-edges (a tight\n\
+         \n               recursive residual rather than one function per call site)\n\
          \n  -o OUT.svmb  write the (re-verified) residual as a binary artifact; else --emit-text\n\
          \n               prints it as text IR, else it is run as a kernel and its results printed.\n\
          \n  lo/hi/N accept decimal or 0x-hex."

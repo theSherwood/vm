@@ -1710,6 +1710,22 @@ pub enum Inst {
     CapSelfGet {
         idx: ValIdx,
     },
+    /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
+    /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
+    /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
+    /// resumable fiber) `get` returns the *new* vCPU's word — the correct per-CPU value, which the
+    /// guest cannot otherwise name (the `thread.spawn` handle is the parent's view, not "which vCPU am
+    /// I on now"). Seeded at vCPU creation to a **dense id** (root = 0, children sequential in spawn
+    /// order), so before any `set` it doubles as a `vcpu.id`; the guest may overwrite it (e.g. a
+    /// pointer to its per-CPU block) for full thread-local storage. Authority-neutral, ambient (the
+    /// `cap.self`/`gc.roots` family). Result is `i64`. (Determinism: program *output* must not depend
+    /// on *which* vCPU runs you, only on per-CPU state being self-consistent — GC.md §3.2.)
+    VcpuTlsGet,
+    /// §12 per-vCPU **thread-local register** write (`vcpu.tls.set`): set the executing vCPU's `i64`
+    /// TLS word to `val`. No result (like `store`). See [`Inst::VcpuTlsGet`].
+    VcpuTlsSet {
+        val: ValIdx,
+    },
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
     /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
     /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
@@ -2083,7 +2099,10 @@ impl Inst {
             Inst::Store { .. }
             | Inst::AtomicStore { .. }
             | Inst::AtomicFence { .. }
+            | Inst::VcpuTlsSet { .. }
             | Inst::V128Store { .. } => 0,
+            // `vcpu.tls.get` appends one `i64`.
+            Inst::VcpuTlsGet => 1,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
             // `cap.self.get` appends `(handle, type_id)`; `cap.self.count` appends one `i32`.
@@ -2215,6 +2234,23 @@ impl Memory {
 /// hard-codes a reservation. The reserved range is `PROT_NONE` + lazily paged, so a large value
 /// costs virtual address space, not committed memory.
 pub const DEFAULT_RESERVED_LOG2: u8 = 40;
+
+/// The §3e powerbox **args-buffer** window offset: where a host seeds the program-arguments blob so
+/// the frontend's `_start` can hand `argc`/`argv` to a C `main(int, char**)`. This is the
+/// "borrowed buffer at a known window offset" of DESIGN §3e / D44, realized as a *fixed* offset (not
+/// an extra entry parameter) so the powerbox entry signature stays the language-neutral handle
+/// vector — the C-specific `argv[]` marshalling lives entirely in the on-ramp's `_start`.
+///
+/// Layout at `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)`:
+/// `{ argc: u32-LE, envc: u32-LE }` then `argc` + `envc` NUL-terminated UTF-8 strings, packed
+/// (the argv strings first, then the envp strings). A guest that never reads it (e.g. `main(void)`)
+/// is unaffected. The region sits below the frontend's globals base, so it never overlaps a data
+/// segment; a host must reject a blob that would reach `POWERBOX_ARGS_END`.
+pub const POWERBOX_ARGS_BASE: u64 = 128;
+/// The end of the powerbox args-buffer region (exclusive) — the frontend's globals/data-stack base
+/// for a powerbox program (`svm-llvm`'s `STACK_PAGE`). The args blob must fit in
+/// `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)` so it never collides with a data segment.
+pub const POWERBOX_ARGS_END: u64 = 16384;
 
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]

@@ -1451,6 +1451,17 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   independent-op reorderings and busy-wait retries, sound vs an unreduced
   enumerator, §18), against which the real-thread JIT is differential-tested; the
   futex glue is loom-checked.
+- **Per-vCPU TLS register (`vcpu.tls.get`/`vcpu.tls.set`).** One ambient i64 of
+  per-vCPU state, **read at the execution point** — so a fiber that migrated to
+  another vCPU reads the *current* vCPU's word, the value only the runtime knows
+  (the `thread.spawn` handle is the parent's view, not "which vCPU am I on now").
+  Seeded at vCPU creation to a **dense id** (root = 0, children sequential), so a
+  bare `get` doubles as a `vcpu.id`; the guest may overwrite it with a pointer to
+  its per-CPU block for full `__thread`-style TLS. The natural primitive for a
+  guest M:N runtime / GC's per-CPU state (mark stacks, allocator magazines). Not a
+  cross-vCPU channel (each vCPU touches only its own word — no new visible op for
+  the DPOR oracle); program *output* must not depend on *which* vCPU runs you,
+  only on per-CPU state being self-consistent (the GC.md §3.2 framing).
 
 ### Host-call ABI: async-first
 - Blocking-capable host calls are **submit/complete** (io_uring-shaped). The
@@ -1972,10 +1983,12 @@ the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
   libraries — SHA-256, xxHash, stb_perlin, tiny-regex-c, jsmn, heapgrow, miniz/tinfl, clay — run
   **byte-identical to a native `clang` build**, on **both** the interpreter and the JIT (the §18
   differential). Every translation test is interp == JIT == native/hand-computed.
-- **Pending (general-C breadth, beyond the corpus; tracked in `LLVM.md`).** Varargs
-  `printf`/`fprintf` (a guest-side format engine), `realloc`, wider/other SIMD (`<4 x float>`,
-  `<2 x double>`), transcendental libm (a guest `libm`), `argc`/`argv`, `bswap`/`bitreverse`,
-  overlapping `memmove`, and the deferred-hard items (C++ EH, `setjmp`/`longjmp`).
+- **Pending (general-C breadth, beyond the corpus; tracked in `LLVM.md`).** Wider/other SIMD
+  (`<2 x double>`, `<8 x i16>`), `llvm.bitreverse`, transcendental libm (a guest `libm`),
+  `envp`/`getenv`, and the deferred-hard items (C++ EH, `setjmp`/`longjmp`, byte-exact float
+  `printf` — needs a bignum formatter). *(Done since: varargs `printf`/`fprintf` with `%s`/flags/
+  precision, `realloc`, overlapping `memmove`, `bswap`, and `argc`/`argv` — the §3e args buffer at
+  the fixed offset `POWERBOX_ARGS_BASE`, D44.)*
 
 ---
 
