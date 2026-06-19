@@ -2038,18 +2038,21 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   dispatch by specialization is **~5–6×** on either backend (apples-to-apples, same backend); the
   end-to-end software-interpreted → compiled-native path is **~470×**. Lean-ISA dispatch-overhead
   fraction, not a universal constant — a heavier decode shows more.
-- **Coverage today:** integer/long **and scalar-float** arithmetic, compares, fused multiply-add,
-  float↔int conversions and reinterpret/demote/promote casts — all constant-**folded** bit-for-bit
-  the interpreter (NaN payloads + the wasm min/max/nearest rules preserved; a trapping `trunc` folds
+- **Coverage today:** integer/long, **scalar-float**, **and common v128 (SIMD)** ops — arithmetic,
+  compares, fused multiply-add, float↔int conversions and reinterpret/demote/promote casts; plus the
+  common SIMD lane ops (splat, extract/replace, lane int+float arithmetic/compares/shifts, bitwise,
+  shuffle, swizzle) — all constant-**folded** bit-for-bit the interpreter (NaN payloads + the wasm
+  min/max/nearest rules preserved, float lanes reusing the scalar folds; a trapping `trunc` folds
   only in range and is otherwise kept so it still traps); static + dynamic branches; any-width
   constant-memory reads; renamed stack/locals (word **and** narrow `i8`/`i16` cells, with a dynamic
-  heap alongside); and cross-function `call` inlining — direct **and** constant-index
+  heap alongside); cross-function `call` inlining — direct **and** constant-index
   `call_indirect`/`return_call_indirect`/`ref.func` (resolved through the identity module-0 table) —
-  with static + dynamic control flow, recursion, and loops. **Remaining enhancements (not gaps):**
-  **v128 (SIMD) constant folding** (the 128-bit lane
-  ops still pass through unfolded — a separate, larger lane/shape surface), and the guest-side engine
-  (ship the specializer inside the sandbox on the §22 `Jit` capability for dynamic-language IC-style
-  recompilation; the residual IR and back half are shared).
+  with static + dynamic control flow, recursion, and loops; and opt-in **outlining** (specialize a
+  callee to a shared residual function, for dynamic-depth recursion / bounded size). **Remaining
+  enhancements (not gaps):** the **exotic SIMD ops** (saturating add/sub, widen/narrow, lane
+  convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15) still pass through
+  unfolded, and the guest-side engine (ship the specializer inside the sandbox on the §22 `Jit`
+  capability for dynamic-language IC-style recompilation; the residual IR and back half are shared).
 
 ---
 

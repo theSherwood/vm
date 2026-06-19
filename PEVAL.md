@@ -27,6 +27,10 @@ it is dropped once the actionable slices (1–2 below) close.
 - **Scalar float constant folding** (`f32`/`f64`): arithmetic, compares, fused multiply-add,
   float↔int conversions, reinterpret/demote/promote casts — bit-for-bit the interpreter (NaN/±0/ties),
   a trapping `trunc` folds only in range.
+- **v128 (SIMD) constant folding** — the common lane ops: splat, extract/replace, lane int+float
+  arithmetic / compares / shifts, bitwise (and/or/xor/andnot/not/bitselect), shuffle, swizzle, FMA —
+  bit-for-bit the interpreter (float lanes reuse the scalar folds). `tests/specialize.rs` (oracle on
+  `Value::V128` bytes, incl. NaN lanes).
 - **Indirect-call specialization**: a `call_indirect` / `return_call_indirect` (and `ref.func`) whose
   index resolves to a *constant, in-range, signature-matching* function is resolved through the
   identity module-0 table to the concrete callee and inlined like a direct call (incl. into a
@@ -51,8 +55,9 @@ it is dropped once the actionable slices (1–2 below) close.
 
 ## Remaining slices (ranked by ROI)
 
-1. **v128 (SIMD) constant folding** — fold the 128-bit lane ops (a separate, larger lane/shape/shuffle
-   surface with its own `Known` representation). Medium–large effort.
+1. **Exotic v128 (SIMD) ops** — fold the remaining lane ops (saturating add/sub, widen/narrow, lane
+   int↔float convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15). Each
+   mirrors a `svm-interp` `simd_*` helper; low-medium effort, low priority (uncommon in residuals).
 2. **Outlining + renaming together** — thread the renamed region's live abstract cells across a
    residual call (as extra params/results), so outlining works even with a rename region (today it
    requires `rename = None`). Medium effort; only needed for very large renamed interpreters.

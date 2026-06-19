@@ -78,14 +78,16 @@
 //! self-recursive residual where inlining would diverge). Constant arguments are baked in; the
 //! dynamic ones are passed.
 //!
-//! **Scope.** Integer and **scalar float** ops — arithmetic, compares, fused multiply-add,
-//! float↔int conversions, reinterpret/demote/promote casts — are specialized (folded where the
-//! operands are constant, bit-for-bit the interpreter). Remaining **pure, single-result** value ops
-//! — v128 (SIMD) lane ops, pointer ops — are emitted faithfully into the residual even though they
-//! are not constant-folded yet, so dispatch is still eliminated around them. Direct calls are
-//! inlined (above). Effectful, multi-result, or other cross-function ops (indirect/host calls,
-//! atomics, fibers/threads), and memory accesses the engine can't resolve, return
-//! [`SpecError::Unsupported`] rather than guessing.
+//! **Scope.** Integer, **scalar float**, and **v128 (SIMD)** ops — arithmetic, compares, fused
+//! multiply-add, float↔int conversions, reinterpret/demote/promote casts; and the common SIMD lane
+//! ops (splat / extract / replace, lane int+float arithmetic / compares / shifts, bitwise, shuffle,
+//! swizzle) — are specialized (folded where the operands are constant, bit-for-bit the interpreter).
+//! Remaining **pure, single-result** value ops — pointer ops and the exotic SIMD ops (saturating
+//! add/sub, widen/narrow, lane convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true,
+//! bitmask, q15) — are emitted faithfully into the residual even though they are not folded yet, so
+//! dispatch is still eliminated around them. Direct calls are inlined (above). Effectful,
+//! multi-result, or other cross-function ops (indirect/host calls, atomics, fibers/threads), and
+//! memory accesses the engine can't resolve, return [`SpecError::Unsupported`] rather than guessing.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -847,6 +849,7 @@ impl Spec<'_> {
             Inst::ConstI64(v) => Abs::Const(Known::I64(v)),
             Inst::ConstF32(b) => Abs::Const(Known::F32(b)),
             Inst::ConstF64(b) => Abs::Const(Known::F64(b)),
+            Inst::ConstV128(b) => Abs::Const(Known::V128(b)),
             // `ref.func` is the function index as a plain `i32` (a funcref is forgeable data, §3c).
             // Folding it to a constant lets a downstream `call_indirect` resolve its callee.
             Inst::RefFunc { func } => Abs::Const(Known::I32(func as i32)),
@@ -949,14 +952,16 @@ impl Spec<'_> {
                 align,
             } => return self.eval_store(op, addr, value, offset, align, env, mem, out, rnext),
 
-            // Any other pure, single-result value op. A scalar **float** op with all-constant
-            // operands folds (bit-for-bit the interpreter; a `FToITrap` that would trap is left
-            // unfolded so it still traps). Otherwise it is emitted faithfully into the residual —
-            // folded constants flow in as operands, dynamics pass through; this also covers v128
-            // (SIMD), casts, and pointer ops, which aren't folded yet. Effectful / multi-result /
+            // Any other pure, single-result value op. A scalar **float** or **v128 (SIMD)** op with
+            // all-constant operands folds (bit-for-bit the interpreter; a `FToITrap` that would trap
+            // is left unfolded so it still traps). Otherwise it is emitted faithfully into the
+            // residual — folded constants flow in as operands, dynamics pass through; this also
+            // covers the not-yet-folded SIMD ops, casts, and pointer ops. Effectful / multi-result /
             // memory / call ops are not handled here and fall through to Unsupported.
             _ => {
-                if let Some(k) = fold_float(inst, env) {
+                let fold =
+                    fold_float(inst, env).or_else(|| crate::fold_simd(inst, |i| cst(env, i)));
+                if let Some(k) = fold {
                     return Ok(Some(Abs::Const(k)));
                 }
                 let abs =
@@ -1353,15 +1358,20 @@ fn succ_stack(
     stack
 }
 
+/// An operand's compile-time constant, if it has one (a dynamic value has none).
+fn cst(env: &[Abs], i: u32) -> Option<Known> {
+    match env[i as usize] {
+        Abs::Const(k) => Some(k),
+        Abs::Dyn(_) => None,
+    }
+}
+
 /// Fold a scalar float op whose operands are all compile-time constants, reusing the shared,
 /// interpreter-exact fold helpers. Returns `None` if any operand is dynamic, the op isn't a scalar
 /// float op, or folding it would trap (a `FToITrap` out of range) — in which case the caller emits
 /// it residually so it computes/traps at run time exactly as the source would.
 fn fold_float(inst: &Inst, env: &[Abs]) -> Option<Known> {
-    let cst = |i: u32| match env[i as usize] {
-        Abs::Const(k) => Some(k),
-        Abs::Dyn(_) => None,
-    };
+    let cst = |i: u32| cst(env, i);
     match *inst {
         Inst::FBin { ty, op, a, b } => crate::fold_fbin(ty, op, cst(a)?, cst(b)?),
         Inst::FUn { ty, op, a } => crate::fold_fun(ty, op, cst(a)?),
@@ -1472,6 +1482,9 @@ fn known_raw(k: Known, width: u64) -> u64 {
         Known::I64(x) => x as u64,
         Known::F32(b) => b as u64,
         Known::F64(b) => b,
+        // A v128 never reaches a renamed cell (a v128 store into the region bails); take its low 8
+        // bytes for totality.
+        Known::V128(b) => u64::from_le_bytes(b[..8].try_into().unwrap()),
     };
     v & width_mask(width)
 }

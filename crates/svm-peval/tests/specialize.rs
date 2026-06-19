@@ -9,7 +9,8 @@
 use svm_interp::{Trap, Value};
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
+    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp, VFCmpOp,
+    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape, VShiftOp, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -3048,4 +3049,306 @@ fn outlining_makes_one_function_per_static_pattern() {
             Ok(vec![Value::I64(expect)])
         );
     }
+}
+
+// ===========================================================================================
+// v128 (SIMD) constant folding: lane ops with all-constant operands fold to a `ConstV128` (or a
+// scalar for extract_lane), bit-for-bit the interpreter. Float lanes reuse the scalar float folds,
+// so NaN/rounding fidelity carries over. The interpreter is the oracle (Value::V128 compares bytes,
+// so the check is exact/NaN-safe). Exotic ops (sat, widen/narrow, convert, dot, …) pass through.
+// ===========================================================================================
+
+const VA: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0xFF];
+const VB: [u8; 16] = [
+    16, 17, 200, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+];
+
+/// Specialize a no-arg module, assert the residual is fully folded to constants, and assert it
+/// matches the interpreter exactly.
+fn check_v128_fold(m: &Module) {
+    verify_module(m).expect("verifies");
+    let r = specialize(m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("residual re-verifies");
+    for b in &r.funcs[0].blocks {
+        assert!(
+            b.insts.iter().all(|i| matches!(
+                i,
+                Inst::ConstI32(_)
+                    | Inst::ConstI64(_)
+                    | Inst::ConstF32(_)
+                    | Inst::ConstF64(_)
+                    | Inst::ConstV128(_)
+            )),
+            "a v128 op survived folding: {:?}",
+            b.insts
+        );
+    }
+    assert_eq!(run(m, &[]), run(&r, &[]), "residual diverged from interp");
+}
+
+#[test]
+fn folds_v128_bitwise_shuffle_and_movement() {
+    let insts = vec![
+        Inst::ConstI32(0x0A0B_0C0D), // 0
+        Inst::Splat {
+            shape: VShape::I32x4,
+            a: 0,
+        }, // 1
+        Inst::ConstI32(42),          // 2
+        Inst::ReplaceLane {
+            shape: VShape::I32x4,
+            lane: 2,
+            a: 1,
+            b: 2,
+        }, // 3
+        Inst::ConstV128(VA),         // 4
+        Inst::ConstV128(VB),         // 5
+        Inst::VBitBin {
+            op: VBitBinOp::And,
+            a: 3,
+            b: 4,
+        }, // 6
+        Inst::VBitBin {
+            op: VBitBinOp::Or,
+            a: 5,
+            b: 6,
+        }, // 7
+        Inst::VBitBin {
+            op: VBitBinOp::Xor,
+            a: 6,
+            b: 7,
+        }, // 8
+        Inst::VBitBin {
+            op: VBitBinOp::AndNot,
+            a: 8,
+            b: 4,
+        }, // 9
+        Inst::VNot { a: 9 },         // 10
+        Inst::Bitselect {
+            a: 4,
+            b: 5,
+            mask: 10,
+        }, // 11
+        Inst::Shuffle {
+            lanes: [0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30],
+            a: 11,
+            b: 4,
+        }, // 12
+        Inst::Swizzle { a: 12, b: 5 }, // 13
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 13));
+}
+
+#[test]
+fn folds_v128_integer_lanes() {
+    let insts = vec![
+        Inst::ConstI32(5), // 0
+        Inst::Splat {
+            shape: VShape::I16x8,
+            a: 0,
+        }, // 1
+        Inst::ConstV128(VA), // 2
+        Inst::VIntBin {
+            shape: VShape::I16x8,
+            op: VIntBinOp::Add,
+            a: 1,
+            b: 2,
+        }, // 3
+        Inst::VIntBin {
+            shape: VShape::I16x8,
+            op: VIntBinOp::MaxS,
+            a: 3,
+            b: 2,
+        }, // 4
+        Inst::VIntBin {
+            shape: VShape::I8x16,
+            op: VIntBinOp::Mul,
+            a: 4,
+            b: 2,
+        }, // 5
+        Inst::ConstI32(3), // 6
+        Inst::VShift {
+            shape: VShape::I32x4,
+            op: VShiftOp::Shl,
+            a: 5,
+            amt: 6,
+        }, // 7
+        Inst::VIntUn {
+            shape: VShape::I32x4,
+            op: VIntUnOp::Neg,
+            a: 7,
+        }, // 8
+        Inst::VIntCmp {
+            shape: VShape::I8x16,
+            op: VICmpOp::GtS,
+            a: 8,
+            b: 2,
+        }, // 9
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 9));
+}
+
+#[test]
+fn folds_v128_float_lanes_including_nan() {
+    let f = |x: f32| Inst::ConstF32(x.to_bits());
+    let insts = vec![
+        f(1.5), // 0
+        Inst::Splat {
+            shape: VShape::F32x4,
+            a: 0,
+        }, // 1: [1.5; 4]
+        f(f32::NAN), // 2
+        Inst::ReplaceLane {
+            shape: VShape::F32x4,
+            lane: 0,
+            a: 1,
+            b: 2,
+        }, // 3: [NaN,1.5,1.5,1.5]
+        f(2.0), // 4
+        Inst::Splat {
+            shape: VShape::F32x4,
+            a: 4,
+        }, // 5: [2; 4]
+        Inst::VFloatBin {
+            shape: VShape::F32x4,
+            op: VFloatBinOp::Mul,
+            a: 3,
+            b: 5,
+        }, // 6
+        Inst::VFloatUn {
+            shape: VShape::F32x4,
+            op: VFloatUnOp::Sqrt,
+            a: 6,
+        }, // 7
+        Inst::VFloatBin {
+            shape: VShape::F32x4,
+            op: VFloatBinOp::Min,
+            a: 7,
+            b: 5,
+        }, // 8: Min with NaN propagation
+        Inst::VFma {
+            shape: VShape::F32x4,
+            neg: false,
+            a: 8,
+            b: 5,
+            c: 1,
+        }, // 9
+        Inst::VFloatCmp {
+            shape: VShape::F32x4,
+            op: VFCmpOp::Eq,
+            a: 9,
+            b: 9,
+        }, // 10: NaN lane -> false mask
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 10));
+
+    // f64x2 too, with ±inf.
+    let g = |x: f64| Inst::ConstF64(x.to_bits());
+    let insts = vec![
+        g(f64::INFINITY), // 0
+        Inst::Splat {
+            shape: VShape::F64x2,
+            a: 0,
+        }, // 1
+        g(-3.25),         // 2
+        Inst::ReplaceLane {
+            shape: VShape::F64x2,
+            lane: 1,
+            a: 1,
+            b: 2,
+        }, // 3: [inf, -3.25]
+        Inst::VFloatUn {
+            shape: VShape::F64x2,
+            op: VFloatUnOp::Neg,
+            a: 3,
+        }, // 4
+        Inst::VFloatBin {
+            shape: VShape::F64x2,
+            op: VFloatBinOp::Div,
+            a: 3,
+            b: 4,
+        }, // 5
+        Inst::VFloatCmp {
+            shape: VShape::F64x2,
+            op: VFCmpOp::Le,
+            a: 5,
+            b: 3,
+        }, // 6
+    ];
+    check_v128_fold(&ret(vec![ValType::V128], insts, 6));
+}
+
+#[test]
+fn folds_v128_extract_lane_to_scalar() {
+    // Signed extract of byte 0xFF (lane 15) -> -1; unsigned -> 255.
+    check_v128_fold(&ret(
+        vec![ValType::I32],
+        vec![
+            Inst::ConstV128(VA),
+            Inst::ExtractLane {
+                shape: VShape::I8x16,
+                lane: 15,
+                signed: true,
+                a: 0,
+            },
+        ],
+        1,
+    ));
+    check_v128_fold(&ret(
+        vec![ValType::I32],
+        vec![
+            Inst::ConstV128(VA),
+            Inst::ExtractLane {
+                shape: VShape::I8x16,
+                lane: 15,
+                signed: false,
+                a: 0,
+            },
+        ],
+        1,
+    ));
+    // i64x2 lane.
+    check_v128_fold(&ret(
+        vec![ValType::I64],
+        vec![
+            Inst::ConstV128(VB),
+            Inst::ExtractLane {
+                shape: VShape::I64x2,
+                lane: 1,
+                signed: false,
+                a: 0,
+            },
+        ],
+        1,
+    ));
+}
+
+#[test]
+fn unfolded_v128_op_passes_through() {
+    // A saturating add isn't folded yet — it survives in the residual and still runs correctly.
+    let m = ret(
+        vec![ValType::V128],
+        vec![
+            Inst::ConstV128(VA),
+            Inst::ConstV128(VB),
+            Inst::VSatBin {
+                shape: VShape::I8x16,
+                op: VSatBinOp::AddS,
+                a: 0,
+                b: 1,
+            },
+        ],
+        2,
+    );
+    verify_module(&m).expect("verifies");
+    let r = specialize(&m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("re-verifies");
+    assert!(
+        r.funcs[0]
+            .blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::VSatBin { .. }))),
+        "an unsupported v128 op should pass through unfolded"
+    );
+    assert_eq!(run(&m, &[]), run(&r, &[]));
 }
