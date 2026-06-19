@@ -1,16 +1,22 @@
 //! SVM **bytecode interpreter as a wasm guest** — the browser entry point (see `BROWSER.md`).
 //!
-//! Two exports for a wasm host (browser / any runtime):
+//! Exports for a wasm host (browser / any runtime):
 //!   * [`run_guest`] — a self-contained, no-import smoke probe (an embedded compute kernel), used by
 //!     the wasm32 anchors in `run.mjs`.
-//!   * [`svm_run`] — the production shape: the host writes an **encoded SVM IR module** (the
-//!     `svm-encode` binary form) into the scratch buffer at [`svm_buf`], then calls `svm_run(len,
-//!     arg)`. We decode it, run function 0 on the **bytecode engine** with a **deny-all `Host`**
-//!     (compute-only v1), and return its first `i64` result. **Fail-closed:** a module the engine
+//!   * [`svm_alloc`]/[`svm_dealloc`] — the host allocates a buffer in linear memory (no fixed cap),
+//!     writes an **encoded SVM IR module** (the `svm-encode` binary form) into it, and frees it
+//!     after the run.
+//!   * [`svm_run`] — the production shape: `svm_run(ptr, len, arg)` decodes the module at
+//!     `[ptr, len)`, runs function 0 on the **bytecode engine** with a **deny-all `Host`**
+//!     (compute-only), and returns its first `i64` result. **Fail-closed:** a module the engine
 //!     can't compile yields `STATUS_UNSUPPORTED` rather than any tree-walker fallback.
+//!   * [`svm_run_pb`] — the **powerbox**: streams/clock/exit, I/O marshalled through allocations.
+//!     `svm_run_live` (feature `live`) instead binds those to real host imports.
 //!
-//! Status of the last [`svm_run`] is read separately via [`svm_status`] (a single `i64` return
-//! can't disambiguate an error from a guest result of the same value).
+//! Status of the last run is read separately via [`svm_status`] (a single `i64` return can't
+//! disambiguate an error from a guest result of the same value).
+
+use std::alloc::Layout;
 
 use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
 #[cfg(feature = "live")]
@@ -177,39 +183,60 @@ pub const STATUS_TRAP: i32 = 3;
 /// The guest returned, but not a single `i64` (compute-only v1 only surfaces `i64`).
 pub const STATUS_BAD_RESULT: i32 = 4;
 
-/// Scratch buffer the host fills with the encoded guest module before calling [`svm_run`].
-/// Fixed-capacity (v1); a real embedding would expose `alloc`/`dealloc` instead.
-const BUF_CAP: usize = 1 << 20;
-static mut BUF: [u8; BUF_CAP] = [0; BUF_CAP];
+/// Most recent status (a `STATUS_*` code), read via [`svm_status`] after any run entry.
 static mut LAST_STATUS: i32 = STATUS_OK;
 
-/// Pointer to the scratch buffer (host writes `len` encoded bytes here, then calls [`svm_run`]).
+// ---- linear-memory allocator: the host manages I/O buffers of arbitrary size ------------------
+//
+// Replaces the old fixed scratch buffers. The host calls [`svm_alloc`] to reserve `len` bytes in
+// *this module's* linear memory (the Rust allocator grows it as needed — no 1 MiB cap), writes the
+// encoded module / stdin there, passes the `(ptr, len)` to a run entry, then [`svm_dealloc`]s it.
+// Allocations are plain bytes (alignment 1), so `dealloc` only needs the same `len`.
+
+/// Allocate `len` bytes (alignment 1) in linear memory; returns the pointer (null for `len == 0` or
+/// on allocation failure). Pair every non-null result with a [`svm_dealloc`] of the same `len`.
 #[no_mangle]
-pub extern "C" fn svm_buf() -> *mut u8 {
-    core::ptr::addr_of_mut!(BUF) as *mut u8
+pub extern "C" fn svm_alloc(len: usize) -> *mut u8 {
+    match Layout::from_size_align(len, 1) {
+        Ok(layout) if len != 0 => unsafe { std::alloc::alloc(layout) },
+        _ => core::ptr::null_mut(),
+    }
 }
 
-/// Capacity of the scratch buffer in bytes.
+/// Free a [`svm_alloc`]ation — `ptr`/`len` must match the original request. No-op for a null `ptr`
+/// or `len == 0`. (Do **not** call this on the `svm_stdout_ptr`/`svm_stderr_ptr` buffers: those are
+/// cdylib-managed, reclaimed on the next [`svm_run_pb`].)
 #[no_mangle]
-pub extern "C" fn svm_buf_cap() -> usize {
-    BUF_CAP
+pub extern "C" fn svm_dealloc(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    if let Ok(layout) = Layout::from_size_align(len, 1) {
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
 }
 
-/// Status of the most recent [`svm_run`] (one of the `STATUS_*` codes).
+/// `1` on a 64-bit (`wasm64`/`memory64`) build, `0` on `wasm32` — so a host harness knows whether
+/// the pointer/length ABI values are `i64` (BigInt) or `i32`.
+#[no_mangle]
+pub extern "C" fn svm_abi_is64() -> i32 {
+    (core::mem::size_of::<usize>() == 8) as i32
+}
+
+/// Status of the most recent run entry (one of the `STATUS_*` codes).
 #[no_mangle]
 pub extern "C" fn svm_status() -> i32 {
     // SAFETY: single-threaded wasm; plain `i32` read.
     unsafe { LAST_STATUS }
 }
 
-/// Decode the `len` bytes at [`svm_buf`] as an SVM IR module, run function 0 on the bytecode engine
-/// with `args` and a deny-all `Host`, and return its first `i64` result (`0` on any non-`OK` status
-/// — read [`svm_status`] to disambiguate). Sets [`LAST_STATUS`].
-fn run_buf(len: usize, args: &[Value]) -> i64 {
-    // SAFETY: single-threaded wasm; `len` is bounded by the host to `<= svm_buf_cap()`.
-    let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BUF) as *const u8, len) };
+/// Decode the `len` bytes at `ptr` as an SVM IR module, run function 0 on the bytecode engine with
+/// `args` and a deny-all `Host`, and return its first `i64` result (`0` on any non-`OK` status —
+/// read [`svm_status`] to disambiguate). Sets [`LAST_STATUS`]. Shared by [`svm_run`]/[`svm_run0`].
+fn run_at(ptr: *const u8, len: usize, args: &[Value]) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-
+    // SAFETY: the host guarantees `[ptr, ptr+len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let m = match svm_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
@@ -218,7 +245,7 @@ fn run_buf(len: usize, args: &[Value]) -> i64 {
         }
     };
     let mut fuel = u64::MAX;
-    let mut host = svm_interp::Host::new(); // deny-all powerbox (compute-only v1)
+    let mut host = svm_interp::Host::new(); // deny-all powerbox (compute-only)
     match bytecode::compile_and_run_with_host(&m, 0, args, &mut fuel, &mut host) {
         None => {
             set(STATUS_UNSUPPORTED);
@@ -241,28 +268,28 @@ fn run_buf(len: usize, args: &[Value]) -> i64 {
     }
 }
 
-/// Run the encoded module at [`svm_buf`] passing a single `i64` argument (the common kernel shape).
+/// Run the encoded module at `[ptr, ptr+len)` passing a single `i64` argument (the common shape).
 #[no_mangle]
-pub extern "C" fn svm_run(len: usize, arg: i64) -> i64 {
-    run_buf(len, &[Value::I64(arg)])
+pub extern "C" fn svm_run(ptr: *const u8, len: usize, arg: i64) -> i64 {
+    run_at(ptr, len, &[Value::I64(arg)])
 }
 
-/// Run the encoded module at [`svm_buf`] with **no** arguments — e.g. the `() -> (i64)` thread
+/// Run the encoded module at `[ptr, ptr+len)` with **no** arguments — e.g. the `() -> (i64)` thread
 /// kernels that spawn/join cooperatively on the engine's `drive`.
 #[no_mangle]
-pub extern "C" fn svm_run0(len: usize) -> i64 {
-    run_buf(len, &[])
+pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
+    run_at(ptr, len, &[])
 }
 
-// ---- host powerbox: console + clock, all marshalled through buffers --------------------------
+// ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------
 //
 // Beyond compute-only: grant the guest a real capability set (stdin/stdout/stderr streams, a
 // monotonic clock, and exit). The `Host` powerbox is already self-contained and **deterministic** —
 // stream writes accumulate in `Host::stdout`/`stderr`, `read` draws from `Host::stdin`, and
 // `Clock.now` is a strictly-increasing counter — so no wasm host *imports* are needed: I/O crosses
-// the boundary the same way the module does, through fixed scratch buffers (`svm_stdin_buf` in,
-// `svm_stdout_ptr`/`svm_stderr_ptr` out). The cdylib stays import-free; the embedder fills stdin
-// before the call and reads the captured streams after.
+// the boundary the same way the module does, through `svm_alloc`ed memory. The host writes stdin to
+// an allocation it passes in; the captured streams come back as cdylib-managed allocations the host
+// reads (via the `*_ptr`/`*_len` exports) before the next call. The cdylib stays import-free.
 
 /// The guest called `Exit.exit(code)` (a non-error trap); read the code via [`svm_exit_code`].
 pub const STATUS_EXIT: i32 = 5;
@@ -334,53 +361,54 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
-/// Stdin scratch buffer (host writes `len` input bytes here, then sets the length via
-/// [`svm_set_stdin_len`] before calling [`svm_run_pb`]).
-static mut STDIN: [u8; BUF_CAP] = [0; BUF_CAP];
-static mut STDIN_LEN: usize = 0;
-/// Captured stdout / stderr of the most recent [`svm_run_pb`] (read via the `*_ptr`/`*_len`
-/// exports). Fixed buffers (mirroring [`svm_buf`]) so the read-back ABI is a plain ptr+len and we
-/// keep the `addr_of_mut!` pattern that avoids `&'static mut`.
-static mut OUT: [u8; BUF_CAP] = [0; BUF_CAP];
-static mut OUT_LEN: usize = 0;
-static mut ERR: [u8; BUF_CAP] = [0; BUF_CAP];
-static mut ERR_LEN: usize = 0;
+/// Captured stdout / stderr of the most recent [`svm_run_pb`], as cdylib-managed allocations
+/// `(ptr, len)`. Each is a leaked boxed slice (exact length, alignment 1) freed when the next
+/// [`svm_run_pb`] replaces it — so the host reads it via the `*_ptr`/`*_len` exports *before* the
+/// next call and never frees it itself.
+static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
 
-/// Copy `src` (capped to `BUF_CAP`) into `dst`, returning the number of bytes written.
-fn fill(dst: *mut u8, src: &[u8]) -> usize {
-    let n = src.len().min(BUF_CAP);
-    // SAFETY: `dst` is one of the fixed `BUF_CAP` capture buffers; `n <= BUF_CAP`.
-    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n) };
-    n
+/// Replace the capture in `slot` with `data`, freeing the previous allocation. Empty `data` stores
+/// `(null, 0)`. The stored allocation is a boxed slice — exactly `len` bytes, alignment 1 — so it is
+/// freed with the matching `Layout`.
+fn stash(slot: &mut (*mut u8, usize), data: Vec<u8>) {
+    let (old_ptr, old_len) = *slot;
+    if !old_ptr.is_null() && old_len != 0 {
+        if let Ok(layout) = Layout::from_size_align(old_len, 1) {
+            unsafe { std::alloc::dealloc(old_ptr, layout) };
+        }
+    }
+    *slot = if data.is_empty() {
+        (core::ptr::null_mut(), 0)
+    } else {
+        let boxed = data.into_boxed_slice(); // shrink-to-fit: capacity == len, alignment 1
+        let len = boxed.len();
+        (Box::into_raw(boxed) as *mut u8, len)
+    };
 }
 
-/// Pointer to the stdin scratch buffer (host writes input bytes here).
-#[no_mangle]
-pub extern "C" fn svm_stdin_buf() -> *mut u8 {
-    core::ptr::addr_of_mut!(STDIN) as *mut u8
-}
-
-/// Set how many bytes at [`svm_stdin_buf`] are valid stdin for the next [`svm_run_pb`].
-#[no_mangle]
-pub extern "C" fn svm_set_stdin_len(len: usize) {
-    // SAFETY: single-threaded wasm; `len` is bounded by the host to `<= svm_buf_cap()`.
-    unsafe { STDIN_LEN = len.min(BUF_CAP) }
-}
-
-/// Decode the `len` bytes at [`svm_buf`] and run function 0 under the **powerbox** (see
-/// [`powerbox_exec`]): grant streams/clock/exit, seed stdin from [`svm_stdin_buf`], capture the
-/// streams + exit code, and return the guest's `i64` result (`0` on any non-`OK`/`EXIT` status —
-/// read [`svm_status`] / [`svm_exit_code`] / the `*_ptr` exports to disambiguate). Sets
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **powerbox** (see
+/// [`powerbox_exec`]): grant streams/clock/exit, seed stdin from `[stdin_ptr, stdin_len)` (a null /
+/// zero-length range ⇒ empty stdin), capture the streams + exit code, and return the guest's `i64`
+/// result (`0` on any non-`OK`/`EXIT` status). Read [`svm_status`] / [`svm_exit_code`] /
+/// `svm_stdout_ptr`+`svm_stdout_len` / `svm_stderr_ptr`+`svm_stderr_len` afterward. Sets
 /// [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_pb(len: usize) -> i64 {
-    // SAFETY: single-threaded wasm; `len`/`STDIN_LEN` are host-bounded to `<= svm_buf_cap()`.
-    let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BUF) as *const u8, len) };
-    let stdin = unsafe {
-        core::slice::from_raw_parts(core::ptr::addr_of!(STDIN) as *const u8, STDIN_LEN)
-    };
+pub extern "C" fn svm_run_pb(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
     let m = match svm_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
@@ -390,34 +418,33 @@ pub extern "C" fn svm_run_pb(len: usize) -> i64 {
     };
     let out = powerbox_exec(&m, stdin);
     set(out.status);
-    let out_len = fill(core::ptr::addr_of_mut!(OUT) as *mut u8, &out.stdout);
-    let err_len = fill(core::ptr::addr_of_mut!(ERR) as *mut u8, &out.stderr);
-    // SAFETY: single-threaded wasm; read back only via the export accessors below.
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
-        OUT_LEN = out_len;
-        ERR_LEN = err_len;
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
     }
     out.value
 }
 
-/// Pointer / length of the captured stdout from the most recent [`svm_run_pb`].
+/// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next
+/// `svm_run_pb`; do not `svm_dealloc` it).
 #[no_mangle]
 pub extern "C" fn svm_stdout_ptr() -> *const u8 {
-    core::ptr::addr_of!(OUT) as *const u8
+    unsafe { (*core::ptr::addr_of!(OUT)).0 }
 }
 #[no_mangle]
 pub extern "C" fn svm_stdout_len() -> usize {
-    unsafe { OUT_LEN }
+    unsafe { (*core::ptr::addr_of!(OUT)).1 }
 }
-/// Pointer / length of the captured stderr from the most recent [`svm_run_pb`].
+/// Pointer / length of the captured stderr from the most recent [`svm_run_pb`] (same lifetime rule).
 #[no_mangle]
 pub extern "C" fn svm_stderr_ptr() -> *const u8 {
-    core::ptr::addr_of!(ERR) as *const u8
+    unsafe { (*core::ptr::addr_of!(ERR)).0 }
 }
 #[no_mangle]
 pub extern "C" fn svm_stderr_len() -> usize {
-    unsafe { ERR_LEN }
+    unsafe { (*core::ptr::addr_of!(ERR)).1 }
 }
 /// Exit code from the most recent [`svm_run_pb`] (valid when [`svm_status`] is [`STATUS_EXIT`]).
 #[no_mangle]
@@ -491,16 +518,15 @@ pub mod live {
     const EFAULT: i64 = -14;
     const EINVAL: i64 = -22;
 
-    /// Decode the module at [`svm_buf`] and run function 0 with a **host-backed** powerbox:
+    /// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a **host-backed** powerbox:
     /// `(console, clock)` capabilities (both iface `HOST_FN` = 13) bridged to the imports above.
     /// The guest calls `cap.call 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
     /// live, and `cap.call 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
     /// `i64` result; sets [`LAST_STATUS`].
     #[no_mangle]
-    pub extern "C" fn svm_run_live(len: usize) -> i64 {
-        // SAFETY: single-threaded wasm; `len` host-bounded to `<= svm_buf_cap()`.
-        let bytes =
-            unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BUF) as *const u8, len) };
+    pub extern "C" fn svm_run_live(mod_ptr: *const u8, mod_len: usize) -> i64 {
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+        let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
         let set = |s: i32| unsafe { LAST_STATUS = s };
         let m = match svm_encode::decode_module(bytes) {
             Ok(m) => m,

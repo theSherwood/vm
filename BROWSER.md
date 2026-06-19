@@ -65,9 +65,10 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
    tree-walker `Scheduler` for wasm is **dead-code cleanup, not a correctness blocker**.
 
 2. **The production entry executes correctly in a wasm sandbox (wasm32).** The `browser/`
-   (`svm-browser`) `cdylib` exports `svm_run`: the host writes an **encoded SVM IR module** into a
-   scratch buffer, `svm_run` **decodes** it (`svm-encode`), runs function 0 on the **bytecode
-   engine** with a **deny-all `Host`**, and returns its `i64` result — **fail-closed** (`None` from
+   (`svm-browser`) `cdylib` exports `svm_run`: the host `svm_alloc`s a buffer, writes an **encoded
+   SVM IR module** into it, and calls `svm_run(ptr, len, arg)` which **decodes** it (`svm-encode`),
+   runs function 0 on the **bytecode engine** with a **deny-all `Host`**, and returns its `i64`
+   result — **fail-closed** (`None` from
    `compile_module` → `STATUS_UNSUPPORTED`, no tree-walker fallback). In Node/V8 with **zero host
    imports**: `svm_run(arg=0) == 0`, `svm_run(arg=1) == 1442695040888963407` (hand-derived anchors,
    exercising loops, i64 wrapping arithmetic, branches, SSA block-arg copies), and garbage bytes →
@@ -108,7 +109,7 @@ wasmtime run --invoke run_threads   -W memory64=y "$W"   # 4000 (8 vCPUs, cooper
 wasmtime run --invoke run_roundtrip -W memory64=y "$W"   # 1442695040888963407 (encode→decode→run)
 wasmtime run --invoke run_powerbox  -W memory64=y "$W"   # 17 (stream write + capture + exit(42))
 
-# Differential (compute + powerbox), wasm32 vs native ground truth — 42/42, zero host imports
+# Differential (compute + powerbox + 2 MiB alloc echo), wasm32 vs native — 43/43, zero host imports
 cargo run --bin gencorpus                                # native ground truth → corpus.json
 node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
 
@@ -137,14 +138,20 @@ are git-ignored.
   3 `Exit` · 4 `Stream(Err)` · 5 `Clock`), so `hello.svm`'s `(out, in, exit)` shape works unchanged.
   The `Host` powerbox is already **deterministic and self-contained** (stream writes accumulate in
   `Host::stdout`/`stderr`, `read` draws from `Host::stdin`, `Clock.now` is a strictly-increasing
-  counter), so I/O crosses the wasm boundary the *same way the module does* — through fixed scratch
-  buffers (`svm_stdin_buf` in; `svm_stdout_ptr`/`svm_stderr_ptr`/`svm_exit_code` out). **The default
-  cdylib stays import-free** (verified: `imports: 0`).
+  counter), so I/O crosses the wasm boundary the *same way the module does* — through host-allocated
+  memory (stdin in an `svm_alloc`ation the host passes to `svm_run_pb`; the captured streams returned
+  as cdylib-managed allocations read via `svm_stdout_ptr`/`svm_stderr_ptr`/`svm_exit_code`). **The
+  default cdylib stays import-free** (verified: `imports: 0`).
+- **Memory ABI → `svm_alloc`/`svm_dealloc`, not fixed buffers.** The host reserves linear memory of
+  any size for module bytes / stdin (the allocator grows memory as needed), passes `(ptr, len)` to a
+  run entry, and frees it after — no 1 MiB scratch cap. Output streams come back as cdylib-managed
+  allocations valid until the next run. Demonstrated by a **2 MiB echo** roundtrip in the
+  differential. `svm_abi_is64()` tells a host whether the pointer/length ABI is `i32` or `i64`.
 - **Live capabilities → a feature-gated variant.** Real host imports are mandatory at instantiation
   for *every* entry, so binding a capability to the live host (`svm_run_live`, bridging guest
   `cap.call`s to `svm_host.host_write`/`host_now_ns` via `grant_host_fn`) lives behind
-  `--features live` — the default build stays import-free for the compute/buffered-powerbox path,
-  and the live build adds exactly the two `svm_host` imports.
+  `--features live` — the default build stays import-free for the compute/powerbox path, and the
+  live build adds exactly the two `svm_host` imports.
 
 ---
 
@@ -181,26 +188,30 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `run_threads` (cooperative `drive` → 4000) both correct on memory64/table64. Node/V8 still lacks
   table64 (above) — browser path stays wasm32 until then. Optional follow-up: reproduce the full
   `svm_run` byte-feeding differential on wasm64 via a Wasmtime embedding (the CLI `--invoke` can't
-  write the scratch buffer; the embedded probes already exercise the whole engine on wasm64).
+  write a host buffer; the embedded probes already exercise the whole engine on wasm64).
 - [x] **cfg-gate `lib.rs` for wasm.** `page_size` is now native-only (`target.'cfg(not(wasm))'`)
   with a 64 KiB wasm fallback in `host_page_size()`/`host_region_granularity()` — dropped from the
   wasm dep graph; native unchanged (full `svm-interp`/`svm-mem` suite green, workspace builds). The
   OS-thread machinery (`Scheduler`/`OffloadPool`/`std::thread`) needed no gating: it's unreachable
   from the `cdylib` exports and already stripped by `--gc-sections` (zero symbols, zero imports in
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
-- [x] **Differential check (compute + concurrency + powerbox, wasm32).** `gencorpus` (host) encodes a
-  corpus + computes the **native** result per case; `corpus.mjs` runs the same modules through the
-  wasm exports and compares. **42/42 match**, zero host imports. *Compute/concurrency* (37):
-  i64 arith+branches, multi-function `call`, memory store/load, divide-by-zero → `STATUS_TRAP`, **and a
-  `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` = **4000** on the cooperative `drive`).
-  *Powerbox* (5): stdout greeting, stdin→stdout echo, monotonic-clock delta, `exit(42)` →
+- [x] **Differential check (compute + concurrency + powerbox + scale, wasm32).** `gencorpus` (host)
+  encodes a corpus + computes the **native** result per case; `corpus.mjs` runs the same modules
+  through the wasm exports and compares. **43/43 match**, zero host imports. *Compute/concurrency*
+  (37): i64 arith+branches, multi-function `call`, memory store/load, divide-by-zero → `STATUS_TRAP`,
+  **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` = **4000** on the cooperative
+  `drive`). *Powerbox* (5): stdout greeting, stdin→stdout echo, monotonic-clock delta, `exit(42)` →
   `STATUS_EXIT`, and stderr role-routing — `gencorpus` and `svm_run_pb` share the *same*
   `powerbox_exec` (the crate is `cdylib`+`rlib`), so the check isolates wasm effects, not logic
-  drift. Remaining: extend to the memory-**snapshot** check via
-  `compile_and_run_capture_reserved_with_host`.
-- [x] **Host powerbox (console + clock), buffer-marshalled.** `svm_run_pb` grants streams/clock/exit,
-  marshalling I/O through scratch buffers so the cdylib stays import-free; validated on wasm32 (5-case
-  differential above) and wasm64 (`run_powerbox() == 17`).
+  drift. *Scale* (1): a **2 MiB** stdin→stdout echo through `svm_alloc`ed buffers. Remaining: extend
+  to the memory-**snapshot** check via `compile_and_run_capture_reserved_with_host`.
+- [x] **Host powerbox (console + clock).** `svm_run_pb` grants streams/clock/exit; the cdylib stays
+  import-free; validated on wasm32 (5-case differential above) and wasm64 (`run_powerbox() == 17`).
+- [x] **Memory ABI (`svm_alloc`/`svm_dealloc`).** Replaced the fixed 1 MiB scratch buffers: the host
+  reserves linear memory of any size for module/stdin and reads captured streams from cdylib-managed
+  allocations; `svm_run`/`svm_run0`/`svm_run_pb`/`svm_run_live` all take `(ptr, len)`. Validated by
+  the 2 MiB echo (wasm32) and a direct `svm_alloc` call on wasm64. `svm_abi_is64()` exposes the
+  pointer width. Follow-up: an `alloc`-returning result struct so multi-value returns avoid statics.
 - [x] **Live host imports (`--features live`).** `svm_run_live` bridges guest capabilities to **real
   wasm imports** via `Host::grant_host_fn` (iface 13): a `(console, clock)` powerbox where
   `console.write` forwards the guest's bytes to the imported `svm_host.host_write` (live host console,
@@ -218,7 +229,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs <module.wasm> <fixture.svmbc>` (compute-only;
-  wasm32 today); later, a memory64 load with a
-  byte-identical differential check against native.
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 43/43
+  compute+powerbox+scale differential vs native), and `node browser/live.mjs` (host-import demo,
+  `--features live`). wasm64 is exercised via the Wasmtime `--invoke` probes under **Reproduce**.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

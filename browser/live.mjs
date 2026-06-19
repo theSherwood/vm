@@ -33,14 +33,16 @@ const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const importNames = WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`);
 console.log(`module: ${wasmPath}  imports: [${importNames.join(', ')}]`);
 ex = (await WebAssembly.instantiate(mod, imports)).exports;
-const is64 = typeof ex.svm_buf_cap() === 'bigint';
+const is64 = ex.svm_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));
 
 const guest = readFileSync(guestPath);
-new Uint8Array(ex.memory.buffer).set(guest, Number(ex.svm_buf()));
+const ptr = ex.svm_alloc(N(guest.length));
+new Uint8Array(ex.memory.buffer).set(guest, Number(ptr)); // re-fetch view (alloc may grow memory)
 console.log('--- guest output (live, via host_write import) ---');
-const ret = ex.svm_run_live(N(guest.length));
+const ret = ex.svm_run_live(ptr, N(guest.length));
 console.log('--------------------------------------------------');
+ex.svm_dealloc(ptr, N(guest.length));
 
 const status = ex.svm_status();
 const okStatus = status === 0;

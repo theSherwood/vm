@@ -253,6 +253,22 @@ block0(v0: i32, v1: i32):
 }
 "#;
 
+// Large-I/O echo guest (encoded for `corpus.mjs`'s alloc-ABI roundtrip, not the corpus): a 4 MiB
+// window, reads up to 4 MiB of stdin and echoes it to stdout — used to push **megabytes** through
+// `svm_alloc`ed buffers, well past the old fixed 1 MiB scratch cap.
+const BIG_ECHO: &str = r#"
+memory 22
+func (i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i64.const 0
+  v4 = i64.const 4194304
+  v5 = cap.call 0 0 (i64, i64) -> (i64) v1(v3, v4)
+  v6 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v5)
+  v7 = i32.const 0
+  return v7
+}
+"#;
+
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -348,7 +364,8 @@ fn main() {
     std::fs::write("corpus.json", json).expect("write corpus.json");
     eprintln!("wrote corpus.json ({} compute, {} powerbox)", compute.len(), powerbox.len());
 
-    // The live-import guest is validated by `live.mjs` (host-backed, non-deterministic), not the
-    // corpus — just encode it so the harness has a module to run.
+    // Encode the guests validated by harnesses (not the deterministic corpus): the live-import guest
+    // (`live.mjs`, host-backed) and the large-I/O echo guest (`corpus.mjs`'s alloc-ABI roundtrip).
     emit("live", LIVE_GUEST);
+    emit("bigecho", BIG_ECHO);
 }
