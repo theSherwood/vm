@@ -1155,6 +1155,9 @@ pub struct SrcRange {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct JitFrameLoc {
     pub func: u32,
+    /// The source function name (`debug_info.func_names`), or `None` when the module carried no name
+    /// for `func` — renderers fall back to `fn{func}`.
+    pub func_name: Option<String>,
     pub file: String,
     pub line: u32,
     pub col: u32,
@@ -1197,6 +1200,7 @@ mod trap_capture_tests {
     fn loc(func: u32, line: u32) -> JitFrameLoc {
         JitFrameLoc {
             func,
+            func_name: None,
             file: "f.c".into(),
             line,
             col: 0,
@@ -1372,6 +1376,9 @@ pub struct CompiledModule {
     src_ranges: Vec<SrcRange>,
     /// Source file paths (from `debug_info.files`), indexed by [`SrcRange::file`].
     src_files: Vec<String>,
+    /// Source function names (`func → name`, from `debug_info.func_names`): for [`Self::symbolize`],
+    /// the DWARF `DW_AT_name`, and kill messages. Empty unless the module carried `-g` names.
+    func_names: std::collections::HashMap<u32, String>,
     /// Per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a), resolved from Cranelift's
     /// `value_labels_ranges` after finalize. Empty unless the module carried `-g` vars. Host-side
     /// tooling, off the runtime path.
@@ -1395,6 +1402,7 @@ impl CompiledModule {
         let r = self.src_ranges[..i].last().filter(|r| pc < r.hi)?;
         Some(JitFrameLoc {
             func: r.func,
+            func_name: self.func_names.get(&r.func).cloned(),
             file: self
                 .src_files
                 .get(r.file as usize)
@@ -1488,7 +1496,12 @@ impl CompiledModule {
         if self.src_ranges.is_empty() {
             return (Vec::new(), Vec::new(), Vec::new());
         }
-        dwarf::debug_info(&self.func_extents(), &self.debug_types, &self.var_locs)
+        dwarf::debug_info(
+            &self.func_extents(),
+            &self.debug_types,
+            &self.var_locs,
+            &self.func_names,
+        )
     }
 
     /// The synthesized DWARF `(.debug_info, .debug_abbrev)` (W5 JIT/DWARF Stages 2b/3b/3c) — a compile
@@ -1555,6 +1568,7 @@ impl CompiledModule {
             code_base,
             code_end.saturating_sub(code_base),
             &funcs,
+            &self.func_names,
             &info,
             &abbrev,
             &line,
@@ -2008,7 +2022,7 @@ impl CompiledModule {
         // W5 JIT/DWARF Stage 1: now that code is finalized, resolve each captured `MachSrcLoc` range
         // (relative to its function's start) to an absolute machine address, building the sorted
         // `machine-pc → source` map `symbolize` consults. Empty without `-g`.
-        let (src_ranges, src_files) = match m.debug_info.as_ref() {
+        let (src_ranges, src_files, func_names) = match m.debug_info.as_ref() {
             Some(di) => {
                 let mut ranges = Vec::new();
                 for (fi, rs) in &raw_srclocs {
@@ -2027,9 +2041,16 @@ impl CompiledModule {
                     }
                 }
                 ranges.sort_by_key(|r| r.lo);
-                (ranges, di.files.clone())
+                // §6 function names (`func → name`), for `symbolize`, the DWARF `DW_AT_name`, and kill
+                // messages — `compute` instead of `fn3`.
+                let names = di
+                    .func_names
+                    .iter()
+                    .map(|f| (f.func, f.name.clone()))
+                    .collect();
+                (ranges, di.files.clone(), names)
             }
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), std::collections::HashMap::new()),
         };
 
         // W5 JIT/DWARF Stage 3a: resolve the captured value-label ranges (relative offsets) to
@@ -2155,6 +2176,7 @@ impl CompiledModule {
             fiber_table,
             src_ranges,
             src_files,
+            func_names,
             var_locs,
             debug_types: m
                 .debug_info

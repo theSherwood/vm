@@ -611,6 +611,18 @@ pub fn source_loc(m: &Module, pc: IrPc) -> Option<SourceLoc> {
     source_loc_in(m.debug_info.as_ref()?, pc)
 }
 
+/// The `-g` source name of function `func` in module 0 (`debug_info.func_names`), or `None` when the
+/// module carried no name for it — renderers fall back to `fn{func}`. Pairs with [`source_loc`] to
+/// render an interpreter trap-time backtrace with function names (the analog of the JIT's
+/// `JitFrameLoc::func_name`).
+pub fn func_name(m: &Module, func: FuncIdx) -> Option<&str> {
+    let di = m.debug_info.as_ref()?;
+    di.func_names
+        .iter()
+        .find(|f| f.func == func)
+        .map(|f| f.name.as_str())
+}
+
 /// The nearest-preceding-`loc` resolution shared by [`source_loc`] and [`Inspector::source_loc`]
 /// (DEBUGGING.md §6/W4 S2): the latest `loc` in `pc`'s block at or before `pc.inst`.
 fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {

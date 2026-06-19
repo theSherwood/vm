@@ -461,9 +461,17 @@ folded into the host's kill message, and validated frame-for-frame against the i
 faults now capture cross-platform** — unix via the SIGSEGV/SIGBUS handler, Windows via the Vectored
 Exception Handler (it walks the faulting `CONTEXT`'s `Rbp` chain in `mem.rs`, validated by
 `memfault_kill_message_carries_a_source_backtrace` on the `windows-latest` CI job). This closes Pillar
-2 (W3) on the JIT. Remaining (ISSUES I3): **Windows explicit-check** traps still lack a backtrace
-(no signal to capture from + MSVC has no `__builtin_frame_address` — fix via Cranelift
-`get_frame_pointer`); and per-fiber naming under work-stealing migration.
+2 (W3) on the JIT.
+
+**Function names** (the readability finish-up): the §6 debug-info waist gained a `func → name` table
+(`debug_info.func_names`, text `debug.fname <func> "<name>"`, binary-encoded; chibicc emits it under
+`-g`). Threaded through every backtrace renderer — `JitFrameLoc::func_name`, the interpreter's free
+`func_name(m, func)`, the kill message (`#0 file:line:col in compute`), and gdb's DWARF `DW_AT_name` +
+ELF `.symtab` — so frames read `in compute` instead of `(fn 0)`/`fn0`. Empty ⇒ the `fn{N}` fallback.
+
+Remaining (ISSUES I4): **Windows explicit-check** traps still lack a backtrace (no signal to capture
+from + MSVC has no `__builtin_frame_address` — fix via Cranelift `get_frame_pointer`); and per-fiber
+naming under work-stealing migration.
 
 ---
 

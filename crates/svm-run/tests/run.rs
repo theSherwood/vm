@@ -341,14 +341,15 @@ fn trap_kill_message_carries_a_source_backtrace() {
          \x20 return v4\n\
          }\n\
          debug.file 0 \"guest.c\"\n\
+         debug.fname 0 \"divide\"\n\
          debug.loc 0 0 1 0 7 5\n",
     );
     let err = run_powerbox_with_deadline(&m, b"", None).expect_err("div-by-zero must be killed");
     assert!(err.contains("DivByZero"), "names the trap kind: {err}");
     #[cfg(unix)]
     assert!(
-        err.contains("guest.c:7"),
-        "the kill message carries the trap-time source backtrace: {err}"
+        err.contains("guest.c:7:5 in divide"),
+        "the kill message carries the trap-time source backtrace + function name: {err}"
     );
 }
 
@@ -370,14 +371,15 @@ fn memfault_kill_message_carries_a_source_backtrace() {
          \x20 return v5\n\
          }\n\
          debug.file 0 \"mem.c\"\n\
+         debug.fname 0 \"store_oob\"\n\
          debug.loc 0 0 2 0 9 5\n",
     );
     let err = run_powerbox_with_deadline(&m, b"", None)
         .expect_err("the overrun must be detect-and-killed");
     assert!(err.contains("MemoryFault"), "names the trap kind: {err}");
     assert!(
-        err.contains("mem.c:9"),
-        "the kill message carries the trap-time source backtrace: {err}"
+        err.contains("mem.c:9:5 in store_oob"),
+        "the kill message carries the trap-time source backtrace + function name: {err}"
     );
 }
 

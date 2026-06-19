@@ -139,6 +139,7 @@ block0(v0: i32):
   return v2
 }
 debug.file 0 \"div.c\"
+debug.fname 0 \"divzero\"
 debug.loc 0 0 1 0 30 3
 ";
 
@@ -176,6 +177,11 @@ fn explicit_trap_backtrace_names_the_div() {
     assert_eq!(bt.len(), 1, "the one faulting guest frame, got {bt:?}");
     assert_eq!(bt[0].func, 0, "the trapping frame is function 0");
     assert_eq!(bt[0].line, 30, "symbolized to the div's source line");
+    assert_eq!(
+        bt[0].func_name.as_deref(),
+        Some("divzero"),
+        "the frame carries the -g function name"
+    );
 }
 
 #[test]

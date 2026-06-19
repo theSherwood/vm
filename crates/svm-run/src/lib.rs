@@ -28,18 +28,23 @@ use svm_ir::{Module, Resolved, ValType};
 pub use svm_interp::{Quota, Value};
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 
-/// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n  at file:line:col (fn N)` per
-/// frame, innermost first. Empty string when there are no frames (the module carried no `-g`), so the
-/// kill message is byte-identical to before in that case.
+/// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
+/// per frame, innermost first, where `<name>` is the `-g` function name or the synthesized `fn{N}`.
+/// Empty string when there are no frames (the module carried no `-g`), so the kill message is
+/// byte-identical to before in that case.
 fn format_backtrace(frames: &[JitFrameLoc]) -> String {
     if frames.is_empty() {
         return String::new();
     }
     let mut s = String::from("\n  backtrace (innermost first):");
     for (i, f) in frames.iter().enumerate() {
+        let name = f
+            .func_name
+            .clone()
+            .unwrap_or_else(|| format!("fn{}", f.func));
         s.push_str(&format!(
-            "\n    #{i} {}:{}:{} (fn {})",
-            f.file, f.line, f.col, f.func
+            "\n    #{i} {}:{}:{} in {name}",
+            f.file, f.line, f.col
         ));
     }
     s

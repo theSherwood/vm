@@ -2267,6 +2267,18 @@ pub struct DebugInfo {
     /// parses it — only a future DWARF/DI re-emitter (W5) does — and the verifier ignores it (§2a,
     /// strippable / untrusted-for-escape). Empty for the common case.
     pub blobs: Vec<ProducerBlob>,
+    /// Source **function names** (the §6 waist's function-name table): a sparse `func → name`, so a
+    /// backtrace / DWARF subprogram / kill message reads `compute` instead of `fn3`. Module 0 only
+    /// (installed §22 units have no source). Empty ⇒ no names — consumers fall back to the
+    /// synthesized `fn{N}`. Frontend-emitted under `-g`; strippable / untrusted-for-escape (§2a).
+    pub func_names: Vec<FuncName>,
+}
+
+/// One source function name (DEBUGGING.md §6): the symbolic `name` of function index `func`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FuncName {
+    pub func: u32,
+    pub name: String,
 }
 
 /// An opaque per-producer debug blob (DEBUGGING.md §6 rich blob). `producer` tags the format so a

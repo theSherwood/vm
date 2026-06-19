@@ -333,6 +333,7 @@ pub fn debug_info(
     funcs: &[(u32, u64, u64)],
     types: &[TypeDef],
     vars: &[VarMachineInfo],
+    names: &std::collections::HashMap<u32, String>,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let abbrev = abbrev_table();
     let mut loc = Vec::new(); // the `.debug_loc` section, grown per variable location list
@@ -402,7 +403,10 @@ pub fn debug_info(
     // null DIE closing the subprogram's children.
     for &(func, lo, hi) in funcs {
         uleb(&mut dies, ABBR_SUBPROGRAM);
-        dw_str(&mut dies, &format!("fn{func}")); // DW_AT_name (synthesized)
+        // DW_AT_name: the §6 source name when present, else the synthesized `fn{func}`.
+        let synth = format!("fn{func}");
+        let name = names.get(&func).map(String::as_str).unwrap_or(&synth);
+        dw_str(&mut dies, name);
         dies.extend_from_slice(&lo.to_le_bytes()); // DW_AT_low_pc (8-byte address)
         dies.extend_from_slice(&hi.saturating_sub(lo).to_le_bytes()); // DW_AT_high_pc (offset)
                                                                       // DW_AT_frame_base = DW_OP_call_frame_cfa (a 1-byte expression): the frame base is the CFA

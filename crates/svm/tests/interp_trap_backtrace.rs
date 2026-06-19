@@ -4,14 +4,15 @@
 //! snapshots the live frames into the run outcome; this exposes them. Useful for kill diagnostics and
 //! for the interp↔JIT differential fuzzer to report *where* a trap/divergence occurred.
 
-use svm_interp::{run_traced, source_loc, Trap, Value};
+use svm_interp::{func_name, run_traced, source_loc, Trap, Value};
 use svm_text::parse_module;
 
-/// A run's result plus its trap-time backtrace as `(func, file, line)` per frame (innermost first).
-type TracedRun = (Result<Vec<Value>, Trap>, Vec<(u32, String, u32)>);
+/// A run's result plus its trap-time backtrace as `(name, file, line)` per frame (innermost first),
+/// where `name` is the `-g` function name (or `fn{N}` when unnamed).
+type TracedRun = (Result<Vec<Value>, Trap>, Vec<(String, String, u32)>);
 
-/// `(func, file, line)` for each frame of the trap-time backtrace, innermost first — `IrPc`s resolved
-/// to source via the module's `-g` debug info.
+/// `(name, file, line)` for each frame of the trap-time backtrace, innermost first — `IrPc`s resolved
+/// to source + function name via the module's `-g` debug info.
 fn traced(src: &str, arg: Value) -> TracedRun {
     let m = parse_module(src).expect("parse");
     svm_verify::verify_module(&m).expect("verify");
@@ -21,7 +22,10 @@ fn traced(src: &str, arg: Value) -> TracedRun {
         .iter()
         .map(|&pc| {
             let s = source_loc(&m, pc).expect("each guest frame resolves to source under -g");
-            (pc.func, s.file, s.line)
+            let name = func_name(&m, pc.func)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("fn{}", pc.func));
+            (name, s.file, s.line)
         })
         .collect();
     (res, frames)
@@ -39,6 +43,7 @@ block0(v0: i32):
   return v3
 }
 debug.file 0 \"fault.c\"
+debug.fname 0 \"store_oob\"
 debug.loc 0 0 2 0 10 3
 ";
 
@@ -59,6 +64,8 @@ block0(v0: i32):
   return v2
 }
 debug.file 0 \"div.c\"
+debug.fname 0 \"outer\"
+debug.fname 1 \"divz\"
 debug.loc 0 0 0 0 40 5
 debug.loc 1 0 1 0 30 3
 ";
@@ -69,8 +76,8 @@ fn interp_trap_backtrace_names_the_faulting_store() {
     assert!(matches!(res, Err(Trap::MemoryFault)), "got {res:?}");
     assert_eq!(
         bt,
-        vec![(0, "fault.c".into(), 10)],
-        "one frame at the store line"
+        vec![("store_oob".into(), "fault.c".into(), 10)],
+        "one frame, named, at the store line"
     );
 }
 
@@ -80,8 +87,11 @@ fn interp_trap_backtrace_walks_the_caller_chain() {
     assert!(matches!(res, Err(Trap::DivByZero)), "got {res:?}");
     assert_eq!(
         bt,
-        vec![(1, "div.c".into(), 30), (0, "div.c".into(), 40)],
-        "innermost callee (func1@div) then caller (func0@call)"
+        vec![
+            ("divz".into(), "div.c".into(), 30),
+            ("outer".into(), "div.c".into(), 40)
+        ],
+        "innermost callee (divz@div) then caller (outer@call), by name"
     );
 }
 

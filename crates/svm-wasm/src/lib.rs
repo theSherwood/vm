@@ -773,6 +773,8 @@ fn build_debug_info(
         types,
         vars,
         blobs,
+        // TODO(§6): extract function names from DWARF `DW_TAG_subprogram` `DW_AT_name` (a follow-up).
+        func_names: Vec::new(),
     })
 }
 
