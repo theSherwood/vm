@@ -132,6 +132,90 @@ fn typed_select_funcref() {
     assert_eq!(eval(pick_b, "f"), 2, "cond=0 selects b");
 }
 
+/// `table.copy`: install two funcs, copy their slots elsewhere (overlap-safe memmove), dispatch the
+/// copies.
+#[test]
+fn table_copy_slots() {
+    let wat = r#"
+    (module
+      (table 8 funcref)
+      (type $r (func (result i32)))
+      (elem declare func $a $b)
+      (func $a (result i32) (i32.const 3))
+      (func $b (result i32) (i32.const 4))
+      (func (export "f") (result i32)
+        (table.set (i32.const 4) (ref.func $a))
+        (table.set (i32.const 5) (ref.func $b))
+        (table.copy (i32.const 0) (i32.const 4) (i32.const 2)) ;; slots 4..6 → 0..2
+        (i32.add
+          (call_indirect (type $r) (i32.const 0))
+          (call_indirect (type $r) (i32.const 1)))))            ;; 3 + 4 = 7
+    "#;
+    assert_eq!(eval(wat, "f"), 7);
+}
+
+/// `table.init` from a **passive** element segment: copy its funcref entries into the table, dispatch.
+#[test]
+fn table_init_from_passive_elem() {
+    let wat = r#"
+    (module
+      (table 8 funcref)
+      (type $r (func (result i32)))
+      (elem $e func $a $b)            ;; passive segment (no table/offset)
+      (func $a (result i32) (i32.const 5))
+      (func $b (result i32) (i32.const 6))
+      (func (export "f") (result i32)
+        (table.init $e (i32.const 2) (i32.const 0) (i32.const 2)) ;; elem[0..2] → table[2..4]
+        (elem.drop $e)                                            ;; no-op
+        (i32.add
+          (call_indirect (type $r) (i32.const 2))
+          (call_indirect (type $r) (i32.const 3)))))              ;; 5 + 6 = 11
+    "#;
+    assert_eq!(eval(wat, "f"), 11);
+}
+
+/// `table.grow`: grow a table from 2→6 slots (filling the new slots with a funcref), confirm the new
+/// `table.size`, and dispatch through a grown slot. The pre-grow size is the grow result.
+#[test]
+fn table_grow_and_use() {
+    let wat = r#"
+    (module
+      (table 2 10 funcref)            ;; initial 2, max 10
+      (type $r (func (result i32)))
+      (elem declare func $g)
+      (func $g (result i32) (i32.const 42))
+      (func (export "grow") (result i32)
+        (table.grow (ref.func $g) (i32.const 4)))   ;; returns old size = 2
+      (func (export "size_after") (result i32)
+        (drop (table.grow (ref.func $g) (i32.const 4)))
+        (table.size))                                ;; 2 + 4 = 6
+      (func (export "use_grown") (result i32)
+        (drop (table.grow (ref.func $g) (i32.const 4))) ;; slots 2..6 = $g
+        (call_indirect (type $r) (i32.const 5))))       ;; dispatch a grown slot → 42
+    "#;
+    assert_eq!(eval(wat, "grow"), 2);
+    assert_eq!(eval(wat, "size_after"), 6);
+    assert_eq!(eval(wat, "use_grown"), 42);
+}
+
+/// `table.grow` past the declared maximum fails (returns `-1`) and leaves the size unchanged.
+#[test]
+fn table_grow_over_max_fails() {
+    let wat = r#"
+    (module
+      (table 2 3 funcref)             ;; max 3, so growing by 4 must fail
+      (elem declare func $g)
+      (func $g)
+      (func (export "f") (result i32)
+        ;; failed grow returns -1; size stays 2. encode as grow_result*100 + size.
+        (i32.add
+          (i32.mul (table.grow (ref.func $g) (i32.const 4)) (i32.const 100))
+          (table.size))))
+    "#;
+    // -1 * 100 + 2 = -98
+    assert_eq!(eval(wat, "f"), -98);
+}
+
 /// `externref` is an opaque i32 handle that flows through values unchanged — a function taking and
 /// returning an externref is the identity on the bits (here via a local round-trip).
 #[test]

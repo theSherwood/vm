@@ -128,6 +128,14 @@ const DEFAULT_MAX_GROW_PAGES: u64 = 256;
 /// can't blow up the committed window (256 MiB).
 const MAX_GROW_PAGES: u64 = 4096;
 
+/// `table.grow` on an **unbounded** wasm table may extend up to this many slots. As with memory the
+/// window must hold the whole growable span (mask-confine, not bounds-check-and-trap), so for an
+/// unbounded table this is a modest cap (4 KiB of slots) keeping the committed window small. A
+/// declared table `maximum` is honored instead.
+const DEFAULT_MAX_GROW_SLOTS: u64 = 1024;
+/// Hard ceiling on the growable table span regardless of a declared `maximum` (256 KiB of slots).
+const MAX_GROW_SLOTS: u64 = 65536;
+
 /// The transpiled module plus the wasm `export name → function index` map (the IR carries no export
 /// names, so the caller — e.g. a differential harness — needs this to pick the entry).
 pub struct Transpiled {
@@ -219,12 +227,17 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut data_segments: Vec<Vec<u8>> = Vec::new();
     let mut globals: Vec<(ValType, Vec<u8>)> = Vec::new();
     let mut table_size: Option<u64> = None;
-    let mut elements: Vec<(u64, Vec<u32>)> = Vec::new(); // (offset, func indices)
-                                                         // Function imports, in import order: each binds to an SVM capability `(type_id, op)` by the naming
-                                                         // convention (`module` = decimal type_id, `name` = decimal op) and lowers to a `cap.call`. The
-                                                         // function index space puts imports first, so a wasm index `< imports.len()` is an import. The 4th
-                                                         // field is the import's **handle slot** — its interface's index in `handle_modules` (`u32::MAX` for
-                                                         // the spawn placeholder, which uses no handle).
+    let mut table_max: Option<u64> = None;
+    let mut elements: Vec<(u64, Vec<u32>)> = Vec::new(); // active segments: (offset, func indices)
+                                                         // Every element segment's IR-function-index list, by segment index — the `table.init` sources
+                                                         // (active and passive both count). A *declarative* segment is `table.init`-empty (dropped). Mirrors
+                                                         // `data_segments` for `memory.init`.
+    let mut element_segments: Vec<Vec<u32>> = Vec::new();
+    // Function imports, in import order: each binds to an SVM capability `(type_id, op)` by the naming
+    // convention (`module` = decimal type_id, `name` = decimal op) and lowers to a `cap.call`. The
+    // function index space puts imports first, so a wasm index `< imports.len()` is an import. The 4th
+    // field is the import's **handle slot** — its interface's index in `handle_modules` (`u32::MAX` for
+    // the spawn placeholder, which uses no handle).
     let mut imports: Vec<(u32, u32, FuncType, u32)> = Vec::new();
     // Distinct import **modules**, in first-appearance order — the handle-slot map. Each distinct wasm
     // `module` string is one capability interface threaded as one `i32` handle: a module spanning N
@@ -364,6 +377,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     if table_size.replace(tb.ty.initial).is_some() {
                         return unsup("multiple tables");
                     }
+                    table_max = tb.ty.maximum;
                 }
             }
             Payload::ElementSection(reader) => {
@@ -378,36 +392,18 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                                 return unsup("multi-table element segment");
                             }
                             let off = const_offset(offset_expr)?;
-                            match el.items {
-                                wasmparser::ElementItems::Functions(fns) => {
-                                    // Store IR function indices (imports first in the wasm index
-                                    // space; the table holds defined functions). A funcref to an
-                                    // import isn't representable as an IR funcref — reject it.
-                                    let mut fs: Vec<u32> = Vec::new();
-                                    for f in fns {
-                                        let f = f?;
-                                        match f.checked_sub(imports.len() as u32) {
-                                            Some(ir) => fs.push(ir),
-                                            None => {
-                                                return unsup("funcref to an imported function")
-                                            }
-                                        }
-                                    }
-                                    elements.push((off, fs));
-                                }
-                                wasmparser::ElementItems::Expressions(..) => {
-                                    return unsup("element segment with const-expr items")
-                                }
-                            }
+                            let fs = element_funcs(el.items, imports.len() as u32)?;
+                            elements.push((off, fs.clone())); // materialized into the table below
+                            element_segments.push(fs); // also a `table.init` source, by index
+                        }
+                        // Passive segments are `table.init` sources only (not auto-applied).
+                        wasmparser::ElementKind::Passive => {
+                            element_segments.push(element_funcs(el.items, imports.len() as u32)?);
                         }
                         // A *declarative* element segment (`elem declare`) only marks functions as
-                        // referenceable by `ref.func` (the validation rule); it has no runtime effect,
-                        // so it's a no-op here. *Passive* element segments (`table.init` sources) are a
-                        // follow-up — still rejected.
-                        wasmparser::ElementKind::Declared => {}
-                        wasmparser::ElementKind::Passive => {
-                            return unsup("passive element segment")
-                        }
+                        // referenceable by `ref.func` (the validation rule); no runtime effect, and it
+                        // is `table.init`-empty (dropped at instantiation).
+                        wasmparser::ElementKind::Declared => element_segments.push(Vec::new()),
                     }
                 }
             }
@@ -477,16 +473,22 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
 
     let mem64 = mem.as_ref().map(|m| m.memory64).unwrap_or(false);
 
-    // Does any function use `memory.grow`? Only then must the window reserve room for the linear memory
-    // to expand (and carry a runtime size cell) — so a non-growing module (every existing kernel)
-    // transpiles to byte-identical IR and the same window. (`memory.size` without growth is a constant.)
+    // Does any function use `memory.grow` / `table.grow`? Only then must the window reserve room for
+    // the linear memory / function table to expand (and carry a runtime size cell) — so a non-growing
+    // module (every existing kernel) transpiles to byte-identical IR and the same window. (`memory.size`
+    // / `table.size` without growth is a constant.)
     let mut uses_grow = false;
-    'scan: for body in &bodies {
+    let mut uses_table_grow = false;
+    for body in &bodies {
         for op in body.get_operators_reader()? {
-            if matches!(op?, Operator::MemoryGrow { .. }) {
-                uses_grow = true;
-                break 'scan;
+            match op? {
+                Operator::MemoryGrow { .. } => uses_grow = true,
+                Operator::TableGrow { .. } => uses_table_grow = true,
+                _ => {}
             }
+        }
+        if uses_grow && uses_table_grow {
+            break;
         }
     }
 
@@ -543,9 +545,25 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // `CallIndirect`, whose `table_lookup` does the type-id check. Empty slots get a sentinel that
     // fails that check (≈ wasm's null-funcref trap). Element segments fill the live slots.
     let tsize = table_size.unwrap_or(0);
+    // When `table.grow` is used the table region must span its growable maximum — the declared table
+    // `maximum`, or a default cap for an unbounded table, bounded by `MAX_GROW_SLOTS` — so a grown slot
+    // is reachable under the mask-confine model (exactly the memory.grow span argument). A non-growing
+    // module reserves only its initial slots and transpiles byte-identically to before.
+    let table_max_slots = if uses_table_grow {
+        table_max
+            .unwrap_or(DEFAULT_MAX_GROW_SLOTS)
+            .clamp(tsize.max(1), MAX_GROW_SLOTS.max(tsize))
+    } else {
+        tsize
+    };
     let table_base = globals_end.div_ceil(4) * 4;
-    if tsize > 0 {
-        let mut bytes = vec![0xFFu8; tsize as usize * 4]; // sentinel = no/bad funcref
+    let table_span_slots = if uses_table_grow {
+        table_max_slots
+    } else {
+        tsize
+    };
+    if table_span_slots > 0 {
+        let mut bytes = vec![0xFFu8; table_span_slots as usize * 4]; // sentinel = no/bad funcref
         for (off, fns) in &elements {
             for (k, &f) in fns.iter().enumerate() {
                 let slot = (*off as usize + k) * 4;
@@ -560,7 +578,21 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             bytes,
         });
     }
-    let table_end = table_base + tsize * 4;
+    let table_data_end = table_base + table_span_slots * 4;
+    // Runtime current-size cell (slots), a 4-byte slot just past the table span — present only when
+    // `table.grow` is used. `table.size`/`grow` load/store it, initialized to the initial slot count
+    // via a `data` segment. (Without growth there is no cell and `table.size` is the constant `tsize`.)
+    let table_size_cell_off = table_data_end;
+    let table_end = if uses_table_grow {
+        data.push(svm_ir::Data {
+            offset: table_size_cell_off,
+            readonly: false,
+            bytes: (tsize as u32).to_le_bytes().to_vec(),
+        });
+        table_size_cell_off + 4
+    } else {
+        table_data_end
+    };
     // §12 wasm threads: a 4-byte reserved unique-tid counter just past the function table (a fresh
     // window reads 0, so the first spawned tid is 1). Only consumed when `wasi:thread/spawn` is used.
     let tid_slot = table_end.div_ceil(4) * 4;
@@ -632,11 +664,17 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             &imports,
             n_handles,
             &data_segments,
+            &element_segments,
             MemGrow {
                 uses_grow,
                 size_cell_off,
                 max_pages,
                 initial_pages,
+            },
+            TableGrow {
+                uses_grow: uses_table_grow,
+                size_cell_off: table_size_cell_off,
+                max_slots: table_max_slots,
             },
             threads,
             code_content_start,
@@ -1041,6 +1079,25 @@ fn const_offset(expr: wasmparser::ConstExpr) -> Result<u64, Error> {
     off.ok_or_else(|| Error::Parse("empty data offset expression".into()))
 }
 
+/// An element segment's function list as **IR function indices** (the wasm function index space puts
+/// imports first; the table holds only defined functions, so a funcref to an import has no IR index
+/// and is rejected). `ref.func`-expression item lists aren't supported yet.
+fn element_funcs(items: wasmparser::ElementItems, n_imp: u32) -> Result<Vec<u32>, Error> {
+    match items {
+        wasmparser::ElementItems::Functions(fns) => {
+            let mut fs = Vec::new();
+            for f in fns {
+                let ir = f?
+                    .checked_sub(n_imp)
+                    .ok_or_else(|| Error::Unsupported("funcref to an imported function".into()))?;
+                fs.push(ir);
+            }
+            Ok(fs)
+        }
+        wasmparser::ElementItems::Expressions(..) => unsup("element segment with const-expr items"),
+    }
+}
+
 /// A block under construction: SSA values are block-local indices — params first (`0..params.len()`),
 /// then each **value-producing** instruction's result. `next_val` tracks that index (a `store` is an
 /// instruction but produces no value, so it must not consume an index). The terminator is filled when
@@ -1100,6 +1157,17 @@ struct MemGrow {
     initial_pages: u64,
 }
 
+/// `table.size`/`table.grow` lowering parameters — the i32-slot twin of [`MemGrow`]. When `uses_grow`
+/// the function table may expand and a runtime **size cell** (a 4-byte window slot at `size_cell_off`,
+/// holding the current slot count) backs both ops; otherwise `table.size` is the constant initial size
+/// and `grow` never appears.
+#[derive(Clone, Copy)]
+struct TableGrow {
+    uses_grow: bool,
+    size_cell_off: u64,
+    max_slots: u64,
+}
+
 /// §12 wasm threads config (wasi-threads). Absent (`spawn_import == None`) for non-threaded modules,
 /// in which case nothing here is referenced and the lowering is byte-identical to before.
 #[derive(Clone, Copy)]
@@ -1147,14 +1215,15 @@ struct Lower<'a> {
     /// Window byte address of function-table slot 0 (each slot an i32 funcref index). `call_indirect`
     /// loads the slot and feeds it to our `CallIndirect`; the §RT `table.*` ops read/write it.
     table_base: u64,
-    /// The (fixed) table size in slots — what `table.size` returns. Tables aren't growable yet, so
-    /// the current size equals the declared initial size.
+    /// The initial table size in slots — what `table.size` returns when the table isn't growable.
     table_size: u32,
     /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
     /// that must be zero-extended before our (i64-addressed) `load`/`store`.
     mem64: bool,
     /// `memory.size`/`memory.grow` lowering config (size-cell offset, page caps).
     mg: MemGrow,
+    /// `table.size`/`table.grow` lowering config (size-cell offset, slot cap).
+    tg: TableGrow,
     /// The threaded **capability handles** (`i32`s, the forgeable indices a `cap.call` takes) — one
     /// per distinct import interface (module). Like the data-SP in the chibicc frontend, they are
     /// block params `0..N` of every block and are prepended to every branch's args, so every function
@@ -1170,6 +1239,8 @@ struct Lower<'a> {
     n_imp: usize,
     /// Every data segment's bytes by index (active + passive), for `memory.init`/`data.drop`.
     data_segments: &'a [Vec<u8>],
+    /// Every element segment's IR-function-index list, by index — the `table.init` sources.
+    element_segments: &'a [Vec<u32>],
     /// §12 wasm threads config — the `wasi:thread/spawn` lowering (the spawn import index, the shim,
     /// the unique-tid slot). `spawn_import` is `None` for non-threaded modules.
     threads: ThreadCfg,
@@ -1527,7 +1598,9 @@ fn lower_func(
     imports: &[(u32, u32, FuncType, u32)],
     n_handles: usize,
     data_segments: &[Vec<u8>],
+    element_segments: &[Vec<u32>],
     mg: MemGrow,
+    tg: TableGrow,
     threads: ThreadCfg,
     code_content_start: usize,
     want_locs: bool,
@@ -1578,10 +1651,12 @@ fn lower_func(
         table_size,
         mem64,
         mg,
+        tg,
         handles: (0..n_handles as ValIdx).collect(),
         imports,
         n_imp,
         data_segments,
+        element_segments,
         threads,
         locs: Vec::new(),
         local_locs: Vec::new(),
@@ -3540,9 +3615,20 @@ fn table_set_op(lo: &mut Lower) -> Result<(), Error> {
     Ok(())
 }
 
-/// `table.size $t`: the current size in slots. Fixed (no `table.grow` yet), so a constant.
+/// `table.size $t`: the current size in slots. With growth it's a load of the runtime size cell;
+/// without growth the size is constant (the declared `table_size`), so no cell is needed.
 fn table_size_op(lo: &mut Lower) -> Result<(), Error> {
-    let v = lo.emit(Inst::ConstI32(lo.table_size as i32));
+    let v = if lo.tg.uses_grow {
+        let a = lo.emit(Inst::ConstI64(lo.tg.size_cell_off as i64));
+        lo.emit(Inst::Load {
+            op: LoadOp::I32,
+            addr: a,
+            offset: 0,
+            align: 2,
+        })
+    } else {
+        lo.emit(Inst::ConstI32(lo.table_size as i32))
+    };
     lo.push(v, ValType::I32);
     Ok(())
 }
@@ -3561,6 +3647,14 @@ fn table_fill_op(lo: &mut Lower) -> Result<(), Error> {
         op: ConvOp::ExtendI32U,
         a: count,
     });
+    table_fill_loop(lo, dest64, val, n);
+    Ok(())
+}
+
+/// Synthesize the table fill loop `for (i=0; i<n; i++) store_i32(table_base + (dest+i)*4, val)`, with
+/// `dest`/`n` as i64 slot indices and `val` an i32 ref. Shared by `table.fill` and `table.grow` (which
+/// fills the newly-grown slots). The current operand stack is carried through the loop's block params.
+fn table_fill_loop(lo: &mut Lower, dest64: ValIdx, val: ValIdx, n: ValIdx) {
     let base = lo.table_base;
 
     let below_t: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
@@ -3637,6 +3731,182 @@ fn table_fill_op(lo: &mut Lower) -> Result<(), Error> {
     });
 
     lo.enter(exit, &below_t);
+}
+
+/// The absolute window byte address of table slot `index` (an i32 on the stack): `table_base +
+/// index*4`, as an i64 (the form `copy_dynamic` consumes).
+fn table_byte_addr(lo: &mut Lower, index: ValIdx, base: u64) -> ValIdx {
+    let idx64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: index,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    let off = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: idx64,
+        b: four,
+    });
+    let base_c = lo.emit(Inst::ConstI64(base as i64));
+    lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: off,
+        b: base_c,
+    })
+}
+
+/// `table.copy`: copy `count` slots — `count*4` bytes — between table regions, reusing the
+/// `memory.copy` memmove (overlap-correct). Stack: `[dest, src, count]`. (Single-table for now.)
+fn table_copy_op(lo: &mut Lower) -> Result<(), Error> {
+    let (count, _) = lo.pop()?;
+    let (src_idx, _) = lo.pop()?;
+    let (dest_idx, _) = lo.pop()?;
+    let base = lo.table_base;
+    let dest = table_byte_addr(lo, dest_idx, base);
+    let src = table_byte_addr(lo, src_idx, base);
+    // `copy_dynamic` widens its length via `widen_to_i64` (i32 unless `memory64`); table counts are
+    // always i32, so hand it the byte length in the width `widen_to_i64` expects.
+    let byte_len = if lo.mem64 {
+        let n64 = lo.emit(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: count,
+        });
+        let four = lo.emit(Inst::ConstI64(4));
+        lo.emit(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Mul,
+            a: n64,
+            b: four,
+        })
+    } else {
+        let four = lo.emit(Inst::ConstI32(4));
+        lo.emit(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Mul,
+            a: count,
+            b: four,
+        })
+    };
+    copy_dynamic(lo, dest, src, byte_len)
+}
+
+/// `table.init(elem_index, dest, src, count)`: copy `count` funcref indices from element segment
+/// `elem_index` — known at transpile time — into the table at `dest` (a possibly-runtime slot index).
+/// `src`/`count` must be **constant** (the same restriction as `memory.init`; there is no runtime
+/// passive-element store), so the exact indices are unrolled into const i32-stores.
+fn table_init_op(lo: &mut Lower, elem_index: u32) -> Result<(), Error> {
+    let (count_v, _) = lo.pop()?;
+    let (src_v, _) = lo.pop()?;
+    let (dest_idx, _) = lo.pop()?;
+    let (Some(src), Some(count)) = (const_bulk_len(lo, src_v), const_bulk_len(lo, count_v)) else {
+        return unsup(
+            "table.init with a non-constant src/count (only constant-range init is supported)",
+        );
+    };
+    let seg = lo
+        .element_segments
+        .get(elem_index as usize)
+        .ok_or_else(|| {
+            Error::Parse(format!(
+                "table.init references unknown element segment {elem_index}"
+            ))
+        })?;
+    let (src, count) = (src as usize, count as usize);
+    let funcs = match src.checked_add(count).filter(|&e| e <= seg.len()) {
+        Some(end) => seg[src..end].to_vec(), // clone to release the borrow on `lo`
+        None => return Err(Error::Parse(format!(
+            "table.init source [{src}, {src}+{count}) is out of segment {elem_index}'s {} entries",
+            seg.len()
+        ))),
+    };
+    let base = lo.table_base;
+    let dest = table_byte_addr(lo, dest_idx, base); // absolute address of slot `dest_idx`
+    for (k, &f) in funcs.iter().enumerate() {
+        let value = lo.emit(Inst::ConstI32(f as i32));
+        lo.emit_void(Inst::Store {
+            op: StoreOp::I32,
+            addr: dest,
+            value,
+            offset: (k * 4) as u64,
+            align: 2,
+        });
+    }
+    Ok(())
+}
+
+/// `table.grow(init, delta)`: extend the table by `delta` slots — filling the new slots with the `init`
+/// ref — and return the previous size (or `-1` if it would exceed `max_slots`). The i32-slot twin of
+/// `memory.grow`: branch-free size-cell update (slot math in i64, the delta being unsigned) via
+/// `select`, then the newly-grown slots `[old, new)` are filled with a `table_fill_loop` (empty on
+/// failure, since `new == old`). Only emitted when `uses_grow`, so the size cell exists.
+fn table_grow_op(lo: &mut Lower) -> Result<(), Error> {
+    let (delta, _) = lo.pop()?;
+    let (init, _) = lo.pop()?;
+    let cell = lo.emit(Inst::ConstI64(lo.tg.size_cell_off as i64));
+    let old = lo.emit(Inst::Load {
+        op: LoadOp::I32,
+        addr: cell,
+        offset: 0,
+        align: 2,
+    });
+    // Overflow-safe in i64 (a near-`u32::MAX` delta must not wrap past the cap into a "fits").
+    let zext = |lo: &mut Lower, v| {
+        lo.emit(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: v,
+        })
+    };
+    let old64 = zext(lo, old);
+    let delta64 = zext(lo, delta);
+    let new64 = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: old64,
+        b: delta64,
+    });
+    let maxc = lo.emit(Inst::ConstI64(lo.tg.max_slots as i64));
+    let ok = lo.emit(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LeU,
+        a: new64,
+        b: maxc,
+    });
+    let new32 = lo.emit(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: new64,
+    });
+    // Store `new` on success, unchanged `old` on failure (a no-op write); reuse `cell` as the address.
+    let stored = lo.emit(Inst::Select {
+        cond: ok,
+        a: new32,
+        b: old,
+    });
+    lo.emit_void(Inst::Store {
+        op: StoreOp::I32,
+        addr: cell,
+        value: stored,
+        offset: 0,
+        align: 2,
+    });
+    let negone = lo.emit(Inst::ConstI32(-1));
+    let result = lo.emit(Inst::Select {
+        cond: ok,
+        a: old,
+        b: negone,
+    });
+    // Push the result *before* the fill loop so it rides the loop's carried operand stack (a value
+    // defined here is otherwise unreachable in the loop's exit block). Then fill `[old, stored)` with
+    // `init` — `stored - old` slots, which is `delta` on success and `0` (an empty loop) on failure.
+    lo.push(result, ValType::I32);
+    let stored64 = zext(lo, stored);
+    let count = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Sub,
+        a: stored64,
+        b: old64,
+    });
+    table_fill_loop(lo, old64, init, count);
     Ok(())
 }
 
@@ -4135,6 +4405,30 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             }
             table_fill_op(lo)?;
         }
+        O::TableGrow { table } => {
+            if table != 0 {
+                return unsup("table.grow on a non-zero table");
+            }
+            table_grow_op(lo)?;
+        }
+        O::TableCopy {
+            dst_table,
+            src_table,
+        } => {
+            if dst_table != 0 || src_table != 0 {
+                return unsup("table.copy on a non-zero table");
+            }
+            table_copy_op(lo)?;
+        }
+        O::TableInit { elem_index, table } => {
+            if table != 0 {
+                return unsup("table.init on a non-zero table");
+            }
+            table_init_op(lo, elem_index)?;
+        }
+        // The element segment's indices are inlined at each `table.init` site, so a drop is a no-op
+        // (like `data.drop`).
+        O::ElemDrop { .. } => {}
         // ---- tail calls (the tail-call proposal): a block-terminating call ----
         O::ReturnCall { function_index } => return_call_op(lo, function_index, fn_results)?,
         O::ReturnCallIndirect {
