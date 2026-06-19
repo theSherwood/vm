@@ -53,8 +53,12 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// widened from `i32` to `i64` (16-bit slot + 48-bit generation), so a handle held live across a
 /// suspend now spills **8** bytes in the shadow stack instead of 4 — the window image layout changed,
 /// so a v2 artifact would mis-thaw and is rejected. (The residue generation is still `uleb`, so that
-/// field alone stays wire-compatible; the version gate is for the shadow-image shift.)
-const FORMAT_VERSION: u16 = 3;
+/// field alone stays wire-compatible; the version gate is for the shadow-image shift.) v4 (slice 3.4:
+/// nested spawns): each spawned-vCPU residue record carries its **`parent_task`** (the task that spawned
+/// it), so a thaw rebuilds the per-parent join-table topology of a multi-level vCPU tree — a grandchild's
+/// handle resolves in its parent child's table, not the root's. The field is a new `uleb` appended to
+/// each Section-2 vCPU record, so a v3 artifact's vCPU section would mis-parse and is rejected.
+const FORMAT_VERSION: u16 = 4;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -238,6 +242,7 @@ pub fn freeze_with_prots(
                 write_uleb(b, vcpus.len() as u64);
                 for v in &vcpus {
                     write_uleb(b, v.task as u64);
+                    write_uleb(b, v.parent_task as u64); // slice 3.4 (v4): who spawned it (nested spawns)
                     write_uleb(b, v.func as u32 as u64);
                     write_uleb(b, v.args.len() as u64);
                     for &a in &v.args {
@@ -455,6 +460,7 @@ fn decode_control(
                 return Err(RestoreError::Malformed); // non-canonical: tasks must ascend
             }
             last = Some(task);
+            let parent_task = cr.uleb()?; // slice 3.4 (v4): the spawning task (nested spawns)
             let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
             let nargs = cr.uleb()?;
             let mut args = Vec::with_capacity(nargs as usize);
@@ -464,6 +470,7 @@ fn decode_control(
             let shadow_sp = cr.uleb()?;
             vcpus.push(FrozenVCpu {
                 task: usize::try_from(task).map_err(|_| RestoreError::Malformed)?,
+                parent_task: usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?,
                 func,
                 args,
                 shadow_sp,
