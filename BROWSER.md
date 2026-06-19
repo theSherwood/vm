@@ -143,12 +143,13 @@ Compile-clean today; gate behind `cfg(not(target_family = "wasm"))` for a clean 
 - [ ] **cfg-gate `lib.rs` for wasm** — `Scheduler`, `OffloadPool`, `std::thread`/`Instant` imports;
   `page_size` → constant. Hygiene/binary-size (compiles today; the entry never calls these), not a
   correctness blocker under fail-closed.
-- [x] **Differential check (compute, wasm32).** `gencorpus` (host) encodes a corpus + computes the
-  **native** bytecode-engine result per arg; `corpus.mjs` runs the same modules through the wasm
-  `svm_run` and compares. **36/36 match** across four op families (i64 arith+branches, multi-function
-  `call`, memory store/load, divide-by-zero → `STATUS_TRAP`), zero host imports. Remaining: extend to
-  the memory-**snapshot** check via `compile_and_run_capture_reserved_with_host`, and a guest
-  `thread.spawn` (exercising the cooperative `drive`).
+- [x] **Differential check (compute + concurrency, wasm32).** `gencorpus` (host) encodes a corpus +
+  computes the **native** bytecode-engine result per case; `corpus.mjs` runs the same modules through
+  the wasm `svm_run`/`svm_run0` and compares. **37/37 match**, zero host imports, across i64
+  arith+branches, multi-function `call`, memory store/load, divide-by-zero → `STATUS_TRAP`, **and a
+  `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` = **4000** on the cooperative `drive`) —
+  i.e. SVM's M:N green-thread concurrency runs inside a single-threaded wasm sandbox. Remaining:
+  extend to the memory-**snapshot** check via `compile_and_run_capture_reserved_with_host`.
 - [ ] **Host powerbox (follow-up)** — design the browser-backed capability set (console/IO/clock).
 
 ## Verification

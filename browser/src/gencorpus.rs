@@ -94,12 +94,78 @@ block0(v0: i64):
 }
 "#;
 
+// 8 vCPUs each `atomic.rmw.add` a shared counter 500× — total exactly 4000 on every interleaving.
+// Lifted from `crates/svm/tests/bytecode_threads.rs`; exercises `thread.spawn`/`join` + atomics on
+// the bytecode engine's cooperative `drive` (the browser concurrency model). Takes no args.
+const THREADS: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 block2(v1) block3()
+block2(v4: i64):
+  v5 = i64.const 500
+  v6 = thread.spawn 1 v5 v5
+  v7 = i64.const 4
+  v8 = i64.mul v4 v7
+  v9 = i64.const 16
+  v10 = i64.add v9 v8
+  i32.store v10 v6
+  v11 = i64.const 1
+  v12 = i64.add v4 v11
+  br block1(v12)
+block3():
+  v13 = i64.const 0
+  br block4(v13)
+block4(v14: i64):
+  v15 = i64.const 8
+  v16 = i64.lt_u v14 v15
+  br_if v16 block5(v14) block6()
+block5(v17: i64):
+  v18 = i64.const 4
+  v19 = i64.mul v17 v18
+  v20 = i64.const 16
+  v21 = i64.add v20 v19
+  v22 = i32.load v21
+  v23 = thread.join v22
+  v24 = i64.const 1
+  v25 = i64.add v17 v24
+  br block4(v25)
+block6():
+  v26 = i64.const 0
+  v27 = i64.atomic.load v26
+  return v27
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 0
+  v3 = i64.eq v1 v2
+  br_if v3 block2() block3(v1)
+block3(v4: i64):
+  v5 = i64.const 0
+  v6 = i64.const 1
+  v7 = i64.atomic.rmw.add v5 v6
+  v8 = i64.const -1
+  v9 = i64.add v4 v8
+  br block1(v9)
+block2():
+  v10 = i64.const 0
+  return v10
+}
+"#;
+
 /// Args fed to each kernel (all `(i64) -> (i64)`), incl. negatives and a large value.
 const ARGS: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000];
 
-fn native(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
+fn native(m: &svm_ir::Module, args: &[Value]) -> (i32, i64) {
     let mut fuel = u64::MAX;
-    match bytecode::compile_and_run(m, 0, &[Value::I64(arg)], &mut fuel) {
+    match bytecode::compile_and_run(m, 0, args, &mut fuel) {
         None => (2, 0),
         Some(Err(_)) => (3, 0),
         Some(Ok(vals)) => match vals.first() {
@@ -110,11 +176,18 @@ fn native(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
 }
 
 fn main() {
-    let modules = [("alu", ALU), ("call", CALL), ("mem", MEM), ("divtrap", DIVTRAP)];
+    // (name, source, nargs): nargs==1 sweeps `ARGS`; nargs==0 runs once with no argument.
+    let modules = [
+        ("alu", ALU, 1u32),
+        ("call", CALL, 1),
+        ("mem", MEM, 1),
+        ("divtrap", DIVTRAP, 1),
+        ("threads", THREADS, 0),
+    ];
     std::fs::create_dir_all("corpus").expect("mkdir corpus");
 
     let mut json = String::from("[\n");
-    for (i, (name, src)) in modules.iter().enumerate() {
+    for (i, (name, src, nargs)) in modules.iter().enumerate() {
         let m = svm_text::parse_module(src).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
         let bytes = svm_encode::encode_module(&m);
         let file = format!("corpus/{name}.svmbc");
@@ -122,9 +195,14 @@ fn main() {
             .and_then(|mut f| f.write_all(&bytes))
             .expect("write module");
 
-        json.push_str(&format!("  {{\"name\":\"{name}\",\"file\":\"{file}\",\"cases\":["));
-        for (j, &arg) in ARGS.iter().enumerate() {
-            let (status, value) = native(&m, arg);
+        // args sweep for 1-arg kernels; a single no-arg case otherwise.
+        let args: &[i64] = if *nargs == 1 { ARGS } else { &[0] };
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"nargs\":{nargs},\"cases\":["
+        ));
+        for (j, &arg) in args.iter().enumerate() {
+            let call_args: &[Value] = if *nargs == 1 { &[Value::I64(arg)] } else { &[] };
+            let (status, value) = native(&m, call_args);
             // i64s as JSON strings so JS keeps full precision (BigInt).
             json.push_str(&format!(
                 "{}{{\"arg\":\"{arg}\",\"status\":{status},\"value\":\"{value}\"}}",
@@ -132,7 +210,7 @@ fn main() {
             ));
         }
         json.push_str(if i + 1 == modules.len() { "]}\n" } else { "]},\n" });
-        eprintln!("{name}: {} bytes, {} cases", bytes.len(), ARGS.len());
+        eprintln!("{name}: {} bytes, {} cases", bytes.len(), args.len());
     }
     json.push_str("]\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");

@@ -96,10 +96,9 @@ pub extern "C" fn svm_status() -> i32 {
 }
 
 /// Decode the `len` bytes at [`svm_buf`] as an SVM IR module, run function 0 on the bytecode engine
-/// with the single `i64` argument `arg` and a deny-all `Host`, and return its first `i64` result
-/// (`0` on any non-`OK` status — read [`svm_status`] to disambiguate).
-#[no_mangle]
-pub extern "C" fn svm_run(len: usize, arg: i64) -> i64 {
+/// with `args` and a deny-all `Host`, and return its first `i64` result (`0` on any non-`OK` status
+/// — read [`svm_status`] to disambiguate). Sets [`LAST_STATUS`].
+fn run_buf(len: usize, args: &[Value]) -> i64 {
     // SAFETY: single-threaded wasm; `len` is bounded by the host to `<= svm_buf_cap()`.
     let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BUF) as *const u8, len) };
     let set = |s: i32| unsafe { LAST_STATUS = s };
@@ -113,7 +112,7 @@ pub extern "C" fn svm_run(len: usize, arg: i64) -> i64 {
     };
     let mut fuel = u64::MAX;
     let mut host = svm_interp::Host::new(); // deny-all powerbox (compute-only v1)
-    match bytecode::compile_and_run_with_host(&m, 0, &[Value::I64(arg)], &mut fuel, &mut host) {
+    match bytecode::compile_and_run_with_host(&m, 0, args, &mut fuel, &mut host) {
         None => {
             set(STATUS_UNSUPPORTED);
             0
@@ -133,4 +132,17 @@ pub extern "C" fn svm_run(len: usize, arg: i64) -> i64 {
             }
         },
     }
+}
+
+/// Run the encoded module at [`svm_buf`] passing a single `i64` argument (the common kernel shape).
+#[no_mangle]
+pub extern "C" fn svm_run(len: usize, arg: i64) -> i64 {
+    run_buf(len, &[Value::I64(arg)])
+}
+
+/// Run the encoded module at [`svm_buf`] with **no** arguments — e.g. the `() -> (i64)` thread
+/// kernels that spawn/join cooperatively on the engine's `drive`.
+#[no_mangle]
+pub extern "C" fn svm_run0(len: usize) -> i64 {
+    run_buf(len, &[])
 }

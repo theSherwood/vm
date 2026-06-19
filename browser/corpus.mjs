@@ -16,13 +16,14 @@ const bufPtr = Number(ex.svm_buf());
 const cap = Number(ex.svm_buf_cap());
 let total = 0, fail = 0;
 
-for (const { name, file, cases } of corpus) {
+for (const { name, file, nargs, cases } of corpus) {
   const bytes = readFileSync(file);
   if (bytes.length > cap) throw new Error(`${file} > buf cap`);
   let bad = 0;
   for (const { arg, status, value } of cases) {
     new Uint8Array(ex.memory.buffer).set(bytes, bufPtr); // re-seed (engine may dirty the window)
-    const got = ex.svm_run(N(bytes.length), BigInt(arg));
+    const got = nargs === 0 ? ex.svm_run0(N(bytes.length))
+                            : ex.svm_run(N(bytes.length), BigInt(arg));
     const gotStatus = ex.svm_status();
     const okStatus = gotStatus === status;
     // value only meaningful when status==OK(0)
