@@ -877,8 +877,14 @@ fn outline_rename_threads_operand_stack_through_helpers() {
         "\n#82 buys: outlining WITHOUT spilling the operand stack — {} -> 0 memory ops vs outline-no-rename.",
         memory_ops(&optimize_module(&outline_mem))
     );
+    // The function count ({} here) is dominated by *constant-argument specialization*, not dead cells:
+    // combine(in, c_i) bakes each distinct c_i into its own residual helper (by design — the same
+    // per-static-pattern specialization the `outlining_makes_*` tests assert), while the all-dynamic
+    // combine(acc, t) calls already share one helper. Renamed region cells are *over-threaded* (the
+    // whole region crosses each call, including cells redundant with the operands or dead above the
+    // live stack), which inflates helper signatures but does not change the count.
     println!(
-        "note: helper sharing is fragmented ({} fns) because dead operand cells above sp pollute the\n      outline key — pruning them would restore sharing (a follow-up).",
+        "note: {} residual fns — fragmentation is constant-arg specialization, not dead cells; the\n      live cells are over-threaded (bigger signatures), a separate liveness cleanup.",
         optimize_module(&outlined).funcs.len()
     );
 }
