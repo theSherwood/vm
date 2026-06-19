@@ -2,7 +2,7 @@
 
 The **design lives in `DESIGN.md` §20c** (the partial-evaluation on-ramp). This file is the working
 tracker for the **remaining slices**, in the repo convention (cf. the former `WASM.md`/`SCHEDULING.md`):
-it is dropped once the actionable slices (1–2 below) close.
+it is dropped once the actionable slices (1–3 below) close.
 
 **Status: BUILT** — first Futamura projection, host-side/offline. `crates/svm-peval` is a pure
 `Module → Module` transform, untrusted-for-escape (re-verified), with the differential oracle
@@ -52,6 +52,21 @@ it is dropped once the actionable slices (1–2 below) close.
   compiled program (1484 → 176 bytes, 8.4× smaller); on a 2M-iteration workload the same-backend
   specialization win is **~16× (JIT)** and the end-to-end interpreted→compiled-native is **~1600×**.
   Proves the projection on frontend-emitted IR, not just hand-written toy interpreters.
+- **Second demo — a recursive Lisp/Scheme tree-walker** (`crates/svm-llvm/tests/lisp_demo.rs`): the
+  same on-ramp (C interpreter, `clang -O2 → svm-llvm`, opaque program pointer) on a *recursive*
+  AST-walking evaluator (`let`/`if`/arithmetic/variables + guest functions), exercising **both**
+  residual strategies. An **expression** program (a finite AST) fully **inlines**: the whole
+  3-function/16-block tree-walker collapses to a **single 4-block straight-line formula** — the
+  dispatch `switch`, node decode, and AST all gone. A **recursive** program (`fib` defined in the AST,
+  dynamic depth) **outlines**: the self-call folds into a finite self-recursive residual (13 functions,
+  one per reached node) — fib(32) is **138× (JIT)** / **323×** end-to-end over the interpreted
+  interpreter. Two practical findings it surfaced: (1) clang's tail-recursion elimination loopifies the
+  evaluator and turns `if` into a `select` of node indices — a *dynamic* index that defeats dispatch
+  folding — so the demo compiles with `-fno-optimize-sibling-calls`; (2) a *counted* host loop
+  (`for i in 0..n`) is unrolled by online PE (its induction variable looks constant each step), so the
+  guest's only foldable looping construct is recursion — which is exactly where outlining earns its
+  keep. The modest same-backend win (2.3×) is because all-or-nothing outlining keeps a real call per
+  AST node; **selective outlining** (slice below) would collapse the leaves into the recursive body.
 - **Benchmarking** (`tests/bench.rs`): `size_corpus` (a normal test, also a size-regression guard)
   reports blocks / insts / encoded `.svmb` bytes for interpreter → residual → optimized across four
   shapes (register machine: constant / straight-line / runtime-loop, plus a renamed stack machine) —
@@ -65,10 +80,17 @@ it is dropped once the actionable slices (1–2 below) close.
 1. **Exotic v128 (SIMD) ops** — fold the remaining lane ops (saturating add/sub, widen/narrow, lane
    int↔float convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15). Each
    mirrors a `svm-interp` `simd_*` helper; low-medium effort, low priority (uncommon in residuals).
-2. **Outlining + renaming together** — thread the renamed region's live abstract cells across a
+2. **Selective outlining (inline leaves, outline recursion)** — today `outline_calls` is all-or-
+   nothing: *every* call becomes a residual function, so a recursive tree-walker decomposes into one
+   tiny function per AST node (a real call each), and the same-backend win is modest (the Lisp `fib`
+   demo: 2.3×). Outline only the calls that need it for termination (recursive / dynamic-depth) and
+   **inline the rest**, so the residual is a tight recursive function with the leaves folded in. The
+   highest-ROI follow-up the demos surfaced; medium effort (a reachability/SCC check on the call
+   graph to decide which call sites must outline).
+3. **Outlining + renaming together** — thread the renamed region's live abstract cells across a
    residual call (as extra params/results), so outlining works even with a rename region (today it
    requires `rename = None`). Medium effort; only needed for very large renamed interpreters.
-3. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
+4. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
    dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
    effort (on-device re-verify, determinism/TCB review) — a project, not a slice.
 
@@ -82,4 +104,4 @@ with new shapes as slices land, so each one's size/speed effect is measured, not
 **Non-goals** (the engine correctly bails, not pending work): effectful / multi-result ops — atomics,
 fibers/threads, host `cap.call` / imports — cannot be folded soundly.
 
-Drop this file once the actionable slices (1–2) close.
+Drop this file once the actionable slices (1–3) close.
