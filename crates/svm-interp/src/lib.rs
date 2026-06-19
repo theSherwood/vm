@@ -3224,22 +3224,25 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             let froze = v.durable
                 && result.is_ok()
                 && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
-            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING`
-            // has drained the root's native stack into the root's shadow region; now flatten the
-            // still-parked fibers into theirs, while the registry is alive, before the window is
-            // snapshotted. A drive trap (out-of-scope module) surfaces as the run's result.
+            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
+            // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
+            // parked into theirs, while the registry is alive, before the window is snapshotted. **Every**
+            // vCPU drives its own (slice 3.4: a spawned child that owns fibers must flatten them too — the
+            // root's drive runs before the children exist, so it can't see a child's fiber). `freeze_drive`
+            // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
+            // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
+            // drive trap (out-of-scope module) surfaces as the run's result.
             let result = if froze {
-                // A **spawned** vCPU (slice 3.2.1) that unwound under a freeze records *itself* as
-                // residue: its continuation now lives in its own region, extent = the live shadow-SP.
-                // (No `freeze_drive` — flattening idle fibers is the root's job, and multi-vCPU + fibers
-                // is out of scope for 3.2.1, guarded at `thread.spawn`.) The root instead flattens its
-                // fibers; children already pushed their residue by the time the root's `drive` returns.
-                let r = if let Some((func, args)) = v.spawn_residue.clone() {
-                    let shadow_sp = v
-                        .mem
-                        .as_ref()
-                        .map(|m| m.durable_get_sp())
-                        .unwrap_or(SHADOW_BASE);
+                // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
+                // repoints the active-SP word to flatten idle fibers and restores it to this extent.
+                let self_sp = v
+                    .mem
+                    .as_ref()
+                    .map(|m| m.durable_get_sp())
+                    .unwrap_or(SHADOW_BASE);
+                if let Some((func, args)) = v.spawn_residue.clone() {
+                    // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
+                    // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -3248,32 +3251,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             task: v.id as usize,
                             func: func as i32,
                             args,
-                            shadow_sp,
+                            shadow_sp: self_sp,
                         });
-                    result
                 } else {
-                    // The root: record its own flattened extent (the shared active-SP word will be
-                    // overwritten by a later child, so the root's residue can't ride the window) before
-                    // `freeze_drive` repoints the word to flatten idle fibers.
-                    let root_sp = v
-                        .mem
-                        .as_ref()
-                        .map(|m| m.durable_get_sp())
-                        .unwrap_or(SHADOW_BASE);
+                    // The root: record its extent (the shared active-SP word will be overwritten by a
+                    // later child, so the root's residue can't ride the window).
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .frozen_root_sp = Some(root_sp);
-                    v.freeze_drive().and(result)
-                };
-                // Hand the flattened fibers back to the embedder via the shared host, so a snapshot
-                // can record them (and a thaw re-seed them).
+                        .frozen_root_sp = Some(self_sp);
+                }
+                let r = v.freeze_drive().and(result);
+                // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
+                // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
+                // makes the accumulation order irrelevant to the artifact.
                 if !v.frozen.is_empty() {
                     let frozen = std::mem::take(&mut v.frozen);
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .frozen_fibers = frozen;
+                        .frozen_fibers
+                        .extend(frozen);
                 }
                 r
             } else {

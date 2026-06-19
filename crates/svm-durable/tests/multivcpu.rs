@@ -301,3 +301,141 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
         "thawed vCPU+fiber domain reloads the saved clock read (57), not a re-issued one"
     );
 }
+
+// Slice 3.4 — a *spawned child* that **owns a fiber** (3.2.2 only covered the *root* owning one). The
+// root just spawns + joins; the child reads the clock, creates a fiber that suspends (yielding 5,
+// parked at the freeze), then unwinds. The child-owned parked fiber must be flattened into its own
+// shadow region and re-seeded on thaw — which needs the *child* to run its own `freeze_drive` (the
+// root's drive runs before the child exists, so it can't see the child's fiber), and the per-vCPU
+// frozen-fiber residue to **accumulate** across vCPUs rather than clobber. The fiber sits at registry
+// slot 0 → context 1 (grows up); the child sits at a top-down vCPU context — non-overlapping.
+// The root spawns the child (`thread.spawn` is not a may-suspend op, so it executes before the freeze
+// point), reads the clock (its first may-suspend op → it unwinds at the trailing poll, parking its
+// continuation at the later `thread.join`), then joins + sums. The child's **first** may-suspend op is
+// its own `cont.resume`, so the fiber runs + suspends (parks, yielding 5) *before* the child unwinds —
+// leaving a child-owned parked fiber for the child's `freeze_drive` to flatten.
+const SRC_CHILD_FIBER: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  v3 = thread.spawn 1 v1 v2
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v0 (v4)
+  v6 = thread.join v3
+  v7 = i64.add v5 v6
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = ref.func 2
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  v8 = i64.const 100
+  v9 = i64.add v7 v8
+  return v9
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+
+#[test]
+fn child_owns_fiber_through_freeze_thaw() {
+    let inst = instrument_src(SRC_CHILD_FIBER);
+
+    // Baseline: the root reads clock (42); the child's fiber yields 5 → child returns 5 + 100 = 105;
+    // result = 42 + 105 = 147.
+    let want = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(want, vec![Value::I64(147)], "uninterrupted: 42 + (5 + 100)");
+
+    // Freeze: UNWINDING. The root unwinds (no fiber); the child reads the clock, parks its fiber at
+    // cont.resume, and unwinds into its top-down context. Capture window + both residues.
+    let (frozen_fibers, frozen_vcpus, root_sp, snap, clock_after) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut win = init_durable_window(WINDOW);
+        write_state(&mut win, STATE_UNWINDING);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+        (
+            h.frozen_fibers().to_vec(),
+            h.frozen_vcpus().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            snap,
+            h.clock_ns,
+        )
+    };
+    assert_eq!(
+        frozen_fibers.len(),
+        1,
+        "the *child's* fiber was flattened (its own freeze_drive ran)"
+    );
+    assert_eq!(frozen_vcpus.len(), 1, "the spawned vCPU was captured");
+    assert_eq!(frozen_vcpus[0].task, 1, "child is task 1");
+    assert!(clock_after > 42, "the freeze ran the child's clock read once");
+
+    // Thaw on a host whose clock has advanced: the root reloads 42, not re-issues. The child's fiber
+    // re-seeds and the child re-spawns; forward execution reproduces the uninterrupted 147.
+    let r_thaw = {
+        let mut win = snap.clone();
+        write_state(&mut win, STATE_REWINDING);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = clock_after;
+        let clk = h.grant_clock();
+        h.set_frozen_fibers(frozen_fibers);
+        h.set_frozen_vcpus(frozen_vcpus);
+        h.set_frozen_root_sp(root_sp);
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        r
+    };
+    assert_eq!(
+        r_thaw,
+        Ok(want),
+        "thawed child-owned-fiber domain reloads the saved clock read (147), not a re-issued one"
+    );
+}
