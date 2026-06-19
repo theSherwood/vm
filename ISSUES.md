@@ -218,6 +218,70 @@ start timing — a strong hint for a park/unpark or steal-loop wakeup race.
 
 ---
 
+### I8 — svm-jit/Cranelift auto-vectorizes only to **128-bit** SIMD, ~2× behind native AVX2/AVX-512 on wide-vectorizable loops (S3) — `claude/svm-jit-alu-simd`
+
+**Where:** the LLVM on-ramp's vector legalization (`crates/svm-llvm/src/lib.rs` `wide_vec_layout`/
+`lower_wide`, the §17 fixed-128 `LegalizeTypes` analog) → svm-ir's fixed-128-bit `v128` (§17/D58) →
+`svm-jit` lowering each `v128` to one SSE/NEON 128-bit op.
+
+**Symptom.** A reduction (`vsum`-style) compiled `clang -O2 -mavx2` runs ~2× slower on svm-jit than
+the native binary, because the on-ramp splits LLVM's wide `<8 x i32>`/`<16 x i32>` vectors into
+**128-bit chunks** (4×i32) and svm-jit emits 128-bit `paddd`/etc., while native uses 256-bit `ymm`
+(AVX2) or 512-bit `zmm` (AVX-512). So the SVM stack *does* vectorize (contrary to my earlier bench
+claim — see below), but at SSE width.
+
+**Root cause — deliberate, not a miss.** The chunk width is fixed at 128 bits and **never
+host-detected**, to preserve the interp↔JIT↔durable-fiber **determinism contract** (a frozen vector
+register file must replay identically on any host, and the tree-walker oracle is scalar-128). Widening
+to the host's native vector width would make results/snapshots host-dependent. So this is a
+throughput-vs-determinism tradeoff, not a codegen bug. (Vector *support* itself — all six `VShape`s +
+wide/sub-128 legalization — already landed; see Resolved **I2**.)
+
+**Benchmark caveat that exaggerated it.** My `bench/cross-engine` SVM driver compiled the kernels with
+`-fno-vectorize -fno-slp-vectorize` (following the stale LLVM.md §4 "MVP" pipeline note), which keeps
+SIMD out **entirely** → the SVM rows looked *scalar*, not merely 128-bit. With vectorization enabled
+the on-ramp emits `v128` IR and svm-jit lowers it to real SIMD. Two measurement hazards make the win
+hard to see in that harness: (a) `vsum`'s known-content array gets **closed-form-folded** by Cranelift
+(the opaque-pointer barrier doesn't survive LLVM→SVM), and (b) `svm_jit::compile_and_run` recompiles
+per call, so a fast vectorized loop is swamped by compile jitter unless timed via `CompiledModule`
+(compile once, run many).
+
+**Fix sketch (deferred — needs a decision):**
+1. **Doc/bench:** drop `-fno-*-vectorize` from the on-ramp invocation in the bench (and LLVM.md §4) so
+   the SVM rows show the real 128-bit-SIMD number, not scalar; measure with a non-foldable kernel via
+   `CompiledModule` (compile-once).
+2. **Throughput (optional, contract change):** an *opt-in*, non-default "fast/non-deterministic" mode
+   that legalizes to the host vector width (256/512) — only for runs that don't need
+   freeze/thaw/oracle determinism. Default stays fixed-128.
+
+---
+
+### I9 — svm-jit lacks LCG/geometric **recurrence strength-reduction**, so a pure `a = a*M + c` loop is ~8× native (S4) — `claude/svm-jit-alu-simd`
+
+**Where:** `svm-jit` (Cranelift) loop codegen, vs `clang`'s x86 backend.
+
+**Symptom.** The `alu` benchmark kernel (`a = a*1103515245 + 12345 + i`) runs ~1.9 ns/iter on svm-jit
+vs ~0.24 ns/iter native — an ~8× gap that *looks* like an svm-jit deficiency.
+
+**Root cause — a clang-specific optimization on a pathological kernel, not a general gap.** clang's
+backend recognizes the linear-congruential recurrence and **collapses 4 unrolled steps into a single
+multiply by `M^4`** (observed: the native loop is one `imul $0xee067f11` — `M^4 mod 2^32` — per 4
+iterations, with the per-step constants folded into additive terms). The on-ramp ingests clang's
+*mid-end* IR, which is unrolled 4× but **not** collapsed (4 separate `i32.mul`), and Cranelift doesn't
+do the collapse either → svm-jit runs 4 muls / 4 iters at multiply latency. **This is the only kernel
+where svm-jit trails native**: on serial loops clang *can't* collapse, svm-jit **matches or beats**
+native — measured `xorshift` 1.61 vs 1.74 ns, `muldep` 1.28 vs 1.52 ns (svm-jit faster). LCG-shaped
+hot loops are rare in real code, so this is low priority.
+
+**Fix sketch (deferred):**
+1. **Don't chase it in svm-jit** — recurrence strength-reduction is a niche backend optimization;
+   implementing it in Cranelift/the on-ramp is high-effort, low-yield.
+2. **Benchmark hygiene:** the `alu` kernel is unrepresentative (it rewards clang's collapse). Report a
+   non-collapsible scalar kernel (e.g. `xorshift`) as the headline scalar-throughput number, where
+   svm-jit ≈ native, and keep `alu` only as a "clang recurrence-collapse" demonstrator.
+
+---
+
 
 ## Resolved
 
