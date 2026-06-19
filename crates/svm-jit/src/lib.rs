@@ -1764,14 +1764,25 @@ impl CompiledModule {
             } else {
                 None
             };
+        // The *root* vCPU's fiber runtime is built only when the module actually uses `cont.*` — a
+        // fiber-free module (even a threaded one) never resumes a fiber, so it needs no execution
+        // context, and the durable shadow-SP word it does use is driven by the instrumented IR
+        // directly (the multi-vCPU deferred/thaw spawn paths go through the `Domain`, not this
+        // runtime). The *table* is still created for `uses_threads` above (the durable vCPU-context
+        // allocator); only the per-vCPU runtime is fiber-gated, so a thread-only run publishes no
+        // `CURRENT_RT` and allocates no idle runtime (matching the pre-slice-3.3 behavior).
         #[cfg(fiber_rt)]
-        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = fiber_table.as_ref().map(|t| {
-            Box::new(fiber_rt::FiberRuntime::new(
-                std::sync::Arc::clone(t),
-                fiber_type_id,
-                fiber_mask,
-            ))
-        });
+        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
+            fiber_table.as_ref().map(|t| {
+                Box::new(fiber_rt::FiberRuntime::new(
+                    std::sync::Arc::clone(t),
+                    fiber_type_id,
+                    fiber_mask,
+                ))
+            })
+        } else {
+            None
+        };
         // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
         #[cfg(fiber_rt)]
         let fiber = if uses_fibers {

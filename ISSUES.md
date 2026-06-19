@@ -13,7 +13,38 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-_(none — I2 resolved below)_
+### I3 — Rare macOS-CI `SIGABRT` in the `svm-wasm` threaded-import test (S4, surface reduced) — `claude/vcpu-context-recycling`
+
+**Where:** `crates/svm-wasm/tests/imports.rs::spawn_alongside_capability_import` — a `wasi:thread-spawn`
+module that spawns 6 OS-thread workers, each doing a `Blocking` `cap.call` + `i64.atomic.rmw.add`, with
+the root parking on `memory.atomic.wait32` until they finish. Runs on the JIT via
+`svm_jit::compile_and_run_with_host`.
+
+**Symptom (observed once):** on PR #72's first slice-3.3 CI run, the `build · test (macos-latest)` job's
+`imports` binary aborted with `signal: 6, SIGABRT`. Tests run in parallel, so the abort surfaced after
+a *sibling* test (`import_handle_threads_through_call_indirect`) had already printed `ok`; the only test
+in that binary still running — and the only one using real OS threads + futex wait/notify — is
+`spawn_alongside_capability_import`. **Not reproduced:** it passed on the very next run (same commit
+range) and passes repeatedly on Linux (5/5 stress), and macOS cannot be run in this environment, so the
+root cause is not pinned.
+
+**Suspected cause / mitigation (landed).** Slice 3.3 (multi-vCPU durable) began creating the
+`SharedFiberTable` for `uses_fibers || uses_threads` (the durable vCPU-context allocator lives on it).
+A `.map` over that table *incidentally* also built the **root vCPU's `FiberRuntime` and published it as
+`CURRENT_RT`** for a thread-only module — behavior it never had pre-3.3. A fiber-free module never
+resumes a fiber, so that runtime is dead weight, but it changed the threaded run's setup/teardown
+surface on the spawning thread. The table-vs-runtime split is now fixed: the **table** stays present for
+`uses_threads` (needed by the allocator), but the **runtime** is built only for `uses_fibers` (so a
+thread-only run again publishes no `CURRENT_RT` and allocates no idle runtime). This *reduces the change
+surface back to the pre-3.3 path* but is **not a confirmed cure** — the abort was never reproduced, so it
+may be a pre-existing macOS-runner flake (e.g. futex/thread teardown timing, or runner memory pressure)
+unrelated to the runtime. Severity is provisional `S4` pending a root cause; if a reproduction shows a
+real abort path it should be re-classified.
+
+**Next step if it recurs:** capture the macOS core/backtrace (the `imports` binary under
+`RUST_BACKTRACE=full`, ideally `--test-threads=1` to localize which test aborts), and check whether it
+is in futex park/teardown (`os_thread_rt::{thread_wait,thread_notify,join_all}`) or the guard/signal
+path — distinct from the now-removed root-runtime delta and from the resolved I1 (fiber-stack alloc).
 
 ---
 
