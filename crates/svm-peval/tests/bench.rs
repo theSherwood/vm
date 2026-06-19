@@ -737,6 +737,163 @@ fn run_stack_calls_ref(program: &[(u8, i64)], input: i64) -> i64 {
     }
 }
 
+// An accumulator machine with a small heap addressed by a *runtime* value (`acc`). When specialized
+// with a rename region, a heap access whose address is dynamic can't be proved disjoint from the
+// region, so the engine bails `Unsupported` — unless the caller promises the region is private
+// (`rename_is_private`), which lets the access be emitted faithfully. The adversarial fuzz shape for
+// the `Unsupported` path and the private-region contract.
+const A_HALT: u8 = 0; //       return acc
+const A_SETI: u8 = 1; // imm   acc = imm                (acc constant)
+const A_ADDIN: u8 = 2; //      acc = acc + input        (acc becomes dynamic)
+const A_ADDK: u8 = 3; // imm   acc = acc + imm
+const A_STOREH: u8 = 4; //     heap[acc & 63] = acc     (dynamic addr when acc is dynamic)
+const A_LOADH: u8 = 5; //      acc = heap[acc & 63]
+const HEAP_LO: u64 = 4096; // disjoint from the program (at 0) and the rename region
+
+fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
+    let t = || ValType::I64;
+    let bin = |op, a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+    let load = |op, addr, offset| Inst::Load {
+        op,
+        addr,
+        offset,
+        align: 0,
+    };
+    // Address of heap[acc & 63] from the op-block's `acc` (param 0): (acc & 63) << 3 + HEAP_LO.
+    let heap_addr = || {
+        vec![
+            Inst::ConstI64(63),
+            bin(BinOp::And, 0, 4), // 5: slot = acc & 63
+            Inst::ConstI64(3),
+            bin(BinOp::Shl, 5, 6), // 7: off = slot << 3
+            Inst::ConstI64(HEAP_LO as i64),
+            bin(BinOp::Add, 7, 8), // 9: addr
+        ]
+    };
+
+    let entry = Block {
+        params: vec![t()],                                 // 0: input
+        insts: vec![Inst::ConstI64(0), Inst::ConstI64(0)], // 1: acc, 2: pc
+        term: Terminator::Br {
+            target: 1,
+            args: vec![1, 2, 0],
+        },
+    };
+    let header = Block {
+        params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
+        insts: vec![
+            Inst::ConstI64(0),
+            bin(BinOp::Add, 3, 1),      // 4: addr = base + pc
+            load(LoadOp::I32_8U, 4, 0), // 5: op
+            load(LoadOp::I64, 4, 1),    // 6: imm
+        ],
+        term: Terminator::BrTable {
+            idx: 5,
+            targets: vec![
+                (2, vec![0]),          // HALT   -> halt(acc)
+                (3, vec![0, 1, 6, 2]), // SETI
+                (4, vec![0, 1, 6, 2]), // ADDIN
+                (5, vec![0, 1, 6, 2]), // ADDK
+                (6, vec![0, 1, 6, 2]), // STOREH
+                (7, vec![0, 1, 6, 2]), // LOADH
+            ],
+            default: (2, vec![0]),
+        },
+    };
+    let halt = Block {
+        params: vec![t()],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    // Op blocks: params (acc, pc, imm, input) = 0,1,2,3.
+    let seti = Block {
+        params: vec![t(), t(), t(), t()],
+        insts: vec![Inst::ConstI64(9), bin(BinOp::Add, 1, 4)], // 5: npc
+        term: Terminator::Br {
+            target: 1,
+            args: vec![2, 5, 3],
+        }, // acc=imm
+    };
+    let addin = Block {
+        params: vec![t(), t(), t(), t()],
+        insts: vec![
+            bin(BinOp::Add, 0, 3), // 4: acc+input
+            Inst::ConstI64(9),
+            bin(BinOp::Add, 1, 5), // 6: npc
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![4, 6, 3],
+        },
+    };
+    let addk = Block {
+        params: vec![t(), t(), t(), t()],
+        insts: vec![
+            bin(BinOp::Add, 0, 2), // 4: acc+imm
+            Inst::ConstI64(9),
+            bin(BinOp::Add, 1, 5), // 6: npc
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![4, 6, 3],
+        },
+    };
+    let storeh = {
+        let mut insts = heap_addr(); // 4..9, addr at 9
+        insts.push(Inst::Store {
+            op: StoreOp::I64,
+            addr: 9,
+            value: 0,
+            offset: 0,
+            align: 0,
+        });
+        insts.push(Inst::ConstI64(9));
+        insts.push(bin(BinOp::Add, 1, 10)); // 11: npc
+        Block {
+            params: vec![t(), t(), t(), t()],
+            insts,
+            term: Terminator::Br {
+                target: 1,
+                args: vec![0, 11, 3],
+            }, // acc unchanged
+        }
+    };
+    let loadh = {
+        let mut insts = heap_addr(); // 4..9, addr at 9
+        insts.push(load(LoadOp::I64, 9, 0)); // 10: nacc
+        insts.push(Inst::ConstI64(9));
+        insts.push(bin(BinOp::Add, 1, 11)); // 12: npc
+        Block {
+            params: vec![t(), t(), t(), t()],
+            insts,
+            term: Terminator::Br {
+                target: 1,
+                args: vec![10, 12, 3],
+            },
+        }
+    };
+
+    Module {
+        funcs: vec![Func {
+            params: vec![t()],
+            results: vec![t()],
+            blocks: vec![entry, header, halt, seti, addin, addk, storeh, loadh],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: true,
+            bytes: encode_program(program),
+        }],
+        ..Default::default()
+    }
+}
+
 /// Count surviving memory ops (loads + stores) across all functions.
 fn memory_ops(m: &Module) -> usize {
     m.funcs
@@ -979,6 +1136,25 @@ fn gen_stack_calls_program(rng: &mut Rng) -> Vec<(u8, i64)> {
     prog
 }
 
+/// A random accumulator+heap program (SETI / ADDIN / ADDK / STOREH / LOADH, then HALT). A heap op
+/// after an ADDIN reaches it with a *dynamic* `acc` ⇒ a dynamic heap address; otherwise the address
+/// is constant. Always terminates (no loops).
+fn gen_heap_program(rng: &mut Rng) -> Vec<(u8, i64)> {
+    let body = 2 + rng.below(6) as usize;
+    let mut prog = Vec::with_capacity(body + 1);
+    for _ in 0..body {
+        prog.push(match rng.below(5) {
+            0 => (A_SETI, rng.imm()),
+            1 => (A_ADDIN, 0),
+            2 => (A_ADDK, rng.imm()),
+            3 => (A_STOREH, 0),
+            _ => (A_LOADH, 0),
+        });
+    }
+    prog.push((A_HALT, 0));
+    prog
+}
+
 /// Run `entry`(`input`) on the reference interpreter under a fuel cap. `None` ⇒ it did not finish
 /// (a non-terminating program / fuel exhausted) — the only `Err` our trap-free op sets can produce.
 fn interp_try(m: &Module, input: i64, fuel: u64) -> Option<i64> {
@@ -1113,6 +1289,81 @@ fn report_shape(label: &str, t: &Tally) {
     }
 }
 
+/// Adversarial differential for the `Unsupported` path and the `rename_is_private` contract: the
+/// accumulator+heap interpreter (heap addressed by a runtime value) specialized under a rename region
+/// two ways. Non-private: a dynamic heap address can't be proved disjoint from the region ⇒
+/// `Unsupported`. Private: the caller's promise lets the access through ⇒ a faithful residual. Asserts
+/// the bail fail-closes, private is at least as permissive as non-private, and every residual is
+/// correct (oracle holds). Returns (programs, non-private Unsupported, rescued-by-private, checks).
+fn fuzz_heap(n: usize, seeds: &[u64]) -> (usize, usize, usize, usize) {
+    const FUEL: u64 = 200_000;
+    let region = Some((STACK_LO, STACK_HI)); // a (private) scratch range disjoint from the heap
+    let inputs = [0i64, 1, 2, 7, -3, 100];
+    let cfg = |private| SpecConfig {
+        rename: region,
+        rename_is_private: private,
+        ..SpecConfig::default()
+    };
+    let (mut progs, mut np_unsup, mut rescues, mut checks) = (0usize, 0usize, 0usize, 0usize);
+    for &seed in seeds {
+        let mut rng = Rng(seed ^ 0x5151);
+        for _ in 0..n {
+            progs += 1;
+            let prog = gen_heap_program(&mut rng);
+            let interp = build_heap_interpreter(&prog);
+            verify_module(&interp).expect("heap interp verifies");
+            let np = specialize_with_config(&interp, 0, &[SpecArg::Dynamic], &cfg(false));
+            let pv = specialize_with_config(&interp, 0, &[SpecArg::Dynamic], &cfg(true));
+            // Heap programs always terminate; precompute the reference results.
+            let wants: Vec<i64> = inputs
+                .iter()
+                .map(|&i| interp_try(&interp, i, FUEL).expect("heap interp terminates"))
+                .collect();
+            let icheck = |r: &Module, who: &str| {
+                verify_module(r)
+                    .unwrap_or_else(|e| panic!("{who} residual verify {e:?}: {prog:?}"));
+                for (k, &input) in inputs.iter().enumerate() {
+                    assert_eq!(
+                        interp_try(r, input, FUEL),
+                        Some(wants[k]),
+                        "{who}: interp(residual) diverged at {input} on {prog:?}"
+                    );
+                }
+            };
+            // Private must be at least as permissive: it never bails where non-private succeeds.
+            if np.is_ok() {
+                assert!(
+                    pv.is_ok(),
+                    "private bailed where non-private succeeded: {prog:?}"
+                );
+            }
+            match (np, pv) {
+                (Ok(rn), Ok(rp)) => {
+                    icheck(&rn, "np");
+                    icheck(&rp, "pv");
+                    assert_eq!(jit_run(&rp, inputs[0]), wants[0], "jit(pv): {prog:?}");
+                    checks += 1;
+                }
+                (Err(svm_peval::SpecError::Unsupported), Ok(rp)) => {
+                    np_unsup += 1;
+                    rescues += 1;
+                    icheck(&rp, "pv");
+                    assert_eq!(jit_run(&rp, inputs[0]), wants[0], "jit(pv): {prog:?}");
+                    checks += 1;
+                }
+                (
+                    Err(svm_peval::SpecError::Unsupported),
+                    Err(svm_peval::SpecError::Unsupported),
+                ) => {
+                    np_unsup += 1;
+                }
+                (a, b) => panic!("unexpected outcomes np={a:?} pv={b:?} on {prog:?}"),
+            }
+        }
+    }
+    (progs, np_unsup, rescues, checks)
+}
+
 fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
     let region = Some((STACK_LO, STACK_HI));
     println!("\n=== differential fuzz: interp(interp) == interp(residual) == jit(residual) ===");
@@ -1181,6 +1432,13 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
         }
     }
 
+    // (3) Adversarial: dynamic-address heap access under a rename region — the canonical Unsupported
+    // case — fuzzed non-private (must bail) vs private (must rescue + stay correct).
+    let (hp_progs, hp_unsup, hp_rescues, hp_checks) = fuzz_heap(n.min(150), seeds);
+    println!(
+        "heap dyn-addr (priv vs non)  {hp_progs:>5} programs | {hp_unsup} non-private Unsupported, {hp_rescues} rescued by private | {hp_checks} oracle checks"
+    );
+
     assert!(
         reg.succeeded > 0 && reg.oracle_checks > 0,
         "register fuzz did no useful work"
@@ -1189,6 +1447,13 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
         stk.succeeded > 0 && stk.oracle_checks > 0,
         "stack fuzz did no useful work"
     );
+    // The thorough run must actually exercise the Unsupported path and the private rescue.
+    if verify_bails {
+        assert!(
+            hp_rescues > 0,
+            "dynamic-address Unsupported path / private rescue was not exercised"
+        );
+    }
 }
 
 /// A fast, deterministic smoke that runs by default — a cheap regression guard on the PE oracle.
