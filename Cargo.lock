@@ -682,6 +682,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-peval",
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",

@@ -8,6 +8,10 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
+/// Phase-1b bytecode-dispatch engine (see `INTERP_PERF.md`) — a flat, operand-resolved execution
+/// path, not yet the default; gated by the equality harness against this interpreter.
+pub mod bytecode;
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -201,6 +205,35 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     // No capabilities granted: an empty powerbox (any `cap.call` is inert → `CapFault`).
     let mut host = Host::new();
     run_with_host(m, func, args, fuel, &mut host)
+}
+
+/// Like [`run`], but also return the guest's **trap-time backtrace** (innermost frame first, as
+/// `IrPc`s; empty on a clean finish) — see [`run_with_host_traced`].
+pub fn run_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+    let mut host = Host::new();
+    run_with_host_traced(m, func, args, fuel, &mut host)
+}
+
+/// The **fast** interpreter entry (INTERP_PERF.md Slice 1c): run on the [`bytecode`] engine when the
+/// module is eligible, else fall back to the tree-walker [`run`]. The two are bit-for-bit equivalent
+/// on the eligible set (the `bytecode_diff` harness gates this), so this is a transparent speedup.
+///
+/// `run` itself stays the tree-walker — it is the reference **oracle** the JIT (and the bytecode
+/// engine) are differentially checked against, so it must not change. Speed-sensitive callers that
+/// are *not* themselves the oracle use `run_fast`.
+pub fn run_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> Result<Vec<Value>, Trap> {
+    let mut host = Host::new();
+    run_with_host_fast(m, func, args, fuel, &mut host)
 }
 
 // ===========================================================================================
@@ -568,6 +601,45 @@ pub struct SourceLoc {
     pub line: u32,
     /// 0 means "no column".
     pub col: u32,
+}
+
+/// Resolve an [`IrPc`] to its source position using `m`'s `-g` debug info (nearest-preceding `loc`
+/// within the block), or `None` without debug info / for an installed §22 unit (`pc.module != 0`).
+/// The free counterpart of [`Inspector::source_loc`]; pairs with [`run_with_host_traced`] to render
+/// an interpreter trap-time backtrace to source (the symmetric analog of the JIT's `JitFrameLoc`).
+pub fn source_loc(m: &Module, pc: IrPc) -> Option<SourceLoc> {
+    source_loc_in(m.debug_info.as_ref()?, pc)
+}
+
+/// The `-g` source name of function `func` in module 0 (`debug_info.func_names`), or `None` when the
+/// module carried no name for it — renderers fall back to `fn{func}`. Pairs with [`source_loc`] to
+/// render an interpreter trap-time backtrace with function names (the analog of the JIT's
+/// `JitFrameLoc::func_name`).
+pub fn func_name(m: &Module, func: FuncIdx) -> Option<&str> {
+    let di = m.debug_info.as_ref()?;
+    di.func_names
+        .iter()
+        .find(|f| f.func == func)
+        .map(|f| f.name.as_str())
+}
+
+/// The nearest-preceding-`loc` resolution shared by [`source_loc`] and [`Inspector::source_loc`]
+/// (DEBUGGING.md §6/W4 S2): the latest `loc` in `pc`'s block at or before `pc.inst`.
+fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
+    if pc.module != 0 {
+        return None;
+    }
+    let l = di
+        .locs
+        .iter()
+        .filter(|l| l.func == pc.func && l.block as usize == pc.block && l.inst as usize <= pc.inst)
+        .max_by_key(|l| l.inst)?;
+    let file = di.files.get(l.file as usize)?.clone();
+    Some(SourceLoc {
+        file,
+        line: l.line,
+        col: l.col,
+    })
 }
 
 /// The value of a source variable ([`Inspector::read_var`]). A promoted scalar resolves to a live
@@ -1352,23 +1424,7 @@ impl Inspector {
     /// semantics). Only the guest's own program (module 0) has source; installed §22 units return
     /// `None`.
     pub fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
-        if pc.module != 0 {
-            return None;
-        }
-        let di = self.debug_info.as_ref()?;
-        let l = di
-            .locs
-            .iter()
-            .filter(|l| {
-                l.func == pc.func && l.block as usize == pc.block && l.inst as usize <= pc.inst
-            })
-            .max_by_key(|l| l.inst)?;
-        let file = di.files.get(l.file as usize)?.clone();
-        Some(SourceLoc {
-            file,
-            line: l.line,
-            col: l.col,
-        })
+        source_loc_in(self.debug_info.as_ref()?, pc)
     }
 
     /// Resolve a source variable by `name` in the frame `frame_from_top` levels up (0 = innermost)
@@ -1488,8 +1544,24 @@ pub fn run_with_host(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
+    run_with_host_traced(m, func, args, fuel, host).0
+}
+
+/// Like [`run_with_host`], but also return the guest's **trap-time backtrace** — the call stack
+/// (innermost frame first, as `IrPc`s) at the point a trap was raised, or empty if the run finished
+/// cleanly (DEBUGGING.md §5 / W3; the interpreter counterpart to the JIT's `last_trap_backtrace`).
+/// The interpreter reifies its call stack and doesn't unwind it on a trap, so this is the exact frame
+/// chain. Resolve each `IrPc` to source with [`source_loc`]. Useful for kill diagnostics and for the
+/// interp↔JIT differential fuzzer to report *where* a divergence/trap occurred.
+pub fn run_with_host_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
     if m.funcs.get(func as usize).is_none() {
-        return Err(Trap::Malformed);
+        return (Err(Trap::Malformed), Vec::new());
     }
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
@@ -1500,6 +1572,32 @@ pub fn run_with_host(
         mm
     });
     drive(&m.funcs, func, args, fuel, &mut mem, host)
+}
+
+/// Host-carrying counterpart of [`run_fast`]: try the [`bytecode`] engine first, fall back to the
+/// tree-walker [`run_with_host`]. The bytecode engine drives no runtime seams yet (no scheduler,
+/// powerbox, fibers, threads, durability), so it is used only when the run needs none of them:
+///
+/// * the host is **not durable** (durability needs the shadow-stack swap in [`drive`]), and
+/// * [`bytecode::compile_and_run`] accepts the module — it returns `None` for any op that needs a
+///   seam (capability / thread / fiber / continuation / `memory.wait` ops), so an accepted module is
+///   pure compute + memory + (direct/indirect) calls, which a granted-capability host never affects.
+///
+/// On the `None` fallback path `compile_and_run` rejects the module *before* executing, so `fuel` is
+/// untouched and the tree-walker runs with the full budget.
+pub fn run_with_host_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    if !host.is_durable() {
+        if let Some(result) = bytecode::compile_and_run_with_host(m, func, args, fuel, host) {
+            return result;
+        }
+    }
+    run_with_host(m, func, args, fuel, host)
 }
 
 /// Run the entry vCPU on the M:N executor: submit the root, become a worker on the calling thread,
@@ -1514,7 +1612,7 @@ fn drive(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
-) -> Result<Vec<Value>, Trap> {
+) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
     let funcs: Arc<[Func]> = funcs.to_vec().into();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1641,18 +1739,23 @@ fn drive(
         {
             let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
             vseed.sort_by_key(|f| f.task);
-            // Re-establish the durable vCPU-context count (slice 3.2.2): the re-spawned children
-            // reclaim the top `n` contexts (their regions return via the restored shadow-SP below), so
-            // a post-thaw spawn allocates below them.
-            root.registry.seed_vcpu_count(vseed.len());
+            // Context recycling makes the live children's contexts (and task ids / join slots)
+            // **non-dense** — a child that finished before the freeze left gaps. So rebuild each piece
+            // explicitly rather than assuming "top `n`, densely":
+            //   • context — *derived* from the restored shadow-SP (`(sp − SHADOW_BASE) / STRIDE`), since
+            //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
+            //     post-thaw spawn lands in a genuinely-free context.
+            //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze records the
+            //     same task and the artifact stays byte-identical.
+            //   • join handle — the slot is `task − 1` (flat root-spawned), so `threads[]` is rebuilt
+            //     *sparsely* (a finished child's slot stays `None`), keeping the guest's held handle valid.
+            let mut vcpu_mask: u16 = 0;
             for ff in vseed {
-                let cid = s.next_task;
-                s.next_task += 1;
+                let cid = ff.task as TaskId;
+                s.next_task = s.next_task.max(cid + 1);
                 s.live += 1;
-                debug_assert_eq!(
-                    cid as usize, ff.task,
-                    "thaw re-spawns children densely by task"
-                );
+                let ctx = ((ff.shadow_sp - SHADOW_BASE) / SHADOW_STRIDE) as usize;
+                vcpu_mask |= 1 << ctx;
                 let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&funcs),
@@ -1674,11 +1777,19 @@ fn drive(
                 child.durable = true;
                 child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
                 child.root_shadow_sp = ff.shadow_sp;
+                child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
                 child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
-                // Rebuild the root's join handle → child mapping (handle slot = spawn order = task − 1).
+                // Rebuild the root's join handle → child mapping at the child's own slot (= task − 1),
+                // padding finished/joined slots with `None` so the guest's held handle still resolves.
+                let slot = ff.task - 1;
+                while root.threads.len() < slot {
+                    root.threads.push(None);
+                }
                 root.threads.push(Some(cid));
                 s.runnable.push_back(child);
             }
+            // Seed the registry's vCPU-context occupancy from the re-spawned children (recycling).
+            root.registry.seed_vcpu_mask(vcpu_mask);
         }
         s.runnable.push_back(root);
         id
@@ -1710,7 +1821,7 @@ fn drive(
         .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    out.result
+    (out.result, out.trap_bt)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -1755,7 +1866,7 @@ pub fn run_capture_reserved(
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -1792,7 +1903,7 @@ pub fn run_capture_reserved_with_host(
         mm.init_data(&m.data);
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -1854,7 +1965,7 @@ pub fn run_capture_reserved_with_host_prots(
         }
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
         .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
@@ -1889,7 +2000,7 @@ pub fn run_capture_sub(
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_parent(parent_bytes))
@@ -2898,6 +3009,25 @@ struct Outcome {
     result: Result<Vec<Value>, Trap>,
     mem: Option<Mem>,
     fuel: u64,
+    /// The vCPU's **trap-time call stack** (innermost frame first), as `IrPc`s — captured from the
+    /// live frames when (and only when) `result` is a trap, before the vCPU is dropped (DEBUGGING.md
+    /// §5 / W3, the interpreter counterpart to the JIT's `last_trap_backtrace`). Empty on a clean
+    /// finish. Resolved to source by the run wrapper via [`source_loc`]; host-side, off the hot path.
+    trap_bt: Vec<IrPc>,
+}
+
+/// The `IrPc`s of `frames`, innermost frame first — the shape [`Outcome::trap_bt`] captures at a trap.
+fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
+    frames
+        .iter()
+        .rev()
+        .map(|f| IrPc {
+            module: f.module,
+            func: f.func,
+            block: f.block,
+            inst: f.inst,
+        })
+        .collect()
 }
 
 /// Why a vCPU yielded its worker (returned by [`VCpu::run`]).
@@ -3157,14 +3287,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     }
     match step {
         Step::Done(result) => {
+            // `froze` distinguishes a **freeze-unwind** (the run is `UNWINDING`; a spawned child
+            // records `FrozenVCpu` residue and its region is kept for thaw) from a **genuine finish**
+            // (NORMAL completion). Context recycling frees a finished child's shadow context back to
+            // the registry, but a frozen child must keep it (it is re-spawned there on thaw).
+            let froze = v.durable
+                && result.is_ok()
+                && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
             // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING`
             // has drained the root's native stack into the root's shadow region; now flatten the
             // still-parked fibers into theirs, while the registry is alive, before the window is
             // snapshotted. A drive trap (out-of-scope module) surfaces as the run's result.
-            let result = if v.durable
-                && result.is_ok()
-                && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
-            {
+            let result = if froze {
                 // A **spawned** vCPU (slice 3.2.1) that unwound under a freeze records *itself* as
                 // residue: its continuation now lives in its own region, extent = the live shadow-SP.
                 // (No `freeze_drive` — flattening idle fibers is the root's job, and multi-vCPU + fibers
@@ -3215,11 +3349,23 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             } else {
                 result
             };
+            // Context recycling: a spawned vCPU that genuinely finished frees its shadow context for a
+            // later spawn to reuse (a freeze-unwound child keeps it — it's re-spawned there on thaw).
+            if v.vcpu_ctx > 0 && !froze {
+                v.registry.free_vcpu_context(v.vcpu_ctx);
+            }
             let id = v.id;
+            // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (only on a trap).
+            let trap_bt = if result.is_err() {
+                frames_to_pcs(&v.frames)
+            } else {
+                Vec::new()
+            };
             let outcome = Outcome {
                 result,
                 mem: v.mem.take(),
                 fuel: v.fuel,
+                trap_bt,
             };
             drop(v);
             let mut s = sched.lock();
@@ -3652,10 +3798,17 @@ impl SchedDriver {
             match step {
                 Step::Done(result) => {
                     let id = v.id;
+                    // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (trap only).
+                    let trap_bt = if result.is_err() {
+                        frames_to_pcs(&v.frames)
+                    } else {
+                        Vec::new()
+                    };
                     let outcome = Outcome {
                         result,
                         mem: v.mem.take(),
                         fuel: v.fuel,
+                        trap_bt,
                     };
                     drop(v);
                     let mut s = det.lock();
@@ -3786,18 +3939,6 @@ fn shadow_region_fits(ctx_idx: usize) -> bool {
 /// The highest usable shadow-context index: the reserve holds `DURABLE_RESERVE / SHADOW_STRIDE`
 /// contexts and index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root regions.
 const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
-
-/// A spawned vCPU's shadow-context index (DURABILITY.md §12.8 slice 3.2.2): the `n`-th spawned vCPU
-/// (0-based, in spawn order) owns context `MAX_SHADOW_CTX - n`. Fibers grow **up** from context 1
-/// (`slot + 1`) and vCPUs grow **down** from the top, so the two pools share the reserve without
-/// colliding until `fibers + vcpus` would exhaust it (a clean capacity refusal) — unifying the
-/// per-context layout that slice 3.2.1 could only use no-fiber. Keeping fibers at `slot + 1`
-/// preserves cross-backend artifact parity (the JIT mirrors that formula). `None` if no region is
-/// free (it would underflow to the root or collide with a fiber).
-fn vcpu_shadow_context(nth: usize, fibers: usize) -> Option<usize> {
-    let ctx = MAX_SHADOW_CTX.checked_sub(nth)?;
-    (ctx >= 1 && ctx > fibers).then_some(ctx)
-}
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
@@ -3987,10 +4128,12 @@ struct RegState {
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
     /// lifetime total. A finished slot's generation is already bumped, so reuse is ABA-safe.
     free: BinaryHeap<Reverse<usize>>,
-    /// Count of durable vCPU contexts handed out (slice 3.2.2): the root spawns children that grow
-    /// **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1, so this counter (with
-    /// `fibers.len()`) bounds the shared reserve — `fibers.len() + vcpus <= MAX_SHADOW_CTX`.
-    vcpus: usize,
+    /// **Occupied** durable vCPU shadow contexts (slice 3.2.2 + context recycling): a bitmask over
+    /// contexts `1..=MAX_SHADOW_CTX` (bit `c` set ⇒ context `c` is live). The root spawns children that
+    /// grow **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1; a child's context is
+    /// *freed* (its bit cleared) when it genuinely finishes, so the bound is now *peak concurrent* vCPUs
+    /// rather than the lifetime total. `MAX_SHADOW_CTX` is 15, so a `u16` holds every context bit.
+    vcpu_mask: u16,
 }
 
 impl FiberRegistry {
@@ -4001,7 +4144,7 @@ impl FiberRegistry {
                 shadow: Vec::new(),
                 gens: Vec::new(),
                 free: BinaryHeap::new(),
-                vcpus: 0,
+                vcpu_mask: 0,
             }),
         }
     }
@@ -4037,16 +4180,36 @@ impl FiberRegistry {
     /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
     fn reserve_vcpu_context(&self) -> Option<usize> {
         let mut t = self.lock();
-        let ctx = vcpu_shadow_context(t.vcpus, t.fibers.len())?;
-        t.vcpus += 1;
-        Some(ctx)
+        // Hand out the **highest free** context above the fiber pool (`fibers.len()` occupies contexts
+        // `1..=fibers.len()`). Top-down keeps the vCPU pool clear of the upward-growing fibers; reusing
+        // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
+        let floor = t.fibers.len();
+        let mut c = MAX_SHADOW_CTX;
+        while c > floor {
+            if t.vcpu_mask & (1 << c) == 0 {
+                t.vcpu_mask |= 1 << c;
+                return Some(c);
+            }
+            c -= 1;
+        }
+        None // the reserve is full (the vCPU pool growing down would meet the fibers growing up)
     }
 
-    /// Seed the durable vCPU-context count a **thaw** re-establishes (slice 3.2.2): the re-spawned
-    /// children occupy the top `n` contexts (their regions come back via the restored shadow-SP), so a
-    /// post-thaw spawn allocates below them. Set once after re-seeding, before forward execution.
-    fn seed_vcpu_count(&self, n: usize) {
-        self.lock().vcpus = n;
+    /// Free a spawned vCPU's shadow context for reuse (context recycling): called when the child
+    /// **genuinely finishes** (not a freeze-unwind, which keeps the region for thaw). A no-op for the
+    /// root / a non-durable child (context 0).
+    fn free_vcpu_context(&self, ctx: usize) {
+        if (1..=MAX_SHADOW_CTX).contains(&ctx) {
+            self.lock().vcpu_mask &= !(1 << ctx);
+        }
+    }
+
+    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (context recycling): the
+    /// re-spawned children reclaim *exactly* the contexts they held at freeze (derived from their
+    /// restored shadow-SPs — recycling means these need not be the top `n`), so a post-thaw spawn
+    /// allocates into a genuinely-free context. Set once after re-seeding, before forward execution.
+    fn seed_vcpu_mask(&self, mask: u16) {
+        self.lock().vcpu_mask = mask;
     }
 
     /// `cont.new`: allocate a slot — the guest handle — under the §15 quota, which is **per run** now
@@ -4068,8 +4231,16 @@ impl FiberRegistry {
         // clean `FiberFault`, like exhausting the quota — never an overflow into another
         // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
         // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
-        // (slice 3.2.2), so this fiber also mustn't meet the vCPUs: `(slot+1) + vcpus <= MAX`.
-        if durable && (!shadow_region_fits(slot + 1) || slot + 1 + t.vcpus > MAX_SHADOW_CTX) {
+        // (slice 3.2.2), so this fiber must stay strictly below the lowest live vCPU context (which,
+        // with recycling, need not be a simple count from the top).
+        let lowest_vcpu = {
+            if t.vcpu_mask == 0 {
+                MAX_SHADOW_CTX + 1
+            } else {
+                t.vcpu_mask.trailing_zeros() as usize
+            }
+        };
+        if durable && (!shadow_region_fits(slot + 1) || slot + 1 >= lowest_vcpu) {
             return Err(Trap::FiberFault);
         }
         let generation = if reuse.is_some() {
@@ -4288,6 +4459,10 @@ struct VCpu {
     /// `None` on the root (whose entry/args the thaw caller supplies) and on every non-durable vCPU.
     /// (slice 3.2.1)
     spawn_residue: Option<(FuncIdx, Vec<i64>)>,
+    /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at
+    /// `thread.spawn` and freed back to the registry when the vCPU genuinely finishes (context
+    /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
+    vcpu_ctx: usize,
     /// This vCPU's **saved durable state word** (`NORMAL | UNWINDING | REWINDING`), swapped into the
     /// shared window word ([`STATE_OFF`]) by the runtime when this vCPU runs and saved back when it
     /// parks (slice 3.2.1). Multi-vCPU freeze/thaw run single-worker, so the one shared state word is
@@ -4320,6 +4495,10 @@ struct VCpu {
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
     id: TaskId,
+    /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
+    /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
+    /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
+    tls: i64,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
@@ -4391,6 +4570,7 @@ impl VCpu {
             root_shadow_sp: SHADOW_BASE,
             frozen: Vec::new(),
             spawn_residue: None,
+            vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             mem,
             host,
@@ -4400,6 +4580,7 @@ impl VCpu {
             fault_yields: false,
             depth,
             id,
+            tls: id as i64, // §12 seed the per-vCPU TLS register to the dense vCPU id (root = 0)
             pending: None,
             sched,
             memop: false,
@@ -4451,6 +4632,7 @@ impl VCpu {
             root_shadow_sp: SHADOW_BASE,
             frozen: Vec::new(),
             spawn_residue: None,
+            vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             mem,
             host,
@@ -4459,7 +4641,8 @@ impl VCpu {
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
-            id: 0, // unused: driven inline, never via the executor
+            id: 0,  // unused: driven inline, never via the executor
+            tls: 0, // §12 per-vCPU TLS seed (id 0)
             pending: None,
             sched,
             memop: false,
@@ -4725,6 +4908,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         root_shadow_sp,
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
+        vcpu_ctx: _,
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
@@ -4737,6 +4921,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         sched,
         funcs: _,
         id: _,
+        tls,
         memop,
         acc,
         quota: _,
@@ -5509,6 +5694,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                     frames[top].vals.push(Reg::from_i32(r[1] as i32));
                 }
+                // §12 per-vCPU TLS register: read/write **this** vCPU's word (`tls`, destructured from
+                // `v` above), so a fiber that migrated here sees the current vCPU's value.
+                Inst::VcpuTlsGet => {
+                    frames[top].vals.push(Reg::from_i64(*tls));
+                }
+                Inst::VcpuTlsSet { val } => {
+                    *tls = get_i64(&frames[top].vals, *val)?;
+                }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
@@ -5722,6 +5915,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                  // above, so its shadow stack lives in its own region; it carries its own state word
                                                  // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
                         child.root_shadow_sp = shadow_region_base(child_ctx);
+                        child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
@@ -6165,6 +6359,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
         Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
+        // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
+        // loop (`run_inner`), never here.
+        Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
             IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?),
             IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?),
@@ -9853,6 +10050,13 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
+    /// Fast-path flag: set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13
+    /// region alias, demand/supply paging) — monotonic, dirtied at the [`Mem::space_write`] choke
+    /// point. While clear — the overwhelmingly common case (no syscalls, no coroutines, no regions)
+    /// — [`Mem::check_prot`] knows every in-prefix page is plain RW and skips the address-space
+    /// `RwLock` read entirely. Shared with the same topology as `space` (cloned for a forked thread,
+    /// fresh for a §14 child, which has its own address space).
+    prot_dirty: Arc<AtomicBool>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
     /// `confine_checked` clears it to [`NO_FAULT`]). A coroutine child with `fault_yields` reads it
@@ -9904,6 +10108,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9926,6 +10131,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9937,6 +10143,11 @@ impl Mem {
         self.space.read().unwrap_or_else(|e| e.into_inner())
     }
     fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
+        // Any address-space mutation (the only reason to take the write lock) disables the lock-free
+        // `check_prot` fast path, monotonically. Set *before* acquiring the lock so a concurrent
+        // reader never observes a clear flag after a mutation has begun (a false positive just makes
+        // it take the read lock — always safe; a false negative would not be).
+        self.prot_dirty.store(true, Ordering::Release);
         self.space.write().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -9951,6 +10162,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
+            prot_dirty: Arc::clone(&self.prot_dirty),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9975,6 +10187,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -10003,6 +10216,12 @@ impl Mem {
         // §14 child).
         let rel = base.wrapping_sub(self.window.base());
         let last = rel + width as u64 - 1;
+        // Lock-free fast path: the address space has never been mutated, so every page is in its
+        // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
+        // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
+        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+            return Ok(());
+        }
         let space = self.space_read();
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
@@ -10107,6 +10326,46 @@ impl Mem {
         self.write_le(base, width, store_bits(v));
         self.writes += 1;
         Ok(())
+    }
+
+    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When no protection has
+    /// ever been mutated (`!prot_dirty` — the common case: no syscalls / coroutines / §13 regions, so
+    /// every prefix page is plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies
+    /// wholly in the backed prefix ([`Window::checked`]), read straight through — skipping the per-op
+    /// `last_fault` atomic store in `confine_checked` and the `check_prot` page scan. **Semantically
+    /// identical** to the cold [`Mem::load`] for this case (the escape-oracle byte-compares it); any
+    /// other case (RO/unmapped/reserved-tail/regions, or a recoverable demand fault) falls to the cold
+    /// path, which keeps the exact trap + `last_fault` semantics. Returns the [`Reg`] slot directly,
+    /// dropping the `Value` round-trip the bytecode engine paid via `Reg::from_value(load(..))`.
+    #[inline]
+    fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
+        let (_, rty, width, signed) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                // `!prot_dirty ⟹ !has_regions`, so the bytes live in `back` (no §13 redirect); the
+                // cooperative bytecode engine is the sole accessor, so a single non-atomic word read
+                // is sound (and one instruction, not `width` atomic byte loads).
+                let raw = self.back.read_word(abs, width);
+                return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
+            }
+        }
+        Ok(Reg::from_value(self.load(addr, offset, op)?))
+    }
+
+    /// Bytecode-engine scalar store (Phase 2): the fast path of [`Mem::store`], taking the value as
+    /// raw slot `lo` bits (no `Value` wrap). Same fast-path gate + cold fallback as
+    /// [`Mem::load_scalar`]; `write_le` truncates to the op width.
+    #[inline]
+    fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
+        let (_, _, width) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                self.back.write_word(abs, width, lo);
+                self.writes += 1;
+                return Ok(());
+            }
+        }
+        self.store(addr, offset, op, Value::I64(lo as i64))
     }
 
     /// §17 `v128.load`: the **16-byte** masked access — the sole escape-TCB delta SIMD adds
@@ -10458,16 +10717,31 @@ impl Mem {
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {
+        // Hoist the `has_regions` check out of the per-byte loop: when no §13 region is aliased in
+        // (the common case) read straight from `back`, one `has_regions` load instead of `width`.
+        // Still per-byte (each `Region::byte` is a relaxed atomic — defined under §12 races).
         let mut raw = 0u64;
-        for k in 0..width as u64 {
-            raw |= (self.byte(base + k) as u64) << (8 * k);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                raw |= (self.back.byte(base + k) as u64) << (8 * k);
+            }
+        } else {
+            for k in 0..width as u64 {
+                raw |= (self.byte(base + k) as u64) << (8 * k);
+            }
         }
         raw
     }
 
     fn write_le(&mut self, base: u64, width: u32, raw: u64) {
-        for k in 0..width as u64 {
-            self.set_byte(base + k, (raw >> (8 * k)) as u8);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                self.back.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
+        } else {
+            for k in 0..width as u64 {
+                self.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
         }
     }
 

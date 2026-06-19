@@ -90,6 +90,10 @@ pub struct LlvmDebug {
     pub types: Vec<TypeDef>,
     pub vars: HashMap<String, Vec<DiVar>>,
     pub globals: Vec<DiGlobal>,
+    /// `DISubprogram` source names, keyed by the function's LLVM value (linkage) name — the §6
+    /// function-name table the translator correlates to IR function indices. Every function with a
+    /// subprogram, whether or not it has tracked variables.
+    pub func_names: HashMap<String, String>,
 }
 
 /// Read the `-g` debug variables/types from a bitcode file, or `None` when the module carries no
@@ -122,8 +126,14 @@ unsafe fn read_debug_unsafe(path: &str) -> Option<LlvmDebug> {
 
         let mut f = LLVMGetFirstFunction(module);
         while !f.is_null() {
-            if !LLVMGetSubprogram(f).is_null() {
+            let sp = LLVMGetSubprogram(f);
+            if !sp.is_null() {
                 let fname = value_name(f);
+                // §6 function name: the subprogram's source name (`DW_AT_name`), keyed by linkage name.
+                let src = di_name(sp);
+                if !src.is_empty() {
+                    out.func_names.insert(fname.clone(), src);
+                }
                 let vars = read_function_vars(ctx, f, &mut out.types, &mut interner);
                 if !vars.is_empty() {
                     out.vars.insert(fname, vars);
@@ -132,7 +142,7 @@ unsafe fn read_debug_unsafe(path: &str) -> Option<LlvmDebug> {
             f = LLVMGetNextFunction(f);
         }
         out.globals = read_globals(ctx, module, &mut out.types, &mut interner);
-        if out.vars.is_empty() && out.globals.is_empty() {
+        if out.vars.is_empty() && out.globals.is_empty() && out.func_names.is_empty() {
             None
         } else {
             Some(out)

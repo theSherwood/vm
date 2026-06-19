@@ -26,7 +26,98 @@ use svm_ir::{Module, Resolved, ValType};
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
 pub use svm_interp::{Quota, Value};
-use svm_jit::{compile_and_run, CompiledModule, JitOutcome, TrapKind, EXIT_CODE};
+use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
+pub use svm_peval::{SpecArg, SpecConfig};
+
+/// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
+/// per frame, innermost first, where `<name>` is the `-g` function name or the synthesized `fn{N}`.
+/// Empty string when there are no frames (the module carried no `-g`), so the kill message is
+/// byte-identical to before in that case.
+fn format_backtrace(frames: &[JitFrameLoc]) -> String {
+    if frames.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n  backtrace (innermost first):");
+    for (i, f) in frames.iter().enumerate() {
+        let name = f
+            .func_name
+            .clone()
+            .unwrap_or_else(|| format!("fn{}", f.func));
+        s.push_str(&format!(
+            "\n    #{i} {}:{}:{} in {name}",
+            f.file, f.line, f.col
+        ));
+    }
+    s
+}
+
+/// Options for the CLI `--specialize` path — the §20c first Futamura projection driven from the
+/// command line.
+#[derive(Clone, Debug, Default)]
+pub struct SpecializeOpts {
+    /// Which function to specialize (the residual's entry, index 0). Default `0`.
+    pub func: u32,
+    /// Per-parameter binding (a static constant or `Dynamic`), in parameter order.
+    pub args: Vec<SpecArg>,
+    /// Window ranges `[lo, hi)` the caller promises are constant at specialization time.
+    pub const_regions: Vec<(u64, u64)>,
+    /// A private, zero-initialized rename region (the interpreter's value-stack / locals) to lift
+    /// into SSA and elide (Stage 2).
+    pub rename: Option<(u64, u64)>,
+    /// Promise the rename region is private (lets a dynamic-address heap coexist with it).
+    pub rename_private: bool,
+    /// Run the generic cleanup optimizer (fold / DCE / block-merge) on the residual.
+    pub optimize: bool,
+    /// Outline calls into shared residual functions instead of inlining them (a multi-function
+    /// residual). Bounds code growth and specializes dynamic-depth recursion; requires no rename
+    /// region (see [`svm_peval::SpecConfig::outline_calls`]).
+    pub outline: bool,
+}
+
+/// Specialize `module`'s entry against `opts` and re-verify the residual. The specializer is
+/// untrusted-for-escape (§20c) like any frontend output, so [`svm_verify::verify_module`] is the
+/// gate: a specializer bug is a clean verify error here, never an escape. Returns the residual — a
+/// single function (index 0) whose parameters are the dynamic args, in order.
+pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Module, String> {
+    let nparams = module
+        .funcs
+        .get(opts.func as usize)
+        .ok_or(format!(
+            "func {} is out of range ({} functions)",
+            opts.func,
+            module.funcs.len()
+        ))?
+        .params
+        .len();
+    if opts.args.len() > nparams {
+        return Err(format!(
+            "{} argument binding(s) given for a {nparams}-parameter function",
+            opts.args.len()
+        ));
+    }
+    // Parameters without an explicit binding default to dynamic.
+    let mut args = opts.args.clone();
+    args.resize(nparams, SpecArg::Dynamic);
+
+    let cfg = SpecConfig {
+        rename: opts.rename,
+        const_regions: opts.const_regions.clone(),
+        rename_is_private: opts.rename_private,
+        outline_calls: opts.outline,
+        ..SpecConfig::default()
+    };
+    let residual = svm_peval::specialize_with_config(module, opts.func, &args, &cfg)
+        .map_err(|e| format!("specialization failed: {e:?}"))?;
+    svm_verify::verify_module(&residual)
+        .map_err(|e| format!("specialized residual failed re-verification: {e:?}"))?;
+    if !opts.optimize {
+        return Ok(residual);
+    }
+    let opt = svm_peval::optimize_module(&residual);
+    svm_verify::verify_module(&opt)
+        .map_err(|e| format!("optimized residual failed re-verification: {e:?}"))?;
+    Ok(opt)
+}
 
 /// Default `call_indirect` table reservation for the CLI powerbox (`2^10` = 1024 slots) so a
 /// guest using the `Jit` capability can `install` units (DESIGN.md §22). Embedders pick their
@@ -2204,7 +2295,7 @@ unsafe fn powerbox_compile_run(
     interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
     quota: svm_jit::Quota,
     init_mem: Option<&[u8]>,
-) -> Result<JitOutcome, svm_jit::JitError> {
+) -> Result<(JitOutcome, Vec<JitFrameLoc>), svm_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
     if let Some(m) = locked {
         let ctx = m as *const Mutex<Host> as *mut c_void;
@@ -2228,7 +2319,9 @@ unsafe fn powerbox_compile_run(
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(0);
-        return r.map(|(out, _)| out);
+        // §5 W3 — carry the trap-time source backtrace out (empty unless the guest trapped and the
+        // module carried `-g`), so the kill message can name where the guest was.
+        return r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec()));
     }
     let mut cm = CompiledModule::compile(
         module,
@@ -2247,7 +2340,7 @@ unsafe fn powerbox_compile_run(
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
     host.set_jit_native_ctx(0);
-    r.map(|(out, _)| out)
+    r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec()))
 }
 
 /// Run `module`'s entry (function 0) on the JIT under the MVP powerbox (§3e): a writable
@@ -2471,7 +2564,7 @@ fn run_powerbox_inner(
         let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
         let _ = handle.join();
     }
-    let jit = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
+    let (jit, backtrace) = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
 
     let outcome = match jit {
         JitOutcome::Returned(s) => {
@@ -2480,7 +2573,12 @@ fn run_powerbox_inner(
         }
         JitOutcome::Exited(code) => Outcome::Exited(code),
         JitOutcome::Trapped(kind) => {
-            return Err(format!("guest trapped ({kind:?}) — detect-and-kill (§5)"))
+            // §5 W3 — fold the trap-time source backtrace into the kill message (innermost frame
+            // first). Empty unless the module carried `-g`, in which case the message is unchanged.
+            return Err(format!(
+                "guest trapped ({kind:?}) — detect-and-kill (§5){}",
+                format_backtrace(&backtrace)
+            ));
         }
     };
     Ok(Run {

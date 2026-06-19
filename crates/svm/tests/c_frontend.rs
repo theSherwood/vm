@@ -2706,6 +2706,34 @@ int compute(int a, int b) {
 }
 
 #[test]
+fn chibicc_g_emits_function_names() {
+    // `-g` emits the §6 function-name table (`debug.fname <func> "<name>"`), so a backtrace / gdb
+    // `bt` / kill message reads the C name instead of `fn{N}`.
+    let src = r#"
+int helper(int x) { return x + 1; }
+int compute(int a) { return helper(a) * 2; }
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(
+        ir.contains("debug.fname"),
+        "emits the function-name table:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+    let names: Vec<&str> = m
+        .debug_info
+        .as_ref()
+        .expect("debug info")
+        .func_names
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"helper") && names.contains(&"compute"),
+        "func_names carries the C names, got {names:?}"
+    );
+}
+
+#[test]
 fn chibicc_g_emits_module_scoped_globals_read_in_any_frame() {
     // chibicc as a *second* producer of the §6 module-scoped-global primitive (slice 28): a source
     // global lives at a fixed window address and is inspectable by name in every frame.

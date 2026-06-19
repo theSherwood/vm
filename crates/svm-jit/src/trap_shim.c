@@ -12,11 +12,17 @@
  * thread-local, so concurrent JIT runs on different threads are independent: the handler
  * runs on the faulting thread and reads that thread's state.
  */
+/* Feature-test macros must precede every include. `_XOPEN_SOURCE` exposes the (macOS-deprecated)
+ * ucontext routines + `ucontext_t` mcontext on Apple SDKs; `_GNU_SOURCE` gates glibc's REG_RIP/REG_RBP
+ * in <sys/ucontext.h>. Both are harmless where unneeded. */
+#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ucontext.h>
 
 static _Thread_local sigjmp_buf g_buf;
 static _Thread_local volatile int g_armed = 0;
@@ -45,6 +51,106 @@ void svm_clear_demand(void) {
     g_demand_lo = 0;
     g_demand_hi = 0;
     g_demand_ctx = 0;
+}
+
+/* The guest call stack captured at the most recent detect-and-kill memory fault, for the host's
+ * trap-time backtrace (DEBUGGING.md §5 W3 Stage 1). The walk must happen *here, in the handler,
+ * while the guest stack is intact*: a siglongjmp unwinds back onto the same stack the post-fault
+ * host code (and this walk's symbolization) then reuses, so the frames are gone by the time the host
+ * could walk them. So the handler chases the frame-pointer chain now and stashes the faulting `pc`
+ * plus each frame's raw return address; the host reads them via svm_take_trap_frame and only
+ * *symbolizes* (pure arithmetic, no stack reads). Thread-local: the trap is attributed to the
+ * faulting worker, and the host takes the capture before re-running anything on this thread. */
+#define SVM_TRAP_MAXFRAMES 64
+static _Thread_local volatile int g_trap_valid = 0;
+static _Thread_local uintptr_t g_trap_pc = 0;
+static _Thread_local uintptr_t g_trap_rets[SVM_TRAP_MAXFRAMES];
+static _Thread_local int g_trap_nrets = 0;
+
+/* Walk the frame-pointer chain from `fp` toward the stack base, appending each frame's return address
+ * to `rets[]` from index `n`; returns the new count. The JIT's `preserve_frame_pointers` gives every
+ * guest frame a `{ saved_fp, ret_addr }` record: `*fp` is the caller's saved frame pointer, `*(fp+1)`
+ * the return address. The walk moves *up* (increasing addresses, away from the low-address stack
+ * guard a fault sits near) and is bounded — aligned, non-null, strictly-increasing links, within a
+ * generous span, and the frame cap — so a corrupt chain terminates instead of looping or reading wild
+ * memory. The host stops at the first return address that isn't guest code (it owns the
+ * address→source map), so capturing a few trailing host frames here is harmless. Reads-only. */
+static int svm_walk_fp_chain(uintptr_t fp, uintptr_t *rets, int n) {
+    uintptr_t cur = fp;
+    const uintptr_t start = fp;
+    const uintptr_t span = 8u * 1024 * 1024; /* don't chase a corrupt chain off the stack */
+    while (n < SVM_TRAP_MAXFRAMES && cur != 0 && (cur & (sizeof(uintptr_t) - 1)) == 0 &&
+           cur >= start && cur - start < span) {
+        uintptr_t next = *(uintptr_t *)cur;
+        uintptr_t ret = *(uintptr_t *)(cur + sizeof(uintptr_t));
+        rets[n++] = ret;
+        if (next <= cur) /* frame pointers grow toward the base; a non-increasing link is the end */
+            break;
+        cur = next;
+    }
+    return n;
+}
+
+/* Memory-fault capture: extract the faulting (pc, fp) from the signal ucontext and walk the chain.
+ * Async-signal-safe: only stack reads + thread-local writes. */
+static void svm_capture_frame(void *uc) {
+    uintptr_t pc = 0, fp = 0;
+#if defined(__linux__) && defined(__x86_64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext.gregs[REG_RIP];
+    fp = (uintptr_t)c->uc_mcontext.gregs[REG_RBP];
+#elif defined(__linux__) && defined(__aarch64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext.pc;
+    fp = (uintptr_t)c->uc_mcontext.regs[29]; /* AAPCS64 frame pointer */
+#elif defined(__APPLE__) && defined(__x86_64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext->__ss.__rip;
+    fp = (uintptr_t)c->uc_mcontext->__ss.__rbp;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext->__ss.__pc;
+    fp = (uintptr_t)c->uc_mcontext->__ss.__fp;
+#else
+    (void)uc; /* an arch we don't decode: pc/fp stay 0 → the host yields an empty backtrace */
+#endif
+    g_trap_pc = pc; /* the exact faulting instruction (symbolized directly by the host) */
+    g_trap_nrets = svm_walk_fp_chain(fp, g_trap_rets, 0);
+    g_trap_valid = 1;
+}
+
+/* Explicit-check trap capture (§5 W3 Stage 2): the JIT calls this from a trap site (div-by-zero,
+ * `unreachable`, `OutOfFuel`, indirect-call-type) *before* storing the trap kind and returning —
+ * those returns unwind every guest frame, so the chain must be walked here, while it is live. Unlike
+ * a memory fault there is no signal context: this helper's own frame links back to the trapping guest
+ * frame via the frame pointer (the JIT is built with `preserve_frame_pointers`, this shim with
+ * `-fno-omit-frame-pointer`). The trap site is a *return address* (just past the `call` here), so it
+ * goes in `rets[0]` (symbolized at `ret - 1`, like every caller) and `pc` is left 0. */
+void svm_capture_explicit_trap(void) {
+    uintptr_t my_fp = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t guest_fp = *(uintptr_t *)my_fp;                      /* the trapping guest frame */
+    uintptr_t trap_site = *(uintptr_t *)(my_fp + sizeof(uintptr_t)); /* return addr into it */
+    g_trap_pc = 0;
+    int n = 0;
+    g_trap_rets[n++] = trap_site;
+    g_trap_nrets = svm_walk_fp_chain(guest_fp, g_trap_rets, n);
+    g_trap_valid = 1;
+}
+
+/* Read and clear the captured trap stack (the host calls this after svm_run_guarded reports a
+ * fault). Fills `*pc` and up to `max` return addresses into `rets`; returns the number written, or
+ * -1 if nothing was captured. */
+int svm_take_trap_frame(uintptr_t *pc, uintptr_t *rets, int max) {
+    if (!g_trap_valid)
+        return -1;
+    g_trap_valid = 0;
+    *pc = g_trap_pc;
+    int n = g_trap_nrets;
+    if (n > max)
+        n = max;
+    for (int i = 0; i < n; i++)
+        rets[i] = g_trap_rets[i];
+    return n;
 }
 
 static struct sigaction g_old_segv;
@@ -77,7 +183,8 @@ static void svm_handler(int sig, siginfo_t *info, void *uc) {
     }
     if (g_armed && addr >= g_lo && addr < g_hi) {
         g_armed = 0;
-        siglongjmp(g_buf, 1); /* back to svm_run_guarded; does not return */
+        svm_capture_frame(uc); /* stash the faulting frame before the stack unwinds (§5 W3) */
+        siglongjmp(g_buf, 1);  /* back to svm_run_guarded; does not return */
     }
     svm_chain(sig == SIGBUS ? &g_old_bus : &g_old_segv, sig, info, uc);
 }

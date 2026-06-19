@@ -2830,6 +2830,12 @@ void codegen_ir(Obj *prog, FILE *out) {
   if (opt_g) {
     for (int i = 0; i < n_dbg_files; i++)
       cg("debug.file %d \"%s\"\n", i, dbg_files[i]);
+    // `debug.fname <func> "<name>"`: the §6 function-name table, so a backtrace / gdb `bt` / kill
+    // message reads `compute` instead of `fn3`. C function names are identifiers (no escaping). The
+    // synthetic `_start` (func 0) has no source name and is left to its `fn0` fallback.
+    for (int i = 0; i < nfuncs; i++)
+      if (funcs[i]->name)
+        cg("debug.fname %d \"%s\"\n", start_off + i, funcs[i]->name);
     for (int i = 0; i < n_dbg_loc; i++) {
       DbgLoc *l = &dbg_loc_buf[i];
       cg("debug.loc %d %d %d %d %d %d\n", l->func, l->block, l->inst, l->file, l->line,

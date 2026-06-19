@@ -1451,6 +1451,17 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   independent-op reorderings and busy-wait retries, sound vs an unreduced
   enumerator, §18), against which the real-thread JIT is differential-tested; the
   futex glue is loom-checked.
+- **Per-vCPU TLS register (`vcpu.tls.get`/`vcpu.tls.set`).** One ambient i64 of
+  per-vCPU state, **read at the execution point** — so a fiber that migrated to
+  another vCPU reads the *current* vCPU's word, the value only the runtime knows
+  (the `thread.spawn` handle is the parent's view, not "which vCPU am I on now").
+  Seeded at vCPU creation to a **dense id** (root = 0, children sequential), so a
+  bare `get` doubles as a `vcpu.id`; the guest may overwrite it with a pointer to
+  its per-CPU block for full `__thread`-style TLS. The natural primitive for a
+  guest M:N runtime / GC's per-CPU state (mark stacks, allocator magazines). Not a
+  cross-vCPU channel (each vCPU touches only its own word — no new visible op for
+  the DPOR oracle); program *output* must not depend on *which* vCPU runs you,
+  only on per-CPU state being self-consistent (the GC.md §3.2 framing).
 
 ### Host-call ABI: async-first
 - Blocking-capable host calls are **submit/complete** (io_uring-shaped). The
@@ -2002,9 +2013,11 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
 - **Engine — online polyvariant symbolic execution** (weval's shape). Each SSA value is
   abstractly a constant or a residual value; pure integer ops with constant operands fold
   (matching the interpreter's arithmetic exactly), the rest is emitted into the residual. The
-  **context** threaded through the CFG is `(block, constant valuation of its block params +
-  live abstract-memory cells)`; one residual block per context, memoized — so a constant PC
-  drives loop unrolling and repeated contexts reconnect (bounded by a block budget).
+  **context** threaded through the CFG is `(call stack, constant valuation of the live
+  abstract-memory cells)` — each frame `(block, constant valuation of its live SSA values)`, one
+  frame for a single function and deeper when calls are CFG-inlined; one residual block per
+  context, memoized — so a constant PC drives loop unrolling and repeated contexts reconnect
+  (bounded by a block budget).
   - **Constant memory** is a *caller contract*, not a runtime-enforced invariant: a load from a
     caller-declared-constant address folds to those bytes (a readonly data segment by default,
     or an arbitrary region / explicit overlay via `SpecConfig`). A false promise is a miscompile,
@@ -2013,6 +2026,18 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
     interpreter's operand stack/locals) is modeled as abstract memory — its constant-address
     full-width stores/loads are lifted into SSA and elided, so the in-memory stack vanishes from
     the residual. `rename_is_private` additionally lets a pointer-addressed heap coexist with it.
+  - **Cross-function `call` is inlined at the call site.** A static-control-flow callee is traced
+    straight-line into the caller's block (static recursion unrolls); a callee whose control flow
+    stays dynamic has its **CFG inlined as residual blocks** — the context's call stack carries the
+    caller's live values through the callee (dead ones cleaned by the optimizer) and each `return`
+    becomes a branch to the continuation. Loops and `unreachable` in the callee work; one residual
+    function still comes out. A constant-index `call_indirect`/`ref.func` resolves through the
+    identity table and inlines too. (Indirect-dynamic/host calls are not inlined.)
+  - **Outlining (residual-call mode, opt-in).** Instead of inlining, each `(callee, arg pattern)`
+    can be specialized to its own residual function (memoized/shared) and called — a multi-function
+    residual that bounds code growth and specializes **dynamic-depth recursion** (a finite
+    self-recursive residual where inlining would diverge). Requires no rename region (no abstract
+    cells to thread across the call).
   - **CFG cleanup** (shared with the generic optimizer): constant folding, branch resolution,
     dead-block / dead-value elimination, block merging, dead block-param elimination — so
     residuals come out as tight straight-line/looped code, not `br`-chains.
@@ -2026,10 +2051,21 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   dispatch by specialization is **~5–6×** on either backend (apples-to-apples, same backend); the
   end-to-end software-interpreted → compiled-native path is **~470×**. Lean-ISA dispatch-overhead
   fraction, not a universal constant — a heavier decode shows more.
-- **Coverage today:** integer/long/float/SIMD arithmetic, casts, comparisons, static + dynamic
-  branches, any-width constant-memory reads, word-width renamed stack/locals, and a dynamic heap.
-  **Open (tracked in `PEVAL.md`):** cross-function `call` specialization, narrow (`i8`/`i16`)
-  renamed cells, and float/SIMD *constant folding* (they pass through unfolded today).
+- **Coverage today:** integer/long, **scalar-float**, **and common v128 (SIMD)** ops — arithmetic,
+  compares, fused multiply-add, float↔int conversions and reinterpret/demote/promote casts; plus the
+  common SIMD lane ops (splat, extract/replace, lane int+float arithmetic/compares/shifts, bitwise,
+  shuffle, swizzle) — all constant-**folded** bit-for-bit the interpreter (NaN payloads + the wasm
+  min/max/nearest rules preserved, float lanes reusing the scalar folds; a trapping `trunc` folds
+  only in range and is otherwise kept so it still traps); static + dynamic branches; any-width
+  constant-memory reads; renamed stack/locals (word **and** narrow `i8`/`i16` cells, with a dynamic
+  heap alongside); cross-function `call` inlining — direct **and** constant-index
+  `call_indirect`/`return_call_indirect`/`ref.func` (resolved through the identity module-0 table) —
+  with static + dynamic control flow, recursion, and loops; and opt-in **outlining** (specialize a
+  callee to a shared residual function, for dynamic-depth recursion / bounded size). **Remaining
+  enhancements (not gaps):** the **exotic SIMD ops** (saturating add/sub, widen/narrow, lane
+  convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15) still pass through
+  unfolded, and the guest-side engine (ship the specializer inside the sandbox on the §22 `Jit`
+  capability for dynamic-language IC-style recompilation; the residual IR and back half are shared).
 
 ---
 

@@ -13,7 +13,154 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I3 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3)
+### I3 — `durable_jit` cross-backend fuzz flakes on Windows CI under cumulative JIT-commit pressure (S4)
+
+**Where:** `crates/svm/tests/durable_jit.rs::freeze_thaw_cross_backend_over_generated_modules`
+(the no-nightly cross-backend freeze/thaw driver), via `support/durjit.rs::fuzz_one_xbackend` →
+`svm-jit` compile + guest-window commit. Windows runners only.
+
+**Symptom:** intermittently the test binary aborts mid-run with
+`memory allocation of 131072 bytes failed` followed by exit code `0xc0000409`
+(`STATUS_STACK_BUFFER_OVERRUN`). Observed on PR #70 (a `svm-peval`-only change that cannot touch
+this path); the exact base commit was green on the same job, and Linux/macOS always pass — i.e. a
+flake, not a regression.
+
+**Root cause.** Each of the 64 seeds JIT-compiles ~3× and commits a fresh guest window, so the
+process's *cumulative* committed VA climbs across the run. On a memory-tight Windows runner the
+commit limit (`os error 1455`) is reached, and the **next ordinary heap allocation** — here a
+128 KiB (`131072`) `Vec`/`Box` — gets a null back. Rust's global-allocator OOM path
+(`handle_alloc_error`) then **aborts** the process, which Windows reports as
+`STATUS_STACK_BUFFER_OVERRUN`. This is the same Windows eager-commit memory-pressure *family* as
+**I1** and shares its abort signature, but a **distinct** site: I1 was the fiber control-stack
+`VirtualAlloc` (now fallible → `Trap::FiberFault`); this is a generic heap allocation that cannot be
+made to trap gracefully — once commit is exhausted, *some* allocation aborts. The test already
+*bounds* the pressure (seed count capped at 64; the heavier recycled variant is
+`#[cfg(not(windows))]`-gated) — that mitigation is just still marginal on the tightest runners.
+
+**Fix sketch (deferred — re-run clears it):**
+1. Reduce the Windows blast radius further: lower the seed count behind `#[cfg(windows)]` (e.g. 32),
+   or drop the JIT window reservation size for this driver so each commit costs less VA.
+2. Reclaim VA between seeds — free/unmap each compiled blob + guest window before the next seed
+   instead of letting them accumulate for the whole test (the libFuzzer target does the heavy run
+   anyway, so the in-tree smoke needn't hold every artifact live).
+3. Or split the driver so each seed (or small batch) runs in its own process, capping peak commit.
+
+Until then, treat a `STATUS_STACK_BUFFER_OVERRUN` / `os error 1455` abort in this specific test on
+Windows as a flake: re-run the failed job (`rerun_failed_jobs`).
+
+---
+
+### I4 — Rare macOS-CI `SIGABRT` in the `svm-wasm` threaded-import test (S4, surface reduced) — `claude/vcpu-context-recycling`
+
+**Where:** `crates/svm-wasm/tests/imports.rs::spawn_alongside_capability_import` — a `wasi:thread-spawn`
+module that spawns 6 OS-thread workers, each doing a `Blocking` `cap.call` + `i64.atomic.rmw.add`, with
+the root parking on `memory.atomic.wait32` until they finish. Runs on the JIT via
+`svm_jit::compile_and_run_with_host`.
+
+**Symptom (observed once):** on PR #72's first slice-3.3 CI run, the `build · test (macos-latest)` job's
+`imports` binary aborted with `signal: 6, SIGABRT`. Tests run in parallel, so the abort surfaced after
+a *sibling* test (`import_handle_threads_through_call_indirect`) had already printed `ok`; the only test
+in that binary still running — and the only one using real OS threads + futex wait/notify — is
+`spawn_alongside_capability_import`. **Not reproduced:** it passed on the very next run (same commit
+range) and passes repeatedly on Linux (5/5 stress), and macOS cannot be run in this environment, so the
+root cause is not pinned.
+
+**Suspected cause / mitigation (landed).** Slice 3.3 (multi-vCPU durable) began creating the
+`SharedFiberTable` for `uses_fibers || uses_threads` (the durable vCPU-context allocator lives on it).
+A `.map` over that table *incidentally* also built the **root vCPU's `FiberRuntime` and published it as
+`CURRENT_RT`** for a thread-only module — behavior it never had pre-3.3. A fiber-free module never
+resumes a fiber, so that runtime is dead weight, but it changed the threaded run's setup/teardown
+surface on the spawning thread. The table-vs-runtime split is now fixed: the **table** stays present for
+`uses_threads` (needed by the allocator), but the **runtime** is built only for `uses_fibers` (so a
+thread-only run again publishes no `CURRENT_RT` and allocates no idle runtime). This *reduces the change
+surface back to the pre-3.3 path* but is **not a confirmed cure** — the abort was never reproduced, so it
+may be a pre-existing macOS-runner flake (e.g. futex/thread teardown timing, or runner memory pressure)
+unrelated to the runtime. Severity is provisional `S4` pending a root cause; if a reproduction shows a
+real abort path it should be re-classified.
+
+**Next step if it recurs:** capture the macOS core/backtrace (the `imports` binary under
+`RUST_BACKTRACE=full`, ideally `--test-threads=1` to localize which test aborts), and check whether it
+is in futex park/teardown (`os_thread_rt::{thread_wait,thread_notify,join_all}`) or the guard/signal
+path — distinct from the now-removed root-runtime delta and from the resolved I1 (fiber-stack alloc).
+
+---
+
+---
+
+### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — on `claude/debug-jit-backtrace`
+
+**Where:** `crates/svm-jit/src/lib.rs` (`trap_capture_addr()` returns `0` on non-unix, so `emit_trap`
+bakes no explicit-trap capture call), `crates/svm-jit/src/trap_shim.c` (the unix-only
+`svm_capture_explicit_trap`).
+
+**Update (memory faults: fixed on Windows).** The Windows Vectored Exception Handler now captures the
+trap-time backtrace for **memory faults**, mirroring the unix SIGSEGV/SIGBUS path: `mem.rs`'s windows
+`pal::veh` reads the faulting `Rip`/`Rbp` from `EXCEPTION_POINTERS->ContextRecord` and walks the
+frame-pointer chain (a Rust `walk_fp_chain`) into a thread-local before restoring the recovery context;
+the windows `pal::take_trap_frame` reads it. So `last_trap_backtrace()` + the kill message now carry
+source frames for a Windows guard fault (covered cross-platform by
+`memfault_kill_message_carries_a_source_backtrace` in `svm-run`'s `run.rs`).
+
+**Still open: explicit-check traps on Windows.** Div/rem-by-zero, `unreachable`, `OutOfFuel`, and
+indirect-call-type traps store a `TrapKind` and return — there is no signal/exception to capture from, so
+on unix the lowering bakes a `call svm_capture_explicit_trap` at the trap site (`trap_capture_addr()`).
+On Windows that address is `0`, so these still produce an **empty** backtrace (correct `TrapKind` + kill,
+no frames). Not a correctness or escape hazard. (The `trap_kill_message_carries_a_source_backtrace` test —
+div-by-zero — keeps its source-line assertion under `#[cfg(unix)]` for this reason.)
+
+**Why it isn't a quick patch (two concrete blockers, found on attempt):**
+1. **Recovering the innermost frame without `__builtin_frame_address`.** The unix helper uses
+   `__builtin_frame_address(0)` to find its own frame → the trapping fn's `rbp` *and* the trap-site
+   return address (`[my_fp+8]`). **MSVC has no `__builtin_frame_address`.** Cranelift's
+   `get_frame_pointer` (confirmed present in cranelift-codegen 0.132 x64) can hand the helper the guest
+   fn's `rbp` as an argument — but walking from *that* yields only the **caller** chain; the trapping
+   function's own line is lost. Recovering it needs the helper's return address (`_ReturnAddress()` on
+   MSVC / `__builtin_return_address(0)` on GCC), which pulls the helper back into C.
+2. **Cross-language capture state.** Windows memory faults capture into **Rust** thread-locals (the VEH
+   is Rust, `mem.rs` windows `pal`); the unix explicit helper writes **C** thread-locals (`trap_shim.c`).
+   A C explicit-trap helper on Windows would write a location the Windows `take_trap_frame` (which reads
+   the Rust thread-locals) never sees. Unifying them is a capture-state refactor, not a patch.
+
+**Refined fix (a proper slice, not a quick win):** unify the capture state in Rust (one thread-local set
+read by `take_trap_frame` on both platforms; the unix C signal handler stores via a small async-signal-
+safe `extern "C"` Rust shim), and make the explicit-trap helper take the frame pointer from
+`get_frame_pointer` + the trap site from `_ReturnAddress`/`__builtin_return_address`. Then `emit_trap`
+bakes `call <helper>(get_frame_pointer())` on **all** targets (de-special-casing unix too). **Test:**
+un-gate `trap_kill_message_carries_a_source_backtrace` on Windows; validate on the `windows-latest` CI
+job.
+
+---
+
+### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
+
+**Where:** the trap-time backtrace capture sites — `crates/svm-jit/src/trap_shim.c` (the SIGSEGV/BUS
+handler + `svm_capture_explicit_trap`), `crates/svm-jit/src/mem.rs` (the windows VEH), and the §14
+coroutine/fiber runtime (`fiber_rt.rs`).
+
+**Is:** a trap-time backtrace (`last_trap_backtrace` / `run_traced`) gives the correct guest **frames**
+regardless of which fiber/coroutine was running when the trap fired — the frame-pointer walk works on
+whatever stack the trap is on, and Stage 3 already collects a spawned vCPU's capture into the `Domain`.
+What's missing is a **fiber-id label** (DEBUGGING.md §5 W3 Stage 3 "names the right fiber under
+work-stealing migration"): the backtrace doesn't say *which* §23/D57 migratable fiber the frames belong
+to. Pure cosmetics — the frames themselves are right.
+
+**Why it isn't a quick patch:** the capture runs in the low-level handlers (C signal handler, Rust VEH,
+the explicit-trap helper), none of which have the running fiber's identity to hand. `fiber_rt::current()`
+returns the thread-local `*mut FiberRuntime` but not a stable handle, and a fiber migrates across worker
+threads, so the id must be read at capture time, not reconstructed after. Threading a "current fiber
+handle" thread-local that the capture sites can cheaply read is the work.
+
+**Fix sketch:** maintain a per-thread "current fiber handle" cell (set on each `cont.resume`/suspend
+switch in `fiber_rt`), read it at capture time into the trap-frame thread-local alongside `pc`/`rets`,
+and surface it (e.g. `JitFrameLoc`-adjacent or a `last_trap_fiber()` accessor) for the kill message.
+
+---
+
+---
+
+_(I1 below is open-adjacent — its abort mechanism is fixed, but I3/I4 are residual same-family CI-abort
+flakes. I2 resolved below.)_
+### I7 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3)
 
 **Where:** the guest-built work-stealing schedulers run end-to-end through the `svm-run` binary —
 `crates/svm-run/demos/work_stealing/work_stealing.c` (stackless tasks) and

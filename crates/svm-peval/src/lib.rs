@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! `svm-peval` — the partial-evaluation / Futamura on-ramp (see `PEVAL.md`).
+//! `svm-peval` — the partial-evaluation / Futamura on-ramp (see `DESIGN.md` §20c).
 //!
 //! Two layers:
 //!
@@ -40,6 +40,11 @@
 //! 6. **Dead block-parameter elimination.** A block parameter never referenced in its block is
 //!    dropped, along with the matching argument in every predecessor edge — a cross-edge
 //!    transform, paired with merging so residuals don't carry threaded-through dead state.
+//! 7. **Copy propagation + algebraic identities.** Within a block, a value that is a *copy* of an
+//!    earlier value — a constant-condition `select`, or an identity (`x+0`/`x-0`/`x*1`/`x<<0`,
+//!    `x|0`/`x&-1`/`x^0`, `x&x`/`x|x`) — has its uses rewritten to that earlier value, so the copy
+//!    becomes dead for step 4. Absorbing / self-cancelling forms that yield a *constant* even with
+//!    one operand unknown (`x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0) fold in step 1.
 //!
 //! **Untrusted for escape (§2a / §20a posture).** Like the LLVM on-ramp, this pass is
 //! *not* in the escape-TCB: its output is meant to be re-verified with
@@ -49,13 +54,18 @@
 //! traps — including a randomized fuzz over dead-heavy arithmetic DAGs that stresses the
 //! renumbering/remapper.
 //!
-//! **Still out of scope** (later increments): float/SIMD *constant folding* (they pass through to
-//! the residual but aren't folded — NaN/rounding fidelity), narrow (`i8`/`i16`) renameable cells,
-//! and cross-function specialization (`call`). Value-stack renaming for memory-backed interpreters
-//! is done — see [`mod@specialize`] (Stage 2).
+//! **Float and v128 (SIMD) constant folding** are done — `f32`/`f64` arithmetic / compares / FMA /
+//! conversions / casts, and the common SIMD lane ops (splat, extract/replace, lane int+float
+//! arithmetic / compares / shifts, bitwise, shuffle, swizzle) all fold bit-for-bit the interpreter
+//! (float lanes reuse the scalar folds, so NaN/rounding fidelity carries over). **Still out of
+//! scope:** the exotic SIMD ops (saturating add/sub, widen/narrow, lane convert, dot, pairwise,
+//! pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15) pass through unfolded. Cross-function `call`,
+//! narrow renameable cells, and value-stack renaming are all done — see [`mod@specialize`].
 
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
+    IntTy, IntUnOp, Module, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
+    VIntBinOp, VIntUnOp, VShape, VShiftOp, ValIdx, ValType,
 };
 
 mod specialize;
@@ -63,12 +73,17 @@ pub use specialize::{
     specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig, SpecError,
 };
 
-/// A value known to be a constant at optimization time. Tracks integers only (the only types
-/// folded); floats/v128 are recorded as "unknown". Shared with the [`specialize`] engine.
+/// A value known to be a constant at optimization time. Tracks scalar integers/floats and `v128`.
+/// Floats and `v128` are held as **raw bits/bytes** so equality/hashing are exact and NaN-safe
+/// (needed for the specializer's memo key) and folds preserve NaN payloads. Shared with the
+/// [`specialize`] engine.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Known {
     I32(i32),
     I64(i64),
+    F32(u32),
+    F64(u64),
+    V128([u8; 16]),
 }
 
 impl Known {
@@ -77,18 +92,50 @@ impl Known {
         match self {
             Known::I32(v) => Inst::ConstI32(v),
             Known::I64(v) => Inst::ConstI64(v),
+            Known::F32(b) => Inst::ConstF32(b),
+            Known::F64(b) => Inst::ConstF64(b),
+            Known::V128(b) => Inst::ConstV128(b),
+        }
+    }
+    /// The raw `v128` bytes, if this is one.
+    pub(crate) fn as_v128(self) -> Option<[u8; 16]> {
+        match self {
+            Known::V128(b) => Some(b),
+            _ => None,
+        }
+    }
+    /// A scalar's low lane bits — the value a `splat`/`replace_lane` writes into a lane.
+    pub(crate) fn lane_bits(self) -> u64 {
+        match self {
+            Known::I32(v) => v as u32 as u64,
+            Known::I64(v) => v as u64,
+            Known::F32(b) => b as u64,
+            Known::F64(b) => b,
+            Known::V128(_) => 0, // not a scalar; unreachable on a verified module
         }
     }
     pub(crate) fn as_i32(self) -> Option<i32> {
         match self {
             Known::I32(v) => Some(v),
-            Known::I64(_) => None,
+            _ => None,
         }
     }
     pub(crate) fn as_i64(self) -> Option<i64> {
         match self {
             Known::I64(v) => Some(v),
-            Known::I32(_) => None,
+            _ => None,
+        }
+    }
+    pub(crate) fn as_f32(self) -> Option<f32> {
+        match self {
+            Known::F32(b) => Some(f32::from_bits(b)),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_f64(self) -> Option<f64> {
+        match self {
+            Known::F64(b) => Some(f64::from_bits(b)),
+            _ => None,
         }
     }
 }
@@ -121,6 +168,13 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
         blocks = prune_unreachable(blocks);
         blocks = merge_blocks(blocks, fn_results);
         blocks = drop_dead_params(blocks, fn_results);
+        // Copy propagation + identity forwarding: rewrite uses of a value that is a copy of an
+        // earlier one (a constant-condition `select`, or an algebraic identity like `x+0`/`x*1`)
+        // to that earlier value, so the copy instruction becomes dead for the DCE pass below.
+        blocks = blocks
+            .iter()
+            .map(|b| copy_propagate(b, fn_results))
+            .collect();
         blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
         // Re-fold: merging brings a constant's definition into the same block as its use, and
         // dropping params can expose new constants — both newly foldable here.
@@ -173,6 +227,9 @@ fn const_value(inst: &Inst) -> Option<Known> {
     match *inst {
         Inst::ConstI32(v) => Some(Known::I32(v)),
         Inst::ConstI64(v) => Some(Known::I64(v)),
+        Inst::ConstF32(b) => Some(Known::F32(b)),
+        Inst::ConstF64(b) => Some(Known::F64(b)),
+        Inst::ConstV128(b) => Some(Known::V128(b)),
         _ => None,
     }
 }
@@ -188,7 +245,17 @@ fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
 /// traps identically to the source.
 fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
     match *inst {
-        Inst::IntBin { ty, op, a, b } => fold_int_bin(ty, op, get(known, a)?, get(known, b)?),
+        Inst::IntBin { ty, op, a, b } => {
+            // Both operands known: the exact arithmetic fold.
+            if let (Some(x), Some(y)) = (get(known, a), get(known, b)) {
+                if let Some(k) = fold_int_bin(ty, op, x, y) {
+                    return Some(k);
+                }
+            }
+            // Absorbing-element / self-cancelling identities that yield a *constant* with only one
+            // operand known (or `a == b`): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0.
+            fold_absorbing(ty, op, a, b, known)
+        }
         Inst::IntCmp { ty, op, a, b } => fold_int_cmp(ty, op, get(known, a)?, get(known, b)?),
         Inst::IntUn { ty, op, a } => fold_int_un(ty, op, get(known, a)?),
         Inst::Eqz { ty, a } => {
@@ -213,8 +280,614 @@ fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
             };
             get(known, chosen)
         }
-        _ => None,
+        // Scalar float folds — bit-for-bit the interpreter's `fbin*`/`fun*`/`fcmp*`/`fto_i`/
+        // `i_to_f`/`cast`. `FToITrap` folds only when in range (else it is kept so it still traps).
+        Inst::FBin { ty, op, a, b } => fold_fbin(ty, op, get(known, a)?, get(known, b)?),
+        Inst::FUn { ty, op, a } => fold_fun(ty, op, get(known, a)?),
+        Inst::FCmp { ty, op, a, b } => fold_fcmp(ty, op, get(known, a)?, get(known, b)?),
+        Inst::Fma { ty, a, b, c } => fold_fma(ty, get(known, a)?, get(known, b)?, get(known, c)?),
+        Inst::FToISat { op, a } => fold_ftoi_sat(op, get(known, a)?),
+        Inst::FToITrap { op, a } => fold_ftoi_trap(op, get(known, a)?),
+        Inst::IToFConv { op, a } => fold_itof(op, get(known, a)?),
+        Inst::Cast { op, a } => fold_cast(op, get(known, a)?),
+        // v128 (SIMD) lane folds.
+        _ => fold_simd(inst, |i| get(known, i)),
     }
+}
+
+// ----- scalar float constant folding (mirrors `svm-interp`'s scalar helpers exactly) -----
+//
+// Floats flow through as raw bits and the math is done in `f32`/`f64`, so NaN payloads and the
+// wasm-specific min/max/nearest rules are preserved. The differential harness (interp vs residual,
+// on both backends, with NaN/±0/±inf/tie inputs) is the spec.
+
+fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b,
+        FBinOp::Min => fmin32(a, b),
+        FBinOp::Max => fmax32(a, b),
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+fn fbin64(op: FBinOp, a: f64, b: f64) -> f64 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b,
+        FBinOp::Min => fmin64(a, b),
+        FBinOp::Max => fmax64(a, b),
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+fn fun32(op: FUnOp, a: f32) -> f32 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(),
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+fn fun64(op: FUnOp, a: f64) -> f64 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(),
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+// wasm min/max: NaN propagates; for ±0, min prefers -0 and max prefers +0.
+fn fmin32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn fmax32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+fn fmin64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn fmax64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Fold a binary float op; operands and result are `ty`.
+pub(crate) fn fold_fbin(ty: FloatTy, op: FBinOp, a: Known, b: Known) -> Option<Known> {
+    Some(match ty {
+        FloatTy::F32 => Known::F32(fbin32(op, a.as_f32()?, b.as_f32()?).to_bits()),
+        FloatTy::F64 => Known::F64(fbin64(op, a.as_f64()?, b.as_f64()?).to_bits()),
+    })
+}
+/// Fold a unary float op; operand and result are `ty`.
+pub(crate) fn fold_fun(ty: FloatTy, op: FUnOp, a: Known) -> Option<Known> {
+    Some(match ty {
+        FloatTy::F32 => Known::F32(fun32(op, a.as_f32()?).to_bits()),
+        FloatTy::F64 => Known::F64(fun64(op, a.as_f64()?).to_bits()),
+    })
+}
+/// Fold a float compare (result is `i32` 0/1).
+pub(crate) fn fold_fcmp(ty: FloatTy, op: FCmpOp, a: Known, b: Known) -> Option<Known> {
+    let r = match ty {
+        FloatTy::F32 => {
+            let (a, b) = (a.as_f32()?, b.as_f32()?);
+            match op {
+                FCmpOp::Eq => a == b,
+                FCmpOp::Ne => a != b,
+                FCmpOp::Lt => a < b,
+                FCmpOp::Le => a <= b,
+                FCmpOp::Gt => a > b,
+                FCmpOp::Ge => a >= b,
+            }
+        }
+        FloatTy::F64 => {
+            let (a, b) = (a.as_f64()?, b.as_f64()?);
+            match op {
+                FCmpOp::Eq => a == b,
+                FCmpOp::Ne => a != b,
+                FCmpOp::Lt => a < b,
+                FCmpOp::Le => a <= b,
+                FCmpOp::Gt => a > b,
+                FCmpOp::Ge => a >= b,
+            }
+        }
+    };
+    Some(Known::I32(r as i32))
+}
+/// Fold a fused multiply-add `a·b + c` (single rounding), matching the interpreter's `mul_add`.
+pub(crate) fn fold_fma(ty: FloatTy, a: Known, b: Known, c: Known) -> Option<Known> {
+    Some(match ty {
+        FloatTy::F32 => Known::F32(a.as_f32()?.mul_add(b.as_f32()?, c.as_f32()?).to_bits()),
+        FloatTy::F64 => Known::F64(a.as_f64()?.mul_add(b.as_f64()?, c.as_f64()?).to_bits()),
+    })
+}
+/// The `f64` value of a float operand, promoting `f32` exactly (matching the interpreter).
+fn ftoi_input(op: FToI, a: Known) -> Option<f64> {
+    Some(match op.parts().0 {
+        FloatTy::F32 => a.as_f32()? as f64,
+        FloatTy::F64 => a.as_f64()?,
+    })
+}
+/// Fold a **saturating** float→int conversion (`trunc_sat`): NaN → 0, out-of-range saturates —
+/// Rust's `as` cast matches wasm exactly, so it never fails.
+pub(crate) fn fold_ftoi_sat(op: FToI, a: Known) -> Option<Known> {
+    let f = ftoi_input(op, a)?;
+    let (_, to, signed) = op.parts();
+    Some(match (to, signed) {
+        (IntTy::I32, true) => Known::I32(f as i32),
+        (IntTy::I32, false) => Known::I32(f as u32 as i32),
+        (IntTy::I64, true) => Known::I64(f as i64),
+        (IntTy::I64, false) => Known::I64(f as u64 as i64),
+    })
+}
+/// Fold a **trapping** float→int conversion (`trunc`) — but only when it would *not* trap (the
+/// input is finite and truncates into range). On a NaN/out-of-range input, return `None` so the
+/// op is kept and traps at runtime exactly as the source would. Bounds mirror `trunc_trap`.
+pub(crate) fn fold_ftoi_trap(op: FToI, a: Known) -> Option<Known> {
+    let f = ftoi_input(op, a)?;
+    let (_, to, signed) = op.parts();
+    if f.is_nan() {
+        return None;
+    }
+    #[allow(clippy::manual_range_contains)]
+    let in_range = match (to, signed) {
+        (IntTy::I32, true) => f > -2_147_483_649.0 && f < 2_147_483_648.0,
+        (IntTy::I32, false) => f > -1.0 && f < 4_294_967_296.0,
+        (IntTy::I64, true) => f >= -9_223_372_036_854_775_808.0 && f < 9_223_372_036_854_775_808.0,
+        (IntTy::I64, false) => f > -1.0 && f < 18_446_744_073_709_551_616.0,
+    };
+    if !in_range {
+        return None;
+    }
+    fold_ftoi_sat(op, a)
+}
+/// Fold an int→float conversion, matching the interpreter's `i_to_f`.
+pub(crate) fn fold_itof(op: IToF, a: Known) -> Option<Known> {
+    Some(match op {
+        IToF::I32F32S => Known::F32((a.as_i32()? as f32).to_bits()),
+        IToF::I32F32U => Known::F32((a.as_i32()? as u32 as f32).to_bits()),
+        IToF::I64F32S => Known::F32((a.as_i64()? as f32).to_bits()),
+        IToF::I64F32U => Known::F32((a.as_i64()? as u64 as f32).to_bits()),
+        IToF::I32F64S => Known::F64((a.as_i32()? as f64).to_bits()),
+        IToF::I32F64U => Known::F64((a.as_i32()? as u32 as f64).to_bits()),
+        IToF::I64F64S => Known::F64((a.as_i64()? as f64).to_bits()),
+        IToF::I64F64U => Known::F64((a.as_i64()? as u64 as f64).to_bits()),
+    })
+}
+/// Fold a `demote`/`promote`/`reinterpret` cast, matching the interpreter's `cast`.
+pub(crate) fn fold_cast(op: CastOp, a: Known) -> Option<Known> {
+    Some(match op {
+        CastOp::Demote => Known::F32((a.as_f64()? as f32).to_bits()),
+        CastOp::Promote => Known::F64((a.as_f32()? as f64).to_bits()),
+        CastOp::ReinterpI32F32 => Known::F32(a.as_i32()? as u32),
+        CastOp::ReinterpF32I32 => Known::I32(a.as_f32()?.to_bits() as i32),
+        CastOp::ReinterpI64F64 => Known::F64(a.as_i64()? as u64),
+        CastOp::ReinterpF64I64 => Known::I64(a.as_f64()?.to_bits() as i64),
+    })
+}
+
+// ----- v128 (SIMD) constant folding (mirrors `svm-interp`'s `simd_*` lane helpers exactly) -----
+//
+// All ops work on raw `[u8; 16]` bytes; float lanes reuse the scalar `fbin*`/`fun*`/`fcmp*` helpers
+// above, so the deliberate NaN/rounding fidelity carries over to vectors for free. The common ops
+// fold; the exotic ones (saturating add/sub, widen/narrow, int↔float convert, dot, pairwise,
+// pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15) pass through to the residual unfolded.
+
+/// Read lane `lane` (`bytes` wide) of a `v128` as a zero-extended `u64`.
+fn lane_read(v: &[u8; 16], lane: usize, bytes: usize) -> u64 {
+    let mut x = 0u64;
+    for k in 0..bytes {
+        x |= (v[lane * bytes + k] as u64) << (8 * k);
+    }
+    x
+}
+
+/// Write the low `bytes` of `x` into lane `lane`.
+fn lane_write(v: &mut [u8; 16], lane: usize, bytes: usize, x: u64) {
+    for k in 0..bytes {
+        v[lane * bytes + k] = (x >> (8 * k)) as u8;
+    }
+}
+
+/// Sign-extend the low `bytes` of a zero-extended lane value to a full `i64`.
+fn lane_sext(x: u64, bytes: usize) -> i64 {
+    let bits = bytes * 8;
+    if bits >= 64 {
+        x as i64
+    } else {
+        let shift = 64 - bits;
+        ((x << shift) as i64) >> shift
+    }
+}
+
+/// Fold a pure `v128` lane op whose operands are all known. `get(i)` returns operand `i`'s constant
+/// (or `None`). Returns `None` for a non-foldable / dynamic / not-yet-supported op (which then
+/// passes through to the residual unfolded).
+pub(crate) fn fold_simd(inst: &Inst, get: impl Fn(ValIdx) -> Option<Known>) -> Option<Known> {
+    let v = |i: ValIdx| get(i)?.as_v128();
+    Some(match *inst {
+        Inst::ConstV128(b) => Known::V128(b),
+        Inst::Splat { shape, a } => Known::V128(simd_splat(shape, get(a)?.lane_bits())),
+        Inst::ExtractLane {
+            shape,
+            lane,
+            signed,
+            a,
+        } => simd_extract(shape, lane, signed, v(a)?),
+        Inst::ReplaceLane { shape, lane, a, b } => {
+            Known::V128(simd_replace(shape, lane, v(a)?, get(b)?.lane_bits()))
+        }
+        Inst::VIntBin { shape, op, a, b } => Known::V128(simd_vint_bin(shape, op, v(a)?, v(b)?)),
+        Inst::VIntCmp { shape, op, a, b } => Known::V128(simd_vint_cmp(shape, op, v(a)?, v(b)?)),
+        Inst::VIntUn { shape, op, a } => Known::V128(simd_vint_un(shape, op, v(a)?)),
+        Inst::VShift { shape, op, a, amt } => {
+            Known::V128(simd_vshift(shape, op, v(a)?, get(amt)?.as_i32()? as u32))
+        }
+        Inst::VFloatBin { shape, op, a, b } => {
+            Known::V128(simd_vfloat_bin(shape, op, v(a)?, v(b)?))
+        }
+        Inst::VFloatUn { shape, op, a } => Known::V128(simd_vfloat_un(shape, op, v(a)?)),
+        Inst::VFloatCmp { shape, op, a, b } => {
+            Known::V128(simd_vfloat_cmp(shape, op, v(a)?, v(b)?))
+        }
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => Known::V128(simd_fma(shape, neg, v(a)?, v(b)?, v(c)?)),
+        Inst::VBitBin { op, a, b } => Known::V128(simd_vbit_bin(op, v(a)?, v(b)?)),
+        Inst::VNot { a } => Known::V128(simd_vnot(v(a)?)),
+        Inst::Bitselect { a, b, mask } => Known::V128(simd_bitselect(v(a)?, v(b)?, v(mask)?)),
+        Inst::Shuffle { lanes, a, b } => Known::V128(simd_shuffle(&lanes, v(a)?, v(b)?)),
+        Inst::Swizzle { a, b } => Known::V128(simd_swizzle(v(a)?, v(b)?)),
+        _ => return None,
+    })
+}
+
+fn simd_splat(shape: VShape, bits: u64) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        lane_write(&mut o, i, bytes, bits);
+    }
+    o
+}
+
+fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Known {
+    let bytes = shape.lane_bytes() as usize;
+    let lane = (lane as usize).min(shape.lanes() as usize - 1);
+    let raw = lane_read(&v, lane, bytes);
+    match shape {
+        VShape::I8x16 | VShape::I16x8 => {
+            let bits = (bytes * 8) as u32;
+            let ext = if signed {
+                let shift = 32 - bits;
+                (((raw as u32) << shift) as i32) >> shift
+            } else {
+                raw as i32
+            };
+            Known::I32(ext)
+        }
+        VShape::I32x4 => Known::I32(raw as i32),
+        VShape::I64x2 => Known::I64(raw as i64),
+        VShape::F32x4 => Known::F32(raw as u32),
+        VShape::F64x2 => Known::F64(raw),
+    }
+}
+
+fn simd_replace(shape: VShape, lane: u8, mut v: [u8; 16], bits: u64) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let lane = (lane as usize).min(shape.lanes() as usize - 1);
+    lane_write(&mut v, lane, bytes, bits);
+    v
+}
+
+fn simd_vint_bin(shape: VShape, op: VIntBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let y = lane_read(&b, i, bytes);
+        let r = match op {
+            VIntBinOp::Add => x.wrapping_add(y),
+            VIntBinOp::Sub => x.wrapping_sub(y),
+            VIntBinOp::Mul => x.wrapping_mul(y),
+            VIntBinOp::MinU => x.min(y),
+            VIntBinOp::MaxU => x.max(y),
+            VIntBinOp::MinS => lane_sext(x, bytes).min(lane_sext(y, bytes)) as u64,
+            VIntBinOp::MaxS => lane_sext(x, bytes).max(lane_sext(y, bytes)) as u64,
+        };
+        lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+fn simd_vint_cmp(shape: VShape, op: VICmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let (xu, yu) = (lane_read(&a, i, bytes), lane_read(&b, i, bytes));
+        let (xs, ys) = (lane_sext(xu, bytes), lane_sext(yu, bytes));
+        let t = match op {
+            VICmpOp::Eq => xu == yu,
+            VICmpOp::Ne => xu != yu,
+            VICmpOp::LtS => xs < ys,
+            VICmpOp::LtU => xu < yu,
+            VICmpOp::GtS => xs > ys,
+            VICmpOp::GtU => xu > yu,
+            VICmpOp::LeS => xs <= ys,
+            VICmpOp::LeU => xu <= yu,
+            VICmpOp::GeS => xs >= ys,
+            VICmpOp::GeU => xu >= yu,
+        };
+        lane_write(&mut o, i, bytes, if t { u64::MAX } else { 0 });
+    }
+    o
+}
+
+fn simd_vint_un(shape: VShape, op: VIntUnOp, a: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_sext(lane_read(&a, i, bytes), bytes);
+        let r = match op {
+            VIntUnOp::Abs => x.wrapping_abs(),
+            VIntUnOp::Neg => x.wrapping_neg(),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
+    }
+    o
+}
+
+fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let sh = amt & (bytes as u32 * 8 - 1);
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let r = match op {
+            VShiftOp::Shl => x << sh,
+            VShiftOp::ShrU => x >> sh,
+            VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
+        };
+        lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Map a vector float op onto the scalar [`FBinOp`]/[`FUnOp`] so lanes match scalars exactly.
+fn vf_bin(op: VFloatBinOp) -> FBinOp {
+    match op {
+        VFloatBinOp::Add => FBinOp::Add,
+        VFloatBinOp::Sub => FBinOp::Sub,
+        VFloatBinOp::Mul => FBinOp::Mul,
+        VFloatBinOp::Div => FBinOp::Div,
+        VFloatBinOp::Min => FBinOp::Min,
+        VFloatBinOp::Max => FBinOp::Max,
+    }
+}
+fn vf_un(op: VFloatUnOp) -> FUnOp {
+    match op {
+        VFloatUnOp::Abs => FUnOp::Abs,
+        VFloatUnOp::Neg => FUnOp::Neg,
+        VFloatUnOp::Sqrt => FUnOp::Sqrt,
+        VFloatUnOp::Ceil => FUnOp::Ceil,
+        VFloatUnOp::Floor => FUnOp::Floor,
+        VFloatUnOp::Trunc => FUnOp::Trunc,
+        VFloatUnOp::Nearest => FUnOp::Nearest,
+    }
+}
+
+fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                lane_write(&mut o, i, 4, fbin32(vf_bin(op), x, y).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                lane_write(&mut o, i, 8, fbin64(vf_bin(op), x, y).to_bits());
+            }
+        }
+        _ => {}
+    }
+    o
+}
+
+fn simd_vfloat_un(shape: VShape, op: VFloatUnOp, a: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, fun32(vf_un(op), x).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 8, fun64(vf_un(op), x).to_bits());
+            }
+        }
+        _ => {}
+    }
+    o
+}
+
+fn simd_vfloat_cmp(shape: VShape, op: VFCmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let cmp32 = |x: f32, y: f32| match op {
+        VFCmpOp::Eq => x == y,
+        VFCmpOp::Ne => x != y,
+        VFCmpOp::Lt => x < y,
+        VFCmpOp::Gt => x > y,
+        VFCmpOp::Le => x <= y,
+        VFCmpOp::Ge => x >= y,
+    };
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                lane_write(&mut o, i, 4, if cmp32(x, y) { u64::MAX } else { 0 });
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let t = match op {
+                    VFCmpOp::Eq => x == y,
+                    VFCmpOp::Ne => x != y,
+                    VFCmpOp::Lt => x < y,
+                    VFCmpOp::Gt => x > y,
+                    VFCmpOp::Le => x <= y,
+                    VFCmpOp::Ge => x >= y,
+                };
+                lane_write(&mut o, i, 8, if t { u64::MAX } else { 0 });
+            }
+        }
+        _ => {}
+    }
+    o
+}
+
+fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let z = f32::from_bits(lane_read(&c, i, 4) as u32);
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let z = f64::from_bits(lane_read(&c, i, 8));
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+            }
+        }
+        _ => {}
+    }
+    o
+}
+
+fn simd_vbit_bin(op: VBitBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        o[i] = match op {
+            VBitBinOp::And => a[i] & b[i],
+            VBitBinOp::Or => a[i] | b[i],
+            VBitBinOp::Xor => a[i] ^ b[i],
+            VBitBinOp::AndNot => a[i] & !b[i],
+        };
+    }
+    o
+}
+
+fn simd_vnot(a: [u8; 16]) -> [u8; 16] {
+    a.map(|x| !x)
+}
+
+fn simd_bitselect(a: [u8; 16], b: [u8; 16], mask: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        o[i] = (a[i] & mask[i]) | (b[i] & !mask[i]);
+    }
+    o
+}
+
+fn simd_shuffle(lanes: &[u8; 16], a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        let sel = lanes[i] as usize;
+        o[i] = if sel < 16 {
+            a[sel]
+        } else if sel < 32 {
+            b[sel - 16]
+        } else {
+            0
+        };
+    }
+    o
+}
+
+fn simd_swizzle(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        let sel = b[i] as usize;
+        o[i] = if sel < 16 { a[sel] } else { 0 };
+    }
+    o
 }
 
 /// Constant-fold an integer binary op, mirroring the interpreter's `bin32`/`bin64` exactly
@@ -371,6 +1044,116 @@ pub(crate) fn fold_int_un(ty: IntTy, op: IntUnOp, a: Known) -> Option<Known> {
             };
             Some(Known::I64(r))
         }
+    }
+}
+
+/// Whether known value `i` equals the signed constant `v` (width-agnostic for `0`/`1`/`-1`).
+fn known_is(known: &[Option<Known>], i: ValIdx, v: i64) -> bool {
+    match get(known, i) {
+        Some(Known::I32(x)) => x as i64 == v,
+        Some(Known::I64(x)) => x == v,
+        _ => false,
+    }
+}
+
+/// Identities that fold to a *constant* even with one operand unknown (absorbing elements and
+/// self-cancellation): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0. Sound for any `x`
+/// (none of these traps on these operands), so they need only one known operand — or `a == b`.
+fn fold_absorbing(
+    ty: IntTy,
+    op: BinOp,
+    a: ValIdx,
+    b: ValIdx,
+    known: &[Option<Known>],
+) -> Option<Known> {
+    let zero = match ty {
+        IntTy::I32 => Known::I32(0),
+        IntTy::I64 => Known::I64(0),
+    };
+    let is = |i, v| known_is(known, i, v);
+    match op {
+        BinOp::Mul | BinOp::And if is(a, 0) || is(b, 0) => Some(zero),
+        BinOp::Or if is(a, -1) || is(b, -1) => Some(match ty {
+            IntTy::I32 => Known::I32(-1),
+            IntTy::I64 => Known::I64(-1),
+        }),
+        BinOp::Sub | BinOp::Xor if a == b => Some(zero),
+        BinOp::RemS | BinOp::RemU if is(b, 1) => Some(zero),
+        _ => None,
+    }
+}
+
+/// If a single-result instruction is a *copy* of an earlier value — a constant-condition `select`,
+/// or an algebraic identity (`x+0`/`x-0`/`x*1`/`x<<0`/`x/1`, `x|0`/`x&-1`/`x^0`, `x&x`/`x|x`) —
+/// return the source value its result should forward to. (Identities that fold to a *constant* go
+/// through [`fold_absorbing`] instead.)
+fn forward_to_operand(inst: &Inst, known: &[Option<Known>]) -> Option<ValIdx> {
+    let is = |i, v| known_is(known, i, v);
+    match *inst {
+        Inst::Select { cond, a, b } => {
+            let c = get(known, cond)?.as_i32()?;
+            Some(if c != 0 { a } else { b })
+        }
+        Inst::IntBin { op, a, b, .. } => match op {
+            BinOp::Add if is(a, 0) => Some(b),
+            BinOp::Add if is(b, 0) => Some(a),
+            BinOp::Sub if is(b, 0) => Some(a),
+            BinOp::Mul if is(a, 1) => Some(b),
+            BinOp::Mul if is(b, 1) => Some(a),
+            BinOp::Or if is(a, 0) => Some(b),
+            BinOp::Or if is(b, 0) || a == b => Some(a),
+            BinOp::And if is(a, -1) => Some(b),
+            BinOp::And if is(b, -1) || a == b => Some(a),
+            BinOp::Xor if is(a, 0) => Some(b),
+            BinOp::Xor if is(b, 0) => Some(a),
+            BinOp::Shl | BinOp::ShrS | BinOp::ShrU | BinOp::Rotl | BinOp::Rotr if is(b, 0) => {
+                Some(a)
+            }
+            // `x / 1` is deliberately *not* forwarded: division is not removable-if-dead (DCE keeps
+            // it conservatively, as a possible trap), so forwarding would leave a dead `div` behind
+            // rather than shrinking. `x % 1 → 0` is handled by `fold_absorbing` (an in-place const).
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Intra-block copy propagation. Rewrites every use of a value that is a copy of an earlier value
+/// (see [`forward_to_operand`]) to that earlier value; the now-unused copy instruction is removed by
+/// the following DCE pass. Index-stable (no instruction is removed here). Sound because an operand
+/// only references an earlier value in the same block, which dominates the use.
+fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
+    let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
+    // `repl[v]` is the value `v` forwards to (its root); params and non-copies map to themselves.
+    let mut repl: Vec<ValIdx> = (0..b.params.len() as u32).collect();
+    let mut insts = b.insts.clone();
+    let mut next = b.params.len() as u32;
+    for inst in insts.iter_mut() {
+        // Compose with prior forwarding first, so an operand always names its root.
+        map_operands(inst, &mut |o| repl[o as usize]);
+        let rc = inst.result_count(fn_results);
+        if rc == 1 {
+            let root = match forward_to_operand(inst, &known) {
+                Some(src) => repl[src as usize],
+                None => next,
+            };
+            repl.push(root);
+            known.push(const_value(inst));
+            next += 1;
+        } else {
+            for _ in 0..rc {
+                repl.push(next);
+                known.push(None);
+                next += 1;
+            }
+        }
+    }
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |o| repl[o as usize]);
+    Block {
+        params: b.params.clone(),
+        insts,
+        term,
     }
 }
 
@@ -593,6 +1376,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::ConstV128(_)
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
+        | Inst::VcpuTlsGet
         | Inst::AtomicFence { .. }
         | Inst::SimdWidthBytes => {}
 
@@ -610,6 +1394,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::AtomicLoad { addr: a, .. }
         | Inst::V128Load { addr: a, .. }
         | Inst::CapSelfGet { idx: a }
+        | Inst::VcpuTlsSet { val: a }
         | Inst::Suspend { value: a }
         | Inst::ThreadJoin { handle: a }
         | Inst::Splat { a, .. }

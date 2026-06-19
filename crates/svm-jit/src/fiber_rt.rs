@@ -94,11 +94,21 @@ const FIBER_STACK: usize = 1 << 18;
 const SHADOW_SP_OFF: u64 = 8;
 const SHADOW_BASE: u64 = 64;
 const SHADOW_STRIDE: u64 = 1 << 12;
+/// Size of the reserved durable low slice (one 64 KiB wasm page); must match `svm-interp`'s
+/// `DURABLE_RESERVE`. The per-context shadow regions live within `[0, DURABLE_RESERVE)`.
+const DURABLE_RESERVE: u64 = 1 << 16;
+/// Highest shadow-context index (must match `svm-interp`'s `MAX_SHADOW_CTX`): `DURABLE_RESERVE /
+/// SHADOW_STRIDE - 1` = 15. Fibers grow **up** from context 1 (`slot+1`); spawned vCPUs grow **down**
+/// from here (slice 3.3, mirroring the interp), so a `u16` mask holds every vCPU-context bit.
+const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
 /// Window byte offset of the durable state word (`NORMAL | UNWINDING | REWINDING`); the freeze
 /// driver reads it to confirm a freeze is in progress. Must match `svm-interp`'s `STATE_OFF`.
 const STATE_OFF: u64 = 0;
 /// State-word value meaning "freeze in progress" (must match `svm-interp`'s `STATE_UNWINDING`).
 const STATE_UNWINDING: i32 = 1;
+/// State-word value meaning "thaw in progress" — a restored vCPU rewinds from its shadow extent
+/// then flips to `NORMAL` and runs forward (must match `svm-interp`'s `STATE_REWINDING`).
+const STATE_REWINDING: i32 = 2;
 /// State-word value meaning "freeze armed" — the mid-run freeze trigger (must match
 /// `svm-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down
 /// [`ARM_COUNTDOWN_OFF`] at each fiber safepoint and promotes the word to `UNWINDING` at 0.
@@ -153,13 +163,45 @@ fn fiber_handle_generation(handle: i64) -> u64 {
 
 /// Read the active shadow-SP word from the durable window. `mem_base` is the window's host base.
 /// # Safety: only called on a durable run, where `[SHADOW_SP_OFF, +8)` is committed RW reserve.
-unsafe fn read_shadow_sp(mem_base: u64) -> u64 {
+pub(crate) unsafe fn read_shadow_sp(mem_base: u64) -> u64 {
     *((mem_base + SHADOW_SP_OFF) as *const u64)
 }
 
 /// Write the active shadow-SP word into the durable window. # Safety: as [`read_shadow_sp`].
-unsafe fn write_shadow_sp(mem_base: u64, sp: u64) {
+pub(crate) unsafe fn write_shadow_sp(mem_base: u64, sp: u64) {
     *((mem_base + SHADOW_SP_OFF) as *mut u64) = sp;
+}
+
+/// The shadow-region base (window offset) of a durable **vCPU** context `ctx` — context `i` owns
+/// `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)` (must match `svm-interp`'s `shadow_region_base`).
+/// Spawned vCPUs occupy the contexts the [`SharedFiberTable`] allocator hands out (top-down from
+/// `MAX_SHADOW_CTX`); the inline single-worker path points the active shadow-SP word here before
+/// running a child (slice 3.3).
+pub(crate) fn shadow_region_base(ctx: usize) -> u64 {
+    SHADOW_BASE + ctx as u64 * SHADOW_STRIDE
+}
+
+/// Whether the durable state word is **not** `NORMAL` (a freeze/thaw is in progress) — the gate for
+/// running spawned children **inline** (single-worker, slice 3.3). `STATE_NORMAL` is 0 (matching
+/// `svm-interp`). # Safety: `mem_base` is a durable run's committed window base.
+pub(crate) unsafe fn window_is_durable_active(mem_base: u64) -> bool {
+    *((mem_base + STATE_OFF) as *const i32) != 0
+}
+
+/// Set the durable state word to `REWINDING` — a thaw re-entry point (slice 3.3): a re-attached child
+/// (and the root) starts in `REWINDING` to rewind from its restored shadow extent, then the
+/// instrumented prologue flips the word to `NORMAL` and runs forward. # Safety: `mem_base` is a
+/// durable run's committed window base.
+pub(crate) unsafe fn window_set_rewinding(mem_base: u64) {
+    *((mem_base + STATE_OFF) as *mut i32) = STATE_REWINDING;
+}
+
+/// The durable vCPU shadow **context** a restored shadow-SP lives in — the inverse of
+/// [`shadow_region_base`] (`(sp − SHADOW_BASE) / SHADOW_STRIDE`, mirroring the interp's thaw). A thaw
+/// derives a re-attached child's context from its frozen extent so the occupancy is rebuilt without a
+/// separate record.
+pub(crate) fn shadow_context_of_sp(sp: u64) -> usize {
+    ((sp - SHADOW_BASE) / SHADOW_STRIDE) as usize
 }
 
 /// Whether the durable state word is `UNWINDING` (a freeze is in progress) — the entry path's gate
@@ -226,6 +268,12 @@ struct TableState {
     /// (so handle values match across backends). A freed slot keeps its bumped generation, so reuse
     /// is ABA-safe; the table is bounded by the *peak concurrent* fiber count, not the lifetime total.
     free: BinaryHeap<Reverse<usize>>,
+    /// **Occupied** durable vCPU shadow contexts (slice 3.3), a bitmask over contexts
+    /// `1..=MAX_SHADOW_CTX` (bit `c` set ⇒ context `c` is live) — the JIT mirror of the interp
+    /// registry's `vcpu_mask`. Spawned vCPUs grow **down** from `MAX_SHADOW_CTX` while fibers grow
+    /// **up** from context 1; a child's bit is freed when it finishes, so the bound is *peak
+    /// concurrent* vCPUs. Only touched on a durable run (state ≠ NORMAL ⇒ single-worker).
+    vcpu_mask: u16,
 }
 
 pub(crate) struct SharedFiberTable {
@@ -243,6 +291,7 @@ impl SharedFiberTable {
             state: Mutex::new(TableState {
                 slots: Vec::new(),
                 free: BinaryHeap::new(),
+                vcpu_mask: 0,
             }),
             max_fibers: max_fibers.clamp(1, MAX_FIBERS),
             next_owner: AtomicU64::new(0),
@@ -251,6 +300,41 @@ impl SharedFiberTable {
 
     fn lock(&self) -> MutexGuard<'_, TableState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reserve the **highest free** durable vCPU shadow context above the fiber pool (slice 3.3,
+    /// mirroring the interp's `reserve_vcpu_context`): spawned vCPUs grow down from `MAX_SHADOW_CTX`
+    /// while fibers occupy contexts `1..=slots.len()`, so the picked context must stay clear of them.
+    /// Reusing a freed (cleared) bit is the recycling that bounds the pool to peak-concurrent vCPUs.
+    /// `None` if the reserve is full (the vCPU pool growing down would meet the fibers growing up).
+    pub(crate) fn reserve_vcpu_context(&self) -> Option<usize> {
+        let mut t = self.lock();
+        let floor = t.slots.len(); // fibers occupy contexts 1..=slots.len()
+        let mut c = MAX_SHADOW_CTX;
+        while c > floor {
+            if t.vcpu_mask & (1 << c) == 0 {
+                t.vcpu_mask |= 1 << c;
+                return Some(c);
+            }
+            c -= 1;
+        }
+        None
+    }
+
+    /// Free a spawned vCPU's shadow context for reuse (slice 3.3): called when the child genuinely
+    /// finishes (a freeze-unwound child keeps it for thaw). A no-op for an out-of-range context.
+    pub(crate) fn free_vcpu_context(&self, ctx: usize) {
+        if (1..=MAX_SHADOW_CTX).contains(&ctx) {
+            self.lock().vcpu_mask &= !(1 << ctx);
+        }
+    }
+
+    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (slice 3.3): the re-attached
+    /// children reclaim exactly the contexts they held at freeze (derived from their restored
+    /// shadow-SPs), so a post-thaw spawn allocates into a genuinely-free context.
+    #[allow(dead_code)] // wired by the inline single-worker path (slice 3.3 freeze side)
+    pub(crate) fn seed_vcpu_mask(&self, mask: u16) {
+        self.lock().vcpu_mask = mask;
     }
 
     /// Quota pre-check (no allocation yet): would one more fiber exceed the domain budget? Checked
@@ -1080,4 +1164,42 @@ pub(crate) unsafe extern "C" fn gc_roots(
         }
     }
     total as i64
+}
+
+#[cfg(all(test, not(loom)))]
+mod vcpu_ctx_tests {
+    use super::{SharedFiberTable, MAX_FIBERS, MAX_SHADOW_CTX};
+
+    // The durable vCPU-context allocator (slice 3.3): top-down reservation above the fiber pool, with
+    // free-then-reuse (recycling) and a thaw-seed — the JIT mirror of the interp registry's `vcpu_mask`.
+    #[test]
+    fn reserve_is_top_down_and_recycles() {
+        let t = SharedFiberTable::new(MAX_FIBERS);
+        // Spawned vCPUs grow down from the top.
+        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX));
+        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX - 1));
+        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX - 2));
+        // Freeing a context returns it to the pool; the next reserve reuses it (peak-concurrent bound).
+        t.free_vcpu_context(MAX_SHADOW_CTX);
+        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX));
+
+        // A thaw seed replaces the occupancy wholesale; reserve then avoids the seeded bit.
+        t.seed_vcpu_mask(1 << (MAX_SHADOW_CTX - 1));
+        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX));
+        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX - 2)); // skips the seeded one
+    }
+
+    #[test]
+    fn reserve_exhausts_cleanly() {
+        let t = SharedFiberTable::new(MAX_FIBERS);
+        // A fresh table has no fibers, so contexts 1..=MAX_SHADOW_CTX are all free.
+        for _ in 0..MAX_SHADOW_CTX {
+            assert!(t.reserve_vcpu_context().is_some());
+        }
+        assert_eq!(
+            t.reserve_vcpu_context(),
+            None,
+            "the reserve is full once every context is live"
+        );
+    }
 }
