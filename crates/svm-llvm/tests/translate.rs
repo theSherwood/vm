@@ -1286,6 +1286,25 @@ fn printf_float_general() {
 }
 
 #[test]
+fn printf_float_fixed_bignum() {
+    // `%f` now goes through the exact bignum formatter (`__svm_dtoa_fix_big`), so large magnitudes
+    // that overflowed the old 128-bit path — and used to trap — format correctly, as does `%F` and
+    // higher precision. The integer parts here have 30–300+ digits. Byte-for-byte vs native.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%.2f\\n\", 1e30); \
+                 printf(\"%.0f\\n\", 1e60); \
+                 printf(\"%.1f\\n\", 1.23456789e40); \
+                 printf(\"%f\\n\", 1e300); \
+                 printf(\"%.20f\\n\", 0.1); \
+                 printf(\"%F\\n\", 12345.678); \
+                 printf(\"%.40f\\n\", 1.0/3.0); \
+                 printf(\"[%50.2f]\\n\", 1e20); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f_big", src, b"");
+}
+
+#[test]
 fn printf_float_fixed() {
     // `%f` via the synthesized exact-decimal helper (`__svm_dtoa_fixed`, fixed 128-bit integer
     // arithmetic — no host float formatting). Covers: default precision (6), explicit precision,
