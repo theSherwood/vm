@@ -1239,6 +1239,29 @@ fn printf_signed_formats() {
 }
 
 #[test]
+fn printf_float_scientific() {
+    // `%e`/`%E` via the bignum Dragon4 formatter (`__svm_dtoa_sci`) — exact, correctly-rounded across
+    // the whole double range (no magnitude cap). Covers default/explicit precision, the exponent sign
+    // and ≥2-digit padding, very large/small magnitudes (1e300, 1e-300 — impossible for the 128-bit
+    // `%f` path), uppercase `%E`, sign flags, width + justification, a carry-on-round, and inf/nan.
+    // Byte-for-byte stdout vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"%e\\n\", 3.14); \
+                 printf(\"%.2e %.0e\\n\", 12345.678, 9.6); \
+                 printf(\"%e %e\\n\", 1e300, 1e-300); \
+                 printf(\"%E\\n\", 6.022e23); \
+                 printf(\"%.3e\\n\", 9.9999); \
+                 printf(\"%+.1e % .1e\\n\", 1.5, 2.5); \
+                 printf(\"[%14.3e][%-14.3e]\\n\", 2.5, 2.5); \
+                 printf(\"%e %e\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"%e %e %E\\n\", inf, -inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_e", src, b"");
+}
+
+#[test]
 fn printf_float_fixed() {
     // `%f` via the synthesized exact-decimal helper (`__svm_dtoa_fixed`, fixed 128-bit integer
     // arithmetic — no host float formatting). Covers: default precision (6), explicit precision,

@@ -353,6 +353,9 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
             i
         })
     };
+    // The float scratch sits just above the data-stack reserve (computed here so it can ride in
+    // `Helpers` to the printf lowering, and drive the window sizing + helper append below).
+    let float_scratch_base = need_dtoa.then_some(entry_sp + STACK_RESERVE);
     let helpers = Helpers {
         memset: take(need_memset),
         memcpy: take(need_memcpy),
@@ -365,6 +368,16 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         memmove: take(need_memmove),
         getenv: take(need_getenv),
         dtoa: take(need_dtoa),
+        big_zero: take(need_dtoa),
+        big_copy: take(need_dtoa),
+        big_cmp: take(need_dtoa),
+        big_sub: take(need_dtoa),
+        big_mul: take(need_dtoa),
+        big_shl: take(need_dtoa),
+        dtoa_digits: take(need_dtoa),
+        dtoa_sci: take(need_dtoa),
+        dtoa_gen: None, // wired with the %g slice
+        float_scratch: float_scratch_base,
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
@@ -442,9 +455,6 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
     // stash / heap state live in the reserved low window).
     let need_window = any_frame || !globals.is_empty() || synth;
-    // The `%f` helper's fixed scratch sits just above the data-stack reserve (so it never collides with
-    // globals, the stack, or the heap, which starts at the mapped boundary above it).
-    let float_scratch_base = need_dtoa.then_some(entry_sp + STACK_RESERVE);
     let memory = need_window.then(|| {
         // Reserve stack when any function (or the argv `_start`) uses the data stack.
         let mut top = if any_frame || wants_argv {
@@ -523,6 +533,23 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
             caps["write"],
             float_scratch_base.expect("need_dtoa reserves float scratch"),
         ));
+        // The bignum family, appended in `Helpers` order; `dtoa_digits` is built against the
+        // primitives' indices and `dtoa_sci` against `dtoa_digits`'s (all interdependent).
+        funcs.push(synth_big_zero());
+        funcs.push(synth_big_copy());
+        funcs.push(synth_big_cmp());
+        funcs.push(synth_big_sub());
+        funcs.push(synth_big_mul_small());
+        funcs.push(synth_big_shl_bits());
+        funcs.push(synth_dtoa_digits(
+            helpers.big_zero.unwrap(),
+            helpers.big_copy.unwrap(),
+            helpers.big_cmp.unwrap(),
+            helpers.big_sub.unwrap(),
+            helpers.big_mul.unwrap(),
+            helpers.big_shl.unwrap(),
+        ));
+        funcs.push(synth_dtoa_sci(helpers.dtoa_digits.unwrap()));
     }
     Ok(Translated {
         module: Module {
@@ -1734,8 +1761,10 @@ const FMT_BUF_END: u64 = 128;
 /// Scratch for the `%f` helper (`__svm_dtoa_fixed`): the 128-bit working limbs, the extracted decimal
 /// digits, the assembled content, a small stashed-context block, and the padded output field. Placed
 /// just above the data-stack reserve in the window (a fixed, reusable region — no per-call alloc),
-/// reserved only when `need_dtoa`. The helper's offsets (`out = 296`, field ≤ 216 B) fit in 512.
-const FLOAT_SCRATCH_SIZE: u64 = 512;
+/// reserved only when `need_dtoa`. Sized for the bignum formatters (three 40-limb big integers, the
+/// digit buffer, content, padded field, and scalar locals — see the `FMT_*_O` offsets); the 128-bit
+/// `%f` helper uses only the low 512 bytes of the same region.
+const FLOAT_SCRATCH_SIZE: u64 = 2304;
 
 /// Which stash slot a capability call reads its handle from.
 #[derive(Clone, Copy)]
@@ -2788,6 +2817,24 @@ struct Helpers {
     /// integer arithmetic and write the padded field to stdout. Self-contained (loads the stdout
     /// handle, calls the `write` import); uses the reserved float scratch.
     dtoa: Option<u32>,
+    /// The bignum float-formatter helper family (`%e`, later `%g`/full-range `%f`): the seven
+    /// big-integer primitives, the `dtoa_digits` engine, and the `dtoa_sci` (`%e`) formatter. Indices
+    /// are interdependent (`dtoa_digits` calls the primitives; `dtoa_sci` calls `dtoa_digits`), so
+    /// they are appended as one block in this order.
+    big_zero: Option<u32>,
+    big_copy: Option<u32>,
+    big_cmp: Option<u32>,
+    big_sub: Option<u32>,
+    big_mul: Option<u32>,
+    big_shl: Option<u32>,
+    dtoa_digits: Option<u32>,
+    dtoa_sci: Option<u32>,
+    /// `__svm_dtoa_gen(bits, prec, width, flags, scratch) -> i64` — `%g` formatter (added with the
+    /// `%g` slice; `None` until then).
+    dtoa_gen: Option<u32>,
+    /// Base window address of the reserved float scratch (`= float_scratch_base`), so the printf
+    /// lowering can `emit_write` the field a bignum formatter (`dtoa_sci`) fills at `+FMT_OUT_O`.
+    float_scratch: Option<u64>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
@@ -3788,6 +3835,13 @@ impl Bdr {
             offset: 0,
             align: 0,
         });
+    }
+    /// Zero-extend an `i32` (e.g. a compare result) to `i64`, so it can feed the I64-typed `bin`.
+    fn ext(&mut self, a: ValIdx) -> u32 {
+        self.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a,
+        })
     }
     /// Call a synth helper that returns one i64 (`big_cmp`); yields its result value.
     fn call1(&mut self, func: u32, args: Vec<ValIdx>) -> u32 {
@@ -5321,9 +5375,11 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
     let num_o = 0i64;
     let den_o = 160i64;
     let tmp_o = 320i64;
-    let dbuf_o = 480i64;
-    let nsig_o = 552i64; // 8-aligned, past a 64-byte digit buffer
-    let e_o = 560i64;
+    // The two scalars sit just above the three 40-limb (160-byte) big integers, so the digit buffer
+    // that follows can grow as large as high-precision / large-magnitude formats need.
+    let nsig_o = 480i64;
+    let e_o = 488i64;
+    let dbuf_o = 496i64;
 
     const ZEROCASE: u32 = 1;
     const ZCASE_LOOP: u32 = 2;
@@ -5629,8 +5685,10 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let den = b.bin(Add, 0, kd);
         let c = b.call1(cmp, vec![num, den]);
         let gt = b.cmpi(CmpOp::GtS, c, 0);
+        let gt64 = b.ext(gt);
         let eq = b.cmpi(Eq, c, 0);
-        // last digit parity (tie ⇒ round to even)
+        let eq64 = b.ext(eq);
+        // last digit parity (tie ⇒ round to even). `odd` is an i64 0/1 already (And of i64s).
         let knsig = b.k(nsig_o);
         let nsa = b.bin(Add, 0, knsig);
         let nsig = b.load64(nsa);
@@ -5641,9 +5699,8 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
         let la = b.bin(Add, dba, lastidx);
         let ld = b.load8u(la);
         let odd = b.bin(And, ld, c1);
-        let oddb = b.cmpi(Eq, odd, 1);
-        let tie = b.bin(And, eq, oddb); // tie (2·rem == den) and last digit odd ⇒ round to even
-        let up = b.bin(Or, gt, tie);
+        let tie = b.bin(And, eq64, odd); // tie (2·rem == den) and last digit odd ⇒ round to even
+        let up = b.bin(Or, gt64, tie);
         let upb = b.cmpi(Ne, up, 0);
         b.block(
             vec![i64t],
@@ -5886,6 +5943,487 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
     }
 }
 
+// Scratch byte offsets shared by the bignum formatters (`%e`/`%g`/big `%f`): the `dtoa_digits` region
+// [0,496) (three 40-limb big integers + the nsig/E scalars), then the digit buffer, the assembled
+// content, the padded output field, and the formatter's scalar locals.
+const FMT_DBUF_O: i64 = 496; // up to ~528 decimal digit values
+const FMT_CBUF_O: i64 = 1024; // assembled "[sign]d.dddde±dd" content
+const FMT_OUT_O: i64 = 1536; // padded field (what the lowering writes)
+const FMT_WIDTH_O: i64 = 2048;
+const FMT_FLAGS_O: i64 = 2056;
+const FMT_SIGN_O: i64 = 2064;
+const FMT_CLEN_O: i64 = 2072; // content cursor → content length
+const FMT_E_O: i64 = 2080;
+const FMT_PREC_O: i64 = 2088;
+const FMT_TOTAL_O: i64 = 2096; // padded field length
+const FMT_LEAD_O: i64 = 2104; // leading-pad count (right-justify)
+
+/// Emit the sign byte for a float field: `'-'` if the sign bit is set, else `'+'`/`' '` for the
+/// `+`/space flags, else `0` (none). `sign`/`flags` are loaded from the scratch locals at `scratch`.
+fn fmt_sign_byte(b: &mut Bdr, scratch: ValIdx) -> ValIdx {
+    use BinOp::{Add, And};
+    use CmpOp::Ne;
+    let ksa = b.k(FMT_SIGN_O);
+    let sa = b.bin(Add, scratch, ksa);
+    let sign = b.load64(sa);
+    let kfa = b.k(FMT_FLAGS_O);
+    let fa = b.bin(Add, scratch, kfa);
+    let flags = b.load64(fa);
+    let isneg = b.cmpi(Ne, sign, 0);
+    let c2 = b.k(2);
+    let plusf = b.bin(And, flags, c2);
+    let hasplus = b.cmpi(Ne, plusf, 0);
+    let c4 = b.k(4);
+    let spacef = b.bin(And, flags, c4);
+    let hasspace = b.cmpi(Ne, spacef, 0);
+    let space = b.k(b' ' as i64);
+    let zero = b.k(0);
+    let sc1 = b.sel(hasspace, space, zero);
+    let plus = b.k(b'+' as i64);
+    let sc2 = b.sel(hasplus, plus, sc1);
+    let minus = b.k(b'-' as i64);
+    b.sel(isneg, minus, sc2)
+}
+
+/// `__svm_dtoa_sci(bits, prec, width, flags, scratch) -> i64` — format the double `bits` in `%e`
+/// scientific notation (`[sign]d.ddde±dd`, `prec` fraction digits, ≥2 exponent digits) into the
+/// scratch output field, returning its length; the caller writes `scratch+FMT_OUT_O .. +len`. Uses
+/// the exact `dtoa_digits` engine (so correctly rounded across the whole double range). `flags` adds
+/// bit3 = uppercase (`%E` ⇒ `E`/`INF`/`NAN`). Composes `dtoa_digits` by func index `dd`.
+#[allow(dead_code)]
+fn synth_dtoa_sci(dd: u32) -> Func {
+    use BinOp::{Add, And, DivU, RemU, ShrU, Sub};
+    use CmpOp::{Eq, GtS, LtS, Ne};
+    let i64t = ValType::I64;
+
+    const SPECIAL: u32 = 1;
+    const FINITE: u32 = 2;
+    const ASSEMBLE: u32 = 3;
+    const DOT: u32 = 4;
+    const FRAC_LOOP: u32 = 5;
+    const FRAC_BODY: u32 = 6;
+    const EXPSTART: u32 = 7;
+    const EXPDIGITS: u32 = 8;
+    const PAD_START: u32 = 9;
+    const PAD_FILL_TEST: u32 = 10;
+    const PAD_FILL_BODY: u32 = 11;
+    const PAD_COPY_TEST: u32 = 12;
+    const PAD_COPY_BODY: u32 = 13;
+    const RET: u32 = 14;
+
+    // 0: ENTRY(bits, prec, width, flags, scratch) — stash params; split non-finite vs finite.
+    let b_entry = {
+        let mut b = Bdr::new(5); // bits=0, prec=1, width=2, flags=3, scratch=4
+        let kp = b.k(FMT_PREC_O);
+        let pa = b.bin(Add, 4, kp);
+        b.store64(pa, 1);
+        let kw = b.k(FMT_WIDTH_O);
+        let wa = b.bin(Add, 4, kw);
+        b.store64(wa, 2);
+        let kf = b.k(FMT_FLAGS_O);
+        let fa = b.bin(Add, 4, kf);
+        b.store64(fa, 3);
+        let c63 = b.k(63);
+        let sgn = b.bin(ShrU, 0, c63);
+        let ks = b.k(FMT_SIGN_O);
+        let sa = b.bin(Add, 4, ks);
+        b.store64(sa, sgn);
+        let c52 = b.k(52);
+        let e0 = b.bin(ShrU, 0, c52);
+        let m7ff = b.k(0x7FF);
+        let exp = b.bin(And, e0, m7ff);
+        let isspec = b.cmpi(Eq, exp, 0x7FF);
+        b.block(
+            vec![i64t, i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: isspec,
+                then_blk: SPECIAL,
+                then_args: vec![4, 0],
+                else_blk: FINITE,
+                else_args: vec![4, 0, 1],
+            },
+        )
+    };
+
+    // 1: SPECIAL(scratch, bits) — "[sign]inf" (mant==0) or "nan", uppercased for %E.
+    let b_special = {
+        let mut b = Bdr::new(2); // scratch=0, bits=1
+        let sc = fmt_sign_byte(&mut b, 0);
+        let kc = b.k(FMT_CBUF_O);
+        let cb = b.bin(Add, 0, kc);
+        b.store8(cb, sc);
+        let hassign = b.cmpi(Ne, sc, 0);
+        let one = b.k(1);
+        let zero = b.k(0);
+        let count = b.sel(hassign, one, zero);
+        // uppercase? (flags bit3)
+        let kf = b.k(FMT_FLAGS_O);
+        let fa = b.bin(Add, 0, kf);
+        let flags = b.load64(fa);
+        let c8 = b.k(8);
+        let upf = b.bin(And, flags, c8);
+        let upper = b.cmpi(Ne, upf, 0);
+        // letters: inf vs nan, lower vs upper
+        let mmask = b.k((1i64 << 52) - 1);
+        let mant = b.bin(And, 1, mmask);
+        let isinf = b.cmpi(Eq, mant, 0);
+        // ch0: i/I vs n/N ; ch1: n/N vs a/A ; ch2: f/F vs n/N
+        let li = b.k(b'i' as i64);
+        let ui = b.k(b'I' as i64);
+        let i_c = b.sel(upper, ui, li);
+        let ln = b.k(b'n' as i64);
+        let un = b.k(b'N' as i64);
+        let n_c = b.sel(upper, un, ln);
+        let la = b.k(b'a' as i64);
+        let ua = b.k(b'A' as i64);
+        let a_c = b.sel(upper, ua, la);
+        let lf = b.k(b'f' as i64);
+        let uf = b.k(b'F' as i64);
+        let f_c = b.sel(upper, uf, lf);
+        let ch0 = b.sel(isinf, i_c, n_c);
+        let ch1 = b.sel(isinf, n_c, a_c);
+        let ch2 = b.sel(isinf, f_c, n_c);
+        let base = b.k(FMT_CBUF_O);
+        let cbase = b.bin(Add, 0, base);
+        let a0 = b.bin(Add, cbase, count);
+        b.store8(a0, ch0);
+        let one1 = b.k(1);
+        let p1 = b.bin(Add, count, one1);
+        let a1 = b.bin(Add, cbase, p1);
+        b.store8(a1, ch1);
+        let two = b.k(2);
+        let p2 = b.bin(Add, count, two);
+        let a2 = b.bin(Add, cbase, p2);
+        b.store8(a2, ch2);
+        let three = b.k(3);
+        let clen = b.bin(Add, count, three);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        b.store64(cla, clen);
+        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+    };
+
+    // 2: FINITE(scratch, bits, prec) — nsig = prec+1; run the digit engine; stash E.
+    let b_finite = {
+        let mut b = Bdr::new(3); // scratch=0, bits=1, prec=2
+        let one = b.k(1);
+        let nsig = b.bin(Add, 2, one);
+        let e = b.call1(dd, vec![1, nsig, 0]); // dtoa_digits(bits, nsig, scratch)
+        let ke = b.k(FMT_E_O);
+        let ea = b.bin(Add, 0, ke);
+        b.store64(ea, e);
+        b.block(vec![i64t, i64t, i64t], Terminator::Br { target: ASSEMBLE, args: vec![0] })
+    };
+
+    // 3: ASSEMBLE(scratch) — [sign] d0 ; then '.' + fraction iff prec>0.
+    let b_assemble = {
+        let mut b = Bdr::new(1);
+        let sc = fmt_sign_byte(&mut b, 0);
+        let kc = b.k(FMT_CBUF_O);
+        let cb = b.bin(Add, 0, kc);
+        b.store8(cb, sc);
+        let hassign = b.cmpi(Ne, sc, 0);
+        let one = b.k(1);
+        let zero = b.k(0);
+        let cur0 = b.sel(hassign, one, zero);
+        // d0 = '0' + dbuf[0]
+        let kd = b.k(FMT_DBUF_O);
+        let dba = b.bin(Add, 0, kd);
+        let d0 = b.load8u(dba);
+        let z0 = b.k(b'0' as i64);
+        let ch = b.bin(Add, d0, z0);
+        let a0 = b.bin(Add, cb, cur0);
+        b.store8(a0, ch);
+        let one2 = b.k(1);
+        let cur1 = b.bin(Add, cur0, one2);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        b.store64(cla, cur1);
+        let kp = b.k(FMT_PREC_O);
+        let pa = b.bin(Add, 0, kp);
+        let prec = b.load64(pa);
+        let pos = b.cmpi(GtS, prec, 0);
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: pos,
+                then_blk: DOT,
+                then_args: vec![0],
+                else_blk: EXPSTART,
+                else_args: vec![0],
+            },
+        )
+    };
+
+    // 4: DOT(scratch) — write '.', enter the fraction loop at j=1.
+    let b_dot = {
+        let mut b = Bdr::new(1);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        let cur = b.load64(cla);
+        let kc = b.k(FMT_CBUF_O);
+        let cb = b.bin(Add, 0, kc);
+        let a = b.bin(Add, cb, cur);
+        let dot = b.k(b'.' as i64);
+        b.store8(a, dot);
+        let one = b.k(1);
+        let cur2 = b.bin(Add, cur, one);
+        b.store64(cla, cur2);
+        let j = b.k(1);
+        b.block(vec![i64t], Terminator::Br { target: FRAC_LOOP, args: vec![0, j] })
+    };
+
+    // 5: FRAC_LOOP(scratch, j) — emit dbuf[1..=prec].
+    let b_frac_loop = {
+        let mut b = Bdr::new(2);
+        let kp = b.k(FMT_PREC_O);
+        let pa = b.bin(Add, 0, kp);
+        let prec = b.load64(pa);
+        let done = b.cmp(GtS, 1, prec); // j > prec
+        b.block(
+            vec![i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: EXPSTART,
+                then_args: vec![0],
+                else_blk: FRAC_BODY,
+                else_args: vec![0, 1],
+            },
+        )
+    };
+
+    // 6: FRAC_BODY(scratch, j) — cbuf[cur++] = '0' + dbuf[j].
+    let b_frac_body = {
+        let mut b = Bdr::new(2);
+        let kd = b.k(FMT_DBUF_O);
+        let dba = b.bin(Add, 0, kd);
+        let da = b.bin(Add, dba, 1);
+        let d = b.load8u(da);
+        let z = b.k(b'0' as i64);
+        let ch = b.bin(Add, d, z);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        let cur = b.load64(cla);
+        let kc = b.k(FMT_CBUF_O);
+        let cb = b.bin(Add, 0, kc);
+        let a = b.bin(Add, cb, cur);
+        b.store8(a, ch);
+        let one = b.k(1);
+        let cur2 = b.bin(Add, cur, one);
+        b.store64(cla, cur2);
+        let j2 = b.bin(Add, 1, one);
+        b.block(vec![i64t, i64t], Terminator::Br { target: FRAC_LOOP, args: vec![0, j2] })
+    };
+
+    // 7: EXPSTART(scratch) — write 'e'/'E', the exponent sign, and set up |E|.
+    let b_expstart = {
+        let mut b = Bdr::new(1);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        let cur = b.load64(cla);
+        let kc = b.k(FMT_CBUF_O);
+        let cb = b.bin(Add, 0, kc);
+        let a = b.bin(Add, cb, cur);
+        // 'e' or 'E'
+        let kf = b.k(FMT_FLAGS_O);
+        let fa = b.bin(Add, 0, kf);
+        let flags = b.load64(fa);
+        let c8 = b.k(8);
+        let upf = b.bin(And, flags, c8);
+        let upper = b.cmpi(Ne, upf, 0);
+        let le = b.k(b'e' as i64);
+        let ue = b.k(b'E' as i64);
+        let echar = b.sel(upper, ue, le);
+        b.store8(a, echar);
+        let one = b.k(1);
+        let cur2 = b.bin(Add, cur, one);
+        // exponent sign
+        let ke = b.k(FMT_E_O);
+        let ea = b.bin(Add, 0, ke);
+        let e = b.load64(ea);
+        let eneg = b.cmpi(LtS, e, 0);
+        let plus = b.k(b'+' as i64);
+        let minus = b.k(b'-' as i64);
+        let esign = b.sel(eneg, minus, plus);
+        let a2 = b.bin(Add, cb, cur2);
+        b.store8(a2, esign);
+        let cur3 = b.bin(Add, cur2, one);
+        b.store64(cla, cur3);
+        let zero = b.k(0);
+        let nege = b.bin(Sub, zero, e);
+        let abs_e = b.sel(eneg, nege, e);
+        b.block(vec![i64t], Terminator::Br { target: EXPDIGITS, args: vec![0, abs_e] })
+    };
+
+    // 8: EXPDIGITS(scratch, absE) — |E| as ≥2 digits (3 if ≥100), then pad.
+    let b_expdigits = {
+        let mut b = Bdr::new(2); // scratch=0, absE=1
+        let c100 = b.k(100);
+        let h = b.bin(DivU, 1, c100);
+        let c10 = b.k(10);
+        let tens0 = b.bin(DivU, 1, c10);
+        let t = b.bin(RemU, tens0, c10);
+        let o = b.bin(RemU, 1, c10);
+        let has3 = b.cmpi(GtS, h, 0);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        let cur = b.load64(cla);
+        let kc = b.k(FMT_CBUF_O);
+        let cb = b.bin(Add, 0, kc);
+        let z = b.k(b'0' as i64);
+        // hundreds digit (overwritten by tens when has3 is false, since cur doesn't advance)
+        let hch = b.bin(Add, h, z);
+        let ah = b.bin(Add, cb, cur);
+        b.store8(ah, hch);
+        let one = b.k(1);
+        let curp = b.bin(Add, cur, one);
+        let cur_t = b.sel(has3, curp, cur);
+        let tch = b.bin(Add, t, z);
+        let at = b.bin(Add, cb, cur_t);
+        b.store8(at, tch);
+        let cur_o = b.bin(Add, cur_t, one);
+        let och = b.bin(Add, o, z);
+        let ao = b.bin(Add, cb, cur_o);
+        b.store8(ao, och);
+        let cur_end = b.bin(Add, cur_o, one);
+        b.store64(cla, cur_end);
+        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_START, args: vec![0] })
+    };
+
+    // 9: PAD_START(scratch) — total = max(clen,width); lead = left?0:pad; fill the field.
+    let b_pad_start = {
+        let mut b = Bdr::new(1);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        let clen = b.load64(cla);
+        let kw = b.k(FMT_WIDTH_O);
+        let wa = b.bin(Add, 0, kw);
+        let width = b.load64(wa);
+        let wgt = b.cmp(GtS, width, clen);
+        let total = b.sel(wgt, width, clen);
+        let pad = b.bin(Sub, total, clen);
+        let kf = b.k(FMT_FLAGS_O);
+        let fa = b.bin(Add, 0, kf);
+        let flags = b.load64(fa);
+        let c1 = b.k(1);
+        let leftf = b.bin(And, flags, c1);
+        let isleft = b.cmpi(Ne, leftf, 0);
+        let zero = b.k(0);
+        let lead = b.sel(isleft, zero, pad);
+        let kt = b.k(FMT_TOTAL_O);
+        let ta = b.bin(Add, 0, kt);
+        b.store64(ta, total);
+        let kl = b.k(FMT_LEAD_O);
+        let lla = b.bin(Add, 0, kl);
+        b.store64(lla, lead);
+        let z = b.k(0);
+        b.block(vec![i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, z] })
+    };
+
+    // 10: PAD_FILL_TEST(scratch, j) — fill out[0..total] with spaces.
+    let b_pad_fill_test = {
+        let mut b = Bdr::new(2);
+        let kt = b.k(FMT_TOTAL_O);
+        let ta = b.bin(Add, 0, kt);
+        let total = b.load64(ta);
+        let go = b.cmp(LtS, 1, total);
+        let z = b.k(0);
+        b.block(
+            vec![i64t, i64t],
+            Terminator::BrIf {
+                cond: go,
+                then_blk: PAD_FILL_BODY,
+                then_args: vec![0, 1],
+                else_blk: PAD_COPY_TEST,
+                else_args: vec![0, z],
+            },
+        )
+    };
+
+    // 11: PAD_FILL_BODY(scratch, j) — out[j] = ' '.
+    let b_pad_fill_body = {
+        let mut b = Bdr::new(2);
+        let ko = b.k(FMT_OUT_O);
+        let ob = b.bin(Add, 0, ko);
+        let a = b.bin(Add, ob, 1);
+        let sp = b.k(b' ' as i64);
+        b.store8(a, sp);
+        let one = b.k(1);
+        let nj = b.bin(Add, 1, one);
+        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_FILL_TEST, args: vec![0, nj] })
+    };
+
+    // 12: PAD_COPY_TEST(scratch, k) — copy content[0..clen] into out[lead..].
+    let b_pad_copy_test = {
+        let mut b = Bdr::new(2);
+        let kcl = b.k(FMT_CLEN_O);
+        let cla = b.bin(Add, 0, kcl);
+        let clen = b.load64(cla);
+        let go = b.cmp(LtS, 1, clen);
+        b.block(
+            vec![i64t, i64t],
+            Terminator::BrIf {
+                cond: go,
+                then_blk: PAD_COPY_BODY,
+                then_args: vec![0, 1],
+                else_blk: RET,
+                else_args: vec![0],
+            },
+        )
+    };
+
+    // 13: PAD_COPY_BODY(scratch, k) — out[lead+k] = content[k].
+    let b_pad_copy_body = {
+        let mut b = Bdr::new(2);
+        let kc = b.k(FMT_CBUF_O);
+        let cb = b.bin(Add, 0, kc);
+        let ca = b.bin(Add, cb, 1);
+        let ch = b.load8u(ca);
+        let kl = b.k(FMT_LEAD_O);
+        let lla = b.bin(Add, 0, kl);
+        let lead = b.load64(lla);
+        let ko = b.k(FMT_OUT_O);
+        let ob = b.bin(Add, 0, ko);
+        let off = b.bin(Add, lead, 1);
+        let oa = b.bin(Add, ob, off);
+        b.store8(oa, ch);
+        let one = b.k(1);
+        let nk = b.bin(Add, 1, one);
+        b.block(vec![i64t, i64t], Terminator::Br { target: PAD_COPY_TEST, args: vec![0, nk] })
+    };
+
+    // 14: RET(scratch) — return the padded field length.
+    let b_ret = {
+        let mut b = Bdr::new(1);
+        let kt = b.k(FMT_TOTAL_O);
+        let ta = b.bin(Add, 0, kt);
+        let total = b.load64(ta);
+        b.block(vec![i64t], Terminator::Return(vec![total]))
+    };
+
+    Func {
+        params: vec![i64t, i64t, i64t, i64t, i64t],
+        results: vec![i64t],
+        blocks: vec![
+            b_entry,
+            b_special,
+            b_finite,
+            b_assemble,
+            b_dot,
+            b_frac_loop,
+            b_frac_body,
+            b_expstart,
+            b_expdigits,
+            b_pad_start,
+            b_pad_fill_test,
+            b_pad_fill_body,
+            b_pad_copy_test,
+            b_pad_copy_body,
+            b_ret,
+        ],
+    }
+}
+
 /// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
@@ -5911,6 +6449,17 @@ fn global_name_of(op: &Operand) -> Option<String> {
 /// width + min-digit precision, `%c`, `%s` (runtime strlen, with width + truncating precision), and
 /// `%%` are handled; float conversions (`%f`/`%e`/`%g`), `*` (dynamic width/precision), and
 /// non-constant format strings are fail-closed `Unsupported` (float needs exact-decimal/bignum).
+/// Which floating-point notation a `%f`/`%e`/`%g` conversion uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FloatKind {
+    /// `%f` — fixed notation `[-]ddd.ffff`.
+    Fixed,
+    /// `%e` — scientific notation `[-]d.ddde±dd`.
+    Sci,
+    /// `%g` — the shorter of `%e`/`%f` with trailing zeros stripped.
+    Gen,
+}
+
 enum FmtSeg {
     /// A verbatim run — bytes `[off, off+len)` of the format global, written directly.
     Lit { off: usize, len: usize },
@@ -5928,14 +6477,17 @@ enum FmtSeg {
     /// `%s` — a NUL-terminated string argument (runtime `strlen`), right-justified in field `width`
     /// (space-padded), optionally truncated to `prec` bytes.
     Str { width: u32, prec: Option<u32> },
-    /// `%f` — fixed-notation `double`. `prec` is the fractional digit count (C default 6 when
-    /// absent). The synthesized `__svm_dtoa_fixed` produces the full `[-]ddd.ffff` (or `inf`/`nan`)
-    /// string; the caller space-pads it to field `width` per `flags`. (`%F`/`%e`/`%g`, the `0` flag,
-    /// and `#` are still fail-closed.)
+    /// A floating-point `double` conversion. `kind` selects fixed (`%f`), scientific (`%e`), or
+    /// general (`%g`) notation; `upper` is the uppercase spelling (`%F`/`%E`/`%G` ⇒ `E`/`INF`/`NAN`).
+    /// `prec` is the parsed precision (C default 6); the caller space-pads to field `width` per
+    /// `flags`. Fixed uses the synthesized 128-bit `__svm_dtoa_fixed`; scientific/general use the
+    /// exact bignum `__svm_dtoa_*` engine.
     Float {
         width: u32,
         prec: u32,
         flags: FmtFlags,
+        kind: FloatKind,
+        upper: bool,
     },
     /// `%%` — a literal percent.
     Percent,
@@ -6091,12 +6643,33 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
                     width,
                     prec: p,
                     flags,
+                    kind: FloatKind::Fixed,
+                    upper: false,
                 }
             }
-            b'F' | b'e' | b'g' | b'E' | b'G' => {
-                return Err(bad(
-                    "float %F/%e/%g (later slice; lowercase %f is supported)",
-                ))
+            // Scientific notation (`%e`/`%E`). Exact decimal via the bignum `__svm_dtoa_sci` (Dragon4
+            // digit engine), so correctly-rounded across the whole double range — no magnitude cap.
+            b'e' | b'E' => {
+                let p = prec.unwrap_or(6);
+                if p > 510 {
+                    return Err(bad("float precision > 510 (digit-buffer cap)"));
+                }
+                if width > 200 {
+                    return Err(bad("float field width > 200 (scratch cap)"));
+                }
+                if flags.zero || flags.alt {
+                    return Err(bad("float `0`/`#` flag (later slice)"));
+                }
+                FmtSeg::Float {
+                    width,
+                    prec: p,
+                    flags,
+                    kind: FloatKind::Sci,
+                    upper: conv == b'E',
+                }
+            }
+            b'F' | b'g' | b'G' => {
+                return Err(bad("float %F/%g (later slice; %f and %e are supported)"))
             }
             other => return Err(bad(&format!("conversion %{}", other as char))),
         });
@@ -6805,7 +7378,13 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                 };
                 emit_printf_int_field(ctx, mag, base, neg, width, prec, flags, utoa)?;
             }
-            FmtSeg::Float { width, prec, flags } => {
+            FmtSeg::Float {
+                width,
+                prec,
+                flags,
+                kind,
+                upper,
+            } => {
                 let arg = c.arguments.get(argi).ok_or_else(|| {
                     Error::Unsupported("printf: more conversions than args".into())
                 })?;
@@ -6816,7 +7395,7 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                     ValType::F64 => {}
                     other => {
                         return Err(Error::Unsupported(format!(
-                            "printf %f expects a double, got {}",
+                            "printf float expects a double, got {}",
                             other.as_str()
                         )))
                     }
@@ -6826,21 +7405,47 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                     op: CastOp::ReinterpF64I64,
                     a: dval,
                 });
-                let dtoa = ctx
-                    .helpers
-                    .dtoa
-                    .ok_or_else(|| Error::Unsupported("printf: dtoa helper missing".into()))?;
                 let precv = ctx.const_i64(prec as i64);
                 let widthv = ctx.const_i64(width as i64);
-                // flags: bit0 left-justify, bit1 `+`, bit2 space (all compile-time constant here).
+                // flags: bit0 left-justify, bit1 `+`, bit2 space, bit3 uppercase (all compile-time).
                 let fbits = (flags.left as i64)
                     | ((flags.plus as i64) << 1)
-                    | ((flags.space as i64) << 2);
+                    | ((flags.space as i64) << 2)
+                    | ((upper as i64) << 3);
                 let flagsv = ctx.const_i64(fbits);
-                ctx.push_effect(Inst::Call {
-                    func: dtoa,
-                    args: vec![bits, precv, widthv, flagsv],
-                });
+                match kind {
+                    FloatKind::Fixed => {
+                        // The self-contained 128-bit `%f` helper writes the field itself.
+                        let dtoa = ctx.helpers.dtoa.ok_or_else(|| {
+                            Error::Unsupported("printf: dtoa helper missing".into())
+                        })?;
+                        ctx.push_effect(Inst::Call {
+                            func: dtoa,
+                            args: vec![bits, precv, widthv, flagsv],
+                        });
+                    }
+                    FloatKind::Sci | FloatKind::Gen => {
+                        // The bignum formatter fills the scratch output field and returns its length;
+                        // we then write `scratch+FMT_OUT_O .. +len` ourselves.
+                        let formatter = match kind {
+                            FloatKind::Sci => ctx.helpers.dtoa_sci,
+                            _ => ctx.helpers.dtoa_gen,
+                        }
+                        .ok_or_else(|| {
+                            Error::Unsupported("printf: bignum float helper missing".into())
+                        })?;
+                        let scratch = ctx.helpers.float_scratch.ok_or_else(|| {
+                            Error::Unsupported("printf: float scratch missing".into())
+                        })?;
+                        let scratchv = ctx.const_i64(scratch as i64);
+                        let len = ctx.push(Inst::Call {
+                            func: formatter,
+                            args: vec![bits, precv, widthv, flagsv, scratchv],
+                        });
+                        let outp = ctx.const_i64((scratch + FMT_OUT_O as u64) as i64);
+                        ctx.emit_write(outp, len)?;
+                    }
+                }
             }
         }
     }
@@ -11366,6 +11971,41 @@ mod bigint_tests {
         (digits, exp)
     }
 
+    // The %e/%E helper set with dtoa_sci at index 0.
+    fn sci_funcs() -> Vec<Func> {
+        vec![
+            synth_dtoa_sci(1),
+            synth_dtoa_digits(2, 3, 4, 5, 6, 7),
+            synth_big_zero(),
+            synth_big_copy(),
+            synth_big_cmp(),
+            synth_big_sub(),
+            synth_big_mul_small(),
+            synth_big_shl_bits(),
+        ]
+    }
+
+    // The expected C `%e` rendering (sign from the sign bit, ≥2 exponent digits).
+    fn c_e(v: f64, prec: usize, upper: bool) -> String {
+        let (d, e) = expected(v.abs(), prec + 1);
+        let mut s = String::new();
+        if v.is_sign_negative() {
+            s.push('-');
+        }
+        s.push((b'0' + d[0]) as char);
+        if prec > 0 {
+            s.push('.');
+            for k in 1..=prec {
+                s.push((b'0' + d[k]) as char);
+            }
+        }
+        s.push(if upper { 'E' } else { 'e' });
+        s.push(if e < 0 { '-' } else { '+' });
+        let ae = e.unsigned_abs();
+        s.push_str(&if ae >= 100 { format!("{ae:03}") } else { format!("{ae:02}") });
+        s
+    }
+
     fn limbs(win: &[u8], off: usize, n: usize) -> Vec<u32> {
         (0..n)
             .map(|k| u32::from_le_bytes(win[off + 4 * k..off + 4 * k + 4].try_into().unwrap()))
@@ -11437,7 +12077,7 @@ mod bigint_tests {
     #[test]
     fn dtoa_digits_works() {
         let scratch = 1024usize;
-        let dbuf = scratch + 480;
+        let dbuf = scratch + 496;
         let cases: &[(f64, usize)] = &[
             (3.14, 3),
             (1.0, 3),
@@ -11464,6 +12104,57 @@ mod bigint_tests {
         let (res, win) = run_funcs(dtoa_funcs(), &[0i64, 4, scratch as i64], &[]);
         assert_eq!(ret_i64(&res), 0);
         assert_eq!((0..4).map(|j| win[dbuf + j]).collect::<Vec<_>>(), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn dtoa_sci_works() {
+        let scratch = 4096usize;
+        let out = scratch + 1536;
+        // (value, prec); no flags, no width
+        let cases: &[(f64, usize)] = &[
+            (3.14, 2),
+            (0.0, 6),
+            (2.0 / 3.0, 6),
+            (1e30, 3),
+            (1e-30, 3),
+            (123456.789, 4),
+            (9.999999, 2), // rounds up, carries → 1.00e+01
+            (5e-324, 2),
+            (1.7976931348623157e308, 4),
+            (-2.5, 3),
+            (-0.0, 2),
+            (1.0, 0), // prec 0 ⇒ no decimal point
+        ];
+        for &(v, prec) in cases {
+            let bits = v.to_bits() as i64;
+            let (res, win) = run_funcs(sci_funcs(), &[bits, prec as i64, 0, 0, scratch as i64], &[]);
+            let len = ret_i64(&res) as usize;
+            let got = String::from_utf8(win[out..out + len].to_vec()).unwrap();
+            assert_eq!(got, c_e(v, prec, false), "v={v} prec={prec}");
+        }
+        // %E (uppercase) + inf/nan + flags + width
+        let bits = 6.022e23f64.to_bits() as i64;
+        let (res, win) = run_funcs(sci_funcs(), &[bits, 3, 0, 8, scratch as i64], &[]); // flags bit3 = upper
+        let len = ret_i64(&res) as usize;
+        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), c_e(6.022e23, 3, true));
+        // +/space flags
+        let (res, win) = run_funcs(sci_funcs(), &[1.5f64.to_bits() as i64, 2, 0, 2, scratch as i64], &[]);
+        let len = ret_i64(&res) as usize;
+        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "+1.50e+00");
+        // width 14, right-justified
+        let (res, win) = run_funcs(sci_funcs(), &[3.14f64.to_bits() as i64, 2, 14, 0, scratch as i64], &[]);
+        let len = ret_i64(&res) as usize;
+        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "      3.14e+00");
+        // inf / nan, lower and upper
+        let (res, win) = run_funcs(sci_funcs(), &[f64::INFINITY.to_bits() as i64, 6, 0, 0, scratch as i64], &[]);
+        let len = ret_i64(&res) as usize;
+        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "inf");
+        let (res, win) = run_funcs(sci_funcs(), &[f64::NAN.to_bits() as i64, 6, 0, 8, scratch as i64], &[]);
+        let len = ret_i64(&res) as usize;
+        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "NAN");
+        let (res, win) = run_funcs(sci_funcs(), &[(f64::NEG_INFINITY).to_bits() as i64, 6, 0, 0, scratch as i64], &[]);
+        let len = ret_i64(&res) as usize;
+        assert_eq!(String::from_utf8(win[out..out + len].to_vec()).unwrap(), "-inf");
     }
 
     #[test]
