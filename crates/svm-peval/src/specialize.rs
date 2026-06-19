@@ -239,18 +239,20 @@ pub struct SpecConfig {
     /// sites with the same static binding share one — and emitted as a residual `call`, producing a
     /// **multi-function** residual. This bounds code growth (a callee specialized once, called N
     /// times) and specializes **dynamic-depth recursion** (a recursive callee with a dynamic
-    /// argument becomes a finite self-recursive residual, where inlining would diverge). Requires
-    /// [`rename`](Self::rename) to be `None` — threading the renamed region's abstract cells across a
-    /// real call boundary isn't implemented, so with a rename region set this is ignored and calls
-    /// inline as usual. Off by default (the residual is a single inlined function).
+    /// argument becomes a finite self-recursive residual, where inlining would diverge). Composes with
+    /// [`rename`](Self::rename): the renamed region's live abstract cells are threaded across each
+    /// residual call boundary (passed in as extra arguments, returned as extra results), so the region
+    /// stays in SSA exactly as across an inlined call. Off by default (the residual is a single
+    /// inlined function).
     pub outline_calls: bool,
     /// **Selective outlining**: outline *only* the calls that need it for termination — an unbounded-
     /// recursion back-edge (a call re-entering an activation already on the stack with the same
     /// argument pattern) — and **inline everything else** (straight-line and bounded recursion via the
     /// usual CFG inlining). The residual is then a *tight* recursive function with its leaves and
     /// structure folded in, instead of one tiny function per call site (full [`outline_calls`]). Like
-    /// `outline_calls` it requires [`rename`](Self::rename) to be `None`, and it implies outlining is
-    /// enabled (no need to also set `outline_calls`). Off by default.
+    /// `outline_calls` it composes with [`rename`](Self::rename) (region cells are threaded across the
+    /// outlined back-edge) and implies outlining is enabled (no need to also set `outline_calls`). Off
+    /// by default.
     pub selective_outline: bool,
 }
 
