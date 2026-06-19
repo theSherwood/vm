@@ -87,7 +87,19 @@ path — distinct from the now-removed root-runtime delta and from the resolved 
 
 ---
 
-### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — on `claude/debug-jit-backtrace`
+### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — **FIX LANDED** on `claude/dap-function-names` (pending `windows-latest` CI confirmation)
+
+**Fix (landed, the refined-fix design below):** the trap-time capture state + frame-pointer walk +
+explicit-trap helper moved into a new cross-platform `crates/svm-jit/src/trap_capture.c` (compiled on
+unix **and** windows). `emit_trap` now bakes `call svm_capture_explicit_trap(get_frame_pointer())` on
+every target — the trapping frame pointer is threaded in via Cranelift `get_frame_pointer` (so MSVC's
+missing `__builtin_frame_address` is sidestepped), and the trap-site return address comes from
+`_ReturnAddress()` (MSVC) / `__builtin_return_address(0)` (GCC). The unix signal handler and the windows
+VEH both feed the shared capture (the handler via `svm_store_trap_frame`; the VEH keeps its Rust
+memory-fault capture and the windows `take_trap_frame` falls back to the C `svm_take_trap_frame` for
+explicit traps). The `trap_kill_message_carries_a_source_backtrace` test (div-by-zero) is now un-gated
+on Windows. Unix validated locally; windows-gnu compiles; **MSVC runtime is validated by the
+`windows-latest` CI job** — move this entry to Resolved once that job is green. _Original report below._
 
 **Where:** `crates/svm-jit/src/lib.rs` (`trap_capture_addr()` returns `0` on non-unix, so `emit_trap`
 bakes no explicit-trap capture call), `crates/svm-jit/src/trap_shim.c` (the unix-only

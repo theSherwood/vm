@@ -14,6 +14,20 @@ fn main() {
         println!("cargo:rustc-cfg=fiber_rt");
     }
 
+    // The cross-platform trap-time backtrace capture (DEBUGGING.md §5 W3): the thread-local capture
+    // state + frame-pointer walk + the explicit-trap helper, shared by the unix signal handler and the
+    // windows VEH. Compiled wherever the trap-backtrace feature exists (unix + windows); other targets
+    // (no-MMU / wasm) are unsupported (`compile_error!` in `mem.rs`) and don't reference these symbols.
+    if std::env::var_os("CARGO_CFG_UNIX").is_some()
+        || std::env::var_os("CARGO_CFG_WINDOWS").is_some()
+    {
+        println!("cargo:rerun-if-changed=src/trap_capture.c");
+        cc::Build::new()
+            .file("src/trap_capture.c")
+            .warnings(true)
+            .compile("svm_trap_capture");
+    }
+
     // The detect-and-kill trap shim (§4/§5) is unix-only. Non-unix targets are unsupported and
     // refuse to build (`compile_error!` in `mem.rs`). Gate on the *target* family (`CARGO_CFG_UNIX`),
     // not the host: cross-compiling to Windows must hit that clean error, not a `cc`/mingw failure
