@@ -2,8 +2,8 @@
 #include <stdint.h>
 #include <time.h>
 // Every kernel is int32_t(int32_t) now (i32-LCG / i32 accumulators), so one bench path covers all.
-int32_t alu(int32_t), call(int32_t), call_indirect(int32_t), mem(int32_t), chase(int32_t),
-    chase_rand(int32_t), fnv(int32_t), fma_k(int32_t), vsum(int32_t);
+int32_t alu(int32_t), xorshift(int32_t), call(int32_t), call_indirect(int32_t), mem(int32_t),
+    chase(int32_t), chase_rand(int32_t), fnv(int32_t), fma_k(int32_t), vadd(int32_t);
 static double now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e9 + t.tv_nsec; }
 static volatile int32_t sink;
 static double min_run(int32_t (*k)(int32_t), int32_t n) {
@@ -17,8 +17,9 @@ static void bench(const char *name, int32_t (*k)(int32_t)) {
   printf("native,%s,%.4f\n", name, (l - s) / 200000.0);
 }
 int main() {
-  bench("alu", alu); bench("call", call); bench("call_indirect", call_indirect); bench("mem", mem);
+  bench("alu", alu); bench("xorshift", xorshift);
+  bench("call", call); bench("call_indirect", call_indirect); bench("mem", mem);
   bench("chase", chase); bench("chase_rand", chase_rand);
-  bench("fnv", fnv); bench("fma", fma_k); bench("vsum", vsum);
+  bench("fnv", fnv); bench("fma", fma_k); bench("vadd", vadd);
   return 0;
 }

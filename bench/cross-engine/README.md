@@ -18,8 +18,8 @@ feeds every engine — including the SVM ones, which run IR produced by the **re
 | `python` | CPython 3 |
 | `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `svm-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
 
-The SVM rows come from compiling `kernels.c` with `clang -O2 -emit-llvm -c -fno-vectorize
--fno-slp-vectorize` (the D54 on-ramp's legalized subset), translating the bitcode to SVM IR with
+The SVM rows come from compiling `kernels.c` with `clang -O2 -emit-llvm -c` (the D54 on-ramp's
+legalized subset, **vectorization on**), translating the bitcode to SVM IR with
 `svm_llvm::translate_bc_path`, and timing each kernel on the three engines — so they reflect IR the
 toolchain actually produces. (Driver: `crates/svm-llvm/examples/cross_engine.rs`.)
 
@@ -27,10 +27,15 @@ toolchain actually produces. (Driver: `crates/svm-llvm/examples/cross_engine.rs`
 
 Each loops `n` times in **int32** arithmetic. Loops are fold-resistant *by construction* — an
 `a = a*1103515245 + 12345 + i` **i32-LCG** recurrence (multiplicative, so `clang`'s SCEV can't
-closed-form it), data-dependent loads, or opaque pointers — rather than inline-asm barriers, because
-the LLVM→SVM on-ramp rejects inline asm. i32 throughout so JS can match via `Math.imul`.
+closed-form it) or data-dependent loads — rather than inline-asm barriers, because the LLVM→SVM
+on-ramp rejects inline asm. i32 throughout so JS can match via `Math.imul`.
 
-- `alu` — the bare i32-LCG recurrence.
+- `alu` — the bare i32-LCG recurrence. **A demonstrator, not the headline scalar number:** clang's
+  backend collapses this recurrence (4 steps → one multiply by `M⁴`), which svm-jit doesn't, so it reads
+  ~8× native. It's the *only* kernel where svm-jit trails native (see ISSUES.md I9) — `xorshift` is the
+  fair scalar number.
+- `xorshift` — a serial scalar hash (`a ^= a<<13; a ^= a>>17; a += i`) clang **can't** strength-reduce.
+  The representative scalar-throughput kernel: svm-jit ≈ native here.
 - `call` — each iteration calls a `noinline` LCG `step` (a real call/return).
 - `call_indirect` — same `step` dispatched through an opaque function pointer.
 - `mem` — `cell = a; a = LCG(cell, i)` — a store→load the optimizers **forward and delete** (so this is
@@ -56,13 +61,14 @@ Three more kernels go beyond the synthetic micros:
 - `fma` — a scalar **f64 FMA recurrence** `acc = acc*C + D`. Covers the floating-point path (everything
   else is integer); the serial FP dependency is latency-bound and not vectorizable. Returns `trunc(acc)`
   so every engine still returns an `i32`.
-- `vsum` — a contiguous **i32 reduction** `sum += arr[k]` over a 1 MiB array. A *vectorizable* loop:
-  auto-vectorizing backends (native AVX, wasm SIMD via `-msimd128`) collapse it to vector adds, while a
-  scalar backend (the interpreters) stays scalar — exposing the vectorization gap. **Omitted from the
-  SVM rows**: the on-ramp legalizes with `-fno-vectorize` (the MVP is scalar) *and* the opaque-pointer
-  barrier doesn't survive LLVM→SVM→Cranelift, so the reduction folds to a bogus ~0 ns. Valid only for
-  `n ≤ 262144` (unwrapped affine sweep); the in-process drivers use `n = 201000`, and the Wasmtime CLI
-  driver omits it (its ~7 ms process overhead can't resolve a sub-0.1 ns/iter kernel anyway).
+- `vadd` — a **vectorizable** reduction `s += (k ^ seed)` with no array (seed runtime, so it can't be
+  folded; nothing to fall out of bounds). Auto-vectorizing backends collapse it to vector adds: **native
+  uses AVX2 (256-bit), while wasm (the `v128` spec) and svm-jit (the on-ramp's determinism-fixed 128-bit
+  legalization) use 128-bit SIMD** — so native leads `vadd` ~2×, and svm-jit lands right with the wasm
+  engines (see ISSUES.md I8). The interpreters stay scalar. (Replaces the old `vsum`, whose known-content
+  array let Cranelift fold the loop to a bogus ~0 on svm-jit and read out of bounds at large `n`.) The
+  Wasmtime *CLI* driver omits `vadd` — its ~7 ms process spawn can't resolve a sub-0.1 ns/iter kernel
+  (use the in-process `wasmtime-rs/` driver).
 
 ## Methodology
 

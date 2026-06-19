@@ -1,6 +1,7 @@
 //! Cross-engine SVM benchmark driven by the **real LLVM frontend** (D54): compile the shared
-//! `bench/cross-engine/kernels.c` with `clang -O2 -emit-llvm -fno-*-vectorize` (the on-ramp's
-//! legalized subset), translate the bitcode to SVM IR via [`svm_llvm::translate_bc_path`], and time
+//! `bench/cross-engine/kernels.c` with `clang -O2 -emit-llvm` (vectorization on — the on-ramp
+//! legalizes `<N x T>` to v128), translate the bitcode to SVM IR via [`svm_llvm::translate_bc_path`],
+//! and time
 //! each kernel on the three SVM engines — **tree-walker**, **bytecode**, **JIT**. So the SVM rows
 //! reflect IR the toolchain actually produces (not hand-written IR), from the *same* C source the
 //! native/wasm/js/python drivers use.
@@ -18,7 +19,8 @@ use svm_interp::{bytecode, Value};
 
 // (display name, exported C symbol). `fma` is `fma_k` in C (libm owns `fma`).
 const KERNELS: &[(&str, &str)] = &[
-    ("alu", "alu"),
+    ("alu", "alu"), // demonstrator: clang collapses the LCG (M^4); svm-jit doesn't (~8x)
+    ("xorshift", "xorshift"), // representative scalar throughput (svm-jit ~= native)
     ("call", "call"),
     ("call_indirect", "call_indirect"),
     ("mem", "mem"),
@@ -26,8 +28,7 @@ const KERNELS: &[(&str, &str)] = &[
     ("chase_rand", "chase_rand"),
     ("fnv", "fnv"),
     ("fma", "fma_k"),
-    // vsum omitted: the on-ramp legalizes with -fno-vectorize (scalar MVP) and the opaque-pointer
-    // barrier does not survive LLVM->SVM->Cranelift, so the reduction folds to a bogus ~0 ns.
+    ("vadd", "vadd"), // vectorizable: the on-ramp emits v128, svm-jit lowers 128-bit SIMD
 ];
 
 // `svm_jit::compile_and_run` recompiles the module on every call, so the timed loop must be long
@@ -45,15 +46,11 @@ fn main() {
     let kernels_c = root.join("bench/cross-engine/kernels.c");
     let bc = std::env::temp_dir().join(format!("svm_llvm_xe_{}.bc", std::process::id()));
 
-    // The on-ramp's legalized subset (LLVM.md §4): O2 with vectorization off (the MVP is scalar).
+    // Vectorization ON (plain -O2 → SSE-width <4 x i32> → one v128): the on-ramp legalizes to v128
+    // (ISSUES.md I2) so `vadd` reaches svm-jit as real 128-bit SIMD. (No -mavx2: wider <8 x i32> splits
+    // into chunks svm-jit doesn't fully lower yet, and 128-bit is the SVM determinism width anyway.)
     let ok = Command::new("clang")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-c",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args(["-O2", "-emit-llvm", "-c"])
         .arg(&kernels_c)
         .arg("-o")
         .arg(&bc)

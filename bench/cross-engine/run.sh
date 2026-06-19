@@ -6,14 +6,16 @@
 #
 # Methodology notes:
 #   * ONE C source (kernels.c) feeds native, wasm, AND svm — the SVM rows come from compiling that
-#     same C through `clang -O2 -emit-llvm -fno-*-vectorize` → svm-llvm (the D54 on-ramp), so the SVM
-#     IR is what the toolchain actually produces, not hand-written.
+#     same C through `clang -O2 -emit-llvm` → svm-llvm (the D54 on-ramp), so the SVM IR is what the
+#     toolchain actually produces, not hand-written.
 #   * All kernels do i32 arithmetic; loops are fold-resistant *by construction* (multiplicative
-#     i32-LCG recurrences, data-dependent loads, opaque pointers) rather than inline-asm barriers,
-#     so the same source survives the LLVM→SVM on-ramp (which rejects inline asm).
-#   * `mem` forwards a store→load (the optimizers delete it; interpreters execute it). `vsum` is a
-#     vectorizable reduction (native AVX / wasm SIMD); the SVM frontend omits it (the on-ramp is
-#     -fno-vectorize, scalar MVP).
+#     i32-LCG recurrences, data-dependent loads) rather than inline-asm barriers, so the same source
+#     survives the LLVM→SVM on-ramp (which rejects inline asm).
+#   * `alu` is a *demonstrator* (clang collapses its LCG recurrence → ~8x native; svm-jit doesn't);
+#     `xorshift` is the representative scalar-throughput kernel (svm-jit ≈ native). `mem` forwards a
+#     store→load (compilers delete it; interpreters execute it). `vadd` is a vectorizable reduction:
+#     native uses AVX2 (-mavx2, 256-bit), wasm + svm-jit use 128-bit SIMD (the wasm v128 spec / the
+#     on-ramp's determinism-fixed legalization), so native leads vadd by ~2x and svm-jit ≈ wasm.
 #
 # Requires: clang, node, python3; the SVM rows additionally need libLLVM-18 (for svm-llvm). Run:
 #   bench/cross-engine/run.sh
@@ -24,8 +26,9 @@ ROOT=$(git rev-parse --show-toplevel)
 echo "engine,kernel,ns_per_iter"
 
 # --- native + wasm (clang) ---
-clang -O2 -c kernels.c -o kernels.o
-clang -O2 native_bench.c kernels.o -o native_bench
+# native uses -mavx2 so `vadd` shows native's real 256-bit SIMD width; wasm/svm are 128-bit.
+clang -O2 -mavx2 -c kernels.c -o kernels.o
+clang -O2 -mavx2 native_bench.c kernels.o -o native_bench
 ./native_bench
 clang --target=wasm32 -O2 -msimd128 -nostdlib -Wl,--no-entry -Wl,--export-all -o k32.wasm kernels.c
 clang --target=wasm64 -O2 -msimd128 -nostdlib -Wl,--no-entry -Wl,--export-all -o k64.wasm kernels.c

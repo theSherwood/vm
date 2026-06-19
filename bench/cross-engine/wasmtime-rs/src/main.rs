@@ -13,6 +13,7 @@ const REPS: usize = 25;
 // Every kernel is i32(i32) now.
 const KERNELS: &[&str] = &[
     "alu",
+    "xorshift",
     "call",
     "call_indirect",
     "mem",
@@ -20,7 +21,7 @@ const KERNELS: &[&str] = &[
     "chase_rand",
     "fnv",
     "fma",
-    "vsum",
+    "vadd",
 ];
 
 fn min_run(store: &mut Store<()>, f: &wasmtime::Func, n: i32) -> f64 {

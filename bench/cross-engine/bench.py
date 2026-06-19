@@ -8,6 +8,11 @@ def alu(n):
     a = 0
     for i in range(n): a = lcg(a, i)
     return a
+def xorshift(n):
+    a = 1
+    for i in range(n):
+        a ^= (a << 13) & MASK; a ^= a >> 17; a = (a + i) & MASK
+    return a
 def step(a, i): return lcg(a, i)
 def call(n):
     a = 0
@@ -45,11 +50,10 @@ def fma(n):
     a = 1.0
     for _ in range(n): a = a * 0.9999999 + 1.0
     return int(a)
-VBUF = 262144
-def vsum(n):
-    vbuf = [i + 1 for i in range(VBUF)]
+def vadd(n):
+    seed = (n * 2654435761) & MASK
     s = 0
-    for k in range(n): s += vbuf[k]
+    for k in range(n): s = (s + (k ^ seed)) & MASK
     return s
 
 def min_run(k, n):
@@ -59,7 +63,7 @@ def min_run(k, n):
         a = now(); k(n); b = now()
         if b - a < best: best = b - a
     return best
-for name, k in [("alu", alu), ("call", call), ("call_indirect", call_indirect), ("mem", mem),
-                ("chase", chase), ("chase_rand", chase_rand), ("fnv", fnv), ("fma", fma), ("vsum", vsum)]:
+for name, k in [("alu", alu), ("xorshift", xorshift), ("call", call), ("call_indirect", call_indirect),
+                ("mem", mem), ("chase", chase), ("chase_rand", chase_rand), ("fnv", fnv), ("fma", fma), ("vadd", vadd)]:
     s = min_run(k, 1000); l = min_run(k, 201000)
     print(f"python,{name},{(l - s) / 200000.0:.4f}")
