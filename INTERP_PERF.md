@@ -530,8 +530,8 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               uninterrupted result and ends NORMAL. Cases: two clock reads (one value spilled across
               the suspend) and multiple live values spilled. Deferred: **multi-fiber** freeze/thaw
               (shadow-SP swap + freeze driver + fiber residue) and multi-vCPU.
-        - [~] **1c-7** — **multi-fiber** durability. The last functional gap: a durable run with live
-              fibers must keep the active shadow-SP word pointing at the *running* context's per-fiber
+        - [x] **1c-7** — **multi-fiber** durability (the last functional gap closed). A durable run with
+              live fibers keeps the active shadow-SP word pointing at the *running* context's per-fiber
               shadow region (root = context 0, fiber registry slot `s` = context `s+1`), so a freeze
               that fires while a fiber runs spills into that fiber's own region, never a sibling's.
             - [x] **commit 1** — the per-fiber **shadow-SP swap** (DURABILITY.md §12.8, D-fiber-cont
@@ -548,10 +548,27 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
                   root that probes, runs two fibers that each probe then suspend, and probes again,
                   asserting the four probes route root→A→B→root to distinct region bases — matching the
                   tree-walker; a non-durable run leaves the reserve untouched.
-            - [ ] **commit 2** — the **freeze driver** (drive each idle/parked fiber under `UNWINDING`
-                  to flatten it into its region + record its residue) + **thaw seeding** (rebuild
-                  Pending fibers from the artifact's residue) + relax the guard for non-NORMAL, proven
-                  by a multi-fiber freeze/thaw byte-identical harness vs the tree-walker.
+            - [x] **commit 2** — the **freeze driver** + **thaw seeding** + guard relaxation. After the
+                  root runs to completion under `UNWINDING`, `freeze_drive` flattens every still-`Parked`
+                  fiber (ascending slot) into *its own* region: it points the active shadow-SP at the
+                  fiber's region base, delivers a placeholder resume value, and re-drives the parked `Vm`
+                  as a single-frame `VTask` (`active_id == ROOT_FIBER`) — the transform's poll fires
+                  immediately after the `suspend`, so the fiber unwinds with zero forward progress and
+                  returns; its flattened shadow-SP is saved and a `super::FrozenFiber` (slot, resolved
+                  entry func, sp, shadow_sp, generation 0 — bytecode never recycles a slot) is recorded
+                  into `host.frozen_fibers` for the snapshot. A new `fiber_meta` table (parallel to the
+                  registry) carries each fiber's `(resolved func, sp)` past the point its `Pending`
+                  fields are gone. **Thaw seeding**: a `REWINDING` run takes `host.frozen_fibers` before
+                  the loop and re-creates each as a `Pending` fiber (dense from slot 0) with its saved
+                  shadow-SP back in `fiber_sp`, so the root's re-issued `cont.resume` names the same
+                  handles and the swap re-points correctly. The durable entry guard now admits `cont.*`
+                  in **any** state (NORMAL / UNWINDING / REWINDING); only `thread.*` (multi-vCPU durable)
+                  still falls back. New harness `bytecode_durable_fibers_freeze.rs` (the bytecode mirror
+                  of `durable_fibers_jit.rs`) freezes one- and two-parked-fiber modules vs the
+                  tree-walker: NORMAL agrees; the UNWINDING freeze yields a **byte-identical** window
+                  snapshot (each fiber's flattened region) *and* §12 artifact (incl. the Section-2 fiber
+                  residue); restore+re-freeze is byte-identical; and the REWINDING thaw (fibers
+                  re-seeded) reproduces the result and ends NORMAL.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
   - [x] Lock-free `check_prot` fast path (`prot_dirty` flag) + `read_le`/`write_le` `has_regions`
         hoist. Tree-walker memory kernel ~176 → ~147 ns (~17%); all oracle suites byte-identical.

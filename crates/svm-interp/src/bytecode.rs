@@ -1219,29 +1219,11 @@ pub fn compile_and_run_capture_reserved_with_host(
     if threadish {
         return None;
     }
-    // `cont.*` durability needs the per-fiber shadow-SP swap (commit 1, now wired) plus, for a
-    // freeze/thaw, the freeze driver that flattens idle fibers + thaw seeding (DURABILITY.md §12.8).
-    // The shadow-SP swap is live, so a **NORMAL** multi-fiber run (no transform-driven unwind/rewind in
-    // flight) routes correctly and is safe to drive here; refuse `cont.*` only when the window is mid
-    // freeze/thaw (state ≠ NORMAL), where the freeze driver — a later commit — is required.
-    let contish = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
-            )
-        })
-    });
-    if contish {
-        let off = super::STATE_OFF as usize;
-        let state = init_mem
-            .get(off..off + 4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .unwrap_or(super::STATE_NORMAL);
-        if state != super::STATE_NORMAL {
-            return None;
-        }
-    }
+    // `cont.*` durability is fully supported (DURABILITY.md §12.8): the per-fiber shadow-SP swap keeps
+    // the active word on the running context (so a freeze poll spills into the right region), the freeze
+    // driver flattens idle parked fibers into their regions, and thaw seeding re-creates them from the
+    // artifact residue. So a single-vCPU `cont.*` module is driven here in any window state (NORMAL /
+    // UNWINDING freeze / REWINDING thaw); only multi-vCPU `thread.*` (above) still falls back.
     let c = compile_module(&m.funcs)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
@@ -1491,8 +1473,9 @@ enum Outcome {
     },
 }
 
-/// A §12 fiber's state in the driver's per-vCPU registry (handle = index). Non-durable only — a
-/// durable run falls back to the tree-walker (`run_with_host_fast` gates on `!host.is_durable()`).
+/// A §12 fiber's state in the driver's per-vCPU registry (handle = index). A durable run maintains the
+/// per-context shadow-SP swap ([`shadow_switch`]) and, on freeze, flattens each `Parked` fiber into its
+/// shadow region ([`freeze_drive`]); on thaw a flattened fiber is re-seeded as `Pending`.
 enum FiberState {
     /// Created by `cont.new` but never resumed: starts by calling `funcref(sp, arg)`.
     Pending { funcref: i32, sp: i64 },
@@ -1573,6 +1556,91 @@ fn shadow_switch(
         fiber_sp[in_ctx]
     };
     m.durable_set_sp(in_sp);
+}
+
+/// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4) — the bytecode mirror of the tree-walker's
+/// `VCpu::freeze_drive`. Called once the root has run to completion under `UNWINDING` (its native
+/// stack drained into context 0's shadow region): flatten every still-**parked** fiber into *its own*
+/// region so the window snapshot captures it, and return the host-side residue (a [`FrozenFiber`] per
+/// flattened fiber) the snapshot records and a thaw re-seeds.
+///
+/// Each parked fiber is resumed under `UNWINDING` like a standalone root run — a fresh single-frame
+/// [`VTask`] whose active `Vm` is the parked continuation with `active_id == ROOT_FIBER` (so its
+/// base-frame return ends the sub-run), the active shadow-SP pointed at the fiber's region base, and a
+/// placeholder resume value delivered (mimicking `cont.resume`, so the post-suspend continuation is
+/// well-formed). The transform places the poll **immediately** after the `suspend`, so the poll fires
+/// before any guest code runs: the fiber unwinds with **zero forward progress** and returns. Its
+/// flattened shadow-SP extent is saved (into `fiber_sp`, for the snapshot) and recorded in the
+/// `FrozenFiber`. The active shadow-SP is left at the **root's** region on return, so the captured
+/// window is thaw-ready (the root rewinds first; each fiber's own SP travels in its `FrozenFiber`).
+///
+/// `generation` is always 0: the bytecode engine is cooperative single-threaded and never recycles a
+/// fiber slot, so handles equal slots (matching a non-recycled tree-walker run).
+fn freeze_drive(
+    fibers: &mut Vec<FiberState>,
+    fiber_sp: &mut Vec<u64>,
+    fiber_meta: &mut Vec<(i32, i64)>,
+    dom: &Domain,
+    ctx: &mut RunCtx,
+    budget: u64,
+) -> Result<Vec<super::FrozenFiber>, Trap> {
+    // The root's post-unwind SP (context 0); restored at the end so the window is thaw-ready.
+    let root_sp = ctx
+        .mem
+        .as_ref()
+        .map(|m| m.durable_get_sp())
+        .unwrap_or(super::SHADOW_BASE);
+    let mut frozen = Vec::new();
+    // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
+    // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
+    for slot in 0..fibers.len() {
+        let (vm, suspend_dst) = match std::mem::replace(&mut fibers[slot], FiberState::Done) {
+            FiberState::Parked { vm, suspend_dst } => (vm, suspend_dst),
+            other => {
+                fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
+                continue;
+            }
+        };
+        let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
+        // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
+        if let Some(m) = ctx.mem.as_mut() {
+            m.durable_set_sp(super::shadow_region_base(slot + 1));
+        }
+        let mut vm = vm;
+        vm.set(suspend_dst, Reg::from_i64(0)); // placeholder resume value (inert; the thaw redelivers)
+        // Drive the fiber to its base return under `UNWINDING` (zero forward progress: the poll fires
+        // immediately). `step_vcpu` runs the active `Vm` to completion in one call, and the unwind does
+        // no fiber/thread ops, so the run-shared registries are untouched and the only stop is `Done`.
+        let mut sub = VTask {
+            active: vm,
+            active_id: ROOT_FIBER,
+            chain: Vec::new(),
+            coroutines: Vec::new(),
+            root_shadow_sp: root_sp,
+        };
+        match step_vcpu(&mut sub, fibers, fiber_sp, fiber_meta, dom, ctx, budget)? {
+            VcpuStop::Done(_) => {}
+            _ => return Err(Trap::FiberFault), // a freeze unwind never spawns / instantiates / blocks
+        }
+        let shadow_sp = ctx
+            .mem
+            .as_ref()
+            .map(|m| m.durable_get_sp())
+            .unwrap_or(super::SHADOW_BASE);
+        fiber_sp[slot] = shadow_sp;
+        frozen.push(super::FrozenFiber {
+            slot,
+            func,
+            sp,
+            shadow_sp,
+            generation: 0,
+        });
+    }
+    // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
+    if let Some(m) = ctx.mem.as_mut() {
+        m.durable_set_sp(root_sp);
+    }
+    Ok(frozen)
 }
 
 /// A §14 coroutine child: its own `Vm` continuation over a **confined** window (`nested_view`) and a
@@ -1848,6 +1916,7 @@ fn step_vcpu(
     vt: &mut VTask,
     fibers: &mut Vec<FiberState>,
     fiber_sp: &mut Vec<u64>,
+    fiber_meta: &mut Vec<(i32, i64)>,
     dom: &Domain,
     ctx: &mut RunCtx,
     budget: u64,
@@ -1896,6 +1965,12 @@ fn step_vcpu(
                 // starts at its region base (empty shadow stack) — so a later switch into it points
                 // the active word there (DURABILITY.md §12.8).
                 fiber_sp.push(super::shadow_region_base(h as usize + 1));
+                // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
+                // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
+                // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
+                // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
+                let func_idx = (funcref as u32 as usize & dom.mods[0].table_mask) as i32;
+                fiber_meta.push((func_idx, sp));
                 vt.active.set(dst, Reg::from_i32(h));
             }
             Outcome::ContResume { kh, arg, dst } => {
@@ -2322,12 +2397,71 @@ fn drive(
     // DURABILITY.md §12.8: each fiber's saved durable shadow-SP (run-shared, parallel to `fibers`;
     // slot `s` is shadow context `s + 1`). Inert on a non-durable run.
     let mut fiber_sp: Vec<u64> = Vec::new();
+    // Freeze residue (DURABILITY.md §12.8): each fiber's `(resolved entry func index, data-stack base)`
+    // — what a [`super::FrozenFiber`] needs after the fiber parks (when its `Pending` `funcref`/`sp` are
+    // gone). Parallel to `fibers`. Inert on a non-durable run.
+    let mut fiber_meta: Vec<(i32, i64)> = Vec::new();
+    // Thaw seeding (DURABILITY.md §12.8 slice 3.1.5): a `REWINDING` run re-creates the fibers a freeze
+    // flattened *before* the root re-enters, so the root's re-issued `cont.resume` names the same dense
+    // handles (0, 1, …) and each fiber's saved shadow-SP is back in `fiber_sp` for the swap to re-point
+    // to. Taken (cleared) from the host; empty for a freeze or ordinary run.
+    {
+        let mut seed = std::mem::take(&mut host.frozen_fibers);
+        seed.sort_by_key(|f| f.slot);
+        for (expected, ff) in seed.into_iter().enumerate() {
+            debug_assert_eq!(
+                expected,
+                fibers.len(),
+                "frozen fibers re-seed densely from slot 0"
+            );
+            debug_assert_eq!(
+                ff.slot,
+                fibers.len(),
+                "re-seeded slot matches the recorded handle"
+            );
+            fibers.push(FiberState::Pending {
+                funcref: ff.func,
+                sp: ff.sp,
+            });
+            fiber_sp.push(ff.shadow_sp);
+            fiber_meta.push((ff.func, ff.sp));
+        }
+    }
     let mut clock: u64 = 0;
 
     loop {
         // The root's result is the run's result (other vCPUs' effects are already reflected in it).
         if let TaskState::Done(res) = &tasks[0].state {
-            return res.clone();
+            let res = res.clone();
+            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING` has
+            // drained the root's native stack into context 0's region; now flatten the still-parked
+            // fibers into theirs, while the registry is alive, before the window is snapshotted. A drive
+            // trap (out-of-scope fiber) surfaces as the run's result. `cont.*` durability is single-vCPU
+            // (the entry guard refuses `thread.*`), so only the root task owns fibers.
+            if res.is_ok()
+                && host.is_durable()
+                && mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
+            {
+                let mut ctx = RunCtx {
+                    table: &dom.table,
+                    fuel: &mut *fuel,
+                    mem: &mut *mem,
+                    durable: true,
+                    host: &mut *host,
+                };
+                match freeze_drive(
+                    &mut fibers,
+                    &mut fiber_sp,
+                    &mut fiber_meta,
+                    &dom,
+                    &mut ctx,
+                    budget,
+                ) {
+                    Ok(frozen) => host.frozen_fibers = frozen,
+                    Err(t) => return Err(t),
+                }
+            }
+            return res;
         }
         let Some(ti) = tasks
             .iter()
@@ -2384,6 +2518,7 @@ fn drive(
             &mut tasks[ti].vt,
             &mut fibers,
             &mut fiber_sp,
+            &mut fiber_meta,
             &dom,
             &mut ctx,
             budget,
