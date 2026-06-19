@@ -665,6 +665,8 @@ mirrors the chibicc lowering exactly:
 - **§12 threads** — `__vm_thread_spawn` (a *direct* funcref → the static `thread.spawn` funcidx) /
   `__vm_thread_join`; **atomics** — `__vm_atomic_{add,load,store}`(`32`)/`cas32` → the `iN.atomic.*`
   ops (seq-cst); **futex** — `__vm_wait32`/`__vm_notify` → `i32.atomic.wait`/`atomic.notify`.
+- **§12 per-vCPU TLS** — `__vm_vcpu_tls_get()` / `__vm_vcpu_tls_set(x)` → `vcpu.tls.get`/`vcpu.tls.set`
+  (the current vCPU's i64 register, seeded to the dense vCPU id — so `get` doubles as `vcpu.id`).
 - **§GC** — `__vm_gc_roots(lo, hi, mask, buf, cap)` → `gc.roots` (conservative root enumeration; `mask`
   is the §GC tagged-pointer payload mask, top-byte-strip only — pass `~0UL` for untagged).
 - **§7 reflection** — `__vm_cap(i)` reads the handle stash (`i32.load` at `i*4`); `__vm_cap_count`/

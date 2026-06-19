@@ -1376,6 +1376,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::ConstV128(_)
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
+        | Inst::VcpuTlsGet
         | Inst::AtomicFence { .. }
         | Inst::SimdWidthBytes => {}
 
@@ -1393,6 +1394,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::AtomicLoad { addr: a, .. }
         | Inst::V128Load { addr: a, .. }
         | Inst::CapSelfGet { idx: a }
+        | Inst::VcpuTlsSet { val: a }
         | Inst::Suspend { value: a }
         | Inst::ThreadJoin { handle: a }
         | Inst::Splat { a, .. }

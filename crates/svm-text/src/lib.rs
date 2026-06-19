@@ -385,6 +385,8 @@ fn print_inst(inst: &Inst) -> String {
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => "cap.self.count".to_string(),
         Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
+        Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
+        Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
@@ -1683,6 +1685,14 @@ impl<'a> Parser<'a> {
         if op == "cap.self.get" {
             let idx = self.value(names)?;
             return Ok(Inst::CapSelfGet { idx });
+        }
+        // §12 per-vCPU TLS register.
+        if op == "vcpu.tls.get" {
+            return Ok(Inst::VcpuTlsGet);
+        }
+        if op == "vcpu.tls.set" {
+            let val = self.value(names)?;
+            return Ok(Inst::VcpuTlsSet { val });
         }
         if op == "call_indirect" {
             let params = self.parse_type_list()?;

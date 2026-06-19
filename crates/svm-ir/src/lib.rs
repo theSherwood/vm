@@ -1710,6 +1710,22 @@ pub enum Inst {
     CapSelfGet {
         idx: ValIdx,
     },
+    /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
+    /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
+    /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
+    /// resumable fiber) `get` returns the *new* vCPU's word — the correct per-CPU value, which the
+    /// guest cannot otherwise name (the `thread.spawn` handle is the parent's view, not "which vCPU am
+    /// I on now"). Seeded at vCPU creation to a **dense id** (root = 0, children sequential in spawn
+    /// order), so before any `set` it doubles as a `vcpu.id`; the guest may overwrite it (e.g. a
+    /// pointer to its per-CPU block) for full thread-local storage. Authority-neutral, ambient (the
+    /// `cap.self`/`gc.roots` family). Result is `i64`. (Determinism: program *output* must not depend
+    /// on *which* vCPU runs you, only on per-CPU state being self-consistent — GC.md §3.2.)
+    VcpuTlsGet,
+    /// §12 per-vCPU **thread-local register** write (`vcpu.tls.set`): set the executing vCPU's `i64`
+    /// TLS word to `val`. No result (like `store`). See [`Inst::VcpuTlsGet`].
+    VcpuTlsSet {
+        val: ValIdx,
+    },
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
     /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
     /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
@@ -2083,7 +2099,10 @@ impl Inst {
             Inst::Store { .. }
             | Inst::AtomicStore { .. }
             | Inst::AtomicFence { .. }
+            | Inst::VcpuTlsSet { .. }
             | Inst::V128Store { .. } => 0,
+            // `vcpu.tls.get` appends one `i64`.
+            Inst::VcpuTlsGet => 1,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
             // `cap.self.get` appends `(handle, type_id)`; `cap.self.count` appends one `i32`.

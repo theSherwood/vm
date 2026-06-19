@@ -1525,6 +1525,35 @@ int f(void) {
     }
 }
 
+// ---- §12 per-vCPU TLS register: `__vm_vcpu_tls_get` / `__vm_vcpu_tls_set` -----------------------
+
+/// The per-vCPU TLS register lowers from the `<svm.h>` builtins and round-trips a written value:
+/// `__vm_vcpu_tls_set(99)` then `__vm_vcpu_tls_get()` returns 99 (the root vCPU is seeded to 0, then
+/// overwritten). Asserts the ops lowered and ran on the interpreter.
+#[test]
+#[cfg(unix)]
+fn vm_vcpu_tls_round_trip() {
+    let src = r#"
+long __vm_vcpu_tls_get(void);
+void __vm_vcpu_tls_set(long x);
+int f(void) {
+  __vm_vcpu_tls_set(99);
+  return (int)__vm_vcpu_tls_get();   /* the value we just set */
+}
+"#;
+    let Some((m, _)) = translate_verified("vm_vcpu_tls", src) else {
+        return;
+    };
+    assert!(
+        module_has_inst(&m, |i| matches!(i, svm_ir::Inst::VcpuTlsGet))
+            && module_has_inst(&m, |i| matches!(i, svm_ir::Inst::VcpuTlsSet { .. })),
+        "expected vcpu.tls.get + vcpu.tls.set instructions"
+    );
+    if let Some(r) = run_interp("vm_vcpu_tls", src, &[]) {
+        assert_eq!(r, vec![Value::I32(99)], "vcpu.tls round-trip");
+    }
+}
+
 // ---- Separate-artifact on-ramp: the export map + the `svm-llvm-translate` CLI ------------------
 
 /// A hand-written caller that resolves `twice` **by name**, used to prove the export map links:
