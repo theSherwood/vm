@@ -3813,13 +3813,16 @@ fn table_init_op(lo: &mut Lower, elem_index: u32) -> Result<(), Error> {
             ))
         })?;
     let (src, count) = (src as usize, count as usize);
-    let funcs = match src.checked_add(count).filter(|&e| e <= seg.len()) {
-        Some(end) => seg[src..end].to_vec(), // clone to release the borrow on `lo`
-        None => return Err(Error::Parse(format!(
-            "table.init source [{src}, {src}+{count}) is out of segment {elem_index}'s {} entries",
-            seg.len()
-        ))),
-    };
+    let end = src
+        .checked_add(count)
+        .filter(|&e| e <= seg.len())
+        .ok_or_else(|| {
+            Error::Parse(format!(
+                "table.init source [{src}, {src}+{count}) is out of segment {elem_index}'s {} entries",
+                seg.len()
+            ))
+        })?;
+    let funcs = seg[src..end].to_vec(); // clone to release the borrow on `lo`
     let base = lo.table_base;
     let dest = table_byte_addr(lo, dest_idx, base); // absolute address of slot `dest_idx`
     for (k, &f) in funcs.iter().enumerate() {
