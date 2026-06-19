@@ -45,6 +45,13 @@ it is dropped once the actionable slices (1–2 below) close.
   multi-function residual that bounds code growth and specializes **dynamic-depth recursion** (a
   finite self-recursive residual where inlining would diverge). Requires no rename region.
 - **AOT pipeline** (`tests/aot.rs`).
+- **End-to-end demo on a real interpreter** (`crates/svm-llvm/tests/peval_demo.rs`): a Brainfuck
+  interpreter **written in C**, compiled `clang -O2 → LLVM → svm-llvm → svm-IR`, then specialized
+  against a fixed BF program (the program is a runtime pointer clang can't fold, declared constant to
+  the specializer — weval's real use case). The generic 21-block interpreter folds to a **5-block**
+  compiled program (1484 → 176 bytes, 8.4× smaller); on a 2M-iteration workload the same-backend
+  specialization win is **~16× (JIT)** and the end-to-end interpreted→compiled-native is **~1600×**.
+  Proves the projection on frontend-emitted IR, not just hand-written toy interpreters.
 - **Benchmarking** (`tests/bench.rs`): `size_corpus` (a normal test, also a size-regression guard)
   reports blocks / insts / encoded `.svmb` bytes for interpreter → residual → optimized across four
   shapes (register machine: constant / straight-line / runtime-loop, plus a renamed stack machine) —
