@@ -1141,6 +1141,74 @@ phases, both worth doing:
 6. **SQLite Phase B (disk via a powerbox `File`/`Storage` capability + guest VFS shim)** — the
    capability-story capstone: real durable I/O under zero ambient authority.
 
+### Stretch goal — self-hosting: LLVM in the sandbox
+
+The moonshot beyond SQLite: run **LLVM itself** as an SVM guest. Not because LLVM "happens to run,"
+but because it closes a **self-hosting, capability-secured toolchain** loop — the sandbox hosting its
+own means of production. With LLVM in-guest and the existing §22 `Jit` capability (a guest emits SVM IR
+→ the host Cranelift-compiles it), the whole pipeline runs *inside the sandbox*:
+
+```
+C/C++/Rust source → clang/LLVM (in-guest) → LLVM IR
+                  → svm-llvm translator (in-guest) → SVM IR
+                  → Jit capability → native code
+```
+
+and the translator is itself Rust (which compiles Rust→LLVM→SVM), so the chain is self-hostable end to
+end. The payoff: a compiler-as-a-sandboxed-service, reproducible builds in a box, untrusted code that
+can compile *and* run other untrusted code with **zero ambient authority**. SQLite proves "a real
+program with real I/O under capabilities"; LLVM proves "the sandbox can host its own toolchain."
+
+**Scoping insight — the backend is (mostly) already ours.** "Run LLVM" is not one thing, and the
+single largest/ugliest part of LLVM — the **target backends + MC layer** (SelectionDAG/GlobalISel,
+object emission) — is **out of scope**: SVM already has a backend in the `Jit` capability. The target
+is LLVM's **front + middle end** (IR data structures, the bitcode reader, the verifier, the `opt` pass
+pipeline), lowering to SVM IR and handing it to `Jit`. That deletes roughly the hardest third of LLVM.
+Slices, smallest meaningful first (do **not** aim at clang first):
+1. **libLLVMCore in isolation** — a program that builds an IR `Module` in memory, runs the
+   **verifier**, and prints it. The "hello world of embedding LLVM," dramatically smaller than clang,
+   and already proves the thesis.
+2. **`llvm-as` / `llvm-dis`** — bitcode ↔ text round-trip.
+3. **`opt` with a few passes** — guest-side optimization.
+4. *(moonshots)* **`llc`** (if a non-`Jit` codegen path is ever wanted), then **clang** (C/C++ front
+   end — millions of lines: the driver, preprocessor, AST, Sema, CodeGen).
+
+**In our favor (de-risks it):**
+- **LLVM builds `-fno-exceptions -fno-rtti` by default** (`LLVM_ENABLE_EH/RTTI` off) — it lands on the
+  exact C++ subset slice AG proved (classes, vtables, templates→monomorphized, global ctors). The
+  on-ramp has *no* EH path, and LLVM needs none.
+- **The window reserves `1 << 40` (1 TiB), lazily paged** (`DEFAULT_RESERVED_LOG2`) — address-space
+  scale is not the blocker; the heap grows to gigabytes through the `Memory` cap.
+- **APFloat** is LLVM's own arbitrary-precision float — self-contained, no libm dependency for the hard
+  numerics.
+- **Templates monomorphize + global ctors run** (slice AG) — both heavily used (cl::opt registration,
+  ManagedStatic).
+
+**The real mountains (honest list):**
+1. **The libc++ + libc surface — the dominant cost.** LLVM exercises a *huge* slice of the C++ standard
+   library + syscalls (`std::vector`/`map`/`string`, `DenseMap`, `<algorithm>`, `std::error_code`,
+   `mmap`, file I/O, `getpagesize`, time, `errno`). Most of libc++ is header-only templates (fine), but
+   the non-header parts + the syscall floor need a real port. This is gating infrastructure — and it is
+   **independently valuable**, because it is what *any* large C++ program needs (so growing C++/stdlib
+   breadth is the honest first rung, see the ladder above).
+2. **C++ `thread_local` / TLS** — `@llvm.threadlocal.address` / `.tdata`/`.tbss` is **not lowered yet**
+   (the existing `__vm_vcpu_tls` is a different, SVM-specific per-vCPU register). LLVM uses
+   `thread_local` for errno/ManagedStatic — a genuinely new feature to build.
+3. **File I/O capability** — LLVM reads/writes files: the **same** powerbox `File`/`Storage` capability
+   SQLite Phase B needs. Shared prerequisite, not extra.
+4. **Translate-time scale** — the `svm-llvm` translator is demo-sized today; a multi-hundred-MB bitcode
+   module is a different regime (translator memory + throughput). Needs measurement, possibly streaming.
+5. **Stragglers** — `%f`/`%g` exact-decimal formatting (textual IR output), a few inline-asm spots
+   (mostly avoidable), possibly computed-goto in clang's lexer (the `indirectbr` work above).
+
+**Why it sequences after SQLite (not a detour).** SQLite and LLVM share their three biggest
+prerequisites — the **File/Storage capability**, **float formatting**, and **large-program scaling** —
+so SQLite is squarely on the critical path. The one LLVM-specific track SQLite does *not* exercise is
+**big C++ + a real chunk of the standard library**; that is the first rung toward LLVM and is worth
+pushing in parallel (a substantial real C++ library through the on-ramp). Sequence:
+**SQLite (shared infra) ∥ grow C++/stdlib breadth → libLLVMCore build-verify-print → llvm-as/opt →
+moonshot llc/clang.**
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
