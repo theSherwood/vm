@@ -1057,9 +1057,15 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   bytecode interpreter dispatch on it. Lowering it (a jump table over `blockaddress` operands → an
   SVM `br_table`, with address-taken blocks assigned dense labels) unlocks the entire interpreter
   category at once. **Highest-leverage single feature.**
-- **`setjmp` / `longjmp`** — **not handled** (deferred-hard, §8). Lua's error model, many parsers.
-  Lowers onto the §6 stack-switching machinery (same substrate as C++ EH). A real program is what
-  justifies building it.
+- **`setjmp`/`longjmp` + C++ EH — a planned substrate (promoted from deferred-hard).** Both lower onto
+  the §6 stack-switching / `cont.*` fiber machinery SVM **already has** (save a stack position; transfer
+  control). Build them in order: **(1) `setjmp`/`longjmp` first** — the minimal form (save SP+callee
+  state at `setjmp`; restore-and-jump at `longjmp`; no cleanup, no type matching) — which is ~80% of the
+  substrate; **(2) EH on top** (`invoke`/`landingpad`/`resume` add cleanup-running + catch-type-matching
+  + unwind tables, reusing the same stack-transfer core). Drivers: **Postgres** (`--single`) is *all*
+  `sigsetjmp`/`siglongjmp` (the `PG_TRY()`/`ereport()` error model), and Lua's error model is `longjmp`
+  too; EH unblocks "real" (throwing) C++ (e.g. Kakoune) and is the §18 open item. This is on the
+  critical path, not speculative — see *Candidate targets* and the ladder.
 - **`%f` / `%g` / `%e` float formatting** — deliberately **fail-closed** (LLVM.md printf notes): an
   `f64`-arithmetic approximation diverges from glibc at the rounding boundary; matching byte-for-byte
   needs a **correctly-rounded exact-decimal (Ryū / Dragon4, big-integer)** formatter. SQLite,
@@ -1115,31 +1121,98 @@ phases, both worth doing:
 - **Byte-exact, zero-OS-surface known-answer suites (cheapest high-confidence wins — start here):**
   - **Monocypher** or **fiat-crypto** — modern crypto (ChaCha20/Blake2/X25519/Ed25519) with built-in
     **KAT vectors**; brutal on 64-bit/carry arithmetic + constant-time bit-twiddling. Extends the
-    existing sha256/crc32/xxhash family, no OS surface at all.
+    existing sha256/crc32/xxhash family, no OS surface at all. (A TLS stack — **BearSSL/mbedTLS** as
+    guest code, handshake vs vectors — fits here too, and is the bring-your-own TLS `curl` needs.)
   - **stb_image** decoding an **embedded** PNG/JPEG → assert exact pixel bytes (real parser + integer
     math, inputs compiled in).
   - **zlib/miniz full roundtrip** (have `tinfl` inflate; add deflate→inflate identity).
-- **Deterministic numeric / search (cheap codegen & control-flow bug finders):**
+- **Deterministic compute / search (cheap codegen & control-flow bug finders, high "wow"):**
   - **A chess `perft`** (micro-Max or a clean perft) — known-answer node counts; recursion + arrays +
     heavy branching. Tiny, catches control-flow/codegen regressions fast.
+  - **A SAT/SMT solver — CaDiCaL / MiniSat (C++)** — pure compute, zero OS surface, and self-validating
+    in the strongest sense: SAT/UNSAT with **machine-checkable DRAT UNSAT proofs**. "An SMT-class solver
+    runs sandboxed" is impressive and trivially hermetic.
+  - **Stockfish (C++)** — `bench` is a reproducible node count + perft is known-answer; compute-bound,
+    threads + NNUE (int8 SIMD — exercises the vector lanes), and a crowd-pleaser.
+  - **FFmpeg, decode-only / in-memory** — codec cores are pure compute, SIMD-heavy, and the **FATE**
+    suite is an enormous byte-exact corpus (decode an embedded clip, hash frames).
+  - **TinyCC (TCC)** — a C compiler in C that compiles-and-runs; a small self-validating step toward the
+    LLVM self-hosting dream (below).
   - **musl `libm` vs its test vectors** — IEEE edge cases; pairs with the `%f`/`%g` formatter work.
+- **Real applications with a narrow I/O waist (each *drives a capability* — the capability-story
+  proofs):**
+  - **SQLite** (the north star, above) — the read/write **VFS** waist → a `File`/`Storage` capability.
+  - **libmdbx** (embedded mmap'd B-tree KV store; the hardened LMDB successor) — no server, no network,
+    but its data plane **is the memory-mapping itself** (readers read straight from the mmap). Drives a
+    distinct **file-backed-mmap** capability ("map this file region into the window"), close to the
+    existing AddressSpace/SharedRegion machinery — a *different* storage shape from SQLite's read/write
+    VFS, so the two pair to prove both. Has a brutal torture-test suite; likely *easier* than Postgres
+    (no setjmp, no server).
+  - **Postgres — `--single` (single-user backend), not the multi-process server.** The postmaster
+    (fork-per-connection + SysV shmem + signals + a listening socket) is OS surface (category 3); but
+    `postgres --single` is one process reading SQL on stdin, collapsing to: the **File** capability (the
+    data dir) + **`sigsetjmp`/`siglongjmp`** (its whole `PG_TRY()`/`ereport()` error model). The program
+    that *justifies* the setjmp substrate; "SQLite Phase B at 100×." Self-validating via `pg_regress`.
+  - **curl / local git** — both drive the **network** frontier. curl *is* the network (category 3) but
+    is exactly what a capability is for: controlled, auditable **egress**. Needs a new **socket/connect
+    capability** (security-sensitive, high narrative value) + bring-your-own TLS (above); its pluggable
+    socket hooks (`CURLOPT_OPENSOCKETFUNCTION`/multi) wire cleanly to a cap. **git/libgit2** splits:
+    local object-store/packfile/diff/merge is File-cap only (zlib + SHA-1/256 + diff, self-validating
+    against a fixture repo); network clone wants the same socket cap.
 - **The "wow" milestone (later):** **Doom** (shareware) — fixed-point-heavy real app; needs a stubbed
   framebuffer + an in-memory WAD, but "Doom runs sandboxed through the LLVM on-ramp" is a strong
-  external signal.
+  external signal. (Graphical apps proper ride the **WebGPU capability** — its own section below.)
 - **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust
   crate (`regex`/`ryu`/`serde_json` `no_std`), a Zig program, a Swift `-enable-experimental-feature
   Embedded` TU — each is "another frontend, no translator change beyond what the corpus proved."
 
-### Suggested ladder (cheap momentum → the capstone)
+### Suggested ladder (cheap momentum → the capstones)
 1. **Monocypher KAT** + **stb_image decode** — zero-OS, byte-exact; widen the corpus and shake out
-   64-bit/parser bugs fast.
-2. **A chess `perft`** — cheap control-flow/recursion stressor.
-3. **`indirectbr` / `blockaddress` (computed goto)** — the unlock for every bytecode interpreter; drive
-   it with **Lua** (which also forces `setjmp`/`longjmp`).
-4. **`%f` / `%g` float formatting** (Ryū/Dragon4) — needed by SQLite and broadly.
-5. **SQLite Phase A (in-memory)** — the SQL-engine capstone, now that goto + float-format are in.
-6. **SQLite Phase B (disk via a powerbox `File`/`Storage` capability + guest VFS shim)** — the
-   capability-story capstone: real durable I/O under zero ambient authority.
+   64-bit/parser bugs fast. (A SAT solver / `perft` slot in here too — pure compute, self-validating.)
+2. **`indirectbr` / `blockaddress` (computed goto)** — the unlock for every bytecode interpreter.
+3. **`setjmp`/`longjmp`** — the stack-transfer substrate; then **EH** on top (reuses it).
+4. **`%f` / `%g` float formatting** (Ryū/Dragon4) — needed by SQLite/Postgres and broadly.
+5. **SQLite Phase A (in-memory)** — the SQL-engine capstone (gated on goto + float-format).
+6. **The storage capability** → **SQLite Phase B** (read/write VFS) and **libmdbx** (file-backed mmap) —
+   two distinct storage shapes proving real durable I/O under zero ambient authority.
+7. **Postgres `--single`** — the setjmp + File-capability capstone ("SQLite Phase B at 100×").
+8. **The WebGPU capability** (its own section below) and **the network/egress capability** (curl/git) —
+   the remaining capability frontiers.
+
+### GPU via a WebGPU capability (graphical + compute)
+
+Graphical and GPU-compute software rides a **WebGPU capability** — and WebGPU is the *right* abstraction
+precisely because it was **designed for the browser sandbox**: it is already capability-shaped. No raw
+pointers, no arbitrary memory — everything is validated buffers/textures/bind-groups, shaders are
+**WGSL** (validated, no arbitrary memory access), and work is submitted as structured command buffers.
+Exposing raw Vulkan/Metal/CUDA would blow the TCB open; WebGPU is the *safe waist* other GPU APIs lack.
+Same thesis as the §22 `Jit` cap (§2a): **verification, not raw access, is the boundary** — and here
+WebGPU does the validation for you (guest-authored WGSL is safe by construction).
+
+**Architecture (mirrors the §9/§12 IoRing pattern).**
+- The host holds the real device — via **`wgpu`** (the Rust WebGPU implementation; fits the codebase).
+- The guest is granted a **WebGPU handle** in the powerbox stash (one more `grant_*` on `Host`, slotted
+  into `synth_start`'s contiguous prefix exactly like `IoRing`/`Blocking`/`Jit` — likely **no translator
+  change**). API calls (create buffer, write, create pipeline, dispatch/submit) cross the boundary as
+  **structured, validated commands**; the guest never holds a GPU pointer.
+- Only **data** flows back into the window (a compute buffer's contents, a texture's pixels). Async
+  readback (`mapAsync` / queue completion) maps onto the existing **IoRing/Blocking + M:N executor** —
+  GPU work is the same submit/validate/return-data shape as I/O.
+
+**Demos that prove safe access (headless first — the safety story is complete with no display):**
+1. **GPU compute → readback → assert vs CPU** *(the ideal first demo)* — a WGSL compute shader
+   (prefix-sum / matmul / N-body) over a guest-uploaded buffer, read back and checked against a CPU
+   reference. Proves the whole data plane (upload → dispatch → readback) + the validated-buffer model,
+   **with zero windowing**.
+2. **Offscreen render-to-texture → read pixels → hash** — "hello triangle" / a rotating cube to an
+   offscreen attachment, pixels compared to a reference image. Proves the render pipeline headlessly.
+3. **Compute image filter / Mandelbrot / a Shadertoy-style shader → PNG** (written via the File cap) —
+   visually compelling, deterministic, self-validating by pixel hash; a great screenshot artifact.
+4. **On-screen presentation (a `Surface`/swapchain capability) — defer.** Presenting to a host window is
+   the OS-coupled part and a later capability; the **safe-access** narrative is fully told headless.
+
+Riders: any C/C++/Rust app on **wgpu-native** or **Dawn** (the WebGPU C API) — learn-wgpu / WebGPU
+samples — plus `wgpu`'s own CTS as a (meta) conformance check.
 
 ### Stretch goal — self-hosting: LLVM in the sandbox
 
@@ -1245,15 +1318,14 @@ moonshot llc/clang.**
       uses `i64` for signed div/rem-by-constant, not `iN`).
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
-- [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
-      tables (the §18 open item). Lower onto §6 stack-switching; perf tax + ABI change. Low
-      ROI until a real workload needs it (mirrors `WASM.md`'s EH stance).
+- [ ] **`setjmp`/`longjmp` + C++ exceptions/unwinding — PROMOTED to planned substrate** (no longer
+      deferred). Both lower onto §6 stack-switching/`cont.*`; build `setjmp`/`longjmp` first (Postgres
+      `--single` / Lua force it), then EH (`invoke`/`landingpad`/`resume` + unwind tables, the §18 open
+      item) on the same core. Full plan + ordering + drivers in *Next frontier → Translator gaps*.
 - [ ] **Computed `goto` — `indirectbr` / `blockaddress`** — **not handled** (fail-closed). The
       linchpin for the interpreter category (SQLite VDBE, Lua, QuickJS): a `blockaddress` is an
       address-taken block's dense label and `indirectbr` a jump-table over it → an SVM `br_table`. See
       *Next frontier* — highest-leverage single feature; drive with Lua.
-- [ ] **`setjmp`/`longjmp`** — onto §6 stack-switching, same machinery as EH. Lua's error model forces
-      it (see *Next frontier*).
 - [ ] **SIMD** (`<N x T>` vectors) — a later pass mirroring §17/D58 `v128` (the proven
       5-step pattern `svm-wasm` used). Reject cleanly until then.
 - [ ] **Full intrinsic coverage** — expand the table in §4 as real programs demand.
