@@ -10308,6 +10308,14 @@ impl Host {
 /// interpreter memory bounded by what a (fuel-limited) run touches, so a huge declared window never
 /// eagerly allocates — safe to fuzz.
 fn host_page_size() -> u64 {
+    // wasm has no host MMU and no `mprotect`: linear-memory pages are a fixed 64 KiB, so report that
+    // (and avoid pulling the `page_size` crate into the wasm dependency graph). On native, query the
+    // real host page so interpreter and JIT agree page-for-page.
+    #[cfg(target_family = "wasm")]
+    {
+        65536
+    }
+    #[cfg(not(target_family = "wasm"))]
     match page_size::get() as u64 {
         0 => 4096,
         p => p,
@@ -10323,6 +10331,13 @@ fn host_page_size() -> u64 {
 /// works on every backend and the §13 differential stays in lockstep. `page_size::get_granularity`
 /// returns `dwAllocationGranularity` on Windows and the page size on unix.
 pub fn host_region_granularity() -> u64 {
+    // wasm: no separate allocation granularity (no `MapViewOfFile3`), so a region aligns to the same
+    // 64 KiB linear-memory page as the protection model.
+    #[cfg(target_family = "wasm")]
+    {
+        host_page_size()
+    }
+    #[cfg(not(target_family = "wasm"))]
     match page_size::get_granularity() as u64 {
         0 => host_page_size(),
         g => g,
