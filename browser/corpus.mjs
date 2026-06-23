@@ -83,6 +83,27 @@ for (const c of corpus.powerbox ?? []) {
   }
 }
 
+// ---- capture corpus: svm_run_capture (final memory image) vs native -------------------------
+for (const c of corpus.capture ?? []) {
+  const m = load(readFileSync(c.file));
+  const init = load(fromHex(c.init));
+  const got = ex.svm_run_capture(m.ptr, m.len, init.ptr, init.len, BigInt(c.arg));
+  const gotStatus = ex.svm_status();
+  const gotSnap = hex(readOut(ex.svm_snapshot_ptr, ex.svm_snapshot_len));
+  m.free(); init.free();
+  const okStatus = gotStatus === c.status;
+  const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
+  const okSnap = c.status !== 0 || gotSnap === c.snapshot; // final image only meaningful when OK
+  total++;
+  if (!(okStatus && okValue && okSnap)) {
+    fail++;
+    console.log(`  FAIL ${c.name}(${c.arg}): native {status:${c.status},value:${c.value},` +
+      `snap:${c.snapshot}} wasm {status:${gotStatus},value:${got},snap:${gotSnap}}`);
+  } else {
+    console.log(`  ${c.name}(${c.arg}): match (final image ${gotSnap.length / 2}B, value ${got})`);
+  }
+}
+
 // ---- alloc-ABI scale check: echo MEGABYTES of stdin → stdout (past the old 1 MiB cap) --------
 {
   const SIZE = 2 << 20; // 2 MiB, double the retired fixed-buffer cap

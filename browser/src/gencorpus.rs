@@ -11,7 +11,7 @@
 
 use std::io::Write;
 
-use svm_browser::powerbox_exec;
+use svm_browser::{capture_exec, powerbox_exec};
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -269,6 +269,33 @@ block0(v0: i32, v1: i32, v2: i32):
 }
 "#;
 
+// Memory-snapshot guest: the window is seeded with 16 little-endian i64 words; the guest adds `arg`
+// to each in place and returns word 0's new value. The captured final image (128 bytes) is the
+// interesting output — the "host hands in a buffer, guest transforms it in place" embedder shape.
+const CAP_ADDK: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  br block1(v0, v1)
+block1(v2: i64, v3: i64):
+  v4 = i64.const 128
+  v5 = i64.lt_u v3 v4
+  br_if v5 block2(v2, v3) block3()
+block2(v6: i64, v7: i64):
+  v8 = i64.load v7
+  v9 = i64.add v8 v6
+  i64.store v7 v9
+  v10 = i64.const 8
+  v11 = i64.add v7 v10
+  br block1(v6, v11)
+block3():
+  v12 = i64.const 0
+  v13 = i64.load v12
+  return v13
+}
+"#;
+
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -360,9 +387,35 @@ fn main() {
             if i + 1 == powerbox.len() { "\n" } else { ",\n" },
         ));
     }
+    // Capture corpus — a window seeded with 16 i64 words (word i = i*1000), the addk guest run for
+    // each arg; the captured final image is the ground truth.
+    json.push_str("],\n\"capture\":[\n");
+    let (cap_m, cap_file) = emit("cap_addk", CAP_ADDK);
+    let mut init = Vec::new();
+    for i in 0..16i64 {
+        init.extend_from_slice(&(i * 1000).to_le_bytes());
+    }
+    let cap_args: &[i64] = &[0, 42, -1];
+    for (k, &arg) in cap_args.iter().enumerate() {
+        let out = capture_exec(&cap_m, &init, arg);
+        json.push_str(&format!(
+            "  {{\"name\":\"cap_addk\",\"file\":\"{cap_file}\",\"init\":\"{}\",\"arg\":\"{arg}\",\
+             \"status\":{},\"value\":\"{}\",\"snapshot\":\"{}\"}}{}",
+            hex(&init),
+            out.status,
+            out.value,
+            hex(&out.snapshot),
+            if k + 1 == cap_args.len() { "\n" } else { ",\n" },
+        ));
+    }
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
-    eprintln!("wrote corpus.json ({} compute, {} powerbox)", compute.len(), powerbox.len());
+    eprintln!(
+        "wrote corpus.json ({} compute, {} powerbox, {} capture)",
+        compute.len(),
+        powerbox.len(),
+        cap_args.len()
+    );
 
     // Encode the guests validated by harnesses (not the deterministic corpus): the live-import guest
     // (`live.mjs`, host-backed) and the large-I/O echo guest (`corpus.mjs`'s alloc-ABI roundtrip).

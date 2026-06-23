@@ -361,6 +361,45 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
+/// Outcome of a [`capture_exec`] run: the status, the `i64`-widened return value (when `STATUS_OK`),
+/// and the **final window image** — the first `init.len()` bytes of the guest's memory after the run.
+pub struct CapOutcome {
+    pub status: i32,
+    pub value: i64,
+    pub snapshot: Vec<u8>,
+}
+
+/// Run `m`'s function 0 over a window seeded with `init` (deny-all `Host`), and capture the final
+/// window image. This is the "host hands in a buffer, the guest transforms it in place, the host
+/// reads it back" shape: [`bytecode::compile_and_run_capture`] snapshots the first `init.len()`
+/// bytes of memory after the run. Shared verbatim by the wasm [`svm_run_capture`] export and the
+/// native `gencorpus` ground truth, so the differential compares identical logic.
+pub fn capture_exec(m: &svm_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run_capture(m, 0, &[Value::I64(arg)], &mut fuel, init) {
+        None => CapOutcome {
+            status: STATUS_UNSUPPORTED,
+            value: 0,
+            snapshot: Vec::new(),
+        },
+        Some((r, snapshot)) => {
+            let (status, value) = match r {
+                Err(_) => (STATUS_TRAP, 0),
+                Ok(vals) => match vals.first() {
+                    Some(Value::I64(x)) => (STATUS_OK, *x),
+                    Some(Value::I32(x)) => (STATUS_OK, *x as i64),
+                    _ => (STATUS_BAD_RESULT, 0),
+                },
+            };
+            CapOutcome {
+                status,
+                value,
+                snapshot,
+            }
+        }
+    }
+}
+
 /// Captured stdout / stderr of the most recent [`svm_run_pb`], as cdylib-managed allocations
 /// `(ptr, len)`. Each is a leaked boxed slice (exact length, alignment 1) freed when the next
 /// [`svm_run_pb`] replaces it — so the host reads it via the `*_ptr`/`*_len` exports *before* the
@@ -368,6 +407,9 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
+/// Captured final window image of the most recent [`svm_run_capture`] (same cdylib-managed lifetime
+/// as `OUT`/`ERR`: valid until the next `svm_run_capture`).
+static mut SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 /// Replace the capture in `slot` with `data`, freeing the previous allocation. Empty `data` stores
 /// `(null, 0)`. The stored allocation is a boxed slice — exactly `len` bytes, alignment 1 — so it is
@@ -452,6 +494,51 @@ pub extern "C" fn svm_exit_code() -> i32 {
     unsafe { EXIT_CODE }
 }
 
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 (single `i64` `arg`, deny-all
+/// `Host`) over a window **seeded** with `[init_ptr, init_len)`, then capture the final window image
+/// (see [`capture_exec`]). Returns the guest's `i64` result; sets [`LAST_STATUS`]. The captured image
+/// (the first `init_len` bytes of memory after the run) is read via [`svm_snapshot_ptr`] /
+/// [`svm_snapshot_len`] and is cdylib-managed (valid until the next call; do not `svm_dealloc` it).
+#[no_mangle]
+pub extern "C" fn svm_run_capture(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    init_ptr: *const u8,
+    init_len: usize,
+    arg: i64,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let init: &[u8] = if init_ptr.is_null() || init_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(init_ptr, init_len) }
+    };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let out = capture_exec(&m, init, arg);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(SNAP), out.snapshot) };
+    out.value
+}
+
+/// Pointer / length of the captured final window image from the most recent [`svm_run_capture`].
+#[no_mangle]
+pub extern "C" fn svm_snapshot_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(SNAP)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_snapshot_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(SNAP)).1 }
+}
+
 /// Self-contained powerbox probe (no host buffers, so usable via `wasmtime --invoke run_powerbox`):
 /// run a greeting guest that writes 17 bytes to stdout, then an `exit(42)` guest, and return `17`
 /// iff both the captured stdout length **and** the exit code are correct on this target — i.e. the
@@ -489,6 +576,49 @@ block0(v0: i32, v1: i32, v2: i32):
     } else {
         -1
     }
+}
+
+/// Self-contained capture probe (seeds its own window, so usable via `wasmtime --invoke run_capture`):
+/// run an in-place "add `arg` to each i64 word" guest over a 16-word window whose word 0 is `1000`,
+/// with `arg = 7`, and return word 0 of the **captured final image** — `1007` iff seeding, the
+/// in-place writes, and the snapshot all work on this target. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_capture() -> i64 {
+    const ADDK: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  br block1(v0, v1)
+block1(v2: i64, v3: i64):
+  v4 = i64.const 128
+  v5 = i64.lt_u v3 v4
+  br_if v5 block2(v2, v3) block3()
+block2(v6: i64, v7: i64):
+  v8 = i64.load v7
+  v9 = i64.add v8 v6
+  i64.store v7 v9
+  v10 = i64.const 8
+  v11 = i64.add v7 v10
+  br block1(v6, v11)
+block3():
+  v12 = i64.const 0
+  v13 = i64.load v12
+  return v13
+}
+"#;
+    let Ok(m) = svm_text::parse_module(ADDK) else {
+        return -1;
+    };
+    // Seed 16 i64 words: word 0 = 1000, the rest 0.
+    let mut init = [0u8; 128];
+    init[..8].copy_from_slice(&1000i64.to_le_bytes());
+    let out = capture_exec(&m, &init, 7);
+    if out.status != STATUS_OK || out.snapshot.len() != 128 {
+        return -1;
+    }
+    // Word 0 of the captured image should be 1000 + 7 = 1007.
+    i64::from_le_bytes(out.snapshot[..8].try_into().unwrap())
 }
 
 // ---- live host imports: bind capabilities to real host functions ----------------------------
