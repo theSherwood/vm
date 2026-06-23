@@ -49,6 +49,15 @@ fn sizes(m: &Module) -> Sizes {
     }
 }
 
+/// Emit one machine-readable metric row when `SVM_BENCH_CSV` is set in the environment, as
+/// `CSV,<bench>,<case>,<metric>,<value>` on stdout (run with `--nocapture` and `grep '^CSV,'` to
+/// collect them). Off by default, so the human-readable tables are unchanged.
+fn csv(bench: &str, case: &str, metric: &str, value: f64) {
+    if std::env::var_os("SVM_BENCH_CSV").is_some() {
+        println!("CSV,{bench},{case},{metric},{value}");
+    }
+}
+
 // Register-machine bytecode, 9 bytes/instruction (opcode + little-endian i64 immediate).
 // Two i64 registers: `acc` and `i`. State also carries the runtime `input`.
 const HALT: u8 = 0; //          return acc
@@ -276,8 +285,20 @@ fn roi_futamura_loop() {
 
     let t_interp_interp = best_of(reps, || interp_run(&interp, n));
     let t_interp_resid = best_of(reps, || interp_run(&residual, n));
-    let t_jit_interp = best_of(reps, || jit_run(&interp, n));
-    let t_jit_resid = best_of(reps, || jit_run(&residual, n));
+    // Compile once, run many — so the JIT timings are run time, not compile+run (the previous
+    // `compile_and_run` per rep folded compilation into every measurement).
+    let mut ci = jit_compile(&interp);
+    let mut cr = jit_compile(&residual);
+    let t_jit_interp = best_of(reps, || jit_call(&mut ci, n));
+    let t_jit_resid = best_of(reps, || jit_call(&mut cr, n));
+    let t_cc_interp = best_of(reps, || {
+        black_box(jit_compile(&interp));
+        0
+    });
+    let t_cc_resid = best_of(reps, || {
+        black_box(jit_compile(&residual));
+        0
+    });
 
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     let base = ms(t_interp_interp);
@@ -303,6 +324,11 @@ fn roi_futamura_loop() {
         100.0 * os.bytes as f64 / is.bytes as f64
     );
     println!(
+        "jit compile: interpreter {:.3} ms, residual {:.3} ms",
+        ms(t_cc_interp),
+        ms(t_cc_resid)
+    );
+    println!(
         "{:<22} {:>10} {:>10}",
         "configuration", "time(ms)", "speedup"
     );
@@ -313,7 +339,14 @@ fn roi_futamura_loop() {
         ("jit(residual)", t_jit_resid),
     ] {
         println!("{:<22} {:>10.3} {:>9.1}x", name, ms(d), base / ms(d));
+        csv("roi_futamura_loop", name, "time_ms", ms(d));
     }
+    csv(
+        "roi_futamura_loop",
+        "jit(residual)",
+        "speedup_vs_jit_interp",
+        ms(t_jit_interp) / ms(t_jit_resid),
+    );
     println!(
         "\nspecialization win, interpreter backend: {:.1}x",
         ms(t_interp_interp) / ms(t_interp_resid)
@@ -524,6 +557,14 @@ fn size_corpus() {
             format!("{}/{}/{}", i.blocks, r.blocks, o.blocks),
             format!("{}/{}/{}", i.insts, r.insts, o.insts),
             format!("{}/{}/{}", i.bytes, r.bytes, o.bytes),
+            100.0 * o.bytes as f64 / i.bytes as f64,
+        );
+        csv("size_corpus", name, "interp_bytes", i.bytes as f64);
+        csv("size_corpus", name, "opt_bytes", o.bytes as f64);
+        csv(
+            "size_corpus",
+            name,
+            "opt_pct",
             100.0 * o.bytes as f64 / i.bytes as f64,
         );
 
@@ -1824,6 +1865,7 @@ fn gain_spectrum() {
             let tr = best(5, || {
                 black_box(jit_call(&mut cr, n));
             }) - fr;
+            csv("gain_spectrum", label, "speedup", ti / tr);
             format!("{:.1}x", ti / tr)
         } else {
             "—".to_string()
@@ -1834,6 +1876,14 @@ fn gain_spectrum() {
             100.0 * sr.bytes as f64 / si.bytes as f64,
             folded,
             speedup
+        );
+        csv("gain_spectrum", label, "interp_bytes", si.bytes as f64);
+        csv("gain_spectrum", label, "residual_bytes", sr.bytes as f64);
+        csv(
+            "gain_spectrum",
+            label,
+            "residual_pct",
+            100.0 * sr.bytes as f64 / si.bytes as f64,
         );
     }
     println!(

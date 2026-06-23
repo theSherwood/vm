@@ -261,6 +261,14 @@ fn sizes(m: &Module) -> Sizes {
     }
 }
 
+/// Emit one machine-readable metric row when `SVM_BENCH_CSV` is set: `CSV,<bench>,<case>,<metric>,
+/// <value>` on stdout (run with `--nocapture` and `grep '^CSV,'`). Off by default.
+fn csv(case: &str, metric: &str, value: f64) {
+    if std::env::var_os("SVM_BENCH_CSV").is_some() {
+        println!("CSV,peval_corpus,{case},{metric},{value}");
+    }
+}
+
 // ===========================================================================================
 // The corpus, as data.
 // ===========================================================================================
@@ -562,6 +570,16 @@ fn corpus_metric_matrix() {
             ms(t_cc_i),
             ms(t_cc_r)
         );
+        csv(c.name, "interp_bytes", i.bytes as f64);
+        csv(c.name, "residual_bytes", r.bytes as f64);
+        csv(
+            c.name,
+            "residual_pct",
+            100.0 * r.bytes as f64 / i.bytes as f64,
+        );
+        csv(c.name, "pe_ms", ms(t_pe));
+        csv(c.name, "jit_compile_interp_ms", ms(t_cc_i));
+        csv(c.name, "jit_compile_residual_ms", ms(t_cc_r));
 
         // Compile each once, then run many.
         let mut cm_i = jit_compile(&c.interpreter, c.entry);
@@ -617,6 +635,7 @@ fn corpus_metric_matrix() {
                     .max(0.0);
                 // Below ~1 µs the subtracted compute is at the floor's noise level; don't report a ratio.
                 let speedup = if tr > 1e-6 {
+                    csv(c.name, &format!("speedup@{n}"), ti / tr);
                     format!("{:.1}x", ti / tr)
                 } else {
                     "n/a".to_string()
