@@ -219,6 +219,35 @@ not compute-bound. This is exactly what the §9/D45 *fast cap resolver* (devirtu
 register cap calls) targets; this generic-dispatch number is the baseline it improves on. Heavier caps
 (real I/O, spawn) add their own work on top of this floor.
 
+## Parallel scaling — many isolated guests at once
+
+The SVM exists to host many sandboxed guests; `parallel` measures whether *W* concurrent guests deliver
+~*W*× throughput. Each OS thread runs its **own** guest (the JIT a private `CompiledModule`, the
+interpreters the shared read-only `&Module`) with no shared mutable runtime state, so it probes the
+runtime for hidden contention (global locks, allocator, false sharing) that would cap multi-tenancy. The
+kernel is a serial `xorshift64*` (pure ALU, no memory) so only the runtime — not memory bandwidth —
+could limit scaling. Runtime-only (no libLLVM):
+
+```sh
+cargo run -p svm-run --release --example parallel
+```
+
+Indicative (machine-dependent; a 4-physical-core host), scaling = `throughput(W) / (W · throughput(1))`:
+
+| threads | jit | bytecode | tree-walk |
+|---|--:|--:|--:|
+| 1 | 100% | 100% | 100% |
+| 2 | 99% | 100% | 100% |
+| 4 (= cores) | **97%** | 96% | 100% |
+| 8 (oversubscribed) | 50% | 45% | 48% |
+
+Reading: **all three engines scale ~linearly to the physical-core count** — *W* guests ≈ *W*× aggregate
+throughput, i.e. the runtime adds no contention to multi-tenant execution (no global JIT/interp lock,
+no allocator hot path on the steady-state run). The plateau past the core count is ordinary
+SMT/oversubscription, not a runtime bottleneck. (This is *independent-guest* scaling — the multi-tenant
+story; *intra*-guest parallelism via the §12 `thread.spawn` scheduler is a separate axis, not measured
+here.)
+
 
 ## Run
 
