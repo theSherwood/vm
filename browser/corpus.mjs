@@ -154,6 +154,23 @@ for (const c of corpus.nested ?? []) {
   }
 }
 
+// ---- SharedRegion corpus: svm_run_region (§13 host-backed memory aliasing) vs native --------
+for (const c of corpus.region ?? []) {
+  const m = load(readFileSync(c.file));
+  const got = ex.svm_run_region(m.ptr, m.len);
+  const gotStatus = ex.svm_status();
+  m.free();
+  const ok = gotStatus === c.status && (c.status !== 0 || BigInt(got) === BigInt(c.value));
+  total++;
+  if (!ok) {
+    fail++;
+    console.log(`  FAIL ${c.name}: native {status:${c.status},value:${c.value}} ` +
+      `wasm {status:${gotStatus},value:${got}}`);
+  } else {
+    console.log(`  ${c.name}: match (value ${got})`);
+  }
+}
+
 // ---- alloc-ABI scale check: echo MEGABYTES of stdin → stdout (past the old 1 MiB cap) --------
 {
   const SIZE = 2 << 20; // 2 MiB, double the retired fixed-buffer cap

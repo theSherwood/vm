@@ -587,6 +587,44 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     }
 }
 
+/// Run `m`'s function 0 with a host-granted **`SharedRegion`** (iface 4, 64 KiB) as its sole cap —
+/// the §13 host-backed memory object a guest `map`s into its window (op 0), aliasing the same backing
+/// at multiple offsets (the magic-ring-buffer primitive); op 2 `len`, op 3 `page_size`. Returns
+/// `(status, i64-widened value)`. Shared by [`svm_run_region`] and `gencorpus`.
+pub fn region_exec(m: &svm_ir::Module) -> (i32, i64) {
+    let mut host = Host::new();
+    let h = host.grant_shared_region(1 << 16); // 64 KiB, comfortably larger than any host page
+    let mut fuel = 5_000_000u64;
+    match bytecode::compile_and_run_with_host(m, 0, &[Value::I32(h)], &mut fuel, &mut host) {
+        None => (STATUS_UNSUPPORTED, 0),
+        Some(Err(_)) => (STATUS_TRAP, 0),
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64),
+            _ => (STATUS_BAD_RESULT, 0),
+        },
+    }
+}
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a `SharedRegion` cap (see
+/// [`region_exec`]). Returns the guest's `i64` result; sets [`LAST_STATUS`].
+#[no_mangle]
+pub extern "C" fn svm_run_region(mod_ptr: *const u8, mod_len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let (status, value) = region_exec(&m);
+    set(status);
+    value
+}
+
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under a fixed 3-cap powerbox, so §7
 /// reflection (`cap.self.count`/`get`) is deterministic (see [`reflect_exec`]). Returns the guest's
 /// `i64` result; sets [`LAST_STATUS`].
@@ -774,6 +812,34 @@ block0(v0: i64):
             Some(Value::I64(x)) => *x,
             _ => -1,
         },
+        _ => -1,
+    }
+}
+
+/// Self-contained SharedRegion probe (`wasmtime --invoke run_region`): map a host region at two
+/// window offsets, store a marker through one and load it through the other → `0x0123456789abcdef`
+/// (`81985529216486895`) iff the mappings alias the same backing. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_region() -> i64 {
+    const R: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 4 3 () -> (i64) v0 ()
+  v2 = i64.const 0
+  v3 = i32.const 3
+  v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)
+  v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)
+  v6 = i64.const 81985529216486895
+  i64.store v2 v6
+  v7 = i64.load v1
+  return v7
+}
+"#;
+    let Ok(m) = svm_text::parse_module(R) else {
+        return -1;
+    };
+    match region_exec(&m) {
+        (STATUS_OK, v) => v,
         _ => -1,
     }
 }

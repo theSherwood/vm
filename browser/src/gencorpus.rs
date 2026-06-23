@@ -11,7 +11,7 @@
 
 use std::io::Write;
 
-use svm_browser::{capture_exec, instantiate_exec, powerbox_exec, reflect_exec};
+use svm_browser::{capture_exec, instantiate_exec, powerbox_exec, reflect_exec, region_exec};
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -583,6 +583,36 @@ block0(v0: i32):
 }
 "#;
 
+// ---- §13 SharedRegion (host-backed memory aliased into the window) -----------------------------
+// From `crates/svm/tests/shared_region.rs`. iface 4: op 0 map(win_off, region_off, len, prot),
+// op 2 len, op 3 page_size. Host grants a 64 KiB region as func 0's arg.
+
+// Map the region at offset 0 and again at offset `page_size`, store a marker at 0, load it from the
+// second mapping → reads back the marker *iff* both mappings alias the same backing (the §13 promise).
+const REGION_ALIAS: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 4 3 () -> (i64) v0 ()
+  v2 = i64.const 0
+  v3 = i32.const 3
+  v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)
+  v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)
+  v6 = i64.const 81985529216486895
+  i64.store v2 v6
+  v7 = i64.load v1
+  return v7
+}
+"#;
+
+// Query the region's length (op 2) → the granted 64 KiB = 65536.
+const REGION_LEN: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 4 2 () -> (i64) v0 ()
+  return v1
+}
+"#;
+
 // ---- §7 reflection (cap.self.count / cap.self.get) over a fixed 3-cap powerbox -----------------
 // Lifted from `crates/svm/tests/bytecode_caps.rs`. Powerbox = Stream(Out) t0, Exit t1, host-fn t13.
 
@@ -950,6 +980,17 @@ fn main() {
             ));
         }
         json.push_str(if i + 1 == reflect.len() { "]}\n" } else { "]},\n" });
+    }
+    // SharedRegion corpus — §13 host-backed memory; func 0 gets a 64 KiB region (svm_run_region).
+    let region = [("region_alias", REGION_ALIAS), ("region_len", REGION_LEN)];
+    json.push_str("],\n\"region\":[\n");
+    for (i, (name, src)) in region.iter().enumerate() {
+        let (m, file) = emit(name, src);
+        let (status, value) = region_exec(&m);
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"status\":{status},\"value\":\"{value}\"}}{}",
+            if i + 1 == region.len() { "\n" } else { ",\n" },
+        ));
     }
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
