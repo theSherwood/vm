@@ -139,6 +139,32 @@ dispatch overhead), not an algorithmic gap. Both SVM interpreters are the same o
 production wasm interpreter, and both are ~20–50× off the JIT (cf. the steady-state table) — which is
 why the JIT exists and why the break-even analysis above matters for tier selection.
 
+## End-to-end real programs
+
+The kernels above are single-algorithm loops. To see how the stack holds up on **whole, branchy
+programs** — not tight arithmetic — `end_to_end` runs four self-contained workloads through the LLVM
+frontend across all four engines, and **cross-checks every engine's result bit-exact against native**
+(so it doubles as a whole-stack differential test):
+
+```sh
+cd crates/svm-llvm && cargo run --release --example end_to_end
+```
+
+- `json` — build a small JSON object from a seed, tokenize it (string/number scan + nesting depth), sum
+  the integers — a realistic parser inner loop.
+- `dfa` — count substrings matching `[a-z]+@[a-z]+\.[a-z]+` via a hand-coded scanner (regex/lexer shape).
+- `lz` — an LZ77-style compressor (longest-match search in a sliding window) — memory + match-search heavy.
+- `vm` — a tiny stack-machine **bytecode interpreter** running a generated program (an interpreter on
+  the SVM).
+
+Result: **all four engines return bit-identical to native**, and **svm-jit lands ~1.4–2.6× native
+(geomean ~1.7×)** on these control-flow-heavy programs — a touch behind its ~1.3× on the straight-line
+`corpus_diff` kernels, as expected where branchy code favors clang's mature backend over Cranelift. The
+interpreters run these programs ~30–110× (bytecode) / ~40–155× (tree-walk) slower than the JIT — the
+same tier ordering the micro-benchmarks show, now confirmed on realistic code. (The JIT uses a large
+per-engine iteration count so its per-call recompile washes out; the interpreters use smaller counts —
+per-iter is normalized, so the columns stay comparable.)
+
 
 ## Run
 
