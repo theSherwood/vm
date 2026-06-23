@@ -295,6 +295,72 @@ hot loops are rare in real code, so this is low priority.
 
 ---
 
+### I11 — on-ramp fails-closed on an auto-vectorized `<8 x i32>` shape the I2 legalizer doesn't cover (S3) — found via Embench `edn`
+
+**Where:** `crates/svm-llvm/src/lib.rs` — the I2 wide-vector legalization (`wide_vec_layout` / `lower_wide`
+and the per-op recognizers it dispatches through).
+
+**Symptom.** Translating Embench-IoT's `edn` (a DSP/FIR-filter kernel) compiled with plain `clang -O2
+-emit-llvm` fails closed: `Error::Unsupported("type <8 x i32> (Milestone 1+)")`. The cross-engine
+Embench driver (`crates/svm-llvm/examples/embench.rs`) skips `edn` for this reason; the other kernels
+(`matmult-int`/`crc32`/`nettle-sha256`/`ud`/`nsichneu`) translate and run bit-exact.
+
+**What's going on.** I2 added fixed-128 chunk legalization for wider-than-128-bit vectors (`<8 x i32>`
+→ 2× `v128`) across loads/stores, lane arith, reductions, conversions, etc. — and the cross-engine
+`vadd`/`corpus_diff` SIMD all work. But `edn` produces a `<8 x i32>` in **some context the splitter
+doesn't reach** — most likely a specific op or value position (a wide constant, a particular
+`shufflevector`/reduction shape, or a wide value crossing a block edge in a form `lower_wide` doesn't
+rewrite) rather than the already-handled load/store/arith. So it's the I2 breadth's remaining tail, the
+same flavor as the (now-fixed) I10 holes: a clean fail-closed at *translate* — **not** a miscompile or
+soundness issue — hence S3.
+
+**Impact.** Real `-O2` programs whose vectorizer emits this shape can't run on any SVM engine until
+vectorization is disabled for that loop (`-fno-slp-vectorize` / `-fno-vectorize` sidesteps it). Narrow:
+4 of the other Embench kernels and the whole cross-engine/corpus suites vectorize fine.
+
+**Fix sketch (bounded, in the I2 style):** pin the exact failing op by dumping the `edn` bitcode
+(`clang -O2 -emit-llvm -S`) and finding the `<8 x i32>` the translator rejects, then extend the
+matching `lower_wide` arm / recognizer to split that shape into `v128` chunks + tail like the others.
+Add `edn` to the on-ramp translate tests once it lands. (Separately, the on-ramp has no `memcmp`/`bcmp`
+definition — `clang` emits those libcalls for array compares; the Embench wrapper supplies them in-module
+with `-fno-builtin-memcmp/-bcmp`. Providing them as on-ramp builtins, like `memcpy`/`memset`, would be a
+small coverage win.)
+
+---
+
+### I12 — the §9/D45 "fast" `cap.call` resolver shares the generic host dispatch, so it barely speeds up cheap caps (S4) — found via the `cap_call` bench
+
+**Where:** `crates/svm-run/src/lib.rs` — `fast_dispatch` (the body behind `fast_clock_now` /
+`fast_blocking_work`, installed by `fast_cap_resolver`).
+
+**Symptom.** `cap_call` (`crates/svm-llvm/examples/cap_call.rs`) measures a `Clock.now()` (0-arg) cap
+loop on the JIT both ways: the generic `cap_thunk` and the D45 fast resolver `run_powerbox` wires by
+default. They are **within ~2%** (~49 vs ~48 ns/call) — the "devirtualized register-to-register fast
+path" is essentially a wash for this cap.
+
+**Root cause.** D45 removes the *JIT-side* cost (the generic `cap_thunk`'s arg marshalling + window
+pointer setup) by calling the resolver's fn with register args. But that fn (`fast_dispatch`) then
+drives **the same `Host::cap_dispatch_slots`** the generic path uses — by design, "so the authority
+check + semantics are identical." For a cheap cap (clock = a slot lookup + a field read), that shared
+host-side dispatch (handle/authority check, binding match, result marshalling) is essentially the
+*entire* ~48 ns, and both paths pay it — so the JIT-side saving D45 removes is negligible. The fast
+path would help more for **arg-heavy** caps (bigger marshalling saving) — untested here — but for the
+hot, cheap caps it targets, it currently doesn't.
+
+**Impact.** Cap-chatty / IO-poll-heavy guests don't get the cap.call speedup the fast resolver was
+meant to provide. Not a correctness issue (semantics/authority identical) — hence S4 — but it's the one
+concrete *perf* lever the benchmark slices surfaced.
+
+**Fix sketch (bounded):** make the hot fast-handlers do the work **inline** rather than re-entering the
+generic slot dispatch — e.g. `fast_clock_now` validates the handle against the granted clock slot and
+reads/advances `host.clock_ns` directly, skipping the general `(type_id, op)` match + binding dispatch
+in `cap_dispatch_slots`. The authority check must be replicated exactly (the resolver is only installed
+for the claimed `(type_id, op)`, so the per-handle check is the only guard left to preserve). Re-run
+`cap_call` to confirm the fast row drops below generic. (Keep the generic path as the correctness
+fallback / the oracle the inline handler is differentially checked against.)
+
+---
+
 ## Resolved
 
 ### I10 — ordinary `clang -O2` auto-vectorized loops hit two narrow holes in the vector breadth (S3) — fixed on `claude/bench-alu-hygiene`

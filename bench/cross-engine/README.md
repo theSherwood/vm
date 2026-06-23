@@ -212,12 +212,18 @@ in-process `Host`:
 cd crates/svm-llvm && cargo run --release --example cap_call
 ```
 
-Indicative: **~54 ns/call (JIT), ~61 ns (bytecode), ~74 ns (tree-walk)** for the clock cap. The cost is
-**roughly engine-independent** — it's the host boundary, not the engine — which means on the JIT a
-`cap.call` is **~50× a normal in-VM op** (~1 ns), so cap-chatty / IO-heavy workloads are boundary-bound,
-not compute-bound. This is exactly what the §9/D45 *fast cap resolver* (devirtualized register-to-
-register cap calls) targets; this generic-dispatch number is the baseline it improves on. Heavier caps
-(real I/O, spawn) add their own work on top of this floor.
+Indicative for the clock cap: **~49 ns/call JIT-generic, ~48 ns JIT-fast (D45), ~49 ns bytecode,
+~66 ns tree-walk.** The cost is **roughly engine-independent** — it's the host boundary, not the engine
+— so on the JIT a `cap.call` is **~50× a normal in-VM op** (~1 ns): cap-chatty / IO-heavy workloads are
+boundary-bound, not compute-bound.
+
+The driver times the JIT *both* ways — the generic `cap_thunk` and the §9/D45 devirtualized fast
+resolver `run_powerbox` wires by default — and they come out **within ~2%**. That's a finding, not a
+win: D45 removes the JIT-side arg marshalling but the fast handler still re-enters the *same*
+`Host::cap_dispatch_slots`, which is essentially the entire cost for a cheap cap. Making the hot
+fast-handlers do their work inline (skipping the general dispatch) is the concrete low-hanging perf
+lever the slices surfaced — see **ISSUES.md I12**. (Window-touching caps — real I/O, spawn — stay on
+the generic path and add their own work on top.)
 
 ## Parallel scaling — many isolated guests at once
 
