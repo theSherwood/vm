@@ -483,8 +483,20 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   fiber's handle (and still names the div line); a **nested** resume (root → A → B) → the innermost
   fiber B, pinning the resume-seam save/restore discipline; a root trap → `-1`; a clean run → `None`.
   (The JIT capture is `-g`-gated, so a trapping differential program carries `-g`; the interpreter
-  reifies frames regardless.) *Remaining:* matching the *exact* killing trap under racing concurrent
-  traps (today: last-wins, any trapping frame's chain is a valid kill backtrace).
+  reifies frames regardless.)
+- [x] **Stage 5 — multi-vCPU trap origin (the interpreter side of Stage 3).** A trap on a
+  `thread.spawn`ed worker propagates to its `thread.join`er as a bare `Err(Trap)` — the parent re-traps
+  with *its* frames at the join — so the interpreter's run outcome named the *join site*, not where the
+  guest actually trapped (the JIT already reported the origin via the `Domain` capture handoff). The
+  interpreter now matches via a run-shared **first-wins trap-origin cell** (`Sched::trap_origin`): the
+  first vCPU to trap on its own op records its backtrace + fiber, and `run_traced` reports that instead
+  of the root's own outcome — the interpreter counterpart of the JIT's `root_trap_cap.or(worker_trap_cap)`.
+  First-wins also makes the reported `(backtrace, fiber)` self-consistent (from a single trap event)
+  under racing concurrent traps, rather than two independently last-wins fields. *Tests*
+  (`multivcpu_trap_origin.rs`, interp↔JIT differential): a worker div-by-zero names the worker's origin
+  line (not the join site), and the interpreter and JIT agree on the origin frame + fiber. *Remaining:*
+  picking the *exact* killing trap when several race simultaneously (first-wins on the interp,
+  last-wins on the JIT — both report *a* valid trapping frame's chain, not necessarily the same one).
 
 **Trust/TCB.** Pure host-side observability, off the runtime hot path and the escape-TCB: a wrong
 backtrace mis-renders a kill message, never affects confinement. The capture stays async-signal-safe

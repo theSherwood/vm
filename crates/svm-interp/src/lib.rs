@@ -1866,11 +1866,11 @@ fn drive(
         h.quiesce_pool();
         h.clear_async_notify();
     }
-    let out = sched
-        .lock()
-        .results
-        .remove(&root_id)
-        .expect("root vCPU finished");
+    let (out, trap_origin) = {
+        let mut s = sched.lock();
+        let out = s.results.remove(&root_id).expect("root vCPU finished");
+        (out, s.trap_origin.take())
+    };
     *fuel = out.fuel;
     *mem = out.mem;
     // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is uniquely
@@ -1879,7 +1879,11 @@ fn drive(
         .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    (out.result, out.trap_bt, out.trap_fiber)
+    // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
+    // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
+    // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
+    let (trap_bt, trap_fiber) = trap_origin.unwrap_or((out.trap_bt, out.trap_fiber));
+    (out.result, trap_bt, trap_fiber)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -3204,6 +3208,13 @@ struct Sched {
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
+    /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
+    /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
+    /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
+    /// outcome would name the join site, not the origin. `drive` reads this instead, so the trap
+    /// diagnostic names *where the guest actually trapped* — the interpreter counterpart to the JIT's
+    /// `Domain` trap-capture handoff. `None` on a clean run.
+    trap_origin: Option<(Vec<IrPc>, Option<i64>)>,
 }
 
 impl Scheduler {
@@ -3445,6 +3456,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             };
             drop(v);
             let mut s = sched.lock();
+            // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
+            // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
+            // true origin. A clean finish leaves it untouched.
+            if outcome.result.is_err() {
+                s.trap_origin
+                    .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
+            }
             if let Some(parent) = s.join_waiters.remove(&id) {
                 s.runnable.push_back(parent);
                 sched.work.notify_one();
