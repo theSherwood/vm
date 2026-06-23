@@ -1526,6 +1526,11 @@ pub struct CompiledModule {
     /// Empty after a non-trapping run (or a trap with no usable frame). Read via
     /// [`Self::last_trap_backtrace`]; host-side, off the runtime path (§2a).
     last_trap_backtrace: Vec<JitFrameLoc>,
+    /// The guest **fiber handle** running when the most recent [`Self::run`] trapped (§5 W3 / §23-D57
+    /// per-fiber attribution): `Some(handle)` for a trap inside a fiber (named even if it had migrated
+    /// across vCPU threads — captured at the trap instant, not inferred from the thread), `Some(-1)`
+    /// for the root computation, `None` after a clean run. Read via [`Self::last_trap_fiber`].
+    last_trap_fiber: Option<i64>,
     // --- the per-run window *plan* (the window itself is allocated in `run`; the mask and
     // --- extents are baked into the code, so they were fixed at compile time).
     win_mapped: usize,
@@ -1684,6 +1689,17 @@ impl CompiledModule {
     /// no `-g`. Host-side, off the runtime path (§2a) — fold it into a kill/trap report.
     pub fn last_trap_backtrace(&self) -> &[JitFrameLoc] {
         &self.last_trap_backtrace
+    }
+
+    /// The guest **fiber** that was running when this module's most recent [`Self::run`] trapped (§5 W3
+    /// / §23-D57 per-fiber attribution): `Some(handle)` for a trap inside a fiber, `Some(-1)` for the
+    /// root computation (no fiber), `None` after a clean run. The handle is captured at the trap
+    /// instant, so it names the right fiber even under work-stealing migration (where the fiber may have
+    /// resumed on a different vCPU thread than it last suspended on). Pairs with
+    /// [`Self::last_trap_backtrace`] to render *which fiber* trapped *where*; host-side, off the runtime
+    /// path (§2a).
+    pub fn last_trap_fiber(&self) -> Option<i64> {
+        self.last_trap_fiber
     }
 
     /// The per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a): for each `-g` source
@@ -2380,6 +2396,7 @@ impl CompiledModule {
             extra_bytes: 0,
             live_fault_range: None,
             last_trap_backtrace: Vec::new(),
+            last_trap_fiber: None,
             win_mapped,
             win_reserved,
             win_size,
@@ -2877,7 +2894,7 @@ impl CompiledModule {
         #[cfg(fiber_rt)]
         let worker_trap_cap = (*this).domain.as_ref().and_then(|d| d.take_trap_capture());
         #[cfg(not(fiber_rt))]
-        let worker_trap_cap: Option<(usize, Vec<usize>)> = None;
+        let worker_trap_cap: Option<(usize, Vec<usize>, i64)> = None;
         // §9/§12 async ring: now that every vCPU is joined, drain the offload pool and drop the futex hook
         // (which holds the `Domain` pointer) before the window is freed below — so no worker
         // can still write the window counter or call into a dead `Domain`.
@@ -2910,12 +2927,19 @@ impl CompiledModule {
         // `*this` for the next `run` / `define_extra` / drop.
         drop(window);
 
-        // Publish the trap-time backtrace for `last_trap_backtrace`: the root vCPU's own capture if it
-        // trapped, else a spawned vCPU's (Stage 3). Symbolizing is pure (reads the address map), so it
-        // is fine here after teardown. Empty on a clean run (every successful run resets it).
-        (*this).last_trap_backtrace = match root_trap_cap.or(worker_trap_cap) {
-            Some((pc, rets)) => (*this).trap_backtrace(pc, &rets),
-            None => Vec::new(),
+        // Publish the trap-time backtrace + fiber for `last_trap_backtrace`/`last_trap_fiber`: the root
+        // vCPU's own capture if it trapped, else a spawned vCPU's (Stage 3). The fiber handle (§23-D57)
+        // rides along, captured at the trap instant. Symbolizing is pure (reads the address map), so it
+        // is fine here after teardown. Reset on a clean run (every successful run resets both).
+        match root_trap_cap.or(worker_trap_cap) {
+            Some((pc, rets, fiber)) => {
+                (*this).last_trap_backtrace = (*this).trap_backtrace(pc, &rets);
+                (*this).last_trap_fiber = Some(fiber);
+            }
+            None => {
+                (*this).last_trap_backtrace = Vec::new();
+                (*this).last_trap_fiber = None;
+            }
         };
 
         // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a

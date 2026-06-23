@@ -256,7 +256,10 @@ pub(crate) fn install_guard() {
 /// return addresses (the handler walked them while the guest stack was intact). `None` if nothing
 /// was captured (no fault since the last take, or an arch the handler doesn't decode). The host
 /// symbolizes them via [`CompiledModule::trap_backtrace`].
-pub(crate) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+/// Returns `(faulting pc, return-address chain, fiber handle)` — the fiber handle is the guest fiber
+/// that was running when the trap fired (per-fiber attribution, §5 W3 / §23-D57), or `-1` for the root
+/// computation (no fiber).
+pub(crate) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
     pal::take_trap_frame()
 }
 
@@ -458,18 +461,22 @@ mod pal {
             hi: usize,
         ) -> i32;
         fn svm_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
+        fn svm_take_trap_fiber() -> i64;
     }
 
     /// Read and clear the trap stack the SIGSEGV/SIGBUS handler captured at the most recent caught
-    /// guard fault (§5 W3 trap-time backtrace): the faulting `pc` and the frame-pointer chain's raw
-    /// return addresses. `None` if none was captured. Must match `SVM_TRAP_MAXFRAMES` in the shim.
-    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+    /// guard fault (§5 W3 trap-time backtrace): the faulting `pc`, the frame-pointer chain's raw
+    /// return addresses, and the fiber running at the trap (§23-D57; `-1` = root). `None` if none was
+    /// captured. Must match `SVM_TRAP_MAXFRAMES` in the shim.
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
         const MAX: usize = 64;
         let mut pc = 0usize;
         let mut rets = [0usize; MAX];
-        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot `rets` buffer.
+        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot `rets` buffer; the
+        // fiber pairs with the same capture (read right after, before any other trap can overwrite it).
         let n = unsafe { svm_take_trap_frame(&mut pc, rets.as_mut_ptr(), MAX as i32) };
-        (n >= 0).then(|| (pc, rets[..n as usize].to_vec()))
+        let fiber = unsafe { svm_take_trap_fiber() };
+        (n >= 0).then(|| (pc, rets[..n as usize].to_vec(), fiber))
     }
 
     pub(super) fn page_size() -> usize {
@@ -814,6 +821,9 @@ mod pal {
         static TRAP_PC: Cell<usize> = const { Cell::new(0) };
         static TRAP_RETS: Cell<[usize; TRAP_MAXFRAMES]> = const { Cell::new([0; TRAP_MAXFRAMES]) };
         static TRAP_N: Cell<usize> = const { Cell::new(0) };
+        // Per-fiber attribution (§5 W3 / §23-D57): the fiber running when the fault fired, snapshotted
+        // in the VEH (the C current-fiber TLS the fiber runtime maintains). `-1` = root (no fiber).
+        static TRAP_FIBER: Cell<i64> = const { Cell::new(-1) };
     }
 
     /// Max trap-backtrace frames captured (matches the unix shim's `SVM_TRAP_MAXFRAMES`).
@@ -863,6 +873,11 @@ mod pal {
         TRAP_PC.with(|c| c.set(ctx.Rip as usize));
         TRAP_RETS.with(|c| c.set(rets));
         TRAP_N.with(|c| c.set(n));
+        // Snapshot the running fiber at fault time (the C trap-capture TLS the fiber runtime maintains).
+        extern "C" {
+            fn svm_current_fiber() -> i64;
+        }
+        TRAP_FIBER.with(|c| c.set(unsafe { svm_current_fiber() }));
         TRAP_VALID.with(|c| c.set(true));
     }
 
@@ -945,23 +960,26 @@ mod pal {
     /// etc.) lands in the shared `trap_capture.c` helper (its C thread-local, `svm_take_trap_frame`).
     /// A run trips at most one, so check the Rust capture first and fall back to the C one. `None` if
     /// neither captured.
-    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
         if TRAP_VALID.with(|c| c.get()) {
             TRAP_VALID.with(|c| c.set(false));
             let pc = TRAP_PC.with(|c| c.get());
             let n = TRAP_N.with(|c| c.get());
             let rets = TRAP_RETS.with(|c| c.get());
-            return Some((pc, rets[..n].to_vec()));
+            let fiber = TRAP_FIBER.with(|c| c.get());
+            return Some((pc, rets[..n].to_vec(), fiber));
         }
         // Explicit-check trap: the C helper (`trap_capture.c`) stashed it in its own thread-local.
         extern "C" {
             fn svm_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
+            fn svm_take_trap_fiber() -> i64;
         }
         const MAX: usize = 64;
         let (mut pc, mut rets) = (0usize, [0usize; MAX]);
         // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot buffer.
         let n = unsafe { svm_take_trap_frame(&mut pc, rets.as_mut_ptr(), MAX as i32) };
-        (n >= 0).then(|| (pc, rets[..n as usize].to_vec()))
+        let fiber = unsafe { svm_take_trap_fiber() };
+        (n >= 0).then(|| (pc, rets[..n as usize].to_vec(), fiber))
     }
 
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
@@ -1045,7 +1063,7 @@ mod pal {
     ) -> bool {
         false
     }
-    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
         None
     }
 }

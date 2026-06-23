@@ -462,8 +462,20 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   backtrace: `powerbox_compile_run` plumbs `last_trap_backtrace()` out and `run_powerbox*` appends a
   `file:line:col (fn N)` block to the `guest trapped (…)` error. *Tests:* a `thread.spawn`ed worker's
   div-by-zero is attributed to the worker's div line; a powerbox div-by-zero's kill message names the
-  source. *Remaining:* per-**fiber** naming under work-stealing migration (§23/D57) — the capture is
-  vCPU-thread-rooted, not yet fiber-rooted; and matching the *exact* killing trap under racing
+  source.
+- [x] **Stage 4 — per-fiber attribution under migration (§23/D57).** The capture was vCPU-thread-rooted,
+  so a work-stealing-migrated fiber (which may resume on a different vCPU thread than it suspended on)
+  couldn't be *named*. Now the fiber runtime publishes the **running fiber handle** into a shared
+  `trap_capture.c` thread-local across the resume seam (`svm_set_current_fiber`, save/restore-bracketed
+  around `(*fib).resume` exactly like the durable shadow-SP swap — stack-disciplined for nested
+  resumes), and every capture path stashes it: unix memory-fault (`svm_store_trap_frame`) + explicit
+  (`svm_capture_explicit_trap`) read it directly, the Windows VEH snapshots it (`svm_current_fiber`).
+  It rides through `take_trap_frame` → the `Domain` handoff → `CompiledModule::last_trap_fiber()`
+  (`Some(handle)` for a fiber, `Some(-1)` for the root, `None` on a clean run), and the kill message
+  names it (`… [fiber N] …`). Captured *at the trap instant*, so migration can't misattribute it — the
+  thread no longer identifies the fiber, but the published handle does. *Tests* (`jit_per_fiber_trap.rs`):
+  a div-by-zero in a resumed fiber attributes to that fiber's handle (and still names the div line); a
+  root trap → `-1`; a clean run → `None`. *Remaining:* matching the *exact* killing trap under racing
   concurrent traps (today: last-wins, any trapping frame's chain is a valid kill backtrace).
 
 **Trust/TCB.** Pure host-side observability, off the runtime hot path and the escape-TCB: a wrong

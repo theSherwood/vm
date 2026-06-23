@@ -173,7 +173,7 @@ pub(crate) struct Domain {
     /// dying worker publishes it here for the run thread to symbolize after `join_all`. `(pc, return
     /// addresses)`; last-wins (matching the last-wins trap cell — any trapping frame's chain is a
     /// valid kill backtrace). `None` until a spawned vCPU traps. Host-side observability (§2a).
-    trap_capture: Mutex<Option<(usize, Vec<usize>)>>,
+    trap_capture: Mutex<Option<(usize, Vec<usize>, i64)>>,
     /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4): the quiesce barrier for a multi-worker
     /// async freeze. `quiesce` holds the count of vCPUs still to reach a quiescent (unwound) state;
     /// the coordinator waits on `quiesce_cv` until it hits 0, then runs the existing single-worker
@@ -251,13 +251,14 @@ impl Domain {
     /// Publish a **spawned** vCPU's raw trap-time backtrace capture (§5 W3 Stage 3), last-wins. Called
     /// from a dying worker ([`run_child`]) when it trapped, so the run thread can symbolize a trap that
     /// originated off the run thread (whose own thread-local capture it can't see).
-    pub(crate) fn publish_trap_capture(&self, cap: (usize, Vec<usize>)) {
+    pub(crate) fn publish_trap_capture(&self, cap: (usize, Vec<usize>, i64)) {
         *lock(&self.trap_capture) = Some(cap);
     }
 
-    /// Take the trap-time backtrace capture a spawned vCPU published (§5 W3 Stage 3), if any. Called
-    /// on the run thread after [`Self::join_all`], so the publishing worker has finished.
-    pub(crate) fn take_trap_capture(&self) -> Option<(usize, Vec<usize>)> {
+    /// Take the trap-time backtrace capture a spawned vCPU published (§5 W3 Stage 3), if any — `(pc,
+    /// return-address chain, trapping fiber handle)`. Called on the run thread after
+    /// [`Self::join_all`], so the publishing worker has finished.
+    pub(crate) fn take_trap_capture(&self) -> Option<(usize, Vec<usize>, i64)> {
         lock(&self.trap_capture).take()
     }
 
