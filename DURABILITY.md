@@ -363,7 +363,7 @@ than miscompiling, so these are latent/extension hazards, not silent-miscompile 
 | --- | --- | --- | --- |
 | R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `cap.call` closure over the direct-call graph) whose single block suspends on one op: a leaf `cap.call` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. **Multiple resume points** and **multi-block CFGs** (branches, loops, joins) now land too — each block is split at its suspend ops, branch targets are remapped, and a global `br_table` dispatch routes the thaw (`tests/multipoint.rs`, `tests/multiblock.rs`; the generator emits multi-frame/multi-point/multi-block modules). Out of scope: `call_indirect`/indirect tail calls to may-suspend targets (treated non-suspending); direct tail calls into may-suspend callees (rejected). A chain deeper than the reserve holds traps cleanly on freeze (R9 overflow guard), rather than overflowing. | §2, §12.7, `svm-durable` | addressed (Phase-1 scope) |
 | R9 | **Placement, not an isolation boundary — cheap for MVP.** The control state + shadow stack are a reserved low slice `[0, DURABLE_RESERVE)` (one 64 KiB page) of the domain's *own* window; guest memory is `[DURABLE_RESERVE, window)`, part of the same budget-accounted allotment (the wasm shadow-stack / `__heap_base` convention). Because the window is per-domain and runtime-masked, a guest that writes the reserve corrupts only **its own** durability — never another domain or the host — and it **fails safe**: a forged resume id hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the host validates the artifact (module hash) on restore. **MVP path:** `transform_module_assume_confined` instruments memory-using guests on the cooperating-toolchain contract that the guest's data/heap is based at `DURABLE_RESERVE` (`tests/guest_memory.rs` shows guest memory round-tripping). Strict `transform_module` still fails closed (`GuestUsesMemory`) for untrusted modules. **Optional defense-in-depth (not MVP):** hard isolation against an *adversarial* guest — guard-paged per-fiber placement (§12.7) or per-access confinement. The shadow stack now **traps on overflow**: the freeze-path `UNWIND` check refuses a push whose top would cross `DURABLE_RESERVE`, so a too-deep call chain fails safe (a clean trap) instead of growing into guest memory (`tests/overflow.rs`). See **[DECISION D-shadow-overflow]** below for why this lives in the transform rather than a unified backend recursion ceiling. | §12.7, `svm-durable` | mitigated (placement + fail-safe + overflow trap; hard isolation optional) |
-| R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). *Mitigated for slice 3.2.1:* a freeze/thaw run (state ≠ `NORMAL`) is forced **single-worker**, and the runtime swaps both control words per-vCPU per dispatch — so the words are never touched concurrently. A lock-free parallel STW (Phase 4 / async freeze) is still open. | §3, §12.7 | mitigated (single-worker STW) |
+| R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). *Mitigated for slice 3.2.1:* a freeze/thaw run (state ≠ `NORMAL`) is forced **single-worker**, and the runtime swaps both control words per-vCPU per dispatch — so the words are never touched concurrently. A lock-free parallel STW for the shadow-SP is **planned via per-context SP** (4A.5 — each context keeps its SP in its own region, addressed through a runtime-private per-context register, so the shared word and its lock both disappear; `FORMAT_VERSION` 4→5). The state word stays per-context-swapped (only flipped, not accumulated, so it needs no lock). | §3, §12.7 | mitigated (single-worker STW); 4A.5 = lock-free SP |
 | R11 | **Equivalence now fuzzed (Phase-1 scope), both single-backend and cross-backend.** The §7/§12.6 property runs over a generator of **in-scope** durable modules: (a) interpreter-only — *inert in `NORMAL`* (instrumented == un-instrumented) and *round-trip* (freeze→serialize→restore→thaw ≡ uninterrupted, reload-not-reissue) — `crates/svm-durable/tests/durable_fuzz.rs` + libFuzzer `fuzz/fuzz_targets/durable.rs`; (b) cross-backend — interp vs Cranelift JIT agree on the NORMAL result, leave a **byte-identical freeze artifact**, and a JIT thaw of the **interpreter-frozen** artifact under a different host clock reproduces the result — `crates/svm/tests/durable_jit.rs` + libFuzzer `fuzz/fuzz_targets/durable_jit.rs`. Both stable drivers run in CI without nightly. Coverage broadens automatically as the transform generalizes (R8). | §7, §12.6 | addressed (Phase-1 scope) |
 
 **[DECISION D-shadow-overflow — RESOLVED: freeze-path guard in the transform, not a unified backend recursion ceiling.]** The shadow stack mirrors the call stack (one frame per suspended activation), so it can only overflow the reserve if the call stack is very deep. We bound it with a check on the freeze-path `UNWIND` (trap if a push would cross `DURABLE_RESERVE`) rather than forcing both backends to a common call-depth ceiling. Rationale: shadow overflow is a **tooling-tier** concern (`svm-durable`, +0 TCB), and the guard sits on the **cold** freeze path, so it costs nothing on the per-call hot path; unifying the ceiling would mean an **escape-TCB JIT codegen change** (the JIT has no depth counter today — recursion rides the native stack; the interp caps at `MAX_CALL_DEPTH = 256`) with a permanent per-call cost, to fix an edge case. Consequence: a domain recursed deeper than the reserve holds simply **cannot be frozen** (the freeze traps) — a safe, coherent limitation. Cross-backend recursion *determinism* (interp 256 vs JIT native-stack) remains a separate, latent, un-exercised divergence; unifying the ceiling is the deliberate fix to make **on its own merits** if/when it matters (the overflow guard then becomes a redundant cheap backstop).
@@ -945,7 +945,9 @@ it at a back-edge, unwinds its native stack into its own in-window shadow region
 The only truly-shared control word is the active shadow-SP (`SHADOW_SP_OFF`); during a multi-worker
 quiesce, concurrent workers swapping their context's SP in/out of it need a **lock/atomic** (the new
 loom obligation) — strictly **gated to `workers > 1`**, a no-op fast path at `workers == 1` so every
-existing deterministic path stays byte-identical. After all vCPUs quiesce (join barrier), a single
+existing deterministic path stays byte-identical. *(4A.5 retires this shared word — and its lock —
+by giving each context its **own** shadow-SP word in its own region; see the per-context shadow-SP
+design below.)* After all vCPUs quiesce (join barrier), a single
 coordinator runs the **existing** freeze-drive/residue/flatten machinery (untouched — it already
 assumes single-worker). Residue is **canonically sorted** (ascending context/task) before serialize, so
 the quiesce *order* (which races) can't change the artifact (§12.6 canonical invariant preserved).
@@ -958,12 +960,67 @@ mid-compute is the first real concurrent multi-vCPU freeze (vs. the deferred sin
 **Staging (interp-oracle-first):** 4A.1 single-vCPU compute-loop freeze via a back-edge poll (interp,
 ticked deterministically like `arm_freeze_after`) — *proves the core*; 4A.2 JIT parity (the IR poll
 compiles for free → byte-identical artifact); 4A.3 async `request_freeze` (single-vCPU); **4A.4
-multi-worker quiesce + active-SP swap sync (LOOM)**; 4A.5 concurrent multi-vCPU STW freeze, JIT (LOOM);
-4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 parked-vCPU / `Blocking.work` latency
+multi-worker quiesce + active-SP swap sync (LOOM)**; 4A.5 concurrent multi-vCPU STW freeze, JIT — via
+**per-context shadow-SP** (`FORMAT_VERSION` 4→5; retires the 4A.4 shared-SP lock; design subsection
+below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 parked-vCPU /
+`Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
 
 **Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
 full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
+
+##### Phase 4 Slice A.5 design — per-context shadow-SP (retires the shared-SP lock)
+
+4A.4 shipped the **shared** active shadow-SP (`SHADOW_SP_OFF`, window offset 8) guarded by a
+`workers > 1` lock during the quiesce swap: it keeps one shared word correct under concurrency by
+*serializing* access to it. 4A.5 takes the other branch — it **removes the shared word** instead of
+serializing it. Each context gets its **own** shadow-SP, so concurrent children never touch a common
+location, the hot-path lock disappears, and the race is dissolved by construction rather than guarded.
+
+*Why a shared word existed at all.* The durable transform emits every spill/reload against the fixed
+offset `SHADOW_SP_OFF`, and the runtime makes that one word mean "the running context's SP" by
+**swapping** it in/out of the window per dispatch (the R10 single-worker mitigation). That swap is
+correct only single-threaded — one context dispatched at a time; concurrent OS-thread children would
+each want offset 8 to be *theirs* at once. The per-child shadow *regions* already exist
+(`shadow_region_base(ctx)` gives each context a disjoint slice of the reserve); **only the SP *word* is
+shared.** The fix relocates each context's SP word into its own region so the transform addresses *its*
+SP, never a global one.
+
+- **Where the SP lives (the format change).** Move the SP word from the global `SHADOW_SP_OFF` = 8 to a
+  **per-context slot** — e.g. the first 8 bytes of each context's region — with that region's frames
+  starting after it. The reserve's global `[0, 64)` header keeps `STATE_OFF`/`ARM_*`; offset 8 is
+  retired as the active-SP word. This changes the artifact's window image ⇒ **`FORMAT_VERSION` 4 → 5**,
+  applied **uniformly** (single-worker, concurrent, both backends) so the new format stays byte-identical
+  cross-backend (R11) and concurrent-vs-single-worker — just not to v4 (a one-time bump).
+
+- **How the transform finds it (the TLS question).** The spill/reload must compute "my context's region
+  base" from compiled code. That needs a *runtime-private per-context identity*. We **do** have a
+  per-vCPU TLS register (`vcpu.tls.get/set`, §12), implemented consistently on both backends — but it is
+  **guest-overwritable** (`vcpu.tls.set`), so it cannot back the shadow-SP: a guest could clobber it and
+  corrupt/escape its own shadow stack (a TCB regression). So 4A.5 adds a **sibling runtime-private
+  register** — the same per-OS-thread thread-local mechanism as `vcpu_tls`, **seeded by the runtime** per
+  dispatch / per child, with **no guest write op** — holding the active context's region base (or its
+  dense id, from which the base is derived). The transform lowers the SP access as `[ctx_base + SP_SLOT]`
+  where `ctx_base` is read from this register. Both backends resolve it identically: JIT via the
+  thread-local (a baked thunk, paid only on the *cold* unwind/rewind path); interp via its dispatch
+  state. It stays **IR-level, not per-backend codegen**, so the byte-identical-artifact invariant (R11)
+  holds automatically and it remains +0 TCB.
+
+- **What it retires.** With per-context SP there is no shared active-SP word, so the 4A.4 `workers > 1`
+  swap-lock is **unnecessary on the unwind path** — concurrent children spill into disjoint SPs with zero
+  coordination. The quiesce primitive collapses to its **join** role: `request_freeze` flips every
+  context's state word; each worker self-unwinds into its own region+SP at its next back-edge poll and
+  parks at base; the coordinator waits on the existing **join barrier** (the loom-verified 4A.4 handshake)
+  before running the **untouched** single-worker freeze-drive/residue/flatten machinery. The loom
+  obligation narrows from "swap-exclusion + join" to just the join handshake.
+
+- **Staging within 4A.5.** *(i)* introduce the runtime-private per-context register + migrate the durable
+  SP to per-context storage on **both** backends; bump `FORMAT_VERSION` 4 → 5; keep single-worker
+  freeze/thaw + the `durable_jit` cross-backend fuzz green (**pure refactor + format change, no
+  concurrency yet** — fully testable single-worker). *(ii)* spawn real concurrent children on the
+  async-STW entry, each self-unwinding into its own SP; coordinator joins via the barrier → existing
+  freeze-drive. *(iii)* loom the join; two-concurrent-children byte-identical-to-single-worker test under
+  a deterministic trigger; `request_freeze` round-trip; cross-backend.
 
 ##### Context recycling plan (next sub-slice)
 
