@@ -88,7 +88,19 @@ fn warm_seek_matches_cold_across_checkpoint_boundaries() {
 
     // Probe times that bracket the stride (1024): below the first checkpoint, just across it, deep in
     // the middle, and right at the end. Each warm seek restores from the nearest checkpoint ≤ t.
-    for &t in &[0u64, 1, 1023, 1024, 1025, 2050, 4096, 7000, 100, 3, u64::MAX] {
+    for &t in &[
+        0u64,
+        1,
+        1023,
+        1024,
+        1025,
+        2050,
+        4096,
+        7000,
+        100,
+        3,
+        u64::MAX,
+    ] {
         let stop = warm.seek(t);
         let got = probe(&warm, &stop);
         let want = cold(LOOP_WITH_MEM, 3000, t);
@@ -129,10 +141,19 @@ fn step_back_one_at_a_time_is_faithful() {
     for _ in 0..12 {
         let before = warm.clock();
         let stop = warm.step_back();
-        assert_eq!(warm.clock(), before - 1, "step_back ticks the clock down by one");
+        assert_eq!(
+            warm.clock(),
+            before - 1,
+            "step_back ticks the clock down by one"
+        );
         let got = probe(&warm, &stop);
         let want = cold(LOOP_WITH_MEM, 1500, warm.clock());
-        assert_eq!(got, want, "step_back to {} diverged from cold", warm.clock());
+        assert_eq!(
+            got,
+            want,
+            "step_back to {} diverged from cold",
+            warm.clock()
+        );
     }
 }
 

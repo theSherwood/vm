@@ -4963,7 +4963,13 @@ impl VCpu {
     /// so a subsequent `run` (with a `seek_target`) resumes the replay exactly at the checkpoint's
     /// logical time. The shared structure (funcs, fresh registry, host, scheduler) already matches a
     /// root-only run, which is the only kind that is checkpointed.
-    fn restore_continuation(&mut self, frames: Vec<Frame>, fuel: u64, mem_bytes: Option<&[u8]>, clock: u64) {
+    fn restore_continuation(
+        &mut self,
+        frames: Vec<Frame>,
+        fuel: u64,
+        mem_bytes: Option<&[u8]>,
+        clock: u64,
+    ) {
         self.frames = frames;
         self.fuel = fuel;
         if let (Some(m), Some(bytes)) = (self.mem.as_mut(), mem_bytes) {
