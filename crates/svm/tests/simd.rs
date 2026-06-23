@@ -237,6 +237,30 @@ fn diff_i32x4_mul_and_sub() {
 }
 
 #[test]
+fn diff_i8x16_mul() {
+    // `i8x16.mul` has no single x86 instruction (no `PMULLB`), so the JIT emulates it
+    // (widen → `i16x8` multiply → low-byte pack). Pin JIT == interp and the wrapping-byte oracle.
+    let s = "func (i32, i32) -> (i32) {\n\
+        block0(v0: i32, v1: i32):\n\
+          v2 = i8x16.splat v0\n\
+          v3 = i8x16.splat v1\n\
+          v4 = i8x16.mul v2 v3\n\
+          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}\n";
+    for (a, b) in [
+        (3i32, 4i32),
+        (7, 7),
+        (200, 3),
+        (255, 255),
+        (16, 16),
+        (-1, -1),
+    ] {
+        let r = diff1(s, &[Value::I32(a), Value::I32(b)]);
+        let want = (a as u8).wrapping_mul(b as u8) as i64;
+        assert_eq!(r, want, "i8x16.mul {a}*{b}");
+    }
+}
+
+#[test]
 fn diff_f32x4_arith() {
     // (x*x + x) / 2 lanewise, observed at lane 0.
     let s = "func (f32) -> (f32) {\n\

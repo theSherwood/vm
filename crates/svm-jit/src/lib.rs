@@ -3571,20 +3571,20 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
                 // (works for a plain non-fiber root), so supported on every target.
                 Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
-                // `i8x16.mul` and `i64x2` min/max have no single-instruction lowering on the target
-                // ISAs, so Cranelift can't legalize them; bail to `Unsupported` (the interp oracle
-                // still covers them, and wasm never emits them — `i64x2` has no min/max op).
+                // `i64x2` min/max has no single-instruction lowering on the target ISAs, so Cranelift
+                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it, and wasm
+                // never emits it — `i64x2` has no min/max op). `i8x16.mul` *is* now lowered (widen →
+                // `i16x8` multiply → low-byte pack; see the `VIntBin` lowering), so it stays supported.
                 Inst::VIntBin { shape, op, .. }
                     if !matches!(
                         (*shape, *op),
-                        (VShape::I8x16, VIntBinOp::Mul)
-                            | (
-                                VShape::I64x2,
-                                VIntBinOp::MinS
-                                    | VIntBinOp::MinU
-                                    | VIntBinOp::MaxS
-                                    | VIntBinOp::MaxU
-                            )
+                        (
+                            VShape::I64x2,
+                            VIntBinOp::MinS
+                                | VIntBinOp::MinU
+                                | VIntBinOp::MaxS
+                                | VIntBinOp::MaxU
+                        )
                     ) => {}
                 // Lane compares lower to a single Cranelift `icmp`/`fcmp` (legalize on every target).
                 Inst::VIntCmp { .. } | Inst::VFloatCmp { .. } => {}
@@ -4707,6 +4707,23 @@ fn lower_block(
                 let r = match op {
                     VIntBinOp::Add => b.ins().iadd(x, y),
                     VIntBinOp::Sub => b.ins().isub(x, y),
+                    // x86 has no per-byte multiply (no `PMULLB`), so Cranelift can't legalize an
+                    // `imul` on `i8x16`. Emulate it: widen each half to `i16x8` and multiply (the low
+                    // byte of an `i16` product equals the low byte of the `i8` product, and that low
+                    // byte is sign-independent), mask each product to its low byte, then pack the two
+                    // halves back with unsigned-saturating narrow (every lane is ≤ 0xFF so nothing
+                    // saturates — it's an exact low-byte truncation). Matches the interp's wrapping mul.
+                    VIntBinOp::Mul if *shape == VShape::I8x16 => {
+                        let (xl, yl) = (b.ins().uwiden_low(x), b.ins().uwiden_low(y));
+                        let (xh, yh) = (b.ins().uwiden_high(x), b.ins().uwiden_high(y));
+                        let pl = b.ins().imul(xl, yl);
+                        let ph = b.ins().imul(xh, yh);
+                        let m = b.ins().iconst(I16, 0x00ff);
+                        let mask = b.ins().splat(I16X8, m);
+                        let pl = b.ins().band(pl, mask);
+                        let ph = b.ins().band(ph, mask);
+                        b.ins().unarrow(pl, ph)
+                    }
                     VIntBinOp::Mul => b.ins().imul(x, y),
                     VIntBinOp::MinS => b.ins().smin(x, y),
                     VIntBinOp::MinU => b.ins().umin(x, y),

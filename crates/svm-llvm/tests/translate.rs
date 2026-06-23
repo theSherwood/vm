@@ -4039,6 +4039,57 @@ fn simd_i16x8_mul_load_store() {
     check_vs_native("simd_i16x8", src, 2);
 }
 
+/// `<16 x i8>` lane multiply through a `v128` load → mul → store (`i8x16` `VIntBin` Mul). x86 has no
+/// per-byte multiply, so the JIT emulates it (widen → `i16x8` multiply → low-byte pack); this pins
+/// that lowering against the native oracle on both backends. Wraps mod 2^8 per lane.
+#[test]
+fn simd_i8x16_mul_load_store() {
+    let src = "void vmul(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[16], F[16], E[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(i + 1); }\n\
+        \x20 vmul(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 16; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char u8x16 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vmul(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 u8x16 a = *(const u8x16 *)P;\n\
+        \x20 u8x16 b = *(const u8x16 *)Q;\n\
+        \x20 *(u8x16 *)O = a * b;\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check_vs_native("simd_i8x16_mul", src, 2);
+}
+
+/// `<4 x i32>` lane shifts by a **constant splat** (`shl`/`lshr`/`ashr` → `VShift`). The on-ramp
+/// ingests a vector shift whose amount is a constant-splat vector (the shape `clang -O2` emits for
+/// `v >> k`); a signed lane covers the arithmetic (`ashr`) path. Read-back folds the lanes.
+#[test]
+fn simd_i32x4_const_shifts() {
+    let src = "void vsh(const int *P, int *O);\n\
+        static int D[4], E[4];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 4; i++) D[i] = (seed << 8) - i * 12345;\n\
+        \x20 vsh(D, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 4; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef int i32x4 __attribute__((vector_size(16)));\n\
+        typedef unsigned u32x4 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vsh(const int *P, int *O) {\n\
+        \x20 i32x4 a = *(const i32x4 *)P;\n\
+        \x20 i32x4 sl = a << 3;\n\
+        \x20 i32x4 sa = a >> 2;\n\
+        \x20 u32x4 su = (u32x4)a >> 5u;\n\
+        \x20 *(i32x4 *)O = sl + sa + (i32x4)su;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("simd_i32x4_shift", src, 7);
+}
+
 /// `<2 x double>` lane multiply + add (`f64x2` `VFloatBin` Mul/Add). Finite values only, so the
 /// per-lane-NaN differential caveat (§17) doesn't apply; the derived integer result is exact.
 #[test]

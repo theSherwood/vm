@@ -8744,6 +8744,30 @@ fn const_int(op: &Operand) -> Option<u64> {
     }
 }
 
+/// The lane value of a **constant integer splat** vector — `<i32 1, i32 1, i32 1, i32 1>`, which is how
+/// clang encodes a vector shift by a *uniform* amount (the common auto-vectorized `x >> k` shape). The
+/// SVM `VShift` shifts every lane by one scalar amount, so a splat maps directly. `None` for a
+/// non-constant or non-uniform amount (those stay fail-closed — a per-lane vector shift is rare).
+fn const_splat_int(op: &Operand) -> Option<u64> {
+    let Operand::ConstantOperand(c) = op else {
+        return None;
+    };
+    let Constant::Vector(elems) = c.as_ref() else {
+        return None;
+    };
+    let mut lanes = elems.iter().map(|e| match e.as_ref() {
+        Constant::Int { value, .. } => Some(*value),
+        _ => None,
+    });
+    let first = lanes.next()??;
+    for v in lanes {
+        if v? != first {
+            return None;
+        }
+    }
+    Some(first)
+}
+
 /// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
 /// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
 /// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
@@ -12270,9 +12294,30 @@ fn bin<'d>(
                 a: av,
                 b: bv,
             },
+            // Lane-wise shift by a uniform amount → `VShift` (§17). clang emits the amount as a
+            // constant splat; a non-uniform (per-lane) amount stays fail-closed (rare in auto-vec code).
+            BinOp::Shl | BinOp::ShrU | BinOp::ShrS => {
+                let Some(amt) = const_splat_int(b) else {
+                    return unsup(format!(
+                        "vector shift {op:?} with non-constant-splat amount"
+                    ));
+                };
+                let vop = match op {
+                    BinOp::Shl => svm_ir::VShiftOp::Shl,
+                    BinOp::ShrU => svm_ir::VShiftOp::ShrU,
+                    _ => svm_ir::VShiftOp::ShrS,
+                };
+                let amtv = ctx.push(Inst::ConstI32(amt as i32));
+                Inst::VShift {
+                    shape,
+                    op: vop,
+                    a: av,
+                    amt: amtv,
+                }
+            }
             other => {
                 return unsup(format!(
-                    "vector integer op {other:?} (only add/sub/mul/and/or/xor)"
+                    "vector integer op {other:?} (only add/sub/mul/and/or/xor/shl/lshr/ashr)"
                 ))
             }
         };
