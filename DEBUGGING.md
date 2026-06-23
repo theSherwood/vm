@@ -251,16 +251,25 @@ sharpest demonstration of why a tape is needed at all: the host-fn *closure* is 
 fresh replay powerbox, so re-execution **cannot** reproduce it any other way (test: a stateful
 counter host-fn replays to `201` after `seek(0)`).
 
-**Not yet — snapshot/checkpoint cadence (the remaining W1 performance piece).** `seek(t)`
-re-executes from time 0, so it is O(t) and repeated `step_back` is O(t²). Bounding that needs
-periodic state snapshots to restart from the nearest checkpoint — but the interpreter's state is not
-cheaply snapshottable: `VCpu`/`Host` aren't `Clone`, and guest memory is a **shared** `Arc<Region>`
-(`Mem::fork_for_thread` shares bytes, it doesn't copy them), so a checkpoint needs a deep window
-copy (ideally dirty-page-tracked) plus a host-substate snapshot (output buffers, `clock_ns`,
-`stdin_pos`, the cap-replay cursor). That is a dedicated effort, not a small slice; correctness
-(seek already works) is unaffected — only long-run navigation cost. Also still open: RNG via a
-dedicated iface (vs a host-fn), and capturing a `SchedTape`/`CapTape` from a *JIT* execution (the
-interpreter is the debug engine by design, so this is lower priority).
+**Snapshot/checkpoint cadence (the W1 performance piece) — built for single-threaded runs.** `seek(t)`
+used to re-execute from time 0, so it was O(t) and repeated `step_back` O(t²). It now keeps a
+**checkpoint ladder**: during a `seek` replay the `Inspector` drives the sole vCPU in stride-sized
+chunks (every `SEEK_CHECKPOINT_STRIDE` ops, via the existing `seek_target` — *no hot-loop change*) and
+snapshots the vCPU at each boundary, so a later `seek`/`step_back` restarts from the nearest snapshot
+(`clock ≤ t`) and replays only the tail — a backward sweep drops from O(t²) to ~O(t·stride). A
+checkpoint is `frames.clone()` + window bytes (`Mem::snapshot`/`seed`) + the host's restorable
+substate (`stdout`/`stderr`/`clock_ns`/`stdin_pos`/cap-replay cursor + record); the shared `VCpu`/`Host`
+structure is rebuilt by `fresh_single_root`, so neither needs to be `Clone`. Captured only for the
+**root-only, non-fiber, non-durable, no-installed-units, simple-memory** subset where `frames` + window
+bytes fully determine the continuation (and the host carries no §13/§14/§22 residue a restore would
+drop) — `VCpu::checkpointable` + `Host::checkpoint_safe`; anything richer turns checkpointing off and
+falls back to the (correct) replay-from-0. *Tests (`debug_checkpoints.rs`):* a **warm** Inspector
+(ladder populated, so `seek` restores) is asserted state-identical — result, paused location, clock,
+and window bytes — to a **cold** one (replays from 0) across checkpoint-stride boundaries, a backward
+sweep, and one-at-a-time `step_back`. *Still open:* **multithreaded** (`turn`-coordinate) checkpoints,
+dirty-page-tracked window copies (today's snapshot is the full mapped prefix), RNG via a dedicated
+iface (vs a host-fn), and capturing a `SchedTape`/`CapTape` from a *JIT* execution (the interpreter is
+the debug engine by design, so this is lower priority).
 
 ---
 

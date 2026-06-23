@@ -556,6 +556,46 @@ pub struct Inspector {
     /// Present in single-threaded mode; `None` in scheduled mode (seek pending there).
     seek_init: Option<SeekInit>,
     finished: Option<Result<Vec<Value>, Trap>>,
+    /// Time-travel **checkpoint ladder** (W1): snapshots of the sole vCPU at ascending `clock`s,
+    /// captured during single-threaded `seek` replays so a later `seek`/`step_back` restarts from the
+    /// nearest one (`clock ≤ t`) instead of clock 0 — turning a backward sweep from O(t²) into
+    /// ~O(t·stride). Kept sorted by `clock`. Empty in scheduled mode or once `checkpointing` is off.
+    checkpoints: Vec<SeekCheckpoint>,
+    /// Whether this run is eligible for checkpointing — the single-threaded, **root-only, non-fiber,
+    /// non-durable, simple-memory** subset where `frames` + window bytes fully capture the
+    /// continuation. Starts `true`; the first replay that observes state outside the subset clears it
+    /// (and the ladder), after which `seek` is exactly the original replay-from-clock-0 path.
+    checkpointing: bool,
+}
+
+/// Capture a checkpoint at most every this many ops. Small enough that `step_back` replays a bounded
+/// tail, large enough that the per-checkpoint snapshot (frames + window bytes) amortizes well.
+const SEEK_CHECKPOINT_STRIDE: u64 = 1024;
+
+/// The run-mutable host substate a time-travel checkpoint restores — see [`Host::replay_substate`].
+#[derive(Clone)]
+struct HostReplaySubstate {
+    stdin_pos: usize,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    clock_ns: i64,
+    cap_cursor: usize,
+    cap_record: Vec<CapRecord>,
+}
+
+/// A single-threaded time-travel **checkpoint** (W1): the full re-executable state of the sole vCPU at
+/// logical time `clock`, so [`Inspector::seek`] can restart a replay here rather than from clock 0.
+/// Captured only for the root-only / non-fiber / non-durable / simple-memory subset (see
+/// [`Inspector::checkpoint_of`]), where `frames` plus the window bytes fully determine the
+/// continuation.
+struct SeekCheckpoint {
+    clock: u64,
+    frames: Vec<Frame>,
+    fuel: u64,
+    /// Mapped window bytes (`Mem::snapshot`), reseeded via `Mem::seed` on restore; `None` for a
+    /// memoryless run.
+    mem: Option<Vec<u8>>,
+    host: HostReplaySubstate,
 }
 
 /// The inputs a single-threaded run was started with, kept so [`Inspector::seek`] can re-execute it
@@ -793,6 +833,8 @@ impl Inspector {
                 seed: None,
             }),
             finished: None,
+            checkpoints: Vec::new(),
+            checkpointing: true,
         }
     }
 
@@ -925,6 +967,10 @@ impl Inspector {
                 seed,
             }),
             finished: None,
+            // Scheduled (multithreaded) seek targets the global turn coordinate and is not
+            // checkpointed in this slice — checkpointing is the single-threaded path only.
+            checkpoints: Vec::new(),
+            checkpointing: false,
         }
     }
 
@@ -1067,36 +1113,125 @@ impl Inspector {
                     },
                 }
             }
-            // Single-threaded: re-execute the sole vCPU to op `clock == t`.
-            None => {
-                let root = Self::fresh_single_root(
-                    init.funcs,
-                    init.func,
-                    &init.args,
-                    init.fuel,
-                    init.memory,
-                    &init.data,
-                    Arc::clone(&host),
-                    Arc::clone(&self.shared),
-                    Some(t),
-                );
-                self.host = host;
-                self.v = Some(root);
-                self.finished = None;
-                self.focus = None;
-                match self.v.as_mut().unwrap().run(u64::MAX) {
-                    Step::Pause(_, pc) => Stop::Break {
-                        reason: StopReason::Step,
-                        pc,
-                    },
-                    Step::Done(r) => {
-                        self.finished = Some(r.clone());
-                        Stop::Finished(r)
+            // Single-threaded: re-execute the sole vCPU to op `clock == t` — restarting from the
+            // nearest checkpoint ≤ t (W1) instead of clock 0 when this run is checkpointable.
+            None => self.seek_single(&init, host, t),
+        }
+    }
+
+    /// Single-threaded `seek` (DEBUGGING.md W1): drive the sole vCPU to logical time `t`, restarting
+    /// from the nearest **checkpoint** (`clock ≤ t`) rather than clock 0 when the run is in the
+    /// checkpointable subset, and laying down fresh checkpoints (every [`SEEK_CHECKPOINT_STRIDE`] ops)
+    /// along the way. This bounds `seek`/`step_back` to the checkpoint stride instead of O(t). For a
+    /// run outside the subset it is exactly the original replay-from-clock-0 (`checkpointing` is off,
+    /// no checkpoint is found, none is captured).
+    fn seek_single(&mut self, init: &SeekInit, host: Arc<Mutex<Host>>, t: u64) -> Stop {
+        // Nearest checkpoint at or before `t` (the ladder is kept sorted by `clock`).
+        let start = if self.checkpointing {
+            self.checkpoints.iter().rev().find(|c| c.clock <= t)
+        } else {
+            None
+        };
+        let mut root = Self::fresh_single_root(
+            init.funcs.clone(),
+            init.func,
+            &init.args,
+            init.fuel,
+            init.memory,
+            &init.data,
+            Arc::clone(&host),
+            Arc::clone(&self.shared),
+            None, // the seek target is set per chunk by the drive loop below
+        );
+        if let Some(cp) = start {
+            root.restore_continuation(cp.frames.clone(), cp.fuel, cp.mem.as_deref(), cp.clock);
+            host.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .restore_replay_substate(&cp.host);
+        }
+        self.host = host;
+        self.finished = None;
+        self.focus = None;
+
+        let stop = self.drive_to(&mut root, t);
+        self.v = Some(root);
+        stop
+    }
+
+    /// Drive `root` forward to logical time `t`, pausing at each [`SEEK_CHECKPOINT_STRIDE`] boundary to
+    /// snapshot a checkpoint (so a later `seek`/`step_back` restarts nearby), then on to `t`. With
+    /// checkpointing off it is a single straight run to `t`. The chunking is transparent: each chunk
+    /// runs purely the `seek_target` replay branch of [`DebugCtx::before_op`], so the cumulative effect
+    /// equals one run from the start point to `t`.
+    fn drive_to(&mut self, root: &mut VCpu, t: u64) -> Stop {
+        loop {
+            let clock = root.debug_clock();
+            // Next pause: the upcoming stride boundary (strictly after `clock`), capped at `t`.
+            let next = if self.checkpointing && clock < t {
+                (clock / SEEK_CHECKPOINT_STRIDE + 1) * SEEK_CHECKPOINT_STRIDE
+            } else {
+                t
+            }
+            .min(t);
+            root.dbg_seek_to(next);
+            match root.run(u64::MAX) {
+                Step::Done(r) => {
+                    self.finished = Some(r.clone());
+                    return Stop::Finished(r);
+                }
+                Step::Park(_) | Step::Yield => return Stop::Blocked,
+                Step::Pause(_, pc) => {
+                    if root.debug_clock() >= t {
+                        return Stop::Break {
+                            reason: StopReason::Step,
+                            pc,
+                        };
                     }
-                    Step::Park(_) | Step::Yield => Stop::Blocked,
+                    // Reached a stride boundary short of `t`: record a checkpoint and continue. If the
+                    // continuation has left the checkpointable subset (a fiber/thread/coroutine/durable
+                    // op, or non-pristine memory), abandon checkpointing for this run.
+                    self.maybe_checkpoint(root);
                 }
             }
         }
+    }
+
+    /// Snapshot `root` into the checkpoint ladder at its current `clock`, if checkpointing is still on
+    /// and the continuation is [`VCpu::checkpointable`]; otherwise disable checkpointing and drop the
+    /// ladder (the run is outside the snapshottable subset, so `seek` reverts to replay-from-0). A
+    /// `clock` already present in the ladder is not duplicated.
+    fn maybe_checkpoint(&mut self, root: &VCpu) {
+        if !self.checkpointing {
+            return;
+        }
+        let clock = root.debug_clock();
+        let host_sub = {
+            let h = self.host.lock().unwrap_or_else(|e| e.into_inner());
+            // Leave the subset (and drop the ladder) if the continuation or the host has grown state a
+            // checkpoint can't faithfully restore.
+            if !root.checkpointable() || !h.checkpoint_safe() {
+                drop(h);
+                self.checkpointing = false;
+                self.checkpoints.clear();
+                return;
+            }
+            h.replay_substate()
+        };
+        if self.checkpoints.iter().any(|c| c.clock == clock) {
+            return;
+        }
+        let host = host_sub;
+        let cp = SeekCheckpoint {
+            clock,
+            frames: root.frames.clone(),
+            fuel: root.fuel,
+            mem: root.mem.as_ref().map(|m| m.window_snapshot()),
+            host,
+        };
+        // Keep the ladder sorted by `clock` (boundaries are usually appended in order, but a fresh
+        // replay-from-0 can fill gaps below an existing entry).
+        let at = self.checkpoints.partition_point(|c| c.clock < clock);
+        self.checkpoints.insert(at, cp);
     }
 
     /// The current call frame's pc, if any (innermost frame).
@@ -1380,6 +1515,15 @@ impl Inspector {
     pub fn clock(&self) -> u64 {
         self.with_focused(|v| v.debug.as_ref().map(|d| d.clock).unwrap_or(0))
             .unwrap_or(0)
+    }
+
+    /// The number of time-travel **checkpoints** currently cached (DEBUGGING.md W1) — snapshots of the
+    /// sole vCPU at ascending logical times that let `seek`/`step_back` restart from the nearest one
+    /// instead of clock 0. `0` for a run that hasn't been seeked far enough to lay one down, or one
+    /// outside the checkpointable subset (multithreaded, or using fibers / a stateful host capability),
+    /// which falls back to replay-from-0. Introspection / test hook; does not affect results.
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
     }
 
     /// The focused thread's call stack, innermost frame first ([`select_task`] chooses the thread;
@@ -2766,6 +2910,7 @@ fn run_one_schedule(
 /// stack — rather than recursing on the host stack — is what makes fibers possible: a
 /// fiber's continuation is exactly its `Vec<Frame>`, which `suspend` pauses and
 /// `cont.resume` restarts.
+#[derive(Clone)]
 struct Frame {
     /// The function this activation is executing — stored as an **index** (not a borrow) so a
     /// `Frame` (hence a whole vCPU continuation) is self-contained and movable between worker
@@ -4779,6 +4924,54 @@ impl VCpu {
     /// futex compare under the scheduler lock). Zero if this vCPU has no memory.
     fn atomic_value(&self, key: u64, width: u32) -> u64 {
         self.mem.as_ref().map_or(0, |m| m.atomic_value(key, width))
+    }
+
+    /// This vCPU's logical-time `clock` (ops executed), or 0 if undebugged. The coordinate a
+    /// single-threaded time-travel `seek`/checkpoint is keyed by.
+    fn debug_clock(&self) -> u64 {
+        self.debug.as_ref().map(|d| d.clock).unwrap_or(0)
+    }
+
+    /// Arm the time-travel replay to fast-forward to logical time `t` (W1): the next `run` advances
+    /// `clock` to `t`, ignoring breakpoints, then pauses. Used by the chunked checkpoint drive.
+    fn dbg_seek_to(&mut self, t: u64) {
+        if let Some(d) = self.debug.as_mut() {
+            d.seek_target = Some(t);
+        }
+    }
+
+    /// Whether this vCPU's state is fully captured by `frames` + the window bytes — the subset a
+    /// single-threaded time-travel **checkpoint** (W1) snapshots: the **root** computation is running
+    /// (no fiber resume-chain or parked root), nothing durable/frozen, no `thread.spawn`/coroutine
+    /// children, and memory has a pristine layout (no `map`/`unmap`/`protect`/grow or §13 region
+    /// aliasing, so `snapshot`/`seed` of the mapped prefix round-trips). Outside this subset the
+    /// `Inspector` stops checkpointing and falls back to replay-from-clock-0.
+    fn checkpointable(&self) -> bool {
+        self.cur == ROOT_FIBER
+            && self.chain.as_slice() == [ROOT_FIBER]
+            && self.root_parked.is_none()
+            && self.frozen.is_empty()
+            && !self.durable
+            && self.threads.is_empty()
+            && self.coroutines.is_empty()
+            && self.invoked.is_none() // no guest-installed §22 units (would need the domain table rebuilt)
+            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+    }
+
+    /// Restore a checkpoint's continuation into this freshly-built root vCPU (from
+    /// [`Inspector::fresh_single_root`]): replace the call stack, fuel, window bytes, and logical clock
+    /// so a subsequent `run` (with a `seek_target`) resumes the replay exactly at the checkpoint's
+    /// logical time. The shared structure (funcs, fresh registry, host, scheduler) already matches a
+    /// root-only run, which is the only kind that is checkpointed.
+    fn restore_continuation(&mut self, frames: Vec<Frame>, fuel: u64, mem_bytes: Option<&[u8]>, clock: u64) {
+        self.frames = frames;
+        self.fuel = fuel;
+        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), mem_bytes) {
+            m.seed(bytes);
+        }
+        if let Some(d) = self.debug.as_mut() {
+            d.clock = clock;
+        }
     }
 
     /// Run for up to `quantum` instructions, then finish / park / yield. The real executor passes
@@ -8608,6 +8801,54 @@ impl Host {
         self.cap_replay = Some((tape, 0));
     }
 
+    /// Whether the only run-mutable state this host has accumulated is the **restorable** replay
+    /// substate (I/O streams, clock, cap cursor) — i.e. no stateful host capability has left residue a
+    /// checkpoint restore would silently drop. A fresh seek-host starts with all of these empty; the
+    /// guest minting a §13 region / §14 module / §12 blocking / async ring / §22 JIT domain, or the
+    /// embedder granting a host-fn, populates one. While they stay empty a checkpoint restored to an
+    /// earlier logical time reproduces the host faithfully (W1); otherwise the `Inspector` stops
+    /// checkpointing and falls back to replay-from-clock-0.
+    fn checkpoint_safe(&self) -> bool {
+        self.regions.is_empty()
+            && self.modules.is_empty()
+            && self.blockings.is_empty()
+            && self.rings.is_empty()
+            && self.host_fns.is_empty()
+            && self.jit_domains.is_empty()
+    }
+
+    /// Snapshot the run-mutable substate a time-travel **checkpoint** (W1) must restore so resuming a
+    /// replay from logical time `c` sees the host exactly as it was then: the I/O streams the run has
+    /// produced/consumed, the deterministic clock, and the cap-replay cursor (which record the next
+    /// `Clock`/stdin input is served from). Everything else on a fresh seek-host is immutable for the
+    /// run (the replay tape, the empty cap table) or absent (no granted powerbox), so this small set is
+    /// the whole mutable frontier. Cheap clones (`stdout`/`stderr` are typically tiny in a debug run).
+    fn replay_substate(&self) -> HostReplaySubstate {
+        HostReplaySubstate {
+            stdin_pos: self.stdin_pos,
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+            clock_ns: self.clock_ns,
+            cap_cursor: self.cap_replay.as_ref().map(|(_, c)| *c).unwrap_or(0),
+            cap_record: self.cap_record.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Restore a [`replay_substate`](Host::replay_substate) snapshot onto a fresh seek-host (one already
+    /// seeded with the replay tape via [`replay_caps`](Host::replay_caps) + recording). Re-points the
+    /// cap-replay cursor and reinstates the I/O streams + clock, so a replay resumed from the
+    /// checkpoint's logical time draws the same subsequent inputs and accumulates onto the same output.
+    fn restore_replay_substate(&mut self, s: &HostReplaySubstate) {
+        self.stdin_pos = s.stdin_pos;
+        self.stdout = s.stdout.clone();
+        self.stderr = s.stderr.clone();
+        self.clock_ns = s.clock_ns;
+        if let Some(slot) = self.cap_replay.as_mut() {
+            slot.1 = s.cap_cursor;
+        }
+        self.cap_record = Some(s.cap_record.clone());
+    }
+
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
     /// anti-bomb ceiling ([`MAX_FIBERS`]/[`MAX_VCPUS`]) — a quota can only *tighten* — and to ≥ 1. The
     /// quota is read at run start ([`run_with_host`]→`drive`); a guest exceeding it traps cleanly
@@ -10919,6 +11160,36 @@ impl Mem {
     fn snapshot(&self, n: u64) -> Vec<u8> {
         let n = n.min(self.window.mapped());
         (0..n).map(|i| self.byte(i)).collect()
+    }
+
+    /// Whether the live memory state is **fully captured** by a [`window_snapshot`](Mem::window_snapshot)
+    /// then [`seed`](Mem::seed) round-trip of the mapped prefix — the precondition for time-travel
+    /// checkpointing the window (W1). True when nothing has changed *how* `[0, mapped)` is read back or
+    /// extended it: no §13 region aliasing, and every explicit page-protection entry is a benign
+    /// in-prefix `Rw` commit (the only kind demand-paging inserts). A `protect`ed (`Ro`), `unmap`ped,
+    /// region-`Backed`, or **grown** (tail `Rw`) page is *not* reproduced by reseeding a fresh window,
+    /// so it makes the run un-checkpointable (it falls back to replay-from-clock-0). Plain in-prefix
+    /// writes are fine — they leave the prefix `Rw` (absent from the map) and snapshot/seed round-trips
+    /// their bytes.
+    fn snapshot_safe(&self) -> bool {
+        if self.has_regions.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            return true; // never mutated ⇒ the prefix is plain Rw throughout
+        }
+        let mapped_pages = self.window.mapped() / self.page;
+        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        space.regions.is_empty()
+            && space
+                .prot
+                .iter()
+                .all(|(&pg, p)| matches!(p, PageProt::Rw) && pg < mapped_pages)
+    }
+
+    /// The full mapped window, for a time-travel checkpoint (restored with [`seed`](Mem::seed)).
+    fn window_snapshot(&self) -> Vec<u8> {
+        self.snapshot(self.window.mapped())
     }
 
     /// Seed the **whole parent backing** of a §14 sub-window (parent-absolute bytes), so the
