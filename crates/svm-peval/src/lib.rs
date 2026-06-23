@@ -1377,6 +1377,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
         | Inst::VcpuTlsGet
+        | Inst::DurableShadowBase
         | Inst::AtomicFence { .. }
         | Inst::SimdWidthBytes => {}
 

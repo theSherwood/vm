@@ -389,6 +389,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::CapSelfCount => "cap.self.count".to_string(),
         Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
         Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
+        Inst::DurableShadowBase => "durable.shadow_base".to_string(),
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
@@ -1708,6 +1709,9 @@ impl<'a> Parser<'a> {
         // §12 per-vCPU TLS register.
         if op == "vcpu.tls.get" {
             return Ok(Inst::VcpuTlsGet);
+        }
+        if op == "durable.shadow_base" {
+            return Ok(Inst::DurableShadowBase);
         }
         if op == "vcpu.tls.set" {
             let val = self.value(names)?;
