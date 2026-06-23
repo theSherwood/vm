@@ -788,8 +788,12 @@ fn transform_func(
     }
 
     // ---- DISPATCH — read the resume id at SP-4 and br_table to the matching arm ----
+    // `sp_a` is the **active context's shadow-SP word address** from the runtime-private register
+    // (`durable.shadow_base`, §12.8 4A.5) — per-context, so concurrent vCPUs each address their own SP
+    // word with no shared location (vs. the former fixed global `SHADOW_SP_OFF`). The runtime seeds the
+    // register; a guest cannot redirect it. Used identically at every SP site (dispatch/unwind/arm).
     let mut db = Bb::new(vec![]);
-    let sp_a = db.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+    let sp_a = db.one(Inst::DurableShadowBase);
     let sp = db.one(load(LoadOp::I64, sp_a, 0));
     let four = db.one(Inst::ConstI64(4));
     let sp_m4 = db.one(ibin(IntTy::I64, BinOp::Sub, sp, four));
@@ -817,7 +821,7 @@ fn transform_func(
         // trips for a chain deeper than `DURABLE_RESERVE` holds — a clean trap, never silent
         // corruption. It lives on the (cold) freeze path, not the per-call path.
         let mut cb = Bb::new(pt.slot_types.clone());
-        let sp_a = cb.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp_a = cb.one(Inst::DurableShadowBase);
         let sp = cb.one(load(LoadOp::I64, sp_a, 0));
         let fsz = cb.one(Inst::ConstI64(pt.frame_size as i64));
         let newsp = cb.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
@@ -834,7 +838,7 @@ fn transform_func(
 
         // UNWIND spill: spill the live (∪ call-arg) values + the resume id, commit the new SP.
         let mut ub = Bb::new(pt.slot_types.clone());
-        let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp_a = ub.one(Inst::DurableShadowBase);
         let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
         for (j, &i) in pt.spilled.iter().enumerate() {
             ub.zero(store(
@@ -854,7 +858,7 @@ fn transform_func(
 
         // ARM: reload the spilled set (self-contained — no incoming params), pop, resume.
         let mut ab = Bb::new(vec![]);
-        let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp_a = ab.one(Inst::DurableShadowBase);
         let sp = ab.one(load(LoadOp::I64, sp_a, 0));
         let fsz = ab.one(Inst::ConstI64(pt.frame_size as i64));
         let base = ab.one(ibin(IntTy::I64, BinOp::Sub, sp, fsz));

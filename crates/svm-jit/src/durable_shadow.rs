@@ -14,14 +14,16 @@
 
 use std::cell::Cell;
 
-/// Root context's region base (`shadow_region_base(0)` = `SHADOW_BASE`); the default seed.
-const ROOT_SHADOW_BASE: u64 = 64;
+/// Step (i)-bridge default: the active SP word is still the single swapped `SHADOW_SP_OFF` (= 8), so
+/// `durable.shadow_base` returns that offset — byte-identical to the former `ConstI64(SHADOW_SP_OFF)`.
+/// The relocation sub-step flips [`seed`] to `shadow_region_base(ctx)` (per-context region words).
+const SHADOW_SP_OFF: u64 = 8;
 
 thread_local! {
-    /// This OS thread's (vCPU's) active durable shadow-region base. Defaults to the root region;
-    /// [`seed`] resets it at the start of every root/child run so a reused worker thread can't leak a
-    /// prior run's value.
-    static DURABLE_SHADOW_BASE: Cell<u64> = const { Cell::new(ROOT_SHADOW_BASE) };
+    /// This OS thread's (vCPU's) active durable shadow-SP word address. Defaults to the shared
+    /// `SHADOW_SP_OFF` (bridge); [`seed`] (once wired) resets it per dispatch / per child so a reused
+    /// worker thread can't leak a prior run's value.
+    static DURABLE_SHADOW_BASE: Cell<u64> = const { Cell::new(SHADOW_SP_OFF) };
 }
 
 /// Seed/reset the current OS thread's durable shadow-region base. Called when the runtime makes a

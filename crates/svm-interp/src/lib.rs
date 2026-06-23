@@ -4984,7 +4984,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         root_shadow_sp,
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
-        vcpu_ctx, // §12.8 4A.5: the active context's region base, read by `durable.shadow_base`
+        vcpu_ctx: _, // (4A.5 relocation will read this for `durable.shadow_base`'s per-context base)
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
@@ -5779,15 +5779,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::VcpuTlsSet { val } => {
                     *tls = get_i64(&frames[top].vals, *val)?;
                 }
-                // §12.8 4A.5 durable-runtime-internal: the active context's shadow region base. The
-                // durable transform emits this to address *this* context's per-context shadow-SP word,
-                // so concurrent vCPUs each spill into their own region. A spawned vCPU's context is
-                // `vcpu_ctx` (root = 0); the transform reads no guest-mutable state, so a guest cannot
-                // redirect its own shadow stack.
+                // §12.8 4A.5 durable-runtime-internal: the active context's shadow-SP **word address**.
+                // The durable transform emits this to address that context's per-context shadow-SP word.
+                // Step (i)-bridge: the active SP word is still the single swapped `SHADOW_SP_OFF`, so
+                // this returns that offset — byte-identical to the former `ConstI64(SHADOW_SP_OFF)`. The
+                // relocation to a per-context region word (so concurrent vCPUs don't share it) flips
+                // this to `shadow_region_base(active ctx)` in the next sub-step.
                 Inst::DurableShadowBase => {
-                    frames[top]
-                        .vals
-                        .push(Reg::from_i64(shadow_region_base(*vcpu_ctx) as i64));
+                    frames[top].vals.push(Reg::from_i64(SHADOW_SP_OFF as i64));
                 }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
