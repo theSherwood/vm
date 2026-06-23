@@ -473,10 +473,18 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   It rides through `take_trap_frame` → the `Domain` handoff → `CompiledModule::last_trap_fiber()`
   (`Some(handle)` for a fiber, `Some(-1)` for the root, `None` on a clean run), and the kill message
   names it (`… [fiber N] …`). Captured *at the trap instant*, so migration can't misattribute it — the
-  thread no longer identifies the fiber, but the published handle does. *Tests* (`jit_per_fiber_trap.rs`):
-  a div-by-zero in a resumed fiber attributes to that fiber's handle (and still names the div line); a
-  root trap → `-1`; a clean run → `None`. *Remaining:* matching the *exact* killing trap under racing
-  concurrent traps (today: last-wins, any trapping frame's chain is a valid kill backtrace).
+  thread no longer identifies the fiber, but the published handle does. The **interpreter** reports the
+  same attribution (it's single-OS-thread M:N, so it always knows the running fiber): `run_traced` now
+  returns the trapping fiber as a third field (`Outcome::trap_fiber`, `trap_fiber_of` = the trapping
+  vCPU's `cur` fiber handle or `-1`). Fiber handles are cross-backend-identical (`(generation <<
+  FIBER_GEN_SHIFT) | slot`), so the two engines must agree — which is the **interp↔JIT differential**
+  that validates the JIT's at-the-trap-instant capture against the oracle. *Tests*
+  (`jit_per_fiber_trap.rs`, unix — interp vs JIT for each): a div-by-zero in a resumed fiber → that
+  fiber's handle (and still names the div line); a **nested** resume (root → A → B) → the innermost
+  fiber B, pinning the resume-seam save/restore discipline; a root trap → `-1`; a clean run → `None`.
+  (The JIT capture is `-g`-gated, so a trapping differential program carries `-g`; the interpreter
+  reifies frames regardless.) *Remaining:* matching the *exact* killing trap under racing concurrent
+  traps (today: last-wins, any trapping frame's chain is a valid kill backtrace).
 
 **Trust/TCB.** Pure host-side observability, off the runtime hot path and the escape-TCB: a wrong
 backtrace mis-renders a kill message, never affects confinement. The capture stays async-signal-safe
