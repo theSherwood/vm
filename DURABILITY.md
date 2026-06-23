@@ -1022,6 +1022,36 @@ SP, never a global one.
   freeze-drive. *(iii)* loom the join; two-concurrent-children byte-identical-to-single-worker test under
   a deterministic trigger; `request_freeze` round-trip; cross-backend.
 
+**Progress (stage i).** *Landed:* (a) the `durable.shadow_base` IR op + a runtime-private per-OS-thread
+register (`svm-jit`'s `durable_shadow`, the interp's `run_inner`), mirroring `vcpu.tls.get` but with no
+guest write op; (b) a **byte-identical bridge** — the durable transform reads the active context's
+shadow-SP **word address** from that register at all four SP sites (dispatch / unwind check / unwind
+spill / arm) instead of `ConstI64(SHADOW_SP_OFF)`, with the register still resolving to the shared
+`SHADOW_SP_OFF` (= 8), so artifacts are unchanged. This proves the transform → register → both-backends
+path end-to-end. *Remaining (the relocation + format bump, one atomic cross-backend change):*
+
+- **Layout.** Put each context's SP word at **`shadow_region_base(ctx) + 0`** (the region's first 8
+  bytes); frames follow at `+ 8`, so `SHADOW_SP_OFF` (global offset 8) is retired. The transform is
+  layout-agnostic: `durable.shadow_base` returns `shadow_region_base(active ctx)` and the SP word is at
+  `+0`, so no within-region stride constant leaks into `svm-durable`. Empty extent = `region_base + 8`.
+- **Register value.** Flip `durable.shadow_base` from `SHADOW_SP_OFF` to `shadow_region_base(active
+  ctx)`. *Interp:* resolve in `run_inner` from `(cur == ROOT_FIBER ? vcpu_ctx : cur + 1)` (both in
+  scope) — no seed needed. *JIT:* `durable_shadow::seed(region_base)` at each point the active context
+  changes — vCPU/child entry (`os_thread_rt`), the dispatch boundary, and both edges of the `fiber_rt`
+  resume swap.
+- **SP word storage (retarget the existing helpers, +8 init).** Give `durable_get_sp`/`durable_set_sp`
+  (interp `Mem`) and `read_shadow_sp`/`write_shadow_sp` (`fiber_rt`) a `region_base` parameter →
+  `window[region_base + 0]` (was the fixed offset 8); each call site already knows its context's region
+  (`shadow_switch` out/in ctx, the `fiber_rt` resumer/slot, `os_thread_rt` `p.ctx`, the root). Shift
+  every SP **init** from `shadow_region_base(ctx)` to `+ 8` (interp `root_shadow_sp` 4644/4707, registry
+  `shadow`/`saved_sp` seeds, child `root_shadow_sp` 6004, the `4839` reset; JIT `AtomicU64` 371,
+  `root_shadow_sp` 538, `thaw_root_sp` lib.rs 2395, `os_thread_rt` 825), and the **"spilled?" extent
+  checks** (e.g. `fiber_rt` `flat_sp > fiber_region_base(slot)` → `+ 8`).
+- **Helpers / format.** `init_durable_window` writes the root SP word at `window[SHADOW_BASE] =
+  SHADOW_BASE + 8` (offset 8 unused). `svm-snapshot`'s `SHADOW_BASE` residue defaults (root_sp, the
+  empty-section path) → `SHADOW_BASE + 8`. Bump `FORMAT_VERSION` 4 → 5. Guard with the `durable_jit`
+  cross-backend fuzz (byte-identical interp↔JIT) — the all-or-nothing oracle for this step.
+
 ##### Context recycling plan (next sub-slice)
 
 Today neither backend recycles fiber slots or vCPU contexts (they grow monotonically), so a long-lived
