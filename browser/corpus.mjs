@@ -90,26 +90,32 @@ for (const c of corpus.powerbox ?? []) {
   }
 }
 
-// ---- capture corpus: svm_run_capture (final memory image) vs native -------------------------
-for (const c of corpus.capture ?? []) {
-  const m = load(readFileSync(c.file));
-  const init = load(fromHex(c.init));
-  const got = ex.svm_run_capture(m.ptr, m.len, init.ptr, init.len, BigInt(c.arg));
-  const gotStatus = ex.svm_status();
-  const gotSnap = hex(readOut(ex.svm_snapshot_ptr, ex.svm_snapshot_len));
-  m.free(); init.free();
-  const okStatus = gotStatus === c.status;
-  const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
-  const okSnap = c.status !== 0 || gotSnap === c.snapshot; // final image only meaningful when OK
-  total++;
-  if (!(okStatus && okValue && okSnap)) {
-    fail++;
-    console.log(`  FAIL ${c.name}(${c.arg}): native {status:${c.status},value:${c.value},` +
-      `snap:${c.snapshot}} wasm {status:${gotStatus},value:${got},snap:${gotSnap}}`);
-  } else {
-    console.log(`  ${c.name}(${c.arg}): match (final image ${gotSnap.length / 2}B, value ${got})`);
+// ---- capture / gc-roots corpora: svm_run_capture (final memory image) vs native -------------
+const runCaptureLike = (list, kind) => {
+  for (const c of list) {
+    const m = load(readFileSync(c.file));
+    const init = load(fromHex(c.init));
+    const got = ex.svm_run_capture(m.ptr, m.len, init.ptr, init.len, BigInt(c.arg));
+    const gotStatus = ex.svm_status();
+    const gotSnap = hex(readOut(ex.svm_snapshot_ptr, ex.svm_snapshot_len));
+    m.free(); init.free();
+    const okStatus = gotStatus === c.status;
+    const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
+    const okSnap = c.status !== 0 || gotSnap === c.snapshot; // image only meaningful when OK
+    total++;
+    if (!(okStatus && okValue && okSnap)) {
+      fail++;
+      console.log(`  FAIL ${c.name}(${c.arg}): native {status:${c.status},value:${c.value},` +
+        `snap:${c.snapshot}} wasm {status:${gotStatus},value:${got},snap:${gotSnap}}`);
+    } else {
+      const detail = kind === 'gc' ? `${got} roots, image ${gotSnap.length / 2}B`
+        : `final image ${gotSnap.length / 2}B, value ${got}`;
+      console.log(`  ${c.name}(${c.arg}): match (${detail})`);
+    }
   }
-}
+};
+runCaptureLike(corpus.capture ?? [], 'capture');
+runCaptureLike(corpus.gcroots ?? [], 'gc');
 
 // ---- nested-child corpus: svm_run_nested (§14 confined child domains) vs native -------------
 for (const c of corpus.nested ?? []) {

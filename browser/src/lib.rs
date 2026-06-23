@@ -730,6 +730,37 @@ block0(v0: i64):
     }
 }
 
+/// Self-contained GC-roots probe (`wasmtime --invoke run_gcroots`): a `gc.roots` scan over an
+/// activation holding the in-range constants `{4096, 5000}` (one duplicated, one out of range)
+/// returns the root count `2`. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_gcroots() -> i64 {
+    const G: &str = r#"memory 16
+func () -> (i64) {
+block0():
+  va = i64.const 4096
+  vb = i64.const 5000
+  vc = i64.const 5000
+  vd = i64.const 9000
+  vlo = i64.const 4096
+  vhi = i64.const 8192
+  vmask = i64.const -1
+  vbuf = i64.const 0
+  vcap = i64.const 64
+  vt = gc.roots vlo vhi vmask vbuf vcap
+  return vt
+}
+"#;
+    let Ok(m) = svm_text::parse_module(G) else {
+        return -1;
+    };
+    let init = [0u8; 4096];
+    match capture_exec(&m, &init, 0) {
+        out if out.status == STATUS_OK => out.value,
+        _ => -1,
+    }
+}
+
 /// Self-contained tail-call probe (`wasmtime --invoke run_tailcall`): a tail-recursive factorial via
 /// `return_call` (O(1) window reuse) returns `5! = 120`. Returns `-1` on any mismatch.
 #[no_mangle]
