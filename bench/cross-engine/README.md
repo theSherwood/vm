@@ -80,6 +80,39 @@ Three more kernels go beyond the synthetic micros:
   loads), so native, wasm, and SVM all honestly execute every iteration — no inline-asm barriers (which
   the LLVM→SVM on-ramp rejects).
 
+## Compile latency & engine break-even
+
+The table above is *steady-state* throughput — `n` is sized huge precisely so the JIT's per-call
+recompile washes out. That hides a first-order property: **time-to-first-result** and **how many
+iterations a workload must run before a JIT (or even a bytecode) compile pays for itself** versus just
+tree-walking. The `compile_latency` driver measures it (same LLVM-frontend IR, same kernels):
+
+```sh
+cd crates/svm-llvm && cargo run --release --example compile_latency
+```
+
+It reports, per kernel: one-time **translate** (LLVM bitcode → SVM IR), each engine's **cold** cost
+(the `n → 0` intercept of `T(n) = cold + n·iter` — the fixed per-`compile_and_run` cost), the
+steady-state **per-iter**, and the **break-even** iteration counts (`cold + n·iter` crossover between
+engines, i.e. compile once + run `n` times).
+
+Indicative shape of the result (absolute numbers are machine-dependent):
+
+- **JIT cold ≈ 5–6 ms** (whole-module Cranelift codegen — `compile_and_run` recompiles *every* call,
+  so it's ~constant across kernels regardless of entry) **+ ~3.6 ms translate ≈ ~9 ms to first
+  result.** **Bytecode cold ≈ 30 µs** (~160× cheaper to start); **tree-walk cold ≈ 0** (pure frame
+  setup).
+- **Break-even ≈ 10⁵–10⁶ iterations**: below that the bytecode engine is the right tier; the JIT's
+  per-iter win (~1–2 ns vs ~30–70 ns) only repays its compile past ~75k–450k iterations.
+- This is the dominant inefficiency the steady-state table omits, and it directly motivates a
+  **compiled-module cache** (compile once, reuse across invocations) — today every `compile_and_run`
+  recompiles from scratch.
+
+Caveat: a kernel with a large in-function *prelude* (e.g. `fnv`'s 4 KiB buffer fill) inflates the
+interpreters' `cold` (the prelude is fixed per-call work, not compile); the JIT runs that prelude in
+microseconds so its `cold` stays ~pure compile.
+
+
 ## Run
 
 ```sh
