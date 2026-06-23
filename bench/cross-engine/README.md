@@ -168,12 +168,18 @@ per-iter is normalized, so the columns stay comparable.)
 ## Footprint — code size & memory
 
 Every section above measures *speed*; `footprint` measures *size*, the other axis for a VM meant to
-host many sandboxes. For `kernels.c` it reports each representation's size and the peak process RSS to
-build + hold each engine's artifact (re-exec'd per engine so the JIT's transient Cranelift compile
-memory shows up):
+host many sandboxes. It deliberately runs from the **deployed-sandbox perspective**: the LLVM frontend
+is an **AOT tool** (`svm-llvm-translate` → SVM IR), and the IR — not the compiler — is what travels to
+the sandbox, so the probe lives in `svm-run` and **links no libLLVM** (verified: `ldd` shows none). It
+takes an AOT-produced `.svmb`/`.svm` and reports each representation's size plus the peak process RSS to
+build + hold each engine's artifact (re-exec'd per engine):
 
 ```sh
-cd crates/svm-llvm && cargo run --release --example footprint
+# AOT (the only place libLLVM is used — produces the shippable IR):
+clang -O2 -emit-llvm -c bench/cross-engine/kernels.c -o /tmp/k.bc
+( cd crates/svm-llvm && cargo run --release --bin svm-llvm-translate -- /tmp/k.bc -o /tmp/k.svmb )
+# Runtime probe (no libLLVM — the real sandbox view):
+cargo run -p svm-run --release --example footprint -- /tmp/k.svmb
 ```
 
 Indicative (machine-dependent; ~11 functions, ~680 IR instructions):
@@ -185,13 +191,14 @@ Indicative (machine-dependent; ~11 functions, ~680 IR instructions):
 | JIT (native code) | ~3.2 KB | **~0.9×** |
 
 Reading: **the JIT'd native code is roughly the *same size* as the encoded IR** (~0.9×) — compact, not
-bloated; bytecode expands the IR ~1.1 ops/instruction. The memory story is in RSS: holding the module
-(tree-walk) or its bytecode adds ~0; a **JIT compile adds ~3 MB resident** (Cranelift's working set)
-for this small module — on top of a ~50 MB **libLLVM frontend** baseline (the translate step, not an
-engine cost). So per-guest steady-state memory is dominated by the JIT compiler, not the emitted code —
-another argument (with the compile-latency section) for a compiled-module cache and for running
-short-lived / many guests on the bytecode tier. (New `svm_jit::CompiledModule::code_byte_count` and
-`svm_interp::bytecode::Compiled::op_count` accessors expose the exact sizes.)
+bloated; bytecode expands the IR ~1.1 ops/instruction. Memory (RSS, libLLVM-free): a runtime process
+baseline is **~2.6 MB**; holding the module (tree-walk) or its bytecode adds **~0**; a **JIT compile
+adds ~3.4 MB resident** (Cranelift's working set) for this small module. So per-guest steady-state
+memory is dominated by the *JIT compiler's working set*, not the emitted code — another argument (with
+the compile-latency section) for a compiled-module cache and for running short-lived / many guests on
+the bytecode tier. **None of the ~50 MB libLLVM the frontend carries is in the sandbox** — it's AOT
+only. (New `svm_jit::CompiledModule::code_byte_count` and `svm_interp::bytecode::Compiled::op_count`
+accessors expose the exact sizes.)
 
 ## Capability-call (host-boundary) overhead
 
