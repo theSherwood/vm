@@ -1023,6 +1023,64 @@ fn variable_length_memset_loop() {
     );
 }
 
+/// A **threaded (computed-`goto`) bytecode interpreter** — the canonical `indirectbr`/`blockaddress`
+/// idiom (`static void *tbl[] = {&&l0,…}; goto *tbl[op];`), the dispatch shape every real bytecode VM
+/// (SQLite's VDBE, Lua, QuickJS) is built on. clang `-O2` lowers `&&label` to `blockaddress` constants
+/// in the dispatch-table global and `goto *p` to an `indirectbr`. The on-ramp recovers the (otherwise
+/// `llvm-ir`-erased) blockaddress targets via `llvm-sys` ([`svm_llvm::blockaddr`]) — baking each as its
+/// block index into the table global — and lowers the `indirectbr` to a `br_table` over those indices.
+/// The program is **derived from `n` at runtime** so no dispatch target constant-folds (which would let
+/// clang thread a `blockaddress` through a φ — an operand-position use, the deferred follow-up); every
+/// blockaddress stays in the table global. Verified byte-for-byte vs native on both backends.
+const COMPUTED_GOTO_SRC: &str = r#"
+int run(int n) {
+  static const void *const tbl[] = {&&op_halt, &&op_dbl, &&op_inc, &&op_xor};
+  unsigned char prog[16];
+  for (int i = 0; i < 15; i++) prog[i] = (unsigned char)(((n + i) * 2654435761u) % 4);
+  prog[15] = 0; /* guaranteed halt */
+  int pc = 0, acc = n, steps = 0;
+  goto *tbl[prog[pc]];
+op_dbl:  acc = acc * 2 + 1; pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_inc:  acc += 3;         pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_xor:  acc ^= 0x5a;      pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_halt: return acc & 0xff;
+}
+int main(void) { return run(7); }
+"#;
+
+#[test]
+fn computed_goto_threaded_interpreter() {
+    check_vs_native("computed_goto", COMPUTED_GOTO_SRC, 7);
+}
+
+/// Structural companion to [`computed_goto_threaded_interpreter`]: prove the computed-`goto` path is
+/// actually exercised (not optimized away) — clang emitted `blockaddress`es into the dispatch global,
+/// the `llvm-sys` recovery found them, and the `indirectbr` lowered to a `br_table`.
+#[test]
+fn computed_goto_lowers_indirectbr_to_br_table() {
+    let Some(bc) = compile_to_bc("computed_goto_struct", COMPUTED_GOTO_SRC) else {
+        return;
+    };
+    // The recovery found the dispatch table's blockaddress labels (one global, ≥ 2 entries).
+    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
+        .expect("blockaddress recovery should find the dispatch table");
+    assert!(
+        ba.per_global.values().any(|labels| labels.len() >= 2),
+        "expected a dispatch-table global with multiple blockaddress labels, got {:?}",
+        ba.per_global
+    );
+    // The `indirectbr` lowered to a `br_table` terminator.
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let has_br_table = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .any(|b| matches!(b.term, svm_ir::Terminator::BrTable { .. }));
+    assert!(has_br_table, "indirectbr should lower to a br_table");
+}
+
 #[test]
 fn demo_sha256_vs_native() {
     // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the

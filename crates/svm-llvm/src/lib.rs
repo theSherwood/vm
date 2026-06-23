@@ -174,6 +174,7 @@ use svm_ir::{
     TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
+pub mod blockaddr;
 pub mod di;
 
 /// Why a translation could not be produced.
@@ -218,16 +219,22 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let path = path.as_ref();
     let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
     let di = path.to_str().and_then(di::read_debug);
-    translate_impl(&m, di.as_ref())
+    // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).
+    let ba = path.to_str().and_then(blockaddr::read_block_addrs);
+    translate_impl(&m, di.as_ref(), ba.as_ref())
 }
 
 /// Translate an already-parsed `llvm-ir` module. The neutral core's source-line half is populated
 /// from `!DILocation`; the variable/type half requires the bitcode path (see [`translate_bc_path`]).
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
-    translate_impl(m, None)
+    translate_impl(m, None, None)
 }
 
-fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated, Error> {
+fn translate_impl(
+    m: &LModule,
+    di: Option<&di::LlvmDebug>,
+    ba: Option<&blockaddr::BlockAddrs>,
+) -> Result<Translated, Error> {
     // Pass 0: assign each *defined* function an IR index (its position among defined functions),
     // so a `call` can resolve its target by name. Declaration-only functions (extern/intrinsic
     // prototypes) have no body and are skipped — a call to one needs import support (a later slice).
@@ -331,7 +338,8 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
     // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
-    let (globals, data, globals_end, cstrs, gbytes) = globals_layout(m, &name2idx, globals_base)?;
+    let (globals, data, globals_end, cstrs, gbytes) =
+        globals_layout(m, &name2idx, globals_base, ba)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -813,6 +821,9 @@ fn const_size(c: &Constant, types: &Types) -> Result<u64, Error> {
         Constant::Int { bits, .. } if *bits <= 64 => Ok((*bits as u64).div_ceil(8).max(1)),
         Constant::Float(Float::Single(_)) => Ok(4),
         Constant::Float(Float::Double(_)) => Ok(8),
+        // A `blockaddress` is pointer-width (its `get_type` is the unsized `label` type, so it must be
+        // special-cased here rather than falling through to `type_size`).
+        Constant::BlockAddress => Ok(8),
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut n = 0;
             for e in elements {
@@ -842,6 +853,7 @@ fn const_bytes(
     types: &Types,
     globals: &HashMap<String, u64>,
     funcs: &HashMap<String, u32>,
+    ba: &mut impl Iterator<Item = u32>,
 ) -> Result<Vec<u8>, Error> {
     match c {
         Constant::Int { bits, value } if *bits <= 64 => {
@@ -850,10 +862,22 @@ fn const_bytes(
         }
         Constant::Float(Float::Single(f)) => Ok(f.to_bits().to_le_bytes().to_vec()),
         Constant::Float(Float::Double(d)) => Ok(d.to_bits().to_le_bytes().to_vec()),
+        // A `blockaddress(@f, %bb)` (a computed-`goto` label table entry): emit the recovered block
+        // index (8 LE bytes — pointer width) the `indirectbr` consumes as a `br_table` index. The
+        // labels arrive in this same DFS order from [`blockaddr`]; an empty feed (no recovery, e.g. the
+        // path-less `translate` entry) is a clean fail-closed `Unsupported`.
+        Constant::BlockAddress => {
+            let label = ba.next().ok_or_else(|| {
+                Error::Unsupported(
+                    "blockaddress without a recovered label (needs the .bc path)".into(),
+                )
+            })?;
+            Ok((label as u64).to_le_bytes().to_vec())
+        }
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut out = Vec::new();
             for e in elements {
-                out.extend(const_bytes(e.as_ref(), types, globals, funcs)?);
+                out.extend(const_bytes(e.as_ref(), types, globals, funcs, ba)?);
             }
             Ok(out)
         }
@@ -865,7 +889,7 @@ fn const_bytes(
             let (offsets, size, _) = struct_layout(&fields, *is_packed, types)?;
             let mut out = vec![0u8; size as usize];
             for (v, &off) in values.iter().zip(&offsets) {
-                let b = const_bytes(v.as_ref(), types, globals, funcs)?;
+                let b = const_bytes(v.as_ref(), types, globals, funcs, ba)?;
                 out[off as usize..off as usize + b.len()].copy_from_slice(&b);
             }
             Ok(out)
@@ -908,6 +932,7 @@ fn globals_layout(
     m: &LModule,
     name2idx: &HashMap<String, u32>,
     base: u64,
+    ba: Option<&blockaddr::BlockAddrs>,
 ) -> Result<Globals, Error> {
     // Phase A: assign every global a window address (from its declared type size), so a relocation
     // in any initializer can resolve a forward/backward reference to another global in phase B.
@@ -961,7 +986,14 @@ fn globals_layout(
     for (gi, at) in placed {
         let g = &m.global_vars[gi];
         let Some(init) = &g.initializer else { continue }; // BSS / extern → zero-init window
-        let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx)?;
+                                                           // The `blockaddress` labels this global's initializer holds (in DFS order — see [`blockaddr`]);
+                                                           // the serializer pops them as it reaches each `Constant::BlockAddress` leaf.
+        let empty: Vec<u32> = Vec::new();
+        let labels = ba
+            .and_then(|b| b.per_global.get(&name_str(&g.name)))
+            .unwrap_or(&empty);
+        let mut feed = labels.iter().copied();
+        let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx, &mut feed)?;
         // Record the C-string length (up to the first NUL) so `puts`/`fputs` on this literal can
         // write the right slice without a runtime strlen.
         let slen = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len()) as u64;
@@ -9600,6 +9632,8 @@ fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
         LTerm::Br(_) => Ok(Vec::new()),
         LTerm::CondBr(c) => Ok(one(&c.condition)),
         LTerm::Switch(sw) => Ok(one(&sw.operand)),
+        // `indirectbr`'s address operand is a use (the loaded label → the `br_table` index).
+        LTerm::IndirectBr(ib) => Ok(one(&ib.operand)),
         LTerm::Unreachable(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
@@ -9720,6 +9754,10 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
             }
             Ok(v)
         }
+        // `indirectbr` enumerates its full destination set (`possible_dests`) — every one is a
+        // successor, so liveness threads each target's live-ins out of this block (the `br_table`
+        // edges then supply them).
+        LTerm::IndirectBr(ib) => ib.possible_dests.iter().map(b).collect(),
         LTerm::Ret(_) | LTerm::Unreachable(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
@@ -13042,9 +13080,68 @@ fn translate_term(
             })
         }
         LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params),
+        LTerm::IndirectBr(ib) => translate_indirectbr(ctx, ib, bi, f, s, block_params),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
         other => unsup(format!("terminator {other:?}")),
     }
+}
+
+/// Lower an `indirectbr` (computed `goto`, `goto *p`) to a `br_table` (the §computed-goto half). The
+/// address operand is a `blockaddress` value the guest loaded from its dispatch table — i.e. a **block
+/// index** (see [`blockaddr`]; the matching label was baked into the global by `const_bytes`). So the
+/// table is indexed directly by that block index over `[0, nblocks)`: each listed destination routes
+/// to its own block; out-of-list slots (and any out-of-range / UB address) fall to the default — the
+/// first listed destination. LLVM guarantees the address is one of `possible_dests`, so the default is
+/// unreachable on well-defined input; on UB it stays in-sandbox (a defined branch to a real block,
+/// §3b totality — no escape, no stuck state).
+fn translate_indirectbr(
+    ctx: &mut BlockCtx,
+    ib: &llvm_ir::terminator::IndirectBr,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+) -> Result<Terminator, Error> {
+    // The address is a pointer (the loaded `blockaddress`); narrow it to the `i32` `br_table` index.
+    let operand = ctx.operand(&ib.operand)?;
+    let idx = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: operand,
+    });
+
+    let mut dests: Vec<usize> = Vec::with_capacity(ib.possible_dests.len());
+    for n in &ib.possible_dests {
+        let blk = *s
+            .block_idx
+            .get(n)
+            .ok_or_else(|| Error::Unsupported(format!("indirectbr to unknown block {n:?}")))?;
+        dests.push(blk);
+    }
+    if dests.is_empty() {
+        return unsup("indirectbr with no destinations");
+    }
+
+    // Branch arguments per distinct destination (each target's φ-results + threaded live-ins).
+    let mut args_for: HashMap<usize, Vec<ValIdx>> = HashMap::new();
+    for &d in &dests {
+        if let std::collections::hash_map::Entry::Vacant(e) = args_for.entry(d) {
+            e.insert(branch_args(ctx, bi, d, f, s, block_params)?);
+        }
+    }
+
+    // The table is indexed by block index, so it spans every block; unlisted indices → the default.
+    let nblocks = f.basic_blocks.len();
+    let default_blk = dests[0];
+    let default_edge: svm_ir::Edge = (default_blk as u32, args_for[&default_blk].clone());
+    let mut targets: Vec<svm_ir::Edge> = vec![default_edge.clone(); nblocks];
+    for &d in &dests {
+        targets[d] = (d as u32, args_for[&d].clone());
+    }
+    Ok(Terminator::BrTable {
+        idx,
+        targets,
+        default: default_edge,
+    })
 }
 
 /// The largest `br_table` span we materialize for a `switch` (gaps fill with the default). A
