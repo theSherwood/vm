@@ -11,7 +11,7 @@
 
 use std::io::Write;
 
-use svm_browser::{capture_exec, instantiate_exec, powerbox_exec};
+use svm_browser::{capture_exec, instantiate_exec, powerbox_exec, reflect_exec};
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -583,6 +583,28 @@ block0(v0: i32):
 }
 "#;
 
+// ---- §7 reflection (cap.self.count / cap.self.get) over a fixed 3-cap powerbox -----------------
+// Lifted from `crates/svm/tests/bytecode_caps.rs`. Powerbox = Stream(Out) t0, Exit t1, host-fn t13.
+
+// Number of caps the domain holds → 3.
+const SELF_COUNT: &str = r#"
+func () -> (i32) {
+block0():
+  v0 = cap.self.count
+  return v0
+}
+"#;
+
+// cap.self.get(idx) → (handle, type_id); sum them so the result depends on both.
+const SELF_GET: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1, v2 = cap.self.get v0
+  v3 = i32.add v1 v2
+  return v3
+}
+"#;
+
 // ---- tail calls (`return_call` / `return_call_indirect`, O(1) window reuse) --------------------
 // Adapted from `crates/svm/tests/bytecode_tailcall.rs` to the single-i64-arg compute shape.
 
@@ -909,6 +931,26 @@ fn main() {
             ("simd_mem", SIMD_MEM),
         ],
     );
+    // Reflection corpus — §7 cap.self.* over the fixed 3-cap powerbox (run via svm_run_reflect).
+    // SELF_COUNT takes no arg (→ 3); SELF_GET sweeps cap indices (0,1,2 valid; 3 out of range).
+    let reflect: &[(&str, &str, &[i64])] =
+        &[("self_count", SELF_COUNT, &[0]), ("self_get", SELF_GET, &[0, 1, 2, 3])];
+    json.push_str("],\n\"reflect\":[\n");
+    for (i, (name, src, args)) in reflect.iter().enumerate() {
+        let (m, file) = emit(name, src);
+        let nargs = m.funcs.first().map_or(0, |f| f.params.len());
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"nargs\":{nargs},\"cases\":["
+        ));
+        for (j, &arg) in args.iter().enumerate() {
+            let (status, value) = reflect_exec(&m, arg);
+            json.push_str(&format!(
+                "{}{{\"arg\":\"{arg}\",\"status\":{status},\"value\":\"{value}\"}}",
+                if j == 0 { "" } else { "," }
+            ));
+        }
+        json.push_str(if i + 1 == reflect.len() { "]}\n" } else { "]},\n" });
+    }
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
     eprintln!("wrote corpus.json");

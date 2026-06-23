@@ -117,6 +117,24 @@ const runCaptureLike = (list, kind) => {
 runCaptureLike(corpus.capture ?? [], 'capture');
 runCaptureLike(corpus.gcroots ?? [], 'gc');
 
+// ---- reflection corpus: svm_run_reflect (§7 cap.self.* over a fixed 3-cap powerbox) ---------
+for (const { name, file, cases } of corpus.reflect ?? []) {
+  let bad = 0;
+  for (const { arg, status, value } of cases) {
+    const m = load(readFileSync(file));
+    const got = ex.svm_run_reflect(m.ptr, m.len, BigInt(arg));
+    const gotStatus = ex.svm_status();
+    m.free();
+    const ok = gotStatus === status && (status !== 0 || BigInt(got) === BigInt(value));
+    total++;
+    if (!ok) { fail++; bad++;
+      console.log(`  FAIL ${name}(${arg}): native {status:${status},value:${value}} ` +
+        `wasm {status:${gotStatus},value:${got}}`);
+    }
+  }
+  console.log(`  ${name}: ${cases.length - bad}/${cases.length} match`);
+}
+
 // ---- nested-child corpus: svm_run_nested (§14 confined child domains) vs native -------------
 for (const c of corpus.nested ?? []) {
   const m = load(readFileSync(c.file));

@@ -559,6 +559,54 @@ pub extern "C" fn svm_snapshot_len() -> usize {
     unsafe { (*core::ptr::addr_of!(SNAP)).1 }
 }
 
+/// Run `m`'s function 0 under a deterministic **3-cap powerbox** — `Stream(Out)` (type 0), `Exit`
+/// (type 1), and a host-fn (type 13), granted in that order — so the §7 reflection ops
+/// `cap.self.count` / `cap.self.get` see a fixed, known capability table. Passes `arg` only if the
+/// entry takes one. Returns `(status, i64-widened value)`. Shared by [`svm_run_reflect`] and
+/// `gencorpus`.
+pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
+    let mut host = Host::new();
+    let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
+    let _ = host.grant_exit(); // handle 1, type_id 1
+    let _ = host.grant_host_fn(Box::new(|_op, _args, _mem| Ok(vec![0]))); // handle 2, type_id 13
+    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    let args: Vec<Value> = if arity >= 1 {
+        vec![Value::I32(arg as i32)]
+    } else {
+        Vec::new()
+    };
+    let mut fuel = 1_000_000u64;
+    match bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut host) {
+        None => (STATUS_UNSUPPORTED, 0),
+        Some(Err(_)) => (STATUS_TRAP, 0),
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64),
+            _ => (STATUS_BAD_RESULT, 0),
+        },
+    }
+}
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 under a fixed 3-cap powerbox, so §7
+/// reflection (`cap.self.count`/`get`) is deterministic (see [`reflect_exec`]). Returns the guest's
+/// `i64` result; sets [`LAST_STATUS`].
+#[no_mangle]
+pub extern "C" fn svm_run_reflect(mod_ptr: *const u8, mod_len: usize, arg: i64) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let (status, value) = reflect_exec(&m, arg);
+    set(status);
+    value
+}
+
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **nested-child** powerbox
 /// (an `Instantiator` over `[0, 128 KiB)`; see [`instantiate_exec`]): function 0 may `instantiate`
 /// confined child guests over sub-windows and `join` them. Returns the guest's `i64` result; sets
@@ -726,6 +774,26 @@ block0(v0: i64):
             Some(Value::I64(x)) => *x,
             _ => -1,
         },
+        _ => -1,
+    }
+}
+
+/// Self-contained reflection probe (`wasmtime --invoke run_reflect`): under the fixed 3-cap powerbox,
+/// `cap.self.count` reports `3`. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_reflect() -> i64 {
+    const R: &str = r#"
+func () -> (i32) {
+block0():
+  v0 = cap.self.count
+  return v0
+}
+"#;
+    let Ok(m) = svm_text::parse_module(R) else {
+        return -1;
+    };
+    match reflect_exec(&m, 0) {
+        (STATUS_OK, v) => v,
         _ => -1,
     }
 }

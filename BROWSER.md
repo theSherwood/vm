@@ -119,8 +119,9 @@ wasmtime run --invoke run_coroutine -W memory64=y "$W"   # 1001329 (spawn_corout
 wasmtime run --invoke run_tailcall  -W memory64=y "$W"   # 120 (return_call tail recursion, O(1) state)
 wasmtime run --invoke run_simd      -W memory64=y "$W"   # 42 (i64x2 splat/add/extract_lane)
 wasmtime run --invoke run_gcroots  -W memory64=y "$W"   # 2 (gc.roots conservative root scan)
+wasmtime run --invoke run_reflect   -W memory64=y "$W"   # 3 (cap.self.count over a 3-cap powerbox)
 
-# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tailcall + SIMD + gc.roots + …) — 105/105
+# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tailcall + SIMD + gc.roots + reflection + …) — 110/110
 cargo run --bin gencorpus                                # native ground truth → corpus.json
 node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
 
@@ -208,7 +209,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
 - [x] **Differential check (compute + concurrency + powerbox + snapshot + nested + fibers/coroutines +
   scale, wasm32).** `gencorpus` (host) encodes a corpus + computes the **native** result per case;
-  `corpus.mjs` runs the same modules through the wasm exports and compares. **105/105 match**, zero host
+  `corpus.mjs` runs the same modules through the wasm exports and compares. **110/110 match**, zero host
   imports.
   *Compute/concurrency* (37): i64 arith+branches, multi-function `call`, memory store/load,
   divide-by-zero → `STATUS_TRAP`, **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` =
@@ -256,8 +257,11 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
 - [x] **§GC `gc.roots`** (conservative root enumeration). Capture path: the guest scans its
   activation for in-range words, writes them to a buffer, returns the count; snapshot+count compared
   byte-identically (same engine wasm vs native). `gc_baseline`/`gc_tagged` (tag-masked) → 2 roots each.
-  wasm64 `run_gcroots() == 2`. *(Remaining unproven in wasm: guest-JIT (interpreted), reflection,
-  dynamic linking, SharedRegion, durability.)*
+  wasm64 `run_gcroots() == 2`.
+- [x] **§7 reflection** (`cap.self.count`/`cap.self.get`). Over a fixed 3-cap powerbox (Stream(Out)
+  t0, Exit t1, host-fn t13): count → 3, and `get(i)` → (handle, type_id) for i=0..2, out-of-range →
+  trap. wasm64 `run_reflect() == 3`. *(Remaining unproven in wasm: guest-JIT (interpreted), dynamic
+  linking, SharedRegion, durability.)*
 - [x] **Live host imports (`--features live`).** `svm_run_live` bridges guest capabilities to **real
   wasm imports** via `Host::grant_host_fn` (iface 13): a `(console, clock)` powerbox where
   `console.write` forwards the guest's bytes to the imported `svm_host.host_write` (live host console,
@@ -275,7 +279,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 105/105
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 110/110
   differential vs native), and `node browser/live.mjs` (host-import demo,
   `--features live`). wasm64 is exercised via the Wasmtime `--invoke` probes under **Reproduce**.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.
