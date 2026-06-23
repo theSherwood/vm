@@ -1314,20 +1314,32 @@ fn fuzz_heap(n: usize, seeds: &[u64]) -> (usize, usize, usize, usize) {
             verify_module(&interp).expect("heap interp verifies");
             let np = specialize_with_config(&interp, 0, &[SpecArg::Dynamic], &cfg(false));
             let pv = specialize_with_config(&interp, 0, &[SpecArg::Dynamic], &cfg(true));
-            // Heap programs always terminate; precompute the reference results.
-            let wants: Vec<i64> = inputs
+            // Reference results per input; `None` if the interpreter doesn't finish (a trap or, on
+            // some platforms, a faulting access) — those inputs are skipped, like the other shapes.
+            let wants: Vec<Option<i64>> = inputs
                 .iter()
-                .map(|&i| interp_try(&interp, i, FUEL).expect("heap interp terminates"))
+                .map(|&i| interp_try(&interp, i, FUEL))
                 .collect();
+            let first_ok: Option<(i64, i64)> = inputs
+                .iter()
+                .zip(&wants)
+                .find_map(|(&i, w)| w.map(|v| (i, v)));
             let icheck = |r: &Module, who: &str| {
                 verify_module(r)
                     .unwrap_or_else(|e| panic!("{who} residual verify {e:?}: {prog:?}"));
                 for (k, &input) in inputs.iter().enumerate() {
-                    assert_eq!(
-                        interp_try(r, input, FUEL),
-                        Some(wants[k]),
-                        "{who}: interp(residual) diverged at {input} on {prog:?}"
-                    );
+                    if let Some(w) = wants[k] {
+                        assert_eq!(
+                            interp_try(r, input, FUEL),
+                            Some(w),
+                            "{who}: interp(residual) diverged at {input} on {prog:?}"
+                        );
+                    }
+                }
+                // One JIT cross-check, on an input the interpreter (and thus the now-verified
+                // residual) finishes on — so the JIT can't hang.
+                if let Some((i0, w0)) = first_ok {
+                    assert_eq!(jit_run(r, i0), w0, "jit({who}): {prog:?}");
                 }
             };
             // Private must be at least as permissive: it never bails where non-private succeeds.
@@ -1341,15 +1353,17 @@ fn fuzz_heap(n: usize, seeds: &[u64]) -> (usize, usize, usize, usize) {
                 (Ok(rn), Ok(rp)) => {
                     icheck(&rn, "np");
                     icheck(&rp, "pv");
-                    assert_eq!(jit_run(&rp, inputs[0]), wants[0], "jit(pv): {prog:?}");
-                    checks += 1;
+                    if first_ok.is_some() {
+                        checks += 1;
+                    }
                 }
                 (Err(svm_peval::SpecError::Unsupported), Ok(rp)) => {
                     np_unsup += 1;
                     rescues += 1;
                     icheck(&rp, "pv");
-                    assert_eq!(jit_run(&rp, inputs[0]), wants[0], "jit(pv): {prog:?}");
-                    checks += 1;
+                    if first_ok.is_some() {
+                        checks += 1;
+                    }
                 }
                 (
                     Err(svm_peval::SpecError::Unsupported),

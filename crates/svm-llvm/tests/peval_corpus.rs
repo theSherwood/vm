@@ -252,6 +252,11 @@ fn sizes(m: &Module) -> Sizes {
 // The corpus, as data.
 // ===========================================================================================
 
+/// `n -> argument vector` for an entry (interpreter args, or residual args, for workload size `n`).
+type ArgsFn = Box<dyn Fn(i64) -> Vec<i64>>;
+/// Produce the residual from a (fresh) copy of the interpreter.
+type SpecializeFn = Box<dyn Fn(&Module) -> Result<Module, SpecError>>;
+
 struct Case {
     name: &'static str,
     /// Interpreter shape, for the report.
@@ -259,13 +264,13 @@ struct Case {
     interpreter: Module,
     entry: u32,
     /// Args to the *interpreter* for workload size `n`.
-    interp_args: Box<dyn Fn(i64) -> Vec<i64>>,
+    interp_args: ArgsFn,
     /// Args to the *residual* (entry func 0) for workload size `n`.
-    residual_args: Box<dyn Fn(i64) -> Vec<i64>>,
+    residual_args: ArgsFn,
     /// The reference result for workload size `n`.
     expect: Box<dyn Fn(i64) -> i64>,
     /// Produce the residual from a (fresh) copy of the interpreter.
-    specialize: Box<dyn Fn(&Module) -> Result<Module, SpecError>>,
+    specialize: SpecializeFn,
     /// Small, varied inputs for the correctness pass.
     correctness: Vec<i64>,
     /// Workload sizes for the timing sweep (last = headline).
