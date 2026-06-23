@@ -43,7 +43,8 @@ it is dropped once the actionable slices (1–2 below) close.
 - **Residual-call mode (outlining)** (`SpecConfig::outline_calls`, `svm-run --outline`): instead of
   inlining, each `(callee, arg pattern)` is specialized to a shared residual function and called — a
   multi-function residual that bounds code growth and specializes **dynamic-depth recursion** (a
-  finite self-recursive residual where inlining would diverge). Requires no rename region.
+  finite self-recursive residual where inlining would diverge). Composes with a rename region (see
+  next bullet).
 - **Selective outlining** (`SpecConfig::selective_outline`): inline straight-line and *bounded*
   recursion as usual, and outline **only an unbounded-recursion back-edge** — a call re-entering an
   activation already live on the stack with the same argument pattern. The residual is then a *tight*
@@ -53,6 +54,14 @@ it is dropped once the actionable slices (1–2 below) close.
   cut by the function-level outline memo, everything else by ordinary CFG inlining. On the Lisp `fib`
   demo this takes the residual from 13 functions to **2** and the same-backend JIT win from 2.3× to
   **~15×**. `tests/specialize.rs` (`selective_outlining_inlines_leaves_and_outlines_recursion`).
+- **Outlining + renaming together**: the renamed region's live abstract cells are threaded across a
+  residual call — passed in as extra arguments, returned as extra results — so the operand stack stays
+  in SSA across an outlined (or selectively-outlined) call instead of forcing the region into real
+  memory. The driver builds callees eagerly depth-first so a callee's out-cell signature is known
+  before its `call` is emitted; the out-cell set is fixed at the first return and required to match at
+  every other (mismatch / recursion-through-a-region / outlined tail-call-with-live-cells fail
+  closed). `tests/specialize.rs` (`outlining_threads_a_renamed_cell_across_a_call`),
+  `tests/bench.rs` (`outline_rename_threads_operand_stack_through_helpers`).
 - **AOT pipeline** (`tests/aot.rs`).
 - **End-to-end demo on a real interpreter** (`crates/svm-llvm/tests/peval_demo.rs`): a Brainfuck
   interpreter **written in C**, compiled `clang -O2 → LLVM → svm-llvm → svm-IR`, then specialized
@@ -75,33 +84,43 @@ it is dropped once the actionable slices (1–2 below) close.
   `-fno-optimize-sibling-calls`; (2) a *counted* host loop (`for i in 0..n`) is unrolled by online PE
   (its induction variable looks constant each step), so the guest's only foldable looping construct is
   recursion — which is exactly where outlining earns its keep.
-- **Benchmarking** (`tests/bench.rs`): `size_corpus` (a normal test, also a size-regression guard)
-  reports blocks / insts / encoded `.svmb` bytes for interpreter → residual → optimized across four
-  shapes (register machine: constant / straight-line / runtime-loop, plus a renamed stack machine) —
-  e.g. the constant program shrinks 236→44 bytes, the runtime-loop residual drops the whole dispatch
-  table (272→131 bytes) while keeping a compiled loop. `roi_futamura_loop` (`#[ignore]`) reports
-  speed + size: ~3.6× (interp backend) / ~3.3× (JIT) specialization win, ~2780× end-to-end
-  interpreted→compiled-native on the sum-loop. Print with `--nocapture` (`--ignored` for the timing).
+- **Benchmarking** — a corpus of harnesses (`size_corpus`, `gain_spectrum`, `roi_futamura_loop`,
+  `fuzz_specialization_*` in `svm-peval`'s `tests/bench.rs`; `peval_corpus` in `svm-llvm`) plus a
+  regenerable consolidated report. See the **Benchmarking** section below and
+  [`PEVAL_BENCH.md`](PEVAL_BENCH.md). Headline: on the sum-loop, ~3.6× (interp backend) / ~7× (JIT,
+  run-time only after the compile-once timing fix) specialization win, thousands× end-to-end
+  interpreted-interpreter→compiled-native.
 
 ## Remaining slices (ranked by ROI)
 
 1. **Exotic v128 (SIMD) ops** — fold the remaining lane ops (saturating add/sub, widen/narrow, lane
    int↔float convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15). Each
    mirrors a `svm-interp` `simd_*` helper; low-medium effort, low priority (uncommon in residuals).
-2. **Outlining + renaming together** — thread the renamed region's live abstract cells across a
-   residual call (as extra params/results), so outlining (incl. selective) works even with a rename
-   region (today both require `rename = None`). Medium effort; only needed for very large renamed
-   interpreters.
-3. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
+2. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
    dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
    effort (on-device re-verify, determinism/TCB review) — a project, not a slice.
 
 ## Benchmarking
 
-Built — see the `tests/bench.rs` bullet under **Done**: `size_corpus` reports residual program size
-(blocks / insts / `.svmb` bytes) across a corpus of interpreter shapes and guards against size
-regressions; `roi_futamura_loop` reports size + speed on the runtime-loop workload. Extend the corpus
-with new shapes as slices land, so each one's size/speed effect is measured, not assumed.
+**Regenerable report: [`PEVAL_BENCH.md`](PEVAL_BENCH.md)** — run
+`python3 scripts/peval_bench_report.py` to rebuild it. The script runs the CSV-emitting benches in
+`svm-peval` and `svm-llvm` (set `SVM_BENCH_CSV=1` to emit `CSV,<bench>,<case>,<metric>,<value>` rows)
+and renders one consolidated markdown table; timings are JIT, compile-once/run-many, single-run and
+machine-dependent (the report records the host).
+
+Benches feeding it:
+- `tests/bench.rs` (`svm-peval`): `size_corpus` (size across toy shapes, also a size-regression
+  guard), `gain_spectrum` (the overhead-bound→work-bound run-time gradient on toy loops), and
+  `roi_futamura_loop` (end-to-end Futamura on the sum-loop: ~3.6× interp / ~7× JIT specialization
+  win, thousands× interpreted-interpreter→compiled-native).
+- `tests/peval_corpus.rs` (`svm-llvm`): the real clang-compiled BF + Lisp interpreters across a range
+  of guest programs — size, PE time, JIT-compile time, and run-time speedup.
+- `tests/bench.rs::fuzz_specialization_*` (`svm-peval`): the differential oracle
+  (interp == interp == jit) over random programs across four interpreter shapes; the bail surface
+  (Budget / Unsupported / nonterminating) is reported and verified legitimate.
+
+Extend the corpus with new shapes as slices land, so each one's size/speed effect is measured, not
+assumed.
 
 **Non-goals** (the engine correctly bails, not pending work): effectful / multi-result ops — atomics,
 fibers/threads, host `cap.call` / imports — cannot be folded soundly.
