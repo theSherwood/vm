@@ -117,8 +117,9 @@ wasmtime run --invoke run_instantiate -W memory64=y "$W" # 42123 (confined neste
 wasmtime run --invoke run_fiber     -W memory64=y "$W"   # 107 (cont.new/resume cooperative fiber)
 wasmtime run --invoke run_coroutine -W memory64=y "$W"   # 1001329 (spawn_coroutine/resume/yield)
 wasmtime run --invoke run_tailcall  -W memory64=y "$W"   # 120 (return_call tail recursion, O(1) state)
+wasmtime run --invoke run_simd      -W memory64=y "$W"   # 42 (i64x2 splat/add/extract_lane)
 
-# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tail calls + …) — 76/76
+# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tailcall + SIMD + …) — 103/103
 cargo run --bin gencorpus                                # native ground truth → corpus.json
 node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
 
@@ -206,7 +207,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
 - [x] **Differential check (compute + concurrency + powerbox + snapshot + nested + fibers/coroutines +
   scale, wasm32).** `gencorpus` (host) encodes a corpus + computes the **native** result per case;
-  `corpus.mjs` runs the same modules through the wasm exports and compares. **76/76 match**, zero host
+  `corpus.mjs` runs the same modules through the wasm exports and compares. **103/103 match**, zero host
   imports.
   *Compute/concurrency* (37): i64 arith+branches, multi-function `call`, memory store/load,
   divide-by-zero → `STATUS_TRAP`, **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` =
@@ -247,8 +248,12 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   fault. All 7 match native; wasm64 `run_fiber() == 107`, `run_coroutine() == 1001329`.
 - [x] **Tail calls** (`return_call`/`return_call_indirect`, O(1) window reuse). Plain compute path:
   tail-recursive factorial (sweep) + indirect dispatch through the natural table (incl. out-of-range →
-  `IndirectCall` trap). wasm64 `run_tailcall() == 120`. *(Remaining unproven in wasm: guest-JIT
-  (interpreted), GC roots, SIMD, reflection, dynamic linking, SharedRegion, durability.)*
+  `IndirectCall` trap). wasm64 `run_tailcall() == 120`.
+- [x] **§17 SIMD / v128.** The bytecode engine delegates the v128 long tail to the reference; observed
+  via `extract_lane` to fit the i64 slot. `i64x2`/`i32x4` splat+add (→ 2·arg), and a `v128.store`/
+  `v128.load` memory round-trip — all swept and matching native. wasm64 `run_simd() == 42`.
+  *(Remaining unproven in wasm: guest-JIT (interpreted), GC roots, reflection, dynamic linking,
+  SharedRegion, durability.)*
 - [x] **Live host imports (`--features live`).** `svm_run_live` bridges guest capabilities to **real
   wasm imports** via `Host::grant_host_fn` (iface 13): a `(console, clock)` powerbox where
   `console.write` forwards the guest's bytes to the imported `svm_host.host_write` (live host console,
@@ -266,7 +271,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 76/76
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 103/103
   differential vs native), and `node browser/live.mjs` (host-import demo,
   `--features live`). wasm64 is exercised via the Wasmtime `--invoke` probes under **Reproduce**.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

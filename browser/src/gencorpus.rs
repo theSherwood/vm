@@ -633,6 +633,46 @@ block0(v0: i64):
 }
 "#;
 
+// ---- §17 SIMD / v128 (the bytecode engine delegates the v128 long tail to the reference) --------
+// Observed via `extract_lane` so the result fits the i64 slot (the natural way a guest consumes one).
+
+// i64x2: splat arg into both lanes, add → [2·arg, 2·arg], extract lane 0 → 2·arg (wraps identically).
+const SIMD_I64X2: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64x2.splat v0
+  v2 = i64x2.add v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
+}
+"#;
+
+// i32x4: splat the low 32 bits, add lanewise, extract lane 0, sign-extend back to i64.
+const SIMD_I32X4: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i32x4.splat v1
+  v3 = i32x4.add v2 v2
+  v4 = i32x4.extract_lane 0 v3
+  v5 = i64.extend_i32_s v4
+  return v5
+}
+"#;
+
+// v128 memory round-trip: splat arg, `v128.store` it, `v128.load` it back, extract lane 1 → arg.
+const SIMD_MEM: &str = r#"memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64x2.splat v0
+  v2 = i64.const 0
+  v128.store v2 v1
+  v3 = v128.load v2
+  v4 = i64x2.extract_lane 1 v3
+  return v4
+}
+"#;
+
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -785,34 +825,36 @@ fn main() {
             if i + 1 == fibers.len() { "\n" } else { ",\n" },
         ));
     }
-    // Tail-call corpus — `return_call`/`return_call_indirect`; plain compute (1-arg sweep, svm_run).
-    let tailcall = [("tail_fact", TAIL_FACT), ("tail_indirect", TAIL_INDIRECT)];
-    json.push_str("],\n\"tailcall\":[\n");
-    for (i, (name, src)) in tailcall.iter().enumerate() {
-        let (m, file) = emit(name, src);
-        json.push_str(&format!(
-            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"nargs\":1,\"cases\":["
-        ));
-        for (j, &arg) in ARGS.iter().enumerate() {
-            let (status, value) = native(&m, &[Value::I64(arg)]);
+    // Compute-style feature sections (1-arg sweep, svm_run): tail calls and SIMD/v128.
+    let mut emit_sweep = |section: &str, mods: &[(&str, &str)]| {
+        json.push_str(&format!("],\n\"{section}\":[\n"));
+        for (i, (name, src)) in mods.iter().enumerate() {
+            let (m, file) = emit(name, src);
             json.push_str(&format!(
-                "{}{{\"arg\":\"{arg}\",\"status\":{status},\"value\":\"{value}\"}}",
-                if j == 0 { "" } else { "," }
+                "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"nargs\":1,\"cases\":["
             ));
+            for (j, &arg) in ARGS.iter().enumerate() {
+                let (status, value) = native(&m, &[Value::I64(arg)]);
+                json.push_str(&format!(
+                    "{}{{\"arg\":\"{arg}\",\"status\":{status},\"value\":\"{value}\"}}",
+                    if j == 0 { "" } else { "," }
+                ));
+            }
+            json.push_str(if i + 1 == mods.len() { "]}\n" } else { "]},\n" });
         }
-        json.push_str(if i + 1 == tailcall.len() { "]}\n" } else { "]},\n" });
-    }
+    };
+    emit_sweep("tailcall", &[("tail_fact", TAIL_FACT), ("tail_indirect", TAIL_INDIRECT)]);
+    emit_sweep(
+        "simd",
+        &[
+            ("simd_i64x2", SIMD_I64X2),
+            ("simd_i32x4", SIMD_I32X4),
+            ("simd_mem", SIMD_MEM),
+        ],
+    );
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
-    eprintln!(
-        "wrote corpus.json ({} compute, {} powerbox, {} capture, {} nested, {} fiber, {} tailcall)",
-        compute.len(),
-        powerbox.len(),
-        cap_args.len(),
-        nested.len(),
-        fibers.len(),
-        tailcall.len()
-    );
+    eprintln!("wrote corpus.json");
 
     // Encode the guests validated by harnesses (not the deterministic corpus): the live-import guest
     // (`live.mjs`, host-backed) and the large-I/O echo guest (`corpus.mjs`'s alloc-ABI roundtrip).

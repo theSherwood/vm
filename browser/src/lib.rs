@@ -704,6 +704,32 @@ block0(v0: i64):
     }
 }
 
+/// Self-contained SIMD probe (`wasmtime --invoke run_simd`): splat 21 into an `i64x2`, add lanewise,
+/// extract lane 0 → `42`. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_simd() -> i64 {
+    const S: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64x2.splat v0
+  v2 = i64x2.add v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
+}
+"#;
+    let Ok(m) = svm_text::parse_module(S) else {
+        return -1;
+    };
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run(&m, 0, &[Value::I64(21)], &mut fuel) {
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            _ => -1,
+        },
+        _ => -1,
+    }
+}
+
 /// Self-contained tail-call probe (`wasmtime --invoke run_tailcall`): a tail-recursive factorial via
 /// `return_call` (O(1) window reuse) returns `5! = 120`. Returns `-1` on any mismatch.
 #[no_mangle]

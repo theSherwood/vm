@@ -59,6 +59,7 @@ const runComputeLike = (list) => {
 runComputeLike(corpus.compute);
 runComputeLike(corpus.fiber ?? []);
 runComputeLike(corpus.tailcall ?? []);
+runComputeLike(corpus.simd ?? []);
 
 // ---- powerbox corpus: svm_run_pb (streams/clock/exit) vs native -----------------------------
 for (const c of corpus.powerbox ?? []) {
