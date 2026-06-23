@@ -587,6 +587,95 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     }
 }
 
+/// The browser's [`svm_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
+/// cap: `decode_module` (fail-closed) → resolve imports (closed-blob ⇒ none) → `verify_module` (the
+/// escape-freedom gate) → the memory-match precondition → reject data segments and concurrency ops.
+/// A pure-Rust replica of `svm-run`'s canonical validator, so it builds for wasm (no Cranelift dep).
+fn browser_jit_validator(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    _symtab: &[u8],
+) -> Result<std::sync::Arc<[svm_ir::Func]>, i64> {
+    const EINVAL: i64 = -22;
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return Err(EINVAL);
+    };
+    // Closed-blob `compile`: resolve nothing, so a unit with §7 imports fails closed.
+    let Ok(m) = svm_ir::resolve_imports_with(&m, |_name: &str| None::<svm_ir::Resolved>) else {
+        return Err(EINVAL);
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        return Err(EINVAL);
+    }
+    if m.memory.map(|mc| mc.size_log2) != mem_log2 {
+        return Err(EINVAL); // declared memory must equal the parent window
+    }
+    if !m.data.is_empty() || m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_concurrency()) {
+        return Err(EINVAL);
+    }
+    Ok(m.funcs.into())
+}
+
+/// A unit the guest-JIT path installs and calls: `service(a, b) = a*b + 100`. Host-compiled (the
+/// bytecode entry builds memory from the module, so no in-guest blob seeding is needed).
+const JIT_SERVICE: &str = r#"memory 16
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.mul v0 v1
+  v3 = i32.const 100
+  v4 = i32.add v2 v3
+  return v4
+}
+"#;
+
+/// Run `m`'s function 0 with a **`Jit`** cap (iface 11) and a host-compiled [`JIT_SERVICE`] unit:
+/// the guest receives `(jit_handle, code_handle, a, b)`, `install`s the unit into its dispatch table
+/// (op 3), then `call_indirect`s it — guest-driven code loading, **interpreted** (the bytecode engine
+/// lowers the submitted unit to bytecode; no native backend). `a=6, b=7`. Returns `(status, value)`.
+pub fn jit_exec(m: &svm_ir::Module) -> (i32, i64) {
+    let service = match svm_text::parse_module(JIT_SERVICE) {
+        Ok(s) => svm_encode::encode_module(&s),
+        Err(_) => return (STATUS_BAD_RESULT, 0),
+    };
+    let mut host = Host::new();
+    let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), 4); // 2^4 = 16-slot table
+    host.set_jit_validator(browser_jit_validator);
+    let code = match host.jit_compile(jit, &service) {
+        Ok(Ok(c)) => c.handle,
+        _ => return (STATUS_TRAP, 0),
+    };
+    let args = [Value::I32(jit), Value::I32(code), Value::I32(6), Value::I32(7)];
+    let mut fuel = 50_000_000u64;
+    match bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut host) {
+        None => (STATUS_UNSUPPORTED, 0),
+        Some(Err(_)) => (STATUS_TRAP, 0),
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64),
+            _ => (STATUS_BAD_RESULT, 0),
+        },
+    }
+}
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **guest-JIT** powerbox (see
+/// [`jit_exec`]). Returns the guest's `i64` result; sets [`LAST_STATUS`].
+#[no_mangle]
+pub extern "C" fn svm_run_jit(mod_ptr: *const u8, mod_len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let (status, value) = jit_exec(&m);
+    set(status);
+    value
+}
+
 /// Run `m`'s function 0 with a host-granted **`SharedRegion`** (iface 4, 64 KiB) as its sole cap —
 /// the §13 host-backed memory object a guest `map`s into its window (op 0), aliasing the same backing
 /// at multiple offsets (the magic-ring-buffer primitive); op 2 `len`, op 3 `page_size`. Returns
@@ -812,6 +901,30 @@ block0(v0: i64):
             Some(Value::I64(x)) => *x,
             _ => -1,
         },
+        _ => -1,
+    }
+}
+
+/// Self-contained guest-JIT probe (`wasmtime --invoke run_jit`): a guest installs a host-compiled
+/// unit (`a*b+100`) into its dispatch table and `call_indirect`s it with `(6, 7)` → `142`. Proves
+/// guest-driven code loading (validated + interpreted, no native backend) works. `-1` on mismatch.
+#[no_mangle]
+pub extern "C" fn run_jit() -> i64 {
+    const G: &str = r#"memory 16
+func (i32, i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32, v3: i32):
+  v4 = i64.extend_i32_u v1
+  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
+  v6 = i32.wrap_i64 v5
+  v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
+  return v7
+}
+"#;
+    let Ok(m) = svm_text::parse_module(G) else {
+        return -1;
+    };
+    match jit_exec(&m) {
+        (STATUS_OK, v) => v,
         _ => -1,
     }
 }

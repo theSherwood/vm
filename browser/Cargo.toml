@@ -34,6 +34,9 @@ svm-encode = { path = "../crates/svm-encode" }
 svm-text   = { path = "../crates/svm-text" }
 # `Module` is named by the fixture/corpus bins and by `powerbox_exec` (shared with the cdylib).
 svm-ir     = { path = "../crates/svm-ir" }
+# The escape-freedom verifier — the security hinge of the guest-driven `Jit` cap's validator
+# (decode → verify → preconditions). Pure (only deps `svm-ir`), so it builds for wasm.
+svm-verify = { path = "../crates/svm-verify" }
 
 [profile.release]
 panic = "abort"

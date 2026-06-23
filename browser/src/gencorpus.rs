@@ -11,7 +11,9 @@
 
 use std::io::Write;
 
-use svm_browser::{capture_exec, instantiate_exec, powerbox_exec, reflect_exec, region_exec};
+use svm_browser::{
+    capture_exec, instantiate_exec, jit_exec, powerbox_exec, reflect_exec, region_exec,
+};
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -583,6 +585,35 @@ block0(v0: i32):
 }
 "#;
 
+// ---- §22 guest-JIT (Jit.install + cross-module call_indirect, interpreted) ----------------------
+// From `crates/svm/tests/bytecode_dynlink.rs`. The unit (jit_exec's JIT_SERVICE = a*b+100) is
+// host-compiled; the guest gets (jit, code, a=6, b=7). iface 11: op 3 install, op 4 uninstall.
+
+// Install the unit (→ table slot), then call_indirect it: 6*7 + 100 = 142.
+const JIT_INSTALL: &str = r#"memory 16
+func (i32, i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32, v3: i32):
+  v4 = i64.extend_i32_u v1
+  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
+  v6 = i32.wrap_i64 v5
+  v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
+  return v7
+}
+"#;
+
+// Install, then uninstall the slot, then call_indirect it → IndirectCall trap (the freed slot).
+const JIT_UNINSTALL: &str = r#"memory 16
+func (i32, i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32, v3: i32):
+  v4 = i64.extend_i32_u v1
+  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
+  v6 = cap.call 11 4 (i64) -> (i64) v0 (v5)
+  v7 = i32.wrap_i64 v5
+  v8 = call_indirect (i32, i32) -> (i32) v7 (v2, v3)
+  return v8
+}
+"#;
+
 // ---- §13 SharedRegion (host-backed memory aliased into the window) -----------------------------
 // From `crates/svm/tests/shared_region.rs`. iface 4: op 0 map(win_off, region_off, len, prot),
 // op 2 len, op 3 page_size. Host grants a 64 KiB region as func 0's arg.
@@ -980,6 +1011,17 @@ fn main() {
             ));
         }
         json.push_str(if i + 1 == reflect.len() { "]}\n" } else { "]},\n" });
+    }
+    // Guest-JIT corpus — §22 install + cross-module call_indirect (interpreted); svm_run_jit.
+    let jit = [("jit_install", JIT_INSTALL), ("jit_uninstall", JIT_UNINSTALL)];
+    json.push_str("],\n\"jit\":[\n");
+    for (i, (name, src)) in jit.iter().enumerate() {
+        let (m, file) = emit(name, src);
+        let (status, value) = jit_exec(&m);
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"status\":{status},\"value\":\"{value}\"}}{}",
+            if i + 1 == jit.len() { "\n" } else { ",\n" },
+        ));
     }
     // SharedRegion corpus — §13 host-backed memory; func 0 gets a 64 KiB region (svm_run_region).
     let region = [("region_alias", REGION_ALIAS), ("region_len", REGION_LEN)];
