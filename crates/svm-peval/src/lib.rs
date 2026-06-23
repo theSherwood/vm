@@ -64,8 +64,9 @@
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
-    IntTy, IntUnOp, Module, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
-    VIntBinOp, VIntUnOp, VShape, VShiftOp, ValIdx, ValType,
+    IntTy, IntUnOp, Module, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp,
+    VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp,
+    ValIdx, ValType,
 };
 
 mod specialize;
@@ -597,8 +598,336 @@ pub(crate) fn fold_simd(inst: &Inst, get: impl Fn(ValIdx) -> Option<Known>) -> O
         Inst::Bitselect { a, b, mask } => Known::V128(simd_bitselect(v(a)?, v(b)?, v(mask)?)),
         Inst::Shuffle { lanes, a, b } => Known::V128(simd_shuffle(&lanes, v(a)?, v(b)?)),
         Inst::Swizzle { a, b } => Known::V128(simd_swizzle(v(a)?, v(b)?)),
+        // Exotic lane ops — each mirrors the matching `svm-interp` `simd_*` helper bit-for-bit (the
+        // differential oracle, `tests/specialize.rs::folds_v128_exotic_lane_ops`, cross-checks them).
+        Inst::VSatBin { shape, op, a, b } => Known::V128(simd_vsat_bin(shape, op, v(a)?, v(b)?)),
+        Inst::VWiden { shape, op, a } => Known::V128(simd_widen(shape, op, v(a)?)),
+        Inst::VNarrow { shape, op, a, b } => Known::V128(simd_narrow(shape, op, v(a)?, v(b)?)),
+        Inst::VConvert { op, a } => Known::V128(simd_convert(op, v(a)?)),
+        Inst::VPMinMax { shape, op, a, b } => Known::V128(simd_pminmax(shape, op, v(a)?, v(b)?)),
+        Inst::VPopcnt { a } => {
+            let x = v(a)?;
+            let mut o = [0u8; 16];
+            for i in 0..16 {
+                o[i] = x[i].count_ones() as u8;
+            }
+            Known::V128(o)
+        }
+        Inst::VAvgr { shape, a, b } => Known::V128(simd_avgr(shape, v(a)?, v(b)?)),
+        Inst::VDot { a, b } => Known::V128(simd_dot(v(a)?, v(b)?)),
+        Inst::VDotI8 { a, b } => Known::V128(simd_dot_i8(v(a)?, v(b)?)),
+        Inst::VExtMul { shape, op, a, b } => Known::V128(simd_extmul(shape, op, v(a)?, v(b)?)),
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            Known::V128(simd_extadd_pairwise(shape, signed, v(a)?))
+        }
+        Inst::VQ15MulrSat { a, b } => Known::V128(simd_q15mulr(v(a)?, v(b)?)),
+        Inst::VAnyTrue { a } => Known::I32(v(a)?.iter().any(|&b| b != 0) as i32),
+        Inst::VAllTrue { shape, a } => Known::I32(simd_all_true(shape, v(a)?)),
+        Inst::VBitmask { shape, a } => Known::I32(simd_bitmask(shape, v(a)?)),
         _ => return None,
     })
+}
+
+// ---- exotic lane-op helpers (ported from `svm-interp`'s `simd_*`, kept bit-identical) ----------
+
+fn simd_vsat_bin(shape: VShape, op: VSatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let bits = bytes as u32 * 8;
+    let max_u = (1i128 << bits) - 1;
+    let max_s = (1i128 << (bits - 1)) - 1;
+    let min_s = -(1i128 << (bits - 1));
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let (xu, yu) = (
+            lane_read(&a, i, bytes) as i128,
+            lane_read(&b, i, bytes) as i128,
+        );
+        let (xs, ys) = (
+            lane_sext(lane_read(&a, i, bytes), bytes) as i128,
+            lane_sext(lane_read(&b, i, bytes), bytes) as i128,
+        );
+        let r = match op {
+            VSatBinOp::AddU => (xu + yu).min(max_u),
+            VSatBinOp::SubU => (xu - yu).max(0),
+            VSatBinOp::AddS => (xs + ys).clamp(min_s, max_s),
+            VSatBinOp::SubS => (xs - ys).clamp(min_s, max_s),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
+    }
+    o
+}
+
+fn simd_widen(out: VShape, op: VWidenOp, a: [u8; 16]) -> [u8; 16] {
+    let (low, signed) = op.parts();
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize;
+    let base = if low { 0 } else { n };
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let s = lane_read(&a, base + i, src_bytes);
+        let v = if signed {
+            lane_sext(s, src_bytes) as u64
+        } else {
+            s
+        };
+        lane_write(&mut o, i, out_bytes, v);
+    }
+    o
+}
+
+fn simd_narrow(out: VShape, op: VNarrowOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let out_bytes = out.lane_bytes() as usize;
+    let src = out.wider().expect("verifier ensures a wider source");
+    let src_bytes = src.lane_bytes() as usize;
+    let src_lanes = src.lanes() as usize; // = out.lanes() / 2
+    let bits = out_bytes as u32 * 8;
+    let (min, max) = match op {
+        VNarrowOp::S => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+        VNarrowOp::U => (0i128, (1i128 << bits) - 1),
+    };
+    let mut o = [0u8; 16];
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&a, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, i, out_bytes, s.clamp(min, max) as u64);
+    }
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&b, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, src_lanes + i, out_bytes, s.clamp(min, max) as u64);
+    }
+    o
+}
+
+fn simd_extmul(out: VShape, op: VWidenOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let (low, signed) = op.parts();
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize;
+    let base = if low { 0 } else { n };
+    let widen = |raw: u64| -> i128 {
+        if signed {
+            lane_sext(raw, src_bytes) as i128
+        } else {
+            raw as i128
+        }
+    };
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let x = widen(lane_read(&a, base + i, src_bytes));
+        let y = widen(lane_read(&b, base + i, src_bytes));
+        lane_write(&mut o, i, out_bytes, (x * y) as u64);
+    }
+    o
+}
+
+fn simd_extadd_pairwise(out: VShape, signed: bool, a: [u8; 16]) -> [u8; 16] {
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize;
+    let widen = |raw: u64| -> i128 {
+        if signed {
+            lane_sext(raw, src_bytes) as i128
+        } else {
+            raw as i128
+        }
+    };
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let lo = widen(lane_read(&a, 2 * i, src_bytes));
+        let hi = widen(lane_read(&a, 2 * i + 1, src_bytes));
+        lane_write(&mut o, i, out_bytes, (lo + hi) as u64);
+    }
+    o
+}
+
+fn simd_q15mulr(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..8 {
+        let x = lane_sext(lane_read(&a, i, 2), 2);
+        let y = lane_sext(lane_read(&b, i, 2), 2);
+        let r = (x * y + 0x4000) >> 15;
+        let sat = r.clamp(i16::MIN as i64, i16::MAX as i64);
+        lane_write(&mut o, i, 2, sat as u16 as u64);
+    }
+    o
+}
+
+fn simd_avgr(shape: VShape, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let y = lane_read(&b, i, bytes);
+        lane_write(&mut o, i, bytes, (x + y + 1) >> 1);
+    }
+    o
+}
+
+fn simd_dot(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..4 {
+        let a0 = lane_sext(lane_read(&a, 2 * i, 2), 2) as i32;
+        let a1 = lane_sext(lane_read(&a, 2 * i + 1, 2), 2) as i32;
+        let b0 = lane_sext(lane_read(&b, 2 * i, 2), 2) as i32;
+        let b1 = lane_sext(lane_read(&b, 2 * i + 1, 2), 2) as i32;
+        let r = a0.wrapping_mul(b0).wrapping_add(a1.wrapping_mul(b1));
+        lane_write(&mut o, i, 4, r as u32 as u64);
+    }
+    o
+}
+
+fn simd_dot_i8(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for j in 0..8 {
+        let a0 = lane_sext(lane_read(&a, 2 * j, 1), 1) as i32;
+        let a1 = lane_sext(lane_read(&a, 2 * j + 1, 1), 1) as i32;
+        let b0 = lane_sext(lane_read(&b, 2 * j, 1), 1) as i32;
+        let b1 = lane_sext(lane_read(&b, 2 * j + 1, 1), 1) as i32;
+        let r = a0 * b0 + a1 * b1; // exact in i32; wraps when written at i16 width
+        lane_write(&mut o, j, 2, r as u16 as u64);
+    }
+    o
+}
+
+fn simd_all_true(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    (0..shape.lanes() as usize).all(|i| lane_read(&a, i, bytes) != 0) as i32
+}
+
+fn simd_bitmask(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    let top = bytes as u32 * 8 - 1;
+    let mut m = 0i32;
+    for i in 0..shape.lanes() as usize {
+        m |= (((lane_read(&a, i, bytes) >> top) & 1) as i32) << i;
+    }
+    m
+}
+
+fn simd_pminmax(shape: VShape, op: VPMinMaxOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    // wasm pmin/pmax: a one-sided compare-and-select — pmin(a,b)=b<a?b:a, pmax(a,b)=a<b?b:a — which
+    // propagates NaN from the second operand and returns the chosen operand's ±0 (no canonicalization).
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let r = match op {
+                    VPMinMaxOp::Pmin => {
+                        if y < x {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                    VPMinMaxOp::Pmax => {
+                        if x < y {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                };
+                lane_write(&mut o, i, 4, r.to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let r = match op {
+                    VPMinMaxOp::Pmin => {
+                        if y < x {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                    VPMinMaxOp::Pmax => {
+                        if x < y {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                };
+                lane_write(&mut o, i, 8, r.to_bits());
+            }
+        }
+        _ => {} // verifier rejects an integer shape here
+    }
+    o
+}
+
+fn simd_convert(op: VCvtOp, a: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match op {
+        VCvtOp::F32x4ConvertI32x4S => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32 as i32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::F32x4ConvertI32x4U => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4S => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as i32) as u32 as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4U => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as u32) as u64);
+            }
+        }
+        VCvtOp::F32x4DemoteF64x2Zero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+        VCvtOp::F64x2PromoteLowF32x4 => {
+            for i in 0..2 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::F64x2ConvertLowI32x4S => {
+            for i in 0..2 {
+                let x = lane_read(&a, i, 4) as u32 as i32;
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::F64x2ConvertLowI32x4U => {
+            for i in 0..2 {
+                let x = lane_read(&a, i, 4) as u32;
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::I32x4TruncSatF64x2SZero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as i32) as u32 as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+        VCvtOp::I32x4TruncSatF64x2UZero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as u32) as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+    }
+    o
 }
 
 fn simd_splat(shape: VShape, bits: u64) -> [u8; 16] {
