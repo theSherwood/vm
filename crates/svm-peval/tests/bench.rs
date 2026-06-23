@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use svm_interp::Value;
 use svm_ir::{
-    BinOp, Block, CmpOp, Data, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator,
-    ValType, DEFAULT_RESERVED_LOG2,
+    BinOp, Block, CmpOp, ConvOp, Data, Func, FuncType, Inst, IntTy, LoadOp, Memory, Module,
+    StoreOp, Terminator, ValType, DEFAULT_RESERVED_LOG2,
 };
 use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
 use svm_peval::{
@@ -894,6 +894,150 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
     }
 }
 
+// A threaded-code interpreter: the program is a sequence of 1-byte *handler indices*, dispatched via
+// `call_indirect` through the identity function table. A handler index loaded from the readonly
+// program is constant, so the indirect call resolves and the handler is outlined — a real Futamura
+// case for `call_indirect`. The `T_DYN` opcode instead computes the index from `acc` (a runtime
+// value), so the index is dynamic and the engine bails `Unsupported`. Handlers are `(acc, input) ->
+// i64` at func indices 1..=4 (T_HALT = 0 ends; bytes 1..4 dispatch; T_DYN = 5 computes).
+const T_HALT: u8 = 0;
+const T_DYN: u8 = 5;
+const T_NHANDLERS: u8 = 4;
+
+fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
+    let t = || ValType::I64;
+    let bin = |op, a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+    let sig = || FuncType {
+        params: vec![t(), t()],
+        results: vec![t()],
+    };
+
+    // Interpreter (func 0). acc starts at `input` (so a computed dispatch index is dynamic).
+    let entry = Block {
+        params: vec![t()],              // 0: input
+        insts: vec![Inst::ConstI64(0)], // 1: pc
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 0], // header(acc=input, pc=0, input)
+        },
+    };
+    let header = Block {
+        params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
+        insts: vec![
+            Inst::ConstI64(0),
+            bin(BinOp::Add, 3, 1), // 4: addr = base + pc
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 4,
+                offset: 0,
+                align: 0,
+            }, // 5: op byte
+        ],
+        term: Terminator::BrTable {
+            idx: 5,
+            targets: vec![
+                (2, vec![0]),          // T_HALT -> halt(acc)
+                (3, vec![0, 1, 5, 2]), // 1 -> dispatch(acc, pc, op, input)
+                (3, vec![0, 1, 5, 2]), // 2
+                (3, vec![0, 1, 5, 2]), // 3
+                (3, vec![0, 1, 5, 2]), // 4
+                (4, vec![0, 1, 2]),    // T_DYN -> dyn_dispatch(acc, pc, input)
+            ],
+            default: (2, vec![0]),
+        },
+    };
+    let halt = Block {
+        params: vec![t()],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    // dispatch(acc, pc, op, input): call_indirect(op, [acc, input]); pc += 1. `op` is the constant
+    // program byte (an i32 funcref index), so the indirect call resolves to a handler.
+    let dispatch = Block {
+        params: vec![t(), t(), ValType::I32, t()], // 0: acc, 1: pc, 2: op (funcref idx), 3: input
+        insts: vec![
+            Inst::CallIndirect {
+                ty: sig(),
+                idx: 2,
+                args: vec![0, 3],
+            }, // 4: result
+            Inst::ConstI64(1),
+            bin(BinOp::Add, 1, 5), // 6: npc
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![4, 6, 3],
+        },
+    };
+    // dyn_dispatch(acc, pc, input): idx = wrap_i64(1 + (acc & 3)) — a dynamic i32 funcref index, so
+    // call_indirect can't resolve it.
+    let dyn_dispatch = Block {
+        params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
+        insts: vec![
+            Inst::ConstI64((T_NHANDLERS - 1) as i64),
+            bin(BinOp::And, 0, 3), // 4: acc & 3
+            Inst::ConstI64(1),
+            bin(BinOp::Add, 4, 5), // 6: 1 + (acc & 3)  (i64)
+            Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: 6,
+            }, // 7: idx (i32)
+            Inst::CallIndirect {
+                ty: sig(),
+                idx: 7,
+                args: vec![0, 2],
+            }, // 8: result
+            Inst::ConstI64(1),
+            bin(BinOp::Add, 1, 9), // 10: npc
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![8, 10, 2],
+        },
+    };
+
+    // Handlers (func 1..=4): (acc, input) -> i64.
+    let handler = |insts: Vec<Inst>, ret: u32| Func {
+        params: vec![t(), t()],
+        results: vec![t()],
+        blocks: vec![Block {
+            params: vec![t(), t()],
+            insts,
+            term: Terminator::Return(vec![ret]),
+        }],
+    };
+    let h_add_input = handler(vec![bin(BinOp::Add, 0, 1)], 2); // acc + input
+    let h_triple = handler(vec![Inst::ConstI64(3), bin(BinOp::Mul, 0, 2)], 3); // acc * 3
+    let h_dec = handler(vec![Inst::ConstI64(1), bin(BinOp::Sub, 0, 2)], 3); // acc - 1
+    let h_add7 = handler(vec![Inst::ConstI64(7), bin(BinOp::Add, 0, 2)], 3); // acc + 7
+
+    Module {
+        funcs: vec![
+            Func {
+                params: vec![t()],
+                results: vec![t()],
+                blocks: vec![entry, header, halt, dispatch, dyn_dispatch],
+            },
+            h_add_input,
+            h_triple,
+            h_dec,
+            h_add7,
+        ],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: true,
+            bytes: program.iter().map(|&(op, _)| op).collect(),
+        }],
+        ..Default::default()
+    }
+}
+
 /// Count surviving memory ops (loads + stores) across all functions.
 fn memory_ops(m: &Module) -> usize {
     m.funcs
@@ -1152,6 +1296,24 @@ fn gen_heap_program(rng: &mut Rng) -> Vec<(u8, i64)> {
         });
     }
     prog.push((A_HALT, 0));
+    prog
+}
+
+/// A random threaded-code program: handler indices 1..=4 (constant dispatch, resolves) with an
+/// occasional T_DYN (computed dispatch ⇒ dynamic index ⇒ Unsupported), then HALT.
+fn gen_threaded_program(rng: &mut Rng) -> Vec<(u8, i64)> {
+    let body = 1 + rng.below(8) as usize;
+    let mut prog = Vec::with_capacity(body + 1);
+    for _ in 0..body {
+        // ~1 in 6 instructions is a computed (dynamic) dispatch.
+        let op = if rng.below(6) == 0 {
+            T_DYN
+        } else {
+            1 + rng.below(T_NHANDLERS as u64) as u8
+        };
+        prog.push((op, 0));
+    }
+    prog.push((T_HALT, 0));
     prog
 }
 
@@ -1417,8 +1579,32 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
             },
         ));
     }
+    // (3) Threaded-code interpreter, outlined: dispatch via call_indirect. Constant handler indices
+    // resolve and the handler is outlined; the T_DYN opcode makes the index dynamic ⇒ Unsupported.
+    let mut thr = Tally::default();
+    for &seed in seeds {
+        thr.merge(fuzz_shape(
+            "threaded (call_indirect)",
+            n,
+            seed ^ 0x7333,
+            gen_threaded_program,
+            build_threaded_interpreter,
+            |m| {
+                specialize_with_config(
+                    m,
+                    0,
+                    &[SpecArg::Dynamic],
+                    &SpecConfig {
+                        outline_calls: true,
+                        ..SpecConfig::default()
+                    },
+                )
+            },
+        ));
+    }
     report_shape("regmachine (plain)", &reg);
     report_shape("stackmachine+helpers (#82)", &stk);
+    report_shape("threaded (call_indirect)", &thr);
 
     // Confirm the bails are legitimate, not the engine giving up on tractable programs. A
     // "nonterminating" example must still not finish with 50x the fuel (genuinely an infinite loop,
@@ -1461,11 +1647,20 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
         stk.succeeded > 0 && stk.oracle_checks > 0,
         "stack fuzz did no useful work"
     );
-    // The thorough run must actually exercise the Unsupported path and the private rescue.
+    assert!(
+        thr.succeeded > 0 && thr.oracle_checks > 0,
+        "threaded (call_indirect) fuzz did no useful work"
+    );
+    // The thorough run must actually exercise the Unsupported paths: the private rescue (dynamic
+    // heap address) and the dynamic call_indirect index.
     if verify_bails {
         assert!(
             hp_rescues > 0,
             "dynamic-address Unsupported path / private rescue was not exercised"
+        );
+        assert!(
+            thr.unsupported > 0,
+            "dynamic call_indirect Unsupported path was not exercised"
         );
     }
 }
