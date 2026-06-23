@@ -244,9 +244,34 @@ Indicative (machine-dependent; a 4-physical-core host), scaling = `throughput(W)
 Reading: **all three engines scale ~linearly to the physical-core count** — *W* guests ≈ *W*× aggregate
 throughput, i.e. the runtime adds no contention to multi-tenant execution (no global JIT/interp lock,
 no allocator hot path on the steady-state run). The plateau past the core count is ordinary
-SMT/oversubscription, not a runtime bottleneck. (This is *independent-guest* scaling — the multi-tenant
-story; *intra*-guest parallelism via the §12 `thread.spawn` scheduler is a separate axis, not measured
-here.)
+SMT/oversubscription, not a runtime bottleneck.
+
+### Intra-guest scaling (one guest, many threads)
+
+The companion axis: a **single** guest that spawns *W* worker threads via `thread.spawn` and joins them
+— does the runtime spread *one* sandbox across cores? On the JIT, `thread.spawn` maps to a real OS
+thread per guest thread (`os_thread_rt`), so this is genuine parallel execution; the interpreters
+model-check thread interleavings on one OS thread, so they're excluded. Driven through `run_powerbox`
+(the concurrent path serializes host access via a per-domain `Mutex<Host>`); runtime-only, no libLLVM:
+
+```sh
+cargo run -p svm-run --release --example thread_scaling
+```
+
+Indicative (4-physical-core host), `efficiency = slope(1)/slope(W)`, `speedup = W·efficiency`:
+
+| threads | speedup | efficiency |
+|---|--:|--:|
+| 2 | 1.97× | 98% |
+| 4 (= cores) | **3.88×** | 97% |
+| 8 (oversubscribed) | 3.83× | 48% |
+
+Reading: **one guest gets near-linear speedup to the physical-core count** (3.88× at 4 threads) — the
+§12 scheduler / `Mutex<Host>` concurrent path spreads a single sandbox's threads across cores with no
+meaningful serialization, despite every host call funneling through the per-domain lock (these workers
+are compute-only, so they don't contend on it; cap-heavy guests would). Single-thread aggregate
+(~480 Miter/s) is a touch below the independent-guest figure (~534), the cost of the concurrent path's
+locking + spawn/join — paid once, not per iteration.
 
 
 ## Run
