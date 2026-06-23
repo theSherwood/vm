@@ -410,6 +410,7 @@ fn translate_impl(
         let (func, frame_size) = translate_func(
             f,
             base + i as u32,
+            i as u32,
             &m.types,
             &name2idx,
             &globals,
@@ -418,6 +419,7 @@ fn translate_impl(
             &gbytes,
             &helpers,
             di,
+            ba,
             &mut dbg,
         )?;
         any_frame |= frame_size > 0;
@@ -1399,6 +1401,7 @@ struct Scan {
 fn translate_func(
     f: &Function,
     func_idx: u32,
+    bc_func_idx: u32,
     types: &Types,
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
@@ -1407,6 +1410,7 @@ fn translate_func(
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
     di: Option<&di::LlvmDebug>,
+    ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
@@ -1486,6 +1490,7 @@ fn translate_func(
             bb,
             bi,
             func_idx,
+            bc_func_idx,
             f,
             types,
             &scan,
@@ -1498,6 +1503,7 @@ fn translate_func(
             cstrs,
             gbytes,
             helpers,
+            ba,
             dbg,
         )?);
     }
@@ -9826,6 +9832,13 @@ struct BlockCtx<'a> {
     helpers: Helpers,
     /// The module's type table — for resolving a constexpr-GEP operand's strides in [`operand`].
     types: &'a Types,
+    /// This function's **defined**-function index (the `blockaddr.rs` `func_idx` key space — i.e.
+    /// position among defined functions, *before* any synthesized `_start` shift). Used only to look
+    /// up an operand-position `blockaddress` in `blockaddrs.phi`.
+    func_idx: u32,
+    /// Recovered `blockaddress` labels ([`blockaddr`]) — the `phi` map resolves an operand-position
+    /// (φ-threaded) blockaddress to its target block index.
+    blockaddrs: Option<&'a blockaddr::BlockAddrs>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
@@ -10209,6 +10222,34 @@ impl<'a> BlockCtx<'a> {
 
     /// Resolve an operand to a block-local index, materializing a constant as a `const` inst
     /// (SVM has no constant pool — constants are instructions, §3b).
+    /// A φ-incoming operand, resolving an **operand-position `blockaddress`** (clang jump-threaded one
+    /// through this φ) to its recovered target block index (the same integer the `br_table` consumes).
+    /// `target`/`phi_ord`/`inc_idx` locate the φ-incoming in [`blockaddr::BlockAddrs::phi`]. Any other
+    /// operand defers to [`Self::operand`].
+    fn phi_operand(
+        &mut self,
+        op: &Operand,
+        target: u32,
+        phi_ord: u32,
+        inc_idx: u32,
+    ) -> Result<ValIdx, Error> {
+        if let Operand::ConstantOperand(c) = op {
+            if matches!(c.as_ref(), Constant::BlockAddress) {
+                let key = (self.func_idx, target, phi_ord, inc_idx);
+                let label = self
+                    .blockaddrs
+                    .and_then(|b| b.phi.get(&key).copied())
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "operand-position blockaddress without a recovered label".into(),
+                        )
+                    })?;
+                return Ok(self.push(Inst::ConstI64(label as i64)));
+            }
+        }
+        self.operand(op)
+    }
+
     fn operand(&mut self, op: &Operand) -> Result<ValIdx, Error> {
         match op {
             Operand::LocalOperand { name, .. } => {
@@ -10348,6 +10389,7 @@ fn translate_block(
     bb: &BasicBlock,
     bi: usize,
     func_idx: u32,
+    bc_func_idx: u32,
     f: &Function,
     types: &Types,
     s: &Scan,
@@ -10360,6 +10402,7 @@ fn translate_block(
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
+    ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
@@ -10397,6 +10440,8 @@ fn translate_block(
         gbytes,
         helpers: *helpers,
         types,
+        func_idx: bc_func_idx,
+        blockaddrs: ba,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
@@ -13317,26 +13362,32 @@ fn branch_args(
     s: &Scan,
     block_params: &[Vec<ValueId>],
 ) -> Result<Vec<ValIdx>, Error> {
-    // Map each φ-result id in `target` to its incoming operand from predecessor `from`.
+    // Map each φ-result id in `target` to its incoming operand from predecessor `from`, plus the φ's
+    // position (`phi_ord` within the block, `incoming_idx` within the φ) — the key into the recovered
+    // operand-position `blockaddress` map (an incoming may be a φ-threaded `blockaddress`).
     let from_name = &s.block_name[from];
     let target_bb = &f.basic_blocks[target];
-    let mut phi_incoming: HashMap<ValueId, &Operand> = HashMap::new();
+    let mut phi_incoming: HashMap<ValueId, (&Operand, u32, u32)> = HashMap::new();
+    let mut phi_ord = 0u32;
     for instr in &target_bb.instrs {
         if let Instruction::Phi(p) = instr {
             if let Some(&vid) = s.name2id.get(&p.dest) {
-                let inc = p
+                let inc_idx = p
                     .incoming_values
                     .iter()
-                    .find(|(_, pred)| pred == from_name)
-                    .map(|(op, _)| op)
+                    .position(|(_, pred)| pred == from_name)
                     .ok_or_else(|| {
                         Error::Unsupported(format!(
                             "φ {:?} has no incoming for predecessor {from_name:?}",
                             p.dest
                         ))
                     })?;
-                phi_incoming.insert(vid, inc);
+                phi_incoming.insert(
+                    vid,
+                    (&p.incoming_values[inc_idx].0, phi_ord, inc_idx as u32),
+                );
             }
+            phi_ord += 1;
         }
     }
     let mut args = Vec::with_capacity(block_params[target].len());
@@ -13344,7 +13395,7 @@ fn branch_args(
         // A wide-vector param takes `K` args — its incoming value's chunk/tail parts, in the same
         // order the target block's param fan-out expects (I2 step 1 cross-block).
         if let Some(&layout) = s.wide.get(&pv) {
-            let parts = if let Some(op) = phi_incoming.get(&pv) {
+            let parts = if let Some(&(op, _, _)) = phi_incoming.get(&pv) {
                 ctx.wide_operand(op, layout)?
             } else {
                 // A threaded wide live-in: its parts are live-out of `from`, available here.
@@ -13353,8 +13404,8 @@ fn branch_args(
                 })?
             };
             args.extend(parts);
-        } else if let Some(op) = phi_incoming.get(&pv) {
-            args.push(ctx.operand(op)?);
+        } else if let Some(&(op, phi_ord, inc_idx)) = phi_incoming.get(&pv) {
+            args.push(ctx.phi_operand(op, target as u32, phi_ord, inc_idx)?);
         } else {
             // A threaded live-in: it is live-out of `from`, so available in this block.
             args.push(ctx.id(pv)?);

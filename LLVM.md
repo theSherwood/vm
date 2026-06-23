@@ -1052,10 +1052,15 @@ constants in the dispatch-table global and `goto *p` into an `indirectbr`:
   from `n` at runtime — so no dispatch constant-folds — byte-identical to native on **both** backends)
   and `computed_goto_lowers_indirectbr_to_br_table` (structural: recovery finds the table labels, the
   `indirectbr` becomes a `br_table`). **159 translate tests green, fmt + clippy clean.**
-- *Follow-up (fail-closed):* an **operand-position** blockaddress — clang's jump-threading can thread one
-  through a φ (an instruction operand, not a global) — is not yet recovered (only global initializers
-  are). A real interpreter at `-O2` may hit it; lifting `blockaddr.rs` to instruction operands (the
-  `di.rs` per-instruction ordinal correlation) is the next step before the first big interpreter (Lua).
+- *Follow-up — DONE (slice AW):* an **operand-position** blockaddress — clang's jump-threading threads
+  one through a φ (an instruction operand, not a global). `blockaddr.rs` now also walks every defined
+  function's φ nodes, keyed positionally `(func_idx, block_idx, phi_ord, incoming_idx)` (φ results /
+  blocks are usually unnamed → the `di.rs` ordinal discipline); `branch_args` resolves a φ-incoming
+  `blockaddress` to its block-index constant (`BlockCtx::phi_operand`). Test:
+  `computed_goto_phi_threaded_blockaddress` — the same threaded VM but with a *constant* first dispatch
+  (so clang threads the entry target through a φ), byte-identical to native on both backends, plus
+  `computed_goto_phi_recovery_finds_operand_blockaddress` (structural). Computed `goto` is now robust
+  enough for a real interpreter (Lua). **161 translate tests green, fmt + clippy clean.**
 
 ### Next frontier — real-world programs as correctness indicators
 
@@ -1076,13 +1081,13 @@ and the **SQLite** north star (in-memory *and* disk-backed via the powerbox).
 
 ### Translator gaps these programs force (the real value of picking them)
 Picking a target is really picking the *gap* it drives to completion. Current status:
-- **Computed `goto` → `indirectbr` / `blockaddress` — DONE (global dispatch tables; slice AV).** The
-  linchpin for the interpreter category (SQLite's VDBE, Lua, QuickJS). A `blockaddress(@f, %bb)` lowers
-  to the **index of `%bb` within `@f`**, baked into the dispatch-table global; an `indirectbr` lowers to
-  a `br_table` over those indices. `llvm-ir` erases the blockaddress operands, so they are recovered via
-  `llvm-sys` (`src/blockaddr.rs`, the `di.rs` pattern). *Follow-up (fail-closed):* an **operand-position**
-  blockaddress — clang's jump-threading can thread one through a φ — is not yet recovered (only global
-  initializers are); a real interpreter at `-O2` may hit this, lifting recovery to instruction operands.
+- **Computed `goto` → `indirectbr` / `blockaddress` — DONE (slices AV + AW).** The linchpin for the
+  interpreter category (SQLite's VDBE, Lua, QuickJS). A `blockaddress(@f, %bb)` lowers to the **index of
+  `%bb` within `@f`**; an `indirectbr` lowers to a `br_table` over those indices. `llvm-ir` erases the
+  blockaddress operands, so they are recovered via `llvm-sys` (`src/blockaddr.rs`, the `di.rs` pattern) —
+  both in **global dispatch tables** (AV) and as **operand-position** φ-threaded blockaddresses clang's
+  jump-threading emits (AW). Robust enough for a real interpreter; next interpreter target is **Lua**
+  (which also needs `setjmp`/`longjmp`, below).
 - **`setjmp`/`longjmp` + C++ EH — a planned substrate (promoted from deferred-hard).** Both lower onto
   the §6 stack-switching / `cont.*` fiber machinery SVM **already has** (save a stack position; transfer
   control). Build them in order: **(1) `setjmp`/`longjmp` first** — the minimal form (save SP+callee
@@ -1195,8 +1200,8 @@ phases, both worth doing:
 ### Suggested ladder (cheap momentum → the capstones)
 1. **Monocypher KAT** + **stb_image decode** — zero-OS, byte-exact; widen the corpus and shake out
    64-bit/parser bugs fast. (A SAT solver / `perft` slot in here too — pure compute, self-validating.)
-2. **`indirectbr` / `blockaddress` (computed goto)** — DONE (slice AV) for global dispatch tables; lift
-   to operand-position (φ-threaded) blockaddress before the first big interpreter.
+2. **`indirectbr` / `blockaddress` (computed goto)** — DONE (slices AV + AW: global tables + φ-threaded
+   operand-position). Robust for real interpreters.
 3. **`setjmp`/`longjmp`** — the stack-transfer substrate; then **EH** on top (reuses it).
 4. **`%f` / `%g` float formatting** (Ryū/Dragon4) — needed by SQLite/Postgres and broadly.
 5. **SQLite Phase A (in-memory)** — the SQL-engine capstone (gated on goto + float-format).
@@ -1349,10 +1354,9 @@ moonshot llc/clang.**
       deferred). Both lower onto §6 stack-switching/`cont.*`; build `setjmp`/`longjmp` first (Postgres
       `--single` / Lua force it), then EH (`invoke`/`landingpad`/`resume` + unwind tables, the §18 open
       item) on the same core. Full plan + ordering + drivers in *Next frontier → Translator gaps*.
-- [x] **Computed `goto` — `indirectbr` / `blockaddress` — DONE (slice AV)** for global dispatch tables
-      (the interpreter idiom). Recovered via `llvm-sys` (`blockaddr.rs`), lowered to a `br_table` over
-      block indices. *Remaining (fail-closed):* operand-position (φ-threaded) blockaddress — lift the
-      recovery to instruction operands before the first big interpreter (Lua).
+- [x] **Computed `goto` — `indirectbr` / `blockaddress` — DONE (slices AV + AW).** Both global dispatch
+      tables (AV) and operand-position φ-threaded blockaddresses (AW), recovered via `llvm-sys`
+      (`blockaddr.rs`), lowered to a `br_table` over block indices. Robust for real interpreters.
 - [ ] **SIMD** (`<N x T>` vectors) — a later pass mirroring §17/D58 `v128` (the proven
       5-step pattern `svm-wasm` used). Reject cleanly until then.
 - [ ] **Full intrinsic coverage** — expand the table in §4 as real programs demand.

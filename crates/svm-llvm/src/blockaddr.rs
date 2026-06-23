@@ -28,6 +28,13 @@ use llvm_sys::LLVMValueKind;
 #[derive(Default)]
 pub struct BlockAddrs {
     pub per_global: HashMap<String, Vec<u32>>,
+    /// Operand-position `blockaddress`es — clang's jump-threading can thread one through a φ (an
+    /// instruction operand, not a global). Keyed positionally `(func_idx, block_idx, phi_ord,
+    /// incoming_idx)` → target block index — the `di.rs` ordinal discipline (φ results / blocks are
+    /// usually *unnamed*, so name-keying is impossible). `func_idx` is the **defined**-function index
+    /// (declarations skipped), matching `lib.rs`'s `defined`/`name2idx`; `phi_ord` counts φs within the
+    /// block; `incoming_idx` indexes the φ's `incoming_values`.
+    pub phi: HashMap<(u32, u32, u32, u32), u32>,
 }
 
 /// Recover the module's `blockaddress` labels from the bitcode at `path`. `None` if the file can't be
@@ -63,7 +70,8 @@ unsafe fn read_unsafe(path: &str) -> Option<BlockAddrs> {
             }
             g = LLVMGetNextGlobal(g);
         }
-        (!out.per_global.is_empty()).then_some(out)
+        collect_phi_addrs(module, &mut out.phi);
+        (!out.per_global.is_empty() || !out.phi.is_empty()).then_some(out)
     })();
     LLVMContextDispose(ctx);
     result
@@ -91,6 +99,47 @@ unsafe fn collect(v: LLVMValueRef, out: &mut Vec<u32>) {
                 }
             }
         }
+    }
+}
+
+/// Walk every defined function's φ nodes, recording each `blockaddress` incoming value keyed by its
+/// position `(func_idx, block_idx, phi_ord, incoming_idx)` — the order `branch_args` reconstructs on
+/// the `llvm-ir` side. `func_idx` counts only **defined** functions (those with a body), in module
+/// order, exactly as `lib.rs`'s `defined` list does.
+unsafe fn collect_phi_addrs(module: LLVMModuleRef, out: &mut HashMap<(u32, u32, u32, u32), u32>) {
+    let mut func_idx = 0u32;
+    let mut f = LLVMGetFirstFunction(module);
+    while !f.is_null() {
+        let mut bb = LLVMGetFirstBasicBlock(f);
+        if bb.is_null() {
+            // A declaration (no body) — not in the `defined` index space; skip without consuming one.
+            f = LLVMGetNextFunction(f);
+            continue;
+        }
+        let mut block_idx = 0u32;
+        while !bb.is_null() {
+            let mut phi_ord = 0u32;
+            let mut inst = LLVMGetFirstInstruction(bb);
+            while !inst.is_null() {
+                if !LLVMIsAPHINode(inst).is_null() {
+                    let n = LLVMCountIncoming(inst);
+                    for i in 0..n {
+                        let val = LLVMGetIncomingValue(inst, i);
+                        if !LLVMIsABlockAddress(val).is_null() {
+                            if let Some(target) = block_index(val) {
+                                out.insert((func_idx, block_idx, phi_ord, i), target);
+                            }
+                        }
+                    }
+                    phi_ord += 1;
+                }
+                inst = LLVMGetNextInstruction(inst);
+            }
+            block_idx += 1;
+            bb = LLVMGetNextBasicBlock(bb);
+        }
+        func_idx += 1;
+        f = LLVMGetNextFunction(f);
     }
 }
 

@@ -1081,6 +1081,50 @@ fn computed_goto_lowers_indirectbr_to_br_table() {
     assert!(has_br_table, "indirectbr should lower to a br_table");
 }
 
+/// Computed `goto` where clang's `-O2` **jump-threading threads a `blockaddress` through a φ** (slice
+/// AW) — an *operand-position* blockaddress, not a global-table entry. This is the shape a real
+/// interpreter produces (and the AV follow-up): the program has a constant first dispatch
+/// (`prog[0] == 2`), so clang knows the entry target and threads `blockaddress(@run, …)` into a φ that
+/// feeds the `indirectbr`. The on-ramp recovers it via `llvm-sys` (`blockaddr::phi`, keyed by φ
+/// position) and materializes the block-index constant. Byte-identical to native on both backends.
+const COMPUTED_GOTO_PHI_SRC: &str = r#"
+int run(int n) {
+  static const void *const tbl[] = {&&op_halt, &&op_dbl, &&op_inc, &&op_loop};
+  static const unsigned char prog[] = {2, 1, 2, 3, 0}; /* inc,dbl,inc,loop,halt — constant first op */
+  int pc = 0, acc = n, iters = 0;
+  goto *tbl[prog[pc]];
+op_dbl:  acc *= 2; pc++; goto *tbl[prog[pc]];
+op_inc:  acc += 1; pc++; goto *tbl[prog[pc]];
+op_loop: if (++iters < 3) pc = 0; else pc++; goto *tbl[prog[pc]];
+op_halt: return acc & 0xff;
+}
+int main(void) { return run(7); }
+"#;
+
+#[test]
+fn computed_goto_phi_threaded_blockaddress() {
+    check_vs_native("computed_goto_phi", COMPUTED_GOTO_PHI_SRC, 7);
+}
+
+/// Structural companion: confirm clang actually threaded a `blockaddress` through a φ (so the
+/// operand-position recovery path — not just the global-table path — is exercised).
+#[test]
+fn computed_goto_phi_recovery_finds_operand_blockaddress() {
+    let Some(bc) = compile_to_bc("computed_goto_phi_struct", COMPUTED_GOTO_PHI_SRC) else {
+        return;
+    };
+    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
+        .expect("recovery should find blockaddresses");
+    assert!(
+        !ba.phi.is_empty(),
+        "expected a φ-threaded (operand-position) blockaddress, got phi map {:?}",
+        ba.phi
+    );
+    // And it still translates + verifies (the operand-position label resolved, no fail-closed).
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+}
+
 #[test]
 fn demo_sha256_vs_native() {
     // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the
