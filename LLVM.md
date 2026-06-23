@@ -1211,6 +1211,45 @@ phases, both worth doing:
 8. **The WebGPU capability** (its own section below) and **the network/egress capability** (curl/git) —
    the remaining capability frontiers.
 
+### `setjmp`/`longjmp` + EH — design & sequencing (the stack-transfer substrate)
+
+The next slice (in progress). Drivers: **Postgres** `--single` (its whole `PG_TRY`/`ereport` model is
+`sigsetjmp`/`siglongjmp`) and **Lua** (error handling); **EH** is the follow-on on the same substrate.
+
+**Why a core primitive (not a pure-IR transform).** `longjmp` transfers control from deep in the call
+stack back to an ancestor `setjmp`, across N intervening frames. The only way to do this *without a
+primitive* is to make every call-return check "am I unwinding?" — which **taxes intervening frames**
+(the SJLJ-via-return-checks model). To keep intervening frames untaxed (the perf goal), the VM needs a
+real **"unwind to a saved stack checkpoint"** primitive — matching the "VM ships primitives" thesis.
+Plan: two svm-ir ops (or one checkpoint + one unwind) lowered from the recognized external `setjmp`/
+`_setjmp`/`sigsetjmp` (returns-twice) and `longjmp`/`siglongjmp` (noreturn) calls — gated on the program
+calling them, like every other capability, so non-users get nothing.
+
+**Interp (tractable — do first).** The interpreter already runs on an **explicit `Vec<Frame>` guest
+call stack** with reified continuations (for fibers). So `setjmp(env)` saves `(frame depth, data-SP,
+resume pc + result slot)` into the guest `jmp_buf` and returns 0; `longjmp(env, v)` truncates `frames`
+back to that depth (the intervening frames discarded with **no per-frame work** — C has no cleanups),
+restores the data-SP, and resumes at the saved pc with the `setjmp` result set to `v`. O(1)-ish capture,
+O(depth-discarded) unwind, both only when called.
+
+**JIT (the hard part — sub-slice after).** Cranelift code runs on the real native control stack, so
+`longjmp` must restore the native SP to the `setjmp` point. The `cont.*` / `svm-fiber` machinery already
+does safe native-stack switching, so the primitive exists; the lowering rides it. Interp-first with the
+JIT fail-closed `Unsupported` is the established split (cf. fibers/`cap.self`).
+
+**Returns-twice in SSA.** `setjmp`'s result (0 first time, `v` on `longjmp`) feeds a branch; the
+`longjmp` re-enters at the instruction after `setjmp`. The interp models this directly (set the result
+slot + resume pc). The `jmp_buf` holds **backend-internal** state (interp frame index vs JIT native SP)
+— opaque to the guest, so *observable* behavior matches across backends (the determinism contract is
+about stdout/results, not `jmp_buf` bytes); it is transient, not snapshot-portable across backends.
+
+**Perf (measured, not assumed — `examples/onramp_perf.rs`).** Non-users: **0** (gated). `setjmp`-using
+functions inherit clang's returns-twice spills (already in the bitcode — the on-ramp adds none) and the
+ops cost O(1) capture / O(1)+unwind, paid only when executed; intervening frames untaxed. A real
+workload's hot path (Lua's interpreter loop) has no `setjmp` in it — cost is confined to `pcall` entry
+and (rare) error unwinds. The harness establishes the non-`setjmp` baseline now; a `setjmp` happy-path
+row + a `longjmp`-taken row slot in beside it once the ops land, so the feature's cost is measured.
+
 ### GPU via a WebGPU capability (graphical + compute)
 
 Graphical and GPU-compute software rides a **WebGPU capability** — and WebGPU is the *right* abstraction
