@@ -704,6 +704,43 @@ block0(v0: i64):
     }
 }
 
+/// Self-contained tail-call probe (`wasmtime --invoke run_tailcall`): a tail-recursive factorial via
+/// `return_call` (O(1) window reuse) returns `5! = 120`. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_tailcall() -> i64 {
+    const T: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 1
+  return_call 1(v0, v1)
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 1
+  v3 = i64.lt_s v0 v2
+  br_if v3 block1(v1) block2(v0, v1)
+block1(v4: i64):
+  return v4
+block2(v5: i64, v6: i64):
+  v7 = i64.mul v6 v5
+  v8 = i64.const -1
+  v9 = i64.add v5 v8
+  return_call 1(v9, v7)
+}
+"#;
+    let Ok(m) = svm_text::parse_module(T) else {
+        return -1;
+    };
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run(&m, 0, &[Value::I64(5)], &mut fuel) {
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            _ => -1,
+        },
+        _ => -1,
+    }
+}
+
 /// Self-contained fiber probe (`wasmtime --invoke run_fiber`): a §12 continuation (`cont.new`/
 /// `cont.resume`) runs to completion, resumed with 7 and returning `7 + 100`. Returns `107` iff
 /// cooperative continuation switching works on this target, else `-1`.

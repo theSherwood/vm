@@ -583,6 +583,56 @@ block0(v0: i32):
 }
 "#;
 
+// ---- tail calls (`return_call` / `return_call_indirect`, O(1) window reuse) --------------------
+// Adapted from `crates/svm/tests/bytecode_tailcall.rs` to the single-i64-arg compute shape.
+
+// Tail-recursive factorial accumulator f(n, acc) = n<1 ? acc : f(n-1, acc*n) via `return_call`; entry
+// seeds acc=1. Runs in O(1) state (window reuse). Terminates for every arg (n<1 returns acc), so it
+// is safe to sweep negatives; large n wraps i64 identically on both engines.
+const TAIL_FACT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 1
+  return_call 1(v0, v1)
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 1
+  v3 = i64.lt_s v0 v2
+  br_if v3 block1(v1) block2(v0, v1)
+block1(v4: i64):
+  return v4
+block2(v5: i64, v6: i64):
+  v7 = i64.mul v6 v5
+  v8 = i64.const -1
+  v9 = i64.add v5 v8
+  return_call 1(v9, v7)
+}
+"#;
+
+// `return_call_indirect` through the natural table with x=5: idx 1 = +10 (→15), idx 2 = *2 (→10);
+// other indices select func 0 (recurses once then) / out-of-range → IndirectCall trap — all
+// identical on both engines.
+const TAIL_INDIRECT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 5
+  return_call_indirect (i64) -> (i64) v0 (v1)
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 10
+  v2 = i64.add v0 v1
+  return v2
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+"#;
+
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -735,15 +785,33 @@ fn main() {
             if i + 1 == fibers.len() { "\n" } else { ",\n" },
         ));
     }
+    // Tail-call corpus — `return_call`/`return_call_indirect`; plain compute (1-arg sweep, svm_run).
+    let tailcall = [("tail_fact", TAIL_FACT), ("tail_indirect", TAIL_INDIRECT)];
+    json.push_str("],\n\"tailcall\":[\n");
+    for (i, (name, src)) in tailcall.iter().enumerate() {
+        let (m, file) = emit(name, src);
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"nargs\":1,\"cases\":["
+        ));
+        for (j, &arg) in ARGS.iter().enumerate() {
+            let (status, value) = native(&m, &[Value::I64(arg)]);
+            json.push_str(&format!(
+                "{}{{\"arg\":\"{arg}\",\"status\":{status},\"value\":\"{value}\"}}",
+                if j == 0 { "" } else { "," }
+            ));
+        }
+        json.push_str(if i + 1 == tailcall.len() { "]}\n" } else { "]},\n" });
+    }
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
     eprintln!(
-        "wrote corpus.json ({} compute, {} powerbox, {} capture, {} nested, {} fiber)",
+        "wrote corpus.json ({} compute, {} powerbox, {} capture, {} nested, {} fiber, {} tailcall)",
         compute.len(),
         powerbox.len(),
         cap_args.len(),
         nested.len(),
-        fibers.len()
+        fibers.len(),
+        tailcall.len()
     );
 
     // Encode the guests validated by harnesses (not the deterministic corpus): the live-import guest
