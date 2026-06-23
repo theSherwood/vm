@@ -11,7 +11,7 @@
 
 use std::io::Write;
 
-use svm_browser::{capture_exec, powerbox_exec};
+use svm_browser::{capture_exec, instantiate_exec, powerbox_exec};
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -296,6 +296,140 @@ block3():
 }
 "#;
 
+// ---- §14 nested child guests (confined sub-window domains) -------------------------------------
+// All lifted verbatim from `crates/svm/tests/bytecode_instantiate.rs` (known parseable + engine-
+// supported, checked bit-identical to the tree-walker there). Func 0 receives an `Instantiator`
+// (iface 6) over `[0, 128 KiB)`; `instantiate` is `cap.call 6 0`, `join` is `cap.call 6 1`.
+
+// Parent instantiates a child in a 4 KiB window at 64 KiB, the child writes 123 at its own offset 7
+// (→ shared backing 64 KiB + 7) and returns 42; the parent joins, reads the marker back, returns
+// 42*1000 + 123 = 42123 — confined child execution over the shared data plane.
+const CHILD_SHARED: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v7 = i64.const 65543
+  v8 = i32.load8_u v7
+  v9 = i64.extend_i32_u v8
+  v10 = i64.const 1000
+  v11 = i64.mul v6 v10
+  v12 = i64.add v11 v9
+  return v12
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 7
+  v2 = i32.const 123
+  i32.store8 v1 v2
+  v3 = i64.const 42
+  return v3
+}
+"#;
+
+// Depth-2 VM-in-VM: the child, handed an `Instantiator` over *its* window, instantiates a grandchild
+// — confinement composes. The grandchild returns 77, propagated up through two joins.
+const CHILD_DEPTH2: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 0
+  v3 = i32.const 171
+  i32.store8 v2 v3
+  v4 = i64.const 2
+  v5 = i64.const 2048
+  v6 = i64.const 10
+  v7 = i64.const 0
+  v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
+  v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
+  return v9
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.const 200
+  i32.store8 v1 v2
+  v3 = i64.const 77
+  return v3
+}
+"#;
+
+// A two-arg child receives its starter caps `(Instantiator, AddressSpace)` and uses the AddressSpace
+// (iface 5, op 1 = unmap) to decommit the first 16 KiB of its **own** 64 KiB window — a confined
+// page op — returning 0. Proves the §14 memory-management capability is attenuated to the child.
+const CHILD_ADDRSPACE: &str = r#"memory 18
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 16
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i32.wrap_i64 v1
+  v3 = i64.const 0
+  v4 = i64.const 16384
+  v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)
+  return v5
+}
+"#;
+
+// Confinement boundary: a 4 KiB child at offset 128 KiB doesn't fit the 128 KiB holder, so
+// `instantiate` returns -EINVAL (-22); the parent returns it without joining.
+const CHILD_BADCARVE: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.extend_i32_s v5
+  return v6
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  return v1
+}
+"#;
+
+// A child trap (`unreachable`) must propagate through `join` as the parent's trap (STATUS_TRAP).
+const CHILD_TRAP: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 0
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  unreachable
+}
+"#;
+
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -408,13 +542,32 @@ fn main() {
             if k + 1 == cap_args.len() { "\n" } else { ",\n" },
         ));
     }
+    // Nested-child corpus — each runs func 0 with an Instantiator over [0, 128 KiB); the (status,
+    // value) is the ground truth (confined child execution, depth, attenuation, boundary, traps).
+    let nested = [
+        ("child_shared", CHILD_SHARED),
+        ("child_depth2", CHILD_DEPTH2),
+        ("child_addrspace", CHILD_ADDRSPACE),
+        ("child_badcarve", CHILD_BADCARVE),
+        ("child_trap", CHILD_TRAP),
+    ];
+    json.push_str("],\n\"nested\":[\n");
+    for (i, (name, src)) in nested.iter().enumerate() {
+        let (m, file) = emit(name, src);
+        let (status, value) = instantiate_exec(&m);
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"status\":{status},\"value\":\"{value}\"}}{}",
+            if i + 1 == nested.len() { "\n" } else { ",\n" },
+        ));
+    }
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
     eprintln!(
-        "wrote corpus.json ({} compute, {} powerbox, {} capture)",
+        "wrote corpus.json ({} compute, {} powerbox, {} capture, {} nested)",
         compute.len(),
         powerbox.len(),
-        cap_args.len()
+        cap_args.len(),
+        nested.len()
     );
 
     // Encode the guests validated by harnesses (not the deterministic corpus): the live-import guest

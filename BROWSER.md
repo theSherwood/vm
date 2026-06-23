@@ -79,9 +79,12 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
    `-1097658151202642380` for `0` / `1000` — matching native + wasm32), the concurrency probe
    (`run_threads() == 4000` — the cooperative `drive` + `thread.spawn` + atomics on memory64), the
    full encode/decode/execute roundtrip (`run_roundtrip() == 1442695040888963407`, exercising the
-   production `svm-encode` decode path `svm_run` depends on), **and** the host powerbox
-   (`run_powerbox() == 17` — `Stream.write` + capture and `Exit.exit(42)` on memory64). So the full
-   stack — compute, concurrency, codec, *and* capabilities — runs on the real production target.
+   production `svm-encode` decode path `svm_run` depends on), the host powerbox
+   (`run_powerbox() == 17` — `Stream.write` + capture and `Exit.exit(42)`), the seed→transform→snapshot
+   capture (`run_capture() == 1007`), **and** a confined nested child guest (`run_instantiate() ==
+   42123` — `Instantiator.instantiate`/`join` over a sub-window on memory64). So the full stack —
+   compute, concurrency, codec, capabilities, memory capture, *and* sub-guest isolation — runs on the
+   real production target.
    *Node/V8 22.x cannot yet load it:* Rust's `wasm64` target emits **64-bit tables** (`table64` —
    table limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but
    not 64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
@@ -109,8 +112,9 @@ wasmtime run --invoke run_threads   -W memory64=y "$W"   # 4000 (8 vCPUs, cooper
 wasmtime run --invoke run_roundtrip -W memory64=y "$W"   # 1442695040888963407 (encode→decode→run)
 wasmtime run --invoke run_powerbox  -W memory64=y "$W"   # 17 (stream write + capture + exit(42))
 wasmtime run --invoke run_capture   -W memory64=y "$W"   # 1007 (seed window → transform → snapshot)
+wasmtime run --invoke run_instantiate -W memory64=y "$W" # 42123 (confined nested child + shared backing)
 
-# Differential (compute + powerbox + memory snapshot + 2 MiB echo) wasm32 vs native — 46/46, no imports
+# Differential (compute + powerbox + snapshot + nested children + 2 MiB echo) wasm32 vs native — 51/51
 cargo run --bin gencorpus                                # native ground truth → corpus.json
 node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
 
@@ -196,17 +200,19 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   OS-thread machinery (`Scheduler`/`OffloadPool`/`std::thread`) needed no gating: it's unreachable
   from the `cdylib` exports and already stripped by `--gc-sections` (zero symbols, zero imports in
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
-- [x] **Differential check (compute + concurrency + powerbox + snapshot + scale, wasm32).**
+- [x] **Differential check (compute + concurrency + powerbox + snapshot + nested + scale, wasm32).**
   `gencorpus` (host) encodes a corpus + computes the **native** result per case; `corpus.mjs` runs the
-  same modules through the wasm exports and compares. **46/46 match**, zero host imports.
+  same modules through the wasm exports and compares. **51/51 match**, zero host imports.
   *Compute/concurrency* (37): i64 arith+branches, multi-function `call`, memory store/load,
   divide-by-zero → `STATUS_TRAP`, **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` =
   **4000** on the cooperative `drive`). *Powerbox* (5): stdout greeting, stdin→stdout echo,
   monotonic-clock delta, `exit(42)` → `STATUS_EXIT`, and stderr role-routing. *Snapshot* (3): a window
   seeded with 16 i64 words, transformed in place (`+arg`), with the **final memory image** captured
-  and compared byte-for-byte. *Scale* (1): a **2 MiB** stdin→stdout echo through `svm_alloc`ed
-  buffers. `gencorpus` and the wasm entries share the *same* `powerbox_exec`/`capture_exec` (the crate
-  is `cdylib`+`rlib`), so the check isolates wasm effects, not logic drift.
+  and compared byte-for-byte. *Nested children* (5): §14 confined sub-guests (shared backing, depth-2,
+  attenuated AddressSpace, boundary rejection, trap propagation). *Scale* (1): a **2 MiB** stdin→stdout
+  echo through `svm_alloc`ed buffers. `gencorpus` and the wasm entries share the *same*
+  `powerbox_exec`/`capture_exec`/`instantiate_exec` (the crate is `cdylib`+`rlib`), so the check
+  isolates wasm effects, not logic drift.
 - [x] **Host powerbox (console + clock).** `svm_run_pb` grants streams/clock/exit; the cdylib stays
   import-free; validated on wasm32 (5-case differential above) and wasm64 (`run_powerbox() == 17`).
 - [x] **Memory ABI (`svm_alloc`/`svm_dealloc`).** Replaced the fixed 1 MiB scratch buffers: the host
@@ -219,8 +225,16 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   run, and return the **final window image** (via `compile_and_run_capture`) as a cdylib-managed
   allocation read through `svm_snapshot_ptr`/`svm_snapshot_len`. Validated wasm32 (3-case snapshot
   differential, byte-for-byte) and wasm64 (`run_capture() == 1007`). Closes the last output channel —
-  return value ✓, streams ✓, **memory image ✓**. Follow-up: the §14 *sub-window* capture
-  (`compile_and_run_capture_sub`) for the escape-oracle, if confinement testing moves into wasm.
+  return value ✓, streams ✓, **memory image ✓**.
+- [x] **§14 nested child guests (`svm_run_nested`).** Function 0 gets an `Instantiator` (iface 6) over
+  `[0, 128 KiB)` and `instantiate`/`join`s **confined child domains** over power-of-two sub-windows —
+  each a fresh domain, masked to its slice, running on the cooperative executor and joinable through
+  the §12 thread machinery. 5-case differential (lifted from `bytecode_instantiate.rs`, all matching
+  native): shared-backing data plane (`42123`), depth-2 VM-in-VM (`77`), a two-arg child managing its
+  own pages via an attenuated `AddressSpace` (`0`), an out-of-range carve rejected at the boundary
+  (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). wasm64 `run_instantiate() ==
+  42123`. So a guest can spin up isolated sub-guests inside the wasm sandbox. Follow-up (unproven in
+  wasm): fibers/coroutines, tail calls, guest-JIT (interpreted), GC roots, SIMD.
 - [x] **Live host imports (`--features live`).** `svm_run_live` bridges guest capabilities to **real
   wasm imports** via `Host::grant_host_fn` (iface 13): a `(console, clock)` powerbox where
   `console.write` forwards the guest's bytes to the imported `svm_host.host_write` (live host console,
@@ -238,7 +252,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 46/46
-  compute+powerbox+snapshot+scale differential vs native), and `node browser/live.mjs` (host-import demo,
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 51/51
+  compute+powerbox+snapshot+nested+scale differential vs native), and `node browser/live.mjs` (host-import demo,
   `--features live`). wasm64 is exercised via the Wasmtime `--invoke` probes under **Reproduce**.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

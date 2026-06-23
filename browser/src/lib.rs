@@ -400,6 +400,26 @@ pub fn capture_exec(m: &svm_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
     }
 }
 
+/// Run `m`'s function 0 with an `Instantiator` (iface 6) granted over `[0, 128 KiB)` — the §14
+/// **nested-child** seam: function 0 may `instantiate`/`join` confined child domains over power-of-two
+/// sub-windows of that range (a child runs on the cooperative executor, confined by masking to its
+/// slice, joinable through the shared thread machinery). Returns `(status, i64-widened value)`.
+/// Shared by the wasm [`svm_run_nested`] export and the native `gencorpus` ground truth.
+pub fn instantiate_exec(m: &svm_ir::Module) -> (i32, i64) {
+    let mut host = Host::new();
+    let inst = host.grant_instantiator(0, 128 << 10);
+    let mut fuel = 5_000_000u64;
+    match bytecode::compile_and_run_with_host(m, 0, &[Value::I32(inst)], &mut fuel, &mut host) {
+        None => (STATUS_UNSUPPORTED, 0),
+        Some(Err(_)) => (STATUS_TRAP, 0),
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64),
+            _ => (STATUS_BAD_RESULT, 0),
+        },
+    }
+}
+
 /// Captured stdout / stderr of the most recent [`svm_run_pb`], as cdylib-managed allocations
 /// `(ptr, len)`. Each is a leaked boxed slice (exact length, alignment 1) freed when the next
 /// [`svm_run_pb`] replaces it — so the host reads it via the `*_ptr`/`*_len` exports *before* the
@@ -539,6 +559,27 @@ pub extern "C" fn svm_snapshot_len() -> usize {
     unsafe { (*core::ptr::addr_of!(SNAP)).1 }
 }
 
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **nested-child** powerbox
+/// (an `Instantiator` over `[0, 128 KiB)`; see [`instantiate_exec`]): function 0 may `instantiate`
+/// confined child guests over sub-windows and `join` them. Returns the guest's `i64` result; sets
+/// [`LAST_STATUS`].
+#[no_mangle]
+pub extern "C" fn svm_run_nested(mod_ptr: *const u8, mod_len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let (status, value) = instantiate_exec(&m);
+    set(status);
+    value
+}
+
 /// Self-contained powerbox probe (no host buffers, so usable via `wasmtime --invoke run_powerbox`):
 /// run a greeting guest that writes 17 bytes to stdout, then an `exit(42)` guest, and return `17`
 /// iff both the captured stdout length **and** the exit code are correct on this target — i.e. the
@@ -619,6 +660,48 @@ block3():
     }
     // Word 0 of the captured image should be 1000 + 7 = 1007.
     i64::from_le_bytes(out.snapshot[..8].try_into().unwrap())
+}
+
+/// Self-contained nested-child probe (so usable via `wasmtime --invoke run_instantiate`): a parent
+/// `instantiate`s a confined child in a 4 KiB sub-window at 64 KiB, the child writes a marker into
+/// the shared backing and returns 42, the parent joins and reads the marker back — returning
+/// `42 * 1000 + 123 = 42123` iff confined child execution + the shared data plane work on this
+/// target. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_instantiate() -> i64 {
+    const SHARED: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v7 = i64.const 65543
+  v8 = i32.load8_u v7
+  v9 = i64.extend_i32_u v8
+  v10 = i64.const 1000
+  v11 = i64.mul v6 v10
+  v12 = i64.add v11 v9
+  return v12
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 7
+  v2 = i32.const 123
+  i32.store8 v1 v2
+  v3 = i64.const 42
+  return v3
+}
+"#;
+    let Ok(m) = svm_text::parse_module(SHARED) else {
+        return -1;
+    };
+    match instantiate_exec(&m) {
+        (STATUS_OK, v) => v,
+        _ => -1,
+    }
 }
 
 // ---- live host imports: bind capabilities to real host functions ----------------------------

@@ -104,6 +104,25 @@ for (const c of corpus.capture ?? []) {
   }
 }
 
+// ---- nested-child corpus: svm_run_nested (§14 confined child domains) vs native -------------
+for (const c of corpus.nested ?? []) {
+  const m = load(readFileSync(c.file));
+  const got = ex.svm_run_nested(m.ptr, m.len);
+  const gotStatus = ex.svm_status();
+  m.free();
+  const okStatus = gotStatus === c.status;
+  const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
+  total++;
+  if (!(okStatus && okValue)) {
+    fail++;
+    console.log(`  FAIL ${c.name}: native {status:${c.status},value:${c.value}} ` +
+      `wasm {status:${gotStatus},value:${got}}`);
+  } else {
+    const detail = c.status === 3 ? 'child trap propagated' : `value ${got}`;
+    console.log(`  ${c.name}: match (${detail})`);
+  }
+}
+
 // ---- alloc-ABI scale check: echo MEGABYTES of stdin → stdout (past the old 1 MiB cap) --------
 {
   const SIZE = 2 << 20; // 2 MiB, double the retired fixed-buffer cap
