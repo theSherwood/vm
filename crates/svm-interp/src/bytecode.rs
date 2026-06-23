@@ -444,6 +444,12 @@ enum Op {
         block_base: u32,
         dst: u32,
     },
+    /// §12.8 4A.5 durable-runtime-internal: push the active context's shadow-SP word address (the
+    /// `Vm`'s `durable_region_base`). The reference `eval_inst` can't service it (it needs the running
+    /// context), so it gets a dedicated op like `vcpu.tls` would.
+    DurableShadowBase {
+        dst: u32,
+    },
 }
 
 /// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
@@ -1113,6 +1119,9 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             dst,
         },
         Inst::CallImport { .. } => return None,
+        // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
+        // context), so it gets a dedicated op rather than the `Eval` fallback.
+        Inst::DurableShadowBase => Op::DurableShadowBase { dst },
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
         // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
         // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
@@ -1661,7 +1670,12 @@ fn shadow_switch(
         return;
     }
     let Some(m) = mem.as_mut() else { return };
-    let sp = m.durable_get_sp();
+    // §12.8 4A.5: each context's SP word lives in its own region (root = context 0, fiber slot `s` =
+    // context `s + 1`). (This bytecode durable path is unreachable today — durable hosts always run on
+    // the tree-walker — but kept correct and compiling.)
+    let region_of =
+        |ctx: usize| super::shadow_region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
+    let sp = m.durable_get_sp(region_of(out_ctx));
     if out_ctx == ROOT_FIBER {
         *root_shadow_sp = sp;
     } else {
@@ -1672,7 +1686,7 @@ fn shadow_switch(
     } else {
         fiber_sp[in_ctx]
     };
-    m.durable_set_sp(in_sp);
+    m.durable_set_sp(region_of(in_ctx), in_sp);
 }
 
 /// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4) — the bytecode mirror of the tree-walker's
@@ -1702,11 +1716,12 @@ fn freeze_drive(
     budget: u64,
 ) -> Result<Vec<super::FrozenFiber>, Trap> {
     // The root's post-unwind SP (context 0); restored at the end so the window is thaw-ready.
+    let root_word = super::shadow_region_base(0);
     let root_sp = ctx
         .mem
         .as_ref()
-        .map(|m| m.durable_get_sp())
-        .unwrap_or(super::SHADOW_BASE);
+        .map(|m| m.durable_get_sp(root_word))
+        .unwrap_or(super::SHADOW_BASE + 8);
     let mut frozen = Vec::new();
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
@@ -1721,7 +1736,10 @@ fn freeze_drive(
         let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
-            m.durable_set_sp(super::shadow_region_base(slot + 1));
+            m.durable_set_sp(
+                super::shadow_region_base(slot + 1),
+                super::shadow_region_base(slot + 1) + 8,
+            );
         }
         // Deliver a placeholder resume value (inert; the thaw redelivers), then drive the fiber to its
         // base return under `UNWINDING` (zero forward progress: the poll fires immediately after the
@@ -1743,8 +1761,8 @@ fn freeze_drive(
         let shadow_sp = ctx
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp())
-            .unwrap_or(super::SHADOW_BASE);
+            .map(|m| m.durable_get_sp(super::shadow_region_base(slot + 1)))
+            .unwrap_or(super::SHADOW_BASE + 8);
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
             slot,
@@ -1756,7 +1774,7 @@ fn freeze_drive(
     }
     // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
     if let Some(m) = ctx.mem.as_mut() {
-        m.durable_set_sp(root_sp);
+        m.durable_set_sp(root_word, root_sp);
     }
     Ok(frozen)
 }
@@ -2082,7 +2100,7 @@ fn step_vcpu(
                 // A fresh fiber (registry slot `h`) is shadow context `h + 1`; its saved shadow-SP
                 // starts at its region base (empty shadow stack) — so a later switch into it points
                 // the active word there (DURABILITY.md §12.8).
-                fiber_sp.push(super::shadow_region_base(h as usize + 1));
+                fiber_sp.push(super::shadow_region_base(h as usize + 1) + 8); // §12.8 4A.5: empty = frame base (past the in-region SP word)
                 // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
                 // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
                 // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
@@ -2115,7 +2133,10 @@ fn step_vcpu(
                         if !ok {
                             return Err(Trap::FiberFault);
                         }
-                        Vm::new(m0, f, &[Value::I64(sp), Value::I64(arg)])?
+                        let mut fvm = Vm::new(m0, f, &[Value::I64(sp), Value::I64(arg)])?;
+                        // §12.8 4A.5: this fiber spills into its own region (slot `k` = context `k + 1`).
+                        fvm.durable_region_base = super::shadow_region_base(k + 1);
+                        fvm
                     }
                     Some(slot @ FiberState::Parked { .. }) => {
                         match std::mem::replace(slot, FiberState::Running) {
@@ -3263,6 +3284,11 @@ struct Vm {
     pc: usize,
     /// Edge-copy staging buffer (parallel-copy safety); kept here so it is reused across resumes.
     scratch: Vec<Reg>,
+    /// §12.8 4A.5: the window offset of this context's shadow-SP **word** — the base of its own region
+    /// (`shadow_region_base`), which `durable.shadow_base` returns so the instrumented IR addresses its
+    /// per-context SP word. The root's is context 0 (`SHADOW_BASE`); a fiber's its `slot + 1`. Set when
+    /// the Vm is created (fiber) / activated; unused on a non-durable run.
+    durable_region_base: u64,
 }
 
 impl Vm {
@@ -3283,6 +3309,7 @@ impl Vm {
             base: 0,
             pc: 0,
             scratch: Vec::new(),
+            durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
         })
     }
 
@@ -4111,6 +4138,11 @@ impl Vm {
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }
+                    pc += 1;
+                }
+                Op::DurableShadowBase { dst } => {
+                    // §12.8 4A.5: this context's shadow-SP word address (its own region base).
+                    self.regs[base + *dst as usize] = Reg::from_i64(self.durable_region_base as i64);
                     pc += 1;
                 }
             }

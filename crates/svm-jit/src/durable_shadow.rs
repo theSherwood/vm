@@ -14,22 +14,20 @@
 
 use std::cell::Cell;
 
-/// Step (i)-bridge default: the active SP word is still the single swapped `SHADOW_SP_OFF` (= 8), so
-/// `durable.shadow_base` returns that offset — byte-identical to the former `ConstI64(SHADOW_SP_OFF)`.
-/// The relocation sub-step flips [`seed`] to `shadow_region_base(ctx)` (per-context region words).
-const SHADOW_SP_OFF: u64 = 8;
+/// Default: the root context's region base (`shadow_region_base(0)` = `SHADOW_BASE`). The runtime
+/// re-seeds at every root entry / inline child / fiber switch before any instrumented code runs, so
+/// this default is only a never-stale fallback.
+const ROOT_SHADOW_BASE: u64 = 64;
 
 thread_local! {
-    /// This OS thread's (vCPU's) active durable shadow-SP word address. Defaults to the shared
-    /// `SHADOW_SP_OFF` (bridge); [`seed`] (once wired) resets it per dispatch / per child so a reused
-    /// worker thread can't leak a prior run's value.
-    static DURABLE_SHADOW_BASE: Cell<u64> = const { Cell::new(SHADOW_SP_OFF) };
+    /// This OS thread's (vCPU's) active durable shadow-SP **word address** — the base of the region
+    /// the running context spills into (§12.8 4A.5). [`seed`] resets it per root entry / inline child /
+    /// fiber switch so a reused worker thread can't leak a prior run's value.
+    static DURABLE_SHADOW_BASE: Cell<u64> = const { Cell::new(ROOT_SHADOW_BASE) };
 }
 
-/// Seed/reset the current OS thread's durable shadow-region base. Called when the runtime makes a
-/// context active (per dispatch on the single worker, once per child OS thread under concurrency).
-// Wired by the runtime in 4A.5 stage (ii); the register is read-only until the transform emits the op.
-#[allow(dead_code)]
+/// Seed/reset the current OS thread's durable shadow-SP word address. Called when the runtime makes a
+/// context active: the root entry, each inline child, and both edges of a fiber resume swap.
 pub(crate) fn seed(base: u64) {
     DURABLE_SHADOW_BASE.with(|c| c.set(base));
 }

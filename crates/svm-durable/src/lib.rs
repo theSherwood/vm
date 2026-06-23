@@ -966,12 +966,14 @@ fn transform_func(
 
 // ---- window helpers for freeze/thaw drivers and tests ----
 
-/// A fresh durable window of `size` bytes: state = `NORMAL`, shadow-SP = `SHADOW_BASE`.
+/// A fresh durable window of `size` bytes: state = `NORMAL`, and the root context's per-context
+/// shadow-SP word (§12.8 4A.5) — the first 8 bytes of its region at `SHADOW_BASE` — set to its empty
+/// frame base (`SHADOW_BASE + 8`, just past the word). The legacy global `SHADOW_SP_OFF` is unused.
 pub fn init_durable_window(size: usize) -> Vec<u8> {
     let mut w = vec![0u8; size];
     write_state(&mut w, STATE_NORMAL);
-    w[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]
-        .copy_from_slice(&SHADOW_BASE.to_le_bytes());
+    w[SHADOW_BASE as usize..SHADOW_BASE as usize + 8]
+        .copy_from_slice(&(SHADOW_BASE + 8).to_le_bytes());
     w
 }
 

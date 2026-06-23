@@ -820,18 +820,22 @@ impl Domain {
                 break;
             }
             for p in pending {
-                // Point the active shadow-SP at this child's region so its unwind spills into its own
-                // context; a later child overwrites the word, so the last leaves it at its extent.
-                fiber_rt::write_shadow_sp(env.mem_base, fiber_rt::shadow_region_base(p.ctx));
+                // §12.8 4A.5: this child's shadow-SP word lives in its **own** region (no shared word);
+                // initialise it empty (frame base) and re-point `durable.shadow_base` so the child's
+                // instrumented code addresses its own region during the unwind.
+                let child_region = fiber_rt::shadow_region_base(p.ctx);
+                fiber_rt::write_shadow_sp(env.mem_base, child_region, fiber_rt::shadow_frame_base(p.ctx));
+                crate::durable_shadow::seed(child_region);
                 // Attribute any grandchild this child spawns to it (its `parent_task` + per-vCPU table).
                 *lock(&self.cur_task) = p.task;
                 // §12: seed the child's per-vCPU TLS register to its (global) task id, matching the interp.
                 let (result, trap, faulted) =
                     self.run_child_inline(env, p.code, p.sp, p.arg, p.task as i64);
                 *lock(&self.cur_task) = 0; // back to the root between children
+                crate::durable_shadow::seed(fiber_rt::shadow_region_base(0)); // back to the root's region
 
                 // The child's flattened extent and whether it unwound under the freeze.
-                let child_sp = fiber_rt::read_shadow_sp(env.mem_base);
+                let child_sp = fiber_rt::read_shadow_sp(env.mem_base, child_region);
                 let froze = !faulted && fiber_rt::window_is_unwinding(env.mem_base);
 
                 // A child that unwound under the freeze records *itself* as residue (its continuation now
@@ -939,12 +943,17 @@ impl Domain {
         runs.sort_by_key(|r| std::cmp::Reverse(r.task));
         for r in &runs {
             fiber_rt::window_set_rewinding(env.mem_base);
-            fiber_rt::write_shadow_sp(env.mem_base, r.shadow_sp);
+            // §12.8 4A.5: restore this child's extent into its **own** region word and re-point
+            // `durable.shadow_base` so its rewinding code addresses its own region.
+            let child_region = fiber_rt::shadow_region_base(r.ctx);
+            fiber_rt::write_shadow_sp(env.mem_base, child_region, r.shadow_sp);
+            crate::durable_shadow::seed(child_region);
             *lock(&self.cur_task) = r.task; // route its own grandchild joins to its table
                                             // §12: seed the child's per-vCPU TLS register to its task id (matching the interp).
             let (result, trap, _faulted) =
                 self.run_child_inline(env, r.code, r.sp, r.arg, r.task as i64);
             *lock(&self.cur_task) = 0;
+            crate::durable_shadow::seed(fiber_rt::shadow_region_base(0)); // back to the root's region
             if let Some(table) = self.fiber_table() {
                 table.free_vcpu_context(r.ctx);
             }
@@ -955,7 +964,9 @@ impl Domain {
         }
         // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
         // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
-        fiber_rt::write_shadow_sp(env.mem_base, root_sp);
+        // §12.8 4A.5: the root's extent goes into context 0's own region word.
+        fiber_rt::write_shadow_sp(env.mem_base, fiber_rt::shadow_region_base(0), root_sp);
+        crate::durable_shadow::seed(fiber_rt::shadow_region_base(0));
         fiber_rt::window_set_rewinding(env.mem_base);
         *lock(&self.cur_task) = 0; // the root runs next (its joins resolve in its table)
     }

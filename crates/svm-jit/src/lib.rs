@@ -2397,7 +2397,7 @@ impl CompiledModule {
             frozen_vcpus_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
-            thaw_root_sp: DURABLE_SHADOW_BASE, // empty extent (context 0's region base)
+            thaw_root_sp: DURABLE_SHADOW_BASE + 8, // §12.8 4A.5: empty root extent = frame base (past the SP word)
             freeze_ctl: None,
             #[cfg(fiber_rt)]
             fiber_rt,
@@ -2792,6 +2792,10 @@ impl CompiledModule {
         // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
         // worker thread carries from a prior run before guest code can `vcpu.tls.get` it.
         vcpu_tls::seed(0);
+        // §12.8 4A.5: seed the durable shadow-base register to the root's region (context 0 =
+        // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
+        // shadow-SP word.
+        durable_shadow::seed(DURABLE_SHADOW_BASE);
         // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
         // guarded call (the guest is about to block in its loop), and retire it right after — so a
         // `request_freeze` can only ever store into the window while it is mapped (freed below).
@@ -2844,7 +2848,10 @@ impl CompiledModule {
             // active shadow-SP to context 0's region (root rewinds first on thaw), but the children
             // below overwrite the shared word with their own extents, so the root's must be read here
             // (its implicit residue, reported separately for a thaw to restore).
-            (*this).frozen_root_sp_out = fiber_rt::read_shadow_sp(mem_base as u64);
+            // §12.8 4A.5: the root's shadow-SP word lives in its own region (context 0); children no
+            // longer share it.
+            (*this).frozen_root_sp_out =
+                fiber_rt::read_shadow_sp(mem_base as u64, fiber_rt::shadow_region_base(0));
             // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
             // request, returning the handle) so the root could unwind first — matching the interp,
             // which enqueues a child and runs it only after the spawning vCPU yields. Now that the

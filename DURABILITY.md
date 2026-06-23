@@ -1028,7 +1028,12 @@ guest write op; (b) a **byte-identical bridge** — the durable transform reads 
 shadow-SP **word address** from that register at all four SP sites (dispatch / unwind check / unwind
 spill / arm) instead of `ConstI64(SHADOW_SP_OFF)`, with the register still resolving to the shared
 `SHADOW_SP_OFF` (= 8), so artifacts are unchanged. This proves the transform → register → both-backends
-path end-to-end. *Remaining (the relocation + format bump, one atomic cross-backend change):*
+path end-to-end. (c) **Relocation + format bump landed** — each context's shadow-SP word now lives at
+`shadow_region_base(ctx) + 0` (frames at `+8`), `durable.shadow_base` returns that region base on all
+three engines (tree-walker, bytecode, Cranelift JIT), the legacy global `SHADOW_SP_OFF` is retired, and
+`FORMAT_VERSION` is bumped 4 → 5. Cross-backend byte-identity (`durable_jit`) + every durable suite
+green. Stage (i) is **done**; stage (ii) (real concurrent children + the join barrier) is next. The
+original site map is retained below for reference:
 
 - **Layout.** Put each context's SP word at **`shadow_region_base(ctx) + 0`** (the region's first 8
   bytes); frames follow at `+ 8`, so `SHADOW_SP_OFF` (global offset 8) is retired. The transform is
