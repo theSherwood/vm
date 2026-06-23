@@ -1088,15 +1088,22 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   both in **global dispatch tables** (AV) and as **operand-position** φ-threaded blockaddresses clang's
   jump-threading emits (AW). Robust enough for a real interpreter; next interpreter target is **Lua**
   (which also needs `setjmp`/`longjmp`, below).
-- **`setjmp`/`longjmp` + C++ EH — a planned substrate (promoted from deferred-hard).** Both lower onto
-  the §6 stack-switching / `cont.*` fiber machinery SVM **already has** (save a stack position; transfer
-  control). Build them in order: **(1) `setjmp`/`longjmp` first** — the minimal form (save SP+callee
-  state at `setjmp`; restore-and-jump at `longjmp`; no cleanup, no type matching) — which is ~80% of the
-  substrate; **(2) EH on top** (`invoke`/`landingpad`/`resume` add cleanup-running + catch-type-matching
-  + unwind tables, reusing the same stack-transfer core). Drivers: **Postgres** (`--single`) is *all*
-  `sigsetjmp`/`siglongjmp` (the `PG_TRY()`/`ereport()` error model), and Lua's error model is `longjmp`
-  too; EH unblocks "real" (throwing) C++ (e.g. Kakoune) and is the §18 open item. This is on the
-  critical path, not speculative — see *Candidate targets* and the ladder.
+- **`setjmp`/`longjmp` — DONE on the interpreter (slice AX); C++ EH next on the same substrate.** The
+  two new core ops (`Inst::SetJmp`/`LongJmp`) lower from the recognized external `setjmp`/`_setjmp`/
+  `sigsetjmp` (returns-twice) and `longjmp`/`siglongjmp` (noreturn) calls (gated on use, so non-users
+  pay nothing). **Tree-walker**: `setjmp` snapshots the frame's resume point (block/inst/value-state —
+  the value state is captured because `Frame::vals` is *replaced per block*) keyed by the `jmp_buf`
+  address in a per-vCPU table; `longjmp` truncates the call stack back to it (intervening frames
+  discarded, no cleanup — C has none), restores the frame + data-SP (which rides in `vals[0]`), and
+  re-enters with the result set to the long-jump value. **Engine matrix** (kept in sync — never
+  divergent): tree-walker runs it; the **bytecode** engine declines the module (`compile_module → None`
+  → tree-walker fallback); the **JIT** bails `Unsupported` (its native-stack `longjmp` is a sub-slice —
+  rides the `cont.*`/`svm-fiber` switch). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_
+  deep_nesting` (byte-identical to native libc, multi-frame unwind + retry loop; the JIT-declines is
+  asserted). Perf (`examples/onramp_perf.rs`): the non-`setjmp` baseline rows are unmoved (gated;
+  byte-identical IR), `setjmp` capture/`longjmp` unwind cost is O(live-values)/O(frames) and paid only
+  when executed. **EH next** (`invoke`/`landingpad`/`resume` + cleanups) reuses this stack-transfer
+  core; the JIT `longjmp` sub-slice and EH unblock Postgres `--single` and throwing C++ respectively.
 - **`%f` / `%g` / `%e` float formatting** — deliberately **fail-closed** (LLVM.md printf notes): an
   `f64`-arithmetic approximation diverges from glibc at the rounding boundary; matching byte-for-byte
   needs a **correctly-rounded exact-decimal (Ryū / Dragon4, big-integer)** formatter. SQLite,
@@ -1202,7 +1209,8 @@ phases, both worth doing:
    64-bit/parser bugs fast. (A SAT solver / `perft` slot in here too — pure compute, self-validating.)
 2. **`indirectbr` / `blockaddress` (computed goto)** — DONE (slices AV + AW: global tables + φ-threaded
    operand-position). Robust for real interpreters.
-3. **`setjmp`/`longjmp`** — the stack-transfer substrate; then **EH** on top (reuses it).
+3. **`setjmp`/`longjmp`** — DONE on the interpreter (slice AX); JIT `longjmp` (native-stack switch) +
+   **EH** on top (reuses the stack-transfer core) next.
 4. **`%f` / `%g` float formatting** (Ryū/Dragon4) — needed by SQLite/Postgres and broadly.
 5. **SQLite Phase A (in-memory)** — the SQL-engine capstone (gated on goto + float-format).
 6. **The storage capability** → **SQLite Phase B** (read/write VFS) and **libmdbx** (file-backed mmap) —
@@ -1213,8 +1221,10 @@ phases, both worth doing:
 
 ### `setjmp`/`longjmp` + EH — design & sequencing (the stack-transfer substrate)
 
-The next slice (in progress). Drivers: **Postgres** `--single` (its whole `PG_TRY`/`ereport` model is
-`sigsetjmp`/`siglongjmp`) and **Lua** (error handling); **EH** is the follow-on on the same substrate.
+**Status: `setjmp`/`longjmp` DONE on the interpreter (slice AX)** — see the gap bullet above for the
+landed design + engine matrix. The JIT `longjmp` (native-stack switch) and **EH** are the remaining
+sub-slices. The design notes below are retained for the EH follow-on + the JIT path. Drivers:
+**Postgres** `--single` (its whole `PG_TRY`/`ereport` model is `sigsetjmp`/`siglongjmp`) and **Lua**.
 
 **Why a core primitive (not a pure-IR transform).** `longjmp` transfers control from deep in the call
 stack back to an ancestor `setjmp`, across N intervening frames. The only way to do this *without a

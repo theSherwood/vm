@@ -577,6 +577,10 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
                     Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
                         has_fiber = true
                     }
+                    // `setjmp`/`longjmp` (the non-local jump) needs the tree-walker's explicit
+                    // `Vec<Frame>` unwind (the bytecode engine's flat register file would need a
+                    // parallel checkpoint machinery — a later sub-slice). Decline → tree-walker.
+                    Inst::SetJmp { .. } | Inst::LongJmp { .. } => return None,
                     Inst::ThreadSpawn { .. }
                     | Inst::ThreadJoin { .. }
                     | Inst::MemoryWait { .. }

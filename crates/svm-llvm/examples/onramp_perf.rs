@@ -9,11 +9,15 @@
 //! beside them once the ops exist (a happy-path `setjmp`-in-a-loop with no `longjmp`, and a
 //! `longjmp`-taken row), so the cost of the feature itself is measured, not assumed.
 //!
-//! Recorded pre-`setjmp` baseline (release, one dev box — for regression eyeballing, not a CI gate):
-//!   loop_lcg interp ~4.1 ns/it  |  calls interp ~25.6 ns/it  |  computed_goto interp ~106 ns/it
-//! The **interpreter** rows are the low-noise guardrail (what must not move when `setjmp` lands); the
-//! JIT rows are compile-dominated/near-noise here because `svm_jit` only exposes compile-and-run
-//! together, so the large/small-n subtraction leaves execution below the timing floor.
+//! Guardrail use: the absolute ns vary by machine/load, so compare **same-box before/after a change**.
+//! The non-`setjmp` rows (`loop_lcg`/`calls`/`computed_goto`) are the baseline that must not move now
+//! that `setjmp`/`longjmp` lowering exists — and it can't, because it is **gated on use**: those
+//! workloads' IR is byte-identical to before (the translate suite asserts it). The `setjmp_*` rows
+//! (interp-only; the JIT bails `Unsupported` for now) measure the feature's own cost: capture is an
+//! O(live-values) frame snapshot, the long-jump an O(frames-unwound) truncate — both paid only when
+//! executed (a typical `setjmp` capture lands a few `calls`-rows' worth; a `longjmp` round-trip ~2–3×
+//! that). The interpreter rows are the low-noise signal; the JIT rows are compile-dominated/near-noise
+//! because `svm_jit` only exposes compile-and-run together.
 //!
 //! Methodology: each workload is `int work(int n)` whose body runs `n` fold-resistant iterations
 //! (a serial recurrence, so the optimizer can't collapse the loop). We time it at a large and a
@@ -31,18 +35,23 @@ const REPS: u32 = 9;
 const N_LARGE: i32 = 4_000_000;
 const N_SMALL: i32 = 1_000;
 
-/// `(name, C source defining `int work(int)`, short note)`.
-const WORKLOADS: &[(&str, &str, &str)] = &[
+/// `(name, C source defining `int work(int)`, short note, runs_on_jit)`. The `setjmp` rows are
+/// interp-only (`false`) — the JIT's native-stack `longjmp` is a later sub-slice, so it bails
+/// `Unsupported` (the rows measure the tree-walker cost). The first three are the **non-`setjmp`
+/// baseline** — they must not move now that `setjmp`/`longjmp` lowering exists (gated on use).
+const WORKLOADS: &[(&str, &str, &str, bool)] = &[
     (
         "loop_lcg",
         "int work(int n){ unsigned a = 1u; for (int i = 0; i < n; i++) a = a*1664525u + 1013904223u; return (int)a; }",
         "tight loop, serial LCG recurrence (loop throughput)",
+        true,
     ),
     (
         "calls",
         "static unsigned mix(unsigned x){ return x*2654435761u + 0x9e3779b9u; } \
          int work(int n){ unsigned a = 1u; for (int i = 0; i < n; i++) a = mix(a) ^ (a >> 13); return (int)a; }",
         "call/return per iteration (call-stack overhead — the setjmp-relevant axis)",
+        true,
     ),
     (
         "computed_goto",
@@ -53,6 +62,24 @@ const WORKLOADS: &[(&str, &str, &str)] = &[
          B: a^=a>>13; pc=2; continue; \
          C: a+=0x9e3779b9u; pc=0; continue; } return (int)a; }",
         "computed-goto dispatch (indirectbr → br_table)",
+        true,
+    ),
+    (
+        "setjmp_happy",
+        // `setjmp` each iteration, never long-jumped (the pcall-entry happy path): measures capture.
+        "#include <setjmp.h>\nstatic jmp_buf e;\n\
+         int work(int n){ unsigned a=1u; for(int i=0;i<n;i++){ setjmp(e); a=a*1664525u+1u; } return (int)a; }",
+        "setjmp capture per iteration, no longjmp (interp-only)",
+        false,
+    ),
+    (
+        "setjmp_longjmp",
+        // setjmp + a one-frame longjmp re-entry each iteration: measures capture + unwind.
+        "#include <setjmp.h>\nstatic jmp_buf e;\n\
+         int work(int n){ unsigned a=1u; for(int i=0;i<n;i++){ volatile int x=setjmp(e); \
+         if(x==0){ a=a*1664525u+1u; longjmp(e,1); } } return (int)a; }",
+        "setjmp + longjmp round-trip per iteration (interp-only)",
+        false,
     ),
 ];
 
@@ -125,7 +152,7 @@ fn main() {
         "workload", "interp ns/it", "jit ns/it"
     );
     println!("{}", "-".repeat(72));
-    for (name, src, note) in WORKLOADS {
+    for (name, src, note, runs_on_jit) in WORKLOADS {
         let Some(bc) = compile(name, src) else {
             eprintln!("note: skipping {name} (clang unavailable)");
             continue;
@@ -136,9 +163,12 @@ fn main() {
         let sp = t.entry_sp;
 
         let (ri, interp) = ns_per_iter(|n| time_interp(m, sp, n));
-        let (rj, jit) = ns_per_iter(|n| time_jit(m, sp, n));
-        assert_eq!(ri, rj, "{name}: interp ({ri}) vs JIT ({rj}) disagree");
-
-        println!("{name:<16} {interp:>14.2} {jit:>14.2}   {note}");
+        if *runs_on_jit {
+            let (rj, jit) = ns_per_iter(|n| time_jit(m, sp, n));
+            assert_eq!(ri, rj, "{name}: interp ({ri}) vs JIT ({rj}) disagree");
+            println!("{name:<16} {interp:>14.2} {jit:>14.2}   {note}");
+        } else {
+            println!("{name:<16} {interp:>14.2} {:>14}   {note}", "n/a");
+        }
     }
 }

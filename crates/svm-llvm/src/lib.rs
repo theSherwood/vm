@@ -9626,6 +9626,46 @@ fn is_rust_abort_call(name: &str) -> bool {
         || name.contains("alloc_error")
 }
 
+/// Lower a `<setjmp.h>` non-local jump to the `SetJmp`/`LongJmp` core ops. `setjmp`/`_setjmp`/
+/// `sigsetjmp` take the `jmp_buf` pointer as their first argument (`sigsetjmp`'s `savesigs` is
+/// ignored) → `Inst::SetJmp { buf }`, yielding the `i32` result (0 on the direct call, the long-jump
+/// value on re-entry); `longjmp`/`siglongjmp` take `(jmp_buf, i32 val)` → `Inst::LongJmp { buf, val }`
+/// (no result — LLVM follows it with `unreachable`). Returns `Ok(true)` if it handled the call. Gated
+/// external by the caller, so a guest definition of the same name shadows it.
+fn lower_setjmp_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    let arg = |ctx: &mut BlockCtx, i: usize| -> Result<ValIdx, Error> {
+        let op = c
+            .arguments
+            .get(i)
+            .map(|(o, _)| o)
+            .ok_or_else(|| Error::Unsupported(format!("{name} missing argument {i}")))?;
+        ctx.operand(op)
+    };
+    match name {
+        "setjmp" | "_setjmp" | "sigsetjmp" => {
+            let buf = arg(ctx, 0)?;
+            let r = ctx.push(Inst::SetJmp { buf });
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, r);
+                }
+            }
+            Ok(true)
+        }
+        "longjmp" | "siglongjmp" => {
+            let buf = arg(ctx, 0)?;
+            let val = arg(ctx, 1)?;
+            ctx.push(Inst::LongJmp { buf, val });
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// The local value operands a terminator uses (the branch condition / returned value). Validates
 /// terminator support. Branch *arguments* are synthesized from block parameters, not from here.
 fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
@@ -10881,6 +10921,13 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // direct-call path below.
         if let Some(name) = callee_name(c) {
             if !ctx.name2idx.contains_key(&name) && lower_io_call(ctx, c, &name)? {
+                return Ok(());
+            }
+        }
+        // A `<setjmp.h>` non-local jump (`setjmp`/`longjmp`, and the `_setjmp`/`sig*` variants) lowers
+        // to the `SetJmp`/`LongJmp` core ops. Gated external (a guest-defined function shadows it).
+        if let Some(name) = callee_name(c) {
+            if !ctx.name2idx.contains_key(&name) && lower_setjmp_call(ctx, c, &name)? {
                 return Ok(());
             }
         }

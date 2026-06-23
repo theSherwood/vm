@@ -1125,6 +1125,88 @@ fn computed_goto_phi_recovery_finds_operand_blockaddress() {
     svm_verify::verify_module(&t.module).expect("verify");
 }
 
+/// `<setjmp.h>` non-local jump (`setjmp`/`longjmp` → the `SetJmp`/`LongJmp` core ops). Compiles `run`
+/// plus `int main(){return run(SEED);}` natively (real libc `setjmp`/`longjmp`) and on the on-ramp,
+/// asserting the **tree-walker** matches the native exit code. Interpreter-only: the JIT's native-stack
+/// `longjmp` is a later sub-slice, so it must cleanly bail `Unsupported` here (asserted) and the
+/// bytecode engine declines the module (→ tree-walker) — the engines stay in sync (no divergence;
+/// either correct or a clean decline). `run` returns a byte so the result survives the Unix exit code.
+fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("svm_llvm_sj_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let svm = match interp.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        svm, native,
+        "{name}: tree-walker={svm} vs native cc={native}"
+    );
+
+    // The JIT must cleanly decline (its native-stack longjmp is a later sub-slice) — not miscompile.
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    assert!(
+        matches!(
+            svm_jit::compile_and_run(&module, 0, &slots),
+            Err(svm_jit::JitError::Unsupported(_))
+        ),
+        "{name}: the JIT should bail Unsupported on setjmp/longjmp (interp-only for now)"
+    );
+}
+
+#[test]
+fn setjmp_longjmp_round_trip() {
+    // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
+    // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
+    // frame, restoring its data-SP and value state. Byte-identical to native libc.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static void deep(int x){ longjmp(env, x*7+1); }\n\
+               int run(int n){ int r = setjmp(env); if (r==0){ deep(n); return -1; } return r & 0xff; }\n\
+               int main(void){ return run(5); }";
+    check_setjmp_vs_native("setjmp_basic", src, 5);
+}
+
+#[test]
+fn setjmp_longjmp_loop_and_deep_nesting() {
+    // A retry loop: each `longjmp` (from several frames deep) re-enters the `setjmp`, incrementing a
+    // counter carried in memory (a `volatile`/`static`, which survives the jump per C), until it
+    // reaches the limit — exercising repeated re-entry (the checkpoint is overwritten on each
+    // `setjmp`) and a multi-frame unwind. Byte-identical to native.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static int counter;\n\
+               static void c(int d, int n){ if (d > 0) { c(d-1, n); return; } longjmp(env, n); }\n\
+               int run(int n){ counter = 0; int r = setjmp(env); \
+                 if (r != 0) counter += r; \
+                 if (counter < n) c(3, counter + 1); \
+                 return counter & 0xff; }\n\
+               int main(void){ return run(20); }";
+    check_setjmp_vs_native("setjmp_loop", src, 20);
+}
+
 #[test]
 fn demo_sha256_vs_native() {
     // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the

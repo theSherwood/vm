@@ -1758,6 +1758,31 @@ pub enum Inst {
     Suspend {
         value: ValIdx,
     },
+    /// `setjmp` (the `<setjmp.h>` non-local-jump save). Captures the **current frame's resume point**
+    /// — a checkpoint of (this call-stack depth, the data-stack pointer, this frame's continuation just
+    /// after the `setjmp`) — into a runtime-owned checkpoint table, writing an opaque token into the
+    /// guest `jmp_buf` at byte offset `buf` (`i64`). Evaluates to `i32` **0** on the direct call; a
+    /// later [`Inst::LongJmp`] re-enters the frame *here* (returns "twice") with the long-jump value.
+    /// Like `cont.*` it is a **call-clobbering** control op (the live state is captured), but it does
+    /// not switch stacks and falls through normally on the direct call. The `jmp_buf` token is
+    /// **backend-internal** (the interpreter stores a checkpoint index) and opaque to the guest, so
+    /// observable behavior matches across engines though the bytes differ; it is transient (not
+    /// snapshot-portable). Lowers from the recognized external `setjmp`/`_setjmp`/`sigsetjmp` call.
+    SetJmp {
+        buf: ValIdx,
+    },
+    /// `longjmp` (the `<setjmp.h>` non-local jump). Reads the checkpoint token from the guest `jmp_buf`
+    /// at byte offset `buf` (`i64`), **unwinds** the call stack back to the captured [`Inst::SetJmp`]
+    /// frame (the intervening frames discarded with no per-frame work — C has no cleanups), restores the
+    /// data-stack pointer, and re-enters at the `setjmp` continuation, making *that* `setjmp` evaluate
+    /// to `val` (`i32`; a `0` `val` becomes `1`, per C). **Never returns** to the next instruction (a
+    /// `noreturn` control op; the trailing `unreachable` is dead). A stale/forged token, or a checkpoint
+    /// whose frame has already returned, **traps** (in-sandbox; §3b totality). Lowers from the
+    /// recognized external `longjmp`/`siglongjmp` call.
+    LongJmp {
+        buf: ValIdx,
+        val: ValIdx,
+    },
     /// §GC (`GC.md`) **conservative root enumeration** (`gc.roots`): scan every fiber of the
     /// domain — parked fibers, resume-chain ancestors, and the calling computation's own live
     /// frames (the op is **call-clobbering**, so the caller's roots are already spilled to its
@@ -2100,6 +2125,7 @@ impl Inst {
             | Inst::AtomicStore { .. }
             | Inst::AtomicFence { .. }
             | Inst::VcpuTlsSet { .. }
+            | Inst::LongJmp { .. }
             | Inst::V128Store { .. } => 0,
             // `vcpu.tls.get` appends one `i64`.
             Inst::VcpuTlsGet => 1,
