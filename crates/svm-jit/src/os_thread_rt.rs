@@ -824,7 +824,11 @@ impl Domain {
                 // initialise it empty (frame base) and re-point `durable.shadow_base` so the child's
                 // instrumented code addresses its own region during the unwind.
                 let child_region = fiber_rt::shadow_region_base(p.ctx);
-                fiber_rt::write_shadow_sp(env.mem_base, child_region, fiber_rt::shadow_frame_base(p.ctx));
+                fiber_rt::write_shadow_sp(
+                    env.mem_base,
+                    child_region,
+                    fiber_rt::shadow_frame_base(p.ctx),
+                );
                 crate::durable_shadow::seed(child_region);
                 // Attribute any grandchild this child spawns to it (its `parent_task` + per-vCPU table).
                 *lock(&self.cur_task) = p.task;

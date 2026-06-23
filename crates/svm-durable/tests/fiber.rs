@@ -14,9 +14,7 @@ use svm_durable::{
     init_durable_window, transform_module, transform_module_assume_confined, write_state,
     STATE_REWINDING, STATE_UNWINDING,
 };
-use svm_interp::{
-    run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_STRIDE,
-};
+use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_STRIDE};
 use svm_ir::{Inst, Memory, Module, Terminator};
 
 const SIZE_LOG2: u8 = 17;

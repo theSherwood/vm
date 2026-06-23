@@ -4056,6 +4056,7 @@ fn fiber_handle_generation(handle: i64) -> u64 {
 /// shadow stacks are empty (frames are pushed only under `UNWINDING`), so a saved SP equals its
 /// region base — but saving/restoring the real word keeps this correct for the freeze/thaw
 /// choreography (slices 3.1.3–4), where a drained fiber carries a non-empty shadow stack.
+#[allow(clippy::too_many_arguments)] // an internal swap helper threading the per-context durable state
 fn shadow_switch(
     mem: &mut Option<Mem>,
     registry: &FiberRegistry,
@@ -5037,7 +5038,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         durable_sp_ctx, // §12.8 4A.5: active spill context, maintained at fiber switches
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
-        vcpu_ctx, // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
+        vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
@@ -5904,7 +5905,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Re-point the active shadow-SP from the resumer's region to the target's
                     // (durable runs only) so a freeze that lands while the target runs spills into
                     // the target's own region — never the resumer's.
-                    shadow_switch(mem, registry, root_shadow_sp, *vcpu_ctx, durable_sp_ctx, durable, *cur, target);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        *cur,
+                        target,
+                    );
                     chain.push(target);
                     *cur = target;
                     *frames = new_frames;
@@ -5924,7 +5934,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     *cur = *chain.last().expect("chain keeps the root");
                     // Hand the active shadow-SP back to the resumer's region (durable runs only):
                     // the suspended fiber's SP is saved to its slot so a later resume restores it.
-                    shadow_switch(mem, registry, root_shadow_sp, *vcpu_ctx, durable_sp_ctx, durable, leaving, *cur);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -6415,7 +6434,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Restore the resumer's active shadow-SP (durable runs only). The fiber is
                     // `Done`, so saving its SP is moot, but `shadow_switch` reads the live word
                     // before overwriting it — correct whether or not it had unwound frames.
-                    shadow_switch(mem, registry, root_shadow_sp, *vcpu_ctx, durable_sp_ctx, durable, leaving, *cur);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {

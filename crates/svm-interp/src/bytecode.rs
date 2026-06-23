@@ -2101,10 +2101,10 @@ fn step_vcpu(
                 // starts at its region base (empty shadow stack) — so a later switch into it points
                 // the active word there (DURABILITY.md §12.8).
                 fiber_sp.push(super::shadow_region_base(h as usize + 1) + 8); // §12.8 4A.5: empty = frame base (past the in-region SP word)
-                // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
-                // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
-                // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
-                // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
+                                                                              // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
+                                                                              // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
+                                                                              // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
+                                                                              // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
                 let func_idx = (funcref as u32 as usize & dom.mods[0].table_mask) as i32;
                 fiber_meta.push((func_idx, sp));
                 vt.active.set(dst, Reg::from_i32(h));
@@ -4142,7 +4142,8 @@ impl Vm {
                 }
                 Op::DurableShadowBase { dst } => {
                     // §12.8 4A.5: this context's shadow-SP word address (its own region base).
-                    self.regs[base + *dst as usize] = Reg::from_i64(self.durable_region_base as i64);
+                    self.regs[base + *dst as usize] =
+                        Reg::from_i64(self.durable_region_base as i64);
                     pc += 1;
                 }
             }
