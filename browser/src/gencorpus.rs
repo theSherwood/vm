@@ -12,7 +12,8 @@
 use std::io::Write;
 
 use svm_browser::{
-    capture_exec, instantiate_exec, jit_exec, powerbox_exec, reflect_exec, region_exec,
+    capture_exec, dynlink_exec, instantiate_exec, jit_exec, powerbox_exec, reflect_exec,
+    region_exec,
 };
 use svm_interp::{bytecode, Value};
 
@@ -614,6 +615,21 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32):
 }
 "#;
 
+// ---- §22 dynamic linking (compile_linked: resolve a named import via a symbol table) -----------
+// The guest gets (jit, code, clock); it installs a unit (dynlink_exec's DL_UNIT, which imports
+// "clock") and call_indirects it, passing the clock handle. The unit's import was bound to the Clock
+// cap by the symbol table → returns clock.now + 777 = 777 (or fail-closed when unlinked).
+const DL_GUEST: &str = r#"memory 16
+func (i32, i32, i32) -> (i64) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i64.extend_i32_u v1
+  v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)
+  v5 = i32.wrap_i64 v4
+  v6 = call_indirect (i32) -> (i64) v5 (v2)
+  return v6
+}
+"#;
+
 // ---- §13 SharedRegion (host-backed memory aliased into the window) -----------------------------
 // From `crates/svm/tests/shared_region.rs`. iface 4: op 0 map(win_off, region_off, len, prot),
 // op 2 len, op 3 page_size. Host grants a 64 KiB region as func 0's arg.
@@ -1022,6 +1038,20 @@ fn main() {
             "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"status\":{status},\"value\":\"{value}\"}}{}",
             if i + 1 == jit.len() { "\n" } else { ",\n" },
         ));
+    }
+    // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
+    // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
+    {
+        let (m, file) = emit("dl_clock", DL_GUEST);
+        json.push_str("],\n\"dynlink\":[\n");
+        for (k, link) in [true, false].iter().enumerate() {
+            let (status, value) = dynlink_exec(&m, *link);
+            json.push_str(&format!(
+                "  {{\"name\":\"dl_clock\",\"file\":\"{file}\",\"link\":{},\"status\":{status},\"value\":\"{value}\"}}{}",
+                if *link { 1 } else { 0 },
+                if k == 1 { "\n" } else { ",\n" },
+            ));
+        }
     }
     // SharedRegion corpus — §13 host-backed memory; func 0 gets a 64 KiB region (svm_run_region).
     let region = [("region_alias", REGION_ALIAS), ("region_len", REGION_LEN)];

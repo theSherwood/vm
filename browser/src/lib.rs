@@ -587,21 +587,68 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     }
 }
 
+// A minimal symbol-table wire form for `compile_linked` (the browser embedder's own, since the engine
+// passes the bytes opaquely to the validator — both ends are ours). Each entry: `name_len: u8`,
+// `name` bytes (UTF-8), `type_id: u32` LE, `op: u32` LE — a name → `Cap(type_id, op)` binding. Empty
+// bytes ⇒ no bindings (the closed-blob `compile` op), so a unit with imports fails closed.
+
+/// Build a `compile_linked` symbol table binding each `name` to a host capability `(type_id, op)`.
+fn encode_symtab(entries: &[(&str, u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, type_id, op) in entries {
+        out.push(name.len() as u8);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&type_id.to_le_bytes());
+        out.extend_from_slice(&op.to_le_bytes());
+    }
+    out
+}
+
+/// Decode an [`encode_symtab`] buffer; `None` (fail-closed) on any malformation.
+fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, u32, u32)>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let len = *bytes.get(i)? as usize;
+        i += 1;
+        let name = core::str::from_utf8(bytes.get(i..i + len)?).ok()?.to_string();
+        i += len;
+        let type_id = u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?);
+        i += 4;
+        let op = u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?);
+        i += 4;
+        out.push((name, type_id, op));
+    }
+    Some(out)
+}
+
 /// The browser's [`svm_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
-/// cap: `decode_module` (fail-closed) → resolve imports (closed-blob ⇒ none) → `verify_module` (the
-/// escape-freedom gate) → the memory-match precondition → reject data segments and concurrency ops.
-/// A pure-Rust replica of `svm-run`'s canonical validator, so it builds for wasm (no Cranelift dep).
+/// cap: decode the symbol table → `decode_module` (fail-closed) → resolve named imports against the
+/// table → `verify_module` (the escape-freedom gate) → the memory-match precondition → reject data
+/// segments and concurrency ops. A pure-Rust replica of `svm-run`'s canonical validator (own symtab
+/// wire form), so it builds for wasm with no Cranelift dep.
 fn browser_jit_validator(
     bytes: &[u8],
     mem_log2: Option<u8>,
-    _symtab: &[u8],
+    symtab: &[u8],
 ) -> Result<std::sync::Arc<[svm_ir::Func]>, i64> {
     const EINVAL: i64 = -22;
+    let Some(table) = decode_symtab(symtab) else {
+        return Err(EINVAL);
+    };
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return Err(EINVAL);
     };
-    // Closed-blob `compile`: resolve nothing, so a unit with §7 imports fails closed.
-    let Ok(m) = svm_ir::resolve_imports_with(&m, |_name: &str| None::<svm_ir::Resolved>) else {
+    // Bind named imports to host caps via the table; an unresolved import ⇒ fail closed (re-verified).
+    let resolve = |name: &str| {
+        table.iter().find(|(n, _, _)| n == name).map(|(_, t, o)| {
+            svm_ir::Resolved::Cap(svm_ir::ResolvedCap {
+                type_id: *t,
+                op: *o,
+            })
+        })
+    };
+    let Ok(m) = svm_ir::resolve_imports_with(&m, resolve) else {
         return Err(EINVAL);
     };
     if svm_verify::verify_module(&m).is_err() {
@@ -655,6 +702,78 @@ pub fn jit_exec(m: &svm_ir::Module) -> (i32, i64) {
             _ => (STATUS_BAD_RESULT, 0),
         },
     }
+}
+
+/// A separately-compiled unit with a **named import** `"clock"`, resolved by `compile_linked`'s
+/// symbol table to a host capability — a plugin reaching a host service by name. `clock.now` first
+/// reads `0`, so the unit returns `0 + 777 = 777` once linked. (Declares `memory 16` to satisfy the
+/// memory-match precondition against the parent window.)
+const DL_UNIT: &str = r#"memory 16
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = call.import "clock" () -> (i64) v0 ()
+  v2 = i64.const 777
+  v3 = i64.add v1 v2
+  return v3
+}
+"#;
+
+/// Run `m`'s function 0 with a `Jit` cap, a `Clock` cap, and a host-`compile_linked` [`DL_UNIT`]:
+/// **dynamic linking** — the unit's named import `"clock"` is bound (via the symbol table) to the
+/// `Clock` capability `(type_id 2, op 0)` before verify, lowering `call.import "clock"` to a real
+/// `cap.call 2 0`. The guest receives `(jit, code, clock)`, installs the unit and `call_indirect`s it
+/// passing the clock handle → `777`. With `link == false` the symbol table is empty, so the import is
+/// unresolved and `compile_linked` fails closed (`STATUS_TRAP`). Returns `(status, value)`.
+pub fn dynlink_exec(m: &svm_ir::Module, link: bool) -> (i32, i64) {
+    let unit = match svm_text::parse_module(DL_UNIT) {
+        Ok(u) => svm_encode::encode_module(&u),
+        Err(_) => return (STATUS_BAD_RESULT, 0),
+    };
+    let mut host = Host::new();
+    let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), 4);
+    host.set_jit_validator(browser_jit_validator);
+    let clock = host.grant_clock();
+    // Bind "clock" → the Clock cap (iface 2, op 0) iff linking; otherwise an empty table (fail-closed).
+    let symtab = if link {
+        encode_symtab(&[("clock", 2, 0)])
+    } else {
+        Vec::new()
+    };
+    let code = match host.jit_compile_linked(jit, &unit, &symtab) {
+        Ok(Ok(c)) => c.handle,
+        _ => return (STATUS_TRAP, 0), // unresolved import ⇒ compile_linked fails closed
+    };
+    let args = [Value::I32(jit), Value::I32(code), Value::I32(clock)];
+    let mut fuel = 50_000_000u64;
+    match bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut host) {
+        None => (STATUS_UNSUPPORTED, 0),
+        Some(Err(_)) => (STATUS_TRAP, 0),
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64),
+            _ => (STATUS_BAD_RESULT, 0),
+        },
+    }
+}
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a dynamically-**linked** unit
+/// (see [`dynlink_exec`]); `link != 0` binds the unit's `"clock"` import, `0` leaves it unresolved
+/// (fail-closed). Returns the guest's `i64` result; sets [`LAST_STATUS`].
+#[no_mangle]
+pub extern "C" fn svm_run_dynlink(mod_ptr: *const u8, mod_len: usize, link: i32) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let (status, value) = dynlink_exec(&m, link != 0);
+    set(status);
+    value
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **guest-JIT** powerbox (see
@@ -901,6 +1020,30 @@ block0(v0: i64):
             Some(Value::I64(x)) => *x,
             _ => -1,
         },
+        _ => -1,
+    }
+}
+
+/// Self-contained dynamic-linking probe (`wasmtime --invoke run_dynlink`): a unit's named import
+/// `"clock"` is resolved by `compile_linked`'s symbol table to the Clock cap; the guest installs and
+/// calls it → `clock.now (0) + 777 = 777`. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_dynlink() -> i64 {
+    const G: &str = r#"memory 16
+func (i32, i32, i32) -> (i64) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i64.extend_i32_u v1
+  v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)
+  v5 = i32.wrap_i64 v4
+  v6 = call_indirect (i32) -> (i64) v5 (v2)
+  return v6
+}
+"#;
+    let Ok(m) = svm_text::parse_module(G) else {
+        return -1;
+    };
+    match dynlink_exec(&m, true) {
+        (STATUS_OK, v) => v,
         _ => -1,
     }
 }

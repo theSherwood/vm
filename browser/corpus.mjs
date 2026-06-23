@@ -171,6 +171,24 @@ for (const c of corpus.jit ?? []) {
   }
 }
 
+// ---- dynamic-linking corpus: svm_run_dynlink (§22 compile_linked symbol resolution) vs native
+for (const c of corpus.dynlink ?? []) {
+  const m = load(readFileSync(c.file));
+  const got = ex.svm_run_dynlink(m.ptr, m.len, c.link);
+  const gotStatus = ex.svm_status();
+  m.free();
+  const ok = gotStatus === c.status && (c.status !== 0 || BigInt(got) === BigInt(c.value));
+  total++;
+  if (!ok) {
+    fail++;
+    console.log(`  FAIL ${c.name}(link=${c.link}): native {status:${c.status},value:${c.value}} ` +
+      `wasm {status:${gotStatus},value:${got}}`);
+  } else {
+    console.log(`  ${c.name}(link=${c.link}): match ` +
+      `(${c.link ? `import resolved → ${got}` : 'unresolved → fail-closed'})`);
+  }
+}
+
 // ---- SharedRegion corpus: svm_run_region (§13 host-backed memory aliasing) vs native --------
 for (const c of corpus.region ?? []) {
   const m = load(readFileSync(c.file));
