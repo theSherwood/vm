@@ -34,25 +34,30 @@ const readOut = (ptrFn, lenFn) => {
 
 let total = 0, fail = 0;
 
-// ---- compute corpus: svm_run / svm_run0 vs native -------------------------------------------
-for (const { name, file, nargs, cases } of corpus.compute) {
-  let bad = 0;
-  for (const { arg, status, value } of cases) {
-    const m = load(readFileSync(file)); // re-load each case (the engine may dirty the window)
-    const got = nargs === 0 ? ex.svm_run0(m.ptr, m.len) : ex.svm_run(m.ptr, m.len, BigInt(arg));
-    const gotStatus = ex.svm_status();
-    m.free();
-    const okStatus = gotStatus === status;
-    const okValue = status !== 0 || BigInt(got) === BigInt(value); // value only meaningful when OK
-    total++;
-    if (!okStatus || !okValue) {
-      fail++; bad++;
-      console.log(`  FAIL ${name}(${arg}): native {status:${status},value:${value}} ` +
-        `wasm {status:${gotStatus},value:${got}}`);
+// ---- compute / fiber corpora: svm_run / svm_run0 vs native ----------------------------------
+// Fibers (§12 cont.*) need no powerbox, so they run on the same plain entries as compute.
+const runComputeLike = (list) => {
+  for (const { name, file, nargs, cases } of list) {
+    let bad = 0;
+    for (const { arg, status, value } of cases) {
+      const m = load(readFileSync(file)); // re-load each case (the engine may dirty the window)
+      const got = nargs === 0 ? ex.svm_run0(m.ptr, m.len) : ex.svm_run(m.ptr, m.len, BigInt(arg));
+      const gotStatus = ex.svm_status();
+      m.free();
+      const okStatus = gotStatus === status;
+      const okValue = status !== 0 || BigInt(got) === BigInt(value); // value only meaningful when OK
+      total++;
+      if (!okStatus || !okValue) {
+        fail++; bad++;
+        console.log(`  FAIL ${name}(${arg}): native {status:${status},value:${value}} ` +
+          `wasm {status:${gotStatus},value:${got}}`);
+      }
     }
+    console.log(`  ${name}: ${cases.length - bad}/${cases.length} match`);
   }
-  console.log(`  ${name}: ${cases.length - bad}/${cases.length} match`);
-}
+};
+runComputeLike(corpus.compute);
+runComputeLike(corpus.fiber ?? []);
 
 // ---- powerbox corpus: svm_run_pb (streams/clock/exit) vs native -----------------------------
 for (const c of corpus.powerbox ?? []) {

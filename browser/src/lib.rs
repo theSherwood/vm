@@ -704,6 +704,94 @@ block0(v0: i64):
     }
 }
 
+/// Self-contained fiber probe (`wasmtime --invoke run_fiber`): a §12 continuation (`cont.new`/
+/// `cont.resume`) runs to completion, resumed with 7 and returning `7 + 100`. Returns `107` iff
+/// cooperative continuation switching works on this target, else `-1`.
+#[no_mangle]
+pub extern "C" fn run_fiber() -> i64 {
+    const FIB: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 7
+  v4, v5 = cont.resume v2 v3
+  return v5
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = i64.const 100
+  v1 = i64.add varg v0
+  return v1
+}
+"#;
+    let Ok(m) = svm_text::parse_module(FIB) else {
+        return -1;
+    };
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run(&m, 0, &[], &mut fuel) {
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            _ => -1,
+        },
+        _ => -1,
+    }
+}
+
+/// Self-contained coroutine probe (`wasmtime --invoke run_coroutine`): a §14 coroutine confined to a
+/// sub-window is resumed three times, yielding 100, 210, then returning 1019. Returns
+/// `100 + 210 + 1019 + RETURNED*1_000_000 = 1001329` iff `spawn_coroutine`/`resume`/`yield` work on
+/// this target, else `-1`.
+#[no_mangle]
+pub extern "C" fn run_coroutine() -> i64 {
+    const CORO: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 16
+  v4 = i64.const 0
+  v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 0
+  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
+  v9 = i64.const 10
+  v10, v11 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
+  v12 = i64.const 20
+  v13, v14 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
+  v15 = i64.add v8 v11
+  v16 = i64.add v15 v14
+  v17 = i64.extend_i32_s v13
+  v18 = i64.const 1000000
+  v19 = i64.mul v17 v18
+  v20 = i64.add v16 v19
+  return v20
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 0
+  v3 = i32.const 7
+  i32.store8 v2 v3
+  v4 = i64.const 100
+  v5 = cap.call 7 0 (i64) -> (i64) v1 (v4)
+  v6 = i64.const 200
+  v7 = i64.add v6 v5
+  v8 = cap.call 7 0 (i64) -> (i64) v1 (v7)
+  v9 = i64.const 999
+  v10 = i64.add v9 v8
+  return v10
+}
+"#;
+    let Ok(m) = svm_text::parse_module(CORO) else {
+        return -1;
+    };
+    match instantiate_exec(&m) {
+        (STATUS_OK, v) => v,
+        _ => -1,
+    }
+}
+
 // ---- live host imports: bind capabilities to real host functions ----------------------------
 //
 // Everything above keeps the cdylib import-free by buffering I/O. This (feature-gated) entry instead

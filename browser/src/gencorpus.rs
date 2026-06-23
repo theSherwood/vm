@@ -430,6 +430,159 @@ block0(v0: i64):
 }
 "#;
 
+// ---- §12 fibers (cooperative continuation switching) -------------------------------------------
+// Lifted verbatim from `crates/svm/tests/bytecode_fibers.rs`. No powerbox needed (cont.* doesn't
+// touch the host), so these run through the plain `svm_run0` path. `cont.new`/`cont.resume`/`suspend`.
+
+// Resume delivers arg=7; the fiber returns arg+100 → resumer sees value 107.
+const FIB_RUN: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 7
+  v4, v5 = cont.resume v2 v3
+  return v5
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = i64.const 100
+  v1 = i64.add varg v0
+  return v1
+}
+"#;
+
+// Suspend round-trip: first resume (10) suspends with 11; second resume (20) → fiber returns 25.
+// Result 11 + 25 = 36 — repeated park/resume of the same fiber with suspend-result delivery.
+const FIB_SUSPEND: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 10
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 20
+  v7, v8 = cont.resume v2 v6
+  v9 = i64.add v5 v8
+  return v9
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = i64.const 1
+  v1 = i64.add varg v0
+  v2 = suspend v1
+  v3 = i64.const 5
+  v4 = i64.add v2 v3
+  return v4
+}
+"#;
+
+// Two suspends in a fiber, resumed with 3, 4, 5 — exercises multiple switches across one fiber.
+const FIB_LOOP: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 3
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 4
+  v7, v8 = cont.resume v2 v6
+  v9 = i64.const 5
+  v10, v11 = cont.resume v2 v9
+  v12 = i64.add v5 v8
+  v13 = i64.add v12 v11
+  return v13
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = suspend varg
+  v1 = suspend v0
+  v2 = i64.add varg v0
+  v3 = i64.add v2 v1
+  return v3
+}
+"#;
+
+// Resuming a never-created fiber handle is an inert FiberFault (a trap) on both engines.
+const FIB_FORGED: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = i32.const 99
+  v1 = i64.const 5
+  v2, v3 = cont.resume v0 v1
+  return v3
+}
+"#;
+
+// The root activation cannot `suspend` (no resumer) — FiberFault on both engines.
+const FIB_ROOTSUSPEND: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = i64.const 5
+  v1 = suspend v0
+  return v1
+}
+"#;
+
+// ---- §14 coroutines (Instantiator.spawn_coroutine / resume + Yielder.yield) --------------------
+// Lifted from `crates/svm/tests/bytecode_coroutines.rs`. Need an Instantiator (iface 6) like nested
+// children, so they run through the `svm_run_nested` path. spawn=op 2, resume=op 3; yield=iface 7 op 0.
+
+// Parent spawns a coroutine confined to [64 KiB, 128 KiB), resumes it 3×; the child yields 100, then
+// 200+r1, then returns 999+r2 (r1=10, r2=20). Result 100 + 210 + 1019 + RETURNED*1_000_000.
+const CORO: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 16
+  v4 = i64.const 0
+  v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 0
+  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
+  v9 = i64.const 10
+  v10, v11 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
+  v12 = i64.const 20
+  v13, v14 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
+  v15 = i64.add v8 v11
+  v16 = i64.add v15 v14
+  v17 = i64.extend_i32_s v13
+  v18 = i64.const 1000000
+  v19 = i64.mul v17 v18
+  v20 = i64.add v16 v19
+  return v20
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 0
+  v3 = i32.const 7
+  i32.store8 v2 v3
+  v4 = i64.const 100
+  v5 = cap.call 7 0 (i64) -> (i64) v1 (v4)
+  v6 = i64.const 200
+  v7 = i64.add v6 v5
+  v8 = cap.call 7 0 (i64) -> (i64) v1 (v7)
+  v9 = i64.const 999
+  v10 = i64.add v9 v8
+  return v10
+}
+"#;
+
+// Resuming a coroutine handle that was never spawned is an inert CapFault (a trap) on both engines.
+const CORO_FORGED: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i32.const 9
+  v2 = i64.const 0
+  v3, v4 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v1, v2)
+  return v4
+}
+"#;
+
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -550,6 +703,9 @@ fn main() {
         ("child_addrspace", CHILD_ADDRSPACE),
         ("child_badcarve", CHILD_BADCARVE),
         ("child_trap", CHILD_TRAP),
+        // §14 coroutines reuse the Instantiator grant, so they run on the same `svm_run_nested` path.
+        ("coro_roundtrip", CORO),
+        ("coro_forged", CORO_FORGED),
     ];
     json.push_str("],\n\"nested\":[\n");
     for (i, (name, src)) in nested.iter().enumerate() {
@@ -560,14 +716,34 @@ fn main() {
             if i + 1 == nested.len() { "\n" } else { ",\n" },
         ));
     }
+    // Fiber corpus — §12 cooperative continuations; no powerbox, so run like compute (no-arg, via
+    // `svm_run0`). `native()` (deny-all `compile_and_run`) is the ground truth.
+    let fibers = [
+        ("fib_run", FIB_RUN),
+        ("fib_suspend", FIB_SUSPEND),
+        ("fib_loop", FIB_LOOP),
+        ("fib_forged", FIB_FORGED),
+        ("fib_rootsuspend", FIB_ROOTSUSPEND),
+    ];
+    json.push_str("],\n\"fiber\":[\n");
+    for (i, (name, src)) in fibers.iter().enumerate() {
+        let (m, file) = emit(name, src);
+        let (status, value) = native(&m, &[]);
+        json.push_str(&format!(
+            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"nargs\":0,\
+             \"cases\":[{{\"arg\":\"0\",\"status\":{status},\"value\":\"{value}\"}}]}}{}",
+            if i + 1 == fibers.len() { "\n" } else { ",\n" },
+        ));
+    }
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");
     eprintln!(
-        "wrote corpus.json ({} compute, {} powerbox, {} capture, {} nested)",
+        "wrote corpus.json ({} compute, {} powerbox, {} capture, {} nested, {} fiber)",
         compute.len(),
         powerbox.len(),
         cap_args.len(),
-        nested.len()
+        nested.len(),
+        fibers.len()
     );
 
     // Encode the guests validated by harnesses (not the deterministic corpus): the live-import guest
