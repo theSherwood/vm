@@ -2706,7 +2706,8 @@ fn vm_jit_threads_demo() {
         svm_run::run_powerbox_with_deadline(&module, b"", Some(std::time::Duration::from_secs(60)))
             .expect("powerbox run");
     assert_eq!(
-        run.stdout, b"0\n",
+        run.stdout,
+        b"0\n",
         "every worker's concurrently-JITed unit must agree with the reference (got {:?})",
         String::from_utf8_lossy(&run.stdout)
     );
