@@ -15,13 +15,13 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
-    iface, AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap,
+    iface, run_with_host, AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use svm_interp::SharedBacking;
-use svm_ir::{Module, Resolved, ValType};
+use svm_ir::{FuncIdx, Module, Resolved, ValType};
 
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
@@ -2611,6 +2611,262 @@ pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
         }
         JitOutcome::Exited(code) => Err(format!("kernel called Exit({code})")),
         JitOutcome::Trapped(kind) => Err(format!("kernel trapped ({kind:?})")),
+    }
+}
+
+/// Pack a typed [`Value`] into the raw `i64` register slot the JIT entry takes (the inverse of the
+/// reference-host [`typed`]). A `v128` arg keeps its low 8 bytes (CLI/entry args are scalar slots).
+fn value_slot(v: Value) -> i64 {
+    match v {
+        Value::I32(x) => x as i64,
+        Value::I64(x) => x,
+        Value::F32(x) => x.to_bits() as i64,
+        Value::F64(x) => x.to_bits() as i64,
+        Value::Ref(x) => x as i64,
+        Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+    }
+}
+
+/// Grant the MVP powerbox (§3e) — the **contiguous prefix** of `n_handles` of the eight fixed
+/// `VM_CAP_*` capabilities, in the canonical order the synthesized `_start` expects (stdout, stdin,
+/// exit, memory, addrspace, ioring, blocking, jit). Mirrors the grant order of [`run_powerbox_inner`]
+/// and the C-frontend test harness so handle values are deterministic; granted identically on the
+/// two backends' hosts, the values match (asserted by [`Instance::run_powerbox_diff`]).
+fn grant_powerbox_prefix(h: &mut Host, n_handles: usize, win: u64) -> Vec<Value> {
+    // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
+    // `Jit` cap (slot 7) needs the canonical blob validator. Both are inert if never used.
+    h.set_region_factory(new_shared_region);
+    h.set_jit_validator(jit_blob_validator);
+    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
+    let mut v = Vec::with_capacity(n_handles);
+    if n_handles >= 1 {
+        v.push(Value::I32(h.grant_stream(StreamRole::Out)));
+    }
+    if n_handles >= 2 {
+        v.push(Value::I32(h.grant_stream(StreamRole::In)));
+    }
+    if n_handles >= 3 {
+        v.push(Value::I32(h.grant_exit()));
+    }
+    if n_handles >= 4 {
+        v.push(Value::I32(h.grant_memory()));
+    }
+    if n_handles >= 5 {
+        v.push(Value::I32(h.grant_address_space(0, win)));
+    }
+    if n_handles >= 6 {
+        v.push(Value::I32(h.grant_io_ring()));
+    }
+    if n_handles >= 7 {
+        v.push(Value::I32(h.grant_blocking(std::time::Duration::ZERO, None)));
+    }
+    if n_handles >= 8 {
+        v.push(Value::I32(h.grant_jit(mem_log2)));
+    }
+    v
+}
+
+/// Reconcile the interpreter's `Result<Vec<Value>, Trap>` with the JIT's [`JitOutcome`] for an entry
+/// whose results are `results`: assert the two backends agree (the differential oracle of
+/// `run_c_full`) and fold them into one [`Outcome`]. `Err` if they diverge or the guest trapped.
+fn diff_outcome(
+    results: &[ValType],
+    interp: Result<Vec<Value>, Trap>,
+    jit: JitOutcome,
+) -> Result<Outcome, String> {
+    match (interp, jit) {
+        (Ok(want), JitOutcome::Returned(got)) => {
+            let got_typed: Vec<Value> = results
+                .iter()
+                .zip(&got)
+                .map(|(t, &v)| typed(*t, v))
+                .collect();
+            if want != got_typed {
+                return Err(format!(
+                    "interp/JIT results diverge: interp={want:?} jit={got_typed:?}"
+                ));
+            }
+            Ok(Outcome::Returned(want))
+        }
+        (Err(Trap::Exit(wi)), JitOutcome::Exited(gj)) => {
+            if wi != gj {
+                return Err(format!("interp/JIT exit codes diverge: interp={wi} jit={gj}"));
+            }
+            Ok(Outcome::Exited(wi))
+        }
+        (Err(t), j) if !matches!(t, Trap::Exit(_)) => {
+            Err(format!("guest trapped under the interpreter ({t:?}); jit={j:?}"))
+        }
+        (i, j) => Err(format!(
+            "interp/JIT outcomes diverge: interp={i:?} jit={j:?}"
+        )),
+    }
+}
+
+/// A resolved, verified program ready to run on **both** backends — the easy "instantiate &amp; run"
+/// default over a frontend's IR (built by [`instantiate`]). This is the [`run_powerbox`] /
+/// `run_c_full` experience **decoupled from any C frontend**: hand it a module whose function 0 is a
+/// powerbox `_start` (e.g. produced by [`svm_ir::synth_powerbox_start`]) and [`Instance::call`] grants
+/// the fixed powerbox, runs the entry on the interpreter *and* the JIT under identical capabilities,
+/// asserts they agree (interp == jit), and returns the captured output.
+///
+/// The handle / object-capability model remains the escape hatch: for a custom capability set, grant
+/// on a [`svm_interp::Host`] yourself and call [`svm_interp::run_with_host`] /
+/// [`svm_jit::compile_and_run_with_host`] directly. This wrapper is the default for the common case.
+pub struct Instance {
+    module: Module,
+    exports: HashMap<String, FuncIdx>,
+}
+
+/// Resolve `module`'s §7 named capability imports under the reference host policy
+/// ([`resolve_capability_imports`]), verify the result (the escape-freedom gate, §2a), and register
+/// the powerbox entry. Function 0 is registered under the export name `"_start"`; pass any additional
+/// named exports (name → funcidx, *after* the `_start` prepend) so they can be reached by name too.
+///
+/// Returns an `Err` (fail-closed) if an import is unbound or the module fails verification — exactly
+/// the gates a frontend's output must pass before it can run.
+pub fn instantiate_with_exports(
+    module: Module,
+    exports: impl IntoIterator<Item = (String, FuncIdx)>,
+) -> Result<Instance, String> {
+    let resolved = resolve_capability_imports(module)?;
+    svm_verify::verify_module(&resolved).map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
+    let mut tab: HashMap<String, FuncIdx> = HashMap::new();
+    tab.insert("_start".to_string(), 0);
+    for (name, idx) in exports {
+        tab.insert(name, idx);
+    }
+    Ok(Instance {
+        module: resolved,
+        exports: tab,
+    })
+}
+
+/// [`instantiate_with_exports`] with no extra named exports — the entry is reached as `"_start"`
+/// (function 0, the powerbox bootstrap). The common case for a `synth_powerbox_start` module.
+pub fn instantiate(module: Module) -> Result<Instance, String> {
+    instantiate_with_exports(module, std::iter::empty())
+}
+
+impl Instance {
+    /// The resolved, verified module (function 0 is the powerbox `_start`).
+    pub fn module(&self) -> &Module {
+        &self.module
+    }
+
+    /// Run the named export on both backends and return its outcome plus captured stdout/stderr.
+    ///
+    /// If the export is the powerbox entry (`"_start"`, function 0, a 3–8 `i32`-handle signature),
+    /// the fixed powerbox is auto-granted and `args` must be empty (the handles are supplied by the
+    /// runtime, not the caller). Any other export is run as a **bare kernel** with `args` and no
+    /// host capabilities (the escape hatch for pure functions). Either way the interpreter and the
+    /// JIT run under identical inputs and must agree (interp == jit), or this returns an `Err`.
+    pub fn call(&self, export: &str, args: &[Value]) -> Result<Run, String> {
+        let &fidx = self
+            .exports
+            .get(export)
+            .ok_or_else(|| format!("no export named `{export}`"))?;
+        let is_powerbox = fidx == 0 && is_powerbox_entry(&self.module);
+        if is_powerbox {
+            if !args.is_empty() {
+                return Err(
+                    "the powerbox entry takes no caller args (the handles are auto-granted)".into(),
+                );
+            }
+            self.run_powerbox_diff(&[])
+        } else {
+            self.run_kernel_diff(fidx, args)
+        }
+    }
+
+    /// Like [`Instance::call`] for the powerbox entry, but seed the guest's `Stream{In}` (stdin) with
+    /// `stdin` first. (The bare-kernel path takes no stdin.)
+    pub fn call_with_stdin(&self, stdin: &[u8]) -> Result<Run, String> {
+        self.run_powerbox_diff(stdin)
+    }
+
+    /// Grant the fixed powerbox on two fresh hosts (one per backend), run function 0 (the `_start`)
+    /// on the interpreter and the JIT, assert they agree, and return the captured output.
+    fn run_powerbox_diff(&self, stdin: &[u8]) -> Result<Run, String> {
+        let m = &self.module;
+        let n_handles = m.funcs[0].params.len();
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+
+        // Two hosts, granted identically (grants are deterministic, so the handle values match).
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        hi.stdin = stdin.to_vec();
+        hj.stdin = stdin.to_vec();
+        let args = grant_powerbox_prefix(&mut hi, n_handles, win);
+        let args_j = grant_powerbox_prefix(&mut hj, n_handles, win);
+        debug_assert_eq!(args, args_j, "powerbox grants must be deterministic");
+
+        // Interpreter.
+        let mut fuel = 50_000_000u64;
+        let interp = run_with_host(m, 0, &args, &mut fuel, &mut hi);
+
+        // JIT — the long-lived compile→run split (so the guest-driven `Jit` cap, if granted, can
+        // re-enter), serialized over a `Mutex<Host>` for a concurrent guest. See [`powerbox_compile_run`].
+        let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
+        let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
+        // SAFETY: each host outlives its run; no interrupt/init_mem; the thunk/ctx contracts hold.
+        let jit = if concurrent {
+            let locked = Mutex::new(std::mem::take(&mut hj));
+            let r = unsafe {
+                powerbox_compile_run(
+                    m,
+                    Some(&locked),
+                    std::ptr::null_mut(),
+                    &slots,
+                    None,
+                    svm_jit::Quota::default(),
+                    None,
+                )
+            };
+            hj = locked.into_inner().unwrap_or_else(|e| e.into_inner());
+            r
+        } else {
+            unsafe {
+                powerbox_compile_run(m, None, &mut hj, &slots, None, svm_jit::Quota::default(), None)
+            }
+        };
+        let (jit, backtrace) = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        if let JitOutcome::Trapped(kind) = jit {
+            return Err(format!(
+                "guest trapped ({kind:?}) — detect-and-kill (§5){}",
+                format_backtrace(&backtrace)
+            ));
+        }
+
+        let outcome = diff_outcome(&m.funcs[0].results, interp, jit)?;
+        if hi.stdout != hj.stdout {
+            return Err("interp/JIT stdout diverge".into());
+        }
+        if hi.stderr != hj.stderr {
+            return Err("interp/JIT stderr diverge".into());
+        }
+        Ok(Run {
+            outcome,
+            stdout: hi.stdout,
+            stderr: hi.stderr,
+        })
+    }
+
+    /// Run a bare (non-powerbox) export with `args` on both backends, assert they agree, and return
+    /// the outcome (no host capabilities granted — the escape hatch for pure kernel functions).
+    fn run_kernel_diff(&self, fidx: FuncIdx, args: &[Value]) -> Result<Run, String> {
+        let m = &self.module;
+        let mut h = Host::new();
+        let mut fuel = 50_000_000u64;
+        let interp = run_with_host(m, fidx, args, &mut fuel, &mut h);
+        let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
+        let jit = compile_and_run(m, fidx, &slots).map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let outcome = diff_outcome(&m.funcs[fidx as usize].results, interp, jit)?;
+        Ok(Run {
+            outcome,
+            stdout: h.stdout,
+            stderr: h.stderr,
+        })
     }
 }
 

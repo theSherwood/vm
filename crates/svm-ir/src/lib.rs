@@ -2287,6 +2287,207 @@ pub const POWERBOX_ARGS_BASE: u64 = 128;
 /// `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)` so it never collides with a data segment.
 pub const POWERBOX_ARGS_END: u64 = 16384;
 
+/// The §3e powerbox **handle-stash** base: the synthesized `_start` stashes each granted capability
+/// handle as an `i32` slot at window offset `STASH_BASE + i*4` (handle `i` at `i*4`), for the
+/// contiguous prefix of the eight fixed `VM_CAP_*` capabilities the program was granted. This is the
+/// *public* contract the C on-ramp (`svm-llvm`) bakes into its private `synth_start`;
+/// [`synth_powerbox_start`] reproduces it byte-for-byte so a frontend that emits SVM-IR directly
+/// gets the identical bootstrap without reaching into the on-ramp.
+pub const POWERBOX_STASH_BASE: u64 = 0;
+/// The guest heap's bump-pointer word (`i64`), just above the 8-handle stash region (`[0, 32)`).
+/// Seeded by `_start` (to the window's mapped boundary) when the program allocates (`seed_heap`).
+pub const POWERBOX_HEAP_BRK: u64 = 32;
+/// The guest heap's committed-boundary word (`i64`), just above [`POWERBOX_HEAP_BRK`]. The allocator
+/// `Memory.map`-commits upward from here into the reserved tail (§1a sparse address space).
+pub const POWERBOX_HEAP_TOP: u64 = 40;
+/// The powerbox globals / data-stack base (= [`POWERBOX_ARGS_END`]): page 0 is the writable
+/// stash + heap state + format scratch + args buffer, so a frontend's globals and the data stack
+/// live at/above this page — a read-only global never shares page 0 with the writable stash, and
+/// `_start`'s handle stores never fault on a read-only page (D40 page isolation).
+pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
+/// The data-stack reserve [`synth_powerbox_start`] leaves above the globals when sizing the window
+/// (matches `svm-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
+pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
+/// The number of fixed powerbox capabilities (`VM_CAP_*`, `<svm.h>`): stdout, stdin, exit, memory,
+/// addrspace, ioring, blocking, jit — always granted as a contiguous prefix of this set.
+pub const POWERBOX_MAX_HANDLES: usize = 8;
+
+/// Prepend the powerbox bootstrap `_start` (the new function 0) to an already-linked, possibly
+/// import-bearing `module`, reproducing the exact layout the C on-ramp (`svm-llvm`) bakes into its
+/// own `synth_start` — so a frontend that emits SVM-IR directly (and links it itself, e.g. via
+/// [`link`]) gets the same "just works" powerbox bootstrap the C path enjoys, with no access to the
+/// on-ramp internals.
+///
+/// The synthesized `_start` takes `n_handles` `i32` capability handles (a contiguous prefix of the
+/// eight fixed [`POWERBOX_MAX_HANDLES`] `VM_CAP_*` slots — stdout, stdin, exit, memory, addrspace,
+/// ioring, blocking, jit), **stashes** each at window offset `i*4` (the public
+/// [`POWERBOX_STASH_BASE`] layout), optionally **seeds** the guest heap (`seed_heap`, when the
+/// program allocates — the bump pointer/boundary at [`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`]),
+/// then calls `entry(sp)` with the page-aligned data-stack base and returns the entry's result.
+///
+/// `entry` is the funcidx (in `module`, **before** the prepend) of the program's entry — a
+/// `(i64 sp) -> ()` or `(i64 sp) -> (T)` function (the C `main(void)` shape: it takes the threaded
+/// data-stack pointer). Prepending `_start` shifts every existing funcidx up by one; this is handled
+/// here (including the call to `entry`), so the returned module is internally consistent.
+///
+/// The window is grown (never shrunk) to cover the stash, the module's globals/data segments, and a
+/// [`POWERBOX_STACK_RESERVE`] data-stack reserve; a frontend's globals must already live at/above
+/// [`POWERBOX_STACK_PAGE`] (page 0 is the writable scratch). Returns an error if `n_handles` is
+/// outside `[3, 8]`, `entry` is out of range, or the entry signature isn't `(i64) -> ()`/`(i64) -> (T)`.
+pub fn synth_powerbox_start(
+    mut module: Module,
+    entry: FuncIdx,
+    n_handles: usize,
+    seed_heap: bool,
+) -> Result<Module, String> {
+    if !(3..=POWERBOX_MAX_HANDLES).contains(&n_handles) {
+        return Err(format!(
+            "powerbox grants a contiguous prefix of [3, {POWERBOX_MAX_HANDLES}] handles, got {n_handles}"
+        ));
+    }
+    let ef = module.funcs.get(entry as usize).ok_or_else(|| {
+        format!(
+            "entry funcidx {entry} out of range ({} funcs)",
+            module.funcs.len()
+        )
+    })?;
+    if ef.params.as_slice() != [ValType::I64] {
+        return Err(format!(
+            "powerbox entry must take a single i64 (the data-stack pointer), got params {:?}",
+            ef.params
+        ));
+    }
+    if ef.results.len() > 1 {
+        return Err(format!(
+            "powerbox entry must return 0 or 1 value, got {:?}",
+            ef.results
+        ));
+    }
+    let results = ef.results.clone();
+
+    // Globals/data segments live at/above STACK_PAGE; the data stack starts page-aligned above the
+    // highest data segment (and never below STACK_PAGE), so a read-only global never shares a page
+    // with the writable stash, and a stack write never lands on a read-only global's page (D40).
+    let data_end = module
+        .data
+        .iter()
+        .map(|d| d.offset + d.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    let globals_end = data_end.max(POWERBOX_STACK_PAGE);
+    let entry_sp = globals_end.div_ceil(POWERBOX_STACK_PAGE) * POWERBOX_STACK_PAGE;
+
+    // The window must cover the stash + globals + a data-stack reserve. Grow the declared memory to
+    // fit (never shrink); beyond the mapped window is the faulting guard region (§5).
+    let top = entry_sp + POWERBOX_STACK_RESERVE;
+    let need_log2 = (64 - (top - 1).leading_zeros()) as u8;
+    let size_log2 = module.memory.map_or(need_log2, |m| m.size_log2.max(need_log2));
+    module.memory = Some(Memory { size_log2 });
+
+    // The guest heap (when the program allocates) begins at the window's mapped boundary and grows up
+    // into the reserved tail via `Memory.map`.
+    let heap_base = seed_heap.then(|| 1u64 << size_log2);
+
+    // Every existing funcidx shifts up by one — the prepended `_start` becomes function 0.
+    shift_func_indices(&mut module, 1);
+    let start = build_powerbox_start(entry + 1, &results, entry_sp, n_handles, heap_base);
+    module.funcs.insert(0, start);
+    Ok(module)
+}
+
+/// Build the powerbox bootstrap `_start` body (the language-neutral core of `svm-llvm`'s
+/// `synth_start`, minus the C-specific argv/ctor paths): stash the granted handles, optionally seed
+/// the heap, then `call entry(sp)` and return its result. See [`synth_powerbox_start`].
+fn build_powerbox_start(
+    entry_idx: FuncIdx,
+    entry_results: &[ValType],
+    entry_sp: u64,
+    n_handles: usize,
+    heap_base: Option<u64>,
+) -> Func {
+    let params = vec![ValType::I32; n_handles];
+    let mut insts: Vec<Inst> = Vec::new();
+    // params v0..v(n-1) = the granted handles; stash param `i` at byte offset `i*4` (the public
+    // STASH layout). A program is granted a prefix sized to the highest capability index it uses.
+    let mut next: ValIdx = n_handles as ValIdx;
+    for i in 0..n_handles {
+        insts.push(Inst::ConstI64(POWERBOX_STASH_BASE as i64 + (i as i64) * 4));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: i as ValIdx,
+            offset: 0,
+            align: 0,
+        });
+    }
+    // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base`
+    // (the window's mapped boundary); the allocator `vm_map`-commits upward from there.
+    if let Some(hb) = heap_base {
+        for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
+            insts.push(Inst::ConstI64(off as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI64(hb as i64));
+            let val = next;
+            next += 1;
+            insts.push(Inst::Store {
+                op: StoreOp::I64,
+                addr,
+                value: val,
+                offset: 0,
+                align: 0,
+            });
+        }
+    }
+    // sp = entry_sp (constant); the data-SP the entry carries as param 0.
+    insts.push(Inst::ConstI64(entry_sp as i64));
+    let sp = next;
+    next += 1;
+    insts.push(Inst::Call {
+        func: entry_idx,
+        args: vec![sp],
+    });
+    let term = if entry_results.is_empty() {
+        Terminator::Return(vec![])
+    } else {
+        Terminator::Return(vec![next]) // the entry's single result, appended by the call
+    };
+    Func {
+        results: entry_results.to_vec(),
+        blocks: vec![Block {
+            params: params.clone(),
+            insts,
+            term,
+        }],
+        params,
+    }
+}
+
+/// Add `by` to every static funcidx reference in `module` — the four `FuncIdx`-bearing forms
+/// ([`Inst::Call`], [`Inst::RefFunc`], [`Inst::ThreadSpawn`], and the [`Terminator::ReturnCall`]
+/// tail call). Used when prepending a function shifts every existing index up.
+/// (`call_indirect`/`return_call_indirect` go through the table, not a static index, so they are
+/// untouched; `cont.new` takes a `funcref` *value* produced by `ref.func`, which is shifted there.)
+fn shift_func_indices(module: &mut Module, by: u32) {
+    for f in &mut module.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => *func += by,
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &mut b.term {
+                *func += by;
+            }
+        }
+    }
+}
+
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
@@ -3002,5 +3203,122 @@ mod import_tests {
         m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
         let r = resolve_imports(&m, policy).expect("resolve");
         assert_eq!(r, m, "a no-import module round-trips identically");
+    }
+}
+
+#[cfg(test)]
+mod powerbox_start_tests {
+    use super::*;
+
+    /// An entry that takes the threaded data-stack pointer and (statically) calls a sibling — so
+    /// we can pin that prepending `_start` shifts both the entry funcidx and its internal `Call`.
+    fn entry_module() -> Module {
+        // func 0: helper `(i64) -> (i64)` returns its arg.
+        let helper = Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64],
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            }],
+        };
+        // func 1: entry `(i64 sp) -> (i32)` calls helper(sp), discards it, returns 0.
+        let entry = Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![ValType::I64],
+                insts: vec![
+                    Inst::Call {
+                        func: 0,
+                        args: vec![0],
+                    }, // v1 = helper(sp)
+                    Inst::ConstI32(0), // v2
+                ],
+                term: Terminator::Return(vec![2]),
+            }],
+        };
+        Module {
+            funcs: vec![helper, entry],
+            memory: Some(Memory { size_log2: 10 }),
+            data: vec![],
+            imports: vec![],
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn prepends_start_and_reindexes() {
+        let m = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
+        // `_start` is the new function 0 with three i32 handle params.
+        assert_eq!(m.funcs.len(), 3);
+        assert_eq!(m.funcs[0].params, vec![ValType::I32; 3]);
+        assert_eq!(m.funcs[0].results, vec![ValType::I32]); // mirrors the entry's result
+                                                            // It stashes each handle at offset i*4 and ends by calling the (shifted) entry at index 2.
+        let blk = &m.funcs[0].blocks[0];
+        assert!(matches!(
+            blk.term,
+            Terminator::Return(ref v) if v.len() == 1
+        ));
+        assert!(
+            blk.insts.iter().any(|i| matches!(i, Inst::Call { func: 2, .. })),
+            "_start must call the entry at its shifted index (2)"
+        );
+        let stores: Vec<_> = blk
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Store { op: StoreOp::I32, .. }))
+            .collect();
+        assert_eq!(stores.len(), 3, "three handle stashes");
+        // The entry's internal `Call func: 0` (to the helper) shifted to `func: 1`.
+        assert!(
+            m.funcs[2].blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { func: 1, .. })),
+            "the entry's static call to the helper must be reindexed +1"
+        );
+    }
+
+    #[test]
+    fn seeds_heap_when_requested() {
+        let m = synth_powerbox_start(entry_module(), 1, 4, true).expect("synth");
+        let blk = &m.funcs[0].blocks[0];
+        // Two i64 stores seed HEAP_BRK / HEAP_TOP (plus heap_base = 1 << size_log2 consts).
+        let i64_stores = blk
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Store { op: StoreOp::I64, .. }))
+            .count();
+        assert_eq!(i64_stores, 2, "heap bump pointer + committed boundary seeded");
+    }
+
+    #[test]
+    fn grows_window_but_never_shrinks() {
+        // A tiny declared window is grown to cover the stash + stack reserve.
+        let grown = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
+        let g = grown.memory.unwrap().size_log2;
+        assert!(
+            (1u64 << g) >= POWERBOX_STACK_PAGE + POWERBOX_STACK_RESERVE,
+            "window must cover globals + the data-stack reserve"
+        );
+        // A generously-declared window is left as-is (never shrunk).
+        let mut big = entry_module();
+        big.memory = Some(Memory { size_log2: 40 });
+        let kept = synth_powerbox_start(big, 1, 3, false).expect("synth");
+        assert_eq!(kept.memory.unwrap().size_log2, 40);
+    }
+
+    #[test]
+    fn rejects_bad_arity_and_entry() {
+        assert!(synth_powerbox_start(entry_module(), 1, 2, false).is_err());
+        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_err());
+        assert!(synth_powerbox_start(entry_module(), 99, 3, false).is_err());
+        // The helper (func 0) takes `(i64) -> (i64)` — a valid entry shape — but the entry must be
+        // chosen by the frontend; a non-`(i64) -> _` entry is rejected.
+        let mut m = entry_module();
+        m.funcs[1].params = vec![ValType::I32]; // wrong: entry must take the i64 data-stack pointer
+        assert!(synth_powerbox_start(m, 1, 3, false).is_err());
     }
 }
