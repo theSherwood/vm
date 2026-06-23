@@ -206,6 +206,30 @@ for (const c of corpus.region ?? []) {
   }
 }
 
+// ---- durability corpus: svm_run_durable (freeze/thaw, IR-driven) vs native -----------------
+for (const c of corpus.durable ?? []) {
+  const m = load(readFileSync(c.file));
+  const win = load(fromHex(c.init));
+  const got = ex.svm_run_durable(m.ptr, m.len, win.ptr, win.len, BigInt(c.clock));
+  const gotStatus = ex.svm_status();
+  const gotSnap = hex(readOut(ex.svm_snapshot_ptr, ex.svm_snapshot_len));
+  m.free(); win.free();
+  const okStatus = gotStatus === c.status;
+  const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
+  const okSnap = c.status !== 0 || gotSnap === c.snapshot;
+  total++;
+  if (!(okStatus && okValue && okSnap)) {
+    fail++;
+    console.log(`  FAIL ${c.name}: native {status:${c.status},value:${c.value},snap#${c.snapshot.length}} ` +
+      `wasm {status:${gotStatus},value:${got},snap#${gotSnap.length}}` +
+      (gotSnap !== c.snapshot ? ' (snapshot differs)' : ''));
+  } else {
+    const detail = c.name === 'dur_freeze' ? 'freeze snapshot identical'
+      : c.name === 'dur_thaw' ? `thaw reproduced ${got}` : `value ${got}`;
+    console.log(`  ${c.name}: match (${detail})`);
+  }
+}
+
 // ---- alloc-ABI scale check: echo MEGABYTES of stdin → stdout (past the old 1 MiB cap) --------
 {
   const SIZE = 2 << 20; // 2 MiB, double the retired fixed-buffer cap

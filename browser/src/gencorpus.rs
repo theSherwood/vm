@@ -12,9 +12,11 @@
 use std::io::Write;
 
 use svm_browser::{
-    capture_exec, dynlink_exec, instantiate_exec, jit_exec, powerbox_exec, reflect_exec,
-    region_exec,
+    capture_exec, durable_run, dynlink_exec, instantiate_exec, jit_exec, powerbox_exec,
+    reflect_exec, region_exec,
 };
+use svm_durable::{init_durable_window, transform_module, write_state, STATE_NORMAL,
+    STATE_REWINDING, STATE_UNWINDING};
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -615,6 +617,21 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32):
 }
 "#;
 
+// ---- durability (freeze / thaw, single-fiber, IR-driven) ---------------------------------------
+// From `crates/svm/tests/bytecode_durable.rs`. A program with two clock reads (each an unwind point);
+// the first value is live across the second, so a freeze after the first spills it to the shadow
+// stack and a thaw reloads it. base = clock_v + (clock_v + 1). The `svm-durable` transform
+// instruments it; gencorpus bakes the *instrumented* module into the corpus.
+const DURABLE_SRC: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 2 0 () -> (i64) v0 ()
+  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v3 = i64.add v1 v2
+  return v3
+}
+"#;
+
 // ---- §22 dynamic linking (compile_linked: resolve a named import via a symbol table) -----------
 // The guest gets (jit, code, clock); it installs a unit (dynlink_exec's DL_UNIT, which imports
 // "clock") and call_indirects it, passing the clock handle. The unit's import was bound to the Clock
@@ -1063,6 +1080,44 @@ fn main() {
             "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"status\":{status},\"value\":\"{value}\"}}{}",
             if i + 1 == region.len() { "\n" } else { ",\n" },
         ));
+    }
+    // Durability corpus — instrument the source, then NORMAL run, UNWINDING freeze, and REWINDING
+    // thaw (fed the freeze snapshot back). Each case bakes its window + clock + (status, value,
+    // snapshot) ground truth; the wasm side runs the *same* instrumented module over the *same* window.
+    {
+        let src = svm_text::parse_module(DURABLE_SRC).expect("parse durable src");
+        let inst = transform_module(&src).expect("durable transform scope");
+        let bytes = svm_encode::encode_module(&inst);
+        let file = "corpus/durable.svmbc".to_string();
+        std::fs::File::create(&file)
+            .and_then(|mut f| f.write_all(&bytes))
+            .expect("write durable module");
+        let clock_v = 1000i64;
+        let mut normal = init_durable_window(1 << 17);
+        write_state(&mut normal, STATE_NORMAL);
+        let mut unwind = init_durable_window(1 << 17);
+        write_state(&mut unwind, STATE_UNWINDING);
+        let (sn, vn, snap_n, _) = durable_run(&inst, &normal, clock_v);
+        let (su, vu, snap_frozen, clk_after) = durable_run(&inst, &unwind, clock_v);
+        // Thaw: feed the freeze snapshot back as the window, flipped to REWINDING; clock continues.
+        let mut rewind = snap_frozen.clone();
+        write_state(&mut rewind, STATE_REWINDING);
+        let (sr, vr, snap_r, _) = durable_run(&inst, &rewind, clk_after);
+        let cases = [
+            ("dur_normal", &normal, clock_v, sn, vn, &snap_n),
+            ("dur_freeze", &unwind, clock_v, su, vu, &snap_frozen),
+            ("dur_thaw", &rewind, clk_after, sr, vr, &snap_r),
+        ];
+        json.push_str("],\n\"durable\":[\n");
+        for (k, (name, win, clk, status, value, snap)) in cases.iter().enumerate() {
+            json.push_str(&format!(
+                "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"init\":\"{}\",\"clock\":\"{clk}\",\
+                 \"status\":{status},\"value\":\"{value}\",\"snapshot\":\"{}\"}}{}",
+                hex(win),
+                hex(snap),
+                if k + 1 == cases.len() { "\n" } else { ",\n" },
+            ));
+        }
     }
     json.push_str("]\n}\n");
     std::fs::write("corpus.json", json).expect("write corpus.json");

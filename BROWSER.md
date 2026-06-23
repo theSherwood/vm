@@ -123,8 +123,9 @@ wasmtime run --invoke run_reflect   -W memory64=y "$W"   # 3 (cap.self.count ove
 wasmtime run --invoke run_region    -W memory64=y "$W"   # ...cdef (SharedRegion two-offset alias)
 wasmtime run --invoke run_jit       -W memory64=y "$W"   # 142 (guest installs + call_indirects a JIT unit)
 wasmtime run --invoke run_dynlink   -W memory64=y "$W"   # 777 (compile_linked resolves a named import)
+wasmtime run --invoke run_durable   -W memory64=y "$W"   # 2001 (durable NORMAL run; freeze/thaw differ in corpus)
 
-# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tailcall + SIMD + gc.roots + reflection + SharedRegion + guest-JIT + dynlink + …) — 116/116
+# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tailcall + SIMD + gc.roots + reflection + SharedRegion + guest-JIT + dynlink + durability) — 119/119
 cargo run --bin gencorpus                                # native ground truth → corpus.json
 node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
 
@@ -212,7 +213,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
 - [x] **Differential check (compute + concurrency + powerbox + snapshot + nested + fibers/coroutines +
   scale, wasm32).** `gencorpus` (host) encodes a corpus + computes the **native** result per case;
-  `corpus.mjs` runs the same modules through the wasm exports and compares. **116/116 match**, zero host
+  `corpus.mjs` runs the same modules through the wasm exports and compares. **119/119 match**, zero host
   imports.
   *Compute/concurrency* (37): i64 arith+branches, multi-function `call`, memory store/load,
   divide-by-zero → `STATUS_TRAP`, **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` =
@@ -277,7 +278,11 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   iface 2) *before* verify — lowering it to a real `cap.call 2 0` — so a plugin reaches a host service
   by name → 777; an empty table leaves the import unresolved and `compile_linked` fails closed. The
   symtab codec + resolution run in wasm (own minimal wire form). wasm64 `run_dynlink() == 777`.
-  *(Remaining unproven in wasm: durability freeze/thaw.)*
+- [x] **Durability** (freeze / thaw, single-fiber, IR-driven). The `svm-durable` transform instruments
+  a program (two clock reads = unwind points); over a durable window the bytecode engine drives:
+  a NORMAL run (→ 2001), an UNWINDING **freeze** (a byte-identical 128 KiB snapshot wasm vs native),
+  and a REWINDING **thaw** fed that snapshot back (→ reproduces 2001, ends NORMAL). wasm64
+  `run_durable() == 2001`. **✅ Every bytecode-engine feature is now proven in wasm.**
 - [x] **Live host imports (`--features live`).** `svm_run_live` bridges guest capabilities to **real
   wasm imports** via `Host::grant_host_fn` (iface 13): a `(console, clock)` powerbox where
   `console.write` forwards the guest's bytes to the imported `svm_host.host_write` (live host console,
@@ -295,7 +300,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 116/116
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 119/119
   differential vs native), and `node browser/live.mjs` (host-import demo,
   `--features live`). wasm64 is exercised via the Wasmtime `--invoke` probes under **Reproduce**.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

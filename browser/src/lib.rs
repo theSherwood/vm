@@ -795,6 +795,71 @@ pub extern "C" fn svm_run_jit(mod_ptr: *const u8, mod_len: usize) -> i64 {
     value
 }
 
+/// Run an **already-instrumented** (durability-transformed) module's function 0 over a durable
+/// `window` (its low bytes carry the state word `NORMAL`/`UNWINDING`/`REWINDING` + the shadow region),
+/// with a `Clock` cap seeded to `clock_v`. Single-vCPU / single-fiber freeze/thaw is *driven by the
+/// transform's emitted IR* (DURABILITY.md §2) — the engine just runs it. Returns `(status, value,
+/// final-window snapshot, clock_after)`. Shared by [`svm_run_durable`] and `gencorpus`.
+pub fn durable_run(inst: &svm_ir::Module, window: &[u8], clock_v: i64) -> (i32, i64, Vec<u8>, i64) {
+    let mut host = Host::new();
+    host.set_durable(true);
+    let clk = host.grant_clock();
+    host.clock_ns = clock_v;
+    let mut fuel = 1_000_000u64;
+    match bytecode::compile_and_run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        window,
+        17, // SIZE_LOG2 = 128 KiB ≥ the durable reserve
+        &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, Vec::new(), host.clock_ns),
+        Some((r, snap)) => {
+            let (status, value) = match r {
+                Err(_) => (STATUS_TRAP, 0),
+                Ok(vals) => match vals.first() {
+                    Some(Value::I64(x)) => (STATUS_OK, *x),
+                    Some(Value::I32(x)) => (STATUS_OK, *x as i64),
+                    _ => (STATUS_BAD_RESULT, 0),
+                },
+            };
+            (status, value, snap, host.clock_ns)
+        }
+    }
+}
+
+/// Decode the **instrumented** module at `[mod_ptr, mod_len)`, run function 0 over the durable window
+/// at `[init_ptr, init_len)` (the state word lives in those bytes) with the clock seeded to `clock`
+/// (see [`durable_run`]). The final window image is captured to the snapshot slot
+/// (`svm_snapshot_ptr`/`svm_snapshot_len`). Returns the guest's `i64` result; sets [`LAST_STATUS`].
+#[no_mangle]
+pub extern "C" fn svm_run_durable(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    init_ptr: *const u8,
+    init_len: usize,
+    clock: i64,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let window = unsafe { core::slice::from_raw_parts(init_ptr, init_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let (status, value, snap, _clk) = durable_run(&m, window, clock);
+    set(status);
+    // SAFETY: single-threaded wasm; read back only via the snapshot accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(SNAP), snap) };
+    value
+}
+
 /// Run `m`'s function 0 with a host-granted **`SharedRegion`** (iface 4, 64 KiB) as its sole cap —
 /// the §13 host-backed memory object a guest `map`s into its window (op 0), aliasing the same backing
 /// at multiple offsets (the magic-ring-buffer primitive); op 2 `len`, op 3 `page_size`. Returns
@@ -1020,6 +1085,35 @@ block0(v0: i64):
             Some(Value::I64(x)) => *x,
             _ => -1,
         },
+        _ => -1,
+    }
+}
+
+/// Self-contained durability probe (`wasmtime --invoke run_durable`): instrument a single-fiber
+/// program that reads the clock twice (each an unwind point), run it NORMAL over a fresh durable
+/// window with the clock seeded to 1000 → `1000 + 1001 = 2001`. Proves the freeze/thaw transform's
+/// emitted IR runs on this target. Returns `-1` on any mismatch.
+#[no_mangle]
+pub extern "C" fn run_durable() -> i64 {
+    const SRC: &str = r#"memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 2 0 () -> (i64) v0 ()
+  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v3 = i64.add v1 v2
+  return v3
+}
+"#;
+    let Ok(m) = svm_text::parse_module(SRC) else {
+        return -1;
+    };
+    let Ok(inst) = svm_durable::transform_module(&m) else {
+        return -1;
+    };
+    let mut win = svm_durable::init_durable_window(1 << 17);
+    svm_durable::write_state(&mut win, svm_durable::STATE_NORMAL);
+    match durable_run(&inst, &win, 1000) {
+        (STATUS_OK, v, _, _) => v,
         _ => -1,
     }
 }
