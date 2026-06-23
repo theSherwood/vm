@@ -17,6 +17,7 @@ feeds every engine — including the SVM ones, which run IR produced by the **re
 | `svm-tree-walk` | this repo's tree-walking oracle (`svm_interp::run`), on LLVM-frontend IR |
 | `python` | CPython 3 |
 | `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `svm-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
+| `wasm32/64(pulley)` | the same wasm on Wasmtime's **Pulley** portable bytecode *interpreter* (`target("pulley64")`) — the interpreter-tier baseline for `svm-bytecode`, in-process via `wasmtime-rs/` |
 
 The SVM rows come from compiling `kernels.c` with `clang -O2 -emit-llvm -c` (the D54 on-ramp's
 legalized subset, **vectorization on**), translating the bitcode to SVM IR with
@@ -112,6 +113,32 @@ Caveat: a kernel with a large in-function *prelude* (e.g. `fnv`'s 4 KiB buffer f
 interpreters' `cold` (the prelude is fixed per-call work, not compile); the JIT runs that prelude in
 microseconds so its `cold` stays ~pure compile.
 
+## Interpreter-tier absolute scale
+
+The cross-engine table places the *JIT* (`svm-jit`) next to native/V8/Wasmtime-Cranelift. To place the
+*interpreters* (`svm-bytecode`, `svm-tree-walk`) on an absolute scale, the table includes two
+interpreter baselines that execute the **same compiled bytecode** of the same C — **Pulley**
+(Wasmtime's production portable bytecode interpreter, added via `wasmtime-rs/`) and CPython (`python`,
+though that interprets a Python *transliteration*, not the same compiled IR). Pulley is the fair
+apples-to-apples reference: a mature switch/tail-call bytecode loop, same input, same in-process
+methodology.
+
+Indicative shape (per-iter ns; absolute numbers machine-dependent):
+
+| kernel | `svm-tree-walk` | `svm-bytecode` | `wasm(pulley)` |
+|---|--:|--:|--:|
+| alu | ~51 | ~28 | ~3 |
+| xorshift | ~70 | ~37 | ~14 |
+| call | ~153 | ~59 | ~19 |
+| fnv | ~115 | ~74 | ~7 |
+| fma | ~31 | ~16 | ~9 |
+
+Reading: **`svm-bytecode` is ~2× faster than the tree-walker** (the bytecode tier earns its keep), but
+still **~3–9× behind Pulley** — real headroom in the bytecode dispatch loop (instruction encoding /
+dispatch overhead), not an algorithmic gap. Both SVM interpreters are the same order of magnitude as a
+production wasm interpreter, and both are ~20–50× off the JIT (cf. the steady-state table) — which is
+why the JIT exists and why the break-even analysis above matters for tier selection.
+
 
 ## Run
 
@@ -123,11 +150,12 @@ Needs `clang`, `node`, `python3`; the SVM rows additionally need **libLLVM-18** 
 `run.sh` skips them with a note if it's absent. (`crates/svm/examples/megabench.rs` is a separate
 hand-written-IR variant that needs no libLLVM, with its own simpler kernels — not part of this table.)
 
-To also compare against **Wasmtime** (Cranelift, like `svm-jit`), run it against the wasm modules
-`run.sh` built. Two drivers:
+To also compare against **Wasmtime** (Cranelift JIT, like `svm-jit`) and **Pulley** (its bytecode
+interpreter, the `svm-bytecode` baseline), run it against the wasm modules `run.sh` built. Two drivers:
 
 ```sh
-# accurate, in-process (covers every kernel incl. vsum; directly comparable to the in-process V8 rows):
+# accurate, in-process (covers every kernel; emits both wasm{32,64}(wasmtime) Cranelift rows and
+# wasm{32,64}(pulley) interpreter rows; directly comparable to the in-process V8 / SVM rows):
 ( cd bench/cross-engine/wasmtime-rs && cargo build --release )   # one-time: fetches + builds Wasmtime
 bench/cross-engine/wasmtime-rs/target/release/wasmtime-bench bench/cross-engine/k{32,64}.wasm
 

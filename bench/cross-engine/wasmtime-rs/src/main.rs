@@ -37,8 +37,18 @@ fn min_run(store: &mut Store<()>, f: &wasmtime::Func, n: i32) -> f64 {
 }
 
 fn bench(label: &str, path: &str, memory64: bool) {
+    bench_cfg(label, path, memory64, false);
+}
+
+/// `pulley` selects Wasmtime's portable **bytecode interpreter** (`target("pulley64")`) instead of the
+/// Cranelift JIT — the apples-to-apples "interpret the same compiled bytecode" baseline for the SVM
+/// bytecode engine (both interpret a compiled IR of the *same* C, in-process, same methodology).
+fn bench_cfg(label: &str, path: &str, memory64: bool, pulley: bool) {
     let mut cfg = Config::new();
     cfg.wasm_memory64(memory64);
+    if pulley {
+        cfg.target("pulley64").unwrap();
+    }
     let engine = Engine::new(&cfg).unwrap();
     let module = Module::from_file(&engine, path).unwrap();
     let mut store = Store::new(&engine, ());
@@ -55,4 +65,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     bench("wasm32(wasmtime)", &args[1], false);
     bench("wasm64(wasmtime)", &args[2], true);
+    // Pulley = Wasmtime's bytecode interpreter — the interpreter-tier baseline (cf. svm-bytecode).
+    bench_cfg("wasm32(pulley)", &args[1], false, true);
+    bench_cfg("wasm64(pulley)", &args[2], true, true);
 }
