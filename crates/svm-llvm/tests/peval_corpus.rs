@@ -38,8 +38,9 @@ use svm_verify::verify_module;
 // ===========================================================================================
 
 /// A Brainfuck interpreter: a flat bytecode dispatch loop over a readonly program, `long` tape cells.
-/// `,[>+++<-]>.` reads the input then loops it down adding 3 to cell 1 each time → out = 3*input.
-const BF_C: &str = r#"
+/// `__PROG__` is replaced by the guest BF program (see [`bf_c`]) so one interpreter serves a range of
+/// programs — e.g. `+++++.` (a constant), `,[>+++<-]>.` (out = 3*input), `,[>+++++<-]>.` (5*input).
+const BF_C_TEMPLATE: &str = r#"
 long run(const char *prog, long input) {
     static long tape[4096];
     long pc = 0, dp = 0, out = 0;
@@ -58,10 +59,22 @@ long run(const char *prog, long input) {
     }
     return out;
 }
-const char bfprog[] = ",[>+++<-]>.";
+const char bfprog[] = "__PROG__";
 int main(void) { return (int)run(bfprog, 0); }
 "#;
-const BF_PROG: &[u8] = b",[>+++<-]>.\0";
+
+/// The BF interpreter C with `prog` baked as the readonly program.
+fn bf_c(prog: &str) -> String {
+    BF_C_TEMPLATE.replace("__PROG__", prog)
+}
+
+/// The program's bytes as they appear in the readonly segment (the C string's trailing NUL included),
+/// so its segment can be located by content.
+fn bf_prog_bytes(prog: &str) -> Vec<u8> {
+    let mut b = prog.as_bytes().to_vec();
+    b.push(0);
+    b
+}
 
 /// A Lisp/Scheme-subset recursive tree-walker over a readonly AST of 16-byte nodes. `expr_ast` is a
 /// finite formula (unrolls); `fib_ast` defines fib in the AST (guest recursion → selective outline).
@@ -300,39 +313,82 @@ fn expr_ref(x: i64, y: i64) -> i64 {
     }
 }
 
+/// Build a corpus `Case` for the BF interpreter running `prog` (`sp`/`prog` baked, input dynamic).
+/// `scaling` ⇒ the program has a runtime-count loop (out grows with input); else it folds.
+fn bf_case(
+    name: &'static str,
+    kind: &'static str,
+    slug: &str,
+    prog: &str,
+    expect: Box<dyn Fn(i64) -> i64>,
+    scaling: bool,
+) -> Case {
+    let (m, sp, exports) = compile_c_to_svm(slug, &bf_c(prog), &[]);
+    let entry = run_entry(&m, &exports);
+    let pa = prog_addr(&m, &bf_prog_bytes(prog));
+    Case {
+        name,
+        kind,
+        interpreter: m,
+        entry,
+        interp_args: Box::new(move |n| vec![sp, pa, n]),
+        residual_args: Box::new(|n| vec![n]),
+        expect,
+        specialize: Box::new(move |m| {
+            specialize(
+                m,
+                entry,
+                &[
+                    SpecArg::ConstI64(sp),
+                    SpecArg::ConstI64(pa),
+                    SpecArg::Dynamic,
+                ],
+            )
+        }),
+        // These multipliers count the tape cell down from the input, so they terminate only for
+        // input >= 0; the constant program ignores the input entirely.
+        correctness: vec![0, 1, 2, 7, 100, 1000],
+        bench_scales: if scaling {
+            vec![10_000, 100_000, 1_000_000]
+        } else {
+            vec![7]
+        },
+        floor_input: 0, // input 0 → tape cell is 0 → the BF loop body is skipped
+        scales_with_work: scaling,
+    }
+}
+
 fn corpus() -> Vec<Case> {
     let mut cases = Vec::new();
 
-    // --- BF: a bytecode dispatch loop with a runtime-count loop (the durable Futamura win) --------
-    {
-        let (m, sp, exports) = compile_c_to_svm("bf", BF_C, &[]);
-        let entry = run_entry(&m, &exports);
-        let pa = prog_addr(&m, BF_PROG);
-        cases.push(Case {
-            name: "bf: out=3*n",
-            kind: "bytecode loop",
-            interpreter: m,
-            entry,
-            interp_args: Box::new(move |n| vec![sp, pa, n]),
-            residual_args: Box::new(|n| vec![n]),
-            expect: Box::new(|n| 3 * n),
-            specialize: Box::new(move |m| {
-                specialize(
-                    m,
-                    entry,
-                    &[
-                        SpecArg::ConstI64(sp),
-                        SpecArg::ConstI64(pa),
-                        SpecArg::Dynamic,
-                    ],
-                )
-            }),
-            correctness: vec![0, 1, 2, 7, 100, 1000],
-            bench_scales: vec![10_000, 100_000, 1_000_000],
-            floor_input: 0, // input 0 → cell0 is 0 → the BF loop body is skipped
-            scales_with_work: true,
-        });
-    }
+    // --- BF, a range of guest programs spanning the gain curve on one real interpreter -------------
+    // Folds to a constant (no input loop): the whole program collapses to `return 5`.
+    cases.push(bf_case(
+        "bf: constant (out=5)",
+        "bytecode (folds)",
+        "bf_const",
+        "+++++.",
+        Box::new(|_| 5),
+        false,
+    ));
+    // Runtime-count loop, light body (+3 per iteration).
+    cases.push(bf_case(
+        "bf: 3*n (light loop)",
+        "bytecode loop",
+        "bf_3x",
+        ",[>+++<-]>.",
+        Box::new(|n| 3 * n),
+        true,
+    ));
+    // Runtime-count loop, heavier body (+5 per iteration) — more real work per dispatch.
+    cases.push(bf_case(
+        "bf: 5*n (heavier loop)",
+        "bytecode loop",
+        "bf_5x",
+        ",[>+++++<-]>.",
+        Box::new(|n| 5 * n),
+        true,
+    ));
 
     // --- Lisp expr: finite AST → fully unrolled formula (size/structure win, run ~constant) -------
     {
