@@ -1517,6 +1517,12 @@ pub struct CompiledModule {
     /// only grows, and restarts near zero in a freshly-compacted module. An embedder watermarks on
     /// [`Self::extra_byte_count`] to auto-compact (DESIGN.md §22).
     extra_bytes: usize,
+    /// Finalized machine-code bytes of the **base module** (every function body lowered by
+    /// [`CompiledModule::compile`], summed at define time from Cranelift's `code_buffer`). The
+    /// analogue of [`Self::extra_bytes`] for the initial compile — a byte-accurate measure of the
+    /// module's emitted code size, exposed via [`Self::code_byte_count`]. Excludes the small
+    /// buffer-ABI trampoline and any later `define_extra` units (those are in `extra_bytes`).
+    base_bytes: usize,
     /// The in-flight run's window fault range, published by `run_code_raw` for the duration of
     /// the guarded call so a mid-run [`Self::invoke_extra`] can arm its nested recovery.
     /// `None` ⇒ no run in flight (invoke is rejected).
@@ -2140,6 +2146,7 @@ impl CompiledModule {
         // Define each function body. `clear_context` after each define resets the cached
         // CFG/domtree so the next function never compiles against a stale CFG.
         let mut ctx = module.make_context();
+        let mut base_bytes = 0usize;
         for (fi, (f, id)) in m.funcs.iter().zip(&ids).enumerate() {
             // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in `lower_block`)
             // takes effect and `value_labels_ranges` is populated. Gated on `-g` vars ⇒ no effect on
@@ -2170,6 +2177,7 @@ impl CompiledModule {
             module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            base_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
             if srcloc_map.is_some() {
                 if let Some(cc) = ctx.compiled_code() {
                     let ranges: Vec<(u32, u32, u32)> = cc
@@ -2378,6 +2386,7 @@ impl CompiledModule {
             fn_table_mask: (table_len as u64) - 1,
             next_extra: 0,
             extra_bytes: 0,
+            base_bytes,
             live_fault_range: None,
             last_trap_backtrace: Vec::new(),
             win_mapped,
@@ -3152,6 +3161,14 @@ impl CompiledModule {
     /// [`crate::CompiledModule`] / `tests/jit_compaction.rs`.
     pub fn extra_byte_count(&self) -> usize {
         self.extra_bytes
+    }
+
+    /// Finalized machine-code bytes of the **base module** — every function body emitted by the
+    /// initial [`CompiledModule::compile`], summed from Cranelift's `code_buffer` at define time.
+    /// The byte-accurate "how big is the JIT'd code" measure (excludes the tiny buffer-ABI
+    /// trampoline and later `define_extra` units — those are [`Self::extra_byte_count`]).
+    pub fn code_byte_count(&self) -> usize {
+        self.base_bytes
     }
 
     /// Whether a run is in flight on this module (a guarded call published its window fault range).

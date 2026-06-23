@@ -165,6 +165,53 @@ same tier ordering the micro-benchmarks show, now confirmed on realistic code. (
 per-engine iteration count so its per-call recompile washes out; the interpreters use smaller counts —
 per-iter is normalized, so the columns stay comparable.)
 
+## Footprint — code size & memory
+
+Every section above measures *speed*; `footprint` measures *size*, the other axis for a VM meant to
+host many sandboxes. For `kernels.c` it reports each representation's size and the peak process RSS to
+build + hold each engine's artifact (re-exec'd per engine so the JIT's transient Cranelift compile
+memory shows up):
+
+```sh
+cd crates/svm-llvm && cargo run --release --example footprint
+```
+
+Indicative (machine-dependent; ~11 functions, ~680 IR instructions):
+
+| representation | size | vs IR |
+|---|--:|--:|
+| IR (encoded) | ~3.5 KB | 1.00× |
+| bytecode (threaded `Vec<Op>`) | ~750 ops | ~1.1 ops/instruction |
+| JIT (native code) | ~3.2 KB | **~0.9×** |
+
+Reading: **the JIT'd native code is roughly the *same size* as the encoded IR** (~0.9×) — compact, not
+bloated; bytecode expands the IR ~1.1 ops/instruction. The memory story is in RSS: holding the module
+(tree-walk) or its bytecode adds ~0; a **JIT compile adds ~3 MB resident** (Cranelift's working set)
+for this small module — on top of a ~50 MB **libLLVM frontend** baseline (the translate step, not an
+engine cost). So per-guest steady-state memory is dominated by the JIT compiler, not the emitted code —
+another argument (with the compile-latency section) for a compiled-module cache and for running
+short-lived / many guests on the bytecode tier. (New `svm_jit::CompiledModule::code_byte_count` and
+`svm_interp::bytecode::Compiled::op_count` accessors expose the exact sizes.)
+
+## Capability-call (host-boundary) overhead
+
+`cap.call` is how a guest reaches the host (I/O, clock, spawn, and the durable safepoint path), yet
+it's absent from the compute tables. `cap_call` times a loop of one `cap.call` to the cheapest cap (the
+clock read) minus an identical no-cap loop, isolating the boundary cost on each engine — the JIT
+through the real `svm_run::cap_thunk` (§9 marshalling + indirect dispatch), the interpreters through the
+in-process `Host`:
+
+```sh
+cd crates/svm-llvm && cargo run --release --example cap_call
+```
+
+Indicative: **~54 ns/call (JIT), ~61 ns (bytecode), ~74 ns (tree-walk)** for the clock cap. The cost is
+**roughly engine-independent** — it's the host boundary, not the engine — which means on the JIT a
+`cap.call` is **~50× a normal in-VM op** (~1 ns), so cap-chatty / IO-heavy workloads are boundary-bound,
+not compute-bound. This is exactly what the §9/D45 *fast cap resolver* (devirtualized register-to-
+register cap calls) targets; this generic-dispatch number is the baseline it improves on. Heavier caps
+(real I/O, spawn) add their own work on top of this floor.
+
 
 ## Run
 
