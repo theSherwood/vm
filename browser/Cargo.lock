@@ -22,10 +22,19 @@ dependencies = [
 name = "svm-browser"
 version = "0.0.0"
 dependencies = [
+ "svm-durable",
  "svm-encode",
  "svm-interp",
  "svm-ir",
  "svm-text",
+ "svm-verify",
+]
+
+[[package]]
+name = "svm-durable"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
 ]
 
 [[package]]
