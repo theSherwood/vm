@@ -79,12 +79,12 @@
 //! dynamic ones are passed.
 //!
 //! **Scope.** Integer, **scalar float**, and **v128 (SIMD)** ops — arithmetic, compares, fused
-//! multiply-add, float↔int conversions, reinterpret/demote/promote casts; and the common SIMD lane
-//! ops (splat / extract / replace, lane int+float arithmetic / compares / shifts, bitwise, shuffle,
-//! swizzle) — are specialized (folded where the operands are constant, bit-for-bit the interpreter).
-//! Remaining **pure, single-result** value ops — pointer ops and the exotic SIMD ops (saturating
-//! add/sub, widen/narrow, lane convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true,
-//! bitmask, q15) — are emitted faithfully into the residual even though they are not folded yet, so
+//! multiply-add, float↔int conversions, reinterpret/demote/promote casts; and the SIMD lane ops —
+//! splat / extract / replace, lane int+float arithmetic / compares / shifts, bitwise, shuffle,
+//! swizzle, **and the exotic ones** (saturating add/sub, widen/narrow, lane convert, dot, pairwise,
+//! pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15) — are specialized (folded where the operands
+//! are constant, bit-for-bit the interpreter). Remaining **pure, single-result** value ops (e.g.
+//! pointer ops, and any lane op with a dynamic operand) are emitted faithfully into the residual, so
 //! dispatch is still eliminated around them. Direct calls are inlined (above). Effectful,
 //! multi-result, or other cross-function ops (indirect/host calls, atomics, fibers/threads), and
 //! memory accesses the engine can't resolve, return [`SpecError::Unsupported`] rather than guessing.

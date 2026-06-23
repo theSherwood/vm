@@ -9,8 +9,9 @@
 use svm_interp::{Trap, Value};
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp, VFCmpOp,
-    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape, VShiftOp, ValType,
+    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp, VCvtOp,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -3599,31 +3600,175 @@ fn folds_v128_extract_lane_to_scalar() {
 }
 
 #[test]
-fn unfolded_v128_op_passes_through() {
-    // A saturating add isn't folded yet — it survives in the residual and still runs correctly.
-    let m = ret(
-        vec![ValType::V128],
-        vec![
-            Inst::ConstV128(VA),
-            Inst::ConstV128(VB),
-            Inst::VSatBin {
-                shape: VShape::I8x16,
-                op: VSatBinOp::AddS,
-                a: 0,
-                b: 1,
-            },
-        ],
-        2,
-    );
+fn dynamic_operand_v128_op_passes_through() {
+    // With a *dynamic* operand a lane op can't fold, so it is emitted faithfully into the residual
+    // and still runs correctly. (Constant-operand lane ops all fold — see folds_v128_exotic_lane_ops.)
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::V128],
+            results: vec![ValType::V128],
+            blocks: vec![Block {
+                params: vec![ValType::V128], // 0: x (dynamic)
+                insts: vec![
+                    Inst::ConstV128(VB), // 1
+                    Inst::VSatBin {
+                        shape: VShape::I8x16,
+                        op: VSatBinOp::AddS,
+                        a: 0,
+                        b: 1,
+                    }, // 2
+                ],
+                term: Terminator::Return(vec![2]),
+            }],
+        }],
+        ..Default::default()
+    };
     verify_module(&m).expect("verifies");
-    let r = specialize(&m, 0, &[]).expect("specializes");
+    let r = specialize(&m, 0, &[SpecArg::Dynamic]).expect("specializes");
     verify_module(&r).expect("re-verifies");
     assert!(
         r.funcs[0]
             .blocks
             .iter()
             .any(|b| b.insts.iter().any(|i| matches!(i, Inst::VSatBin { .. }))),
-        "an unsupported v128 op should pass through unfolded"
+        "a dynamic-operand v128 op should pass through unfolded"
     );
-    assert_eq!(run(&m, &[]), run(&r, &[]));
+    for x in [VA, VB, [0u8; 16]] {
+        assert_eq!(run(&m, &[Value::V128(x)]), run(&r, &[Value::V128(x)]));
+    }
+}
+
+#[test]
+fn folds_v128_exotic_lane_ops() {
+    // Every "exotic" lane op folds when its operands are constant, bit-for-bit the interpreter
+    // (`check_v128_fold` runs the original through interp and the folded residual and compares).
+    use VShape::*;
+    let v = ValType::V128;
+    let i = ValType::I32;
+    let bin = |res, op| {
+        ret(
+            vec![res],
+            vec![Inst::ConstV128(VA), Inst::ConstV128(VB), op],
+            2,
+        )
+    };
+    let un = |res, op| ret(vec![res], vec![Inst::ConstV128(VA), op], 1);
+
+    for (shape, op) in [
+        (I8x16, VSatBinOp::AddS),
+        (I8x16, VSatBinOp::SubU),
+        (I16x8, VSatBinOp::AddU),
+        (I16x8, VSatBinOp::SubS),
+    ] {
+        check_v128_fold(&bin(
+            v,
+            Inst::VSatBin {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    for (shape, op) in [
+        (I16x8, VWidenOp::LowS),
+        (I16x8, VWidenOp::HighU),
+        (I32x4, VWidenOp::LowU),
+        (I64x2, VWidenOp::HighS),
+    ] {
+        check_v128_fold(&un(v, Inst::VWiden { shape, op, a: 0 }));
+        check_v128_fold(&bin(
+            v,
+            Inst::VExtMul {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    for (shape, op) in [(I8x16, VNarrowOp::S), (I16x8, VNarrowOp::U)] {
+        check_v128_fold(&bin(
+            v,
+            Inst::VNarrow {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    for op in [
+        VCvtOp::F32x4ConvertI32x4S,
+        VCvtOp::F32x4ConvertI32x4U,
+        VCvtOp::I32x4TruncSatF32x4S,
+        VCvtOp::I32x4TruncSatF32x4U,
+        VCvtOp::F32x4DemoteF64x2Zero,
+        VCvtOp::F64x2PromoteLowF32x4,
+        VCvtOp::F64x2ConvertLowI32x4S,
+        VCvtOp::F64x2ConvertLowI32x4U,
+        VCvtOp::I32x4TruncSatF64x2SZero,
+        VCvtOp::I32x4TruncSatF64x2UZero,
+    ] {
+        check_v128_fold(&un(v, Inst::VConvert { op, a: 0 }));
+    }
+    for (shape, op) in [
+        (F32x4, VPMinMaxOp::Pmin),
+        (F32x4, VPMinMaxOp::Pmax),
+        (F64x2, VPMinMaxOp::Pmin),
+        (F64x2, VPMinMaxOp::Pmax),
+    ] {
+        check_v128_fold(&bin(
+            v,
+            Inst::VPMinMax {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    check_v128_fold(&un(v, Inst::VPopcnt { a: 0 }));
+    check_v128_fold(&bin(
+        v,
+        Inst::VAvgr {
+            shape: I8x16,
+            a: 0,
+            b: 1,
+        },
+    ));
+    check_v128_fold(&bin(
+        v,
+        Inst::VAvgr {
+            shape: I16x8,
+            a: 0,
+            b: 1,
+        },
+    ));
+    check_v128_fold(&bin(v, Inst::VDot { a: 0, b: 1 }));
+    check_v128_fold(&bin(v, Inst::VDotI8 { a: 0, b: 1 }));
+    check_v128_fold(&bin(v, Inst::VQ15MulrSat { a: 0, b: 1 }));
+    check_v128_fold(&un(
+        v,
+        Inst::VExtAddPairwise {
+            shape: I16x8,
+            signed: true,
+            a: 0,
+        },
+    ));
+    check_v128_fold(&un(
+        v,
+        Inst::VExtAddPairwise {
+            shape: I32x4,
+            signed: false,
+            a: 0,
+        },
+    ));
+    // Boolean reductions fold to an i32 scalar.
+    check_v128_fold(&un(i, Inst::VAnyTrue { a: 0 }));
+    check_v128_fold(&un(i, Inst::VAllTrue { shape: I8x16, a: 0 }));
+    check_v128_fold(&un(i, Inst::VAllTrue { shape: I32x4, a: 0 }));
+    for shape in [I8x16, I16x8, I32x4, I64x2] {
+        check_v128_fold(&un(i, Inst::VBitmask { shape, a: 0 }));
+    }
 }
