@@ -273,6 +273,36 @@ are compute-only, so they don't contend on it; cap-heavy guests would). Single-t
 (~480 Miter/s) is a touch below the independent-guest figure (~534), the cost of the concurrent path's
 locking + spawn/join — paid once, not per iteration.
 
+## Embench-IoT — externally-comparable kernels
+
+Everything above uses *our* kernels; `embench` runs the recognized **Embench-IoT** embedded suite
+through the LLVM frontend across native + all three SVM engines, for numbers comparable to published
+Embench results. The source isn't vendored (mixed per-benchmark licenses) — point it at a checkout
+(`bench/embench/wrapper.c` `#include`s each kernel and exposes `long run(long n)` →
+`verify_benchmark`'s strict pass/fail, used as both the timed kernel and the cross-engine oracle):
+
+```sh
+curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
+EMBENCH=/tmp/embench-iot-master cargo run -p svm-llvm --release --example embench
+```
+
+Indicative (svm-jit ÷ native; **every engine bit-exact = native, `verify`=1**):
+
+| benchmark | ratio |
+|---|--:|
+| nsichneu *(big state machine)* | ~1.0× |
+| crc32 | ~1.1× |
+| nettle-sha256 | ~1.5× |
+| ud *(LU decomposition)* | ~1.6× |
+| matmult-int | ~3.9× |
+
+**geomean ~1.6× native over 5 kernels**, all bit-identical across tree-walk / bytecode / JIT / native.
+The tail is the familiar one: `matmult-int` vectorizes, so it pays the 128-bit-vs-AVX2 SIMD-width gap
+(ISSUES I8), exactly like `corpus_diff`'s `matmul8`. Honestly skipped (real on-ramp coverage gaps, not
+silent): `edn` (a wide-vector legalization edge — `<8 x i32>` in a context the I2 pass doesn't cover)
+and `aha-mont64` (`i128` 64×64→128 Montgomery multiply). This is real third-party code — so the suite
+doubles as a whole-stack differential test on programs we didn't write.
+
 
 ## Run
 
