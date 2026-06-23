@@ -1,0 +1,21 @@
+# Detached (`[workspace]`) host harness: drive the **wasm64** `svm-browser` module through a real
+# Wasmtime embedding, feeding it the same corpus `corpus.mjs` feeds the wasm32 build in Node — so the
+# full byte-for-byte differential runs on the production target too (the CLI `--invoke` can't write
+# the scratch buffers). See BROWSER.md. Standalone: only `wasmtime` + `serde_json`, no SVM crates.
+[workspace]
+
+[package]
+name = "svm-wt"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "wt"
+path = "src/main.rs"
+
+[dependencies]
+wasmtime = "45"
+serde_json = "1"
+
+[profile.release]
+opt-level = 1
