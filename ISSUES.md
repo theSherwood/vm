@@ -57,31 +57,37 @@ module that spawns 6 OS-thread workers, each doing a `Blocking` `cap.call` + `i6
 the root parking on `memory.atomic.wait32` until they finish. Runs on the JIT via
 `svm_jit::compile_and_run_with_host`.
 
-**Symptom (observed once):** on PR #72's first slice-3.3 CI run, the `build · test (macos-latest)` job's
+**Symptom (observed twice):** on PR #72's first slice-3.3 CI run, the `build · test (macos-latest)` job's
 `imports` binary aborted with `signal: 6, SIGABRT`. Tests run in parallel, so the abort surfaced after
 a *sibling* test (`import_handle_threads_through_call_indirect`) had already printed `ok`; the only test
 in that binary still running — and the only one using real OS threads + futex wait/notify — is
-`spawn_alongside_capability_import`. **Not reproduced:** it passed on the very next run (same commit
-range) and passes repeatedly on Linux (5/5 stress), and macOS cannot be run in this environment, so the
-root cause is not pinned.
+`spawn_alongside_capability_import`. **Recurred** on PR #92 (run #887 attempt 1, commit `4d45f97`), an
+exports-only change that touches no threading code: identical signature (`signal: 6, SIGABRT` in the
+`imports` binary after the same sibling test's `ok`), macOS-only — Linux *and* Windows ran the same
+`cargo test --workspace` green in that very run, and a plain re-run of just the macOS job (attempt 2)
+passed. **Not reproduced deterministically:** it has always cleared on the next run, and macOS cannot be
+run in this environment, so the root cause is not pinned.
 
-**Suspected cause / mitigation (landed).** Slice 3.3 (multi-vCPU durable) began creating the
-`SharedFiberTable` for `uses_fibers || uses_threads` (the durable vCPU-context allocator lives on it).
-A `.map` over that table *incidentally* also built the **root vCPU's `FiberRuntime` and published it as
-`CURRENT_RT`** for a thread-only module — behavior it never had pre-3.3. A fiber-free module never
-resumes a fiber, so that runtime is dead weight, but it changed the threaded run's setup/teardown
-surface on the spawning thread. The table-vs-runtime split is now fixed: the **table** stays present for
-`uses_threads` (needed by the allocator), but the **runtime** is built only for `uses_fibers` (so a
-thread-only run again publishes no `CURRENT_RT` and allocates no idle runtime). This *reduces the change
-surface back to the pre-3.3 path* but is **not a confirmed cure** — the abort was never reproduced, so it
-may be a pre-existing macOS-runner flake (e.g. futex/thread teardown timing, or runner memory pressure)
-unrelated to the runtime. Severity is provisional `S4` pending a root cause; if a reproduction shows a
-real abort path it should be re-classified.
+**Suspected cause / mitigation (landed, now confirmed NOT a cure).** Slice 3.3 (multi-vCPU durable) began
+creating the `SharedFiberTable` for `uses_fibers || uses_threads` (the durable vCPU-context allocator
+lives on it). A `.map` over that table *incidentally* also built the **root vCPU's `FiberRuntime` and
+published it as `CURRENT_RT`** for a thread-only module — behavior it never had pre-3.3. A fiber-free
+module never resumes a fiber, so that runtime is dead weight, but it changed the threaded run's
+setup/teardown surface on the spawning thread. The table-vs-runtime split was fixed in I4's original
+slice: the **table** stays present for `uses_threads` (needed by the allocator), but the **runtime** is
+built only for `uses_fibers`. The **PR-#92 recurrence post-fix rules this delta out** — the abort
+reappeared with the runtime split already in place, on a change that cannot touch the threading path. So
+the cause is a **pre-existing macOS-runner flake** in real-thread futex park/notify/teardown (or runner
+memory pressure), not the slice-3.3 runtime delta. Severity stays `S4` (transient, re-run clears it).
 
 **Next step if it recurs:** capture the macOS core/backtrace (the `imports` binary under
 `RUST_BACKTRACE=full`, ideally `--test-threads=1` to localize which test aborts), and check whether it
 is in futex park/teardown (`os_thread_rt::{thread_wait,thread_notify,join_all}`) or the guard/signal
 path — distinct from the now-removed root-runtime delta and from the resolved I1 (fiber-stack alloc).
+If it keeps tripping unrelated PRs' CI, the cheap unblock (until root-caused) is to de-flake the test
+itself — serialize it (`--test-threads=1` for the `imports` binary, or a process-global lock so the
+6-worker spawn doesn't overlap other tests) or lengthen the `memory.atomic.wait32` timeout — rather than
+re-running the whole macOS job by hand each time.
 
 ---
 
