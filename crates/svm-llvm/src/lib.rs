@@ -1429,33 +1429,6 @@ fn translate_func(
     let results = result_types(f.return_type.as_ref(), types)?;
 
     let scan = scan_func(f, types)?;
-    // I13 soundness fail-close: a φ that carries a **tiny all-tail sub-32-bit** wide vector
-    // (≤ 2 lanes of i8/i16 — i.e. a 32-bit `<2 x i16>`/`<2 x i8>`) across a block edge, as in Embench
-    // `edn`'s `fir_no_red_ld` (a carried `<2 x i16>` recombined by a deinterleave shuffle), round-trips
-    // its lanes incorrectly through the per-part block-param fan-out — a *silent miscompile*
-    // (ISSUES.md I13). Until the tiny-tail-lane representation is fixed, refuse it rather than
-    // miscompile. Narrowly scoped to the confirmed-broken 32-bit case: a 4-lane `<4 x i16>` (64-bit)
-    // φ — e.g. the Clay-UI demo's carried point vector — round-trips correctly and is untouched, as are
-    // full-chunk wide φ accumulators (`<8 x i32>`) and all straight-line sub-128 vector ops.
-    for bb in &f.basic_blocks {
-        for instr in &bb.instrs {
-            if let Instruction::Phi(p) = instr {
-                if let Some(layout) = scan.name2id.get(&p.dest).and_then(|id| scan.wide.get(id)) {
-                    if layout.full_chunks == 0
-                        && layout.shape.lane_bytes() < 4
-                        && layout.tail_lanes <= 2
-                    {
-                        return unsup(format!(
-                            "φ of a tiny all-tail sub-32-bit wide vector ({} × {}-byte lane) — silent \
-                             miscompile, fail-closed (ISSUES.md I13)",
-                            layout.tail_lanes,
-                            layout.shape.lane_bytes()
-                        ));
-                    }
-                }
-            }
-        }
-    }
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
@@ -12561,6 +12534,31 @@ fn bin<'d>(
             }
         };
         return Ok((dest, ctx.push(inst)));
+    }
+    // A **2-lane 32-bit integer vector** (`<2 x i32>`, e.g. the deinterleaved widening multiply in
+    // Embench `edn`'s `fir_no_red_ld`) is carried as a *packed* `i64` (lane 0 low, lane 1 high). A plain
+    // `i64` op on that image is **not** lane-wise: `mul` mixes the lanes (the low product's carry and
+    // the lane0×lane1 cross term land in lane 1), and `add`/`sub`/`shl`/`lshr`/`ashr` carry/shift across
+    // the 32-bit lane boundary. So operate on the two `i32` lanes independently and repack. (The bitwise
+    // `and`/`or`/`xor` would be lane-safe even packed, but lane-wise is uniformly correct.) This is the
+    // ISSUES.md I13 root fix — previously a silent miscompile, narrowly fail-closed via a φ guard.
+    if vec2_lane_ty(a.get_type(types).as_ref()) == Some(ValType::I32) {
+        let la = vec_explode(ctx, a, types, false)?;
+        let lb = vec_explode(ctx, b, types, false)?;
+        let r0 = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op,
+            a: la[0],
+            b: lb[0],
+        });
+        let r1 = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op,
+            a: la[1],
+            b: lb[1],
+        });
+        let packed = ctx.vec_pack(r0, r1, ValType::I32);
+        return Ok((dest, packed));
     }
     let width = int_bits(a.get_type(types).as_ref());
     let a = ctx.operand(a)?;
