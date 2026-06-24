@@ -182,23 +182,36 @@ and calls `specialize`, then `svm-llvm-translate`. Each gap, in the order hit, a
    live-ins + a φ successor, a 5-block chain, and the i32 path — all `interp == JIT`; full svm-llvm
    suite (178 tests) green, dense `br_table` path untouched. The specializer probe now translates past
    the switch.
-5. 🔜 **non-power-of-two integer load** (current wall) — `Unsupported("load of type i56 …")`. Rust's
-   niche layouts also produce odd-width integer accesses (e.g. loading a 7-byte `i56` discriminant
-   field). svm-IR has only `i32`/`i64` loads/stores, so the on-ramp must legalize a sub-word /
-   non-power-of-two integer memory access (load the enclosing aligned bytes, mask/shift to the width) —
-   the next slice. *Bounded and mechanical, the same flavor as the existing narrow-`i8`/`i16` handling.*
+5. ✅ **non-power-of-two integer memory + extend** — Rust niche layouts produce odd-width integer
+   accesses (e.g. a 7-byte `i56` discriminant field). **Implemented:** `load iN` (33–63) reads the
+   enclosing `i64` and masks; `store iN` writes exactly `ceil(N/8)` bytes (byte-exact, never clobbering
+   an adjacent field); `emit_ext` sign/zero-extends a 33–63-bit source in `i64` (it previously
+   mis-applied the i32 extend ops). Tested round-trip (unsigned + signed ±) on interp+JIT.
+6. ✅ **saturating arithmetic** — `llvm.{u,s}{add,sub}.sat` (i32/i64, Rust `saturating_*`) → wrapping
+   op + `select` clamp.
+7. ✅ **saturating float→int casts** — `llvm.fpto{si,ui}.sat` (Rust float `as` casts) → svm-IR
+   `FToISat`. (6+7 covered by `rust_saturating_and_fp_sat_casts_match_native`: 22 values byte-identical
+   to native, incl. overflow/underflow/NaN.)
+8. ✅ **vector popcount** — `llvm.ctpop.v16i8` → `Inst::VPopcnt`.
+9. ✅ **i128 from a 16-byte struct-eq coalesce** — `-O2` compares `Known`'s `[u8;16]` payload as a
+   single `load i128` + `icmp eq/ne i128`. Held as a **pair of i64 halves** in the aggregate
+   side-table (load → two i64 loads; eq/ne → compare the halves). Same-block only.
+10. 🔜 **`memcmp`/`bcmp`** (current wall) — `Unsupported("call to external/undefined function memcmp")`.
+    Rust slice/`[u8]` equality and `BTreeMap` key ordering call these; the on-ramp synthesizes
+    `memcpy`/`memset`/`memmove` but not yet `memcmp`/`bcmp`. Next slice: a synthesized counted-loop
+    helper (`__svm_memcmp`), like the existing mem-loop helpers (`bcmp` ⇒ `memcmp` then `!= 0`).
 
 **Earlier worry retired.** The core/alloc *panic* runtime symbols (`core::panicking::*`, bounds-check,
 `unwrap_failed`, `handle_alloc_error`, `raw_vec::handle_error`) that looked like a fundamental blocker
 are in fact **already shimmed** by the on-ramp (`is_rust_abort_call` → `trap`, under `-C panic=abort`).
-Likely still to handle further along: the allocator shims (`__rust_alloc`/`dealloc`/`realloc` → the
-synthesized `malloc`/`free`), `bcmp` → `memcmp`, and `cell::panic_already_borrowed` (extend the
-abort-call list) — each small. So the remaining translate work is a tail of **bounded on-ramp
-legalizations** (odd-width int memory, a few runtime-symbol shims), *not* `-Z build-std`.
+Likely still ahead: the allocator shims (`__rust_alloc`/`dealloc`/`realloc` → the synthesized
+`malloc`/`free`) and `cell::panic_already_borrowed` (extend the abort-call list) — each small. So the
+remaining translate work is a tail of **bounded on-ramp legalizations** (the `memcmp` helper, a few
+runtime-symbol shims), *not* `-Z build-std`.
 
 So Milestone 2's compile half is **done**, and the translate half is a **shrinking, enumerated gap
-list** being cleared in order — four down (inline-asm, i128, switch-overflow panic, sparse switch),
-non-power-of-two integer loads next.
+list** being cleared in order — nine down (inline-asm, i128-SIMD, switch-overflow panic, sparse switch,
+i56 memory/extend, saturating arithmetic, fp-sat casts, vector ctpop, i128 struct-eq), `memcmp` next.
 
 **Why not `std`.** `std` is Rust's OS-abstraction layer (`core` + `alloc` + a `std::sys::<target>`
 platform backend for files/threads/time/net/startup). svm has none of those as ambient services (it
@@ -219,11 +232,11 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
 2. `no_std`-ify `svm-peval` —
    - **compile half: DONE** — the three crates compile to `no_std`/`panic=abort` LLVM-18 bitcode on
      `rustc 1.81` (`BTreeMap`, `libm` float folds, `not(test)` no_std, 1.81-clean).
-   - **translate half: in progress** — gaps cleared in order: inline-asm (libm float folds gated off),
-     i128 (exotic SIMD folds rewritten to i64/u64), a translator switch-span overflow panic (fixed),
-     and **sparse-switch compare-chain lowering** (implemented + heavily tested in `svm-llvm`). **Next:
-     non-power-of-two integer loads** (e.g. `i56` niche fields), then a short tail of runtime-symbol
-     shims. See "translation status" above.
+   - **translate half: in progress** — nine on-ramp gaps cleared in order (inline-asm, i128 in SIMD
+     folds, switch-span overflow panic, sparse-switch compare chain, i56 memory + extend, saturating
+     arithmetic, fp-sat casts, vector ctpop, i128 struct-eq), each implemented + tested in `svm-llvm`.
+     **Next: a `memcmp`/`bcmp` synthesized helper**, then a short tail of runtime-symbol shims. See
+     "translation status" above.
 3. End-to-end in-sandbox demo: a guest specializes a toy interpreter against a script and runs the
    residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`). *Gated on Milestone 2's
    translate half.*
