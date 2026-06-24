@@ -1724,7 +1724,7 @@ cross-domain, supervisor, capability bookkeeping); the *software-isolation half*
 Frameworks like the seL4 Core Platform / Microkit, CAmkES, or Genode would host
 our components.
 
-### Platform abstraction & portability  [OPEN — Linux/macOS first, Windows next]
+### Platform abstraction & portability  [SETTLED — Linux/macOS/Windows at parity (Phase 3.5 done); seL4 backend still future]
 
 The escape-critical core is **already portable**: confinement masking (§4) is pure
 arithmetic (`svm-mask` is `no_std`, dependency-free), so the security hinge carries no
@@ -1853,7 +1853,7 @@ browser — good enough here.
 
 ---
 
-## 19. Debugging & observability  [DESIGN — foundations built; debug surfaces staged]
+## 19. Debugging & observability  [PARTIALLY BUILT — interpreter stepping + DAP shipped; DWARF & cap.call record/replay staged]
 
 > **Work-breakdown & detailed designs:** `DEBUGGING.md` (workstreams W1–W8, sequencing,
 > open decisions). This section stays the canonical *rationale*; that doc is the *plan*.
@@ -1862,13 +1862,18 @@ Good debugging is a **first-class ergonomics goal**, not an afterthought. The ar
 yields three debugging pillars cheaply, plus one that is real work — pursue all three cheap
 ones as pillars and stage the expensive one.
 
-**Status (2026-06).** The *architectural premises* these pillars rest on are now built and
+**Status (2026-06).** The *architectural premises* these pillars rest on are built and
 cross-platform-validated — the out-of-band control stack + per-fiber two-stack split (§5/§3d,
 `svm-fiber`), the deterministic interpreter oracle (§12, `run_scheduled`/`explore_all`),
-capabilities (§3c/§7), and SSA promotion (§3d). The *debug surfaces themselves* — a `cap.call`
-record log, an interpreter stepping API, the §3a IR debug-info side-table, DWARF/DAP — are not
-yet built. So the pillars have moved from "promised" to "grounded but unimplemented"; nothing
-built since has invalidated them.
+capabilities (§3c/§7), and SSA promotion (§3d). **Two of the four debug surfaces have now
+shipped:** the **interpreter stepping engine** (the `svm-interp` `Inspector` — breakpoints,
+single-step, backtrace, watchpoints over the masked window) and an **IR debug-info side-table**
+(W4) that carries source locations + named locals, consumed by an **interpreter-backed Debug
+Adapter Protocol server** (`svm-dap`, W5 slice 1; `DEBUGGING.md`) — so a client (VS Code) sets a
+source-line breakpoint, it binds, and hitting it shows the source frame with inspectable locals,
+with no DWARF and no JIT in the loop. **Still staged:** the `cap.call` record/replay log (pillar 1)
+and source-level **DWARF for JIT-compiled code** (pillar 4's full form). So pillars 2–4 are
+realized in their interpreter-tier form; the DWARF/record-replay work remains.
 
 1. **Record/replay & time-travel — nearly free *in deterministic mode*, a genuine
    differentiator.** With no ambient authority (§7), guest nondeterminism enters through
@@ -1892,7 +1897,7 @@ built since has invalidated them.
    Single-step / breakpoint / watchpoint over a masked, contiguous window is straightforward
    and deterministic with no JIT plumbing; address watchpoints are trivial (the window is one
    buffer). The interpreter (`svm-interp`) is mature and is already the deterministic oracle,
-   but exposes only `run*`/`explore_all` — no stepping API yet.
+   it now also exposes the `Inspector` stepping API (breakpoints/step/backtrace/watchpoints) that `svm-dap` drives.
 4. **Source-level debugging (the real work, staged).** Preserve source-location +
    variable-location info **frontend → an IR debug-info side-table (§3a) → Cranelift →
    DWARF**, so gdb/lldb and VS Code (via **DAP**) set breakpoints and inspect variables in
@@ -1906,7 +1911,8 @@ built since has invalidated them.
 **Debugger = a host-side capability** (an `Inspector`/`Debugger`, shaped like the §15
 `Monitor`): it *observes* a guest from outside, so it never widens the guest's authority and
 fits the ocap model. (§15's metering *properties* — fuel/quota — exist on `Host` today, but
-`Monitor`/`Inspector` is still a **pattern**, not a built type.) Debug info is **tooling,
+`Monitor` is still a **pattern**, not a built type — though the `Inspector` half is now real
+(`svm-interp`'s `Inspector`, driven by the `svm-dap` DAP server).) Debug info is **tooling,
 untrusted for escape** (§2a) — strippable, and the verifier never trusts it.
 
 **Tension to record (it entangles the §3d perf pass — now concrete, not hypothetical):** SSA
@@ -2110,6 +2116,72 @@ tier**, not by the interface:
 parent-as-host blocks on *its* host → …) blocks the vCPU per level (§12 overcommit), and
 parent-virtualized faults are the slow path (§14). Bounded, but it is where synchronous
 nesting bites.
+
+---
+
+## 21. Durable domains, snapshots & embedding  [DURABILITY built (single+multi-vCPU); browser built]
+
+> **Detailed designs & status:** `DURABILITY.md` (durable domains — the freeze/thaw transform,
+> the snapshot container, phase tracker) and `BROWSER.md` (the interpreter-as-wasm build). This
+> section is the canonical *rationale*; those docs are the *plans*.
+
+Three capabilities the architecture makes cheap and wasm makes hard: **freeze a running domain to
+bytes, restore it elsewhere, and run the whole VM inside a browser.** Each falls out of decisions
+already settled — total IR (D34), out-of-band control stack (D5), block-local SSA with no phi (D1),
+and the masked-window memory model (D38) — rather than needing new escape-TCB.
+
+### Durable domains (freeze / thaw / restore)  [D60]
+A **durable** domain can be quiesced, serialized to `(window pages + per-page prots, shadow control
+state, handle table)`, and later restored to **bytewise-equivalent** execution — possibly on the
+other backend, possibly on a different host, surviving a recompile, a Cranelift version bump, and
+ASLR (the precise meaning of "survive a recompile" is narrower than it sounds — see `DURABILITY.md`
+§1). Two crates, both **tooling-tier / +0-TCB** (they depend only on `svm-ir` and move bytes; an
+embedder running pre-instrumented modules links neither into the escape-TCB):
+
+- **`svm-durable` — the IR→IR freeze/thaw transform.** It instruments a function so an in-flight
+  may-suspend op (a `cap.call`, or a `Call` into a suspended chain) can be **unwound** into
+  guest-resident shadow state and later **rewound** back into execution, byte-for-byte. The codec is
+  pure IR — *no new instruction*: a state word (`NORMAL | UNWINDING | REWINDING`) + a per-fiber
+  **shadow stack**, both in the window; unwind spills the live set + a resume id and returns out to
+  the host; rewind `br_table`s on the saved resume id in the prologue, reloads the live values, and
+  continues. The IR shape pays off here — a continuation block's `params` *are* the resume-point live
+  set, so liveness is free and the verifier still does one linear pass. Handles arbitrary single-vCPU
+  CFGs (branches, loops, joins), leaf `cap.call`s, and propagated call chains (re-issue vs. continue).
+- **`svm-snapshot` — the snapshot artifact codec.** (De)serializes a quiesced durable domain into a
+  backend-independent, recompile-survivable artifact and back. A frozen domain is described almost
+  entirely by its **window image** (shadow stack, spilled live values, state word are all
+  guest-resident bytes, so they ride along for free); what is captured host-side is the **handle
+  table** (authority, not the resources it names). The artifact binds the **instrumented-module
+  digest** — restore refuses on a mismatch (the durability boundary: the shadow schema is a function
+  of the instrumented module's structure). Container is `b"SVMD"` + versioned ascending-tag TLV,
+  **canonical** encoding (so "re-serialize a freshly-restored domain at the same safepoint is
+  byte-identical" is a plain `==`), with sparse window pages + zero-page elision + per-page
+  protection, and parked **fibers** flattened into the image. **Status:** single- and multi-vCPU
+  freeze + thaw land on **both backends** (nested spawns + child-owned fibers, snapshot v4),
+  validated by the interp↔JIT differential; a `Backed` §13 shared-region page is out of scope (freeze
+  refuses a domain holding shared regions).
+
+### Browser embedding (the interpreter as a wasm guest)  [built]
+The bytecode **interpreter** (`svm-interp`'s `bytecode.rs`, `#![forbid(unsafe_code)]`, with its own
+single-OS-thread cooperative scheduler) compiles **to wasm** so an SVM guest runs **client-side** —
+ship one `.wasm`, no native dependency. The payoff is portability/embeddability, **not** added
+isolation (inside wasm you are double-sandboxing: the host's wasm sandbox over SVM's own masking +
+guard pages). The production target is **wasm64** (memory64), because SVM addresses are `u64`
+end-to-end (`svm-mask` confines into `[0, 1<<reserved_log2)`); `wasm32` is kept only as a flag-free
+Node smoke target for compute-only guests. Don't confuse this *outbound* direction (the VM compiled
+*to* wasm) with the *inbound* `svm-wasm` frontend (wasm bytes → IR, §20) — a guest could even be
+`svm-wasm`-transpiled and then run by this interpreter-in-wasm. See `BROWSER.md`.
+
+### Conservative GC support (`gc.roots`)  [primitive built; collector is guest policy]
+SVM implements **no GC and no object model**. It contributes exactly one thing a guest's own
+collector cannot do itself: enumerate the roots living on the **out-of-band control stack +
+saved-register blocks** (§3d/§5) — the one place the guest cannot reach by masking. `gc.roots` does
+that conservatively (reporting candidate root words, with an optional top-byte-only payload mask for
+guests that tag pointers in the high byte). Everything else — heap, allocator, mark/sweep,
+object/line maps, world-stop coordination, scanning the in-window data stack + heap — is guest policy
+over primitives that already exist (the `Memory` cap, the futex, atomics). World-stop is cooperative
+and guest-coordinated; SVM provides no preemptive any-PC register-capturing stop (it would add
+escape-TCB). See `GC.md` (a draft RFC, converged with the JACL guest side).
 
 ---
 
@@ -2691,3 +2763,4 @@ as open-ended, not a byproduct of the build.
 | D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
 | D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (§23 "verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `svm-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `svm-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full design + verification story + demo evidence in **§23** |
 | D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (cap.call trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |
+| D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`svm-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`svm-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |
