@@ -207,6 +207,22 @@ faster but needs separate capture: that's the main perf lever if `NORMAL`-state
 overhead ever shows up on `svm-bench`. **Non-durable modules pay none of this** — the
 pass is opt-in and no runtime/TCB crate depends on `svm-durable`.
 
+**Measured (interpreter, back-edge polls).** `cargo run --release --example
+durable_overhead -p svm-durable` times a transformed loop vs the same loop
+un-transformed (steady-state, large/small-`n` subtraction), plus freeze/thaw. On the
+**tree-walking interpreter** the always-on back-edge poll costs **~+25–28 ns/iter**,
+which is **+50% on a realistic arithmetic-body loop and ~+75% on a minimal-body loop** —
+*higher* than the table's "10–30%" estimate, because (a) it's the worst case (a loop-only
+back-edge poll, not a call-gated safepoint) and (b) the interpreter's baseline per-op is
+already cheap, so a masked window load is a large *relative* add. (On the JIT, where the
+baseline op is ~1 ns and the poll lowers to a register-friendly epoch check, the relative
+tax should be smaller — that path is not yet measured here.) Freeze/thaw are dominated by
+loop execution: freeze runs to the checkpoint with the countdown armed (heavier than the
+inert poll) then unwinds + spills; **thaw rewinds the loop header to the checkpoint**, so
+thaw cost grows with freeze depth — i.e. **checkpoint at shallow safepoints / loop
+boundaries, not deep inside long-running loops.** The serialized image is the full
+reserved window (here 256 KiB); the live loop-carried spill is a small prefix.
+
 **Caveat on "pure compute untouched":** the conservative rule treats *any indirect
 call* as may-suspend, and `call_indirect` is the normal lowering for C function
 pointers / vtables. So "untouched" holds for **direct-call** compute (sha256/perlin/

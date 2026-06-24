@@ -486,6 +486,16 @@ pub struct Compiled {
     table_mask: usize,
 }
 
+impl Compiled {
+    /// Total compiled **bytecode op count** across all functions — the structural-size measure of this
+    /// threaded register-VM program (the analogue of the JIT's emitted code bytes / the IR's
+    /// instruction count). The engine is a `Vec<Op>` per function, not a serialized byte stream, so op
+    /// count, not a byte length, is the meaningful size.
+    pub fn op_count(&self) -> usize {
+        self.progs.iter().map(|p| p.ops.len()).sum()
+    }
+}
+
 /// One slot of a domain's `call_indirect` dispatch table: `(module, func)`, where module 0 is the
 /// primary program and `k ≥ 1` is `mods[k]` (an installed §22 unit). `None` is a trapping padding
 /// slot. The flat analogue of the tree-walker's [`crate::DomainTable`] (`module<<32 | func`).

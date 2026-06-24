@@ -8,7 +8,9 @@ publish = false
 [workspace]
 
 [dependencies]
-wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime"] }
+# `pulley` adds Wasmtime's portable bytecode *interpreter* backend (selected via target("pulley64")) —
+# a same-compiled-bytecode interpreter baseline for the SVM bytecode engine, alongside the Cranelift JIT.
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "pulley"] }
 
 [profile.release]
 opt-level = 3
