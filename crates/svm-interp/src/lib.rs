@@ -9769,6 +9769,34 @@ impl Host {
         }
     }
 
+    /// **D45 allocation-free fast path for `Clock.now()`** (ISSUES.md I12). The generic
+    /// [`Self::cap_dispatch_slots`] path is dominated, for a cheap cap, by the per-call `Vec` result
+    /// allocation and the W1 record/replay gate — not by the work (a field read). This does the
+    /// authority check ([`Self::resolve`], identical to the generic path: a forged/closed/wrong-type
+    /// handle is an inert `CapFault`) and the read+advance **inline**, returning the `i64` directly.
+    ///
+    /// Returns `None` when a W1 record or replay tape is active — the caller must then use the full
+    /// [`Self::cap_dispatch_slots`] so the crossing is taped/served faithfully (the clock is a recorded
+    /// nondeterministic input, [`is_recorded_input`]). Semantics are otherwise byte-identical to the
+    /// `Binding::Clock` arm, so interp == JIT still holds.
+    #[inline]
+    pub fn fast_clock_now(&mut self, handle: i32) -> Option<Result<i64, Trap>> {
+        if self.cap_record.is_some() || self.cap_replay.is_some() {
+            return None; // a tape is active — fall back so the input is recorded/replayed
+        }
+        Some(match self.resolve(handle, iface::CLOCK) {
+            Ok(Binding::Clock) => {
+                let now = self.clock_ns;
+                self.clock_ns = self.clock_ns.wrapping_add(1);
+                Ok(now)
+            }
+            // `resolve` already enforced `type_id == CLOCK`, so a success is always `Binding::Clock`;
+            // any other binding at a CLOCK-typed slot would be a host bug — fail closed like a fault.
+            Ok(_) => Err(Trap::CapFault),
+            Err(t) => Err(t),
+        })
+    }
+
     /// Dispatch a `cap.call` (§3c): resolve the handle, then run the mock operation.
     /// Returns the op's result values (negative-errno encoded in an `i64` for the
     /// fallible ops, §3e D42), or a `Trap` for escape/exit. `mem` backs buffer args.

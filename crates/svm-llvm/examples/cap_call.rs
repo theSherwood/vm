@@ -8,8 +8,10 @@
 //! engine dispatch through the in-process `Host`; the JIT is timed twice — through the generic
 //! `svm_run::cap_thunk` (§9 trampoline: marshalling + indirect dispatch) and through the §9/D45
 //! devirtualized **fast resolver** that `run_powerbox` wires by default for known caps. Comparing the
-//! two isolates how much the fast path actually buys (spoiler: for a cheap 0-arg cap, ~nothing — both
-//! share `Host::cap_dispatch_slots`; see ISSUES.md I12).
+//! two isolates what the fast path buys: with `Host::fast_clock_now` (the ISSUES.md I12 allocation-free
+//! inline read) the fast path is ~9× cheaper than generic for `Clock.now()`. (The *whole* win only
+//! shows when the `cap.call` matches the resolver's claimed arity — the clock is **0-arg**, so the
+//! call below passes no args; a stray arg silently falls back to the generic path.)
 //!
 //! Run: cd crates/svm-llvm && cargo run --release --example cap_call
 
@@ -20,8 +22,9 @@ use std::time::Instant;
 use svm_interp::{bytecode, Host, Value};
 use svm_ir::Module;
 
-// `(i32 clk, i32 n) -> i64`: loop `n` times, each calling the clock cap (type_id 2, op 0) and folding
-// the result. The clock handle and `n` are threaded as block params (cross-block values must be).
+// `(i32 clk, i32 n) -> i64`: loop `n` times, each calling `Clock.now()` (type_id 2, op 0, **0 args** —
+// the real signature, so the §9/D45 fast resolver `(CLOCK,0,0,1)` actually engages) and folding the
+// result. The clock handle and `n` are threaded as block params (cross-block values must be).
 const CAPCALL_SRC: &str = r#"
 func (i32, i32) -> (i64) {
 block0(v0: i32, v1: i32):
@@ -29,15 +32,14 @@ block0(v0: i32, v1: i32):
   v3 = i32.const 0
   br block1(v3, v2, v0, v1)
 block1(v4: i32, v5: i64, v6: i32, v7: i32):
-  v8 = i32.const 0
-  v9 = cap.call 2 0 (i32) -> (i64) v6 (v8)
-  v10 = i64.add v5 v9
-  v11 = i32.const 1
-  v12 = i32.add v4 v11
-  v13 = i32.lt_s v12 v7
-  br_if v13 block1(v12, v10, v6, v7) block2(v10)
-block2(v14: i64):
-  return v14
+  v8 = cap.call 2 0 () -> (i64) v6 ()
+  v9 = i64.add v5 v8
+  v10 = i32.const 1
+  v11 = i32.add v4 v10
+  v12 = i32.lt_s v11 v7
+  br_if v12 block1(v11, v9, v6, v7) block2(v9)
+block2(v13: i64):
+  return v13
 }
 "#;
 
@@ -178,8 +180,8 @@ fn main() {
         "\n(cap.call cost = cap-loop per-iter − a no-cap loop of the same shape, so it isolates the\n \
          host-boundary crossing. `jit (generic)` routes through the runtime `cap_thunk` (marshalling +\n \
          indirect dispatch); `jit (fast/D45)` uses the devirtualized resolver `run_powerbox` wires by\n \
-         default for known caps (clock/blocking) — register-to-register, the production cost. The\n \
-         interpreters dispatch the clock cap through the in-process Host. The clock read is the cheapest\n \
-         cap — window-touching caps (I/O, spawn) stay on the generic path and add their own work.)"
+         default — for `Clock.now()` it hits `Host::fast_clock_now`, an authority-checked allocation-free\n \
+         inline read (ISSUES.md I12), so it's ~9× cheaper than generic. The interpreters dispatch the\n \
+         clock through the in-process Host. Window-touching caps (I/O, spawn) stay on the generic path.)"
     );
 }

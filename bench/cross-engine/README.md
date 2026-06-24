@@ -212,18 +212,19 @@ in-process `Host`:
 cd crates/svm-llvm && cargo run --release --example cap_call
 ```
 
-Indicative for the clock cap: **~49 ns/call JIT-generic, ~48 ns JIT-fast (D45), ~49 ns bytecode,
-~66 ns tree-walk.** The cost is **roughly engine-independent** — it's the host boundary, not the engine
-— so on the JIT a `cap.call` is **~50× a normal in-VM op** (~1 ns): cap-chatty / IO-heavy workloads are
+Indicative for the clock cap: **~54 ns/call JIT-generic, ~5.7 ns JIT-fast (D45), ~40 ns bytecode,
+~58 ns tree-walk.** On the *generic* path a `cap.call` is **~50× a normal in-VM op** (~1 ns) and roughly
+engine-independent (it's the host boundary) — so cap-chatty / IO-heavy workloads on that path are
 boundary-bound, not compute-bound.
 
 The driver times the JIT *both* ways — the generic `cap_thunk` and the §9/D45 devirtualized fast
-resolver `run_powerbox` wires by default — and they come out **within ~2%**. That's a finding, not a
-win: D45 removes the JIT-side arg marshalling but the fast handler still re-enters the *same*
-`Host::cap_dispatch_slots`, which is essentially the entire cost for a cheap cap. Making the hot
-fast-handlers do their work inline (skipping the general dispatch) is the concrete low-hanging perf
-lever the slices surfaced — see **ISSUES.md I12**. (Window-touching caps — real I/O, spawn — stay on
-the generic path and add their own work on top.)
+resolver `run_powerbox` wires by default. The fast path is **~9× cheaper** (~5.7 vs ~54 ns) for
+`Clock.now()`: D45 removes the JIT-side marshalling (~1.7×) and `Host::fast_clock_now` does the
+authority-checked read inline with no per-call `Vec` allocation (a further ~5.5×) — see **ISSUES.md
+I12** (fixed). Caveat the bench learned the hard way: the fast resolver only engages when the
+`cap.call` matches its claimed arity — `Clock.now()` is **0-arg**, so a stray argument silently drops
+to the generic path. (Window-touching caps — real I/O, spawn — stay on the generic path and add their
+own work on top.)
 
 ## Parallel scaling — many isolated guests at once
 

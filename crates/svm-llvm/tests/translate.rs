@@ -4435,6 +4435,61 @@ fn simd_autovec_avx2_elementwise() {
     check_avx_vs_native("simd_avx2_elem", src, 4);
 }
 
+/// `-O2 -mavx2` auto-vectorized **wide lane shifts** (`shl`/`lshr`/`ashr` on a `<8 x i32>` by a
+/// constant splat) — ISSUES.md I11. The legalization pass splits the `<8 x i32>` shift into two
+/// `v128` `VShift` chunks (the `wide_int_shift` arm in `lower_wide`); before that the on-ramp
+/// fail-closed on `lshr <8 x i32>` even though the v128 case worked. Mixes a logical and an arithmetic shift so
+/// both `ShrU`/`Shl` and `ShrS` are exercised. Byte-identical to the native scalar oracle.
+#[test]
+fn simd_autovec_avx2_wide_shifts() {
+    let src = "void sh(const int *a, int *c, int n);\n\
+        static int A[64], C[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) A[i] = (seed + i * 7) * 1103515245 + 12345;\n\
+        \x20 sh(A, C, 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += C[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        __attribute__((noinline)) void sh(const int *a, int *c, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) c[i] = ((unsigned) a[i] >> 5) ^ (a[i] << 3) ^ (a[i] >> 2);\n\
+        }\n\
+        int main(void) { return run(9); }\n";
+    check_avx_vs_native("simd_avx2_wide_shifts", src, 9);
+}
+
+/// ISSUES.md I13 — a `<2 x i16>` carried across a loop (Embench `edn`'s `fir_no_red_ld` "no-redundant
+/// -load" FIR) round-trips its 16-bit lanes incorrectly through the per-part block-param fan-out, a
+/// *silent miscompile*. Until the tiny-tail-lane representation is fixed, the on-ramp **fail-closes**
+/// on a φ carrying a ≤2-lane sub-32-bit vector. This pins that it stays a clean `Unsupported` (never a
+/// wrong answer); the 4-lane `<4 x i16>` carry stays supported (`demo_clay_vs_native`).
+#[test]
+fn simd_tiny_i16_carry_phi_fails_closed_i13() {
+    let src = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
+        static short X[256], H[256]; static long Y[256];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 256; i++) { X[i] = seed + i; H[i] = seed * 2 - i; Y[i] = 0; }\n\
+        \x20 fir_no_red_ld(X, H, Y); long a = 0; for (int i = 0; i < 256; i++) a += Y[i]; return (int) a;\n\
+        }\n\
+        void fir_no_red_ld(const short x[], const short h[], long y[]) {\n\
+        \x20 long i, j, sum0, sum1; short x0, x1, h0, h1;\n\
+        \x20 for (j = 0; j < 100; j += 2) { sum0 = 0; sum1 = 0; x0 = x[j];\n\
+        \x20   for (i = 0; i < 32; i += 2) {\n\
+        \x20     x1 = x[j+i+1]; h0 = h[i]; sum0 += x0*h0; sum1 += x1*h0;\n\
+        \x20     x0 = x[j+i+2]; h1 = h[i+1]; sum0 += x1*h1; sum1 += x0*h1; }\n\
+        \x20   y[j] = sum0 >> 15; y[j+1] = sum1 >> 15; }\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    let Some(bc) = compile_to_bc("i13_tiny_i16_carry", src) else {
+        return; // clang unavailable
+    };
+    // Must fail-close, not translate (a translated module here would silently miscompile).
+    assert!(
+        svm_llvm::translate_bc_path(&bc).is_err(),
+        "I13: a carried <2 x i16> must fail-close (Unsupported), not translate-and-miscompile"
+    );
+}
+
 /// `-O2 -mavx2` auto-vectorized **fixed-point DSP** kernel (Embench `edn`'s `vec_mpy` shape):
 /// `y[i] += (short)((scaler * x[i]) >> 15)`. The `short` widening multiply produces a wide `<8 x i32>`
 /// intermediate that is then **shifted** (`>>15`) and truncated back to `<8 x i16>` — the I11 shape the
