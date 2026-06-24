@@ -139,11 +139,17 @@ different things depending on which pair you compare:
   per-function slot metadata). `DebugRun` also has the **stepping verbs** (`step`/`step_over`/`step_out`,
   mirroring the tree-walker's `step_to_depth`); `stepping_parity_over_and_out_at_a_call` checks that
   step-over (run a call to completion) and step-out (return from a frame) land at the same op and agree
-  on the call result. So the bytecode engine now has the full debug-primitive surface — breakpoints,
-  cross-frame inspection, backtrace, stepping — all parity-tested against the tree-walker. *Remaining:*
-  wire `DebugRun` into the `svm-dap` server (a backend seam, so one DAP conversation replays against both
-  engines — the last bytecode-side piece) and the JIT path (Stage 5). The *static* source-map half is
-  already covered transitively by **G1**.
+  on the call result. So the bytecode engine now has the full **forward-debug** primitive surface —
+  breakpoints, cross-frame inspection, backtrace, stepping — all parity-tested against the tree-walker.
+  *Remaining, and scope-bounded:* the `svm-dap` server calls 18 distinct `Inspector` methods;
+  `DebugRun` covers the forward-debug subset, but the rest — `seek`/`step_back` (reverse debugging),
+  `set_watchpoint` (data breakpoints), `select_task`/`threads`/`stopped_task` (multithreading) — are
+  **outside the bytecode engine's single-vCPU debug scope** (it delegates those to the tree-walker, per
+  G2). So a DAP-over-bytecode backend can only ever cover the *forward-debug subset*; wiring it in is a
+  server-side backend seam (abstract that subset, add a name→`VarLoc` variable read on `DebugRun`) whose
+  *correctness* is already guaranteed by the engine-level parity here — it is feature plumbing for users,
+  not a parity risk. The JIT path is Stage 5 (separate). The *static* source-map half is covered
+  transitively by **G1**.
 
 ---
 
