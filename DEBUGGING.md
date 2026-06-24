@@ -340,11 +340,16 @@ in whichever thread touches the range, reporting that thread + the confined addr
 (`cross_thread_watchpoints.rs`): a write-watch on a contended counter fires before *each* worker's
 store (attributed per thread) and a read-watch before each worker's *and* the root's load; while
 stopped at a watch you can read the value the thread is about to write and `select_task` another
-thread's stack; a watch on an untouched range never fires. *Not yet:* stepping that crosses a
-scheduler decision point (step-over-a-spawn) — which also blocks composing a watch with a **fixed
-`find_schedule` witness plan** (a watch pause perturbs the plan's decision-point sequence, so the
-headline above uses the live default schedule). That, plus W1 record/replay, is the rest of
-Milestone B.
+thread's stack; a watch on an untouched range never fires. **Debug stops compose with a fixed
+`find_schedule` witness-plan replay** too: a breakpoint or watch can pause *within* the exact failing
+interleaving and resume without desyncing the plan — so you can **catch a lost-update race in the act**,
+watching the contended address under the witness and reading the stale value each thread is about to
+write (`debug_witness_stepping.rs`). The enabling fix: the one-visible-op-per-turn *yield* now precedes
+the debug seam in `run_inner`, so a stop at a budget-exhausted visible op fires at the **start of its
+own turn** (on the next pick) instead of running the op inside the previous turn — which had collapsed
+two turns into one and left the plan's next `TaskId` no longer runnable (`debug_assert` desync); the
+DPOR explorer (no debug seam) and the single-threaded debugger (unbounded budget) are unaffected, gated
+by `dpor.rs` matching the brute-force oracle. *Not yet:* W1 record/replay is the rest of Milestone B.
 
 ---
 

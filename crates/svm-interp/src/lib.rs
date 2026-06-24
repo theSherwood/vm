@@ -5310,6 +5310,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 
         // Execute the remaining instructions of this block.
         while frames[top].inst < block.insts.len() {
+            // An op counts against the scheduling quantum when it is "visible": every op in the real
+            // executor / single-threaded debugger (`!memop`), or only a **shared-state / sync** op in
+            // `memop` mode (so thread-local computation runs to the next memory op before a yield is
+            // possible — the partial-order reduction that keeps exhaustive exploration tractable).
+            let visible = !memop || is_visible(&block.insts[frames[top].inst]);
+            // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
+            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`, so
+            // it never yields. **This precedes the debug seam below**: a debug stop (breakpoint /
+            // watch / step) at a budget-exhausted visible op must fire at the *start of its own turn*
+            // (budget fresh, on the next pick), not inside the previous turn — otherwise a stop would
+            // run the op in the prior turn, collapsing two one-visible-op turns into one and desyncing
+            // a fixed replay plan (DEBUGGING.md Milestone B). Undebugged runs are unaffected (the
+            // ordering only matters when something stops).
+            if visible && budget == 0 {
+                return Ok(Inner::Yield);
+            }
             // Debug seam (DEBUGGING.md W2/S4): before each op, consult the inspector's probe. A
             // breakpoint/step hit returns `Inner::Pause` with the op not yet advanced, so the
             // continuation is intact and the next `run` resumes exactly here. Gated on `debug`
@@ -5335,28 +5351,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
-            // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
-            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`.
-            // In `memop` mode the budget counts only **visible** (shared-state / sync) ops, so
-            // thread-local computation runs to the next memory op before a yield is possible — the
-            // partial-order reduction that keeps exhaustive exploration tractable.
-            if memop {
-                if is_visible(&block.insts[frames[top].inst]) {
-                    if budget == 0 {
-                        return Ok(Inner::Yield);
-                    }
-                    // Record the object this visible op touches (for DPOR's race analysis) before it
-                    // runs — the confined address is a pure function of the live SSA values here.
+            // Charge the quantum for the visible op about to run, recording the object it touches (for
+            // DPOR's race analysis) first — the confined address is a pure function of the live SSA
+            // values here.
+            if visible {
+                if memop {
                     *acc = Some(access_of(
                         &block.insts[frames[top].inst],
                         &frames[top].vals,
                         mem,
                     ));
-                    budget -= 1;
-                }
-            } else {
-                if budget == 0 {
-                    return Ok(Inner::Yield);
                 }
                 budget -= 1;
             }

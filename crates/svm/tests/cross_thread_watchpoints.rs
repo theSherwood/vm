@@ -132,10 +132,8 @@ fn read_watchpoint_fires_at_every_thread_read() {
 /// sequential — worker 1 writes `1` (it read `0`), worker 2 writes `2` (it read `1`) — and the
 /// watchpoint surfaces both, attributed to their threads, before they take effect.
 ///
-/// (Combining a watch with a *fixed* `find_schedule` witness plan to freeze a specific racing
-/// interleaving is a separate composition — a watch pause perturbs the plan's decision-point sequence,
-/// the same "stepping across a scheduler decision point" item still open in Milestone B — so this
-/// headline uses the live default schedule.)
+/// (Freezing a *specific* racing interleaving — a watch under a fixed `find_schedule` witness plan —
+/// is covered separately in `debug_witness_stepping.rs`; this one uses the live default schedule.)
 #[test]
 fn watchpoint_reads_each_threads_pending_write() {
     let m = parse_module(RACY_COUNTER).expect("parse");
