@@ -43,6 +43,12 @@ const BENCHES: &[(&str, &str, bool, i64)] = &[
     ("huffbench", "src/huffbench/libhuffbench.c", true, 5_000),
     ("nettle-aes", "src/nettle-aes/nettle-aes.c", false, 20_000),
     ("tarfind", "src/tarfind/tarfind.c", true, 50_000),
+    (
+        "sglib-combined",
+        "src/sglib-combined/combined.c",
+        true,
+        20_000,
+    ),
     // Not included (need harness/on-ramp work, not just a BENCHES row):
     //  - `statemate`: defines a global `unsigned long time;` that collides with `<time.h>`'s `time()`
     //    in the native-oracle build (the wrapper includes time.h); the SVM side translates fine, but
@@ -50,7 +56,8 @@ const BENCHES: &[(&str, &str, bool, i64)] = &[
     //  - `slre`: translates past `strlen` now but needs `__ctype_b_loc` (glibc locale ctype table).
     //  - `md5sum`/`xgboost`: the shared wrapper's `benchmark_body` arity doesn't match these kernels.
     //  - `picojpeg`/`qrduino`/`xgboost`: multi-`.c` kernels (the driver `#include`s a single file).
-    //  - `wikisort` (`{i64,i64}` AggregateZero const), `sglib-combined` (`<2 x ptr>`): on-ramp gaps.
+    //  - `wikisort`: a `phi {i64,i64}` carries a struct across a block edge (cross-block aggregate
+    //    threading — the block-local `agg` table doesn't span blocks); a larger on-ramp slice.
 ];
 
 const SMALL: i64 = 10;
