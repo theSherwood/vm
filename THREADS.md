@@ -62,9 +62,16 @@ property, so in practice:
   increments of a single shared cell. Result: **atomic → exactly 4,000,000** (`i32.atomic.rmw.add`
   across two OS threads on contended memory), and the **non-atomic path lost ~1.4M updates** —
   proving the workers genuinely ran in parallel, so the atomic correctness isn't serialized luck.
-- [ ] **Step 2 — `Region::Shared` svm-mem backing.** A guest window over wasm shared linear memory,
-  with `load_word`/`store_word`/CAS lowering to wasm atomics (svm-mem already has the atomic API +
-  is TSan-verified on `Mapped`; this is a new variant, not a redesign).
+- [x] **Step 2 — `Region::Shared` svm-mem backing.** A new `Region` variant over **caller-owned**
+  memory (`unsafe fn Region::shared(base, size)`), with the *same* raw-pointer hardware atomics as
+  the unix `Mapped` mmap backing — but borrowed, not owned, and available on **every** target (so it
+  spans the wasm shared linear memory). The atomic/byte/word bodies lower to `core::sync::atomic`
+  (→ `i32`/`i64.atomic.rmw` under wasm `+atomics`). Verified natively (the substrate stand-in for the
+  wasm Worker pool): **8 OS threads racing one counter through `&Region::Shared` land on the exact
+  total**, the new `differential_shared_vs_paged_fuzz` gates `Shared` against the safe `Paged` model
+  byte-for-byte across 20k random ops (so it can't drift from `Mapped`), and both pass under **Miri**
+  (no UB / data race / provenance error). Compiles clean for `wasm32`; `Mapped` left untouched (zero
+  regression to the existing TCB). The engine doesn't use it yet — that's Steps 3–4.
 - [ ] **Step 3 — the executor seam.** `Cooperative` | `Parallel` behind one interface
   (`spawn`/`wait`/`notify`); the threads build runs either, host-selected, cooperative default.
 - [ ] **Step 4 — `thread.spawn` → Worker-spawn import + atomic futex**, then differential-test the
