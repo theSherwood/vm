@@ -133,9 +133,32 @@ property, so in practice:
   where the **root** genuinely parks until the last worker `notify`s it → **8**, both matching the oracle
   and stable across 100/50 real-race repeats. So `Parallel` now covers `thread.spawn`/`join` +
   `memory.wait`/`notify` + atomics + compute — the complete pure-threads model — genuinely in parallel.
-  Remaining fail-closed (need a `&mut Domain`/shared powerbox): §14 `instantiate`, §22 JIT install, and a
-  shared locked `Host` for `cap.call`; plus running the driver's vCPUs as real wasm Workers (per-Worker
-  stack/TLS from 4b) — the follow-ons below.
+- [x] **Step 4c-miri — race/UB verification of the parallel driver.** `svm-interp/tests/parallel_miri.rs`
+  drives the **real interpreter**'s concurrent atomic + non-atomic accesses over one `Region::shared`
+  backing across genuine OS threads, exercising the whole parallel machinery (per-thread `fork_for_thread`
+  views, the cross-thread `Futex` park/wake, the spawn/join registry). **Miri reports no data race, UB, or
+  provenance error** (4-vCPU counter → 200; 2-thread futex handoff → 987654). The test lives in `svm-interp`
+  (small dep set + `svm-text` dev-dep) so Miri can build it — the `svm` integration crate pulls in the
+  Cranelift JIT Miri can't compile. So the genuinely-parallel substrate is now both differentially correct
+  *and* memory-model-clean.
+
+#### Remaining follow-ons (each its own project)
+
+- [ ] **4c-host — a shared `Host` for `cap.call` under parallelism.** The hard one: the `Host` is
+  heavily **stateful** (a mutable `clock_ns` counter, `Vec` `stdout`/`stderr`, record/replay tape
+  cursors), and `cap.call` is serviced **inline inside `resume`** (not bubbled to the driver like
+  `Spawn`/`Join`). So sharing it has a real fork: (a) one `Arc<Mutex<Host>>` locked across each step —
+  *correct but serializes all execution*, or (b) make each capability individually thread-safe — *true
+  parallelism, but breaks the deterministic differential story for stateful caps* (a parallel `Clock.now`
+  / interleaved `stdout` has no single oracle answer). Needs a design decision before coding.
+- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel.** These mutate the `Domain`
+  (`&mut`), which the parallel driver shares `&`-immutably. Needs the domain's installable parts behind
+  their own synchronization (or to route these events back to a single owner).
+- [ ] **4c-wasm — the driver's vCPUs as real wasm Workers.** The browser payoff. wasm32 has no native
+  `thread::spawn`, so a guest `thread.spawn` in parallel mode must **bubble out to JS**, which creates a
+  Worker (with its own stack/TLS, per 4b) that re-enters an exported `run_child_vcpu`; the futex becomes
+  real `memory.atomic.wait`/`notify`, and join/result delivery crosses the JS boundary via shared memory.
+  A sizable host-driven-spawn integration on top of today's native driver (which is its differential oracle).
 
 ### Known wrinkles (surfaced for later steps)
 
