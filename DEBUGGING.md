@@ -334,9 +334,22 @@ at a breakpoint in one thread and examine another's stack; the focus resets on t
 and stepping always drives the *stopped* thread. Tests (`debug_threads.rs`): a worker breakpoint
 fires once per spawned thread (distinct vCPUs); a W7 race witness replays to the lost update (1)
 *under the debugger*; single-stepping advances the stopped thread one op; `select_task` inspects a
-second live thread mid-stop and switches back. *Not yet:* watchpoints across threads as a headline
-test, and stepping that crosses a scheduler decision point (step-over-a-spawn). Those, plus W1
-record/replay, are the rest of Milestone B.
+second live thread mid-stop and switches back. **Watchpoints are cross-thread** — they live in the
+same run-shared `DebugShared` and every vCPU's per-op seam checks them, so a window-range watch fires
+in whichever thread touches the range, reporting that thread + the confined address + read/write
+(`cross_thread_watchpoints.rs`): a write-watch on a contended counter fires before *each* worker's
+store (attributed per thread) and a read-watch before each worker's *and* the root's load; while
+stopped at a watch you can read the value the thread is about to write and `select_task` another
+thread's stack; a watch on an untouched range never fires. **Debug stops compose with a fixed
+`find_schedule` witness-plan replay** too: a breakpoint or watch can pause *within* the exact failing
+interleaving and resume without desyncing the plan — so you can **catch a lost-update race in the act**,
+watching the contended address under the witness and reading the stale value each thread is about to
+write (`debug_witness_stepping.rs`). The enabling fix: the one-visible-op-per-turn *yield* now precedes
+the debug seam in `run_inner`, so a stop at a budget-exhausted visible op fires at the **start of its
+own turn** (on the next pick) instead of running the op inside the previous turn — which had collapsed
+two turns into one and left the plan's next `TaskId` no longer runnable (`debug_assert` desync); the
+DPOR explorer (no debug seam) and the single-threaded debugger (unbounded budget) are unaffected, gated
+by `dpor.rs` matching the brute-force oracle. *Not yet:* W1 record/replay is the rest of Milestone B.
 
 ---
 
