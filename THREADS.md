@@ -97,11 +97,23 @@ property, so in practice:
   so two Workers over disjoint windows won't race on ABI globals. Still **cooperative** (one thread) —
   this is the substrate + window the parallel driver distributes; the default build stays import-free
   (185/185 differential intact).
-- [ ] **Step 4b — the parallel driver + host mode selection.** Run each `thread.spawn`ed vCPU on its
-  own Worker (1:1, per D56) over the shared window, the futex on `memory.atomic.wait`/`notify`,
-  selected by a host-set mode (`Cooperative` default | `Parallel`). The remaining wrinkles below
-  (main-thread can't `wait`; per-Worker stack/TLS; thread-safe allocator/`Mutex` across Workers) all
-  belong here. Then differential-test the parallel backend against the cooperative oracle on the corpus.
+- [x] **Step 4b — genuine multi-core parallelism in wasm (independent domains).** Real `worker_threads`
+  (separate OS threads) each run the **full SVM engine** over the **one shared** `SharedArrayBuffer`,
+  each over its own guest window — **concurrently**. The hard wasm-threads hurdle is solved: each
+  Worker is bootstrapped with its **own stack + TLS block** (export `__stack_pointer` / `__tls_*` /
+  `__wasm_init_tls`; the main thread pre-allocates the per-Worker stacks+TLS in shared memory so a
+  Worker never touches the shared default stack before its own is set). Verified
+  (`threads-parallel.mjs`): **4 and 8 Workers** each run the 8-vCPU `thread.spawn`+atomics+futex kernel
+  (so 8×8 = 64 vCPUs total) over disjoint windows → every Worker returns **4000**, robust across
+  repeats. So SVM runs genuinely in parallel across cores in wasm — N programs, N threads, one shared
+  memory. (The runs are *independent* — each Worker its own window; one guest's `thread.spawn` vCPUs
+  fanned across Workers is step 4c.)
+- [ ] **Step 4c — the shared-memory `thread.spawn` parallel driver.** The remaining piece: a driver
+  that runs **one** guest's `thread.spawn`ed vCPUs on **separate Workers** sharing **one** window, the
+  futex on `memory.atomic.wait`/`notify`, host-selected mode (`Cooperative` default | `Parallel`). This
+  is the large engine refactor — the cooperative `drive` shares `mem`/`host`/`fuel` by `&mut` on one
+  thread, so a parallel driver needs a shared (locked) `Host` for `cap.call`, `Send` vCPU state, and
+  the atomic futex. Differential-tested against the cooperative oracle. The wrinkles below live here.
 
 ### Known wrinkles (surfaced for later steps)
 
@@ -131,12 +143,17 @@ cd ..
 cargo test -p svm-mem shared                          # Region::Shared cross-thread atomics + fuzz
 cargo test -p svm --test bytecode_shared_window       # engine over a caller-owned shared window
 
-# Step 4a — the FULL engine as a wasm threads module, run over a SharedArrayBuffer window
+# Step 4a/4b — the FULL engine as a wasm threads module, run over a SharedArrayBuffer window.
+# The `--export=__stack_pointer/__tls_*/__wasm_init_tls` are the per-Worker bootstrap hooks (4b).
 cargo run --bin gencorpus                             # → corpus/threads.svmbc
 RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
-  -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824" \
+  -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
+  -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
+  -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align -Clink-arg=--export=__wasm_init_tls" \
   cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
-node threads-engine.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm corpus/threads.svmbc 4000
+W=target/wasm32-unknown-unknown/release/svm_browser.wasm
+node threads-engine.mjs   "$W" corpus/threads.svmbc 4000      # 4a: engine over a shared-mem window
+node threads-parallel.mjs "$W" corpus/threads.svmbc 4000 8    # 4b: 8 Workers, real parallelism → 4000
 ```
 
 The threads-build flags (`+atomics` · `--shared-memory --import-memory --max-memory` · `build-std`)
