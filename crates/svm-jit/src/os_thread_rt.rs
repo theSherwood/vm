@@ -532,11 +532,13 @@ struct PendingSpawn {
 }
 
 std::thread_local! {
-    /// §12.8 4A.5 follow-up B.2 guard: true on an OS thread running a **concurrent durable child**
-    /// ([`run_child`]). [`thread_spawn`] reads it to fail a *nested* concurrent spawn closed (a clean
-    /// `ThreadFault`) rather than mis-attribute the grandchild's `parent_task` via the shared `cur_task`.
-    /// Per-OS-thread; the root's thread never sets it, so flat root-spawned children are unaffected.
-    static IN_CONCURRENT_CHILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// §12.8 4A.5 follow-up B.2: the **spawning-task source** for a concurrent durable run. `Some(t)` on
+    /// an OS thread running concurrent durable child vCPU `t` ([`run_child`] seeds it); `None` on the
+    /// root's own thread (which never runs `run_child`). [`thread_spawn`] reads it to attribute a
+    /// (possibly nested) concurrent spawn's `parent_task` to the **spawning** vCPU — a per-OS-thread read,
+    /// so concurrent spawners never race (unlike the shared `cur_task`, which only the single-worker
+    /// inline/thaw paths maintain). `None` ⇒ the root (task `0`).
+    static CONCURRENT_SPAWN_TASK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 fn run_child(a: SpawnArgs) {
@@ -554,10 +556,10 @@ fn run_child(a: SpawnArgs) {
         unsafe {
             fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
         };
-        // §12.8 4A.5 follow-up B.2: mark this OS thread as a concurrent durable child, so a nested
-        // `thread.spawn` it makes fails closed (see `thread_spawn`) until B.2 is built. The OS thread is
-        // fresh per child, so the flag is naturally scoped to this child.
-        IN_CONCURRENT_CHILD.with(|c| c.set(true));
+        // §12.8 4A.5 follow-up B.2: record this OS thread's spawning task, so a *nested* `thread.spawn`
+        // it makes attributes the grandchild's `parent_task` to **this** child (read per-OS-thread in
+        // `thread_spawn`). The OS thread is fresh per child, so the value is naturally scoped to it.
+        CONCURRENT_SPAWN_TASK.with(|c| c.set(Some(dc.task)));
     }
     // Arm this OS thread's detect-and-kill recovery (idempotent; handler is process-wide, recovery is
     // thread-local — §5 / `mem::install_guard`).
@@ -747,16 +749,10 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     // task id matches the interp/deferred path (seeded into `vcpu.tls`). `None` on every existing path,
     // so behavior is unchanged there.
     let durable_child = if env.durable && dom.is_concurrent_durable() {
-        // §12.8 4A.5 follow-up B.2 (not yet built): a **concurrent** child that spawns a grandchild
-        // would mis-attribute its `parent_task` — `thread_spawn` reads the shared `cur_task`, which only
-        // the single-worker paths maintain and which would race across concurrent spawners. Until a
-        // per-OS-thread spawning-task source lands, **fail closed**: a nested concurrent spawn is a clean
-        // `ThreadFault` rather than a silently-wrong artifact. (Flat root-spawned children are fine: the
-        // root's OS thread never set this flag.)
-        if IN_CONCURRENT_CHILD.with(|c| c.get()) {
-            store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
-            return -1;
-        }
+        // §12.8 4A.5 follow-up B.2: a **concurrent** child that spawns a grandchild attributes the
+        // grandchild's `parent_task` to itself via the per-OS-thread spawning-task source (`run_child`
+        // seeded it) — not the shared `cur_task`, which the concurrent path never maintains and which
+        // would race across spawners. The root's own thread leaves it `None` ⇒ task `0`.
         let table = match dom.fiber_table() {
             Some(t) => t,
             None => {
@@ -771,7 +767,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                 return -1;
             }
         };
-        let parent = *lock(&dom.cur_task);
+        let parent = CONCURRENT_SPAWN_TASK.with(|c| c.get()).unwrap_or(0);
         let task = {
             let mut nt = lock(&dom.next_task);
             let t = *nt;

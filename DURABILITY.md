@@ -351,17 +351,17 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   (back-edge polls, JIT parity, async `request_freeze`, the loom quiesce model) and **4A.5
   per-context shadow-SP → genuinely-concurrent multi-vCPU STW freeze** (`FORMAT_VERSION` 4→5→6;
   the shared shadow-SP word + its lock retired), plus follow-ups **A** (a `thread.join` result
-  survives a concurrent freeze), **B.1** (a concurrent child flattens its own fibers), and the
+  survives a concurrent freeze), **B.1** (a concurrent child flattens its own fibers), the
   **blocked-in-`thread.join` freeze** (`thread.join` is now a may-suspend re-issue safepoint; a vCPU
-  parked in a join unwinds and the thaw re-issues the join).
+  parked in a join unwinds and the thaw re-issues the join), and **B.2** (full nested concurrent
+  spawns — a concurrent child can `thread.spawn` a grandchild; the per-OS-thread spawning-task source
+  attributes the grandchild's `parent_task` correctly and the thaw rebuilds the nested topology).
   **Next slices (all detailed under "Phase 4 Slice A.5", and either fail-closed or documented today):**
-  (1) **B.2 — full nested concurrent spawns** (a concurrent child spawning a grandchild; currently
-  *fail-closed* with `ThreadFault` — needs a per-OS-thread spawning-task source);
-  (2) **B.1′ — concurrent child-fiber freeze *mid-resume-chain*** (cleanly-parked is done; this
+  (1) **B.1′ — concurrent child-fiber freeze *mid-resume-chain*** (cleanly-parked is done; this
   interleaving is unverified — the likely Windows flake too);
-  (3) **freeze a vCPU blocked in `thread.wait`** (the futex `atomic.wait` thunk doesn't yet return on
+  (2) **freeze a vCPU blocked in `thread.wait`** (the futex `atomic.wait` thunk doesn't yet return on
   an in-flight freeze — folds into **4A.7** parked-vCPU below; the `thread.join` case is now done);
-  (4) **4A.6** recycled-context async freeze (sparse-residue payoff); **4A.7** parked-vCPU /
+  (3) **4A.6** recycled-context async freeze (sparse-residue payoff); **4A.7** parked-vCPU /
   `Blocking.work` latency; and the non-STW Phase-4 items — handle hardening (drainable non-durable
   bindings), CoW clone, `SharedRegion` consistent-cut (R4).
 
@@ -998,12 +998,12 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 `Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
 
-**Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** + the **blocked-in-`thread.join` freeze** are
-**landed** (the first three merged, all-platform CI green; the blocked-in-join slice on
-`claude/durable-next-slices-tracker`). The remaining queue — **B.2** full nested concurrent spawns
-(fail-closed today), **B.1′** concurrent child-fiber freeze *mid-resume-chain*, freezing a vCPU
-**blocked in `thread.wait`** (futex), then 4A.6 / 4A.7 — is detailed in the *"Phase 4 Slice A.5 —
-per-context shadow-SP"* follow-up notes below.
+**Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** + the **blocked-in-`thread.join` freeze** + **B.2**
+(full nested concurrent spawns) are **landed** (the first three merged, all-platform CI green; the
+blocked-in-join and B.2 slices on `claude/durable-next-slices-tracker`). The remaining queue — **B.1′**
+concurrent child-fiber freeze *mid-resume-chain*, freezing a vCPU **blocked in `thread.wait`** (futex),
+then 4A.6 / 4A.7 — is detailed in the *"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes
+below.
 
 **Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
 full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
@@ -1133,16 +1133,19 @@ and is **not yet verified** on the concurrent path — the test asserts the stro
 clean shape and skips otherwise (an over-subscribed runner can land the freeze in the harder
 interleaving; that path is a follow-up, not a guaranteed-correct case today).
 
-*Follow-up B.2 — nested concurrent spawns (FAIL-CLOSED; full support remaining).* A *concurrent* child
-that itself `thread.spawn`s a grandchild would mis-attribute the grandchild's `parent_task`:
-`thread_spawn` reads the **shared** `Domain::cur_task`, which only the single-worker inline/thaw paths
-maintain — `run_child` never sets it, and it would race across concurrent spawners anyway. Rather than
-emit a silently-wrong artifact, a nested concurrent spawn now **fails closed** with a clean
-`ThreadFault` (a per-OS-thread `IN_CONCURRENT_CHILD` flag set in `run_child`, checked in `thread_spawn`),
-pinned by `nested_concurrent_spawn_fails_closed`. **Full support** needs a per-OS-thread spawning-task
-source (seed the child's task in `run_child`; read it in `thread_spawn` instead of the shared
-`cur_task`) + a nested concurrent test (root → child → grandchild, all frozen, thaw rebuilds the
-per-parent topology). Deferred nested spawns (slice 3.4) and concurrent *flat* spawns already work.
+*Follow-up B.2 — nested concurrent spawns (done).* A *concurrent* child that itself `thread.spawn`s a
+grandchild attributes the grandchild's `parent_task` via a **per-OS-thread spawning-task source**
+(`CONCURRENT_SPAWN_TASK`, seeded to the child's task in `run_child`, read in `thread_spawn`) — *not* the
+shared `Domain::cur_task`, which only the single-worker inline/thaw paths maintain and which would race
+across concurrent spawners. The earlier `IN_CONCURRENT_CHILD` fail-closed guard is retired. During NORMAL
+the nested spawn/join resolves through the flat global thread table (dense global handles); on a freeze
+each level self-unwinds into its own per-context region and records a `FrozenVCpu` with the correct
+`parent_task`, and the thaw's per-parent rebuild (slice 3.4) reconstructs the topology and runs the tree
+in descending-task order so each `thread.join` resolves. Pinned by
+`nested_concurrent_spawn_returns_grandchild_value` (NORMAL, returns the grandchild's 42 through both
+joins) and `nested_concurrent_tree_freezes_and_thaws` (root → child → grandchild, all real OS threads,
+caught mid-flight; the grandchild drives the spawn-before-freeze handshake; the thaw reproduces
+`K`/`2K`/`3K`). Deferred nested spawns (slice 3.4) and concurrent *flat* spawns already worked.
 
 **Freezing a vCPU blocked in `thread.join` — done.** `thread.join` is now a may-suspend re-issue
 safepoint: `compute_may_suspend` counts it (so a "spawn then join" root is instrumented), the transform

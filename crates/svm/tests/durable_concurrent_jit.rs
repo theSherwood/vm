@@ -449,11 +449,10 @@ fn concurrent_freeze_while_root_blocked_in_join() {
     );
 }
 
-// Follow-up B.2 guard: nested concurrent spawns aren't supported yet (the grandchild's `parent_task`
-// would be mis-attributed via the shared `cur_task`), so a *concurrent* durable child that itself
-// `thread.spawn`s must **fail closed** — a clean `ThreadFault`, not a silently-wrong artifact. Here the
-// root spawns a concurrent child that spawns a grandchild; the nested spawn traps, which propagates
-// through the child's (and root's) join, so the run traps instead of returning the grandchild's value.
+// Follow-up B.2: nested concurrent spawns now work — a *concurrent* durable child that itself
+// `thread.spawn`s attributes the grandchild's `parent_task` to itself via the per-OS-thread
+// spawning-task source (not the shared `cur_task`). Here the root spawns a concurrent child that spawns
+// a grandchild; with no freeze, the grandchild's value (42) flows back through both joins.
 const SRC_NESTED: &str = r#"
 func (i32) -> (i64) {
 block0(v0: i32):
@@ -477,13 +476,12 @@ block0(v0: i64, v1: i64):
 "#;
 
 #[test]
-fn nested_concurrent_spawn_fails_closed() {
+fn nested_concurrent_spawn_returns_grandchild_value() {
     let inst = instrument(SRC_NESTED);
     let mut host = Host::new();
     host.clock_ns = 42;
     let _clk = host.grant_clock();
-    // A controller is required by the entry but never triggered — the guard fires during NORMAL, at the
-    // child's nested `thread.spawn`, before any freeze.
+    // A controller is required by the entry but never triggered — this is a pure NORMAL nested spawn.
     let freeze = FreezeController::new();
     let res = compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
         &inst,
@@ -501,11 +499,113 @@ fn nested_concurrent_spawn_fails_closed() {
     );
     match res {
         Ok((out, ..)) => assert!(
-            matches!(out, JitOutcome::Trapped(_)),
-            "a nested concurrent spawn must fail closed (ThreadFault), not return the grandchild value",
+            matches!(out, JitOutcome::Returned(ref s) if s == &[42]),
+            "a nested concurrent spawn resolves the grandchild's value through both joins, got {out:?}",
         ),
         Err(JitError::Unsupported(_)) => {}
         Err(JitError::Backend(msg)) if msg.contains("Allocation error") => {}
-        Err(e) => panic!("nested-spawn guard run failed: {e:?}"),
+        Err(e) => panic!("nested-spawn run failed: {e:?}"),
     }
+}
+
+// Follow-up B.2 under a freeze: a **three-level** concurrent tree (root → child → grandchild, all real
+// OS threads) caught mid-flight. The grandchild drives the spawn-before-freeze handshake (it is the last
+// to start, so by the time it signals, root + child are already looping), then every level self-unwinds
+// into its own per-context region. The thaw rebuilds the **per-parent** join topology (grandchild under
+// child, child under root) from the frozen residue and reproduces the uninterrupted result.
+const SRC_NESTED_FREEZE: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 0
+  br block1(v4, v5)
+block1(v6: i32, v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v6, v9) block2(v6, v9)
+block2(v12: i32, v13: i64):
+  v14 = thread.join v12
+  v15 = i64.add v13 v14
+  v16 = i64.const 65536
+  i64.store v16 v15
+  return v15
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  v3 = thread.spawn 2 v2 v2
+  v4 = i64.const 0
+  br block1(v3, v4)
+block1(v5: i32, v6: i64):
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  v9 = i64.const 100000000
+  v10 = i64.lt_s v8 v9
+  br_if v10 block1(v5, v8) block2(v5, v8)
+block2(v11: i32, v12: i64):
+  v13 = thread.join v11
+  v14 = i64.add v12 v13
+  v15 = i64.const 65544
+  i64.store v15 v14
+  return v14
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v13 = i64.const 65552
+  i64.store v13 v12
+  return v12
+}
+"#;
+
+#[test]
+fn nested_concurrent_tree_freezes_and_thaws() {
+    let inst = instrument(SRC_NESTED_FREEZE);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // Everything finished before the freeze landed (rare): already correct.
+        assert_eq!(le_i64(&fsnap, OFF_C2), K, "grandchild");
+        assert_eq!(le_i64(&fsnap, OFF_C1), 2 * K, "child + grandchild");
+        assert_eq!(le_i64(&fsnap, OFF_ROOT), 3 * K, "root + child + grandchild");
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "concurrent freeze returns a placeholder",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(le_i64(&tfinal, OFF_C2), K, "grandchild total reproduced");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        2 * K,
+        "child's loop + its joined grandchild reproduced",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        3 * K,
+        "root's loop + child + grandchild reproduced across the nested concurrent freeze",
+    );
 }
