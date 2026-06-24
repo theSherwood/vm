@@ -123,16 +123,31 @@ fn engine_runs_over_caller_owned_shared_window() {
 
     let (back, base, layout) = shared_window(1 << 16);
     let mut f2 = u64::MAX;
-    let (got_r, got_snap) =
-        bytecode::compile_and_run_capture_over(&m, 0, &[Value::I64(5)], &mut f2, &init, Arc::clone(&back))
-            .unwrap();
+    let (got_r, got_snap) = bytecode::compile_and_run_capture_over(
+        &m,
+        0,
+        &[Value::I64(5)],
+        &mut f2,
+        &init,
+        Arc::clone(&back),
+    )
+    .unwrap();
 
     assert_eq!(got_r, want_r, "result over shared window != engine backing");
-    assert_eq!(got_snap, want_snap, "final image over shared window != engine backing");
+    assert_eq!(
+        got_snap, want_snap,
+        "final image over shared window != engine backing"
+    );
     // The guest's store at offset 8 physically landed in the caller's buffer.
     let in_buf = back.read_word(8, 8);
-    assert_eq!(in_buf, u64::from_le_bytes(got_snap[8..16].try_into().unwrap()));
-    assert_ne!(in_buf, 0, "the guest write should be visible in the borrowed buffer");
+    assert_eq!(
+        in_buf,
+        u64::from_le_bytes(got_snap[8..16].try_into().unwrap())
+    );
+    assert_ne!(
+        in_buf, 0,
+        "the guest write should be visible in the borrowed buffer"
+    );
 
     drop(back);
     // SAFETY: same layout; the region (and all borrows of `base`) are gone.
@@ -146,7 +161,9 @@ fn cooperative_threads_over_shared_window() {
     let m = parse_module(THREADS).unwrap();
 
     let mut f = u64::MAX;
-    let want = bytecode::compile_and_run_capture(&m, 0, &[], &mut f, &[]).unwrap().0;
+    let want = bytecode::compile_and_run_capture(&m, 0, &[], &mut f, &[])
+        .unwrap()
+        .0;
 
     let (back, base, layout) = shared_window(1 << 16);
     let mut f2 = u64::MAX;
@@ -154,8 +171,15 @@ fn cooperative_threads_over_shared_window() {
         .unwrap()
         .0;
 
-    assert_eq!(got, want, "thread kernel over shared window != engine backing");
-    assert_eq!(got, Ok(vec![Value::I64(4000)]), "8 cooperative vCPUs over the shared window → 4000");
+    assert_eq!(
+        got, want,
+        "thread kernel over shared window != engine backing"
+    );
+    assert_eq!(
+        got,
+        Ok(vec![Value::I64(4000)]),
+        "8 cooperative vCPUs over the shared window → 4000"
+    );
 
     drop(back);
     // SAFETY: same layout; the region (and all borrows of `base`) are gone.
