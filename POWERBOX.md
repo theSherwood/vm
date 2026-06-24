@@ -293,15 +293,21 @@ impl Session {
    per-export trampoline (the JIT compiles function 0; calling an arbitrary export needs an
    entry-by-index run over the live window — check `CompiledModule` supports invoking a chosen funcidx,
    or extend it). This is the main implementation cost.
-4. **Differential.** `call_export` differential (interp vs JIT) must run *both* sessions in lockstep
-   across the *sequence* of calls (state diverges if they desync), not per-call in isolation.
+4. **Differential — all three backends.** The `call_export` differential runs a **tree-walker, a
+   bytecode-engine, and a JIT** session in lockstep across the *sequence* of calls (state diverges if
+   they desync, so it must be per-sequence, not per-call), asserting all three agree on results, the
+   persisted window, and captured output after every call. This is the powerbox layer's first direct
+   exercise of the bytecode engine (Followup F10) — note that for a module the bytecode engine doesn't
+   support, its session transparently falls back to the tree-walker, so that arm degenerates to a
+   second tree-walk; a `start` should report which engine each session actually used.
 5. **Concurrency / durability.** Out of scope for the first slice (single-threaded reactor); note the
    interaction with §12 threads and durability snapshots as later work.
 
 ### Acceptance (first slice)
 A hand-written module that exports `add(i64 sp, i64 x) -> i64` accumulating into a persistent global,
 called via `Session::call_export("add", …)` several times, returns the running total (proving window
-state persists), with interp == jit across the call sequence. Plus a C-ABI mirror (`svm_session_*`).
+state persists), with **all three backends** (tree-walk, bytecode, JIT) agreeing across the call
+sequence. Plus a C-ABI mirror (`svm_session_*`).
 
 ### Scope notes
 - Keep `command`-mode `Instance::run`/`run_diff` unchanged (the program use case).
@@ -333,6 +339,14 @@ state persists), with interp == jit across the call sequence. Plus a C-ABI mirro
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic interface labels** (Phase 4 deferral): an untrusted, verifier-ignored human-readable
   label alongside a `HostFn` grant for diagnostics / `cap.self.*`. Not a nominal type_id.
+- **F10 — pin bytecode parity *in the powerbox layer*.** The bytecode engine is held to exact
+  bug-for-bug parity with the tree-walker by the standalone `bytecode_diff.rs` gate, but the powerbox
+  differential (`run_diff`) only diffs tree-walk vs JIT, and `Backend::Bytecode` (via
+  `run_with_host_fast`) can *silently fall back* to the tree-walker for unsupported modules — so the
+  powerbox tests don't prove the bytecode engine actually executed. **Folded into Phase 6**: the
+  reactor `call_export` differential runs **all three** backends in lockstep across the call sequence,
+  which exercises the bytecode engine directly under the powerbox. (Still worth a way to *assert* the
+  bytecode engine ran vs fell back, rather than infer it.)
 
 ---
 
