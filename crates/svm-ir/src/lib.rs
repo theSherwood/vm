@@ -2340,9 +2340,27 @@ pub fn synth_powerbox_start(
     n_handles: usize,
     seed_heap: bool,
 ) -> Result<Module, String> {
-    if !(3..=POWERBOX_MAX_HANDLES).contains(&n_handles) {
+    // The handle stash occupies `[0, n_handles*4)`. It must not run into the reserved low state that
+    // sits above it: the heap bump/boundary words at [`POWERBOX_HEAP_BRK`] (when the program seeds a
+    // heap), else the format scratch / §3e args buffer at [`POWERBOX_ARGS_BASE`]. So a *fixed*
+    // powerbox is the 8-handle case (`32 == POWERBOX_HEAP_BRK`), and a name-bound frontend may stash
+    // more (up to 32 handles) as long as it doesn't seed a heap. This is the only cap — there is no
+    // lower bound (a capability-free program stashes nothing).
+    let stash_end = n_handles as u64 * 4;
+    let ceiling = if seed_heap {
+        POWERBOX_HEAP_BRK
+    } else {
+        POWERBOX_ARGS_BASE
+    };
+    if stash_end > ceiling {
         return Err(format!(
-            "powerbox grants a contiguous prefix of [3, {POWERBOX_MAX_HANDLES}] handles, got {n_handles}"
+            "powerbox stash for {n_handles} handles ([0, {stash_end})) overflows the reserved low \
+             region (must end by offset {ceiling}{})",
+            if seed_heap {
+                " — with seed_heap the heap state lives just above the 8-handle region"
+            } else {
+                ""
+            }
         ));
     }
     let ef = module.funcs.get(entry as usize).ok_or_else(|| {
@@ -3382,14 +3400,24 @@ mod powerbox_start_tests {
     }
 
     #[test]
-    fn rejects_bad_arity_and_entry() {
-        assert!(synth_powerbox_start(entry_module(), 1, 2, false).is_err());
-        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_err());
-        assert!(synth_powerbox_start(entry_module(), 99, 3, false).is_err());
-        // The helper (func 0) takes `(i64) -> (i64)` — a valid entry shape — but the entry must be
-        // chosen by the frontend; a non-`(i64) -> _` entry is rejected.
+    fn handle_count_is_bounded_only_by_the_stash_region() {
+        // No lower bound now (a 2-handle name-bound entry is fine), and >8 is allowed without a heap
+        // (the stash may run up to `POWERBOX_ARGS_BASE`).
+        assert!(synth_powerbox_start(entry_module(), 1, 2, false).is_ok());
+        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_ok());
+        assert!(synth_powerbox_start(entry_module(), 1, 32, false).is_ok()); // 32*4 == 128 == ARGS_BASE
+                                                                             // …but the stash can't run into the format/args region, or (with a heap) the heap words.
+        assert!(synth_powerbox_start(entry_module(), 1, 33, false).is_err()); // 33*4 > 128
+        assert!(synth_powerbox_start(entry_module(), 1, 9, true).is_err()); // 9*4 > HEAP_BRK(32)
+        assert!(synth_powerbox_start(entry_module(), 1, 8, true).is_ok()); // the fixed 8-handle heap case
+    }
+
+    #[test]
+    fn rejects_bad_entry() {
+        assert!(synth_powerbox_start(entry_module(), 99, 3, false).is_err()); // entry out of range
+                                                                              // The entry must take the i64 data-stack pointer; a non-`(i64) -> _` entry is rejected.
         let mut m = entry_module();
-        m.funcs[1].params = vec![ValType::I32]; // wrong: entry must take the i64 data-stack pointer
+        m.funcs[1].params = vec![ValType::I32];
         assert!(synth_powerbox_start(m, 1, 3, false).is_err());
     }
 }

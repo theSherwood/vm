@@ -145,12 +145,23 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
 - [x] `Instance::call(name)` resolves through `Module::resolve_export` (the ad-hoc map is gone).
 - [x] Guest-JIT demos updated to emit the v3 blob format (version byte + empty export section).
 
-### Phase 2 — name-based dynamic import binding (decision #2)
-- [ ] An `Imports`/host-capability registry keyed by name (grant closures or descriptors).
-- [ ] `instantiate` matches `Module.imports[i].name` → registry entry; fail-closed on miss/sig-mismatch.
-- [ ] Generalize `synth_powerbox_start`: stash an arbitrary N handles (lift the `3..=8` cap), in the
-      bound order; the fixed powerbox becomes a preset over this.
-- [ ] (Optional) a runtime name→handle directory capability for true dynamic/dlopen-style lookup.
+### Phase 2 — name-based dynamic import binding (decision #2) — done
+- [x] `svm_run::Imports` — a name → `HostCap` registry; `HostCap::{stdout,stdin,exit,clock,host_fn,
+      custom}` cover built-ins and arbitrary host-defined interfaces (`HOST_FN` + op).
+- [x] `instantiate_with_imports(module, imports)` matches each `call.import "<name>"` by name →
+      `(type_id, op)`, fail-closed on an unbound name; the fixed §3e powerbox is now one preset over
+      the same machinery (`instantiate` stays the canonical-prefix path).
+- [x] Generalized `synth_powerbox_start`: the `3..=8` cap is lifted — the stash may hold any N that
+      fits the reserved low region (≤ 8 with a seeded heap, ≤ 32 without). Grant order = import order
+      = stash slot order (slot `i` ↔ import `i`).
+- [x] `Instance::call` routes the powerbox entry through the name-bound registry when present, else
+      the fixed powerbox; both share one differential body (`run_entry0_diff`). Acceptance:
+      `crates/svm/tests/powerbox_imports.rs` (arbitrary-named host-fn caps, unbound fail-closed,
+      standard names as a preset), interp == jit.
+- [ ] (Deferred) a runtime name→handle directory capability for true dynamic/dlopen-style lookup —
+      compile-time name binding covers wasm parity; revisit if a consumer needs in-guest discovery.
+- [ ] (Deferred) full dynamic stash sizing (heap base above an arbitrary-N stash) to lift the
+      ≤8-with-heap / ≤32-without cap; not needed until a frontend wants >8 named caps *and* a heap.
 
 ### Phase 3 — uniform run config across backends
 - [ ] Unify `Quota` into one type.

@@ -15,7 +15,8 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
-    iface, run_with_host, AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap,
+    iface, run_with_host, AsyncCounter, CapPageMap, GuestMem, Host, HostFn, RegionBacking,
+    StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -2707,18 +2708,125 @@ fn diff_outcome(
     }
 }
 
+/// A host capability offered to a module's named import (wasm-style import matching, §7). It carries
+/// the `(type_id, op)` the guest's `call.import "<name>"` lowers to *and* a re-grantable action that
+/// mints the backing handle on a [`Host`]. Re-grantable (a plain `Fn`, not `FnOnce`) because the
+/// differential wrapper grants it on **two** hosts (interpreter + JIT) which must agree; grants are
+/// deterministic, so granting in the same order on both yields the same handle value.
+/// The re-grantable grant action a [`HostCap`] carries: `(host, window_size) -> handle`. The window
+/// size serves window-scoped caps (e.g. `AddressSpace`); most ignore it. `Arc` + `Send`/`Sync` so a
+/// `HostCap` is cheap to clone and the differential wrapper can grant it on either backend's host.
+type GrantFn = Arc<dyn Fn(&mut Host, u64) -> i32 + Send + Sync>;
+
+#[derive(Clone)]
+pub struct HostCap {
+    type_id: u32,
+    op: u32,
+    grant: GrantFn,
+}
+
+impl HostCap {
+    /// A `Stream` write endpoint (stdout): `write(buf, len)` is op 1.
+    pub fn stdout() -> HostCap {
+        HostCap {
+            type_id: iface::STREAM,
+            op: 1,
+            grant: Arc::new(|h, _| h.grant_stream(StreamRole::Out)),
+        }
+    }
+    /// A `Stream` read endpoint (stdin): `read(buf, len)` is op 0.
+    pub fn stdin() -> HostCap {
+        HostCap {
+            type_id: iface::STREAM,
+            op: 0,
+            grant: Arc::new(|h, _| h.grant_stream(StreamRole::In)),
+        }
+    }
+    /// The `Exit` lifecycle capability: `exit(code)` (op 0, noreturn).
+    pub fn exit() -> HostCap {
+        HostCap {
+            type_id: iface::EXIT,
+            op: 0,
+            grant: Arc::new(|h, _| h.grant_exit()),
+        }
+    }
+    /// The `Clock` capability: `now(clock_id) -> i64` (op 0).
+    pub fn clock() -> HostCap {
+        HostCap {
+            type_id: iface::CLOCK,
+            op: 0,
+            grant: Arc::new(|h, _| h.grant_clock()),
+        }
+    }
+    /// A **host-defined** capability (iface [`iface::HOST_FN`]) — arbitrary semantics behind a named
+    /// import, the wasm-like escape hatch. `op` is the operation this name selects; `make` builds a
+    /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
+    /// `(op, args, guest_mem) -> result slots | Trap`.
+    pub fn host_fn(op: u32, make: impl Fn() -> HostFn + Send + Sync + 'static) -> HostCap {
+        let make = Arc::new(make);
+        HostCap {
+            type_id: iface::HOST_FN,
+            op,
+            grant: Arc::new(move |h, _| h.grant_host_fn(make())),
+        }
+    }
+    /// A fully custom binding: an explicit `(type_id, op)` and a re-grantable grant action. The escape
+    /// hatch for any capability the named constructors don't cover (e.g. `Memory`, `AddressSpace`).
+    pub fn custom(
+        type_id: u32,
+        op: u32,
+        grant: impl Fn(&mut Host, u64) -> i32 + Send + Sync + 'static,
+    ) -> HostCap {
+        HostCap {
+            type_id,
+            op,
+            grant: Arc::new(grant),
+        }
+    }
+}
+
+/// A name → [`HostCap`] registry: the capabilities a host offers a module's imports, matched **by
+/// name** at [`instantiate_with_imports`] (wasm-style linking — arbitrary names, interfaces, and
+/// counts). The fixed §3e powerbox is just one preset over this mechanism (see [`instantiate`]).
+#[derive(Default, Clone)]
+pub struct Imports {
+    map: HashMap<String, HostCap>,
+}
+
+impl Imports {
+    pub fn new() -> Imports {
+        Imports::default()
+    }
+    /// Offer `cap` under `name`. Builder-style; last write wins.
+    pub fn provide(mut self, name: impl Into<String>, cap: HostCap) -> Imports {
+        self.map.insert(name.into(), cap);
+        self
+    }
+}
+
+/// The name-bound capability set captured at [`instantiate_with_imports`]: the registry plus the
+/// module's import order (slot `i` of the powerbox stash ↔ import `i`), so grant order matches the
+/// stash layout `svm_ir::synth_powerbox_start` lays down.
+struct NamedBinding {
+    imports: Imports,
+    order: Vec<String>,
+}
+
 /// A resolved, verified program ready to run on **both** backends — the easy "instantiate &amp; run"
-/// default over a frontend's IR (built by [`instantiate`]). This is the [`run_powerbox`] /
-/// `run_c_full` experience **decoupled from any C frontend**: hand it a module whose function 0 is a
-/// powerbox `_start` (e.g. produced by [`svm_ir::synth_powerbox_start`]) and [`Instance::call`] grants
-/// the fixed powerbox, runs the entry on the interpreter *and* the JIT under identical capabilities,
-/// asserts they agree (interp == jit), and returns the captured output.
+/// default over a frontend's IR (built by [`instantiate`] / [`instantiate_with_imports`]). This is the
+/// [`run_powerbox`] / `run_c_full` experience **decoupled from any C frontend**: hand it a module whose
+/// function 0 is a powerbox `_start` (e.g. produced by [`svm_ir::synth_powerbox_start`]) and
+/// [`Instance::call`] grants the capabilities, runs the entry on the interpreter *and* the JIT under
+/// identical capabilities, asserts they agree (interp == jit), and returns the captured output.
 ///
-/// The handle / object-capability model remains the escape hatch: for a custom capability set, grant
-/// on a [`svm_interp::Host`] yourself and call [`svm_interp::run_with_host`] /
+/// The handle / object-capability model remains the escape hatch: for a fully custom setup, grant on a
+/// [`svm_interp::Host`] yourself and call [`svm_interp::run_with_host`] /
 /// [`svm_jit::compile_and_run_with_host`] directly. This wrapper is the default for the common case.
 pub struct Instance {
     module: Module,
+    // `Some` when built via `instantiate_with_imports` (name-bound capabilities); `None` for the fixed
+    // powerbox preset (`instantiate`).
+    binding: Option<NamedBinding>,
 }
 
 /// Resolve `module`'s §7 named capability imports under the reference host policy
@@ -2733,7 +2841,44 @@ pub fn instantiate(module: Module) -> Result<Instance, String> {
     let resolved = resolve_capability_imports(module)?;
     svm_verify::verify_module(&resolved)
         .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
-    Ok(Instance { module: resolved })
+    Ok(Instance {
+        module: resolved,
+        binding: None,
+    })
+}
+
+/// Instantiate `module` against a **name-keyed capability registry** (`imports`), wasm-style: each
+/// `call.import "<name>"` is matched by name to a [`HostCap`], lowered to its `(type_id, op)`, and —
+/// at [`Instance::call`] — granted in import order so the powerbox stash slot `i`
+/// (`svm_ir::synth_powerbox_start`) holds the handle for import `i`. This is decision #2's *dynamic,
+/// name-based* binding: arbitrary names, interfaces, and counts, with the fixed §3e powerbox
+/// ([`instantiate`]) just one preset over the same machinery.
+///
+/// `module` is the post-`synth_powerbox_start` module (function 0 is the `_start`; the import table is
+/// untouched by the prepend). Fails closed if an imported name has no binding in `imports`, or the
+/// resolved module fails verification.
+pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Instance, String> {
+    // Capture the import order *before* resolving (which clears the table). Slot i ↔ import i.
+    let order: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
+    // Resolve every name through the registry; an unbound name is fail-closed (no silent no-op).
+    let resolved = svm_ir::resolve_imports(&module, |name| {
+        imports.map.get(name).map(|c| svm_ir::ResolvedCap {
+            type_id: c.type_id,
+            op: c.op,
+        })
+    })
+    .map_err(|e| match e {
+        svm_ir::ImportError::Unresolved(n) => {
+            format!("unbound capability import `{n}` (no binding in the host registry)")
+        }
+        other => format!("resolve imports: {other:?}"),
+    })?;
+    svm_verify::verify_module(&resolved)
+        .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
+    Ok(Instance {
+        module: resolved,
+        binding: Some(NamedBinding { imports, order }),
+    })
 }
 
 impl Instance {
@@ -2744,18 +2889,20 @@ impl Instance {
 
     /// Run the named export on both backends and return its outcome plus captured stdout/stderr.
     ///
-    /// If the export is the powerbox entry (`"_start"`, function 0, a 3–8 `i32`-handle signature),
-    /// the fixed powerbox is auto-granted and `args` must be empty (the handles are supplied by the
-    /// runtime, not the caller). Any other export is run as a **bare kernel** with `args` and no
-    /// host capabilities (the escape hatch for pure functions). Either way the interpreter and the
-    /// JIT run under identical inputs and must agree (interp == jit), or this returns an `Err`.
+    /// For the powerbox entry (`"_start"`, function 0), the capabilities are auto-granted — the
+    /// name-bound registry (from [`instantiate_with_imports`]) if present, else the fixed §3e powerbox
+    /// ([`instantiate`]) — and `args` must be empty (handles are supplied by the runtime, not the
+    /// caller). Any other export runs as a **bare kernel** with `args` and no host capabilities (the
+    /// escape hatch for pure functions). Either way the interpreter and the JIT run under identical
+    /// inputs and must agree (interp == jit), or this returns an `Err`.
     pub fn call(&self, export: &str, args: &[Value]) -> Result<Run, String> {
         let fidx = self
             .module
             .resolve_export(export)
             .ok_or_else(|| format!("no export named `{export}`"))?;
-        let is_powerbox = fidx == 0 && is_powerbox_entry(&self.module);
-        if is_powerbox {
+        let is_powerbox_func0 =
+            fidx == 0 && (self.binding.is_some() || is_powerbox_entry(&self.module));
+        if is_powerbox_func0 {
             if !args.is_empty() {
                 return Err(
                     "the powerbox entry takes no caller args (the handles are auto-granted)".into(),
@@ -2773,21 +2920,54 @@ impl Instance {
         self.run_powerbox_diff(stdin)
     }
 
-    /// Grant the fixed powerbox on two fresh hosts (one per backend), run function 0 (the `_start`)
-    /// on the interpreter and the JIT, assert they agree, and return the captured output.
+    /// Grant the powerbox on two fresh hosts (one per backend) and run function 0 (`_start`)
+    /// differentially. The grant is the name-bound registry when present, else the fixed §3e powerbox.
     fn run_powerbox_diff(&self, stdin: &[u8]) -> Result<Run, String> {
+        let win = self.module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        match &self.binding {
+            Some(b) => {
+                // Name-bound: grant each import's capability in import order (slot i ↔ import i).
+                let order = &b.order;
+                let imports = &b.imports;
+                self.run_entry0_diff(stdin, |h| {
+                    // Inert unless a granted cap needs them (region-backed / Jit caps).
+                    h.set_region_factory(new_shared_region);
+                    h.set_jit_validator(jit_blob_validator);
+                    order
+                        .iter()
+                        .map(|name| {
+                            let cap = &imports.map[name]; // present: resolve already checked every name
+                            Value::I32((cap.grant)(h, win))
+                        })
+                        .collect()
+                })
+            }
+            None => {
+                // Fixed §3e powerbox: the contiguous prefix of the eight canonical handles.
+                let n_handles = self.module.funcs[0].params.len();
+                self.run_entry0_diff(stdin, |h| grant_powerbox_prefix(h, n_handles, win))
+            }
+        }
+    }
+
+    /// The shared differential body for function 0 (`_start`): grant capabilities on two fresh hosts
+    /// via `grant` (called once per host — grants must be deterministic so the handle vectors match),
+    /// run `_start` on the interpreter and the JIT, assert they agree, return the captured output.
+    fn run_entry0_diff(
+        &self,
+        stdin: &[u8],
+        grant: impl Fn(&mut Host) -> Vec<Value>,
+    ) -> Result<Run, String> {
         let m = &self.module;
-        let n_handles = m.funcs[0].params.len();
-        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
 
         // Two hosts, granted identically (grants are deterministic, so the handle values match).
         let mut hi = Host::new();
         let mut hj = Host::new();
         hi.stdin = stdin.to_vec();
         hj.stdin = stdin.to_vec();
-        let args = grant_powerbox_prefix(&mut hi, n_handles, win);
-        let args_j = grant_powerbox_prefix(&mut hj, n_handles, win);
-        debug_assert_eq!(args, args_j, "powerbox grants must be deterministic");
+        let args = grant(&mut hi);
+        let args_j = grant(&mut hj);
+        debug_assert_eq!(args, args_j, "grants must be deterministic across backends");
 
         // Interpreter.
         let mut fuel = 50_000_000u64;
