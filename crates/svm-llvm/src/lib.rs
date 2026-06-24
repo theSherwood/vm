@@ -11753,6 +11753,57 @@ fn wide_int_binop(
     Ok(true)
 }
 
+/// Lower a wide **lane-wise shift** by a uniform amount (the wide counterpart of the 128-bit `VShift`
+/// path): each `v128` chunk shifts via `VShift` (one scalar amount for all its lanes), each scalar tail
+/// lane via `IntBin`. The amount must be a constant splat — `const_splat_int` — since `VShift` takes a
+/// single scalar count; a per-lane-varying amount stays fail-closed (rare in auto-vectorized code).
+fn wide_int_shift(
+    ctx: &mut BlockCtx,
+    types: &Types,
+    dest: &Name,
+    a: &Operand,
+    b: &Operand,
+    op: svm_ir::VShiftOp,
+    tail_op: BinOp,
+) -> Result<bool, Error> {
+    let Some(layout) = wide_vec_layout(a.get_type(types).as_ref()) else {
+        return Ok(false);
+    };
+    let Some(amt) = const_splat_int(b) else {
+        return unsup(format!(
+            "wide vector shift {op:?} with non-constant-splat amount"
+        ));
+    };
+    let pa = ctx.wide_operand(a, layout)?;
+    let tail_ty = int_ty(layout.shape.lane_val())?;
+    // `VShift`'s amount is a scalar `i32` (one count for every lane of every chunk); the scalar tail
+    // shifts by the same count in the lane's own integer type.
+    let amt_i32 = ctx.push(Inst::ConstI32(amt as i32));
+    let tail_amt = match tail_ty {
+        IntTy::I64 => ctx.push(Inst::ConstI64(amt as i64)),
+        _ => amt_i32,
+    };
+    let mut out = Vec::with_capacity(layout.nparts());
+    for &chunk in pa.iter().take(layout.full_chunks) {
+        out.push(ctx.push(Inst::VShift {
+            shape: layout.shape,
+            op,
+            a: chunk,
+            amt: amt_i32,
+        }));
+    }
+    for &lane in pa.iter().take(layout.nparts()).skip(layout.full_chunks) {
+        out.push(ctx.push(Inst::IntBin {
+            ty: tail_ty,
+            op: tail_op,
+            a: lane,
+            b: tail_amt,
+        }));
+    }
+    ctx.bind_wide(dest, out);
+    Ok(true)
+}
+
 /// Lower a wide **float** lane binop (`VFloatBin` per chunk + scalar `FBin` per tail lane).
 fn wide_float_binop(
     ctx: &mut BlockCtx,
@@ -11978,6 +12029,37 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             &x.operand1,
             WIntChunk::Bit(Bit::Xor),
             BinOp::Xor,
+        ),
+        // Wide lane-wise shift by a uniform amount → per-chunk `VShift` + scalar-tail shift (the wide
+        // counterpart of the 128-bit shift path; a non-constant-splat amount stays fail-closed). I11:
+        // an auto-vectorized widening multiply (`short` DSP fixed-point, e.g. Embench `edn`) emits a
+        // `<8 x i32>` shift the 128-bit path couldn't reach.
+        I::Shl(x) => wide_int_shift(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            svm_ir::VShiftOp::Shl,
+            BinOp::Shl,
+        ),
+        I::LShr(x) => wide_int_shift(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            svm_ir::VShiftOp::ShrU,
+            BinOp::ShrU,
+        ),
+        I::AShr(x) => wide_int_shift(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            svm_ir::VShiftOp::ShrS,
+            BinOp::ShrS,
         ),
         I::FAdd(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Add),
         I::FSub(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Sub),

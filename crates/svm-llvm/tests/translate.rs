@@ -4435,6 +4435,29 @@ fn simd_autovec_avx2_elementwise() {
     check_avx_vs_native("simd_avx2_elem", src, 4);
 }
 
+/// `-O2 -mavx2` auto-vectorized **fixed-point DSP** kernel (Embench `edn`'s `vec_mpy` shape):
+/// `y[i] += (short)((scaler * x[i]) >> 15)`. The `short` widening multiply produces a wide `<8 x i32>`
+/// intermediate that is then **shifted** (`>>15`) and truncated back to `<8 x i16>` — the I11 shape the
+/// wide legalizer rejected before it dispatched shifts through the chunk path. Verified against the
+/// native scalar oracle on both backends.
+#[test]
+fn simd_autovec_avx2_fixed_point_shift() {
+    let src = "void vmpy(short *y, const short *x, short scaler, int n);\n\
+        static short Y[64], X[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) { X[i] = (short)((seed + i) * 200); Y[i] = (short)(i * 3); }\n\
+        \x20 vmpy(Y, X, (short)(seed * 300 + 100), 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += Y[i];\n\
+        \x20 return s;\n\
+        }\n\
+        __attribute__((noinline)) void vmpy(short *y, const short *x, short scaler, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) y[i] += (short)((scaler * x[i]) >> 15);\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_avx_vs_native("simd_avx2_fixshift", src, 4);
+}
+
 // ============================================================================================
 // SIMD — the **other 128-bit lane shapes** (`i8x16`/`i16x8`/`i64x2`/`f64x2`), beyond the original
 // `i32x4`/`f32x4`. These use explicit `vector_size(16)` types compiled with vectorization *off*
