@@ -39,6 +39,18 @@ const BENCHES: &[(&str, &str, bool, i64)] = &[
     ("ud", "src/ud/libud.c", false, 200_000),
     ("aha-mont64", "src/aha-mont64/mont64.c", false, 200_000),
     ("nsichneu", "src/nsichneu/libnsichneu.c", false, 50_000),
+    ("depthconv", "src/depthconv/depthconv.c", false, 50_000),
+    ("huffbench", "src/huffbench/libhuffbench.c", true, 5_000),
+    ("nettle-aes", "src/nettle-aes/nettle-aes.c", false, 20_000),
+    ("tarfind", "src/tarfind/tarfind.c", true, 50_000),
+    // Not included (need harness/on-ramp work, not just a BENCHES row):
+    //  - `statemate`: defines a global `unsigned long time;` that collides with `<time.h>`'s `time()`
+    //    in the native-oracle build (the wrapper includes time.h); the SVM side translates fine, but
+    //    without a buildable native oracle the differential can't be honest. Needs a per-kernel rename.
+    //  - `slre`: translates past `strlen` now but needs `__ctype_b_loc` (glibc locale ctype table).
+    //  - `md5sum`/`xgboost`: the shared wrapper's `benchmark_body` arity doesn't match these kernels.
+    //  - `picojpeg`/`qrduino`/`xgboost`: multi-`.c` kernels (the driver `#include`s a single file).
+    //  - `wikisort` (`{i64,i64}` AggregateZero const), `sglib-combined` (`<2 x ptr>`): on-ramp gaps.
 ];
 
 const SMALL: i64 = 10;
@@ -78,6 +90,14 @@ fn main() {
                 .arg(&bench_def);
             if beebs {
                 c.arg(&beebs_def);
+            }
+            // `aha-mont64`'s `mulul64` uses `unsigned __int128` for a 64×64→128 widening multiply, which
+            // the on-ramp has no 128-bit integer support for (fail-closes; see ISSUES.md I14). The kernel
+            // has a `#ifdef __SIZEOF_INT128__` guard with a pure-64-bit fallback, so undefining the macro
+            // routes it to code the on-ramp already handles. Applied to *both* the native and SVM builds
+            // so the differential stays honest (both compile the same source).
+            if name == "aha-mont64" {
+                c.arg("-U__SIZEOF_INT128__");
             }
         };
 
@@ -169,9 +189,10 @@ fn main() {
         let ok = nat_chk == 1 && tw == nat_chk && bcv == nat_chk && jitv == nat_chk;
 
         // Backstop: a runtime miscompile is reported but **excluded from the perf geomean** — a wrong
-        // answer has no meaningful speed. (`edn` now *fail-closes* at translate instead — its
-        // `fir_no_red_ld` `<2 x i16>` carry is rejected by the ISSUES.md I13 stopgap — so it skips
-        // above; this branch remains as a guard against any future translate-but-miscompile kernel.)
+        // answer has no meaningful speed. (`edn` now translates *and* verifies correct across all three
+        // engines — the ISSUES.md I13 `<2 x i16>`/`<2 x i32>` lane-arithmetic miscompile is fixed — so it
+        // no longer trips this; the branch remains as a guard against any future translate-but-miscompile
+        // kernel.)
         if !ok {
             println!(
                 "{name:<16} {nat_ns:>12.1} {:>12}   {:>7}   MISCOMPILE (excluded) nat={nat_chk} tw={tw} bc={bcv} jit={jitv} — see ISSUES.md I13",

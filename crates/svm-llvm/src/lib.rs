@@ -77,7 +77,9 @@
 //!   libc `FILE*` stream argument is ignored (the handle is the endpoint). `clang -O2` also lowers
 //!   `printf("…\n")` → `puts` and `printf("%c",c)` → `putc`, so format-free `printf` rides this path.
 //! - **P — funnel shifts + runtime mem-loop helpers (first real corpus demo).** `llvm.fshl`/`fshr`
-//!   lower to `rotl`/`rotr` for the rotate idiom (identical operands — SHA-256's `ROTRIGHT`). A
+//!   lower to `rotl`/`rotr` for the rotate idiom (identical operands — SHA-256's `ROTRIGHT`); the
+//!   general (distinct-operand) case with a **constant** amount on an i32/i64 lowers to
+//!   `(a << s) | (b >>u (w - s))` (Embench `aha-mont64`'s double-word `modul64` shift). A
 //!   variable-length (or oversized-constant) `memset`/`memcpy` calls a **synthesized runtime loop
 //!   helper** (`__svm_memset`/`__svm_memcpy`, a real counted byte loop — the first multi-block helper)
 //!   instead of an inline unroll. Together these make B-Con's **SHA-256** run byte-identical to
@@ -154,7 +156,8 @@
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): `printf` float conversions
 //! (`%f`/`%e`/`%g` — need exact-decimal/bignum formatting), `*` (dynamic width/precision), and
-//! non-constant formats; general (non-rotate) funnel shifts, `llvm.bitreverse`, transcendental math
+//! non-constant formats; general (non-rotate) funnel shifts with a *non-constant* amount (the
+//! constant-amount i32/i64 case is lowered), `llvm.bitreverse`, transcendental math
 //! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
 //! (`<2 x double>`, `<8 x i16>`, dynamic lanes), and `i33`.
 
@@ -276,6 +279,10 @@ fn translate_impl(
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
+    // A direct `strlen` call routes to the same synthesized `__svm_strlen` byte loop that `printf %s`
+    // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
+    // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
+    let need_strlen = need_printf || calls_external(m, &defined_names, "strlen");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -370,9 +377,9 @@ fn translate_impl(
         memcpy: take(need_memcpy),
         malloc: take(need_malloc),
         utoa: take(need_printf),
-        // `%s` needs a runtime strlen; synthesized alongside `utoa` whenever `printf` is present
-        // (one small function — `%s`-free printf programs carry an unused helper, negligible).
-        strlen: take(need_printf),
+        // `%s` needs a runtime strlen (synthesized alongside `utoa` for any `printf`); a direct
+        // `strlen` call also routes here — `need_strlen` covers both (see above).
+        strlen: take(need_strlen),
         realloc: take(need_realloc),
         memmove: take(need_memmove),
         getenv: take(need_getenv),
@@ -531,6 +538,8 @@ fn translate_impl(
     }
     if need_printf {
         funcs.push(synth_utoa());
+    }
+    if need_strlen {
         funcs.push(synth_strlen());
     }
     if need_realloc {
@@ -1442,33 +1451,6 @@ fn translate_func(
     let results = result_types(f.return_type.as_ref(), types)?;
 
     let scan = scan_func(f, types)?;
-    // I13 soundness fail-close: a φ that carries a **tiny all-tail sub-32-bit** wide vector
-    // (≤ 2 lanes of i8/i16 — i.e. a 32-bit `<2 x i16>`/`<2 x i8>`) across a block edge, as in Embench
-    // `edn`'s `fir_no_red_ld` (a carried `<2 x i16>` recombined by a deinterleave shuffle), round-trips
-    // its lanes incorrectly through the per-part block-param fan-out — a *silent miscompile*
-    // (ISSUES.md I13). Until the tiny-tail-lane representation is fixed, refuse it rather than
-    // miscompile. Narrowly scoped to the confirmed-broken 32-bit case: a 4-lane `<4 x i16>` (64-bit)
-    // φ — e.g. the Clay-UI demo's carried point vector — round-trips correctly and is untouched, as are
-    // full-chunk wide φ accumulators (`<8 x i32>`) and all straight-line sub-128 vector ops.
-    for bb in &f.basic_blocks {
-        for instr in &bb.instrs {
-            if let Instruction::Phi(p) = instr {
-                if let Some(layout) = scan.name2id.get(&p.dest).and_then(|id| scan.wide.get(id)) {
-                    if layout.full_chunks == 0
-                        && layout.shape.lane_bytes() < 4
-                        && layout.tail_lanes <= 2
-                    {
-                        return unsup(format!(
-                            "φ of a tiny all-tail sub-32-bit wide vector ({} × {}-byte lane) — silent \
-                             miscompile, fail-closed (ISSUES.md I13)",
-                            layout.tail_lanes,
-                            layout.shape.lane_bytes()
-                        ));
-                    }
-                }
-            }
-        }
-    }
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
@@ -8300,6 +8282,19 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `strlen(s)`: the synthesized `__svm_strlen` NUL-scan loop (also used by `printf %s`).
+        "strlen" => {
+            let Some(f) = ctx.helpers.strlen else {
+                return Ok(false); // no strlen helper synthesized → fail-closed
+            };
+            let p = ctx.operand(&c.arguments[0].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![p],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // `getenv(name)`: the synthesized `__svm_getenv` scans the §3e env strings for `name=`.
         "getenv" => {
             let Some(f) = ctx.helpers.getenv else {
@@ -9037,19 +9032,76 @@ fn lower_int_intrinsic(
         // `llvm.fshl(a, b, s)` / `fshr`: funnel shift. The **rotate idiom** (the two value operands
         // identical — what clang emits for `(x<<n)|(x>>(w-n))`, e.g. SHA-256's `ROTRIGHT`) lowers to
         // `rotl`/`rotr`, which mask the count mod width and so have no shift-by-`w` edge case. A true
-        // funnel shift (distinct operands) needs a width-edge-safe `select` sequence — deferred.
+        // funnel shift (distinct operands) with a **constant** amount on a full-width (i32/i64) value
+        // lowers to `(a << s) | (b >>u (w - s))` (`s = amt mod w`; `s == 0` ⇒ the no-shift operand) —
+        // both shift counts are then in `1..w`, so there is no shift-by-`w` edge case. Found via Embench
+        // `aha-mont64`'s `modul64` (a double-word `<< 1` shift-and-subtract → `fshl.i64(hi, lo, 1)`). A
+        // non-constant amount (needs a width-edge-safe `select`) or a sub-32-bit width stays fail-closed.
         "llvm.fshl" | "llvm.fshr" => {
-            if args[0] != args[1] {
-                return unsup(format!("general funnel shift `{name}` (non-rotate)"));
-            }
-            let a = ctx.operand(args[0])?;
-            let amt = ctx.operand(args[2])?;
-            let op = if base == "llvm.fshl" {
-                BinOp::Rotl
+            let is_fshl = base == "llvm.fshl";
+            if args[0] == args[1] {
+                let a = ctx.operand(args[0])?;
+                let amt = ctx.operand(args[2])?;
+                let op = if is_fshl { BinOp::Rotl } else { BinOp::Rotr };
+                ctx.push(Inst::IntBin { ty, op, a, b: amt })
             } else {
-                BinOp::Rotr
-            };
-            ctx.push(Inst::IntBin { ty, op, a, b: amt })
+                let w = src_bits(args[0], types)?;
+                if w != 32 && w != 64 {
+                    return unsup(format!(
+                        "general funnel shift `{name}` on i{w} (only i32/i64)"
+                    ));
+                }
+                let Some(c) = const_int(args[2]) else {
+                    return unsup(format!(
+                        "general funnel shift `{name}` (non-constant amount)"
+                    ));
+                };
+                let s = (c % w as u64) as i64;
+                let a = ctx.operand(args[0])?;
+                let b = ctx.operand(args[1])?;
+                if s == 0 {
+                    // `fshl(a,b,0) = a`, `fshr(a,b,0) = b` (the concatenation shifted by nothing).
+                    if is_fshl {
+                        a
+                    } else {
+                        b
+                    }
+                } else {
+                    // fshl: a's bits go up by `s`, b supplies the low `w-s`; fshr is the mirror.
+                    let (lsh, rsh) = if is_fshl {
+                        (s, w as i64 - s)
+                    } else {
+                        (w as i64 - s, s)
+                    };
+                    let kk = |ctx: &mut BlockCtx, n: i64| {
+                        if ty == IntTy::I64 {
+                            ctx.push(Inst::ConstI64(n))
+                        } else {
+                            ctx.push(Inst::ConstI32(n as i32))
+                        }
+                    };
+                    let lc = kk(ctx, lsh);
+                    let rc = kk(ctx, rsh);
+                    let hi = ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Shl,
+                        a,
+                        b: lc,
+                    });
+                    let lo = ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::ShrU,
+                        a: b,
+                        b: rc,
+                    });
+                    ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Or,
+                        a: hi,
+                        b: lo,
+                    })
+                }
+            }
         }
         // `llvm.bswap` — reverse the value's bytes inline (no SVM op): each source byte `i` is
         // shifted to destination byte `nbytes-1-i`.
@@ -12847,6 +12899,31 @@ fn bin<'d>(
             }
         };
         return Ok((dest, ctx.push(inst)));
+    }
+    // A **2-lane 32-bit integer vector** (`<2 x i32>`, e.g. the deinterleaved widening multiply in
+    // Embench `edn`'s `fir_no_red_ld`) is carried as a *packed* `i64` (lane 0 low, lane 1 high). A plain
+    // `i64` op on that image is **not** lane-wise: `mul` mixes the lanes (the low product's carry and
+    // the lane0×lane1 cross term land in lane 1), and `add`/`sub`/`shl`/`lshr`/`ashr` carry/shift across
+    // the 32-bit lane boundary. So operate on the two `i32` lanes independently and repack. (The bitwise
+    // `and`/`or`/`xor` would be lane-safe even packed, but lane-wise is uniformly correct.) This is the
+    // ISSUES.md I13 root fix — previously a silent miscompile, narrowly fail-closed via a φ guard.
+    if vec2_lane_ty(a.get_type(types).as_ref()) == Some(ValType::I32) {
+        let la = vec_explode(ctx, a, types, false)?;
+        let lb = vec_explode(ctx, b, types, false)?;
+        let r0 = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op,
+            a: la[0],
+            b: lb[0],
+        });
+        let r1 = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op,
+            a: la[1],
+            b: lb[1],
+        });
+        let packed = ctx.vec_pack(r0, r1, ValType::I32);
+        return Ok((dest, packed));
     }
     let width = int_bits(a.get_type(types).as_ref());
     let a = ctx.operand(a)?;
