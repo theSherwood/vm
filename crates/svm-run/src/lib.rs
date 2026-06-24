@@ -1201,6 +1201,11 @@ pub unsafe extern "C" fn fast_cap_resolver(
 
 /// `Clock.now() -> i64` (iface 2, op 0, no args) on the fast path.
 ///
+/// Uses [`svm_interp::Host::fast_clock_now`] — an authority-checked, **allocation-free** inline read
+/// (ISSUES.md I12), so this is genuinely cheaper than the generic dispatch, not just a leaner JIT→host
+/// boundary. Falls back to [`fast_dispatch`] (the full slot dispatch) when a W1 record/replay tape is
+/// active, so the clock crossing is still taped/served faithfully.
+///
 /// # Safety
 /// `ctx` is a live `*mut Host`; `trap_out` is writable — the [`svm_jit::FastCapResolver`] contract.
 unsafe extern "C" fn fast_clock_now(
@@ -1210,7 +1215,19 @@ unsafe extern "C" fn fast_clock_now(
     handle: i32,
     trap_out: *mut i64,
 ) -> i64 {
-    fast_dispatch(ctx, svm_interp::iface::CLOCK, 0, handle, &[], trap_out)
+    let host = &mut *(ctx as *mut Host);
+    match host.fast_clock_now(handle) {
+        Some(Ok(ns)) => {
+            *trap_out = 0;
+            ns
+        }
+        Some(Err(_)) => {
+            *trap_out = TrapKind::CapFault as i64;
+            0
+        }
+        // A W1 tape is active — take the full path so the input is recorded/replayed.
+        None => fast_dispatch(ctx, svm_interp::iface::CLOCK, 0, handle, &[], trap_out),
+    }
 }
 
 /// `Blocking.work(a0) -> i64` (iface 10, op 0, one arg) on the fast path.

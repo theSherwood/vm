@@ -328,40 +328,33 @@ small coverage win.)
 
 ---
 
-### I12 — the §9/D45 "fast" `cap.call` resolver shares the generic host dispatch, so it barely speeds up cheap caps (S4) — found via the `cap_call` bench
+## Resolved
 
-**Where:** `crates/svm-run/src/lib.rs` — `fast_dispatch` (the body behind `fast_clock_now` /
-`fast_blocking_work`, installed by `fast_cap_resolver`).
+### I12 — the §9/D45 `cap.call` fast path left ~9× on the table for cheap caps by re-entering the generic host dispatch (S4) — fixed on `claude/perf-i11-i12`
 
-**Symptom.** `cap_call` (`crates/svm-llvm/examples/cap_call.rs`) measures a `Clock.now()` (0-arg) cap
-loop on the JIT both ways: the generic `cap_thunk` and the D45 fast resolver `run_powerbox` wires by
-default. They are **within ~2%** (~49 vs ~48 ns/call) — the "devirtualized register-to-register fast
-path" is essentially a wash for this cap.
+**Was:** `cap_call` first reported the JIT generic and "fast" (`fast_cap_resolver`) paths as **within
+~2%** — but that was a *benchmark artifact*: the probe's `cap.call` passed a stray arg, so it didn't
+match the resolver's claimed `(CLOCK, 0, n_args=0, ...)` and silently ran the generic path *both* times.
+With a correct **0-arg** `Clock.now()` call the fast path was already **~1.7×** generic (53→31 ns,
+the JIT-side marshalling saving) — but the host side still re-entered `Host::cap_dispatch_slots`, which
+for a cheap cap is dominated by the per-call `Vec` result allocation + the W1 record/replay gate.
 
-**Root cause.** D45 removes the *JIT-side* cost (the generic `cap_thunk`'s arg marshalling + window
-pointer setup) by calling the resolver's fn with register args. But that fn (`fast_dispatch`) then
-drives **the same `Host::cap_dispatch_slots`** the generic path uses — by design, "so the authority
-check + semantics are identical." For a cheap cap (clock = a slot lookup + a field read), that shared
-host-side dispatch (handle/authority check, binding match, result marshalling) is essentially the
-*entire* ~48 ns, and both paths pay it — so the JIT-side saving D45 removes is negligible. The fast
-path would help more for **arg-heavy** caps (bigger marshalling saving) — untested here — but for the
-hot, cheap caps it targets, it currently doesn't.
+**Fix (landed):** a new `Host::fast_clock_now(handle) -> Option<Result<i64, Trap>>` (svm-interp) does
+the authority check (`resolve`, identical to the generic path — a forged/closed/wrong-type handle is an
+inert `CapFault`) and the read+advance **inline**, returning the `i64` with no `Vec`. It returns `None`
+when a W1 record/replay tape is active, so `svm_run::fast_clock_now` falls back to the full
+`cap_dispatch_slots` and the clock crossing is still taped/served faithfully (the clock is a recorded
+nondeterministic input). Net: `Clock.now()` on the fast path drops **31 → 5.7 ns** (a further ~5.5×),
+so the fast path is now **~9× cheaper than generic** end-to-end.
 
-**Impact.** Cap-chatty / IO-poll-heavy guests don't get the cap.call speedup the fast resolver was
-meant to provide. Not a correctness issue (semantics/authority identical) — hence S4 — but it's the one
-concrete *perf* lever the benchmark slices surfaced.
-
-**Fix sketch (bounded):** make the hot fast-handlers do the work **inline** rather than re-entering the
-generic slot dispatch — e.g. `fast_clock_now` validates the handle against the granted clock slot and
-reads/advances `host.clock_ns` directly, skipping the general `(type_id, op)` match + binding dispatch
-in `cap_dispatch_slots`. The authority check must be replicated exactly (the resolver is only installed
-for the claimed `(type_id, op)`, so the per-handle check is the only guard left to preserve). Re-run
-`cap_call` to confirm the fast row drops below generic. (Keep the generic path as the correctness
-fallback / the oracle the inline handler is differentially checked against.)
+**Verification.** `cap_call` now shows jit-generic ≈ 54 ns vs jit-fast ≈ 5.7 ns. New
+`crates/svm-run/tests/fast_cap.rs` pins interp == generic-JIT == fast-JIT on a 0-arg clock delta and
+that a forged handle still faults; the interp↔JIT differential (`svm/tests/jit_diff.rs`, 54),
+`jit_quota` (fast-resolver path), and all `svm-run`/`svm-durable` clock tests stay green. (`Blocking.work`
+still uses the shared `fast_dispatch` — it's arg-bearing and rarer; same inline treatment is a future
+follow-up if it shows up hot.)
 
 ---
-
-## Resolved
 
 ### I10 — ordinary `clang -O2` auto-vectorized loops hit two narrow holes in the vector breadth (S3) — fixed on `claude/bench-alu-hygiene`
 
