@@ -309,12 +309,21 @@ impl Domain {
         self.concurrent_durable.store(true, Ordering::Release);
     }
 
-    /// True on a concurrent multi-worker durable run (4A.5). A worker observing a freeze takes the
-    /// quiesce path ([`Self::quiesce_arrive`]) only when this holds; otherwise it unwinds directly on
-    /// the (uncontended) active-SP word exactly as today.
-    #[allow(dead_code)] // wired live by 4A.5
+    /// True on a concurrent multi-worker durable run (4A.5). `thread_spawn` reserves a per-context
+    /// shadow context for a child spawned during NORMAL (so a later freeze makes it self-unwind into its
+    /// own region); `run_child` seeds the durable shadow-base register and records freeze residue. Off
+    /// on every existing path, so they are byte-identical.
     pub(crate) fn is_concurrent_durable(&self) -> bool {
         self.concurrent_durable.load(Ordering::Acquire)
+    }
+
+    /// Engage the concurrent durable path (§12.8 4A.5 stage ii) for a freezable multi-vCPU run. Set once
+    /// at run setup, before any child is spawned. The coordinator joins concurrent children via the
+    /// existing `join_all` (each child's freeze-unwind into its own per-context region completes its OS
+    /// thread); no shared active-SP word and no quiesce lock — the per-context relocation (stage i)
+    /// made that serialization unnecessary.
+    pub(crate) fn engage_concurrent_durable(&self) {
+        self.concurrent_durable.store(true, Ordering::Release);
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
@@ -421,6 +430,23 @@ extern "C" fn child_entry(
 
 /// What a spawned OS thread runs: set up its own fiber runtime (for `cont.*`), arm the guard, call the
 /// guest entry, then publish the result/trap into its completion cell.
+/// §12.8 4A.5 stage (ii): a **concurrent durable** child's per-context durability state. Present only
+/// when a freezable (interruptible) durable run spawns a child as a real OS thread during NORMAL — the
+/// child reserves its own top-down shadow context up front so it can self-unwind into it if a freeze
+/// fires mid-run. `None` on non-durable / single-worker / deferred spawns.
+struct DurableChild {
+    /// Global task id (monotonic spawn order; matches the interp + the deferred path), recorded in the
+    /// child's `FrozenVCpu` residue.
+    task: u64,
+    /// The spawning task (`parent_task`) — the root (`0`) for a flat spawn.
+    parent: u64,
+    /// The reserved top-down shadow context the child unwinds into (kept on a freeze-unwind so a thaw
+    /// re-spawns it there; freed on a genuine finish).
+    ctx: usize,
+    /// The child's entry function index — recorded in its residue so a thaw re-spawns it.
+    func_idx: u32,
+}
+
 struct SpawnArgs {
     env: Env,
     code: u64,
@@ -429,6 +455,8 @@ struct SpawnArgs {
     /// §12 dense vCPU id seeded into this child's per-vCPU TLS register (`vcpu.tls`). Root is 0, so a
     /// spawned vCPU takes `handle + 1` (handles are 0-based, cumulative spawn order).
     vcpu_id: i64,
+    /// §12.8 4A.5 stage (ii): present on a concurrent durable child (see [`DurableChild`]).
+    durable_child: Option<DurableChild>,
     done: std::sync::Arc<Done>,
     /// The owning [`Domain`] — so this vCPU can drop its §15 concurrent-live count when it finishes.
     /// The domain outlives every spawned thread (`run_inner` joins them at run end), so the pointer
@@ -463,6 +491,13 @@ fn run_child(a: SpawnArgs) {
     let env = a.env;
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
+    // §12.8 4A.5 stage (ii): a concurrent durable child seeds its durable shadow-base register to its
+    // own region, so if a freeze fires its instrumented code spills into *its* per-context SP word
+    // (concurrent with siblings, no shared word). NORMAL never reads the SP word, so this is inert
+    // until a freeze.
+    if let Some(dc) = &a.durable_child {
+        crate::durable_shadow::seed(fiber_rt::shadow_region_base(dc.ctx));
+    }
     // Arm this OS thread's detect-and-kill recovery (idempotent; handler is process-wide, recovery is
     // thread-local — §5 / `mem::install_guard`).
     mem::install_guard();
@@ -516,6 +551,29 @@ fn run_child(a: SpawnArgs) {
         let t = unsafe { load_trap(env.trap_out) };
         (call.ret, t)
     };
+    // §12.8 4A.5 stage (ii): if this concurrent durable child observed a freeze, its instrumented code
+    // has now unwound into *its own* region; record its `FrozenVCpu` residue (extent = its region's
+    // shadow-SP word) so the coordinator's snapshot (taken after `join_all`) captures its continuation,
+    // and keep its context for the thaw to re-spawn it there. A genuine finish (no freeze) frees the
+    // context for reuse. SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
+    if let Some(dc) = &a.durable_child {
+        let froze = !faulted && unsafe { fiber_rt::window_is_unwinding(env.mem_base) };
+        if froze {
+            let region = fiber_rt::shadow_region_base(dc.ctx);
+            let extent = unsafe { fiber_rt::read_shadow_sp(env.mem_base, region) };
+            unsafe {
+                lock(&(*a.dom).frozen_vcpus).push(crate::FrozenVCpu {
+                    task: dc.task as usize,
+                    parent_task: dc.parent as usize,
+                    func: dc.func_idx as i32,
+                    args: vec![a.sp as i64, a.arg as i64],
+                    shadow_sp: extent,
+                });
+            }
+        } else if let Some(table) = unsafe { (*a.dom).fiber_table() } {
+            table.free_vcpu_context(dc.ctx);
+        }
+    }
     // §5 W3 Stage 3: if this spawned vCPU trapped, hand its trap-time backtrace capture (the SIGSEGV
     // handler's, or the explicit-trap helper's — both in this thread's `trap_shim.c` thread-local) to
     // the domain before this worker ends, else it would be lost and the run thread couldn't symbolize
@@ -568,6 +626,42 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     if env.durable && fiber_rt::window_is_durable_active(env.mem_base) {
         return defer_spawn(dom, code, func_idx, sp, arg, trap_out);
     }
+    // §12.8 4A.5 stage (ii): on a freezable (interruptible) durable run, a child spawned during NORMAL
+    // runs as a real OS thread but reserves its own top-down shadow context now, so a later freeze can
+    // make it self-unwind into its own per-context SP word (concurrent, lock-free — stage i). Its global
+    // task id matches the interp/deferred path (seeded into `vcpu.tls`). `None` on every existing path,
+    // so behavior is unchanged there.
+    let durable_child = if env.durable && dom.is_concurrent_durable() {
+        let table = match dom.fiber_table() {
+            Some(t) => t,
+            None => {
+                store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                return -1;
+            }
+        };
+        let ctx = match table.reserve_vcpu_context() {
+            Some(c) => c,
+            None => {
+                store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                return -1;
+            }
+        };
+        let parent = *lock(&dom.cur_task);
+        let task = {
+            let mut nt = lock(&dom.next_task);
+            let t = *nt;
+            *nt += 1;
+            t
+        };
+        Some(DurableChild {
+            task,
+            parent,
+            ctx,
+            func_idx,
+        })
+    } else {
+        None
+    };
     let done = std::sync::Arc::new(Done {
         state: Mutex::new(None),
         cv: Condvar::new(),
@@ -577,18 +671,28 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         // §15: bound *concurrent* live vCPUs (root + unfinished spawns), not the cumulative handle
         // table — so a spawn-join loop never trips, matching the interpreter.
         if t.live >= dom.max_vcpus {
+            if let Some(dc) = &durable_child {
+                if let Some(table) = dom.fiber_table() {
+                    table.free_vcpu_context(dc.ctx);
+                }
+            }
             store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return -1;
         }
         let idx = t.cells.len();
         t.cells.push(std::sync::Arc::clone(&done));
         t.joined.push(false);
+        let vcpu_id = durable_child
+            .as_ref()
+            .map(|d| d.task as i64)
+            .unwrap_or(idx as i64 + 1); // dense id seed (root 0; children 1, 2, …)
         let args = SpawnArgs {
             env,
             code,
             sp,
             arg,
-            vcpu_id: idx as i64 + 1, // dense id seed (root 0; children 1, 2, …)
+            vcpu_id,
+            durable_child,
             done,
             dom: sched,
         };
@@ -604,7 +708,8 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                 idx as i32
             }
             Err(_) => {
-                // Out of OS threads: pop the cell we reserved and trap (no `live` change).
+                // Out of OS threads: pop the cell we reserved and trap (no `live` change). The child's
+                // reserved shadow context (if any) leaks for this run — a spawn failure aborts the run.
                 t.cells.pop();
                 t.joined.pop();
                 store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
