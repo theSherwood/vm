@@ -75,9 +75,9 @@ fn check(m: &svm_ir::Module, args: &[Value], seed: u64) -> bool {
     // scope); skip those, the result equality above already covers them.
     if interp.is_err() {
         let mut ft = 2_000_000u64;
-        let (tw_res, tw_bt) = run_traced(m, 0, args, &mut ft);
+        let (tw_res, tw_bt, _) = run_traced(m, 0, args, &mut ft);
         let mut fbt = 2_000_000u64;
-        if let Some((bc_res, bc_bt)) =
+        if let Some((bc_res, bc_bt, _)) =
             bytecode::compile_and_run_with_host_traced(m, 0, args, &mut fbt, &mut Host::new())
         {
             if !matches!(tw_res, Err(Trap::OutOfFuel)) && !matches!(bc_res, Err(Trap::OutOfFuel)) {

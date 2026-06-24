@@ -17,7 +17,7 @@ fn traced(src: &str, arg: Value) -> TracedRun {
     let m = parse_module(src).expect("parse");
     svm_verify::verify_module(&m).expect("verify");
     let mut fuel = u64::MAX;
-    let (res, bt) = run_traced(&m, 0, &[arg], &mut fuel);
+    let (res, bt, _) = run_traced(&m, 0, &[arg], &mut fuel);
     let frames = bt
         .iter()
         .map(|&pc| {

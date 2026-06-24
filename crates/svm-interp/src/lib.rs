@@ -207,14 +207,15 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     run_with_host(m, func, args, fuel, &mut host)
 }
 
+/// A traced run's outcome: the result, the **trap-time backtrace** (innermost frame first, as `IrPc`s;
+/// empty on a clean finish), and the **trapping fiber** (§5 W3 / §23-D57 — `Some(handle)` for a fiber,
+/// `Some(-1)` for the root, `None` on a clean finish). Returned by [`run_traced`] /
+/// [`run_with_host_traced`] and the `*_fast_traced` fast-path counterparts.
+pub type TracedRun = (Result<Vec<Value>, Trap>, Vec<IrPc>, Option<i64>);
+
 /// Like [`run`], but also return the guest's **trap-time backtrace** (innermost frame first, as
-/// `IrPc`s; empty on a clean finish) — see [`run_with_host_traced`].
-pub fn run_traced(
-    m: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+/// `IrPc`s; empty on a clean finish) and the trapping fiber — see [`run_with_host_traced`].
+pub fn run_traced(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> TracedRun {
     let mut host = Host::new();
     run_with_host_traced(m, func, args, fuel, &mut host)
 }
@@ -1715,9 +1716,9 @@ pub fn run_with_host_traced(
     args: &[Value],
     fuel: &mut u64,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+) -> TracedRun {
     if m.funcs.get(func as usize).is_none() {
-        return (Err(Trap::Malformed), Vec::new());
+        return (Err(Trap::Malformed), Vec::new(), None);
     }
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
@@ -1771,7 +1772,7 @@ pub fn run_with_host_fast_traced(
     args: &[Value],
     fuel: &mut u64,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+) -> TracedRun {
     if !host.is_durable() {
         if let Some(result) = bytecode::compile_and_run_with_host_traced(m, func, args, fuel, host)
         {
@@ -1783,12 +1784,7 @@ pub fn run_with_host_fast_traced(
 
 /// Capability-free [`run_with_host_fast_traced`] (an empty powerbox), the traced counterpart of
 /// [`run_fast`] — mirrors [`run_traced`] on the fast path.
-pub fn run_fast_traced(
-    m: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+pub fn run_fast_traced(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> TracedRun {
     let mut host = Host::new();
     run_with_host_fast_traced(m, func, args, fuel, &mut host)
 }
@@ -1805,7 +1801,7 @@ fn drive(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+) -> TracedRun {
     let funcs: Arc<[Func]> = funcs.to_vec().into();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -2015,11 +2011,11 @@ fn drive(
         h.quiesce_pool();
         h.clear_async_notify();
     }
-    let out = sched
-        .lock()
-        .results
-        .remove(&root_id)
-        .expect("root vCPU finished");
+    let (out, trap_origin) = {
+        let mut s = sched.lock();
+        let out = s.results.remove(&root_id).expect("root vCPU finished");
+        (out, s.trap_origin.take())
+    };
     *fuel = out.fuel;
     *mem = out.mem;
     // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is uniquely
@@ -2028,7 +2024,11 @@ fn drive(
         .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    (out.result, out.trap_bt)
+    // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
+    // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
+    // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
+    let (trap_bt, trap_fiber) = trap_origin.unwrap_or((out.trap_bt, out.trap_fiber));
+    (out.result, trap_bt, trap_fiber)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -2073,7 +2073,7 @@ pub fn run_capture_reserved(
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -2110,7 +2110,7 @@ pub fn run_capture_reserved_with_host(
         mm.init_data(&m.data);
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -2172,7 +2172,7 @@ pub fn run_capture_reserved_with_host_prots(
         }
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
         .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
@@ -2207,7 +2207,7 @@ pub fn run_capture_sub(
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_parent(parent_bytes))
@@ -3222,6 +3222,23 @@ struct Outcome {
     /// §5 / W3, the interpreter counterpart to the JIT's `last_trap_backtrace`). Empty on a clean
     /// finish. Resolved to source by the run wrapper via [`source_loc`]; host-side, off the hot path.
     trap_bt: Vec<IrPc>,
+    /// The guest **fiber handle** running on this vCPU when it trapped (§5 W3 / §23-D57 per-fiber
+    /// attribution, the interpreter counterpart to the JIT's `last_trap_fiber`): `Some(handle)` for a
+    /// trap inside a fiber, `Some(-1)` for the root computation (no fiber), `None` on a clean finish.
+    /// The handle uses the cross-backend `(generation << FIBER_GEN_SHIFT) | slot` encoding, so it
+    /// compares equal to the JIT's for the same fiber.
+    trap_fiber: Option<i64>,
+}
+
+/// The trapping vCPU's running-fiber handle for [`Outcome::trap_fiber`]: `-1` when the root is running
+/// (no fiber), else the running fiber's guest handle (slot + live generation). Only meaningful at a
+/// trap — call when `result.is_err()`.
+fn trap_fiber_of(v: &VCpu) -> i64 {
+    if v.cur == ROOT_FIBER {
+        -1
+    } else {
+        fiber_handle(v.cur, v.registry.generation(v.cur))
+    }
 }
 
 /// The `IrPc`s of `frames`, innermost frame first — the shape [`Outcome::trap_bt`] captures at a trap.
@@ -3337,6 +3354,13 @@ struct Sched {
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
+    /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
+    /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
+    /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
+    /// outcome would name the join site, not the origin. `drive` reads this instead, so the trap
+    /// diagnostic names *where the guest actually trapped* — the interpreter counterpart to the JIT's
+    /// `Domain` trap-capture handoff. `None` on a clean run.
+    trap_origin: Option<(Vec<IrPc>, Option<i64>)>,
 }
 
 impl Scheduler {
@@ -3573,14 +3597,23 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             } else {
                 Vec::new()
             };
+            let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
             let outcome = Outcome {
                 result,
                 mem: v.mem.take(),
                 fuel: v.fuel,
                 trap_bt,
+                trap_fiber,
             };
             drop(v);
             let mut s = sched.lock();
+            // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
+            // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
+            // true origin. A clean finish leaves it untouched.
+            if outcome.result.is_err() {
+                s.trap_origin
+                    .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
+            }
             if let Some(parent) = s.join_waiters.remove(&id) {
                 s.runnable.push_back(parent);
                 sched.work.notify_one();
@@ -4016,11 +4049,13 @@ impl SchedDriver {
                     } else {
                         Vec::new()
                     };
+                    let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
                     let outcome = Outcome {
                         result,
                         mem: v.mem.take(),
                         fuel: v.fuel,
                         trap_bt,
+                        trap_fiber,
                     };
                     drop(v);
                     let mut s = det.lock();

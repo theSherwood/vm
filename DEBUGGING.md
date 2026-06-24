@@ -471,9 +471,41 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   backtrace: `powerbox_compile_run` plumbs `last_trap_backtrace()` out and `run_powerbox*` appends a
   `file:line:col (fn N)` block to the `guest trapped (…)` error. *Tests:* a `thread.spawn`ed worker's
   div-by-zero is attributed to the worker's div line; a powerbox div-by-zero's kill message names the
-  source. *Remaining:* per-**fiber** naming under work-stealing migration (§23/D57) — the capture is
-  vCPU-thread-rooted, not yet fiber-rooted; and matching the *exact* killing trap under racing
-  concurrent traps (today: last-wins, any trapping frame's chain is a valid kill backtrace).
+  source.
+- [x] **Stage 4 — per-fiber attribution under migration (§23/D57).** The capture was vCPU-thread-rooted,
+  so a work-stealing-migrated fiber (which may resume on a different vCPU thread than it suspended on)
+  couldn't be *named*. Now the fiber runtime publishes the **running fiber handle** into a shared
+  `trap_capture.c` thread-local across the resume seam (`svm_set_current_fiber`, save/restore-bracketed
+  around `(*fib).resume` exactly like the durable shadow-SP swap — stack-disciplined for nested
+  resumes), and every capture path stashes it: unix memory-fault (`svm_store_trap_frame`) + explicit
+  (`svm_capture_explicit_trap`) read it directly, the Windows VEH snapshots it (`svm_current_fiber`).
+  It rides through `take_trap_frame` → the `Domain` handoff → `CompiledModule::last_trap_fiber()`
+  (`Some(handle)` for a fiber, `Some(-1)` for the root, `None` on a clean run), and the kill message
+  names it (`… [fiber N] …`). Captured *at the trap instant*, so migration can't misattribute it — the
+  thread no longer identifies the fiber, but the published handle does. The **interpreter** reports the
+  same attribution (it's single-OS-thread M:N, so it always knows the running fiber): `run_traced` now
+  returns the trapping fiber as a third field (`Outcome::trap_fiber`, `trap_fiber_of` = the trapping
+  vCPU's `cur` fiber handle or `-1`). Fiber handles are cross-backend-identical (`(generation <<
+  FIBER_GEN_SHIFT) | slot`), so the two engines must agree — which is the **interp↔JIT differential**
+  that validates the JIT's at-the-trap-instant capture against the oracle. *Tests*
+  (`jit_per_fiber_trap.rs`, unix — interp vs JIT for each): a div-by-zero in a resumed fiber → that
+  fiber's handle (and still names the div line); a **nested** resume (root → A → B) → the innermost
+  fiber B, pinning the resume-seam save/restore discipline; a root trap → `-1`; a clean run → `None`.
+  (The JIT capture is `-g`-gated, so a trapping differential program carries `-g`; the interpreter
+  reifies frames regardless.)
+- [x] **Stage 5 — multi-vCPU trap origin (the interpreter side of Stage 3).** A trap on a
+  `thread.spawn`ed worker propagates to its `thread.join`er as a bare `Err(Trap)` — the parent re-traps
+  with *its* frames at the join — so the interpreter's run outcome named the *join site*, not where the
+  guest actually trapped (the JIT already reported the origin via the `Domain` capture handoff). The
+  interpreter now matches via a run-shared **first-wins trap-origin cell** (`Sched::trap_origin`): the
+  first vCPU to trap on its own op records its backtrace + fiber, and `run_traced` reports that instead
+  of the root's own outcome — the interpreter counterpart of the JIT's `root_trap_cap.or(worker_trap_cap)`.
+  First-wins also makes the reported `(backtrace, fiber)` self-consistent (from a single trap event)
+  under racing concurrent traps, rather than two independently last-wins fields. *Tests*
+  (`multivcpu_trap_origin.rs`, interp↔JIT differential): a worker div-by-zero names the worker's origin
+  line (not the join site), and the interpreter and JIT agree on the origin frame + fiber. *Remaining:*
+  picking the *exact* killing trap when several race simultaneously (first-wins on the interp,
+  last-wins on the JIT — both report *a* valid trapping frame's chain, not necessarily the same one).
 
 **Trust/TCB.** Pure host-side observability, off the runtime hot path and the escape-TCB: a wrong
 backtrace mis-renders a kill message, never affects confinement. The capture stays async-signal-safe

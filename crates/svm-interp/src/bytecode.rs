@@ -1191,9 +1191,10 @@ pub fn compile_and_run_with_host(
     Some(run(dom, func, args, fuel, &mut mem, host))
 }
 
-/// A run result paired with its trap-time backtrace (innermost frame first, as [`crate::IrPc`]s;
-/// empty on a clean finish) — what [`compile_and_run_with_host_traced`] returns.
-pub type TracedRun = (Result<Vec<Value>, Trap>, Vec<super::IrPc>);
+/// What [`compile_and_run_with_host_traced`] returns — the shared traced-run shape (result + trap-time
+/// backtrace + trapping fiber). The single-step path is root-only, so its fiber is `-1` (a trap) or
+/// `None` (clean); a fibered run is a seam it declines, so the tree-walker reports the real handle.
+pub type TracedRun = super::TracedRun;
 
 /// Trap-time-backtrace counterpart of [`compile_and_run_with_host`] — the bytecode mirror of the
 /// tree-walker's [`crate::run_with_host_traced`]. Drives the entry **one op at a time** (the proven
@@ -1218,22 +1219,25 @@ pub fn compile_and_run_with_host_traced(
 ) -> Option<TracedRun> {
     let c = compile_module(&m.funcs)?;
     if func as usize >= c.progs.len() {
-        return Some((Err(Trap::Malformed), Vec::new()));
+        return Some((Err(Trap::Malformed), Vec::new(), None));
     }
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
     let mut vm = match Vm::new(&dom.mods[0], func as usize, args) {
         Ok(v) => v,
-        Err(e) => return Some((Err(e), Vec::new())),
+        Err(e) => return Some((Err(e), Vec::new(), None)),
     };
     loop {
         match vm.resume(&dom.mods, &dom.table, fuel, &mut mem, host, 1) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
-            Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new())),
+            Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new(), None)),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
             Err(t) => {
                 let bt = vm_trap_bt(&vm, &dom.mods, &t);
-                return Some((Err(t), bt));
+                // This single-step path only ever drives the **root** (a fiber/thread op is a seam →
+                // the `Ok(_)` arm above bails to the tree-walker), so a trap here is always the root —
+                // attributed `-1`, matching the JIT's root-trap convention.
+                return Some((Err(t), bt, Some(-1)));
             }
         }
     }

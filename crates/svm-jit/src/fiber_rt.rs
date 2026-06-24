@@ -71,6 +71,13 @@ fn current() -> *mut FiberRuntime {
     CURRENT_RT.with(|c| c.get())
 }
 
+extern "C" {
+    /// Publish the guest fiber handle now running on this thread into the shared `trap_capture.c`
+    /// thread-local (per-fiber trap attribution, §5 W3 / §23-D57); returns the previous value so the
+    /// resume seam can restore it. A no-op on the trap path until something traps — just a TLS store.
+    fn svm_set_current_fiber(handle: i64) -> i64;
+}
+
 /// Max concurrently-allocated fibers per run (matches the interpreter's `MAX_FIBERS`): an anti-bomb
 /// ceiling so a fiber-bomb traps (`FiberFault`) instead of exhausting host memory.
 const MAX_FIBERS: usize = 1 << 16;
@@ -808,10 +815,17 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     } else {
         None
     };
+    // Per-fiber trap attribution (DEBUGGING.md §5 W3 / §23-D57): publish this fiber as the one running
+    // on this thread, so a trap inside the switch below is captured against *its* handle (the C
+    // `trap_capture` reads the current-fiber TLS at the trap instant), and restore the resumer (root or
+    // an outer fiber) when the resume returns. Stack-disciplined across nested resumes, mirroring the
+    // durable shadow-SP bracket above — so a migrated fiber is named by identity, not by thread.
+    let prev_fiber = svm_set_current_fiber(fiber_handle(slot_idx, slot.own.generation()));
     // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
     // `*fib` exclusive to this vCPU. The same `svm-fiber` instruction sequence regardless of which
     // thread the fiber last ran on (see the module header's 3c soundness argument).
     let st = (*fib).resume(arg as u64);
+    svm_set_current_fiber(prev_fiber);
     // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
     // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region (+ register).
     if let Some((resumer, resumer_region)) = resumer {

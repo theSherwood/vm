@@ -2300,7 +2300,7 @@ unsafe fn powerbox_compile_run(
     interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
     quota: svm_jit::Quota,
     init_mem: Option<&[u8]>,
-) -> Result<(JitOutcome, Vec<JitFrameLoc>), svm_jit::JitError> {
+) -> Result<(JitOutcome, Vec<JitFrameLoc>, Option<i64>), svm_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
     if let Some(m) = locked {
         let ctx = m as *const Mutex<Host> as *mut c_void;
@@ -2324,9 +2324,10 @@ unsafe fn powerbox_compile_run(
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(0);
-        // §5 W3 — carry the trap-time source backtrace out (empty unless the guest trapped and the
-        // module carried `-g`), so the kill message can name where the guest was.
-        return r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec()));
+        // §5 W3 — carry the trap-time source backtrace + trapping fiber (§23-D57) out (empty/`None`
+        // unless the guest trapped and the module carried `-g`), so the kill message can name *which
+        // fiber* was *where*.
+        return r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec(), cm.last_trap_fiber()));
     }
     let mut cm = CompiledModule::compile(
         module,
@@ -2345,7 +2346,7 @@ unsafe fn powerbox_compile_run(
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
     host.set_jit_native_ctx(0);
-    r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec()))
+    r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec(), cm.last_trap_fiber()))
 }
 
 /// Run `module`'s entry (function 0) on the JIT under the MVP powerbox (§3e): a writable
@@ -2569,7 +2570,7 @@ fn run_powerbox_inner(
         let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
         let _ = handle.join();
     }
-    let (jit, backtrace) = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
+    let (jit, backtrace, trap_fiber) = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
 
     let outcome = match jit {
         JitOutcome::Returned(s) => {
@@ -2579,9 +2580,14 @@ fn run_powerbox_inner(
         JitOutcome::Exited(code) => Outcome::Exited(code),
         JitOutcome::Trapped(kind) => {
             // §5 W3 — fold the trap-time source backtrace into the kill message (innermost frame
-            // first). Empty unless the module carried `-g`, in which case the message is unchanged.
+            // first), and name the trapping **fiber** (§23-D57) when one was running. Empty/absent
+            // unless the module carried `-g`, in which case the message is unchanged.
+            let who = match trap_fiber {
+                Some(h) if h >= 0 => format!(" [fiber {h}]"),
+                _ => String::new(), // root computation (-1) or a clean/un-`-g` run
+            };
             return Err(format!(
-                "guest trapped ({kind:?}) — detect-and-kill (§5){}",
+                "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
                 format_backtrace(&backtrace)
             ));
         }
