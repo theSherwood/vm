@@ -15,6 +15,9 @@
 //! them register/local-only sidesteps per-thread stack setup, which a real runtime would provide.
 
 #![no_std]
+// The wasm blocking-futex intrinsics (`memory_atomic_wait32`/`memory_atomic_notify`) are still
+// nightly-gated (rust-lang/rust#77839); this spike is already nightly + build-std, so opt in.
+#![feature(stdarch_wasm_atomic_wait)]
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicI32, Ordering};
@@ -73,4 +76,31 @@ pub extern "C" fn load(addr: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn store(addr: i32, v: i32) {
     cell(addr).store(v, Ordering::SeqCst);
+}
+
+// --- Cross-Worker **blocking futex** (THREADS.md step 4c-wasm) -----------------------------------
+// The foundational unknown for distributing one guest's vCPUs across Workers: does the real wasm
+// `memory.atomic.wait`/`notify` blocking futex work across OS threads, called from Rust? These thin
+// wrappers over the `core::arch::wasm32` intrinsics let the Node driver prove it (a consumer Worker
+// genuinely parks until a producer wakes it) before the engine's parallel driver relies on it.
+
+/// `memory.atomic.wait32`: block while the cell at `addr` equals `expected`, until woken by [`wake`]
+/// or `timeout_ns` elapses (negative = forever). Returns the wasm futex code: 0 = woken, 1 =
+/// not-equal (the value already differed — no park), 2 = timed out. Must run on a Worker, not the
+/// main thread (a non-blocking agent traps on wait).
+#[no_mangle]
+pub extern "C" fn wait_eq(addr: i32, expected: i32, timeout_ns: i64) -> i32 {
+    let p = addr as usize as *mut i32;
+    // SAFETY (spike): `p` is a host-provided, naturally-aligned cell in the shared memory; blocking
+    // futex wait on it is the whole point (a producer on another Worker wakes it via `wake`).
+    unsafe { core::arch::wasm32::memory_atomic_wait32(p, expected, timeout_ns) }
+}
+
+/// `memory.atomic.notify`: wake up to `count` waiters parked on the cell at `addr`; returns how many
+/// were actually woken.
+#[no_mangle]
+pub extern "C" fn wake(addr: i32, count: i32) -> i32 {
+    let p = addr as usize as *mut i32;
+    // SAFETY (spike): `p` is the same host-provided aligned shared cell the waiters parked on.
+    unsafe { core::arch::wasm32::memory_atomic_notify(p, count as u32) as i32 }
 }
