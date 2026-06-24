@@ -195,11 +195,12 @@ fn main() {
             println!("  {}: {}/{} match", s(m, "name"), cases.len() - bad, cases.len());
         }
     };
-    println!("[compute / fiber / tailcall / simd]");
-    run_compute_like(&mut vm, &mut sc, "compute", "svm_run");
+    println!("[compute / fiber / tailcall / simd / float]");
+    run_compute_like(&mut vm, &mut sc, "compute", "svm_run"); // incl. fail-closed `unsup`
     run_compute_like(&mut vm, &mut sc, "fiber", "svm_run");
     run_compute_like(&mut vm, &mut sc, "tailcall", "svm_run");
     run_compute_like(&mut vm, &mut sc, "simd", "svm_run");
+    run_compute_like(&mut vm, &mut sc, "float", "svm_run"); // scalar f32/f64, bit-exact
     println!("[reflection]");
     run_compute_like(&mut vm, &mut sc, "reflect", "svm_run_reflect");
 

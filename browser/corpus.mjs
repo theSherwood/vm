@@ -56,8 +56,9 @@ const runComputeLike = (list) => {
     console.log(`  ${name}: ${cases.length - bad}/${cases.length} match`);
   }
 };
-runComputeLike(corpus.compute);
+runComputeLike(corpus.compute); // includes the fail-closed `unsup` case (STATUS_UNSUPPORTED)
 runComputeLike(corpus.fiber ?? []);
+runComputeLike(corpus.float ?? []); // scalar f32/f64 — bit-exact (NaN payloads, rounding)
 runComputeLike(corpus.tailcall ?? []);
 runComputeLike(corpus.simd ?? []);
 
