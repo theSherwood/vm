@@ -297,35 +297,6 @@ hot loops are rare in real code, so this is low priority.
 
 ### I11 — on-ramp fails-closed on an auto-vectorized `<8 x i32>` shape the I2 legalizer doesn't cover (S3) — found via Embench `edn` — **FIX LANDED** on `claude/onramp-i11-wide-i32x8`
 
-**Where:** `crates/svm-llvm/src/lib.rs` — the I2 wide-vector legalization (`wide_vec_layout` / `lower_wide`
-and the per-op recognizers it dispatches through).
-
-**Symptom.** Translating Embench-IoT's `edn` (a DSP/FIR-filter kernel) compiled with plain `clang -O2
--emit-llvm` fails closed: `Error::Unsupported("type <8 x i32> (Milestone 1+)")`. The cross-engine
-Embench driver (`crates/svm-llvm/examples/embench.rs`) skips `edn` for this reason; the other kernels
-(`matmult-int`/`crc32`/`nettle-sha256`/`ud`/`nsichneu`) translate and run bit-exact.
-
-**What's going on.** I2 added fixed-128 chunk legalization for wider-than-128-bit vectors (`<8 x i32>`
-→ 2× `v128`) across loads/stores, lane arith, reductions, conversions, etc. — and the cross-engine
-`vadd`/`corpus_diff` SIMD all work. But `edn` produces a `<8 x i32>` in **some context the splitter
-doesn't reach** — most likely a specific op or value position (a wide constant, a particular
-`shufflevector`/reduction shape, or a wide value crossing a block edge in a form `lower_wide` doesn't
-rewrite) rather than the already-handled load/store/arith. So it's the I2 breadth's remaining tail, the
-same flavor as the (now-fixed) I10 holes: a clean fail-closed at *translate* — **not** a miscompile or
-soundness issue — hence S3.
-
-**Impact.** Real `-O2` programs whose vectorizer emits this shape can't run on any SVM engine until
-vectorization is disabled for that loop (`-fno-slp-vectorize` / `-fno-vectorize` sidesteps it). Narrow:
-4 of the other Embench kernels and the whole cross-engine/corpus suites vectorize fine.
-
-**Fix sketch (bounded, in the I2 style):** pin the exact failing op by dumping the `edn` bitcode
-(`clang -O2 -emit-llvm -S`) and finding the `<8 x i32>` the translator rejects, then extend the
-matching `lower_wide` arm / recognizer to split that shape into `v128` chunks + tail like the others.
-Add `edn` to the on-ramp translate tests once it lands. (Separately, the on-ramp has no `memcmp`/`bcmp`
-definition — `clang` emits those libcalls for array compares; the Embench wrapper supplies them in-module
-with `-fno-builtin-memcmp/-bcmp`. Providing them as on-ramp builtins, like `memcpy`/`memset`, would be a
-small coverage win.)
-
 **Fixed.** The pinned shape was a **wide lane-wise shift**: `edn`'s `vec_mpy` fixed-point kernel
 (`y[i] += (short)((scaler * x[i]) >> 15)`) auto-vectorizes to a `<8 x i32>` widening multiply followed
 by a `>>15` shift. I10 added 128-bit vector shifts but the **wide** legalizer's op dispatch had no
@@ -340,40 +311,110 @@ on-ramp builtins noted above (the other reason `edn` may need the Embench wrappe
 
 ---
 
-### I12 — the §9/D45 "fast" `cap.call` resolver shares the generic host dispatch, so it barely speeds up cheap caps (S4) — found via the `cap_call` bench
+### I13 — `<2 x i16>` "no-redundant-load" vector pattern miscompiled (soundness) — **fail-closed (stopgap landed)**, root fix pending — found via Embench `edn`/`fir_no_red_ld`
 
-**Where:** `crates/svm-run/src/lib.rs` — `fast_dispatch` (the body behind `fast_clock_now` /
-`fast_blocking_work`, installed by `fast_cap_resolver`).
+**STATUS:** the silent miscompile is **fail-closed** on `claude/perf-i11-i12` (a φ that carries a tiny
+all-tail sub-32-bit vector — ≤ 2 lanes of i8/i16 — now returns `Unsupported` instead of miscompiling,
+in `translate_function` right after `scan_func`). So the no-miscompile invariant is restored: `edn`
+*fail-closes* (skipped by the `embench` driver) rather than returning a wrong answer. The **root fix**
+(making the tiny-tail-lane representation correct so the pattern *translates*) is still open — see the
+fix sketch below. The guard is deliberately narrow: a 4-lane `<4 x i16>` φ (e.g. the Clay-UI demo's
+carried point vector) round-trips correctly and is untouched (`tests/translate.rs::demo_clay_vs_native`
+covers it); only the confirmed-broken 32-bit `<2 x i16>`/`<2 x i8>` carry is rejected.
 
-**Symptom.** `cap_call` (`crates/svm-llvm/examples/cap_call.rs`) measures a `Clock.now()` (0-arg) cap
-loop on the JIT both ways: the generic `cap_thunk` and the D45 fast resolver `run_powerbox` wires by
-default. They are **within ~2%** (~49 vs ~48 ns/call) — the "devirtualized register-to-register fast
-path" is essentially a wash for this cap.
 
-**Root cause.** D45 removes the *JIT-side* cost (the generic `cap_thunk`'s arg marshalling + window
-pointer setup) by calling the resolver's fn with register args. But that fn (`fast_dispatch`) then
-drives **the same `Host::cap_dispatch_slots`** the generic path uses — by design, "so the authority
-check + semantics are identical." For a cheap cap (clock = a slot lookup + a field read), that shared
-host-side dispatch (handle/authority check, binding match, result marshalling) is essentially the
-*entire* ~48 ns, and both paths pay it — so the JIT-side saving D45 removes is negligible. The fast
-path would help more for **arg-heavy** caps (bigger marshalling saving) — untested here — but for the
-hot, cheap caps it targets, it currently doesn't.
 
-**Impact.** Cap-chatty / IO-poll-heavy guests don't get the cap.call speedup the fast resolver was
-meant to provide. Not a correctness issue (semantics/authority identical) — hence S4 — but it's the one
-concrete *perf* lever the benchmark slices surfaced.
+**Where:** `crates/svm-llvm/src/lib.rs` — the sub-128 / all-tail vector handling for **2-lane 16-bit
+vectors** (`<2 x i16>`, and the `<4 x i16>` they're shuffled from): `vec_explode`/`vec_implode`,
+`ShuffleVector`/`InsertElement` in the normal path, and a cross-block `<2 x i16>` phi.
 
-**Fix sketch (bounded):** make the hot fast-handlers do the work **inline** rather than re-entering the
-generic slot dispatch — e.g. `fast_clock_now` validates the handle against the granted clock slot and
-reads/advances `host.clock_ns` directly, skipping the general `(type_id, op)` match + binding dispatch
-in `cap_dispatch_slots`. The authority check must be replicated exactly (the resolver is only installed
-for the claimed `(type_id, op)`, so the per-handle check is the only guard left to preserve). Re-run
-`cap_call` to confirm the fast row drops below generic. (Keep the generic path as the correctness
-fallback / the oracle the inline handler is differentially checked against.)
+**Symptom (S2 — silent miscompile, not fail-closed).** With I11 landed, Embench `edn` now *translates*
+but returns a wrong answer: `verify_benchmark` = 1 native vs 0 on **all three** SVM engines (so the bug
+is in translation, not an engine). Bisected to **`fir_no_red_ld`** (the FIR variant that carries a
+loaded sample across iterations to avoid a redundant load); `fir` and `jpegdct` — which use the *same*
+`<4 x i16>` deinterleave shuffles — are correct, so it's specific to this pattern, not the shape alone.
+`edn` compiled `-fno-vectorize` is correct, confirming it's the vectorized translation.
+
+**The pattern (from `fir_no_red_ld`'s `-O2` IR).** A `<2 x i16>` carried across the loop backedge:
+`insertelement <2 x i16> poison, i16 %s, 1` (lane 0 left undef) → loop phi `<2 x i16>` →
+`shufflevector <2 x i16> %prev, <2 x i16> %cur, <i32 1, i32 2>` (recombine: take lane 1 of the carried
+value, lane 0 of the new) → `sext <2 x i16> → <2 x i32>` → `mul` → `sext → <2 x i64>` →
+`add` → `llvm.vector.reduce.add.v2i64`. `<2 x i16>` is **not** a `vec2` (that's `<2 x i32>`/`<2 x float>`
+only) and not a `v128`, so it takes the all-tail `wide_vec_layout` path (0 chunks, 2 tail lanes of an
+`i16x8` shape). Something in that path — most likely how a single i16 tail lane survives
+`insertelement`/`shufflevector`/the cross-block phi (width/sign of the lane "container"), or the
+explode→implode round-trip for the recombine shuffle — drops or corrupts a lane.
+
+**Impact (before the stopgap).** This was the on-ramp's worst failure mode — a **silent miscompile**
+violating the fail-closed contract. It is **pre-existing and independent of I11**: `fir_no_red_ld` uses
+no wide shifts, so it would miscompile on `main` too once reached; I11 merely let the *whole* `edn`
+translate far enough to hit it. Narrow in practice (this exact carried-`<2 x i16>` shape). The stopgap
+above converts it to a clean fail-close; the `embench` driver also still excludes a *runtime* MISMATCH
+from the geomean as a backstop.
+
+**Root-fix sketch (needs care — soundness; the stopgap only fail-closes):** reproduce minimally (the
+bisection harness: include `src/edn/libedn.c`, call only `fir_no_red_ld` on a seeded buffer, diff interp
+vs native — both via `bench/embench`), then dump the **SVM IR** the translator emits and compare against
+the scalar form. The lane corruption is *not* the lane count alone (the 4-lane `<4 x i16>` φ works), so
+it's specific to the 32-bit 2-lane carry — likely how a 16-bit tail lane round-trips through
+`insertelement`-into-poison + the cross-block φ fan-out + the `<1,2>` recombine `shufflevector`'s
+explode→implode (width/sign of the i32 lane "container"). Fix the representation so a 16-bit lane is
+lossless there, then narrow/remove the fail-close guard. A differential fuzz over small i8/i16 vectors
+(interp vs JIT vs a scalar oracle) would catch the whole class and guard against regressions.
 
 ---
 
 ## Resolved
+
+### I11 — on-ramp fail-closed on auto-vectorized **wide vector shifts** (`shl`/`lshr`/`ashr` on `<8 x i32>`) (S3) — fixed on `claude/perf-i11-i12`
+
+**Was:** a plain `clang -O2 -mavx2` (or `-O2` with interleave) program whose vectorizer emits a wide
+integer shift — e.g. Embench `edn`'s `lshr <8 x i32> v, <i32 15, …>` — fail-closed at translate with
+`Unsupported("type <8 x i32> …")`. The I2 legalization split wide loads/stores/arith/reductions/
+conversions into `v128` chunks, but `lower_wide` had **no arm for shifts**, so a wide `Shl`/`LShr`/`AShr`
+fell through to the normal `bin()` path, which only handles a single `v128` and rejected the 256-bit type.
+
+**Fix (landed):** a `wide_shift` helper (mirroring `wide_int_binop`) splits a wide constant-splat shift
+into one `VShift` per `v128` chunk + a scalar shift per tail lane, dispatched from new
+`I::Shl`/`I::LShr`/`I::AShr` arms in `lower_wide`. The amount is taken from the constant splat (the shape
+the auto-vectorizer emits; a non-uniform amount stays fail-closed, as in the v128 path). Verified by
+`simd_autovec_avx2_wide_shifts` in `tests/translate.rs` (interp == JIT == native on a mixed
+logical/arithmetic `<8 x i32>` shift) and a 10-op wide-op isolation sweep (shifts/sext/zext/trunc/
+reduction/i16 — all bit-exact).
+
+**Note:** this unblocked `edn`'s *shift* op, but `edn` as a whole still fails — it additionally trips
+the **I13** `<2 x i16>` miscompile in `fir_no_red_ld`. (Separately, the on-ramp has no `memcmp`/`bcmp`
+builtin — `clang` emits those for array compares; the Embench wrapper supplies them in-module with
+`-fno-builtin-memcmp/-bcmp`. Providing them as on-ramp builtins, like `memcpy`/`memset`, is a small
+coverage win.)
+
+---
+
+### I12 — the §9/D45 `cap.call` fast path left ~9× on the table for cheap caps by re-entering the generic host dispatch (S4) — fixed on `claude/perf-i11-i12`
+
+**Was:** `cap_call` first reported the JIT generic and "fast" (`fast_cap_resolver`) paths as **within
+~2%** — but that was a *benchmark artifact*: the probe's `cap.call` passed a stray arg, so it didn't
+match the resolver's claimed `(CLOCK, 0, n_args=0, ...)` and silently ran the generic path *both* times.
+With a correct **0-arg** `Clock.now()` call the fast path was already **~1.7×** generic (53→31 ns,
+the JIT-side marshalling saving) — but the host side still re-entered `Host::cap_dispatch_slots`, which
+for a cheap cap is dominated by the per-call `Vec` result allocation + the W1 record/replay gate.
+
+**Fix (landed):** a new `Host::fast_clock_now(handle) -> Option<Result<i64, Trap>>` (svm-interp) does
+the authority check (`resolve`, identical to the generic path — a forged/closed/wrong-type handle is an
+inert `CapFault`) and the read+advance **inline**, returning the `i64` with no `Vec`. It returns `None`
+when a W1 record/replay tape is active, so `svm_run::fast_clock_now` falls back to the full
+`cap_dispatch_slots` and the clock crossing is still taped/served faithfully (the clock is a recorded
+nondeterministic input). Net: `Clock.now()` on the fast path drops **31 → 5.7 ns** (a further ~5.5×),
+so the fast path is now **~9× cheaper than generic** end-to-end.
+
+**Verification.** `cap_call` now shows jit-generic ≈ 54 ns vs jit-fast ≈ 5.7 ns. New
+`crates/svm-run/tests/fast_cap.rs` pins interp == generic-JIT == fast-JIT on a 0-arg clock delta and
+that a forged handle still faults; the interp↔JIT differential (`svm/tests/jit_diff.rs`, 54),
+`jit_quota` (fast-resolver path), and all `svm-run`/`svm-durable` clock tests stay green. (`Blocking.work`
+still uses the shared `fast_dispatch` — it's arg-bearing and rarer; same inline treatment is a future
+follow-up if it shows up hot.)
+
+---
 
 ### I10 — ordinary `clang -O2` auto-vectorized loops hit two narrow holes in the vector breadth (S3) — fixed on `claude/bench-alu-hygiene`
 
