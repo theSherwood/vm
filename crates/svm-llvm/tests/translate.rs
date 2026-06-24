@@ -1127,10 +1127,10 @@ fn computed_goto_phi_recovery_finds_operand_blockaddress() {
 
 /// `<setjmp.h>` non-local jump (`setjmp`/`longjmp` → the `SetJmp`/`LongJmp` core ops). Compiles `run`
 /// plus `int main(){return run(SEED);}` natively (real libc `setjmp`/`longjmp`) and on the on-ramp,
-/// asserting the **tree-walker** matches the native exit code. Interpreter-only: the JIT's native-stack
-/// `longjmp` is a later sub-slice, so it must cleanly bail `Unsupported` here (asserted) and the
-/// bytecode engine declines the module (→ tree-walker) — the engines stay in sync (no divergence;
-/// either correct or a clean decline). `run` returns a byte so the result survives the Unix exit code.
+/// asserting **all three engines** — tree-walker, bytecode, and JIT — match the native exit code. The
+/// JIT runs `setjmp`/`longjmp` via libc `_setjmp`/`_longjmp` inline from JITted code (LLVM.md §"JIT
+/// `longjmp`"); on a target without that runtime it declines cleanly and the interpreters cover it.
+/// `run` returns a byte so the result survives the Unix exit code.
 fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
     let Some(bc) = compile_to_bc(name, src) else {
         return;
@@ -1180,15 +1180,25 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
         "{name}: bytecode={bsvm} vs native cc={native}"
     );
 
-    // The JIT must cleanly decline (its native-stack longjmp is a later sub-slice) — not miscompile.
+    // The JIT runs setjmp/longjmp natively (libc `_setjmp`/`_longjmp` inline from JITted code, with a
+    // host-side `jmp_buf` table — LLVM.md §"JIT `longjmp`", Option B) on the targets where its runtime
+    // exists (`setjmp_rt` = unix among `fiber_rt`). It must agree with the interpreters + native. On a
+    // target without the runtime it declines cleanly (the interpreters above already proved
+    // correctness); either way it must never miscompile.
     let slots: Vec<i64> = full.iter().map(to_slot).collect();
-    assert!(
-        matches!(
-            svm_jit::compile_and_run(&module, 0, &slots),
-            Err(svm_jit::JitError::Unsupported(_))
-        ),
-        "{name}: the JIT should bail Unsupported on setjmp/longjmp (interp-only for now)"
-    );
+    match svm_jit::compile_and_run(&module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            let jsvm = s[0] as i32 as u8;
+            assert_eq!(jsvm, native, "{name}: JIT={jsvm} vs native cc={native}");
+        }
+        Ok(other) => panic!("{name}: unexpected JIT outcome {other:?} on a valid setjmp program"),
+        Err(svm_jit::JitError::Unsupported(_)) => {
+            eprintln!(
+                "note: {name} JIT declined setjmp/longjmp (no native-stack runtime on this target)"
+            );
+        }
+        Err(e) => panic!("{name}: JIT errored on setjmp/longjmp: {e:?}"),
+    }
 }
 
 #[test]
@@ -1220,6 +1230,36 @@ fn setjmp_longjmp_loop_and_deep_nesting() {
                  return counter & 0xff; }\n\
                int main(void){ return run(20); }";
     check_setjmp_vs_native("setjmp_loop", src, 20);
+}
+
+#[test]
+fn setjmp_value_live_across() {
+    // The returns-twice hazard (LLVM.md §"JIT `longjmp`"): a `volatile` automatic is live across the
+    // `setjmp` — modified before the `longjmp` and read after the re-entry. Per C a `volatile` auto is
+    // preserved across `longjmp`; clang spills it to the stack at `-O2`, so it rides in guest window
+    // memory and survives the native `_longjmp`. Result = (100 + n + 7) & 0xff. Byte-identical to native.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static void boom(int x){ longjmp(env, x); }\n\
+               int run(int n){ volatile int acc = 100; int r = setjmp(env); \
+                 if (r == 0){ acc += n; boom(7); return -1; } \
+                 return (acc + r) & 0xff; }\n\
+               int main(void){ return run(20); }";
+    check_setjmp_vs_native("setjmp_value_live", src, 20);
+}
+
+#[test]
+fn setjmp_nested_buffers() {
+    // Two distinct `jmp_buf`s (two host table slots): an inner `setjmp` then a `longjmp` to the
+    // **outer** buffer, skipping the inner — exercises keying by buffer address and a longjmp that
+    // crosses a frame holding a *different* live checkpoint. `setjmp(outer)` re-enters with 9 → 42.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf outer, inner;\n\
+               static void deep(void){ longjmp(outer, 9); }\n\
+               int run(int n){ if (setjmp(outer) != 0) return (40 + n) & 0xff; \
+                 if (setjmp(inner) == 0){ deep(); return -1; } return -2; }\n\
+               int main(void){ return run(2); }";
+    check_setjmp_vs_native("setjmp_nested_bufs", src, 2);
 }
 
 #[test]

@@ -232,3 +232,32 @@ jobs:
           cargo run --manifest-path wt/Cargo.toml --release -- \
             target/wasm64-unknown-unknown/release/svm_browser.wasm
 
+  asan-jit-setjmp:
+    # AddressSanitizer over the JIT setjmp/longjmp path (Option B: libc _setjmp/_longjmp called
+    # inline from JITted code — memory-unsafe native-stack manipulation, so it gets svm-fiber-grade
+    # rigor, LLVM.md §"JIT longjmp"). Runs the on-ramp setjmp differential (all engines incl. the
+    # live JIT == native) under ASan. The baked _setjmp/_longjmp addresses resolve to ASan's
+    # interceptors, which unpoison the stack on the non-local jump — so a returns-twice mishandle
+    # surfaces here as a red-zone/use-after-return report rather than silent corruption.
+    name: ASan (JIT setjmp/longjmp)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: install LLVM 18 (dev headers + dynamic lib)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: cargo test -p svm-llvm setjmp (ASan, JIT path live)
+        run: cargo test -p svm-llvm -Z build-std --target x86_64-unknown-linux-gnu setjmp
+        env:
+          # -Zsanitizer=address replaces the workflow-global `-D warnings`: -Z build-std recompiles
+          # std from source, which would trip warnings-as-errors (same reason the wasm64 lane clears it).
+          RUSTFLAGS: "-Zsanitizer=address"
+          # The fiber scheduler intentionally leaks values on a dropped-suspended fiber's stack, so
+          # keep leak detection off and check UB/use-after-return/red-zones only (matches the asan lane).
+          ASAN_OPTIONS: "detect_leaks=0"

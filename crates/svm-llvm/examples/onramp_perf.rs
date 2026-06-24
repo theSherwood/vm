@@ -35,10 +35,11 @@ const REPS: u32 = 9;
 const N_LARGE: i32 = 4_000_000;
 const N_SMALL: i32 = 1_000;
 
-/// `(name, C source defining `int work(int)`, short note, runs_on_jit)`. The `setjmp` rows are
-/// interp-only (`false`) — the JIT's native-stack `longjmp` is a later sub-slice, so it bails
-/// `Unsupported` (the rows measure the tree-walker cost). The first three are the **non-`setjmp`
-/// baseline** — they must not move now that `setjmp`/`longjmp` lowering exists (gated on use).
+/// `(name, C source defining `int work(int)`, short note, runs_on_jit)`. All rows run on the JIT now
+/// that its native-stack `setjmp`/`longjmp` has landed (libc `_setjmp`/`_longjmp` inline from JITted
+/// code, LLVM.md §"JIT `longjmp`"): the `setjmp_*` rows measure the JIT's capture / round-trip cost
+/// alongside the interpreters'. The first three are the **non-`setjmp` baseline** — they must not move
+/// now that `setjmp`/`longjmp` lowering exists (gated on use; their IR is byte-identical to before).
 const WORKLOADS: &[(&str, &str, &str, bool)] = &[
     (
         "loop_lcg",
@@ -69,8 +70,8 @@ const WORKLOADS: &[(&str, &str, &str, bool)] = &[
         // `setjmp` each iteration, never long-jumped (the pcall-entry happy path): measures capture.
         "#include <setjmp.h>\nstatic jmp_buf e;\n\
          int work(int n){ unsigned a=1u; for(int i=0;i<n;i++){ setjmp(e); a=a*1664525u+1u; } return (int)a; }",
-        "setjmp capture per iteration, no longjmp (interp-only)",
-        false,
+        "setjmp capture per iteration, no longjmp",
+        true,
     ),
     (
         "setjmp_longjmp",
@@ -78,8 +79,8 @@ const WORKLOADS: &[(&str, &str, &str, bool)] = &[
         "#include <setjmp.h>\nstatic jmp_buf e;\n\
          int work(int n){ unsigned a=1u; for(int i=0;i<n;i++){ volatile int x=setjmp(e); \
          if(x==0){ a=a*1664525u+1u; longjmp(e,1); } } return (int)a; }",
-        "setjmp + longjmp round-trip per iteration (interp-only)",
-        false,
+        "setjmp + longjmp round-trip per iteration",
+        true,
     ),
 ];
 
