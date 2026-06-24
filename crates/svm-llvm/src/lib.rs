@@ -11626,14 +11626,17 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             };
             let v0 = ctx.operand(&sv.operand0)?;
             let v1 = ctx.operand(&sv.operand1)?;
-            if let Some(shape) = vec128_shape(vty.as_ref()) {
+            // The v128 fast-path is a same-width permute (result lane count == input lane count) →
+            // one `i8x16.shuffle`. A width-changing shuffle (clang's auto-vectorizer emits these to
+            // widen/narrow/concat, e.g. `<16 x i8>` → `<8 x i8>`) falls through to the generic
+            // scalarize path below, which gathers lanes per the mask into the result's own shape.
+            if let Some(shape) =
+                vec128_shape(vty.as_ref()).filter(|s| mask.len() == s.lanes() as usize)
+            {
                 let n = shape.lanes() as u64; // lanes per input vector
                 let lb = shape.lane_bytes() as u64; // bytes per lane
-                if mask.len() != n as usize {
-                    return unsup("shufflevector: result lane count != input lane count");
-                }
-                // `lb`-byte lanes; source lane `src` (0..2n over the `a ++ b` concat) → concat byte
-                // base (src<n ? lb*src : 16 + lb*(src-n)). An undef/oob mask lane reads lane 0 of `a`.
+                                                    // `lb`-byte lanes; source lane `src` (0..2n over the `a ++ b` concat) → concat byte
+                                                    // base (src<n ? lb*src : 16 + lb*(src-n)). An undef/oob mask lane reads lane 0 of `a`.
                 let mut lanes = [0u8; 16];
                 for (k, &src) in mask.iter().enumerate() {
                     let base = if src < n {
