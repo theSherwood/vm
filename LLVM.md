@@ -1096,14 +1096,22 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   address in a per-vCPU table; `longjmp` truncates the call stack back to it (intervening frames
   discarded, no cleanup — C has none), restores the frame + data-SP (which rides in `vals[0]`), and
   re-enters with the result set to the long-jump value. **Engine matrix** (kept in sync — never
-  divergent): tree-walker runs it; the **bytecode** engine declines the module (`compile_module → None`
-  → tree-walker fallback); the **JIT** bails `Unsupported` (its native-stack `longjmp` is a sub-slice —
-  rides the `cont.*`/`svm-fiber` switch). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_
-  deep_nesting` (byte-identical to native libc, multi-frame unwind + retry loop; the JIT-declines is
+  divergent): **both interpreters run it** — the tree-walker (snapshots the frame's value state, since
+  `vals` is replaced per block) and the **bytecode** engine (no snapshot: its flat per-function register
+  layout gives each block distinct slots, so the `setjmp` block's values survive a deeper call in place
+  — it only restores the `(module, cur, base, pc)` cursor + pops the activation stack). The **JIT** bails
+  `Unsupported` (the remaining sub-slice — **Option B: call libc `_setjmp`/`_longjmp` from JITted code**,
+  `jmp_buf` in a host-side table keyed by the guest buffer address so no host SP/return-addr leaks; the
+  in-frame `_setjmp` call dodges the "helper-frame-is-gone" problem, and clang's `-O2` returns-twice
+  spills + Cranelift's caller-saved spills largely defuse the optimizer hazard — to be proven by a native
+  differential **under ASan**). Until it lands the JIT declines and the interpreters cover it. Tests:
+  `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting` (byte-identical to native libc on
+  **both** the tree-walker and the bytecode engine, multi-frame unwind + retry loop; the JIT-declines is
   asserted). Perf (`examples/onramp_perf.rs`): the non-`setjmp` baseline rows are unmoved (gated;
   byte-identical IR), `setjmp` capture/`longjmp` unwind cost is O(live-values)/O(frames) and paid only
-  when executed. **EH next** (`invoke`/`landingpad`/`resume` + cleanups) reuses this stack-transfer
-  core; the JIT `longjmp` sub-slice and EH unblock Postgres `--single` and throwing C++ respectively.
+  when executed (the JIT path will be real-`setjmp`-class O(1)). **EH next** (`invoke`/`landingpad`/
+  `resume` + cleanups) reuses this stack-transfer core; the JIT `longjmp` + EH unblock Postgres
+  `--single` and throwing C++ respectively.
 - **`%f` / `%g` / `%e` float formatting** — deliberately **fail-closed** (LLVM.md printf notes): an
   `f64`-arithmetic approximation diverges from glibc at the rounding boundary; matching byte-for-byte
   needs a **correctly-rounded exact-decimal (Ryū / Dragon4, big-integer)** formatter. SQLite,

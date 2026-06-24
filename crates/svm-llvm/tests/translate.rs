@@ -1165,6 +1165,21 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
         "{name}: tree-walker={svm} vs native cc={native}"
     );
 
+    // The **bytecode** engine implements setjmp/longjmp too (interpreter-grade) and must agree — it
+    // runs the module (does not decline) and matches the tree-walker + native.
+    let mut bfuel = 100_000_000u64;
+    let bc_out = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+        .expect("bytecode engine should run setjmp/longjmp (not decline)")
+        .expect("bytecode run");
+    let bsvm = match bc_out.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: bytecode expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        bsvm, native,
+        "{name}: bytecode={bsvm} vs native cc={native}"
+    );
+
     // The JIT must cleanly decline (its native-stack longjmp is a later sub-slice) — not miscompile.
     let slots: Vec<i64> = full.iter().map(to_slot).collect();
     assert!(
