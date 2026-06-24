@@ -1562,3 +1562,305 @@ fn dap_expands_and_evaluates_a_windowvia_struct() {
     ));
     assert_eq!(eval_result(&out), (true, Some("30".into())));
 }
+
+/// **Data breakpoints (DEBUGGING.md W2 watchpoints) end-to-end.** The full editor conversation: a
+/// client mints a `dataId` for a window-located source variable (`dataBreakpointInfo`), arms a
+/// write-watch on it (`setDataBreakpoints`), continues, and the guest's `i32.store` to that variable
+/// trips the watchpoint — surfacing as a `stopped` event with reason `data breakpoint`. Reuses
+/// `NON_C_DBG`, where `n` lives at window `v0 + 0` and the first store writes 1000 to it.
+#[test]
+fn dap_data_breakpoint_stops_on_window_write() {
+    let mut s = DapServer::new();
+
+    // The server must advertise the capability so the client offers "Break on Value Change".
+    let out = s.handle(&req(1, "initialize", Json::obj(vec![])));
+    assert_eq!(
+        response(&out)
+            .get("body")
+            .unwrap()
+            .get("supportsDataBreakpoints"),
+        Some(&Json::Bool(true)),
+        "advertises data breakpoints"
+    );
+
+    // Launch paused at entry (before the store), arg v0 = window address 1024 (n's base).
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(NON_C_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(1024)])),
+            ("stopOnEntry", Json::Bool(true)),
+        ]),
+    ));
+    let out = s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("entry"))
+    );
+
+    // stackTrace populates the frame refs; scopes yields the Locals `variablesReference`.
+    let out = s.handle(&req(
+        4,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let frame_id = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        5,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(frame_id))]),
+    ));
+    let scope_ref = response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+
+    // dataBreakpointInfo on `n` → a non-null dataId the client can arm.
+    let out = s.handle(&req(
+        6,
+        "dataBreakpointInfo",
+        Json::obj(vec![
+            ("variablesReference", Json::i(scope_ref)),
+            ("name", Json::s("n")),
+        ]),
+    ));
+    let data_id = response(&out).get("body").unwrap().get("dataId").unwrap();
+    let data_id = match data_id {
+        Json::Str(id) => id.clone(),
+        other => panic!("`n` should be watchable, got dataId {other:?}"),
+    };
+
+    // setDataBreakpoints arms a write-watch → verified.
+    let out = s.handle(&req(
+        7,
+        "setDataBreakpoints",
+        Json::obj(vec![(
+            "breakpoints",
+            Json::Arr(vec![Json::obj(vec![
+                ("dataId", Json::s(data_id)),
+                ("accessType", Json::s("write")),
+            ])]),
+        )]),
+    ));
+    assert_eq!(
+        response(&out)
+            .get("body")
+            .unwrap()
+            .get("breakpoints")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("verified"),
+        Some(&Json::Bool(true)),
+        "the data breakpoint arms"
+    );
+
+    // continue → the store to n trips the watchpoint → stopped, reason `data breakpoint`.
+    let out = s.handle(&req(8, "continue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .expect("the write to n trips the data breakpoint")
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("data breakpoint"))
+    );
+}
+
+/// A promoted SSA scalar has no window address, so it is honestly **not** watchable: the server
+/// returns a `null` `dataId` (the client greys out "Break on Value Change") rather than arming a
+/// bogus watch. `LOOP_SUM_DBG`'s `acc` is `ssa`-located.
+#[test]
+fn dap_data_breakpoint_info_null_for_unaddressable_local() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+            ("stopOnEntry", Json::Bool(true)),
+        ]),
+    ));
+    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    s.handle(&req(
+        4,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let out = s.handle(&req(
+        5,
+        "dataBreakpointInfo",
+        Json::obj(vec![
+            ("variablesReference", Json::i(1)),
+            ("name", Json::s("acc")),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("body").unwrap().get("dataId"),
+        Some(&Json::Null),
+        "an SSA-promoted local reports as unwatchable"
+    );
+}
+
+// WORKERS_DBG plus a window-located source variable `shared` over the raced address (window 0): each
+// worker does a read-modify-write `i64.store` to it. Gives `dataBreakpointInfo` a named, addressable
+// target so a *worker* thread's store can trip a watchpoint armed over DAP.
+const WATCH_MT_DBG: &str = r#"
+memory 17
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vaddr = i64.const 0
+  vc = i64.load vaddr
+  vn = i64.add vc varg
+  i64.store vaddr vn
+  vz = i64.const 0
+  return vz
+}
+
+debug.file 0 "worker.c"
+debug.loc 1 0 1 0 4 3
+debug.type 0 base "long" signed 8
+debug.var 1 "shared" win 0 "long" 0
+"#;
+
+/// **Cross-thread data breakpoint over DAP (DEBUGGING.md Milestone B — the headline).** A watchpoint
+/// armed through the protocol fires on *whichever thread* touches the range: we stop a worker at its
+/// load, arm a write-watch on the shared window variable, clear the source breakpoint so only the
+/// watch can stop us, and continue — a worker's `i64.store` to the shared cell trips it, surfacing as
+/// `stopped` / reason `data breakpoint`. This is the engine's global watchpoint reaching VS Code.
+#[test]
+fn dap_data_breakpoint_fires_cross_thread() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    // `schedule: []` ⇒ a deterministic multithreaded run.
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(WATCH_MT_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("schedule", Json::Arr(vec![])),
+        ]),
+    ));
+    // Stop a worker at its load (worker.c:4), before its store.
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("worker.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(4))])]),
+            ),
+        ]),
+    ));
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let tid = event(&out, "stopped")
+        .unwrap()
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert!(tid >= 2, "a worker stopped (got thread {tid})");
+
+    // Arm a write-watch on `shared` in the stopped worker's frame.
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid))]),
+    ));
+    let frame_id = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        6,
+        "dataBreakpointInfo",
+        Json::obj(vec![
+            ("variablesReference", Json::i(frame_id + 1)),
+            ("name", Json::s("shared")),
+        ]),
+    ));
+    let data_id = match response(&out).get("body").unwrap().get("dataId").unwrap() {
+        Json::Str(id) => id.clone(),
+        other => panic!("`shared` should be watchable, got {other:?}"),
+    };
+    s.handle(&req(
+        7,
+        "setDataBreakpoints",
+        Json::obj(vec![(
+            "breakpoints",
+            Json::Arr(vec![Json::obj(vec![
+                ("dataId", Json::s(data_id)),
+                ("accessType", Json::s("write")),
+            ])]),
+        )]),
+    ));
+    // Clear the source breakpoint so only the watchpoint can stop the run.
+    s.handle(&req(
+        8,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("worker.c"))])),
+            ("breakpoints", Json::Arr(vec![])),
+        ]),
+    ));
+    // continue → a worker's store to the shared cell trips the watch.
+    let out = s.handle(&req(9, "continue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .expect("a worker's store trips the cross-thread watch")
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("data breakpoint"))
+    );
+}

@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue};
+use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue, WatchId, WatchKind};
 use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
 mod expr;
@@ -55,6 +55,10 @@ struct Session {
     /// `variables` request on such a reference enumerates the struct's fields / array's elements
     /// (each itself expandable if aggregate). Cleared on resume alongside `frame_refs`.
     place_refs: Vec<Place>,
+    /// Window watchpoints armed via DAP `setDataBreakpoints` (DEBUGGING.md W2 — the user-facing
+    /// surface for `Inspector::set_watchpoint`, incl. the Milestone-B cross-thread case). Held so
+    /// the next `setDataBreakpoints` can clear the prior set, per the protocol's replace semantics.
+    data_watch_ids: Vec<WatchId>,
     /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
     /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
     scheduled: bool,
@@ -72,6 +76,21 @@ impl Session {
             .find(|v| (v.func == func || v.func == svm_ir::GLOBAL_SCOPE) && v.name == name)?;
         let width = scalar_width(&debug.types, var.type_id, &var.ty);
         var_to_i64(&self.inspector.read_var(frame_idx, name, width)?)
+    }
+
+    /// Resolve a source variable `name` (declared in `func`) to its `(window address, byte length)`
+    /// for a data watchpoint, in the frame `frame_idx` levels up the focused thread. `None` if the
+    /// name has no in-scope **memory** location (`var_addr` rejects a promoted SSA scalar) — honestly
+    /// unwatchable. Length comes from the variable's debug type (scalar width or full aggregate size).
+    fn resolve_watch(&self, frame_idx: usize, func: u32, name: &str) -> Option<(u64, u64)> {
+        let addr = self.inspector.var_addr(frame_idx, name)?;
+        let debug = self.debug.as_ref()?;
+        let var = debug
+            .vars
+            .iter()
+            .find(|v| (v.func == func || v.func == svm_ir::GLOBAL_SCOPE) && v.name == name)?;
+        let len = scalar_width(&debug.types, var.type_id, &var.ty).max(1) as u64;
+        Some((addr, len))
     }
 
     /// Whether a breakpoint stop at `pc` should fire: `true` for an unconditional breakpoint, or a
@@ -143,6 +162,8 @@ impl DapServer {
             "initialize" => self.on_initialize(),
             "launch" => self.on_launch(args),
             "setBreakpoints" => self.on_set_breakpoints(args),
+            "dataBreakpointInfo" => self.on_data_breakpoint_info(args),
+            "setDataBreakpoints" => self.on_set_data_breakpoints(args),
             "configurationDone" => self.on_configuration_done(),
             "threads" => self.on_threads(),
             "stackTrace" => self.on_stack_trace(args),
@@ -209,6 +230,10 @@ impl DapServer {
             ("supportsEvaluateForHovers", Json::Bool(true)),
             // Conditional breakpoints (DEBUGGING.md W5): stop only when the `condition` is nonzero.
             ("supportsConditionalBreakpoints", Json::Bool(true)),
+            // Data breakpoints (DEBUGGING.md W2 watchpoints): "Break on Value Change/Access" over a
+            // source variable's window range, backed by `Inspector::set_watchpoint`. Two-request
+            // protocol — `dataBreakpointInfo` mints a `dataId`, `setDataBreakpoints` arms it.
+            ("supportsDataBreakpoints", Json::Bool(true)),
         ]);
         // The client now sends breakpoints, then `configurationDone`.
         (true, caps, vec![("initialized", Json::obj(vec![]))])
@@ -274,6 +299,7 @@ impl DapServer {
             conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
             place_refs: Vec::new(),
+            data_watch_ids: Vec::new(),
             scheduled,
         });
         (true, Json::Null, vec![])
@@ -323,6 +349,106 @@ impl DapServer {
                     ]));
                 }
                 None => out.push(Json::obj(vec![("verified", Json::Bool(false))])),
+            }
+        }
+        (
+            true,
+            Json::obj(vec![("breakpoints", Json::Arr(out))]),
+            vec![],
+        )
+    }
+
+    /// `dataBreakpointInfo`: mint an opaque `dataId` for a source variable the client wants to watch
+    /// (the right-click "Break on Value Change/Access" target). The `dataId` encodes the variable's
+    /// resolved window range (`addr:len`) so `setDataBreakpoints` can arm it without re-resolving. A
+    /// `null` `dataId` is the protocol's "not watchable" — e.g. a promoted scalar with no address.
+    fn on_data_breakpoint_info(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let name = args
+            .and_then(|a| a.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        let body = match self.data_watch_target(args, &name) {
+            Some((addr, len)) => Json::obj(vec![
+                ("dataId", Json::s(format!("{addr}:{len}"))),
+                ("description", Json::s(name)),
+                (
+                    "accessTypes",
+                    Json::Arr(vec![
+                        Json::s("read"),
+                        Json::s("write"),
+                        Json::s("readWrite"),
+                    ]),
+                ),
+                // The id is range-not-handle, valid only at the current stop, so don't persist it.
+                ("canPersist", Json::Bool(false)),
+            ]),
+            None => Json::obj(vec![
+                ("dataId", Json::Null),
+                (
+                    "description",
+                    Json::s(format!("`{name}` has no watchable address here")),
+                ),
+            ]),
+        };
+        (true, body, vec![])
+    }
+
+    /// Resolve the `(addr, len)` a `dataBreakpointInfo` request names: the variable `name` scoped to
+    /// the request's container (a scope's `variablesReference` == `frameId + 1`), else the stopped
+    /// thread's top frame. `None` if there is no such in-scope memory-located variable.
+    fn data_watch_target(&mut self, args: Option<&Json>, name: &str) -> Option<(u64, u64)> {
+        let session = self.session.as_ref()?;
+        let (tid, frame_idx) = args
+            .and_then(|a| a.get("variablesReference"))
+            .and_then(|v| v.as_i64())
+            .and_then(|v| v.checked_sub(1))
+            .and_then(|r| session.frame_refs.get(r as usize).copied())
+            .or_else(|| session.frame_refs.first().copied())?;
+        let session = self.session.as_mut()?;
+        session.inspector.select_task(tid);
+        let func = session.inspector.backtrace().get(frame_idx)?.pc.func;
+        self.session.as_ref()?.resolve_watch(frame_idx, func, name)
+    }
+
+    /// `setDataBreakpoints`: replace the armed data watchpoints with the requested set (the protocol
+    /// sends the full list each call, like `setBreakpoints`). Each `dataId` (`addr:len` from
+    /// `dataBreakpointInfo`) arms an `Inspector::set_watchpoint`; the stop side is already wired —
+    /// a hit surfaces as `StopReason::Watchpoint` → a `stopped` event with reason `data breakpoint`.
+    fn on_set_data_breakpoints(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        for id in session.data_watch_ids.drain(..) {
+            session.inspector.clear_watchpoint(id);
+        }
+        let requested = args
+            .and_then(|a| a.get("breakpoints"))
+            .and_then(|b| b.as_array())
+            .map(|a| a.to_vec())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for bp in &requested {
+            // `accessType` omitted (or "write") ⇒ break on value change, the common case.
+            let kind = match bp.get("accessType").and_then(|a| a.as_str()) {
+                Some("read") => WatchKind::Read,
+                Some("readWrite") => WatchKind::ReadWrite,
+                _ => WatchKind::Write,
+            };
+            match bp
+                .get("dataId")
+                .and_then(|d| d.as_str())
+                .and_then(parse_data_id)
+            {
+                Some((addr, len)) => {
+                    let id = session.inspector.set_watchpoint(addr, len, kind);
+                    session.data_watch_ids.push(id);
+                    out.push(Json::obj(vec![("verified", Json::Bool(true))]));
+                }
+                None => out.push(Json::obj(vec![
+                    ("verified", Json::Bool(false)),
+                    ("message", Json::s("unresolved dataId")),
+                ])),
             }
         }
         (
@@ -959,6 +1085,13 @@ fn stopped_event(reason: &'static str, thread_id: i64) -> Event {
             ("allThreadsStopped", Json::Bool(true)),
         ]),
     )
+}
+
+/// Parse a `dataBreakpointInfo` `dataId` (`"addr:len"`, both decimal) back into the window range to
+/// watch. `None` on any malformed id (an old/foreign id ⇒ the breakpoint reports unverified).
+fn parse_data_id(s: &str) -> Option<(u64, u64)> {
+    let (addr, len) = s.split_once(':')?;
+    Some((addr.parse().ok()?, len.parse().ok()?))
 }
 
 fn dap_reason(r: StopReason) -> &'static str {
