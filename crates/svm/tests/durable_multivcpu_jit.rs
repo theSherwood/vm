@@ -318,6 +318,7 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,
+            completed_result: None,
         })
         .collect();
     let mut twin = isnap.clone();

@@ -15,13 +15,14 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
-    iface, AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap,
+    iface, run_with_host, run_with_host_fast, AsyncCounter, CapPageMap, GuestMem, Host, HostFn,
+    RegionBacking, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use svm_interp::SharedBacking;
-use svm_ir::{Module, Resolved, ValType};
+use svm_ir::{FuncIdx, Module, Resolved, ValType};
 
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
@@ -2628,6 +2629,606 @@ pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
         }
         JitOutcome::Exited(code) => Err(format!("kernel called Exit({code})")),
         JitOutcome::Trapped(kind) => Err(format!("kernel trapped ({kind:?})")),
+    }
+}
+
+/// Pack a typed [`Value`] into the raw `i64` register slot the JIT entry takes (the inverse of the
+/// reference-host [`typed`]). A `v128` arg keeps its low 8 bytes (CLI/entry args are scalar slots).
+fn value_slot(v: Value) -> i64 {
+    match v {
+        Value::I32(x) => x as i64,
+        Value::I64(x) => x,
+        Value::F32(x) => x.to_bits() as i64,
+        Value::F64(x) => x.to_bits() as i64,
+        Value::Ref(x) => x as i64,
+        Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+    }
+}
+
+/// Grant the MVP powerbox (§3e) — the **contiguous prefix** of `n_handles` of the eight fixed
+/// `VM_CAP_*` capabilities, in the canonical order the synthesized `_start` expects (stdout, stdin,
+/// exit, memory, addrspace, ioring, blocking, jit). Mirrors the grant order of [`run_powerbox_inner`]
+/// and the C-frontend test harness so handle values are deterministic; granted identically on the
+/// two backends' hosts, the values match (asserted by [`Instance::run_powerbox_diff`]).
+fn grant_powerbox_prefix(h: &mut Host, n_handles: usize, win: u64) -> Vec<Value> {
+    // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
+    // `Jit` cap (slot 7) needs the canonical blob validator. Both are inert if never used.
+    h.set_region_factory(new_shared_region);
+    h.set_jit_validator(jit_blob_validator);
+    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
+    let mut v = Vec::with_capacity(n_handles);
+    if n_handles >= 1 {
+        v.push(Value::I32(h.grant_stream(StreamRole::Out)));
+    }
+    if n_handles >= 2 {
+        v.push(Value::I32(h.grant_stream(StreamRole::In)));
+    }
+    if n_handles >= 3 {
+        v.push(Value::I32(h.grant_exit()));
+    }
+    if n_handles >= 4 {
+        v.push(Value::I32(h.grant_memory()));
+    }
+    if n_handles >= 5 {
+        v.push(Value::I32(h.grant_address_space(0, win)));
+    }
+    if n_handles >= 6 {
+        v.push(Value::I32(h.grant_io_ring()));
+    }
+    if n_handles >= 7 {
+        v.push(Value::I32(
+            h.grant_blocking(std::time::Duration::ZERO, None),
+        ));
+    }
+    if n_handles >= 8 {
+        v.push(Value::I32(h.grant_jit(mem_log2)));
+    }
+    v
+}
+
+/// Reconcile the interpreter's `Result<Vec<Value>, Trap>` with the JIT's [`JitOutcome`] for an entry
+/// whose results are `results`: assert the two backends agree (the differential oracle of
+/// `run_c_full`) and fold them into one [`Outcome`]. `Err` if they diverge or the guest trapped.
+fn diff_outcome(
+    results: &[ValType],
+    interp: Result<Vec<Value>, Trap>,
+    jit: JitOutcome,
+) -> Result<Outcome, String> {
+    match (interp, jit) {
+        (Ok(want), JitOutcome::Returned(got)) => {
+            let got_typed: Vec<Value> = results
+                .iter()
+                .zip(&got)
+                .map(|(t, &v)| typed(*t, v))
+                .collect();
+            if want != got_typed {
+                return Err(format!(
+                    "interp/JIT results diverge: interp={want:?} jit={got_typed:?}"
+                ));
+            }
+            Ok(Outcome::Returned(want))
+        }
+        (Err(Trap::Exit(wi)), JitOutcome::Exited(gj)) => {
+            if wi != gj {
+                return Err(format!(
+                    "interp/JIT exit codes diverge: interp={wi} jit={gj}"
+                ));
+            }
+            Ok(Outcome::Exited(wi))
+        }
+        (Err(t), j) if !matches!(t, Trap::Exit(_)) => Err(format!(
+            "guest trapped under the interpreter ({t:?}); jit={j:?}"
+        )),
+        (i, j) => Err(format!(
+            "interp/JIT outcomes diverge: interp={i:?} jit={j:?}"
+        )),
+    }
+}
+
+/// Fold an interpreter result (`TreeWalk`/`Bytecode`) into an [`Outcome`]: a clean return, an
+/// `Exit(code)`, or a trap (detect-and-kill, surfaced as `Err`). The interpreter already returns typed
+/// [`Value`]s, so no result-type table is needed (unlike [`outcome_from_jit`]).
+fn outcome_from_interp(r: Result<Vec<Value>, Trap>) -> Result<Outcome, String> {
+    match r {
+        Ok(v) => Ok(Outcome::Returned(v)),
+        Err(Trap::Exit(code)) => Ok(Outcome::Exited(code)),
+        Err(t) => Err(format!("guest trapped ({t:?}) — detect-and-kill (§5)")),
+    }
+}
+
+/// Fold a JIT outcome into an [`Outcome`], typing the raw result slots. A `Trapped` is normally folded
+/// to `Err` earlier (with the backtrace + trapping fiber) by [`run_jit`]; handled here for totality.
+fn outcome_from_jit(results: &[ValType], jit: JitOutcome) -> Result<Outcome, String> {
+    match jit {
+        JitOutcome::Returned(s) => Ok(Outcome::Returned(
+            results.iter().zip(&s).map(|(t, &v)| typed(*t, v)).collect(),
+        )),
+        JitOutcome::Exited(code) => Ok(Outcome::Exited(code)),
+        JitOutcome::Trapped(kind) => Err(format!("guest trapped ({kind:?})")),
+    }
+}
+
+/// The default per-op fuel budget for the interpreters when [`Limits::fuel`] is `None` — generous, but
+/// finite so a non-terminating guest under the tree-walker can't hang the host (a runaway guest is
+/// better bounded by a `deadline` on the JIT, which has no cheap per-op counter).
+const DEFAULT_FUEL: u64 = 1 << 34;
+
+/// Which execution backend a run targets. All three honour the same [`RunConfig`] where they support
+/// it; the differential oracle ([`Instance::run_diff`]) cross-checks `TreeWalk` against `Jit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// The reference tree-walking interpreter (the §18 differential oracle).
+    TreeWalk,
+    /// The bytecode engine (transparently falls back to the tree-walker for ops it doesn't lower).
+    Bytecode,
+    /// The Cranelift JIT.
+    Jit,
+}
+
+/// Resource limits applied **uniformly across backends, where each supports them** — the consumer
+/// sets these once regardless of backend. Two knobs are inherently backend-specific (and documented as
+/// such): `fuel` is the interpreters' per-op budget (the JIT has no cheap per-op counter), and
+/// `deadline` arms the JIT's §5 watchdog (the interpreters bound themselves with `fuel`). The spawn
+/// quota (`max_fibers` / `max_vcpus`) and the window size (via [`RunConfig::memory_size_log2`]) bind
+/// all three.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Per-op budget for `TreeWalk`/`Bytecode` (`None` ⇒ [`DEFAULT_FUEL`]); ignored by the JIT.
+    pub fuel: Option<u64>,
+    /// Wall-clock deadline for the JIT's detect-and-kill watchdog (§5); ignored by the interpreters.
+    pub deadline: Option<std::time::Duration>,
+    /// §15 spawn quota — max fibers (`cont.new`) a run may create.
+    pub max_fibers: usize,
+    /// §15 spawn quota — max concurrently-live vCPUs (`thread.spawn`); the "CPUs available" cap.
+    pub max_vcpus: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        let q = Quota::default();
+        Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: q.max_fibers,
+            max_vcpus: q.max_vcpus,
+        }
+    }
+}
+
+impl Limits {
+    /// The §15 spawn quota these limits imply (the interpreter form; the JIT form has identical fields).
+    fn quota(&self) -> Quota {
+        Quota {
+            max_fibers: self.max_fibers,
+            max_vcpus: self.max_vcpus,
+        }
+    }
+}
+
+/// How to run a powerbox entry: the resource [`Limits`], the guest's stdin, and an optional override of
+/// the module's declared window size (the "amount of memory available"). `Default` is the easy button —
+/// default limits, empty stdin, the module's own window.
+#[derive(Clone, Debug, Default)]
+pub struct RunConfig {
+    pub limits: Limits,
+    pub stdin: Vec<u8>,
+    /// Override the module's linear-memory window `size_log2` for this run (must be ≥ what the program
+    /// needs, or the guest faults). `None` ⇒ the module's declared size.
+    pub memory_size_log2: Option<u8>,
+}
+
+/// Run `f` with the §5 kill-path armed when `deadline` is `Some`: a watchdog thread sets an interrupt
+/// cell after `deadline` (the JIT polls it at back-edges → detect-and-kill), and wakes early when `f`
+/// returns so a fast run is never delayed. `None` ⇒ no watchdog. Mirrors `run_powerbox_inner`'s arming.
+fn with_deadline<T>(
+    deadline: Option<std::time::Duration>,
+    f: impl FnOnce(Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>) -> T,
+) -> T {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    match deadline.filter(|d| !d.is_zero()) {
+        None => f(None),
+        Some(d) => {
+            let interrupt = std::sync::Arc::new(AtomicU64::new(0));
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let wd = interrupt.clone();
+            let handle = std::thread::spawn(move || {
+                if done_rx.recv_timeout(d).is_err() {
+                    wd.store(1, Ordering::SeqCst);
+                }
+            });
+            let out = f(Some(&interrupt));
+            let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
+            let _ = handle.join();
+            out
+        }
+    }
+}
+
+/// Compile + run function 0 on the JIT under `limits` (quota + optional deadline watchdog), folding a
+/// guest trap into an `Err` (with the §5 W3 backtrace + trapping fiber). A concurrent guest serializes
+/// the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the unlocked fast path. Shared by
+/// the single-backend [`Instance::run`] and the [`Instance::run_diff`] oracle.
+fn run_jit(
+    m: &Module,
+    slots: &[i64],
+    host: &mut Host,
+    limits: &Limits,
+) -> Result<JitOutcome, String> {
+    let quota = svm_jit::Quota {
+        max_fibers: limits.max_fibers,
+        max_vcpus: limits.max_vcpus,
+    };
+    let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
+    // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
+    // `with_deadline`); the thunk/ctx contracts hold exactly as in `run_powerbox_inner`.
+    let (jit, backtrace, trap_fiber) = with_deadline(limits.deadline, |interrupt| {
+        if concurrent {
+            let locked = Mutex::new(std::mem::take(host));
+            let r = unsafe {
+                powerbox_compile_run(
+                    m,
+                    Some(&locked),
+                    std::ptr::null_mut(),
+                    slots,
+                    interrupt,
+                    quota,
+                    None,
+                )
+            };
+            *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
+            r
+        } else {
+            unsafe { powerbox_compile_run(m, None, host, slots, interrupt, quota, None) }
+        }
+    })
+    .map_err(|e| format!("JIT compile failed: {e:?}"))?;
+    if let JitOutcome::Trapped(kind) = jit {
+        let who = match trap_fiber {
+            Some(h) if h >= 0 => format!(" [fiber {h}]"),
+            _ => String::new(),
+        };
+        return Err(format!(
+            "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
+            format_backtrace(&backtrace)
+        ));
+    }
+    Ok(jit)
+}
+
+/// A host capability offered to a module's named import (wasm-style import matching, §7). It carries
+/// the `(type_id, op)` the guest's `call.import "<name>"` lowers to *and* a re-grantable action that
+/// mints the backing handle on a [`Host`]. Re-grantable (a plain `Fn`, not `FnOnce`) because the
+/// differential wrapper grants it on **two** hosts (interpreter + JIT) which must agree; grants are
+/// deterministic, so granting in the same order on both yields the same handle value.
+/// The re-grantable grant action a [`HostCap`] carries: `(host, window_size) -> handle`. The window
+/// size serves window-scoped caps (e.g. `AddressSpace`); most ignore it. `Arc` + `Send`/`Sync` so a
+/// `HostCap` is cheap to clone and the differential wrapper can grant it on either backend's host.
+type GrantFn = Arc<dyn Fn(&mut Host, u64) -> i32 + Send + Sync>;
+
+#[derive(Clone)]
+pub struct HostCap {
+    type_id: u32,
+    op: u32,
+    grant: GrantFn,
+}
+
+impl HostCap {
+    /// A `Stream` write endpoint (stdout): `write(buf, len)` is op 1.
+    pub fn stdout() -> HostCap {
+        HostCap {
+            type_id: iface::STREAM,
+            op: 1,
+            grant: Arc::new(|h, _| h.grant_stream(StreamRole::Out)),
+        }
+    }
+    /// A `Stream` read endpoint (stdin): `read(buf, len)` is op 0.
+    pub fn stdin() -> HostCap {
+        HostCap {
+            type_id: iface::STREAM,
+            op: 0,
+            grant: Arc::new(|h, _| h.grant_stream(StreamRole::In)),
+        }
+    }
+    /// The `Exit` lifecycle capability: `exit(code)` (op 0, noreturn).
+    pub fn exit() -> HostCap {
+        HostCap {
+            type_id: iface::EXIT,
+            op: 0,
+            grant: Arc::new(|h, _| h.grant_exit()),
+        }
+    }
+    /// The `Clock` capability: `now(clock_id) -> i64` (op 0).
+    pub fn clock() -> HostCap {
+        HostCap {
+            type_id: iface::CLOCK,
+            op: 0,
+            grant: Arc::new(|h, _| h.grant_clock()),
+        }
+    }
+    /// A **host-defined** capability (iface [`iface::HOST_FN`]) — arbitrary semantics behind a named
+    /// import, the wasm-like escape hatch. `op` is the operation this name selects; `make` builds a
+    /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
+    /// `(op, args, guest_mem) -> result slots | Trap`.
+    pub fn host_fn(op: u32, make: impl Fn() -> HostFn + Send + Sync + 'static) -> HostCap {
+        let make = Arc::new(make);
+        HostCap {
+            type_id: iface::HOST_FN,
+            op,
+            grant: Arc::new(move |h, _| h.grant_host_fn(make())),
+        }
+    }
+    /// A fully custom binding: an explicit `(type_id, op)` and a re-grantable grant action. The escape
+    /// hatch for any capability the named constructors don't cover (e.g. `Memory`, `AddressSpace`).
+    pub fn custom(
+        type_id: u32,
+        op: u32,
+        grant: impl Fn(&mut Host, u64) -> i32 + Send + Sync + 'static,
+    ) -> HostCap {
+        HostCap {
+            type_id,
+            op,
+            grant: Arc::new(grant),
+        }
+    }
+}
+
+/// A name → [`HostCap`] registry: the capabilities a host offers a module's imports, matched **by
+/// name** at [`instantiate_with_imports`] (wasm-style linking — arbitrary names, interfaces, and
+/// counts). The fixed §3e powerbox is just one preset over this mechanism (see [`instantiate`]).
+#[derive(Default, Clone)]
+pub struct Imports {
+    map: HashMap<String, HostCap>,
+}
+
+impl Imports {
+    pub fn new() -> Imports {
+        Imports::default()
+    }
+    /// Offer `cap` under `name`. Builder-style; last write wins.
+    pub fn provide(mut self, name: impl Into<String>, cap: HostCap) -> Imports {
+        self.map.insert(name.into(), cap);
+        self
+    }
+}
+
+/// The name-bound capability set captured at [`instantiate_with_imports`]: the registry plus the
+/// module's import order (slot `i` of the powerbox stash ↔ import `i`), so grant order matches the
+/// stash layout `svm_ir::synth_powerbox_start` lays down.
+struct NamedBinding {
+    imports: Imports,
+    order: Vec<String>,
+}
+
+/// A resolved, verified program ready to run on **both** backends — the easy "instantiate &amp; run"
+/// default over a frontend's IR (built by [`instantiate`] / [`instantiate_with_imports`]). This is the
+/// [`run_powerbox`] / `run_c_full` experience **decoupled from any C frontend**: hand it a module whose
+/// function 0 is a powerbox `_start` (e.g. produced by [`svm_ir::synth_powerbox_start`]) and
+/// [`Instance::call`] grants the capabilities, runs the entry on the interpreter *and* the JIT under
+/// identical capabilities, asserts they agree (interp == jit), and returns the captured output.
+///
+/// The handle / object-capability model remains the escape hatch: for a fully custom setup, grant on a
+/// [`svm_interp::Host`] yourself and call [`svm_interp::run_with_host`] /
+/// [`svm_jit::compile_and_run_with_host`] directly. This wrapper is the default for the common case.
+pub struct Instance {
+    module: Module,
+    // `Some` when built via `instantiate_with_imports` (name-bound capabilities); `None` for the fixed
+    // powerbox preset (`instantiate`).
+    binding: Option<NamedBinding>,
+}
+
+/// Resolve `module`'s §7 named capability imports under the reference host policy
+/// ([`resolve_capability_imports`]) and verify the result (the escape-freedom gate, §2a). Entry
+/// points are reached by name through the module's first-class [`svm_ir::Module::exports`] table — a
+/// `svm_ir::synth_powerbox_start` module registers its bootstrap as `"_start"`, and any frontend
+/// export (e.g. `"main"`) survives there too.
+///
+/// Returns an `Err` (fail-closed) if an import is unbound or the module fails verification — exactly
+/// the gates a frontend's output must pass before it can run.
+pub fn instantiate(module: Module) -> Result<Instance, String> {
+    let resolved = resolve_capability_imports(module)?;
+    svm_verify::verify_module(&resolved)
+        .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
+    Ok(Instance {
+        module: resolved,
+        binding: None,
+    })
+}
+
+/// Instantiate `module` against a **name-keyed capability registry** (`imports`), wasm-style: each
+/// `call.import "<name>"` is matched by name to a [`HostCap`], lowered to its `(type_id, op)`, and —
+/// at [`Instance::call`] — granted in import order so the powerbox stash slot `i`
+/// (`svm_ir::synth_powerbox_start`) holds the handle for import `i`. This is decision #2's *dynamic,
+/// name-based* binding: arbitrary names, interfaces, and counts, with the fixed §3e powerbox
+/// ([`instantiate`]) just one preset over the same machinery.
+///
+/// `module` is the post-`synth_powerbox_start` module (function 0 is the `_start`; the import table is
+/// untouched by the prepend). Fails closed if an imported name has no binding in `imports`, or the
+/// resolved module fails verification.
+pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Instance, String> {
+    // Capture the import order *before* resolving (which clears the table). Slot i ↔ import i.
+    let order: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
+    // Resolve every name through the registry; an unbound name is fail-closed (no silent no-op).
+    let resolved = svm_ir::resolve_imports(&module, |name| {
+        imports.map.get(name).map(|c| svm_ir::ResolvedCap {
+            type_id: c.type_id,
+            op: c.op,
+        })
+    })
+    .map_err(|e| match e {
+        svm_ir::ImportError::Unresolved(n) => {
+            format!("unbound capability import `{n}` (no binding in the host registry)")
+        }
+        other => format!("resolve imports: {other:?}"),
+    })?;
+    svm_verify::verify_module(&resolved)
+        .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
+    Ok(Instance {
+        module: resolved,
+        binding: Some(NamedBinding { imports, order }),
+    })
+}
+
+impl Instance {
+    /// The resolved, verified module (function 0 is the powerbox `_start`).
+    pub fn module(&self) -> &Module {
+        &self.module
+    }
+
+    /// Run the named export and return its outcome plus captured stdout/stderr.
+    ///
+    /// For the powerbox entry (`"_start"`, function 0), the capabilities are auto-granted — the
+    /// name-bound registry (from [`instantiate_with_imports`]) if present, else the fixed §3e powerbox
+    /// ([`instantiate`]) — and `args` must be empty. This is the easy default: [`Instance::run_diff`]
+    /// with [`RunConfig::default`] (interpreter == JIT enforced). Any other export runs as a **bare
+    /// kernel** with `args` and no host capabilities (the escape hatch for pure functions). For a
+    /// single backend or non-default limits, use [`Instance::run`] / [`Instance::run_diff`].
+    pub fn call(&self, export: &str, args: &[Value]) -> Result<Run, String> {
+        let fidx = self
+            .module
+            .resolve_export(export)
+            .ok_or_else(|| format!("no export named `{export}`"))?;
+        let is_powerbox_func0 =
+            fidx == 0 && (self.binding.is_some() || is_powerbox_entry(&self.module));
+        if is_powerbox_func0 {
+            if !args.is_empty() {
+                return Err(
+                    "the powerbox entry takes no caller args (the handles are auto-granted)".into(),
+                );
+            }
+            self.run_diff(&RunConfig::default())
+        } else {
+            self.run_kernel_diff(fidx, args)
+        }
+    }
+
+    /// Like [`Instance::call`] for the powerbox entry, but seed the guest's `Stream{In}` (stdin).
+    pub fn call_with_stdin(&self, stdin: &[u8]) -> Result<Run, String> {
+        self.run_diff(&RunConfig {
+            stdin: stdin.to_vec(),
+            ..RunConfig::default()
+        })
+    }
+
+    /// Run the powerbox entry (function 0) on a **single** `backend` under `config`. Grants the
+    /// name-bound registry (or the fixed powerbox) and applies the [`Limits`] each backend supports —
+    /// the uniform "pick a backend, set the knobs, run" entry. Returns the outcome + captured output,
+    /// or `Err` on a guest trap / compile failure.
+    pub fn run(&self, backend: Backend, config: &RunConfig) -> Result<Run, String> {
+        let owned = self.window_override(config);
+        let m = owned.as_ref().unwrap_or(&self.module);
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+
+        let mut host = Host::new();
+        host.stdin = config.stdin.clone();
+        host.set_quota(config.limits.quota());
+        let args = self.grant_caps(&mut host, win);
+
+        let outcome = match backend {
+            Backend::TreeWalk | Backend::Bytecode => {
+                let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
+                let r = if backend == Backend::Bytecode {
+                    run_with_host_fast(m, 0, &args, &mut fuel, &mut host)
+                } else {
+                    run_with_host(m, 0, &args, &mut fuel, &mut host)
+                };
+                outcome_from_interp(r)?
+            }
+            Backend::Jit => {
+                let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
+                let jit = run_jit(m, &slots, &mut host, &config.limits)?;
+                outcome_from_jit(&m.funcs[0].results, jit)?
+            }
+        };
+        Ok(Run {
+            outcome,
+            stdout: host.stdout,
+            stderr: host.stderr,
+        })
+    }
+
+    /// Run the powerbox entry on the tree-walker **and** the JIT under identical capabilities + `config`
+    /// and assert they agree (the §18 interp == jit oracle), returning the shared outcome + output.
+    /// `Err` on divergence, a guest trap, or compile failure.
+    pub fn run_diff(&self, config: &RunConfig) -> Result<Run, String> {
+        let owned = self.window_override(config);
+        let m = owned.as_ref().unwrap_or(&self.module);
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+
+        // Two hosts, granted identically (grants are deterministic, so the handle vectors match).
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        hi.stdin = config.stdin.clone();
+        hj.stdin = config.stdin.clone();
+        hi.set_quota(config.limits.quota());
+        hj.set_quota(config.limits.quota());
+        let args = self.grant_caps(&mut hi, win);
+        let args_j = self.grant_caps(&mut hj, win);
+        debug_assert_eq!(args, args_j, "grants must be deterministic across backends");
+
+        let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
+        let interp = run_with_host(m, 0, &args, &mut fuel, &mut hi);
+
+        let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
+        let jit = run_jit(m, &slots, &mut hj, &config.limits)?;
+
+        let outcome = diff_outcome(&m.funcs[0].results, interp, jit)?;
+        if hi.stdout != hj.stdout {
+            return Err("interp/JIT stdout diverge".into());
+        }
+        if hi.stderr != hj.stderr {
+            return Err("interp/JIT stderr diverge".into());
+        }
+        Ok(Run {
+            outcome,
+            stdout: hi.stdout,
+            stderr: hi.stderr,
+        })
+    }
+
+    /// An owned copy of the module with its window resized, when `config` overrides it; else `None`
+    /// (run against `self.module` directly — no clone in the common case).
+    fn window_override(&self, config: &RunConfig) -> Option<Module> {
+        config.memory_size_log2.map(|size_log2| {
+            let mut m = self.module.clone();
+            m.memory = Some(svm_ir::Memory { size_log2 });
+            m
+        })
+    }
+
+    /// Grant the powerbox capabilities on `h` for function 0, returning the handle vector in stash
+    /// order: the name-bound registry (import order, slot i ↔ import i) when present, else the fixed
+    /// §3e powerbox prefix.
+    fn grant_caps(&self, h: &mut Host, win: u64) -> Vec<Value> {
+        match &self.binding {
+            Some(b) => {
+                // Inert unless a granted cap needs them (region-backed / Jit caps).
+                h.set_region_factory(new_shared_region);
+                h.set_jit_validator(jit_blob_validator);
+                b.order
+                    .iter()
+                    .map(|name| Value::I32((b.imports.map[name].grant)(h, win)))
+                    .collect()
+            }
+            None => grant_powerbox_prefix(h, self.module.funcs[0].params.len(), win),
+        }
+    }
+
+    /// Run a bare (non-powerbox) export with `args` on both backends, assert they agree, and return
+    /// the outcome (no host capabilities granted — the escape hatch for pure kernel functions).
+    fn run_kernel_diff(&self, fidx: FuncIdx, args: &[Value]) -> Result<Run, String> {
+        let m = &self.module;
+        let mut h = Host::new();
+        let mut fuel = 50_000_000u64;
+        let interp = run_with_host(m, fidx, args, &mut fuel, &mut h);
+        let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
+        let jit =
+            compile_and_run(m, fidx, &slots).map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let outcome = diff_outcome(&m.funcs[fidx as usize].results, interp, jit)?;
+        Ok(Run {
+            outcome,
+            stdout: h.stdout,
+            stderr: h.stderr,
+        })
     }
 }
 

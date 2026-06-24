@@ -62,8 +62,11 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// `SHADOW_SP_OFF` (offset 8) into the **first 8 bytes of its own region** (`shadow_region_base(ctx)`),
 /// with frames now starting 8 bytes later — so concurrent vCPUs never share an SP word. The window
 /// image layout changed (SP word location + an 8-byte frame shift), so a v4 artifact mis-thaws and is
-/// rejected.
-const FORMAT_VERSION: u16 = 5;
+/// rejected. v6 (§12.8 4A.5 follow-up A: concurrent join results): each spawned-vCPU residue record carries
+/// a `completed_result` flag (+ the i64 when set) — a concurrent child that finished before the freeze
+/// point but wasn't yet joined, so its `thread.join` result rides the artifact and the thaw delivers it
+/// without re-running the child. One extra `uleb` (0) per record otherwise, so a v5 record mis-parses.
+const FORMAT_VERSION: u16 = 6;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -254,6 +257,15 @@ pub fn freeze_with_prots(
                         write_uleb(b, a as u64);
                     }
                     write_uleb(b, v.shadow_sp);
+                    // §12.8 4A.5 follow-up A (v6): a completed-but-unjoined concurrent child carries its
+                    // join result (1 + the i64); a normal frozen child writes 0.
+                    match v.completed_result {
+                        None => write_uleb(b, 0),
+                        Some(r) => {
+                            write_uleb(b, 1);
+                            write_uleb(b, r as u64);
+                        }
+                    }
                 }
                 write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
             }
@@ -473,12 +485,18 @@ fn decode_control(
                 args.push(cr.uleb()? as i64);
             }
             let shadow_sp = cr.uleb()?;
+            // §12.8 4A.5 follow-up A (v6): completed-but-unjoined concurrent child's join result.
+            let completed_result = match cr.uleb()? {
+                0 => None,
+                _ => Some(cr.uleb()? as i64),
+            };
             vcpus.push(FrozenVCpu {
                 task: usize::try_from(task).map_err(|_| RestoreError::Malformed)?,
                 parent_task: usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?,
                 func,
                 args,
                 shadow_sp,
+                completed_result,
             });
         }
         root_sp = cr.uleb()?;

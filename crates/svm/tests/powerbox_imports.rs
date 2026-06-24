@@ -1,0 +1,120 @@
+//! **Phase 2 — name-based dynamic import binding.** A hand-written IR module (no C, no `svm-llvm`)
+//! declares arbitrarily-named capability imports and is bound to a host-provided registry **by name**
+//! (wasm-style linking), then run through the differential wrapper. This exercises decision #2: the
+//! host offers capabilities under arbitrary names/interfaces/counts, `instantiate_with_imports`
+//! matches each `call.import "<name>"` to a [`svm_run::HostCap`], and the powerbox stash delivers the
+//! granted handles in import order — the fixed §3e powerbox is just one preset over this.
+//!
+//! Gated `#![cfg(unix)]` like the other JIT differential suites.
+#![cfg(unix)]
+
+use svm_run::{instantiate_with_imports, HostCap, Imports, Outcome, Value};
+
+/// Two **arbitrary-named** host-function imports — `add_seven` and `triple` — each its own handle but
+/// the same nominal interface (`HOST_FN`), distinguished object-capability-style by which handle the
+/// guest holds. The entry loads import 0's handle from stash slot 0 and import 1's from slot 1 (the
+/// `slot i ↔ import i` contract), threads `5 → add_seven → triple`, and returns `(5+7)*3 = 36`.
+const SRC: &str = "\
+memory 15
+export \"entry\" 0
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.const 5
+  v4 = call.import \"add_seven\" (i64) -> (i64) v2 (v3)
+  v5 = i64.const 4
+  v6 = i32.load v5
+  v7 = call.import \"triple\" (i64) -> (i64) v6 (v4)
+  return v7
+}
+";
+
+#[test]
+fn arbitrary_named_host_capabilities_bind_and_run() {
+    let module = svm_text::parse_module(SRC).expect("frontend IR parses");
+    // The text parser builds the import table from `call.import` names, in first-occurrence order.
+    assert_eq!(
+        module
+            .imports
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>(),
+        ["add_seven", "triple"],
+        "two arbitrarily-named imports, in declaration order"
+    );
+
+    // Prepend the powerbox `_start` for exactly the 2 granted handles (not the fixed 3–8 powerbox).
+    let with_start =
+        svm_ir::synth_powerbox_start(module, 0, 2, false).expect("prepend _start (2 handles)");
+
+    // The host offers each name a host-defined capability with arbitrary semantics. Distinct grants ⇒
+    // distinct handles, so the guest reaches the right closure purely by which handle it holds.
+    let imports = Imports::new()
+        .provide(
+            "add_seven",
+            HostCap::host_fn(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] + 7]))),
+        )
+        .provide(
+            "triple",
+            HostCap::host_fn(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] * 3]))),
+        );
+
+    // Bound by name; runs interp + JIT under identical capabilities (interp == jit asserted inside).
+    let instance = instantiate_with_imports(with_start, imports).expect("instantiate by name");
+    let run = instance.call("_start", &[]).expect("run via the wrapper");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I64(36)]),
+        "(5 + 7) * 3, threaded through two name-bound host capabilities"
+    );
+}
+
+/// An imported name with no entry in the registry is fail-closed at instantiation — wasm-style
+/// "unsatisfied import", surfaced before anything runs.
+#[test]
+fn unbound_name_fails_closed() {
+    let module = svm_text::parse_module(SRC).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 2, false).expect("synth");
+    // Provide only one of the two imports.
+    let imports = Imports::new().provide(
+        "add_seven",
+        HostCap::host_fn(0, || Box::new(|_op, args, _mem| Ok(vec![args[0]]))),
+    );
+    let err = match instantiate_with_imports(with_start, imports) {
+        Ok(_) => panic!("instantiation must fail closed when `triple` is unbound"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("triple"),
+        "the error must name the unbound import, got: {err}"
+    );
+}
+
+/// The standard powerbox names work through the registry too — proving the fixed §3e powerbox is just
+/// one preset over the same name-based mechanism. Here a single `write` import emits a RO string.
+#[test]
+fn standard_names_are_just_a_preset() {
+    let src = "\
+memory 15
+data ro 16384 \"hi via registry\\n\"
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.const 16384
+  v4 = i64.const 16
+  v5 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v4)
+  v6 = i32.const 0
+  return v6
+}
+";
+    let module = svm_text::parse_module(src).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth (1 handle)");
+    let imports = Imports::new().provide("write", HostCap::stdout());
+    let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+    let run = instance.call("_start", &[]).expect("run");
+    assert_eq!(run.stdout, b"hi via registry\n");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+}

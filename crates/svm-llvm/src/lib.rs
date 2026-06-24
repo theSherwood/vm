@@ -595,6 +595,17 @@ fn translate_impl(
             // §7 named capability imports (`write`/`read`/`exit` …) the host resolves at load
             // (`resolve_capability_imports`); empty for a pure-compute (kernel) module.
             imports,
+            // First-class function exports: each defined function's name → its final `module.funcs`
+            // index, so a C-compiled module is name-addressable (`call("main")`) like the wasm path.
+            // Mirrors the out-of-band `Translated::exports` (the `.syms` sidecar source).
+            exports: defined
+                .iter()
+                .enumerate()
+                .map(|(i, f)| svm_ir::Export {
+                    name: f.name.clone(),
+                    func: base + i as u32,
+                })
+                .collect(),
             // §6 debug-info waist: the source-line half, mapped from each LLVM `!DILocation` (the
             // variable/type half is blocked on the `llvm-ir` metadata reader — see `DebugAcc`).
             // `None` for a non-`-g` build (no instruction carried a location).
@@ -616,15 +627,17 @@ const DATA_BASE: u64 = 16;
 /// The page granularity the data stack is aligned to above the globals (≥ the largest OS page so
 /// a stack write never lands in a read-only global's protected page, D40). For a powerbox program
 /// this is also the globals base, so `[0, STACK_PAGE)` is the reserved low scratch — the handle
-/// stash, allocator/format state, and the §3e args buffer all live there.
-const STACK_PAGE: u64 = 16384;
+/// stash, allocator/format state, and the §3e args buffer all live there. The powerbox layout is a
+/// public ABI ([`svm_ir::POWERBOX_STACK_PAGE`]), shared with the frontend-independent
+/// [`svm_ir::synth_powerbox_start`] so the two `_start` synthesizers stay byte-identical.
+const STACK_PAGE: u64 = svm_ir::POWERBOX_STACK_PAGE;
 // The §3e powerbox args buffer (`svm_ir::POWERBOX_ARGS_BASE..POWERBOX_ARGS_END`) must sit *above*
 // the frontend's format/scratch region and *below* the globals base, so it never overlaps either.
 const _: () = assert!(svm_ir::POWERBOX_ARGS_BASE >= FMT_BUF_END);
 const _: () = assert!(svm_ir::POWERBOX_ARGS_END == STACK_PAGE);
 /// The data-stack reserve (bytes) above the entry SP before the guard region — a stack overflow
-/// past this faults rather than escaping the window.
-const STACK_RESERVE: u64 = 1 << 20;
+/// past this faults rather than escaping the window ([`svm_ir::POWERBOX_STACK_RESERVE`]).
+const STACK_RESERVE: u64 = svm_ir::POWERBOX_STACK_RESERVE;
 
 /// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
 /// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
@@ -1825,34 +1838,42 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
 /// Blocking/Jit tail so granting it later (the P2 async-I/O work) needs **no stash relocation**. The
 /// allocator/scratch/format state lives strictly **above** the handle region, so it never collides
 /// with a newly-granted handle (the bug this layout forecloses).
-const STASH_STDOUT: u64 = 0;
-const STASH_STDIN: u64 = 4;
-const STASH_EXIT: u64 = 8;
+// The handle stash is the public powerbox layout ([`svm_ir::POWERBOX_STASH_BASE`] + `i*4`), shared
+// with the frontend-independent [`svm_ir::synth_powerbox_start`]; the per-`VM_CAP_*` slots derive
+// from it so this and the public synthesizer can never drift.
+const STASH_STDOUT: u64 = svm_ir::POWERBOX_STASH_BASE;
+const STASH_STDIN: u64 = STASH_STDOUT + 4;
+const STASH_EXIT: u64 = STASH_STDOUT + 8;
 /// The `Memory` capability handle (`i32`) — present when the program uses `malloc` *or* a direct
 /// `<svm.h>` Memory builtin (then `_start` takes a 4th granted handle). The bump allocator + the
 /// `__vm_map`/… builtins reload it to drive `Memory` capability calls.
-const STASH_MEMORY: u64 = 12;
+const STASH_MEMORY: u64 = STASH_STDOUT + 12;
 /// The `AddressSpace` handle (slot 4) — granted when the program mints a §13/§14 `SharedRegion`
 /// (`__vm_region_create` calls `AddressSpace.create_region`). The region handle it returns is then the
 /// capability for `__vm_region_map`/`unmap`/`page_size` (not a stash slot — those take it as an arg).
-const STASH_ADDRSPACE: u64 = 16;
+const STASH_ADDRSPACE: u64 = STASH_STDOUT + 16;
 /// The `IoRing` (slot 5) and `Blocking` (slot 6) handles — granted when the program uses the §9/§12
 /// async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap` drive `IoRing`; `__vm_blocking_handle`
 /// returns the `Blocking` handle a guest names in an SQE).
-const STASH_IORING: u64 = 20;
-const STASH_BLOCKING: u64 = 24;
+const STASH_IORING: u64 = STASH_STDOUT + 20;
+const STASH_BLOCKING: u64 = STASH_STDOUT + 24;
 /// The `Jit` handle (slot 7) — granted when the program uses the §22 guest-driven-JIT builtins
 /// (`__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/`compile_linked`): a guest submits
 /// serialized SVM IR built in its own window and the host verifies + Cranelift-compiles it into THIS
 /// domain. Slot 4 (`AddressSpace`) stays reserved (offset 16) for the §13/§14 region builtins.
-const STASH_JIT: u64 = 28;
+const STASH_JIT: u64 = STASH_STDOUT + 28;
 /// End of the reserved 8-handle region (`[0, 32)`, one `i32` slot per `VM_CAP_*` index). The
 /// allocator/scratch/format state begins here, so it is collision-proof against the full handle set.
-const HANDLE_REGION_END: u64 = 32;
+/// This is exactly the public heap base ([`svm_ir::POWERBOX_HEAP_BRK`]).
+const HANDLE_REGION_END: u64 = svm_ir::POWERBOX_HEAP_BRK;
 /// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state,
-/// placed just above the 8-handle region.
+/// placed just above the 8-handle region ([`svm_ir::POWERBOX_HEAP_BRK`]/[`svm_ir::POWERBOX_HEAP_TOP`]).
 const HEAP_BRK: u64 = HANDLE_REGION_END; // 32
 const HEAP_TOP: u64 = HEAP_BRK + 8; // 40
+                                    // Pin the C `_start` layout to the public powerbox ABI so this and `svm_ir::synth_powerbox_start`
+                                    // can never silently diverge (the dedup hinge: one source of truth in `svm-ir`).
+const _: () = assert!(HEAP_TOP == svm_ir::POWERBOX_HEAP_TOP);
+const _: () = assert!(STASH_STDOUT == svm_ir::POWERBOX_STASH_BASE);
 /// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
 /// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit
 /// memory). Reused per call — single-threaded, fully produced-then-consumed within one lowering.

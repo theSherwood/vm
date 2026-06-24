@@ -223,6 +223,7 @@ fn gen_module(g: &mut Rng) -> Module {
         memory: None,
         data: Vec::new(),
         imports: Vec::new(),
+        exports: Vec::new(),
         debug_info: None,
     }
 }
@@ -243,6 +244,7 @@ fn gen_module_acyclic(g: &mut Rng) -> Module {
         memory: None,
         data: Vec::new(),
         imports: Vec::new(),
+        exports: Vec::new(),
         debug_info: None,
     }
 }

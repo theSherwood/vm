@@ -144,6 +144,13 @@ pub(crate) struct Domain {
     /// by [`Domain::drive_frozen_spawns`]; `run_inner` drains it into the run's residue so a snapshot
     /// records the children (a thaw re-attaches them). Empty on a non-durable run.
     frozen_vcpus: Mutex<Vec<crate::FrozenVCpu>>,
+    /// §12.8 4A.5 follow-up A: concurrent durable children that **finished** (didn't freeze) during a
+    /// run, recorded by [`run_child`]. On a freeze the coordinator turns *every* one into a
+    /// `completed_result` residue (so the spawner's `thread.join` of a child that finished before the
+    /// freeze point resolves on thaw — the host-side Done cell isn't in the snapshot). Emitting them all
+    /// keeps the thaw's per-parent join table dense so every handle still resolves. Drained on a freeze;
+    /// discarded on a non-freeze run.
+    completed_children: Mutex<Vec<CompletedChild>>,
     /// **Durable** (slice 3.4): residue of the fibers a *spawned child* flattened with its own
     /// `freeze_drive` (a child that owns `cont.*` fibers). Accumulated by [`Domain::run_child_inline`];
     /// `run_inner` merges it into the run's `frozen_out` (the root's own fibers are flattened directly
@@ -234,6 +241,7 @@ impl Domain {
             }),
             pending_spawns: Mutex::new(Vec::new()),
             frozen_vcpus: Mutex::new(Vec::new()),
+            completed_children: Mutex::new(Vec::new()),
             frozen_fibers: Mutex::new(Vec::new()),
             dchildren: Mutex::new(HashMap::new()),
             cur_task: Mutex::new(0),
@@ -301,34 +309,49 @@ impl Domain {
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4). Arm the quiesce barrier for `runners`
-    /// concurrently-unwinding vCPUs and engage the concurrent path. Called once by the 4A.5 concurrent
-    /// entry before the workers can observe a freeze; never on a single-worker path (where `quiesce`
-    /// stays 0 and the lock is untouched, so the run is byte-identical).
-    #[cfg_attr(not(loom), allow(dead_code))] // wired live by 4A.5
+    /// concurrently-unwinding vCPUs.
+    ///
+    /// NOTE: this barrier ([`Self::arm_quiesce`] / [`Self::quiesce_arrive`] / [`Self::quiesce_wait_all`])
+    /// is **not on the live path**. Stage (ii) chose `run_inner`'s existing `join_all` as the
+    /// coordinator-wait: with per-context shadow-SP (stage i), each child's freeze-unwind into its own
+    /// region simply completes its OS thread, and `join_all` blocks until all have — so an explicit
+    /// barrier is unnecessary. It is retained as a **loom-verified primitive** (model:
+    /// `loom_quiesce_barrier_never_hangs_with_per_context_sp`) in case a future park-in-place quiesce
+    /// (workers that stop *without* ending their OS thread) needs it. Exercised only under `cfg(loom)`.
+    #[cfg_attr(not(loom), allow(dead_code))]
     pub(crate) fn arm_quiesce(&self, runners: usize) {
         *lock(&self.quiesce) = runners;
         self.concurrent_durable.store(true, Ordering::Release);
     }
 
-    /// True on a concurrent multi-worker durable run (4A.5). A worker observing a freeze takes the
-    /// quiesce path ([`Self::quiesce_arrive`]) only when this holds; otherwise it unwinds directly on
-    /// the (uncontended) active-SP word exactly as today.
-    #[allow(dead_code)] // wired live by 4A.5
+    /// True on a concurrent multi-worker durable run (4A.5). `thread_spawn` reserves a per-context
+    /// shadow context for a child spawned during NORMAL (so a later freeze makes it self-unwind into its
+    /// own region); `run_child` seeds the durable shadow-base register and records freeze residue. Off
+    /// on every existing path, so they are byte-identical.
     pub(crate) fn is_concurrent_durable(&self) -> bool {
         self.concurrent_durable.load(Ordering::Acquire)
     }
 
-    /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4) — a worker reaches the quiesce barrier. Runs
-    /// `unwind` while holding the `quiesce` lock, so the single shared active shadow-SP scratch has
-    /// exactly one owner for the whole set-SP → unwind → read-SP → record sequence (O-A4.1/.2/.3 — no
-    /// torn SP write, each context unwinds against its own region). Then decrements the runner count
-    /// and, when the last worker arrives, wakes the coordinator. The notify can't be lost: both the
-    /// decrement-to-zero and the coordinator's wait hold `quiesce`, so the coordinator either sees
+    /// Engage the concurrent durable path (§12.8 4A.5 stage ii) for a freezable multi-vCPU run. Set once
+    /// at run setup, before any child is spawned. The coordinator joins concurrent children via the
+    /// existing `join_all` (each child's freeze-unwind into its own per-context region completes its OS
+    /// thread); no shared active-SP word and no quiesce lock — the per-context relocation (stage i)
+    /// made that serialization unnecessary.
+    pub(crate) fn engage_concurrent_durable(&self) {
+        self.concurrent_durable.store(true, Ordering::Release);
+    }
+
+    /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
+    /// each context unwinds into its **own** region's shadow-SP word (per-context, no shared scratch
+    /// since the relocation), so `unwind` runs **concurrently, outside the lock** — workers no longer
+    /// serialize on a single active-SP word. The lock guards only the *join*: decrement the runner
+    /// count and, when the last worker arrives, wake the coordinator. The notify can't be lost: both
+    /// the decrement-to-zero and the coordinator's wait hold `quiesce`, so the coordinator either sees
     /// `runners == 0` before parking or is woken after (O-A4.4 — the same invariant as the futex).
     #[cfg_attr(not(loom), allow(dead_code))]
     pub(crate) fn quiesce_arrive(&self, unwind: impl FnOnce()) {
+        unwind(); // concurrent: each context spills into its own per-context region word (4A.5)
         let mut runners = lock(&self.quiesce);
-        unwind(); // single-owner critical section: the active-SP scratch
         *runners -= 1;
         if *runners == 0 {
             self.quiesce_cv.notify_all();
@@ -354,6 +377,24 @@ impl Domain {
     /// snapshot. Empty on a non-durable / non-freeze run.
     pub(crate) fn take_frozen_vcpus(&self) -> Vec<crate::FrozenVCpu> {
         std::mem::take(&mut lock(&self.frozen_vcpus))
+    }
+
+    /// §12.8 4A.5 follow-up A: drain the **completed** concurrent children as `completed_result`
+    /// residue (every one, so the thaw's per-parent join table stays dense and all handles resolve).
+    /// Each thaws as a no-re-run cell pre-filled with the recorded `thread.join` result. Called by the
+    /// coordinator on a freeze, after `join_all`.
+    pub(crate) fn take_completed_children_residue(&self) -> Vec<crate::FrozenVCpu> {
+        std::mem::take(&mut *lock(&self.completed_children))
+            .into_iter()
+            .map(|c| crate::FrozenVCpu {
+                task: c.task as usize,
+                parent_task: c.parent as usize,
+                func: c.func,
+                args: c.args,
+                shadow_sp: 0, // inert — a completed child is not re-run
+                completed_result: Some(c.result),
+            })
+            .collect()
     }
 
     /// Drain the child-owned fiber residue (slice 3.4) — the fibers spawned children flattened with
@@ -422,6 +463,34 @@ extern "C" fn child_entry(
 
 /// What a spawned OS thread runs: set up its own fiber runtime (for `cont.*`), arm the guard, call the
 /// guest entry, then publish the result/trap into its completion cell.
+/// §12.8 4A.5 stage (ii): a **concurrent durable** child's per-context durability state. Present only
+/// when a freezable (interruptible) durable run spawns a child as a real OS thread during NORMAL — the
+/// child reserves its own top-down shadow context up front so it can self-unwind into it if a freeze
+/// fires mid-run. `None` on non-durable / single-worker / deferred spawns.
+struct DurableChild {
+    /// Global task id (monotonic spawn order; matches the interp + the deferred path), recorded in the
+    /// child's `FrozenVCpu` residue.
+    task: u64,
+    /// The spawning task (`parent_task`) — the root (`0`) for a flat spawn.
+    parent: u64,
+    /// The reserved top-down shadow context the child unwinds into (kept on a freeze-unwind so a thaw
+    /// re-spawns it there; freed on a genuine finish).
+    ctx: usize,
+    /// The child's entry function index — recorded in its residue so a thaw re-spawns it.
+    func_idx: u32,
+}
+
+/// §12.8 4A.5 follow-up A: a concurrent durable child that **finished** (didn't freeze). Recorded so a
+/// freeze can carry its `thread.join` result in the artifact (`FrozenVCpu::completed_result`), to be
+/// delivered on thaw without re-running the child.
+struct CompletedChild {
+    task: u64,
+    parent: u64,
+    func: i32,
+    args: Vec<i64>,
+    result: i64,
+}
+
 struct SpawnArgs {
     env: Env,
     code: u64,
@@ -430,6 +499,8 @@ struct SpawnArgs {
     /// §12 dense vCPU id seeded into this child's per-vCPU TLS register (`vcpu.tls`). Root is 0, so a
     /// spawned vCPU takes `handle + 1` (handles are 0-based, cumulative spawn order).
     vcpu_id: i64,
+    /// §12.8 4A.5 stage (ii): present on a concurrent durable child (see [`DurableChild`]).
+    durable_child: Option<DurableChild>,
     done: std::sync::Arc<Done>,
     /// The owning [`Domain`] — so this vCPU can drop its §15 concurrent-live count when it finishes.
     /// The domain outlives every spawned thread (`run_inner` joins them at run end), so the pointer
@@ -460,10 +531,34 @@ struct PendingSpawn {
     done: std::sync::Arc<Done>,
 }
 
+std::thread_local! {
+    /// §12.8 4A.5 follow-up B.2 guard: true on an OS thread running a **concurrent durable child**
+    /// ([`run_child`]). [`thread_spawn`] reads it to fail a *nested* concurrent spawn closed (a clean
+    /// `ThreadFault`) rather than mis-attribute the grandchild's `parent_task` via the shared `cur_task`.
+    /// Per-OS-thread; the root's thread never sets it, so flat root-spawned children are unaffected.
+    static IN_CONCURRENT_CHILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn run_child(a: SpawnArgs) {
     let env = a.env;
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
+    // §12.8 4A.5 stage (ii): a concurrent durable child points its durable shadow-base register at its
+    // own region AND initialises that region's shadow-SP word to the empty frame base, so if a freeze
+    // fires its instrumented code spills into *its* per-context region (concurrent with siblings, no
+    // shared word). Without the init the word would read 0 and the unwind would spill over the reserve
+    // header — corrupting the state word. SAFETY: durable run ⇒ the reserve is committed RW.
+    if let Some(dc) = &a.durable_child {
+        let region = fiber_rt::shadow_region_base(dc.ctx);
+        crate::durable_shadow::seed(region);
+        unsafe {
+            fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
+        };
+        // §12.8 4A.5 follow-up B.2: mark this OS thread as a concurrent durable child, so a nested
+        // `thread.spawn` it makes fails closed (see `thread_spawn`) until B.2 is built. The OS thread is
+        // fresh per child, so the flag is naturally scoped to this child.
+        IN_CONCURRENT_CHILD.with(|c| c.set(true));
+    }
     // Arm this OS thread's detect-and-kill recovery (idempotent; handler is process-wide, recovery is
     // thread-local — §5 / `mem::install_guard`).
     mem::install_guard();
@@ -476,6 +571,13 @@ fn run_child(a: SpawnArgs) {
             .expect("fiber_cfg set ⇒ the domain fiber table is set");
         let mut rt = FiberRuntime::new(table, tid, mask);
         rt.set_call_tramp(env.call_tramp);
+        // §12.8 4A.5 follow-up B: a **concurrent durable** child that owns fibers needs `mem_base` +
+        // the `durable` flag on its own runtime, so its `cont.resume` swap repoints the active
+        // shadow-SP at the fiber's region and the freeze driver records flattened fibers as residue
+        // (mirrors `run_child_inline`). Off the durable concurrent path this is inert.
+        if a.durable_child.is_some() {
+            rt.set_durable_env(env.mem_base, env.durable);
+        }
         Box::new(rt)
     });
     let prev = frt
@@ -503,6 +605,27 @@ fn run_child(a: SpawnArgs) {
             env.fault_hi,
         )
     };
+    // §12.8 4A.5 follow-up B: a concurrent durable child that **owns fibers** must flatten the ones it
+    // parked into their shadow regions — its own `freeze_drive`, the concurrent mirror of
+    // `run_child_inline`'s (the root's drive ran before this child existed). Run it while the child's
+    // runtime is still `CURRENT_RT` and the window is `UNWINDING`; drain the child's fiber residue into
+    // the domain accumulator (`run_inner` merges it; canonical sort-by-slot keeps the artifact
+    // order-independent). SAFETY: durable run ⇒ committed reserve; live `Domain`.
+    if a.durable_child.is_some()
+        && !faulted
+        && unsafe { fiber_rt::window_is_unwinding(env.mem_base) }
+    {
+        if let Some(b) = frt.as_mut() {
+            let rt = &mut **b as *mut FiberRuntime;
+            unsafe {
+                fiber_rt::freeze_drive(rt, env.trap_out as u64);
+                let child_frozen = fiber_rt::take_frozen(rt);
+                if !child_frozen.is_empty() {
+                    lock(&(*a.dom).frozen_fibers).extend(child_frozen);
+                }
+            }
+        }
+    }
     if let Some(p) = prev {
         fiber_rt::set_current(p);
     }
@@ -517,6 +640,55 @@ fn run_child(a: SpawnArgs) {
         let t = unsafe { load_trap(env.trap_out) };
         (call.ret, t)
     };
+    // §12.8 4A.5 stage (ii): if this concurrent durable child observed a freeze, its instrumented code
+    // has now unwound into *its own* region; record its `FrozenVCpu` residue (extent = its region's
+    // shadow-SP word) so the coordinator's snapshot (taken after `join_all`) captures its continuation,
+    // and keep its context for the thaw to re-spawn it there. A genuine finish (no freeze) frees the
+    // context for reuse. SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
+    if let Some(dc) = &a.durable_child {
+        let region = fiber_rt::shadow_region_base(dc.ctx);
+        let extent = if faulted {
+            0
+        } else {
+            unsafe { fiber_rt::read_shadow_sp(env.mem_base, region) }
+        };
+        // A freeze-unwind iff the window is UNWINDING **and** the child actually spilled past its frame
+        // base — a child that ran to a genuine finish under an UNWINDING window left its region empty.
+        let froze = !faulted
+            && unsafe { fiber_rt::window_is_unwinding(env.mem_base) }
+            && extent > fiber_rt::shadow_frame_base(dc.ctx);
+        if froze {
+            unsafe {
+                lock(&(*a.dom).frozen_vcpus).push(crate::FrozenVCpu {
+                    task: dc.task as usize,
+                    parent_task: dc.parent as usize,
+                    func: dc.func_idx as i32,
+                    args: vec![a.sp as i64, a.arg as i64],
+                    shadow_sp: extent,
+                    completed_result: None, // a spilled (frozen) child re-runs on thaw
+                });
+            }
+        } else {
+            // A genuine finish: free the context for reuse, and record the child's result so a freeze
+            // (if one is in flight / about to be) can carry it as residue — a `thread.join` of a child
+            // that finished before the freeze point must resolve on thaw. Discarded if the run doesn't
+            // freeze. SAFETY: live `Domain`.
+            unsafe {
+                if let Some(table) = (*a.dom).fiber_table() {
+                    table.free_vcpu_context(dc.ctx);
+                }
+                if trap == 0 {
+                    lock(&(*a.dom).completed_children).push(CompletedChild {
+                        task: dc.task,
+                        parent: dc.parent,
+                        func: dc.func_idx as i32,
+                        args: vec![a.sp as i64, a.arg as i64],
+                        result,
+                    });
+                }
+            }
+        }
+    }
     // §5 W3 Stage 3: if this spawned vCPU trapped, hand its trap-time backtrace capture (the SIGSEGV
     // handler's, or the explicit-trap helper's — both in this thread's `trap_shim.c` thread-local) to
     // the domain before this worker ends, else it would be lost and the run thread couldn't symbolize
@@ -569,6 +741,52 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     if env.durable && fiber_rt::window_is_durable_active(env.mem_base) {
         return defer_spawn(dom, code, func_idx, sp, arg, trap_out);
     }
+    // §12.8 4A.5 stage (ii): on a freezable (interruptible) durable run, a child spawned during NORMAL
+    // runs as a real OS thread but reserves its own top-down shadow context now, so a later freeze can
+    // make it self-unwind into its own per-context SP word (concurrent, lock-free — stage i). Its global
+    // task id matches the interp/deferred path (seeded into `vcpu.tls`). `None` on every existing path,
+    // so behavior is unchanged there.
+    let durable_child = if env.durable && dom.is_concurrent_durable() {
+        // §12.8 4A.5 follow-up B.2 (not yet built): a **concurrent** child that spawns a grandchild
+        // would mis-attribute its `parent_task` — `thread_spawn` reads the shared `cur_task`, which only
+        // the single-worker paths maintain and which would race across concurrent spawners. Until a
+        // per-OS-thread spawning-task source lands, **fail closed**: a nested concurrent spawn is a clean
+        // `ThreadFault` rather than a silently-wrong artifact. (Flat root-spawned children are fine: the
+        // root's OS thread never set this flag.)
+        if IN_CONCURRENT_CHILD.with(|c| c.get()) {
+            store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+            return -1;
+        }
+        let table = match dom.fiber_table() {
+            Some(t) => t,
+            None => {
+                store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                return -1;
+            }
+        };
+        let ctx = match table.reserve_vcpu_context() {
+            Some(c) => c,
+            None => {
+                store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                return -1;
+            }
+        };
+        let parent = *lock(&dom.cur_task);
+        let task = {
+            let mut nt = lock(&dom.next_task);
+            let t = *nt;
+            *nt += 1;
+            t
+        };
+        Some(DurableChild {
+            task,
+            parent,
+            ctx,
+            func_idx,
+        })
+    } else {
+        None
+    };
     let done = std::sync::Arc::new(Done {
         state: Mutex::new(None),
         cv: Condvar::new(),
@@ -578,18 +796,28 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         // §15: bound *concurrent* live vCPUs (root + unfinished spawns), not the cumulative handle
         // table — so a spawn-join loop never trips, matching the interpreter.
         if t.live >= dom.max_vcpus {
+            if let Some(dc) = &durable_child {
+                if let Some(table) = dom.fiber_table() {
+                    table.free_vcpu_context(dc.ctx);
+                }
+            }
             store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return -1;
         }
         let idx = t.cells.len();
         t.cells.push(std::sync::Arc::clone(&done));
         t.joined.push(false);
+        let vcpu_id = durable_child
+            .as_ref()
+            .map(|d| d.task as i64)
+            .unwrap_or(idx as i64 + 1); // dense id seed (root 0; children 1, 2, …)
         let args = SpawnArgs {
             env,
             code,
             sp,
             arg,
-            vcpu_id: idx as i64 + 1, // dense id seed (root 0; children 1, 2, …)
+            vcpu_id,
+            durable_child,
             done,
             dom: sched,
         };
@@ -605,7 +833,8 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                 idx as i32
             }
             Err(_) => {
-                // Out of OS threads: pop the cell we reserved and trap (no `live` change).
+                // Out of OS threads: pop the cell we reserved and trap (no `live` change). The child's
+                // reserved shadow context (if any) leaks for this run — a spawn failure aborts the run.
                 t.cells.pop();
                 t.joined.pop();
                 store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
@@ -854,6 +1083,7 @@ impl Domain {
                         func: p.func_idx as i32,
                         args: vec![p.sp as i64, p.arg as i64],
                         shadow_sp: child_sp,
+                        completed_result: None, // a spilled (frozen) child re-runs on thaw
                     });
                 } else if let Some(table) = self.fiber_table() {
                     table.free_vcpu_context(p.ctx);
@@ -916,8 +1146,12 @@ impl Domain {
         ordered.sort_by_key(|v| v.task);
         let mut runs: Vec<Run> = Vec::with_capacity(ordered.len());
         for v in &ordered {
+            // §12.8 4A.5 follow-up A: a child that **completed** before the freeze point (no frozen
+            // continuation) gets its `thread.join` result delivered into the spawner's table directly —
+            // its Done cell is pre-filled and it is **not** re-run (its side effects are already in the
+            // snapshot). Pushed in task order alongside frozen children so handles stay dense.
             let done = std::sync::Arc::new(Done {
-                state: Mutex::new(None),
+                state: Mutex::new(v.completed_result.map(|r| (r, 0))),
                 cv: Condvar::new(),
             });
             {
@@ -925,6 +1159,9 @@ impl Domain {
                 let tbl = dc.entry(v.parent_task as u64).or_default();
                 tbl.cells.push(std::sync::Arc::clone(&done));
                 tbl.joined.push(false);
+            }
+            if v.completed_result.is_some() {
+                continue; // already-done: no re-run, no §15 live count, no context
             }
             lock(&self.threads).live += 1;
             let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
@@ -1269,47 +1506,33 @@ mod loom_tests {
         });
     }
 
-    /// O-A4 (Phase-4 Slice A, 4A.4): the multi-worker quiesce barrier — the R10 seam. `N` workers each
-    /// unwind under the `quiesce` lock (the single shared active shadow-SP scratch must have one owner
-    /// at a time) and arrive at the barrier; the coordinator waits for all of them. Under every
-    /// interleaving:
-    ///   * O-A4.1 — no two workers are inside the SP critical section at once (the `occupied` flag is
-    ///     never observed already set);
-    ///   * O-A4.2/.3 — each worker reads back exactly the extent it wrote (no torn/lost SP update; it
-    ///     never picks up a sibling's region);
+    /// O-A4 (Phase-4 Slice A): the multi-worker quiesce barrier — the R10 seam. §12.8 4A.5: each worker
+    /// unwinds into its **own** per-context region's shadow-SP word (no shared scratch since the
+    /// relocation), so the unwind runs concurrently *outside* the lock; the lock guards only the join.
+    /// `N` workers each unwind + arrive; the coordinator waits for all. Under every interleaving:
+    ///   * O-A4.2/.3 — each worker's own SP slot ends at exactly the extent it wrote (concurrent
+    ///     unwinds into disjoint per-context words never clobber a sibling);
     ///   * O-A4.4 — the coordinator never hangs (the last-arriver notify can't be lost — same property
     ///     as `loom_wait_notify_never_hangs`, here for the barrier).
     /// The single-vCPU async-request ordering (O-A3) is the degenerate `N = 1` case.
     #[test]
-    fn loom_quiesce_barrier_never_hangs_and_sp_swap_is_exclusive() {
+    fn loom_quiesce_barrier_never_hangs_with_per_context_sp() {
         loom::model(|| {
             const N: usize = 2;
             let dom = Arc::new(Domain::new(MAX_VCPUS));
             dom.arm_quiesce(N);
-            // The single shared active shadow-SP scratch + an "occupied" flag to catch any overlap of
-            // two unwind critical sections.
-            let sp = Arc::new(AtomicU64::new(0));
-            let occupied = Arc::new(AtomicU64::new(0));
+            // §12.8 4A.5: per-context SP words — each worker owns its own slot (no shared scratch).
+            let sps: Vec<Arc<AtomicU64>> = (0..N).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
             let workers: Vec<_> = (0..N)
                 .map(|i| {
-                    let (d, sp, occ) = (Arc::clone(&dom), Arc::clone(&sp), Arc::clone(&occupied));
+                    let (d, sp) = (Arc::clone(&dom), Arc::clone(&sps[i]));
                     loom::thread::spawn(move || {
                         let my_extent = (i as u64) + 1; // a distinct per-context extent
                         d.quiesce_arrive(|| {
-                            // O-A4.1: exactly one worker in the SP critical section at a time.
-                            assert_eq!(
-                                occ.swap(1, Ordering::AcqRel),
-                                0,
-                                "active-SP scratch double-owned"
-                            );
-                            sp.store(my_extent, Ordering::Release); // set own SP + "unwind"
-                            let read = sp.load(Ordering::Acquire); // read the extent back to record
-                            assert_eq!(
-                                read, my_extent,
-                                "SP write torn/lost (read a sibling's extent)"
-                            );
-                            occ.store(0, Ordering::Release);
+                            // The unwind runs concurrently with siblings: it touches only this
+                            // context's own region word, so there is no critical section to serialize.
+                            sp.store(my_extent, Ordering::Release);
                         });
                     })
                 })
@@ -1320,11 +1543,15 @@ mod loom_tests {
             for w in workers {
                 w.join().unwrap();
             }
-            assert_eq!(
-                occupied.load(Ordering::Acquire),
-                0,
-                "scratch released after all quiesced"
-            );
+            // O-A4.2/.3: each context's own word holds exactly its extent — concurrent unwinds into
+            // disjoint per-context words never clobbered a sibling.
+            for (i, sp) in sps.iter().enumerate() {
+                assert_eq!(
+                    sp.load(Ordering::Acquire),
+                    (i as u64) + 1,
+                    "a context's own per-context SP word was clobbered"
+                );
+            }
         });
     }
 }
