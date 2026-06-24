@@ -136,9 +136,14 @@ different things depending on which pair you compare:
   **every hit** — resume included — and the same result) and `breakpoint_runtime_parity_across_call_frames`
   (stopped *inside a callee*, both report the same **call-stack depth, per-frame location, and per-frame
   locals** — the `stackTrace`/`scopes`/`variables` surface, now matched cross-frame via `DebugRun`'s
-  per-function slot metadata). *Remaining:* wire `DebugRun` into the `svm-dap` server (a backend seam, so
-  one DAP conversation replays against both engines), stepping verbs (step in/over/out), and the JIT path
-  (Stage 5). The *static* source-map half is already covered transitively by **G1**.
+  per-function slot metadata). `DebugRun` also has the **stepping verbs** (`step`/`step_over`/`step_out`,
+  mirroring the tree-walker's `step_to_depth`); `stepping_parity_over_and_out_at_a_call` checks that
+  step-over (run a call to completion) and step-out (return from a frame) land at the same op and agree
+  on the call result. So the bytecode engine now has the full debug-primitive surface — breakpoints,
+  cross-frame inspection, backtrace, stepping — all parity-tested against the tree-walker. *Remaining:*
+  wire `DebugRun` into the `svm-dap` server (a backend seam, so one DAP conversation replays against both
+  engines — the last bytecode-side piece) and the JIT path (Stage 5). The *static* source-map half is
+  already covered transitively by **G1**.
 
 ---
 

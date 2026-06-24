@@ -1690,6 +1690,70 @@ impl DebugRun {
         }
     }
 
+    /// Execute the current op, then stop at the next instruction whose call depth is `<= max_depth`
+    /// (`None` ⇒ any depth). The shared driver for the stepping verbs — mirrors the tree-walker's
+    /// `step_to_depth` (step off the current op first, then seek the next qualifying stop).
+    fn step_to(&mut self, max_depth: Option<usize>, fuel: &mut u64) -> Option<super::IrPc> {
+        if self.done.is_some() {
+            return None;
+        }
+        let Self {
+            mods,
+            table,
+            mem,
+            host,
+            vm,
+            at_bp,
+            done,
+            ..
+        } = self;
+        *at_bp = false; // a step leaves the breakpoint-paused state
+        loop {
+            match vm.resume(&mods[..], table, fuel, mem, host, 1) {
+                Ok(Outcome::Suspended) => {}
+                Ok(Outcome::Done(vals)) => {
+                    *done = Some(Ok(vals));
+                    return None;
+                }
+                Ok(_) => {
+                    *done = Some(Err(Trap::Malformed));
+                    return None;
+                }
+                Err(t) => {
+                    *done = Some(Err(t));
+                    return None;
+                }
+            }
+            let depth = vm.stack.len() + 1;
+            if max_depth.is_none_or(|m| depth <= m) {
+                if let Some(pc) = vm.cur_ir_pc(&mods[..]) {
+                    return Some(pc);
+                }
+            }
+        }
+    }
+
+    /// **Step** one instruction — descends into a call (stops at the callee's first op), the bytecode
+    /// counterpart of `Inspector::step`. `None` at completion / a seam.
+    pub fn step(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
+        self.step_to(None, fuel)
+    }
+
+    /// **Step over**: execute the current op and stop at the next op in *this* frame — running any call
+    /// it makes to completion rather than descending. The counterpart of `Inspector::step_over`.
+    pub fn step_over(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
+        let d = self.depth();
+        self.step_to(Some(d), fuel)
+    }
+
+    /// **Step out**: run until the current function returns, stopping at the op in the caller it
+    /// returned to (from the outermost frame, runs to completion). The counterpart of
+    /// `Inspector::step_out`.
+    pub fn step_out(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
+        let d = self.depth();
+        self.step_to(Some(d.saturating_sub(1)), fuel)
+    }
+
     /// Number of live call frames at the current stop (callers + the running activation) — the depth a
     /// DAP `stackTrace` would report.
     pub fn depth(&self) -> usize {

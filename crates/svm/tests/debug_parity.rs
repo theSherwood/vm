@@ -631,3 +631,77 @@ fn breakpoint_runtime_parity_across_call_frames() {
     assert_eq!(&bt[0].vals[..2], &[Value::I32(5), Value::I32(2)]);
     assert_eq!(&bt[1].vals[..2], &[Value::I32(5), Value::I32(10)]);
 }
+
+/// Stepping-verb parity (G3 follow-up): `step_over` and `step_out` exercise call-frame control the
+/// linear traces don't reach — `step_over` runs a call to completion, `step_out` returns from a frame.
+/// The tree-walker `Inspector` and the bytecode `DebugRun` must land at the same op and agree on the
+/// (now-defined) call result. Uses `CALL_DBG` (caller `func 0` calls callee `func 1`).
+#[test]
+fn stepping_parity_over_and_out_at_a_call() {
+    let m = parse_module(CALL_DBG).expect("parse");
+    let args = [Value::I32(5)];
+    let call = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 1,
+    }; // v2 = call 1(v0)
+    let after_call = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 2,
+    }; // v3 = add (the return point)
+    let in_callee = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 1,
+    }; // v2 = mul, inside the callee
+
+    let stop_pc = |s: Stop| match s {
+        Stop::Break { pc, .. } => Some(pc),
+        _ => None,
+    };
+
+    // step_over the call: both land at the next caller op, the callee having run to completion.
+    {
+        let mut insp = Inspector::attach(&m, 0, &args, 100_000);
+        insp.set_breakpoint(call);
+        assert_eq!(stop_pc(insp.run_until_stop()), Some(call));
+        let mut dbg = bytecode::DebugRun::new(&m, 0, &args).unwrap();
+        let mut fuel = 100_000u64;
+        assert_eq!(dbg.run_to(&[call], &mut fuel), Some(call));
+
+        assert_eq!(dbg.step_over(&mut fuel), stop_pc(insp.step_over()));
+        assert_eq!(
+            dbg.frame_pc(0),
+            Some(after_call),
+            "step_over lands at the next caller op"
+        );
+        assert_eq!(dbg.depth(), 1, "back in the caller frame");
+        // v2 = the call result (5 * 2 = 10), now defined and equal on both engines.
+        assert_eq!(dbg.value(2), insp.read_ir_value(0, 2));
+        assert_eq!(dbg.value(2), Some(Value::I32(10)));
+    }
+
+    // step_out from inside the callee: both return to the same caller op.
+    {
+        let mut insp = Inspector::attach(&m, 0, &args, 100_000);
+        insp.set_breakpoint(in_callee);
+        assert_eq!(stop_pc(insp.run_until_stop()), Some(in_callee));
+        let mut dbg = bytecode::DebugRun::new(&m, 0, &args).unwrap();
+        let mut fuel = 100_000u64;
+        assert_eq!(dbg.run_to(&[in_callee], &mut fuel), Some(in_callee));
+        assert_eq!(dbg.depth(), 2, "stopped inside the callee");
+
+        assert_eq!(dbg.step_out(&mut fuel), stop_pc(insp.step_out()));
+        assert_eq!(
+            dbg.frame_pc(0),
+            Some(after_call),
+            "step_out returns to the caller"
+        );
+        assert_eq!(dbg.depth(), 1);
+        assert_eq!(dbg.value(2), Some(Value::I32(10)));
+    }
+}
