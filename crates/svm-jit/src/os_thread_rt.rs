@@ -557,10 +557,18 @@ fn run_child(a: SpawnArgs) {
     // and keep its context for the thaw to re-spawn it there. A genuine finish (no freeze) frees the
     // context for reuse. SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
     if let Some(dc) = &a.durable_child {
-        let froze = !faulted && unsafe { fiber_rt::window_is_unwinding(env.mem_base) };
+        let region = fiber_rt::shadow_region_base(dc.ctx);
+        let extent = if faulted {
+            0
+        } else {
+            unsafe { fiber_rt::read_shadow_sp(env.mem_base, region) }
+        };
+        // A freeze-unwind iff the window is UNWINDING **and** the child actually spilled past its frame
+        // base — a child that ran to a genuine finish under an UNWINDING window left its region empty.
+        let froze = !faulted
+            && unsafe { fiber_rt::window_is_unwinding(env.mem_base) }
+            && extent > fiber_rt::shadow_frame_base(dc.ctx);
         if froze {
-            let region = fiber_rt::shadow_region_base(dc.ctx);
-            let extent = unsafe { fiber_rt::read_shadow_sp(env.mem_base, region) };
             unsafe {
                 lock(&(*a.dom).frozen_vcpus).push(crate::FrozenVCpu {
                     task: dc.task as usize,

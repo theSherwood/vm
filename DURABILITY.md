@@ -1057,8 +1057,20 @@ original site map is retained below for reference:
   empty-section path) → `SHADOW_BASE + 8`. Bump `FORMAT_VERSION` 4 → 5. Guard with the `durable_jit`
   cross-backend fuzz (byte-identical interp↔JIT) — the all-or-nothing oracle for this step.
 
-**Stage (ii) — concurrent multi-vCPU STW freeze (JIT).** With per-context SP landed, children can unwind
-*concurrently* into disjoint region words with no shared scratch and no lock. Implementation map:
+**Stage (ii) — concurrent multi-vCPU STW freeze (JIT). LANDED.** With per-context SP landed, children
+unwind *concurrently* into disjoint region words with no shared scratch and no lock. A new entry
+(`..._durable_mv_interruptible`) engages the concurrent path; `thread_spawn` reserves a per-context
+shadow context for a durable child spawned during NORMAL; `run_child` seeds the durable shadow-base
+register and, on a freeze-unwind (UNWINDING + spilled past its frame base), records the child's
+`FrozenVCpu` residue. **`join_all` is the coordinator-wait** — the per-context relocation made the 4A.4
+barrier's serialization unnecessary, so each child's freeze-unwind simply completes its OS thread and
+`join_all` blocks until all have; the concurrent residue is then drained (after the join) so the
+snapshot sees a fully-quiesced window. The quiesce barrier is retained as a loom-verified primitive.
+Pinned by `crates/svm/tests/durable_concurrent_jit.rs`: a root + two children all freeze mid-loop under
+an async `request_freeze` and the thaw reproduces the result (each total in its own guest-memory slot, so
+the round-trip is robust to which context froze when). *Follow-ups:* surviving a **`thread.join`** result
+across a concurrent freeze (a child that finishes before the freeze point — needs join-table capture);
+a concurrent child that itself owns fibers / nested concurrent spawns. Original map:
 
 - **Barrier adaptation (LANDED).** The 4A.4 `quiesce_arrive` ran `unwind` *under* the `quiesce` lock to
   serialize the (then-shared) active-SP scratch. With per-context SP that serialization is unnecessary —
