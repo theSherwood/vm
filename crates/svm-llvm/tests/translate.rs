@@ -771,6 +771,56 @@ fn memcmp_synthesized_helper() {
 }
 
 #[test]
+fn fcmp_unordered_ordered() {
+    // The NaN-test float predicates `fcmp uno`/`ord` have no single svm-ir op; the on-ramp expands
+    // them (`uno` = `a!=a | b!=b`, `ord` = `a==a & b==b`). `__builtin_isunordered` emits `uno`, its
+    // negation emits `ord` (verified). Runtime args incl. NaN prevent folding. Differential interp+JIT.
+    let src = "int f(int which, double a, double b){ switch(which){ \
+               case 0: return __builtin_isunordered(a, b); \
+               case 1: return !__builtin_isunordered(a, b); \
+               default: return 0; } }";
+    let nan = f64::NAN;
+    // uno (which==0): 1 iff either operand is NaN.
+    check(
+        "uno_a",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_b",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_both",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_none",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(0)],
+    );
+    // ord (which==1): 1 iff neither operand is NaN.
+    check(
+        "ord_nan",
+        src,
+        &[Value::I32(1), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(0)],
+    );
+    check(
+        "ord_none",
+        src,
+        &[Value::I32(1), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(1)],
+    );
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";

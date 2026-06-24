@@ -1282,6 +1282,69 @@ fn fcmp_op(p: FPPredicate) -> Result<FCmpOp, Error> {
     })
 }
 
+/// Emit a float compare, returning its `i32` (0/1) result. The ordered/unordered NaN predicates have
+/// no single svm-ir op, so they expand: `uno` (either operand NaN) = `(a != a) | (b != b)` and `ord`
+/// (neither NaN) = `(a == a) & (b == b)` — `x != x` is true iff `x` is NaN. `true`/`false` fold to a
+/// constant. Everything else is the direct [`fcmp_op`] mapping. Rust's float code (`is_nan`, `min`/
+/// `max`, partial compares) emits these.
+fn emit_fcmp(
+    ctx: &mut BlockCtx,
+    ty: FloatTy,
+    p: FPPredicate,
+    a: ValIdx,
+    b: ValIdx,
+) -> Result<ValIdx, Error> {
+    use FPPredicate as P;
+    Ok(match p {
+        P::UNO => {
+            let na = ctx.push(Inst::FCmp {
+                ty,
+                op: FCmpOp::Ne,
+                a,
+                b: a,
+            });
+            let nb = ctx.push(Inst::FCmp {
+                ty,
+                op: FCmpOp::Ne,
+                a: b,
+                b,
+            });
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: na,
+                b: nb,
+            })
+        }
+        P::ORD => {
+            let aa = ctx.push(Inst::FCmp {
+                ty,
+                op: FCmpOp::Eq,
+                a,
+                b: a,
+            });
+            let bb = ctx.push(Inst::FCmp {
+                ty,
+                op: FCmpOp::Eq,
+                a: b,
+                b,
+            });
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: aa,
+                b: bb,
+            })
+        }
+        P::True => ctx.push(Inst::ConstI32(1)),
+        P::False => ctx.push(Inst::ConstI32(0)),
+        _ => {
+            let op = fcmp_op(p)?;
+            ctx.push(Inst::FCmp { ty, op, a, b })
+        }
+    })
+}
+
 /// The size in bytes of an LLVM type (the SysV/§3d layout for the subset we lower). Used to lay
 /// out `alloca` frames and compute GEP strides. SIMD vectors and odd scalars are a clean
 /// `Unsupported` until a later slice.
@@ -11829,10 +11892,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         I::FCmp(x) => {
             let ty = fty(&x.operand0)?;
-            let op = fcmp_op(x.predicate)?;
             let a = ctx.operand(&x.operand0)?;
             let b = ctx.operand(&x.operand1)?;
-            (&x.dest, ctx.push(Inst::FCmp { ty, op, a, b }))
+            (&x.dest, emit_fcmp(ctx, ty, x.predicate, a, b)?)
         }
         // A lane-wise vector int↔float / float↔float conversion scalarizes through the unified
         // float-vector converter; a scalar one keeps the direct path.
@@ -12748,18 +12810,12 @@ fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             let Some(shape) = vec_lane_shape(x.operand0.get_type(types).as_ref()) else {
                 return Ok(false);
             };
-            let op = fcmp_op(x.predicate)?;
             let lane_ty = float_ty(shape.lane_val())?;
             let a = vec_explode(ctx, &x.operand0, types, false)?;
             let b = vec_explode(ctx, &x.operand1, types, false)?;
             let mut m = Vec::with_capacity(a.len());
             for (&av, &bv) in a.iter().zip(b.iter()) {
-                m.push(ctx.push(Inst::FCmp {
-                    ty: lane_ty,
-                    op,
-                    a: av,
-                    b: bv,
-                }));
+                m.push(emit_fcmp(ctx, lane_ty, x.predicate, av, bv)?);
             }
             bind_mask(ctx, &x.dest, m);
             Ok(true)
