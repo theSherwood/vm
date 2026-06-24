@@ -1324,9 +1324,11 @@ local to memory at `-O2` (returns-twice at the LLVM level), so they arrive as lo
 not long-lived SSA across the `SetJmp`. A value live across the `setjmp` in a callee-saved reg is restored
 to its `setjmp`-time value by `_longjmp` — correct for pre-`setjmp` values; values *modified* after
 `setjmp` are C-indeterminate anyway. **Verification bar (gating): a native differential on the JIT path
-run under ASan** (this is memory-unsafe native-stack manipulation; it gets `svm-fiber`-grade rigor — the
-repo already has an "ASan (svm-fiber switches)" CI lane to extend). Add returns-twice stress cases
-(values live across the `setjmp`; nested/loop `longjmp`; `longjmp` across several JIT frames).
+run under ASan** (this is memory-unsafe native-stack manipulation; it gets `svm-fiber`-grade rigor —
+landed as the dedicated `ASan (JIT setjmp/longjmp)` CI lane alongside "ASan (svm-fiber switches)", running
+`cargo test -p svm-llvm … setjmp` under `-Zsanitizer=address`). Returns-twice stress cases landed: a value
+live across the `setjmp` (`setjmp_value_live_across`), nested buffers (`setjmp_nested_buffers`), and the
+loop / deep-nesting `longjmp` across several frames (`setjmp_longjmp_loop_and_deep_nesting`).
 
 **Reference implementations to mirror (already landed, byte-identical to native):** the tree-walker
 (`crates/svm-interp/src/lib.rs` — `SetJmpPoint`, `setjmp_points`, the `SetJmp`/`LongJmp` arms in
