@@ -3984,6 +3984,38 @@ fn simd_autovec_avx2_wide_shifts() {
     check_avx_vs_native("simd_avx2_wide_shifts", src, 9);
 }
 
+/// ISSUES.md I13 — a `<2 x i16>` carried across a loop (Embench `edn`'s `fir_no_red_ld` "no-redundant
+/// -load" FIR) round-trips its 16-bit lanes incorrectly through the per-part block-param fan-out, a
+/// *silent miscompile*. Until the tiny-tail-lane representation is fixed, the on-ramp **fail-closes**
+/// on a φ carrying a ≤2-lane sub-32-bit vector. This pins that it stays a clean `Unsupported` (never a
+/// wrong answer); the 4-lane `<4 x i16>` carry stays supported (`demo_clay_vs_native`).
+#[test]
+fn simd_tiny_i16_carry_phi_fails_closed_i13() {
+    let src = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
+        static short X[256], H[256]; static long Y[256];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 256; i++) { X[i] = seed + i; H[i] = seed * 2 - i; Y[i] = 0; }\n\
+        \x20 fir_no_red_ld(X, H, Y); long a = 0; for (int i = 0; i < 256; i++) a += Y[i]; return (int) a;\n\
+        }\n\
+        void fir_no_red_ld(const short x[], const short h[], long y[]) {\n\
+        \x20 long i, j, sum0, sum1; short x0, x1, h0, h1;\n\
+        \x20 for (j = 0; j < 100; j += 2) { sum0 = 0; sum1 = 0; x0 = x[j];\n\
+        \x20   for (i = 0; i < 32; i += 2) {\n\
+        \x20     x1 = x[j+i+1]; h0 = h[i]; sum0 += x0*h0; sum1 += x1*h0;\n\
+        \x20     x0 = x[j+i+2]; h1 = h[i+1]; sum0 += x1*h1; sum1 += x0*h1; }\n\
+        \x20   y[j] = sum0 >> 15; y[j+1] = sum1 >> 15; }\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    let Some(bc) = compile_to_bc("i13_tiny_i16_carry", src) else {
+        return; // clang unavailable
+    };
+    // Must fail-close, not translate (a translated module here would silently miscompile).
+    assert!(
+        svm_llvm::translate_bc_path(&bc).is_err(),
+        "I13: a carried <2 x i16> must fail-close (Unsupported), not translate-and-miscompile"
+    );
+}
+
 // ============================================================================================
 // SIMD — the **other 128-bit lane shapes** (`i8x16`/`i16x8`/`i64x2`/`f64x2`), beyond the original
 // `i32x4`/`f32x4`. These use explicit `vector_size(16)` types compiled with vectorization *off*

@@ -295,7 +295,18 @@ hot loops are rare in real code, so this is low priority.
 
 ---
 
-### I13 — `<2 x i16>` "no-redundant-load" vector pattern **miscompiles** (soundness) — found via Embench `edn`/`fir_no_red_ld`
+### I13 — `<2 x i16>` "no-redundant-load" vector pattern miscompiled (soundness) — **fail-closed (stopgap landed)**, root fix pending — found via Embench `edn`/`fir_no_red_ld`
+
+**STATUS:** the silent miscompile is **fail-closed** on `claude/perf-i11-i12` (a φ that carries a tiny
+all-tail sub-32-bit vector — ≤ 2 lanes of i8/i16 — now returns `Unsupported` instead of miscompiling,
+in `translate_function` right after `scan_func`). So the no-miscompile invariant is restored: `edn`
+*fail-closes* (skipped by the `embench` driver) rather than returning a wrong answer. The **root fix**
+(making the tiny-tail-lane representation correct so the pattern *translates*) is still open — see the
+fix sketch below. The guard is deliberately narrow: a 4-lane `<4 x i16>` φ (e.g. the Clay-UI demo's
+carried point vector) round-trips correctly and is untouched (`tests/translate.rs::demo_clay_vs_native`
+covers it); only the confirmed-broken 32-bit `<2 x i16>`/`<2 x i8>` carry is rejected.
+
+
 
 **Where:** `crates/svm-llvm/src/lib.rs` — the sub-128 / all-tail vector handling for **2-lane 16-bit
 vectors** (`<2 x i16>`, and the `<4 x i16>` they're shuffled from): `vec_explode`/`vec_implode`,
@@ -318,20 +329,22 @@ only) and not a `v128`, so it takes the all-tail `wide_vec_layout` path (0 chunk
 `insertelement`/`shufflevector`/the cross-block phi (width/sign of the lane "container"), or the
 explode→implode round-trip for the recombine shuffle — drops or corrupts a lane.
 
-**Impact.** This is the on-ramp's worst failure mode — a **silent miscompile** that violates the
-fail-closed contract. It is **pre-existing and independent of I11**: `fir_no_red_ld` uses no wide
-shifts, so it would miscompile on `main` too once reached; I11 merely lets the *whole* `edn` translate
-far enough to hit it. Narrow in practice (this exact carried-`<2 x i16>` shape), but any program with it
-miscompiles. The `embench` driver now flags `edn` as **MISCOMPILE (excluded)** rather than counting it.
+**Impact (before the stopgap).** This was the on-ramp's worst failure mode — a **silent miscompile**
+violating the fail-closed contract. It is **pre-existing and independent of I11**: `fir_no_red_ld` uses
+no wide shifts, so it would miscompile on `main` too once reached; I11 merely let the *whole* `edn`
+translate far enough to hit it. Narrow in practice (this exact carried-`<2 x i16>` shape). The stopgap
+above converts it to a clean fail-close; the `embench` driver also still excludes a *runtime* MISMATCH
+from the geomean as a backstop.
 
-**Fix sketch (needs care — soundness):** reproduce minimally (the bisection harness: include
-`src/edn/libedn.c`, call only `fir_no_red_ld` on a seeded buffer, diff interp vs native — both via
-`bench/embench`), then dump the **SVM IR** the translator emits for it and compare against the scalar
-form. Likely either (a) fix the i16 tail-lane representation through `insertelement`/`shufflevector`/phi
-so a 16-bit lane round-trips losslessly, or (b) if a clean fix is out of reach, **fail-close** the
-specific carried-`<2 x i16>` shuffle/phi shape (return `Unsupported`) so it never miscompiles — but
-*without* regressing the working `<4 x i16>` shuffles in `fir`/`jpegdct`. A differential fuzz over small
-i16 vectors (interp vs JIT vs a scalar oracle) would catch the whole class.
+**Root-fix sketch (needs care — soundness; the stopgap only fail-closes):** reproduce minimally (the
+bisection harness: include `src/edn/libedn.c`, call only `fir_no_red_ld` on a seeded buffer, diff interp
+vs native — both via `bench/embench`), then dump the **SVM IR** the translator emits and compare against
+the scalar form. The lane corruption is *not* the lane count alone (the 4-lane `<4 x i16>` φ works), so
+it's specific to the 32-bit 2-lane carry — likely how a 16-bit tail lane round-trips through
+`insertelement`-into-poison + the cross-block φ fan-out + the `<1,2>` recombine `shufflevector`'s
+explode→implode (width/sign of the i32 lane "container"). Fix the representation so a 16-bit lane is
+lossless there, then narrow/remove the fail-close guard. A differential fuzz over small i8/i16 vectors
+(interp vs JIT vs a scalar oracle) would catch the whole class and guard against regressions.
 
 ---
 

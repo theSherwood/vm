@@ -168,9 +168,10 @@ fn main() {
         };
         let ok = nat_chk == 1 && tw == nat_chk && bcv == nat_chk && jitv == nat_chk;
 
-        // A miscompile is reported but **excluded from the perf geomean** — a wrong answer has no
-        // meaningful speed. (`edn` currently lands here: it translates but `fir_no_red_ld`'s `<2 x i16>`
-        // no-redundant-load pattern miscompiles — ISSUES.md I13.)
+        // Backstop: a runtime miscompile is reported but **excluded from the perf geomean** — a wrong
+        // answer has no meaningful speed. (`edn` now *fail-closes* at translate instead — its
+        // `fir_no_red_ld` `<2 x i16>` carry is rejected by the ISSUES.md I13 stopgap — so it skips
+        // above; this branch remains as a guard against any future translate-but-miscompile kernel.)
         if !ok {
             println!(
                 "{name:<16} {nat_ns:>12.1} {:>12}   {:>7}   MISCOMPILE (excluded) nat={nat_chk} tw={tw} bc={bcv} jit={jitv} — see ISSUES.md I13",
