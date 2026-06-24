@@ -272,6 +272,16 @@ fn run_cooperative(src: &str) -> (Result<Vec<Value>, svm_interp::Trap>, Vec<u8>)
     bytecode::compile_and_run_capture(&m, 0, &[], &mut f, &[]).unwrap()
 }
 
+/// Real-race repeat count: many natively (flakiness shows up across repeats), but just a couple under
+/// Miri, whose data-race/UB checker (not the count) is the point and which runs ~100× slower.
+const fn reps(native: usize) -> usize {
+    if cfg!(miri) {
+        2
+    } else {
+        native
+    }
+}
+
 /// 8 vCPUs on 8 real OS threads racing one counter through the shared window land on the exact total —
 /// genuine parallel atomicity, byte-identical to the cooperative oracle, and stable across repeats.
 #[test]
@@ -284,7 +294,7 @@ fn parallel_threads_match_cooperative_oracle() {
     );
 
     // Repeat: real races, so a wrong driver would be flaky — a stable exact match is the evidence.
-    for i in 0..50 {
+    for i in 0..reps(50) {
         let (got_r, got_snap) = run_parallel(THREADS);
         assert_eq!(
             got_r, want_r,
@@ -308,7 +318,7 @@ fn parallel_join_delivers_child_return_values() {
         "oracle: sum of joined args"
     );
 
-    for i in 0..50 {
+    for i in 0..reps(50) {
         let (got_r, _) = run_parallel(JOIN_VALUES);
         assert_eq!(got_r, want_r, "parallel join sum != oracle (run {i})");
     }
@@ -326,7 +336,7 @@ fn parallel_futex_handoff_matches_oracle() {
         "oracle: futex handoff"
     );
 
-    for i in 0..100 {
+    for i in 0..reps(100) {
         let (got_r, _) = run_parallel(FUTEX_HANDOFF);
         assert_eq!(got_r, want_r, "parallel futex handoff != oracle (run {i})");
     }
@@ -340,7 +350,7 @@ fn parallel_futex_barrier_matches_oracle() {
     let (want_r, _) = run_cooperative(BARRIER);
     assert_eq!(want_r, Ok(vec![Value::I64(8)]), "oracle: 8-worker barrier");
 
-    for i in 0..50 {
+    for i in 0..reps(50) {
         let (got_r, _) = run_parallel(BARRIER);
         assert_eq!(got_r, want_r, "parallel barrier != oracle (run {i})");
     }
