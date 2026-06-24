@@ -132,11 +132,13 @@ specialize from within svm, the specializer must itself be svm-IR. Status of the
     this lane. (`rustup toolchain install 1.81.0` to run it locally; the test skips without it.)
   - **Guest constraints:** `#![no_std]` (no OS) + `panic=abort` (no EH/unwinding → "lowers like C").
 - **Gap to running `svm-peval` (each bounded, none greenfield):**
-  1. **`core + alloc`** — `svm-peval` is all `Vec`/`BTreeMap`/`HashMap`. Needs a `#[global_allocator]`
-     backed by the guest window heap. The on-ramp already supports a `vm_map`-growing
-     `malloc`/`calloc`/`free`, so an allocator shim is plausible — but **the existing test is `core`-only;
-     `alloc` through the on-ramp is unproven.** ← the next concrete slice (prove a heap-allocating
-     `no_std` Rust program end-to-end).
+  1. ~~**`core + alloc`**~~ **DONE.** A `no_std` Rust program with a `#[global_allocator]` over the guest
+     `malloc`/`free` (the `vm_map`-growing bump allocator) now runs end-to-end through the on-ramp:
+     `rust_core_alloc_heap_matches_native` in `crates/svm-llvm/tests/translate.rs` builds a growing
+     `Vec<u64>` (many `RawVec` reallocs → `malloc`/`free` churn → heap growth) + a `Box`, sums on the
+     heap, and prints — byte-identical to the same program built as a native `std` binary. The full
+     `alloc` stack (`RawVec`, `__rust_alloc`/`__rust_dealloc`/`__rust_realloc`, `Box`) lowers with no
+     translator change beyond the C heap path.
   2. **`HashMap` → `BTreeMap`/`hashbrown`** (`HashMap` is `std`-only). Mechanical; memo keys gain `Ord`.
   3. **`no_std`-ify `svm-peval`** (drop `std`, allocator shim, `panic=abort`) and fix whatever LLVM
      shapes a large Rust program hits that the C corpus didn't (same "on-ramp coverage at scale" story
@@ -157,7 +159,8 @@ is **not needed for the specializer** (a pure `Module → Module` transform: no 
 on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not here.
 
 **Milestones (smallest first):**
-1. `core + alloc` through the Rust on-ramp (heap-allocating `no_std` program, `interp == JIT == native`).
+1. ~~`core + alloc` through the Rust on-ramp~~ **DONE** — heap-allocating `no_std` program, on-ramp
+   stdout byte-identical to native (`rust_core_alloc_heap_matches_native`).
 2. `no_std`-ify `svm-peval` (`BTreeMap` for `HashMap`, allocator shim, `panic=abort`); it translates.
 3. End-to-end in-sandbox demo: a guest specializes a toy interpreter against a script and runs the
    residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`).

@@ -2879,6 +2879,146 @@ fn rust_no_std_matches_native() {
     }
 }
 
+// ============================================================================================
+// Milestone 1 (PEVAL.md) — `core + alloc` through the Rust on-ramp. The existing Rust lane proves
+// `core` (a pure compute fn). This proves the next layer: a heap-allocating `no_std` program whose
+// `#[global_allocator]` is backed by the guest `malloc`/`free` (the same `vm_map`-growing bump
+// allocator the C/C++ heap tests use). `Vec`/`Box` from `alloc` lower to `__rust_alloc` →
+// (our `#[global_allocator]`) → `extern "C" malloc`, so the on-ramp synthesizes the allocator and
+// the program grows its own heap. This is the prerequisite for running `svm-peval` (all
+// `Vec`/`BTreeMap`) as an svm-IR guest. Differential: stdout matches the *same* program built as a
+// native `std` Rust binary.
+// ============================================================================================
+
+/// Build a native `std` Rust binary from `src`, run it (feeding `stdin`), return its stdout. `None`
+/// (skip) if `rustc +1.81.0` is unavailable — the on-ramp lane is pinned to that toolchain, so the
+/// oracle uses it too (no behavioural difference for these programs, but keeps one toolchain).
+fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("svm_llvm_{}_{}_nat.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_nat", std::process::id(), name));
+    std::fs::write(&rs, src).expect("write native Rust source");
+    match Command::new("rustc")
+        .args(["+1.81.0", "-C", "opt-level=2"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let mut child = Command::new(&exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn native rust");
+    child.stdin.take().unwrap().write_all(stdin).ok();
+    Some(child.wait_with_output().expect("run native rust").stdout)
+}
+
+/// Translate a `no_std`/`alloc` powerbox Rust program through the on-ramp and run it, returning its
+/// stdout. Mirrors [`powerbox_diff`]'s SVM half but for a Rust frontend: the program must produce a
+/// powerbox entry (it uses `malloc` + `write`), so we resolve §7 imports to capabilities, verify, and
+/// run through `run_powerbox`. `None` (skip) if `rustc +1.81.0` is unavailable.
+fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
+    let bc = compile_rust_to_bc(name, src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust heap bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a heap-allocating Rust program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    Some(
+        svm_run::run_powerbox(&module, stdin)
+            .expect("powerbox run")
+            .stdout,
+    )
+}
+
+/// **`core + alloc` through the Rust on-ramp (PEVAL.md Milestone 1).** A `no_std` Rust program with a
+/// `#[global_allocator]` over the guest `malloc`/`free` builds a `Vec` that grows past its initial
+/// capacity (many `RawVec` reallocs → `malloc`/`free` churn → `vm_map` heap growth), boxes a value,
+/// and prints a heap-derived sum. The whole `alloc` stack (`RawVec`, the global-allocator shims
+/// `__rust_alloc`/`__rust_dealloc`/`__rust_realloc`, `Box`) lowers through the on-ramp with no change
+/// beyond the C heap path, and the output is byte-identical to the same program as a native `std`
+/// binary. This is the layer `svm-peval` needs (it is all `Vec`/maps).
+#[test]
+fn rust_core_alloc_heap_matches_native() {
+    // The on-ramp guest: `no_std` + `alloc`, allocator backed by the guest `malloc`/`free`. Builds a
+    // growing `Vec<u64>` of squares (forces reallocs), a `Box`, sums on the heap, prints the decimal.
+    let onramp = r#"
+#![no_std]
+#![no_main]
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+    fn write(fd: i32, buf: *const u8, n: isize) -> isize;
+}
+
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p) }
+}
+#[global_allocator]
+static A: Guest = Guest;
+
+#[panic_handler]
+fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+fn putdec(mut x: u64) {
+    let mut buf = [0u8; 24];
+    let mut i = 24usize;
+    if x == 0 { i -= 1; buf[i] = b'0'; }
+    while x > 0 { i -= 1; buf[i] = b'0' + (x % 10) as u8; x /= 10; }
+    unsafe { write(1, buf.as_ptr().add(i), (24 - i) as isize); }
+    unsafe { write(1, b"\n".as_ptr(), 1); }
+}
+
+#[no_mangle]
+pub extern "C" fn main() -> i32 {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 { v.push(i * i); }   // grows -> realloc -> malloc/free churn
+    let mut sum: u64 = 0;
+    for &x in &v { sum = sum.wrapping_add(x); }
+    let boxed = Box::new(sum.wrapping_mul(2));
+    putdec(*boxed);
+    0
+}
+"#;
+    // The native `std` oracle: the *same* computation, printed with `println!`.
+    let native = r#"
+fn main() {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 { v.push(i * i); }
+    let mut sum: u64 = 0;
+    for &x in &v { sum = sum.wrapping_add(x); }
+    let boxed = Box::new(sum.wrapping_mul(2));
+    println!("{}", *boxed);
+}
+"#;
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_heap", onramp, b""),
+        rust_native_stdout("rs_heap", native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm, nat,
+        "heap Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
 // ---- §6 / D-DBG-7: the debug-info waist (LLVM as the third producer) -------------------------
 
 /// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from
