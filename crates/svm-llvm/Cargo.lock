@@ -702,6 +702,7 @@ dependencies = [
 name = "svm-peval"
 version = "0.0.0"
 dependencies = [
+ "libm",
  "svm-ir",
  "svm-verify",
 ]

@@ -16,6 +16,10 @@
 //! the precondition for the escape-freedom contract (§2a); soundness of *this code*
 //! is the separate hard problem (§18).
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+use alloc::vec::Vec;
 
 use svm_ir::{Block, BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
 

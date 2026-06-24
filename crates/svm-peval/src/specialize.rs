@@ -89,8 +89,10 @@
 //! multi-result, or other cross-function ops (indirect/host calls, atomics, fibers/threads), and
 //! memory accesses the engine can't resolve, return [`SpecError::Unsupported`] rather than guessing.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::vec; // the `vec!` macro
+use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use svm_ir::{ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType};
 use svm_verify::func_value_types;
@@ -142,7 +144,7 @@ type MemPattern = Vec<(u64, u32, Option<Known>)>;
 /// freshly-entered block (where `env` is exactly the block's parameters), or, for a frame suspended
 /// at a [`Inst::Call`] that needed CFG inlining, the index just after the call (where `env` has been
 /// extended with the call's results before the frame resumes).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Frame {
     func: u32,
     block: u32,
@@ -386,7 +388,7 @@ fn build_func(
         selective,
         thread_cells,
         out_cells: None,
-        memo: HashMap::new(),
+        memo: BTreeMap::new(),
         queue: VecDeque::new(),
         next_id: 0,
     };
@@ -443,7 +445,7 @@ fn outline_funcs(
     entry_pattern: ParamPattern,
 ) -> Result<Vec<Func>, SpecError> {
     let state = RefCell::new(OutlineState {
-        memo: HashMap::new(),
+        memo: BTreeMap::new(),
         funcs: Vec::new(),
     });
     // The entry is residual function 0. It does **not** thread region cells in/out: the rename region
@@ -487,7 +489,7 @@ type OutlineKey = (u32, ParamPattern, MemPattern);
 /// A threaded region's live-cell signature: `(address, width)` in address order.
 type CellSig = Vec<(u64, u32)>;
 struct OutlineState {
-    memo: HashMap<OutlineKey, (u32, Option<CellSig>)>,
+    memo: BTreeMap<OutlineKey, (u32, Option<CellSig>)>,
     funcs: Vec<Option<Func>>,
 }
 
@@ -585,7 +587,7 @@ struct Spec<'a> {
     out_cells: Option<CellSig>,
     /// `(call stack, memory pattern) → residual block id`. The memo that makes the loop terminate
     /// and that closes residual loops.
-    memo: HashMap<(Vec<Frame>, MemPattern), u32>,
+    memo: BTreeMap<(Vec<Frame>, MemPattern), u32>,
     queue: VecDeque<Task>,
     next_id: u32,
 }

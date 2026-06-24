@@ -12,6 +12,11 @@ svm-ir.workspace = true
 # Per-SSA-value types (`func_value_types`): needed to type the caller values threaded across an
 # inlined call boundary when a dynamic-control-flow callee is specialized into residual blocks.
 svm-verify.workspace = true
+# `sqrt`/`ceil`/`floor`/`trunc`/round-ties-even/`fma` are `std`-only float methods (they need libm).
+# Since this crate is `no_std` (to compile to svm-IR), the float folds route through `libm` instead.
+# These are correctly-rounded IEEE ops, so libm is bit-identical to the `std` methods the interpreter
+# uses (verified by the differential harness). Pure Rust, so it translates through the on-ramp too.
+libm = "0.2"
 
 [dev-dependencies]
 # The differential harness: re-verify the optimized module, then run original vs

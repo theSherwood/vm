@@ -12,8 +12,11 @@
 //! `br`/`br_if`/`br_table`/`return` terminators. Float, memory, calls, and
 //! capabilities come in later batches per §3b.
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+use alloc::string::String;
+use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 
 /// Block-local value index (parameters first, then instruction results in order).
@@ -2593,7 +2596,7 @@ pub fn resolve_imports_with(
                 // Pull the call's pieces out of the placeholder so we can rebuild it.
                 let (sig, args) = match &mut b.insts[i] {
                     Inst::CallImport { sig, args, .. } => {
-                        (std::mem::take(sig), std::mem::take(args))
+                        (core::mem::take(sig), core::mem::take(args))
                     }
                     _ => unreachable!(),
                 };
@@ -2716,9 +2719,10 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         dtotal = dbase + span;
     }
     // Symbol tables: exported name → global function index, and exported data name → window address.
-    let mut funcs_tab: std::collections::HashMap<String, FuncIdx> =
-        std::collections::HashMap::new();
-    let mut data_tab: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut funcs_tab: alloc::collections::BTreeMap<String, FuncIdx> =
+        alloc::collections::BTreeMap::new();
+    let mut data_tab: alloc::collections::BTreeMap<String, u64> =
+        alloc::collections::BTreeMap::new();
     for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
         for (name, local) in &u.exports {
             if *local as usize >= u.module.funcs.len() {

@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), no_std)]
 //! `svm-peval` — the partial-evaluation / Futamura on-ramp (see `DESIGN.md` §20c).
 //!
 //! Two layers:
@@ -55,12 +56,22 @@
 //! renumbering/remapper.
 //!
 //! **Float and v128 (SIMD) constant folding** are done — `f32`/`f64` arithmetic / compares / FMA /
-//! conversions / casts, and the common SIMD lane ops (splat, extract/replace, lane int+float
-//! arithmetic / compares / shifts, bitwise, shuffle, swizzle) all fold bit-for-bit the interpreter
-//! (float lanes reuse the scalar folds, so NaN/rounding fidelity carries over). **Still out of
-//! scope:** the exotic SIMD ops (saturating add/sub, widen/narrow, lane convert, dot, pairwise,
-//! pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15) pass through unfolded. Cross-function `call`,
-//! narrow renameable cells, and value-stack renaming are all done — see [`mod@specialize`].
+//! conversions / casts, and **every** SIMD lane op folds bit-for-bit the interpreter: the common ones
+//! (splat, extract/replace, lane int+float arithmetic / compares / shifts, bitwise, shuffle, swizzle)
+//! and the exotic ones (saturating add/sub, widen/narrow, lane convert, dot, pairwise, pmin/pmax,
+//! avgr, popcnt, any/all-true, bitmask, q15). Float lanes reuse the scalar folds, so NaN/rounding
+//! fidelity carries over. Cross-function `call`, narrow renameable cells, and value-stack renaming are
+//! all done — see [`mod@specialize`].
+//!
+//! **`no_std` + `alloc`.** This crate compiles `no_std` (gated on `not(test)`; its own test harness
+//! gets `std`) so it can itself be translated to svm-IR through the Rust on-ramp and run *inside* svm
+//! (PEVAL.md Milestone 2). The transform is a pure `Module -> Module` — no I/O, threads, or time — so
+//! `core + alloc` suffices; the `std`-only float methods (`sqrt`/`ceil`/`floor`/`trunc`/round-ties-even
+//! /`fma`) route through the `libm` crate, which is bit-identical for these correctly-rounded ops.
+
+extern crate alloc;
+use alloc::vec; // the `vec!` macro
+use alloc::vec::Vec;
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
@@ -78,7 +89,7 @@ pub use specialize::{
 /// Floats and `v128` are held as **raw bits/bytes** so equality/hashing are exact and NaN-safe
 /// (needed for the specializer's memo key) and folds preserve NaN payloads. Shared with the
 /// [`specialize`] engine.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Known {
     I32(i32),
     I64(i64),
@@ -328,22 +339,26 @@ fn fun32(op: FUnOp, a: f32) -> f32 {
     match op {
         FUnOp::Abs => a.abs(),
         FUnOp::Neg => -a,
-        FUnOp::Sqrt => a.sqrt(),
-        FUnOp::Ceil => a.ceil(),
-        FUnOp::Floor => a.floor(),
-        FUnOp::Trunc => a.trunc(),
-        FUnOp::Nearest => a.round_ties_even(),
+        // `sqrt`/`ceil`/`floor`/`trunc`/round-ties-even live in `std`, not `core` (they need libm);
+        // since this crate is `no_std` (to compile to svm-IR), route through the `libm` crate. These
+        // are all *correctly-rounded* IEEE ops, so libm is bit-identical to the `std` methods the
+        // interpreter uses — the differential harness (folds vs interp) is the proof.
+        FUnOp::Sqrt => libm::sqrtf(a),
+        FUnOp::Ceil => libm::ceilf(a),
+        FUnOp::Floor => libm::floorf(a),
+        FUnOp::Trunc => libm::truncf(a),
+        FUnOp::Nearest => libm::rintf(a), // default FP env: round to nearest, ties to even
     }
 }
 fn fun64(op: FUnOp, a: f64) -> f64 {
     match op {
         FUnOp::Abs => a.abs(),
         FUnOp::Neg => -a,
-        FUnOp::Sqrt => a.sqrt(),
-        FUnOp::Ceil => a.ceil(),
-        FUnOp::Floor => a.floor(),
-        FUnOp::Trunc => a.trunc(),
-        FUnOp::Nearest => a.round_ties_even(),
+        FUnOp::Sqrt => libm::sqrt(a),
+        FUnOp::Ceil => libm::ceil(a),
+        FUnOp::Floor => libm::floor(a),
+        FUnOp::Trunc => libm::trunc(a),
+        FUnOp::Nearest => libm::rint(a), // default FP env: round to nearest, ties to even
     }
 }
 // wasm min/max: NaN propagates; for ±0, min prefers -0 and max prefers +0.
@@ -453,8 +468,10 @@ pub(crate) fn fold_fcmp(ty: FloatTy, op: FCmpOp, a: Known, b: Known) -> Option<K
 /// Fold a fused multiply-add `a·b + c` (single rounding), matching the interpreter's `mul_add`.
 pub(crate) fn fold_fma(ty: FloatTy, a: Known, b: Known, c: Known) -> Option<Known> {
     Some(match ty {
-        FloatTy::F32 => Known::F32(a.as_f32()?.mul_add(b.as_f32()?, c.as_f32()?).to_bits()),
-        FloatTy::F64 => Known::F64(a.as_f64()?.mul_add(b.as_f64()?, c.as_f64()?).to_bits()),
+        // `mul_add` is `std`-only; `libm::fmaf`/`fma` is the same correctly-rounded IEEE FMA (so
+        // bit-identical to the interpreter's `mul_add`), and works in `no_std`.
+        FloatTy::F32 => Known::F32(libm::fmaf(a.as_f32()?, b.as_f32()?, c.as_f32()?).to_bits()),
+        FloatTy::F64 => Known::F64(libm::fma(a.as_f64()?, b.as_f64()?, c.as_f64()?).to_bits()),
     })
 }
 /// The `f64` value of a float operand, promoting `f32` exactly (matching the interpreter).
@@ -1153,7 +1170,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f32::from_bits(lane_read(&b, i, 4) as u32);
                 let z = f32::from_bits(lane_read(&c, i, 4) as u32);
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+                lane_write(&mut o, i, 4, libm::fmaf(x, y, z).to_bits() as u64);
             }
         }
         VShape::F64x2 => {
@@ -1162,7 +1179,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f64::from_bits(lane_read(&b, i, 8));
                 let z = f64::from_bits(lane_read(&c, i, 8));
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+                lane_write(&mut o, i, 8, libm::fma(x, y, z).to_bits());
             }
         }
         _ => {}
