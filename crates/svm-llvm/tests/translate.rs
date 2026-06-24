@@ -3012,7 +3012,8 @@ fn main() {
         return; // toolchain unavailable — skip
     };
     assert_eq!(
-        svm, nat,
+        svm,
+        nat,
         "heap Rust: on-ramp stdout {:?} vs native {:?}",
         String::from_utf8_lossy(&svm),
         String::from_utf8_lossy(&nat)
