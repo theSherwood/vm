@@ -14,6 +14,17 @@ fn main() {
         println!("cargo:rustc-cfg=fiber_rt");
     }
 
+    // `setjmp_rt`: the JIT's `setjmp`/`longjmp` path (LLVM.md §"JIT `longjmp`", Option B) calls libc
+    // `_setjmp`/`_longjmp` inline from JITted code with a host-side `jmp_buf` table. Gated to **unix**
+    // among the `fiber_rt` targets — `libc` is a unix-only dep here and the plain `_setjmp`/`_longjmp`
+    // symbols/semantics are unix; Windows `setjmp` is SEH-coupled (a separate follow-on), so the JIT
+    // keeps bailing `Unsupported` there and the interpreters cover it. Registered unconditionally so
+    // `#[cfg(setjmp_rt)]` never trips the unexpected-cfg lint.
+    println!("cargo:rustc-check-cfg=cfg(setjmp_rt)");
+    if fiber_rt && on_unix {
+        println!("cargo:rustc-cfg=setjmp_rt");
+    }
+
     // The cross-platform trap-time backtrace capture (DEBUGGING.md §5 W3): the thread-local capture
     // state + frame-pointer walk + the explicit-trap helper, shared by the unix signal handler and the
     // windows VEH. Compiled wherever the trap-backtrace feature exists (unix + windows); other targets

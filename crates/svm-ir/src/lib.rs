@@ -2240,6 +2240,17 @@ impl Func {
             })
         })
     }
+
+    /// Whether this function contains any `setjmp`/`longjmp` op ([`Inst::SetJmp`]/[`Inst::LongJmp`]).
+    /// Used to reject a §14 JIT child that uses `setjmp` (no per-child `setjmp` runtime yet — like
+    /// `uses_concurrency` for fibers/threads).
+    pub fn uses_setjmp(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
+        })
+    }
 }
 
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —

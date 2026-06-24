@@ -87,6 +87,13 @@ mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill h
 #[cfg(fiber_rt)]
 mod fiber_rt;
 
+// JIT `setjmp`/`longjmp` runtime (LLVM.md §"JIT `longjmp`", Option B): a host-side `jmp_buf` table +
+// `extern "C"` slot thunks, with libc `_setjmp`/`_longjmp` called inline from JITted code. Unix-only
+// among the fiber_rt targets (`setjmp_rt` cfg); elsewhere the JIT keeps bailing `Unsupported` and the
+// interpreters cover it.
+#[cfg(setjmp_rt)]
+mod setjmp_rt;
+
 // 1:1 OS-thread executor for `thread.spawn`/`thread.join` + the `wait`/`notify` futex (§12): the VM
 // exposes these as *primitives*, not a scheduler — a spawned vCPU is one real OS thread; any M:N model
 // is built by the guest runtime over these + `cont.*` (D22: no built-in scheduler). The futex core is
@@ -411,6 +418,10 @@ pub enum TrapKind {
     /// lowering polls that cell at loop back-edges and function entries and traps here. Matches the
     /// interpreter's `Trap::OutOfFuel` — both report "the host bounded this run".
     OutOfFuel = 11,
+    /// A `longjmp` to a `jmp_buf` that was never `setjmp`'d (a stale/forged token) — caught by the
+    /// host `setjmp` table's lookup before the (skipped) `_longjmp` (§3b totality). Matches the
+    /// interpreters' `Trap::Malformed` for the same condition (LLVM.md §"JIT `longjmp`").
+    SetjmpFault = 12,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -430,6 +441,7 @@ impl TrapKind {
             9 => TrapKind::FiberFault,
             10 => TrapKind::ThreadFault,
             11 => TrapKind::OutOfFuel,
+            12 => TrapKind::SetjmpFault,
             _ => return None,
         })
     }
@@ -1507,6 +1519,7 @@ pub struct CompiledModule {
     fiber: FiberEnv,
     thread: ThreadEnv,
     inst: InstEnv,
+    setjmp: SetjmpEnv,
     mask: u64,
     cap_mapped: u64,
     sub_base: u64,
@@ -1593,6 +1606,10 @@ pub struct CompiledModule {
     /// Kept alive because its address is baked into the module's `Instantiator` cap.call sites.
     #[cfg(fiber_rt)]
     _nursery: Option<Box<instantiator_rt::Nursery>>,
+    /// Kept alive because its address (`setjmp.rt_addr`) is baked into the module's `SetJmp`/`LongJmp`
+    /// sites (LLVM.md §"JIT `longjmp`"). Holds the per-run host `jmp_buf` table.
+    #[cfg(setjmp_rt)]
+    _setjmp_rt: Option<Box<setjmp_rt::SetjmpRuntime>>,
     #[cfg(fiber_rt)]
     call_tramp: Option<fiber_rt::FiberCallTramp>,
     /// `(fiber_type_id, fiber_mask)` when the module uses `cont.*` — the per-vCPU fiber config
@@ -2119,6 +2136,45 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let inst = InstEnv::null();
 
+        // `setjmp`/`longjmp` (LLVM.md §"JIT `longjmp`", Option B): when the module uses them, stand up
+        // the per-run host `jmp_buf` table whose stable address is baked into the `SetJmp`/`LongJmp`
+        // sites. Owned by the `CompiledModule` (`_setjmp_rt`), so it outlives every (re-)run. Unix-only
+        // (the `setjmp_rt` cfg); elsewhere `ensure_supported` has already rejected the ops.
+        #[cfg(setjmp_rt)]
+        let uses_setjmp = module_uses_setjmp(m);
+        // Fail-closed (guard against cross-stack corruption): the per-run `jmp_buf` table is keyed by
+        // the guest buffer address and shared across the run's native stacks, so a module that mixes
+        // `setjmp` with fibers/threads could let one stack's `setjmp` overwrite another's saved native
+        // SP (a `longjmp` would then restore into the wrong stack). The on-ramp never emits that combo,
+        // but a hand-crafted IR module could — so decline the JIT and let the interpreters (which key
+        // `setjmp_points` per-vCPU) cover it. Per-fiber JIT keying is a documented follow-on.
+        #[cfg(setjmp_rt)]
+        if uses_setjmp && (uses_fibers || uses_threads) {
+            return Err(JitError::Unsupported(
+                "setjmp/longjmp combined with fibers/threads is not supported on the JIT yet",
+            ));
+        }
+        #[cfg(setjmp_rt)]
+        let setjmp_runtime: Option<Box<setjmp_rt::SetjmpRuntime>> = if uses_setjmp {
+            Some(Box::new(setjmp_rt::SetjmpRuntime::new()))
+        } else {
+            None
+        };
+        #[cfg(setjmp_rt)]
+        let setjmp = if let Some(r) = &setjmp_runtime {
+            SetjmpEnv {
+                rt_addr: (&**r as *const setjmp_rt::SetjmpRuntime) as i64,
+                slot_thunk: setjmp_rt::rt_setjmp_slot as *const () as i64,
+                lookup_thunk: setjmp_rt::rt_setjmp_lookup as *const () as i64,
+                setjmp_addr: setjmp_rt::setjmp_addr(),
+                longjmp_addr: setjmp_rt::longjmp_addr(),
+            }
+        } else {
+            SetjmpEnv::null()
+        };
+        #[cfg(not(setjmp_rt))]
+        let setjmp = SetjmpEnv::null();
+
         // W5 JIT/DWARF tier (Stages 0–1): when the module carries `-g` debug info, build the
         // `(func,block,inst) → debug_info.locs` index lookup that stamps each op with a `SourceLoc`,
         // and capture each function's `MachSrcLoc` ranges (relative offsets) to resolve to a
@@ -2184,6 +2240,7 @@ impl CompiledModule {
                 fiber,
                 thread,
                 inst,
+                setjmp,
                 &mut ctx.func,
                 f,
                 mask,
@@ -2400,6 +2457,7 @@ impl CompiledModule {
             fiber,
             thread,
             inst,
+            setjmp,
             mask,
             cap_mapped,
             sub_base,
@@ -2431,6 +2489,8 @@ impl CompiledModule {
             domain,
             #[cfg(fiber_rt)]
             _nursery: nursery,
+            #[cfg(setjmp_rt)]
+            _setjmp_rt: setjmp_runtime,
             #[cfg(fiber_rt)]
             call_tramp,
             #[cfg(fiber_rt)]
@@ -3040,6 +3100,7 @@ impl CompiledModule {
                 self.fiber,
                 self.thread,
                 self.inst,
+                self.setjmp,
                 &mut ctx.func,
                 f,
                 self.mask,
@@ -3378,6 +3439,13 @@ fn compile_child(
                 "a §14 JIT child using fibers/threads is not supported yet",
             ));
         }
+        // Likewise `setjmp`/`longjmp`: the child gets a null `SetjmpEnv` (no per-child `setjmp` table
+        // yet), so reject rather than bake a null table address into a `SetJmp` site.
+        if f.uses_setjmp() {
+            return Err(JitError::Unsupported(
+                "a §14 JIT child using setjmp/longjmp is not supported yet",
+            ));
+        }
     }
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
     let mask = child_size - 1;
@@ -3424,6 +3492,7 @@ fn compile_child(
             FiberEnv::null(),
             ThreadEnv::null(),
             InstEnv::null(), // a JIT child cannot itself nest yet (its Instantiator cap.call → CapFault)
+            SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
             &mut ctx.func,
             f,
             mask,
@@ -3693,6 +3762,11 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // the interpreter covers it).
                 | Inst::GcRoots { .. }
                     if cfg!(fiber_rt) => {}
+                // `setjmp`/`longjmp` (LLVM.md §"JIT `longjmp`", Option B): libc `_setjmp`/`_longjmp`
+                // called inline from JITted code with a host-side `jmp_buf` table. Supported on the
+                // `setjmp_rt` targets (unix among `fiber_rt`); elsewhere bail so the interpreters cover
+                // it (module-granular fallback).
+                Inst::SetJmp { .. } | Inst::LongJmp { .. } if cfg!(setjmp_rt) => {}
                 _ => return Err(JitError::Unsupported("instruction")),
             }
         }
@@ -3797,6 +3871,33 @@ impl InstEnv {
     }
 }
 
+/// The per-run `setjmp` table address + the four thunk/libc addresses baked into the module's
+/// `SetJmp`/`LongJmp` sites (LLVM.md §"JIT `longjmp`", Option B). All `0` (`null`) when the module uses
+/// no `setjmp`, or the target lacks the `setjmp_rt` runtime (non-unix / non-`fiber_rt`), in which case
+/// `ensure_supported` has already rejected any `SetJmp`/`LongJmp`. `rt_addr` is the per-run
+/// `SetjmpRuntime` (owned by the `CompiledModule`); `setjmp_addr`/`longjmp_addr` are libc `_setjmp`/
+/// `_longjmp`, called inline in the guest frame.
+#[derive(Clone, Copy)]
+struct SetjmpEnv {
+    rt_addr: i64,
+    slot_thunk: i64,
+    lookup_thunk: i64,
+    setjmp_addr: i64,
+    longjmp_addr: i64,
+}
+
+impl SetjmpEnv {
+    fn null() -> SetjmpEnv {
+        SetjmpEnv {
+            rt_addr: 0,
+            slot_thunk: 0,
+            lookup_thunk: 0,
+            setjmp_addr: 0,
+            longjmp_addr: 0,
+        }
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
@@ -3829,6 +3930,10 @@ struct Lower<'a> {
     /// The §14 nesting runtime + thunk addresses for `Instantiator` `cap.call` lowering (`null` ⇒
     /// `Instantiator` cap.calls take the ordinary `cap.call` path — an inert `CapFault`).
     inst: InstEnv,
+    /// The per-run `setjmp` table + libc `_setjmp`/`_longjmp` addresses for `SetJmp`/`LongJmp` lowering
+    /// (`null` ⇒ the module has no `setjmp`, or the target lacks the runtime and `ensure_supported`
+    /// already rejected the ops).
+    setjmp: SetjmpEnv,
     /// Address of the host-owned **interrupt cell** (`AtomicU64`) for the §5 fuel/epoch kill-path.
     /// `0` ⇒ no kill-path is armed for this compile (the checks are not emitted — guest code is
     /// byte-identical to the un-armed build). When non-zero, the lowering polls `*epoch_addr` at
@@ -3904,6 +4009,7 @@ fn build_clif(
     fiber: FiberEnv,
     thread: ThreadEnv,
     inst: InstEnv,
+    setjmp: SetjmpEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -3990,6 +4096,7 @@ fn build_clif(
         fiber,
         thread,
         inst,
+        setjmp,
         epoch_addr,
         ids,
         distinct,
@@ -4121,6 +4228,19 @@ fn module_uses_threads(m: &IrModule) -> bool {
                         | Inst::MemoryNotify { .. }
                 )
             })
+        })
+    })
+}
+
+/// Whether `m` contains any `setjmp`/`longjmp` op, so `run_inner` knows to stand up the per-run
+/// [`setjmp_rt::SetjmpRuntime`] whose address is baked into those sites.
+#[cfg(setjmp_rt)]
+fn module_uses_setjmp(m: &IrModule) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|blk| {
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
         })
     })
 }
@@ -4374,6 +4494,69 @@ fn lower_block(
             let call = b.ins().call_indirect(tref, thunk, &[v, trap_out]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // `setjmp` (LLVM.md §"JIT `longjmp`", Option B): two calls. First a host thunk returns the
+        // stable host `jmp_buf` slot for this guest `buf` address (`rt_setjmp_slot`); then `_setjmp` is
+        // called **inline in this guest frame** — the frame a later `longjmp` returns to — so it saves
+        // *this* frame's SP/return-addr. The libc `_setjmp` address is baked directly (not wrapped in a
+        // Rust thunk, whose frame would be gone by `longjmp` time — UB). Result is the `i32` 0 (direct)
+        // / long-jump value (re-entry). The slot alloc is infallible, so no trap-propagate.
+        if let Inst::SetJmp { buf } = inst {
+            let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
+                                          // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
+            let mut s1 = module.make_signature();
+            for t in [I64, I64] {
+                s1.params.push(AbiParam::new(t));
+            }
+            s1.returns.push(AbiParam::new(I64));
+            let r1 = b.import_signature(s1);
+            let slot_thunk = b.ins().iconst(I64, lower.setjmp.slot_thunk);
+            let rt_addr = b.ins().iconst(I64, lower.setjmp.rt_addr);
+            let c1 = b.ins().call_indirect(r1, slot_thunk, &[rt_addr, bufv]);
+            let slot = b.inst_results(c1)[0];
+            // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
+            let mut s2 = module.make_signature();
+            s2.params.push(AbiParam::new(I64));
+            s2.returns.push(AbiParam::new(I32));
+            let r2 = b.import_signature(s2);
+            let setjmp_fn = b.ins().iconst(I64, lower.setjmp.setjmp_addr);
+            let c2 = b.ins().call_indirect(r2, setjmp_fn, &[slot]);
+            vals.push(b.inst_results(c2)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // `longjmp` (LLVM.md §"JIT `longjmp`"): look up the host `jmp_buf` slot for this `buf` (set by a
+        // prior `setjmp`); a miss writes the trap cell and `emit_trap_propagate` bails *before* the
+        // (skipped) `_longjmp`. Otherwise `_longjmp(slot, val)` restores the saved frame and never
+        // returns — the IR's trailing `unreachable` terminator caps the block (the call isn't marked
+        // noreturn, but the dead fall-through is terminated by it). No result.
+        if let Inst::LongJmp { buf, val } = inst {
+            let bufv = get(&vals, *buf)?;
+            let valv = get(&vals, *val)?; // i32 long-jump value (0 → 1 is applied by libc `_longjmp`)
+            let trap_out = b.use_var(lower.trap_var);
+            // slot = rt_setjmp_lookup(rt_addr, buf, trap_out) -> *mut jmp_buf (null + trap on miss)
+            let mut s1 = module.make_signature();
+            for t in [I64, I64, I64] {
+                s1.params.push(AbiParam::new(t));
+            }
+            s1.returns.push(AbiParam::new(I64));
+            let r1 = b.import_signature(s1);
+            let lookup_thunk = b.ins().iconst(I64, lower.setjmp.lookup_thunk);
+            let rt_addr = b.ins().iconst(I64, lower.setjmp.rt_addr);
+            let c1 = b
+                .ins()
+                .call_indirect(r1, lookup_thunk, &[rt_addr, bufv, trap_out]);
+            let slot = b.inst_results(c1)[0];
+            emit_trap_propagate(b, lower); // bail on a miss (forged/stale token) before `_longjmp`
+                                           // _longjmp(slot, val) — inline, noreturn.
+            let mut s2 = module.make_signature();
+            s2.params.push(AbiParam::new(I64));
+            s2.params.push(AbiParam::new(I32));
+            let r2 = b.import_signature(s2);
+            let longjmp_fn = b.ins().iconst(I64, lower.setjmp.longjmp_addr);
+            b.ins().call_indirect(r2, longjmp_fn, &[slot, valv]);
             ubs.resize(vals.len(), UB_TOP);
             continue;
         }

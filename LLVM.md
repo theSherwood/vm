@@ -1088,7 +1088,7 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   both in **global dispatch tables** (AV) and as **operand-position** φ-threaded blockaddresses clang's
   jump-threading emits (AW). Robust enough for a real interpreter; next interpreter target is **Lua**
   (which also needs `setjmp`/`longjmp`, below).
-- **`setjmp`/`longjmp` — DONE on the interpreter (slice AX); C++ EH next on the same substrate.** The
+- **`setjmp`/`longjmp` — DONE on all three engines (slices AX + the JIT sub-slice); C++ EH next on the same substrate.** The
   two new core ops (`Inst::SetJmp`/`LongJmp`) lower from the recognized external `setjmp`/`_setjmp`/
   `sigsetjmp` (returns-twice) and `longjmp`/`siglongjmp` (noreturn) calls (gated on use, so non-users
   pay nothing). **Tree-walker**: `setjmp` snapshots the frame's resume point (block/inst/value-state —
@@ -1099,19 +1099,21 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   divergent): **both interpreters run it** — the tree-walker (snapshots the frame's value state, since
   `vals` is replaced per block) and the **bytecode** engine (no snapshot: its flat per-function register
   layout gives each block distinct slots, so the `setjmp` block's values survive a deeper call in place
-  — it only restores the `(module, cur, base, pc)` cursor + pops the activation stack). The **JIT** bails
-  `Unsupported` (the remaining sub-slice — **Option B: call libc `_setjmp`/`_longjmp` from JITted code**,
-  `jmp_buf` in a host-side table keyed by the guest buffer address so no host SP/return-addr leaks; the
-  in-frame `_setjmp` call dodges the "helper-frame-is-gone" problem, and clang's `-O2` returns-twice
-  spills + Cranelift's caller-saved spills largely defuse the optimizer hazard — to be proven by a native
-  differential **under ASan**). Until it lands the JIT declines and the interpreters cover it. Tests:
-  `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting` (byte-identical to native libc on
-  **both** the tree-walker and the bytecode engine, multi-frame unwind + retry loop; the JIT-declines is
-  asserted). Perf (`examples/onramp_perf.rs`): the non-`setjmp` baseline rows are unmoved (gated;
-  byte-identical IR), `setjmp` capture/`longjmp` unwind cost is O(live-values)/O(frames) and paid only
-  when executed (the JIT path will be real-`setjmp`-class O(1)). **EH next** (`invoke`/`landingpad`/
-  `resume` + cleanups) reuses this stack-transfer core; the JIT `longjmp` + EH unblock Postgres
-  `--single` and throwing C++ respectively.
+  — it only restores the `(module, cur, base, pc)` cursor + pops the activation stack). The **JIT** now
+  runs it too (**Option B, DONE** — see "JIT `longjmp`" below): libc `_setjmp`/`_longjmp` called **inline
+  from JITted code** with the `jmp_buf` in a host-side per-run table keyed by the guest buffer address
+  (no host SP/return-addr leaks into the window); the in-frame `_setjmp` dodges the "helper-frame-is-gone"
+  problem, and clang's `-O2` returns-twice spills + Cranelift's caller-saved spills defuse the optimizer
+  hazard. Gated to the `setjmp_rt` targets (unix among `fiber_rt`); a module mixing `setjmp` with
+  fibers/threads is fail-closed-declined (the interpreters' per-vCPU keying covers it — a documented
+  per-fiber-JIT-keying follow-on). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting`,
+  plus returns-twice stress (`setjmp_value_live_across`, `setjmp_nested_buffers`) — **all three engines ==
+  native libc** (the JIT lane now asserts agreement, not a decline). Perf (`examples/onramp_perf.rs`): the
+  non-`setjmp` baseline rows are unmoved (gated; byte-identical IR); the JIT runs `setjmp_happy` ~3× and
+  `setjmp_longjmp` ~5–6× faster than the tree-walker (real-`setjmp`-class O(1) capture/unwind). ASan gate:
+  the `ASan (JIT setjmp/longjmp)` CI lane runs the differential under `-Zsanitizer=address`. **EH next**
+  (`invoke`/`landingpad`/`resume` + cleanups) reuses this stack-transfer core; the JIT `longjmp` + EH
+  unblock Postgres `--single` and throwing C++ respectively.
 - **`%f` / `%g` / `%e` float formatting** — deliberately **fail-closed** (LLVM.md printf notes): an
   `f64`-arithmetic approximation diverges from glibc at the rounding boundary; matching byte-for-byte
   needs a **correctly-rounded exact-decimal (Ryū / Dragon4, big-integer)** formatter. SQLite,
@@ -1229,10 +1231,11 @@ phases, both worth doing:
 
 ### `setjmp`/`longjmp` + EH — design & sequencing (the stack-transfer substrate)
 
-**Status: `setjmp`/`longjmp` DONE on the interpreter (slice AX)** — see the gap bullet above for the
-landed design + engine matrix. The JIT `longjmp` (native-stack switch) and **EH** are the remaining
-sub-slices. The design notes below are retained for the EH follow-on + the JIT path. Drivers:
-**Postgres** `--single` (its whole `PG_TRY`/`ereport` model is `sigsetjmp`/`siglongjmp`) and **Lua**.
+**Status: `setjmp`/`longjmp` DONE on all three engines (slice AX + the JIT sub-slice)** — see the gap
+bullet above for the landed design + engine matrix, and "JIT `longjmp`" below for the JIT specifics.
+**EH** (`invoke`/`landingpad`/`resume` + cleanups) is the remaining sub-slice on this substrate. The
+design notes below are retained for the EH follow-on. Drivers: **Postgres** `--single` (its whole
+`PG_TRY`/`ereport` model is `sigsetjmp`/`siglongjmp`) and **Lua**.
 
 **Why a core primitive (not a pure-IR transform).** `longjmp` transfers control from deep in the call
 stack back to an ancestor `setjmp`, across N intervening frames. The only way to do this *without a
@@ -1250,12 +1253,29 @@ back to that depth (the intervening frames discarded with **no per-frame work** 
 restores the data-SP, and resumes at the saved pc with the `setjmp` result set to `v`. O(1)-ish capture,
 O(depth-discarded) unwind, both only when called.
 
-#### JIT `longjmp` — the remaining sub-slice (HANDOFF — design locked, not yet implemented)
+#### JIT `longjmp` — DONE (Option B; `crates/svm-jit/src/setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering)
 
 Cranelift code runs on the real native control stack, so `longjmp` must restore the native SP to the
-`setjmp` point. **Chosen approach — Option B: call libc `_setjmp`/`_longjmp` from JITted code, with the
-`jmp_buf` in a host-side table.** Rationale + the rejected alternatives are below; this is the concrete
-work for the next session.
+`setjmp` point. **Approach — Option B: call libc `_setjmp`/`_longjmp` from JITted code, with the
+`jmp_buf` in a host-side table.** Rationale + the rejected alternatives are below.
+
+**What landed.** A per-run host `jmp_buf` table (`setjmp_rt::SetjmpRuntime`, owned by the
+`CompiledModule` so its address stays valid for re-runs) keyed by the guest `jmp_buf` window address;
+`Inst::SetJmp` lowers to `rt_setjmp_slot` (alloc/find the host slot) then an **inline** `call _setjmp`,
+and `Inst::LongJmp` to `rt_setjmp_lookup` (find, or write the `SetjmpFault` trap cell on a miss — a
+fail-closed §3b totality check) then an inline `call _longjmp`. The libc `_setjmp`/`_longjmp` addresses
+are baked **directly** as the call targets (not via a Rust thunk, whose frame would be gone by
+`longjmp` time), mirroring the `cap.call`/fiber-thunk "call-to-baked-host-address" template. Gated to
+the `setjmp_rt` cfg (= `fiber_rt && unix`; built in `build.rs`) — Windows `setjmp` is SEH-coupled, a
+follow-on, and there the JIT keeps declining and the interpreters cover it. A §14 JIT child using
+`setjmp`, and any module mixing `setjmp` with fibers/threads, are **fail-closed-declined** (no per-child
+/ per-fiber `setjmp` table yet — the per-run table is keyed only by buffer address, so concurrent
+shared-buffer use across native stacks would corrupt; the interpreters' per-vCPU keying covers it). The
+returns-twice hazard held up: clang's `-O2` setjmp-crossing spills + Cranelift's caller-saved spills
+across the `SetJmp` call site mean live values arrive as loads/stores, not long-lived SSA, and the
+guest's data-stack values ride in window memory (preserved across `_longjmp`). Validated by the on-ramp
+differential (all three engines == native, incl. value-live-across-setjmp + nested-buffers) and the
+`ASan (JIT setjmp/longjmp)` CI lane.
 
 **Why Option B (and not the others) — decision record:**
 - **Option B (chosen): libc `_setjmp`/`_longjmp` called inline from JITted code.** Reuses battle-tested
@@ -1311,9 +1331,9 @@ repo already has an "ASan (svm-fiber switches)" CI lane to extend). Add returns-
 **Reference implementations to mirror (already landed, byte-identical to native):** the tree-walker
 (`crates/svm-interp/src/lib.rs` — `SetJmpPoint`, `setjmp_points`, the `SetJmp`/`LongJmp` arms in
 `run_inner`) and the bytecode engine (`crates/svm-interp/src/bytecode.rs` — `ByteSetJmp`, `Op::SetJmp`/
-`LongJmp`). The on-ramp lowering is `lower_setjmp_call` in `crates/svm-llvm/src/lib.rs`. **Current state:
-both interpreters run `setjmp`/`longjmp`; the JIT cleanly declines `Unsupported`** — so the branch is a
-clean checkpoint to start the JIT pass from, engines in sync, never divergent.
+`LongJmp`). The on-ramp lowering is `lower_setjmp_call` in `crates/svm-llvm/src/lib.rs`; the JIT path is `setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering arms in
+`build_clif`. **Current state: all three engines run `setjmp`/`longjmp`** (the JIT via Option B, above),
+byte-identical to native, engines in sync, never divergent.
 
 **Returns-twice in SSA.** `setjmp`'s result (0 first time, `v` on `longjmp`) feeds a branch; the
 `longjmp` re-enters at the instruction after `setjmp`. The interp models this directly (set the result
