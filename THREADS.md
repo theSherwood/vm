@@ -154,22 +154,42 @@ property, so in practice:
 - [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel.** These mutate the `Domain`
   (`&mut`), which the parallel driver shares `&`-immutably. Needs the domain's installable parts behind
   their own synchronization (or to route these events back to a single owner).
-- [ ] **4c-wasm — the driver's vCPUs as real wasm Workers.** The browser payoff. wasm32 has no native
-  `thread::spawn`, so a guest `thread.spawn` in parallel mode must **bubble out to JS**, which creates a
-  Worker (with its own stack/TLS, per 4b) that re-enters an exported `run_child_vcpu`; the futex becomes
-  real `memory.atomic.wait`/`notify`, and join/result delivery crosses the JS boundary via shared memory.
-  A sizable host-driven-spawn integration on top of today's native driver (which is its differential oracle).
+- [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
+  `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
+  `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
+  in parallel. Built in three de-risked slices:
+  - **The cross-Worker blocking futex** (`browser/threads-spike/threads-futex.mjs`): proved
+    `memory.atomic.wait`/`notify` works across OS threads from Rust (`core::arch::wasm32`) — park/wake,
+    not-equal, and timeout paths — the foundational unknown, mirroring how Step 1 de-risked atomics.
+  - **A resumable per-vCPU API** in `svm-interp` (`VcpuProgram` + `Vcpu` + `VcpuEvent`): platform-agnostic,
+    no threads/FFI — `run` advances one vCPU until a host-serviced event (`Spawn`/`Join`/`Wait`/`Notify`),
+    the host services it and `deliver_*`s the result. Proven natively by `bytecode_vcpu_orchestration.rs`
+    (a `std::thread` host — the native model of the JS host — drives the counter kernel to 4000 and a
+    futex handoff to 987654), which is the wasm driver's **differential oracle**.
+  - **The wasm driver** (`browser/src/lib.rs` `svm_par_*` C-ABI + `browser/threads-spawn.mjs`): each vCPU
+    runs on its own Worker through the resumable API; the host services `thread.spawn` → start a Worker,
+    `thread.join` → `Atomics.wait` on the child's completion slot, `memory.wait`/`notify` → `Atomics` on
+    the futex word. The 4b per-Worker stack/TLS bootstrap and the "main can't `atomic.wait`" wrinkle are
+    both handled (every vCPU runs on a Worker; main only fans out). Verified: the counter kernel runs on
+    **9 Workers** (1 root + 8 spawned) → **4000**, and the futex kernel on **2 Workers** → **987654**,
+    stable across repeats.
 
-### Known wrinkles (surfaced for later steps)
+  Remaining `4c-host` / `4c-domain` (`cap.call` under a shared `Host`; §14/§22 domain-mutating events) are
+  unchanged below — orthogonal to the threading model, each its own project.
 
-- **Main thread can't `atomic.wait`** (it traps in browsers) — the root vCPU must run on a Worker, or
-  poll non-blockingly.
-- **Per-thread stack + TLS** — each Worker needs its own `__stack_pointer` / `__wasm_init_tls` block;
-  the spike sidesteps this with register-only functions, but a real runtime must set it up.
-- **Thread-safe ABI** — the cdylib's `static mut` scratch/state globals race under shared memory; they
-  must become per-Worker (TLS) or per-instance.
-- **Data init once** — under `--shared-memory` only the first instance may run memory init; workers
-  set up TLS/stack and skip it.
+### Known wrinkles — all resolved in `4c-wasm`
+
+- **Main thread can't `atomic.wait`** (it traps in browsers) — *resolved*: every vCPU (including the
+  root) runs on a Worker; `threads-spawn.mjs`'s main thread only compiles, carves the window, and fans
+  out Workers — it never blocks.
+- **Per-thread stack + TLS** — *resolved*: each vCPU's Worker sets its own `__stack_pointer` +
+  `__wasm_init_tls` (the 4b bootstrap); a spawner `svm_par_alloc`s the child's stack/TLS before asking
+  main to start it.
+- **Thread-safe ABI** — *resolved*: the parallel `svm_par_*` path is stateless (no `static mut`); each
+  vCPU's state is a heap `Box` in the shared linear memory, and the `VcpuProgram` is shared read-only by
+  pointer. (The thread-safe shared allocator was de-risked by 4b.)
+- **Data init once** — *resolved*: only the root `Vcpu::new_root` seeds + data-initialises the window; a
+  `Vcpu::new_child` shares it without re-seeding.
 
 ---
 
@@ -184,10 +204,15 @@ cargo +nightly build --release   # flags baked into .cargo/config.toml (shared m
 node threads.mjs                 # two worker_threads → atomic EXACT 4,000,000; plain races
 cd ..
 
-# Step 2/3 — the substrate + engine bridge (native, in CI)
+# Step 2/3/4c — the substrate, engine bridge, and parallel drivers (native, in CI)
 cargo test -p svm-mem shared                          # Region::Shared cross-thread atomics + fuzz
 cargo test -p svm --test bytecode_shared_window       # engine over a caller-owned shared window
-cargo test -p svm --test bytecode_parallel            # 4c: parallel driver (real OS threads) vs oracle
+cargo test -p svm --test bytecode_parallel            # 4c: native parallel driver vs oracle
+cargo test -p svm --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
+cargo +nightly miri test -p svm-interp --test parallel_miri  # 4c: parallel driver is race/UB-free
+
+# Step 1-futex / 4c-wasm — the cross-Worker blocking futex (tiny spike)
+cd browser/threads-spike && cargo +nightly build --release && node threads-futex.mjs && cd ..
 
 # Step 4a/4b — the FULL engine as a wasm threads module, run over a SharedArrayBuffer window.
 # The `--export=__stack_pointer/__tls_*/__wasm_init_tls` are the per-Worker bootstrap hooks (4b).
@@ -199,7 +224,9 @@ RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
   cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
 W=target/wasm32-unknown-unknown/release/svm_browser.wasm
 node threads-engine.mjs   "$W" corpus/threads.svmbc 4000      # 4a: engine over a shared-mem window
-node threads-parallel.mjs "$W" corpus/threads.svmbc 4000 8    # 4b: 8 Workers, real parallelism → 4000
+node threads-parallel.mjs "$W" corpus/threads.svmbc 4000 8    # 4b: 8 Workers, independent domains → 4000
+node threads-spawn.mjs    "$W" corpus/threads.svmbc 4000      # 4c-wasm: ONE guest's vCPUs across Workers
+node threads-spawn.mjs    "$W" corpus/futex.svmbc   987654    # 4c-wasm: the cross-Worker futex handoff
 ```
 
 The threads-build flags (`+atomics` · `--shared-memory --import-memory --max-memory` · `build-std`)
