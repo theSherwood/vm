@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use svm_interp::{bytecode, source_loc, Inspector, IrPc, Stop, Trap, Value};
+use svm_interp::{bytecode, source_loc, Inspector, IrPc, Stop, Trap, Value, VarValue};
 use svm_ir::{Module, DEFAULT_RESERVED_LOG2};
 use svm_jit::{CompiledModule, Quota, INERT_CAP_THUNK};
 use svm_text::parse_module;
@@ -250,5 +250,125 @@ fn jit_elides_const_only_source_line() {
     assert!(
         jit.is_subset(&executed),
         "the JIT never maps a line the interpreters don't step: jit={jit:?} executed={executed:?}"
+    );
+}
+
+// ---- G2: variable-value parity + the debug/fast delegation boundary -------------------------------
+
+// A window-located source variable `x` at the arg pointer (`v0 + 0`), written twice: 0 -> 11 -> 22.
+// Both engines drive the *same* `Mem`, so a window variable has a comparable value at every step —
+// unlike a register-allocated SSA value, whose bytecode slot is reused and has no stable cross-engine
+// identity (which is exactly why debugging stays on the tree-walker; DEBUGGING.md §1b G2).
+const WINDOW_VAR_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 11
+  i32.store v0 v1
+  v2 = i32.const 22
+  i32.store v0 v2
+  v3 = i32.const 0
+  return v3
+}
+
+debug.file 0 "win.c"
+debug.fname 0 "w"
+debug.type 0 base "int" signed 4
+debug.var 0 "x" win 0 "int" 0
+debug.loc 0 0 1 0 2 1
+debug.loc 0 0 3 0 3 1
+"#;
+
+/// The inspection-parity guarantee G2 is about: a *window* source variable holds the **same value at
+/// every step** on both engines. The tree-walker reads it through the real debugger APIs
+/// (`var_addr` + `read_var`) at each `seek(t)`; the bytecode engine snapshots the same window range at
+/// each single-step (`ir_window_trace`). The `(IrPc, bytes)` sequences must be identical — so what the
+/// debugger shows for `x` is exactly what the fast engine computes, op for op.
+#[test]
+fn window_var_value_parity_per_step() {
+    let m = parse_module(WINDOW_VAR_DBG).expect("parse");
+    let addr: u64 = 1024;
+    let width = 4usize;
+
+    // Tree-walker: read `x` via `var_addr`/`read_var` at every executed instruction.
+    let mut insp = Inspector::attach(&m, 0, &[Value::I64(addr as i64)], 100_000);
+    let mut tw: Vec<(IrPc, Vec<u8>)> = Vec::new();
+    let mut t = 0u64;
+    let tw_res = loop {
+        match insp.seek(t) {
+            Stop::Break { pc, .. } => {
+                assert_eq!(
+                    insp.var_addr(0, "x"),
+                    Some(addr),
+                    "x resolves to the arg window address"
+                );
+                let bytes = match insp.read_var(0, "x", width) {
+                    Some(VarValue::Bytes(b)) => b,
+                    other => panic!("x reads as window bytes, got {other:?}"),
+                };
+                tw.push((pc, bytes));
+                t += 1;
+            }
+            Stop::Finished(r) => break r,
+            Stop::Blocked => panic!("single-threaded fixture must not block"),
+        }
+    };
+
+    // Bytecode engine: the per-step snapshot of the same window range (declining here would mean a
+    // fallback — `expect` pins that the bytecode engine actually ran the module).
+    let mut fuel = 100_000u64;
+    let (bc, bc_res) =
+        bytecode::ir_window_trace(&m, 0, &[Value::I64(addr as i64)], &mut fuel, addr, width)
+            .expect("bytecode engine runs this module (not a fallback)");
+
+    assert_eq!(
+        bc, tw,
+        "window-variable value sequence diverges between the engines"
+    );
+    assert_eq!(bc_res, tw_res, "result diverges between the engines");
+
+    // Guard against a vacuous pass: `x` must actually change (0 -> 11 -> 22) over the run.
+    let distinct: BTreeSet<Vec<u8>> = tw.iter().map(|(_, b)| b.clone()).collect();
+    assert!(
+        distinct.len() >= 3,
+        "fixture must mutate x so the per-step check is meaningful: {distinct:?}"
+    );
+}
+
+// A thread-spawning module: outside the bytecode engine's *single-vCPU* debug scope. (Production runs
+// threads on the bytecode engine — see `bytecode_threads.rs` — but its debug-trace path is single-vCPU
+// and declines, delegating to the tree-walker / Milestone-B scheduled Inspector.)
+const THREADS_DBG: &str = r#"
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh = thread.spawn 1 vsp va
+  vj = thread.join vh
+  vr = i64.const 0
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vz = i64.const 0
+  return vz
+}
+"#;
+
+/// The delegation boundary G2 names, pinned: the bytecode engine's single-vCPU debug-trace path
+/// **declines** (`None`) a module outside its seam-free scope, so a debugger must fall back to the
+/// tree-walker. If a later slice extended the bytecode debug scope to threads, this `None` would flip
+/// — and that is exactly the boundary change worth noticing here.
+#[test]
+fn bytecode_debug_trace_declines_outside_single_vcpu_scope() {
+    let m = parse_module(THREADS_DBG).expect("parse");
+    let mut fuel = 100_000u64;
+    assert!(
+        bytecode::ir_trace(&m, 0, &[], &mut fuel).is_none(),
+        "the bytecode debug-trace declines a multi-vCPU module (delegates to the tree-walker)"
+    );
+    assert!(
+        bytecode::ir_window_trace(&m, 0, &[], &mut fuel, 0, 4).is_none(),
+        "the window-variable trace declines it too"
     );
 }

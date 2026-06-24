@@ -1408,6 +1408,10 @@ pub fn compile_and_run_capture_reserved_with_host(
 /// An [`ir_trace`] result: the executed instruction-location sequence plus the run's result.
 pub type IrTrace = (Vec<super::IrPc>, Result<Vec<Value>, Trap>);
 
+/// A per-step **window-variable** trace ([`ir_window_trace`]): each executed instruction's [`crate::IrPc`]
+/// paired with the watched window range's bytes at that point, plus the run result.
+pub type WindowTrace = (Vec<(super::IrPc, Vec<u8>)>, Result<Vec<Value>, Trap>);
+
 /// Debug seam (Slice 1c-3): single-step `m`'s `func(args)` and record the [`crate::IrPc`] of each
 /// **instruction** executed (terminators are skipped, matching the tree-walker's `before_op`, which
 /// only stops at instructions), returning the location trace plus the result. `None` if the module is
@@ -1438,6 +1442,55 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
         }
         match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
+            Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
+            Ok(_) => return None, // a seam — out of single-vCPU debug scope
+            Err(t) => return Some((trace, Err(t))),
+        }
+    }
+}
+
+/// Debug-seam **variable-inspection** support (DEBUGGING.md §1b G2). Like [`ir_trace`], but at each
+/// instruction step also snapshots `len` window bytes at `addr` — the value a *window-located* source
+/// variable (`VarLoc::Window`) holds at that program point. Register-allocated SSA values have no
+/// stable cross-engine storage (the bytecode engine packs them into reused slots), but a window
+/// variable lives at a shared address in the same `Mem` both engines drive, so its value *is*
+/// comparable per step. Paired with the tree-walker `Inspector` driven by `seek(t)` +
+/// `read_var`/`read_window`, this proves the two engines hold the **same variable value at every
+/// step** — not merely the same locations (`ir_trace`). `None` on the same out-of-subset / seam
+/// conditions as [`ir_trace`]. Test surface; not a production entry point.
+pub fn ir_window_trace(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    addr: u64,
+    len: usize,
+) -> Option<WindowTrace> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Vec::new(), Err(Trap::Malformed)));
+    }
+    let mods = [c];
+    let table = build_table(mods[0].progs.len(), 0);
+    let mut mem = build_mem(m);
+    let mut host = Host::new();
+    let mut vm = match Vm::new(&mods[0], func as usize, args) {
+        Ok(v) => v,
+        Err(e) => return Some((Vec::new(), Err(e))),
+    };
+    let mut trace = Vec::new();
+    loop {
+        // Snapshot the window var *before* running the op — the same point `Inspector::seek(t)` pauses
+        // at (paused before the op at clock `t`), so the two byte sequences align step-for-step.
+        if let Some(pc) = vm.cur_ir_pc(&mods) {
+            let bytes = mem
+                .as_ref()
+                .and_then(|mm| mm.read_window(addr, len).ok())
+                .unwrap_or_default();
+            trace.push((pc, bytes));
+        }
+        match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
+            Ok(Outcome::Suspended) => continue,
             Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
             Err(t) => return Some((trace, Err(t))),

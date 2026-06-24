@@ -104,10 +104,19 @@ different things depending on which pair you compare:
   is stepped by both interpreters but has no JIT machine-code range — compiled code has no instruction
   for a materialized immediate — while the invariant "the JIT never maps a line the interpreters don't
   step" still holds.
-- **G2 — bytecode debug parity is single-vCPU *locations + results* only.** `bytecode_debug.rs` does not
-  cover *variable inspection* (`var_addr`/`read_var`) on the bytecode path, and watchpoints/conditional
-  breakpoints/time-travel are not independently implemented there (they delegate to the tree-walker) —
-  so the delegation boundary itself is untested end-to-end.
+- **G2 — bytecode debug = single-vCPU; variable inspection + delegation boundary. ✅ Landed
+  (`debug_parity.rs` + `bytecode::ir_window_trace`).** *Variable-value parity:* register-allocated SSA
+  values have no stable cross-engine storage (the bytecode engine reuses slots), so they are inspected
+  only on the tree-walker — by design. But a **window-located** variable lives at a shared address in
+  the one `Mem` both engines drive, so its value *is* comparable per step: `window_var_value_parity_per_step`
+  reads `x` through the real debugger APIs (`var_addr`/`read_var`) at each `seek(t)` and asserts the
+  `(IrPc, bytes)` sequence equals the bytecode engine's per-step window snapshot — so the value the
+  debugger shows is exactly what the fast engine computes, op for op. *Delegation boundary:*
+  `bytecode_debug_trace_declines_outside_single_vcpu_scope` pins that the bytecode debug-trace returns
+  `None` for a module outside its seam-free scope (a thread-spawner), so a debugger falls back to the
+  tree-walker / Milestone-B scheduled Inspector — and that flipping to `Some` later is a boundary change
+  worth noticing. *Residual:* watchpoints/conditional breakpoints/time-travel on the bytecode path stay
+  delegated (no independent implementation to regress).
 - **G3 — DAP is tree-walker-only.** The DAP server (incl. the new data breakpoints, stepping, reverse
   debugging) drives the `Inspector` exclusively; there is no DAP-over-bytecode or DAP-over-JIT, so there
   is no DAP-level cross-engine parity to test yet (gated on W5 Stage 5).
