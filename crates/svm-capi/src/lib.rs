@@ -443,6 +443,9 @@ unsafe fn run_config(c: *const SvmRunConfig) -> RunConfig {
         },
         stdin,
         memory_size_log2: (c.memory_set != 0).then_some(c.memory_size_log2),
+        // argv/env are not part of the current C config surface (the C tests run arg-less programs);
+        // an `svm_run_config_set_args`-style setter is a later C-ABI follow-up.
+        ..RunConfig::default()
     }
 }
 

@@ -216,18 +216,24 @@ rather than converged:
 | Path | Backends | Caps | Used by |
 |---|---|---|---|
 | `Instance::{call,run,run_diff}` (this work) | all 3 | fixed or name-bound | new tests, C ABI |
-| `run_powerbox*` → `run_powerbox_inner` | JIT | fixed 8-handle powerbox | **the CLI** (`svm-run` bin) |
+| `run_powerbox*` → `run_powerbox_inner` → `Instance::run` (F1) | JIT | fixed 8-handle powerbox | **the CLI** (`svm-run` bin) |
 | `run_kernel` | bare | none | kernels / bench |
 | `run_c_full` (test) | interp+JIT | fixed | chibicc suite |
 | `JitSession` | JIT | fixed | guest-JIT REPL |
 | §14 nested (`Instantiator`/`Module`) | interp+JIT | object-cap | `instantiator.rs`, `separate_module.rs` |
 
-Two consequences worth fixing (Phase 6 / followups):
-- The new `Instance` layer **did not replace** `run_powerbox_inner`; the powerbox-grant logic is now
-  **duplicated** (`grant_caps` vs the hardcoded grant in `run_powerbox_inner`), and the CLI still uses
-  the old path.
+One consequence still worth fixing (followup):
 - The §14 nested path is **func-0-only and ignores `Module.exports`** — a child/separate-module guest
   cannot be called by name.
+
+**Resolved (F1).** `run_powerbox_inner` no longer carries its own grant/compile/watchdog: it builds an
+`Instance` (fixed powerbox preset) and delegates to `Instance::run(Backend::Jit, config)`, so the
+powerbox-grant logic lives in exactly one place (`grant_powerbox_prefix`, shared with the embedding
+API). The `Jit`-cap grant on both paths now reserves the install table at the same `CLI_JIT_TABLE_LOG2`
+(previously `grant_powerbox_prefix` reserved `0`, which would have starved a `Jit.install` guest). The
+CLI is unchanged — same `run_powerbox*` signatures, JIT-only, no re-verify/re-resolve of already-
+validated frontend output. `run_c_full` (the chibicc test harness) is **not** yet folded in; that
+remains the open part of F1.
 
 **Test gaps:** we test the export *table* (`resolve_export`) and calling `_start` by name, but **not**
 calling a named non-`_start` export with args and checking results (host *or* nested). And
@@ -349,17 +355,24 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
 
 ## Followups / known gaps (logged, not yet scheduled)
 
-- **F1 — converge the host runners.** Fold `run_powerbox_inner` and `run_c_full` onto the `Instance`
-  layer (or factor one shared powerbox-grant/run core) so the powerbox-grant logic isn't duplicated and
-  the CLI/tests use one interface. Do this alongside or after Phase 6.
+- **F1 — converge the host runners.** *Mostly landed.* `run_powerbox_inner` now delegates to
+  `Instance::run(Backend::Jit, config)` — the powerbox-grant logic (`grant_powerbox_prefix`) and the
+  JIT compile→run + §5 watchdog (`run_jit`) are no longer duplicated, and the `Jit`-cap install-table
+  reservation is aligned across both paths. `argv`/env now flow through `RunConfig` (closing **F4**) and
+  seed all three backends (run-once) via a shared `run_interp`/`init_mem` path. **Still open:** fold the
+  test-only `run_c_full` (chibicc interp+JIT differential harness) onto the same core, and unify the
+  reactor's `jit_call_capture` with `run_jit` (they differ only by snapshot vs deadline/concurrency).
 - **F2 — name-addressable nested guests.** Thread `Module.exports` through the §14 `Module`-capability
   path so a parent can call a child's export by name, not just func 0 — consistent with host-driven
   calls. (Today nested children are func-0-only.)
 - **F3 — test the named-export call path.** Even before Phase 6, add a test for `Instance::call("<non-
   _start>", args)` returning results; decide whether a non-`_start` export should get the powerbox caps
   (it currently gets none — likely wrong once reactors exist).
-- **F4 — `argv`/env through `Instance`/`RunConfig`.** `synth_powerbox_start` is `main(void)`-only; the
-  older `run_powerbox_with_args` supports the §3e args buffer. Thread it through the new layer.
+- **F4 — `argv`/env through `Instance`/`RunConfig`.** *Landed (with F1).* `RunConfig` now carries
+  `args`/`env`; `RunConfig::init_mem` builds the §3e args buffer (the single source, shared by the
+  `run_powerbox*` wrappers and `Instance::run`/`run_diff`), seeding all three backends run-once. The C
+  ABI surface does not yet expose a setter for these (logged inline; a `svm_run_config_set_args` is the
+  remaining bit).
 - **F5 — guest-memory access from C callbacks** (Phase 5 deferral): a bounds-checked `GuestMem` shim so
   a C `HostFn` can read/write the window, not just compute on scalars.
 - **F6 — unify `Quota`** into one shared type (Phase 3 deferral): currently `svm_interp::Quota` and
