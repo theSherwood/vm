@@ -151,43 +151,48 @@ specialize from within svm, the specializer must itself be svm-IR. Status of the
      are now the wall, *not* compilation.
   4. **Wire residual → §22 `Jit.compile`** to run/share it in-sandbox (Milestone 3).
 
-### Milestone 2 — translation status: **BLOCKED at the on-ramp (the actual remaining work).**
+### Milestone 2 — translation status: **in progress, gaps falling one by one.**
 
-The specializer **compiles** to `no_std` LLVM-18 bitcode (above), but does **not yet translate**
-through `svm-llvm`. Probing the merged bitcode (`cargo +1.81.0 build --release` with
-`RUSTFLAGS=--emit=llvm-bc`, `llvm-link-18`, `opt-18 internalize,globaldce` down to the closure reachable
-from `specialize`, then `svm-llvm-translate`) surfaces an ordered list of gaps — and the root causes are
-**not the specializer's own code** (it uses no i128, no inline-asm, no exotic intrinsics):
+The specializer **compiles** to `no_std` LLVM-18 bitcode (above). To find what it takes to *translate*,
+we probe the merged bitcode: `cargo +1.81.0 build --release` (`--ignore-rust-version`,
+`default-features=false`) with `RUSTFLAGS=--emit=llvm-bc`, then `llvm-link-18`, then `opt-18
+internalize,globaldce` down to the closure reachable from a powerbox `main` that builds a tiny module
+and calls `specialize`, then `svm-llvm-translate`. Each gap, in the order hit, and its disposition:
 
-1. **`Unsupported("inline-asm call")`** — `libm`'s `fma` does runtime CPU-feature detection
-   (`core::core_arch::x86::_xgetbv`, `cpuid`) to pick a hardware vs software path. Inline asm has no
-   svm-IR meaning; the on-ramp rejects it.
-2. **`Unsupported("integer width i128 …")`** — `libm`'s correctly-rounded `fma` software fallback uses
-   extended-precision integer math (`support::big::u256`, `narrowing_div`, `widen_mul`). svm-IR has no
-   i128; the on-ramp would need to **legalize i128 → pairs of i64** (add/sub/mul/cmp/shift/ctlz/cttz).
-3. **Structural, behind those: core/alloc runtime symbols absent from the bitcode.** `core::panicking::*`
-   (`panic_fmt`, bounds-check, `unwrap_failed`), `cell::panic_already_borrowed`,
-   `alloc::alloc::handle_alloc_error`, `raw_vec::handle_error`, `__rust_alloc`/`dealloc`/`realloc`,
-   `bcmp`, `String::clone` — these are **non-generic** library functions that live in the *precompiled
-   `core`/`alloc` rlibs*, so they are never emitted as bitcode. (Generic code — `Vec`, `BTreeMap`, slice
-   ops — *is* monomorphized into the crate bitcode, which is why Milestone 1 worked.) Getting them into
-   bitcode needs **`-Z build-std`** (nightly) — which fights the 1.81/LLVM-18 pin — *or* the on-ramp must
-   **stub them** (panics → `trap`; `__rust_alloc`/`realloc`/`dealloc` → the synthesized `malloc`/`free`;
-   `bcmp` → `memcmp`; `handle_alloc_error` → `trap`).
+1. ✅ **inline-asm** — came from `libm`'s `fma` doing x86 CPU-feature detection. **Cleared:** the
+   libm-requiring float folds (`sqrt`/`ceil`/`floor`/`trunc`/round-ties-even/`fma`) are now behind the
+   default-on `libm-floats` feature; the in-svm build turns it off and leaves those ops unfolded
+   (sound passthrough). `abs`/`copysign` moved to pure-`core` bit ops (still fold everywhere). x86
+   inline-asm is fundamentally untranslatable, so avoiding libm is the right call, not a shortcut.
+2. ✅ **i128** — came from the specializer's *own* exotic SIMD folds (saturating add/sub, narrow,
+   ext-mul, ext-add-pairwise), which used `i128` for wide intermediates. **Cleared:** rewritten to
+   `i64`/`u64` (wasm SIMD lane results cap at 64 bits; unsigned 32→64 ext-mul uses `u64`). Bit-identical
+   — exotic-ops test + thorough fuzz green. The on-ramp i128 dependency is gone.
+3. ✅ **translator panic** — `translate_switch` computed `max - min + 1` in `i64`, which **overflowed**
+   on a switch whose cases straddle the i64 range (a niche-discriminant match). **Fixed** to compute the
+   span in `i128` → clean `Unsupported` instead of a panic.
+4. 🔜 **sparse switch** (current wall) — `Unsupported("sparse switch (span … > 4096)")`. Rust's
+   **niche-optimized enum layouts** (e.g. `drop_in_place::<Option<(u32, Option<Vec<(u64,u32)>>)>>` —
+   literally the specializer's memo value type) match the discriminant with `i64::MIN`-ish sentinels, so
+   the switch is dense in *cases* but astronomically sparse in *span* — a `br_table` can't represent it.
+   The on-ramp lowers switches to `br_table` only; it needs **sparse-switch lowering as a comparison
+   chain** (the code already flags this as "a later option"). This is a real but intricate SSA
+   transformation: synthesize a chain of blocks that thread the data-SP, the switch operand, **and**
+   every case-target's branch args (φ operands must be evaluated in the original switch block's context,
+   not the synthetic predecessors). TCB-adjacent, so it wants its own focused pass + differential tests.
+   *Niche optimization is pervasive in Rust, so this is unavoidable for translating real Rust — and is
+   the next slice.*
 
-**Two root causes, two directions:**
-- **`libm` (gaps 1–2).** It's pulled in *only* by the float folds. Cheapest unblock: in the in-svm
-  (`no_std`) build, **don't fold the `libm`-requiring float ops** (`fma`/`sqrt`/… pass through unfolded
-  — sound: they just run at runtime in the residual). That deletes the inline-asm + i128 surface
-  entirely. The "right" fix is i128 legalization in the on-ramp (wanted anyway for general Rust).
-- **core/alloc runtime symbols (gap 3) — the fundamental one.** Independent of `libm`; *any* non-trivial
-  Rust hits panics/bounds-checks/allocator shims. The on-ramp needs a **runtime-symbol shim layer**
-  (panics→trap, `__rust_*`→`malloc`/`free`, `bcmp`→`memcmp`), the Rust analogue of how it already
-  synthesizes libc. This — plus i128 — *is* the "on-ramp coverage at scale" work the milestone
-  predicted (the same class as QuickJS), now **enumerated concretely** instead of hypothesized.
+**Earlier worry retired.** The core/alloc *panic* runtime symbols (`core::panicking::*`, bounds-check,
+`unwrap_failed`, `handle_alloc_error`, `raw_vec::handle_error`) that looked like a fundamental blocker
+are in fact **already shimmed** by the on-ramp (`is_rust_abort_call` → `trap`, under `-C panic=abort`).
+What may still need handling once the switch is past: the allocator shims (`__rust_alloc`/`dealloc`/
+`realloc` → the synthesized `malloc`/`free`), `bcmp` → `memcmp`, and `cell::panic_already_borrowed`
+(extend the abort-call list) — each small. So the remaining translate work is the **sparse-switch
+compare-chain** (substantial) plus a short tail of runtime-symbol shims, *not* `-Z build-std`.
 
-So Milestone 2's compile half is **done**; the translate half reduces to a **scoped on-ramp feature
-list** (i128 legalization + a Rust runtime-symbol shim), which is the next chunk of work.
+So Milestone 2's compile half is **done**, and the translate half is a **shrinking, enumerated gap
+list** being cleared in order — three down, sparse-switch lowering next.
 
 **Why not `std`.** `std` is Rust's OS-abstraction layer (`core` + `alloc` + a `std::sys::<target>`
 platform backend for files/threads/time/net/startup). svm has none of those as ambient services (it
@@ -208,9 +213,10 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
 2. `no_std`-ify `svm-peval` —
    - **compile half: DONE** — the three crates compile to `no_std`/`panic=abort` LLVM-18 bitcode on
      `rustc 1.81` (`BTreeMap`, `libm` float folds, `not(test)` no_std, 1.81-clean).
-   - **translate half: BLOCKED** on a scoped on-ramp feature list (i128 legalization + a Rust
-     runtime-symbol shim for panics/`__rust_alloc`/`bcmp`; `libm` inline-asm+i128 avoidable by not
-     folding libm-requiring float ops in the in-svm build). See "translation status" above.
+   - **translate half: in progress** — gaps cleared in order: inline-asm (libm float folds gated off),
+     i128 (exotic SIMD folds rewritten to i64/u64), and a translator switch-span overflow panic
+     (fixed). **Next: sparse-switch compare-chain lowering** (niche-optimized enums make it necessary),
+     then a short tail of runtime-symbol shims. See "translation status" above.
 3. End-to-end in-sandbox demo: a guest specializes a toy interpreter against a script and runs the
    residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`). *Gated on Milestone 2's
    translate half.*
