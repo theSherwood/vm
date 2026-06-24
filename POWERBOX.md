@@ -163,15 +163,30 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
 - [ ] (Deferred) full dynamic stash sizing (heap base above an arbitrary-N stash) to lift the
       ≤8-with-heap / ≤32-without cap; not needed until a frontend wants >8 named caps *and* a heap.
 
-### Phase 3 — uniform run config across backends
-- [ ] Unify `Quota` into one type.
-- [ ] `Limits` + `RunConfig` (deadline binds all three; fuel interp-only; reserved_log2 threaded).
-- [ ] `Backend` selector + `run(backend, …)` facade; `run_diff` for the interp==jit oracle.
-- [ ] Thread `memory_size_log2` / `reserved_log2` overrides through all three backends.
+### Phase 3 — uniform run config across backends — done
+- [x] `Limits` is the single unified quota knob the consumer sets (`max_fibers`/`max_vcpus` =
+      "CPUs available", `fuel`, `deadline`); the facade converts to `svm_interp::Quota` /
+      `svm_jit::Quota` internally, so the two structurally-identical backend `Quota` types stay an
+      impl detail the embedder never touches. (Deduping them into one shared type would churn both
+      escape-TCB-adjacent crates for no consumer-visible gain — left as optional cleanup.)
+- [x] `Limits` + `RunConfig` (fuel = interpreters' per-op budget, ignored by the JIT; deadline = the
+      JIT's §5 watchdog, ignored by the interpreters; `memory_size_log2` overrides the window). The
+      asymmetry is modeled honestly and documented per-knob rather than papered over.
+- [x] `Backend` selector + `Instance::run(backend, &config)` single-backend facade; `Instance::run_diff`
+      for the tree-walk == JIT oracle; `call`/`call_with_stdin` are now `run_diff` with a default/stdin
+      config. Acceptance: `crates/svm/tests/powerbox_run.rs` (every backend under one config; fuel
+      bounds the interpreters not the JIT; window override on every backend).
+- [x] `memory_size_log2` threaded through all three backends (window override per run). `reserved_log2`
+      deliberately **not** exposed: it's a guard-region policy, not "memory available", and both
+      backends must share it for the differential oracle to stay sound — so it's pinned at the shared
+      default rather than made a knob.
 
-### Phase 4 — host-defined nominal interfaces (decision #3, lowest priority)
-- [ ] Reserve `[HOST_IFACE_BASE, u32::MAX)` for host-assigned interface type_ids.
-- [ ] Carry the nominal id for diagnostics + `cap.self.*`; dispatch through the generic HostFn seam.
+### Phase 4 — host-defined nominal interfaces (decision #3 — resolved: NOT doing type_ids)
+Decision #3 settled: keep `HOST_FN` + handle as the mechanism. The handle is already an unforgeable,
+more-expressive disambiguator than a nominal type_id, and an open host-assignable type_id range would
+weaken the §3c type-check's closed-enum audit surface for only a diagnostics gain.
+- [ ] (Optional, cosmetic) carry an optional human-readable **interface label** alongside a `HostFn`
+      grant — untrusted, verifier-ignored, for diagnostics / `cap.self.*` only. Not a type_id.
 
 ### Phase 5 — C bindings
 - [ ] A C ABI crate (`svm-capi` / `cdylib` + generated `svm.h`) over the embedding surface:
