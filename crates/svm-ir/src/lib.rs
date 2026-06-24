@@ -2381,7 +2381,9 @@ pub fn synth_powerbox_start(
     // fit (never shrink); beyond the mapped window is the faulting guard region (§5).
     let top = entry_sp + POWERBOX_STACK_RESERVE;
     let need_log2 = (64 - (top - 1).leading_zeros()) as u8;
-    let size_log2 = module.memory.map_or(need_log2, |m| m.size_log2.max(need_log2));
+    let size_log2 = module
+        .memory
+        .map_or(need_log2, |m| m.size_log2.max(need_log2));
     module.memory = Some(Memory { size_log2 });
 
     // The guest heap (when the program allocates) begins at the window's mapped boundary and grows up
@@ -2472,7 +2474,6 @@ fn build_powerbox_start(
     }
 }
 
-
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
@@ -2513,10 +2514,7 @@ impl Module {
     /// carries `name`. The verifier guarantees export names are unique, so the first match is the
     /// only match.
     pub fn resolve_export(&self, name: &str) -> Option<FuncIdx> {
-        self.exports
-            .iter()
-            .find(|e| e.name == name)
-            .map(|e| e.func)
+        self.exports.iter().find(|e| e.name == name).map(|e| e.func)
     }
 }
 
@@ -3291,13 +3289,23 @@ mod powerbox_start_tests {
             Terminator::Return(ref v) if v.len() == 1
         ));
         assert!(
-            blk.insts.iter().any(|i| matches!(i, Inst::Call { func: 2, .. })),
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { func: 2, .. })),
             "_start must call the entry at its shifted index (2)"
         );
         let stores: Vec<_> = blk
             .insts
             .iter()
-            .filter(|i| matches!(i, Inst::Store { op: StoreOp::I32, .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::Store {
+                        op: StoreOp::I32,
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(stores.len(), 3, "three handle stashes");
         // The entry's internal `Call func: 0` (to the helper) shifted to `func: 1`.
@@ -3320,8 +3328,16 @@ mod powerbox_start_tests {
             func: 1,
         }];
         let m = synth_powerbox_start(m, 1, 3, false).expect("synth");
-        assert_eq!(m.resolve_export("_start"), Some(0), "_start registered at 0");
-        assert_eq!(m.resolve_export("main"), Some(2), "the entry export shifted +1");
+        assert_eq!(
+            m.resolve_export("_start"),
+            Some(0),
+            "_start registered at 0"
+        );
+        assert_eq!(
+            m.resolve_export("main"),
+            Some(2),
+            "the entry export shifted +1"
+        );
         assert_eq!(m.resolve_export("absent"), None);
     }
 
@@ -3333,9 +3349,20 @@ mod powerbox_start_tests {
         let i64_stores = blk
             .insts
             .iter()
-            .filter(|i| matches!(i, Inst::Store { op: StoreOp::I64, .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::Store {
+                        op: StoreOp::I64,
+                        ..
+                    }
+                )
+            })
             .count();
-        assert_eq!(i64_stores, 2, "heap bump pointer + committed boundary seeded");
+        assert_eq!(
+            i64_stores, 2,
+            "heap bump pointer + committed boundary seeded"
+        );
     }
 
     #[test]

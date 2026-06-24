@@ -23,10 +23,10 @@ use std::fmt::Write as _;
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, Export, FBinOp,
-    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy, IntUnOp,
-    LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef, VBitBinOp,
-    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
-    VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
+    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy,
+    IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef,
+    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).

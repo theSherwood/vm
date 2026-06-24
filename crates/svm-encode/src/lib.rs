@@ -17,10 +17,10 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, Export,
     FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncIdx, FuncName, FuncType, IToF, Import,
-    Inst, IntTy,
-    IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp, Terminator,
-    TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
+    Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp,
+    Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
+    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).

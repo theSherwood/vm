@@ -2658,7 +2658,9 @@ fn grant_powerbox_prefix(h: &mut Host, n_handles: usize, win: u64) -> Vec<Value>
         v.push(Value::I32(h.grant_io_ring()));
     }
     if n_handles >= 7 {
-        v.push(Value::I32(h.grant_blocking(std::time::Duration::ZERO, None)));
+        v.push(Value::I32(
+            h.grant_blocking(std::time::Duration::ZERO, None),
+        ));
     }
     if n_handles >= 8 {
         v.push(Value::I32(h.grant_jit(mem_log2)));
@@ -2690,13 +2692,15 @@ fn diff_outcome(
         }
         (Err(Trap::Exit(wi)), JitOutcome::Exited(gj)) => {
             if wi != gj {
-                return Err(format!("interp/JIT exit codes diverge: interp={wi} jit={gj}"));
+                return Err(format!(
+                    "interp/JIT exit codes diverge: interp={wi} jit={gj}"
+                ));
             }
             Ok(Outcome::Exited(wi))
         }
-        (Err(t), j) if !matches!(t, Trap::Exit(_)) => {
-            Err(format!("guest trapped under the interpreter ({t:?}); jit={j:?}"))
-        }
+        (Err(t), j) if !matches!(t, Trap::Exit(_)) => Err(format!(
+            "guest trapped under the interpreter ({t:?}); jit={j:?}"
+        )),
         (i, j) => Err(format!(
             "interp/JIT outcomes diverge: interp={i:?} jit={j:?}"
         )),
@@ -2727,7 +2731,8 @@ pub struct Instance {
 /// the gates a frontend's output must pass before it can run.
 pub fn instantiate(module: Module) -> Result<Instance, String> {
     let resolved = resolve_capability_imports(module)?;
-    svm_verify::verify_module(&resolved).map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
+    svm_verify::verify_module(&resolved)
+        .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
     Ok(Instance { module: resolved })
 }
 
@@ -2810,13 +2815,27 @@ impl Instance {
             r
         } else {
             unsafe {
-                powerbox_compile_run(m, None, &mut hj, &slots, None, svm_jit::Quota::default(), None)
+                powerbox_compile_run(
+                    m,
+                    None,
+                    &mut hj,
+                    &slots,
+                    None,
+                    svm_jit::Quota::default(),
+                    None,
+                )
             }
         };
-        let (jit, backtrace) = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let (jit, backtrace, trap_fiber) = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
         if let JitOutcome::Trapped(kind) = jit {
+            // §5 W3 — fold the trap-time backtrace and the trapping fiber (§23-D57) into the kill
+            // message, mirroring `run_powerbox_inner`.
+            let who = match trap_fiber {
+                Some(h) if h >= 0 => format!(" [fiber {h}]"),
+                _ => String::new(),
+            };
             return Err(format!(
-                "guest trapped ({kind:?}) — detect-and-kill (§5){}",
+                "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
                 format_backtrace(&backtrace)
             ));
         }
@@ -2843,7 +2862,8 @@ impl Instance {
         let mut fuel = 50_000_000u64;
         let interp = run_with_host(m, fidx, args, &mut fuel, &mut h);
         let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-        let jit = compile_and_run(m, fidx, &slots).map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let jit =
+            compile_and_run(m, fidx, &slots).map_err(|e| format!("JIT compile failed: {e:?}"))?;
         let outcome = diff_outcome(&m.funcs[fidx as usize].results, interp, jit)?;
         Ok(Run {
             outcome,

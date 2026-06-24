@@ -43,7 +43,11 @@ fn handwritten_ir_runs_through_the_powerbox_wrapper() {
     let module = svm_text::parse_module(HELLO).expect("frontend IR parses");
     assert_eq!(module.imports.len(), 1, "one named import: \"write\"");
     assert_eq!(module.imports[0].name, "write");
-    assert_eq!(module.resolve_export("entry"), Some(0), "frontend export by name");
+    assert_eq!(
+        module.resolve_export("entry"),
+        Some(0),
+        "frontend export by name"
+    );
 
     // 2. Generalized synth_start: prepend the powerbox `_start` (stdout/stdin/exit — 3 handles), no
     //    heap. The entry is funcidx 0 before the prepend; it becomes funcidx 1 after.

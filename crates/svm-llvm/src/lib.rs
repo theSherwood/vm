@@ -1840,8 +1840,8 @@ const HANDLE_REGION_END: u64 = svm_ir::POWERBOX_HEAP_BRK;
 /// placed just above the 8-handle region ([`svm_ir::POWERBOX_HEAP_BRK`]/[`svm_ir::POWERBOX_HEAP_TOP`]).
 const HEAP_BRK: u64 = HANDLE_REGION_END; // 32
 const HEAP_TOP: u64 = HEAP_BRK + 8; // 40
-// Pin the C `_start` layout to the public powerbox ABI so this and `svm_ir::synth_powerbox_start`
-// can never silently diverge (the dedup hinge: one source of truth in `svm-ir`).
+                                    // Pin the C `_start` layout to the public powerbox ABI so this and `svm_ir::synth_powerbox_start`
+                                    // can never silently diverge (the dedup hinge: one source of truth in `svm-ir`).
 const _: () = assert!(HEAP_TOP == svm_ir::POWERBOX_HEAP_TOP);
 const _: () = assert!(STASH_STDOUT == svm_ir::POWERBOX_STASH_BASE);
 /// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
