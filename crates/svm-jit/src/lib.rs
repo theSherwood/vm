@@ -369,6 +369,12 @@ pub struct FrozenVCpu {
     pub func: i32,
     pub args: Vec<i64>,
     pub shadow_sp: u64,
+    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child — one
+    /// that finished before the freeze point, so its `thread.join` result must survive in the snapshot
+    /// (the host-side Done cell isn't captured otherwise). The thaw delivers this result into the
+    /// spawner's join table **without re-running** the child (no double side effects). `None` for a
+    /// normal frozen child (re-spawned + rewound on thaw); `shadow_sp`/`func`/`args` are then inert.
+    pub completed_result: Option<i64>,
 }
 
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /

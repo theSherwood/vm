@@ -576,6 +576,7 @@ fn run_child(a: SpawnArgs) {
                     func: dc.func_idx as i32,
                     args: vec![a.sp as i64, a.arg as i64],
                     shadow_sp: extent,
+                    completed_result: None, // a spilled (frozen) child re-runs on thaw
                 });
             }
         } else if let Some(table) = unsafe { (*a.dom).fiber_table() } {
@@ -966,6 +967,7 @@ impl Domain {
                         func: p.func_idx as i32,
                         args: vec![p.sp as i64, p.arg as i64],
                         shadow_sp: child_sp,
+                        completed_result: None, // a spilled (frozen) child re-runs on thaw
                     });
                 } else if let Some(table) = self.fiber_table() {
                     table.free_vcpu_context(p.ctx);
