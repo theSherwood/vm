@@ -1250,33 +1250,70 @@ back to that depth (the intervening frames discarded with **no per-frame work** 
 restores the data-SP, and resumes at the saved pc with the `setjmp` result set to `v`. O(1)-ish capture,
 O(depth-discarded) unwind, both only when called.
 
-**JIT (the hard part — the remaining sub-slice; design below).** Cranelift code runs on the real native
-control stack, so `longjmp` must restore the native SP to the `setjmp` point. **Investigation result: the
-existing `svm-fiber` switch (`jump`/`make`, boost.context `fcontext`-style) does *not* fit** — it is an
-*asymmetric-coroutine* primitive (the captured `fctx` is a transient register block on the suspended
-stack, valid only *while* suspended; the moment you `jump` back and continue, that slot is reused/stale).
-`setjmp` needs the opposite: **capture-in-place and keep running**, then `longjmp` back later from a
-deeper frame. That is exactly C `setjmp`/`longjmp` and needs a **new arch-specific in-place
-context-save/restore primitive** (save callee-saved regs + SP + return address into a host-side buffer
-*without* switching; restore + jump later), one file per ABI — mirroring `svm-fiber`'s
-`switch_{x86_64_sysv,aarch64,x86_64_windows}.rs`, but `save`/`restore` rather than `swap`. Concretely:
-- **Host-side `jmp_buf` table (never the guest window).** The saved context holds **host** SP / return
-  address / callee-saved regs — leaking those into guest-readable memory would defeat ASLR. So store it
-  in a host-side table keyed by `(ctx, guest jmp_buf address)`, exactly like the tree-walker's per-vCPU
-  `setjmp_points` (the guest `jmp_buf` address is only the key). Lives next to / in `fiber_rt`.
-- **Cranelift lowering.** `Inst::SetJmp` → emit the in-place context-save (a tiny arch asm thunk, called
-  from JITted code, that saves *its caller's* resumable context into the table slot) returning `i32` 0;
-  `Inst::LongJmp` → a thunk that restores the slot's context and resumes it with the value (returns-twice
-  at the `SetJmp` site). The intervening native frames are abandoned by the SP restore (no unwinding — C
-  has no cleanups, and Cranelift frames have no destructors).
-- **Returns-twice / Cranelift.** The `SetJmp` is a call site, so Cranelift already spills caller-saved
-  values across it; callee-saved values are saved/restored *by the context primitive*; and clang already
-  spilled every `setjmp`-crossing local to memory at `-O2` (returns-twice at the LLVM level), so those
-  arrive as loads/stores in the IR, not long-lived SSA across the `SetJmp`. So the classic
-  optimizing-compiler-vs-`setjmp` hazard is largely defused — **to be proven** with a differential +
-  **ASan** (this is memory-unsafe native-stack manipulation; it gets the `svm-fiber`-grade test rigor).
-- Until it lands, the JIT stays fail-closed `Unsupported` (the established interp-first split, cf.
-  fibers/`cap.self`) and the tree-walker covers `setjmp`/`longjmp` — engines in sync, never divergent.
+#### JIT `longjmp` — the remaining sub-slice (HANDOFF — design locked, not yet implemented)
+
+Cranelift code runs on the real native control stack, so `longjmp` must restore the native SP to the
+`setjmp` point. **Chosen approach — Option B: call libc `_setjmp`/`_longjmp` from JITted code, with the
+`jmp_buf` in a host-side table.** Rationale + the rejected alternatives are below; this is the concrete
+work for the next session.
+
+**Why Option B (and not the others) — decision record:**
+- **Option B (chosen): libc `_setjmp`/`_longjmp` called inline from JITted code.** Reuses battle-tested
+  libc; no custom asm. The one trick that makes it correct: the `_setjmp` call must be emitted **inline in
+  the JIT function's own frame** (the frame we long-jump back to) — *not* in a host helper thunk that
+  `setjmp`s and returns, because that helper's frame is gone by `longjmp` time (`longjmp` to a returned
+  frame is UB). So `SetJmp` lowers to *two* calls: a thunk that hands back the host `jmp_buf` pointer, then
+  an **inline `call _setjmp(buf_ptr)`**.
+- **Option A (rejected): a new arch-specific in-place context-save/restore asm primitive** (save
+  callee-saved + SP + return-addr without switching; one file per ABI like `svm-fiber`'s `switch_*`).
+  Strictly more risk (hand-written unsafe asm per ABI) for no benefit over B unless libc `_setjmp` has a
+  concrete problem — fall back to A only if B hits a wall.
+- **Rejected: the existing `svm-fiber` switch (`jump`/`make`, boost.context `fcontext`).** It is an
+  *asymmetric-coroutine* primitive — the captured `fctx` is a transient register block on the *suspended*
+  stack, valid only while suspended; the moment you `jump` back and keep running it is reused/stale.
+  `setjmp` needs **capture-in-place + keep running**, then `longjmp` from a deeper frame. Doesn't fit.
+- **Rejected: per-function interp fallback** (JIT declines `setjmp` modules). It is the current safety net,
+  but module-granular: a Lua-as-a-guest would lose JIT speed on its *hot computed-goto loop* just because
+  `pcall` uses `setjmp`. Keep it only as the fallback, not the goal.
+
+**Implementation steps (concrete):**
+1. **Host-side `jmp_buf` table + thunks** (new, in/next to `crates/svm-jit/src/fiber_rt.rs`, per-run like
+   the fiber runtime): `rt_setjmp_slot(ctx, guest_buf_addr) -> *mut JmpBuf` (alloc/find a host slot keyed
+   by `(ctx, guest_buf_addr)`) and `rt_setjmp_lookup(ctx, guest_buf_addr) -> *mut JmpBuf` (or trap-marker
+   on miss). **The `jmp_buf` is host-allocated and lives in this table — never the guest window** (it
+   holds host SP / return-addr / callee-saved; leaking those into guest-readable memory defeats ASLR; the
+   guest `jmp_buf` address is *only the key*). This mirrors the interp's per-vCPU `setjmp_points`.
+2. **Cranelift lowering** (the JIT supportedness check + codegen): `Inst::SetJmp { buf }` → `slot = call
+   rt_setjmp_slot(ctx, operand(buf))`, then **inline** `r = call _setjmp(slot)`, bind `r` (i32) as the
+   result. `Inst::LongJmp { buf, val }` → `slot = call rt_setjmp_lookup(ctx, operand(buf))`, then `call
+   _longjmp(slot, operand(val))` (noreturn; the trailing `unreachable` is dead). Bake `&_setjmp`/`&_longjmp`
+   as call-target constants (declare them `extern "C"`), exactly as `cap.call` bakes `cap_thunk as usize as
+   i64` and the fiber thunks bake their addresses — the **call-to-baked-host-address template** is the
+   `cap.call` / `cont.*` lowering already in the crate.
+3. **Un-bail + gate.** Remove `SetJmp`/`LongJmp` from the JIT's `_ => Err(JitError::Unsupported)` path (the
+   supportedness check ~`crates/svm-jit/src/lib.rs:3640`, the `if cfg!(fiber_rt)` block just above lists
+   the ops needing the runtime). Gate to the Unix targets first (like `fiber_rt`); the interpreters cover
+   the rest. Thread the per-run `jmp_buf` table through the compile/run setup like the fiber runtime is.
+4. **Flip the test.** `check_setjmp_vs_native` (`crates/svm-llvm/tests/translate.rs`) currently asserts the
+   JIT *declines*; change that to run the JIT and assert it agrees with the interpreters + native.
+
+**The one real hazard — returns-twice vs Cranelift — and why it's largely defused (still must be proven):**
+`Inst::SetJmp` is a *call site*, so Cranelift already spills caller-saved values across it; callee-saved
+are saved/restored *by `_setjmp`/`_longjmp` themselves*; and clang already spilled every `setjmp`-crossing
+local to memory at `-O2` (returns-twice at the LLVM level), so they arrive as loads/stores in the SVM IR,
+not long-lived SSA across the `SetJmp`. A value live across the `setjmp` in a callee-saved reg is restored
+to its `setjmp`-time value by `_longjmp` — correct for pre-`setjmp` values; values *modified* after
+`setjmp` are C-indeterminate anyway. **Verification bar (gating): a native differential on the JIT path
+run under ASan** (this is memory-unsafe native-stack manipulation; it gets `svm-fiber`-grade rigor — the
+repo already has an "ASan (svm-fiber switches)" CI lane to extend). Add returns-twice stress cases
+(values live across the `setjmp`; nested/loop `longjmp`; `longjmp` across several JIT frames).
+
+**Reference implementations to mirror (already landed, byte-identical to native):** the tree-walker
+(`crates/svm-interp/src/lib.rs` — `SetJmpPoint`, `setjmp_points`, the `SetJmp`/`LongJmp` arms in
+`run_inner`) and the bytecode engine (`crates/svm-interp/src/bytecode.rs` — `ByteSetJmp`, `Op::SetJmp`/
+`LongJmp`). The on-ramp lowering is `lower_setjmp_call` in `crates/svm-llvm/src/lib.rs`. **Current state:
+both interpreters run `setjmp`/`longjmp`; the JIT cleanly declines `Unsupported`** — so the branch is a
+clean checkpoint to start the JIT pass from, engines in sync, never divergent.
 
 **Returns-twice in SSA.** `setjmp`'s result (0 first time, `v` on `longjmp`) feeds a branch; the
 `longjmp` re-enters at the instruction after `setjmp`. The interp models this directly (set the result
