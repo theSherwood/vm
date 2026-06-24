@@ -81,6 +81,111 @@ fn both(parent_src: &str) -> BothOut {
     (ir, imem, jo, jmem)
 }
 
+/// A child ("plugin") with two exported entries — `"alpha"` (func 0) → `byte+1000`, `"beta"` (func 1)
+/// → `byte+2000` — to prove name→funcidx resolution selects the non-default entry identically on both
+/// backends (see `separate_module.rs`).
+fn named_child_src() -> &'static str {
+    "memory 16
+data 100 \"VM\"
+export \"alpha\" 0
+export \"beta\" 1
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  v4 = i64.const 2000
+  v5 = i64.add v3 v4
+  return v5
+}
+"
+}
+
+/// Like [`both`], but grants [`named_child_src`] (the two-export child) so a parent can resolve a child
+/// entry by name on both backends.
+fn both_named(parent_src: &str) -> BothOut {
+    let parent = parse_module(parent_src).expect("parse parent");
+    verify_module(&parent).expect("verify parent");
+    let child = parse_module(named_child_src()).expect("parse child");
+    verify_module(&child).expect("verify child");
+    let init: Vec<u8> = (0..(128u64 << 10))
+        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+        .collect();
+
+    let mut hi = Host::new();
+    let ii = hi.grant_instantiator(0, 128 << 10);
+    let mi = hi.grant_module(&child);
+    let mut hj = Host::new();
+    let ij = hj.grant_instantiator(0, 128 << 10);
+    let mj = hj.grant_module(&child);
+    assert_eq!((ii, mi), (ij, mj), "grants must encode identically");
+
+    let mut fuel = 5_000_000u64;
+    let (ir, imem) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ii), Value::I32(mi)],
+        &mut fuel,
+        &init,
+        0,
+        &mut hi,
+    );
+    let (jo, jmem) = compile_and_run_capture_reserved_with_host_ex(
+        &parent,
+        0,
+        &[ij as i64, mj as i64],
+        &init,
+        0,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut core::ffi::c_void,
+        Some(svm_run::module_resolver),
+    )
+    .expect("jit");
+    (ir, imem, jo, jmem)
+}
+
+#[test]
+fn jit_module_child_by_export_name_matches_interp() {
+    if !svm_jit::fiber_supported() {
+        return; // no JIT nesting runtime on this target
+    }
+    // The parent resolves "beta" (func 1) via Module op 0 — routed through `cap_thunk` →
+    // `cap_dispatch_slots` on the JIT, same as the interpreter — then instantiate_module's it → join.
+    let parent = "memory 17
+data 200 \"beta\"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 200
+  v3 = i64.const 4
+  v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
+  v5 = i64.extend_i32_s v1
+  v6 = i64.const 0
+  v7 = i64.const 65536
+  v8 = i64.const 16
+  v9 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
+  v10 = cap.call 6 1 (i32) -> (i64) v0 (v9)
+  return v10
+}
+";
+    let (ir, imem, jo, jmem) = both_named(parent);
+    let ival = ir.expect("interp ran ok").pop().expect("one result");
+    assert_eq!(ival, Value::I64(86 + 2000), "interp name-addressed child");
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[86 + 2000]),
+        "jit name-addressed child: {jo:?}"
+    );
+    assert_eq!(imem, jmem, "interp/JIT parent windows diverge");
+}
+
 #[test]
 fn jit_module_child_matches_interp() {
     if !svm_jit::fiber_supported() {

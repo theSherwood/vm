@@ -220,11 +220,18 @@ rather than converged:
 | `run_kernel` | bare | none | kernels / bench |
 | `run_c_full` (test) → `Instance::run_diff` (F1) | interp+JIT | fixed | chibicc suite |
 | `JitSession` | JIT | fixed | guest-JIT REPL |
-| §14 nested (`Instantiator`/`Module`) | interp+JIT | object-cap | `instantiator.rs`, `separate_module.rs` |
+| §14 nested (`Instantiator`/`Module`, name-addressable F2) | all 3 | object-cap | `instantiator.rs`, `separate_module.rs` |
 
-One consequence still worth fixing (followup):
-- The §14 nested path is **func-0-only and ignores `Module.exports`** — a child/separate-module guest
-  cannot be called by name.
+**Resolved (F2).** The §14 nested path can now address a child's entry **by name**: a `Module`
+capability (iface 8) gained one callable op — `op 0 resolve_export(name_ptr, name_len) -> funcidx |
+-errno` — backed by `Module.exports` (now retained in the host's `ModuleGrant`, previously dropped at
+`grant_module`). A parent resolves a name to a funcidx, then passes it as the `entry` to the existing
+Instantiator module ops (5/6/7). It lives in the generic `cap_dispatch_slots` seam, so **all three
+backends** get it from one implementation (tree-walker generic `CapCall`; bytecode generic `Op::CapCall`;
+JIT `cap_thunk`) — verified by name-addressed-child tests in `separate_module.rs`,
+`bytecode_separate_module.rs`, and `jit_separate_module.rs` (each picks a *non-0* export). The name is
+borrowed from the caller's window, fail-closed (`-EFAULT` out of bounds, `-EINVAL` bad UTF-8 / unknown);
+only the funcidx crosses back, never a host pointer.
 
 **Resolved (F1).** The run paths are converged onto one core:
 - `run_powerbox_inner` no longer carries its own grant/compile/watchdog: it builds an `Instance` (fixed
@@ -377,9 +384,15 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   4. The test-only `run_c_full` (chibicc interp+JIT differential harness) is folded onto
      `svm_run::instantiate` + `Instance::run_diff` — every C test now exercises the same grant/run core
      the CLI and embedders use, not a hand-rolled compile/run.
-- **F2 — name-addressable nested guests.** Thread `Module.exports` through the §14 `Module`-capability
-  path so a parent can call a child's export by name, not just func 0 — consistent with host-driven
-  calls. (Today nested children are func-0-only.)
+- **F2 — name-addressable nested guests.** *Landed.* `Module.exports` is retained in the host's
+  `ModuleGrant`, and the `Module` capability (iface 8) gained `op 0 resolve_export(name_ptr, name_len)
+  -> funcidx | -errno`. A parent resolves a child export name to a funcidx, then passes it as the
+  `entry` to the existing Instantiator module ops (5/6/7). Implemented once in the generic
+  `cap_dispatch_slots` seam → works on all three backends; fail-closed on the new untrusted-name surface
+  (`-EFAULT`/`-EINVAL`). Tests: `separate_module.rs`, `bytecode_separate_module.rs`,
+  `jit_separate_module.rs` (each resolves a *non-0* export). *Note:* the earlier "func-0-only" framing
+  was imprecise — invocation was always by integer `entry`; the real gap was the absence of name→index
+  resolution (exports were dropped at grant), which this closes.
 - **F3 — test the named-export call path.** Even before Phase 6, add a test for `Instance::call("<non-
   _start>", args)` returning results; decide whether a non-`_start` export should get the powerbox caps
   (it currently gets none — likely wrong once reactors exist).

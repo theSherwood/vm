@@ -163,6 +163,57 @@ fn forged_module_handle_faults_identically() {
     check(PARENT_FORGED, CHILD_SRC, Err(()));
 }
 
+/// A two-export child ("plugin"): `"alpha"` (func 0) → `byte+1000`, `"beta"` (func 1) → `byte+2000`.
+/// Used to prove the bytecode engine drives `Module` op 0 (`resolve_export`, F2) identically to the
+/// tree-walker — name → funcidx through the generic `cap_dispatch_slots` seam.
+const NAMED_CHILD_SRC: &str = r#"memory 16
+data 100 "VM"
+export "alpha" 0
+export "beta" 1
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  v4 = i64.const 2000
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+
+/// The parent resolves "beta" (func 1, in its own data segment at 200) via `Module` op 0, then
+/// instantiate_module's that funcidx → join → the *beta* result (`'V'` 86 + 2000).
+const PARENT_BY_NAME: &str = r#"memory 17
+data 200 "beta"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 200
+  v3 = i64.const 4
+  v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
+  v5 = i64.extend_i32_s v1
+  v6 = i64.const 0
+  v7 = i64.const 65536
+  v8 = i64.const 16
+  v9 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
+  v10 = cap.call 6 1 (i32) -> (i64) v0 (v9)
+  return v10
+}
+"#;
+
+#[test]
+fn module_child_addressed_by_export_name_matches_treewalker() {
+    check(PARENT_BY_NAME, NAMED_CHILD_SRC, Ok(vec![Value::I64(2086)]));
+}
+
 /// A coroutine ("plugin") module: a 64 KiB window whose entry (`(i64 yielder) -> (i64)`) yields 100,
 /// then `200 + r1`, then returns `999 + r2` (r1/r2 are the resume values). Stores a marker at offset
 /// 0 to exercise its confined window too.
