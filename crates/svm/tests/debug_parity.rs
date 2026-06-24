@@ -705,3 +705,67 @@ fn stepping_parity_over_and_out_at_a_call() {
         assert_eq!(dbg.value(2), Some(Value::I32(10)));
     }
 }
+
+// Both a window-located var `w` (at v0+0) and an SSA-located var `s` (= v2), live at the breakpoint
+// (block 0, inst 3). Exercises both VarLoc paths of the name-based reader.
+const READVAR_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 7
+  i32.store v0 v1
+  v2 = i32.const 3
+  v3 = i32.add v2 v2
+  return v3
+}
+
+debug.file 0 "rv.c"
+debug.fname 0 "f"
+debug.type 0 base "int" signed 4
+debug.var 0 "w" win 0 "int" 0
+debug.var 0 "s" ssa 2 "int"
+"#;
+
+/// Name-based variable read parity (the engine-side prerequisite for a DAP `variables` backend):
+/// `DebugRun::read_var` resolves the same `VarLoc`s as `Inspector::read_var` — a window var from
+/// window memory, an SSA var from the typed value slot — and returns identical `VarValue`s at the same
+/// stop. With this, `DebugRun` mirrors the Inspector's full forward-debug API (breakpoints, stepping,
+/// backtrace, indexed + named inspection), all parity-tested.
+#[test]
+fn read_var_by_name_parity() {
+    let m = parse_module(READVAR_DBG).expect("parse");
+    let args = [Value::I64(1024)];
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 3,
+    }; // before v3 = add: w (=7) and s (=3) both live
+
+    let mut insp = Inspector::attach(&m, 0, &args, 100_000);
+    insp.set_breakpoint(bp);
+    assert!(matches!(insp.run_until_stop(), Stop::Break { pc, .. } if pc == bp));
+
+    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut fuel = 100_000u64;
+    assert_eq!(dbg.run_to(&[bp], &mut fuel), Some(bp));
+
+    for name in ["w", "s"] {
+        let tw = insp.read_var(0, name, 4);
+        let bc = dbg.read_var(0, name, 4);
+        assert_eq!(
+            bc, tw,
+            "read_var(\"{name}\") diverges between engines (tree-walker {tw:?})"
+        );
+        assert!(bc.is_some(), "\"{name}\" resolves on the bytecode engine");
+    }
+    // Concretely: window var w = 7 (4 LE bytes), SSA var s = v2 = 3.
+    assert_eq!(
+        dbg.read_var(0, "w", 4),
+        Some(VarValue::Bytes(vec![7, 0, 0, 0]))
+    );
+    assert_eq!(
+        dbg.read_var(0, "s", 4),
+        Some(VarValue::Value(Value::I32(3)))
+    );
+}

@@ -145,11 +145,15 @@ different things depending on which pair you compare:
   `DebugRun` covers the forward-debug subset, but the rest — `seek`/`step_back` (reverse debugging),
   `set_watchpoint` (data breakpoints), `select_task`/`threads`/`stopped_task` (multithreading) — are
   **outside the bytecode engine's single-vCPU debug scope** (it delegates those to the tree-walker, per
-  G2). So a DAP-over-bytecode backend can only ever cover the *forward-debug subset*; wiring it in is a
-  server-side backend seam (abstract that subset, add a name→`VarLoc` variable read on `DebugRun`) whose
-  *correctness* is already guaranteed by the engine-level parity here — it is feature plumbing for users,
-  not a parity risk. The JIT path is Stage 5 (separate). The *static* source-map half is covered
-  transitively by **G1**.
+  G2). So a DAP-over-bytecode backend can only ever cover the *forward-debug subset*. The **engine-side
+  API for that subset is now complete**: `DebugRun::read_var` resolves a source variable by name over
+  the same `VarLoc`s as `Inspector::read_var` (SSA from the typed slot, window/fixed from window memory),
+  with `read_var_by_name_parity` checking it matches op-for-op — so `DebugRun` now mirrors the Inspector's
+  full forward API (breakpoints, stepping, backtrace, indexed **and** named inspection), all parity-tested.
+  What's left is purely **server-side routing**: a backend seam in `svm-dap` that dispatches the
+  forward-subset handlers to either engine — feature plumbing for users whose *correctness* is already
+  guaranteed by the parity tests here, not a parity risk. The JIT path is Stage 5 (separate). The *static*
+  source-map half is covered transitively by **G1**.
 
 ---
 

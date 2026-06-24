@@ -45,14 +45,14 @@
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
 
 use svm_ir::{
-    BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, IToF, Inst,
-    IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValType,
+    BinOp, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx,
+    IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValType, VarLoc,
 };
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, GuestMem, Host, Mem, Reg, Trap,
-    Value, DEFAULT_RESERVED_LOG2,
+    Value, VarValue, DEFAULT_RESERVED_LOG2,
 };
 
 /// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative).
@@ -1581,6 +1581,9 @@ pub struct DebugRun {
     fn_block_base: Vec<Vec<u32>>,
     /// Per-function, per-block value types (`func_value_types`), for typing a slot's `Reg` to a `Value`.
     fn_block_types: Vec<Vec<Vec<ValType>>>,
+    /// The §6 debug info (cloned from the module), for resolving a source variable name to its `VarLoc`
+    /// in [`read_var`](DebugRun::read_var). `None` ⇒ the module carried no `-g` section.
+    debug: Option<DebugInfo>,
     /// Paused on a reported breakpoint — step past it before the next `run_to` so we make progress.
     at_bp: bool,
     done: Option<Result<Vec<Value>, Trap>>,
@@ -1625,6 +1628,7 @@ impl DebugRun {
             vm,
             fn_block_base,
             fn_block_types,
+            debug: m.debug_info.clone(),
             at_bp: false,
             done: None,
         })
@@ -1760,36 +1764,31 @@ impl DebugRun {
         self.vm.stack.len() + 1
     }
 
-    /// The `(module, func, block, window base)` of the frame `depth` levels from the top (0 = running
-    /// activation; each caller is resolved at its call site, `resume_pc - 1`). `None` past the stack or
-    /// when the top is paused on a non-instruction.
-    fn frame_at(&self, depth: usize) -> Option<(usize, usize, usize, usize)> {
+    /// The `(module, func, block, inst, window base)` of the frame `depth` levels from the top (0 =
+    /// running activation; each caller is resolved at its call site, `resume_pc - 1`). `None` past the
+    /// stack or when the top is paused on a non-instruction.
+    fn frame_at(&self, depth: usize) -> Option<(usize, usize, usize, usize, usize)> {
         if depth == 0 {
             let pc = self.vm.cur_ir_pc(&self.mods[..])?;
-            return Some((self.vm.module, self.vm.cur, pc.block, self.vm.base));
+            return Some((self.vm.module, self.vm.cur, pc.block, pc.inst, self.vm.base));
         }
         // depth 1 = innermost caller = last stack entry; depth n = outermost.
         let n = self.vm.stack.len();
         let &(module, f, base, resume_pc, _) = self.vm.stack.get(n.checked_sub(depth)?)?;
-        let (block, _) = self.mods[module]
+        let (block, inst) = self.mods[module]
             .progs
             .get(f)?
             .src
             .get(resume_pc.checked_sub(1)?)
             .copied()
             .flatten()?;
-        Some((module, f, block as usize, base))
+        Some((module, f, block as usize, inst as usize, base))
     }
 
     /// The `IrPc` of the frame `depth` levels from the top — the bytecode counterpart of a
     /// `Inspector::backtrace` entry. `None` past the stack.
     pub fn frame_pc(&self, depth: usize) -> Option<super::IrPc> {
-        let (module, func, block, _) = self.frame_at(depth)?;
-        let inst = if depth == 0 {
-            self.vm.cur_ir_pc(&self.mods[..])?.inst
-        } else {
-            0
-        };
+        let (module, func, block, inst, _) = self.frame_at(depth)?;
         Some(super::IrPc {
             module: module as u32,
             func: func as FuncIdx,
@@ -1803,13 +1802,55 @@ impl DebugRun {
     /// the stack. A not-yet-computed slot reads as its default; the caller compares only the defined
     /// prefix (where `read_ir_value` returns `Some`).
     pub fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
-        let (module, func, block, base) = self.frame_at(depth)?;
+        let (module, func, block, _inst, base) = self.frame_at(depth)?;
         if module != 0 {
             return None; // metadata is for module-0 functions
         }
         let off = *self.fn_block_base.get(func)?.get(block)? as usize;
         let ty = *self.fn_block_types.get(func)?.get(block)?.get(idx)?;
         Some(self.vm.regs[base + off + idx].to_value(ty))
+    }
+
+    /// Read a **source variable by name** in the frame `depth` levels from the top — the bytecode
+    /// counterpart of `Inspector::read_var`, resolving the same `VarLoc` over the §6 debug info: an
+    /// `Ssa`/`SsaList` promoted scalar from the typed value slot, a `Window`/`WindowVia`/`Fixed` var
+    /// from window memory. `None` if there is no debug info, the name isn't an in-scope var here, or
+    /// the location can't be resolved. This is the name→value read a DAP `variables` backend needs.
+    pub fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
+        let di = self.debug.as_ref()?;
+        let (module, func, block, inst, base) = self.frame_at(depth)?;
+        if module != 0 {
+            return None;
+        }
+        let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
+        let window_read = |addr: u64| -> Option<VarValue> {
+            Some(VarValue::Bytes(
+                self.mem.as_ref()?.read_window(addr, width).ok()?,
+            ))
+        };
+        match &var.loc {
+            VarLoc::Ssa { value } => self
+                .value_in_frame(depth, *value as usize)
+                .map(VarValue::Value),
+            VarLoc::SsaList(locs) => {
+                let v = super::loclist_value(locs, block, inst)?;
+                self.value_in_frame(depth, v as usize).map(VarValue::Value)
+            }
+            // Address = data-SP (the frame's first value, v0) + off.
+            VarLoc::Window { off } => {
+                window_read((self.vm.regs[base].i64() as u64).wrapping_add(*off as u64))
+            }
+            VarLoc::WindowVia { base: locs, off } => {
+                let v = super::loclist_value(locs, block, inst)?;
+                let addr = match self.value_in_frame(depth, v as usize)? {
+                    Value::I32(x) => x as i64 as u64,
+                    Value::I64(x) => x as u64,
+                    _ => return None,
+                };
+                window_read(addr.wrapping_add(*off as u64))
+            }
+            VarLoc::Fixed { addr } => window_read(*addr),
+        }
     }
 
     /// The running frame's block-local SSA value `idx` ([`value_in_frame`] at depth 0).
