@@ -125,9 +125,12 @@ wasmtime run --invoke run_jit       -W memory64=y "$W"   # 142 (guest installs +
 wasmtime run --invoke run_dynlink   -W memory64=y "$W"   # 777 (compile_linked resolves a named import)
 wasmtime run --invoke run_durable   -W memory64=y "$W"   # 2001 (durable NORMAL run; freeze/thaw differ in corpus)
 
-# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tailcall + SIMD + gc.roots + reflection + SharedRegion + guest-JIT + dynlink + durability) — 119/119
+# Full differential (13 feature families, 119 cases) vs native ground truth — byte-identical
 cargo run --bin gencorpus                                # native ground truth → corpus.json
-node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
+node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm   # wasm32 (Node): 119/119
+# wasm64 (Wasmtime embedding): the same 119 cases byte-fed through the production target
+cargo run --manifest-path wt/Cargo.toml --release -- \
+  target/wasm64-unknown-unknown/release/svm_browser.wasm                 # wasm64: 119/119
 
 # Live host imports — guest console/clock bound to real wasm imports (default build is import-free)
 cargo build --release --lib --target wasm32-unknown-unknown --features live
@@ -200,11 +203,16 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   bytecode engine (decode encoded IR → run → `i64`), deny-all `Host` (compute-only v1), fail-closed
   on `compile_module == None`. Builds for wasm32 **and** wasm64; runtime-validated end-to-end on
   wasm32 in Node (anchors + decode-error path green).
-- [x] **wasm64 runtime validation.** On Wasmtime 45 (`-W memory64=y`): `run_guest` (compute) and
-  `run_threads` (cooperative `drive` → 4000) both correct on memory64/table64. Node/V8 still lacks
-  table64 (above) — browser path stays wasm32 until then. Optional follow-up: reproduce the full
-  `svm_run` byte-feeding differential on wasm64 via a Wasmtime embedding (the CLI `--invoke` can't
-  write a host buffer; the embedded probes already exercise the whole engine on wasm64).
+- [x] **wasm64 runtime validation.** On Wasmtime 45 (`-W memory64=y`): the 16 embedded `--invoke`
+  probes (`run_guest`/`run_threads`/… → `run_durable`) all correct on memory64/table64. Node/V8 still
+  lacks table64 (above) — the browser-via-V8 path stays wasm32 until then.
+- [x] **wasm64 byte-feeding differential (`browser/wt/`).** The CLI `--invoke` can't write the
+  `svm_alloc` buffers, so a small Wasmtime-embedding harness (`svm-wt`, deps `wasmtime` + `serde_json`,
+  no SVM crates) loads the **wasm64** module, `svm_alloc`s + writes each corpus module/stdin/window,
+  calls the exports, reads results/streams/snapshots back, and compares to the *same* `corpus.json`.
+  **119/119 match on wasm64** — byte-identical to wasm32 and native, including the 128 KiB durability
+  snapshots and the 2 MiB echo. So the full differential now runs on **both** targets, not probe-only
+  on the production one.
 - [x] **cfg-gate `lib.rs` for wasm.** `page_size` is now native-only (`target.'cfg(not(wasm))'`)
   with a 64 KiB wasm fallback in `host_page_size()`/`host_region_granularity()` — dropped from the
   wasm dep graph; native unchanged (full `svm-interp`/`svm-mem` suite green, workspace builds). The
@@ -301,6 +309,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
 - **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 119/119
-  differential vs native), and `node browser/live.mjs` (host-import demo,
-  `--features live`). wasm64 is exercised via the Wasmtime `--invoke` probes under **Reproduce**.
+  differential vs native on wasm32), `browser/wt` (the **same 119 on wasm64** via a Wasmtime
+  embedding), and `node browser/live.mjs` (host-import demo, `--features live`). The 16 embedded
+  `--invoke` probes under **Reproduce** spot-check each feature on wasm64 directly.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

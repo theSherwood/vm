@@ -1,4 +1,5 @@
 /target
+/wt/target
 # regenerable fixtures/corpus (see `cargo run --bin genfixture` / `gencorpus`)
 *.svmbc
 /corpus
