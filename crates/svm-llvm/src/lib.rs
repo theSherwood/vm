@@ -1525,6 +1525,9 @@ fn translate_func(
     }
 
     let mut blocks = Vec::with_capacity(f.basic_blocks.len());
+    // Synthetic blocks appended *after* all real blocks (so real block indices are unchanged): a
+    // sparse `switch` lowers to a comparison chain whose extra blocks land here (see `translate_switch`).
+    let mut aux_blocks: Vec<Block> = Vec::new();
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
         blocks.push(translate_block(
             bb,
@@ -1545,8 +1548,10 @@ fn translate_func(
             helpers,
             ba,
             dbg,
+            &mut aux_blocks,
         )?);
     }
+    blocks.extend(aux_blocks);
     Ok((
         Func {
             params,
@@ -1665,6 +1670,12 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
                     // `mask_lanes`, never used as a scalar — record a placeholder type.
                     Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
+                    // An `i128` result (a `-O2` 16-byte struct-eq coalesce: `load i128` + `icmp`) is
+                    // held as a 2×`i64` aggregate pair, never a scalar — placeholder type, like a
+                    // struct. (Same-block only, the aggregate-side-table assumption.)
+                    Err(_) if matches!(ty.as_ref(), Type::IntegerType { bits: 128 }) => {
+                        ValType::I64
+                    }
                     Err(e) => return Err(e),
                 };
                 s.ty.push(vt);
@@ -8854,6 +8865,46 @@ fn const_splat_int(op: &Operand) -> Option<u64> {
     Some(first)
 }
 
+/// Lower a **saturating float→int** intrinsic (`llvm.fptosi.sat.<int>.<float>` /
+/// `llvm.fptoui.sat.…`, which Rust's `as` casts from float emit) to svm-IR's `FToISat` — exactly the
+/// saturating semantics (NaN→0, out-of-range→clamped) the on-ramp already gives the plain `fptosi`
+/// instruction (§3b). The src/dst widths are parsed from the mangled name. `Ok(None)` for other calls;
+/// `Unsupported` for a vector form (`v4i32`/…), a later slice.
+fn lower_fp_sat_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    let signed = if name.starts_with("llvm.fptosi.sat.") {
+        true
+    } else if name.starts_with("llvm.fptoui.sat.") {
+        false
+    } else {
+        return Ok(None);
+    };
+    // `llvm.fpto{si,ui}.sat.<int>.<float>` — the last two dot-components are the dst int / src float.
+    let mut parts = name.rsplit('.');
+    let fstr = parts.next().unwrap_or("");
+    let istr = parts.next().unwrap_or("");
+    let dst = match istr {
+        "i32" => IntTy::I32,
+        "i64" => IntTy::I64,
+        _ => return unsup(format!("`{name}` (only i32/i64 result)")),
+    };
+    let src = match fstr {
+        "f32" => FloatTy::F32,
+        "f64" => FloatTy::F64,
+        _ => return unsup(format!("`{name}` (only f32/f64 source)")),
+    };
+    let a = ctx.operand(&c.arguments[0].0)?;
+    Ok(Some(ctx.push(Inst::FToISat {
+        op: ftoi_op(src, dst, signed),
+        a,
+    })))
+}
+
 /// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
 /// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
 /// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
@@ -8880,6 +8931,10 @@ fn lower_int_intrinsic(
             | "llvm.fshl"
             | "llvm.fshr"
             | "llvm.bswap"
+            | "llvm.uadd.sat"
+            | "llvm.usub.sat"
+            | "llvm.sadd.sat"
+            | "llvm.ssub.sat"
     ) {
         return Ok(None);
     }
@@ -8919,12 +8974,20 @@ fn lower_int_intrinsic(
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
         }
+        // Per-lane popcount — wasm has it only for `i8x16` (the sole vector `ctpop` width).
+        if base == "llvm.ctpop" {
+            if shape != svm_ir::VShape::I8x16 {
+                return unsup(format!("vector ctpop on {shape:?} (only i8x16)"));
+            }
+            let a = ctx.operand(args[0])?;
+            return Ok(Some(ctx.push(Inst::VPopcnt { a })));
+        }
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
             "llvm.smin" => svm_ir::VIntBinOp::MinS,
             "llvm.umax" => svm_ir::VIntBinOp::MaxU,
             "llvm.umin" => svm_ir::VIntBinOp::MinU,
-            other => return unsup(format!("vector `{other}` (only min/max)")),
+            other => return unsup(format!("vector `{other}` (only min/max or ctpop)")),
         };
         let a = ctx.operand(args[0])?;
         let b = ctx.operand(args[1])?;
@@ -8994,6 +9057,102 @@ fn lower_int_intrinsic(
             let bits = src_bits(args[0], types)?;
             let v = ctx.operand(args[0])?;
             emit_bswap(ctx, v, ty, (bits / 8).max(1) as u64)
+        }
+        // Saturating add/sub (`llvm.{u,s}{add,sub}.sat`): the wrapping op, then clamp on over/underflow
+        // via `select`. Rust's `saturating_add`/`sub` (and slice/capacity math) emit these. Only the
+        // native widths (i32/i64) — a narrow saturating width would need width-specific clamp bounds.
+        "llvm.uadd.sat" | "llvm.usub.sat" | "llvm.sadd.sat" | "llvm.ssub.sat" => {
+            let bits = src_bits(args[0], types)?;
+            if bits != 32 && bits != 64 {
+                return unsup(format!("`{name}` (only i32/i64 saturating)"));
+            }
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let k = |ctx: &mut BlockCtx, v: i64| {
+                ctx.push(if ty == IntTy::I64 {
+                    Inst::ConstI64(v)
+                } else {
+                    Inst::ConstI32(v as i32)
+                })
+            };
+            let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                ctx.push(Inst::IntBin { ty, op, a, b })
+            };
+            match base {
+                // unsigned add: carry (s <u a) ⇒ all-ones (UMAX).
+                "llvm.uadd.sat" => {
+                    let s = bin(ctx, BinOp::Add, a, b);
+                    let carry = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtU,
+                        a: s,
+                        b: a,
+                    });
+                    let umax = k(ctx, -1);
+                    ctx.push(Inst::Select {
+                        cond: carry,
+                        a: umax,
+                        b: s,
+                    })
+                }
+                // unsigned sub: borrow (a <u b) ⇒ 0.
+                "llvm.usub.sat" => {
+                    let under = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtU,
+                        a,
+                        b,
+                    });
+                    let diff = bin(ctx, BinOp::Sub, a, b);
+                    let zero = k(ctx, 0);
+                    ctx.push(Inst::Select {
+                        cond: under,
+                        a: zero,
+                        b: diff,
+                    })
+                }
+                // signed add/sub: overflow when the sign rule is violated ⇒ clamp to SMIN/SMAX by the
+                // sign of `a`. `sadd`: overflow iff `(a^s)&(b^s) < 0`; `ssub`: iff `(a^b)&(a^d) < 0`.
+                "llvm.sadd.sat" | "llvm.ssub.sat" => {
+                    let is_add = base == "llvm.sadd.sat";
+                    let r = bin(ctx, if is_add { BinOp::Add } else { BinOp::Sub }, a, b);
+                    let (l, rr) = if is_add {
+                        (bin(ctx, BinOp::Xor, a, r), bin(ctx, BinOp::Xor, b, r))
+                    } else {
+                        (bin(ctx, BinOp::Xor, a, b), bin(ctx, BinOp::Xor, a, r))
+                    };
+                    let ov_bits = bin(ctx, BinOp::And, l, rr);
+                    let zero = k(ctx, 0);
+                    let ov = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtS,
+                        a: ov_bits,
+                        b: zero,
+                    });
+                    let (smax, smin) = if ty == IntTy::I64 {
+                        (k(ctx, i64::MAX), k(ctx, i64::MIN))
+                    } else {
+                        (k(ctx, i32::MAX as i64), k(ctx, i32::MIN as i64))
+                    };
+                    let neg = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtS,
+                        a,
+                        b: zero,
+                    });
+                    let sat = ctx.push(Inst::Select {
+                        cond: neg,
+                        a: smin,
+                        b: smax,
+                    });
+                    ctx.push(Inst::Select {
+                        cond: ov,
+                        a: sat,
+                        b: r,
+                    })
+                }
+                _ => unreachable!(),
+            }
         }
         _ => unreachable!(),
     };
@@ -10516,6 +10675,7 @@ fn translate_block(
     helpers: &Helpers,
     ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
@@ -10592,7 +10752,7 @@ fn translate_block(
     // and falls through to the ordinary `ret` here.)
     let term = match ctx.pending_tail.take() {
         Some(t) => t,
-        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params)?,
+        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params, aux_blocks)?,
     };
     Ok(Block {
         params,
@@ -10868,6 +11028,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 offset: 0,
                 align: 0,
             });
+        } else if let Some(bits) = nonstd_int_bits(st.value.get_type(types).as_ref()) {
+            // Non-power-of-two integer store (e.g. an `i56` niche field): write exactly its bytes.
+            store_nonstd_int(ctx, addr, value, bits);
         } else {
             let op = store_op(st.value.get_type(types).as_ref())?;
             ctx.push_effect(Inst::Store {
@@ -10936,6 +11099,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // A call to an external libm-math function with a direct SVM op (`sqrt`/`floor`/…) lowers
         // inline (only when the guest hasn't defined its own function of that name).
         if let Some(idx) = lower_libm_call(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // Saturating float→int intrinsics (`llvm.fptosi.sat`/`fptoui.sat`, Rust's float `as` casts).
+        if let Some(idx) = lower_fp_sat_intrinsic(ctx, c)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
@@ -11115,6 +11287,80 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         return Ok(());
     }
+    // i128 is held as a **pair of i64 halves** (`[lo, hi]`) in the aggregate side-table — svm-IR has no
+    // 128-bit type. This covers what `-O2` actually produces: clang coalesces a 16-byte struct/array
+    // equality (e.g. comparing `Known`'s `[u8;16]` payload) into a `load i128` + `icmp eq/ne i128`.
+    // Only those two ops are supported; any other i128 use stays a clean `Unsupported`.
+    if let I::Load(l) = instr {
+        if matches!(l.loaded_ty.as_ref(), Type::IntegerType { bits: 128 }) {
+            let addr = ctx.operand(&l.address)?;
+            let lo = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr,
+                offset: 0,
+                align: 0,
+            });
+            let c8 = ctx.const_i64(8);
+            let hi_addr = ctx.add_i64(addr, c8);
+            let hi = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr: hi_addr,
+                offset: 0,
+                align: 0,
+            });
+            if let Some(&vid) = ctx.s.name2id.get(&l.dest) {
+                ctx.agg.insert(vid, vec![lo, hi]);
+            }
+            return Ok(());
+        }
+    }
+    if let I::ICmp(x) = instr {
+        if matches!(
+            x.operand0.get_type(types).as_ref(),
+            Type::IntegerType { bits: 128 }
+        ) {
+            if !matches!(x.predicate, IntPredicate::EQ | IntPredicate::NE) {
+                return unsup(format!("i128 icmp {:?} (only eq/ne)", x.predicate));
+            }
+            let a = ctx
+                .agg_of(&x.operand0)
+                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
+            let b = ctx
+                .agg_of(&x.operand1)
+                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
+            let lo = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: a[0],
+                b: b[0],
+            });
+            let hi = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: a[1],
+                b: b[1],
+            });
+            let mut r = ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: lo,
+                b: hi,
+            });
+            if x.predicate == IntPredicate::NE {
+                let one = ctx.push(Inst::ConstI32(1));
+                r = ctx.push(Inst::IntBin {
+                    ty: IntTy::I32,
+                    op: BinOp::Xor,
+                    a: r,
+                    b: one,
+                });
+            }
+            if let Some(&vid) = ctx.s.name2id.get(&x.dest) {
+                ctx.idx_of.insert(vid, r);
+            }
+            return Ok(());
+        }
+    }
 
     let (dest, idx) = match instr {
         I::Alloca(a) => {
@@ -11157,6 +11403,25 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         align: 0,
                     }),
                 )
+            } else if let Some(bits) = nonstd_int_bits(l.loaded_ty.as_ref()) {
+                // Non-power-of-two integer load (e.g. an `i56` niche-discriminant field): svm-IR has no
+                // `iN` load, so read the enclosing `i64` and mask to N bits. The window-bounded read may
+                // touch up to 3 padding/adjacent bytes, discarded by the mask (the narrow-int path
+                // over-reads the same way); a read straddling the window end traps, which is safe.
+                let raw = ctx.push(Inst::Load {
+                    op: svm_ir::LoadOp::I64,
+                    addr,
+                    offset: 0,
+                    align: 0,
+                });
+                let m = ctx.const_i64(((1u64 << bits) - 1) as i64);
+                let v = ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::And,
+                    a: raw,
+                    b: m,
+                });
+                (&l.dest, v)
             } else {
                 let op = load_op(l.loaded_ty.as_ref())?;
                 (
@@ -12733,6 +12998,99 @@ fn finish(ctx: &mut BlockCtx, dest: &Name, idx: ValIdx) -> Result<(), Error> {
     Ok(())
 }
 
+/// The bit width of a **non-power-of-two integer** (33..=63 bits, e.g. an `i56` niche-discriminant
+/// field) that the on-ramp legalizes via the enclosing `i64`. `None` for the natively-handled widths
+/// (≤32 → `i32` container, 64 → `i64`) and non-integers. svm-IR has only `i32`/`i64` memory ops, so a
+/// load of such a width reads the enclosing `i64` and masks to the width; a store splits into exact
+/// byte-width writes (so it never clobbers an adjacent field).
+fn nonstd_int_bits(ty: &Type) -> Option<u32> {
+    match ty {
+        Type::IntegerType { bits } if *bits > 32 && *bits < 64 => Some(*bits),
+        _ => None,
+    }
+}
+
+/// Store a non-power-of-two integer (`bits` in 33..=63, held in an `i64`) **byte-exactly** — exactly
+/// `ceil(bits/8)` bytes, so it never clobbers an adjacent field (unlike an over-write). The low 32
+/// bits go as an `i32`; the remaining 1–3 bytes as `i16`/`i8` chunks shifted down from the high half.
+/// (`bits` ≥ 57 ⇒ 8 bytes ⇒ a plain `i64` store.)
+fn store_nonstd_int(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx, bits: u32) {
+    use svm_ir::StoreOp;
+    let byte_len = bits.div_ceil(8); // 5..=8 for 33..=63
+    if byte_len >= 8 {
+        ctx.push_effect(Inst::Store {
+            op: StoreOp::I64,
+            addr,
+            value,
+            offset: 0,
+            align: 0,
+        });
+        return;
+    }
+    // Low 32 bits at +0.
+    let lo = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: value,
+    });
+    ctx.push_effect(Inst::Store {
+        op: StoreOp::I32,
+        addr,
+        value: lo,
+        offset: 0,
+        align: 0,
+    });
+    // High bytes (bits 32+) shifted down, written exactly.
+    let c32 = ctx.const_i64(32);
+    let hi = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::ShrU,
+        a: value,
+        b: c32,
+    });
+    let hi32 = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: hi,
+    });
+    let c4 = ctx.const_i64(4);
+    let addr4 = ctx.add_i64(addr, c4);
+    let rem = byte_len - 4; // 1, 2, or 3
+    let wide_op = if rem == 1 {
+        StoreOp::I32_8
+    } else {
+        StoreOp::I32_16
+    };
+    ctx.push_effect(Inst::Store {
+        op: wide_op,
+        addr: addr4,
+        value: hi32,
+        offset: 0,
+        align: 0,
+    });
+    if rem == 3 {
+        // The 7th byte (bits 48..56) at +6.
+        let c48 = ctx.const_i64(48);
+        let hi2 = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::ShrU,
+            a: value,
+            b: c48,
+        });
+        let hi2_32 = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: hi2,
+        });
+        let c6 = ctx.const_i64(6);
+        let addr6 = ctx.add_i64(addr, c6);
+        ctx.push_effect(Inst::Store {
+            op: StoreOp::I32_8,
+            addr: addr6,
+            value: hi2_32,
+            offset: 0,
+            align: 0,
+        });
+    }
+}
+
 /// The `LoadOp` (width + result container) for an LLVM loaded type. Narrow loads zero-extend
 /// into the `i32` container; a following `sext`/`zext` (the §3b discipline) fixes signedness.
 fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
@@ -12749,7 +13107,6 @@ fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
         other => unsup(format!("load of type {other} (Milestone 1+)")),
     }
 }
-
 /// The `StoreOp` (width) for an LLVM stored value type.
 fn store_op(ty: &Type) -> Result<svm_ir::StoreOp, Error> {
     use svm_ir::StoreOp as S;
@@ -12881,6 +13238,33 @@ fn emit_trunc(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32) -> ValIdx {
 /// Lower a `zext`/`sext from→to`. Produces a value whose low `to` bits are the (zero- or sign-)
 /// extended result, in the destination container.
 fn emit_ext(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32, signed: bool) -> ValIdx {
+    // A non-power-of-two source wider than 32 bits (e.g. an `i56` niche field) sits in an `i64`;
+    // extend it **in i64** (the i32 helpers below don't apply). The widening target is always i64.
+    if (33..64).contains(&from) {
+        return if signed {
+            let sh = ctx.const_i64((64 - from) as i64);
+            let l = ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Shl,
+                a: v,
+                b: sh,
+            });
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::ShrS,
+                a: l,
+                b: sh,
+            })
+        } else {
+            let m = ctx.const_i64(((1u64 << from) - 1) as i64);
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::And,
+                a: v,
+                b: m,
+            })
+        };
+    }
     // First make a clean i32 holding the value extended from `from` bits (if `from < 32`).
     let i32v = if from >= 32 {
         v
@@ -13314,6 +13698,7 @@ fn translate_term(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     match term {
         LTerm::Ret(r) => match &r.return_operand {
@@ -13346,7 +13731,7 @@ fn translate_term(
                 else_args,
             })
         }
-        LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params),
+        LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params, aux_blocks),
         LTerm::IndirectBr(ib) => translate_indirectbr(ctx, ib, bi, f, s, block_params),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
         other => unsup(format!("terminator {other:?}")),
@@ -13427,6 +13812,7 @@ fn translate_switch(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     // `br_table`'s index is `i32`; an `i64` operand (e.g. a Rust enum discriminant) is handled by
     // folding its high 32 bits into the index below (an out-of-`[0,2^32)` value forces the default).
@@ -13462,10 +13848,26 @@ fn translate_switch(
     }
     let min = cases.iter().map(|(v, _)| *v).min().unwrap();
     let max = cases.iter().map(|(v, _)| *v).max().unwrap();
-    let span = max - min + 1;
-    if span > MAX_SWITCH_SPAN {
-        return unsup(format!("sparse switch (span {span} > {MAX_SWITCH_SPAN})"));
+    // Compute the span in `i128` so a switch whose `i64` cases straddle more than the `i64` range
+    // (a sparse `match` on a wide value) reports `Unsupported` instead of overflow-panicking. Once
+    // bounded by `MAX_SWITCH_SPAN` it fits `i64`/`usize` for the table below.
+    let span_wide = max as i128 - min as i128 + 1;
+    if span_wide > MAX_SWITCH_SPAN as i128 {
+        // Too sparse for a dense `br_table` (e.g. a niche-optimized enum discriminant with
+        // `i64::MIN`-ish sentinels): lower to an equality compare chain of synthetic blocks instead.
+        return lower_sparse_switch(
+            ctx,
+            sw,
+            bi,
+            f,
+            s,
+            block_params,
+            aux_blocks,
+            &cases,
+            default_blk,
+        );
     }
+    let span = span_wide as i64;
 
     // Index = operand - min (so the table starts at 0). An out-of-range / unbiased value lands on
     // the default (a too-large biased value, ≥ len ⇒ default).
@@ -13556,6 +13958,174 @@ fn translate_switch(
         idx,
         targets,
         default: (default_blk as u32, default_args),
+    })
+}
+
+/// The svm-IR types of a block's parameters, in the fan-out order `branch_args` supplies them: the
+/// data-SP and scalars one slot each (`i64` for the SP), a wide-vector value its `C` `v128` chunks then
+/// `T` lane scalars. Mirrors `translate_block`'s param materialization — used to type the synthetic
+/// blocks of a sparse-switch compare chain so their params line up with the edge args.
+fn block_param_types(param_ids: &[ValueId], s: &Scan) -> Vec<ValType> {
+    let mut types = Vec::new();
+    for &vid in param_ids {
+        if let Some(&layout) = s.wide.get(&vid) {
+            for _ in 0..layout.full_chunks {
+                types.push(ValType::V128);
+            }
+            let lane = layout.shape.lane_val();
+            for _ in 0..layout.tail_lanes {
+                types.push(lane);
+            }
+        } else {
+            types.push(if vid == SP { ValType::I64 } else { s.ty[vid] });
+        }
+    }
+    types
+}
+
+/// Lower a too-sparse `switch` to an **equality compare chain** (§3b). The switch block tests the
+/// operand against the first case (`br_if x == v0 → t0, else → c1`); each synthetic chain block tests
+/// the next case; the last falls through to the default. svm-IR has no first-class sparse jump, and
+/// Rust's niche-optimized enums (discriminants at `i64::MIN`-ish sentinels) produce exactly these
+/// astronomically-sparse switches. The chain blocks are appended to `aux_blocks` — *after* all real
+/// blocks, so existing block indices are unchanged — and thread, as block parameters, everything a
+/// downstream edge consumes: the data-SP (every block's param 0, §3d), the compared operand, and every
+/// case/default target's branch args. Those args are computed **once here**, in the switch block's
+/// context, because φ-operand / live-in resolution needs the real predecessor (`bi`), not the synthetic
+/// blocks; they are then threaded to wherever the chain consumes them.
+#[allow(clippy::too_many_arguments)]
+fn lower_sparse_switch(
+    ctx: &mut BlockCtx,
+    sw: &llvm_ir::terminator::Switch,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
+    cases: &[(i64, usize)],
+    default_blk: usize,
+) -> Result<Terminator, Error> {
+    let width = operand_bits(&sw.operand)?;
+    let cmp_ty = if width <= 32 { IntTy::I32 } else { IntTy::I64 };
+    let operand_ty = if width <= 32 {
+        ValType::I32
+    } else {
+        ValType::I64
+    };
+    let mk_const = |v: i64| {
+        if width <= 32 {
+            Inst::ConstI32(v as i32)
+        } else {
+            Inst::ConstI64(v)
+        }
+    };
+    let operand = ctx.operand(&sw.operand)?;
+
+    // Compute every target's branch args in *this* block's context (φ/live-in resolution needs the
+    // real predecessor `bi`). The returned ids are this-block-local.
+    let default_args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+    let mut case_args: Vec<Vec<ValIdx>> = Vec::with_capacity(cases.len());
+    for &(_, blk) in cases {
+        case_args.push(branch_args(ctx, bi, blk, f, s, block_params)?);
+    }
+
+    // The threaded value set `T`, in order: the data-SP (param 0 of every block), the operand, then
+    // every distinct value any edge consumes. A chain block's params are exactly `T` (this order), so a
+    // value's chain-block param index is its position in `T`.
+    let sp = ctx.sp()?;
+    let mut t_vals: Vec<ValIdx> = Vec::new();
+    let mut pos: HashMap<ValIdx, usize> = HashMap::new();
+    for &v in std::iter::once(&sp)
+        .chain(std::iter::once(&operand))
+        .chain(default_args.iter())
+        .chain(case_args.iter().flatten())
+    {
+        if let std::collections::hash_map::Entry::Vacant(e) = pos.entry(v) {
+            e.insert(t_vals.len());
+            t_vals.push(v);
+        }
+    }
+
+    // Type each threaded value by position: SP is `i64`, the operand its compare type, and every other
+    // value by the target parameter it feeds (`branch_args` and `block_param_types` agree in order).
+    let mut t_types: Vec<ValType> = vec![ValType::I32; t_vals.len()];
+    t_types[pos[&sp]] = ValType::I64;
+    t_types[pos[&operand]] = operand_ty;
+    for (args, target) in std::iter::once((&default_args, default_blk))
+        .chain(case_args.iter().zip(cases.iter().map(|&(_, b)| b)))
+    {
+        for (a, ty) in args.iter().zip(block_param_types(&block_params[target], s)) {
+            t_types[pos[a]] = ty;
+        }
+    }
+
+    // Identity edge: pass all of `T` through unchanged. Remap a this-block arg list to chain-block
+    // param indices (every arg is in `T`).
+    let pass_through: Vec<ValIdx> = (0..t_vals.len() as ValIdx).collect();
+    let remap =
+        |args: &[ValIdx]| -> Vec<ValIdx> { args.iter().map(|a| pos[a] as ValIdx).collect() };
+
+    // Synthetic blocks land after all real blocks and any chain from an earlier switch in this fn.
+    let base = (f.basic_blocks.len() + aux_blocks.len()) as u32;
+    let n = cases.len();
+    // Chain block for case `k` (1..n) has index `base + (k - 1)`; case 0 is the switch block itself.
+    let chain_blk = |k: usize| base + (k as u32 - 1);
+    let x_param = pos[&operand] as ValIdx;
+
+    for k in 1..n {
+        let (v, target) = cases[k];
+        // Block-local ids: params `0..t_vals.len()`, then the two pushed insts.
+        let cst = t_vals.len() as ValIdx;
+        let cond = cst + 1;
+        let insts = vec![
+            mk_const(v),
+            Inst::IntCmp {
+                ty: cmp_ty,
+                op: CmpOp::Eq,
+                a: x_param,
+                b: cst,
+            },
+        ];
+        // Match → target; else → next chain block (pass `T` on) or, for the last, the default.
+        let (else_blk, else_args) = if k + 1 < n {
+            (chain_blk(k + 1), pass_through.clone())
+        } else {
+            (default_blk as u32, remap(&default_args))
+        };
+        aux_blocks.push(Block {
+            params: t_types.clone(),
+            insts,
+            term: Terminator::BrIf {
+                cond,
+                then_blk: target as u32,
+                then_args: remap(&case_args[k]),
+                else_blk,
+                else_args,
+            },
+        });
+    }
+
+    // The switch block's own terminator: test case 0, else enter the chain (threading `T`). A single
+    // case can't exceed `MAX_SWITCH_SPAN`, so `n > 1` here, but handle `n == 1` for totality.
+    let (v0, target0) = cases[0];
+    let cst = ctx.push(mk_const(v0));
+    let cond = ctx.push(Inst::IntCmp {
+        ty: cmp_ty,
+        op: CmpOp::Eq,
+        a: operand,
+        b: cst,
+    });
+    let (else_blk, else_args) = if n > 1 {
+        (chain_blk(1), t_vals.clone())
+    } else {
+        (default_blk as u32, default_args.clone())
+    };
+    Ok(Terminator::BrIf {
+        cond,
+        then_blk: target0 as u32,
+        then_args: case_args[0].clone(),
+        else_blk,
+        else_args,
     })
 }
 

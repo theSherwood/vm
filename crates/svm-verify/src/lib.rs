@@ -16,6 +16,10 @@
 //! the precondition for the escape-freedom contract (§2a); soundness of *this code*
 //! is the separate hard problem (§18).
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+use alloc::vec::Vec;
 
 use svm_ir::{Block, BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
 
@@ -121,8 +125,15 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         let Some(mem) = &m.memory else {
             return Err(VerifyError::DataWithoutMemory { seg });
         };
+        // Reject if `offset + len` overflows (`None`) or exceeds the window. Written as an explicit
+        // match (not `is_none_or`, stabilized in 1.82) so this crate also compiles on the on-ramp's
+        // pinned `rustc 1.81` (LLVM-18) toolchain — see PEVAL.md Milestone 2.
         let end = d.offset.checked_add(d.bytes.len() as u64);
-        if end.is_none_or(|e| e > mem.size()) {
+        let out_of_window = match end {
+            Some(e) => e > mem.size(),
+            None => true,
+        };
+        if out_of_window {
             return Err(VerifyError::DataOutOfWindow { seg });
         }
     }

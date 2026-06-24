@@ -93,11 +93,153 @@ it is dropped once the actionable slices (1–2 below) close.
   run-time only after the compile-once timing fix) specialization win, thousands× end-to-end
   interpreted-interpreter→compiled-native.
 
-## Remaining slices (ranked by ROI)
+## Remaining work
 
-1. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
-   dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
-   effort (on-device re-verify, determinism/TCB review) — a project, not a slice.
+### Guest-side specialization — the plan9 substrate goal
+
+**Goal.** svm is meant to be the substrate for a plan9-like OS where freely-shared programs run in
+nested sandboxes. Part of that vision: **from within svm, a process can specialize a script and get a
+residual that runs in svm** — e.g. take a JS source + a QuickJS interpreter (both as svm-IR) and
+partial-evaluate them into a smaller/faster residual that runs *without* the interpreter, then share
+that residual over the wire / run it in a nested sandbox. The classic first Futamura projection, but
+performed *in-sandbox by an ordinary program*, not host-side/offline.
+
+**Explicit non-goal: no speculative / V8-style engine.** No type-feedback, inline caches, speculation,
+or deoptimization guards. We only want the **sound** projection we already have (constants that are
+*provably* constant get folded). For a dynamic language this means the residual removes the
+parser/bytecode-dispatch/decode (invariant given the program) but **keeps** the dynamic value runtime
+(GC, boxing, type-dispatch on runtime values) — a real but bounded win, not native speed. That is
+accepted; chasing the work-bound part is what needs speculation, and we're not doing it.
+
+**Security/architecture — already settled, no new escape-TCB.** The §22 `Jit` capability is built: a
+guest hands the VM a serialized IR blob, the VM `decode → verify → compile → invoke`s it, and **the
+trust hinge is verification, not the producer**. So the specializer is *just another untrusted
+program*: however buggy, its residual is re-verified before a single instruction runs, a bad residual
+only hurts the guest that ran it (confined to its own sandbox), and guest-side specialization adds
+**zero escape-TCB surface** (DESIGN §22). This fits the plan9 ethos: anyone can write/share/improve a
+specializer; running someone else's is safe by construction. The "run the residual" half is done; the
+"residual IR + back half" are shared with the host-side engine (DESIGN §20c).
+
+**The actual enabler: run `svm-peval` as an svm-IR program — i.e. the Rust→svm-IR on-ramp.** To
+specialize from within svm, the specializer must itself be svm-IR. Status of the pieces:
+
+- **Rust→svm-IR exists and is tested.** `crates/svm-llvm` is a generic *LLVM-bitcode → svm-IR*
+  translator ("one component buys every LLVM language", `LLVM.md` / D54), not C-specific. The Milestone-2
+  test `crates/svm-llvm/tests/translate.rs` compiles a `#![no_std]` / `panic=abort` Rust crate with
+  **`rustc +1.81.0`** and runs it `interp == JIT == native rustc` — including `-O2` auto-vectorized SIMD.
+  - **Toolchain pin:** the bitcode version must match the pinned reader (LLVM 18). Default `rustc`
+    (1.94 / LLVM 21) is rejected; **`rustc +1.81.0` (LLVM 18.1)** is accepted. CI installs `1.81.0` for
+    this lane. (`rustup toolchain install 1.81.0` to run it locally; the test skips without it.)
+  - **Guest constraints:** `#![no_std]` (no OS) + `panic=abort` (no EH/unwinding → "lowers like C").
+- **Gap to running `svm-peval` (each bounded, none greenfield):**
+  1. ~~**`core + alloc`**~~ **DONE.** A `no_std` Rust program with a `#[global_allocator]` over the guest
+     `malloc`/`free` (the `vm_map`-growing bump allocator) now runs end-to-end through the on-ramp:
+     `rust_core_alloc_heap_matches_native` in `crates/svm-llvm/tests/translate.rs` builds a growing
+     `Vec<u64>` (many `RawVec` reallocs → `malloc`/`free` churn → heap growth) + a `Box`, sums on the
+     heap, and prints — byte-identical to the same program built as a native `std` binary. The full
+     `alloc` stack (`RawVec`, `__rust_alloc`/`__rust_dealloc`/`__rust_realloc`, `Box`) lowers with no
+     translator change beyond the C heap path.
+  2. ~~**`HashMap` → `BTreeMap`**~~ **DONE.** `svm-peval`'s memo maps and `svm-ir`'s linker symbol
+     tables are `BTreeMap` now; `Known`/`Frame` gained `Ord`. (`HashMap` is `std`-only.)
+  3. ~~**`no_std`-ify `svm-peval`** (compile half)~~ **DONE.** `svm-ir`, `svm-verify`, and `svm-peval`
+     are `#![cfg_attr(not(test), no_std)]` + `alloc` (their own test harnesses still get `std`;
+     dependents are unaffected, they bring their own `std`). Float folds route through `libm`
+     (`sqrt`/`ceil`/`floor`/`trunc`/round-ties-even/`fma`/`abs`/`copysign` — all not in `core` on the
+     pinned `rustc 1.81`; correctly-rounded/exact so bit-identical, proven by the differential fuzz).
+     Also made 1.81-clean (`is_none_or` → explicit match). **Result: the three crates compile to
+     `no_std`/`panic=abort` LLVM-18 bitcode on the pinned toolchain.** The translator gaps (next bullet)
+     are now the wall, *not* compilation.
+  4. **Wire residual → §22 `Jit.compile`** to run/share it in-sandbox (Milestone 3).
+
+### Milestone 2 — translation status: **in progress, gaps falling one by one.**
+
+The specializer **compiles** to `no_std` LLVM-18 bitcode (above). To find what it takes to *translate*,
+we probe the merged bitcode: `cargo +1.81.0 build --release` (`--ignore-rust-version`,
+`default-features=false`) with `RUSTFLAGS=--emit=llvm-bc`, then `llvm-link-18`, then `opt-18
+internalize,globaldce` down to the closure reachable from a powerbox `main` that builds a tiny module
+and calls `specialize`, then `svm-llvm-translate`. Each gap, in the order hit, and its disposition:
+
+1. ✅ **inline-asm** — came from `libm`'s `fma` doing x86 CPU-feature detection. **Cleared:** the
+   libm-requiring float folds (`sqrt`/`ceil`/`floor`/`trunc`/round-ties-even/`fma`) are now behind the
+   default-on `libm-floats` feature; the in-svm build turns it off and leaves those ops unfolded
+   (sound passthrough). `abs`/`copysign` moved to pure-`core` bit ops (still fold everywhere). x86
+   inline-asm is fundamentally untranslatable, so avoiding libm is the right call, not a shortcut.
+2. ✅ **i128** — came from the specializer's *own* exotic SIMD folds (saturating add/sub, narrow,
+   ext-mul, ext-add-pairwise), which used `i128` for wide intermediates. **Cleared:** rewritten to
+   `i64`/`u64` (wasm SIMD lane results cap at 64 bits; unsigned 32→64 ext-mul uses `u64`). Bit-identical
+   — exotic-ops test + thorough fuzz green. The on-ramp i128 dependency is gone.
+3. ✅ **translator panic** — `translate_switch` computed `max - min + 1` in `i64`, which **overflowed**
+   on a switch whose cases straddle the i64 range (a niche-discriminant match). **Fixed** to compute the
+   span in `i128` → clean `Unsupported` instead of a panic.
+4. ✅ **sparse switch** — Rust's **niche-optimized enum layouts** (e.g.
+   `drop_in_place::<Option<(u32, Option<Vec<(u64,u32)>>)>>`, the specializer's memo value type) match the
+   discriminant with `i64::MIN`-ish sentinels: dense in *cases*, astronomically sparse in *span*, so a
+   `br_table` can't represent it. **Implemented** `lower_sparse_switch` in `svm-llvm` — an equality
+   **compare chain** of synthetic blocks (appended after the real blocks, so existing indices are
+   unchanged) that thread the data-SP, the operand, and every case/default target's branch args
+   (computed once in the switch block's context, where φ/live-in resolution is valid). Heavily tested:
+   four new differential tests (`switch_sparse_*`) covering i64 cases at `i64::MIN/MAX`, threaded
+   live-ins + a φ successor, a 5-block chain, and the i32 path — all `interp == JIT`; full svm-llvm
+   suite (178 tests) green, dense `br_table` path untouched. The specializer probe now translates past
+   the switch.
+5. ✅ **non-power-of-two integer memory + extend** — Rust niche layouts produce odd-width integer
+   accesses (e.g. a 7-byte `i56` discriminant field). **Implemented:** `load iN` (33–63) reads the
+   enclosing `i64` and masks; `store iN` writes exactly `ceil(N/8)` bytes (byte-exact, never clobbering
+   an adjacent field); `emit_ext` sign/zero-extends a 33–63-bit source in `i64` (it previously
+   mis-applied the i32 extend ops). Tested round-trip (unsigned + signed ±) on interp+JIT.
+6. ✅ **saturating arithmetic** — `llvm.{u,s}{add,sub}.sat` (i32/i64, Rust `saturating_*`) → wrapping
+   op + `select` clamp.
+7. ✅ **saturating float→int casts** — `llvm.fpto{si,ui}.sat` (Rust float `as` casts) → svm-IR
+   `FToISat`. (6+7 covered by `rust_saturating_and_fp_sat_casts_match_native`: 22 values byte-identical
+   to native, incl. overflow/underflow/NaN.)
+8. ✅ **vector popcount** — `llvm.ctpop.v16i8` → `Inst::VPopcnt`.
+9. ✅ **i128 from a 16-byte struct-eq coalesce** — `-O2` compares `Known`'s `[u8;16]` payload as a
+   single `load i128` + `icmp eq/ne i128`. Held as a **pair of i64 halves** in the aggregate
+   side-table (load → two i64 loads; eq/ne → compare the halves). Same-block only.
+10. 🔜 **`memcmp`/`bcmp`** (current wall) — `Unsupported("call to external/undefined function memcmp")`.
+    Rust slice/`[u8]` equality and `BTreeMap` key ordering call these; the on-ramp synthesizes
+    `memcpy`/`memset`/`memmove` but not yet `memcmp`/`bcmp`. Next slice: a synthesized counted-loop
+    helper (`__svm_memcmp`), like the existing mem-loop helpers (`bcmp` ⇒ `memcmp` then `!= 0`).
+
+**Earlier worry retired.** The core/alloc *panic* runtime symbols (`core::panicking::*`, bounds-check,
+`unwrap_failed`, `handle_alloc_error`, `raw_vec::handle_error`) that looked like a fundamental blocker
+are in fact **already shimmed** by the on-ramp (`is_rust_abort_call` → `trap`, under `-C panic=abort`).
+Likely still ahead: the allocator shims (`__rust_alloc`/`dealloc`/`realloc` → the synthesized
+`malloc`/`free`) and `cell::panic_already_borrowed` (extend the abort-call list) — each small. So the
+remaining translate work is a tail of **bounded on-ramp legalizations** (the `memcmp` helper, a few
+runtime-symbol shims), *not* `-Z build-std`.
+
+So Milestone 2's compile half is **done**, and the translate half is a **shrinking, enumerated gap
+list** being cleared in order — nine down (inline-asm, i128-SIMD, switch-overflow panic, sparse switch,
+i56 memory/extend, saturating arithmetic, fp-sat casts, vector ctpop, i128 struct-eq), `memcmp` next.
+
+**Why not `std`.** `std` is Rust's OS-abstraction layer (`core` + `alloc` + a `std::sys::<target>`
+platform backend for files/threads/time/net/startup). svm has none of those as ambient services (it
+has capabilities), and rustc has no `std::sys::svm` backend, so a `std` build drags in unresolved
+syscall/libc externs (or inline-asm `syscall`), `panic=unwind` EH (`invoke`/`landingpad` + libunwind),
+pthreads/TLS, the libc allocator, and `lang_start` OS startup — none of which the on-ramp can map.
+Supporting `std` = **porting `std` to svm** (a `std::sys::svm` backend over svm caps, à la WASI/Redox)
+— a separate, larger **OS-personality workstream**, gated on svm exposing the host caps `std` needs. It
+is **not needed for the specializer** (a pure `Module → Module` transform: no I/O, threads, or time —
+`core + alloc` suffices), only for running *general* `std`-using Rust as guests.
+
+**Related but separate workstream:** translating large real interpreters (QuickJS) to svm-IR is blocked
+on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not here.
+
+**Milestones (smallest first):**
+1. ~~`core + alloc` through the Rust on-ramp~~ **DONE** — heap-allocating `no_std` program, on-ramp
+   stdout byte-identical to native (`rust_core_alloc_heap_matches_native`).
+2. `no_std`-ify `svm-peval` —
+   - **compile half: DONE** — the three crates compile to `no_std`/`panic=abort` LLVM-18 bitcode on
+     `rustc 1.81` (`BTreeMap`, `libm` float folds, `not(test)` no_std, 1.81-clean).
+   - **translate half: in progress** — nine on-ramp gaps cleared in order (inline-asm, i128 in SIMD
+     folds, switch-span overflow panic, sparse-switch compare chain, i56 memory + extend, saturating
+     arithmetic, fp-sat casts, vector ctpop, i128 struct-eq), each implemented + tested in `svm-llvm`.
+     **Next: a `memcmp`/`bcmp` synthesized helper**, then a short tail of runtime-symbol shims. See
+     "translation status" above.
+3. End-to-end in-sandbox demo: a guest specializes a toy interpreter against a script and runs the
+   residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`). *Gated on Milestone 2's
+   translate half.*
 
 ## Benchmarking
 
