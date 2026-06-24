@@ -4479,19 +4479,40 @@ fn simd_autovec_avx2_wide_shifts() {
     check_avx_vs_native("simd_avx2_wide_shifts", src, 9);
 }
 
-/// ISSUES.md I13 — a `<2 x i16>` carried across a loop (Embench `edn`'s `fir_no_red_ld` "no-redundant
-/// -load" FIR) round-trips its 16-bit lanes incorrectly through the per-part block-param fan-out, a
-/// *silent miscompile*. Until the tiny-tail-lane representation is fixed, the on-ramp **fail-closes**
-/// on a φ carrying a ≤2-lane sub-32-bit vector. This pins that it stays a clean `Unsupported` (never a
-/// wrong answer); the 4-lane `<4 x i16>` carry stays supported (`demo_clay_vs_native`).
+/// ISSUES.md I13 (root fix, isolated) — `<2 x i32>` lane arithmetic carried as a packed `i64` must be
+/// lane-wise for **every** cross-lane-unsafe op, not just `mul`: `add`/`sub` carry across the 32-bit lane
+/// boundary and `shl`/`lshr`/`ashr` shift bits between lanes. This uses an explicit `vector_size(8)`
+/// `<2 x i32>` so clang emits the ops directly (`add`, `mul`, `shl`), with large lane values chosen so a
+/// packed-`i64` op would visibly corrupt the high lane. Bit-exact vs the native `cc` oracle on both
+/// backends (and interp == JIT).
 #[test]
-fn simd_tiny_i16_carry_phi_fails_closed_i13() {
-    let src = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
-        static short X[256], H[256]; static long Y[256];\n\
+fn simd_vec2_i32_lane_arith_add_shift_i13() {
+    let src = "typedef int v2 __attribute__((vector_size(8)));\n\
         int run(int seed) {\n\
-        \x20 for (int i = 0; i < 256; i++) { X[i] = seed + i; H[i] = seed * 2 - i; Y[i] = 0; }\n\
-        \x20 fir_no_red_ld(X, H, Y); long a = 0; for (int i = 0; i < 256; i++) a += Y[i]; return (int) a;\n\
+        \x20 v2 a = {seed * 7 + 100000, seed + 30000};\n\
+        \x20 v2 b = {seed + 3, seed * 5 + 70000};\n\
+        \x20 v2 c = (a + b) * b;\n\
+        \x20 v2 d = c << 2;\n\
+        \x20 v2 e = d - a;\n\
+        \x20 return e[0] + e[1];\n\
         }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("i13_vec2_addshift", src, 4);
+}
+
+/// ISSUES.md I13 (root fix) — Embench `edn`'s `fir_no_red_ld` ("no-redundant-load" FIR) carries a
+/// `<2 x i16>` across the loop and auto-vectorizes the deinterleaved widening multiply to **`<2 x i32>`
+/// lane arithmetic**. A 2-lane 32-bit vector is held as a *packed* `i64` (lane 0 low, lane 1 high), and
+/// the lane `mul` was lowered as a single `i64` multiply on that packed image — which cross-contaminates
+/// the lanes (the low product's carry and the lane0×lane1 cross term corrupt lane 1). That was a silent
+/// miscompile (previously fail-closed by a φ guard). The fix lowers `<2 x i32>` integer arithmetic
+/// lane-wise. This pins the kernel **bit-exact (full 64-bit checksum)** vs the native `cc` oracle on
+/// both backends — and forces the `mul` lowering to be per-lane `i32`, never a packed `i64.mul`.
+#[test]
+fn simd_vec2_i32_carried_widening_mul_i13() {
+    // `run(long n)` runs the FIR `n` times over a seeded buffer and folds a weighted 64-bit checksum —
+    // wide enough that a corrupted high lane changes the result well beyond a low-byte coincidence.
+    let kernel = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
         void fir_no_red_ld(const short x[], const short h[], long y[]) {\n\
         \x20 long i, j, sum0, sum1; short x0, x1, h0, h1;\n\
         \x20 for (j = 0; j < 100; j += 2) { sum0 = 0; sum1 = 0; x0 = x[j];\n\
@@ -4500,15 +4521,67 @@ fn simd_tiny_i16_carry_phi_fails_closed_i13() {
         \x20     x0 = x[j+i+2]; h1 = h[i+1]; sum0 += x1*h1; sum1 += x0*h1; }\n\
         \x20   y[j] = sum0 >> 15; y[j+1] = sum1 >> 15; }\n\
         }\n\
-        int main(void) { return run(3); }\n";
-    let Some(bc) = compile_to_bc("i13_tiny_i16_carry", src) else {
+        long run(long n) {\n\
+        \x20 long acc = 0;\n\
+        \x20 for (long t = 0; t < n; t++) {\n\
+        \x20   short X[132], H[32]; long Y[100];\n\
+        \x20   for (int i=0;i<132;i++) X[i]=(short)((i*7+t*3+1)%97 - 48);\n\
+        \x20   for (int i=0;i<32;i++) H[i]=(short)((i*5+t+1)%31 - 15);\n\
+        \x20   for (int i=0;i<100;i++) Y[i]=0;\n\
+        \x20   fir_no_red_ld(X,H,Y);\n\
+        \x20   for (int i=0;i<100;i++) acc += Y[i]*(i+1);\n\
+        \x20 }\n\
+        \x20 return acc;\n\
+        }\n";
+    let main = "long run(long);\n#include <stdio.h>\n\
+        int main(void){ printf(\"%ld %ld\\n\", run(1), run(7)); return 0; }\n";
+    let Some(bc) = compile_to_bc("i13_vec2_fir", kernel) else {
         return; // clang unavailable
     };
-    // Must fail-close, not translate (a translated module here would silently miscompile).
-    assert!(
-        svm_llvm::translate_bc_path(&bc).is_err(),
-        "I13: a carried <2 x i16> must fail-close (Unsupported), not translate-and-miscompile"
-    );
+    // Native oracle: full 64-bit results for n=1 and n=7 via stdout.
+    let dir = std::env::temp_dir();
+    let csrc = dir.join(format!("svm_llvm_i13_{}.c", std::process::id()));
+    let exe = dir.join(format!("svm_llvm_i13_{}", std::process::id()));
+    std::fs::write(&csrc, format!("{kernel}{main}")).expect("write C");
+    match Command::new("cc").arg(&csrc).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping i13 (cc unavailable)");
+            return;
+        }
+    }
+    let out = Command::new(&exe).output().expect("run native");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let nat: Vec<i64> = s
+        .split_whitespace()
+        .map(|w| w.parse().expect("native i64"))
+        .collect();
+    assert_eq!(nat.len(), 2, "native printed two checksums");
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate (I13 root fix: no longer fail-closed)");
+    let module = &t.module;
+    svm_verify::verify_module(module).expect("verify");
+    let e = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    for (k, &expect) in [1i64, 7].iter().zip(&nat) {
+        let mut fuel = 200_000_000u64;
+        let interp = svm_interp::run(module, e, &[Value::I64(t.entry_sp as i64), Value::I64(*k)], &mut fuel)
+            .expect("interp")[0];
+        let jit = match svm_jit::compile_and_run(module, e, &[t.entry_sp as i64, *k]).expect("jit") {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("jit outcome {o:?}"),
+        };
+        let interp = match interp {
+            Value::I64(x) => x,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(interp, jit, "I13 n={k}: interp vs jit");
+        assert_eq!(interp, expect, "I13 n={k}: svm vs native cc");
+    }
 }
 
 /// `-O2 -mavx2` auto-vectorized **fixed-point DSP** kernel (Embench `edn`'s `vec_mpy` shape):

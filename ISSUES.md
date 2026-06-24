@@ -301,75 +301,6 @@ hot loops are rare in real code, so this is low priority.
 
 ---
 
-### I11 — on-ramp fails-closed on an auto-vectorized `<8 x i32>` shape the I2 legalizer doesn't cover (S3) — found via Embench `edn` — **FIX LANDED** on `claude/onramp-i11-wide-i32x8`
-
-**Fixed.** The pinned shape was a **wide lane-wise shift**: `edn`'s `vec_mpy` fixed-point kernel
-(`y[i] += (short)((scaler * x[i]) >> 15)`) auto-vectorizes to a `<8 x i32>` widening multiply followed
-by a `>>15` shift. I10 added 128-bit vector shifts but the **wide** legalizer's op dispatch had no
-`Shl`/`LShr`/`AShr` arm, so a wider-than-128 shift fell through to the `Unsupported("<8 x i32>")` type
-fallthrough — even though the surrounding `sext`/`mul`/`trunc` already chunked. The fix adds those three
-arms (`lower_wide`) routed through a new `wide_int_shift`: each `v128` chunk shifts via `VShift` (one
-scalar splat amount, the same uniform-amount recognizer the 128-bit path uses — a per-lane-varying amount
-stays fail-closed), each scalar tail lane via `IntBin`. *Test* (`translate.rs`
-`simd_autovec_avx2_fixed_point_shift`): the `-O2 -mavx2` `vec_mpy` kernel translates and runs **bit-exact
-vs the native scalar `cc` oracle on both backends**. *Still a small follow-up:* the `memcmp`/`bcmp`
-on-ramp builtins noted above (the other reason `edn` may need the Embench wrapper's `-fno-builtin`).
-
----
-
-### I13 — `<2 x i16>` "no-redundant-load" vector pattern miscompiled (soundness) — **fail-closed (stopgap landed)**, root fix pending — found via Embench `edn`/`fir_no_red_ld`
-
-**STATUS:** the silent miscompile is **fail-closed** on `claude/perf-i11-i12` (a φ that carries a tiny
-all-tail sub-32-bit vector — ≤ 2 lanes of i8/i16 — now returns `Unsupported` instead of miscompiling,
-in `translate_function` right after `scan_func`). So the no-miscompile invariant is restored: `edn`
-*fail-closes* (skipped by the `embench` driver) rather than returning a wrong answer. The **root fix**
-(making the tiny-tail-lane representation correct so the pattern *translates*) is still open — see the
-fix sketch below. The guard is deliberately narrow: a 4-lane `<4 x i16>` φ (e.g. the Clay-UI demo's
-carried point vector) round-trips correctly and is untouched (`tests/translate.rs::demo_clay_vs_native`
-covers it); only the confirmed-broken 32-bit `<2 x i16>`/`<2 x i8>` carry is rejected.
-
-
-
-**Where:** `crates/svm-llvm/src/lib.rs` — the sub-128 / all-tail vector handling for **2-lane 16-bit
-vectors** (`<2 x i16>`, and the `<4 x i16>` they're shuffled from): `vec_explode`/`vec_implode`,
-`ShuffleVector`/`InsertElement` in the normal path, and a cross-block `<2 x i16>` phi.
-
-**Symptom (S2 — silent miscompile, not fail-closed).** With I11 landed, Embench `edn` now *translates*
-but returns a wrong answer: `verify_benchmark` = 1 native vs 0 on **all three** SVM engines (so the bug
-is in translation, not an engine). Bisected to **`fir_no_red_ld`** (the FIR variant that carries a
-loaded sample across iterations to avoid a redundant load); `fir` and `jpegdct` — which use the *same*
-`<4 x i16>` deinterleave shuffles — are correct, so it's specific to this pattern, not the shape alone.
-`edn` compiled `-fno-vectorize` is correct, confirming it's the vectorized translation.
-
-**The pattern (from `fir_no_red_ld`'s `-O2` IR).** A `<2 x i16>` carried across the loop backedge:
-`insertelement <2 x i16> poison, i16 %s, 1` (lane 0 left undef) → loop phi `<2 x i16>` →
-`shufflevector <2 x i16> %prev, <2 x i16> %cur, <i32 1, i32 2>` (recombine: take lane 1 of the carried
-value, lane 0 of the new) → `sext <2 x i16> → <2 x i32>` → `mul` → `sext → <2 x i64>` →
-`add` → `llvm.vector.reduce.add.v2i64`. `<2 x i16>` is **not** a `vec2` (that's `<2 x i32>`/`<2 x float>`
-only) and not a `v128`, so it takes the all-tail `wide_vec_layout` path (0 chunks, 2 tail lanes of an
-`i16x8` shape). Something in that path — most likely how a single i16 tail lane survives
-`insertelement`/`shufflevector`/the cross-block phi (width/sign of the lane "container"), or the
-explode→implode round-trip for the recombine shuffle — drops or corrupts a lane.
-
-**Impact (before the stopgap).** This was the on-ramp's worst failure mode — a **silent miscompile**
-violating the fail-closed contract. It is **pre-existing and independent of I11**: `fir_no_red_ld` uses
-no wide shifts, so it would miscompile on `main` too once reached; I11 merely let the *whole* `edn`
-translate far enough to hit it. Narrow in practice (this exact carried-`<2 x i16>` shape). The stopgap
-above converts it to a clean fail-close; the `embench` driver also still excludes a *runtime* MISMATCH
-from the geomean as a backstop.
-
-**Root-fix sketch (needs care — soundness; the stopgap only fail-closes):** reproduce minimally (the
-bisection harness: include `src/edn/libedn.c`, call only `fir_no_red_ld` on a seeded buffer, diff interp
-vs native — both via `bench/embench`), then dump the **SVM IR** the translator emits and compare against
-the scalar form. The lane corruption is *not* the lane count alone (the 4-lane `<4 x i16>` φ works), so
-it's specific to the 32-bit 2-lane carry — likely how a 16-bit tail lane round-trips through
-`insertelement`-into-poison + the cross-block φ fan-out + the `<1,2>` recombine `shufflevector`'s
-explode→implode (width/sign of the i32 lane "container"). Fix the representation so a 16-bit lane is
-lossless there, then narrow/remove the fail-close guard. A differential fuzz over small i8/i16 vectors
-(interp vs JIT vs a scalar oracle) would catch the whole class and guard against regressions.
-
----
-
 ### I14 — on-ramp has no 128-bit integer (`__int128` / `i128`) support (S3) — found via Embench `aha-mont64`
 
 **Symptom.** A `clang -O2` program that uses `__int128` fail-closes at translate with
@@ -417,6 +348,36 @@ genuine 128-bit *arithmetic* beyond widening multiply, which is rare.
 ---
 
 ## Resolved
+
+### I13 — `<2 x i32>` (packed-`i64`) lane arithmetic miscompiled (soundness, S2) — found via Embench `edn`/`fir_no_red_ld` — **fixed**
+
+**Was:** Embench `edn`'s `fir_no_red_ld` ("no-redundant-load" FIR) carries a `<2 x i16>` across the loop
+and auto-vectorizes its deinterleaved widening multiply to **`<2 x i32>` lane arithmetic**. `edn`
+translated but returned a wrong answer (`verify_benchmark` = 1 native vs 0 on **all three** SVM engines —
+so a translation bug, not an engine bug). Pre-existing and independent of I11; I11 merely let the *whole*
+`edn` translate far enough to reach it.
+
+**Root cause.** A 2-lane 32-bit vector (`<2 x i32>`/`<2 x float>`) is the one vector shape the on-ramp
+carries *packed into an `i64`* (lane 0 = low 32 bits, lane 1 = high 32 bits) rather than a `v128` or a
+legalized chunk+tail. Integer arithmetic on it fell through `bin` to a **single `i64` `IntBin`** on that
+packed image — which is **not lane-wise**: `mul` mixes the lanes (the low product's carry and the
+lane0×lane1 cross term corrupt lane 1), and `add`/`sub`/`shl`/`lshr`/`ashr` carry/shift across the 32-bit
+lane boundary. (The earlier bisection fingered the carried-`<2 x i16>` φ because that φ is what forces
+clang to *keep* the `<2 x i32>` shape — but the corruption was the `<2 x i32>` `mul`, not the i16 tail
+lane or the φ fan-out, both of which round-trip correctly.)
+
+**Fix (landed):** `bin` now lowers `<2 x i32>` integer arithmetic **lane-wise** — explode the packed
+`i64` to its two `i32` lanes (`vec_explode`), apply the scalar `IntBin` per lane, repack (`vec_pack`).
+The bitwise `and`/`or`/`xor` would be lane-safe even packed, but the path is uniform. The narrow φ
+fail-close stopgap (a guard in `translate_function` that rejected a carried tiny all-tail sub-32-bit
+vector) is **removed** — the pattern now translates correctly.
+
+**Tests (`translate.rs`):** `simd_vec2_i32_carried_widening_mul_i13` compiles the real `fir_no_red_ld`
+kernel and asserts the full **64-bit** checksum is bit-exact vs the native `cc` oracle on interp **and**
+JIT (for two seeds); `simd_vec2_i32_lane_arith_add_shift_i13` covers `add`/`sub`/`shl` on an explicit
+`vector_size(8)` `<2 x i32>` with lane values large enough that a packed-`i64` op would visibly corrupt
+the high lane. End-to-end, Embench `edn` now reports `OK (all engines = native, verify=1)` in the
+`embench` example.
 
 ### I11 — on-ramp fail-closed on auto-vectorized **wide vector shifts** (`shl`/`lshr`/`ashr` on `<8 x i32>`) (S3) — fixed on `claude/perf-i11-i12`
 
