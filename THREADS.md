@@ -108,12 +108,25 @@ property, so in practice:
   repeats. So SVM runs genuinely in parallel across cores in wasm — N programs, N threads, one shared
   memory. (The runs are *independent* — each Worker its own window; one guest's `thread.spawn` vCPUs
   fanned across Workers is step 4c.)
-- [ ] **Step 4c — the shared-memory `thread.spawn` parallel driver.** The remaining piece: a driver
-  that runs **one** guest's `thread.spawn`ed vCPUs on **separate Workers** sharing **one** window, the
-  futex on `memory.atomic.wait`/`notify`, host-selected mode (`Cooperative` default | `Parallel`). This
-  is the large engine refactor — the cooperative `drive` shares `mem`/`host`/`fuel` by `&mut` on one
-  thread, so a parallel driver needs a shared (locked) `Host` for `cap.call`, `Send` vCPU state, and
-  the atomic futex. Differential-tested against the cooperative oracle. The wrinkles below live here.
+- [x] **Step 4c — the shared-memory `thread.spawn` parallel driver (native slice).** The host-selected
+  `Parallel` mode now exists: `bytecode::drive_parallel` runs **one** guest's `thread.spawn`ed vCPUs on
+  **separate OS threads** (the native stand-in for per-vCPU Workers) sharing **one** `Region::shared`
+  window — genuine cross-core `thread.spawn`/`join` + hardware `atomic.*`, not a single-thread
+  interleaving. Each vCPU runs on its own scoped `std::thread` over a `fork_for_thread` view of the
+  shared backing (so the `Arc<Region>` bytes + address space are shared, real atomics); `std::thread::scope`
+  borrows the `&Domain` (now `Sync`) and a `ThreadRegistry` (`Mutex<HashMap>` + `Condvar`) into each
+  child, with the registry serving the cross-thread `thread.join` rendezvous (handle→id, value-or-trap
+  delivery, the `MAX_VCPUS` anti-bomb gate). The root runs on the calling thread and `join`s via the
+  condvar — never `atomic.wait`, sidestepping the browser main-thread-wait wrinkle. Differential-tested
+  against the cooperative oracle (`bytecode_parallel.rs`): the 8-vCPU counter kernel → **4000** and a
+  join-value kernel → **46**, both **byte-identical** to `compile_and_run_capture` and **stable across
+  50 real-race repeats** (a wrong driver would be flaky). New public entry
+  `compile_and_run_capture_over_parallel` (the `Parallel` sibling of `compile_and_run_capture_over`).
+  **Scope:** the pure-threads subset (`thread.spawn`/`join` + atomics) — exactly the wasm backend's core
+  need. Because `Domain` is shared `&`-immutably, the cross-thread futex (`memory.wait`/`notify`), §14
+  `instantiate`, and §22 JIT install **fail closed** (`Trap::ThreadFault`) rather than run wrong; wiring
+  them — plus running the driver's Workers in real wasm (per-Worker stack/TLS from 4b, the
+  `atomic.wait`/`notify` futex, a shared locked `Host` for `cap.call`) — are the follow-ons below.
 
 ### Known wrinkles (surfaced for later steps)
 
@@ -142,6 +155,7 @@ cd ..
 # Step 2/3 — the substrate + engine bridge (native, in CI)
 cargo test -p svm-mem shared                          # Region::Shared cross-thread atomics + fuzz
 cargo test -p svm --test bytecode_shared_window       # engine over a caller-owned shared window
+cargo test -p svm --test bytecode_parallel            # 4c: parallel driver (real OS threads) vs oracle
 
 # Step 4a/4b — the FULL engine as a wasm threads module, run over a SharedArrayBuffer window.
 # The `--export=__stack_pointer/__tls_*/__wasm_init_tls` are the per-Worker bootstrap hooks (4b).

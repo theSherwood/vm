@@ -1395,6 +1395,52 @@ pub fn compile_and_run_capture_over(
     Some((r, snap))
 }
 
+/// THREADS.md step 4c — the **parallel** sibling of [`compile_and_run_capture_over`]: run the guest's
+/// `thread.spawn`ed vCPUs on **separate OS threads** (the native stand-in for per-vCPU wasm Workers)
+/// over the **one** caller-owned shared window, instead of cooperatively multiplexing them onto one
+/// thread. Every vCPU executes over the same `Region::shared` backing — `thread.spawn`/`join` +
+/// hardware `atomic.*` are genuine cross-core operations, not a single-thread interleaving. This is
+/// the host-selected `Parallel` mode; the cooperative [`compile_and_run_capture_over`] is its
+/// **deterministic oracle** (differential-tested in `bytecode_parallel.rs`).
+///
+/// Scope of this first slice: the **pure-threads subset** — `thread.spawn`/`join` + atomics (the
+/// shapes the parallel-wasm backend most needs, and exactly what the 8-vCPU counter kernel uses). The
+/// `Domain` is shared `&`-immutably across threads, so events that need a `&mut Domain`/shared powerbox
+/// (`cont.*` fibers' cross-thread futex `memory.wait`/`notify`, §14 `instantiate`, §22 JIT install)
+/// **fail closed** (`Trap::ThreadFault`) here rather than run wrong; they are follow-on steps. Pure
+/// compute, atomics, and spawn/join run fully. Returns `None` only if the module is outside the
+/// engine's subset, same as the cooperative entry.
+pub fn compile_and_run_capture_over_parallel(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    back: std::sync::Arc<super::Region>,
+) -> Option<Capture> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Err(Trap::Malformed), Vec::new()));
+    }
+    let dom = Domain::new(c, Host::new().jit_table_log2());
+    let mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation_over(
+            DEFAULT_RESERVED_LOG2,
+            mc.size_log2,
+            std::sync::Arc::clone(&back),
+        );
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        mm
+    });
+    let (r, mem) = drive_parallel(dom, func, args, *fuel, mem);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .unwrap_or_default();
+    Some((r, snap))
+}
+
 /// Durability seam (Slice 1c-6): the bytecode mirror of [`crate::run_capture_reserved_with_host`] —
 /// seed the window with `init_mem` (which for a durable run carries the state word + shadow region),
 /// run `m`'s transformed entry over a caller-prepared `host` (the powerbox), and snapshot the window
@@ -3304,6 +3350,169 @@ fn drive(
                     }
                 }
             }
+        }
+    }
+}
+
+/// THREADS.md step 4c — the cross-thread `thread.spawn`/`join` rendezvous for the parallel driver.
+/// The cooperative `drive` keeps its child vCPUs in one `tasks` vec and wakes joiners inline; the
+/// parallel driver runs each vCPU on its **own OS thread**, so a joiner blocks here on a `Condvar`
+/// until the child it named publishes its result. One `id` namespace across the whole run (handed out
+/// by `next_id`); a child's result (value-or-trap) is delivered to the lowest-index waiter via the
+/// `done` map. `live` mirrors the cooperative `MAX_VCPUS` anti-bomb gate across threads.
+struct ThreadRegistry {
+    done: std::sync::Mutex<std::collections::HashMap<u64, Result<Vec<Value>, Trap>>>,
+    woken: std::sync::Condvar,
+    next_id: std::sync::atomic::AtomicU64,
+    live: std::sync::atomic::AtomicUsize,
+}
+
+impl ThreadRegistry {
+    fn new() -> ThreadRegistry {
+        ThreadRegistry {
+            done: std::sync::Mutex::new(std::collections::HashMap::new()),
+            woken: std::sync::Condvar::new(),
+            next_id: std::sync::atomic::AtomicU64::new(0),
+            live: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// A spawned vCPU finished: publish its result and wake any joiner parked on it.
+    fn publish(&self, id: u64, res: Result<Vec<Value>, Trap>) {
+        self.done.lock().unwrap().insert(id, res);
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.woken.notify_all();
+    }
+
+    /// Block until vCPU `id` has published, then take (consume) its result — the parallel analogue of
+    /// the cooperative `BlockedJoin` wakeup. A child trap is returned to propagate to the joiner.
+    fn join(&self, id: u64) -> Result<Vec<Value>, Trap> {
+        let mut g = self.done.lock().unwrap();
+        loop {
+            if let Some(r) = g.remove(&id) {
+                return r;
+            }
+            g = self.woken.wait(g).unwrap();
+        }
+    }
+}
+
+/// THREADS.md step 4c — the **parallel** driver (the host-selected `Parallel` mode). One guest's vCPUs
+/// run on **separate OS threads** sharing **one** `Region::shared` window, instead of the cooperative
+/// `drive`'s single-thread `tasks` loop. `std::thread::scope` borrows the `&Domain` (which is `Sync`)
+/// and the `&ThreadRegistry` into each child and joins every still-running thread before returning, so
+/// the window is quiescent for the snapshot. The root runs on the calling thread (it never
+/// `atomic.wait`s — `join` blocks on a `Condvar`, sidestepping the browser main-thread-wait wrinkle).
+/// Returns the root's result and its (now-quiescent) `Mem` for capture. Scope: the pure-threads subset
+/// (`thread.spawn`/`join` + atomics); other multi-vCPU events fail closed (see
+/// [`compile_and_run_capture_over_parallel`]).
+fn drive_parallel(
+    dom: Domain,
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    mem: Option<Mem>,
+) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
+    let root_vt = match VTask::new(&dom.mods[0], entry as usize, args) {
+        Ok(v) => v,
+        Err(t) => return (Err(t), mem),
+    };
+    let reg = ThreadRegistry::new();
+    std::thread::scope(|scope| run_vcpu_parallel(scope, &dom, &reg, root_vt, mem, fuel))
+}
+
+/// Run one vCPU of the parallel driver to completion on **this** OS thread, fanning each
+/// `thread.spawn` onto a fresh scoped thread (over a `fork_for_thread` view of the shared window) and
+/// blocking each `thread.join` on the [`ThreadRegistry`]. Mirrors the cooperative `drive`'s `Spawn` /
+/// `Join` / `Done` arms, one vCPU at a time. Returns this vCPU's result and the `Mem` it owned (the
+/// root's is the one captured; a child's is dropped, its bytes already live in the shared backing).
+fn run_vcpu_parallel<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    dom: &'env Domain,
+    reg: &'env ThreadRegistry,
+    mut vt: VTask,
+    mut mem: Option<Mem>,
+    mut fuel: u64,
+) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
+    let mut host = Host::new();
+    let mut fibers: Vec<FiberState> = Vec::new();
+    let mut fiber_sp: Vec<u64> = Vec::new();
+    let mut fiber_meta: Vec<(i32, i64)> = Vec::new();
+    // handle (index) → global vCPU id of a `thread.spawn` child (shares the cooperative handle scheme).
+    let mut threads: Vec<Option<u64>> = Vec::new();
+    loop {
+        let mut ctx = RunCtx {
+            table: &dom.table,
+            fuel: &mut fuel,
+            mem: &mut mem,
+            durable: false,
+            host: &mut host,
+        };
+        // NLL ends `ctx`'s borrows of `mem`/`fuel` at this call, so the arms below may touch them.
+        let stop = step_vcpu(
+            &mut vt,
+            &mut fibers,
+            &mut fiber_sp,
+            &mut fiber_meta,
+            dom,
+            &mut ctx,
+            u64::MAX,
+        );
+        match stop {
+            Err(trap) => return (Err(trap), mem),
+            Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
+            Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
+                if func as usize >= dom.mods[0].progs.len() {
+                    return (Err(Trap::Malformed), mem);
+                }
+                // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`).
+                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                    > super::MAX_VCPUS
+                {
+                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return (Err(Trap::ThreadFault), mem);
+                }
+                let id = reg
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let child_vt = match VTask::new(
+                    &dom.mods[0],
+                    func as usize,
+                    &[Value::I64(sp), Value::I64(arg)],
+                ) {
+                    Ok(v) => v,
+                    Err(t) => return (Err(t), mem),
+                };
+                // The child runs over its own `Mem` view of the **same** shared backing (real atomics).
+                let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
+                scope.spawn(move || {
+                    let (r, _m) = run_vcpu_parallel(scope, dom, reg, child_vt, child_mem, fuel);
+                    reg.publish(id, r);
+                });
+                let handle = threads.len() as i32;
+                threads.push(Some(id));
+                vt.active.set(dst, Reg::from_i32(handle));
+            }
+            Ok(VcpuStop::Join { handle, dst }) => {
+                let slot = match super::resolve_thread(&threads, handle) {
+                    Ok(s) => s,
+                    Err(t) => return (Err(t), mem),
+                };
+                let id = threads[slot].expect("resolve_thread checked liveness");
+                threads[slot] = None; // single join — the handle is now spent
+                match reg.join(id) {
+                    // A joined child's first result value lands in the joiner's `dst`.
+                    Ok(vals) => {
+                        let v = vals.first().copied().unwrap_or(Value::I64(0));
+                        vt.active.set(dst, Reg::from_value(v));
+                    }
+                    // A child trap propagates: the joiner completes with the same trap.
+                    Err(t) => return (Err(t), mem),
+                }
+            }
+            // Outside the pure-threads subset (futex wait/notify, §14 instantiate, §22 JIT): the
+            // shared `&Domain` / per-thread host can't service these in parallel yet — fail closed.
+            Ok(_) => return (Err(Trap::ThreadFault), mem),
         }
     }
 }
