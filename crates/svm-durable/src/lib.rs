@@ -371,6 +371,7 @@ fn compute_may_suspend(m: &Module) -> Vec<bool> {
                         | Inst::ContResume { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadJoin { .. }
+                        | Inst::MemoryWait { .. }
                 )
             })
         }) {
@@ -422,6 +423,20 @@ enum SuspendKind {
     /// been re-spawned and run to completion, so the re-executed join resolves immediately to its
     /// recorded result. `handle` is the joined vCPU handle's block-local index (spilled + reloaded).
     ThreadJoin { handle: ValIdx },
+    /// `<ty>.atomic.wait` (§12.8 parked-vCPU slice): a vCPU blocked in a futex wait is a freeze
+    /// safepoint too — the `thread_wait` thunk returns on observing `UNWINDING`, the trailing poll
+    /// unwinds, and the wait is **re-issued on thaw** (like `thread.join`): the re-executed wait
+    /// re-checks the guest value, so a wake that landed as a value change (already in the snapshot, or
+    /// replayed by another re-run vCPU) resolves it immediately with `WAIT_NOT_EQUAL`. A re-issue that
+    /// would still *park* on the single-worker thaw can't be satisfied (no concurrent notifier) and
+    /// fails closed (`ThreadFault`, matching the interp's join-deadlock). `ty` reconstructs the op;
+    /// `addr`/`expected`/`timeout` are its block-local operands (spilled + reloaded).
+    MemoryWait {
+        ty: IntTy,
+        addr: ValIdx,
+        expected: ValIdx,
+        timeout: ValIdx,
+    },
     /// `suspend` (fiber side): unwinds the fiber's stack like a leaf, and thaw **re-parks** the
     /// fiber — flips the state word to `NORMAL` (a parked fiber's suspend is the globally-deepest
     /// frozen frame) and re-executes `suspend` so control returns to the resumer awaiting a future
@@ -499,7 +514,8 @@ fn transform_func(
                 Inst::CapCall { .. }
                 | Inst::ContResume { .. }
                 | Inst::Suspend { .. }
-                | Inst::ThreadJoin { .. } => true,
+                | Inst::ThreadJoin { .. }
+                | Inst::MemoryWait { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
                 _ => false,
             })
@@ -699,8 +715,19 @@ fn transform_func(
                     Inst::ContResume { k, arg } => SuspendKind::Resume { k: *k, arg: *arg },
                     Inst::Suspend { value } => SuspendKind::Yield { value: *value },
                     Inst::ThreadJoin { handle } => SuspendKind::ThreadJoin { handle: *handle },
+                    Inst::MemoryWait {
+                        ty,
+                        addr,
+                        expected,
+                        timeout,
+                    } => SuspendKind::MemoryWait {
+                        ty: *ty,
+                        addr: *addr,
+                        expected: *expected,
+                        timeout: *timeout,
+                    },
                     _ => unreachable!(
-                        "suspend position is a cap.call / call / fiber / thread.join op"
+                        "suspend position is a cap.call / call / fiber / thread.join / atomic.wait op"
                     ),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
@@ -711,6 +738,7 @@ fn transform_func(
                     (SuspendKind::Resume { .. }, _) => 2, // (status, value)
                     (SuspendKind::Yield { .. }, _) => 1,  // the resume arg
                     (SuspendKind::ThreadJoin { .. }, _) => 1, // the join result (i64)
+                    (SuspendKind::MemoryWait { .. }, _) => 1, // the wait status (i32)
                     _ => unreachable!(),
                 };
                 // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
@@ -723,7 +751,8 @@ fn transform_func(
                     SuspendKind::Propagated { .. }
                     | SuspendKind::Resume { .. }
                     | SuspendKind::Yield { .. }
-                    | SuspendKind::ThreadJoin { .. } => out - nres,
+                    | SuspendKind::ThreadJoin { .. }
+                    | SuspendKind::MemoryWait { .. } => out - nres,
                     // Header polls are built separately (above), never from an in-block op.
                     SuspendKind::LoopHeader => unreachable!("loop-header point not from an op"),
                 };
@@ -768,6 +797,17 @@ fn transform_func(
                 }
                 if let SuspendKind::ThreadJoin { handle } = &kind {
                     used[*handle as usize] = true; // operand of the re-issued thread.join
+                }
+                if let SuspendKind::MemoryWait {
+                    addr,
+                    expected,
+                    timeout,
+                    ..
+                } = &kind
+                {
+                    used[*addr as usize] = true; // operands of the re-issued atomic.wait
+                    used[*expected as usize] = true;
+                    used[*timeout as usize] = true;
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -953,6 +993,35 @@ fn transform_func(
                 let hh =
                     reloaded[spill_slot(*handle as usize).expect("thread.join handle spilled")];
                 ab.many(Inst::ThreadJoin { handle: hh }, pt.nres)
+            }
+            // `atomic.wait` re-issue: like `thread.join`, the wait is the globally-deepest frozen frame
+            // on this thread (the notifier is a *separate* vCPU), so flip the state word to `NORMAL`
+            // itself, then reload the spilled `addr`/`expected`/`timeout` and re-execute the wait. The
+            // re-issued wait re-checks the value: a wake that landed as a value change resolves it with
+            // `WAIT_NOT_EQUAL` (no block); a would-park fails closed in the thunk (`ThreadFault`).
+            SuspendKind::MemoryWait {
+                ty,
+                addr,
+                expected,
+                timeout,
+            } => {
+                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                let aa = reloaded[spill_slot(*addr as usize).expect("atomic.wait addr spilled")];
+                let ee =
+                    reloaded[spill_slot(*expected as usize).expect("atomic.wait expected spilled")];
+                let tt =
+                    reloaded[spill_slot(*timeout as usize).expect("atomic.wait timeout spilled")];
+                ab.many(
+                    Inst::MemoryWait {
+                        ty: *ty,
+                        addr: aa,
+                        expected: ee,
+                        timeout: tt,
+                    },
+                    pt.nres,
+                )
             }
         };
 
@@ -1207,6 +1276,10 @@ fn result_types(
         // runtime's (durable §12.8 slice 3.2.1), so the transform only needs to type them.
         ThreadSpawn { .. } => vec![ValType::I32],
         ThreadJoin { .. } => vec![ValType::I64],
+        // §12 futex ops: `atomic.wait` yields an `i32` status (woken / not-equal / timed-out),
+        // `atomic.notify` an `i32` woken count. `atomic.wait` is a may-suspend re-issue safepoint
+        // (the parked-vCPU slice); `atomic.notify` is copied verbatim into its segment.
+        MemoryWait { .. } | MemoryNotify { .. } => vec![ValType::I32],
         _ => return Err(TransformError::UnsupportedInst),
     })
 }

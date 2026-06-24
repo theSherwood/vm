@@ -224,6 +224,13 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
     *((mem_base + STATE_OFF) as *const i32) == STATE_UNWINDING
 }
 
+/// Whether the durable state word is `REWINDING` (a thaw is in progress) at run entry — the gate the
+/// parked-vCPU slice uses to mark the [`Domain`] thawing (an `atomic.wait` re-issue then fails closed
+/// rather than parking on the single worker). # Safety: `mem_base` is a durable run's committed window base.
+pub(crate) unsafe fn window_is_rewinding(mem_base: u64) -> bool {
+    *((mem_base + STATE_OFF) as *const i32) == STATE_REWINDING
+}
+
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
 /// `call_indirect`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, trap_out, sp, arg) ->
 /// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).

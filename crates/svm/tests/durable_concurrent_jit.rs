@@ -22,7 +22,7 @@ use svm_ir::{Memory, Module};
 use svm_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv,
     compile_and_run_capture_reserved_with_host_durable_mv_interruptible, FreezeController,
-    FrozenFiber, FrozenVCpu, JitError, JitOutcome,
+    FrozenFiber, FrozenVCpu, JitError, JitOutcome, TrapKind,
 };
 
 const SIZE_LOG2: u8 = 17;
@@ -36,6 +36,10 @@ const K: i64 = 100_000_000;
 const OFF_ROOT: i64 = 65536;
 const OFF_C1: i64 = 65544;
 const OFF_C2: i64 = 65552;
+// §12.8 parked-vCPU slice: the root `atomic.wait`s on the futex word at guest offset 65568 (4-byte
+// aligned; 65560 stays the clock/host-fn stash). `atomic.wait` status `1` = the value did not equal
+// `expected` (no / end-of wait) — wasm's `WAIT_NOT_EQUAL`.
+const WAIT_NOT_EQUAL: i64 = 1;
 
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
@@ -607,5 +611,153 @@ fn nested_concurrent_tree_freezes_and_thaws() {
         le_i64(&tfinal, OFF_ROOT),
         3 * K,
         "root's loop + child + grandchild reproduced across the nested concurrent freeze",
+    );
+}
+
+// §12.8 parked-vCPU slice — **freeze while a vCPU is blocked in `atomic.wait`, thaw resolves it.** The
+// root spawns a concurrent child and *immediately* parks in `atomic.wait` on `FLAG_OFF` (expected 0, no
+// timeout), so it is blocked when the freeze lands. The **child** drives the spawn-before-freeze
+// handshake, but only *after* it has stored `FLAG_OFF = 1` (a plain atomic store — **no** notify, so the
+// parked root is **not** woken): the controller therefore freezes with the value already changed in the
+// window. On thaw the root re-issues the wait, which re-checks the value, finds `1 != 0`, and resolves
+// immediately with `WAIT_NOT_EQUAL` — no re-park, no notifier needed. This is the thaw-able case: the
+// wake landed as a value change that rode the snapshot.
+const SRC_WAIT_WORKS: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 65568
+  v6 = i32.const 0
+  v7 = i64.const -1
+  v8 = i32.atomic.wait v5 v6 v7
+  v9 = i64.const 65536
+  i32.store v9 v8
+  v10 = i64.const 0
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  br block1(v2)
+block1(v3: i64):
+  v4 = i64.const 1
+  v5 = i64.add v3 v4
+  v6 = i64.const 100000000
+  v7 = i64.lt_s v5 v6
+  br_if v7 block1(v5) block2(v5)
+block2(v8: i64):
+  v9 = i64.const 65568
+  v10 = i32.const 1
+  i32.atomic.store v9 v10
+  v11 = i64.const 65560
+  v12 = i32.load v11
+  v13 = i32.const 0
+  v14 = cap.call 13 0 (i32) -> (i64) v12 (v13)
+  v15 = i64.const 65544
+  i64.store v15 v8
+  return v8
+}
+"#;
+
+#[test]
+fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
+    let inst = instrument(SRC_WAIT_WORKS);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The root's wait found the changed value and returned before the freeze landed (rare): its
+        // recorded status already rides the snapshot.
+        assert_eq!(le_i64(&fsnap, OFF_ROOT), WAIT_NOT_EQUAL);
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder while the root was blocked in the wait",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        K,
+        "the re-run child completed its loop across the freeze",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        WAIT_NOT_EQUAL,
+        "the root's re-issued atomic.wait re-checked the value (1 != 0) and resolved NOT_EQUAL on thaw",
+    );
+}
+
+// §12.8 parked-vCPU slice — **fail-closed thaw.** Same shape, but the child **never** changes
+// `FLAG_OFF`: it signals first (so the freeze lands while the root is parked), then just loops. The
+// value the root waits on is still `0` (== `expected`) in the snapshot, so the thaw's re-issued wait
+// would have to *park* again — which the single-worker thaw can't satisfy (no concurrent notifier). It
+// must therefore **fail closed** with `ThreadFault` (matching the interpreter, which surfaces a guest
+// wait/join-deadlock as `Trap::ThreadFault`) rather than hang. The full thaw of this case needs the
+// concurrent-thaw rework; until then, failing closed keeps the freeze safe and the run honest.
+const SRC_WAIT_DEADLOCK: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 65568
+  v6 = i32.const 0
+  v7 = i64.const -1
+  v8 = i32.atomic.wait v5 v6 v7
+  v9 = i64.const 65536
+  i32.store v9 v8
+  v10 = i64.const 0
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v13 = i64.const 65544
+  i64.store v13 v12
+  return v12
+}
+"#;
+
+#[test]
+fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
+    let inst = instrument(SRC_WAIT_DEADLOCK);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The freeze didn't catch the root parked (rare): nothing to assert about the wait.
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder while the root was blocked in the wait",
+    );
+
+    let (tout, _tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(
+        matches!(tout, JitOutcome::Trapped(TrapKind::ThreadFault)),
+        "a re-issued wait that would re-park on the single-worker thaw fails closed (ThreadFault), got {tout:?}",
     );
 }

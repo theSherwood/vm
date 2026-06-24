@@ -192,6 +192,14 @@ pub(crate) struct Domain {
     quiesce: Mutex<usize>,
     quiesce_cv: Condvar,
     concurrent_durable: AtomicBool,
+    /// §12.8 parked-vCPU slice: set for the duration of a **thaw** run (the single worker re-executes
+    /// the frozen vCPUs under `REWINDING`). While set, an `atomic.wait` re-issue that would *park* can't
+    /// be satisfied — there is no concurrent notifier on the single worker — so it fails closed
+    /// (`ThreadFault`, the interp's join-deadlock) rather than hanging. A wait whose value already
+    /// changed (the wake landed as a store in the snapshot, or replayed by another re-run vCPU) still
+    /// resolves immediately with `WAIT_NOT_EQUAL` (no park), so the common case thaws. False on a fresh
+    /// run, where a parked wait is woken by a real concurrent `notify`.
+    thawing: AtomicBool,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -253,6 +261,7 @@ impl Domain {
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
             concurrent_durable: AtomicBool::new(false),
+            thawing: AtomicBool::new(false),
         }
     }
 
@@ -339,6 +348,17 @@ impl Domain {
     /// made that serialization unnecessary.
     pub(crate) fn engage_concurrent_durable(&self) {
         self.concurrent_durable.store(true, Ordering::Release);
+    }
+
+    /// Mark this run as a **thaw** (§12.8 parked-vCPU slice): the single worker re-executes the frozen
+    /// vCPUs under `REWINDING`, so an `atomic.wait` re-issue that would park fails closed instead of
+    /// hanging (no concurrent notifier). Set once at thaw setup, before the root re-enters.
+    pub(crate) fn engage_thawing(&self) {
+        self.thawing.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_thawing(&self) -> bool {
+        self.thawing.load(Ordering::Acquire)
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
@@ -1335,21 +1355,44 @@ unsafe fn read_phys(phys: u64, width: u32) -> u64 {
 /// `i32` status (woken / not-equal / timed-out). The value is re-read **under the futex lock**, so a
 /// concurrent store-then-`notify` cannot be lost.
 ///
+/// §12.8 parked-vCPU slice: like `thread_join`, a waiter parked here when a freeze begins returns on
+/// observing `UNWINDING` (its instrumented caller then unwinds at the trailing re-issue safepoint). On a
+/// **thaw** the wait is re-issued: a wake that landed as a value change resolves it immediately
+/// (`WAIT_NOT_EQUAL`, no park); a re-issue that would still park can't be satisfied on the single worker
+/// (no concurrent notifier), so it fails closed via `trap_out` (`ThreadFault`, the interp's join-deadlock).
+///
 /// # Safety
-/// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes.
+/// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes; `trap_out` is the
+/// live trap cell.
 pub(crate) unsafe extern "C" fn thread_wait(
     sched: *const Domain,
     phys: u64,
     expected: u64,
     width: u32,
     timeout: i64,
+    trap_out: u64,
 ) -> i32 {
     let dom = &*sched;
     let mask = width_mask(width);
+    // Thaw fail-closed: a re-issued wait that would *park* (value unchanged) has no concurrent notifier
+    // on the single-worker thaw, so it would deadlock. Fail closed with `ThreadFault` instead — matching
+    // the interpreter, which surfaces a guest wait/join-deadlock as `Trap::ThreadFault`. A wait whose
+    // value already changed falls through and resolves below as `WAIT_NOT_EQUAL` (no park).
+    if dom.is_thawing() && read_phys(phys, width) & mask == expected & mask {
+        store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+        return 0;
+    }
     let deadline = if timeout < 0 {
         None
     } else {
         Some(Instant::now() + Duration::from_nanos(timeout as u64))
+    };
+    // §12.8 parked-vCPU freeze: gate on `durable` so window offset 0 is the reserved state word (a
+    // non-durable run's offset 0 is ordinary guest memory that could spuriously read `UNWINDING`).
+    let unwind_base = if dom.env().durable {
+        dom.env().mem_base
+    } else {
+        0
     };
     futex_wait(
         &dom.futex,
@@ -1358,6 +1401,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
         || read_phys(phys, width) & mask == expected & mask,
         deadline,
         dom.env().epoch_addr,
+        unwind_base,
     )
 }
 
@@ -1383,6 +1427,7 @@ fn futex_wait(
     still_eq: impl Fn() -> bool,
     deadline: Option<Instant>,
     epoch_addr: usize,
+    unwind_base: u64,
 ) -> i32 {
     let mut g = lock(futex);
     if !still_eq() {
@@ -1403,11 +1448,21 @@ fn futex_wait(
         if epoch_fired(epoch_addr) {
             break WAIT_WOKEN;
         }
+        // §12.8 parked-vCPU freeze: a waiter parked here when a freeze begins must also return so its
+        // instrumented caller can unwind at the re-issue safepoint the `svm-durable` transform now emits
+        // after `atomic.wait`. The returned status is discarded (the safepoint unwinds before the guest
+        // observes it); on thaw the wait is re-issued. SAFETY: on a durable run `unwind_base` is the
+        // committed window base, offset 0 RW for the run.
+        #[cfg(not(loom))]
+        if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
+            break WAIT_WOKEN;
+        }
         match deadline {
             None => {
-                // Armed (real build): bounded re-check so an *infinite* wait still observes a kill.
+                // Armed (real build): bounded re-check so an *infinite* wait still observes a kill or a
+                // freeze even when no `notify` arrives.
                 #[cfg(not(loom))]
-                if epoch_addr != 0 {
+                if epoch_addr != 0 || unwind_base != 0 {
                     g = cv
                         .wait_timeout(g, KILL_RECHECK)
                         .unwrap_or_else(|e| e.into_inner())
@@ -1511,6 +1566,7 @@ mod loom_tests {
                 KEY,
                 || word.load(Ordering::SeqCst) == 0,
                 None,
+                0,
                 0,
             );
             producer.join().unwrap();
