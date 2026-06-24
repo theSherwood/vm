@@ -235,7 +235,7 @@ third-party C header, vendored) sandboxed: it compiles through the frontend to ~
 IR, verifies, and runs on the JIT, producing the same render commands as a native build.
 Getting it to run drove a batch of frontend/IR/JIT fixes (anonymous-aggregate designated
 inits, ternary-returns-struct, >16-byte struct returns, mixed-width shifts, program-sized
-windows, a contiguous JIT code arena, gcc-parity packed-enum/struct layout) — see `HANDOFF.md`.
+windows, a contiguous JIT code arena, gcc-parity packed-enum/struct layout) — see `FRONTEND.md`.
 **`jsmn/jsmn_demo.c`** runs the [jsmn](https://github.com/zserge/jsmn) zero-allocation JSON
 tokenizer — a different shape (char/state-machine string scanning) that ran identically to a
 native build with no new fixes, validating string handling, escapes, nesting, and error paths.

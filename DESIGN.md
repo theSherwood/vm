@@ -2434,7 +2434,7 @@ call *not-yet-loaded* code by name without recompiling the caller.
 
 How the VM exposes concurrency, why, and how **stackful work-stealing over migratable
 fibers** was designed, staged, and verified. (Absorbed from the former `SCHEDULING.md`
-when the track completed; the build history lives in HANDOFF.md's log.)
+when the track completed; the build history lives in the git log.)
 
 ### The model: two primitives, nothing more
 
