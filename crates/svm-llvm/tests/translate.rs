@@ -573,6 +573,43 @@ fn switch_with_gaps_via_global_table() {
 }
 
 #[test]
+fn switch_sparse_compare_chain() {
+    // A switch on sparse 4-byte keys (PNG-chunk-style fourccs) — span ≫ 4096, so it can't be a
+    // `br_table`. The on-ramp's pre-pass rewrites it into an `icmp eq`/`condbr` decision chain;
+    // checked against native `cc`. (The case real parsers like stb_image's PNG loop hit.)
+    let src = "int sw(int k);\n\
+               int run(int s){\n\
+                 static const int keys[5] = {0x43674249,0x49484452,0x49444154,0x504c5445,0x49454e44};\n\
+                 int acc = 0;\n\
+                 for (int i = 0; i < 7; i++) acc = acc*31 + sw(keys[(i + s) % 5]);\n\
+                 return acc & 0x7fffffff;\n\
+               }\n\
+               int sw(int k){\n\
+                 switch (k){\n\
+                   case 0x43674249: return 1; case 0x49484452: return 2; case 0x49444154: return 3;\n\
+                   case 0x504c5445: return 4; case 0x49454e44: return 5; default: return 0;\n\
+                 }\n\
+               }";
+    check_vs_native("switch_sparse", src, 3);
+}
+
+#[test]
+fn bitreverse_intrinsic() {
+    // A bit-reversal loop `-O2` folds into `llvm.bitreverse.i32`; lowered inline via the log-N
+    // swap network. Checked against native `cc`.
+    let src = "unsigned br(unsigned x);\n\
+               int run(int s){\n\
+                 unsigned acc = 0;\n\
+                 for (int i = 0; i < 6; i++) acc = acc*7 + br((unsigned)(s + i) * 2654435761u);\n\
+                 return (int)(acc & 0x7fffffff);\n\
+               }\n\
+               unsigned br(unsigned x){\n\
+                 unsigned r = 0; for (int i = 0; i < 32; i++){ r = (r << 1) | (x & 1u); x >>= 1; } return r;\n\
+               }";
+    check_vs_native("bitreverse", src, 5);
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";
@@ -1310,6 +1347,24 @@ fn demo_monocypher_vs_native() {
     check_demo_vs_native_flags(
         "monocypher",
         "monocypher/monocypher_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_stb_image_vs_native() {
+    // Sean Barrett's stb_image (public domain), PNG-only: decode an embedded 24×24 RGBA PNG and
+    // write the raw decoded pixels. A real-parser shakedown — stb's built-in zlib inflate
+    // (Huffman + LZ77), the PNG row unfilters (None/Sub/Up/Average/Paeth — the test image cycles
+    // all five, hitting the narrow `unsigned char` predictor arithmetic, the slice-U class), the
+    // chunk/CRC walk, and heap traffic through the on-ramp's synthesized malloc/realloc/free. The
+    // native build decodes the same bytes → byte-exact oracle. Vectorization off for the on-ramp
+    // (the inflate/unfilter loops clang would SIMD-vectorize are the §17 lane); exact integer
+    // decoding agrees scalar-vs-vectorized.
+    check_demo_vs_native_flags(
+        "stb_image",
+        "stb_image/stb_image_demo.c",
         b"",
         &["-fno-vectorize", "-fno-slp-vectorize"],
     );

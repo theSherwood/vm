@@ -217,7 +217,8 @@ pub struct Translated {
 /// `llvm-sys` walk ([`di`]) over the same file and correlated to the IR ([`di::read_debug`]).
 pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let path = path.as_ref();
-    let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
+    let mut m = LModule::from_bc_path(path).map_err(Error::Parse)?;
+    lower_sparse_switches(&mut m);
     let di = path.to_str().and_then(di::read_debug);
     // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).
     let ba = path.to_str().and_then(blockaddr::read_block_addrs);
@@ -228,6 +229,161 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 /// from `!DILocation`; the variable/type half requires the bitcode path (see [`translate_bc_path`]).
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
     translate_impl(m, None, None)
+}
+
+/// Pre-pass: rewrite each **sparse** `switch` — one whose case-value span exceeds [`MAX_SWITCH_SPAN`],
+/// so it cannot become a compact `br_table` — into a chain of `icmp eq` + `condbr` over fresh basic
+/// blocks. Real parsers and interpreters dispatch on sparse keys (4-byte chunk fourccs, enum tags),
+/// which clang keeps as a `switch`; this lets them translate while **dense** switches keep the
+/// branchless `br_table` (the rewrite is skipped for them).
+///
+/// The rewrite stays in ordinary LLVM IR, so every downstream pass (liveness, block-params, branch
+/// args, verification) handles the new blocks unchanged — no synthetic-SVM-block bookkeeping. The one
+/// fixup is φ-predecessors: a case target's φ named the switch's parent block; for every case after
+/// the first (and for the default), the branch now originates from a fresh block, so that incoming
+/// label is repointed. A switch with a **repeated** target (including a target equal to the default)
+/// is left as-is — the simple per-edge φ repoint can't split one φ entry into several — so it fails
+/// closed in the dense-switch path rather than risk a miscompile.
+fn lower_sparse_switches(m: &mut LModule) {
+    use llvm_ir::instruction::ICmp;
+    use llvm_ir::terminator::CondBr;
+    let i1 = m.types.bool();
+    for f in &mut m.functions {
+        // Phase A: collect sparse-switch work items (immutable scan; clone what the rewrite needs).
+        struct Work {
+            bi: usize,
+            operand: Operand,
+            cases: Vec<(llvm_ir::constant::ConstantRef, Name)>,
+            default: Name,
+        }
+        let mut work: Vec<Work> = Vec::new();
+        for (bi, bb) in f.basic_blocks.iter().enumerate() {
+            let LTerm::Switch(sw) = &bb.term else {
+                continue;
+            };
+            if sw.dests.is_empty() {
+                continue;
+            }
+            let Ok(width) = operand_bits(&sw.operand) else {
+                continue; // i128+ / non-int — let the dense path report it
+            };
+            // Case values as the dense path sees them (sign-fit for i32), to match its span gate.
+            let fit = |c: &llvm_ir::constant::ConstantRef| match c.as_ref() {
+                Constant::Int { value, .. } if width <= 32 => Some(*value as i32 as i64),
+                Constant::Int { value, .. } => Some(*value as i64),
+                _ => None,
+            };
+            let Some(vals): Option<Vec<i64>> = sw.dests.iter().map(|(c, _)| fit(c)).collect()
+            else {
+                continue; // non-int case constant — let the dense path report it
+            };
+            let (min, max) = (
+                *vals.iter().min().unwrap() as i128,
+                *vals.iter().max().unwrap() as i128,
+            );
+            // Dense (`span = max-min+1 <= MAX_SWITCH_SPAN`, i.e. `max-min < MAX`) → keep the `br_table`.
+            if max - min < MAX_SWITCH_SPAN as i128 {
+                continue;
+            }
+            // Distinct targets, and distinct from the default (else the per-edge φ repoint is ambiguous).
+            let mut seen = std::collections::HashSet::new();
+            let distinct = sw.dests.iter().all(|(_, t)| seen.insert(t))
+                && sw.dests.iter().all(|(_, t)| *t != sw.default_dest);
+            if !distinct {
+                continue;
+            }
+            work.push(Work {
+                bi,
+                operand: sw.operand.clone(),
+                cases: sw.dests.clone(),
+                default: sw.default_dest.clone(),
+            });
+        }
+        if work.is_empty() {
+            continue;
+        }
+
+        // Phase B/C: rewrite each parent block in place + collect the fresh chain blocks.
+        let mut new_blocks: Vec<BasicBlock> = Vec::new();
+        for w in work {
+            let k = w.cases.len();
+            let sname = |j: usize| Name::Name(Box::new(format!("svm.sw.{}.{}", w.bi, j)));
+            let cmp_name = |j: usize| Name::Name(Box::new(format!("svm.sw.{}.{}.eq", w.bi, j)));
+            let cmp_use = |j: usize| Operand::LocalOperand {
+                name: cmp_name(j),
+                ty: i1.clone(),
+            };
+            let eq = |operand: &Operand, c: llvm_ir::constant::ConstantRef, j: usize| {
+                Instruction::ICmp(ICmp {
+                    predicate: IntPredicate::EQ,
+                    operand0: operand.clone(),
+                    operand1: Operand::ConstantOperand(c),
+                    dest: cmp_name(j),
+                    debugloc: None,
+                })
+            };
+            let condbr = |cond: Operand, t: Name, e: Name| {
+                LTerm::CondBr(CondBr {
+                    condition: cond,
+                    true_dest: t,
+                    false_dest: e,
+                    debugloc: None,
+                })
+            };
+
+            // Parent block: test case 0; on miss fall to the first chain block (or default if 1 case).
+            let b_name = f.basic_blocks[w.bi].name.clone();
+            let b = &mut f.basic_blocks[w.bi];
+            b.instrs.push(eq(&w.operand, w.cases[0].0.clone(), 0));
+            b.term = condbr(
+                cmp_use(0),
+                w.cases[0].1.clone(),
+                if k == 1 { w.default.clone() } else { sname(1) },
+            );
+
+            // Chain blocks for cases 1..k-1; the last one's miss edge is the default.
+            for j in 1..k {
+                let mut sb = BasicBlock::new(sname(j));
+                sb.instrs.push(eq(&w.operand, w.cases[j].0.clone(), j));
+                sb.term = condbr(
+                    cmp_use(j),
+                    w.cases[j].1.clone(),
+                    if j == k - 1 {
+                        w.default.clone()
+                    } else {
+                        sname(j + 1)
+                    },
+                );
+                new_blocks.push(sb);
+            }
+
+            // φ fixups: case j≥1 target's predecessor B → S_j; the default's predecessor B → S_{k-1}.
+            for j in 1..k {
+                repoint_phi_pred(f, &w.cases[j].1, &b_name, &sname(j));
+            }
+            if k >= 2 {
+                repoint_phi_pred(f, &w.default, &b_name, &sname(k - 1));
+            }
+        }
+        f.basic_blocks.extend(new_blocks);
+    }
+}
+
+/// In the block named `target`, repoint any φ incoming edge labelled `old_pred` to `new_pred` — used
+/// when [`lower_sparse_switches`] moves a switch edge onto a fresh chain block.
+fn repoint_phi_pred(f: &mut Function, target: &Name, old_pred: &Name, new_pred: &Name) {
+    let Some(bb) = f.basic_blocks.iter_mut().find(|b| &b.name == target) else {
+        return;
+    };
+    for instr in &mut bb.instrs {
+        if let Instruction::Phi(p) = instr {
+            for (_, pred) in &mut p.incoming_values {
+                if pred == old_pred {
+                    *pred = new_pred.clone();
+                }
+            }
+        }
+    }
 }
 
 fn translate_impl(
@@ -8880,6 +9036,7 @@ fn lower_int_intrinsic(
             | "llvm.fshl"
             | "llvm.fshr"
             | "llvm.bswap"
+            | "llvm.bitreverse"
     ) {
         return Ok(None);
     }
@@ -8994,6 +9151,12 @@ fn lower_int_intrinsic(
             let bits = src_bits(args[0], types)?;
             let v = ctx.operand(args[0])?;
             emit_bswap(ctx, v, ty, (bits / 8).max(1) as u64)
+        }
+        // `llvm.bitreverse` — reverse the value's bits inline (no SVM op), via the log-N swap network.
+        "llvm.bitreverse" => {
+            let bits = src_bits(args[0], types)?;
+            let v = ctx.operand(args[0])?;
+            emit_bitreverse(ctx, v, ty, bits)?
         }
         _ => unreachable!(),
     };
@@ -9234,6 +9397,72 @@ fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
         });
     }
     acc.unwrap_or(v)
+}
+
+/// Reverse the low `bits` bits of `v` (a power-of-2 width: 8/16/32/64) with the classic log-N swap
+/// network: `((v & m_s) << s) | ((v >> s) & m_s)` for s = 1,2,…,bits/2, where `m_s` selects the
+/// even-indexed `s`-bit groups (`s` ones, `s` zeros, repeating). The on-ramp keeps narrow integers
+/// zero-extended in their container (§3b), so a 16-bit value reverses cleanly into the low 16 bits.
+/// Lowers `llvm.bitreverse.{i8,i16,i32,i64}`; a non-power-of-2 width is `Unsupported` (fail-closed).
+fn emit_bitreverse(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, bits: u32) -> Result<ValIdx, Error> {
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return unsup(format!("llvm.bitreverse.i{bits} (non-power-of-2 width)"));
+    }
+    let kof = |ctx: &mut BlockCtx, k: u64| {
+        ctx.push(if ty == IntTy::I64 {
+            Inst::ConstI64(k as i64)
+        } else {
+            Inst::ConstI32(k as i32)
+        })
+    };
+    let mut cur = v;
+    let mut s = 1u32;
+    while s < bits {
+        // `m_s`: `s` ones then `s` zeros, repeating across the low `bits` bits.
+        let mut mask = 0u64;
+        let mut i = 0u32;
+        while i < bits {
+            for b in i..(i + s).min(bits) {
+                mask |= 1u64 << b;
+            }
+            i += 2 * s;
+        }
+        let m = kof(ctx, mask);
+        let sc = kof(ctx, s as u64);
+        // (v & m_s) << s  |  (v >> s) & m_s
+        let lo = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::And,
+            a: cur,
+            b: m,
+        });
+        let lo = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::Shl,
+            a: lo,
+            b: sc,
+        });
+        let hi = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::ShrU,
+            a: cur,
+            b: sc,
+        });
+        let hi = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::And,
+            a: hi,
+            b: m,
+        });
+        cur = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::Or,
+            a: lo,
+            b: hi,
+        });
+        s *= 2;
+    }
+    Ok(cur)
 }
 
 /// Lower a call to an external **libm math** function that has a direct SVM float op (`sqrt`,

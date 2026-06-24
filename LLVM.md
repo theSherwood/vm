@@ -344,9 +344,14 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 **Slice D (DONE) — `switch`.**
 - [x] `switch` → `br_table` (§3b): the `i32` operand is biased by the minimum case value, then
       indexes a target vector spanning `[min, max]` with gaps filled by the default edge; each edge
-      carries its destination's block args (computed once per distinct target). Too-sparse switches
-      (span > 4096) and i64-operand switches are a clean `Unsupported`. Tested on a dense switch and
-      the `even`/`odd` mutual recursion `-O2` lowers onto a switch-loop.
+      carries its destination's block args (computed once per distinct target). i64-operand switches
+      are a clean `Unsupported`. Tested on a dense switch and the `even`/`odd` mutual recursion
+      `-O2` lowers onto a switch-loop.
+- [x] **Sparse switches** (span > 4096 — real parsers dispatching on 4-byte fourccs/enum tags) are
+      rewritten by an LLVM-level pre-pass (`lower_sparse_switches`) into an `icmp eq`/`condbr`
+      decision chain over fresh basic blocks, so all downstream passes (liveness, block-params,
+      verify) handle them unchanged; only φ-predecessors are repointed. Dense switches keep the
+      branchless `br_table`. Lands stb_image's PNG chunk loop (slice BH). See `switch_sparse_compare_chain`.
 
 **Slice E (DONE) — global variables + the data-stack guard.**
 - [x] Globals laid out **low** in the window (`[DATA_BASE, globals_end)`), each natural-aligned.
@@ -660,6 +665,32 @@ environment (`{argc, envc}` then the `argc` argv strings followed by the `envc` 
   `argc` argv strings, then compares each env key against `name` char-by-char, returning the value
   pointer just past the `=` on a full match landing on `=` (so `"F"` does not match `"FOO=…"`). Test:
   `getenv_lookup` (hit, miss, prefix guard, and the no-env case).
+
+**Slice BG (DONE) — Monocypher crypto KAT (the 64-bit-carry shakedown; ladder #1a).** Loup Vaillant's
+Monocypher 4.0.2 (public domain) runs byte-identical to native: **BLAKE2b**, **ChaCha20**, **Poly1305**,
+and an **X25519 ECDH** known-answer test (both sides must derive the same shared secret; exit code =
+mismatch count). Extends the integer corpus (SHA-256/xxHash/crc32) into modern AEAD + an elliptic curve,
+whose 25.5-bit-limb field arithmetic (`i32 × i32 → i64` products + carry) stresses the 64-bit
+shift/rotate/multiply paths. One on-ramp fix it forced: **width-changing `shufflevector`** — clang's
+auto-vectorizer emits shuffles whose result lane count differs from the input; the `v128` fast-path is now
+gated to same-width permutes, with width-changers falling through to the existing generic scalarize path.
+Compiled with on-ramp vectorization off (`-fno-vectorize -fno-slp-vectorize`, via the new
+`check_demo_vs_native_flags`) — the SIMD-vectorized crypto loops are the §17 lane, not the scalar
+arithmetic this targets; the native oracle keeps vectorizing and exact integer crypto agrees. Test:
+`demo_monocypher_vs_native`.
+
+**Slice BH (DONE) — stb_image PNG decoder (the real-parser shakedown; ladder #1b).** Sean Barrett's
+stb_image (public domain), PNG-only, decodes an embedded 24×24 RGBA PNG byte-identical to native —
+exercising the built-in zlib inflate (Huffman + LZ77), the row unfilters (None/Sub/Up/Average/Paeth — the
+test image cycles all five), the chunk/CRC walk, and heap traffic through the synthesized
+malloc/realloc/free. Two on-ramp features it forced (both broadly useful):
+- **Sparse-switch decision-tree lowering** (`lower_sparse_switches`, Slice D) — the PNG chunk loop
+  switches on 4-byte fourccs (span ≫ 4096); rewritten to an `icmp`/`condbr` chain. See
+  `switch_sparse_compare_chain`.
+- **`llvm.bitreverse.{i8,i16,i32,i64}`** — the Huffman setup reverses bits; lowered inline via the log-N
+  swap network (mirroring the `llvm.bswap` inline lowering). See `bitreverse_intrinsic`.
+- Configured `STBI_NO_THREAD_LOCALS` (the incidental `_Thread_local` failure-string → `llvm.threadlocal.address`,
+  out of scope) and vectorization off, like BG. Test: `demo_stb_image_vs_native`.
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
@@ -1215,7 +1246,7 @@ phases, both worth doing:
   Embedded` TU — each is "another frontend, no translator change beyond what the corpus proved."
 
 ### Suggested ladder (cheap momentum → the capstones)
-1. **Monocypher KAT** + **stb_image decode** — zero-OS, byte-exact; widen the corpus and shake out
+1. **Monocypher KAT** + **stb_image decode** — **DONE** (slices BG + BH): zero-OS, byte-exact; widen the corpus and shook out
    64-bit/parser bugs fast. (A SAT solver / `perft` slot in here too — pure compute, self-validating.)
 2. **`indirectbr` / `blockaddress` (computed goto)** — DONE (slices AV + AW: global tables + φ-threaded
    operand-position). Robust for real interpreters.
