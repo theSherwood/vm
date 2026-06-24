@@ -93,11 +93,74 @@ it is dropped once the actionable slices (1–2 below) close.
   run-time only after the compile-once timing fix) specialization win, thousands× end-to-end
   interpreted-interpreter→compiled-native.
 
-## Remaining slices (ranked by ROI)
+## Remaining work
 
-1. **Guest-side engine (§22 `Jit` capability)** — ship the specializer inside the sandbox for
-   dynamic-language IC-style recompilation (guests recompile themselves). Highest ceiling, very large
-   effort (on-device re-verify, determinism/TCB review) — a project, not a slice.
+### Guest-side specialization — the plan9 substrate goal
+
+**Goal.** svm is meant to be the substrate for a plan9-like OS where freely-shared programs run in
+nested sandboxes. Part of that vision: **from within svm, a process can specialize a script and get a
+residual that runs in svm** — e.g. take a JS source + a QuickJS interpreter (both as svm-IR) and
+partial-evaluate them into a smaller/faster residual that runs *without* the interpreter, then share
+that residual over the wire / run it in a nested sandbox. The classic first Futamura projection, but
+performed *in-sandbox by an ordinary program*, not host-side/offline.
+
+**Explicit non-goal: no speculative / V8-style engine.** No type-feedback, inline caches, speculation,
+or deoptimization guards. We only want the **sound** projection we already have (constants that are
+*provably* constant get folded). For a dynamic language this means the residual removes the
+parser/bytecode-dispatch/decode (invariant given the program) but **keeps** the dynamic value runtime
+(GC, boxing, type-dispatch on runtime values) — a real but bounded win, not native speed. That is
+accepted; chasing the work-bound part is what needs speculation, and we're not doing it.
+
+**Security/architecture — already settled, no new escape-TCB.** The §22 `Jit` capability is built: a
+guest hands the VM a serialized IR blob, the VM `decode → verify → compile → invoke`s it, and **the
+trust hinge is verification, not the producer**. So the specializer is *just another untrusted
+program*: however buggy, its residual is re-verified before a single instruction runs, a bad residual
+only hurts the guest that ran it (confined to its own sandbox), and guest-side specialization adds
+**zero escape-TCB surface** (DESIGN §22). This fits the plan9 ethos: anyone can write/share/improve a
+specializer; running someone else's is safe by construction. The "run the residual" half is done; the
+"residual IR + back half" are shared with the host-side engine (DESIGN §20c).
+
+**The actual enabler: run `svm-peval` as an svm-IR program — i.e. the Rust→svm-IR on-ramp.** To
+specialize from within svm, the specializer must itself be svm-IR. Status of the pieces:
+
+- **Rust→svm-IR exists and is tested.** `crates/svm-llvm` is a generic *LLVM-bitcode → svm-IR*
+  translator ("one component buys every LLVM language", `LLVM.md` / D54), not C-specific. The Milestone-2
+  test `crates/svm-llvm/tests/translate.rs` compiles a `#![no_std]` / `panic=abort` Rust crate with
+  **`rustc +1.81.0`** and runs it `interp == JIT == native rustc` — including `-O2` auto-vectorized SIMD.
+  - **Toolchain pin:** the bitcode version must match the pinned reader (LLVM 18). Default `rustc`
+    (1.94 / LLVM 21) is rejected; **`rustc +1.81.0` (LLVM 18.1)** is accepted. CI installs `1.81.0` for
+    this lane. (`rustup toolchain install 1.81.0` to run it locally; the test skips without it.)
+  - **Guest constraints:** `#![no_std]` (no OS) + `panic=abort` (no EH/unwinding → "lowers like C").
+- **Gap to running `svm-peval` (each bounded, none greenfield):**
+  1. **`core + alloc`** — `svm-peval` is all `Vec`/`BTreeMap`/`HashMap`. Needs a `#[global_allocator]`
+     backed by the guest window heap. The on-ramp already supports a `vm_map`-growing
+     `malloc`/`calloc`/`free`, so an allocator shim is plausible — but **the existing test is `core`-only;
+     `alloc` through the on-ramp is unproven.** ← the next concrete slice (prove a heap-allocating
+     `no_std` Rust program end-to-end).
+  2. **`HashMap` → `BTreeMap`/`hashbrown`** (`HashMap` is `std`-only). Mechanical; memo keys gain `Ord`.
+  3. **`no_std`-ify `svm-peval`** (drop `std`, allocator shim, `panic=abort`) and fix whatever LLVM
+     shapes a large Rust program hits that the C corpus didn't (same "on-ramp coverage at scale" story
+     as QuickJS, but the riskiest question — does Rust translate at all — is already **yes**).
+  4. **Wire residual → §22 `Jit.compile`** to run/share it in-sandbox.
+
+**Why not `std`.** `std` is Rust's OS-abstraction layer (`core` + `alloc` + a `std::sys::<target>`
+platform backend for files/threads/time/net/startup). svm has none of those as ambient services (it
+has capabilities), and rustc has no `std::sys::svm` backend, so a `std` build drags in unresolved
+syscall/libc externs (or inline-asm `syscall`), `panic=unwind` EH (`invoke`/`landingpad` + libunwind),
+pthreads/TLS, the libc allocator, and `lang_start` OS startup — none of which the on-ramp can map.
+Supporting `std` = **porting `std` to svm** (a `std::sys::svm` backend over svm caps, à la WASI/Redox)
+— a separate, larger **OS-personality workstream**, gated on svm exposing the host caps `std` needs. It
+is **not needed for the specializer** (a pure `Module → Module` transform: no I/O, threads, or time —
+`core + alloc` suffices), only for running *general* `std`-using Rust as guests.
+
+**Related but separate workstream:** translating large real interpreters (QuickJS) to svm-IR is blocked
+on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not here.
+
+**Milestones (smallest first):**
+1. `core + alloc` through the Rust on-ramp (heap-allocating `no_std` program, `interp == JIT == native`).
+2. `no_std`-ify `svm-peval` (`BTreeMap` for `HashMap`, allocator shim, `panic=abort`); it translates.
+3. End-to-end in-sandbox demo: a guest specializes a toy interpreter against a script and runs the
+   residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`).
 
 ## Benchmarking
 
