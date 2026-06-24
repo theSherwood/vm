@@ -266,6 +266,36 @@ review, fuzzing infra, audit), tracked as open-ended in §18.
   structured-control-flow straitjacket. This is a direct target for LLVM-style
   producers and feeds register allocation directly in the JIT.
 
+### Three backends, one observable behavior (the parity invariant)  [SETTLED]
+The same verified IR is executed by **three backends**, each with a distinct job:
+
+1. **Tree-walk interpreter** (`svm_interp::run`/`run_with_host`) — walks the SSA IR
+   data structure directly. This is the reference **oracle**: escape-TCB,
+   `#![forbid(unsafe_code)]`, total and panic-free *even on unverified input* (so it
+   is safe to drive from a fuzzer, §18). Correctness is defined *here*.
+2. **Bytecode interpreter** (`svm_interp::bytecode`) — the IR lowered to a flat,
+   operand-resolved bytecode with threaded dispatch and its own single-OS-thread
+   cooperative scheduler; also `#![forbid(unsafe_code)]`. It is faster than the
+   tree-walker and is the portable execution path for **targets where the JIT is
+   unavailable** — notably the wasm64 browser build (§21) — and the JIT-not-viable
+   fallback generally.
+3. **Cranelift JIT** (`svm-jit`) — the production **speed** path (§9).
+
+> **Invariant:** on every verified module, all three backends produce **identical
+> observable behavior** — same results, same trap kind, same final memory window.
+
+The tree-walker is the hub against which the other two are continuously
+differential-tested: the **bytecode engine is held bit-exact** against it (shared
+semantic helpers → results, trap kind, *and* float/NaN bits all identical;
+`crates/svm/tests/bytecode_diff.rs` — "the gate that must stay green before the
+bytecode path is made a default"), and the **JIT is held exact** against it *modulo*
+cross-backend float-NaN bit patterns, which are host-defined and deliberately
+unpinned (§3b; `crates/svm/tests/jit_diff.rs`). Where the bytecode engine does not
+yet implement an op, that module is excluded from its differential corpus; every op
+it *does* support must match exactly. This three-way agreement is what lets the JIT
+(the dominant escape-TCB, §2a) and the bytecode path be trusted: both are checked,
+continuously and generatively, against a small, auditable, `unsafe`-free oracle.
+
 ---
 
 ## 3a. Type system, value model & binary encoding  [SETTLED]
@@ -2665,8 +2695,10 @@ review, serious fuzzing/differential-testing infra, eventually an audit. Treat i
 as open-ended, not a byproduct of the build.
 
 **De-risking moves that fit this setup:**
-- **Interpreter-as-oracle:** differential-test the JIT against the interpreter on
-  a large random corpus — catches codegen bugs without expert eyes.
+- **Interpreter-as-oracle:** the tree-walk interpreter is the reference; differential-test
+  **both** the Cranelift JIT (`jit_diff`) **and** the bytecode interpreter (`bytecode_diff`,
+  bit-exact) against it on a large random corpus — catches codegen/compile bugs without
+  expert eyes. This is the §3 parity invariant (three backends, one observable behavior).
 - **Fuzz the verifier from day one** (invariant: verified ⇒ cannot escape) — the
   one security validation that doesn't need a continuous expert in the loop.
 - **Fuzz the confinement-masking lowering as its own unit** (D38) — it is the part

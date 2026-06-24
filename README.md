@@ -156,7 +156,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | `svm-mem` | Shared guest-memory substrate (§12/§13) — owns the memory `unsafe` behind a safe API (audited in isolation, like `svm-mask`), so the interpreter stays `forbid(unsafe_code)` | escape-TCB |
 | `svm-encode` | Binary encode + **decode** (untrusted-input-facing) (§3a) | escape-TCB |
 | `svm-verify` | The verifier — single linear pass, fail-closed (§2a I2/I3/I4; §3b) | escape-TCB |
-| `svm-interp` | Reference interpreter — the differential oracle (§18) | — |
+| `svm-interp` | Two of the three IR backends: the **tree-walk interpreter** (the differential oracle, §18) and the **bytecode interpreter** (`bytecode.rs` — the JIT-not-viable / wasm64 fallback). All three backends must agree (§3 parity invariant) | — |
 | `svm-fiber` | Native stack-switch primitive for fibers / green threads (§3d/§6/§12); the lone home for that `unsafe`, tiny and auditable (x86-64 + aarch64 unix, x86-64 Windows) | escape-TCB |
 | `svm-jit` | Cranelift JIT — CLIF lowering + the §4 masking lowering + guard page/signal (§9) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
