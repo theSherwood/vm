@@ -281,6 +281,51 @@ pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
     run_at(ptr, len, &[])
 }
 
+// ---- shared-memory window: run the engine over a caller-owned region of *this* linear memory ----
+//
+// THREADS.md step 4. `svm_run` runs over a window the engine backs internally; `svm_run_shared` runs
+// over a window the **host** carves out of this module's linear memory (`[win_ptr, win_size)`, via
+// `svm_alloc`). Built as a wasm threads module (shared memory + `+atomics`), that linear memory is
+// the host's `SharedArrayBuffer`, so the window lives in shared memory — the substrate the parallel
+// mode's per-vCPU Workers will all execute over. Today still cooperative (one thread); the only
+// change from `svm_run` is *where the guest window lives*. Stateless (no `static mut`), so two
+// Workers running it over **disjoint** windows don't race on engine ABI globals.
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 over the guest window
+/// `[win_ptr, win_ptr+win_size)` of this module's linear memory (a `Region::shared`; `win_size` must
+/// cover the module's `memory` size). Returns the guest's `i64` result, or `i64::MIN` on
+/// decode/unsupported/trap/non-`i64`. The host reads the guest's memory effects directly from the
+/// window region afterward.
+#[no_mangle]
+pub extern "C" fn svm_run_shared(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    win_ptr: *mut u8,
+    win_size: usize,
+    arg: i64,
+) -> i64 {
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return i64::MIN;
+    };
+    // SAFETY: the host guarantees `[win_ptr, win_size)` is a live `svm_alloc`ed region of this linear
+    // memory used solely as this guest window for the call. The `unsafe` borrow lives here in the
+    // embedder; the engine stays `#![forbid(unsafe_code)]` and just takes the `Arc<Region>`.
+    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    let args: &[Value] = if arity >= 1 { &[Value::I64(arg)] } else { &[] };
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run_capture_over(&m, 0, args, &mut fuel, &[], back) {
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            Some(Value::I32(x)) => *x as i64,
+            _ => i64::MIN,
+        },
+        _ => i64::MIN,
+    }
+}
+
 // ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------
 //
 // Beyond compute-only: grant the guest a real capability set (stdin/stdout/stderr streams, a

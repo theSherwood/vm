@@ -85,10 +85,23 @@ property, so in practice:
   (result + final image) to the engine's own backing and its writes land in the caller's buffer, and
   the 8-vCPU `thread.spawn`+atomics+futex kernel runs cooperatively over the shared window → **4000**.
   This is the exact window the parallel mode will run every Worker over.
-- [ ] **Step 4 — the parallel driver + host mode selection.** A driver that runs each `thread.spawn`ed
-  vCPU on a Worker (`thread.spawn` → Worker-spawn import) over the shared window from Step 3, with the
-  futex on `memory.atomic.wait`/`notify`; selected by a host-set mode (`Cooperative` default |
-  `Parallel`). Then differential-test the parallel backend against the cooperative oracle on the corpus.
+- [x] **Step 4a — the engine runs over **shared wasm linear memory** (real-wasm integration).** The
+  whole point of steps 1–3, now proven in the actual artifact: the **full** SVM engine (not the spike)
+  builds as a wasm **threads module** — `+atomics`/`+bulk-memory`/`+mutable-globals` ·
+  `--shared-memory --import-memory` · `build-std=std,panic_abort` — so svm-interp/svm-mem with all
+  their `Mutex`/`RwLock`/`Arc` compile and instantiate over a host `SharedArrayBuffer` (a major
+  de-risk: ~54 s, clean). New export `svm_run_shared(mod, len, win_ptr, win_size, arg)` runs a guest
+  over a `Region::shared` window the **host** carves out of that shared linear memory (Step 3's
+  `compile_and_run_capture_over`). Verified (`threads-engine.mjs`): the 8-vCPU `thread.spawn`+atomics+
+  futex kernel runs over a window **in the SharedArrayBuffer** → **4000**. Stateless (no `static mut`),
+  so two Workers over disjoint windows won't race on ABI globals. Still **cooperative** (one thread) —
+  this is the substrate + window the parallel driver distributes; the default build stays import-free
+  (185/185 differential intact).
+- [ ] **Step 4b — the parallel driver + host mode selection.** Run each `thread.spawn`ed vCPU on its
+  own Worker (1:1, per D56) over the shared window, the futex on `memory.atomic.wait`/`notify`,
+  selected by a host-set mode (`Cooperative` default | `Parallel`). The remaining wrinkles below
+  (main-thread can't `wait`; per-Worker stack/TLS; thread-safe allocator/`Mutex` across Workers) all
+  belong here. Then differential-test the parallel backend against the cooperative oracle on the corpus.
 
 ### Known wrinkles (surfaced for later steps)
 
@@ -103,15 +116,28 @@ property, so in practice:
 
 ---
 
-## Reproduce (step 1)
+## Reproduce
 
 ```sh
 rustup toolchain install nightly -c rust-src
+
+# Step 1 — shared-memory atomics across OS threads (tiny no_std spike)
 cd browser/threads-spike
 cargo +nightly build --release   # flags baked into .cargo/config.toml (shared mem + atomics)
 node threads.mjs                 # two worker_threads → atomic EXACT 4,000,000; plain races
+cd ..
+
+# Step 2/3 — the substrate + engine bridge (native, in CI)
+cargo test -p svm-mem shared                          # Region::Shared cross-thread atomics + fuzz
+cargo test -p svm --test bytecode_shared_window       # engine over a caller-owned shared window
+
+# Step 4a — the FULL engine as a wasm threads module, run over a SharedArrayBuffer window
+cargo run --bin gencorpus                             # → corpus/threads.svmbc
+RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
+  -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824" \
+  cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+node threads-engine.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm corpus/threads.svmbc 4000
 ```
 
-The build recipe (in `.cargo/config.toml`) is the reusable core for the real threads build:
-`+atomics,+bulk-memory,+mutable-globals` · `--shared-memory --max-memory=… --import-memory` ·
-`--no-entry` · `build-std` (core must be recompiled for `+atomics`).
+The threads-build flags (`+atomics` · `--shared-memory --import-memory --max-memory` · `build-std`)
+are the reusable core; the spike's `.cargo/config.toml` and the Step-4a command share them.
