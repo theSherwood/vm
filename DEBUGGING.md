@@ -122,16 +122,20 @@ different things depending on which pair you compare:
   - *Residual:* watchpoints/conditional breakpoints/time-travel on the bytecode path stay delegated (no
     independent implementation to regress); the per-step SSA reader is single-block-scoped (slot index ==
     block-local index there — multi-block adds the per-block slot base).
-- **G3 — DAP-level cross-engine parity. ⏳ Prerequisite-blocked, *not* design-blocked.** The DAP server
-  drives the `Inspector` (tree-walker) and nothing else, so there is no second backend to compare against
-  — and building one is feature work, not a test: **DAP-over-JIT** is W5 Stage 5 (unbuilt; open design
-  fork — drive the JIT under DAP via `int3`/single-step, *or* interpreter-steps-JIT-runs), and
-  **DAP-over-bytecode** needs a bytecode `Inspector` (breakpoint-stops + the now-demonstrated value
-  reader wired up) — tractable given G2, just unbuilt for priority reasons (the tree-walker already does
-  full-fidelity debugging; the JIT covers native-speed debugging via gdb/DWARF). The *static* source-map
-  half of DAP parity is already covered transitively by **G1** (DAP binds breakpoints through the same
-  §6-derived map G1 proves consistent); the missing piece is **runtime** stepping/inspection *on* a
-  second engine.
+- **G3 — DAP-level cross-engine parity. ⏳ Foundation landed; full backend still feature work.** The DAP
+  server drives the `Inspector` (tree-walker) and nothing else, so the *full* gap — a DAP conversation
+  replayed against a second backend — needs that backend *built*, not just tested: **DAP-over-JIT** is W5
+  Stage 5 (unbuilt; open design fork — drive the JIT under DAP via `int3`/single-step, *or*
+  interpreter-steps-JIT-runs), and **DAP-over-bytecode** needs the bytecode debug primitive wired into
+  the DAP server. The first prerequisite of the bytecode path **landed**: `bytecode::DebugRun` — a
+  resumable debug session (`run_to` a breakpoint, stopping *before* the op like the tree-walker; `value`
+  reads a block-local SSA value at the stop) — the engine-level control+inspection a DAP-over-bytecode
+  backend wires into. `breakpoint_runtime_parity_across_loop_iterations` proves the **runtime** half that
+  G1/G2's one-shot traces don't: the tree-walker `Inspector` and `DebugRun`, driven through the same
+  loop-body breakpoint, report identical stop locations and inspected `(i, acc)` at **every hit** (resume
+  included) and the same result. *Remaining:* wire `DebugRun` into the `svm-dap` server (a backend seam),
+  multi-function/cross-frame value reading, and the JIT path (Stage 5). The *static* source-map half is
+  already covered transitively by **G1**.
 
 ---
 

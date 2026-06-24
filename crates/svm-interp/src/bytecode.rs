@@ -1561,6 +1561,139 @@ pub fn ir_value_trace(
     }
 }
 
+/// A minimal **resumable bytecode debug session** (DEBUGGING.md §1b G3) — the engine-level primitive a
+/// DAP-over-bytecode backend would wire into, the first prerequisite for that second backend. Holds the
+/// running [`Vm`] across stops: [`DebugRun::run_to`] steps until the current op's [`crate::IrPc`] is a
+/// breakpoint (stopping *before* it, like the tree-walker's `seek`/`run_until_stop`) or the run
+/// finishes, and is **resumable** — call it again to reach the next hit (a loop-body breakpoint each
+/// iteration). [`DebugRun::value`] reads a block-local SSA value at the current stop, typed via
+/// `func_value_types` over the stable per-value slots — the bytecode counterpart of
+/// `Inspector::read_ir_value`. Scoped to a single function (the value reader resolves slots for the
+/// entry function's blocks; a call or concurrency seam ends the run). Test surface; not production.
+pub struct DebugRun {
+    mods: [Compiled; 1],
+    table: Table,
+    mem: Option<Mem>,
+    host: Host,
+    vm: Vm,
+    /// Per-block slot base for the entry function (mirror of `compile_func`'s `base`).
+    block_base: Vec<u32>,
+    /// Per-block value types (`func_value_types`), for typing a slot's `Reg` back to a `Value`.
+    block_types: Vec<Vec<ValType>>,
+    /// Paused on a reported breakpoint — step past it before the next `run_to` so we make progress.
+    at_bp: bool,
+    done: Option<Result<Vec<Value>, Trap>>,
+}
+
+impl DebugRun {
+    /// Open a debug session on `m`'s `func(args)`. `None` if the module is outside the engine's subset.
+    pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<DebugRun> {
+        let f = m.funcs.get(func as usize)?;
+        let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
+        let mut block_base = Vec::with_capacity(f.blocks.len());
+        let mut n = 0u32;
+        for b in &f.blocks {
+            block_base.push(n);
+            n += b.params.len() as u32;
+            for inst in &b.insts {
+                n += inst.result_count(&arities) as u32;
+            }
+        }
+        let block_types = svm_verify::func_value_types(f, &m.funcs, m.memory.is_some());
+        let c = compile_module(&m.funcs)?;
+        let mods = [c];
+        let table = build_table(mods[0].progs.len(), 0);
+        let mem = build_mem(m);
+        let host = Host::new();
+        let vm = Vm::new(&mods[0], func as usize, args).ok()?;
+        Some(DebugRun {
+            mods,
+            table,
+            mem,
+            host,
+            vm,
+            block_base,
+            block_types,
+            at_bp: false,
+            done: None,
+        })
+    }
+
+    /// Run until the current op's `IrPc` is in `bps` (stopping *before* it) or the run finishes; returns
+    /// the stop pc, or `None` at completion / a seam. Resumable — a re-entry steps past the last hit.
+    pub fn run_to(&mut self, bps: &[super::IrPc], fuel: &mut u64) -> Option<super::IrPc> {
+        if self.done.is_some() {
+            return None;
+        }
+        let Self {
+            mods,
+            table,
+            mem,
+            host,
+            vm,
+            at_bp,
+            done,
+            ..
+        } = self;
+        // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
+        if *at_bp {
+            *at_bp = false;
+            match vm.resume(&mods[..], table, fuel, mem, host, 1) {
+                Ok(Outcome::Suspended) => {}
+                Ok(Outcome::Done(vals)) => {
+                    *done = Some(Ok(vals));
+                    return None;
+                }
+                Ok(_) => {
+                    *done = Some(Err(Trap::Malformed));
+                    return None;
+                }
+                Err(t) => {
+                    *done = Some(Err(t));
+                    return None;
+                }
+            }
+        }
+        loop {
+            if let Some(pc) = vm.cur_ir_pc(&mods[..]) {
+                if bps.contains(&pc) {
+                    *at_bp = true;
+                    return Some(pc);
+                }
+            }
+            match vm.resume(&mods[..], table, fuel, mem, host, 1) {
+                Ok(Outcome::Suspended) => continue,
+                Ok(Outcome::Done(vals)) => {
+                    *done = Some(Ok(vals));
+                    return None;
+                }
+                Ok(_) => {
+                    *done = Some(Err(Trap::Malformed));
+                    return None;
+                }
+                Err(t) => {
+                    *done = Some(Err(t));
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// The current stop's block-local SSA value `idx`, typed — the bytecode counterpart of
+    /// `Inspector::read_ir_value`. `None` if not paused at an instruction or `idx` is out of range.
+    pub fn value(&self, idx: usize) -> Option<Value> {
+        let pc = self.vm.cur_ir_pc(&self.mods[..])?;
+        let off = *self.block_base.get(pc.block)? as usize;
+        let ty = *self.block_types.get(pc.block)?.get(idx)?;
+        Some(self.vm.regs[self.vm.base + off + idx].to_value(ty))
+    }
+
+    /// The run result once finished (`None` while still running).
+    pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
+        self.done.as_ref()
+    }
+}
+
 /// Like [`compile_and_run`], but drives the reified [`Vm`] in slices of at most `slice` ops,
 /// suspending and resuming at op boundaries until the entry function completes (or traps). The
 /// result must be **bit-identical** to [`compile_and_run`] for any `slice ≥ 1` — that equality is

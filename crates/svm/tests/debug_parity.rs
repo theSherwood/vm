@@ -463,3 +463,94 @@ fn ssa_var_value_parity_per_step() {
     assert_eq!(bc[last].1[2], Value::I32(6));
     assert_eq!(bc[last].1[3], Value::I32(36));
 }
+
+// ---- G3 foundation: runtime breakpoint parity on a *second* engine -------------------------------
+
+// A counting loop with two SSA loop variables visible in the body block: `i` = block1's value 0 (the
+// down-counter), `acc` = block1's value 1 (the accumulator). Stopping at the body each iteration lets
+// us compare the inspected (i, acc) across engines hit-for-hit.
+const LOOP_VAR_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 0
+  br block1(v0, v1)
+block1(v2: i32, v3: i32):
+  v4 = i32.add v3 v2
+  v5 = i32.const -1
+  v6 = i32.add v2 v5
+  br_if v6 block1(v6, v4) block2(v4)
+block2(v7: i32):
+  return v7
+}
+
+debug.file 0 "loopvar.c"
+debug.fname 0 "loopsum"
+debug.type 0 base "int" signed 4
+debug.var 0 "i" ssa 0 "int"
+debug.var 0 "acc" ssa 1 "int"
+"#;
+
+/// G3 foundation — **runtime** debug parity on a second engine, the piece G1/G2's one-shot traces
+/// don't exercise: the tree-walker `Inspector` and the resumable `bytecode::DebugRun` are driven
+/// through the *same loop-body breakpoint* and must report identical stop locations and inspected
+/// `(i, acc)` at **every hit** (resume included), plus the same result. This is the load-bearing
+/// behavior a DAP-over-bytecode backend would wire into.
+#[test]
+fn breakpoint_runtime_parity_across_loop_iterations() {
+    let m = parse_module(LOOP_VAR_DBG).expect("parse");
+    let args = [Value::I32(3)];
+    // The loop-body breakpoint: block 1, inst 0 (`v4 = add`); block-local 0/1 are `i`/`acc`.
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 1,
+        inst: 0,
+    };
+
+    // Tree-walker: stop at the breakpoint each iteration; read i/acc via the inspection API.
+    let mut insp = Inspector::attach(&m, 0, &args, 100_000);
+    insp.set_breakpoint(bp);
+    let mut tw_hits: Vec<(Value, Value)> = Vec::new();
+    let tw_res = loop {
+        match insp.run_until_stop() {
+            Stop::Break { pc, .. } => {
+                assert_eq!(pc, bp, "tree-walker stopped at the loop-body breakpoint");
+                tw_hits.push((
+                    insp.read_ir_value(0, 0).unwrap(),
+                    insp.read_ir_value(0, 1).unwrap(),
+                ));
+            }
+            Stop::Finished(r) => break r,
+            Stop::Blocked => panic!("single-threaded fixture must not block"),
+        }
+    };
+
+    // Bytecode engine: the resumable debug session, same breakpoint, same inspection.
+    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut fuel = 100_000u64;
+    let mut bc_hits: Vec<(Value, Value)> = Vec::new();
+    while let Some(pc) = dbg.run_to(&[bp], &mut fuel) {
+        assert_eq!(
+            pc, bp,
+            "bytecode engine stopped at the loop-body breakpoint"
+        );
+        bc_hits.push((dbg.value(0).unwrap(), dbg.value(1).unwrap()));
+    }
+    let bc_res = dbg.result().cloned().unwrap();
+
+    assert_eq!(
+        bc_hits, tw_hits,
+        "per-iteration (i, acc) at the breakpoint diverge between engines"
+    );
+    assert_eq!(bc_res, tw_res, "result diverges between engines");
+    // Concretely: counter 3 -> 0 yields hits (3,0),(2,3),(1,5) and result 6.
+    assert_eq!(
+        tw_hits,
+        vec![
+            (Value::I32(3), Value::I32(0)),
+            (Value::I32(2), Value::I32(3)),
+            (Value::I32(1), Value::I32(5)),
+        ]
+    );
+    assert_eq!(tw_res, Ok(vec![Value::I32(6)]));
+}
