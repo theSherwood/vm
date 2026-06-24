@@ -295,6 +295,22 @@ hot loops are rare in real code, so this is low priority.
 
 ---
 
+### I11 — on-ramp fails-closed on an auto-vectorized `<8 x i32>` shape the I2 legalizer doesn't cover (S3) — found via Embench `edn` — **FIX LANDED** on `claude/onramp-i11-wide-i32x8`
+
+**Fixed.** The pinned shape was a **wide lane-wise shift**: `edn`'s `vec_mpy` fixed-point kernel
+(`y[i] += (short)((scaler * x[i]) >> 15)`) auto-vectorizes to a `<8 x i32>` widening multiply followed
+by a `>>15` shift. I10 added 128-bit vector shifts but the **wide** legalizer's op dispatch had no
+`Shl`/`LShr`/`AShr` arm, so a wider-than-128 shift fell through to the `Unsupported("<8 x i32>")` type
+fallthrough — even though the surrounding `sext`/`mul`/`trunc` already chunked. The fix adds those three
+arms (`lower_wide`) routed through a new `wide_int_shift`: each `v128` chunk shifts via `VShift` (one
+scalar splat amount, the same uniform-amount recognizer the 128-bit path uses — a per-lane-varying amount
+stays fail-closed), each scalar tail lane via `IntBin`. *Test* (`translate.rs`
+`simd_autovec_avx2_fixed_point_shift`): the `-O2 -mavx2` `vec_mpy` kernel translates and runs **bit-exact
+vs the native scalar `cc` oracle on both backends**. *Still a small follow-up:* the `memcmp`/`bcmp`
+on-ramp builtins noted above (the other reason `edn` may need the Embench wrapper's `-fno-builtin`).
+
+---
+
 ### I13 — `<2 x i16>` "no-redundant-load" vector pattern miscompiled (soundness) — **fail-closed (stopgap landed)**, root fix pending — found via Embench `edn`/`fir_no_red_ld`
 
 **STATUS:** the silent miscompile is **fail-closed** on `claude/perf-i11-i12` (a φ that carries a tiny

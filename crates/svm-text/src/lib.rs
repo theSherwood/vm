@@ -395,6 +395,8 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
+        Inst::SetJmp { buf } => format!("setjmp v{buf}"),
+        Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
         // §GC conservative root enumeration.
         Inst::GcRoots {
             heap_lo,
@@ -1785,6 +1787,16 @@ impl<'a> Parser<'a> {
             return Ok(Inst::Suspend {
                 value: self.value(names)?,
             });
+        }
+        if op == "setjmp" {
+            return Ok(Inst::SetJmp {
+                buf: self.value(names)?,
+            });
+        }
+        if op == "longjmp" {
+            let buf = self.value(names)?;
+            let val = self.value(names)?;
+            return Ok(Inst::LongJmp { buf, val });
         }
         if op == "gc.roots" {
             let heap_lo = self.value(names)?;

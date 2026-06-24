@@ -1370,6 +1370,36 @@ block0(v0: i64):
     }
 }
 
+/// Self-contained scalar-float probe (`wasmtime --invoke run_float`): reinterpret the f64 bits of
+/// `4.0`, take `sqrt(|·|)`, and return the result's i64 bits — `4611686018427387904` (the bits of
+/// `2.0`) iff f64 reinterpret/abs/sqrt round-trip bit-exactly on this target, else `-1`.
+#[no_mangle]
+pub extern "C" fn run_float() -> i64 {
+    const SQRT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.reinterpret_i64 v0
+  v2 = f64.abs v1
+  v3 = f64.sqrt v2
+  v4 = i64.reinterpret_f64 v3
+  return v4
+}
+"#;
+    let Ok(m) = svm_text::parse_module(SQRT) else {
+        return -1;
+    };
+    let mut fuel = u64::MAX;
+    // arg = bits(4.0) = 0x4010000000000000; sqrt(4.0) = 2.0 = bits 0x4000000000000000.
+    let arg = 0x4010000000000000u64 as i64;
+    match bytecode::compile_and_run(&m, 0, &[Value::I64(arg)], &mut fuel) {
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            _ => -1,
+        },
+        _ => -1,
+    }
+}
+
 // ---- live host imports: bind capabilities to real host functions ----------------------------
 //
 // Everything above keeps the cdylib import-free by buffering I/O. This (feature-gated) entry instead

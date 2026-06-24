@@ -13,6 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 jobs:
+
   check:
     name: build · test · fmt · clippy
     runs-on: ubuntu-latest
@@ -31,6 +32,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -45,6 +47,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --workspace
       - run: cargo test --workspace
+
   fuzz:
     name: cargo-fuzz (escape-TCB targets)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -60,6 +63,7 @@ jobs:
         with: { workspaces: fuzz }
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+
   bench:
     # Non-gating perf signal (DESIGN §1a). Wall-clock on shared runners is noisy and the
     # committed `bench/baseline.txt` records *another* machine's ratios, so this never blocks a
@@ -81,6 +85,7 @@ jobs:
       - name: bench --check vs committed baseline
         working-directory: bench
         run: cargo run --release -- --check baseline.txt --tol 0.4
+
   loom:
     name: loom (parallel scheduler model check)
     runs-on: ubuntu-latest
@@ -137,6 +142,7 @@ jobs:
           # ("partially overlapping store buffer when previous write was atomic" — a Miri bug, not ours).
           # Disabling it keeps full UB / provenance / data-race / alignment checking.
           MIRIFLAGS: "-Zmiri-disable-weak-memory-emulation"
+
   supply-chain:
     # Scan the dependency tree against the RustSec advisory DB. Gated off pull_request so a
     # newly-published advisory on a transitive dep surfaces on main / nightly without blocking
@@ -169,6 +175,7 @@ jobs:
           # The scheduler intentionally leaks values live on a dropped-suspended fiber's stack
           # (documented), so leak detection would false-positive — keep it to UB/races here.
           ASAN_OPTIONS: "detect_leaks=0"
+
   tsan:
     # ThreadSanitizer over the shared-region hardware atomics (svm-mem's parallel vCPU substrate).
     name: TSan (svm-mem concurrency)
@@ -183,3 +190,45 @@ jobs:
         run: cargo test -p svm-mem -Z build-std --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
+
+  wasm32-differential:
+    name: wasm32 differential (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      - run: rustup target add wasm32-unknown-unknown
+      # gencorpus (native) writes corpus.json + corpus/*.svmbc; build the wasm32 lib; diff in Node
+      # (Node is preinstalled on ubuntu-latest — corpus.mjs needs only WebAssembly + BigInt).
+      - name: wasm32 corpus differential (119/119 vs native)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          cargo build --release --lib --target wasm32-unknown-unknown
+          node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
+
+  wasm64-differential:
+    name: wasm64 differential (Wasmtime embedding)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "" # override the global -D warnings: -Z build-std recompiles std from source
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            browser
+            browser/wt
+      - name: wasm64 corpus differential (119/119 vs native)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          cargo build -Z build-std=std,panic_abort --release --lib \
+            --target wasm64-unknown-unknown
+          cargo run --manifest-path wt/Cargo.toml --release -- \
+            target/wasm64-unknown-unknown/release/svm_browser.wasm
+

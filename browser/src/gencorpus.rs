@@ -838,6 +838,127 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Args fed to each kernel (all `(i64) -> (i64)`), incl. negatives and a large value.
+// ---- scalar floating-point (f32/f64) — the one numeric family where wasm↔native can diverge ----
+// Each guest reinterprets the i64 arg to an f64, computes, and reinterprets the result back to i64
+// **bits**, so the differential is exact — it catches NaN-payload canonicalization and rounding,
+// which integer ops can't. Float constants come from `f64.convert_i64_s` (no float-literal parsing).
+
+// add/sub/mul/div + i64→f64 convert: ((a + 3) * 2 - 1) / 2, all in f64.
+const FLOAT_ARITH: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.reinterpret_i64 v0
+  v2 = i64.const 3
+  v3 = f64.convert_i64_s v2
+  v4 = f64.add v1 v3
+  v5 = i64.const 2
+  v6 = f64.convert_i64_s v5
+  v7 = f64.mul v4 v6
+  v8 = i64.const 1
+  v9 = f64.convert_i64_s v8
+  v10 = f64.sub v7 v9
+  v11 = f64.div v10 v6
+  v12 = i64.reinterpret_f64 v11
+  return v12
+}
+"#;
+
+// sqrt(|a|) — sqrt rounding + abs; sqrt(NaN)/sqrt(-x) exercise NaN canonicalization.
+const FLOAT_SQRT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.reinterpret_i64 v0
+  v2 = f64.abs v1
+  v3 = f64.sqrt v2
+  v4 = i64.reinterpret_f64 v3
+  return v4
+}
+"#;
+
+// min/max/copysign vs 1.0 — the signed-zero and NaN-propagation edges of min/max + sign transfer.
+const FLOAT_MINMAX: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.reinterpret_i64 v0
+  v2 = i64.const 1
+  v3 = f64.convert_i64_s v2
+  v4 = f64.min v1 v3
+  v5 = f64.max v4 v3
+  v6 = f64.copysign v5 v1
+  v7 = i64.reinterpret_f64 v6
+  return v7
+}
+"#;
+
+// f64→f32→f64 round-trip (precision loss, inf/NaN), then saturating f64→i64 (inf→MAX, NaN→0).
+const FLOAT_CONVERT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.reinterpret_i64 v0
+  v2 = f32.demote_f64 v1
+  v3 = f64.promote_f32 v2
+  v4 = i64.trunc_sat_f64_s v3
+  return v4
+}
+"#;
+
+// comparisons: (a < 1.0) + (a == a) — the second is 0 only for NaN (the classic NaN ≠ NaN test).
+const FLOAT_CMP: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.reinterpret_i64 v0
+  v2 = i64.const 1
+  v3 = f64.convert_i64_s v2
+  v4 = f64.lt v1 v3
+  v5 = f64.eq v1 v1
+  v6 = i32.add v4 v5
+  v7 = i64.extend_i32_u v6
+  return v7
+}
+"#;
+
+// f64 bit patterns spanning the corners where a backend might diverge.
+const FLOAT_ARGS: &[i64] = &[
+    0x0000000000000000u64 as i64, // +0.0
+    0x8000000000000000u64 as i64, // -0.0
+    0x3FF0000000000000u64 as i64, // 1.0
+    0xBFF0000000000000u64 as i64, // -1.0
+    0x4000000000000000u64 as i64, // 2.0
+    0x3FB999999999999Au64 as i64, // 0.1 (rounding)
+    0x400921FB54442D18u64 as i64, // π
+    0x7FF0000000000000u64 as i64, // +inf
+    0xFFF0000000000000u64 as i64, // -inf
+    0x7FF8000000000000u64 as i64, // quiet NaN
+    0x7FF0000000000001u64 as i64, // signaling NaN
+    0x7FEFFFFFFFFFFFFFu64 as i64, // max finite
+    0x0000000000000001u64 as i64, // smallest subnormal
+];
+
+// Fail-closed UNSUPPORTED path: a module the bytecode engine rejects (`compile_module → None`) —
+// `cont.new` (fiber) **and** a coroutine `cap.call 6 2` in one module is an unsupported combination,
+// so `svm_run` must return STATUS_UNSUPPORTED, matching native. (Forged handle never runs.)
+const UNSUP: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i32.const 0
+  v4 = i64.const 1
+  v5 = i64.const 0
+  v6 = i64.const 12
+  v7 = i64.const 0
+  v8 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v3 (v4, v5, v6, v7)
+  v9 = i64.const 0
+  return v9
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = i64.const 0
+  return v0
+}
+"#;
+
 const ARGS: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000];
 
 fn native(m: &svm_ir::Module, args: &[Value]) -> (i32, i64) {
@@ -872,6 +993,7 @@ fn main() {
         ("mem", MEM, 1),
         ("divtrap", DIVTRAP, 1),
         ("threads", THREADS, 0),
+        ("unsup", UNSUP, 0), // fail-closed: bytecode engine rejects it → STATUS_UNSUPPORTED
     ];
     // Powerbox corpus — (name, source, stdin): each runs once under the real capability set.
     let powerbox = [
@@ -998,15 +1120,15 @@ fn main() {
             if i + 1 == fibers.len() { "\n" } else { ",\n" },
         ));
     }
-    // Compute-style feature sections (1-arg sweep, svm_run): tail calls and SIMD/v128.
-    let mut emit_sweep = |section: &str, mods: &[(&str, &str)]| {
+    // Compute-style feature sections (1-arg sweep, svm_run): tail calls, SIMD/v128, scalar floats.
+    let mut emit_sweep = |section: &str, mods: &[(&str, &str)], sweep: &[i64]| {
         json.push_str(&format!("],\n\"{section}\":[\n"));
         for (i, (name, src)) in mods.iter().enumerate() {
             let (m, file) = emit(name, src);
             json.push_str(&format!(
                 "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"nargs\":1,\"cases\":["
             ));
-            for (j, &arg) in ARGS.iter().enumerate() {
+            for (j, &arg) in sweep.iter().enumerate() {
                 let (status, value) = native(&m, &[Value::I64(arg)]);
                 json.push_str(&format!(
                     "{}{{\"arg\":\"{arg}\",\"status\":{status},\"value\":\"{value}\"}}",
@@ -1016,7 +1138,7 @@ fn main() {
             json.push_str(if i + 1 == mods.len() { "]}\n" } else { "]},\n" });
         }
     };
-    emit_sweep("tailcall", &[("tail_fact", TAIL_FACT), ("tail_indirect", TAIL_INDIRECT)]);
+    emit_sweep("tailcall", &[("tail_fact", TAIL_FACT), ("tail_indirect", TAIL_INDIRECT)], ARGS);
     emit_sweep(
         "simd",
         &[
@@ -1024,6 +1146,19 @@ fn main() {
             ("simd_i32x4", SIMD_I32X4),
             ("simd_mem", SIMD_MEM),
         ],
+        ARGS,
+    );
+    // Scalar floats swept over NaN/inf/subnormal/rounding bit patterns (the divergence corners).
+    emit_sweep(
+        "float",
+        &[
+            ("float_arith", FLOAT_ARITH),
+            ("float_sqrt", FLOAT_SQRT),
+            ("float_minmax", FLOAT_MINMAX),
+            ("float_convert", FLOAT_CONVERT),
+            ("float_cmp", FLOAT_CMP),
+        ],
+        FLOAT_ARGS,
     );
     // Reflection corpus — §7 cap.self.* over the fixed 3-cap powerbox (run via svm_run_reflect).
     // SELF_COUNT takes no arg (→ 3); SELF_GET sweeps cap indices (0,1,2 valid; 3 out of range).

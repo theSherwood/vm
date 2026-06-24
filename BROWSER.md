@@ -124,10 +124,14 @@ wasmtime run --invoke run_region    -W memory64=y "$W"   # ...cdef (SharedRegion
 wasmtime run --invoke run_jit       -W memory64=y "$W"   # 142 (guest installs + call_indirects a JIT unit)
 wasmtime run --invoke run_dynlink   -W memory64=y "$W"   # 777 (compile_linked resolves a named import)
 wasmtime run --invoke run_durable   -W memory64=y "$W"   # 2001 (durable NORMAL run; freeze/thaw differ in corpus)
+wasmtime run --invoke run_float     -W memory64=y "$W"   # 4611686018427387904 (sqrt(4.0)=2.0, bit-exact)
 
-# Differential (compute + powerbox + snapshot + nested + fibers/coroutines + tailcall + SIMD + gc.roots + reflection + SharedRegion + guest-JIT + dynlink + durability) — 119/119
+# Full differential (14 feature families, 185 cases) vs native ground truth — byte-identical
 cargo run --bin gencorpus                                # native ground truth → corpus.json
-node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
+node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm   # wasm32 (Node): 185/185
+# wasm64 (Wasmtime embedding): the same 185 cases byte-fed through the production target
+cargo run --manifest-path wt/Cargo.toml --release -- \
+  target/wasm64-unknown-unknown/release/svm_browser.wasm                 # wasm64: 185/185
 
 # Live host imports — guest console/clock bound to real wasm imports (default build is import-free)
 cargo build --release --lib --target wasm32-unknown-unknown --features live
@@ -200,31 +204,49 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   bytecode engine (decode encoded IR → run → `i64`), deny-all `Host` (compute-only v1), fail-closed
   on `compile_module == None`. Builds for wasm32 **and** wasm64; runtime-validated end-to-end on
   wasm32 in Node (anchors + decode-error path green).
-- [x] **wasm64 runtime validation.** On Wasmtime 45 (`-W memory64=y`): `run_guest` (compute) and
-  `run_threads` (cooperative `drive` → 4000) both correct on memory64/table64. Node/V8 still lacks
-  table64 (above) — browser path stays wasm32 until then. Optional follow-up: reproduce the full
-  `svm_run` byte-feeding differential on wasm64 via a Wasmtime embedding (the CLI `--invoke` can't
-  write a host buffer; the embedded probes already exercise the whole engine on wasm64).
+- [x] **wasm64 runtime validation.** On Wasmtime 45 (`-W memory64=y`): the 17 embedded `--invoke`
+  probes (`run_guest`/`run_threads`/… → `run_durable`/`run_float`) all correct on memory64/table64.
+  Node/V8 still lacks table64 (above) — the browser-via-V8 path stays wasm32 until then.
+- [x] **wasm64 byte-feeding differential (`browser/wt/`).** The CLI `--invoke` can't write the
+  `svm_alloc` buffers, so a small Wasmtime-embedding harness (`svm-wt`, deps `wasmtime` + `serde_json`,
+  no SVM crates) loads the **wasm64** module, `svm_alloc`s + writes each corpus module/stdin/window,
+  calls the exports, reads results/streams/snapshots back, and compares to the *same* `corpus.json`.
+  **185/185 match on wasm64** — byte-identical to wasm32 and native, including the 128 KiB durability
+  snapshots and the 2 MiB echo. So the full differential now runs on **both** targets, not probe-only
+  on the production one.
 - [x] **cfg-gate `lib.rs` for wasm.** `page_size` is now native-only (`target.'cfg(not(wasm))'`)
   with a 64 KiB wasm fallback in `host_page_size()`/`host_region_granularity()` — dropped from the
   wasm dep graph; native unchanged (full `svm-interp`/`svm-mem` suite green, workspace builds). The
   OS-thread machinery (`Scheduler`/`OffloadPool`/`std::thread`) needed no gating: it's unreachable
   from the `cdylib` exports and already stripped by `--gc-sections` (zero symbols, zero imports in
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
-- [x] **Differential check (compute + concurrency + powerbox + snapshot + nested + fibers/coroutines +
-  scale, wasm32).** `gencorpus` (host) encodes a corpus + computes the **native** result per case;
-  `corpus.mjs` runs the same modules through the wasm exports and compares. **119/119 match**, zero host
-  imports.
+- [x] **Differential check (14 feature families, wasm32 + wasm64).** `gencorpus` (host) encodes a
+  corpus + computes the **native** result per case; `corpus.mjs` (wasm32, Node) and `browser/wt`
+  (wasm64, Wasmtime) run the same modules through the wasm exports and compare. **185/185 match**, zero
+  host imports.
   *Compute/concurrency* (37): i64 arith+branches, multi-function `call`, memory store/load,
   divide-by-zero → `STATUS_TRAP`, **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` =
   **4000** on the cooperative `drive`). *Powerbox* (5): stdout greeting, stdin→stdout echo,
   monotonic-clock delta, `exit(42)` → `STATUS_EXIT`, and stderr role-routing. *Snapshot* (3): a window
   seeded with 16 i64 words, transformed in place (`+arg`), with the **final memory image** captured
   and compared byte-for-byte. *Nested children* (5): §14 confined sub-guests (shared backing, depth-2,
-  attenuated AddressSpace, boundary rejection, trap propagation). *Scale* (1): a **2 MiB** stdin→stdout
-  echo through `svm_alloc`ed buffers. `gencorpus` and the wasm entries share the *same*
-  `powerbox_exec`/`capture_exec`/`instantiate_exec` (the crate is `cdylib`+`rlib`), so the check
-  isolates wasm effects, not logic drift.
+  attenuated AddressSpace, boundary rejection, trap propagation). Plus fibers/coroutines, tail calls,
+  SIMD/v128, gc.roots, reflection, SharedRegion, guest-JIT, dynlink, durability. *Scalar floats* (65):
+  f32/f64 `add`/`sub`/`mul`/`div`/`sqrt`/`min`/`max`/`copysign`/conversions/comparisons over **NaN /
+  ±inf / ±0 / subnormal / rounding** bit patterns — reinterpreted to i64 bits and compared **exactly**,
+  the one numeric corner where a backend could diverge (NaN-payload canonicalization, rounding); it
+  doesn't. *Fail-closed* (1): a module the engine rejects → `STATUS_UNSUPPORTED` (the negative path
+  beside `STATUS_DECODE_ERR`). *Scale* (1): a **2 MiB** stdin→stdout echo through `svm_alloc`ed
+  buffers. `gencorpus` and the wasm entries share the *same* exec helpers (the crate is
+  `cdylib`+`rlib`), so the check isolates wasm effects, not logic drift.
+- [x] **Scalar floats + fail-closed path.** The one numeric family integer ops can't stand in for:
+  f32/f64 `add`/`sub`/`mul`/`div`/`sqrt`/`min`/`max`/`copysign`, `i64↔f64` conversions (incl. saturating
+  trunc + f32 demote/promote), and comparisons — each guest reinterprets the i64 arg to f64, computes,
+  and reinterprets the result to **i64 bits**, swept over NaN / ±inf / ±0 / subnormal / rounding
+  patterns and compared **exactly**. Proves NaN-payload canonicalization and rounding agree across
+  native / wasm32 / wasm64 (65 cases). Plus the `unsup` guest — a module the engine rejects →
+  `STATUS_UNSUPPORTED`, pinning the fail-closed boundary's second negative path. wasm64
+  `run_float() == 4611686018427387904` (bits of `2.0`).
 - [x] **Host powerbox (console + clock).** `svm_run_pb` grants streams/clock/exit; the cdylib stays
   import-free; validated on wasm32 (5-case differential above) and wasm64 (`run_powerbox() == 17`).
 - [x] **Memory ABI (`svm_alloc`/`svm_dealloc`).** Replaced the fixed 1 MiB scratch buffers: the host
@@ -300,7 +322,8 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 119/119
-  differential vs native), and `node browser/live.mjs` (host-import demo,
-  `--features live`). wasm64 is exercised via the Wasmtime `--invoke` probes under **Reproduce**.
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 185/185
+  differential vs native on wasm32), `browser/wt` (the **same 119 on wasm64** via a Wasmtime
+  embedding), and `node browser/live.mjs` (host-import demo, `--features live`). The 16 embedded
+  `--invoke` probes under **Reproduce** spot-check each feature on wasm64 directly.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

@@ -41,8 +41,7 @@ fn clock_fast_path_matches_generic_and_interp() {
     let mut host = Host::new();
     let clk = host.grant_clock();
     let ctx = &mut host as *mut Host as *mut core::ffi::c_void;
-    let gen =
-        unsafe { compile_and_run_with_host(&m, 0, &[clk as i64], cap_thunk, ctx) }.expect("jit");
+    let gen = compile_and_run_with_host(&m, 0, &[clk as i64], cap_thunk, ctx).expect("jit");
     assert_eq!(
         gen,
         JitOutcome::Returned(vec![1]),
@@ -53,17 +52,15 @@ fn clock_fast_path_matches_generic_and_interp() {
     let mut host = Host::new();
     let clk = host.grant_clock();
     let ctx = &mut host as *mut Host as *mut core::ffi::c_void;
-    let fast = unsafe {
-        compile_and_run_with_host_fast(
-            &m,
-            0,
-            &[clk as i64],
-            cap_thunk,
-            ctx,
-            fast_cap_resolver,
-            Quota::default(),
-        )
-    }
+    let fast = compile_and_run_with_host_fast(
+        &m,
+        0,
+        &[clk as i64],
+        cap_thunk,
+        ctx,
+        fast_cap_resolver,
+        Quota::default(),
+    )
     .expect("jit fast");
     assert_eq!(fast, JitOutcome::Returned(vec![1]), "jit fast clock delta");
 }
@@ -77,17 +74,15 @@ fn clock_fast_path_faults_on_forged_handle() {
     let _real = host.grant_clock();
     let forged = 0x7fff_fffe; // not a valid (slot, generation) for a CLOCK binding
     let ctx = &mut host as *mut Host as *mut core::ffi::c_void;
-    let r = unsafe {
-        compile_and_run_with_host_fast(
-            &m,
-            0,
-            &[forged],
-            cap_thunk,
-            ctx,
-            fast_cap_resolver,
-            Quota::default(),
-        )
-    };
+    let r = compile_and_run_with_host_fast(
+        &m,
+        0,
+        &[forged],
+        cap_thunk,
+        ctx,
+        fast_cap_resolver,
+        Quota::default(),
+    );
     // A CapFault surfaces as a trap (Err) or a Trapped outcome — either way, not a clean return.
     let faulted = !matches!(r, Ok(JitOutcome::Returned(_)));
     assert!(

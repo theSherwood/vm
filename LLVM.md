@@ -996,6 +996,441 @@ lanes re-enable vectorization (the capstone).** The remaining gaps that blocked 
   corpus (`sha256`/`xxhash`/`perlin`/`crc32`/`clay`/`regex`/`jsmn`/`heapgrow`/…), C++, Rust, the
   powerbox/async/JIT demos, and the focused `simd_*` shape/op-class tests. fmt + clippy clean.
 
+**Slice AU (DONE) — full chibicc-demo parity: every program the C frontend runs now runs through the
+on-ramp.** LLVM is the main frontend, so the on-ramp must cover *everything* chibicc does. The corpus
+demos already crossed (slices A–AT); this closes the remaining chibicc demos — the two compute demos
+and the **five concurrency demos** — with **no translator change** (the `__vm_*` capability/concurrency
+surface from slices AC–AF already lowers them):
+- **`calc` / `rational`** (`demos/calc.c`, `demos/rational.c`) — added to the native differential
+  (`check_demo_vs_native`, byte-identical to `cc`). `calc` is a recursive-descent calculator over a
+  **global function-pointer dispatch table** (relocations + `call_indirect`, slices K/G) with
+  recursion; `rational` hammers the **by-value-aggregate sret ABI** (D39/slice J) — every op passes
+  *and* returns a `struct Rat` by value, including an **indirect struct-returning call** through a
+  dispatch table (sret + funcref relocation + struct-valued `call_indirect`, all at once).
+- **The concurrency demos** (`work_stealing`, `mn_sched`, `steal_fibers`, `malloc_threads`,
+  `async_work_stealing`) — these `#include <pthread.h>`, which is **chibicc's bundled guest libc** (a
+  1:1 threading layer over `thread.spawn`/`join` + the futex + atomics). clang compiles them with the
+  chibicc include dir on the path (`-I frontend/chibicc/include`), so the pthread shim resolves to the
+  `__vm_*` builtins the on-ramp lowers — i.e. **the guest brings its own libc** (the on-ramp's model),
+  here reusing chibicc's. They have no native oracle (`__vm_*` / guest fibers have no native symbol),
+  so each asserts its **interleaving-invariant total** (the chibicc `c_guest_*` contract, via the LLVM
+  frontend): `work_stealing` → 256, `mn_sched` → 1024 (stackful fibers, `cont.*`), `steal_fibers` →
+  256 + 121920 (migratable fibers + stack-integrity), `malloc_threads` → 0 (thread-safe allocator, no
+  overlap), `async_work_stealing` → Σ mix(0..16). The first four run on the **real powerbox**
+  (`run_powerbox_with_deadline`, M:N executor); `async_work_stealing` is interpreter-only (the M:N +
+  offload-pool oracle, like `vm_async_io_runtime` — the JIT async path needs the `HostAsyncHooks`
+  harness). Tests (`translate.rs`): `demo_calc_vs_native`, `demo_rational_vs_native`,
+  `demo_{work_stealing,mn_sched,steal_fibers,malloc_threads}_vs_chibicc`,
+  `vm_async_work_stealing_runtime`.
+- **`jit_threads`** (`demos/jit/jit_threads.c`) — the **threaded** guest-driven JIT (the threaded
+  sibling of the `jit_demo` capstone): `NWORKERS` pthreads each build + `__vm_jit_compile` a distinct
+  unit concurrently (several `Jit.compile`s in flight, serialized through the per-domain `Mutex<Host>`
+  the powerbox engages for a `thread.spawn`ing guest) and check the native code against a C reference.
+  Combines the guest pthread shim with the `Jit` capability + the 8-handle powerbox; prints `0`. Like
+  the single-threaded demo it probes svm-llvm's window `size_log2` and patches the blob descriptor.
+  Test: `vm_jit_threads_demo`.
+- **157 translate tests green, fmt + clippy clean.** The on-ramp now runs **every demo the chibicc
+  frontend does** — the breadth frontier is now *bigger* real-world programs (and other-language
+  runtimes), not chibicc parity.
+
+**Slice AV (DONE) — computed `goto`: `indirectbr` / `blockaddress` (the interpreter-category unlock).**
+The threaded-dispatch idiom (`static void *tbl[] = {&&l0,…}; goto *tbl[op];`) every real bytecode VM is
+built on (SQLite's VDBE, Lua, QuickJS) now lowers. clang `-O2` turns `&&label` into `blockaddress`
+constants in the dispatch-table global and `goto *p` into an `indirectbr`:
+- **The `llvm-ir` gap.** `llvm-ir` 0.11.3 erases a `blockaddress`'s operands (`Constant::BlockAddress`
+  is payloadless). The LLVM-C API *does* expose them, so — exactly as `di.rs` does for the debug-info
+  graph — `src/blockaddr.rs` re-parses the `.bc` through `llvm-sys` and recovers, per global, the
+  blockaddress targets **in DFS order** (the `const_bytes` serialization order, popped positionally —
+  the `di.rs` ordinal discipline). Threaded in via `translate_bc_path` like `di`.
+- **Lowering.** A `blockaddress(@f, %bb)` → the **index of `%bb` within `@f`** (matching `block_idx`),
+  baked into the table global by `const_bytes` (8 LE bytes, pointer width). `indirectbr %p, [dests…]`
+  (`translate_indirectbr`) → a `br_table` indexed by that block index over `[0, nblocks)`: each listed
+  dest routes to its block; out-of-list / out-of-range (UB) falls to the default (the first dest — a
+  defined in-sandbox branch, §3b totality, never taken on well-defined input). `possible_dests` are all
+  successors, so liveness threads each target's live-ins as `br_table` edge args (reusing `branch_args`).
+- **Tests:** `computed_goto_threaded_interpreter` (a real threaded bytecode VM whose program is derived
+  from `n` at runtime — so no dispatch constant-folds — byte-identical to native on **both** backends)
+  and `computed_goto_lowers_indirectbr_to_br_table` (structural: recovery finds the table labels, the
+  `indirectbr` becomes a `br_table`). **159 translate tests green, fmt + clippy clean.**
+- *Follow-up — DONE (slice AW):* an **operand-position** blockaddress — clang's jump-threading threads
+  one through a φ (an instruction operand, not a global). `blockaddr.rs` now also walks every defined
+  function's φ nodes, keyed positionally `(func_idx, block_idx, phi_ord, incoming_idx)` (φ results /
+  blocks are usually unnamed → the `di.rs` ordinal discipline); `branch_args` resolves a φ-incoming
+  `blockaddress` to its block-index constant (`BlockCtx::phi_operand`). Test:
+  `computed_goto_phi_threaded_blockaddress` — the same threaded VM but with a *constant* first dispatch
+  (so clang threads the entry target through a φ), byte-identical to native on both backends, plus
+  `computed_goto_phi_recovery_finds_operand_blockaddress` (structural). Computed `goto` is now robust
+  enough for a real interpreter (Lua). **161 translate tests green, fmt + clippy clean.**
+
+### Next frontier — real-world programs as correctness indicators
+
+chibicc parity is done (slice AU). The on-ramp ingests *any* LLVM frontend's `-O2` bitcode, so the
+next proof is **whole real-world programs** — not feature unit-tests but recognizable software whose
+own test suites/known-answers validate the translation. This section is the standing plan for that
+push: the selection criteria, the concrete translator gaps these programs force, the target ladder,
+and the **SQLite** north star (in-memory *and* disk-backed via the powerbox).
+
+### What makes a strong indicator (selection criteria)
+1. **Self-validating** — ships known-answer vectors or its own test suite, so "correct" is a
+   differential (native build vs on-ramp, or built-in KAT) rather than a hand-computed guess.
+2. **Feature-dense in bug-finding ways** — hits translator corners toy demos don't: irregular control
+   flow, the by-value-aggregate/varargs ABI, float formatting, wide integer math.
+3. **Low OS surface** — can run in-memory / over embedded inputs. The on-ramp supplies
+   `malloc`/string/`printf` (synthesized helpers) and the `__vm_*` capability surface, but **no
+   ambient filesystem or sockets** — real I/O must come through a granted powerbox capability (below).
+
+### Translator gaps these programs force (the real value of picking them)
+Picking a target is really picking the *gap* it drives to completion. Current status:
+- **Computed `goto` → `indirectbr` / `blockaddress` — DONE (slices AV + AW).** The linchpin for the
+  interpreter category (SQLite's VDBE, Lua, QuickJS). A `blockaddress(@f, %bb)` lowers to the **index of
+  `%bb` within `@f`**; an `indirectbr` lowers to a `br_table` over those indices. `llvm-ir` erases the
+  blockaddress operands, so they are recovered via `llvm-sys` (`src/blockaddr.rs`, the `di.rs` pattern) —
+  both in **global dispatch tables** (AV) and as **operand-position** φ-threaded blockaddresses clang's
+  jump-threading emits (AW). Robust enough for a real interpreter; next interpreter target is **Lua**
+  (which also needs `setjmp`/`longjmp`, below).
+- **`setjmp`/`longjmp` — DONE on the interpreter (slice AX); C++ EH next on the same substrate.** The
+  two new core ops (`Inst::SetJmp`/`LongJmp`) lower from the recognized external `setjmp`/`_setjmp`/
+  `sigsetjmp` (returns-twice) and `longjmp`/`siglongjmp` (noreturn) calls (gated on use, so non-users
+  pay nothing). **Tree-walker**: `setjmp` snapshots the frame's resume point (block/inst/value-state —
+  the value state is captured because `Frame::vals` is *replaced per block*) keyed by the `jmp_buf`
+  address in a per-vCPU table; `longjmp` truncates the call stack back to it (intervening frames
+  discarded, no cleanup — C has none), restores the frame + data-SP (which rides in `vals[0]`), and
+  re-enters with the result set to the long-jump value. **Engine matrix** (kept in sync — never
+  divergent): **both interpreters run it** — the tree-walker (snapshots the frame's value state, since
+  `vals` is replaced per block) and the **bytecode** engine (no snapshot: its flat per-function register
+  layout gives each block distinct slots, so the `setjmp` block's values survive a deeper call in place
+  — it only restores the `(module, cur, base, pc)` cursor + pops the activation stack). The **JIT** bails
+  `Unsupported` (the remaining sub-slice — **Option B: call libc `_setjmp`/`_longjmp` from JITted code**,
+  `jmp_buf` in a host-side table keyed by the guest buffer address so no host SP/return-addr leaks; the
+  in-frame `_setjmp` call dodges the "helper-frame-is-gone" problem, and clang's `-O2` returns-twice
+  spills + Cranelift's caller-saved spills largely defuse the optimizer hazard — to be proven by a native
+  differential **under ASan**). Until it lands the JIT declines and the interpreters cover it. Tests:
+  `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting` (byte-identical to native libc on
+  **both** the tree-walker and the bytecode engine, multi-frame unwind + retry loop; the JIT-declines is
+  asserted). Perf (`examples/onramp_perf.rs`): the non-`setjmp` baseline rows are unmoved (gated;
+  byte-identical IR), `setjmp` capture/`longjmp` unwind cost is O(live-values)/O(frames) and paid only
+  when executed (the JIT path will be real-`setjmp`-class O(1)). **EH next** (`invoke`/`landingpad`/
+  `resume` + cleanups) reuses this stack-transfer core; the JIT `longjmp` + EH unblock Postgres
+  `--single` and throwing C++ respectively.
+- **`%f` / `%g` / `%e` float formatting** — deliberately **fail-closed** (LLVM.md printf notes): an
+  `f64`-arithmetic approximation diverges from glibc at the rounding boundary; matching byte-for-byte
+  needs a **correctly-rounded exact-decimal (Ryū / Dragon4, big-integer)** formatter. SQLite,
+  `printf`-heavy programs, and any numeric output force this.
+- **`qsort` + comparator function pointers** — the libc callback ABI (an indirect call from synthesized
+  libc into guest code); confirm it lands cleanly when a target needs it.
+- **`__int128` / `long double` (`x86_fp80`/`fp128`)** — rejected (§7 deferred). SQLite has a few `i128`
+  paths; add on demand.
+- **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
+  synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
+
+### SQLite — the north star (in-memory, then disk via the powerbox)
+SQLite is the gold-standard target (≈600:1 test-to-code ratio, ships as one amalgamation `.c`). Two
+phases, both worth doing:
+- **Phase A — in-memory (`:memory:` / `memdb` VFS).** Build `SQLITE_THREADSAFE=0`,
+  `SQLITE_OMIT_LOAD_EXTENSION`, run its SQL logic scripts; the differential is native-SQLite vs
+  on-ramp-SQLite over the same script. **No filesystem needed** — SQLite's built-in in-memory VFS
+  keeps the whole DB in `malloc`'d pages. This phase is gated by *computed goto* (VDBE) + *float
+  formatting* above, not by any I/O capability.
+- **Phase B — disk-backed (real persistence through a powerbox capability).** In-memory proves the SQL
+  engine; **disk proves the capability story** — that a sandboxed guest can do real, durable I/O
+  *only* through explicitly granted authority. SQLite is built for exactly this: its **VFS** (`sqlite3_vfs`)
+  is a narrow, swappable I/O shim (`xOpen`/`xRead`/`xWrite`/`xTruncate`/`xSync`/`xFileSize`/locking).
+  The plan: a **guest VFS shim** (the SQLite analog of the guest `<pthread.h>` shim — ordinary guest C
+  the program brings) that bridges `sqlite3_vfs` to a granted **file/storage capability** delivered
+  through the powerbox handle stash, exactly like `Stream`/`Memory`/`IoRing` are today. Concretely:
+  - **The capability.** Today's powerbox grants are `stream`/`exit`/`memory`/`address_space`/`io_ring`/
+    `blocking`/`jit`/`shared_region`/`clock`/… (`grant_*` on `Host`). There is **no file/storage
+    capability yet** — that is the new host-side piece: a positioned-I/O surface (`read_at`/`write_at`/
+    `truncate`/`sync`/`size`/advisory-lock) over a host-chosen backing file or block store, granted as
+    one more handle in the stash. Two viable shapes: (a) a **dedicated `File`/`Storage` capability**
+    (cleanest semantics), or (b) **ride the existing §9/§12 `IoRing` + `Blocking` path** — a VFS that
+    `submit_async`s `pread`/`pwrite`/`fsync` as blocking ops onto the offload pool (reuses the async
+    machinery slices AD/async demos already exercise; the parked-vCPU completion model is a natural fit
+    for SQLite's synchronous file calls). Recommend prototyping over `IoRing`/`Blocking` first (no new
+    capability type), then promoting to a first-class `File` cap if the ergonomics warrant.
+  - **On-ramp side: already done.** The frontend already lowers `__vm_*` builtins and resolves
+    capability imports to stash handles (slices AC–AF) and grants a contiguous handle prefix in the
+    synthesized `_start`. A new `File`/storage handle slots into that same mechanism — likely **no
+    translator change**, just the host capability + the guest VFS shim + extending `synth_start`'s
+    grant prefix to include it.
+  - **Why it matters.** It is the end-to-end demonstration of the whole thesis: a real database, real
+    durable files, **zero ambient authority** — every byte of disk access flows through a capability the
+    embedder explicitly handed over, auditable at the powerbox boundary.
+
+### Candidate targets, grouped by the dimension they prove
+- **Self-validating interpreters (densest control-flow + ABI stressors):**
+  - **Lua** (reference impl) — runs the *official* `testes/` suite; forces **`setjmp`/`longjmp`** +
+    computed goto. The cleanest "second SQLite."
+  - **QuickJS** (Bellard) — full JS engine with a **test262** runner; extreme density (NaN-boxing,
+    bigint, regex, computed goto). Big lift; little is left unproven if it passes.
+  - **mal / chibi-scheme / a tiny Forth** — cheap stepping stones to the same control-flow features.
+- **Byte-exact, zero-OS-surface known-answer suites (cheapest high-confidence wins — start here):**
+  - **Monocypher** or **fiat-crypto** — modern crypto (ChaCha20/Blake2/X25519/Ed25519) with built-in
+    **KAT vectors**; brutal on 64-bit/carry arithmetic + constant-time bit-twiddling. Extends the
+    existing sha256/crc32/xxhash family, no OS surface at all. (A TLS stack — **BearSSL/mbedTLS** as
+    guest code, handshake vs vectors — fits here too, and is the bring-your-own TLS `curl` needs.)
+  - **stb_image** decoding an **embedded** PNG/JPEG → assert exact pixel bytes (real parser + integer
+    math, inputs compiled in).
+  - **zlib/miniz full roundtrip** (have `tinfl` inflate; add deflate→inflate identity).
+- **Deterministic compute / search (cheap codegen & control-flow bug finders, high "wow"):**
+  - **A chess `perft`** (micro-Max or a clean perft) — known-answer node counts; recursion + arrays +
+    heavy branching. Tiny, catches control-flow/codegen regressions fast.
+  - **A SAT/SMT solver — CaDiCaL / MiniSat (C++)** — pure compute, zero OS surface, and self-validating
+    in the strongest sense: SAT/UNSAT with **machine-checkable DRAT UNSAT proofs**. "An SMT-class solver
+    runs sandboxed" is impressive and trivially hermetic.
+  - **Stockfish (C++)** — `bench` is a reproducible node count + perft is known-answer; compute-bound,
+    threads + NNUE (int8 SIMD — exercises the vector lanes), and a crowd-pleaser.
+  - **FFmpeg, decode-only / in-memory** — codec cores are pure compute, SIMD-heavy, and the **FATE**
+    suite is an enormous byte-exact corpus (decode an embedded clip, hash frames).
+  - **TinyCC (TCC)** — a C compiler in C that compiles-and-runs; a small self-validating step toward the
+    LLVM self-hosting dream (below).
+  - **musl `libm` vs its test vectors** — IEEE edge cases; pairs with the `%f`/`%g` formatter work.
+- **Real applications with a narrow I/O waist (each *drives a capability* — the capability-story
+  proofs):**
+  - **SQLite** (the north star, above) — the read/write **VFS** waist → a `File`/`Storage` capability.
+  - **libmdbx** (embedded mmap'd B-tree KV store; the hardened LMDB successor) — no server, no network,
+    but its data plane **is the memory-mapping itself** (readers read straight from the mmap). Drives a
+    distinct **file-backed-mmap** capability ("map this file region into the window"), close to the
+    existing AddressSpace/SharedRegion machinery — a *different* storage shape from SQLite's read/write
+    VFS, so the two pair to prove both. Has a brutal torture-test suite; likely *easier* than Postgres
+    (no setjmp, no server).
+  - **Postgres — `--single` (single-user backend), not the multi-process server.** The postmaster
+    (fork-per-connection + SysV shmem + signals + a listening socket) is OS surface (category 3); but
+    `postgres --single` is one process reading SQL on stdin, collapsing to: the **File** capability (the
+    data dir) + **`sigsetjmp`/`siglongjmp`** (its whole `PG_TRY()`/`ereport()` error model). The program
+    that *justifies* the setjmp substrate; "SQLite Phase B at 100×." Self-validating via `pg_regress`.
+  - **curl / local git** — both drive the **network** frontier. curl *is* the network (category 3) but
+    is exactly what a capability is for: controlled, auditable **egress**. Needs a new **socket/connect
+    capability** (security-sensitive, high narrative value) + bring-your-own TLS (above); its pluggable
+    socket hooks (`CURLOPT_OPENSOCKETFUNCTION`/multi) wire cleanly to a cap. **git/libgit2** splits:
+    local object-store/packfile/diff/merge is File-cap only (zlib + SHA-1/256 + diff, self-validating
+    against a fixture repo); network clone wants the same socket cap.
+- **The "wow" milestone (later):** **Doom** (shareware) — fixed-point-heavy real app; needs a stubbed
+  framebuffer + an in-memory WAD, but "Doom runs sandboxed through the LLVM on-ramp" is a strong
+  external signal. (Graphical apps proper ride the **WebGPU capability** — its own section below.)
+- **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust
+  crate (`regex`/`ryu`/`serde_json` `no_std`), a Zig program, a Swift `-enable-experimental-feature
+  Embedded` TU — each is "another frontend, no translator change beyond what the corpus proved."
+
+### Suggested ladder (cheap momentum → the capstones)
+1. **Monocypher KAT** + **stb_image decode** — zero-OS, byte-exact; widen the corpus and shake out
+   64-bit/parser bugs fast. (A SAT solver / `perft` slot in here too — pure compute, self-validating.)
+2. **`indirectbr` / `blockaddress` (computed goto)** — DONE (slices AV + AW: global tables + φ-threaded
+   operand-position). Robust for real interpreters.
+3. **`setjmp`/`longjmp`** — DONE on the interpreter (slice AX); JIT `longjmp` (native-stack switch) +
+   **EH** on top (reuses the stack-transfer core) next.
+4. **`%f` / `%g` float formatting** (Ryū/Dragon4) — needed by SQLite/Postgres and broadly.
+5. **SQLite Phase A (in-memory)** — the SQL-engine capstone (gated on goto + float-format).
+6. **The storage capability** → **SQLite Phase B** (read/write VFS) and **libmdbx** (file-backed mmap) —
+   two distinct storage shapes proving real durable I/O under zero ambient authority.
+7. **Postgres `--single`** — the setjmp + File-capability capstone ("SQLite Phase B at 100×").
+8. **The WebGPU capability** (its own section below) and **the network/egress capability** (curl/git) —
+   the remaining capability frontiers.
+
+### `setjmp`/`longjmp` + EH — design & sequencing (the stack-transfer substrate)
+
+**Status: `setjmp`/`longjmp` DONE on the interpreter (slice AX)** — see the gap bullet above for the
+landed design + engine matrix. The JIT `longjmp` (native-stack switch) and **EH** are the remaining
+sub-slices. The design notes below are retained for the EH follow-on + the JIT path. Drivers:
+**Postgres** `--single` (its whole `PG_TRY`/`ereport` model is `sigsetjmp`/`siglongjmp`) and **Lua**.
+
+**Why a core primitive (not a pure-IR transform).** `longjmp` transfers control from deep in the call
+stack back to an ancestor `setjmp`, across N intervening frames. The only way to do this *without a
+primitive* is to make every call-return check "am I unwinding?" — which **taxes intervening frames**
+(the SJLJ-via-return-checks model). To keep intervening frames untaxed (the perf goal), the VM needs a
+real **"unwind to a saved stack checkpoint"** primitive — matching the "VM ships primitives" thesis.
+Plan: two svm-ir ops (or one checkpoint + one unwind) lowered from the recognized external `setjmp`/
+`_setjmp`/`sigsetjmp` (returns-twice) and `longjmp`/`siglongjmp` (noreturn) calls — gated on the program
+calling them, like every other capability, so non-users get nothing.
+
+**Interp (tractable — do first).** The interpreter already runs on an **explicit `Vec<Frame>` guest
+call stack** with reified continuations (for fibers). So `setjmp(env)` saves `(frame depth, data-SP,
+resume pc + result slot)` into the guest `jmp_buf` and returns 0; `longjmp(env, v)` truncates `frames`
+back to that depth (the intervening frames discarded with **no per-frame work** — C has no cleanups),
+restores the data-SP, and resumes at the saved pc with the `setjmp` result set to `v`. O(1)-ish capture,
+O(depth-discarded) unwind, both only when called.
+
+#### JIT `longjmp` — the remaining sub-slice (HANDOFF — design locked, not yet implemented)
+
+Cranelift code runs on the real native control stack, so `longjmp` must restore the native SP to the
+`setjmp` point. **Chosen approach — Option B: call libc `_setjmp`/`_longjmp` from JITted code, with the
+`jmp_buf` in a host-side table.** Rationale + the rejected alternatives are below; this is the concrete
+work for the next session.
+
+**Why Option B (and not the others) — decision record:**
+- **Option B (chosen): libc `_setjmp`/`_longjmp` called inline from JITted code.** Reuses battle-tested
+  libc; no custom asm. The one trick that makes it correct: the `_setjmp` call must be emitted **inline in
+  the JIT function's own frame** (the frame we long-jump back to) — *not* in a host helper thunk that
+  `setjmp`s and returns, because that helper's frame is gone by `longjmp` time (`longjmp` to a returned
+  frame is UB). So `SetJmp` lowers to *two* calls: a thunk that hands back the host `jmp_buf` pointer, then
+  an **inline `call _setjmp(buf_ptr)`**.
+- **Option A (rejected): a new arch-specific in-place context-save/restore asm primitive** (save
+  callee-saved + SP + return-addr without switching; one file per ABI like `svm-fiber`'s `switch_*`).
+  Strictly more risk (hand-written unsafe asm per ABI) for no benefit over B unless libc `_setjmp` has a
+  concrete problem — fall back to A only if B hits a wall.
+- **Rejected: the existing `svm-fiber` switch (`jump`/`make`, boost.context `fcontext`).** It is an
+  *asymmetric-coroutine* primitive — the captured `fctx` is a transient register block on the *suspended*
+  stack, valid only while suspended; the moment you `jump` back and keep running it is reused/stale.
+  `setjmp` needs **capture-in-place + keep running**, then `longjmp` from a deeper frame. Doesn't fit.
+- **Rejected: per-function interp fallback** (JIT declines `setjmp` modules). It is the current safety net,
+  but module-granular: a Lua-as-a-guest would lose JIT speed on its *hot computed-goto loop* just because
+  `pcall` uses `setjmp`. Keep it only as the fallback, not the goal.
+
+**Implementation steps (concrete):**
+1. **Host-side `jmp_buf` table + thunks** (new, in/next to `crates/svm-jit/src/fiber_rt.rs`, per-run like
+   the fiber runtime): `rt_setjmp_slot(ctx, guest_buf_addr) -> *mut JmpBuf` (alloc/find a host slot keyed
+   by `(ctx, guest_buf_addr)`) and `rt_setjmp_lookup(ctx, guest_buf_addr) -> *mut JmpBuf` (or trap-marker
+   on miss). **The `jmp_buf` is host-allocated and lives in this table — never the guest window** (it
+   holds host SP / return-addr / callee-saved; leaking those into guest-readable memory defeats ASLR; the
+   guest `jmp_buf` address is *only the key*). This mirrors the interp's per-vCPU `setjmp_points`.
+2. **Cranelift lowering** (the JIT supportedness check + codegen): `Inst::SetJmp { buf }` → `slot = call
+   rt_setjmp_slot(ctx, operand(buf))`, then **inline** `r = call _setjmp(slot)`, bind `r` (i32) as the
+   result. `Inst::LongJmp { buf, val }` → `slot = call rt_setjmp_lookup(ctx, operand(buf))`, then `call
+   _longjmp(slot, operand(val))` (noreturn; the trailing `unreachable` is dead). Bake `&_setjmp`/`&_longjmp`
+   as call-target constants (declare them `extern "C"`), exactly as `cap.call` bakes `cap_thunk as usize as
+   i64` and the fiber thunks bake their addresses — the **call-to-baked-host-address template** is the
+   `cap.call` / `cont.*` lowering already in the crate.
+3. **Un-bail + gate.** Remove `SetJmp`/`LongJmp` from the JIT's `_ => Err(JitError::Unsupported)` path (the
+   supportedness check ~`crates/svm-jit/src/lib.rs:3640`, the `if cfg!(fiber_rt)` block just above lists
+   the ops needing the runtime). Gate to the Unix targets first (like `fiber_rt`); the interpreters cover
+   the rest. Thread the per-run `jmp_buf` table through the compile/run setup like the fiber runtime is.
+4. **Flip the test.** `check_setjmp_vs_native` (`crates/svm-llvm/tests/translate.rs`) currently asserts the
+   JIT *declines*; change that to run the JIT and assert it agrees with the interpreters + native.
+
+**The one real hazard — returns-twice vs Cranelift — and why it's largely defused (still must be proven):**
+`Inst::SetJmp` is a *call site*, so Cranelift already spills caller-saved values across it; callee-saved
+are saved/restored *by `_setjmp`/`_longjmp` themselves*; and clang already spilled every `setjmp`-crossing
+local to memory at `-O2` (returns-twice at the LLVM level), so they arrive as loads/stores in the SVM IR,
+not long-lived SSA across the `SetJmp`. A value live across the `setjmp` in a callee-saved reg is restored
+to its `setjmp`-time value by `_longjmp` — correct for pre-`setjmp` values; values *modified* after
+`setjmp` are C-indeterminate anyway. **Verification bar (gating): a native differential on the JIT path
+run under ASan** (this is memory-unsafe native-stack manipulation; it gets `svm-fiber`-grade rigor — the
+repo already has an "ASan (svm-fiber switches)" CI lane to extend). Add returns-twice stress cases
+(values live across the `setjmp`; nested/loop `longjmp`; `longjmp` across several JIT frames).
+
+**Reference implementations to mirror (already landed, byte-identical to native):** the tree-walker
+(`crates/svm-interp/src/lib.rs` — `SetJmpPoint`, `setjmp_points`, the `SetJmp`/`LongJmp` arms in
+`run_inner`) and the bytecode engine (`crates/svm-interp/src/bytecode.rs` — `ByteSetJmp`, `Op::SetJmp`/
+`LongJmp`). The on-ramp lowering is `lower_setjmp_call` in `crates/svm-llvm/src/lib.rs`. **Current state:
+both interpreters run `setjmp`/`longjmp`; the JIT cleanly declines `Unsupported`** — so the branch is a
+clean checkpoint to start the JIT pass from, engines in sync, never divergent.
+
+**Returns-twice in SSA.** `setjmp`'s result (0 first time, `v` on `longjmp`) feeds a branch; the
+`longjmp` re-enters at the instruction after `setjmp`. The interp models this directly (set the result
+slot + resume pc). The `jmp_buf` holds **backend-internal** state (interp frame index vs JIT native SP)
+— opaque to the guest, so *observable* behavior matches across backends (the determinism contract is
+about stdout/results, not `jmp_buf` bytes); it is transient, not snapshot-portable across backends.
+
+**Perf (measured, not assumed — `examples/onramp_perf.rs`).** Non-users: **0** (gated). `setjmp`-using
+functions inherit clang's returns-twice spills (already in the bitcode — the on-ramp adds none) and the
+ops cost O(1) capture / O(1)+unwind, paid only when executed; intervening frames untaxed. A real
+workload's hot path (Lua's interpreter loop) has no `setjmp` in it — cost is confined to `pcall` entry
+and (rare) error unwinds. The harness establishes the non-`setjmp` baseline now; a `setjmp` happy-path
+row + a `longjmp`-taken row slot in beside it once the ops land, so the feature's cost is measured.
+
+### GPU via a WebGPU capability (graphical + compute)
+
+Graphical and GPU-compute software rides a **WebGPU capability** — and WebGPU is the *right* abstraction
+precisely because it was **designed for the browser sandbox**: it is already capability-shaped. No raw
+pointers, no arbitrary memory — everything is validated buffers/textures/bind-groups, shaders are
+**WGSL** (validated, no arbitrary memory access), and work is submitted as structured command buffers.
+Exposing raw Vulkan/Metal/CUDA would blow the TCB open; WebGPU is the *safe waist* other GPU APIs lack.
+Same thesis as the §22 `Jit` cap (§2a): **verification, not raw access, is the boundary** — and here
+WebGPU does the validation for you (guest-authored WGSL is safe by construction).
+
+**Architecture (mirrors the §9/§12 IoRing pattern).**
+- The host holds the real device — via **`wgpu`** (the Rust WebGPU implementation; fits the codebase).
+- The guest is granted a **WebGPU handle** in the powerbox stash (one more `grant_*` on `Host`, slotted
+  into `synth_start`'s contiguous prefix exactly like `IoRing`/`Blocking`/`Jit` — likely **no translator
+  change**). API calls (create buffer, write, create pipeline, dispatch/submit) cross the boundary as
+  **structured, validated commands**; the guest never holds a GPU pointer.
+- Only **data** flows back into the window (a compute buffer's contents, a texture's pixels). Async
+  readback (`mapAsync` / queue completion) maps onto the existing **IoRing/Blocking + M:N executor** —
+  GPU work is the same submit/validate/return-data shape as I/O.
+
+**Demos that prove safe access (headless first — the safety story is complete with no display):**
+1. **GPU compute → readback → assert vs CPU** *(the ideal first demo)* — a WGSL compute shader
+   (prefix-sum / matmul / N-body) over a guest-uploaded buffer, read back and checked against a CPU
+   reference. Proves the whole data plane (upload → dispatch → readback) + the validated-buffer model,
+   **with zero windowing**.
+2. **Offscreen render-to-texture → read pixels → hash** — "hello triangle" / a rotating cube to an
+   offscreen attachment, pixels compared to a reference image. Proves the render pipeline headlessly.
+3. **Compute image filter / Mandelbrot / a Shadertoy-style shader → PNG** (written via the File cap) —
+   visually compelling, deterministic, self-validating by pixel hash; a great screenshot artifact.
+4. **On-screen presentation (a `Surface`/swapchain capability) — defer.** Presenting to a host window is
+   the OS-coupled part and a later capability; the **safe-access** narrative is fully told headless.
+
+Riders: any C/C++/Rust app on **wgpu-native** or **Dawn** (the WebGPU C API) — learn-wgpu / WebGPU
+samples — plus `wgpu`'s own CTS as a (meta) conformance check.
+
+### Stretch goal — self-hosting: LLVM in the sandbox
+
+The moonshot beyond SQLite: run **LLVM itself** as an SVM guest. Not because LLVM "happens to run,"
+but because it closes a **self-hosting, capability-secured toolchain** loop — the sandbox hosting its
+own means of production. With LLVM in-guest and the existing §22 `Jit` capability (a guest emits SVM IR
+→ the host Cranelift-compiles it), the whole pipeline runs *inside the sandbox*:
+
+```
+C/C++/Rust source → clang/LLVM (in-guest) → LLVM IR
+                  → svm-llvm translator (in-guest) → SVM IR
+                  → Jit capability → native code
+```
+
+and the translator is itself Rust (which compiles Rust→LLVM→SVM), so the chain is self-hostable end to
+end. The payoff: a compiler-as-a-sandboxed-service, reproducible builds in a box, untrusted code that
+can compile *and* run other untrusted code with **zero ambient authority**. SQLite proves "a real
+program with real I/O under capabilities"; LLVM proves "the sandbox can host its own toolchain."
+
+**Scoping insight — the backend is (mostly) already ours.** "Run LLVM" is not one thing, and the
+single largest/ugliest part of LLVM — the **target backends + MC layer** (SelectionDAG/GlobalISel,
+object emission) — is **out of scope**: SVM already has a backend in the `Jit` capability. The target
+is LLVM's **front + middle end** (IR data structures, the bitcode reader, the verifier, the `opt` pass
+pipeline), lowering to SVM IR and handing it to `Jit`. That deletes roughly the hardest third of LLVM.
+Slices, smallest meaningful first (do **not** aim at clang first):
+1. **libLLVMCore in isolation** — a program that builds an IR `Module` in memory, runs the
+   **verifier**, and prints it. The "hello world of embedding LLVM," dramatically smaller than clang,
+   and already proves the thesis.
+2. **`llvm-as` / `llvm-dis`** — bitcode ↔ text round-trip.
+3. **`opt` with a few passes** — guest-side optimization.
+4. *(moonshots)* **`llc`** (if a non-`Jit` codegen path is ever wanted), then **clang** (C/C++ front
+   end — millions of lines: the driver, preprocessor, AST, Sema, CodeGen).
+
+**In our favor (de-risks it):**
+- **LLVM builds `-fno-exceptions -fno-rtti` by default** (`LLVM_ENABLE_EH/RTTI` off) — it lands on the
+  exact C++ subset slice AG proved (classes, vtables, templates→monomorphized, global ctors). The
+  on-ramp has *no* EH path, and LLVM needs none.
+- **The window reserves `1 << 40` (1 TiB), lazily paged** (`DEFAULT_RESERVED_LOG2`) — address-space
+  scale is not the blocker; the heap grows to gigabytes through the `Memory` cap.
+- **APFloat** is LLVM's own arbitrary-precision float — self-contained, no libm dependency for the hard
+  numerics.
+- **Templates monomorphize + global ctors run** (slice AG) — both heavily used (cl::opt registration,
+  ManagedStatic).
+
+**The real mountains (honest list):**
+1. **The libc++ + libc surface — the dominant cost.** LLVM exercises a *huge* slice of the C++ standard
+   library + syscalls (`std::vector`/`map`/`string`, `DenseMap`, `<algorithm>`, `std::error_code`,
+   `mmap`, file I/O, `getpagesize`, time, `errno`). Most of libc++ is header-only templates (fine), but
+   the non-header parts + the syscall floor need a real port. This is gating infrastructure — and it is
+   **independently valuable**, because it is what *any* large C++ program needs (so growing C++/stdlib
+   breadth is the honest first rung, see the ladder above).
+2. **C++ `thread_local` / TLS** — `@llvm.threadlocal.address` / `.tdata`/`.tbss` is **not lowered yet**
+   (the existing `__vm_vcpu_tls` is a different, SVM-specific per-vCPU register). LLVM uses
+   `thread_local` for errno/ManagedStatic — a genuinely new feature to build.
+3. **File I/O capability** — LLVM reads/writes files: the **same** powerbox `File`/`Storage` capability
+   SQLite Phase B needs. Shared prerequisite, not extra.
+4. **Translate-time scale** — the `svm-llvm` translator is demo-sized today; a multi-hundred-MB bitcode
+   module is a different regime (translator memory + throughput). Needs measurement, possibly streaming.
+5. **Stragglers** — `%f`/`%g` exact-decimal formatting (textual IR output), a few inline-asm spots
+   (mostly avoidable), possibly computed-goto in clang's lexer (the `indirectbr` work above).
+
+**Why it sequences after SQLite (not a detour).** SQLite and LLVM share their three biggest
+prerequisites — the **File/Storage capability**, **float formatting**, and **large-program scaling** —
+so SQLite is squarely on the critical path. The one LLVM-specific track SQLite does *not* exercise is
+**big C++ + a real chunk of the standard library**; that is the first rung toward LLVM and is worth
+pushing in parallel (a substantial real C++ library through the on-ramp). Sequence:
+**SQLite (shared infra) ∥ grow C++/stdlib breadth → libLLVMCore build-verify-print → llvm-as/opt →
+moonshot llc/clang.**
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
@@ -1032,10 +1467,13 @@ lanes re-enable vectorization (the capstone).** The remaining gaps that blocked 
       uses `i64` for signed div/rem-by-constant, not `iN`).
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
-- [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
-      tables (the §18 open item). Lower onto §6 stack-switching; perf tax + ABI change. Low
-      ROI until a real workload needs it (mirrors `WASM.md`'s EH stance).
-- [ ] **`setjmp`/`longjmp`** — onto §6 stack-switching, same machinery as EH.
+- [ ] **`setjmp`/`longjmp` + C++ exceptions/unwinding — PROMOTED to planned substrate** (no longer
+      deferred). Both lower onto §6 stack-switching/`cont.*`; build `setjmp`/`longjmp` first (Postgres
+      `--single` / Lua force it), then EH (`invoke`/`landingpad`/`resume` + unwind tables, the §18 open
+      item) on the same core. Full plan + ordering + drivers in *Next frontier → Translator gaps*.
+- [x] **Computed `goto` — `indirectbr` / `blockaddress` — DONE (slices AV + AW).** Both global dispatch
+      tables (AV) and operand-position φ-threaded blockaddresses (AW), recovered via `llvm-sys`
+      (`blockaddr.rs`), lowered to a `br_table` over block indices. Robust for real interpreters.
 - [ ] **SIMD** (`<N x T>` vectors) — a later pass mirroring §17/D58 `v128` (the proven
       5-step pattern `svm-wasm` used). Reject cleanly until then.
 - [ ] **Full intrinsic coverage** — expand the table in §4 as real programs demand.

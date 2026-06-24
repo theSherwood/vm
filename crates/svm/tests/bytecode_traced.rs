@@ -42,10 +42,10 @@ fn check_fuel(src: &str, arg: Value, fuel: u64) {
     svm_verify::verify_module(&m).expect("verify");
 
     let mut tw_fuel = fuel;
-    let (tw_res, tw_bt) = run_with_host_traced(&m, 0, &[arg], &mut tw_fuel, &mut Host::new());
+    let (tw_res, tw_bt, _) = run_with_host_traced(&m, 0, &[arg], &mut tw_fuel, &mut Host::new());
 
     let mut bc_fuel = fuel;
-    let (bc_res, bc_bt) =
+    let (bc_res, bc_bt, _) =
         bytecode::compile_and_run_with_host_traced(&m, 0, &[arg], &mut bc_fuel, &mut Host::new())
             .expect("bytecode engine must drive this single-vCPU module");
 
@@ -264,7 +264,7 @@ fn clean_run_has_empty_backtrace() {
     // belt-and-braces: the rendered backtrace really is empty (not just equal-and-nonempty)
     let m = parse_module(CLEAN).expect("parse");
     let mut fuel = u64::MAX;
-    let (res, bt) = bytecode::compile_and_run_with_host_traced(
+    let (res, bt, _) = bytecode::compile_and_run_with_host_traced(
         &m,
         0,
         &[Value::I32(41)],
