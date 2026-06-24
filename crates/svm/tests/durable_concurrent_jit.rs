@@ -376,3 +376,64 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
         "child resumed its loop + its fiber's yielded value across the freeze",
     );
 }
+
+// Follow-up B.2 guard: nested concurrent spawns aren't supported yet (the grandchild's `parent_task`
+// would be mis-attributed via the shared `cur_task`), so a *concurrent* durable child that itself
+// `thread.spawn`s must **fail closed** — a clean `ThreadFault`, not a silently-wrong artifact. Here the
+// root spawns a concurrent child that spawns a grandchild; the nested spawn traps, which propagates
+// through the child's (and root's) join, so the run traps instead of returning the grandchild's value.
+const SRC_NESTED: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = thread.spawn 1 v1 v1
+  v3 = thread.join v2
+  return v3
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  v3 = thread.spawn 2 v2 v2
+  v4 = thread.join v3
+  return v4
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 42
+  return v2
+}
+"#;
+
+#[test]
+fn nested_concurrent_spawn_fails_closed() {
+    let inst = instrument(SRC_NESTED);
+    let mut host = Host::new();
+    host.clock_ns = 42;
+    let _clk = host.grant_clock();
+    // A controller is required by the entry but never triggered — the guard fires during NORMAL, at the
+    // child's nested `thread.spawn`, before any freeze.
+    let freeze = FreezeController::new();
+    let res = compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
+        &inst,
+        0,
+        &[0],
+        &init_durable_window(WINDOW),
+        &[],
+        &[],
+        &[],
+        SHADOW_BASE + 8,
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut host as *mut Host as *mut c_void,
+        freeze,
+    );
+    match res {
+        Ok((out, ..)) => assert!(
+            matches!(out, JitOutcome::Trapped(_)),
+            "a nested concurrent spawn must fail closed (ThreadFault), not return the grandchild value",
+        ),
+        Err(JitError::Unsupported(_)) => {}
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => {}
+        Err(e) => panic!("nested-spawn guard run failed: {e:?}"),
+    }
+}

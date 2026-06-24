@@ -308,10 +308,16 @@ impl Domain {
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4). Arm the quiesce barrier for `runners`
-    /// concurrently-unwinding vCPUs and engage the concurrent path. Called once by the 4A.5 concurrent
-    /// entry before the workers can observe a freeze; never on a single-worker path (where `quiesce`
-    /// stays 0 and the lock is untouched, so the run is byte-identical).
-    #[cfg_attr(not(loom), allow(dead_code))] // wired live by 4A.5
+    /// concurrently-unwinding vCPUs.
+    ///
+    /// NOTE: this barrier ([`Self::arm_quiesce`] / [`Self::quiesce_arrive`] / [`Self::quiesce_wait_all`])
+    /// is **not on the live path**. Stage (ii) chose `run_inner`'s existing `join_all` as the
+    /// coordinator-wait: with per-context shadow-SP (stage i), each child's freeze-unwind into its own
+    /// region simply completes its OS thread, and `join_all` blocks until all have — so an explicit
+    /// barrier is unnecessary. It is retained as a **loom-verified primitive** (model:
+    /// `loom_quiesce_barrier_never_hangs_with_per_context_sp`) in case a future park-in-place quiesce
+    /// (workers that stop *without* ending their OS thread) needs it. Exercised only under `cfg(loom)`.
+    #[cfg_attr(not(loom), allow(dead_code))]
     pub(crate) fn arm_quiesce(&self, runners: usize) {
         *lock(&self.quiesce) = runners;
         self.concurrent_durable.store(true, Ordering::Release);
@@ -524,6 +530,14 @@ struct PendingSpawn {
     done: std::sync::Arc<Done>,
 }
 
+std::thread_local! {
+    /// §12.8 4A.5 follow-up B.2 guard: true on an OS thread running a **concurrent durable child**
+    /// ([`run_child`]). [`thread_spawn`] reads it to fail a *nested* concurrent spawn closed (a clean
+    /// `ThreadFault`) rather than mis-attribute the grandchild's `parent_task` via the shared `cur_task`.
+    /// Per-OS-thread; the root's thread never sets it, so flat root-spawned children are unaffected.
+    static IN_CONCURRENT_CHILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn run_child(a: SpawnArgs) {
     let env = a.env;
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
@@ -539,6 +553,10 @@ fn run_child(a: SpawnArgs) {
         unsafe {
             fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
         };
+        // §12.8 4A.5 follow-up B.2: mark this OS thread as a concurrent durable child, so a nested
+        // `thread.spawn` it makes fails closed (see `thread_spawn`) until B.2 is built. The OS thread is
+        // fresh per child, so the flag is naturally scoped to this child.
+        IN_CONCURRENT_CHILD.with(|c| c.set(true));
     }
     // Arm this OS thread's detect-and-kill recovery (idempotent; handler is process-wide, recovery is
     // thread-local — §5 / `mem::install_guard`).
@@ -728,6 +746,16 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     // task id matches the interp/deferred path (seeded into `vcpu.tls`). `None` on every existing path,
     // so behavior is unchanged there.
     let durable_child = if env.durable && dom.is_concurrent_durable() {
+        // §12.8 4A.5 follow-up B.2 (not yet built): a **concurrent** child that spawns a grandchild
+        // would mis-attribute its `parent_task` — `thread_spawn` reads the shared `cur_task`, which only
+        // the single-worker paths maintain and which would race across concurrent spawners. Until a
+        // per-OS-thread spawning-task source lands, **fail closed**: a nested concurrent spawn is a clean
+        // `ThreadFault` rather than a silently-wrong artifact. (Flat root-spawned children are fine: the
+        // root's OS thread never set this flag.)
+        if IN_CONCURRENT_CHILD.with(|c| c.get()) {
+            store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+            return -1;
+        }
         let table = match dom.fiber_table() {
             Some(t) => t,
             None => {

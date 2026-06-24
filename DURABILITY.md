@@ -1087,23 +1087,41 @@ Pinned by `concurrent_join_result_survives_a_freeze_before_the_join`.
 *Follow-up B.1 — concurrent child owns fibers (LANDED).* `run_child` now arms the child's fiber runtime
 durable (`set_durable_env`) and, on a freeze-unwind, runs its own `freeze_drive` over its parked fibers
 (the concurrent mirror of `run_child_inline`'s), draining the residue into the domain accumulator
-(collected after `join_all`). Pinned by `concurrent_child_owns_fiber_through_freeze_thaw`.
+(collected after `join_all`). Pinned by `concurrent_child_owns_fiber_through_freeze_thaw`. **Scope:** this
+covers a child whose fiber is **cleanly parked** at the freeze point (the test's signal-after-park
+handshake). A child caught with its fiber still *mid-resume-chain* is the deferred path's slice-3.2 case
+and is **not yet verified** on the concurrent path — the test asserts the strong properties only on the
+clean shape and skips otherwise (an over-subscribed runner can land the freeze in the harder
+interleaving; that path is a follow-up, not a guaranteed-correct case today).
 
-*Follow-up B.2 — nested concurrent spawns (REMAINING).* A *concurrent* child that itself `thread.spawn`s
-a grandchild mis-attributes the grandchild's `parent_task`: `thread_spawn` reads the **shared**
-`Domain::cur_task` for the parent, which only the single-worker inline/thaw paths maintain — `run_child`
-never sets it, and it would race across concurrent spawners anyway. The fix is a **per-OS-thread
-spawning-task source** (a runtime-private thread-local seeded in `run_child` to the child's task, read by
-`thread_spawn` instead of the shared `cur_task`), plus a nested concurrent test (root → concurrent child
-→ concurrent grandchild, all frozen, thaw rebuilds the per-parent topology). Deferred nested spawns
-(slice 3.4) and concurrent *flat* spawns already work; this is the narrow remaining gap. Original map:
+*Follow-up B.2 — nested concurrent spawns (FAIL-CLOSED; full support remaining).* A *concurrent* child
+that itself `thread.spawn`s a grandchild would mis-attribute the grandchild's `parent_task`:
+`thread_spawn` reads the **shared** `Domain::cur_task`, which only the single-worker inline/thaw paths
+maintain — `run_child` never sets it, and it would race across concurrent spawners anyway. Rather than
+emit a silently-wrong artifact, a nested concurrent spawn now **fails closed** with a clean
+`ThreadFault` (a per-OS-thread `IN_CONCURRENT_CHILD` flag set in `run_child`, checked in `thread_spawn`),
+pinned by `nested_concurrent_spawn_fails_closed`. **Full support** needs a per-OS-thread spawning-task
+source (seed the child's task in `run_child`; read it in `thread_spawn` instead of the shared
+`cur_task`) + a nested concurrent test (root → child → grandchild, all frozen, thaw rebuilds the
+per-parent topology). Deferred nested spawns (slice 3.4) and concurrent *flat* spawns already work.
 
-- **Barrier adaptation (LANDED).** The 4A.4 `quiesce_arrive` ran `unwind` *under* the `quiesce` lock to
-  serialize the (then-shared) active-SP scratch. With per-context SP that serialization is unnecessary —
-  `unwind` now runs **outside** the lock (each context spills into its own region word concurrently); the
-  lock guards only the join (decrement + notify). The O-A4 loom model is updated to per-context SP words
-  (`loom_quiesce_barrier_never_hangs_with_per_context_sp`): concurrent unwinds into disjoint slots, the
-  coordinator never hangs, no slot is clobbered.
+*Also out of scope (documented limitation):* freezing a vCPU **blocked in `thread.join`/`thread.wait`**.
+Thread ops aren't may-suspend safepoints, so a vCPU parked in a join/wait doesn't observe a freeze — the
+natural "spawn then join" root can be frozen only while it is *running* (e.g. at a back-edge poll or
+`cap.call`), not while blocked. Making thread ops freeze-safepoints (unwind + re-issue on thaw) is a
+separate slice. Original map:
+
+- **Barrier adaptation (loom-verified, but NOT the live path).** The 4A.4 `quiesce_arrive` ran `unwind`
+  *under* the `quiesce` lock to serialize the (then-shared) active-SP scratch; with per-context SP that
+  serialization is unnecessary, so `unwind` now runs outside the lock and the lock guards only the join.
+  The O-A4 loom model is updated to per-context SP words
+  (`loom_quiesce_barrier_never_hangs_with_per_context_sp`). **However**, stage (ii) ultimately chose
+  `run_inner`'s existing `join_all` as the coordinator-wait (each child's freeze-unwind into its own
+  region completes its OS thread; `join_all` blocks until all do), so `arm_quiesce`/`quiesce_arrive`/
+  `quiesce_wait_all` are **unused in production** (`cfg(loom)`-only). They are retained as a verified
+  primitive for a possible future *park-in-place* quiesce (workers that stop without ending their OS
+  thread). The "Concurrent-durable entry + arming" bullet below describes that original barrier-based
+  design; the shipped design uses `join_all` instead.
 - **Concurrent-durable entry + arming.** A new multi-vCPU+interruptible entry (combining
   `..._durable_mv` and `..._interruptible`) calls `arm_quiesce(runners)` before any worker can observe a
   freeze, engaging `is_concurrent_durable()`. Single-worker paths stay byte-identical (`quiesce == 0`,
