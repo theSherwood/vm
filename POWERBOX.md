@@ -208,6 +208,134 @@ weaken the §3c type-check's closed-enum audit surface for only a diagnostics ga
 
 ---
 
+## Where the interfaces stand (audit, post-Phase-5)
+
+There is **not** one host interface — several overlapping run paths coexist, and they have diverged
+rather than converged:
+
+| Path | Backends | Caps | Used by |
+|---|---|---|---|
+| `Instance::{call,run,run_diff}` (this work) | all 3 | fixed or name-bound | new tests, C ABI |
+| `run_powerbox*` → `run_powerbox_inner` | JIT | fixed 8-handle powerbox | **the CLI** (`svm-run` bin) |
+| `run_kernel` | bare | none | kernels / bench |
+| `run_c_full` (test) | interp+JIT | fixed | chibicc suite |
+| `JitSession` | JIT | fixed | guest-JIT REPL |
+| §14 nested (`Instantiator`/`Module`) | interp+JIT | object-cap | `instantiator.rs`, `separate_module.rs` |
+
+Two consequences worth fixing (Phase 6 / followups):
+- The new `Instance` layer **did not replace** `run_powerbox_inner`; the powerbox-grant logic is now
+  **duplicated** (`grant_caps` vs the hardcoded grant in `run_powerbox_inner`), and the CLI still uses
+  the old path.
+- The §14 nested path is **func-0-only and ignores `Module.exports`** — a child/separate-module guest
+  cannot be called by name.
+
+**Test gaps:** we test the export *table* (`resolve_export`) and calling `_start` by name, but **not**
+calling a named non-`_start` export with args and checking results (host *or* nested). And
+`Instance::call("<name>", args)` for a non-`_start` export currently runs as a **bare kernel with no
+capabilities** — so a named export that uses caps can't be called at all today.
+
+---
+
+## Phase 6 — the reactor model: a live instance you call into (spec)
+
+**Problem.** First-class exports (Phase 1) made entry points *addressable*, but you still can't really
+*call* them: every `call`/`run`/`run_diff` builds fresh hosts + a fresh window, runs `_start` once, and
+discards all state. There is no **live, stateful instance** you invoke repeatedly — the wasm
+"reactor"/component model (instantiate once → call exports N times → linear memory, heap, and
+capability handles persist between calls). This is the missing half of "calling exports from the host,"
+and it subsumes the test gap above. `JitSession` already proves persistence is possible (it keeps a
+compiled module + window alive across `run_prompt` calls) — Phase 6 generalizes that into `Instance`,
+across backends, with named export calls.
+
+**Model.** Split today's run-once `Instance` into:
+- a **command** mode (what exists): run `_start` once, fresh state, return outcome — keep as-is for the
+  program use case;
+- a **reactor** mode (new): `instantiate` → optionally run an initializer (`_start`/`_initialize`) once
+  → then `call_export("name", args) -> results` **repeatedly**, with the window (globals, heap) and the
+  granted capability handles **persisting** between calls.
+
+### Proposed API (`svm-run`)
+
+```rust
+/// A live, stateful instance: capabilities granted once, window persists across calls.
+pub struct Session { /* module, host, window/CompiledModule, granted handle vector, backend */ }
+
+impl Instance {
+    /// Start a reactor session on `backend` under `config`: grant the powerbox once, set up the
+    /// persistent window, and (if present) run the `_start`/`_initialize` export once.
+    pub fn start(&self, backend: Backend, config: &RunConfig) -> Result<Session, String>;
+}
+
+impl Session {
+    /// Call an exported function by name with `args`, returning its results. The window (heap,
+    /// globals) and capability handles persist from prior calls. Caps are reached the normal way
+    /// (the export loads handles from the stash that `start` populated once).
+    pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>, String>;
+
+    /// Captured output so far, and a handle to read/seed the window if needed.
+    pub fn stdout(&self) -> &[u8];
+    pub fn stderr(&self) -> &[u8];
+}
+```
+
+### Design questions to resolve before coding
+1. **Export calling convention.** A reactor export is `(i64 sp, <args…>) -> <results…>`? It needs the
+   data-stack pointer (like `_start` passes `main`) *plus* its own args. Decide: does `call_export`
+   synthesize the `sp` (a fresh frame above the persistent globals/heap each call), and append the
+   caller's `args` after it? (Likely yes — mirrors how `_start` calls `main(sp)`.)
+2. **Handle delivery across calls.** `_start`/`start` stashes handles once at window offsets `i*4`; a
+   reactor export reaches caps by loading from the stash (already persistent in the window). So the
+   stash *is* the persistence mechanism — no per-call regrant. Confirm the frontend emits exports that
+   read handles from the stash, same as `main`.
+3. **Backend persistence.** Tree-walker: keep the `Mem` (window) + `Host` alive across calls (today
+   `run_capture_reserved_with_host` owns the `Mem` internally — needs an entry that takes a persistent
+   `Mem`). JIT: keep the `CompiledModule` + window alive (à la `JitSession`) and call exports via a
+   per-export trampoline (the JIT compiles function 0; calling an arbitrary export needs an
+   entry-by-index run over the live window — check `CompiledModule` supports invoking a chosen funcidx,
+   or extend it). This is the main implementation cost.
+4. **Differential.** `call_export` differential (interp vs JIT) must run *both* sessions in lockstep
+   across the *sequence* of calls (state diverges if they desync), not per-call in isolation.
+5. **Concurrency / durability.** Out of scope for the first slice (single-threaded reactor); note the
+   interaction with §12 threads and durability snapshots as later work.
+
+### Acceptance (first slice)
+A hand-written module that exports `add(i64 sp, i64 x) -> i64` accumulating into a persistent global,
+called via `Session::call_export("add", …)` several times, returns the running total (proving window
+state persists), with interp == jit across the call sequence. Plus a C-ABI mirror (`svm_session_*`).
+
+### Scope notes
+- Keep `command`-mode `Instance::run`/`run_diff` unchanged (the program use case).
+- This is the natural place to also wire `argv`/env (Followup F4) since a reactor's `start` is where an
+  initializer would consume them.
+
+---
+
+## Followups / known gaps (logged, not yet scheduled)
+
+- **F1 — converge the host runners.** Fold `run_powerbox_inner` and `run_c_full` onto the `Instance`
+  layer (or factor one shared powerbox-grant/run core) so the powerbox-grant logic isn't duplicated and
+  the CLI/tests use one interface. Do this alongside or after Phase 6.
+- **F2 — name-addressable nested guests.** Thread `Module.exports` through the §14 `Module`-capability
+  path so a parent can call a child's export by name, not just func 0 — consistent with host-driven
+  calls. (Today nested children are func-0-only.)
+- **F3 — test the named-export call path.** Even before Phase 6, add a test for `Instance::call("<non-
+  _start>", args)` returning results; decide whether a non-`_start` export should get the powerbox caps
+  (it currently gets none — likely wrong once reactors exist).
+- **F4 — `argv`/env through `Instance`/`RunConfig`.** `synth_powerbox_start` is `main(void)`-only; the
+  older `run_powerbox_with_args` supports the §3e args buffer. Thread it through the new layer.
+- **F5 — guest-memory access from C callbacks** (Phase 5 deferral): a bounds-checked `GuestMem` shim so
+  a C `HostFn` can read/write the window, not just compute on scalars.
+- **F6 — unify `Quota`** into one shared type (Phase 3 deferral): currently `svm_interp::Quota` and
+  `svm_jit::Quota` are structurally identical and converted at the facade.
+- **F7 — runtime name→handle directory** (Phase 2 deferral): in-guest dlopen-style discovery, if a
+  consumer needs it beyond compile-time name binding.
+- **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
+  placing the heap base above an arbitrary-N stash.
+- **F9 — cosmetic interface labels** (Phase 4 deferral): an untrusted, verifier-ignored human-readable
+  label alongside a `HostFn` grant for diagnostics / `cap.self.*`. Not a nominal type_id.
+
+---
+
 ## Open questions
 
 - Phase 2: do we want the **runtime** name→handle directory (true dynamic lookup the *guest* can
