@@ -313,6 +313,47 @@ fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
 // wasm-specific min/max/nearest rules are preserved. The differential harness (interp vs residual,
 // on both backends, with NaN/±0/±inf/tie inputs) is the spec.
 
+/// Evaluate a `libm`-only float fold. With the `libm-floats` feature the expression runs; without it
+/// (the in-svm svm-IR build, which can't translate libm's inline-asm/i128) the op is never reached —
+/// the fold dispatch returns `None` first ([`op_needs_libm`]) — so the arm is `unreachable!`.
+macro_rules! libm_only {
+    ($e:expr) => {{
+        #[cfg(feature = "libm-floats")]
+        {
+            $e
+        }
+        #[cfg(not(feature = "libm-floats"))]
+        {
+            unreachable!("libm float fold reached without the `libm-floats` feature")
+        }
+    }};
+}
+
+/// The unary float ops that need `libm` (no `core` impl): `sqrt`/`ceil`/`floor`/`trunc`/round-ties-
+/// even. `abs`/`neg` are pure `core`. The in-svm build (no `libm-floats`) leaves these unfolded.
+fn fun_needs_libm(op: FUnOp) -> bool {
+    matches!(
+        op,
+        FUnOp::Sqrt | FUnOp::Ceil | FUnOp::Floor | FUnOp::Trunc | FUnOp::Nearest
+    )
+}
+
+/// `|a|` in pure `core` (clear the sign bit) — bit-identical to `libm::fabs`/`f*::abs`, so it folds in
+/// every build (no libm).
+fn fabs32(a: f32) -> f32 {
+    f32::from_bits(a.to_bits() & 0x7fff_ffff)
+}
+fn fabs64(a: f64) -> f64 {
+    f64::from_bits(a.to_bits() & 0x7fff_ffff_ffff_ffff)
+}
+/// `copysign(a, b)` in pure `core` (a's magnitude, b's sign) — bit-identical to `libm::copysign`.
+fn fcopysign32(a: f32, b: f32) -> f32 {
+    f32::from_bits((a.to_bits() & 0x7fff_ffff) | (b.to_bits() & 0x8000_0000))
+}
+fn fcopysign64(a: f64, b: f64) -> f64 {
+    f64::from_bits((a.to_bits() & 0x7fff_ffff_ffff_ffff) | (b.to_bits() & 0x8000_0000_0000_0000))
+}
+
 fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
     match op {
         FBinOp::Add => a + b,
@@ -321,7 +362,7 @@ fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
         FBinOp::Div => a / b,
         FBinOp::Min => fmin32(a, b),
         FBinOp::Max => fmax32(a, b),
-        FBinOp::Copysign => libm::copysignf(a, b),
+        FBinOp::Copysign => fcopysign32(a, b),
     }
 }
 fn fbin64(op: FBinOp, a: f64, b: f64) -> f64 {
@@ -332,33 +373,32 @@ fn fbin64(op: FBinOp, a: f64, b: f64) -> f64 {
         FBinOp::Div => a / b,
         FBinOp::Min => fmin64(a, b),
         FBinOp::Max => fmax64(a, b),
-        FBinOp::Copysign => libm::copysign(a, b),
+        FBinOp::Copysign => fcopysign64(a, b),
     }
 }
 fn fun32(op: FUnOp, a: f32) -> f32 {
     match op {
-        // `abs`/`copysign`/`sqrt`/`ceil`/`floor`/`trunc`/round-ties-even are not in `core` on the
-        // on-ramp's pinned `rustc 1.81` (they need libm); since this crate is `no_std`, route them
-        // through the `libm` crate. All are *correctly-rounded* (or exact) IEEE ops, so libm is
-        // bit-identical to the `std` methods the interpreter uses — the differential harness proves it.
-        FUnOp::Abs => libm::fabsf(a),
+        // `abs`/`neg` are pure `core` and fold in every build. `sqrt`/`ceil`/`floor`/`trunc`/round-
+        // ties-even are not in `core` (std-only) — folded via `libm` only with the `libm-floats`
+        // feature; the in-svm build leaves them unfolded (the dispatch returns `None` first).
+        FUnOp::Abs => fabs32(a),
         FUnOp::Neg => -a,
-        FUnOp::Sqrt => libm::sqrtf(a),
-        FUnOp::Ceil => libm::ceilf(a),
-        FUnOp::Floor => libm::floorf(a),
-        FUnOp::Trunc => libm::truncf(a),
-        FUnOp::Nearest => libm::rintf(a), // default FP env: round to nearest, ties to even
+        FUnOp::Sqrt => libm_only!(libm::sqrtf(a)),
+        FUnOp::Ceil => libm_only!(libm::ceilf(a)),
+        FUnOp::Floor => libm_only!(libm::floorf(a)),
+        FUnOp::Trunc => libm_only!(libm::truncf(a)),
+        FUnOp::Nearest => libm_only!(libm::rintf(a)), // default FP env: round to nearest, ties to even
     }
 }
 fn fun64(op: FUnOp, a: f64) -> f64 {
     match op {
-        FUnOp::Abs => libm::fabs(a),
+        FUnOp::Abs => fabs64(a),
         FUnOp::Neg => -a,
-        FUnOp::Sqrt => libm::sqrt(a),
-        FUnOp::Ceil => libm::ceil(a),
-        FUnOp::Floor => libm::floor(a),
-        FUnOp::Trunc => libm::trunc(a),
-        FUnOp::Nearest => libm::rint(a), // default FP env: round to nearest, ties to even
+        FUnOp::Sqrt => libm_only!(libm::sqrt(a)),
+        FUnOp::Ceil => libm_only!(libm::ceil(a)),
+        FUnOp::Floor => libm_only!(libm::floor(a)),
+        FUnOp::Trunc => libm_only!(libm::trunc(a)),
+        FUnOp::Nearest => libm_only!(libm::rint(a)), // default FP env: round to nearest, ties to even
     }
 }
 // wasm min/max: NaN propagates; for ±0, min prefers -0 and max prefers +0.
@@ -432,6 +472,10 @@ pub(crate) fn fold_fbin(ty: FloatTy, op: FBinOp, a: Known, b: Known) -> Option<K
 }
 /// Fold a unary float op; operand and result are `ty`.
 pub(crate) fn fold_fun(ty: FloatTy, op: FUnOp, a: Known) -> Option<Known> {
+    // The in-svm build (no `libm-floats`) can't fold the libm ops — pass them through unfolded.
+    if !cfg!(feature = "libm-floats") && fun_needs_libm(op) {
+        return None;
+    }
     Some(match ty {
         FloatTy::F32 => Known::F32(fun32(op, a.as_f32()?).to_bits()),
         FloatTy::F64 => Known::F64(fun64(op, a.as_f64()?).to_bits()),
@@ -466,13 +510,20 @@ pub(crate) fn fold_fcmp(ty: FloatTy, op: FCmpOp, a: Known, b: Known) -> Option<K
     Some(Known::I32(r as i32))
 }
 /// Fold a fused multiply-add `a·b + c` (single rounding), matching the interpreter's `mul_add`.
+/// FMA needs `libm` (correctly-rounded software FMA → x86 inline-asm + i128), so it folds only with
+/// the `libm-floats` feature; the in-svm build leaves `fma` unfolded (sound — it runs at runtime).
+#[cfg(feature = "libm-floats")]
 pub(crate) fn fold_fma(ty: FloatTy, a: Known, b: Known, c: Known) -> Option<Known> {
     Some(match ty {
-        // `mul_add` is `std`-only; `libm::fmaf`/`fma` is the same correctly-rounded IEEE FMA (so
-        // bit-identical to the interpreter's `mul_add`), and works in `no_std`.
+        // `libm::fmaf`/`fma` is the correctly-rounded IEEE FMA, bit-identical to the interpreter's
+        // `mul_add` (a hardware/correctly-rounded FMA).
         FloatTy::F32 => Known::F32(libm::fmaf(a.as_f32()?, b.as_f32()?, c.as_f32()?).to_bits()),
         FloatTy::F64 => Known::F64(libm::fma(a.as_f64()?, b.as_f64()?, c.as_f64()?).to_bits()),
     })
+}
+#[cfg(not(feature = "libm-floats"))]
+pub(crate) fn fold_fma(_ty: FloatTy, _a: Known, _b: Known, _c: Known) -> Option<Known> {
+    None // in-svm build: FMA needs libm (i128/inline-asm), so leave it unfolded
 }
 /// The `f64` value of a float operand, promoting `f32` exactly (matching the interpreter).
 fn ftoi_input(op: FToI, a: Known) -> Option<f64> {
@@ -599,10 +650,19 @@ pub(crate) fn fold_simd(inst: &Inst, get: impl Fn(ValIdx) -> Option<Known>) -> O
         Inst::VFloatBin { shape, op, a, b } => {
             Known::V128(simd_vfloat_bin(shape, op, v(a)?, v(b)?))
         }
-        Inst::VFloatUn { shape, op, a } => Known::V128(simd_vfloat_un(shape, op, v(a)?)),
+        // SIMD `sqrt`/`ceil`/`floor`/`trunc`/nearest per lane need libm (like the scalar path); fold
+        // only with `libm-floats`. `abs`/`neg` lanes are pure `core`, so they still fold.
+        Inst::VFloatUn { shape, op, a }
+            if cfg!(feature = "libm-floats") || !fun_needs_libm(vf_un(op)) =>
+        {
+            Known::V128(simd_vfloat_un(shape, op, v(a)?))
+        }
         Inst::VFloatCmp { shape, op, a, b } => {
             Known::V128(simd_vfloat_cmp(shape, op, v(a)?, v(b)?))
         }
+        // SIMD FMA needs libm (i128/inline-asm); fold only with `libm-floats` (else this arm is
+        // removed and `VFma` falls through to `_ => return None`, i.e. passes through unfolded).
+        #[cfg(feature = "libm-floats")]
         Inst::VFma {
             shape,
             neg,
@@ -650,18 +710,20 @@ pub(crate) fn fold_simd(inst: &Inst, get: impl Fn(ValIdx) -> Option<Known>) -> O
 fn simd_vsat_bin(shape: VShape, op: VSatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
     let bytes = shape.lane_bytes() as usize;
     let bits = bytes as u32 * 8;
-    let max_u = (1i128 << bits) - 1;
-    let max_s = (1i128 << (bits - 1)) - 1;
-    let min_s = -(1i128 << (bits - 1));
+    // Saturating add/sub exist only for 8/16-bit lanes (wasm), so every value and sum fits `i64` —
+    // no need for `i128` (which the svm-IR on-ramp can't translate; see PEVAL.md Milestone 2).
+    let max_u = (1i64 << bits) - 1;
+    let max_s = (1i64 << (bits - 1)) - 1;
+    let min_s = -(1i64 << (bits - 1));
     let mut o = [0u8; 16];
     for i in 0..shape.lanes() as usize {
         let (xu, yu) = (
-            lane_read(&a, i, bytes) as i128,
-            lane_read(&b, i, bytes) as i128,
+            lane_read(&a, i, bytes) as i64,
+            lane_read(&b, i, bytes) as i64,
         );
         let (xs, ys) = (
-            lane_sext(lane_read(&a, i, bytes), bytes) as i128,
-            lane_sext(lane_read(&b, i, bytes), bytes) as i128,
+            lane_sext(lane_read(&a, i, bytes), bytes),
+            lane_sext(lane_read(&b, i, bytes), bytes),
         );
         let r = match op {
             VSatBinOp::AddU => (xu + yu).min(max_u),
@@ -699,17 +761,19 @@ fn simd_narrow(out: VShape, op: VNarrowOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16]
     let src_bytes = src.lane_bytes() as usize;
     let src_lanes = src.lanes() as usize; // = out.lanes() / 2
     let bits = out_bytes as u32 * 8;
+    // Narrow targets 8/16-bit lanes from 16/32-bit sources, so the clamp bounds and sign-extended
+    // sources all fit `i64` (no `i128` — the on-ramp can't translate it).
     let (min, max) = match op {
-        VNarrowOp::S => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
-        VNarrowOp::U => (0i128, (1i128 << bits) - 1),
+        VNarrowOp::S => (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1),
+        VNarrowOp::U => (0i64, (1i64 << bits) - 1),
     };
     let mut o = [0u8; 16];
     for i in 0..src_lanes {
-        let s = lane_sext(lane_read(&a, i, src_bytes), src_bytes) as i128;
+        let s = lane_sext(lane_read(&a, i, src_bytes), src_bytes);
         lane_write(&mut o, i, out_bytes, s.clamp(min, max) as u64);
     }
     for i in 0..src_lanes {
-        let s = lane_sext(lane_read(&b, i, src_bytes), src_bytes) as i128;
+        let s = lane_sext(lane_read(&b, i, src_bytes), src_bytes);
         lane_write(&mut o, src_lanes + i, out_bytes, s.clamp(min, max) as u64);
     }
     o
@@ -721,18 +785,19 @@ fn simd_extmul(out: VShape, op: VWidenOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] 
     let src_bytes = out_bytes / 2;
     let n = out.lanes() as usize;
     let base = if low { 0 } else { n };
-    let widen = |raw: u64| -> i128 {
-        if signed {
-            lane_sext(raw, src_bytes) as i128
-        } else {
-            raw as i128
-        }
-    };
     let mut o = [0u8; 16];
     for i in 0..n {
-        let x = widen(lane_read(&a, base + i, src_bytes));
-        let y = widen(lane_read(&b, base + i, src_bytes));
-        lane_write(&mut o, i, out_bytes, (x * y) as u64);
+        let ra = lane_read(&a, base + i, src_bytes);
+        let rb = lane_read(&b, base + i, src_bytes);
+        // Widening multiply: source lanes are ≤32-bit, so the 2× product fits 64 bits — `i64` for
+        // signed, `u64` for unsigned (`u32×u32` can exceed `i64::MAX` but fits `u64`). `i128` was
+        // unnecessary, and the on-ramp can't translate it (PEVAL.md Milestone 2).
+        let prod = if signed {
+            lane_sext(ra, src_bytes).wrapping_mul(lane_sext(rb, src_bytes)) as u64
+        } else {
+            ra.wrapping_mul(rb)
+        };
+        lane_write(&mut o, i, out_bytes, prod);
     }
     o
 }
@@ -741,11 +806,13 @@ fn simd_extadd_pairwise(out: VShape, signed: bool, a: [u8; 16]) -> [u8; 16] {
     let out_bytes = out.lane_bytes() as usize;
     let src_bytes = out_bytes / 2;
     let n = out.lanes() as usize;
-    let widen = |raw: u64| -> i128 {
+    // Pairwise widen-add of 8/16-bit lanes into 16/32-bit lanes — sums of two ≤16-bit values fit
+    // `i64` comfortably (no `i128`, which the on-ramp can't translate).
+    let widen = |raw: u64| -> i64 {
         if signed {
-            lane_sext(raw, src_bytes) as i128
+            lane_sext(raw, src_bytes)
         } else {
-            raw as i128
+            raw as i64
         }
     };
     let mut o = [0u8; 16];
@@ -1161,6 +1228,9 @@ fn simd_vfloat_cmp(shape: VShape, op: VFCmpOp, a: [u8; 16], b: [u8; 16]) -> [u8;
     o
 }
 
+// Only compiled with `libm-floats` (its sole caller, the `VFma` fold arm, is `#[cfg]`-gated the same
+// way); the in-svm build leaves SIMD FMA unfolded.
+#[cfg(feature = "libm-floats")]
 fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
     let mut o = [0u8; 16];
     match shape {

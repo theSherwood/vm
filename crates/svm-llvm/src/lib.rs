@@ -13143,10 +13143,16 @@ fn translate_switch(
     }
     let min = cases.iter().map(|(v, _)| *v).min().unwrap();
     let max = cases.iter().map(|(v, _)| *v).max().unwrap();
-    let span = max - min + 1;
-    if span > MAX_SWITCH_SPAN {
-        return unsup(format!("sparse switch (span {span} > {MAX_SWITCH_SPAN})"));
+    // Compute the span in `i128` so a switch whose `i64` cases straddle more than the `i64` range
+    // (a sparse `match` on a wide value) reports `Unsupported` instead of overflow-panicking. Once
+    // bounded by `MAX_SWITCH_SPAN` it fits `i64`/`usize` for the table below.
+    let span_wide = max as i128 - min as i128 + 1;
+    if span_wide > MAX_SWITCH_SPAN as i128 {
+        return unsup(format!(
+            "sparse switch (span {span_wide} > {MAX_SWITCH_SPAN})"
+        ));
     }
+    let span = span_wide as i64;
 
     // Index = operand - min (so the table starts at 0). An out-of-range / unbiased value lands on
     // the default (a too-large biased value, ≥ len ⇒ default).
