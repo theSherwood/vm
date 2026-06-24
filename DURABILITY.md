@@ -10,7 +10,7 @@
 > the R5 identity gate **+ Section-2 fiber residue**), and **per-page protection capture +
 > re-establish on both backends** (Phase 2). A single-fiber domain round-trips
 > `freeze → serialize → restore → thaw` end-to-end. The master design is `DESIGN.md` (D-notes,
-> §-sections); the project status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and
+> §-sections). Keep this doc and `DESIGN.md` in step — if code and
 > a doc disagree, fix one of them in the same change (per `AGENTS.md`).
 >
 > Proposed decision: **D60** (D59 is currently the last). See bottom of file.

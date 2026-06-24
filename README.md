@@ -10,7 +10,8 @@ The full design lives in [`DESIGN.md`](DESIGN.md); the working agreement (keep i
 simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 [`AGENTS.md`](AGENTS.md).
 
-> Status: **Phase 3 + cross-platform parity (3.5) complete, into Phase 4 (concurrency)** — the core loop, the Cranelift JIT, and the
+> Status: **Phase 3 + cross-platform parity (3.5) complete, deep into Phase 4 (concurrency, nesting,
+> durability, second/third frontends, tooling)** — the core loop, the Cranelift JIT, and the
 > C frontend are all in place. The full **scalar IR** (integer /
 > float ops, linear memory with confinement masking, direct / indirect / tail calls +
 > the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
@@ -123,10 +124,26 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > free), transparently — and worker threads can **compile concurrently** (a per-domain `Mutex<Host>`
 > serializes compiles while execution stays parallel), with full platform parity. All on **both backends,
 > differentially identical**.
+> Beyond the runtime, several **frontends and tooling subsystems** have landed (each with its own
+> design doc):
+> a second-and-a-half frontend, **`svm-llvm`** — an **LLVM-bitcode → IR** translator (the AOT LLVM
+> on-ramp, D54/§20a; `LLVM.md`) that runs `clang -O2 -emit-llvm` output and clears its exit criterion
+> (all chibicc corpus libraries byte-identical to native on both backends); **durable domains**
+> (`svm-durable` + `svm-snapshot`, D60/§21; `DURABILITY.md`) — an IR→IR **freeze/thaw** transform plus
+> a backend-independent, recompile-survivable **snapshot codec**, so a running domain can be quiesced,
+> serialized, and restored bytewise (single- and multi-vCPU, both backends); **time-travel-capable
+> debugging** (`svm-dap`, §19; `DEBUGGING.md`) — an interpreter-backed **Debug Adapter Protocol**
+> server (breakpoints / stepping / backtrace / source-level locals over the IR debug info, no DWARF/JIT
+> needed); a **partial evaluator** (`svm-peval`, §20c; `PEVAL.md`) — a semantics-preserving IR→IR
+> optimizer plus the first **Futamura projection** (specialize an interpreter + fixed program into a
+> residual); a minimal **WASI preview1** host shim (`svm-wasi`, §7) over the `svm-wasm` import
+> mechanism; **conservative-GC support** (`gc.roots` control-stack root enumeration for a guest's own
+> collector, `GC.md`); and the **interpreter-as-wasm browser build** (`browser/`, §21; `BROWSER.md`) —
+> the bytecode engine compiled to **wasm64** so SVM guests run client-side.
 > Still ahead:
 > narrow-scalar promotion, honoring *weak* memory orderings (both backends seq-cst today), wider SIMD
 > (`v256`/`v512` — fixed-128 `v128` is done across all backends, D58), isolation tiers, Spectre
-> hardening, and the LLVM-bitcode on-ramp.
+> hardening, source-level **DWARF** for JIT-compiled code, and broadening LLVM/wasm frontend coverage.
 > This is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 
@@ -139,13 +156,20 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | `svm-mem` | Shared guest-memory substrate (§12/§13) — owns the memory `unsafe` behind a safe API (audited in isolation, like `svm-mask`), so the interpreter stays `forbid(unsafe_code)` | escape-TCB |
 | `svm-encode` | Binary encode + **decode** (untrusted-input-facing) (§3a) | escape-TCB |
 | `svm-verify` | The verifier — single linear pass, fail-closed (§2a I2/I3/I4; §3b) | escape-TCB |
-| `svm-interp` | Reference interpreter — the differential oracle (§18) | — |
+| `svm-interp` | Two of the three IR backends: the **tree-walk interpreter** (the differential oracle, §18) and the **bytecode interpreter** (`bytecode.rs` — the JIT-not-viable / wasm64 fallback). All three backends must agree (§3 parity invariant) | — |
 | `svm-fiber` | Native stack-switch primitive for fibers / green threads (§3d/§6/§12); the lone home for that `unsafe`, tiny and auditable (x86-64 + aarch64 unix, x86-64 Windows) | escape-TCB |
 | `svm-jit` | Cranelift JIT — CLIF lowering + the §4 masking lowering + guard page/signal (§9) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
-| `svm-wasm` | **Core-wasm → IR transpiler** — a second frontend (untrusted, re-verified); stack→SSA reconstruction | — |
+| `svm-wasm` | **Core-wasm → IR transpiler** — a second frontend (untrusted, re-verified); stack→SSA reconstruction (`WASM.md`) | — |
+| `svm-llvm` | **LLVM-bitcode → IR translator** — the AOT LLVM on-ramp (untrusted, re-verified); dominance-SSA → block-args (§20a, D54; `LLVM.md`) | — |
+| `svm-wasi` | Minimal **WASI preview1** host shim (`fd_write`/`proc_exit`) over the `svm-wasm` import mechanism (§7) | — (host shim) |
+| `svm-peval` | **Partial evaluator** — semantics-preserving IR→IR optimizer + the first Futamura projection (§20c; `PEVAL.md`) | — |
+| `svm-durable` | IR→IR **freeze/thaw** transform for durable domains (tooling-tier, +0 TCB; §21, D60; `DURABILITY.md`) | — |
+| `svm-snapshot` | Durable-domain **snapshot artifact codec** (window image + handle table + identity gate; §21; `DURABILITY.md`) | — |
+| `svm-dap` | Interpreter-backed **Debug Adapter Protocol** server (breakpoints/stepping/locals; §19; `DEBUGGING.md`) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
 | `svm-run` | Embedding runtime + **`svm-run` CLI**: instantiate with the powerbox, run on the JIT | — |
+| `browser/` | The bytecode interpreter compiled to **wasm64** — run SVM guests client-side (`BROWSER.md`) | — |
 | `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
 
 †`svm-jit` is escape-TCB but, by design (§1), shares Wasmtime's codegen — so unlike
@@ -187,6 +211,18 @@ cargo run -p svm-run -- crates/svm-run/demos/regex/regex_demo.c   # tiny-regex-c
 cargo run -p svm-run -- crates/svm-run/demos/heapgrow/heapgrow.c  # a guest heap that grows via the Memory cap
 cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c      # a guest bytecode interpreter that JITs itself (§22)
 cargo run -p svm-run -- crates/svm-run/demos/jit/jit_threads.c   # worker threads each Cranelift-compile concurrently
+cargo run -p svm-run -- crates/svm-run/demos/raytrace/raytrace.c # ASCII sphere raytracer (guest-side libm: sin/exp/sqrt)
+cargo run -p svm-run -- crates/svm-run/demos/mat4/mat4.c         # 4×4 matrix×vec4 via 128-bit SIMD (§17 v128)
+cargo run -p svm-run -- crates/svm-run/demos/crc32/crc32.c       # CRC-32 over stdin (exercises bswap)
+cargo run -p svm-run -- crates/svm-run/demos/hexdump/hexdump.c   # hexdump -C-style tool (varargs printf)
+cargo run -p svm-run -- crates/svm-run/demos/lineedit/lineedit.c # tiny line editor (overlapping memmove)
+cargo run -p svm-run -- crates/svm-run/demos/sortvec/sortvec.c   # growable int vector + sort (realloc)
+cargo run -p svm-run -- crates/svm-run/demos/mn_sched/mn_sched.c # guest M:N scheduler — sharded stackful fibers (§23)
+cargo run -p svm-run -- crates/svm-run/demos/work_stealing/work_stealing.c       # work-stealing M:N over stackless tasks (§23)
+cargo run -p svm-run -- crates/svm-run/demos/steal_fibers/steal_fibers.c         # work-stealing over migratable stackful fibers (D57)
+cargo run -p svm-run -- crates/svm-run/demos/malloc_threads/malloc_threads.c     # concurrent malloc from many vCPUs (thread-safe heap)
+cargo run -p svm-run -- crates/svm-run/demos/async_io/async_io.c                 # async event loop over the §9/§12 I/O ring
+cargo run -p svm-run -- crates/svm-run/demos/async_work_stealing/async_work_stealing.c # async work-stealing M:N runtime (capstone)
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
@@ -199,7 +235,7 @@ third-party C header, vendored) sandboxed: it compiles through the frontend to ~
 IR, verifies, and runs on the JIT, producing the same render commands as a native build.
 Getting it to run drove a batch of frontend/IR/JIT fixes (anonymous-aggregate designated
 inits, ternary-returns-struct, >16-byte struct returns, mixed-width shifts, program-sized
-windows, a contiguous JIT code arena, gcc-parity packed-enum/struct layout) — see `HANDOFF.md`.
+windows, a contiguous JIT code arena, gcc-parity packed-enum/struct layout) — see `FRONTEND.md`.
 **`jsmn/jsmn_demo.c`** runs the [jsmn](https://github.com/zserge/jsmn) zero-allocation JSON
 tokenizer — a different shape (char/state-machine string scanning) that ran identically to a
 native build with no new fixes, validating string handling, escapes, nesting, and error paths.

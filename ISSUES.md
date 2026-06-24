@@ -1,8 +1,8 @@
 # Known Issues & Robustness Gaps
 
 A registry of **known bugs, robustness gaps, and latent hazards** that are understood but not yet
-fixed — distinct from the forward-looking design/status docs (`DESIGN.md`, `DURABILITY.md`,
-`HANDOFF.md`). An entry here is a deliberately-deferred problem with a recorded root cause and a fix
+fixed — distinct from the forward-looking design/status docs (`DESIGN.md`, `DURABILITY.md`).
+An entry here is a deliberately-deferred problem with a recorded root cause and a fix
 sketch, so it isn't rediscovered from scratch. When an issue is fixed, move it to the bottom
 ("Resolved") with the commit/PR, or delete it and note the fix in the relevant design doc.
 
