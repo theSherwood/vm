@@ -295,7 +295,7 @@ hot loops are rare in real code, so this is low priority.
 
 ---
 
-### I11 — on-ramp fails-closed on an auto-vectorized `<8 x i32>` shape the I2 legalizer doesn't cover (S3) — found via Embench `edn`
+### I11 — on-ramp fails-closed on an auto-vectorized `<8 x i32>` shape the I2 legalizer doesn't cover (S3) — found via Embench `edn` — **FIX LANDED** on `claude/onramp-i11-wide-i32x8`
 
 **Where:** `crates/svm-llvm/src/lib.rs` — the I2 wide-vector legalization (`wide_vec_layout` / `lower_wide`
 and the per-op recognizers it dispatches through).
@@ -325,6 +325,18 @@ Add `edn` to the on-ramp translate tests once it lands. (Separately, the on-ramp
 definition — `clang` emits those libcalls for array compares; the Embench wrapper supplies them in-module
 with `-fno-builtin-memcmp/-bcmp`. Providing them as on-ramp builtins, like `memcpy`/`memset`, would be a
 small coverage win.)
+
+**Fixed.** The pinned shape was a **wide lane-wise shift**: `edn`'s `vec_mpy` fixed-point kernel
+(`y[i] += (short)((scaler * x[i]) >> 15)`) auto-vectorizes to a `<8 x i32>` widening multiply followed
+by a `>>15` shift. I10 added 128-bit vector shifts but the **wide** legalizer's op dispatch had no
+`Shl`/`LShr`/`AShr` arm, so a wider-than-128 shift fell through to the `Unsupported("<8 x i32>")` type
+fallthrough — even though the surrounding `sext`/`mul`/`trunc` already chunked. The fix adds those three
+arms (`lower_wide`) routed through a new `wide_int_shift`: each `v128` chunk shifts via `VShift` (one
+scalar splat amount, the same uniform-amount recognizer the 128-bit path uses — a per-lane-varying amount
+stays fail-closed), each scalar tail lane via `IntBin`. *Test* (`translate.rs`
+`simd_autovec_avx2_fixed_point_shift`): the `-O2 -mavx2` `vec_mpy` kernel translates and runs **bit-exact
+vs the native scalar `cc` oracle on both backends**. *Still a small follow-up:* the `memcmp`/`bcmp`
+on-ramp builtins noted above (the other reason `edn` may need the Embench wrapper's `-fno-builtin`).
 
 ---
 
