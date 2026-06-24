@@ -1726,6 +1726,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::CapSelfGet { idx: a }
         | Inst::VcpuTlsSet { val: a }
         | Inst::Suspend { value: a }
+        | Inst::SetJmp { buf: a }
         | Inst::ThreadJoin { handle: a }
         | Inst::Splat { a, .. }
         | Inst::ExtractLane { a, .. }
@@ -1765,6 +1766,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         }
         | Inst::ContNew { func: a, sp: b }
         | Inst::ContResume { k: a, arg: b }
+        | Inst::LongJmp { buf: a, val: b }
         | Inst::ThreadSpawn { sp: a, arg: b, .. }
         | Inst::ReplaceLane { a, b, .. }
         | Inst::VIntBin { a, b, .. }

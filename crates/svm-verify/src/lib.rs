@@ -471,6 +471,31 @@ fn check_inst(
         cx.expect(*value, ValType::V128)?;
         return Ok(None);
     }
+    // `setjmp`/`longjmp` (the non-local jump): both touch the guest `jmp_buf` token in window memory,
+    // so both require a declared window. `setjmp` takes an `i64` buffer address, yields `i32` (0 on the
+    // direct call, the long-jump value on re-entry); `longjmp` takes the `i64` address + an `i32` value
+    // and yields no result (a `noreturn` control op).
+    if let Inst::SetJmp { buf } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*buf, ValType::I64)?;
+        return Ok(Some(ValType::I32));
+    }
+    if let Inst::LongJmp { buf, val } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*buf, ValType::I64)?;
+        cx.expect(*val, ValType::I32)?;
+        return Ok(None);
+    }
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
@@ -980,6 +1005,8 @@ fn check_inst(
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContResume { .. }
+        | Inst::SetJmp { .. }
+        | Inst::LongJmp { .. }
         | Inst::ThreadSpawn { .. } => return Ok(None),
     };
     Ok(Some(ty))

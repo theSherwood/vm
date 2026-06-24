@@ -144,6 +144,8 @@ mod op {
     pub const VCPU_TLS_GET: u8 = 0xEB; // §12 per-vCPU TLS register: () -> i64
     pub const VCPU_TLS_SET: u8 = 0xEC; // §12 per-vCPU TLS register: val -> ()
     pub const DURABLE_SHADOW_BASE: u8 = 0xED; // durable-internal: () -> i64 (current ctx shadow base)
+    pub const SETJMP: u8 = 0xEE; // <setjmp.h>: buf -> i32 (0, or the longjmp value on re-entry)
+    pub const LONGJMP: u8 = 0xEF; // <setjmp.h>: buf, val -> () (noreturn)
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -693,6 +695,15 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::Suspend { value } => {
             out.push(op::SUSPEND);
             write_uleb(out, *value as u64);
+        }
+        Inst::SetJmp { buf } => {
+            out.push(op::SETJMP);
+            write_uleb(out, *buf as u64);
+        }
+        Inst::LongJmp { buf, val } => {
+            out.push(op::LONGJMP);
+            write_uleb(out, *buf as u64);
+            write_uleb(out, *val as u64);
         }
         Inst::GcRoots {
             heap_lo,
@@ -1857,6 +1868,11 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             arg: c.idx()?,
         },
         op::SUSPEND => Inst::Suspend { value: c.idx()? },
+        op::SETJMP => Inst::SetJmp { buf: c.idx()? },
+        op::LONGJMP => Inst::LongJmp {
+            buf: c.idx()?,
+            val: c.idx()?,
+        },
         op::GC_ROOTS => Inst::GcRoots {
             heap_lo: c.idx()?,
             heap_hi: c.idx()?,

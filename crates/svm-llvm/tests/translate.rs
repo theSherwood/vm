@@ -1023,6 +1023,205 @@ fn variable_length_memset_loop() {
     );
 }
 
+/// A **threaded (computed-`goto`) bytecode interpreter** — the canonical `indirectbr`/`blockaddress`
+/// idiom (`static void *tbl[] = {&&l0,…}; goto *tbl[op];`), the dispatch shape every real bytecode VM
+/// (SQLite's VDBE, Lua, QuickJS) is built on. clang `-O2` lowers `&&label` to `blockaddress` constants
+/// in the dispatch-table global and `goto *p` to an `indirectbr`. The on-ramp recovers the (otherwise
+/// `llvm-ir`-erased) blockaddress targets via `llvm-sys` ([`svm_llvm::blockaddr`]) — baking each as its
+/// block index into the table global — and lowers the `indirectbr` to a `br_table` over those indices.
+/// The program is **derived from `n` at runtime** so no dispatch target constant-folds (which would let
+/// clang thread a `blockaddress` through a φ — an operand-position use, the deferred follow-up); every
+/// blockaddress stays in the table global. Verified byte-for-byte vs native on both backends.
+const COMPUTED_GOTO_SRC: &str = r#"
+int run(int n) {
+  static const void *const tbl[] = {&&op_halt, &&op_dbl, &&op_inc, &&op_xor};
+  unsigned char prog[16];
+  for (int i = 0; i < 15; i++) prog[i] = (unsigned char)(((n + i) * 2654435761u) % 4);
+  prog[15] = 0; /* guaranteed halt */
+  int pc = 0, acc = n, steps = 0;
+  goto *tbl[prog[pc]];
+op_dbl:  acc = acc * 2 + 1; pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_inc:  acc += 3;         pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_xor:  acc ^= 0x5a;      pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_halt: return acc & 0xff;
+}
+int main(void) { return run(7); }
+"#;
+
+#[test]
+fn computed_goto_threaded_interpreter() {
+    check_vs_native("computed_goto", COMPUTED_GOTO_SRC, 7);
+}
+
+/// Structural companion to [`computed_goto_threaded_interpreter`]: prove the computed-`goto` path is
+/// actually exercised (not optimized away) — clang emitted `blockaddress`es into the dispatch global,
+/// the `llvm-sys` recovery found them, and the `indirectbr` lowered to a `br_table`.
+#[test]
+fn computed_goto_lowers_indirectbr_to_br_table() {
+    let Some(bc) = compile_to_bc("computed_goto_struct", COMPUTED_GOTO_SRC) else {
+        return;
+    };
+    // The recovery found the dispatch table's blockaddress labels (one global, ≥ 2 entries).
+    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
+        .expect("blockaddress recovery should find the dispatch table");
+    assert!(
+        ba.per_global.values().any(|labels| labels.len() >= 2),
+        "expected a dispatch-table global with multiple blockaddress labels, got {:?}",
+        ba.per_global
+    );
+    // The `indirectbr` lowered to a `br_table` terminator.
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let has_br_table = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .any(|b| matches!(b.term, svm_ir::Terminator::BrTable { .. }));
+    assert!(has_br_table, "indirectbr should lower to a br_table");
+}
+
+/// Computed `goto` where clang's `-O2` **jump-threading threads a `blockaddress` through a φ** (slice
+/// AW) — an *operand-position* blockaddress, not a global-table entry. This is the shape a real
+/// interpreter produces (and the AV follow-up): the program has a constant first dispatch
+/// (`prog[0] == 2`), so clang knows the entry target and threads `blockaddress(@run, …)` into a φ that
+/// feeds the `indirectbr`. The on-ramp recovers it via `llvm-sys` (`blockaddr::phi`, keyed by φ
+/// position) and materializes the block-index constant. Byte-identical to native on both backends.
+const COMPUTED_GOTO_PHI_SRC: &str = r#"
+int run(int n) {
+  static const void *const tbl[] = {&&op_halt, &&op_dbl, &&op_inc, &&op_loop};
+  static const unsigned char prog[] = {2, 1, 2, 3, 0}; /* inc,dbl,inc,loop,halt — constant first op */
+  int pc = 0, acc = n, iters = 0;
+  goto *tbl[prog[pc]];
+op_dbl:  acc *= 2; pc++; goto *tbl[prog[pc]];
+op_inc:  acc += 1; pc++; goto *tbl[prog[pc]];
+op_loop: if (++iters < 3) pc = 0; else pc++; goto *tbl[prog[pc]];
+op_halt: return acc & 0xff;
+}
+int main(void) { return run(7); }
+"#;
+
+#[test]
+fn computed_goto_phi_threaded_blockaddress() {
+    check_vs_native("computed_goto_phi", COMPUTED_GOTO_PHI_SRC, 7);
+}
+
+/// Structural companion: confirm clang actually threaded a `blockaddress` through a φ (so the
+/// operand-position recovery path — not just the global-table path — is exercised).
+#[test]
+fn computed_goto_phi_recovery_finds_operand_blockaddress() {
+    let Some(bc) = compile_to_bc("computed_goto_phi_struct", COMPUTED_GOTO_PHI_SRC) else {
+        return;
+    };
+    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
+        .expect("recovery should find blockaddresses");
+    assert!(
+        !ba.phi.is_empty(),
+        "expected a φ-threaded (operand-position) blockaddress, got phi map {:?}",
+        ba.phi
+    );
+    // And it still translates + verifies (the operand-position label resolved, no fail-closed).
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+}
+
+/// `<setjmp.h>` non-local jump (`setjmp`/`longjmp` → the `SetJmp`/`LongJmp` core ops). Compiles `run`
+/// plus `int main(){return run(SEED);}` natively (real libc `setjmp`/`longjmp`) and on the on-ramp,
+/// asserting the **tree-walker** matches the native exit code. Interpreter-only: the JIT's native-stack
+/// `longjmp` is a later sub-slice, so it must cleanly bail `Unsupported` here (asserted) and the
+/// bytecode engine declines the module (→ tree-walker) — the engines stay in sync (no divergence;
+/// either correct or a clean decline). `run` returns a byte so the result survives the Unix exit code.
+fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("svm_llvm_sj_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let svm = match interp.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        svm, native,
+        "{name}: tree-walker={svm} vs native cc={native}"
+    );
+
+    // The **bytecode** engine implements setjmp/longjmp too (interpreter-grade) and must agree — it
+    // runs the module (does not decline) and matches the tree-walker + native.
+    let mut bfuel = 100_000_000u64;
+    let bc_out = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+        .expect("bytecode engine should run setjmp/longjmp (not decline)")
+        .expect("bytecode run");
+    let bsvm = match bc_out.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: bytecode expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        bsvm, native,
+        "{name}: bytecode={bsvm} vs native cc={native}"
+    );
+
+    // The JIT must cleanly decline (its native-stack longjmp is a later sub-slice) — not miscompile.
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    assert!(
+        matches!(
+            svm_jit::compile_and_run(&module, 0, &slots),
+            Err(svm_jit::JitError::Unsupported(_))
+        ),
+        "{name}: the JIT should bail Unsupported on setjmp/longjmp (interp-only for now)"
+    );
+}
+
+#[test]
+fn setjmp_longjmp_round_trip() {
+    // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
+    // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
+    // frame, restoring its data-SP and value state. Byte-identical to native libc.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static void deep(int x){ longjmp(env, x*7+1); }\n\
+               int run(int n){ int r = setjmp(env); if (r==0){ deep(n); return -1; } return r & 0xff; }\n\
+               int main(void){ return run(5); }";
+    check_setjmp_vs_native("setjmp_basic", src, 5);
+}
+
+#[test]
+fn setjmp_longjmp_loop_and_deep_nesting() {
+    // A retry loop: each `longjmp` (from several frames deep) re-enters the `setjmp`, incrementing a
+    // counter carried in memory (a `volatile`/`static`, which survives the jump per C), until it
+    // reaches the limit — exercising repeated re-entry (the checkpoint is overwritten on each
+    // `setjmp`) and a multi-frame unwind. Byte-identical to native.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static int counter;\n\
+               static void c(int d, int n){ if (d > 0) { c(d-1, n); return; } longjmp(env, n); }\n\
+               int run(int n){ counter = 0; int r = setjmp(env); \
+                 if (r != 0) counter += r; \
+                 if (counter < n) c(3, counter + 1); \
+                 return counter & 0xff; }\n\
+               int main(void){ return run(20); }";
+    check_setjmp_vs_native("setjmp_loop", src, 20);
+}
+
 #[test]
 fn demo_sha256_vs_native() {
     // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the
@@ -1112,6 +1311,175 @@ fn demo_clay_vs_native() {
     // to a packed `i64`. Lays out a small UI and prints the render commands, byte-identical to native.
     // The eighth and final corpus demo (the D54 exit criterion).
     check_demo_vs_native("clay", "clay/clay_demo.c", b"");
+}
+
+#[test]
+fn demo_calc_vs_native() {
+    // The chibicc `calc` demo (a recursive-descent arithmetic calculator) through the LLVM on-ramp.
+    // Exercises a **global array of string pointers** + a **global struct array holding function
+    // pointers** (both relocations, slice K), **indirect calls** through that dispatch table (slice G
+    // → `call_indirect`), and **recursion** (expr → term → factor). It drives itself from a global
+    // expression table and writes `"<expr> = <result>"` rows — byte-identical to native `cc`. The
+    // first of the two non-corpus chibicc demos the on-ramp now covers (LLVM is the main frontend).
+    check_demo_vs_native("calc", "calc.c", b"");
+}
+
+#[test]
+fn demo_rational_vs_native() {
+    // The chibicc `rational` demo (exact-rational arithmetic) through the LLVM on-ramp. Where `calc`
+    // stresses the function-pointer table, this hammers the **by-value aggregate ABI** (D39 / slice
+    // J): every op takes two `struct Rat` *by value* and returns one *by value* (the hidden-`sret`
+    // path), composed with recursion (Euclid's `gcd`) and an **indirect call that both passes and
+    // returns a struct by value** through a global dispatch table — sret + a function-pointer
+    // relocation + a struct-valued `call_indirect`, all at once. Byte-identical to native `cc`.
+    check_demo_vs_native("rational", "rational.c", b"");
+}
+
+/// Build a **guest-concurrency** corpus demo (`crates/svm-run/demos/<rel>`) that pulls in chibicc's
+/// bundled guest libc — `<pthread.h>` (a 1:1 threading layer over the `__vm_thread_spawn`/`join` +
+/// futex + atomic builtins) and `<stdlib.h>` (`malloc`). clang compiles the demo with the chibicc
+/// include dir on the path, so `pthread_create`/`pthread_mutex_*`/etc. resolve to that guest shim,
+/// which the on-ramp lowers to the §12 primitives (`thread.spawn`, `i32.atomic.wait`/`notify`, the
+/// `iN.atomic.*` ops). The same source built with native `cc` would instead use the platform pthreads
+/// — but these demos call `__vm_*` builtins / guest fibers with no native symbol, so they have no
+/// native oracle; the assertion is the **interleaving-invariant total** (the chibicc `c_guest_*`
+/// contract, now via the LLVM frontend). `None` (skip) if clang is unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn compile_demo_libc_to_bc(name: &str, rel: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos")
+        .join(rel);
+    let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
+    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.bc", std::process::id(), name));
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-c"])
+        .arg("-I")
+        .arg(&inc)
+        .arg(&path)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Compile an inline C **source string** with chibicc's guest-libc include dir on the path (the
+/// `<pthread.h>`/`<svm.h>` shims) → bitcode. The text variant of [`compile_demo_libc_to_bc`], for a
+/// demo that must be *patched* before compiling (the guest-JIT blob descriptor). `None` if clang is
+/// unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn compile_libc_src_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+    let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
+    let c = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.c", std::process::id(), name));
+    let bc = std::env::temp_dir().join(format!("svm_llvm_cc_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-c"])
+        .arg("-I")
+        .arg(&inc)
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Run a guest-built concurrency scheduler demo (threads / stackful fibers / futex over the `__vm_*`
+/// primitives + the guest pthread shim) through the on-ramp on the **real powerbox** and assert its
+/// stdout. The printed total is interleaving-invariant — deterministic regardless of which worker ran
+/// each unit — so it is the same fixed value the chibicc `c_guest_*` tests check (the LLVM frontend
+/// must reach the same answer). A generous deadline guards against a hang (a livelocked scheduler is a
+/// failure, not an infinite test). Skips silently if clang is unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
+    let Some(bc) = compile_demo_libc_to_bc(name, rel) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a threads/libc program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run =
+        svm_run::run_powerbox_with_deadline(&module, b"", Some(std::time::Duration::from_secs(60)))
+            .expect("powerbox run");
+    assert_eq!(
+        run.stdout, expect,
+        "{name}: stdout {:?} vs expected {:?}",
+        run.stdout, expect
+    );
+    let code = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(code, 0, "{name}: exit/return code {code} (expected 0)");
+}
+
+/// The chibicc `work_stealing` demo through the LLVM on-ramp: a guest-built **work-stealing M:N
+/// scheduler** over *stackless* tasks (a global injector + per-worker deques + stealing, the tokio
+/// shape). Four vCPUs (`thread.spawn`) drain 16 tasks of 16 steps each, coordinating only through
+/// `pthread_mutex` (the futex) + C11 atomics — no fibers, no scheduler in the VM (D56). The grand
+/// total `NTASKS * STEPS = 256` is interleaving-invariant. Mirrors `c_frontend::c_guest_work_stealing`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_work_stealing_vs_chibicc() {
+    check_guest_concurrency_demo("work_stealing", "work_stealing/work_stealing.c", b"256\n");
+}
+
+/// The chibicc `mn_sched` demo through the LLVM on-ramp: a guest-built **sharded M:N green-thread
+/// scheduler** — `NWORKERS` OS threads (`thread.spawn`), each running a cooperative round-robin over
+/// `TASKS_PER_WORKER` **stackful fibers** (`__vm_fiber_new`/`resume`/`suspend` → `cont.*`), pinned
+/// per worker (fibers are thread-affine, D57). Coordinates through one shared atomic counter. The
+/// total `NWORKERS * TASKS_PER_WORKER * STEPS = 1024` is interleaving-invariant. Mirrors
+/// `c_frontend::c_guest_mn_scheduler`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_mn_sched_vs_chibicc() {
+    check_guest_concurrency_demo("mn_sched", "mn_sched/mn_sched.c", b"1024\n");
+}
+
+/// The chibicc `steal_fibers` demo through the LLVM on-ramp: a work-stealing scheduler over
+/// **stackful, migratable fibers** (D57) — suspended fibers are stolen across real OS threads and
+/// resumed inside nested call frames. Prints both interleaving-invariant totals: `256` work units and
+/// `121920`, the sum of returns whose values depend on locals carried across **every migration** (the
+/// stack-integrity check that a stackless state machine cannot express). Mirrors
+/// `c_frontend::c_guest_steal_fibers`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_steal_fibers_vs_chibicc() {
+    check_guest_concurrency_demo(
+        "steal_fibers",
+        "steal_fibers/steal_fibers.c",
+        b"256\n121920\n",
+    );
+}
+
+/// The chibicc `malloc_threads` demo through the LLVM on-ramp: concurrent `malloc` from `NWORKERS`
+/// vCPUs, exercising the **thread-safe** guest allocator. Each worker `malloc`s 64 disjoint blocks
+/// and fills every byte with a `(worker, block, offset)`-unique pattern; after join, main re-checks
+/// every byte — a clobber from an overlapping allocation (the race a non-thread-safe bump allocator
+/// would allow) would show as a corrupt block. Prints `0` (no corruption). Mirrors
+/// `c_frontend::c_guest_malloc_threads`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_malloc_threads_vs_chibicc() {
+    check_guest_concurrency_demo("malloc_threads", "malloc_threads/malloc_threads.c", b"0\n");
 }
 
 #[test]
@@ -2292,6 +2660,57 @@ fn vm_async_io_runtime() {
     );
 }
 
+/// The chibicc `async_work_stealing` demo through the LLVM on-ramp: the async **work-stealing M:N
+/// runtime** (the union of the stackless work-stealing scheduler and the async submit/complete ring).
+/// `NWORKERS` vCPUs cooperatively drain `NTASKS = 16` I/O-bound tasks, each issuing a `Blocking` op
+/// through the ring; a worker **never blocks on an I/O** — it `submit_async`s and moves on, parking on
+/// the completion counter only when nothing is runnable, woken by a pool worker's `notify`. Combines
+/// the guest pthread shim (`thread.spawn` + futex), the async ring (`__vm_io_*` → 7-handle powerbox),
+/// and the offload pool. Interpreter-only (the M:N executor + offload-pool oracle; the JIT async path
+/// needs the separate `HostAsyncHooks` harness), exactly like `vm_async_io_runtime`. The total is
+/// completion-order- *and* interleaving-invariant: Σ mix(i) for i in 0..16. Mirrors
+/// `c_frontend::c_guest_async_work_stealing`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn vm_async_work_stealing_runtime() {
+    let Some(bc) = compile_demo_libc_to_bc(
+        "async_work_stealing",
+        "async_work_stealing/async_work_stealing.c",
+    ) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
+        "expected async-ring imports, got {import_names:?}"
+    );
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let nparams = module.funcs[0].params.len();
+    assert_eq!(
+        nparams, 7,
+        "async program must declare the 7-handle powerbox entry"
+    );
+
+    let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut h = svm_interp::Host::new();
+    let args = grant_powerbox(&mut h, win, nparams, std::time::Duration::from_millis(10));
+    let mut fuel = 1_000_000_000u64;
+    let out =
+        svm_interp::run_with_host(&module, 0, &args, &mut fuel, &mut h).expect("interp async run");
+    assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
+    // NTASKS = 16 (see the demo); the total is Σ of the host's deterministic per-op results.
+    let total: u64 = (0..16).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
+    assert_eq!(
+        h.stdout,
+        format!("{total}\n").into_bytes(),
+        "async total Σ mix(0..16)"
+    );
+}
+
 /// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`) now that `synth_start` stashes them:
 /// `__vm_cap(6)` (the Blocking slot) must equal `__vm_blocking_handle()` — both read stash slot 24.
 /// Proves the relocated 8-handle layout is wired through both the generic `__vm_cap` reader and the
@@ -2435,6 +2854,61 @@ long __vm_jit_uninstall(long slot);\n";
     assert!(
         out.contains("98 inputs agree (invoke + installed call_indirect)"),
         "guest self-JIT (invoke + installed call_indirect) must agree on every input:\n{out}"
+    );
+}
+
+/// End-to-end: the **threaded** guest-driven JIT (`demos/jit/jit_threads.c`, DESIGN §22) through the
+/// LLVM on-ramp — the threaded sibling of `vm_jit_guest_self_jit_demo`. `NWORKERS` pthreads each build
+/// serialized SVM IR for a *distinct* unit at runtime and `__vm_jit_compile` it — so several
+/// `Jit.compile`s are in flight at once — then `__vm_jit_invoke2` the freshly-native code and check it
+/// against a C reference on a grid of inputs. Combines the guest pthread shim (`thread.spawn`) with the
+/// `Jit` capability + the **8-handle powerbox**; the host serializes the concurrent compiles through
+/// the per-domain `Mutex<Host>` (engaged automatically for a `thread.spawn`ing guest) while execution
+/// stays parallel. Prints `0` — no worker's concurrently-JITed unit disagreed.
+///
+/// Like the single-threaded demo, the blob's memory descriptor must match the parent window's
+/// `size_log2` (the validator's exact-match precondition); the demo hardcodes chibicc's `16`, so we
+/// probe svm-llvm's window and patch `eb(&e, 16);` to it before the real translate+run.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn vm_jit_threads_demo() {
+    let src0 = include_str!("../../svm-run/demos/jit/jit_threads.c");
+    let Some(bc0) = compile_libc_src_to_bc("jit_threads_probe", src0) else {
+        return;
+    };
+    // Probe svm-llvm's parent window size, then patch the blob descriptor to it (no magic constant —
+    // it tracks svm-llvm's sizing, exactly as `vm_jit_guest_self_jit_demo` does).
+    let s = svm_llvm::translate_bc_path(&bc0)
+        .expect("translate probe")
+        .module
+        .memory
+        .expect("powerbox program declares a window")
+        .size_log2;
+    let src = src0.replace("eb(&e, 16);", &format!("eb(&e, {s});"));
+    assert_ne!(
+        src, src0,
+        "expected to patch the blob memory descriptor `eb(&e, 16);`"
+    );
+
+    let Some(bc) = compile_libc_src_to_bc("jit_threads", &src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    assert_eq!(
+        t.module.funcs[0].params.len(),
+        8,
+        "a Jit-using program declares the full 8-handle powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let run =
+        svm_run::run_powerbox_with_deadline(&module, b"", Some(std::time::Duration::from_secs(60)))
+            .expect("powerbox run");
+    assert_eq!(
+        run.stdout,
+        b"0\n",
+        "every worker's concurrently-JITed unit must agree with the reference (got {:?})",
+        String::from_utf8_lossy(&run.stdout)
     );
 }
 

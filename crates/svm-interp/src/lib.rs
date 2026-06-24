@@ -2933,6 +2933,26 @@ struct Frame {
     vals: Vec<Reg>,
 }
 
+/// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call (see [`VCpu::setjmp_points`]). Since
+/// `Frame::vals` is **replaced per block** (block-param SSA), the value state at the `setjmp` point can
+/// not be reconstructed from the live (later-block) frame, so it is snapshotted here. `longjmp` truncates
+/// the call stack to `depth` (the intervening frames discarded — C has no cleanups), overwrites the
+/// surviving `setjmp` frame with `(block, inst, vals)`, sets `vals[result_idx]` to the long-jump value,
+/// and resumes. The data-stack pointer rides in `vals[0]` (the §3d SP block-param), so restoring `vals`
+/// restores it.
+#[derive(Clone)]
+struct SetJmpPoint {
+    /// Call-stack length at `setjmp` (the `setjmp` frame is at index `depth - 1`).
+    depth: usize,
+    /// The `setjmp` frame's block, and the instruction index just *after* the `setjmp`.
+    block: usize,
+    inst: usize,
+    /// The `setjmp` frame's value array at the `setjmp` point (its result slot included).
+    vals: Vec<Reg>,
+    /// Index in `vals` of the `setjmp` result — overwritten with the long-jump value on re-entry.
+    result_idx: usize,
+}
+
 /// One slot of a vCPU's **`call_indirect` dispatch table** — the explicit, module-aware
 /// generalization of "mask the index into `funcs`". Each slot names which module's function it
 /// holds, so the table can mix the parent's functions (Model A: populated from module 0) with
@@ -4796,6 +4816,12 @@ struct VCpu {
     /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
     /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
     tls: i64,
+    /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here keyed by the guest
+    /// `jmp_buf` window address; `longjmp` looks it up. Per-vCPU (a checkpoint references *this* frame
+    /// stack; cross-thread `longjmp` is UB in C and simply misses). Keyed by buffer address (not a
+    /// growing token table) so a re-`setjmp` to the same buffer overwrites and a `pcall`-in-a-loop
+    /// stays bounded; the trade-off is that a *copied* `jmp_buf` (rare/UB-adjacent) misses → traps.
+    setjmp_points: BTreeMap<u64, SetJmpPoint>,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
@@ -4880,6 +4906,7 @@ impl VCpu {
             id,
             parent_task: 0,
             tls: id as i64, // §12 seed the per-vCPU TLS register to the dense vCPU id (root = 0)
+            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -4944,6 +4971,7 @@ impl VCpu {
             id: 0, // unused: driven inline, never via the executor
             parent_task: 0,
             tls: 0, // §12 per-vCPU TLS seed (id 0)
+            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -5290,6 +5318,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         memop,
         acc,
         quota: _,
+        setjmp_points,
         dt,
         units,
         invoked,
@@ -6189,6 +6218,48 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[rtop].vals.push(Reg::from_i64(v));
                     continue 'frames;
                 }
+                // `setjmp`: snapshot this frame's resume point (the value state is captured because
+                // `vals` is replaced per block) keyed by the guest `jmp_buf` address, and fall through
+                // returning 0. `frames[top].inst` is already advanced past the `setjmp` (line above), so
+                // it is exactly the re-entry point. A re-`setjmp` to the same buffer overwrites.
+                Inst::SetJmp { buf } => {
+                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let result_idx = frames[top].vals.len();
+                    let mut snap = frames[top].vals.clone();
+                    snap.push(Reg::from_i32(0)); // the result slot (overwritten by longjmp)
+                    setjmp_points.insert(
+                        key,
+                        SetJmpPoint {
+                            depth: frames.len(),
+                            block: frames[top].block,
+                            inst: frames[top].inst,
+                            vals: snap,
+                            result_idx,
+                        },
+                    );
+                    frames[top].vals.push(Reg::from_i32(0)); // the direct call returns 0
+                }
+                // `longjmp`: look up the checkpoint by `jmp_buf` address, unwind the call stack to it
+                // (the intervening frames discarded — C has no cleanups), restore the `setjmp` frame's
+                // (block, inst, vals) with the result slot set to `val` (a `0` `val` becomes `1`, per C),
+                // and resume there. A missing checkpoint, or one whose frame already returned (its
+                // `depth` now exceeds the live stack), traps in-sandbox (§3b totality).
+                Inst::LongJmp { buf, val } => {
+                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let v = get_i32(&frames[top].vals, *val)?;
+                    let resume = if v == 0 { 1 } else { v };
+                    let point = setjmp_points.get(&key).cloned().ok_or(Trap::Malformed)?;
+                    if point.depth == 0 || point.depth > frames.len() {
+                        return Err(Trap::Malformed); // the setjmp frame has already returned
+                    }
+                    frames.truncate(point.depth);
+                    let f = &mut frames[point.depth - 1];
+                    f.block = point.block;
+                    f.inst = point.inst;
+                    f.vals = point.vals;
+                    f.vals[point.result_idx] = Reg::from_i32(resume);
+                    continue 'frames;
+                }
                 // §GC conservative root enumeration (`gc.roots`): collect the deduplicated set of
                 // candidate words in `[heap_lo, heap_hi)` across **every** fiber of the domain —
                 // this computation's own live `frames` (the caller; the op is call-clobbering, so
@@ -7078,6 +7149,8 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }
+        | Inst::SetJmp { .. }
+        | Inst::LongJmp { .. }
         | Inst::GcRoots { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
