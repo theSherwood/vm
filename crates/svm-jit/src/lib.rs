@@ -2967,6 +2967,11 @@ impl CompiledModule {
             // snapshot below captures a fully-quiesced window. No-op off the concurrent path.
             if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
                 (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
+                // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
+                // `thread.join` of a child that finished before the freeze point resolves on thaw.
+                (*this)
+                    .frozen_vcpus_out
+                    .extend(d.take_completed_children_residue());
             }
         }
         // §5 W3 Stage 3 — a trap that originated on a *spawned* vCPU stashed its backtrace capture in

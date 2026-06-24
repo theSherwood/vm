@@ -144,6 +144,13 @@ pub(crate) struct Domain {
     /// by [`Domain::drive_frozen_spawns`]; `run_inner` drains it into the run's residue so a snapshot
     /// records the children (a thaw re-attaches them). Empty on a non-durable run.
     frozen_vcpus: Mutex<Vec<crate::FrozenVCpu>>,
+    /// §12.8 4A.5 follow-up A: concurrent durable children that **finished** (didn't freeze) during a
+    /// run, recorded by [`run_child`]. On a freeze the coordinator turns *every* one into a
+    /// `completed_result` residue (so the spawner's `thread.join` of a child that finished before the
+    /// freeze point resolves on thaw — the host-side Done cell isn't in the snapshot). Emitting them all
+    /// keeps the thaw's per-parent join table dense so every handle still resolves. Drained on a freeze;
+    /// discarded on a non-freeze run.
+    completed_children: Mutex<Vec<CompletedChild>>,
     /// **Durable** (slice 3.4): residue of the fibers a *spawned child* flattened with its own
     /// `freeze_drive` (a child that owns `cont.*` fibers). Accumulated by [`Domain::run_child_inline`];
     /// `run_inner` merges it into the run's `frozen_out` (the root's own fibers are flattened directly
@@ -234,6 +241,7 @@ impl Domain {
             }),
             pending_spawns: Mutex::new(Vec::new()),
             frozen_vcpus: Mutex::new(Vec::new()),
+            completed_children: Mutex::new(Vec::new()),
             frozen_fibers: Mutex::new(Vec::new()),
             dchildren: Mutex::new(HashMap::new()),
             cur_task: Mutex::new(0),
@@ -364,6 +372,24 @@ impl Domain {
         std::mem::take(&mut lock(&self.frozen_vcpus))
     }
 
+    /// §12.8 4A.5 follow-up A: drain the **completed** concurrent children as `completed_result`
+    /// residue (every one, so the thaw's per-parent join table stays dense and all handles resolve).
+    /// Each thaws as a no-re-run cell pre-filled with the recorded `thread.join` result. Called by the
+    /// coordinator on a freeze, after `join_all`.
+    pub(crate) fn take_completed_children_residue(&self) -> Vec<crate::FrozenVCpu> {
+        std::mem::take(&mut *lock(&self.completed_children))
+            .into_iter()
+            .map(|c| crate::FrozenVCpu {
+                task: c.task as usize,
+                parent_task: c.parent as usize,
+                func: c.func,
+                args: c.args,
+                shadow_sp: 0, // inert — a completed child is not re-run
+                completed_result: Some(c.result),
+            })
+            .collect()
+    }
+
     /// Drain the child-owned fiber residue (slice 3.4) — the fibers spawned children flattened with
     /// their own `freeze_drive`. `run_inner` merges this into the run's `frozen_out`.
     pub(crate) fn take_frozen_fibers(&self) -> Vec<crate::FrozenFiber> {
@@ -447,6 +473,17 @@ struct DurableChild {
     func_idx: u32,
 }
 
+/// §12.8 4A.5 follow-up A: a concurrent durable child that **finished** (didn't freeze). Recorded so a
+/// freeze can carry its `thread.join` result in the artifact (`FrozenVCpu::completed_result`), to be
+/// delivered on thaw without re-running the child.
+struct CompletedChild {
+    task: u64,
+    parent: u64,
+    func: i32,
+    args: Vec<i64>,
+    result: i64,
+}
+
 struct SpawnArgs {
     env: Env,
     code: u64,
@@ -491,12 +528,17 @@ fn run_child(a: SpawnArgs) {
     let env = a.env;
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
-    // §12.8 4A.5 stage (ii): a concurrent durable child seeds its durable shadow-base register to its
-    // own region, so if a freeze fires its instrumented code spills into *its* per-context SP word
-    // (concurrent with siblings, no shared word). NORMAL never reads the SP word, so this is inert
-    // until a freeze.
+    // §12.8 4A.5 stage (ii): a concurrent durable child points its durable shadow-base register at its
+    // own region AND initialises that region's shadow-SP word to the empty frame base, so if a freeze
+    // fires its instrumented code spills into *its* per-context region (concurrent with siblings, no
+    // shared word). Without the init the word would read 0 and the unwind would spill over the reserve
+    // header — corrupting the state word. SAFETY: durable run ⇒ the reserve is committed RW.
     if let Some(dc) = &a.durable_child {
-        crate::durable_shadow::seed(fiber_rt::shadow_region_base(dc.ctx));
+        let region = fiber_rt::shadow_region_base(dc.ctx);
+        crate::durable_shadow::seed(region);
+        unsafe {
+            fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
+        };
     }
     // Arm this OS thread's detect-and-kill recovery (idempotent; handler is process-wide, recovery is
     // thread-local — §5 / `mem::install_guard`).
@@ -579,8 +621,25 @@ fn run_child(a: SpawnArgs) {
                     completed_result: None, // a spilled (frozen) child re-runs on thaw
                 });
             }
-        } else if let Some(table) = unsafe { (*a.dom).fiber_table() } {
-            table.free_vcpu_context(dc.ctx);
+        } else {
+            // A genuine finish: free the context for reuse, and record the child's result so a freeze
+            // (if one is in flight / about to be) can carry it as residue — a `thread.join` of a child
+            // that finished before the freeze point must resolve on thaw. Discarded if the run doesn't
+            // freeze. SAFETY: live `Domain`.
+            unsafe {
+                if let Some(table) = (*a.dom).fiber_table() {
+                    table.free_vcpu_context(dc.ctx);
+                }
+                if trap == 0 {
+                    lock(&(*a.dom).completed_children).push(CompletedChild {
+                        task: dc.task,
+                        parent: dc.parent,
+                        func: dc.func_idx as i32,
+                        args: vec![a.sp as i64, a.arg as i64],
+                        result,
+                    });
+                }
+            }
         }
     }
     // §5 W3 Stage 3: if this spawned vCPU trapped, hand its trap-time backtrace capture (the SIGSEGV
@@ -1030,8 +1089,12 @@ impl Domain {
         ordered.sort_by_key(|v| v.task);
         let mut runs: Vec<Run> = Vec::with_capacity(ordered.len());
         for v in &ordered {
+            // §12.8 4A.5 follow-up A: a child that **completed** before the freeze point (no frozen
+            // continuation) gets its `thread.join` result delivered into the spawner's table directly —
+            // its Done cell is pre-filled and it is **not** re-run (its side effects are already in the
+            // snapshot). Pushed in task order alongside frozen children so handles stay dense.
             let done = std::sync::Arc::new(Done {
-                state: Mutex::new(None),
+                state: Mutex::new(v.completed_result.map(|r| (r, 0))),
                 cv: Condvar::new(),
             });
             {
@@ -1039,6 +1102,9 @@ impl Domain {
                 let tbl = dc.entry(v.parent_task as u64).or_default();
                 tbl.cells.push(std::sync::Arc::clone(&done));
                 tbl.joined.push(false);
+            }
+            if v.completed_result.is_some() {
+                continue; // already-done: no re-run, no §15 live count, no context
             }
             lock(&self.threads).live += 1;
             let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
