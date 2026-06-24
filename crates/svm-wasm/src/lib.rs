@@ -755,6 +755,16 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             // §7 named imports (real WASI etc.): the host resolves these to concrete capabilities at
             // load (`resolve_imports`). Empty for the numeric host-ABI convention (inline `cap.call`).
             imports: named_imports,
+            // wasm's exported functions map straight onto the first-class IR export table (name →
+            // funcidx), so a transpiled module is name-addressable like its wasm source. (Also
+            // returned out-of-band in `Transpiled::exports` for callers that want just the list.)
+            exports: exports
+                .iter()
+                .map(|(name, func)| svm_ir::Export {
+                    name: name.clone(),
+                    func: *func,
+                })
+                .collect(),
             // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7) and
             // carry every `.debug_*` section through as a rich blob.
             debug_info: build_debug_info(debug_line.as_deref(), op_locs, local_locs, debug_blobs),
