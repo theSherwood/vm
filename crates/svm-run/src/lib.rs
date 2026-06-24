@@ -2298,13 +2298,24 @@ fn typed(t: ValType, v: i64) -> Value {
     }
 }
 
-/// Compile `module`'s entry, register the live module for the `Jit` cap's mid-run re-entry, and run
-/// it over `slots` under the §5 kill-path armed by `interrupt`. A **concurrent** guest (`locked` is
-/// `Some`) runs the serialized [`cap_thunk_locked`] over a per-domain `Mutex<Host>` — so worker
-/// threads can `cap.call` (incl. threaded `Jit.compile`) without racing — and forgoes the
-/// single-threaded-only D45 fast path; a single-threaded guest keeps the unlocked [`cap_thunk`] +
-/// raw `*mut Host` + [`fast_cap_resolver`] exactly as before (zero lock cost). Exactly one of
-/// `locked` / `raw_host` is used.
+/// The raw result of a JIT compile→run: the outcome plus the §5 W3 trap diagnostics (source
+/// backtrace + trapping fiber, both empty/`None` unless the guest trapped under a `-g` module) and the
+/// captured low-window snapshot (`snapshot_cap` bytes; empty when no snapshot was requested).
+struct JitRun {
+    outcome: JitOutcome,
+    backtrace: Vec<JitFrameLoc>,
+    trap_fiber: Option<i64>,
+    snapshot: Vec<u8>,
+}
+
+/// Compile `module`'s function `func`, register the live module for the `Jit` cap's mid-run re-entry,
+/// and run it over `slots` under the §5 kill-path armed by `interrupt`, seeded with `init_mem` and
+/// (when `snapshot_cap` is `Some`) snapshotting the low `snapshot_cap` window bytes. A **concurrent**
+/// guest (`locked` is `Some`) runs the serialized [`cap_thunk_locked`] over a per-domain `Mutex<Host>`
+/// — so worker threads can `cap.call` (incl. threaded `Jit.compile`) without racing — and forgoes the
+/// single-threaded-only D45 fast path; a single-threaded guest keeps the unlocked [`cap_thunk`] + raw
+/// `*mut Host` + [`fast_cap_resolver`] exactly as before (zero lock cost). Exactly one of `locked` /
+/// `raw_host` is used. The single low-level JIT entry, shared by [`jit_run`].
 ///
 /// # Safety
 /// `raw_host` (when `locked` is `None`) is a live `*mut Host`; `interrupt` (when `Some`) outlives the
@@ -2312,19 +2323,21 @@ fn typed(t: ValType, v: i64) -> Value {
 #[allow(clippy::too_many_arguments)]
 unsafe fn powerbox_compile_run(
     module: &Module,
+    func: FuncIdx,
     locked: Option<&Mutex<Host>>,
     raw_host: *mut Host,
     slots: &[i64],
     interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
     quota: svm_jit::Quota,
     init_mem: Option<&[u8]>,
-) -> Result<(JitOutcome, Vec<JitFrameLoc>, Option<i64>), svm_jit::JitError> {
+    snapshot_cap: Option<usize>,
+) -> Result<JitRun, svm_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
     if let Some(m) = locked {
         let ctx = m as *const Mutex<Host> as *mut c_void;
         let mut cm = CompiledModule::compile(
             module,
-            0,
+            func,
             cap_thunk_locked,
             ctx,
             svm_ir::DEFAULT_RESERVED_LOG2,
@@ -2338,18 +2351,23 @@ unsafe fn powerbox_compile_run(
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
+        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(0);
         // §5 W3 — carry the trap-time source backtrace + trapping fiber (§23-D57) out (empty/`None`
         // unless the guest trapped and the module carried `-g`), so the kill message can name *which
         // fiber* was *where*.
-        return r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec(), cm.last_trap_fiber()));
+        return r.map(|(outcome, snapshot)| JitRun {
+            outcome,
+            backtrace: cm.last_trap_backtrace().to_vec(),
+            trap_fiber: cm.last_trap_fiber(),
+            snapshot,
+        });
     }
     let mut cm = CompiledModule::compile(
         module,
-        0,
+        func,
         cap_thunk,
         raw_host as *mut c_void,
         svm_ir::DEFAULT_RESERVED_LOG2,
@@ -2362,9 +2380,14 @@ unsafe fn powerbox_compile_run(
     )?;
     let host = &mut *raw_host;
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-    let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
+    let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
     host.set_jit_native_ctx(0);
-    r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec(), cm.last_trap_fiber()))
+    r.map(|(outcome, snapshot)| JitRun {
+        outcome,
+        backtrace: cm.last_trap_backtrace().to_vec(),
+        trap_fiber: cm.last_trap_fiber(),
+        snapshot,
+    })
 }
 
 /// Run `module`'s entry (function 0) on the JIT under the MVP powerbox (§3e): a writable
@@ -2752,17 +2775,21 @@ fn with_deadline<T>(
     }
 }
 
-/// Compile + run function 0 on the JIT under `limits` (quota + optional deadline watchdog), folding a
-/// guest trap into an `Err` (with the §5 W3 backtrace + trapping fiber). A concurrent guest serializes
-/// the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the unlocked fast path. Shared by
-/// the single-backend [`Instance::run`] and the [`Instance::run_diff`] oracle.
-fn run_jit(
+/// The single JIT compile→run path: run `func` on the JIT under `limits` (quota + optional deadline
+/// watchdog), seeded with `init_mem` and (when `snapshot_cap` is `Some`) returning the low-window
+/// snapshot, folding a guest trap into an `Err` (with the §5 W3 backtrace + trapping fiber). A
+/// concurrent guest serializes the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the
+/// unlocked fast path. Backs both the run-once [`run_jit`] (`func` 0, no snapshot) and the reactor
+/// per-call capture ([`run_capture_on`]'s `Jit` arm: an export `func`, `REACTOR_SNAP_CAP` snapshot).
+fn jit_run(
     m: &Module,
+    func: FuncIdx,
     slots: &[i64],
     host: &mut Host,
     limits: &Limits,
     init_mem: Option<&[u8]>,
-) -> Result<JitOutcome, String> {
+    snapshot_cap: Option<usize>,
+) -> Result<(JitOutcome, Vec<u8>), String> {
     let quota = svm_jit::Quota {
         max_fibers: limits.max_fibers,
         max_vcpus: limits.max_vcpus,
@@ -2770,38 +2797,65 @@ fn run_jit(
     let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
     // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
     // `with_deadline`); `init_mem` (when `Some`) outlives the call; the thunk/ctx contracts hold.
-    let (jit, backtrace, trap_fiber) = with_deadline(limits.deadline, |interrupt| {
+    let run = with_deadline(limits.deadline, |interrupt| {
         if concurrent {
             let locked = Mutex::new(std::mem::take(host));
             let r = unsafe {
                 powerbox_compile_run(
                     m,
+                    func,
                     Some(&locked),
                     std::ptr::null_mut(),
                     slots,
                     interrupt,
                     quota,
                     init_mem,
+                    snapshot_cap,
                 )
             };
             *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
             r
         } else {
-            unsafe { powerbox_compile_run(m, None, host, slots, interrupt, quota, init_mem) }
+            unsafe {
+                powerbox_compile_run(
+                    m,
+                    func,
+                    None,
+                    host,
+                    slots,
+                    interrupt,
+                    quota,
+                    init_mem,
+                    snapshot_cap,
+                )
+            }
         }
     })
     .map_err(|e| format!("JIT compile failed: {e:?}"))?;
-    if let JitOutcome::Trapped(kind) = jit {
-        let who = match trap_fiber {
+    if let JitOutcome::Trapped(kind) = run.outcome {
+        let who = match run.trap_fiber {
             Some(h) if h >= 0 => format!(" [fiber {h}]"),
             _ => String::new(),
         };
         return Err(format!(
             "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
-            format_backtrace(&backtrace)
+            format_backtrace(&run.backtrace)
         ));
     }
-    Ok(jit)
+    Ok((run.outcome, run.snapshot))
+}
+
+/// Compile + run function 0 on the JIT under `limits` (the run-once powerbox entry, no snapshot),
+/// folding a guest trap into an `Err`. A thin wrapper over [`jit_run`]. Shared by the single-backend
+/// [`Instance::run`] and the [`Instance::run_diff`] oracle.
+fn run_jit(
+    m: &Module,
+    slots: &[i64],
+    host: &mut Host,
+    limits: &Limits,
+    init_mem: Option<&[u8]>,
+) -> Result<JitOutcome, String> {
+    jit_run(m, 0, slots, host, limits, init_mem, None).map(|(outcome, _snap)| outcome)
 }
 
 /// Run an interpreter `backend` (`TreeWalk`/`Bytecode`) on `func`, seeding the window with `init_mem`
@@ -3224,45 +3278,6 @@ impl Instance {
 /// `Session` diff would fail loudly if these ever diverged.)
 const REACTOR_SNAP_CAP: usize = 1 << 18; // 256 KiB
 
-/// Compile + run a chosen export `fidx` on the JIT, seeded with `init_mem` and snapshotting the low
-/// [`REACTOR_SNAP_CAP`] window bytes — the JIT half of the reactor's per-call round-trip. Compiles per
-/// call (slice 1; a per-funcidx `CompiledModule` cache is a later optimization).
-fn jit_call_capture(
-    m: &Module,
-    fidx: FuncIdx,
-    slots: &[i64],
-    init_mem: &[u8],
-    host: &mut Host,
-    limits: &Limits,
-) -> Result<(JitOutcome, Vec<u8>), String> {
-    let quota = svm_jit::Quota {
-        max_fibers: limits.max_fibers,
-        max_vcpus: limits.max_vcpus,
-    };
-    let mut cm = CompiledModule::compile(
-        m,
-        fidx,
-        cap_thunk,
-        host as *mut Host as *mut c_void,
-        svm_ir::DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        Some(fast_cap_resolver),
-        quota,
-        CLI_JIT_TABLE_LOG2,
-    )
-    .map_err(|e| format!("JIT compile failed: {e:?}"))?;
-    host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-    // SAFETY: single-threaded reactor (start() rejects concurrent guests); `host`/`cm` outlive the
-    // run; `cm` is registered for any `Jit`-cap re-entry and unregistered before it's dropped.
-    let r = unsafe {
-        CompiledModule::run_raw(&mut cm, slots, Some(init_mem), Some(REACTOR_SNAP_CAP), None)
-    };
-    host.set_jit_native_ctx(0);
-    r.map_err(|e| format!("JIT run failed: {e:?}"))
-}
-
 /// Run export `fidx` on `backend`, seeded from `init_mem`, returning its outcome and the new window
 /// snapshot. `Bytecode` transparently falls back to the tree-walker for modules it doesn't support
 /// (so that arm matches `TreeWalk` exactly there). The shared per-call primitive for [`Session`].
@@ -3312,7 +3327,18 @@ fn run_capture_on(
         }
         Backend::Jit => {
             let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-            let (jo, snap) = jit_call_capture(m, fidx, &slots, init_mem, host, limits)?;
+            // Snapshot the low `REACTOR_SNAP_CAP` window so the next call resumes this state. The
+            // reactor is single-threaded (`start` rejects concurrent guests), so `jit_run` takes its
+            // unlocked fast path.
+            let (jo, snap) = jit_run(
+                m,
+                fidx,
+                &slots,
+                host,
+                limits,
+                Some(init_mem),
+                Some(REACTOR_SNAP_CAP),
+            )?;
             Ok((outcome_from_jit(&m.funcs[fidx as usize].results, jo)?, snap))
         }
     }

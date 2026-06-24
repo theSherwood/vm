@@ -218,7 +218,7 @@ rather than converged:
 | `Instance::{call,run,run_diff}` (this work) | all 3 | fixed or name-bound | new tests, C ABI |
 | `run_powerbox*` → `run_powerbox_inner` → `Instance::run` (F1) | JIT | fixed 8-handle powerbox | **the CLI** (`svm-run` bin) |
 | `run_kernel` | bare | none | kernels / bench |
-| `run_c_full` (test) | interp+JIT | fixed | chibicc suite |
+| `run_c_full` (test) → `Instance::run_diff` (F1) | interp+JIT | fixed | chibicc suite |
 | `JitSession` | JIT | fixed | guest-JIT REPL |
 | §14 nested (`Instantiator`/`Module`) | interp+JIT | object-cap | `instantiator.rs`, `separate_module.rs` |
 
@@ -226,14 +226,20 @@ One consequence still worth fixing (followup):
 - The §14 nested path is **func-0-only and ignores `Module.exports`** — a child/separate-module guest
   cannot be called by name.
 
-**Resolved (F1).** `run_powerbox_inner` no longer carries its own grant/compile/watchdog: it builds an
-`Instance` (fixed powerbox preset) and delegates to `Instance::run(Backend::Jit, config)`, so the
-powerbox-grant logic lives in exactly one place (`grant_powerbox_prefix`, shared with the embedding
-API). The `Jit`-cap grant on both paths now reserves the install table at the same `CLI_JIT_TABLE_LOG2`
-(previously `grant_powerbox_prefix` reserved `0`, which would have starved a `Jit.install` guest). The
-CLI is unchanged — same `run_powerbox*` signatures, JIT-only, no re-verify/re-resolve of already-
-validated frontend output. `run_c_full` (the chibicc test harness) is **not** yet folded in; that
-remains the open part of F1.
+**Resolved (F1).** The run paths are converged onto one core:
+- `run_powerbox_inner` no longer carries its own grant/compile/watchdog: it builds an `Instance` (fixed
+  powerbox preset) and delegates to `Instance::run(Backend::Jit, config)`, so the powerbox-grant logic
+  lives in exactly one place (`grant_powerbox_prefix`, shared with the embedding API). The `Jit`-cap
+  grant on both paths now reserves the install table at the same `CLI_JIT_TABLE_LOG2` (previously
+  `grant_powerbox_prefix` reserved `0`, which would have starved a `Jit.install` guest).
+- The JIT half is one path too: `powerbox_compile_run` (now `func` + `snapshot_cap` parameterized,
+  returning a `JitRun`) under a single `jit_run` mid-level entry; `run_jit` and the reactor's per-call
+  capture are thin callers (the bespoke `jit_call_capture` is gone).
+- `run_c_full` (the chibicc differential harness) drives through `svm_run::instantiate` +
+  `Instance::run_diff` — the test suite exercises the same core as the CLI/embedders.
+
+The CLI is unchanged — same `run_powerbox*` signatures, JIT-only, no re-verify/re-resolve of already-
+validated frontend output.
 
 **Test gaps:** we test the export *table* (`resolve_export`) and calling `_start` by name, but **not**
 calling a named non-`_start` export with args and checking results (host *or* nested). And
@@ -355,13 +361,22 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
 
 ## Followups / known gaps (logged, not yet scheduled)
 
-- **F1 — converge the host runners.** *Mostly landed.* `run_powerbox_inner` now delegates to
-  `Instance::run(Backend::Jit, config)` — the powerbox-grant logic (`grant_powerbox_prefix`) and the
-  JIT compile→run + §5 watchdog (`run_jit`) are no longer duplicated, and the `Jit`-cap install-table
-  reservation is aligned across both paths. `argv`/env now flow through `RunConfig` (closing **F4**) and
-  seed all three backends (run-once) via a shared `run_interp`/`init_mem` path. **Still open:** fold the
-  test-only `run_c_full` (chibicc interp+JIT differential harness) onto the same core, and unify the
-  reactor's `jit_call_capture` with `run_jit` (they differ only by snapshot vs deadline/concurrency).
+- **F1 — converge the host runners.** *Landed.* Three convergences, all behind unchanged public
+  signatures and verified against the full suite (workspace + the 88-test `c_frontend` + svm-llvm's
+  8-handle chibicc/`Jit.install` programs):
+  1. `run_powerbox_inner` delegates to `Instance::run(Backend::Jit, config)` — the powerbox-grant
+     logic (`grant_powerbox_prefix`) and the JIT compile→run + §5 watchdog are no longer duplicated;
+     the `Jit`-cap install-table reservation is aligned across both paths.
+  2. `argv`/env flow through `RunConfig` (closing **F4**) and seed all three backends (run-once) via a
+     shared `run_interp`/`init_mem` path.
+  3. One JIT run path: `powerbox_compile_run` is parameterized by `func` + `snapshot_cap` and returns a
+     `JitRun`; `jit_run` is the single mid-level entry (deadline watchdog + concurrent `Mutex<Host>` +
+     trap folding). `run_jit` (run-once, func 0, no snapshot) and the reactor's per-call capture (an
+     export func + `REACTOR_SNAP_CAP` snapshot) are now thin callers of it — the bespoke
+     `jit_call_capture` is gone.
+  4. The test-only `run_c_full` (chibicc interp+JIT differential harness) is folded onto
+     `svm_run::instantiate` + `Instance::run_diff` — every C test now exercises the same grant/run core
+     the CLI and embedders use, not a hand-rolled compile/run.
 - **F2 — name-addressable nested guests.** Thread `Module.exports` through the §14 `Module`-capability
   path so a parent can call a child's export by name, not just func 0 — consistent with host-driven
   calls. (Today nested children are func-0-only.)
