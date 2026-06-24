@@ -24,7 +24,7 @@ use svm_durable::{
 };
 use svm_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,
-    SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
+    SHADOW_BASE, SHADOW_STRIDE,
 };
 use svm_jit::{
     compile_and_run_capture_reserved_with_host_durable, FrozenFiber as JitFrozen, JitOutcome,
@@ -77,27 +77,33 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     // Same module as the interpreter's `durable_fiber_switch_routes_shadow_sp_per_context`: root
     // (v0 = host-fn handle) probes, creates+resumes fiber A, creates+resumes fiber B, probes again.
     // Each fiber probes via a cap.call whose handle arrives (as i64) in the resume arg.
+    // §12.8 4A.5: each probe passes `durable.shadow_base` (the active context's own region base, from
+    // the runtime-private register) to the host fn, which records it — directly exercising per-context
+    // routing (vs. the legacy single swapped `SHADOW_SP_OFF` word, now retired).
     let src = "memory 17\n\
         func (i32) -> (i64) {\n\
         block0(v0: i32):\n\
-        \x20 v1 = cap.call 13 0 () -> (i64) v0 ()\n\
-        \x20 v2 = ref.func 1\n\
-        \x20 v3 = i64.const 4096\n\
-        \x20 v4 = cont.new v2 v3\n\
-        \x20 v5 = i64.extend_i32_u v0\n\
-        \x20 v6, v7 = cont.resume v4 v5\n\
-        \x20 v8 = i64.const 8192\n\
-        \x20 v9 = cont.new v2 v8\n\
-        \x20 v10, v11 = cont.resume v9 v5\n\
-        \x20 v12 = cap.call 13 0 () -> (i64) v0 ()\n\
-        \x20 return v1\n\
+        \x20 v1 = durable.shadow_base\n\
+        \x20 v2 = cap.call 13 0 (i64) -> (i64) v0 (v1)\n\
+        \x20 v3 = ref.func 1\n\
+        \x20 v4 = i64.const 4096\n\
+        \x20 v5 = cont.new v3 v4\n\
+        \x20 v6 = i64.extend_i32_u v0\n\
+        \x20 v7, v8 = cont.resume v5 v6\n\
+        \x20 v9 = i64.const 8192\n\
+        \x20 v10 = cont.new v3 v9\n\
+        \x20 v11, v12 = cont.resume v10 v6\n\
+        \x20 v13 = durable.shadow_base\n\
+        \x20 v14 = cap.call 13 0 (i64) -> (i64) v0 (v13)\n\
+        \x20 return v2\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
         block0(v0: i64, v1: i64):\n\
         \x20 v2 = i32.wrap_i64 v1\n\
-        \x20 v3 = cap.call 13 0 () -> (i64) v2 ()\n\
-        \x20 v4 = suspend v3\n\
-        \x20 return v4\n\
+        \x20 v3 = durable.shadow_base\n\
+        \x20 v4 = cap.call 13 0 (i64) -> (i64) v2 (v3)\n\
+        \x20 v5 = suspend v4\n\
+        \x20 return v5\n\
         }\n";
     // The fibers `suspend` (rather than return) so both stay concurrently live in their own slots —
     // otherwise §12.8 recycling step 3 would reclaim fiber A's finished slot for fiber B, routing B
@@ -109,18 +115,14 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     let probes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&probes);
     let mut host = Host::new();
-    let hf = host.grant_host_fn(Box::new(move |_op, _args, mem| {
-        let m = mem.expect("durable module has a window");
-        let bytes = m.read_bytes(SHADOW_SP_OFF, 8).expect("shadow-SP readable");
-        let sp = u64::from_le_bytes(bytes.try_into().unwrap());
-        sink.lock().unwrap().push(sp);
+    let hf = host.grant_host_fn(Box::new(move |_op, args, _mem| {
+        sink.lock().unwrap().push(args[0] as u64);
         Ok(vec![0])
     }));
 
-    // Seed the window so the root's active shadow-SP starts at its (context-0) region base.
-    let mut init = vec![0u8; WINDOW];
-    init[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]
-        .copy_from_slice(&SHADOW_BASE.to_le_bytes());
+    // A zeroed window (state = NORMAL); the per-context shadow-base comes from the runtime register,
+    // not the window, so no seed is needed.
+    let init = vec![0u8; WINDOW];
 
     let (outcome, _win, _residue) = compile_and_run_capture_reserved_with_host_durable(
         &m,

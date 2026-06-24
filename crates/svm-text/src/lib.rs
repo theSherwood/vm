@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, FBinOp, FCmpOp,
-    FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy, IntUnOp,
-    LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef, VBitBinOp,
-    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
-    VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, Export, FBinOp,
+    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy,
+    IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef,
+    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -74,6 +74,13 @@ pub fn print_module(m: &Module) -> String {
                 types(&imp.sig.params),
                 types(&imp.sig.results)
             );
+        }
+        s.push('\n');
+    }
+    // First-class function exports, one per line, in declaration order: `export "<name>" <funcidx>`.
+    if !m.exports.is_empty() {
+        for e in &m.exports {
+            let _ = writeln!(s, "export \"{}\" {}", e.name, e.func);
         }
         s.push('\n');
     }
@@ -389,11 +396,14 @@ fn print_inst(inst: &Inst) -> String {
         Inst::CapSelfCount => "cap.self.count".to_string(),
         Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
         Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
+        Inst::DurableShadowBase => "durable.shadow_base".to_string(),
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
+        Inst::SetJmp { buf } => format!("setjmp v{buf}"),
+        Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
         // §GC conservative root enumeration.
         Inst::GcRoots {
             heap_lo,
@@ -847,6 +857,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let mut funcs = Vec::new();
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
+    let mut exports: Vec<Export> = Vec::new();
     let mut dbg_files: Vec<String> = Vec::new();
     let mut dbg_locs: Vec<Loc> = Vec::new();
     let mut dbg_types: Vec<TypeDef> = Vec::new();
@@ -1084,6 +1095,16 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     bytes,
                 });
             }
+            // First-class function export: `export "<name>" <funcidx>`.
+            Some(Tok::Ident(s)) if s == "export" => {
+                p.next()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
+                let n = p.parse_int()?;
+                let func = u32::try_from(n)
+                    .map_err(|_| ParseError(format!("export funcidx out of range: {n}")))?;
+                exports.push(Export { name, func });
+            }
             _ => funcs.push(p.parse_func()?),
         }
     }
@@ -1110,6 +1131,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         memory,
         data,
         imports: std::mem::take(&mut p.imports),
+        exports,
         debug_info,
     })
 }
@@ -1147,6 +1169,12 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 }
                 p.parse_int()?;
                 p.parse_str()?;
+            }
+            // `export "<name>" <funcidx>` — skip past it in the header prescan.
+            Some(Tok::Ident(s)) if s == "export" => {
+                p.next()?;
+                p.parse_str()?;
+                p.parse_int()?;
             }
             Some(Tok::Ident(s)) if s == "func" => {
                 p.next()?;
@@ -1709,6 +1737,9 @@ impl<'a> Parser<'a> {
         if op == "vcpu.tls.get" {
             return Ok(Inst::VcpuTlsGet);
         }
+        if op == "durable.shadow_base" {
+            return Ok(Inst::DurableShadowBase);
+        }
         if op == "vcpu.tls.set" {
             let val = self.value(names)?;
             return Ok(Inst::VcpuTlsSet { val });
@@ -1781,6 +1812,16 @@ impl<'a> Parser<'a> {
             return Ok(Inst::Suspend {
                 value: self.value(names)?,
             });
+        }
+        if op == "setjmp" {
+            return Ok(Inst::SetJmp {
+                buf: self.value(names)?,
+            });
+        }
+        if op == "longjmp" {
+            let buf = self.value(names)?;
+            let val = self.value(names)?;
+            return Ok(Inst::LongJmp { buf, val });
         }
         if op == "gc.roots" {
             let heap_lo = self.value(names)?;
@@ -2464,6 +2505,31 @@ block0(v0: i32):
         let printed = print_module(&m);
         let m2 = parse_module(&printed).expect("reparse");
         assert_eq!(m, m2, "import syntax must round-trip");
+    }
+
+    #[test]
+    fn exports_round_trip() {
+        let src = "\
+export \"main\" 1
+export \"helper\" 0
+
+func (i64) -> (i64) {
+block0(v0: i64):
+  return v0
+}
+
+func (i64) -> (i64) {
+block0(v0: i64):
+  return v0
+}
+";
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.exports.len(), 2);
+        assert_eq!(m.resolve_export("main"), Some(1));
+        assert_eq!(m.resolve_export("helper"), Some(0));
+        // Print → re-parse is identity (exports preserved in declaration order).
+        let m2 = parse_module(&print_module(&m)).expect("reparse");
+        assert_eq!(m, m2, "export syntax must round-trip");
     }
 
     #[test]

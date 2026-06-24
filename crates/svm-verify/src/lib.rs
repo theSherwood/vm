@@ -100,6 +100,10 @@ pub enum VerifyError {
     /// top-byte-strip masks (`mask | 0xFF00_0000_0000_0000 == !0`) are allowed; the runtime also
     /// rejects a non-constant mask that violates this at execution.
     GcRootsMaskUnsafe { func: u32, block: u32, mask: u64 },
+    /// A named [`Module::exports`] entry points at a funcidx past the end of `funcs`.
+    ExportFuncOutOfRange { export: u32, func: u32 },
+    /// Two [`Module::exports`] entries share a name — exports must be uniquely addressable.
+    DuplicateExport { export: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -136,6 +140,20 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     let has_memory = m.memory.is_some();
     for (fi, f) in m.funcs.iter().enumerate() {
         verify_func(fi as u32, f, &m.funcs, has_memory)?;
+    }
+    // Named exports must point at a real function and be uniquely addressable (backends ignore the
+    // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
+    // fail-closed here).
+    for (ei, e) in m.exports.iter().enumerate() {
+        if e.func as usize >= m.funcs.len() {
+            return Err(VerifyError::ExportFuncOutOfRange {
+                export: ei as u32,
+                func: e.func,
+            });
+        }
+        if m.exports[..ei].iter().any(|o| o.name == e.name) {
+            return Err(VerifyError::DuplicateExport { export: ei as u32 });
+        }
     }
     Ok(())
 }
@@ -482,6 +500,31 @@ fn check_inst(
         cx.expect(*value, ValType::V128)?;
         return Ok(None);
     }
+    // `setjmp`/`longjmp` (the non-local jump): both touch the guest `jmp_buf` token in window memory,
+    // so both require a declared window. `setjmp` takes an `i64` buffer address, yields `i32` (0 on the
+    // direct call, the long-jump value on re-entry); `longjmp` takes the `i64` address + an `i32` value
+    // and yields no result (a `noreturn` control op).
+    if let Inst::SetJmp { buf } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*buf, ValType::I64)?;
+        return Ok(Some(ValType::I32));
+    }
+    if let Inst::LongJmp { buf, val } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*buf, ValType::I64)?;
+        cx.expect(*val, ValType::I32)?;
+        return Ok(None);
+    }
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
@@ -496,6 +539,8 @@ fn check_inst(
         // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
         // `set` consumes an i64 and yields nothing (handled like `store`).
         Inst::VcpuTlsGet => ValType::I64,
+        // Durable-runtime-internal: the current context's shadow region base (a window byte offset).
+        Inst::DurableShadowBase => ValType::I64,
         Inst::VcpuTlsSet { val } => {
             cx.expect(*val, ValType::I64)?;
             return Ok(None);
@@ -989,6 +1034,8 @@ fn check_inst(
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContResume { .. }
+        | Inst::SetJmp { .. }
+        | Inst::LongJmp { .. }
         | Inst::ThreadSpawn { .. } => return Ok(None),
     };
     Ok(Some(ty))

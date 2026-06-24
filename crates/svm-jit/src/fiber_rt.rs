@@ -71,6 +71,13 @@ fn current() -> *mut FiberRuntime {
     CURRENT_RT.with(|c| c.get())
 }
 
+extern "C" {
+    /// Publish the guest fiber handle now running on this thread into the shared `trap_capture.c`
+    /// thread-local (per-fiber trap attribution, §5 W3 / §23-D57); returns the previous value so the
+    /// resume seam can restore it. A no-op on the trap path until something traps — just a TLS store.
+    fn svm_set_current_fiber(handle: i64) -> i64;
+}
+
 /// Max concurrently-allocated fibers per run (matches the interpreter's `MAX_FIBERS`): an anti-bomb
 /// ceiling so a fiber-bomb traps (`FiberFault`) instead of exhausting host memory.
 const MAX_FIBERS: usize = 1 << 16;
@@ -84,14 +91,13 @@ const FIBER_STACK: usize = 1 << 18;
 
 // ---- Durable per-fiber shadow-stack layout (DURABILITY.md §12.8, D-fiber-cont option A) ----
 //
-// These MUST match `svm-interp`'s `SHADOW_SP_OFF` / `SHADOW_BASE` / `SHADOW_STRIDE` (the durable
-// runtime ABI) — like `DURABLE_SNAPSHOT_PAGE`, svm-jit is TCB and can't depend on the interpreter,
-// so the constants are duplicated; the cross-backend fiber freeze/thaw property catches drift. On a
-// **durable** run the active shadow-SP word lives at `SHADOW_SP_OFF` in the window, and context `i`
-// owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)` — the root is context 0,
-// a fiber in registry slot `s` is context `s+1`. The runtime keeps the active word pointing at the
-// running context's region, swapping it on every fiber switch so a freeze spills into the right one.
-const SHADOW_SP_OFF: u64 = 8;
+// These MUST match `svm-interp`'s `SHADOW_BASE` / `SHADOW_STRIDE` (the durable runtime ABI) — like
+// `DURABLE_SNAPSHOT_PAGE`, svm-jit is TCB and can't depend on the interpreter, so the constants are
+// duplicated; the cross-backend fiber freeze/thaw property catches drift. On a **durable** run context
+// `i` owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)` — the root is context 0,
+// a fiber in registry slot `s` is context `s+1`. §12.8 4A.5: each context's shadow-SP word is the
+// **first 8 bytes of its own region**, with frames following, so `durable.shadow_base` (the per-OS-thread
+// register the instrumented IR reads) points at the running context's region — no shared SP word.
 const SHADOW_BASE: u64 = 64;
 const SHADOW_STRIDE: u64 = 1 << 12;
 /// Size of the reserved durable low slice (one 64 KiB wasm page); must match `svm-interp`'s
@@ -161,15 +167,17 @@ fn fiber_handle_generation(handle: i64) -> u64 {
     (handle as u64) >> FIBER_GEN_SHIFT
 }
 
-/// Read the active shadow-SP word from the durable window. `mem_base` is the window's host base.
-/// # Safety: only called on a durable run, where `[SHADOW_SP_OFF, +8)` is committed RW reserve.
-pub(crate) unsafe fn read_shadow_sp(mem_base: u64) -> u64 {
-    *((mem_base + SHADOW_SP_OFF) as *const u64)
+/// Read a context's shadow-SP word from the durable window. `mem_base` is the window's host base;
+/// `sp_word` is the window offset of the SP word — §12.8 4A.5: the first 8 bytes of that context's
+/// region (`shadow_region_base(ctx)`), so each context has its own (vs. the legacy global
+/// `SHADOW_SP_OFF`). # Safety: only called on a durable run, where the region is committed RW reserve.
+pub(crate) unsafe fn read_shadow_sp(mem_base: u64, sp_word: u64) -> u64 {
+    *((mem_base + sp_word) as *const u64)
 }
 
-/// Write the active shadow-SP word into the durable window. # Safety: as [`read_shadow_sp`].
-pub(crate) unsafe fn write_shadow_sp(mem_base: u64, sp: u64) {
-    *((mem_base + SHADOW_SP_OFF) as *mut u64) = sp;
+/// Write a context's shadow-SP word into the durable window. # Safety: as [`read_shadow_sp`].
+pub(crate) unsafe fn write_shadow_sp(mem_base: u64, sp_word: u64, sp: u64) {
+    *((mem_base + sp_word) as *mut u64) = sp;
 }
 
 /// The shadow-region base (window offset) of a durable **vCPU** context `ctx` — context `i` owns
@@ -179,6 +187,12 @@ pub(crate) unsafe fn write_shadow_sp(mem_base: u64, sp: u64) {
 /// running a child (slice 3.3).
 pub(crate) fn shadow_region_base(ctx: usize) -> u64 {
     SHADOW_BASE + ctx as u64 * SHADOW_STRIDE
+}
+
+/// The empty shadow-SP / frame base of a vCPU context `ctx`: just past its in-region SP word (§12.8
+/// 4A.5). Frames grow upward from here; the 8-byte SP word itself lives at `shadow_region_base(ctx)`.
+pub(crate) fn shadow_frame_base(ctx: usize) -> u64 {
+    shadow_region_base(ctx) + 8
 }
 
 /// Whether the durable state word is **not** `NORMAL` (a freeze/thaw is in progress) — the gate for
@@ -368,7 +382,7 @@ impl SharedFiberTable {
             running_on: AtomicU64::new(NOT_RUNNING),
             fiber: Mutex::new(Some(fiber)),
             // Fresh/reused: the shadow region starts empty (SP at the region base).
-            shadow_sp: AtomicU64::new(fiber_region_base(slot)),
+            shadow_sp: AtomicU64::new(fiber_region_base(slot) + 8), // §12.8 4A.5: empty = frame base (past the SP word)
             func,
             sp,
         });
@@ -535,7 +549,7 @@ impl FiberRuntime {
             root_entry_sp: 0,
             durable: false,
             mem_base: 0,
-            root_shadow_sp: SHADOW_BASE,
+            root_shadow_sp: shadow_frame_base(0), // §12.8 4A.5: root empty SP = frame base (past its SP word)
             cur_shadow: None,
             frozen: Vec::new(),
         }
@@ -776,35 +790,55 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         let rt = &*rt;
         (rt.durable, rt.mem_base)
     };
+    // §12.8 4A.5: each context keeps its shadow-SP word in its **own** region, so the swap saves/loads
+    // *per-region* words (no shared `SHADOW_SP_OFF`) and re-points `durable.shadow_base` (the
+    // per-OS-thread register the instrumented IR reads) at the incoming context. The resumer's SP-word
+    // address is whatever is active now; the fiber's is its region base.
     let resumer = if durable {
         let rtm = &mut *rt;
         let resumer = rtm.cur_shadow.take(); // the context being suspended (None = root)
-        let cur_sp = read_shadow_sp(mem_base);
+        let resumer_region = crate::durable_shadow::get();
+        let cur_sp = read_shadow_sp(mem_base, resumer_region);
         match &resumer {
             None => rtm.root_shadow_sp = cur_sp,
             Some(rs) => rs.shadow_sp.store(cur_sp, Ordering::Relaxed),
         }
-        write_shadow_sp(mem_base, slot.shadow_sp.load(Ordering::Relaxed));
+        let fiber_region = fiber_region_base(slot_idx);
+        write_shadow_sp(
+            mem_base,
+            fiber_region,
+            slot.shadow_sp.load(Ordering::Relaxed),
+        );
+        crate::durable_shadow::seed(fiber_region);
         rtm.cur_shadow = Some(Arc::clone(&slot));
-        Some(resumer)
+        Some((resumer, resumer_region))
     } else {
         None
     };
+    // Per-fiber trap attribution (DEBUGGING.md §5 W3 / §23-D57): publish this fiber as the one running
+    // on this thread, so a trap inside the switch below is captured against *its* handle (the C
+    // `trap_capture` reads the current-fiber TLS at the trap instant), and restore the resumer (root or
+    // an outer fiber) when the resume returns. Stack-disciplined across nested resumes, mirroring the
+    // durable shadow-SP bracket above — so a migrated fiber is named by identity, not by thread.
+    let prev_fiber = svm_set_current_fiber(fiber_handle(slot_idx, slot.own.generation()));
     // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
     // `*fib` exclusive to this vCPU. The same `svm-fiber` instruction sequence regardless of which
     // thread the fiber last ran on (see the module header's 3c soundness argument).
     let st = (*fib).resume(arg as u64);
+    svm_set_current_fiber(prev_fiber);
     // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
-    // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region.
-    if let Some(resumer) = resumer {
+    // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region (+ register).
+    if let Some((resumer, resumer_region)) = resumer {
         let rtm = &mut *current();
+        let fiber_region = fiber_region_base(slot_idx);
         slot.shadow_sp
-            .store(read_shadow_sp(mem_base), Ordering::Relaxed);
+            .store(read_shadow_sp(mem_base, fiber_region), Ordering::Relaxed);
         let restore = match &resumer {
             None => rtm.root_shadow_sp,
             Some(rs) => rs.shadow_sp.load(Ordering::Relaxed),
         };
-        write_shadow_sp(mem_base, restore);
+        write_shadow_sp(mem_base, resumer_region, restore);
+        crate::durable_shadow::seed(resumer_region);
         rtm.cur_shadow = resumer;
     }
     // Phase 3: publish the fiber's new state (clearing the seam assert *before* republishing).
@@ -824,8 +858,11 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // unwound mid-resume-chain during the root run **and** a parked fiber driven by
             // `freeze_drive` — both Complete here. Record its residue so a thaw re-seeds it; a
             // genuine return (non-instrumented fiber, empty region) is left as an ordinary finish.
+            // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word is the region's
+            // first 8 bytes); an empty stack sits exactly at the frame base.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
-            if durable && flat_sp > fiber_region_base(slot_idx) && window_is_unwinding(mem_base) {
+            if durable && flat_sp > fiber_region_base(slot_idx) + 8 && window_is_unwinding(mem_base)
+            {
                 (*current()).frozen.push(crate::FrozenFiber {
                     slot: slot_idx,
                     func: slot.func,

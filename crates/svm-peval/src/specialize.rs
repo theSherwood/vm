@@ -341,6 +341,9 @@ pub fn specialize_with_config(
         memory: module.memory,
         data: module.data.clone(),
         imports: vec![],
+        // The residual's functions are freshly built (specialized/renumbered), so the source
+        // module's name→funcidx exports no longer apply; a residual is addressed by index.
+        exports: vec![],
         debug_info: None,
     })
 }

@@ -1,8 +1,8 @@
 # Known Issues & Robustness Gaps
 
 A registry of **known bugs, robustness gaps, and latent hazards** that are understood but not yet
-fixed — distinct from the forward-looking design/status docs (`DESIGN.md`, `DURABILITY.md`,
-`HANDOFF.md`). An entry here is a deliberately-deferred problem with a recorded root cause and a fix
+fixed — distinct from the forward-looking design/status docs (`DESIGN.md`, `DURABILITY.md`).
+An entry here is a deliberately-deferred problem with a recorded root cause and a fix
 sketch, so it isn't rediscovered from scratch. When an issue is fixed, move it to the bottom
 ("Resolved") with the commit/PR, or delete it and note the fix in the relevant design doc.
 
@@ -57,31 +57,37 @@ module that spawns 6 OS-thread workers, each doing a `Blocking` `cap.call` + `i6
 the root parking on `memory.atomic.wait32` until they finish. Runs on the JIT via
 `svm_jit::compile_and_run_with_host`.
 
-**Symptom (observed once):** on PR #72's first slice-3.3 CI run, the `build · test (macos-latest)` job's
+**Symptom (observed twice):** on PR #72's first slice-3.3 CI run, the `build · test (macos-latest)` job's
 `imports` binary aborted with `signal: 6, SIGABRT`. Tests run in parallel, so the abort surfaced after
 a *sibling* test (`import_handle_threads_through_call_indirect`) had already printed `ok`; the only test
 in that binary still running — and the only one using real OS threads + futex wait/notify — is
-`spawn_alongside_capability_import`. **Not reproduced:** it passed on the very next run (same commit
-range) and passes repeatedly on Linux (5/5 stress), and macOS cannot be run in this environment, so the
-root cause is not pinned.
+`spawn_alongside_capability_import`. **Recurred** on PR #92 (run #887 attempt 1, commit `4d45f97`), an
+exports-only change that touches no threading code: identical signature (`signal: 6, SIGABRT` in the
+`imports` binary after the same sibling test's `ok`), macOS-only — Linux *and* Windows ran the same
+`cargo test --workspace` green in that very run, and a plain re-run of just the macOS job (attempt 2)
+passed. **Not reproduced deterministically:** it has always cleared on the next run, and macOS cannot be
+run in this environment, so the root cause is not pinned.
 
-**Suspected cause / mitigation (landed).** Slice 3.3 (multi-vCPU durable) began creating the
-`SharedFiberTable` for `uses_fibers || uses_threads` (the durable vCPU-context allocator lives on it).
-A `.map` over that table *incidentally* also built the **root vCPU's `FiberRuntime` and published it as
-`CURRENT_RT`** for a thread-only module — behavior it never had pre-3.3. A fiber-free module never
-resumes a fiber, so that runtime is dead weight, but it changed the threaded run's setup/teardown
-surface on the spawning thread. The table-vs-runtime split is now fixed: the **table** stays present for
-`uses_threads` (needed by the allocator), but the **runtime** is built only for `uses_fibers` (so a
-thread-only run again publishes no `CURRENT_RT` and allocates no idle runtime). This *reduces the change
-surface back to the pre-3.3 path* but is **not a confirmed cure** — the abort was never reproduced, so it
-may be a pre-existing macOS-runner flake (e.g. futex/thread teardown timing, or runner memory pressure)
-unrelated to the runtime. Severity is provisional `S4` pending a root cause; if a reproduction shows a
-real abort path it should be re-classified.
+**Suspected cause / mitigation (landed, now confirmed NOT a cure).** Slice 3.3 (multi-vCPU durable) began
+creating the `SharedFiberTable` for `uses_fibers || uses_threads` (the durable vCPU-context allocator
+lives on it). A `.map` over that table *incidentally* also built the **root vCPU's `FiberRuntime` and
+published it as `CURRENT_RT`** for a thread-only module — behavior it never had pre-3.3. A fiber-free
+module never resumes a fiber, so that runtime is dead weight, but it changed the threaded run's
+setup/teardown surface on the spawning thread. The table-vs-runtime split was fixed in I4's original
+slice: the **table** stays present for `uses_threads` (needed by the allocator), but the **runtime** is
+built only for `uses_fibers`. The **PR-#92 recurrence post-fix rules this delta out** — the abort
+reappeared with the runtime split already in place, on a change that cannot touch the threading path. So
+the cause is a **pre-existing macOS-runner flake** in real-thread futex park/notify/teardown (or runner
+memory pressure), not the slice-3.3 runtime delta. Severity stays `S4` (transient, re-run clears it).
 
 **Next step if it recurs:** capture the macOS core/backtrace (the `imports` binary under
 `RUST_BACKTRACE=full`, ideally `--test-threads=1` to localize which test aborts), and check whether it
 is in futex park/teardown (`os_thread_rt::{thread_wait,thread_notify,join_all}`) or the guard/signal
 path — distinct from the now-removed root-runtime delta and from the resolved I1 (fiber-stack alloc).
+If it keeps tripping unrelated PRs' CI, the cheap unblock (until root-caused) is to de-flake the test
+itself — serialize it (`--test-threads=1` for the `imports` binary, or a process-global lock so the
+6-worker spawn doesn't overlap other tests) or lengthen the `memory.atomic.wait32` timeout — rather than
+re-running the whole macOS job by hand each time.
 
 ---
 
@@ -295,7 +301,126 @@ hot loops are rare in real code, so this is low priority.
 
 ---
 
+### I11 — on-ramp fails-closed on an auto-vectorized `<8 x i32>` shape the I2 legalizer doesn't cover (S3) — found via Embench `edn` — **FIX LANDED** on `claude/onramp-i11-wide-i32x8`
+
+**Fixed.** The pinned shape was a **wide lane-wise shift**: `edn`'s `vec_mpy` fixed-point kernel
+(`y[i] += (short)((scaler * x[i]) >> 15)`) auto-vectorizes to a `<8 x i32>` widening multiply followed
+by a `>>15` shift. I10 added 128-bit vector shifts but the **wide** legalizer's op dispatch had no
+`Shl`/`LShr`/`AShr` arm, so a wider-than-128 shift fell through to the `Unsupported("<8 x i32>")` type
+fallthrough — even though the surrounding `sext`/`mul`/`trunc` already chunked. The fix adds those three
+arms (`lower_wide`) routed through a new `wide_int_shift`: each `v128` chunk shifts via `VShift` (one
+scalar splat amount, the same uniform-amount recognizer the 128-bit path uses — a per-lane-varying amount
+stays fail-closed), each scalar tail lane via `IntBin`. *Test* (`translate.rs`
+`simd_autovec_avx2_fixed_point_shift`): the `-O2 -mavx2` `vec_mpy` kernel translates and runs **bit-exact
+vs the native scalar `cc` oracle on both backends**. *Still a small follow-up:* the `memcmp`/`bcmp`
+on-ramp builtins noted above (the other reason `edn` may need the Embench wrapper's `-fno-builtin`).
+
+---
+
+### I13 — `<2 x i16>` "no-redundant-load" vector pattern miscompiled (soundness) — **fail-closed (stopgap landed)**, root fix pending — found via Embench `edn`/`fir_no_red_ld`
+
+**STATUS:** the silent miscompile is **fail-closed** on `claude/perf-i11-i12` (a φ that carries a tiny
+all-tail sub-32-bit vector — ≤ 2 lanes of i8/i16 — now returns `Unsupported` instead of miscompiling,
+in `translate_function` right after `scan_func`). So the no-miscompile invariant is restored: `edn`
+*fail-closes* (skipped by the `embench` driver) rather than returning a wrong answer. The **root fix**
+(making the tiny-tail-lane representation correct so the pattern *translates*) is still open — see the
+fix sketch below. The guard is deliberately narrow: a 4-lane `<4 x i16>` φ (e.g. the Clay-UI demo's
+carried point vector) round-trips correctly and is untouched (`tests/translate.rs::demo_clay_vs_native`
+covers it); only the confirmed-broken 32-bit `<2 x i16>`/`<2 x i8>` carry is rejected.
+
+
+
+**Where:** `crates/svm-llvm/src/lib.rs` — the sub-128 / all-tail vector handling for **2-lane 16-bit
+vectors** (`<2 x i16>`, and the `<4 x i16>` they're shuffled from): `vec_explode`/`vec_implode`,
+`ShuffleVector`/`InsertElement` in the normal path, and a cross-block `<2 x i16>` phi.
+
+**Symptom (S2 — silent miscompile, not fail-closed).** With I11 landed, Embench `edn` now *translates*
+but returns a wrong answer: `verify_benchmark` = 1 native vs 0 on **all three** SVM engines (so the bug
+is in translation, not an engine). Bisected to **`fir_no_red_ld`** (the FIR variant that carries a
+loaded sample across iterations to avoid a redundant load); `fir` and `jpegdct` — which use the *same*
+`<4 x i16>` deinterleave shuffles — are correct, so it's specific to this pattern, not the shape alone.
+`edn` compiled `-fno-vectorize` is correct, confirming it's the vectorized translation.
+
+**The pattern (from `fir_no_red_ld`'s `-O2` IR).** A `<2 x i16>` carried across the loop backedge:
+`insertelement <2 x i16> poison, i16 %s, 1` (lane 0 left undef) → loop phi `<2 x i16>` →
+`shufflevector <2 x i16> %prev, <2 x i16> %cur, <i32 1, i32 2>` (recombine: take lane 1 of the carried
+value, lane 0 of the new) → `sext <2 x i16> → <2 x i32>` → `mul` → `sext → <2 x i64>` →
+`add` → `llvm.vector.reduce.add.v2i64`. `<2 x i16>` is **not** a `vec2` (that's `<2 x i32>`/`<2 x float>`
+only) and not a `v128`, so it takes the all-tail `wide_vec_layout` path (0 chunks, 2 tail lanes of an
+`i16x8` shape). Something in that path — most likely how a single i16 tail lane survives
+`insertelement`/`shufflevector`/the cross-block phi (width/sign of the lane "container"), or the
+explode→implode round-trip for the recombine shuffle — drops or corrupts a lane.
+
+**Impact (before the stopgap).** This was the on-ramp's worst failure mode — a **silent miscompile**
+violating the fail-closed contract. It is **pre-existing and independent of I11**: `fir_no_red_ld` uses
+no wide shifts, so it would miscompile on `main` too once reached; I11 merely let the *whole* `edn`
+translate far enough to hit it. Narrow in practice (this exact carried-`<2 x i16>` shape). The stopgap
+above converts it to a clean fail-close; the `embench` driver also still excludes a *runtime* MISMATCH
+from the geomean as a backstop.
+
+**Root-fix sketch (needs care — soundness; the stopgap only fail-closes):** reproduce minimally (the
+bisection harness: include `src/edn/libedn.c`, call only `fir_no_red_ld` on a seeded buffer, diff interp
+vs native — both via `bench/embench`), then dump the **SVM IR** the translator emits and compare against
+the scalar form. The lane corruption is *not* the lane count alone (the 4-lane `<4 x i16>` φ works), so
+it's specific to the 32-bit 2-lane carry — likely how a 16-bit tail lane round-trips through
+`insertelement`-into-poison + the cross-block φ fan-out + the `<1,2>` recombine `shufflevector`'s
+explode→implode (width/sign of the i32 lane "container"). Fix the representation so a 16-bit lane is
+lossless there, then narrow/remove the fail-close guard. A differential fuzz over small i8/i16 vectors
+(interp vs JIT vs a scalar oracle) would catch the whole class and guard against regressions.
+
+---
+
 ## Resolved
+
+### I11 — on-ramp fail-closed on auto-vectorized **wide vector shifts** (`shl`/`lshr`/`ashr` on `<8 x i32>`) (S3) — fixed on `claude/perf-i11-i12`
+
+**Was:** a plain `clang -O2 -mavx2` (or `-O2` with interleave) program whose vectorizer emits a wide
+integer shift — e.g. Embench `edn`'s `lshr <8 x i32> v, <i32 15, …>` — fail-closed at translate with
+`Unsupported("type <8 x i32> …")`. The I2 legalization split wide loads/stores/arith/reductions/
+conversions into `v128` chunks, but `lower_wide` had **no arm for shifts**, so a wide `Shl`/`LShr`/`AShr`
+fell through to the normal `bin()` path, which only handles a single `v128` and rejected the 256-bit type.
+
+**Fix (landed):** a `wide_shift` helper (mirroring `wide_int_binop`) splits a wide constant-splat shift
+into one `VShift` per `v128` chunk + a scalar shift per tail lane, dispatched from new
+`I::Shl`/`I::LShr`/`I::AShr` arms in `lower_wide`. The amount is taken from the constant splat (the shape
+the auto-vectorizer emits; a non-uniform amount stays fail-closed, as in the v128 path). Verified by
+`simd_autovec_avx2_wide_shifts` in `tests/translate.rs` (interp == JIT == native on a mixed
+logical/arithmetic `<8 x i32>` shift) and a 10-op wide-op isolation sweep (shifts/sext/zext/trunc/
+reduction/i16 — all bit-exact).
+
+**Note:** this unblocked `edn`'s *shift* op, but `edn` as a whole still fails — it additionally trips
+the **I13** `<2 x i16>` miscompile in `fir_no_red_ld`. (Separately, the on-ramp has no `memcmp`/`bcmp`
+builtin — `clang` emits those for array compares; the Embench wrapper supplies them in-module with
+`-fno-builtin-memcmp/-bcmp`. Providing them as on-ramp builtins, like `memcpy`/`memset`, is a small
+coverage win.)
+
+---
+
+### I12 — the §9/D45 `cap.call` fast path left ~9× on the table for cheap caps by re-entering the generic host dispatch (S4) — fixed on `claude/perf-i11-i12`
+
+**Was:** `cap_call` first reported the JIT generic and "fast" (`fast_cap_resolver`) paths as **within
+~2%** — but that was a *benchmark artifact*: the probe's `cap.call` passed a stray arg, so it didn't
+match the resolver's claimed `(CLOCK, 0, n_args=0, ...)` and silently ran the generic path *both* times.
+With a correct **0-arg** `Clock.now()` call the fast path was already **~1.7×** generic (53→31 ns,
+the JIT-side marshalling saving) — but the host side still re-entered `Host::cap_dispatch_slots`, which
+for a cheap cap is dominated by the per-call `Vec` result allocation + the W1 record/replay gate.
+
+**Fix (landed):** a new `Host::fast_clock_now(handle) -> Option<Result<i64, Trap>>` (svm-interp) does
+the authority check (`resolve`, identical to the generic path — a forged/closed/wrong-type handle is an
+inert `CapFault`) and the read+advance **inline**, returning the `i64` with no `Vec`. It returns `None`
+when a W1 record/replay tape is active, so `svm_run::fast_clock_now` falls back to the full
+`cap_dispatch_slots` and the clock crossing is still taped/served faithfully (the clock is a recorded
+nondeterministic input). Net: `Clock.now()` on the fast path drops **31 → 5.7 ns** (a further ~5.5×),
+so the fast path is now **~9× cheaper than generic** end-to-end.
+
+**Verification.** `cap_call` now shows jit-generic ≈ 54 ns vs jit-fast ≈ 5.7 ns. New
+`crates/svm-run/tests/fast_cap.rs` pins interp == generic-JIT == fast-JIT on a 0-arg clock delta and
+that a forged handle still faults; the interp↔JIT differential (`svm/tests/jit_diff.rs`, 54),
+`jit_quota` (fast-resolver path), and all `svm-run`/`svm-durable` clock tests stay green. (`Blocking.work`
+still uses the shared `fast_dispatch` — it's arg-bearing and rarer; same inline treatment is a future
+follow-up if it shows up hot.)
+
+---
 
 ### I10 — ordinary `clang -O2` auto-vectorized loops hit two narrow holes in the vector breadth (S3) — fixed on `claude/bench-alu-hygiene`
 

@@ -12,4 +12,4 @@ cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c
 
 It compiles through the chibicc frontend (`#define CLAY_DISABLE_SIMD`) to ~93k lines of our IR,
 verifies, and runs on the JIT — output identical to a native build. This exercised and fixed
-several frontend/IR gaps (see the commits / `HANDOFF.md`).
+several frontend/IR gaps (see the commits / `FRONTEND.md`).

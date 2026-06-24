@@ -152,9 +152,10 @@ impl Known {
     }
 }
 
-/// Optimize every function in a module. Memory/data/imports are carried through unchanged;
-/// `debug_info` is **dropped** because its `(func, block, inst)` positions go stale once we
-/// fold instructions and drop blocks (it is strippable and untrusted for escape, §3a).
+/// Optimize every function in a module. Memory/data/imports/exports are carried through unchanged
+/// (optimization is per-function and order-preserving, so funcidxs — and the names that point at
+/// them — stay valid); `debug_info` is **dropped** because its `(func, block, inst)` positions go
+/// stale once we fold instructions and drop blocks (it is strippable and untrusted for escape, §3a).
 pub fn optimize_module(m: &Module) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     Module {
@@ -166,6 +167,7 @@ pub fn optimize_module(m: &Module) -> Module {
         memory: m.memory,
         data: m.data.clone(),
         imports: m.imports.clone(),
+        exports: m.exports.clone(),
         debug_info: None,
     }
 }
@@ -1793,6 +1795,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
         | Inst::VcpuTlsGet
+        | Inst::DurableShadowBase
         | Inst::AtomicFence { .. }
         | Inst::SimdWidthBytes => {}
 
@@ -1812,6 +1815,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::CapSelfGet { idx: a }
         | Inst::VcpuTlsSet { val: a }
         | Inst::Suspend { value: a }
+        | Inst::SetJmp { buf: a }
         | Inst::ThreadJoin { handle: a }
         | Inst::Splat { a, .. }
         | Inst::ExtractLane { a, .. }
@@ -1851,6 +1855,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         }
         | Inst::ContNew { func: a, sp: b }
         | Inst::ContResume { k: a, arg: b }
+        | Inst::LongJmp { buf: a, val: b }
         | Inst::ThreadSpawn { sp: a, arg: b, .. }
         | Inst::ReplaceLane { a, b, .. }
         | Inst::VIntBin { a, b, .. }

@@ -274,6 +274,19 @@ enum Op {
         value: u32,
         dst: u32,
     },
+    /// `<setjmp.h>` `setjmp`: checkpoint this activation's resume point (the op after `setjmp`) keyed
+    /// by the guest `jmp_buf` address in `buf`; `dst` receives `i32` 0 (or the long-jump value on
+    /// re-entry). Intra-vCPU — handled inline, no scheduler escape.
+    SetJmp {
+        buf: u32,
+        dst: u32,
+    },
+    /// `<setjmp.h>` `longjmp`: pop the activation stack back to the `setjmp` checkpoint named by `buf`,
+    /// re-entering it with the `setjmp` result set to `val` (a `0` becomes `1`, per C). Noreturn.
+    LongJmp {
+        buf: u32,
+        val: u32,
+    },
     /// §12 `thread.spawn`: spawn a vCPU running `func` (a direct func index) with `(sp, arg)`; its
     /// handle lands at `dst`. Scheduler-driven.
     ThreadSpawn {
@@ -444,6 +457,12 @@ enum Op {
         block_base: u32,
         dst: u32,
     },
+    /// §12.8 4A.5 durable-runtime-internal: push the active context's shadow-SP word address (the
+    /// `Vm`'s `durable_region_base`). The reference `eval_inst` can't service it (it needs the running
+    /// context), so it gets a dedicated op like `vcpu.tls` would.
+    DurableShadowBase {
+        dst: u32,
+    },
 }
 
 /// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
@@ -478,6 +497,16 @@ pub struct Compiled {
     /// `len - 1` of the natural table (`next_power_of_two(n_funcs)`), used to mask a `ref.func`/fiber
     /// funcref to a module-local slot (the fiber/coroutine dispatch is module-0-natural).
     table_mask: usize,
+}
+
+impl Compiled {
+    /// Total compiled **bytecode op count** across all functions — the structural-size measure of this
+    /// threaded register-VM program (the analogue of the JIT's emitted code bytes / the IR's
+    /// instruction count). The engine is a `Vec<Op>` per function, not a serialized byte stream, so op
+    /// count, not a byte length, is the meaningful size.
+    pub fn op_count(&self) -> usize {
+        self.progs.iter().map(|p| p.ops.len()).sum()
+    }
 }
 
 /// One slot of a domain's `call_indirect` dispatch table: `(module, func)`, where module 0 is the
@@ -1064,6 +1093,15 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             value: g(*value),
             dst,
         },
+        // `<setjmp.h>` non-local jump — intra-vCPU (no scheduler escape). `setjmp` checkpoints the
+        // activation's resume point (the flat per-function register layout keeps each block's slots
+        // distinct, so the `setjmp` block's values survive a deeper call — no window snapshot needed,
+        // unlike the tree-walker's per-block `vals`); `longjmp` pops the activation stack back to it.
+        Inst::SetJmp { buf } => Op::SetJmp { buf: g(*buf), dst },
+        Inst::LongJmp { buf, val } => Op::LongJmp {
+            buf: g(*buf),
+            val: g(*val),
+        },
         // §12 threads / futex — cooperative multi-vCPU, serviced by the `drive` scheduler. (A module
         // mixing threads *and* fibers is rejected at the module level — see `compile_module` — until
         // the run-shared fiber registry / migration lands.)
@@ -1113,6 +1151,9 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             dst,
         },
         Inst::CallImport { .. } => return None,
+        // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
+        // context), so it gets a dedicated op rather than the `Eval` fallback.
+        Inst::DurableShadowBase => Op::DurableShadowBase { dst },
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
         // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
         // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
@@ -1172,9 +1213,10 @@ pub fn compile_and_run_with_host(
     Some(run(dom, func, args, fuel, &mut mem, host))
 }
 
-/// A run result paired with its trap-time backtrace (innermost frame first, as [`crate::IrPc`]s;
-/// empty on a clean finish) — what [`compile_and_run_with_host_traced`] returns.
-pub type TracedRun = (Result<Vec<Value>, Trap>, Vec<super::IrPc>);
+/// What [`compile_and_run_with_host_traced`] returns — the shared traced-run shape (result + trap-time
+/// backtrace + trapping fiber). The single-step path is root-only, so its fiber is `-1` (a trap) or
+/// `None` (clean); a fibered run is a seam it declines, so the tree-walker reports the real handle.
+pub type TracedRun = super::TracedRun;
 
 /// Trap-time-backtrace counterpart of [`compile_and_run_with_host`] — the bytecode mirror of the
 /// tree-walker's [`crate::run_with_host_traced`]. Drives the entry **one op at a time** (the proven
@@ -1199,22 +1241,25 @@ pub fn compile_and_run_with_host_traced(
 ) -> Option<TracedRun> {
     let c = compile_module(&m.funcs)?;
     if func as usize >= c.progs.len() {
-        return Some((Err(Trap::Malformed), Vec::new()));
+        return Some((Err(Trap::Malformed), Vec::new(), None));
     }
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
     let mut vm = match Vm::new(&dom.mods[0], func as usize, args) {
         Ok(v) => v,
-        Err(e) => return Some((Err(e), Vec::new())),
+        Err(e) => return Some((Err(e), Vec::new(), None)),
     };
     loop {
         match vm.resume(&dom.mods, &dom.table, fuel, &mut mem, host, 1) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
-            Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new())),
+            Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new(), None)),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
             Err(t) => {
                 let bt = vm_trap_bt(&vm, &dom.mods, &t);
-                return Some((Err(t), bt));
+                // This single-step path only ever drives the **root** (a fiber/thread op is a seam →
+                // the `Ok(_)` arm above bails to the tree-walker), so a trap here is always the root —
+                // attributed `-1`, matching the JIT's root-trap convention.
+                return Some((Err(t), bt, Some(-1)));
             }
         }
     }
@@ -1661,7 +1706,12 @@ fn shadow_switch(
         return;
     }
     let Some(m) = mem.as_mut() else { return };
-    let sp = m.durable_get_sp();
+    // §12.8 4A.5: each context's SP word lives in its own region (root = context 0, fiber slot `s` =
+    // context `s + 1`). (This bytecode durable path is unreachable today — durable hosts always run on
+    // the tree-walker — but kept correct and compiling.)
+    let region_of =
+        |ctx: usize| super::shadow_region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
+    let sp = m.durable_get_sp(region_of(out_ctx));
     if out_ctx == ROOT_FIBER {
         *root_shadow_sp = sp;
     } else {
@@ -1672,7 +1722,7 @@ fn shadow_switch(
     } else {
         fiber_sp[in_ctx]
     };
-    m.durable_set_sp(in_sp);
+    m.durable_set_sp(region_of(in_ctx), in_sp);
 }
 
 /// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4) — the bytecode mirror of the tree-walker's
@@ -1702,11 +1752,12 @@ fn freeze_drive(
     budget: u64,
 ) -> Result<Vec<super::FrozenFiber>, Trap> {
     // The root's post-unwind SP (context 0); restored at the end so the window is thaw-ready.
+    let root_word = super::shadow_region_base(0);
     let root_sp = ctx
         .mem
         .as_ref()
-        .map(|m| m.durable_get_sp())
-        .unwrap_or(super::SHADOW_BASE);
+        .map(|m| m.durable_get_sp(root_word))
+        .unwrap_or(super::SHADOW_BASE + 8);
     let mut frozen = Vec::new();
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
@@ -1721,7 +1772,10 @@ fn freeze_drive(
         let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
-            m.durable_set_sp(super::shadow_region_base(slot + 1));
+            m.durable_set_sp(
+                super::shadow_region_base(slot + 1),
+                super::shadow_region_base(slot + 1) + 8,
+            );
         }
         // Deliver a placeholder resume value (inert; the thaw redelivers), then drive the fiber to its
         // base return under `UNWINDING` (zero forward progress: the poll fires immediately after the
@@ -1743,8 +1797,8 @@ fn freeze_drive(
         let shadow_sp = ctx
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp())
-            .unwrap_or(super::SHADOW_BASE);
+            .map(|m| m.durable_get_sp(super::shadow_region_base(slot + 1)))
+            .unwrap_or(super::SHADOW_BASE + 8);
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
             slot,
@@ -1756,7 +1810,7 @@ fn freeze_drive(
     }
     // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
     if let Some(m) = ctx.mem.as_mut() {
-        m.durable_set_sp(root_sp);
+        m.durable_set_sp(root_word, root_sp);
     }
     Ok(frozen)
 }
@@ -2082,11 +2136,11 @@ fn step_vcpu(
                 // A fresh fiber (registry slot `h`) is shadow context `h + 1`; its saved shadow-SP
                 // starts at its region base (empty shadow stack) — so a later switch into it points
                 // the active word there (DURABILITY.md §12.8).
-                fiber_sp.push(super::shadow_region_base(h as usize + 1));
-                // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
-                // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
-                // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
-                // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
+                fiber_sp.push(super::shadow_region_base(h as usize + 1) + 8); // §12.8 4A.5: empty = frame base (past the in-region SP word)
+                                                                              // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
+                                                                              // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
+                                                                              // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
+                                                                              // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
                 let func_idx = (funcref as u32 as usize & dom.mods[0].table_mask) as i32;
                 fiber_meta.push((func_idx, sp));
                 vt.active.set(dst, Reg::from_i32(h));
@@ -2115,7 +2169,10 @@ fn step_vcpu(
                         if !ok {
                             return Err(Trap::FiberFault);
                         }
-                        Vm::new(m0, f, &[Value::I64(sp), Value::I64(arg)])?
+                        let mut fvm = Vm::new(m0, f, &[Value::I64(sp), Value::I64(arg)])?;
+                        // §12.8 4A.5: this fiber spills into its own region (slot `k` = context `k + 1`).
+                        fvm.durable_region_base = super::shadow_region_base(k + 1);
+                        fvm
                     }
                     Some(slot @ FiberState::Parked { .. }) => {
                         match std::mem::replace(slot, FiberState::Running) {
@@ -3247,6 +3304,23 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
 /// [`Vm::resume`]'s loop at suspension points (preemption budget, blocking op, debug stop), persists
 /// the cursor back into `self`, and hands this struct to the caller to park / hash / resume — exactly
 /// what `park_suspended(frames)` does for the tree-walker today.
+/// A `<setjmp.h>` checkpoint (see [`Vm::setjmp_points`]): everything needed to re-enter a `setjmp`
+/// activation. `longjmp` truncates [`Vm::stack`] to `depth` (the intervening activations discarded —
+/// C has no cleanups), restores the `(module, cur, base, pc)` cursor, and sets the `dst` register to
+/// the long-jump value. The activation's register window survives in place, so it is not snapshotted.
+#[derive(Clone, Copy)]
+struct ByteSetJmp {
+    /// `Vm::stack` length at `setjmp` (the `setjmp` activation is the current one, not yet pushed).
+    depth: usize,
+    module: usize,
+    cur: usize,
+    base: usize,
+    /// The op index just after the `setjmp`.
+    pc: usize,
+    /// The `setjmp` result's window slot (relative to `base`) — set to the long-jump value on re-entry.
+    dst: u32,
+}
+
 struct Vm {
     /// Function-wide register file, shared across activations by register windows (`[base, base +
     /// nslots)` per activation). Grows on demand as calls open deeper windows.
@@ -3263,6 +3337,16 @@ struct Vm {
     pc: usize,
     /// Edge-copy staging buffer (parallel-copy safety); kept here so it is reused across resumes.
     scratch: Vec<Reg>,
+    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here keyed by the
+    /// guest `jmp_buf` address; `longjmp` looks it up. No register snapshot is needed (unlike the
+    /// tree-walker): the flat per-function register layout gives each block its own slots, so the
+    /// `setjmp` block's values survive a deeper call in place. Keyed by address (re-`setjmp` overwrites).
+    setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
+    /// §12.8 4A.5: the window offset of this context's shadow-SP **word** — the base of its own region
+    /// (`shadow_region_base`), which `durable.shadow_base` returns so the instrumented IR addresses its
+    /// per-context SP word. The root's is context 0 (`SHADOW_BASE`); a fiber's its `slot + 1`. Set when
+    /// the Vm is created (fiber) / activated; unused on a non-durable run.
+    durable_region_base: u64,
 }
 
 impl Vm {
@@ -3283,6 +3367,8 @@ impl Vm {
             base: 0,
             pc: 0,
             scratch: Vec::new(),
+            setjmp_points: std::collections::BTreeMap::new(),
+            durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
         })
     }
 
@@ -3574,6 +3660,45 @@ impl Vm {
                     let (copies, target) = arms.get(i).unwrap_or(default);
                     edge!(copies);
                     pc = *target as usize;
+                }
+                // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
+                // activation) keyed by the guest `jmp_buf` address, and return 0. The register window
+                // survives in place (per-block slots are distinct), so no snapshot is taken.
+                Op::SetJmp { buf, dst } => {
+                    let key = r!(*buf).i64() as u64;
+                    self.setjmp_points.insert(
+                        key,
+                        ByteSetJmp {
+                            depth: self.stack.len(),
+                            module,
+                            cur,
+                            base,
+                            pc: pc + 1,
+                            dst: *dst,
+                        },
+                    );
+                    r!(*dst) = Reg::from_i32(0);
+                    pc += 1;
+                }
+                // `<setjmp.h>` `longjmp`: pop the activation stack back to the checkpoint (intervening
+                // activations discarded — C has no cleanups), restore its cursor, and re-enter with the
+                // `setjmp` result set to `val` (a `0` becomes `1`, per C). A missing checkpoint or one
+                // whose activation already returned traps in-sandbox (§3b totality).
+                Op::LongJmp { buf, val } => {
+                    let key = r!(*buf).i64() as u64;
+                    let v = r!(*val).i32();
+                    let resume = if v == 0 { 1 } else { v };
+                    let point = *self.setjmp_points.get(&key).ok_or(Trap::Malformed)?;
+                    if point.depth > self.stack.len() {
+                        return Err(Trap::Malformed); // the setjmp activation already returned
+                    }
+                    self.stack.truncate(point.depth);
+                    module = point.module;
+                    cur = point.cur;
+                    base = point.base;
+                    pc = point.pc;
+                    c = &mods[module];
+                    self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
                     let callee = *callee as usize;
@@ -4111,6 +4236,12 @@ impl Vm {
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }
+                    pc += 1;
+                }
+                Op::DurableShadowBase { dst } => {
+                    // §12.8 4A.5: this context's shadow-SP word address (its own region base).
+                    self.regs[base + *dst as usize] =
+                        Reg::from_i64(self.durable_region_base as i64);
                     pc += 1;
                 }
             }

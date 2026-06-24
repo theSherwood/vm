@@ -586,6 +586,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-capi"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-run",
+ "svm-text",
+]
+
+[[package]]
 name = "svm-dap"
 version = "0.0.0"
 dependencies = [

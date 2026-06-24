@@ -15,7 +15,8 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 
@@ -1729,6 +1730,15 @@ pub enum Inst {
     VcpuTlsSet {
         val: ValIdx,
     },
+    /// **Durable-runtime-internal** (DURABILITY.md §12.8, Phase 4 Slice A.5): read the **current
+    /// durable context's shadow region base** — a window byte offset. Emitted only by the durable
+    /// transform (`svm-durable`) to address that context's *own* per-context shadow-SP word, so
+    /// concurrent vCPUs each spill against their own region with no shared word. Like
+    /// [`Inst::VcpuTlsGet`] it is a per-OS-thread runtime register read (no window/trap context, cannot
+    /// fault), but **runtime-private**: the runtime seeds it per dispatch / per child and there is no
+    /// guest write op, so a guest cannot clobber it (unlike the guest-overwritable `vcpu.tls`). Result
+    /// is `i64`.
+    DurableShadowBase,
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
     /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
     /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
@@ -1760,6 +1770,31 @@ pub enum Inst {
     /// [`Inst::ContResume`] this is a call-clobbering control op.
     Suspend {
         value: ValIdx,
+    },
+    /// `setjmp` (the `<setjmp.h>` non-local-jump save). Captures the **current frame's resume point**
+    /// — a checkpoint of (this call-stack depth, the data-stack pointer, this frame's continuation just
+    /// after the `setjmp`) — into a runtime-owned checkpoint table, writing an opaque token into the
+    /// guest `jmp_buf` at byte offset `buf` (`i64`). Evaluates to `i32` **0** on the direct call; a
+    /// later [`Inst::LongJmp`] re-enters the frame *here* (returns "twice") with the long-jump value.
+    /// Like `cont.*` it is a **call-clobbering** control op (the live state is captured), but it does
+    /// not switch stacks and falls through normally on the direct call. The `jmp_buf` token is
+    /// **backend-internal** (the interpreter stores a checkpoint index) and opaque to the guest, so
+    /// observable behavior matches across engines though the bytes differ; it is transient (not
+    /// snapshot-portable). Lowers from the recognized external `setjmp`/`_setjmp`/`sigsetjmp` call.
+    SetJmp {
+        buf: ValIdx,
+    },
+    /// `longjmp` (the `<setjmp.h>` non-local jump). Reads the checkpoint token from the guest `jmp_buf`
+    /// at byte offset `buf` (`i64`), **unwinds** the call stack back to the captured [`Inst::SetJmp`]
+    /// frame (the intervening frames discarded with no per-frame work — C has no cleanups), restores the
+    /// data-stack pointer, and re-enters at the `setjmp` continuation, making *that* `setjmp` evaluate
+    /// to `val` (`i32`; a `0` `val` becomes `1`, per C). **Never returns** to the next instruction (a
+    /// `noreturn` control op; the trailing `unreachable` is dead). A stale/forged token, or a checkpoint
+    /// whose frame has already returned, **traps** (in-sandbox; §3b totality). Lowers from the
+    /// recognized external `longjmp`/`siglongjmp` call.
+    LongJmp {
+        buf: ValIdx,
+        val: ValIdx,
     },
     /// §GC (`GC.md`) **conservative root enumeration** (`gc.roots`): scan every fiber of the
     /// domain — parked fibers, resume-chain ancestors, and the calling computation's own live
@@ -2103,9 +2138,10 @@ impl Inst {
             | Inst::AtomicStore { .. }
             | Inst::AtomicFence { .. }
             | Inst::VcpuTlsSet { .. }
+            | Inst::LongJmp { .. }
             | Inst::V128Store { .. } => 0,
-            // `vcpu.tls.get` appends one `i64`.
-            Inst::VcpuTlsGet => 1,
+            // `vcpu.tls.get` appends one `i64`; `durable.shadow_base` likewise (a window byte offset).
+            Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
             // `cap.self.get` appends `(handle, type_id)`; `cap.self.count` appends one `i32`.
@@ -2208,6 +2244,17 @@ impl Func {
             })
         })
     }
+
+    /// Whether this function contains any `setjmp`/`longjmp` op ([`Inst::SetJmp`]/[`Inst::LongJmp`]).
+    /// Used to reject a §14 JIT child that uses `setjmp` (no per-child `setjmp` runtime yet — like
+    /// `uses_concurrency` for fibers/threads).
+    pub fn uses_setjmp(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
+        })
+    }
 }
 
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —
@@ -2255,6 +2302,211 @@ pub const POWERBOX_ARGS_BASE: u64 = 128;
 /// `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)` so it never collides with a data segment.
 pub const POWERBOX_ARGS_END: u64 = 16384;
 
+/// The §3e powerbox **handle-stash** base: the synthesized `_start` stashes each granted capability
+/// handle as an `i32` slot at window offset `STASH_BASE + i*4` (handle `i` at `i*4`), for the
+/// contiguous prefix of the eight fixed `VM_CAP_*` capabilities the program was granted. This is the
+/// *public* contract the C on-ramp (`svm-llvm`) bakes into its private `synth_start`;
+/// [`synth_powerbox_start`] reproduces it byte-for-byte so a frontend that emits SVM-IR directly
+/// gets the identical bootstrap without reaching into the on-ramp.
+pub const POWERBOX_STASH_BASE: u64 = 0;
+/// The guest heap's bump-pointer word (`i64`), just above the 8-handle stash region (`[0, 32)`).
+/// Seeded by `_start` (to the window's mapped boundary) when the program allocates (`seed_heap`).
+pub const POWERBOX_HEAP_BRK: u64 = 32;
+/// The guest heap's committed-boundary word (`i64`), just above [`POWERBOX_HEAP_BRK`]. The allocator
+/// `Memory.map`-commits upward from here into the reserved tail (§1a sparse address space).
+pub const POWERBOX_HEAP_TOP: u64 = 40;
+/// The powerbox globals / data-stack base (= [`POWERBOX_ARGS_END`]): page 0 is the writable
+/// stash + heap state + format scratch + args buffer, so a frontend's globals and the data stack
+/// live at/above this page — a read-only global never shares page 0 with the writable stash, and
+/// `_start`'s handle stores never fault on a read-only page (D40 page isolation).
+pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
+/// The data-stack reserve [`synth_powerbox_start`] leaves above the globals when sizing the window
+/// (matches `svm-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
+pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
+/// The number of fixed powerbox capabilities (`VM_CAP_*`, `<svm.h>`): stdout, stdin, exit, memory,
+/// addrspace, ioring, blocking, jit — always granted as a contiguous prefix of this set.
+pub const POWERBOX_MAX_HANDLES: usize = 8;
+
+/// Prepend the powerbox bootstrap `_start` (the new function 0) to an already-linked, possibly
+/// import-bearing `module`, reproducing the exact layout the C on-ramp (`svm-llvm`) bakes into its
+/// own `synth_start` — so a frontend that emits SVM-IR directly (and links it itself, e.g. via
+/// [`link`]) gets the same "just works" powerbox bootstrap the C path enjoys, with no access to the
+/// on-ramp internals.
+///
+/// The synthesized `_start` takes `n_handles` `i32` capability handles (a contiguous prefix of the
+/// eight fixed [`POWERBOX_MAX_HANDLES`] `VM_CAP_*` slots — stdout, stdin, exit, memory, addrspace,
+/// ioring, blocking, jit), **stashes** each at window offset `i*4` (the public
+/// [`POWERBOX_STASH_BASE`] layout), optionally **seeds** the guest heap (`seed_heap`, when the
+/// program allocates — the bump pointer/boundary at [`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`]),
+/// then calls `entry(sp)` with the page-aligned data-stack base and returns the entry's result.
+///
+/// `entry` is the funcidx (in `module`, **before** the prepend) of the program's entry — a
+/// `(i64 sp) -> ()` or `(i64 sp) -> (T)` function (the C `main(void)` shape: it takes the threaded
+/// data-stack pointer). Prepending `_start` shifts every existing funcidx up by one; this is handled
+/// here (including the call to `entry`), so the returned module is internally consistent.
+///
+/// The window is grown (never shrunk) to cover the stash, the module's globals/data segments, and a
+/// [`POWERBOX_STACK_RESERVE`] data-stack reserve; a frontend's globals must already live at/above
+/// [`POWERBOX_STACK_PAGE`] (page 0 is the writable scratch). Returns an error if `n_handles` is
+/// outside `[3, 8]`, `entry` is out of range, or the entry signature isn't `(i64) -> ()`/`(i64) -> (T)`.
+pub fn synth_powerbox_start(
+    mut module: Module,
+    entry: FuncIdx,
+    n_handles: usize,
+    seed_heap: bool,
+) -> Result<Module, String> {
+    // The handle stash occupies `[0, n_handles*4)`. It must not run into the reserved low state that
+    // sits above it: the heap bump/boundary words at [`POWERBOX_HEAP_BRK`] (when the program seeds a
+    // heap), else the format scratch / §3e args buffer at [`POWERBOX_ARGS_BASE`]. So a *fixed*
+    // powerbox is the 8-handle case (`32 == POWERBOX_HEAP_BRK`), and a name-bound frontend may stash
+    // more (up to 32 handles) as long as it doesn't seed a heap. This is the only cap — there is no
+    // lower bound (a capability-free program stashes nothing).
+    let stash_end = n_handles as u64 * 4;
+    let ceiling = if seed_heap {
+        POWERBOX_HEAP_BRK
+    } else {
+        POWERBOX_ARGS_BASE
+    };
+    if stash_end > ceiling {
+        return Err(format!(
+            "powerbox stash for {n_handles} handles ([0, {stash_end})) overflows the reserved low \
+             region (must end by offset {ceiling}{})",
+            if seed_heap {
+                " — with seed_heap the heap state lives just above the 8-handle region"
+            } else {
+                ""
+            }
+        ));
+    }
+    let ef = module.funcs.get(entry as usize).ok_or_else(|| {
+        format!(
+            "entry funcidx {entry} out of range ({} funcs)",
+            module.funcs.len()
+        )
+    })?;
+    if ef.params.as_slice() != [ValType::I64] {
+        return Err(format!(
+            "powerbox entry must take a single i64 (the data-stack pointer), got params {:?}",
+            ef.params
+        ));
+    }
+    if ef.results.len() > 1 {
+        return Err(format!(
+            "powerbox entry must return 0 or 1 value, got {:?}",
+            ef.results
+        ));
+    }
+    let results = ef.results.clone();
+
+    // Globals/data segments live at/above STACK_PAGE; the data stack starts page-aligned above the
+    // highest data segment (and never below STACK_PAGE), so a read-only global never shares a page
+    // with the writable stash, and a stack write never lands on a read-only global's page (D40).
+    let data_end = module
+        .data
+        .iter()
+        .map(|d| d.offset + d.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    let globals_end = data_end.max(POWERBOX_STACK_PAGE);
+    let entry_sp = globals_end.div_ceil(POWERBOX_STACK_PAGE) * POWERBOX_STACK_PAGE;
+
+    // The window must cover the stash + globals + a data-stack reserve. Grow the declared memory to
+    // fit (never shrink); beyond the mapped window is the faulting guard region (§5).
+    let top = entry_sp + POWERBOX_STACK_RESERVE;
+    let need_log2 = (64 - (top - 1).leading_zeros()) as u8;
+    let size_log2 = module
+        .memory
+        .map_or(need_log2, |m| m.size_log2.max(need_log2));
+    module.memory = Some(Memory { size_log2 });
+
+    // The guest heap (when the program allocates) begins at the window's mapped boundary and grows up
+    // into the reserved tail via `Memory.map`.
+    let heap_base = seed_heap.then(|| 1u64 << size_log2);
+
+    // Every existing funcidx (in code *and* in the export table) shifts up by one — the prepended
+    // `_start` becomes function 0.
+    offset_func_indices(&mut module, 1);
+    let start = build_powerbox_start(entry + 1, &results, entry_sp, n_handles, heap_base);
+    module.funcs.insert(0, start);
+    // Expose the bootstrap as a named export so an embedder reaches it by name (`call("_start")`),
+    // not by a magic funcidx. A frontend's own entry export (e.g. "main") survives, shifted above.
+    module.exports.push(Export {
+        name: "_start".to_string(),
+        func: 0,
+    });
+    Ok(module)
+}
+
+/// Build the powerbox bootstrap `_start` body (the language-neutral core of `svm-llvm`'s
+/// `synth_start`, minus the C-specific argv/ctor paths): stash the granted handles, optionally seed
+/// the heap, then `call entry(sp)` and return its result. See [`synth_powerbox_start`].
+fn build_powerbox_start(
+    entry_idx: FuncIdx,
+    entry_results: &[ValType],
+    entry_sp: u64,
+    n_handles: usize,
+    heap_base: Option<u64>,
+) -> Func {
+    let params = vec![ValType::I32; n_handles];
+    let mut insts: Vec<Inst> = Vec::new();
+    // params v0..v(n-1) = the granted handles; stash param `i` at byte offset `i*4` (the public
+    // STASH layout). A program is granted a prefix sized to the highest capability index it uses.
+    let mut next: ValIdx = n_handles as ValIdx;
+    for i in 0..n_handles {
+        insts.push(Inst::ConstI64(POWERBOX_STASH_BASE as i64 + (i as i64) * 4));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: i as ValIdx,
+            offset: 0,
+            align: 0,
+        });
+    }
+    // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base`
+    // (the window's mapped boundary); the allocator `vm_map`-commits upward from there.
+    if let Some(hb) = heap_base {
+        for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
+            insts.push(Inst::ConstI64(off as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI64(hb as i64));
+            let val = next;
+            next += 1;
+            insts.push(Inst::Store {
+                op: StoreOp::I64,
+                addr,
+                value: val,
+                offset: 0,
+                align: 0,
+            });
+        }
+    }
+    // sp = entry_sp (constant); the data-SP the entry carries as param 0.
+    insts.push(Inst::ConstI64(entry_sp as i64));
+    let sp = next;
+    next += 1;
+    insts.push(Inst::Call {
+        func: entry_idx,
+        args: vec![sp],
+    });
+    let term = if entry_results.is_empty() {
+        Terminator::Return(vec![])
+    } else {
+        Terminator::Return(vec![next]) // the entry's single result, appended by the call
+    };
+    Func {
+        results: entry_results.to_vec(),
+        blocks: vec![Block {
+            params: params.clone(),
+            insts,
+            term,
+        }],
+        params,
+    }
+}
+
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
@@ -2274,6 +2526,13 @@ pub struct Module {
     /// backend is a fail-closed error (resolution is mandatory first). Empty for modules that
     /// inline their capability calls (the legacy `cap.call`-only form).
     pub imports: Vec<Import>,
+    /// Named function **exports** (name → funcidx): the host-addressable entry points, the
+    /// runtime-`Module` analogue of [`LinkUnit::exports`]. Populated by [`link`] from each unit's
+    /// exports, or declared directly by a frontend (`export "name" <funcidx>` in the text IR). Lets
+    /// an embedder reach a function by name ([`resolve_export`]) instead of tracking funcidxs. The
+    /// verifier checks each `func` is in range and names are unique; both backends ignore the table
+    /// (they execute a funcidx). Empty for a module with no named entry points.
+    pub exports: Vec<Export>,
     /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
     /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
     /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
@@ -2281,6 +2540,15 @@ pub struct Module {
     /// interpreter debugger and (later) DWARF/DAP. Slice 1 carries the neutral core (source
     /// locations + variables); the per-producer rich blob is a later field.
     pub debug_info: Option<DebugInfo>,
+}
+
+impl Module {
+    /// Resolve a named [export](Module::exports) to its function index, or `None` if no export
+    /// carries `name`. The verifier guarantees export names are unique, so the first match is the
+    /// only match.
+    pub fn resolve_export(&self, name: &str) -> Option<FuncIdx> {
+        self.exports.iter().find(|e| e.name == name).map(|e| e.func)
+    }
 }
 
 /// The neutral core of the debug-info waist (`DEBUGGING.md` §6): everything the interpreter
@@ -2490,6 +2758,17 @@ pub struct SsaLoc {
 pub struct Import {
     pub name: String,
     pub sig: FuncType,
+}
+
+/// A named function **export**: a `name` the host (or a linker) addresses a function by, mapping to
+/// its index in [`Module::funcs`]. The runtime-`Module` analogue of [`LinkUnit::exports`] — wasm-like
+/// name-addressable entry points, so an embedder can `call("main")` without tracking funcidxs. The
+/// verifier checks `func` is in range and names are unique; backends ignore exports (they run a
+/// funcidx). Empty for a module with no named entry points (e.g. a bare kernel run by index).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Export {
+    pub name: String,
+    pub func: FuncIdx,
 }
 
 /// A capability binding resolved from an import name at instantiation (§7): the concrete
@@ -2723,6 +3002,9 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
         alloc::collections::BTreeMap::new();
     let mut data_tab: alloc::collections::BTreeMap<String, u64> =
         alloc::collections::BTreeMap::new();
+    // The merged module's first-class export table — every unit's function exports, in declaration
+    // order (deterministic, unlike a by-name map walk), at their reindexed global funcidxs.
+    let mut exports: Vec<Export> = Vec::new();
     for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
         for (name, local) in &u.exports {
             if *local as usize >= u.module.funcs.len() {
@@ -2736,6 +3018,10 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             {
                 return Err(LinkError::DuplicateSymbol(name.clone()));
             }
+            exports.push(Export {
+                name: name.clone(),
+                func: fbase + local,
+            });
         }
         for (name, local_off) in &u.data_exports {
             if data_tab.insert(name.clone(), dbase + local_off).is_some()
@@ -2788,6 +3074,7 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             .max_by_key(|m| m.size_log2),
         data,
         imports: Vec::new(),
+        exports,
         // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
         debug_info: None,
     })
@@ -2832,6 +3119,10 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
                 *func += offset;
             }
         }
+    }
+    // Named exports point at funcidxs too, so they shift with the functions.
+    for e in &mut m.exports {
+        e.func += offset;
     }
 }
 
@@ -2899,6 +3190,7 @@ mod import_tests {
                     sig: sig_exit,
                 },
             ],
+            exports: vec![],
             debug_info: None,
         }
     }
@@ -2971,5 +3263,177 @@ mod import_tests {
         m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
         let r = resolve_imports(&m, policy).expect("resolve");
         assert_eq!(r, m, "a no-import module round-trips identically");
+    }
+}
+
+#[cfg(test)]
+mod powerbox_start_tests {
+    use super::*;
+
+    /// An entry that takes the threaded data-stack pointer and (statically) calls a sibling — so
+    /// we can pin that prepending `_start` shifts both the entry funcidx and its internal `Call`.
+    fn entry_module() -> Module {
+        // func 0: helper `(i64) -> (i64)` returns its arg.
+        let helper = Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64],
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            }],
+        };
+        // func 1: entry `(i64 sp) -> (i32)` calls helper(sp), discards it, returns 0.
+        let entry = Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![ValType::I64],
+                insts: vec![
+                    Inst::Call {
+                        func: 0,
+                        args: vec![0],
+                    }, // v1 = helper(sp)
+                    Inst::ConstI32(0), // v2
+                ],
+                term: Terminator::Return(vec![2]),
+            }],
+        };
+        Module {
+            funcs: vec![helper, entry],
+            memory: Some(Memory { size_log2: 10 }),
+            data: vec![],
+            imports: vec![],
+            exports: vec![],
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn prepends_start_and_reindexes() {
+        let m = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
+        // `_start` is the new function 0 with three i32 handle params.
+        assert_eq!(m.funcs.len(), 3);
+        assert_eq!(m.funcs[0].params, vec![ValType::I32; 3]);
+        assert_eq!(m.funcs[0].results, vec![ValType::I32]); // mirrors the entry's result
+                                                            // It stashes each handle at offset i*4 and ends by calling the (shifted) entry at index 2.
+        let blk = &m.funcs[0].blocks[0];
+        assert!(matches!(
+            blk.term,
+            Terminator::Return(ref v) if v.len() == 1
+        ));
+        assert!(
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { func: 2, .. })),
+            "_start must call the entry at its shifted index (2)"
+        );
+        let stores: Vec<_> = blk
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::Store {
+                        op: StoreOp::I32,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(stores.len(), 3, "three handle stashes");
+        // The entry's internal `Call func: 0` (to the helper) shifted to `func: 1`.
+        assert!(
+            m.funcs[2].blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { func: 1, .. })),
+            "the entry's static call to the helper must be reindexed +1"
+        );
+    }
+
+    #[test]
+    fn registers_start_export_and_shifts_existing_ones() {
+        let mut m = entry_module();
+        // A frontend exports its entry by name; after the prepend it must shift +1 and `_start`
+        // must be registered at funcidx 0.
+        m.exports = vec![Export {
+            name: "main".to_string(),
+            func: 1,
+        }];
+        let m = synth_powerbox_start(m, 1, 3, false).expect("synth");
+        assert_eq!(
+            m.resolve_export("_start"),
+            Some(0),
+            "_start registered at 0"
+        );
+        assert_eq!(
+            m.resolve_export("main"),
+            Some(2),
+            "the entry export shifted +1"
+        );
+        assert_eq!(m.resolve_export("absent"), None);
+    }
+
+    #[test]
+    fn seeds_heap_when_requested() {
+        let m = synth_powerbox_start(entry_module(), 1, 4, true).expect("synth");
+        let blk = &m.funcs[0].blocks[0];
+        // Two i64 stores seed HEAP_BRK / HEAP_TOP (plus heap_base = 1 << size_log2 consts).
+        let i64_stores = blk
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::Store {
+                        op: StoreOp::I64,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            i64_stores, 2,
+            "heap bump pointer + committed boundary seeded"
+        );
+    }
+
+    #[test]
+    fn grows_window_but_never_shrinks() {
+        // A tiny declared window is grown to cover the stash + stack reserve.
+        let grown = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
+        let g = grown.memory.unwrap().size_log2;
+        assert!(
+            (1u64 << g) >= POWERBOX_STACK_PAGE + POWERBOX_STACK_RESERVE,
+            "window must cover globals + the data-stack reserve"
+        );
+        // A generously-declared window is left as-is (never shrunk).
+        let mut big = entry_module();
+        big.memory = Some(Memory { size_log2: 40 });
+        let kept = synth_powerbox_start(big, 1, 3, false).expect("synth");
+        assert_eq!(kept.memory.unwrap().size_log2, 40);
+    }
+
+    #[test]
+    fn handle_count_is_bounded_only_by_the_stash_region() {
+        // No lower bound now (a 2-handle name-bound entry is fine), and >8 is allowed without a heap
+        // (the stash may run up to `POWERBOX_ARGS_BASE`).
+        assert!(synth_powerbox_start(entry_module(), 1, 2, false).is_ok());
+        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_ok());
+        assert!(synth_powerbox_start(entry_module(), 1, 32, false).is_ok()); // 32*4 == 128 == ARGS_BASE
+                                                                             // …but the stash can't run into the format/args region, or (with a heap) the heap words.
+        assert!(synth_powerbox_start(entry_module(), 1, 33, false).is_err()); // 33*4 > 128
+        assert!(synth_powerbox_start(entry_module(), 1, 9, true).is_err()); // 9*4 > HEAP_BRK(32)
+        assert!(synth_powerbox_start(entry_module(), 1, 8, true).is_ok()); // the fixed 8-handle heap case
+    }
+
+    #[test]
+    fn rejects_bad_entry() {
+        assert!(synth_powerbox_start(entry_module(), 99, 3, false).is_err()); // entry out of range
+                                                                              // The entry must take the i64 data-stack pointer; a non-`(i64) -> _` entry is rejected.
+        let mut m = entry_module();
+        m.funcs[1].params = vec![ValType::I32];
+        assert!(synth_powerbox_start(m, 1, 3, false).is_err());
     }
 }

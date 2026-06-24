@@ -8,7 +8,7 @@
 
 use svm_durable::{
     init_durable_window, transform_module, write_state, DURABLE_RESERVE, SHADOW_BASE,
-    SHADOW_SP_OFF, STATE_UNWINDING,
+    STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use svm_ir::{Memory, Module};
@@ -41,7 +41,9 @@ fn instrument() -> Module {
 fn freeze_with_sp(inst: &Module, sp: u64) -> Result<Vec<Value>, Trap> {
     let mut win = init_durable_window(WINDOW);
     write_state(&mut win, STATE_UNWINDING);
-    win[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8].copy_from_slice(&sp.to_le_bytes());
+    // §12.8 4A.5: the root context's shadow-SP word is the first 8 bytes of its region (at
+    // `SHADOW_BASE`), not the legacy global `SHADOW_SP_OFF`.
+    win[SHADOW_BASE as usize..SHADOW_BASE as usize + 8].copy_from_slice(&sp.to_le_bytes());
     let mut host = Host::new();
     host.clock_ns = 42;
     let clk = host.grant_clock();

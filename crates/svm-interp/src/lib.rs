@@ -207,14 +207,15 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     run_with_host(m, func, args, fuel, &mut host)
 }
 
+/// A traced run's outcome: the result, the **trap-time backtrace** (innermost frame first, as `IrPc`s;
+/// empty on a clean finish), and the **trapping fiber** (§5 W3 / §23-D57 — `Some(handle)` for a fiber,
+/// `Some(-1)` for the root, `None` on a clean finish). Returned by [`run_traced`] /
+/// [`run_with_host_traced`] and the `*_fast_traced` fast-path counterparts.
+pub type TracedRun = (Result<Vec<Value>, Trap>, Vec<IrPc>, Option<i64>);
+
 /// Like [`run`], but also return the guest's **trap-time backtrace** (innermost frame first, as
-/// `IrPc`s; empty on a clean finish) — see [`run_with_host_traced`].
-pub fn run_traced(
-    m: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+/// `IrPc`s; empty on a clean finish) and the trapping fiber — see [`run_with_host_traced`].
+pub fn run_traced(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> TracedRun {
     let mut host = Host::new();
     run_with_host_traced(m, func, args, fuel, &mut host)
 }
@@ -1715,9 +1716,9 @@ pub fn run_with_host_traced(
     args: &[Value],
     fuel: &mut u64,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+) -> TracedRun {
     if m.funcs.get(func as usize).is_none() {
-        return (Err(Trap::Malformed), Vec::new());
+        return (Err(Trap::Malformed), Vec::new(), None);
     }
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
@@ -1771,7 +1772,7 @@ pub fn run_with_host_fast_traced(
     args: &[Value],
     fuel: &mut u64,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+) -> TracedRun {
     if !host.is_durable() {
         if let Some(result) = bytecode::compile_and_run_with_host_traced(m, func, args, fuel, host)
         {
@@ -1783,12 +1784,7 @@ pub fn run_with_host_fast_traced(
 
 /// Capability-free [`run_with_host_fast_traced`] (an empty powerbox), the traced counterpart of
 /// [`run_fast`] — mirrors [`run_traced`] on the fast path.
-pub fn run_fast_traced(
-    m: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+pub fn run_fast_traced(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> TracedRun {
     let mut host = Host::new();
     run_with_host_fast_traced(m, func, args, fuel, &mut host)
 }
@@ -1805,7 +1801,7 @@ fn drive(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
+) -> TracedRun {
     let funcs: Arc<[Func]> = funcs.to_vec().into();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1897,11 +1893,12 @@ fn drive(
         // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
         // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
         // dispatch (slice 3.2.1).
+        let root_word = shadow_region_base(root.vcpu_ctx);
         root.root_shadow_sp = thaw_root_sp.unwrap_or_else(|| {
             root.mem
                 .as_ref()
-                .map(|m| m.durable_get_sp())
-                .unwrap_or(SHADOW_BASE)
+                .map(|m| m.durable_get_sp(root_word))
+                .unwrap_or_else(|| shadow_frame_base(root.vcpu_ctx))
         });
         // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
         // ascending slot order, so the dense handle namespace matches the freeze (the root's
@@ -2014,11 +2011,11 @@ fn drive(
         h.quiesce_pool();
         h.clear_async_notify();
     }
-    let out = sched
-        .lock()
-        .results
-        .remove(&root_id)
-        .expect("root vCPU finished");
+    let (out, trap_origin) = {
+        let mut s = sched.lock();
+        let out = s.results.remove(&root_id).expect("root vCPU finished");
+        (out, s.trap_origin.take())
+    };
     *fuel = out.fuel;
     *mem = out.mem;
     // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is uniquely
@@ -2027,7 +2024,11 @@ fn drive(
         .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    (out.result, out.trap_bt)
+    // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
+    // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
+    // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
+    let (trap_bt, trap_fiber) = trap_origin.unwrap_or((out.trap_bt, out.trap_fiber));
+    (out.result, trap_bt, trap_fiber)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -2072,7 +2073,7 @@ pub fn run_capture_reserved(
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -2109,7 +2110,7 @@ pub fn run_capture_reserved_with_host(
         mm.init_data(&m.data);
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -2171,7 +2172,7 @@ pub fn run_capture_reserved_with_host_prots(
         }
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
         .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
@@ -2206,7 +2207,7 @@ pub fn run_capture_sub(
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
         mm
     });
-    let (r, _bt) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_parent(parent_bytes))
@@ -2932,6 +2933,26 @@ struct Frame {
     vals: Vec<Reg>,
 }
 
+/// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call (see [`VCpu::setjmp_points`]). Since
+/// `Frame::vals` is **replaced per block** (block-param SSA), the value state at the `setjmp` point can
+/// not be reconstructed from the live (later-block) frame, so it is snapshotted here. `longjmp` truncates
+/// the call stack to `depth` (the intervening frames discarded — C has no cleanups), overwrites the
+/// surviving `setjmp` frame with `(block, inst, vals)`, sets `vals[result_idx]` to the long-jump value,
+/// and resumes. The data-stack pointer rides in `vals[0]` (the §3d SP block-param), so restoring `vals`
+/// restores it.
+#[derive(Clone)]
+struct SetJmpPoint {
+    /// Call-stack length at `setjmp` (the `setjmp` frame is at index `depth - 1`).
+    depth: usize,
+    /// The `setjmp` frame's block, and the instruction index just *after* the `setjmp`.
+    block: usize,
+    inst: usize,
+    /// The `setjmp` frame's value array at the `setjmp` point (its result slot included).
+    vals: Vec<Reg>,
+    /// Index in `vals` of the `setjmp` result — overwritten with the long-jump value on re-entry.
+    result_idx: usize,
+}
+
 /// One slot of a vCPU's **`call_indirect` dispatch table** — the explicit, module-aware
 /// generalization of "mask the index into `funcs`". Each slot names which module's function it
 /// holds, so the table can mix the parent's functions (Model A: populated from module 0) with
@@ -3221,6 +3242,23 @@ struct Outcome {
     /// §5 / W3, the interpreter counterpart to the JIT's `last_trap_backtrace`). Empty on a clean
     /// finish. Resolved to source by the run wrapper via [`source_loc`]; host-side, off the hot path.
     trap_bt: Vec<IrPc>,
+    /// The guest **fiber handle** running on this vCPU when it trapped (§5 W3 / §23-D57 per-fiber
+    /// attribution, the interpreter counterpart to the JIT's `last_trap_fiber`): `Some(handle)` for a
+    /// trap inside a fiber, `Some(-1)` for the root computation (no fiber), `None` on a clean finish.
+    /// The handle uses the cross-backend `(generation << FIBER_GEN_SHIFT) | slot` encoding, so it
+    /// compares equal to the JIT's for the same fiber.
+    trap_fiber: Option<i64>,
+}
+
+/// The trapping vCPU's running-fiber handle for [`Outcome::trap_fiber`]: `-1` when the root is running
+/// (no fiber), else the running fiber's guest handle (slot + live generation). Only meaningful at a
+/// trap — call when `result.is_err()`.
+fn trap_fiber_of(v: &VCpu) -> i64 {
+    if v.cur == ROOT_FIBER {
+        -1
+    } else {
+        fiber_handle(v.cur, v.registry.generation(v.cur))
+    }
 }
 
 /// The `IrPc`s of `frames`, innermost frame first — the shape [`Outcome::trap_bt`] captures at a trap.
@@ -3336,6 +3374,13 @@ struct Sched {
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
+    /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
+    /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
+    /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
+    /// outcome would name the join site, not the origin. `drive` reads this instead, so the trap
+    /// diagnostic names *where the guest actually trapped* — the interpreter counterpart to the JIT's
+    /// `Domain` trap-capture handoff. `None` on a clean run.
+    trap_origin: Option<(Vec<IrPc>, Option<i64>)>,
 }
 
 impl Scheduler {
@@ -3477,9 +3522,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     // rewinding. Only at root context — a vCPU parked mid-fiber-resume keeps the fiber swap's own
     // bookkeeping (a no-op for the no-fiber slice, where `cur` is always `ROOT_FIBER`).
     if v.durable && v.cur == ROOT_FIBER {
+        // §12.8 4A.5: at root, the active spill context is this vCPU's own; its SP word lives in *its*
+        // region (`shadow_region_base(vcpu_ctx)`), not a shared offset.
+        v.durable_sp_ctx = v.vcpu_ctx;
+        let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_mut() {
             m.durable_set_state(v.dstate);
-            m.durable_set_sp(v.root_shadow_sp);
+            m.durable_set_sp(root_word, v.root_shadow_sp);
         }
     }
     let step = v.run(u64::MAX);
@@ -3487,9 +3536,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
     // from the live words below).
     if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
+        let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_ref() {
             v.dstate = m.durable_state();
-            v.root_shadow_sp = m.durable_get_sp();
+            v.root_shadow_sp = m.durable_get_sp(root_word);
         }
     }
     match step {
@@ -3515,8 +3565,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let self_sp = v
                     .mem
                     .as_ref()
-                    .map(|m| m.durable_get_sp())
-                    .unwrap_or(SHADOW_BASE);
+                    .map(|m| m.durable_get_sp(shadow_region_base(v.vcpu_ctx)))
+                    .unwrap_or_else(|| shadow_frame_base(v.vcpu_ctx));
                 if let Some((func, args)) = v.spawn_residue.clone() {
                     // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
                     // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
@@ -3530,6 +3580,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             func: func as i32,
                             args,
                             shadow_sp: self_sp,
+                            completed_result: None, // interp runs durable single-worker
                         });
                 } else {
                     // The root: record its extent (the shared active-SP word will be overwritten by a
@@ -3567,14 +3618,23 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             } else {
                 Vec::new()
             };
+            let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
             let outcome = Outcome {
                 result,
                 mem: v.mem.take(),
                 fuel: v.fuel,
                 trap_bt,
+                trap_fiber,
             };
             drop(v);
             let mut s = sched.lock();
+            // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
+            // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
+            // true origin. A clean finish leaves it untouched.
+            if outcome.result.is_err() {
+                s.trap_origin
+                    .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
+            }
             if let Some(parent) = s.join_waiters.remove(&id) {
                 s.runnable.push_back(parent);
                 sched.work.notify_one();
@@ -4010,11 +4070,13 @@ impl SchedDriver {
                     } else {
                         Vec::new()
                     };
+                    let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
                     let outcome = Outcome {
                         result,
                         mem: v.mem.take(),
                         fuel: v.fuel,
                         trap_bt,
+                        trap_fiber,
                     };
                     drop(v);
                     let mut s = det.lock();
@@ -4141,6 +4203,17 @@ fn shadow_region_base(ctx_idx: usize) -> u64 {
     SHADOW_BASE + ctx_idx as u64 * SHADOW_STRIDE
 }
 
+/// Bytes reserved at each region's base for its **per-context shadow-SP word** (§12.8 4A.5): the SP
+/// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
+/// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
+const SHADOW_SP_WORD_LEN: u64 = 8;
+
+/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP word. The empty
+/// (no-frames) extent of a context's shadow stack.
+fn shadow_frame_base(ctx_idx: usize) -> u64 {
+    shadow_region_base(ctx_idx) + SHADOW_SP_WORD_LEN
+}
+
 /// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
 /// `cont.new` checks before handing out a new fiber's region.
 fn shadow_region_fits(ctx_idx: usize) -> bool {
@@ -4184,10 +4257,13 @@ fn fiber_handle_generation(handle: i64) -> u64 {
 /// shadow stacks are empty (frames are pushed only under `UNWINDING`), so a saved SP equals its
 /// region base — but saving/restoring the real word keeps this correct for the freeze/thaw
 /// choreography (slices 3.1.3–4), where a drained fiber carries a non-empty shadow stack.
+#[allow(clippy::too_many_arguments)] // an internal swap helper threading the per-context durable state
 fn shadow_switch(
     mem: &mut Option<Mem>,
     registry: &FiberRegistry,
     root_shadow_sp: &mut u64,
+    root_ctx: usize,
+    sp_ctx: &mut usize,
     durable: bool,
     out_ctx: usize,
     in_ctx: usize,
@@ -4195,21 +4271,38 @@ fn shadow_switch(
     if !durable {
         return;
     }
+    // The incoming context becomes the active spill context for `durable.shadow_base`.
+    *sp_ctx = if in_ctx == ROOT_FIBER {
+        root_ctx
+    } else {
+        shadow_context_index(in_ctx)
+    };
     let Some(m) = mem.as_mut() else { return };
+    // §12.8 4A.5: each context's SP word lives in its **own** region (`shadow_region_base`); the
+    // off-table root uses this vCPU's `root_ctx`, a fiber slot `s` its context `s + 1`. The save/load
+    // mirror the host-side caches — with per-context words the load is a redundant equal-write (the
+    // incoming region already holds its SP), retained for choreography parity with freeze/thaw.
+    let region_of = |ctx: usize| {
+        shadow_region_base(if ctx == ROOT_FIBER {
+            root_ctx
+        } else {
+            shadow_context_index(ctx)
+        })
+    };
     // Save the outgoing context's live SP to its host-side slot.
-    let sp = m.durable_get_sp();
+    let sp = m.durable_get_sp(region_of(out_ctx));
     if out_ctx == ROOT_FIBER {
         *root_shadow_sp = sp;
     } else {
         registry.set_saved_sp(out_ctx, sp);
     }
-    // Load the incoming context's SP into the active word.
+    // Load the incoming context's SP into its (own) region word.
     let in_sp = if in_ctx == ROOT_FIBER {
         *root_shadow_sp
     } else {
         registry.saved_sp(in_ctx)
     };
-    m.durable_set_sp(in_sp);
+    m.durable_set_sp(region_of(in_ctx), in_sp);
 }
 
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
@@ -4269,6 +4362,11 @@ pub struct FrozenVCpu {
     /// Window offset of the child's flattened shadow-SP — the extent of its frozen continuation in its
     /// region; restored as the child's shadow-SP so its thaw re-entry rewinds from the right point.
     pub shadow_sp: u64,
+    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child (JIT
+    /// only — the interp runs durable single-worker, so it always records `None`). The thaw delivers the
+    /// result into the spawner's join table without re-running the child. `None` for a normal frozen
+    /// child (re-spawned + rewound).
+    pub completed_result: Option<i64>,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -4461,11 +4559,11 @@ impl FiberRegistry {
         let generation = if reuse.is_some() {
             t.free.pop();
             t.fibers[slot] = RegFiber::Pending { func, sp };
-            t.shadow[slot] = shadow_region_base(slot + 1); // reused region: empty stack at its base
+            t.shadow[slot] = shadow_frame_base(slot + 1); // reused region: empty stack at its frame base
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
             t.fibers.push(RegFiber::Pending { func, sp });
-            t.shadow.push(shadow_region_base(slot + 1));
+            t.shadow.push(shadow_frame_base(slot + 1));
             t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
             0
         };
@@ -4664,8 +4762,14 @@ struct VCpu {
     durable: bool,
     /// The root computation's saved shadow-SP (window offset) while it is parked resuming a fiber
     /// — the off-table root's slot in the per-context saved-SP table (a fiber's lives in the
-    /// registry's `shadow`). The root is context 0, so this starts at [`SHADOW_BASE`].
+    /// registry's `shadow`). The root is context 0, so this starts at [`shadow_frame_base`]`(0)` (its
+    /// in-region SP word at `SHADOW_BASE`, frames just past it).
     root_shadow_sp: u64,
+    /// §12.8 4A.5: the **active spill context** — whose region the running instrumented code addresses
+    /// via `durable.shadow_base`. The root's `vcpu_ctx` while at root, a fiber's `slot + 1` while a
+    /// fiber runs (maintained at the fiber switch), and the driven fiber's during `freeze_drive` (where
+    /// `cur` is the `ROOT_FIBER` sentinel but the spill must land in the fiber's region).
+    durable_sp_ctx: usize,
     /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
     /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
     frozen: Vec<FrozenFiber>,
@@ -4718,6 +4822,12 @@ struct VCpu {
     /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
     /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
     tls: i64,
+    /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here keyed by the guest
+    /// `jmp_buf` window address; `longjmp` looks it up. Per-vCPU (a checkpoint references *this* frame
+    /// stack; cross-thread `longjmp` is UB in C and simply misses). Keyed by buffer address (not a
+    /// growing token table) so a re-`setjmp` to the same buffer overwrites and a `pcall`-in-a-loop
+    /// stays bounded; the trade-off is that a *copied* `jmp_buf` (rare/UB-adjacent) misses → traps.
+    setjmp_points: BTreeMap<u64, SetJmpPoint>,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
@@ -4786,7 +4896,8 @@ impl VCpu {
             root_parked: None,
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: SHADOW_BASE,
+            root_shadow_sp: shadow_frame_base(0),
+            durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
             vcpu_ctx: 0,
@@ -4801,6 +4912,7 @@ impl VCpu {
             id,
             parent_task: 0,
             tls: id as i64, // §12 seed the per-vCPU TLS register to the dense vCPU id (root = 0)
+            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -4849,7 +4961,8 @@ impl VCpu {
             root_parked: None,
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: SHADOW_BASE,
+            root_shadow_sp: shadow_frame_base(0),
+            durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
             vcpu_ctx: 0,
@@ -4864,6 +4977,7 @@ impl VCpu {
             id: 0, // unused: driven inline, never via the executor
             parent_task: 0,
             tls: 0, // §12 per-vCPU TLS seed (id 0)
+            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -5018,12 +5132,14 @@ impl VCpu {
     /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
     /// is a 3.1.5/3.2 follow-up.
     fn freeze_drive(&mut self) -> Result<(), Trap> {
-        // The root's post-unwind SP (context 0); restored at the end so the window is thaw-ready.
+        // §12.8 4A.5: this vCPU's root region word (where the root's SP lives); restored at the end so
+        // the window is thaw-ready (the root rewinds first).
+        let root_word = shadow_region_base(self.vcpu_ctx);
         let root_sp = self
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp())
-            .unwrap_or(SHADOW_BASE);
+            .map(|m| m.durable_get_sp(root_word))
+            .unwrap_or_else(|| shadow_frame_base(self.vcpu_ctx));
         while let Some((slot, mut frames)) = self.registry.take_parked_for_freeze() {
             // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
             let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
@@ -5034,8 +5150,13 @@ impl VCpu {
             if let Some(f) = frames.last_mut() {
                 f.vals.push(Reg::from_i64(0)); // placeholder resume value (inert; not spilled by Yield)
             }
+            // The fiber spills into *its* region: its SP word starts empty (frame base) and
+            // `durable.shadow_base` must resolve to its region during the unwind sub-run (where `cur`
+            // is the `ROOT_FIBER` sentinel), so set the active spill context explicitly.
+            let fctx = shadow_context_index(slot);
+            self.durable_sp_ctx = fctx;
             if let Some(m) = self.mem.as_mut() {
-                m.durable_set_sp(shadow_region_base(shadow_context_index(slot)));
+                m.durable_set_sp(shadow_region_base(fctx), shadow_frame_base(fctx));
             }
             self.frames = frames;
             self.cur = ROOT_FIBER;
@@ -5046,8 +5167,8 @@ impl VCpu {
             let shadow_sp = self
                 .mem
                 .as_ref()
-                .map(|m| m.durable_get_sp())
-                .unwrap_or(SHADOW_BASE);
+                .map(|m| m.durable_get_sp(shadow_region_base(fctx)))
+                .unwrap_or_else(|| shadow_frame_base(fctx));
             self.registry.set_saved_sp(slot, shadow_sp);
             self.frozen.push(FrozenFiber {
                 slot,
@@ -5058,8 +5179,9 @@ impl VCpu {
             });
         }
         // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
+        self.durable_sp_ctx = self.vcpu_ctx;
         if let Some(m) = self.mem.as_mut() {
-            m.durable_set_sp(root_sp);
+            m.durable_set_sp(root_word, root_sp);
         }
         Ok(())
     }
@@ -5181,9 +5303,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         parked_frames,
         durable,
         root_shadow_sp,
+        durable_sp_ctx, // §12.8 4A.5: active spill context, maintained at fiber switches
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
-        vcpu_ctx: _,
+        vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
@@ -5201,6 +5324,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         memop,
         acc,
         quota: _,
+        setjmp_points,
         dt,
         units,
         invoked,
@@ -5256,6 +5380,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 
         // Execute the remaining instructions of this block.
         while frames[top].inst < block.insts.len() {
+            // An op counts against the scheduling quantum when it is "visible": every op in the real
+            // executor / single-threaded debugger (`!memop`), or only a **shared-state / sync** op in
+            // `memop` mode (so thread-local computation runs to the next memory op before a yield is
+            // possible — the partial-order reduction that keeps exhaustive exploration tractable).
+            let visible = !memop || is_visible(&block.insts[frames[top].inst]);
+            // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
+            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`, so
+            // it never yields. **This precedes the debug seam below**: a debug stop (breakpoint /
+            // watch / step) at a budget-exhausted visible op must fire at the *start of its own turn*
+            // (budget fresh, on the next pick), not inside the previous turn — otherwise a stop would
+            // run the op in the prior turn, collapsing two one-visible-op turns into one and desyncing
+            // a fixed replay plan (DEBUGGING.md Milestone B). Undebugged runs are unaffected (the
+            // ordering only matters when something stops).
+            if visible && budget == 0 {
+                return Ok(Inner::Yield);
+            }
             // Debug seam (DEBUGGING.md W2/S4): before each op, consult the inspector's probe. A
             // breakpoint/step hit returns `Inner::Pause` with the op not yet advanced, so the
             // continuation is intact and the next `run` resumes exactly here. Gated on `debug`
@@ -5281,28 +5421,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
-            // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
-            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`.
-            // In `memop` mode the budget counts only **visible** (shared-state / sync) ops, so
-            // thread-local computation runs to the next memory op before a yield is possible — the
-            // partial-order reduction that keeps exhaustive exploration tractable.
-            if memop {
-                if is_visible(&block.insts[frames[top].inst]) {
-                    if budget == 0 {
-                        return Ok(Inner::Yield);
-                    }
-                    // Record the object this visible op touches (for DPOR's race analysis) before it
-                    // runs — the confined address is a pure function of the live SSA values here.
+            // Charge the quantum for the visible op about to run, recording the object it touches (for
+            // DPOR's race analysis) first — the confined address is a pure function of the live SSA
+            // values here.
+            if visible {
+                if memop {
                     *acc = Some(access_of(
                         &block.insts[frames[top].inst],
                         &frames[top].vals,
                         mem,
                     ));
-                    budget -= 1;
-                }
-            } else {
-                if budget == 0 {
-                    return Ok(Inner::Yield);
                 }
                 budget -= 1;
             }
@@ -5978,6 +6106,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::VcpuTlsSet { val } => {
                     *tls = get_i64(&frames[top].vals, *val)?;
                 }
+                // §12.8 4A.5 durable-runtime-internal: the active context's shadow-SP **word address** —
+                // the base of *its own* region (the SP word is the region's first 8 bytes), so concurrent
+                // vCPUs never share an SP word. The active context is the running fiber's (`cur + 1`) or,
+                // off-table, this vCPU's root context (`vcpu_ctx`). The transform reads no guest-mutable
+                // state, so a guest cannot redirect its own shadow stack.
+                Inst::DurableShadowBase => {
+                    frames[top]
+                        .vals
+                        .push(Reg::from_i64(shadow_region_base(*durable_sp_ctx) as i64));
+                }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
@@ -6040,7 +6178,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Re-point the active shadow-SP from the resumer's region to the target's
                     // (durable runs only) so a freeze that lands while the target runs spills into
                     // the target's own region — never the resumer's.
-                    shadow_switch(mem, registry, root_shadow_sp, durable, *cur, target);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        *cur,
+                        target,
+                    );
                     chain.push(target);
                     *cur = target;
                     *frames = new_frames;
@@ -6060,7 +6207,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     *cur = *chain.last().expect("chain keeps the root");
                     // Hand the active shadow-SP back to the resumer's region (durable runs only):
                     // the suspended fiber's SP is saved to its slot so a later resume restores it.
-                    shadow_switch(mem, registry, root_shadow_sp, durable, leaving, *cur);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -6070,6 +6226,48 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let rtop = frames.len() - 1;
                     frames[rtop].vals.push(Reg::from_i32(FIBER_SUSPENDED));
                     frames[rtop].vals.push(Reg::from_i64(v));
+                    continue 'frames;
+                }
+                // `setjmp`: snapshot this frame's resume point (the value state is captured because
+                // `vals` is replaced per block) keyed by the guest `jmp_buf` address, and fall through
+                // returning 0. `frames[top].inst` is already advanced past the `setjmp` (line above), so
+                // it is exactly the re-entry point. A re-`setjmp` to the same buffer overwrites.
+                Inst::SetJmp { buf } => {
+                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let result_idx = frames[top].vals.len();
+                    let mut snap = frames[top].vals.clone();
+                    snap.push(Reg::from_i32(0)); // the result slot (overwritten by longjmp)
+                    setjmp_points.insert(
+                        key,
+                        SetJmpPoint {
+                            depth: frames.len(),
+                            block: frames[top].block,
+                            inst: frames[top].inst,
+                            vals: snap,
+                            result_idx,
+                        },
+                    );
+                    frames[top].vals.push(Reg::from_i32(0)); // the direct call returns 0
+                }
+                // `longjmp`: look up the checkpoint by `jmp_buf` address, unwind the call stack to it
+                // (the intervening frames discarded — C has no cleanups), restore the `setjmp` frame's
+                // (block, inst, vals) with the result slot set to `val` (a `0` `val` becomes `1`, per C),
+                // and resume there. A missing checkpoint, or one whose frame already returned (its
+                // `depth` now exceeds the live stack), traps in-sandbox (§3b totality).
+                Inst::LongJmp { buf, val } => {
+                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let v = get_i32(&frames[top].vals, *val)?;
+                    let resume = if v == 0 { 1 } else { v };
+                    let point = setjmp_points.get(&key).cloned().ok_or(Trap::Malformed)?;
+                    if point.depth == 0 || point.depth > frames.len() {
+                        return Err(Trap::Malformed); // the setjmp frame has already returned
+                    }
+                    frames.truncate(point.depth);
+                    let f = &mut frames[point.depth - 1];
+                    f.block = point.block;
+                    f.inst = point.inst;
+                    f.vals = point.vals;
+                    f.vals[point.result_idx] = Reg::from_i32(resume);
                     continue 'frames;
                 }
                 // §GC conservative root enumeration (`gc.roots`): collect the deduplicated set of
@@ -6191,7 +6389,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                  // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
                                                  // above, so its shadow stack lives in its own region; it carries its own state word
                                                  // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
-                        child.root_shadow_sp = shadow_region_base(child_ctx);
+                        child.root_shadow_sp = shadow_frame_base(child_ctx);
                         child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
@@ -6513,13 +6711,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // whereas a non-instrumented fiber that truly returned left it empty. Only the
                     // former is `Frozen` (an instrumented fiber always unwinds at a poll before its
                     // real return, so this never mis-classifies one that should be `Done`).
+                    let lctx = shadow_context_index(leaving);
+                    let region_base = shadow_region_base(lctx);
                     let shadow_sp = mem
                         .as_ref()
-                        .map(|m| m.durable_get_sp())
-                        .unwrap_or(SHADOW_BASE);
-                    let region_base = shadow_region_base(shadow_context_index(leaving));
+                        .map(|m| m.durable_get_sp(region_base))
+                        .unwrap_or_else(|| shadow_frame_base(lctx));
+                    // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word occupies
+                    // the region's first 8 bytes); an empty stack sits exactly at the frame base.
                     let freezing = durable
-                        && shadow_sp > region_base
+                        && shadow_sp > shadow_frame_base(lctx)
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
                     if freezing {
                         let (func, sp) = match popped.as_ref() {
@@ -6548,7 +6749,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Restore the resumer's active shadow-SP (durable runs only). The fiber is
                     // `Done`, so saving its SP is moot, but `shadow_switch` reads the live word
                     // before overwriting it — correct whether or not it had unwound frames.
-                    shadow_switch(mem, registry, root_shadow_sp, durable, leaving, *cur);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -6655,6 +6865,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
         // loop (`run_inner`), never here.
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
+        // §12.8 4A.5 durable shadow base needs the running vCPU's context, so it's serviced in the
+        // eval loop (`run_inner`), never here.
+        Inst::DurableShadowBase => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
             IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?),
             IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?),
@@ -6946,6 +7159,8 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }
+        | Inst::SetJmp { .. }
+        | Inst::LongJmp { .. }
         | Inst::GcRoots { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
@@ -9560,6 +9775,34 @@ impl Host {
         }
     }
 
+    /// **D45 allocation-free fast path for `Clock.now()`** (ISSUES.md I12). The generic
+    /// [`Self::cap_dispatch_slots`] path is dominated, for a cheap cap, by the per-call `Vec` result
+    /// allocation and the W1 record/replay gate — not by the work (a field read). This does the
+    /// authority check ([`Self::resolve`], identical to the generic path: a forged/closed/wrong-type
+    /// handle is an inert `CapFault`) and the read+advance **inline**, returning the `i64` directly.
+    ///
+    /// Returns `None` when a W1 record or replay tape is active — the caller must then use the full
+    /// [`Self::cap_dispatch_slots`] so the crossing is taped/served faithfully (the clock is a recorded
+    /// nondeterministic input, [`is_recorded_input`]). Semantics are otherwise byte-identical to the
+    /// `Binding::Clock` arm, so interp == JIT still holds.
+    #[inline]
+    pub fn fast_clock_now(&mut self, handle: i32) -> Option<Result<i64, Trap>> {
+        if self.cap_record.is_some() || self.cap_replay.is_some() {
+            return None; // a tape is active — fall back so the input is recorded/replayed
+        }
+        Some(match self.resolve(handle, iface::CLOCK) {
+            Ok(Binding::Clock) => {
+                let now = self.clock_ns;
+                self.clock_ns = self.clock_ns.wrapping_add(1);
+                Ok(now)
+            }
+            // `resolve` already enforced `type_id == CLOCK`, so a success is always `Binding::Clock`;
+            // any other binding at a CLOCK-typed slot would be a host bug — fail closed like a fault.
+            Ok(_) => Err(Trap::CapFault),
+            Err(t) => Err(t),
+        })
+    }
+
     /// Dispatch a `cap.call` (§3c): resolve the handle, then run the mock operation.
     /// Returns the op's result values (negative-errno encoded in an `i64` for the
     /// fallible ops, §3e D42), or a `Trap` for escape/exit. `mem` backs buffer args.
@@ -10308,6 +10551,14 @@ impl Host {
 /// interpreter memory bounded by what a (fuel-limited) run touches, so a huge declared window never
 /// eagerly allocates — safe to fuzz.
 fn host_page_size() -> u64 {
+    // wasm has no host MMU and no `mprotect`: linear-memory pages are a fixed 64 KiB, so report that
+    // (and avoid pulling the `page_size` crate into the wasm dependency graph). On native, query the
+    // real host page so interpreter and JIT agree page-for-page.
+    #[cfg(target_family = "wasm")]
+    {
+        65536
+    }
+    #[cfg(not(target_family = "wasm"))]
     match page_size::get() as u64 {
         0 => 4096,
         p => p,
@@ -10323,6 +10574,13 @@ fn host_page_size() -> u64 {
 /// works on every backend and the §13 differential stays in lockstep. `page_size::get_granularity`
 /// returns `dwAllocationGranularity` on Windows and the page size on unix.
 pub fn host_region_granularity() -> u64 {
+    // wasm: no separate allocation granularity (no `MapViewOfFile3`), so a region aligns to the same
+    // 64 KiB linear-memory page as the protection model.
+    #[cfg(target_family = "wasm")]
+    {
+        host_page_size()
+    }
+    #[cfg(not(target_family = "wasm"))]
     match page_size::get_granularity() as u64 {
         0 => host_page_size(),
         g => g,
@@ -11010,15 +11268,15 @@ impl Mem {
     /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
     /// the current context's region (D-fiber-cont option A). Falls back to [`SHADOW_BASE`] if the
     /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
-    fn durable_get_sp(&self) -> u64 {
-        self.read_bytes_impl(SHADOW_SP_OFF, 8)
+    fn durable_get_sp(&self, sp_word: u64) -> u64 {
+        self.read_bytes_impl(sp_word, 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(SHADOW_BASE)
     }
 
-    fn durable_set_sp(&mut self, sp: u64) {
-        let _ = self.write_bytes_impl(SHADOW_SP_OFF, &sp.to_le_bytes());
+    fn durable_set_sp(&mut self, sp_word: u64, sp: u64) {
+        let _ = self.write_bytes_impl(sp_word, &sp.to_le_bytes());
     }
 
     /// The durable state word at [`STATE_OFF`] (the freeze driver's trigger). `STATE_NORMAL` if the

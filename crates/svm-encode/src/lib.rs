@@ -15,11 +15,12 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, FBinOp,
-    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy,
-    IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp, Terminator,
-    TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, Export,
+    FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncIdx, FuncName, FuncType, IToF, Import,
+    Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp,
+    Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
+    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -143,6 +144,9 @@ mod op {
     pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
     pub const VCPU_TLS_GET: u8 = 0xEB; // §12 per-vCPU TLS register: () -> i64
     pub const VCPU_TLS_SET: u8 = 0xEC; // §12 per-vCPU TLS register: val -> ()
+    pub const DURABLE_SHADOW_BASE: u8 = 0xED; // durable-internal: () -> i64 (current ctx shadow base)
+    pub const SETJMP: u8 = 0xEE; // <setjmp.h>: buf -> i32 (0, or the longjmp value on re-entry)
+    pub const LONGJMP: u8 = 0xEF; // <setjmp.h>: buf, val -> () (noreturn)
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -196,11 +200,15 @@ mod op {
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
+// v3 adds the first-class **export section** (named function entry points: name + funcidx), the
+// runtime-`Module` analogue of a link unit's exports — so an embedder can `call("main")` by name.
+// The decoder accepts only the exact current `VERSION`, so the bump simply retires v2 readers; there
+// is no in-place v2 blob to stay compatible with.
 // v2 adds the §7 import section (name + op signature per import) and the `call.import` opcode, so a
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -269,6 +277,13 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
         write_str(&mut out, &imp.name);
         write_types(&mut out, &imp.sig.params);
         write_types(&mut out, &imp.sig.results);
+    }
+    // Export section (v3): count, then each export's `name` and target funcidx. Usually a handful
+    // (the named entry points); empty for a bare kernel addressed only by index.
+    write_uleb(&mut out, m.exports.len() as u64);
+    for e in &m.exports {
+        write_str(&mut out, &e.name);
+        write_uleb(&mut out, e.func as u64);
     }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
@@ -457,6 +472,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *idx as u64);
         }
         Inst::VcpuTlsGet => out.push(op::VCPU_TLS_GET),
+        Inst::DurableShadowBase => out.push(op::DURABLE_SHADOW_BASE),
         Inst::VcpuTlsSet { val } => {
             out.push(op::VCPU_TLS_SET);
             write_uleb(out, *val as u64);
@@ -691,6 +707,15 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::Suspend { value } => {
             out.push(op::SUSPEND);
             write_uleb(out, *value as u64);
+        }
+        Inst::SetJmp { buf } => {
+            out.push(op::SETJMP);
+            write_uleb(out, *buf as u64);
+        }
+        Inst::LongJmp { buf, val } => {
+            out.push(op::LONGJMP);
+            write_uleb(out, *buf as u64);
+            write_uleb(out, *val as u64);
         }
         Inst::GcRoots {
             heap_lo,
@@ -1455,6 +1480,16 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         };
         imports.push(Import { name, sig });
     }
+    // Export section (v3): mirrors the encoder. Grows on demand (the count is attacker-influenced).
+    // Funcidx range + name uniqueness are the verifier's job, not the decoder's (it stays a pure,
+    // fail-closed byte reader).
+    let nexports = c.count()?;
+    let mut exports = Vec::new();
+    for _ in 0..nexports {
+        let name = c.str()?;
+        let func = c.uleb()? as FuncIdx;
+        exports.push(Export { name, func });
+    }
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
     for _ in 0..nfuncs {
@@ -1475,6 +1510,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         memory,
         data,
         imports,
+        exports,
         debug_info,
     })
 }
@@ -1777,6 +1813,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
         op::VCPU_TLS_GET => Inst::VcpuTlsGet,
         op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
+        op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,
 
         op::CONST_F32 => Inst::ConstF32(c.u32_le()?),
         op::CONST_F64 => Inst::ConstF64(c.u64_le()?),
@@ -1854,6 +1891,11 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             arg: c.idx()?,
         },
         op::SUSPEND => Inst::Suspend { value: c.idx()? },
+        op::SETJMP => Inst::SetJmp { buf: c.idx()? },
+        op::LONGJMP => Inst::LongJmp {
+            buf: c.idx()?,
+            val: c.idx()?,
+        },
         op::GC_ROOTS => Inst::GcRoots {
             heap_lo: c.idx()?,
             heap_hi: c.idx()?,
@@ -2335,6 +2377,7 @@ mod debug_tests {
             memory: None,
             data: vec![],
             imports: vec![],
+            exports: vec![],
             debug_info,
         }
     }
@@ -2363,6 +2406,33 @@ mod debug_tests {
             bytes_dbg.starts_with(&bytes_none),
             "debug section is appended after a byte-identical prefix"
         );
+    }
+
+    #[test]
+    fn exports_round_trip_through_binary() {
+        let mut m = module(None);
+        m.funcs.push(Func {
+            params: vec![],
+            results: vec![],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![],
+                term: Terminator::Return(vec![]),
+            }],
+        });
+        m.exports = vec![
+            Export {
+                name: "main".to_string(),
+                func: 0,
+            },
+            Export {
+                name: "aux".to_string(),
+                func: 0,
+            },
+        ];
+        let decoded = decode_module(&encode_module(&m)).expect("decode");
+        assert_eq!(decoded.exports, m.exports, "export section round-trips");
+        assert_eq!(decoded, m);
     }
 
     #[test]

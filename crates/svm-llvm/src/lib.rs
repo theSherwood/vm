@@ -174,6 +174,7 @@ use svm_ir::{
     TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
+pub mod blockaddr;
 pub mod di;
 
 /// Why a translation could not be produced.
@@ -218,16 +219,22 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let path = path.as_ref();
     let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
     let di = path.to_str().and_then(di::read_debug);
-    translate_impl(&m, di.as_ref())
+    // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).
+    let ba = path.to_str().and_then(blockaddr::read_block_addrs);
+    translate_impl(&m, di.as_ref(), ba.as_ref())
 }
 
 /// Translate an already-parsed `llvm-ir` module. The neutral core's source-line half is populated
 /// from `!DILocation`; the variable/type half requires the bitcode path (see [`translate_bc_path`]).
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
-    translate_impl(m, None)
+    translate_impl(m, None, None)
 }
 
-fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated, Error> {
+fn translate_impl(
+    m: &LModule,
+    di: Option<&di::LlvmDebug>,
+    ba: Option<&blockaddr::BlockAddrs>,
+) -> Result<Translated, Error> {
     // Pass 0: assign each *defined* function an IR index (its position among defined functions),
     // so a `call` can resolve its target by name. Declaration-only functions (extern/intrinsic
     // prototypes) have no body and are skipped — a call to one needs import support (a later slice).
@@ -331,7 +338,8 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
     // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
-    let (globals, data, globals_end, cstrs, gbytes) = globals_layout(m, &name2idx, globals_base)?;
+    let (globals, data, globals_end, cstrs, gbytes) =
+        globals_layout(m, &name2idx, globals_base, ba)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -402,6 +410,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         let (func, frame_size) = translate_func(
             f,
             base + i as u32,
+            i as u32,
             &m.types,
             &name2idx,
             &globals,
@@ -410,6 +419,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
             &gbytes,
             &helpers,
             di,
+            ba,
             &mut dbg,
         )?;
         any_frame |= frame_size > 0;
@@ -582,6 +592,17 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
             // §7 named capability imports (`write`/`read`/`exit` …) the host resolves at load
             // (`resolve_capability_imports`); empty for a pure-compute (kernel) module.
             imports,
+            // First-class function exports: each defined function's name → its final `module.funcs`
+            // index, so a C-compiled module is name-addressable (`call("main")`) like the wasm path.
+            // Mirrors the out-of-band `Translated::exports` (the `.syms` sidecar source).
+            exports: defined
+                .iter()
+                .enumerate()
+                .map(|(i, f)| svm_ir::Export {
+                    name: f.name.clone(),
+                    func: base + i as u32,
+                })
+                .collect(),
             // §6 debug-info waist: the source-line half, mapped from each LLVM `!DILocation` (the
             // variable/type half is blocked on the `llvm-ir` metadata reader — see `DebugAcc`).
             // `None` for a non-`-g` build (no instruction carried a location).
@@ -603,15 +624,17 @@ const DATA_BASE: u64 = 16;
 /// The page granularity the data stack is aligned to above the globals (≥ the largest OS page so
 /// a stack write never lands in a read-only global's protected page, D40). For a powerbox program
 /// this is also the globals base, so `[0, STACK_PAGE)` is the reserved low scratch — the handle
-/// stash, allocator/format state, and the §3e args buffer all live there.
-const STACK_PAGE: u64 = 16384;
+/// stash, allocator/format state, and the §3e args buffer all live there. The powerbox layout is a
+/// public ABI ([`svm_ir::POWERBOX_STACK_PAGE`]), shared with the frontend-independent
+/// [`svm_ir::synth_powerbox_start`] so the two `_start` synthesizers stay byte-identical.
+const STACK_PAGE: u64 = svm_ir::POWERBOX_STACK_PAGE;
 // The §3e powerbox args buffer (`svm_ir::POWERBOX_ARGS_BASE..POWERBOX_ARGS_END`) must sit *above*
 // the frontend's format/scratch region and *below* the globals base, so it never overlaps either.
 const _: () = assert!(svm_ir::POWERBOX_ARGS_BASE >= FMT_BUF_END);
 const _: () = assert!(svm_ir::POWERBOX_ARGS_END == STACK_PAGE);
 /// The data-stack reserve (bytes) above the entry SP before the guard region — a stack overflow
-/// past this faults rather than escaping the window.
-const STACK_RESERVE: u64 = 1 << 20;
+/// past this faults rather than escaping the window ([`svm_ir::POWERBOX_STACK_RESERVE`]).
+const STACK_RESERVE: u64 = svm_ir::POWERBOX_STACK_RESERVE;
 
 /// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
 /// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
@@ -813,6 +836,9 @@ fn const_size(c: &Constant, types: &Types) -> Result<u64, Error> {
         Constant::Int { bits, .. } if *bits <= 64 => Ok((*bits as u64).div_ceil(8).max(1)),
         Constant::Float(Float::Single(_)) => Ok(4),
         Constant::Float(Float::Double(_)) => Ok(8),
+        // A `blockaddress` is pointer-width (its `get_type` is the unsized `label` type, so it must be
+        // special-cased here rather than falling through to `type_size`).
+        Constant::BlockAddress => Ok(8),
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut n = 0;
             for e in elements {
@@ -842,6 +868,7 @@ fn const_bytes(
     types: &Types,
     globals: &HashMap<String, u64>,
     funcs: &HashMap<String, u32>,
+    ba: &mut impl Iterator<Item = u32>,
 ) -> Result<Vec<u8>, Error> {
     match c {
         Constant::Int { bits, value } if *bits <= 64 => {
@@ -850,10 +877,22 @@ fn const_bytes(
         }
         Constant::Float(Float::Single(f)) => Ok(f.to_bits().to_le_bytes().to_vec()),
         Constant::Float(Float::Double(d)) => Ok(d.to_bits().to_le_bytes().to_vec()),
+        // A `blockaddress(@f, %bb)` (a computed-`goto` label table entry): emit the recovered block
+        // index (8 LE bytes — pointer width) the `indirectbr` consumes as a `br_table` index. The
+        // labels arrive in this same DFS order from [`blockaddr`]; an empty feed (no recovery, e.g. the
+        // path-less `translate` entry) is a clean fail-closed `Unsupported`.
+        Constant::BlockAddress => {
+            let label = ba.next().ok_or_else(|| {
+                Error::Unsupported(
+                    "blockaddress without a recovered label (needs the .bc path)".into(),
+                )
+            })?;
+            Ok((label as u64).to_le_bytes().to_vec())
+        }
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut out = Vec::new();
             for e in elements {
-                out.extend(const_bytes(e.as_ref(), types, globals, funcs)?);
+                out.extend(const_bytes(e.as_ref(), types, globals, funcs, ba)?);
             }
             Ok(out)
         }
@@ -865,7 +904,7 @@ fn const_bytes(
             let (offsets, size, _) = struct_layout(&fields, *is_packed, types)?;
             let mut out = vec![0u8; size as usize];
             for (v, &off) in values.iter().zip(&offsets) {
-                let b = const_bytes(v.as_ref(), types, globals, funcs)?;
+                let b = const_bytes(v.as_ref(), types, globals, funcs, ba)?;
                 out[off as usize..off as usize + b.len()].copy_from_slice(&b);
             }
             Ok(out)
@@ -908,6 +947,7 @@ fn globals_layout(
     m: &LModule,
     name2idx: &HashMap<String, u32>,
     base: u64,
+    ba: Option<&blockaddr::BlockAddrs>,
 ) -> Result<Globals, Error> {
     // Phase A: assign every global a window address (from its declared type size), so a relocation
     // in any initializer can resolve a forward/backward reference to another global in phase B.
@@ -961,7 +1001,14 @@ fn globals_layout(
     for (gi, at) in placed {
         let g = &m.global_vars[gi];
         let Some(init) = &g.initializer else { continue }; // BSS / extern → zero-init window
-        let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx)?;
+                                                           // The `blockaddress` labels this global's initializer holds (in DFS order — see [`blockaddr`]);
+                                                           // the serializer pops them as it reaches each `Constant::BlockAddress` leaf.
+        let empty: Vec<u32> = Vec::new();
+        let labels = ba
+            .and_then(|b| b.per_global.get(&name_str(&g.name)))
+            .unwrap_or(&empty);
+        let mut feed = labels.iter().copied();
+        let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx, &mut feed)?;
         // Record the C-string length (up to the first NUL) so `puts`/`fputs` on this literal can
         // write the right slice without a runtime strlen.
         let slen = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len()) as u64;
@@ -1367,6 +1414,7 @@ struct Scan {
 fn translate_func(
     f: &Function,
     func_idx: u32,
+    bc_func_idx: u32,
     types: &Types,
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
@@ -1375,6 +1423,7 @@ fn translate_func(
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
     di: Option<&di::LlvmDebug>,
+    ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
@@ -1393,6 +1442,33 @@ fn translate_func(
     let results = result_types(f.return_type.as_ref(), types)?;
 
     let scan = scan_func(f, types)?;
+    // I13 soundness fail-close: a φ that carries a **tiny all-tail sub-32-bit** wide vector
+    // (≤ 2 lanes of i8/i16 — i.e. a 32-bit `<2 x i16>`/`<2 x i8>`) across a block edge, as in Embench
+    // `edn`'s `fir_no_red_ld` (a carried `<2 x i16>` recombined by a deinterleave shuffle), round-trips
+    // its lanes incorrectly through the per-part block-param fan-out — a *silent miscompile*
+    // (ISSUES.md I13). Until the tiny-tail-lane representation is fixed, refuse it rather than
+    // miscompile. Narrowly scoped to the confirmed-broken 32-bit case: a 4-lane `<4 x i16>` (64-bit)
+    // φ — e.g. the Clay-UI demo's carried point vector — round-trips correctly and is untouched, as are
+    // full-chunk wide φ accumulators (`<8 x i32>`) and all straight-line sub-128 vector ops.
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            if let Instruction::Phi(p) = instr {
+                if let Some(layout) = scan.name2id.get(&p.dest).and_then(|id| scan.wide.get(id)) {
+                    if layout.full_chunks == 0
+                        && layout.shape.lane_bytes() < 4
+                        && layout.tail_lanes <= 2
+                    {
+                        return unsup(format!(
+                            "φ of a tiny all-tail sub-32-bit wide vector ({} × {}-byte lane) — silent \
+                             miscompile, fail-closed (ISSUES.md I13)",
+                            layout.tail_lanes,
+                            layout.shape.lane_bytes()
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
@@ -1457,6 +1533,7 @@ fn translate_func(
             bb,
             bi,
             func_idx,
+            bc_func_idx,
             f,
             types,
             &scan,
@@ -1469,6 +1546,7 @@ fn translate_func(
             cstrs,
             gbytes,
             helpers,
+            ba,
             dbg,
             &mut aux_blocks,
         )?);
@@ -1768,34 +1846,42 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
 /// Blocking/Jit tail so granting it later (the P2 async-I/O work) needs **no stash relocation**. The
 /// allocator/scratch/format state lives strictly **above** the handle region, so it never collides
 /// with a newly-granted handle (the bug this layout forecloses).
-const STASH_STDOUT: u64 = 0;
-const STASH_STDIN: u64 = 4;
-const STASH_EXIT: u64 = 8;
+// The handle stash is the public powerbox layout ([`svm_ir::POWERBOX_STASH_BASE`] + `i*4`), shared
+// with the frontend-independent [`svm_ir::synth_powerbox_start`]; the per-`VM_CAP_*` slots derive
+// from it so this and the public synthesizer can never drift.
+const STASH_STDOUT: u64 = svm_ir::POWERBOX_STASH_BASE;
+const STASH_STDIN: u64 = STASH_STDOUT + 4;
+const STASH_EXIT: u64 = STASH_STDOUT + 8;
 /// The `Memory` capability handle (`i32`) — present when the program uses `malloc` *or* a direct
 /// `<svm.h>` Memory builtin (then `_start` takes a 4th granted handle). The bump allocator + the
 /// `__vm_map`/… builtins reload it to drive `Memory` capability calls.
-const STASH_MEMORY: u64 = 12;
+const STASH_MEMORY: u64 = STASH_STDOUT + 12;
 /// The `AddressSpace` handle (slot 4) — granted when the program mints a §13/§14 `SharedRegion`
 /// (`__vm_region_create` calls `AddressSpace.create_region`). The region handle it returns is then the
 /// capability for `__vm_region_map`/`unmap`/`page_size` (not a stash slot — those take it as an arg).
-const STASH_ADDRSPACE: u64 = 16;
+const STASH_ADDRSPACE: u64 = STASH_STDOUT + 16;
 /// The `IoRing` (slot 5) and `Blocking` (slot 6) handles — granted when the program uses the §9/§12
 /// async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap` drive `IoRing`; `__vm_blocking_handle`
 /// returns the `Blocking` handle a guest names in an SQE).
-const STASH_IORING: u64 = 20;
-const STASH_BLOCKING: u64 = 24;
+const STASH_IORING: u64 = STASH_STDOUT + 20;
+const STASH_BLOCKING: u64 = STASH_STDOUT + 24;
 /// The `Jit` handle (slot 7) — granted when the program uses the §22 guest-driven-JIT builtins
 /// (`__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/`compile_linked`): a guest submits
 /// serialized SVM IR built in its own window and the host verifies + Cranelift-compiles it into THIS
 /// domain. Slot 4 (`AddressSpace`) stays reserved (offset 16) for the §13/§14 region builtins.
-const STASH_JIT: u64 = 28;
+const STASH_JIT: u64 = STASH_STDOUT + 28;
 /// End of the reserved 8-handle region (`[0, 32)`, one `i32` slot per `VM_CAP_*` index). The
 /// allocator/scratch/format state begins here, so it is collision-proof against the full handle set.
-const HANDLE_REGION_END: u64 = 32;
+/// This is exactly the public heap base ([`svm_ir::POWERBOX_HEAP_BRK`]).
+const HANDLE_REGION_END: u64 = svm_ir::POWERBOX_HEAP_BRK;
 /// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state,
-/// placed just above the 8-handle region.
+/// placed just above the 8-handle region ([`svm_ir::POWERBOX_HEAP_BRK`]/[`svm_ir::POWERBOX_HEAP_TOP`]).
 const HEAP_BRK: u64 = HANDLE_REGION_END; // 32
 const HEAP_TOP: u64 = HEAP_BRK + 8; // 40
+                                    // Pin the C `_start` layout to the public powerbox ABI so this and `svm_ir::synth_powerbox_start`
+                                    // can never silently diverge (the dedup hinge: one source of truth in `svm-ir`).
+const _: () = assert!(HEAP_TOP == svm_ir::POWERBOX_HEAP_TOP);
+const _: () = assert!(STASH_STDOUT == svm_ir::POWERBOX_STASH_BASE);
 /// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
 /// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit
 /// memory). Reused per call — single-threaded, fully produced-then-consumed within one lowering.
@@ -9771,6 +9857,46 @@ fn is_rust_abort_call(name: &str) -> bool {
         || name.contains("alloc_error")
 }
 
+/// Lower a `<setjmp.h>` non-local jump to the `SetJmp`/`LongJmp` core ops. `setjmp`/`_setjmp`/
+/// `sigsetjmp` take the `jmp_buf` pointer as their first argument (`sigsetjmp`'s `savesigs` is
+/// ignored) → `Inst::SetJmp { buf }`, yielding the `i32` result (0 on the direct call, the long-jump
+/// value on re-entry); `longjmp`/`siglongjmp` take `(jmp_buf, i32 val)` → `Inst::LongJmp { buf, val }`
+/// (no result — LLVM follows it with `unreachable`). Returns `Ok(true)` if it handled the call. Gated
+/// external by the caller, so a guest definition of the same name shadows it.
+fn lower_setjmp_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    let arg = |ctx: &mut BlockCtx, i: usize| -> Result<ValIdx, Error> {
+        let op = c
+            .arguments
+            .get(i)
+            .map(|(o, _)| o)
+            .ok_or_else(|| Error::Unsupported(format!("{name} missing argument {i}")))?;
+        ctx.operand(op)
+    };
+    match name {
+        "setjmp" | "_setjmp" | "sigsetjmp" => {
+            let buf = arg(ctx, 0)?;
+            let r = ctx.push(Inst::SetJmp { buf });
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, r);
+                }
+            }
+            Ok(true)
+        }
+        "longjmp" | "siglongjmp" => {
+            let buf = arg(ctx, 0)?;
+            let val = arg(ctx, 1)?;
+            ctx.push(Inst::LongJmp { buf, val });
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// The local value operands a terminator uses (the branch condition / returned value). Validates
 /// terminator support. Branch *arguments* are synthesized from block parameters, not from here.
 fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
@@ -9783,6 +9909,8 @@ fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
         LTerm::Br(_) => Ok(Vec::new()),
         LTerm::CondBr(c) => Ok(one(&c.condition)),
         LTerm::Switch(sw) => Ok(one(&sw.operand)),
+        // `indirectbr`'s address operand is a use (the loaded label → the `br_table` index).
+        LTerm::IndirectBr(ib) => Ok(one(&ib.operand)),
         LTerm::Unreachable(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
@@ -9903,6 +10031,10 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
             }
             Ok(v)
         }
+        // `indirectbr` enumerates its full destination set (`possible_dests`) — every one is a
+        // successor, so liveness threads each target's live-ins out of this block (the `br_table`
+        // edges then supply them).
+        LTerm::IndirectBr(ib) => ib.possible_dests.iter().map(b).collect(),
         LTerm::Ret(_) | LTerm::Unreachable(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
@@ -9971,6 +10103,13 @@ struct BlockCtx<'a> {
     helpers: Helpers,
     /// The module's type table — for resolving a constexpr-GEP operand's strides in [`operand`].
     types: &'a Types,
+    /// This function's **defined**-function index (the `blockaddr.rs` `func_idx` key space — i.e.
+    /// position among defined functions, *before* any synthesized `_start` shift). Used only to look
+    /// up an operand-position `blockaddress` in `blockaddrs.phi`.
+    func_idx: u32,
+    /// Recovered `blockaddress` labels ([`blockaddr`]) — the `phi` map resolves an operand-position
+    /// (φ-threaded) blockaddress to its target block index.
+    blockaddrs: Option<&'a blockaddr::BlockAddrs>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
@@ -10354,6 +10493,34 @@ impl<'a> BlockCtx<'a> {
 
     /// Resolve an operand to a block-local index, materializing a constant as a `const` inst
     /// (SVM has no constant pool — constants are instructions, §3b).
+    /// A φ-incoming operand, resolving an **operand-position `blockaddress`** (clang jump-threaded one
+    /// through this φ) to its recovered target block index (the same integer the `br_table` consumes).
+    /// `target`/`phi_ord`/`inc_idx` locate the φ-incoming in [`blockaddr::BlockAddrs::phi`]. Any other
+    /// operand defers to [`Self::operand`].
+    fn phi_operand(
+        &mut self,
+        op: &Operand,
+        target: u32,
+        phi_ord: u32,
+        inc_idx: u32,
+    ) -> Result<ValIdx, Error> {
+        if let Operand::ConstantOperand(c) = op {
+            if matches!(c.as_ref(), Constant::BlockAddress) {
+                let key = (self.func_idx, target, phi_ord, inc_idx);
+                let label = self
+                    .blockaddrs
+                    .and_then(|b| b.phi.get(&key).copied())
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "operand-position blockaddress without a recovered label".into(),
+                        )
+                    })?;
+                return Ok(self.push(Inst::ConstI64(label as i64)));
+            }
+        }
+        self.operand(op)
+    }
+
     fn operand(&mut self, op: &Operand) -> Result<ValIdx, Error> {
         match op {
             Operand::LocalOperand { name, .. } => {
@@ -10493,6 +10660,7 @@ fn translate_block(
     bb: &BasicBlock,
     bi: usize,
     func_idx: u32,
+    bc_func_idx: u32,
     f: &Function,
     types: &Types,
     s: &Scan,
@@ -10505,6 +10673,7 @@ fn translate_block(
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
+    ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
     aux_blocks: &mut Vec<Block>,
 ) -> Result<Block, Error> {
@@ -10543,6 +10712,8 @@ fn translate_block(
         gbytes,
         helpers: *helpers,
         types,
+        func_idx: bc_func_idx,
+        blockaddrs: ba,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
@@ -10994,6 +11165,13 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // direct-call path below.
         if let Some(name) = callee_name(c) {
             if !ctx.name2idx.contains_key(&name) && lower_io_call(ctx, c, &name)? {
+                return Ok(());
+            }
+        }
+        // A `<setjmp.h>` non-local jump (`setjmp`/`longjmp`, and the `_setjmp`/`sig*` variants) lowers
+        // to the `SetJmp`/`LongJmp` core ops. Gated external (a guest-defined function shadows it).
+        if let Some(name) = callee_name(c) {
+            if !ctx.name2idx.contains_key(&name) && lower_setjmp_call(ctx, c, &name)? {
                 return Ok(());
             }
         }
@@ -11888,6 +12066,57 @@ fn wide_int_binop(
     Ok(true)
 }
 
+/// Lower a wide **lane-wise shift** by a uniform amount (the wide counterpart of the 128-bit `VShift`
+/// path): each `v128` chunk shifts via `VShift` (one scalar amount for all its lanes), each scalar tail
+/// lane via `IntBin`. The amount must be a constant splat — `const_splat_int` — since `VShift` takes a
+/// single scalar count; a per-lane-varying amount stays fail-closed (rare in auto-vectorized code).
+fn wide_int_shift(
+    ctx: &mut BlockCtx,
+    types: &Types,
+    dest: &Name,
+    a: &Operand,
+    b: &Operand,
+    op: svm_ir::VShiftOp,
+    tail_op: BinOp,
+) -> Result<bool, Error> {
+    let Some(layout) = wide_vec_layout(a.get_type(types).as_ref()) else {
+        return Ok(false);
+    };
+    let Some(amt) = const_splat_int(b) else {
+        return unsup(format!(
+            "wide vector shift {op:?} with non-constant-splat amount"
+        ));
+    };
+    let pa = ctx.wide_operand(a, layout)?;
+    let tail_ty = int_ty(layout.shape.lane_val())?;
+    // `VShift`'s amount is a scalar `i32` (one count for every lane of every chunk); the scalar tail
+    // shifts by the same count in the lane's own integer type.
+    let amt_i32 = ctx.push(Inst::ConstI32(amt as i32));
+    let tail_amt = match tail_ty {
+        IntTy::I64 => ctx.push(Inst::ConstI64(amt as i64)),
+        _ => amt_i32,
+    };
+    let mut out = Vec::with_capacity(layout.nparts());
+    for &chunk in pa.iter().take(layout.full_chunks) {
+        out.push(ctx.push(Inst::VShift {
+            shape: layout.shape,
+            op,
+            a: chunk,
+            amt: amt_i32,
+        }));
+    }
+    for &lane in pa.iter().take(layout.nparts()).skip(layout.full_chunks) {
+        out.push(ctx.push(Inst::IntBin {
+            ty: tail_ty,
+            op: tail_op,
+            a: lane,
+            b: tail_amt,
+        }));
+    }
+    ctx.bind_wide(dest, out);
+    Ok(true)
+}
+
 /// Lower a wide **float** lane binop (`VFloatBin` per chunk + scalar `FBin` per tail lane).
 fn wide_float_binop(
     ctx: &mut BlockCtx,
@@ -12113,6 +12342,37 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             &x.operand1,
             WIntChunk::Bit(Bit::Xor),
             BinOp::Xor,
+        ),
+        // Wide lane-wise shift by a uniform amount → per-chunk `VShift` + scalar-tail shift (the wide
+        // counterpart of the 128-bit shift path; a non-constant-splat amount stays fail-closed). I11:
+        // an auto-vectorized widening multiply (`short` DSP fixed-point, e.g. Embench `edn`) emits a
+        // `<8 x i32>` shift the 128-bit path couldn't reach.
+        I::Shl(x) => wide_int_shift(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            svm_ir::VShiftOp::Shl,
+            BinOp::Shl,
+        ),
+        I::LShr(x) => wide_int_shift(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            svm_ir::VShiftOp::ShrU,
+            BinOp::ShrU,
+        ),
+        I::AShr(x) => wide_int_shift(
+            ctx,
+            types,
+            &x.dest,
+            &x.operand0,
+            &x.operand1,
+            svm_ir::VShiftOp::ShrS,
+            BinOp::ShrS,
         ),
         I::FAdd(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Add),
         I::FSub(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Sub),
@@ -13472,9 +13732,68 @@ fn translate_term(
             })
         }
         LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params, aux_blocks),
+        LTerm::IndirectBr(ib) => translate_indirectbr(ctx, ib, bi, f, s, block_params),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
         other => unsup(format!("terminator {other:?}")),
     }
+}
+
+/// Lower an `indirectbr` (computed `goto`, `goto *p`) to a `br_table` (the §computed-goto half). The
+/// address operand is a `blockaddress` value the guest loaded from its dispatch table — i.e. a **block
+/// index** (see [`blockaddr`]; the matching label was baked into the global by `const_bytes`). So the
+/// table is indexed directly by that block index over `[0, nblocks)`: each listed destination routes
+/// to its own block; out-of-list slots (and any out-of-range / UB address) fall to the default — the
+/// first listed destination. LLVM guarantees the address is one of `possible_dests`, so the default is
+/// unreachable on well-defined input; on UB it stays in-sandbox (a defined branch to a real block,
+/// §3b totality — no escape, no stuck state).
+fn translate_indirectbr(
+    ctx: &mut BlockCtx,
+    ib: &llvm_ir::terminator::IndirectBr,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+) -> Result<Terminator, Error> {
+    // The address is a pointer (the loaded `blockaddress`); narrow it to the `i32` `br_table` index.
+    let operand = ctx.operand(&ib.operand)?;
+    let idx = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: operand,
+    });
+
+    let mut dests: Vec<usize> = Vec::with_capacity(ib.possible_dests.len());
+    for n in &ib.possible_dests {
+        let blk = *s
+            .block_idx
+            .get(n)
+            .ok_or_else(|| Error::Unsupported(format!("indirectbr to unknown block {n:?}")))?;
+        dests.push(blk);
+    }
+    if dests.is_empty() {
+        return unsup("indirectbr with no destinations");
+    }
+
+    // Branch arguments per distinct destination (each target's φ-results + threaded live-ins).
+    let mut args_for: HashMap<usize, Vec<ValIdx>> = HashMap::new();
+    for &d in &dests {
+        if let std::collections::hash_map::Entry::Vacant(e) = args_for.entry(d) {
+            e.insert(branch_args(ctx, bi, d, f, s, block_params)?);
+        }
+    }
+
+    // The table is indexed by block index, so it spans every block; unlisted indices → the default.
+    let nblocks = f.basic_blocks.len();
+    let default_blk = dests[0];
+    let default_edge: svm_ir::Edge = (default_blk as u32, args_for[&default_blk].clone());
+    let mut targets: Vec<svm_ir::Edge> = vec![default_edge.clone(); nblocks];
+    for &d in &dests {
+        targets[d] = (d as u32, args_for[&d].clone());
+    }
+    Ok(Terminator::BrTable {
+        idx,
+        targets,
+        default: default_edge,
+    })
 }
 
 /// The largest `br_table` span we materialize for a `switch` (gaps fill with the default). A
@@ -13835,26 +14154,32 @@ fn branch_args(
     s: &Scan,
     block_params: &[Vec<ValueId>],
 ) -> Result<Vec<ValIdx>, Error> {
-    // Map each φ-result id in `target` to its incoming operand from predecessor `from`.
+    // Map each φ-result id in `target` to its incoming operand from predecessor `from`, plus the φ's
+    // position (`phi_ord` within the block, `incoming_idx` within the φ) — the key into the recovered
+    // operand-position `blockaddress` map (an incoming may be a φ-threaded `blockaddress`).
     let from_name = &s.block_name[from];
     let target_bb = &f.basic_blocks[target];
-    let mut phi_incoming: HashMap<ValueId, &Operand> = HashMap::new();
+    let mut phi_incoming: HashMap<ValueId, (&Operand, u32, u32)> = HashMap::new();
+    let mut phi_ord = 0u32;
     for instr in &target_bb.instrs {
         if let Instruction::Phi(p) = instr {
             if let Some(&vid) = s.name2id.get(&p.dest) {
-                let inc = p
+                let inc_idx = p
                     .incoming_values
                     .iter()
-                    .find(|(_, pred)| pred == from_name)
-                    .map(|(op, _)| op)
+                    .position(|(_, pred)| pred == from_name)
                     .ok_or_else(|| {
                         Error::Unsupported(format!(
                             "φ {:?} has no incoming for predecessor {from_name:?}",
                             p.dest
                         ))
                     })?;
-                phi_incoming.insert(vid, inc);
+                phi_incoming.insert(
+                    vid,
+                    (&p.incoming_values[inc_idx].0, phi_ord, inc_idx as u32),
+                );
             }
+            phi_ord += 1;
         }
     }
     let mut args = Vec::with_capacity(block_params[target].len());
@@ -13862,7 +14187,7 @@ fn branch_args(
         // A wide-vector param takes `K` args — its incoming value's chunk/tail parts, in the same
         // order the target block's param fan-out expects (I2 step 1 cross-block).
         if let Some(&layout) = s.wide.get(&pv) {
-            let parts = if let Some(op) = phi_incoming.get(&pv) {
+            let parts = if let Some(&(op, _, _)) = phi_incoming.get(&pv) {
                 ctx.wide_operand(op, layout)?
             } else {
                 // A threaded wide live-in: its parts are live-out of `from`, available here.
@@ -13871,8 +14196,8 @@ fn branch_args(
                 })?
             };
             args.extend(parts);
-        } else if let Some(op) = phi_incoming.get(&pv) {
-            args.push(ctx.operand(op)?);
+        } else if let Some(&(op, phi_ord, inc_idx)) = phi_incoming.get(&pv) {
+            args.push(ctx.phi_operand(op, target as u32, phi_ord, inc_idx)?);
         } else {
             // A threaded live-in: it is live-out of `from`, so available in this block.
             args.push(ctx.id(pv)?);
