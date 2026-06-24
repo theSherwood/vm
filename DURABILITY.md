@@ -346,8 +346,21 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   on the interpreter (§12.8, `svm-durable/tests/fiber.rs` + `svm-snapshot/tests/roundtrip.rs`).
   Remaining: 3.2 multi-vCPU + per-context layout, 3.3 JIT parity (replicate the swap in the JIT
   fiber-switch path). (Dispatch table is a no-op — §12.4.) Single-vCPU durability is a coherent MVP.
-- **[ ] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
-  durability quality + cheap clone. Incremental, off critical path.
+- **[~] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
+  durability quality + cheap clone. Off critical path. **Slice A (async STW) landed:** 4A.1–4A.4
+  (back-edge polls, JIT parity, async `request_freeze`, the loom quiesce model) and **4A.5
+  per-context shadow-SP → genuinely-concurrent multi-vCPU STW freeze** (`FORMAT_VERSION` 4→5→6;
+  the shared shadow-SP word + its lock retired), plus follow-ups **A** (a `thread.join` result
+  survives a concurrent freeze) and **B.1** (a concurrent child flattens its own fibers).
+  **Next slices (all detailed under "Phase 4 Slice A.5", and either fail-closed or documented today):**
+  (1) **B.2 — full nested concurrent spawns** (a concurrent child spawning a grandchild; currently
+  *fail-closed* with `ThreadFault` — needs a per-OS-thread spawning-task source);
+  (2) **B.1′ — concurrent child-fiber freeze *mid-resume-chain*** (cleanly-parked is done; this
+  interleaving is unverified — the likely Windows flake too);
+  (3) **freeze a vCPU blocked in `thread.join`/`wait`** (thread ops aren't may-suspend safepoints yet);
+  (4) **4A.6** recycled-context async freeze (sparse-residue payoff); **4A.7** parked-vCPU /
+  `Blocking.work` latency; and the non-STW Phase-4 items — handle hardening (drainable non-durable
+  bindings), CoW clone, `SharedRegion` consistent-cut (R4).
 
 ---
 
@@ -981,6 +994,11 @@ multi-worker quiesce + active-SP swap sync (LOOM)**; 4A.5 concurrent multi-vCPU 
 below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 parked-vCPU /
 `Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
+
+**Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** are **landed** (merged, all-platform CI green). The
+remaining queue — **B.2** full nested concurrent spawns (fail-closed today), **B.1′** concurrent
+child-fiber freeze *mid-resume-chain*, freezing a vCPU **blocked in `thread.join`/`wait`**, then 4A.6 /
+4A.7 — is detailed in the *"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes below.
 
 **Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
 full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
