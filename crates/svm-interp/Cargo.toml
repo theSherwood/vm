@@ -20,5 +20,8 @@ svm-verify.workspace = true
 # Host page size for the protection model — a tiny *safe* wrapper (keeps `#![forbid(unsafe_code)]`),
 # so the interpreter's RO/unmap granularity matches the JIT's real `mprotect` on the same host
 # (§4 "pin page size" → host-page default; both backends query the same value, so they agree
-# page-for-page on any platform: 4 KiB / 16 KiB / …).
+# page-for-page on any platform: 4 KiB / 16 KiB / …). Native-only: wasm has no host MMU (its
+# linear-memory pages are a fixed 64 KiB), so the wasm build hard-codes that and drops this crate
+# from its dependency graph — see `host_page_size`.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 page_size = "0.6"

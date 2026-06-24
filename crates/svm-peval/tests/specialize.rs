@@ -9,8 +9,9 @@
 use svm_interp::{Trap, Value};
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp, VFCmpOp,
-    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape, VShiftOp, ValType,
+    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp, VCvtOp,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -2886,6 +2887,134 @@ fn outlining_shares_a_callee_across_call_sites() {
 }
 
 #[test]
+fn outlining_threads_a_renamed_cell_across_a_call() {
+    // main(x) = { [R] = x; helper(); [R] + [R2] }, with helper() = { t = [R]; [R2] = t*3; [R] = t+10 }.
+    // Two renamed cells live across the call: R flows IN (x) and back OUT (x+10), and R2 is CREATED by
+    // the callee and read back by the caller (x*3). Outlining must thread both as call arguments /
+    // results so the region never touches real memory — the whole point of combining outlining with a
+    // rename region. Result: (x+10) + (x*3).
+    let region = (STACK_LO, STACK_LO + 16);
+    let r2 = (STACK_LO + 8) as i64;
+    let st = |addr, value| Inst::Store {
+        op: StoreOp::I64,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |addr| Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::ConstI64(STACK_LO as i64), // 1: R
+                        st(1, 0),                        // [R] = x
+                        Inst::Call {
+                            func: 1,
+                            args: vec![],
+                        }, // helper()
+                        Inst::ConstI64(STACK_LO as i64), // 2: R
+                        ld(2),                           // 3: a = [R]   (x + 10)
+                        Inst::ConstI64(r2),              // 4: R2
+                        ld(4),                           // 5: b = [R2]  (x * 3)
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 3,
+                            b: 5,
+                        }, // 6: a + b
+                    ],
+                    term: Terminator::Return(vec![6]),
+                }],
+            },
+            Func {
+                params: vec![],
+                results: vec![],
+                blocks: vec![Block {
+                    params: vec![],
+                    insts: vec![
+                        Inst::ConstI64(STACK_LO as i64), // 0: R
+                        ld(0),                           // 1: t = [R]
+                        Inst::ConstI64(r2),              // 2: R2
+                        Inst::ConstI64(3),               // 3
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Mul,
+                            a: 1,
+                            b: 3,
+                        }, // 4: t*3
+                        st(2, 4),                        // [R2] = t*3
+                        Inst::ConstI64(10),              // 5
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 1,
+                            b: 5,
+                        }, // 6: t+10
+                        st(0, 6),                        // [R] = t+10
+                    ],
+                    term: Terminator::Return(vec![]),
+                }],
+            },
+        ],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize_with_config(
+        &m,
+        0,
+        &[SpecArg::Dynamic],
+        &SpecConfig {
+            outline_calls: true,
+            rename: Some(region),
+            ..SpecConfig::default()
+        },
+    )
+    .expect("outlines with a rename region");
+    verify_module(&residual).expect("residual verifies");
+    // The region never hits real memory: every cell access became an SSA value, even across the call.
+    assert_no_memory_ops(&residual);
+    // Entry + one shared residual helper, and the call survives (not inlined).
+    assert_eq!(residual.funcs.len(), 2, "entry + outlined helper");
+    assert!(residual.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Call { .. }))));
+    // Threaded signature: helper gains the one incoming cell (R) as a parameter and returns the two
+    // live-out cells (R, R2) as results — the cells crossed the boundary as data, not memory.
+    assert_eq!(
+        residual.funcs[1].params.len(),
+        1,
+        "incoming cell R threaded in"
+    );
+    assert_eq!(
+        residual.funcs[1].results.len(),
+        2,
+        "live-out cells R and R2 threaded back"
+    );
+
+    for x in [0i64, 1, -3, 7, 1000, i64::MIN] {
+        let expect = x.wrapping_add(10).wrapping_add(x.wrapping_mul(3));
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
 fn outlining_specializes_dynamic_depth_recursion() {
     // sum(n) = if n == 0 { 0 } else { n + sum(n - 1) }, with n DYNAMIC. The recursion depth is a
     // runtime value, so inlining would diverge (unbounded contexts → Budget); outlining produces a
@@ -3471,31 +3600,175 @@ fn folds_v128_extract_lane_to_scalar() {
 }
 
 #[test]
-fn unfolded_v128_op_passes_through() {
-    // A saturating add isn't folded yet — it survives in the residual and still runs correctly.
-    let m = ret(
-        vec![ValType::V128],
-        vec![
-            Inst::ConstV128(VA),
-            Inst::ConstV128(VB),
-            Inst::VSatBin {
-                shape: VShape::I8x16,
-                op: VSatBinOp::AddS,
-                a: 0,
-                b: 1,
-            },
-        ],
-        2,
-    );
+fn dynamic_operand_v128_op_passes_through() {
+    // With a *dynamic* operand a lane op can't fold, so it is emitted faithfully into the residual
+    // and still runs correctly. (Constant-operand lane ops all fold — see folds_v128_exotic_lane_ops.)
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::V128],
+            results: vec![ValType::V128],
+            blocks: vec![Block {
+                params: vec![ValType::V128], // 0: x (dynamic)
+                insts: vec![
+                    Inst::ConstV128(VB), // 1
+                    Inst::VSatBin {
+                        shape: VShape::I8x16,
+                        op: VSatBinOp::AddS,
+                        a: 0,
+                        b: 1,
+                    }, // 2
+                ],
+                term: Terminator::Return(vec![2]),
+            }],
+        }],
+        ..Default::default()
+    };
     verify_module(&m).expect("verifies");
-    let r = specialize(&m, 0, &[]).expect("specializes");
+    let r = specialize(&m, 0, &[SpecArg::Dynamic]).expect("specializes");
     verify_module(&r).expect("re-verifies");
     assert!(
         r.funcs[0]
             .blocks
             .iter()
             .any(|b| b.insts.iter().any(|i| matches!(i, Inst::VSatBin { .. }))),
-        "an unsupported v128 op should pass through unfolded"
+        "a dynamic-operand v128 op should pass through unfolded"
     );
-    assert_eq!(run(&m, &[]), run(&r, &[]));
+    for x in [VA, VB, [0u8; 16]] {
+        assert_eq!(run(&m, &[Value::V128(x)]), run(&r, &[Value::V128(x)]));
+    }
+}
+
+#[test]
+fn folds_v128_exotic_lane_ops() {
+    // Every "exotic" lane op folds when its operands are constant, bit-for-bit the interpreter
+    // (`check_v128_fold` runs the original through interp and the folded residual and compares).
+    use VShape::*;
+    let v = ValType::V128;
+    let i = ValType::I32;
+    let bin = |res, op| {
+        ret(
+            vec![res],
+            vec![Inst::ConstV128(VA), Inst::ConstV128(VB), op],
+            2,
+        )
+    };
+    let un = |res, op| ret(vec![res], vec![Inst::ConstV128(VA), op], 1);
+
+    for (shape, op) in [
+        (I8x16, VSatBinOp::AddS),
+        (I8x16, VSatBinOp::SubU),
+        (I16x8, VSatBinOp::AddU),
+        (I16x8, VSatBinOp::SubS),
+    ] {
+        check_v128_fold(&bin(
+            v,
+            Inst::VSatBin {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    for (shape, op) in [
+        (I16x8, VWidenOp::LowS),
+        (I16x8, VWidenOp::HighU),
+        (I32x4, VWidenOp::LowU),
+        (I64x2, VWidenOp::HighS),
+    ] {
+        check_v128_fold(&un(v, Inst::VWiden { shape, op, a: 0 }));
+        check_v128_fold(&bin(
+            v,
+            Inst::VExtMul {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    for (shape, op) in [(I8x16, VNarrowOp::S), (I16x8, VNarrowOp::U)] {
+        check_v128_fold(&bin(
+            v,
+            Inst::VNarrow {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    for op in [
+        VCvtOp::F32x4ConvertI32x4S,
+        VCvtOp::F32x4ConvertI32x4U,
+        VCvtOp::I32x4TruncSatF32x4S,
+        VCvtOp::I32x4TruncSatF32x4U,
+        VCvtOp::F32x4DemoteF64x2Zero,
+        VCvtOp::F64x2PromoteLowF32x4,
+        VCvtOp::F64x2ConvertLowI32x4S,
+        VCvtOp::F64x2ConvertLowI32x4U,
+        VCvtOp::I32x4TruncSatF64x2SZero,
+        VCvtOp::I32x4TruncSatF64x2UZero,
+    ] {
+        check_v128_fold(&un(v, Inst::VConvert { op, a: 0 }));
+    }
+    for (shape, op) in [
+        (F32x4, VPMinMaxOp::Pmin),
+        (F32x4, VPMinMaxOp::Pmax),
+        (F64x2, VPMinMaxOp::Pmin),
+        (F64x2, VPMinMaxOp::Pmax),
+    ] {
+        check_v128_fold(&bin(
+            v,
+            Inst::VPMinMax {
+                shape,
+                op,
+                a: 0,
+                b: 1,
+            },
+        ));
+    }
+    check_v128_fold(&un(v, Inst::VPopcnt { a: 0 }));
+    check_v128_fold(&bin(
+        v,
+        Inst::VAvgr {
+            shape: I8x16,
+            a: 0,
+            b: 1,
+        },
+    ));
+    check_v128_fold(&bin(
+        v,
+        Inst::VAvgr {
+            shape: I16x8,
+            a: 0,
+            b: 1,
+        },
+    ));
+    check_v128_fold(&bin(v, Inst::VDot { a: 0, b: 1 }));
+    check_v128_fold(&bin(v, Inst::VDotI8 { a: 0, b: 1 }));
+    check_v128_fold(&bin(v, Inst::VQ15MulrSat { a: 0, b: 1 }));
+    check_v128_fold(&un(
+        v,
+        Inst::VExtAddPairwise {
+            shape: I16x8,
+            signed: true,
+            a: 0,
+        },
+    ));
+    check_v128_fold(&un(
+        v,
+        Inst::VExtAddPairwise {
+            shape: I32x4,
+            signed: false,
+            a: 0,
+        },
+    ));
+    // Boolean reductions fold to an i32 scalar.
+    check_v128_fold(&un(i, Inst::VAnyTrue { a: 0 }));
+    check_v128_fold(&un(i, Inst::VAllTrue { shape: I8x16, a: 0 }));
+    check_v128_fold(&un(i, Inst::VAllTrue { shape: I32x4, a: 0 }));
+    for shape in [I8x16, I16x8, I32x4, I64x2] {
+        check_v128_fold(&un(i, Inst::VBitmask { shape, a: 0 }));
+    }
 }

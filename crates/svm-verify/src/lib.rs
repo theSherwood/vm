@@ -510,6 +510,8 @@ fn check_inst(
         // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
         // `set` consumes an i64 and yields nothing (handled like `store`).
         Inst::VcpuTlsGet => ValType::I64,
+        // Durable-runtime-internal: the current context's shadow region base (a window byte offset).
+        Inst::DurableShadowBase => ValType::I64,
         Inst::VcpuTlsSet { val } => {
             cx.expect(*val, ValType::I64)?;
             return Ok(None);

@@ -11,7 +11,7 @@ def t(args):
         best=min(best,b-a)
     return best
 def bench(label, module, extra):
-    for k in ["alu","call","call_indirect","mem","chase","chase_rand"]:
+    for k in ["alu","xorshift","call","call_indirect","mem","chase","chase_rand","fnv","fma"]:  # vadd/vsum omitted: too fast to resolve via subprocess spawns
         s=t([WT,"run",*extra,"--invoke",k,module,str(NS)])
         l=t([WT,"run",*extra,"--invoke",k,module,str(NL)])
         print(f"{label},{k},{(l-s)/(NL-NS)*1e9:.4f}", flush=True)

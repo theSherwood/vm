@@ -14,9 +14,7 @@ use svm_durable::{
     init_durable_window, transform_module, transform_module_assume_confined, write_state,
     STATE_REWINDING, STATE_UNWINDING,
 };
-use svm_interp::{
-    run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
-};
+use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_STRIDE};
 use svm_ir::{Inst, Memory, Module, Terminator};
 
 const SIZE_LOG2: u8 = 17;
@@ -224,7 +222,9 @@ block0(v0: i64, v1: i64):
         fiber_sp > fiber_base && fiber_sp <= fiber_base + SHADOW_STRIDE,
         "the fiber flattened a frame into its own region [{fiber_base}, +stride): sp={fiber_sp}"
     );
-    let active_sp = le_u64(&snap[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
+    // §12.8 4A.5: the root's shadow-SP word is the first 8 bytes of its own region (at `root_base`),
+    // not the legacy global `SHADOW_SP_OFF`.
+    let active_sp = le_u64(&snap[root_base as usize..root_base as usize + 8]);
     assert!(
         active_sp >= root_base && active_sp < fiber_base,
         "the active shadow-SP is left at the root's region for thaw: {active_sp}"

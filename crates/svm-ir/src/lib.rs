@@ -1726,6 +1726,15 @@ pub enum Inst {
     VcpuTlsSet {
         val: ValIdx,
     },
+    /// **Durable-runtime-internal** (DURABILITY.md §12.8, Phase 4 Slice A.5): read the **current
+    /// durable context's shadow region base** — a window byte offset. Emitted only by the durable
+    /// transform (`svm-durable`) to address that context's *own* per-context shadow-SP word, so
+    /// concurrent vCPUs each spill against their own region with no shared word. Like
+    /// [`Inst::VcpuTlsGet`] it is a per-OS-thread runtime register read (no window/trap context, cannot
+    /// fault), but **runtime-private**: the runtime seeds it per dispatch / per child and there is no
+    /// guest write op, so a guest cannot clobber it (unlike the guest-overwritable `vcpu.tls`). Result
+    /// is `i64`.
+    DurableShadowBase,
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
     /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
     /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
@@ -2127,8 +2136,8 @@ impl Inst {
             | Inst::VcpuTlsSet { .. }
             | Inst::LongJmp { .. }
             | Inst::V128Store { .. } => 0,
-            // `vcpu.tls.get` appends one `i64`.
-            Inst::VcpuTlsGet => 1,
+            // `vcpu.tls.get` appends one `i64`; `durable.shadow_base` likewise (a window byte offset).
+            Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
             // `cap.self.get` appends `(handle, type_id)`; `cap.self.count` appends one `i32`.

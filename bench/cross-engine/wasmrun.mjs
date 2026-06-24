@@ -9,7 +9,7 @@ function minRun(k,n){
   return best;
 }
 function bench(label, ex){
-  for(const name of ["alu","call","call_indirect","mem","chase","chase_rand"]){
+  for(const name of ["alu","xorshift","call","call_indirect","mem","chase","chase_rand","fnv","fma","vadd"]){
     const k=ex[name];
     const s=minRun(k,1000), l=minRun(k,201000);
     console.log(`${label},${name},${((l-s)/200000).toFixed(4)}`);

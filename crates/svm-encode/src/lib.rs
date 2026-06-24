@@ -143,8 +143,9 @@ mod op {
     pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
     pub const VCPU_TLS_GET: u8 = 0xEB; // §12 per-vCPU TLS register: () -> i64
     pub const VCPU_TLS_SET: u8 = 0xEC; // §12 per-vCPU TLS register: val -> ()
-    pub const SETJMP: u8 = 0xED; // <setjmp.h>: buf -> i32 (0, or the longjmp value on re-entry)
-    pub const LONGJMP: u8 = 0xEE; // <setjmp.h>: buf, val -> () (noreturn)
+    pub const DURABLE_SHADOW_BASE: u8 = 0xED; // durable-internal: () -> i64 (current ctx shadow base)
+    pub const SETJMP: u8 = 0xEE; // <setjmp.h>: buf -> i32 (0, or the longjmp value on re-entry)
+    pub const LONGJMP: u8 = 0xEF; // <setjmp.h>: buf, val -> () (noreturn)
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -459,6 +460,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *idx as u64);
         }
         Inst::VcpuTlsGet => out.push(op::VCPU_TLS_GET),
+        Inst::DurableShadowBase => out.push(op::DURABLE_SHADOW_BASE),
         Inst::VcpuTlsSet { val } => {
             out.push(op::VCPU_TLS_SET);
             write_uleb(out, *val as u64);
@@ -1788,6 +1790,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
         op::VCPU_TLS_GET => Inst::VcpuTlsGet,
         op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
+        op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,
 
         op::CONST_F32 => Inst::ConstF32(c.u32_le()?),
         op::CONST_F64 => Inst::ConstF64(c.u64_le()?),

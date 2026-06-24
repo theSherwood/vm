@@ -218,8 +218,125 @@ start timing — a strong hint for a park/unpark or steal-loop wakeup race.
 
 ---
 
+### I8 — svm-jit/Cranelift auto-vectorizes only to **128-bit** SIMD, ~2× behind native AVX2/AVX-512 on wide-vectorizable loops (S3) — `claude/svm-jit-alu-simd`
+
+**Where:** the LLVM on-ramp's vector legalization (`crates/svm-llvm/src/lib.rs` `wide_vec_layout`/
+`lower_wide`, the §17 fixed-128 `LegalizeTypes` analog) → svm-ir's fixed-128-bit `v128` (§17/D58) →
+`svm-jit` lowering each `v128` to one SSE/NEON 128-bit op.
+
+**Symptom.** A reduction (`vadd`: `s += k ^ seed`) compiled `clang -O2 -mavx2` runs ~2× slower on
+svm-jit than the native binary, because the on-ramp splits LLVM's wide `<8 x i32>`/`<16 x i32>` vectors
+into **128-bit chunks** (4×i32) and svm-jit emits 128-bit `paddd`/etc., while native uses 256-bit `ymm`
+(AVX2) or 512-bit `zmm` (AVX-512). So the SVM stack *does* vectorize (contrary to my earlier bench
+claim — see below), but at SSE width.
+
+**Measured, across the wasm comparison columns (ns/iter, the same C kernels):**
+
+| kernel | native AVX2 | wasm32 V8 | wasm32 Wasmtime | **svm-jit** | bytecode |
+|---|---|---|---|---|---|
+| `xorshift` (scalar serial) | 1.73 | 1.99 | 2.04 | **1.59** | 58.3 |
+| `vadd` (vectorizable)      | 0.042 | 0.098 | 0.147 | **0.083** | 37.6 |
+
+The key context: **wasm SIMD is itself fixed at 128 bits** (the spec's `v128`), so V8 and Wasmtime are
+*also* ~2–3.5× behind native AVX2 on `vadd` — the exact same cap svm-jit has. **svm-jit is not behind
+wasm; it is ahead** (0.083 vs V8 0.098 / Wasmtime 0.147), and on the representative *scalar* kernel it
+is the fastest engine measured, beating native. So relative to the VM's actual peer (wasm), there is no
+SIMD deficit — only native AVX2/AVX-512 leads, by the determinism-bound 128→256/512 margin.
+
+**Root cause — deliberate, not a miss.** The chunk width is fixed at 128 bits and **never
+host-detected**, to preserve the interp↔JIT↔durable-fiber **determinism contract** (a frozen vector
+register file must replay identically on any host, and the tree-walker oracle is scalar-128). Widening
+to the host's native vector width would make results/snapshots host-dependent. So this is a
+throughput-vs-determinism tradeoff, not a codegen bug. (Vector *support* itself — all six `VShape`s +
+wide/sub-128 legalization — already landed; see Resolved **I2**.)
+
+**Benchmark caveat that exaggerated it.** My `bench/cross-engine` SVM driver compiled the kernels with
+`-fno-vectorize -fno-slp-vectorize` (following the stale LLVM.md §4 "MVP" pipeline note), which keeps
+SIMD out **entirely** → the SVM rows looked *scalar*, not merely 128-bit. With vectorization enabled
+the on-ramp emits `v128` IR and svm-jit lowers it to real SIMD. Two measurement hazards make the win
+hard to see in that harness: (a) `vsum`'s known-content array gets **closed-form-folded** by Cranelift
+(the opaque-pointer barrier doesn't survive LLVM→SVM), and (b) `svm_jit::compile_and_run` recompiles
+per call, so a fast vectorized loop is swamped by compile jitter unless timed via `CompiledModule`
+(compile once, run many).
+
+**Fix sketch (deferred — needs a decision):**
+1. **Doc/bench:** drop `-fno-*-vectorize` from the on-ramp invocation in the bench (and LLVM.md §4) so
+   the SVM rows show the real 128-bit-SIMD number, not scalar; measure with a non-foldable kernel via
+   `CompiledModule` (compile-once).
+2. **Throughput (optional, contract change):** an *opt-in*, non-default "fast/non-deterministic" mode
+   that legalizes to the host vector width (256/512) — only for runs that don't need
+   freeze/thaw/oracle determinism. Default stays fixed-128.
+
+---
+
+### I9 — svm-jit lacks LCG/geometric **recurrence strength-reduction**, so a pure `a = a*M + c` loop is ~8× native (S4) — `claude/svm-jit-alu-simd`
+
+**Where:** `svm-jit` (Cranelift) loop codegen, vs `clang`'s x86 backend.
+
+**Symptom.** The `alu` benchmark kernel (`a = a*1103515245 + 12345 + i`) runs ~1.9 ns/iter on svm-jit
+vs ~0.24 ns/iter native — an ~8× gap that *looks* like an svm-jit deficiency.
+
+**Root cause — a clang-specific optimization on a pathological kernel, not a general gap.** clang's
+backend recognizes the linear-congruential recurrence and **collapses 4 unrolled steps into a single
+multiply by `M^4`** (observed: the native loop is one `imul $0xee067f11` — `M^4 mod 2^32` — per 4
+iterations, with the per-step constants folded into additive terms). The on-ramp ingests clang's
+*mid-end* IR, which is unrolled 4× but **not** collapsed (4 separate `i32.mul`), and Cranelift doesn't
+do the collapse either → svm-jit runs 4 muls / 4 iters at multiply latency. **This is the only kernel
+where svm-jit trails native**: on serial loops clang *can't* collapse, svm-jit **matches or beats**
+native — measured `xorshift` 1.61 vs 1.74 ns, `muldep` 1.28 vs 1.52 ns (svm-jit faster). LCG-shaped
+hot loops are rare in real code, so this is low priority.
+
+**Fix sketch (deferred):**
+1. **Don't chase it in svm-jit** — recurrence strength-reduction is a niche backend optimization;
+   implementing it in Cranelift/the on-ramp is high-effort, low-yield.
+2. **Benchmark hygiene:** the `alu` kernel is unrepresentative (it rewards clang's collapse). Report a
+   non-collapsible scalar kernel (e.g. `xorshift`) as the headline scalar-throughput number, where
+   svm-jit ≈ native, and keep `alu` only as a "clang recurrence-collapse" demonstrator.
+
+---
 
 ## Resolved
+
+### I10 — ordinary `clang -O2` auto-vectorized loops hit two narrow holes in the vector breadth (S3) — fixed on `claude/bench-alu-hygiene`
+
+**Where:** `crates/svm-jit/src/lib.rs` (v128 lane-arith lowering) and `crates/svm-llvm/src/lib.rs`
+(vector integer-op translation in `bin`).
+
+**Was.** A plain `clang -O2` program (vectorization on — *not* hand-written SIMD) fail-closed when the
+loop vectorizer turned a common scalar loop into vector ops the I2 breadth didn't cover:
+
+1. **`i8x16.mul` — svm-jit `Unsupported("instruction")`.** A byte-array fill like
+   `for (i) buf[i] = i*31 + 7;` (`unsigned char buf[256]`) vectorizes to a `<16 x i8>` body whose
+   multiply becomes `i8x16.mul`. svm-jit lowered `v128.load/store/const`, `i8x16.add/extract_lane`, and
+   `i32x4`/`i64x2` multiply — but **not the 8-bit packed multiply** (x86 has no `PMULLB`). Translation
+   *succeeded*; only the JIT lowering was missing.
+2. **vector integer shifts — on-ramp `Unsupported("vector integer op ShrU (only add/sub/mul/and/or/xor)")`.**
+   A bit-twiddling loop like a table-driven CRC (`c = (c & 1) ? P ^ (c >> 1) : (c >> 1)`) vectorizes to
+   `lshr <4 x i32>`, and the on-ramp's vector lane-arith set omitted **`shl`/`lshr`/`ashr`**, so it
+   fail-closed at *translate*.
+
+**Fix (landed, both in the I2 style):**
+1. **`i8x16.mul` lowering in svm-jit** (`Inst::VIntBin` with `VShape::I8x16`): widen each half to
+   `i16x8` (`uwiden_low`/`uwiden_high`), multiply (the low byte of an `i16` product equals the low byte
+   of the `i8` product, sign-independent), mask each product to its low byte, then pack the two halves
+   back with unsigned-saturating narrow (`unarrow` — every lane ≤ 0xFF, so nothing saturates: an exact
+   low-byte truncation matching the interp's wrapping mul). Removed from the JIT's `Unsupported`
+   pre-check. The interpreters already implemented `i8x16.mul`, so they needed no change.
+2. **Vector `shl`/`lshr`/`ashr` in the on-ramp** (`bin`'s `vec128_shape` path): a `const_splat_int`
+   helper recognizes a constant-splat shift amount (`<i32 k, …>`, the shape `clang -O2` emits for
+   `v >> k`) and emits `Inst::VShift { shape, op: Shl/ShrU/ShrS, .. }` (svm-ir/verify/jit/interp already
+   support `VShift` for every shape; the JIT lets Cranelift legalize even `i8x16`'s no-native-per-byte
+   shift). A non-constant-splat amount still fail-closes (no corpus need yet).
+
+**Verification.** New `cargo test -p svm` (`diff_i8x16_mul`, interp↔JIT differential) and
+`cargo test -p svm-llvm --test translate` (`simd_i8x16_mul_load_store`, `simd_i32x4_const_shifts`) pin
+both fixes against the native oracle. End-to-end, `corpus_diff.rs`'s `fnv` (case 1) and `crc32`
+(case 2) now translate + run **vectorized** (NOVEC workaround removed) bit-identical across tree-walk,
+bytecode, JIT, and native — `fnv`/`crc32` both land at ~1.03× native.
+
+---
+
+
 
 ### I2 — LLVM on-ramp now ingests auto-vectorized output wider than 128 bits (vector legalization landed) (S3) — fixed on `claude/dreamy-newton-ni7epv`
 

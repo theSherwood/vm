@@ -57,8 +57,13 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// nested spawns): each spawned-vCPU residue record carries its **`parent_task`** (the task that spawned
 /// it), so a thaw rebuilds the per-parent join-table topology of a multi-level vCPU tree — a grandchild's
 /// handle resolves in its parent child's table, not the root's. The field is a new `uleb` appended to
-/// each Section-2 vCPU record, so a v3 artifact's vCPU section would mis-parse and is rejected.
-const FORMAT_VERSION: u16 = 4;
+/// each Section-2 vCPU record, so a v3 artifact's vCPU section would mis-parse and is rejected. v5 (§12.8
+/// 4A.5: per-context shadow-SP): each context's shadow-SP word moved from the single global
+/// `SHADOW_SP_OFF` (offset 8) into the **first 8 bytes of its own region** (`shadow_region_base(ctx)`),
+/// with frames now starting 8 bytes later — so concurrent vCPUs never share an SP word. The window
+/// image layout changed (SP word location + an 8-byte frame shift), so a v4 artifact mis-thaws and is
+/// rejected.
+const FORMAT_VERSION: u16 = 5;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
