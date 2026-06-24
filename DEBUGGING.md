@@ -266,10 +266,22 @@ drop) — `VCpu::checkpointable` + `Host::checkpoint_safe`; anything richer turn
 falls back to the (correct) replay-from-0. *Tests (`debug_checkpoints.rs`):* a **warm** Inspector
 (ladder populated, so `seek` restores) is asserted state-identical — result, paused location, clock,
 and window bytes — to a **cold** one (replays from 0) across checkpoint-stride boundaries, a backward
-sweep, and one-at-a-time `step_back`. *Still open:* **multithreaded** (`turn`-coordinate) checkpoints,
-dirty-page-tracked window copies (today's snapshot is the full mapped prefix), RNG via a dedicated
-iface (vs a host-fn), and capturing a `SchedTape`/`CapTape` from a *JIT* execution (the interpreter is
-the debug engine by design, so this is lower priority).
+sweep, and one-at-a-time `step_back`.
+
+**Multithreaded (`turn`-coordinate) seek — incremental forward, built.** A scheduled `seek(t)` used to
+rebuild the whole multi-vCPU run from turn 0 every time (O(t)); a **forward** seek now *continues the
+live run* (`seek_scheduled_forward`) to turn `t` instead — O(t − current turn) — reusing the current
+vCPUs / scheduler / host. The replay is deterministic (fixed schedule + cap tape + seed), so the landed
+state is identical to a rebuild (gated by `multithreaded_checkpoints.rs`: a forward sweep, a backward
+jump, and forward-after-backward each match a cold rebuild). This covers forward time-travel and
+forward stepping — the common interactive case — at a fraction of the cost. A **backward** jump still
+rebuilds from turn 0: a full multi-vCPU *snapshot* ladder for backward seeks would have to capture every
+live vCPU's continuation plus the scheduler structure (much heavier than the single-threaded root vCPU,
+and DPOR-critical), and the marginal value is low at typical turn counts (tens of turns), so it is
+deferred. *Still open:* that backward snapshot ladder, dirty-page-tracked window copies (today's
+snapshot is the full mapped prefix), RNG via a dedicated iface (vs a host-fn), and capturing a
+`SchedTape`/`CapTape` from a *JIT* execution (the interpreter is the debug engine by design, so this is
+lower priority).
 
 ---
 

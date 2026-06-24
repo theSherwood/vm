@@ -1054,6 +1054,20 @@ impl Inspector {
         let Some(init) = self.seek_init.clone() else {
             return Stop::Blocked;
         };
+        // Incremental forward seek (scheduled, W1): a live scheduled run already at or behind turn `t`
+        // continues forward to `t` instead of rebuilding from turn 0. The replay is deterministic
+        // (fixed plan + cap tape + seed), so the landed state is identical — but the work is
+        // O(t − current turn), not O(t), so forward time-travel / stepping doesn't re-pay the whole
+        // prefix each turn. Only forward: a backward seek still rebuilds (a multi-vCPU snapshot ladder
+        // for backward jumps is deferred — heavy, and low marginal value at typical turn counts; see
+        // DEBUGGING.md). The single-threaded path keeps its own checkpoint ladder (`seek_single`).
+        if init.schedule.is_some() {
+            if let Some(s) = self.sched.as_ref() {
+                if t >= s.driver.turns {
+                    return self.seek_scheduled_forward(t);
+                }
+            }
+        }
         // A fresh powerbox seeded to *replay* the recorded cap inputs (W1) and keep recording past
         // `t`, so re-execution reproduces nondeterministic inputs (e.g. `Clock`, stdin `read`).
         let tape: Arc<[CapRecord]> = self.cap_tape().records.into();
@@ -1117,6 +1131,46 @@ impl Inspector {
             // Single-threaded: re-execute the sole vCPU to op `clock == t` — restarting from the
             // nearest checkpoint ≤ t (W1) instead of clock 0 when this run is checkpointable.
             None => self.seek_single(&init, host, t),
+        }
+    }
+
+    /// Continue the **live** scheduled run forward to global turn `t` (W1 incremental forward seek),
+    /// reusing the current vCPUs / scheduler / host instead of rebuilding from turn 0. The caller
+    /// guarantees `t ≥ self.turn()`. Deterministic replay makes the landed state identical to a
+    /// rebuild; the post-run bookkeeping (focus the last-run thread, read the root's outcome) mirrors
+    /// the rebuild path in [`seek`].
+    fn seek_scheduled_forward(&mut self, t: u64) -> Stop {
+        self.shared().suppress_stops = true; // fast-forward past breakpoints
+        let (focus, finished, pc) = {
+            let SchedState {
+                det,
+                dpor,
+                driver,
+                root_id,
+            } = self.sched.as_mut().expect("a live scheduled run");
+            driver.turn_limit = Some(t);
+            let mut policy = Policy::Dpor(dpor);
+            let _ = driver.run(det, &mut policy);
+            driver.turn_limit = None; // continuing from here runs forward normally
+            let focus = dpor.trace.last().map(|e| e.tid).unwrap_or(*root_id);
+            let finished = det.lock().results.get(root_id).map(|o| o.result.clone());
+            let pc = det.lock().find_vcpu(focus).and_then(Self::pc_of);
+            (focus, finished, pc)
+        };
+        self.shared().suppress_stops = false;
+        self.focus = Some(focus);
+        self.finished = finished.clone();
+        match finished {
+            Some(r) => Stop::Finished(r),
+            None => Stop::Break {
+                reason: StopReason::Step,
+                pc: pc.unwrap_or(IrPc {
+                    module: 0,
+                    func: 0,
+                    block: 0,
+                    inst: 0,
+                }),
+            },
         }
     }
 
