@@ -552,6 +552,13 @@ fn run_child(a: SpawnArgs) {
             .expect("fiber_cfg set ⇒ the domain fiber table is set");
         let mut rt = FiberRuntime::new(table, tid, mask);
         rt.set_call_tramp(env.call_tramp);
+        // §12.8 4A.5 follow-up B: a **concurrent durable** child that owns fibers needs `mem_base` +
+        // the `durable` flag on its own runtime, so its `cont.resume` swap repoints the active
+        // shadow-SP at the fiber's region and the freeze driver records flattened fibers as residue
+        // (mirrors `run_child_inline`). Off the durable concurrent path this is inert.
+        if a.durable_child.is_some() {
+            rt.set_durable_env(env.mem_base, env.durable);
+        }
         Box::new(rt)
     });
     let prev = frt
@@ -579,6 +586,27 @@ fn run_child(a: SpawnArgs) {
             env.fault_hi,
         )
     };
+    // §12.8 4A.5 follow-up B: a concurrent durable child that **owns fibers** must flatten the ones it
+    // parked into their shadow regions — its own `freeze_drive`, the concurrent mirror of
+    // `run_child_inline`'s (the root's drive ran before this child existed). Run it while the child's
+    // runtime is still `CURRENT_RT` and the window is `UNWINDING`; drain the child's fiber residue into
+    // the domain accumulator (`run_inner` merges it; canonical sort-by-slot keeps the artifact
+    // order-independent). SAFETY: durable run ⇒ committed reserve; live `Domain`.
+    if a.durable_child.is_some()
+        && !faulted
+        && unsafe { fiber_rt::window_is_unwinding(env.mem_base) }
+    {
+        if let Some(b) = frt.as_mut() {
+            let rt = &mut **b as *mut FiberRuntime;
+            unsafe {
+                fiber_rt::freeze_drive(rt, env.trap_out as u64);
+                let child_frozen = fiber_rt::take_frozen(rt);
+                if !child_frozen.is_empty() {
+                    lock(&(*a.dom).frozen_fibers).extend(child_frozen);
+                }
+            }
+        }
+    }
     if let Some(p) = prev {
         fiber_rt::set_current(p);
     }

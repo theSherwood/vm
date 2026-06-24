@@ -22,7 +22,7 @@ use svm_ir::{Memory, Module};
 use svm_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv,
     compile_and_run_capture_reserved_with_host_durable_mv_interruptible, FreezeController,
-    FrozenVCpu, JitError, JitOutcome,
+    FrozenFiber, FrozenVCpu, JitError, JitOutcome,
 };
 
 const SIZE_LOG2: u8 = 17;
@@ -55,7 +55,9 @@ fn le_i64(w: &[u8], off: i64) -> i64 {
 /// Run the durable concurrent freeze with the spawn-before-freeze handshake. `v0` = clock handle (for
 /// the children), `v1` = host-fn handle (the root calls it to signal "children spawned"). Returns the
 /// freeze outcome, or `None` to skip (unsupported shape / host alloc pressure).
-fn concurrent_freeze(inst: &Module) -> Option<(JitOutcome, Vec<u8>, Vec<FrozenVCpu>, u64)> {
+fn concurrent_freeze(
+    inst: &Module,
+) -> Option<(JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64)> {
     let spawned = Arc::new(AtomicBool::new(false));
     let sig = Arc::clone(&spawned);
     let mut host = Host::new();
@@ -93,14 +95,20 @@ fn concurrent_freeze(inst: &Module) -> Option<(JitOutcome, Vec<u8>, Vec<FrozenVC
     );
     controller.join().unwrap();
     match res {
-        Ok((o, s, _f, v, r)) => Some((o, s, v, r)),
+        Ok((o, s, f, v, r)) => Some((o, s, f, v, r)),
         Err(JitError::Unsupported(_)) => None,
         Err(JitError::Backend(msg)) if msg.contains("Allocation error") => None,
         Err(e) => panic!("concurrent freeze failed: {e:?}"),
     }
 }
 
-fn thaw(inst: &Module, snap: &[u8], vcpus: &[FrozenVCpu], root_sp: u64) -> (JitOutcome, Vec<u8>) {
+fn thaw(
+    inst: &Module,
+    snap: &[u8],
+    fibers: &[FrozenFiber],
+    vcpus: &[FrozenVCpu],
+    root_sp: u64,
+) -> (JitOutcome, Vec<u8>) {
     let mut twin = snap.to_vec();
     write_state(&mut twin, STATE_REWINDING);
     let mut thost = Host::new();
@@ -113,8 +121,8 @@ fn thaw(inst: &Module, snap: &[u8], vcpus: &[FrozenVCpu], root_sp: u64) -> (JitO
         0,
         &[tclk as i64, 0],
         &twin,
-        &[],
-        &[],
+        &[], // init_prots
+        fibers,
         vcpus,
         root_sp,
         SIZE_LOG2,
@@ -176,7 +184,7 @@ block2(v12: i64, v13: i32, v14: i64):
 #[test]
 fn concurrent_children_self_unwind_and_thaw_reproduces_the_result() {
     let inst = instrument(SRC_LOOPS);
-    let Some((fout, fsnap, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -197,7 +205,7 @@ fn concurrent_children_self_unwind_and_thaw_reproduces_the_result() {
         "both concurrent children were captured as residue"
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
     assert_eq!(le_i64(&tfinal, OFF_ROOT), K, "root total reproduced");
@@ -245,7 +253,7 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
     let inst = instrument(SRC_JOIN);
     const ORACLE: i64 = K + 1007; // loop total + child(arg 7 + 1000)
 
-    let Some((fout, fsnap, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -264,12 +272,109 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
         "the child's join result rides the artifact",
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
     assert_eq!(
         le_i64(&tfinal, OFF_ROOT),
         ORACLE,
         "the root's re-executed thread.join resolved the completed child's result across the freeze",
+    );
+}
+
+// Follow-up B.1: a **concurrent** child that itself owns a fiber. The child creates + resumes a fiber
+// that suspends (parks), then signals (so the freeze lands while its fiber is parked) and loops. On the
+// freeze the child must flatten its own parked fiber — its own `freeze_drive`, the concurrent mirror of
+// `run_child_inline`'s. (Here the *child*, not the root, drives the handshake; `concurrent_freeze`'s
+// host fn flips the same flag regardless of caller.)
+const SRC_CHILD_FIBER: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65568
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 0
+  br block1(v0, v5)
+block1(v6: i32, v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v6, v9) block2(v6, v9)
+block2(v12: i32, v13: i64):
+  v14 = i32.const 0
+  v15 = cap.call 2 0 (i32) -> (i64) v12 (v14)
+  v16 = i64.const 65536
+  i64.store v16 v13
+  return v13
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = ref.func 2
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  v8 = i64.const 65568
+  v9 = i32.load v8
+  v10 = i32.const 0
+  v11 = cap.call 13 0 (i32) -> (i64) v9 (v10)
+  v12 = i64.const 0
+  br block1(v7, v12)
+block1(v13: i64, v14: i64):
+  v15 = i64.const 1
+  v16 = i64.add v14 v15
+  v17 = i64.const 100000000
+  v18 = i64.lt_s v16 v17
+  br_if v18 block1(v13, v16) block2(v13, v16)
+block2(v19: i64, v20: i64):
+  v21 = i64.add v19 v20
+  v22 = i64.const 65544
+  i64.store v22 v21
+  return v21
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+
+#[test]
+fn concurrent_child_owns_fiber_through_freeze_thaw() {
+    let inst = instrument(SRC_CHILD_FIBER);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // Everything finished before the freeze landed (rare): already correct.
+        assert_eq!(le_i64(&fsnap, OFF_ROOT), K);
+        assert_eq!(le_i64(&fsnap, OFF_C1), K + 5);
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder"
+    );
+    assert_eq!(fvcpus.len(), 1, "the concurrent child froze");
+    assert_eq!(
+        ffibers.len(),
+        1,
+        "the concurrent child flattened its own parked fiber on the freeze",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(le_i64(&tfinal, OFF_ROOT), K, "root total reproduced");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        K + 5,
+        "child resumed its loop + its fiber's yielded value across the freeze",
     );
 }

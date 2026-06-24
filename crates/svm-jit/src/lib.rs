@@ -2972,6 +2972,9 @@ impl CompiledModule {
                 (*this)
                     .frozen_vcpus_out
                     .extend(d.take_completed_children_residue());
+                // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
+                // `run_child` `freeze_drive`, recorded during `join_all` — drain after the join.
+                (*this).frozen_out.extend(d.take_frozen_fibers());
             }
         }
         // §5 W3 Stage 3 — a trap that originated on a *spawned* vCPU stashed its backtrace capture in
