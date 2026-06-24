@@ -3169,6 +3169,97 @@ fn main() {
     );
 }
 
+/// The statements both the on-ramp `no_std` program and the native `std` oracle run — each prints one
+/// value with `putdec`. Exercises the saturating-arithmetic intrinsics (`llvm.{u,s}{add,sub}.sat`, on
+/// i32/i64, both the clamped and the non-clamped path) and the saturating float→int casts
+/// (`llvm.fpto{si,ui}.sat`, f32/f64 → i32/i64, incl. ±overflow and NaN). Each side defines `putdec`
+/// differently (manual `write` vs `println!`) but the call sequence is identical, so the stdout must
+/// match byte-for-byte.
+const RUST_SAT_BODY: &str = "
+    putdec((10u64).saturating_sub(25) as i64);   // usub.sat -> 0
+    putdec((100u64).saturating_sub(40) as i64);  // usub.sat -> 60
+    putdec(u64::MAX.saturating_add(5) as i64);   // uadd.sat -> u64::MAX (-1 as i64)
+    putdec((7u64).saturating_add(8) as i64);     // uadd.sat -> 15 (no clamp)
+    putdec(i64::MIN.saturating_sub(1));          // ssub.sat -> i64::MIN
+    putdec(i64::MAX.saturating_add(1));          // sadd.sat -> i64::MAX
+    putdec((5i64).saturating_add(3));            // sadd.sat -> 8 (no clamp)
+    putdec((-5i64).saturating_sub(3));           // ssub.sat -> -8 (no clamp)
+    putdec((7u32).saturating_sub(100) as i64);   // usub.sat.i32 -> 0
+    putdec(u32::MAX.saturating_add(2) as i64);   // uadd.sat.i32 -> u32::MAX
+    putdec(i32::MIN.saturating_sub(1) as i64);   // ssub.sat.i32 -> i32::MIN
+    putdec(i32::MAX.saturating_add(1) as i64);   // sadd.sat.i32 -> i32::MAX
+    putdec((1e30f64) as i64);                    // fptosi.sat.i64.f64 -> i64::MAX
+    putdec((-1e30f64) as i64);                   // -> i64::MIN
+    putdec((f64::NAN) as i64);                   // -> 0
+    putdec((3.99f64) as i64);                    // -> 3
+    putdec((1e30f64) as u64 as i64);             // fptoui.sat.i64.f64 -> u64::MAX (-1)
+    putdec((-7.0f64) as u64 as i64);             // -> 0 (clamped low)
+    putdec((1e20f32) as i32 as i64);             // fptosi.sat.i32.f32 -> i32::MAX
+    putdec((-1e20f32) as i32 as i64);            // -> i32::MIN
+    putdec((1e20f32) as u32 as i64);             // fptoui.sat.i32.f32 -> u32::MAX
+    putdec((2.5f32) as i32 as i64);              // -> 2
+";
+
+/// **Saturating arithmetic + saturating float→int casts through the on-ramp.** These are the LLVM
+/// intrinsics Rust emits for `saturating_add`/`saturating_sub` and float `as` integer casts — the gaps
+/// the specializer hit. The on-ramp lowers them inline (clamp via `select`; `FToISat`), and every
+/// result is byte-identical to the same program built natively, across the clamp/no-clamp and
+/// over/underflow/NaN cases on both `i32` and `i64`.
+#[test]
+fn rust_saturating_and_fp_sat_casts_match_native() {
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\n\
+         extern \"C\" {{ fn write(fd: i32, buf: *const u8, n: isize) -> isize; }}\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         fn putdec(x: i64) {{\n\
+             let neg = x < 0;\n\
+             let mut mag: u64 = if neg {{ (x as u64).wrapping_neg() }} else {{ x as u64 }};\n\
+             let mut buf = [0u8; 24];\n\
+             let mut i = 24usize;\n\
+             if mag == 0 {{ i -= 1; buf[i] = b'0'; }}\n\
+             while mag > 0 {{ i -= 1; buf[i] = b'0' + (mag % 10) as u8; mag /= 10; }}\n\
+             if neg {{ i -= 1; buf[i] = b'-'; }}\n\
+             unsafe {{ write(1, buf.as_ptr().add(i), (24 - i) as isize); }}\n\
+             unsafe {{ write(1, b\"\\n\".as_ptr(), 1); }}\n\
+         }}\n\
+         #[no_mangle] pub extern \"C\" fn main() -> i32 {{ {RUST_SAT_BODY} 0 }}\n"
+    );
+    let native = format!(
+        "fn putdec(x: i64) {{ println!(\"{{}}\", x); }}\nfn main() {{ {RUST_SAT_BODY} }}\n"
+    );
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_sat", &onramp, b""),
+        rust_native_stdout("rs_sat", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "saturating/fp-sat Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+#[test]
+fn bitint56_load_store_roundtrips() {
+    // A non-power-of-two integer (`_BitInt(56)` = `i56`) round-trips through memory: the on-ramp
+    // legalizes `load i56` (read the enclosing i64, mask to 56 bits), `store i56` (byte-exact, so it
+    // never clobbers an adjacent field), and the `i56 → i64` zero/sign-extend (in i64). A `volatile`
+    // local forces the real store+load. Differential on interp + JIT (`check`).
+    // Unsigned: store, load (mask), add — no sign extension.
+    let u = "unsigned long f(void){ volatile unsigned _BitInt(56) g = 0x1234567890ABULL; \
+             return (unsigned long)g + 1; }";
+    check("u56", u, &[], &[Value::I64(20_015_998_341_292)]);
+    // Signed negative: store, load, then sign-extend the 56-bit value to i64.
+    let s = "long f(void){ volatile _BitInt(56) g = -100; return (long)g; }";
+    check("s56", s, &[], &[Value::I64(-100)]);
+    // Signed positive (top niche bit clear): sign-extend must keep it positive.
+    let p = "long f(void){ volatile _BitInt(56) g = 0x1234567890AB; return (long)g; }";
+    check("p56", p, &[], &[Value::I64(20_015_998_341_291)]);
+}
+
 // ---- §6 / D-DBG-7: the debug-info waist (LLVM as the third producer) -------------------------
 
 /// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from

@@ -1592,6 +1592,12 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
                     // `mask_lanes`, never used as a scalar — record a placeholder type.
                     Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
+                    // An `i128` result (a `-O2` 16-byte struct-eq coalesce: `load i128` + `icmp`) is
+                    // held as a 2×`i64` aggregate pair, never a scalar — placeholder type, like a
+                    // struct. (Same-block only, the aggregate-side-table assumption.)
+                    Err(_) if matches!(ty.as_ref(), Type::IntegerType { bits: 128 }) => {
+                        ValType::I64
+                    }
                     Err(e) => return Err(e),
                 };
                 s.ty.push(vt);
@@ -8773,6 +8779,46 @@ fn const_splat_int(op: &Operand) -> Option<u64> {
     Some(first)
 }
 
+/// Lower a **saturating float→int** intrinsic (`llvm.fptosi.sat.<int>.<float>` /
+/// `llvm.fptoui.sat.…`, which Rust's `as` casts from float emit) to svm-IR's `FToISat` — exactly the
+/// saturating semantics (NaN→0, out-of-range→clamped) the on-ramp already gives the plain `fptosi`
+/// instruction (§3b). The src/dst widths are parsed from the mangled name. `Ok(None)` for other calls;
+/// `Unsupported` for a vector form (`v4i32`/…), a later slice.
+fn lower_fp_sat_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    let signed = if name.starts_with("llvm.fptosi.sat.") {
+        true
+    } else if name.starts_with("llvm.fptoui.sat.") {
+        false
+    } else {
+        return Ok(None);
+    };
+    // `llvm.fpto{si,ui}.sat.<int>.<float>` — the last two dot-components are the dst int / src float.
+    let mut parts = name.rsplit('.');
+    let fstr = parts.next().unwrap_or("");
+    let istr = parts.next().unwrap_or("");
+    let dst = match istr {
+        "i32" => IntTy::I32,
+        "i64" => IntTy::I64,
+        _ => return unsup(format!("`{name}` (only i32/i64 result)")),
+    };
+    let src = match fstr {
+        "f32" => FloatTy::F32,
+        "f64" => FloatTy::F64,
+        _ => return unsup(format!("`{name}` (only f32/f64 source)")),
+    };
+    let a = ctx.operand(&c.arguments[0].0)?;
+    Ok(Some(ctx.push(Inst::FToISat {
+        op: ftoi_op(src, dst, signed),
+        a,
+    })))
+}
+
 /// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
 /// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
 /// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
@@ -8799,6 +8845,10 @@ fn lower_int_intrinsic(
             | "llvm.fshl"
             | "llvm.fshr"
             | "llvm.bswap"
+            | "llvm.uadd.sat"
+            | "llvm.usub.sat"
+            | "llvm.sadd.sat"
+            | "llvm.ssub.sat"
     ) {
         return Ok(None);
     }
@@ -8838,12 +8888,20 @@ fn lower_int_intrinsic(
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
         }
+        // Per-lane popcount — wasm has it only for `i8x16` (the sole vector `ctpop` width).
+        if base == "llvm.ctpop" {
+            if shape != svm_ir::VShape::I8x16 {
+                return unsup(format!("vector ctpop on {shape:?} (only i8x16)"));
+            }
+            let a = ctx.operand(args[0])?;
+            return Ok(Some(ctx.push(Inst::VPopcnt { a })));
+        }
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
             "llvm.smin" => svm_ir::VIntBinOp::MinS,
             "llvm.umax" => svm_ir::VIntBinOp::MaxU,
             "llvm.umin" => svm_ir::VIntBinOp::MinU,
-            other => return unsup(format!("vector `{other}` (only min/max)")),
+            other => return unsup(format!("vector `{other}` (only min/max or ctpop)")),
         };
         let a = ctx.operand(args[0])?;
         let b = ctx.operand(args[1])?;
@@ -8913,6 +8971,102 @@ fn lower_int_intrinsic(
             let bits = src_bits(args[0], types)?;
             let v = ctx.operand(args[0])?;
             emit_bswap(ctx, v, ty, (bits / 8).max(1) as u64)
+        }
+        // Saturating add/sub (`llvm.{u,s}{add,sub}.sat`): the wrapping op, then clamp on over/underflow
+        // via `select`. Rust's `saturating_add`/`sub` (and slice/capacity math) emit these. Only the
+        // native widths (i32/i64) — a narrow saturating width would need width-specific clamp bounds.
+        "llvm.uadd.sat" | "llvm.usub.sat" | "llvm.sadd.sat" | "llvm.ssub.sat" => {
+            let bits = src_bits(args[0], types)?;
+            if bits != 32 && bits != 64 {
+                return unsup(format!("`{name}` (only i32/i64 saturating)"));
+            }
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let k = |ctx: &mut BlockCtx, v: i64| {
+                ctx.push(if ty == IntTy::I64 {
+                    Inst::ConstI64(v)
+                } else {
+                    Inst::ConstI32(v as i32)
+                })
+            };
+            let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                ctx.push(Inst::IntBin { ty, op, a, b })
+            };
+            match base {
+                // unsigned add: carry (s <u a) ⇒ all-ones (UMAX).
+                "llvm.uadd.sat" => {
+                    let s = bin(ctx, BinOp::Add, a, b);
+                    let carry = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtU,
+                        a: s,
+                        b: a,
+                    });
+                    let umax = k(ctx, -1);
+                    ctx.push(Inst::Select {
+                        cond: carry,
+                        a: umax,
+                        b: s,
+                    })
+                }
+                // unsigned sub: borrow (a <u b) ⇒ 0.
+                "llvm.usub.sat" => {
+                    let under = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtU,
+                        a,
+                        b,
+                    });
+                    let diff = bin(ctx, BinOp::Sub, a, b);
+                    let zero = k(ctx, 0);
+                    ctx.push(Inst::Select {
+                        cond: under,
+                        a: zero,
+                        b: diff,
+                    })
+                }
+                // signed add/sub: overflow when the sign rule is violated ⇒ clamp to SMIN/SMAX by the
+                // sign of `a`. `sadd`: overflow iff `(a^s)&(b^s) < 0`; `ssub`: iff `(a^b)&(a^d) < 0`.
+                "llvm.sadd.sat" | "llvm.ssub.sat" => {
+                    let is_add = base == "llvm.sadd.sat";
+                    let r = bin(ctx, if is_add { BinOp::Add } else { BinOp::Sub }, a, b);
+                    let (l, rr) = if is_add {
+                        (bin(ctx, BinOp::Xor, a, r), bin(ctx, BinOp::Xor, b, r))
+                    } else {
+                        (bin(ctx, BinOp::Xor, a, b), bin(ctx, BinOp::Xor, a, r))
+                    };
+                    let ov_bits = bin(ctx, BinOp::And, l, rr);
+                    let zero = k(ctx, 0);
+                    let ov = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtS,
+                        a: ov_bits,
+                        b: zero,
+                    });
+                    let (smax, smin) = if ty == IntTy::I64 {
+                        (k(ctx, i64::MAX), k(ctx, i64::MIN))
+                    } else {
+                        (k(ctx, i32::MAX as i64), k(ctx, i32::MIN as i64))
+                    };
+                    let neg = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtS,
+                        a,
+                        b: zero,
+                    });
+                    let sat = ctx.push(Inst::Select {
+                        cond: neg,
+                        a: smin,
+                        b: smax,
+                    });
+                    ctx.push(Inst::Select {
+                        cond: ov,
+                        a: sat,
+                        b: r,
+                    })
+                }
+                _ => unreachable!(),
+            }
         }
         _ => unreachable!(),
     };
@@ -10703,6 +10857,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 offset: 0,
                 align: 0,
             });
+        } else if let Some(bits) = nonstd_int_bits(st.value.get_type(types).as_ref()) {
+            // Non-power-of-two integer store (e.g. an `i56` niche field): write exactly its bytes.
+            store_nonstd_int(ctx, addr, value, bits);
         } else {
             let op = store_op(st.value.get_type(types).as_ref())?;
             ctx.push_effect(Inst::Store {
@@ -10771,6 +10928,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // A call to an external libm-math function with a direct SVM op (`sqrt`/`floor`/…) lowers
         // inline (only when the guest hasn't defined its own function of that name).
         if let Some(idx) = lower_libm_call(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // Saturating float→int intrinsics (`llvm.fptosi.sat`/`fptoui.sat`, Rust's float `as` casts).
+        if let Some(idx) = lower_fp_sat_intrinsic(ctx, c)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
@@ -10943,6 +11109,80 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         return Ok(());
     }
+    // i128 is held as a **pair of i64 halves** (`[lo, hi]`) in the aggregate side-table — svm-IR has no
+    // 128-bit type. This covers what `-O2` actually produces: clang coalesces a 16-byte struct/array
+    // equality (e.g. comparing `Known`'s `[u8;16]` payload) into a `load i128` + `icmp eq/ne i128`.
+    // Only those two ops are supported; any other i128 use stays a clean `Unsupported`.
+    if let I::Load(l) = instr {
+        if matches!(l.loaded_ty.as_ref(), Type::IntegerType { bits: 128 }) {
+            let addr = ctx.operand(&l.address)?;
+            let lo = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr,
+                offset: 0,
+                align: 0,
+            });
+            let c8 = ctx.const_i64(8);
+            let hi_addr = ctx.add_i64(addr, c8);
+            let hi = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr: hi_addr,
+                offset: 0,
+                align: 0,
+            });
+            if let Some(&vid) = ctx.s.name2id.get(&l.dest) {
+                ctx.agg.insert(vid, vec![lo, hi]);
+            }
+            return Ok(());
+        }
+    }
+    if let I::ICmp(x) = instr {
+        if matches!(
+            x.operand0.get_type(types).as_ref(),
+            Type::IntegerType { bits: 128 }
+        ) {
+            if !matches!(x.predicate, IntPredicate::EQ | IntPredicate::NE) {
+                return unsup(format!("i128 icmp {:?} (only eq/ne)", x.predicate));
+            }
+            let a = ctx
+                .agg_of(&x.operand0)
+                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
+            let b = ctx
+                .agg_of(&x.operand1)
+                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
+            let lo = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: a[0],
+                b: b[0],
+            });
+            let hi = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: a[1],
+                b: b[1],
+            });
+            let mut r = ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: lo,
+                b: hi,
+            });
+            if x.predicate == IntPredicate::NE {
+                let one = ctx.push(Inst::ConstI32(1));
+                r = ctx.push(Inst::IntBin {
+                    ty: IntTy::I32,
+                    op: BinOp::Xor,
+                    a: r,
+                    b: one,
+                });
+            }
+            if let Some(&vid) = ctx.s.name2id.get(&x.dest) {
+                ctx.idx_of.insert(vid, r);
+            }
+            return Ok(());
+        }
+    }
 
     let (dest, idx) = match instr {
         I::Alloca(a) => {
@@ -10985,6 +11225,25 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         align: 0,
                     }),
                 )
+            } else if let Some(bits) = nonstd_int_bits(l.loaded_ty.as_ref()) {
+                // Non-power-of-two integer load (e.g. an `i56` niche-discriminant field): svm-IR has no
+                // `iN` load, so read the enclosing `i64` and mask to N bits. The window-bounded read may
+                // touch up to 3 padding/adjacent bytes, discarded by the mask (the narrow-int path
+                // over-reads the same way); a read straddling the window end traps, which is safe.
+                let raw = ctx.push(Inst::Load {
+                    op: svm_ir::LoadOp::I64,
+                    addr,
+                    offset: 0,
+                    align: 0,
+                });
+                let m = ctx.const_i64(((1u64 << bits) - 1) as i64);
+                let v = ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::And,
+                    a: raw,
+                    b: m,
+                });
+                (&l.dest, v)
             } else {
                 let op = load_op(l.loaded_ty.as_ref())?;
                 (
@@ -12479,6 +12738,99 @@ fn finish(ctx: &mut BlockCtx, dest: &Name, idx: ValIdx) -> Result<(), Error> {
     Ok(())
 }
 
+/// The bit width of a **non-power-of-two integer** (33..=63 bits, e.g. an `i56` niche-discriminant
+/// field) that the on-ramp legalizes via the enclosing `i64`. `None` for the natively-handled widths
+/// (≤32 → `i32` container, 64 → `i64`) and non-integers. svm-IR has only `i32`/`i64` memory ops, so a
+/// load of such a width reads the enclosing `i64` and masks to the width; a store splits into exact
+/// byte-width writes (so it never clobbers an adjacent field).
+fn nonstd_int_bits(ty: &Type) -> Option<u32> {
+    match ty {
+        Type::IntegerType { bits } if *bits > 32 && *bits < 64 => Some(*bits),
+        _ => None,
+    }
+}
+
+/// Store a non-power-of-two integer (`bits` in 33..=63, held in an `i64`) **byte-exactly** — exactly
+/// `ceil(bits/8)` bytes, so it never clobbers an adjacent field (unlike an over-write). The low 32
+/// bits go as an `i32`; the remaining 1–3 bytes as `i16`/`i8` chunks shifted down from the high half.
+/// (`bits` ≥ 57 ⇒ 8 bytes ⇒ a plain `i64` store.)
+fn store_nonstd_int(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx, bits: u32) {
+    use svm_ir::StoreOp;
+    let byte_len = bits.div_ceil(8); // 5..=8 for 33..=63
+    if byte_len >= 8 {
+        ctx.push_effect(Inst::Store {
+            op: StoreOp::I64,
+            addr,
+            value,
+            offset: 0,
+            align: 0,
+        });
+        return;
+    }
+    // Low 32 bits at +0.
+    let lo = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: value,
+    });
+    ctx.push_effect(Inst::Store {
+        op: StoreOp::I32,
+        addr,
+        value: lo,
+        offset: 0,
+        align: 0,
+    });
+    // High bytes (bits 32+) shifted down, written exactly.
+    let c32 = ctx.const_i64(32);
+    let hi = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::ShrU,
+        a: value,
+        b: c32,
+    });
+    let hi32 = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: hi,
+    });
+    let c4 = ctx.const_i64(4);
+    let addr4 = ctx.add_i64(addr, c4);
+    let rem = byte_len - 4; // 1, 2, or 3
+    let wide_op = if rem == 1 {
+        StoreOp::I32_8
+    } else {
+        StoreOp::I32_16
+    };
+    ctx.push_effect(Inst::Store {
+        op: wide_op,
+        addr: addr4,
+        value: hi32,
+        offset: 0,
+        align: 0,
+    });
+    if rem == 3 {
+        // The 7th byte (bits 48..56) at +6.
+        let c48 = ctx.const_i64(48);
+        let hi2 = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::ShrU,
+            a: value,
+            b: c48,
+        });
+        let hi2_32 = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: hi2,
+        });
+        let c6 = ctx.const_i64(6);
+        let addr6 = ctx.add_i64(addr, c6);
+        ctx.push_effect(Inst::Store {
+            op: StoreOp::I32_8,
+            addr: addr6,
+            value: hi2_32,
+            offset: 0,
+            align: 0,
+        });
+    }
+}
+
 /// The `LoadOp` (width + result container) for an LLVM loaded type. Narrow loads zero-extend
 /// into the `i32` container; a following `sext`/`zext` (the §3b discipline) fixes signedness.
 fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
@@ -12495,7 +12847,6 @@ fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
         other => unsup(format!("load of type {other} (Milestone 1+)")),
     }
 }
-
 /// The `StoreOp` (width) for an LLVM stored value type.
 fn store_op(ty: &Type) -> Result<svm_ir::StoreOp, Error> {
     use svm_ir::StoreOp as S;
@@ -12627,6 +12978,33 @@ fn emit_trunc(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32) -> ValIdx {
 /// Lower a `zext`/`sext from→to`. Produces a value whose low `to` bits are the (zero- or sign-)
 /// extended result, in the destination container.
 fn emit_ext(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32, signed: bool) -> ValIdx {
+    // A non-power-of-two source wider than 32 bits (e.g. an `i56` niche field) sits in an `i64`;
+    // extend it **in i64** (the i32 helpers below don't apply). The widening target is always i64.
+    if (33..64).contains(&from) {
+        return if signed {
+            let sh = ctx.const_i64((64 - from) as i64);
+            let l = ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Shl,
+                a: v,
+                b: sh,
+            });
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::ShrS,
+                a: l,
+                b: sh,
+            })
+        } else {
+            let m = ctx.const_i64(((1u64 << from) - 1) as i64);
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::And,
+                a: v,
+                b: m,
+            })
+        };
+    }
     // First make a clean i32 holding the value extended from `from` bits (if `from < 32`).
     let i32v = if from >= 32 {
         v
