@@ -342,16 +342,15 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       `clang -O2` recursive `fib` and a `noinline` cross-function call, interp == JIT == hand-computed.
 
 **Slice D (DONE) — `switch`.**
-- [x] `switch` → `br_table` (§3b): the `i32` operand is biased by the minimum case value, then
+- [x] **Dense** `switch` → `br_table` (§3b): the operand is biased by the minimum case value, then
       indexes a target vector spanning `[min, max]` with gaps filled by the default edge; each edge
-      carries its destination's block args (computed once per distinct target). i64-operand switches
-      are a clean `Unsupported`. Tested on a dense switch and the `even`/`odd` mutual recursion
-      `-O2` lowers onto a switch-loop.
-- [x] **Sparse switches** (span > 4096 — real parsers dispatching on 4-byte fourccs/enum tags) are
-      rewritten by an LLVM-level pre-pass (`lower_sparse_switches`) into an `icmp eq`/`condbr`
-      decision chain over fresh basic blocks, so all downstream passes (liveness, block-params,
-      verify) handle them unchanged; only φ-predecessors are repointed. Dense switches keep the
-      branchless `br_table`. Lands stb_image's PNG chunk loop (slice BH). See `switch_sparse_compare_chain`.
+      carries its destination's block args (computed once per distinct target). Tested on a dense
+      switch and the `even`/`odd` mutual recursion `-O2` lowers onto a switch-loop.
+- [x] **Sparse** switches (span > 4096 — i64 niche-optimized enum discriminants, real parsers
+      dispatching on 4-byte fourccs) → an equality **compare chain** of synthetic blocks
+      (`lower_sparse_switch`, threading live-ins/φ args via `aux_blocks`), since a dense `br_table`
+      would be astronomically large. Tested by `switch_sparse_*`; also lands stb_image's PNG chunk
+      loop (slice BH).
 
 **Slice E (DONE) — global variables + the data-stack guard.**
 - [x] Globals laid out **low** in the window (`[DATA_BASE, globals_end)`), each natural-aligned.
@@ -683,10 +682,8 @@ arithmetic this targets; the native oracle keeps vectorizing and exact integer c
 stb_image (public domain), PNG-only, decodes an embedded 24×24 RGBA PNG byte-identical to native —
 exercising the built-in zlib inflate (Huffman + LZ77), the row unfilters (None/Sub/Up/Average/Paeth — the
 test image cycles all five), the chunk/CRC walk, and heap traffic through the synthesized
-malloc/realloc/free. Two on-ramp features it forced (both broadly useful):
-- **Sparse-switch decision-tree lowering** (`lower_sparse_switches`, Slice D) — the PNG chunk loop
-  switches on 4-byte fourccs (span ≫ 4096); rewritten to an `icmp`/`condbr` chain. See
-  `switch_sparse_compare_chain`.
+malloc/realloc/free. It rides on the **sparse-switch compare chain** (Slice D, `lower_sparse_switch`)
+— the PNG chunk loop switches on 4-byte fourccs (span ≫ 4096) — and forced one new on-ramp intrinsic:
 - **`llvm.bitreverse.{i8,i16,i32,i64}`** — the Huffman setup reverses bits; lowered inline via the log-N
   swap network (mirroring the `llvm.bswap` inline lowering). See `bitreverse_intrinsic`.
 - Configured `STBI_NO_THREAD_LOCALS` (the incidental `_Thread_local` failure-string → `llvm.threadlocal.address`,

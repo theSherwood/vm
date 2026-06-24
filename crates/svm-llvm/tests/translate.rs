@@ -574,23 +574,151 @@ fn switch_with_gaps_via_global_table() {
 
 #[test]
 fn switch_sparse_compare_chain() {
-    // A switch on sparse 4-byte keys (PNG-chunk-style fourccs) — span ≫ 4096, so it can't be a
-    // `br_table`. The on-ramp's pre-pass rewrites it into an `icmp eq`/`condbr` decision chain;
-    // checked against native `cc`. (The case real parsers like stb_image's PNG loop hit.)
-    let src = "int sw(int k);\n\
-               int run(int s){\n\
-                 static const int keys[5] = {0x43674249,0x49484452,0x49444154,0x504c5445,0x49454e44};\n\
-                 int acc = 0;\n\
-                 for (int i = 0; i < 7; i++) acc = acc*31 + sw(keys[(i + s) % 5]);\n\
-                 return acc & 0x7fffffff;\n\
-               }\n\
-               int sw(int k){\n\
-                 switch (k){\n\
-                   case 0x43674249: return 1; case 0x49484452: return 2; case 0x49444154: return 3;\n\
-                   case 0x504c5445: return 4; case 0x49454e44: return 5; default: return 0;\n\
-                 }\n\
-               }";
-    check_vs_native("switch_sparse", src, 3);
+    // Far-apart `i64` cases (span ≫ MAX_SWITCH_SPAN) — clang keeps a real `switch` instruction, which
+    // the on-ramp lowers to an **equality compare chain** of synthetic blocks (a dense `br_table`
+    // would be astronomically large). Rust's niche-optimized enum discriminants produce exactly these.
+    // Every case, the default, and several between-case misses must agree on interp and JIT.
+    let src = "long sw(long x){ switch(x){ \
+               case 0: return 11; \
+               case 1000000L: return 22; \
+               case 1000000000000L: return 33; \
+               case -2000000000000L: return 44; \
+               default: return 99; } }";
+    check("ssw_0", src, &[Value::I64(0)], &[Value::I64(11)]);
+    check("ssw_1m", src, &[Value::I64(1_000_000)], &[Value::I64(22)]);
+    check(
+        "ssw_1t",
+        src,
+        &[Value::I64(1_000_000_000_000)],
+        &[Value::I64(33)],
+    );
+    check(
+        "ssw_neg",
+        src,
+        &[Value::I64(-2_000_000_000_000)],
+        &[Value::I64(44)],
+    );
+    check("ssw_def1", src, &[Value::I64(5)], &[Value::I64(99)]);
+    check("ssw_def2", src, &[Value::I64(-1)], &[Value::I64(99)]);
+    check(
+        "ssw_def3",
+        src,
+        &[Value::I64(999_999_999_999)],
+        &[Value::I64(99)],
+    );
+    check(
+        "ssw_defmin",
+        src,
+        &[Value::I64(i64::MIN)],
+        &[Value::I64(99)],
+    );
+    check(
+        "ssw_defmax",
+        src,
+        &[Value::I64(i64::MAX)],
+        &[Value::I64(99)],
+    );
+}
+
+#[test]
+fn switch_sparse_threads_live_ins_and_phi() {
+    // The hard case for the compare chain: the case bodies read `a`/`b` (live-ins that must be threaded
+    // through the synthetic chain blocks to the case targets), and the cases converge on a common
+    // successor whose `r` is a φ (so the chain's targets carry a branch argument). Exercises the full
+    // arg/live-in/φ threading, not just `(SP, operand)`.
+    let src = "long sw2(long x, long a, long b){ long r; switch(x){ \
+               case 0: r = a + 1; break; \
+               case 1000000000000L: r = b * 2; break; \
+               case -3000000000000L: r = a - b; break; \
+               default: r = a + b; break; } return r * 3; }";
+    // (x, a, b) with a=10, b=4
+    check(
+        "sw2_c0",
+        src,
+        &[Value::I64(0), Value::I64(10), Value::I64(4)],
+        &[Value::I64(33)],
+    ); // (10+1)*3
+    check(
+        "sw2_c1",
+        src,
+        &[Value::I64(1_000_000_000_000), Value::I64(10), Value::I64(4)],
+        &[Value::I64(24)], // (4*2)*3
+    );
+    check(
+        "sw2_c2",
+        src,
+        &[
+            Value::I64(-3_000_000_000_000),
+            Value::I64(10),
+            Value::I64(4),
+        ],
+        &[Value::I64(18)], // (10-4)*3
+    );
+    check(
+        "sw2_def",
+        src,
+        &[Value::I64(7), Value::I64(10), Value::I64(4)],
+        &[Value::I64(42)], // (10+4)*3
+    );
+}
+
+#[test]
+fn switch_sparse_long_chain() {
+    // A six-case sparse switch → a five-block compare chain: stresses the synthetic-block indexing
+    // (each chain block branches to the next, the last to the default).
+    let src = "long swN(long x){ switch(x){ \
+               case 0: return 1; \
+               case 100000L: return 2; \
+               case 200000000L: return 3; \
+               case 300000000000L: return 4; \
+               case -400000000000L: return 5; \
+               case -500000L: return 6; \
+               default: return 0; } }";
+    check("swN_a", src, &[Value::I64(0)], &[Value::I64(1)]);
+    check("swN_b", src, &[Value::I64(100_000)], &[Value::I64(2)]);
+    check("swN_c", src, &[Value::I64(200_000_000)], &[Value::I64(3)]);
+    check(
+        "swN_d",
+        src,
+        &[Value::I64(300_000_000_000)],
+        &[Value::I64(4)],
+    );
+    check(
+        "swN_e",
+        src,
+        &[Value::I64(-400_000_000_000)],
+        &[Value::I64(5)],
+    );
+    check("swN_f", src, &[Value::I64(-500_000)], &[Value::I64(6)]);
+    check("swN_def", src, &[Value::I64(12345)], &[Value::I64(0)]);
+}
+
+#[test]
+fn switch_sparse_i32() {
+    // The `i32` (width ≤ 32) compare-chain path: far-apart 32-bit cases. Confirms the chain compares
+    // and materializes constants at `i32`, and a negative case round-trips.
+    let src = "int sw32(int x){ switch(x){ \
+               case 0: return 7; \
+               case 100000: return 8; \
+               case -200000: return 9; \
+               case 50000000: return 10; \
+               default: return -1; } }";
+    check("sw32_0", src, &[Value::I32(0)], &[Value::I32(7)]);
+    check("sw32_p", src, &[Value::I32(100_000)], &[Value::I32(8)]);
+    check("sw32_n", src, &[Value::I32(-200_000)], &[Value::I32(9)]);
+    check(
+        "sw32_big",
+        src,
+        &[Value::I32(50_000_000)],
+        &[Value::I32(10)],
+    );
+    check("sw32_def", src, &[Value::I32(1)], &[Value::I32(-1)]);
+    check(
+        "sw32_defmin",
+        src,
+        &[Value::I32(i32::MIN)],
+        &[Value::I32(-1)],
+    );
 }
 
 #[test]
@@ -1053,6 +1181,44 @@ fn funnel_shift_rotate() {
         &[Value::I32(0x12345678), Value::I32(8)],
         &[Value::I32(0x78123456u32 as i32)],
     );
+}
+
+#[test]
+fn funnel_shift_general_const() {
+    // A **non-rotate** funnel shift with a constant amount — clang's canonical form for a double-word
+    // shift `(hi << k) | (lo >> (64 - k))` (the `fshl.i64(hi, lo, k)` Embench `aha-mont64`'s `modul64`
+    // emits). Distinct operands, so this is the general path: `(a << s) | (b >>u (w - s))`. Three
+    // amounts (1, 5, 63 — `(lo>>1)|(hi<<63)` canonicalizes to `fshl(.,.,63)`) and the full 64-bit result
+    // is folded down into the exit byte, so an error in *any* bit flips it. Bit-exact vs native `cc`.
+    let src = "int run(int seed) {\n\
+        \x20 unsigned long hi = (unsigned long) seed * 0x9E3779B97F4A7C15UL + 1;\n\
+        \x20 unsigned long lo = (unsigned long) seed * 0xC2B2AE3D27D4EB4FUL + 7;\n\
+        \x20 unsigned long a = (hi << 1)  | (lo >> 63);\n\
+        \x20 unsigned long b = (hi << 5)  | (lo >> 59);\n\
+        \x20 unsigned long c = (lo >> 1)  | (hi << 63);\n\
+        \x20 unsigned long r = a ^ (b * 3) ^ c;\n\
+        \x20 r ^= r >> 32; r ^= r >> 16; r ^= r >> 8;\n\
+        \x20 return (int)(r & 0xff);\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("funnel_general", src, 5);
+}
+
+#[test]
+fn strlen_builtin() {
+    // A direct `strlen` call (not via `printf %s`) routes to the synthesized `__svm_strlen` NUL-scan
+    // helper — even in a `run`-only module with no `main` (the helper reads memory, needs no powerbox).
+    // Two calls (a base pointer and a `buf + k` offset) over a runtime-length string; bit-exact vs the
+    // native `cc` oracle on both backends. Found needed by Embench `slre`.
+    let src = "#include <string.h>\n\
+        int run(int seed) {\n\
+        \x20 const char *s = \"the quick brown fox jumps over the lazy dog\";\n\
+        \x20 const char *t = \"embench strlen test vector\";\n\
+        \x20 unsigned long total = strlen(s + (seed % 5)) + strlen(t + (seed % 3));\n\
+        \x20 return (int)(total & 0x7fffffff);\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("strlen_builtin", src, 7);
 }
 
 #[test]
@@ -3478,6 +3644,238 @@ fn rust_no_std_matches_native() {
     }
 }
 
+// ============================================================================================
+// Milestone 1 (PEVAL.md) — `core + alloc` through the Rust on-ramp. The existing Rust lane proves
+// `core` (a pure compute fn). This proves the next layer: a heap-allocating `no_std` program whose
+// `#[global_allocator]` is backed by the guest `malloc`/`free` (the same `vm_map`-growing bump
+// allocator the C/C++ heap tests use). `Vec`/`Box` from `alloc` lower to `__rust_alloc` →
+// (our `#[global_allocator]`) → `extern "C" malloc`, so the on-ramp synthesizes the allocator and
+// the program grows its own heap. This is the prerequisite for running `svm-peval` (all
+// `Vec`/`BTreeMap`) as an svm-IR guest. Differential: stdout matches the *same* program built as a
+// native `std` Rust binary.
+// ============================================================================================
+
+/// Build a native `std` Rust binary from `src`, run it (feeding `stdin`), return its stdout. `None`
+/// (skip) if `rustc +1.81.0` is unavailable — the on-ramp lane is pinned to that toolchain, so the
+/// oracle uses it too (no behavioural difference for these programs, but keeps one toolchain).
+fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("svm_llvm_{}_{}_nat.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_nat", std::process::id(), name));
+    std::fs::write(&rs, src).expect("write native Rust source");
+    match Command::new("rustc")
+        .args(["+1.81.0", "-C", "opt-level=2"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let mut child = Command::new(&exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn native rust");
+    child.stdin.take().unwrap().write_all(stdin).ok();
+    Some(child.wait_with_output().expect("run native rust").stdout)
+}
+
+/// Translate a `no_std`/`alloc` powerbox Rust program through the on-ramp and run it, returning its
+/// stdout. Mirrors [`powerbox_diff`]'s SVM half but for a Rust frontend: the program must produce a
+/// powerbox entry (it uses `malloc` + `write`), so we resolve §7 imports to capabilities, verify, and
+/// run through `run_powerbox`. `None` (skip) if `rustc +1.81.0` is unavailable.
+fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
+    let bc = compile_rust_to_bc(name, src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust heap bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a heap-allocating Rust program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    Some(
+        svm_run::run_powerbox(&module, stdin)
+            .expect("powerbox run")
+            .stdout,
+    )
+}
+
+/// **`core + alloc` through the Rust on-ramp (PEVAL.md Milestone 1).** A `no_std` Rust program with a
+/// `#[global_allocator]` over the guest `malloc`/`free` builds a `Vec` that grows past its initial
+/// capacity (many `RawVec` reallocs → `malloc`/`free` churn → `vm_map` heap growth), boxes a value,
+/// and prints a heap-derived sum. The whole `alloc` stack (`RawVec`, the global-allocator shims
+/// `__rust_alloc`/`__rust_dealloc`/`__rust_realloc`, `Box`) lowers through the on-ramp with no change
+/// beyond the C heap path, and the output is byte-identical to the same program as a native `std`
+/// binary. This is the layer `svm-peval` needs (it is all `Vec`/maps).
+#[test]
+fn rust_core_alloc_heap_matches_native() {
+    // The on-ramp guest: `no_std` + `alloc`, allocator backed by the guest `malloc`/`free`. Builds a
+    // growing `Vec<u64>` of squares (forces reallocs), a `Box`, sums on the heap, prints the decimal.
+    let onramp = r#"
+#![no_std]
+#![no_main]
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+    fn write(fd: i32, buf: *const u8, n: isize) -> isize;
+}
+
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p) }
+}
+#[global_allocator]
+static A: Guest = Guest;
+
+#[panic_handler]
+fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+fn putdec(mut x: u64) {
+    let mut buf = [0u8; 24];
+    let mut i = 24usize;
+    if x == 0 { i -= 1; buf[i] = b'0'; }
+    while x > 0 { i -= 1; buf[i] = b'0' + (x % 10) as u8; x /= 10; }
+    unsafe { write(1, buf.as_ptr().add(i), (24 - i) as isize); }
+    unsafe { write(1, b"\n".as_ptr(), 1); }
+}
+
+#[no_mangle]
+pub extern "C" fn main() -> i32 {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 { v.push(i * i); }   // grows -> realloc -> malloc/free churn
+    let mut sum: u64 = 0;
+    for &x in &v { sum = sum.wrapping_add(x); }
+    let boxed = Box::new(sum.wrapping_mul(2));
+    putdec(*boxed);
+    0
+}
+"#;
+    // The native `std` oracle: the *same* computation, printed with `println!`.
+    let native = r#"
+fn main() {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 { v.push(i * i); }
+    let mut sum: u64 = 0;
+    for &x in &v { sum = sum.wrapping_add(x); }
+    let boxed = Box::new(sum.wrapping_mul(2));
+    println!("{}", *boxed);
+}
+"#;
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_heap", onramp, b""),
+        rust_native_stdout("rs_heap", native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "heap Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+/// The statements both the on-ramp `no_std` program and the native `std` oracle run — each prints one
+/// value with `putdec`. Exercises the saturating-arithmetic intrinsics (`llvm.{u,s}{add,sub}.sat`, on
+/// i32/i64, both the clamped and the non-clamped path) and the saturating float→int casts
+/// (`llvm.fpto{si,ui}.sat`, f32/f64 → i32/i64, incl. ±overflow and NaN). Each side defines `putdec`
+/// differently (manual `write` vs `println!`) but the call sequence is identical, so the stdout must
+/// match byte-for-byte.
+const RUST_SAT_BODY: &str = "
+    putdec((10u64).saturating_sub(25) as i64);   // usub.sat -> 0
+    putdec((100u64).saturating_sub(40) as i64);  // usub.sat -> 60
+    putdec(u64::MAX.saturating_add(5) as i64);   // uadd.sat -> u64::MAX (-1 as i64)
+    putdec((7u64).saturating_add(8) as i64);     // uadd.sat -> 15 (no clamp)
+    putdec(i64::MIN.saturating_sub(1));          // ssub.sat -> i64::MIN
+    putdec(i64::MAX.saturating_add(1));          // sadd.sat -> i64::MAX
+    putdec((5i64).saturating_add(3));            // sadd.sat -> 8 (no clamp)
+    putdec((-5i64).saturating_sub(3));           // ssub.sat -> -8 (no clamp)
+    putdec((7u32).saturating_sub(100) as i64);   // usub.sat.i32 -> 0
+    putdec(u32::MAX.saturating_add(2) as i64);   // uadd.sat.i32 -> u32::MAX
+    putdec(i32::MIN.saturating_sub(1) as i64);   // ssub.sat.i32 -> i32::MIN
+    putdec(i32::MAX.saturating_add(1) as i64);   // sadd.sat.i32 -> i32::MAX
+    putdec((1e30f64) as i64);                    // fptosi.sat.i64.f64 -> i64::MAX
+    putdec((-1e30f64) as i64);                   // -> i64::MIN
+    putdec((f64::NAN) as i64);                   // -> 0
+    putdec((3.99f64) as i64);                    // -> 3
+    putdec((1e30f64) as u64 as i64);             // fptoui.sat.i64.f64 -> u64::MAX (-1)
+    putdec((-7.0f64) as u64 as i64);             // -> 0 (clamped low)
+    putdec((1e20f32) as i32 as i64);             // fptosi.sat.i32.f32 -> i32::MAX
+    putdec((-1e20f32) as i32 as i64);            // -> i32::MIN
+    putdec((1e20f32) as u32 as i64);             // fptoui.sat.i32.f32 -> u32::MAX
+    putdec((2.5f32) as i32 as i64);              // -> 2
+";
+
+/// **Saturating arithmetic + saturating float→int casts through the on-ramp.** These are the LLVM
+/// intrinsics Rust emits for `saturating_add`/`saturating_sub` and float `as` integer casts — the gaps
+/// the specializer hit. The on-ramp lowers them inline (clamp via `select`; `FToISat`), and every
+/// result is byte-identical to the same program built natively, across the clamp/no-clamp and
+/// over/underflow/NaN cases on both `i32` and `i64`.
+#[test]
+fn rust_saturating_and_fp_sat_casts_match_native() {
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\n\
+         extern \"C\" {{ fn write(fd: i32, buf: *const u8, n: isize) -> isize; }}\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         fn putdec(x: i64) {{\n\
+             let neg = x < 0;\n\
+             let mut mag: u64 = if neg {{ (x as u64).wrapping_neg() }} else {{ x as u64 }};\n\
+             let mut buf = [0u8; 24];\n\
+             let mut i = 24usize;\n\
+             if mag == 0 {{ i -= 1; buf[i] = b'0'; }}\n\
+             while mag > 0 {{ i -= 1; buf[i] = b'0' + (mag % 10) as u8; mag /= 10; }}\n\
+             if neg {{ i -= 1; buf[i] = b'-'; }}\n\
+             unsafe {{ write(1, buf.as_ptr().add(i), (24 - i) as isize); }}\n\
+             unsafe {{ write(1, b\"\\n\".as_ptr(), 1); }}\n\
+         }}\n\
+         #[no_mangle] pub extern \"C\" fn main() -> i32 {{ {RUST_SAT_BODY} 0 }}\n"
+    );
+    let native = format!(
+        "fn putdec(x: i64) {{ println!(\"{{}}\", x); }}\nfn main() {{ {RUST_SAT_BODY} }}\n"
+    );
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_sat", &onramp, b""),
+        rust_native_stdout("rs_sat", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "saturating/fp-sat Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+#[test]
+fn bitint56_load_store_roundtrips() {
+    // A non-power-of-two integer (`_BitInt(56)` = `i56`) round-trips through memory: the on-ramp
+    // legalizes `load i56` (read the enclosing i64, mask to 56 bits), `store i56` (byte-exact, so it
+    // never clobbers an adjacent field), and the `i56 → i64` zero/sign-extend (in i64). A `volatile`
+    // local forces the real store+load. Differential on interp + JIT (`check`).
+    // Unsigned: store, load (mask), add — no sign extension.
+    let u = "unsigned long f(void){ volatile unsigned _BitInt(56) g = 0x1234567890ABULL; \
+             return (unsigned long)g + 1; }";
+    check("u56", u, &[], &[Value::I64(20_015_998_341_292)]);
+    // Signed negative: store, load, then sign-extend the 56-bit value to i64.
+    let s = "long f(void){ volatile _BitInt(56) g = -100; return (long)g; }";
+    check("s56", s, &[], &[Value::I64(-100)]);
+    // Signed positive (top niche bit clear): sign-extend must keep it positive.
+    let p = "long f(void){ volatile _BitInt(56) g = 0x1234567890AB; return (long)g; }";
+    check("p56", p, &[], &[Value::I64(20_015_998_341_291)]);
+}
+
 // ---- §6 / D-DBG-7: the debug-info waist (LLVM as the third producer) -------------------------
 
 /// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from
@@ -4583,19 +4981,40 @@ fn simd_autovec_avx2_wide_shifts() {
     check_avx_vs_native("simd_avx2_wide_shifts", src, 9);
 }
 
-/// ISSUES.md I13 — a `<2 x i16>` carried across a loop (Embench `edn`'s `fir_no_red_ld` "no-redundant
-/// -load" FIR) round-trips its 16-bit lanes incorrectly through the per-part block-param fan-out, a
-/// *silent miscompile*. Until the tiny-tail-lane representation is fixed, the on-ramp **fail-closes**
-/// on a φ carrying a ≤2-lane sub-32-bit vector. This pins that it stays a clean `Unsupported` (never a
-/// wrong answer); the 4-lane `<4 x i16>` carry stays supported (`demo_clay_vs_native`).
+/// ISSUES.md I13 (root fix, isolated) — `<2 x i32>` lane arithmetic carried as a packed `i64` must be
+/// lane-wise for **every** cross-lane-unsafe op, not just `mul`: `add`/`sub` carry across the 32-bit lane
+/// boundary and `shl`/`lshr`/`ashr` shift bits between lanes. This uses an explicit `vector_size(8)`
+/// `<2 x i32>` so clang emits the ops directly (`add`, `mul`, `shl`), with large lane values chosen so a
+/// packed-`i64` op would visibly corrupt the high lane. Bit-exact vs the native `cc` oracle on both
+/// backends (and interp == JIT).
 #[test]
-fn simd_tiny_i16_carry_phi_fails_closed_i13() {
-    let src = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
-        static short X[256], H[256]; static long Y[256];\n\
+fn simd_vec2_i32_lane_arith_add_shift_i13() {
+    let src = "typedef int v2 __attribute__((vector_size(8)));\n\
         int run(int seed) {\n\
-        \x20 for (int i = 0; i < 256; i++) { X[i] = seed + i; H[i] = seed * 2 - i; Y[i] = 0; }\n\
-        \x20 fir_no_red_ld(X, H, Y); long a = 0; for (int i = 0; i < 256; i++) a += Y[i]; return (int) a;\n\
+        \x20 v2 a = {seed * 7 + 100000, seed + 30000};\n\
+        \x20 v2 b = {seed + 3, seed * 5 + 70000};\n\
+        \x20 v2 c = (a + b) * b;\n\
+        \x20 v2 d = c << 2;\n\
+        \x20 v2 e = d - a;\n\
+        \x20 return e[0] + e[1];\n\
         }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("i13_vec2_addshift", src, 4);
+}
+
+/// ISSUES.md I13 (root fix) — Embench `edn`'s `fir_no_red_ld` ("no-redundant-load" FIR) carries a
+/// `<2 x i16>` across the loop and auto-vectorizes the deinterleaved widening multiply to **`<2 x i32>`
+/// lane arithmetic**. A 2-lane 32-bit vector is held as a *packed* `i64` (lane 0 low, lane 1 high), and
+/// the lane `mul` was lowered as a single `i64` multiply on that packed image — which cross-contaminates
+/// the lanes (the low product's carry and the lane0×lane1 cross term corrupt lane 1). That was a silent
+/// miscompile (previously fail-closed by a φ guard). The fix lowers `<2 x i32>` integer arithmetic
+/// lane-wise. This pins the kernel **bit-exact (full 64-bit checksum)** vs the native `cc` oracle on
+/// both backends — and forces the `mul` lowering to be per-lane `i32`, never a packed `i64.mul`.
+#[test]
+fn simd_vec2_i32_carried_widening_mul_i13() {
+    // `run(long n)` runs the FIR `n` times over a seeded buffer and folds a weighted 64-bit checksum —
+    // wide enough that a corrupted high lane changes the result well beyond a low-byte coincidence.
+    let kernel = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
         void fir_no_red_ld(const short x[], const short h[], long y[]) {\n\
         \x20 long i, j, sum0, sum1; short x0, x1, h0, h1;\n\
         \x20 for (j = 0; j < 100; j += 2) { sum0 = 0; sum1 = 0; x0 = x[j];\n\
@@ -4604,15 +5023,74 @@ fn simd_tiny_i16_carry_phi_fails_closed_i13() {
         \x20     x0 = x[j+i+2]; h1 = h[i+1]; sum0 += x1*h1; sum1 += x0*h1; }\n\
         \x20   y[j] = sum0 >> 15; y[j+1] = sum1 >> 15; }\n\
         }\n\
-        int main(void) { return run(3); }\n";
-    let Some(bc) = compile_to_bc("i13_tiny_i16_carry", src) else {
+        long run(long n) {\n\
+        \x20 long acc = 0;\n\
+        \x20 for (long t = 0; t < n; t++) {\n\
+        \x20   short X[132], H[32]; long Y[100];\n\
+        \x20   for (int i=0;i<132;i++) X[i]=(short)((i*7+t*3+1)%97 - 48);\n\
+        \x20   for (int i=0;i<32;i++) H[i]=(short)((i*5+t+1)%31 - 15);\n\
+        \x20   for (int i=0;i<100;i++) Y[i]=0;\n\
+        \x20   fir_no_red_ld(X,H,Y);\n\
+        \x20   for (int i=0;i<100;i++) acc += Y[i]*(i+1);\n\
+        \x20 }\n\
+        \x20 return acc;\n\
+        }\n";
+    let main = "long run(long);\n#include <stdio.h>\n\
+        int main(void){ printf(\"%ld %ld\\n\", run(1), run(7)); return 0; }\n";
+    let Some(bc) = compile_to_bc("i13_vec2_fir", kernel) else {
         return; // clang unavailable
     };
-    // Must fail-close, not translate (a translated module here would silently miscompile).
-    assert!(
-        svm_llvm::translate_bc_path(&bc).is_err(),
-        "I13: a carried <2 x i16> must fail-close (Unsupported), not translate-and-miscompile"
-    );
+    // Native oracle: full 64-bit results for n=1 and n=7 via stdout.
+    let dir = std::env::temp_dir();
+    let csrc = dir.join(format!("svm_llvm_i13_{}.c", std::process::id()));
+    let exe = dir.join(format!("svm_llvm_i13_{}", std::process::id()));
+    std::fs::write(&csrc, format!("{kernel}{main}")).expect("write C");
+    match Command::new("cc").arg(&csrc).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping i13 (cc unavailable)");
+            return;
+        }
+    }
+    let out = Command::new(&exe).output().expect("run native");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let nat: Vec<i64> = s
+        .split_whitespace()
+        .map(|w| w.parse().expect("native i64"))
+        .collect();
+    assert_eq!(nat.len(), 2, "native printed two checksums");
+
+    let t =
+        svm_llvm::translate_bc_path(&bc).expect("translate (I13 root fix: no longer fail-closed)");
+    let module = &t.module;
+    svm_verify::verify_module(module).expect("verify");
+    let e = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    for (k, &expect) in [1i64, 7].iter().zip(&nat) {
+        let mut fuel = 200_000_000u64;
+        let interp = svm_interp::run(
+            module,
+            e,
+            &[Value::I64(t.entry_sp as i64), Value::I64(*k)],
+            &mut fuel,
+        )
+        .expect("interp")[0];
+        let jit = match svm_jit::compile_and_run(module, e, &[t.entry_sp as i64, *k]).expect("jit")
+        {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("jit outcome {o:?}"),
+        };
+        let interp = match interp {
+            Value::I64(x) => x,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(interp, jit, "I13 n={k}: interp vs jit");
+        assert_eq!(interp, expect, "I13 n={k}: svm vs native cc");
+    }
 }
 
 /// `-O2 -mavx2` auto-vectorized **fixed-point DSP** kernel (Embench `edn`'s `vec_mpy` shape):

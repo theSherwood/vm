@@ -77,7 +77,9 @@
 //!   libc `FILE*` stream argument is ignored (the handle is the endpoint). `clang -O2` also lowers
 //!   `printf("…\n")` → `puts` and `printf("%c",c)` → `putc`, so format-free `printf` rides this path.
 //! - **P — funnel shifts + runtime mem-loop helpers (first real corpus demo).** `llvm.fshl`/`fshr`
-//!   lower to `rotl`/`rotr` for the rotate idiom (identical operands — SHA-256's `ROTRIGHT`). A
+//!   lower to `rotl`/`rotr` for the rotate idiom (identical operands — SHA-256's `ROTRIGHT`); the
+//!   general (distinct-operand) case with a **constant** amount on an i32/i64 lowers to
+//!   `(a << s) | (b >>u (w - s))` (Embench `aha-mont64`'s double-word `modul64` shift). A
 //!   variable-length (or oversized-constant) `memset`/`memcpy` calls a **synthesized runtime loop
 //!   helper** (`__svm_memset`/`__svm_memcpy`, a real counted byte loop — the first multi-block helper)
 //!   instead of an inline unroll. Together these make B-Con's **SHA-256** run byte-identical to
@@ -154,7 +156,8 @@
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): `printf` float conversions
 //! (`%f`/`%e`/`%g` — need exact-decimal/bignum formatting), `*` (dynamic width/precision), and
-//! non-constant formats; general (non-rotate) funnel shifts, `llvm.bitreverse`, transcendental math
+//! non-constant formats; general (non-rotate) funnel shifts with a *non-constant* amount (the
+//! constant-amount i32/i64 case is lowered), `llvm.bitreverse`, transcendental math
 //! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
 //! (`<2 x double>`, `<8 x i16>`, dynamic lanes), and `i33`.
 
@@ -217,8 +220,7 @@ pub struct Translated {
 /// `llvm-sys` walk ([`di`]) over the same file and correlated to the IR ([`di::read_debug`]).
 pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let path = path.as_ref();
-    let mut m = LModule::from_bc_path(path).map_err(Error::Parse)?;
-    lower_sparse_switches(&mut m);
+    let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
     let di = path.to_str().and_then(di::read_debug);
     // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).
     let ba = path.to_str().and_then(blockaddr::read_block_addrs);
@@ -229,161 +231,6 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 /// from `!DILocation`; the variable/type half requires the bitcode path (see [`translate_bc_path`]).
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
     translate_impl(m, None, None)
-}
-
-/// Pre-pass: rewrite each **sparse** `switch` — one whose case-value span exceeds [`MAX_SWITCH_SPAN`],
-/// so it cannot become a compact `br_table` — into a chain of `icmp eq` + `condbr` over fresh basic
-/// blocks. Real parsers and interpreters dispatch on sparse keys (4-byte chunk fourccs, enum tags),
-/// which clang keeps as a `switch`; this lets them translate while **dense** switches keep the
-/// branchless `br_table` (the rewrite is skipped for them).
-///
-/// The rewrite stays in ordinary LLVM IR, so every downstream pass (liveness, block-params, branch
-/// args, verification) handles the new blocks unchanged — no synthetic-SVM-block bookkeeping. The one
-/// fixup is φ-predecessors: a case target's φ named the switch's parent block; for every case after
-/// the first (and for the default), the branch now originates from a fresh block, so that incoming
-/// label is repointed. A switch with a **repeated** target (including a target equal to the default)
-/// is left as-is — the simple per-edge φ repoint can't split one φ entry into several — so it fails
-/// closed in the dense-switch path rather than risk a miscompile.
-fn lower_sparse_switches(m: &mut LModule) {
-    use llvm_ir::instruction::ICmp;
-    use llvm_ir::terminator::CondBr;
-    let i1 = m.types.bool();
-    for f in &mut m.functions {
-        // Phase A: collect sparse-switch work items (immutable scan; clone what the rewrite needs).
-        struct Work {
-            bi: usize,
-            operand: Operand,
-            cases: Vec<(llvm_ir::constant::ConstantRef, Name)>,
-            default: Name,
-        }
-        let mut work: Vec<Work> = Vec::new();
-        for (bi, bb) in f.basic_blocks.iter().enumerate() {
-            let LTerm::Switch(sw) = &bb.term else {
-                continue;
-            };
-            if sw.dests.is_empty() {
-                continue;
-            }
-            let Ok(width) = operand_bits(&sw.operand) else {
-                continue; // i128+ / non-int — let the dense path report it
-            };
-            // Case values as the dense path sees them (sign-fit for i32), to match its span gate.
-            let fit = |c: &llvm_ir::constant::ConstantRef| match c.as_ref() {
-                Constant::Int { value, .. } if width <= 32 => Some(*value as i32 as i64),
-                Constant::Int { value, .. } => Some(*value as i64),
-                _ => None,
-            };
-            let Some(vals): Option<Vec<i64>> = sw.dests.iter().map(|(c, _)| fit(c)).collect()
-            else {
-                continue; // non-int case constant — let the dense path report it
-            };
-            let (min, max) = (
-                *vals.iter().min().unwrap() as i128,
-                *vals.iter().max().unwrap() as i128,
-            );
-            // Dense (`span = max-min+1 <= MAX_SWITCH_SPAN`, i.e. `max-min < MAX`) → keep the `br_table`.
-            if max - min < MAX_SWITCH_SPAN as i128 {
-                continue;
-            }
-            // Distinct targets, and distinct from the default (else the per-edge φ repoint is ambiguous).
-            let mut seen = std::collections::HashSet::new();
-            let distinct = sw.dests.iter().all(|(_, t)| seen.insert(t))
-                && sw.dests.iter().all(|(_, t)| *t != sw.default_dest);
-            if !distinct {
-                continue;
-            }
-            work.push(Work {
-                bi,
-                operand: sw.operand.clone(),
-                cases: sw.dests.clone(),
-                default: sw.default_dest.clone(),
-            });
-        }
-        if work.is_empty() {
-            continue;
-        }
-
-        // Phase B/C: rewrite each parent block in place + collect the fresh chain blocks.
-        let mut new_blocks: Vec<BasicBlock> = Vec::new();
-        for w in work {
-            let k = w.cases.len();
-            let sname = |j: usize| Name::Name(Box::new(format!("svm.sw.{}.{}", w.bi, j)));
-            let cmp_name = |j: usize| Name::Name(Box::new(format!("svm.sw.{}.{}.eq", w.bi, j)));
-            let cmp_use = |j: usize| Operand::LocalOperand {
-                name: cmp_name(j),
-                ty: i1.clone(),
-            };
-            let eq = |operand: &Operand, c: llvm_ir::constant::ConstantRef, j: usize| {
-                Instruction::ICmp(ICmp {
-                    predicate: IntPredicate::EQ,
-                    operand0: operand.clone(),
-                    operand1: Operand::ConstantOperand(c),
-                    dest: cmp_name(j),
-                    debugloc: None,
-                })
-            };
-            let condbr = |cond: Operand, t: Name, e: Name| {
-                LTerm::CondBr(CondBr {
-                    condition: cond,
-                    true_dest: t,
-                    false_dest: e,
-                    debugloc: None,
-                })
-            };
-
-            // Parent block: test case 0; on miss fall to the first chain block (or default if 1 case).
-            let b_name = f.basic_blocks[w.bi].name.clone();
-            let b = &mut f.basic_blocks[w.bi];
-            b.instrs.push(eq(&w.operand, w.cases[0].0.clone(), 0));
-            b.term = condbr(
-                cmp_use(0),
-                w.cases[0].1.clone(),
-                if k == 1 { w.default.clone() } else { sname(1) },
-            );
-
-            // Chain blocks for cases 1..k-1; the last one's miss edge is the default.
-            for j in 1..k {
-                let mut sb = BasicBlock::new(sname(j));
-                sb.instrs.push(eq(&w.operand, w.cases[j].0.clone(), j));
-                sb.term = condbr(
-                    cmp_use(j),
-                    w.cases[j].1.clone(),
-                    if j == k - 1 {
-                        w.default.clone()
-                    } else {
-                        sname(j + 1)
-                    },
-                );
-                new_blocks.push(sb);
-            }
-
-            // φ fixups: case j≥1 target's predecessor B → S_j; the default's predecessor B → S_{k-1}.
-            for j in 1..k {
-                repoint_phi_pred(f, &w.cases[j].1, &b_name, &sname(j));
-            }
-            if k >= 2 {
-                repoint_phi_pred(f, &w.default, &b_name, &sname(k - 1));
-            }
-        }
-        f.basic_blocks.extend(new_blocks);
-    }
-}
-
-/// In the block named `target`, repoint any φ incoming edge labelled `old_pred` to `new_pred` — used
-/// when [`lower_sparse_switches`] moves a switch edge onto a fresh chain block.
-fn repoint_phi_pred(f: &mut Function, target: &Name, old_pred: &Name, new_pred: &Name) {
-    let Some(bb) = f.basic_blocks.iter_mut().find(|b| &b.name == target) else {
-        return;
-    };
-    for instr in &mut bb.instrs {
-        if let Instruction::Phi(p) = instr {
-            for (_, pred) in &mut p.incoming_values {
-                if pred == old_pred {
-                    *pred = new_pred.clone();
-                }
-            }
-        }
-    }
 }
 
 fn translate_impl(
@@ -432,6 +279,10 @@ fn translate_impl(
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
+    // A direct `strlen` call routes to the same synthesized `__svm_strlen` byte loop that `printf %s`
+    // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
+    // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
+    let need_strlen = need_printf || calls_external(m, &defined_names, "strlen");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -526,9 +377,9 @@ fn translate_impl(
         memcpy: take(need_memcpy),
         malloc: take(need_malloc),
         utoa: take(need_printf),
-        // `%s` needs a runtime strlen; synthesized alongside `utoa` whenever `printf` is present
-        // (one small function — `%s`-free printf programs carry an unused helper, negligible).
-        strlen: take(need_printf),
+        // `%s` needs a runtime strlen (synthesized alongside `utoa` for any `printf`); a direct
+        // `strlen` call also routes here — `need_strlen` covers both (see above).
+        strlen: take(need_strlen),
         realloc: take(need_realloc),
         memmove: take(need_memmove),
         getenv: take(need_getenv),
@@ -687,6 +538,8 @@ fn translate_impl(
     }
     if need_printf {
         funcs.push(synth_utoa());
+    }
+    if need_strlen {
         funcs.push(synth_strlen());
     }
     if need_realloc {
@@ -1598,33 +1451,6 @@ fn translate_func(
     let results = result_types(f.return_type.as_ref(), types)?;
 
     let scan = scan_func(f, types)?;
-    // I13 soundness fail-close: a φ that carries a **tiny all-tail sub-32-bit** wide vector
-    // (≤ 2 lanes of i8/i16 — i.e. a 32-bit `<2 x i16>`/`<2 x i8>`) across a block edge, as in Embench
-    // `edn`'s `fir_no_red_ld` (a carried `<2 x i16>` recombined by a deinterleave shuffle), round-trips
-    // its lanes incorrectly through the per-part block-param fan-out — a *silent miscompile*
-    // (ISSUES.md I13). Until the tiny-tail-lane representation is fixed, refuse it rather than
-    // miscompile. Narrowly scoped to the confirmed-broken 32-bit case: a 4-lane `<4 x i16>` (64-bit)
-    // φ — e.g. the Clay-UI demo's carried point vector — round-trips correctly and is untouched, as are
-    // full-chunk wide φ accumulators (`<8 x i32>`) and all straight-line sub-128 vector ops.
-    for bb in &f.basic_blocks {
-        for instr in &bb.instrs {
-            if let Instruction::Phi(p) = instr {
-                if let Some(layout) = scan.name2id.get(&p.dest).and_then(|id| scan.wide.get(id)) {
-                    if layout.full_chunks == 0
-                        && layout.shape.lane_bytes() < 4
-                        && layout.tail_lanes <= 2
-                    {
-                        return unsup(format!(
-                            "φ of a tiny all-tail sub-32-bit wide vector ({} × {}-byte lane) — silent \
-                             miscompile, fail-closed (ISSUES.md I13)",
-                            layout.tail_lanes,
-                            layout.shape.lane_bytes()
-                        ));
-                    }
-                }
-            }
-        }
-    }
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
@@ -1681,6 +1507,9 @@ fn translate_func(
     }
 
     let mut blocks = Vec::with_capacity(f.basic_blocks.len());
+    // Synthetic blocks appended *after* all real blocks (so real block indices are unchanged): a
+    // sparse `switch` lowers to a comparison chain whose extra blocks land here (see `translate_switch`).
+    let mut aux_blocks: Vec<Block> = Vec::new();
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
         blocks.push(translate_block(
             bb,
@@ -1701,8 +1530,10 @@ fn translate_func(
             helpers,
             ba,
             dbg,
+            &mut aux_blocks,
         )?);
     }
+    blocks.extend(aux_blocks);
     Ok((
         Func {
             params,
@@ -1821,6 +1652,12 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
                     // `mask_lanes`, never used as a scalar — record a placeholder type.
                     Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
+                    // An `i128` result (a `-O2` 16-byte struct-eq coalesce: `load i128` + `icmp`) is
+                    // held as a 2×`i64` aggregate pair, never a scalar — placeholder type, like a
+                    // struct. (Same-block only, the aggregate-side-table assumption.)
+                    Err(_) if matches!(ty.as_ref(), Type::IntegerType { bits: 128 }) => {
+                        ValType::I64
+                    }
                     Err(e) => return Err(e),
                 };
                 s.ty.push(vt);
@@ -8445,6 +8282,19 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `strlen(s)`: the synthesized `__svm_strlen` NUL-scan loop (also used by `printf %s`).
+        "strlen" => {
+            let Some(f) = ctx.helpers.strlen else {
+                return Ok(false); // no strlen helper synthesized → fail-closed
+            };
+            let p = ctx.operand(&c.arguments[0].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![p],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // `getenv(name)`: the synthesized `__svm_getenv` scans the §3e env strings for `name=`.
         "getenv" => {
             let Some(f) = ctx.helpers.getenv else {
@@ -9010,6 +8860,46 @@ fn const_splat_int(op: &Operand) -> Option<u64> {
     Some(first)
 }
 
+/// Lower a **saturating float→int** intrinsic (`llvm.fptosi.sat.<int>.<float>` /
+/// `llvm.fptoui.sat.…`, which Rust's `as` casts from float emit) to svm-IR's `FToISat` — exactly the
+/// saturating semantics (NaN→0, out-of-range→clamped) the on-ramp already gives the plain `fptosi`
+/// instruction (§3b). The src/dst widths are parsed from the mangled name. `Ok(None)` for other calls;
+/// `Unsupported` for a vector form (`v4i32`/…), a later slice.
+fn lower_fp_sat_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    let signed = if name.starts_with("llvm.fptosi.sat.") {
+        true
+    } else if name.starts_with("llvm.fptoui.sat.") {
+        false
+    } else {
+        return Ok(None);
+    };
+    // `llvm.fpto{si,ui}.sat.<int>.<float>` — the last two dot-components are the dst int / src float.
+    let mut parts = name.rsplit('.');
+    let fstr = parts.next().unwrap_or("");
+    let istr = parts.next().unwrap_or("");
+    let dst = match istr {
+        "i32" => IntTy::I32,
+        "i64" => IntTy::I64,
+        _ => return unsup(format!("`{name}` (only i32/i64 result)")),
+    };
+    let src = match fstr {
+        "f32" => FloatTy::F32,
+        "f64" => FloatTy::F64,
+        _ => return unsup(format!("`{name}` (only f32/f64 source)")),
+    };
+    let a = ctx.operand(&c.arguments[0].0)?;
+    Ok(Some(ctx.push(Inst::FToISat {
+        op: ftoi_op(src, dst, signed),
+        a,
+    })))
+}
+
 /// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
 /// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
 /// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
@@ -9037,6 +8927,10 @@ fn lower_int_intrinsic(
             | "llvm.fshr"
             | "llvm.bswap"
             | "llvm.bitreverse"
+            | "llvm.uadd.sat"
+            | "llvm.usub.sat"
+            | "llvm.sadd.sat"
+            | "llvm.ssub.sat"
     ) {
         return Ok(None);
     }
@@ -9076,12 +8970,20 @@ fn lower_int_intrinsic(
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
         }
+        // Per-lane popcount — wasm has it only for `i8x16` (the sole vector `ctpop` width).
+        if base == "llvm.ctpop" {
+            if shape != svm_ir::VShape::I8x16 {
+                return unsup(format!("vector ctpop on {shape:?} (only i8x16)"));
+            }
+            let a = ctx.operand(args[0])?;
+            return Ok(Some(ctx.push(Inst::VPopcnt { a })));
+        }
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
             "llvm.smin" => svm_ir::VIntBinOp::MinS,
             "llvm.umax" => svm_ir::VIntBinOp::MaxU,
             "llvm.umin" => svm_ir::VIntBinOp::MinU,
-            other => return unsup(format!("vector `{other}` (only min/max)")),
+            other => return unsup(format!("vector `{other}` (only min/max or ctpop)")),
         };
         let a = ctx.operand(args[0])?;
         let b = ctx.operand(args[1])?;
@@ -9131,19 +9033,76 @@ fn lower_int_intrinsic(
         // `llvm.fshl(a, b, s)` / `fshr`: funnel shift. The **rotate idiom** (the two value operands
         // identical — what clang emits for `(x<<n)|(x>>(w-n))`, e.g. SHA-256's `ROTRIGHT`) lowers to
         // `rotl`/`rotr`, which mask the count mod width and so have no shift-by-`w` edge case. A true
-        // funnel shift (distinct operands) needs a width-edge-safe `select` sequence — deferred.
+        // funnel shift (distinct operands) with a **constant** amount on a full-width (i32/i64) value
+        // lowers to `(a << s) | (b >>u (w - s))` (`s = amt mod w`; `s == 0` ⇒ the no-shift operand) —
+        // both shift counts are then in `1..w`, so there is no shift-by-`w` edge case. Found via Embench
+        // `aha-mont64`'s `modul64` (a double-word `<< 1` shift-and-subtract → `fshl.i64(hi, lo, 1)`). A
+        // non-constant amount (needs a width-edge-safe `select`) or a sub-32-bit width stays fail-closed.
         "llvm.fshl" | "llvm.fshr" => {
-            if args[0] != args[1] {
-                return unsup(format!("general funnel shift `{name}` (non-rotate)"));
-            }
-            let a = ctx.operand(args[0])?;
-            let amt = ctx.operand(args[2])?;
-            let op = if base == "llvm.fshl" {
-                BinOp::Rotl
+            let is_fshl = base == "llvm.fshl";
+            if args[0] == args[1] {
+                let a = ctx.operand(args[0])?;
+                let amt = ctx.operand(args[2])?;
+                let op = if is_fshl { BinOp::Rotl } else { BinOp::Rotr };
+                ctx.push(Inst::IntBin { ty, op, a, b: amt })
             } else {
-                BinOp::Rotr
-            };
-            ctx.push(Inst::IntBin { ty, op, a, b: amt })
+                let w = src_bits(args[0], types)?;
+                if w != 32 && w != 64 {
+                    return unsup(format!(
+                        "general funnel shift `{name}` on i{w} (only i32/i64)"
+                    ));
+                }
+                let Some(c) = const_int(args[2]) else {
+                    return unsup(format!(
+                        "general funnel shift `{name}` (non-constant amount)"
+                    ));
+                };
+                let s = (c % w as u64) as i64;
+                let a = ctx.operand(args[0])?;
+                let b = ctx.operand(args[1])?;
+                if s == 0 {
+                    // `fshl(a,b,0) = a`, `fshr(a,b,0) = b` (the concatenation shifted by nothing).
+                    if is_fshl {
+                        a
+                    } else {
+                        b
+                    }
+                } else {
+                    // fshl: a's bits go up by `s`, b supplies the low `w-s`; fshr is the mirror.
+                    let (lsh, rsh) = if is_fshl {
+                        (s, w as i64 - s)
+                    } else {
+                        (w as i64 - s, s)
+                    };
+                    let kk = |ctx: &mut BlockCtx, n: i64| {
+                        if ty == IntTy::I64 {
+                            ctx.push(Inst::ConstI64(n))
+                        } else {
+                            ctx.push(Inst::ConstI32(n as i32))
+                        }
+                    };
+                    let lc = kk(ctx, lsh);
+                    let rc = kk(ctx, rsh);
+                    let hi = ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Shl,
+                        a,
+                        b: lc,
+                    });
+                    let lo = ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::ShrU,
+                        a: b,
+                        b: rc,
+                    });
+                    ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Or,
+                        a: hi,
+                        b: lo,
+                    })
+                }
+            }
         }
         // `llvm.bswap` — reverse the value's bytes inline (no SVM op): each source byte `i` is
         // shifted to destination byte `nbytes-1-i`.
@@ -9157,6 +9116,102 @@ fn lower_int_intrinsic(
             let bits = src_bits(args[0], types)?;
             let v = ctx.operand(args[0])?;
             emit_bitreverse(ctx, v, ty, bits)?
+        }
+        // Saturating add/sub (`llvm.{u,s}{add,sub}.sat`): the wrapping op, then clamp on over/underflow
+        // via `select`. Rust's `saturating_add`/`sub` (and slice/capacity math) emit these. Only the
+        // native widths (i32/i64) — a narrow saturating width would need width-specific clamp bounds.
+        "llvm.uadd.sat" | "llvm.usub.sat" | "llvm.sadd.sat" | "llvm.ssub.sat" => {
+            let bits = src_bits(args[0], types)?;
+            if bits != 32 && bits != 64 {
+                return unsup(format!("`{name}` (only i32/i64 saturating)"));
+            }
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let k = |ctx: &mut BlockCtx, v: i64| {
+                ctx.push(if ty == IntTy::I64 {
+                    Inst::ConstI64(v)
+                } else {
+                    Inst::ConstI32(v as i32)
+                })
+            };
+            let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                ctx.push(Inst::IntBin { ty, op, a, b })
+            };
+            match base {
+                // unsigned add: carry (s <u a) ⇒ all-ones (UMAX).
+                "llvm.uadd.sat" => {
+                    let s = bin(ctx, BinOp::Add, a, b);
+                    let carry = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtU,
+                        a: s,
+                        b: a,
+                    });
+                    let umax = k(ctx, -1);
+                    ctx.push(Inst::Select {
+                        cond: carry,
+                        a: umax,
+                        b: s,
+                    })
+                }
+                // unsigned sub: borrow (a <u b) ⇒ 0.
+                "llvm.usub.sat" => {
+                    let under = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtU,
+                        a,
+                        b,
+                    });
+                    let diff = bin(ctx, BinOp::Sub, a, b);
+                    let zero = k(ctx, 0);
+                    ctx.push(Inst::Select {
+                        cond: under,
+                        a: zero,
+                        b: diff,
+                    })
+                }
+                // signed add/sub: overflow when the sign rule is violated ⇒ clamp to SMIN/SMAX by the
+                // sign of `a`. `sadd`: overflow iff `(a^s)&(b^s) < 0`; `ssub`: iff `(a^b)&(a^d) < 0`.
+                "llvm.sadd.sat" | "llvm.ssub.sat" => {
+                    let is_add = base == "llvm.sadd.sat";
+                    let r = bin(ctx, if is_add { BinOp::Add } else { BinOp::Sub }, a, b);
+                    let (l, rr) = if is_add {
+                        (bin(ctx, BinOp::Xor, a, r), bin(ctx, BinOp::Xor, b, r))
+                    } else {
+                        (bin(ctx, BinOp::Xor, a, b), bin(ctx, BinOp::Xor, a, r))
+                    };
+                    let ov_bits = bin(ctx, BinOp::And, l, rr);
+                    let zero = k(ctx, 0);
+                    let ov = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtS,
+                        a: ov_bits,
+                        b: zero,
+                    });
+                    let (smax, smin) = if ty == IntTy::I64 {
+                        (k(ctx, i64::MAX), k(ctx, i64::MIN))
+                    } else {
+                        (k(ctx, i32::MAX as i64), k(ctx, i32::MIN as i64))
+                    };
+                    let neg = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::LtS,
+                        a,
+                        b: zero,
+                    });
+                    let sat = ctx.push(Inst::Select {
+                        cond: neg,
+                        a: smin,
+                        b: smax,
+                    });
+                    ctx.push(Inst::Select {
+                        cond: ov,
+                        a: sat,
+                        b: r,
+                    })
+                }
+                _ => unreachable!(),
+            }
         }
         _ => unreachable!(),
     };
@@ -10745,6 +10800,7 @@ fn translate_block(
     helpers: &Helpers,
     ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
@@ -10821,7 +10877,7 @@ fn translate_block(
     // and falls through to the ordinary `ret` here.)
     let term = match ctx.pending_tail.take() {
         Some(t) => t,
-        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params)?,
+        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params, aux_blocks)?,
     };
     Ok(Block {
         params,
@@ -11097,6 +11153,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 offset: 0,
                 align: 0,
             });
+        } else if let Some(bits) = nonstd_int_bits(st.value.get_type(types).as_ref()) {
+            // Non-power-of-two integer store (e.g. an `i56` niche field): write exactly its bytes.
+            store_nonstd_int(ctx, addr, value, bits);
         } else {
             let op = store_op(st.value.get_type(types).as_ref())?;
             ctx.push_effect(Inst::Store {
@@ -11165,6 +11224,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // A call to an external libm-math function with a direct SVM op (`sqrt`/`floor`/…) lowers
         // inline (only when the guest hasn't defined its own function of that name).
         if let Some(idx) = lower_libm_call(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // Saturating float→int intrinsics (`llvm.fptosi.sat`/`fptoui.sat`, Rust's float `as` casts).
+        if let Some(idx) = lower_fp_sat_intrinsic(ctx, c)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
@@ -11344,6 +11412,80 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         return Ok(());
     }
+    // i128 is held as a **pair of i64 halves** (`[lo, hi]`) in the aggregate side-table — svm-IR has no
+    // 128-bit type. This covers what `-O2` actually produces: clang coalesces a 16-byte struct/array
+    // equality (e.g. comparing `Known`'s `[u8;16]` payload) into a `load i128` + `icmp eq/ne i128`.
+    // Only those two ops are supported; any other i128 use stays a clean `Unsupported`.
+    if let I::Load(l) = instr {
+        if matches!(l.loaded_ty.as_ref(), Type::IntegerType { bits: 128 }) {
+            let addr = ctx.operand(&l.address)?;
+            let lo = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr,
+                offset: 0,
+                align: 0,
+            });
+            let c8 = ctx.const_i64(8);
+            let hi_addr = ctx.add_i64(addr, c8);
+            let hi = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr: hi_addr,
+                offset: 0,
+                align: 0,
+            });
+            if let Some(&vid) = ctx.s.name2id.get(&l.dest) {
+                ctx.agg.insert(vid, vec![lo, hi]);
+            }
+            return Ok(());
+        }
+    }
+    if let I::ICmp(x) = instr {
+        if matches!(
+            x.operand0.get_type(types).as_ref(),
+            Type::IntegerType { bits: 128 }
+        ) {
+            if !matches!(x.predicate, IntPredicate::EQ | IntPredicate::NE) {
+                return unsup(format!("i128 icmp {:?} (only eq/ne)", x.predicate));
+            }
+            let a = ctx
+                .agg_of(&x.operand0)
+                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
+            let b = ctx
+                .agg_of(&x.operand1)
+                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
+            let lo = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: a[0],
+                b: b[0],
+            });
+            let hi = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: a[1],
+                b: b[1],
+            });
+            let mut r = ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: lo,
+                b: hi,
+            });
+            if x.predicate == IntPredicate::NE {
+                let one = ctx.push(Inst::ConstI32(1));
+                r = ctx.push(Inst::IntBin {
+                    ty: IntTy::I32,
+                    op: BinOp::Xor,
+                    a: r,
+                    b: one,
+                });
+            }
+            if let Some(&vid) = ctx.s.name2id.get(&x.dest) {
+                ctx.idx_of.insert(vid, r);
+            }
+            return Ok(());
+        }
+    }
 
     let (dest, idx) = match instr {
         I::Alloca(a) => {
@@ -11386,6 +11528,25 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         align: 0,
                     }),
                 )
+            } else if let Some(bits) = nonstd_int_bits(l.loaded_ty.as_ref()) {
+                // Non-power-of-two integer load (e.g. an `i56` niche-discriminant field): svm-IR has no
+                // `iN` load, so read the enclosing `i64` and mask to N bits. The window-bounded read may
+                // touch up to 3 padding/adjacent bytes, discarded by the mask (the narrow-int path
+                // over-reads the same way); a read straddling the window end traps, which is safe.
+                let raw = ctx.push(Inst::Load {
+                    op: svm_ir::LoadOp::I64,
+                    addr,
+                    offset: 0,
+                    align: 0,
+                });
+                let m = ctx.const_i64(((1u64 << bits) - 1) as i64);
+                let v = ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::And,
+                    a: raw,
+                    b: m,
+                });
+                (&l.dest, v)
             } else {
                 let op = load_op(l.loaded_ty.as_ref())?;
                 (
@@ -12815,6 +12976,31 @@ fn bin<'d>(
         };
         return Ok((dest, ctx.push(inst)));
     }
+    // A **2-lane 32-bit integer vector** (`<2 x i32>`, e.g. the deinterleaved widening multiply in
+    // Embench `edn`'s `fir_no_red_ld`) is carried as a *packed* `i64` (lane 0 low, lane 1 high). A plain
+    // `i64` op on that image is **not** lane-wise: `mul` mixes the lanes (the low product's carry and
+    // the lane0×lane1 cross term land in lane 1), and `add`/`sub`/`shl`/`lshr`/`ashr` carry/shift across
+    // the 32-bit lane boundary. So operate on the two `i32` lanes independently and repack. (The bitwise
+    // `and`/`or`/`xor` would be lane-safe even packed, but lane-wise is uniformly correct.) This is the
+    // ISSUES.md I13 root fix — previously a silent miscompile, narrowly fail-closed via a φ guard.
+    if vec2_lane_ty(a.get_type(types).as_ref()) == Some(ValType::I32) {
+        let la = vec_explode(ctx, a, types, false)?;
+        let lb = vec_explode(ctx, b, types, false)?;
+        let r0 = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op,
+            a: la[0],
+            b: lb[0],
+        });
+        let r1 = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op,
+            a: la[1],
+            b: lb[1],
+        });
+        let packed = ctx.vec_pack(r0, r1, ValType::I32);
+        return Ok((dest, packed));
+    }
     let width = int_bits(a.get_type(types).as_ref());
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
@@ -12965,6 +13151,99 @@ fn finish(ctx: &mut BlockCtx, dest: &Name, idx: ValIdx) -> Result<(), Error> {
     Ok(())
 }
 
+/// The bit width of a **non-power-of-two integer** (33..=63 bits, e.g. an `i56` niche-discriminant
+/// field) that the on-ramp legalizes via the enclosing `i64`. `None` for the natively-handled widths
+/// (≤32 → `i32` container, 64 → `i64`) and non-integers. svm-IR has only `i32`/`i64` memory ops, so a
+/// load of such a width reads the enclosing `i64` and masks to the width; a store splits into exact
+/// byte-width writes (so it never clobbers an adjacent field).
+fn nonstd_int_bits(ty: &Type) -> Option<u32> {
+    match ty {
+        Type::IntegerType { bits } if *bits > 32 && *bits < 64 => Some(*bits),
+        _ => None,
+    }
+}
+
+/// Store a non-power-of-two integer (`bits` in 33..=63, held in an `i64`) **byte-exactly** — exactly
+/// `ceil(bits/8)` bytes, so it never clobbers an adjacent field (unlike an over-write). The low 32
+/// bits go as an `i32`; the remaining 1–3 bytes as `i16`/`i8` chunks shifted down from the high half.
+/// (`bits` ≥ 57 ⇒ 8 bytes ⇒ a plain `i64` store.)
+fn store_nonstd_int(ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx, bits: u32) {
+    use svm_ir::StoreOp;
+    let byte_len = bits.div_ceil(8); // 5..=8 for 33..=63
+    if byte_len >= 8 {
+        ctx.push_effect(Inst::Store {
+            op: StoreOp::I64,
+            addr,
+            value,
+            offset: 0,
+            align: 0,
+        });
+        return;
+    }
+    // Low 32 bits at +0.
+    let lo = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: value,
+    });
+    ctx.push_effect(Inst::Store {
+        op: StoreOp::I32,
+        addr,
+        value: lo,
+        offset: 0,
+        align: 0,
+    });
+    // High bytes (bits 32+) shifted down, written exactly.
+    let c32 = ctx.const_i64(32);
+    let hi = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::ShrU,
+        a: value,
+        b: c32,
+    });
+    let hi32 = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: hi,
+    });
+    let c4 = ctx.const_i64(4);
+    let addr4 = ctx.add_i64(addr, c4);
+    let rem = byte_len - 4; // 1, 2, or 3
+    let wide_op = if rem == 1 {
+        StoreOp::I32_8
+    } else {
+        StoreOp::I32_16
+    };
+    ctx.push_effect(Inst::Store {
+        op: wide_op,
+        addr: addr4,
+        value: hi32,
+        offset: 0,
+        align: 0,
+    });
+    if rem == 3 {
+        // The 7th byte (bits 48..56) at +6.
+        let c48 = ctx.const_i64(48);
+        let hi2 = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::ShrU,
+            a: value,
+            b: c48,
+        });
+        let hi2_32 = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: hi2,
+        });
+        let c6 = ctx.const_i64(6);
+        let addr6 = ctx.add_i64(addr, c6);
+        ctx.push_effect(Inst::Store {
+            op: StoreOp::I32_8,
+            addr: addr6,
+            value: hi2_32,
+            offset: 0,
+            align: 0,
+        });
+    }
+}
+
 /// The `LoadOp` (width + result container) for an LLVM loaded type. Narrow loads zero-extend
 /// into the `i32` container; a following `sext`/`zext` (the §3b discipline) fixes signedness.
 fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
@@ -12981,7 +13260,6 @@ fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
         other => unsup(format!("load of type {other} (Milestone 1+)")),
     }
 }
-
 /// The `StoreOp` (width) for an LLVM stored value type.
 fn store_op(ty: &Type) -> Result<svm_ir::StoreOp, Error> {
     use svm_ir::StoreOp as S;
@@ -13113,6 +13391,33 @@ fn emit_trunc(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32) -> ValIdx {
 /// Lower a `zext`/`sext from→to`. Produces a value whose low `to` bits are the (zero- or sign-)
 /// extended result, in the destination container.
 fn emit_ext(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32, signed: bool) -> ValIdx {
+    // A non-power-of-two source wider than 32 bits (e.g. an `i56` niche field) sits in an `i64`;
+    // extend it **in i64** (the i32 helpers below don't apply). The widening target is always i64.
+    if (33..64).contains(&from) {
+        return if signed {
+            let sh = ctx.const_i64((64 - from) as i64);
+            let l = ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Shl,
+                a: v,
+                b: sh,
+            });
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::ShrS,
+                a: l,
+                b: sh,
+            })
+        } else {
+            let m = ctx.const_i64(((1u64 << from) - 1) as i64);
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::And,
+                a: v,
+                b: m,
+            })
+        };
+    }
     // First make a clean i32 holding the value extended from `from` bits (if `from < 32`).
     let i32v = if from >= 32 {
         v
@@ -13546,6 +13851,7 @@ fn translate_term(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     match term {
         LTerm::Ret(r) => match &r.return_operand {
@@ -13578,7 +13884,7 @@ fn translate_term(
                 else_args,
             })
         }
-        LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params),
+        LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params, aux_blocks),
         LTerm::IndirectBr(ib) => translate_indirectbr(ctx, ib, bi, f, s, block_params),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
         other => unsup(format!("terminator {other:?}")),
@@ -13659,6 +13965,7 @@ fn translate_switch(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     // `br_table`'s index is `i32`; an `i64` operand (e.g. a Rust enum discriminant) is handled by
     // folding its high 32 bits into the index below (an out-of-`[0,2^32)` value forces the default).
@@ -13694,10 +14001,26 @@ fn translate_switch(
     }
     let min = cases.iter().map(|(v, _)| *v).min().unwrap();
     let max = cases.iter().map(|(v, _)| *v).max().unwrap();
-    let span = max - min + 1;
-    if span > MAX_SWITCH_SPAN {
-        return unsup(format!("sparse switch (span {span} > {MAX_SWITCH_SPAN})"));
+    // Compute the span in `i128` so a switch whose `i64` cases straddle more than the `i64` range
+    // (a sparse `match` on a wide value) reports `Unsupported` instead of overflow-panicking. Once
+    // bounded by `MAX_SWITCH_SPAN` it fits `i64`/`usize` for the table below.
+    let span_wide = max as i128 - min as i128 + 1;
+    if span_wide > MAX_SWITCH_SPAN as i128 {
+        // Too sparse for a dense `br_table` (e.g. a niche-optimized enum discriminant with
+        // `i64::MIN`-ish sentinels): lower to an equality compare chain of synthetic blocks instead.
+        return lower_sparse_switch(
+            ctx,
+            sw,
+            bi,
+            f,
+            s,
+            block_params,
+            aux_blocks,
+            &cases,
+            default_blk,
+        );
     }
+    let span = span_wide as i64;
 
     // Index = operand - min (so the table starts at 0). An out-of-range / unbiased value lands on
     // the default (a too-large biased value, ≥ len ⇒ default).
@@ -13788,6 +14111,174 @@ fn translate_switch(
         idx,
         targets,
         default: (default_blk as u32, default_args),
+    })
+}
+
+/// The svm-IR types of a block's parameters, in the fan-out order `branch_args` supplies them: the
+/// data-SP and scalars one slot each (`i64` for the SP), a wide-vector value its `C` `v128` chunks then
+/// `T` lane scalars. Mirrors `translate_block`'s param materialization — used to type the synthetic
+/// blocks of a sparse-switch compare chain so their params line up with the edge args.
+fn block_param_types(param_ids: &[ValueId], s: &Scan) -> Vec<ValType> {
+    let mut types = Vec::new();
+    for &vid in param_ids {
+        if let Some(&layout) = s.wide.get(&vid) {
+            for _ in 0..layout.full_chunks {
+                types.push(ValType::V128);
+            }
+            let lane = layout.shape.lane_val();
+            for _ in 0..layout.tail_lanes {
+                types.push(lane);
+            }
+        } else {
+            types.push(if vid == SP { ValType::I64 } else { s.ty[vid] });
+        }
+    }
+    types
+}
+
+/// Lower a too-sparse `switch` to an **equality compare chain** (§3b). The switch block tests the
+/// operand against the first case (`br_if x == v0 → t0, else → c1`); each synthetic chain block tests
+/// the next case; the last falls through to the default. svm-IR has no first-class sparse jump, and
+/// Rust's niche-optimized enums (discriminants at `i64::MIN`-ish sentinels) produce exactly these
+/// astronomically-sparse switches. The chain blocks are appended to `aux_blocks` — *after* all real
+/// blocks, so existing block indices are unchanged — and thread, as block parameters, everything a
+/// downstream edge consumes: the data-SP (every block's param 0, §3d), the compared operand, and every
+/// case/default target's branch args. Those args are computed **once here**, in the switch block's
+/// context, because φ-operand / live-in resolution needs the real predecessor (`bi`), not the synthetic
+/// blocks; they are then threaded to wherever the chain consumes them.
+#[allow(clippy::too_many_arguments)]
+fn lower_sparse_switch(
+    ctx: &mut BlockCtx,
+    sw: &llvm_ir::terminator::Switch,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
+    cases: &[(i64, usize)],
+    default_blk: usize,
+) -> Result<Terminator, Error> {
+    let width = operand_bits(&sw.operand)?;
+    let cmp_ty = if width <= 32 { IntTy::I32 } else { IntTy::I64 };
+    let operand_ty = if width <= 32 {
+        ValType::I32
+    } else {
+        ValType::I64
+    };
+    let mk_const = |v: i64| {
+        if width <= 32 {
+            Inst::ConstI32(v as i32)
+        } else {
+            Inst::ConstI64(v)
+        }
+    };
+    let operand = ctx.operand(&sw.operand)?;
+
+    // Compute every target's branch args in *this* block's context (φ/live-in resolution needs the
+    // real predecessor `bi`). The returned ids are this-block-local.
+    let default_args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+    let mut case_args: Vec<Vec<ValIdx>> = Vec::with_capacity(cases.len());
+    for &(_, blk) in cases {
+        case_args.push(branch_args(ctx, bi, blk, f, s, block_params)?);
+    }
+
+    // The threaded value set `T`, in order: the data-SP (param 0 of every block), the operand, then
+    // every distinct value any edge consumes. A chain block's params are exactly `T` (this order), so a
+    // value's chain-block param index is its position in `T`.
+    let sp = ctx.sp()?;
+    let mut t_vals: Vec<ValIdx> = Vec::new();
+    let mut pos: HashMap<ValIdx, usize> = HashMap::new();
+    for &v in std::iter::once(&sp)
+        .chain(std::iter::once(&operand))
+        .chain(default_args.iter())
+        .chain(case_args.iter().flatten())
+    {
+        if let std::collections::hash_map::Entry::Vacant(e) = pos.entry(v) {
+            e.insert(t_vals.len());
+            t_vals.push(v);
+        }
+    }
+
+    // Type each threaded value by position: SP is `i64`, the operand its compare type, and every other
+    // value by the target parameter it feeds (`branch_args` and `block_param_types` agree in order).
+    let mut t_types: Vec<ValType> = vec![ValType::I32; t_vals.len()];
+    t_types[pos[&sp]] = ValType::I64;
+    t_types[pos[&operand]] = operand_ty;
+    for (args, target) in std::iter::once((&default_args, default_blk))
+        .chain(case_args.iter().zip(cases.iter().map(|&(_, b)| b)))
+    {
+        for (a, ty) in args.iter().zip(block_param_types(&block_params[target], s)) {
+            t_types[pos[a]] = ty;
+        }
+    }
+
+    // Identity edge: pass all of `T` through unchanged. Remap a this-block arg list to chain-block
+    // param indices (every arg is in `T`).
+    let pass_through: Vec<ValIdx> = (0..t_vals.len() as ValIdx).collect();
+    let remap =
+        |args: &[ValIdx]| -> Vec<ValIdx> { args.iter().map(|a| pos[a] as ValIdx).collect() };
+
+    // Synthetic blocks land after all real blocks and any chain from an earlier switch in this fn.
+    let base = (f.basic_blocks.len() + aux_blocks.len()) as u32;
+    let n = cases.len();
+    // Chain block for case `k` (1..n) has index `base + (k - 1)`; case 0 is the switch block itself.
+    let chain_blk = |k: usize| base + (k as u32 - 1);
+    let x_param = pos[&operand] as ValIdx;
+
+    for k in 1..n {
+        let (v, target) = cases[k];
+        // Block-local ids: params `0..t_vals.len()`, then the two pushed insts.
+        let cst = t_vals.len() as ValIdx;
+        let cond = cst + 1;
+        let insts = vec![
+            mk_const(v),
+            Inst::IntCmp {
+                ty: cmp_ty,
+                op: CmpOp::Eq,
+                a: x_param,
+                b: cst,
+            },
+        ];
+        // Match → target; else → next chain block (pass `T` on) or, for the last, the default.
+        let (else_blk, else_args) = if k + 1 < n {
+            (chain_blk(k + 1), pass_through.clone())
+        } else {
+            (default_blk as u32, remap(&default_args))
+        };
+        aux_blocks.push(Block {
+            params: t_types.clone(),
+            insts,
+            term: Terminator::BrIf {
+                cond,
+                then_blk: target as u32,
+                then_args: remap(&case_args[k]),
+                else_blk,
+                else_args,
+            },
+        });
+    }
+
+    // The switch block's own terminator: test case 0, else enter the chain (threading `T`). A single
+    // case can't exceed `MAX_SWITCH_SPAN`, so `n > 1` here, but handle `n == 1` for totality.
+    let (v0, target0) = cases[0];
+    let cst = ctx.push(mk_const(v0));
+    let cond = ctx.push(Inst::IntCmp {
+        ty: cmp_ty,
+        op: CmpOp::Eq,
+        a: operand,
+        b: cst,
+    });
+    let (else_blk, else_args) = if n > 1 {
+        (chain_blk(1), t_vals.clone())
+    } else {
+        (default_blk as u32, default_args.clone())
+    };
+    Ok(Terminator::BrIf {
+        cond,
+        then_blk: target0 as u32,
+        then_args: case_args[0].clone(),
+        else_blk,
+        else_args,
     })
 }
 
