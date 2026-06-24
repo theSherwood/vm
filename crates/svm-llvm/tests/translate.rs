@@ -1008,6 +1008,27 @@ fn funnel_shift_rotate() {
 }
 
 #[test]
+fn funnel_shift_general_const() {
+    // A **non-rotate** funnel shift with a constant amount — clang's canonical form for a double-word
+    // shift `(hi << k) | (lo >> (64 - k))` (the `fshl.i64(hi, lo, k)` Embench `aha-mont64`'s `modul64`
+    // emits). Distinct operands, so this is the general path: `(a << s) | (b >>u (w - s))`. Three
+    // amounts (1, 5, 63 — `(lo>>1)|(hi<<63)` canonicalizes to `fshl(.,.,63)`) and the full 64-bit result
+    // is folded down into the exit byte, so an error in *any* bit flips it. Bit-exact vs native `cc`.
+    let src = "int run(int seed) {\n\
+        \x20 unsigned long hi = (unsigned long) seed * 0x9E3779B97F4A7C15UL + 1;\n\
+        \x20 unsigned long lo = (unsigned long) seed * 0xC2B2AE3D27D4EB4FUL + 7;\n\
+        \x20 unsigned long a = (hi << 1)  | (lo >> 63);\n\
+        \x20 unsigned long b = (hi << 5)  | (lo >> 59);\n\
+        \x20 unsigned long c = (lo >> 1)  | (hi << 63);\n\
+        \x20 unsigned long r = a ^ (b * 3) ^ c;\n\
+        \x20 r ^= r >> 32; r ^= r >> 16; r ^= r >> 8;\n\
+        \x20 return (int)(r & 0xff);\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("funnel_general", src, 5);
+}
+
+#[test]
 fn variable_length_memset_loop() {
     // A runtime-length zero-fill: clang's loop-idiom recognizer emits `llvm.memset.p0.i64` with a
     // non-constant length, which lowers to a call to the synthesized `__svm_memset` loop helper.

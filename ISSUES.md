@@ -364,6 +364,52 @@ lossless there, then narrow/remove the fail-close guard. A differential fuzz ove
 
 ---
 
+### I14 — on-ramp has no 128-bit integer (`__int128` / `i128`) support (S3) — found via Embench `aha-mont64`
+
+**Symptom.** A `clang -O2` program that uses `__int128` fail-closes at translate with
+`Unsupported("integer width i128 (i128+ unsupported)")`. Found via Embench `aha-mont64`, whose
+`mulul64` does a 64×64→128 widening multiply (`(unsigned __int128)u * v`, then `>>64` / truncate for the
+hi/lo halves) — clang lowers it to `zext i64→i128`, `mul i128`, `lshr 128, 64`, `trunc i128→i64`.
+
+**Where.** There is **no 128-bit integer anywhere in the stack**: `svm-ir`'s scalar value model is
+`I32 | I64 | F32 | F64 | V128` and the interpreter's `Value` enum matches it. The on-ramp rejects
+`bits > 64` in `crates/svm-llvm/src/lib.rs` (`val_type`, ~line 1029), with the same wall in switch
+lowering (`switch on i128`), the load/store width tags, and constant materialization. Integer widths
+33–63 are handled today by living in an `i64` and masking after de-normalizing ops; 128 genuinely needs
+a second word.
+
+**Status (stopgap landed — `aha-mont64` only).** The `embench` example (`examples/embench.rs`) compiles
+`aha-mont64` with **`-U__SIZEOF_INT128__`** (applied to *both* the native and SVM builds so the
+differential stays honest). `mont64.c` has a `#ifdef __SIZEOF_INT128__` guard with a pure-64-bit fallback
+`mulul64`, so undefining the macro routes it to code the on-ramp handles. (The fallback then exposed a
+*separate, unrelated* gap — a constant-amount non-rotate funnel shift `fshl.i64(hi, lo, 1)` from
+`modul64`'s double-word shift — which is now lowered in `lower_int_intrinsic`; see
+`tests/translate.rs::funnel_shift_general_const`.) With both, `aha-mont64` translates and verifies
+`OK (all engines = native, verify=1)`. The i128 piece is a **benchmark-harness workaround, not an engine
+capability**: any `__int128` program without such a fallback still fails closed (which is correct —
+fail-closed, never miscompile).
+
+**Fix sketch (three tiers, by scope):**
+1. *(landed)* Harness sidestep: `-U__SIZEOF_INT128__` for kernels with a 64-bit fallback. Zero engine
+   work; gets `aha-mont64` green. Not a capability.
+2. **Pattern-match the widening multiply** (the high-value slice, ~I13-sized): recognize `mul i128` of two
+   `zext i64` operands feeding `trunc` / `lshr 64`+`trunc` and lower it to a 64×64→128 primitive yielding
+   an `(lo, hi)` i64 pair (a `mul_hi`-style op on the JIT/interp if not already exposed). Covers
+   `aha-mont64` and the overwhelming majority of real `__int128` use (bignum, fixed-point, hashing,
+   mulhi). Self-contained in `svm-llvm`; anything beyond the mulhi idiom still fails closed.
+3. **General i128 legalization** (the real, larger fix): represent every i128 SSA value as a pair of i64
+   parts and thread it through the whole on-ramp — add/sub as carry chains, mul as the schoolbook 64×64
+   expansion, variable shifts as cross-word logic, compares, zext/trunc, loads/stores, **and**
+   phi/call/ret/block-params. Reuses the existing multi-part value-threading machinery (`wide_vals`,
+   `bind_wide`, the block-param fan-out, `branch_args`) that already splits wide vectors into parts — an
+   i128 is just a fixed 2-part case. Bigger mainly because of the carry/borrow/shift arithmetic and the
+   test surface (a differential fuzz over i128 ops: interp vs JIT vs a scalar oracle).
+
+Recommendation: tier 2 when a real-world i128 program (not just a benchmark) needs it; tier 3 only for
+genuine 128-bit *arithmetic* beyond widening multiply, which is rare.
+
+---
+
 ## Resolved
 
 ### I11 — on-ramp fail-closed on auto-vectorized **wide vector shifts** (`shl`/`lshr`/`ashr` on `<8 x i32>`) (S3) — fixed on `claude/perf-i11-i12`

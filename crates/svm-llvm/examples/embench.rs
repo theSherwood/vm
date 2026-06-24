@@ -79,6 +79,14 @@ fn main() {
             if beebs {
                 c.arg(&beebs_def);
             }
+            // `aha-mont64`'s `mulul64` uses `unsigned __int128` for a 64×64→128 widening multiply, which
+            // the on-ramp has no 128-bit integer support for (fail-closes; see ISSUES.md I14). The kernel
+            // has a `#ifdef __SIZEOF_INT128__` guard with a pure-64-bit fallback, so undefining the macro
+            // routes it to code the on-ramp already handles. Applied to *both* the native and SVM builds
+            // so the differential stays honest (both compile the same source).
+            if name == "aha-mont64" {
+                c.arg("-U__SIZEOF_INT128__");
+            }
         };
 
         // Native: compile + run → (per_iter ns, verify checksum).

@@ -77,7 +77,9 @@
 //!   libc `FILE*` stream argument is ignored (the handle is the endpoint). `clang -O2` also lowers
 //!   `printf("…\n")` → `puts` and `printf("%c",c)` → `putc`, so format-free `printf` rides this path.
 //! - **P — funnel shifts + runtime mem-loop helpers (first real corpus demo).** `llvm.fshl`/`fshr`
-//!   lower to `rotl`/`rotr` for the rotate idiom (identical operands — SHA-256's `ROTRIGHT`). A
+//!   lower to `rotl`/`rotr` for the rotate idiom (identical operands — SHA-256's `ROTRIGHT`); the
+//!   general (distinct-operand) case with a **constant** amount on an i32/i64 lowers to
+//!   `(a << s) | (b >>u (w - s))` (Embench `aha-mont64`'s double-word `modul64` shift). A
 //!   variable-length (or oversized-constant) `memset`/`memcpy` calls a **synthesized runtime loop
 //!   helper** (`__svm_memset`/`__svm_memcpy`, a real counted byte loop — the first multi-block helper)
 //!   instead of an inline unroll. Together these make B-Con's **SHA-256** run byte-identical to
@@ -154,7 +156,8 @@
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): `printf` float conversions
 //! (`%f`/`%e`/`%g` — need exact-decimal/bignum formatting), `*` (dynamic width/precision), and
-//! non-constant formats; general (non-rotate) funnel shifts, `llvm.bitreverse`, transcendental math
+//! non-constant formats; general (non-rotate) funnel shifts with a *non-constant* amount (the
+//! constant-amount i32/i64 case is lowered), `llvm.bitreverse`, transcendental math
 //! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
 //! (`<2 x double>`, `<8 x i16>`, dynamic lanes), and `i33`.
 
@@ -8953,19 +8956,68 @@ fn lower_int_intrinsic(
         // `llvm.fshl(a, b, s)` / `fshr`: funnel shift. The **rotate idiom** (the two value operands
         // identical — what clang emits for `(x<<n)|(x>>(w-n))`, e.g. SHA-256's `ROTRIGHT`) lowers to
         // `rotl`/`rotr`, which mask the count mod width and so have no shift-by-`w` edge case. A true
-        // funnel shift (distinct operands) needs a width-edge-safe `select` sequence — deferred.
+        // funnel shift (distinct operands) with a **constant** amount on a full-width (i32/i64) value
+        // lowers to `(a << s) | (b >>u (w - s))` (`s = amt mod w`; `s == 0` ⇒ the no-shift operand) —
+        // both shift counts are then in `1..w`, so there is no shift-by-`w` edge case. Found via Embench
+        // `aha-mont64`'s `modul64` (a double-word `<< 1` shift-and-subtract → `fshl.i64(hi, lo, 1)`). A
+        // non-constant amount (needs a width-edge-safe `select`) or a sub-32-bit width stays fail-closed.
         "llvm.fshl" | "llvm.fshr" => {
-            if args[0] != args[1] {
-                return unsup(format!("general funnel shift `{name}` (non-rotate)"));
-            }
-            let a = ctx.operand(args[0])?;
-            let amt = ctx.operand(args[2])?;
-            let op = if base == "llvm.fshl" {
-                BinOp::Rotl
+            let is_fshl = base == "llvm.fshl";
+            if args[0] == args[1] {
+                let a = ctx.operand(args[0])?;
+                let amt = ctx.operand(args[2])?;
+                let op = if is_fshl { BinOp::Rotl } else { BinOp::Rotr };
+                ctx.push(Inst::IntBin { ty, op, a, b: amt })
             } else {
-                BinOp::Rotr
-            };
-            ctx.push(Inst::IntBin { ty, op, a, b: amt })
+                let w = src_bits(args[0], types)?;
+                if w != 32 && w != 64 {
+                    return unsup(format!("general funnel shift `{name}` on i{w} (only i32/i64)"));
+                }
+                let Some(c) = const_int(args[2]) else {
+                    return unsup(format!("general funnel shift `{name}` (non-constant amount)"));
+                };
+                let s = (c % w as u64) as i64;
+                let a = ctx.operand(args[0])?;
+                let b = ctx.operand(args[1])?;
+                if s == 0 {
+                    // `fshl(a,b,0) = a`, `fshr(a,b,0) = b` (the concatenation shifted by nothing).
+                    if is_fshl {
+                        a
+                    } else {
+                        b
+                    }
+                } else {
+                    // fshl: a's bits go up by `s`, b supplies the low `w-s`; fshr is the mirror.
+                    let (lsh, rsh) = if is_fshl { (s, w as i64 - s) } else { (w as i64 - s, s) };
+                    let kk = |ctx: &mut BlockCtx, n: i64| {
+                        if ty == IntTy::I64 {
+                            ctx.push(Inst::ConstI64(n))
+                        } else {
+                            ctx.push(Inst::ConstI32(n as i32))
+                        }
+                    };
+                    let lc = kk(ctx, lsh);
+                    let rc = kk(ctx, rsh);
+                    let hi = ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Shl,
+                        a,
+                        b: lc,
+                    });
+                    let lo = ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::ShrU,
+                        a: b,
+                        b: rc,
+                    });
+                    ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Or,
+                        a: hi,
+                        b: lo,
+                    })
+                }
+            }
         }
         // `llvm.bswap` — reverse the value's bytes inline (no SVM op): each source byte `i` is
         // shifted to destination byte `nbytes-1-i`.
