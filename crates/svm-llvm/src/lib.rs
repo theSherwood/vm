@@ -351,9 +351,13 @@ fn translate_impl(
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
     let (need_memset, need_memcpy0, need_memmove) = needs_mem_helpers(m);
     let need_memcpy = need_memcpy0 || need_realloc; // `realloc` copies via `__svm_memcpy`
-                                                    // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
-                                                    // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
-                                                    // order below must match.
+                                                    // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
+                                                    // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
+    let need_memcmp =
+        calls_external(m, &defined_names, "memcmp") || calls_external(m, &defined_names, "bcmp");
+    // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
+    // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
+    // order below must match.
     let mut next_helper = base + defined.len() as u32;
     let mut take = |needed: bool| {
         needed.then(|| {
@@ -392,6 +396,7 @@ fn translate_impl(
         dtoa_fix: take(need_dtoa),
         atomic_rmw_narrow: take(need_narrow_atomic),
         atomic_cas_narrow: take(need_narrow_atomic),
+        memcmp: take(need_memcmp),
         float_scratch: float_scratch_base,
     };
 
@@ -583,6 +588,11 @@ fn translate_impl(
     if need_narrow_atomic {
         funcs.push(synth_atomic_rmw_narrow());
         funcs.push(synth_atomic_cas_narrow());
+    }
+    // `__svm_memcmp` (after the atomics — matches the `take` order). Self-contained: it touches only
+    // the two passed window addresses.
+    if need_memcmp {
+        funcs.push(synth_memcmp());
     }
     Ok(Translated {
         module: Module {
@@ -2944,6 +2954,10 @@ struct Helpers {
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
     memmove: Option<u32>,
+    /// `__svm_memcmp(a:i64, b:i64, len:i64) -> i32` — compare `len` bytes as unsigned; `0` if equal,
+    /// else the signed first-mismatch difference (`a[i] - b[i]`). Backs `memcmp` *and* `bcmp` (Rust's
+    /// `[u8]`/slice equality and `BTreeMap` key ordering emit these).
+    memcmp: Option<u32>,
     /// `__svm_getenv(name:i64) -> i64` — scan the §3e env strings for `name=`, returning the value
     /// pointer (just past the `=`) or NULL. Reads the blob in the reserved low scratch directly.
     getenv: Option<u32>,
@@ -3275,6 +3289,116 @@ fn synth_memcpy() -> Func {
         params,
         results: vec![],
         blocks: vec![entry, test, body, done],
+    }
+}
+
+/// Synthesize `__svm_memcmp(a:i64, b:i64, len:i64) -> i32`: compare `len` bytes as **unsigned**.
+/// Returns `0` if all equal, else `a[i] - b[i]` at the first mismatch — each byte is loaded
+/// zero-extended (0..=255), so the `i32` difference carries `memcmp`'s sign. Five blocks: entry seeds
+/// `i=0`; the loop tests `i <u len` (fell through ⇒ all equal ⇒ `0`); the body loads both bytes and
+/// either returns the difference or steps `i`. Backs `memcmp` *and* `bcmp` (a `bcmp` caller only tests
+/// `!= 0`, which this preserves).
+fn synth_memcmp() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64, ValType::I64, ValType::I64]; // a, b, len
+                                                                 // block0(a=0, b=1, len=2): i = 0; br loop(a, b, len, i)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![Inst::ConstI64(0)], // v3 = i
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2, 3],
+        },
+    };
+    let loop_params = vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64]; // a, b, len, i
+                                                                                    // loop(a=0, b=1, len=2, i=3): cond = i <u len; br_if cond → body, else → equal
+    let test = Block {
+        params: loop_params.clone(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 3,
+            b: 2,
+        }], // v4
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 2, // body
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 4, // equal
+            else_args: vec![],
+        },
+    };
+    // body(a=0, b=1, len=2, i=3): av = a[i]; bv = b[i]; if av != bv → diff(av,bv) else loop(.., i+1)
+    let body = Block {
+        params: loop_params,
+        insts: vec![
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 3,
+            }, // v4 = a + i
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 4,
+                offset: 0,
+                align: 0,
+            }, // v5 = av
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 3,
+            }, // v6 = b + i
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 6,
+                offset: 0,
+                align: 0,
+            }, // v7 = bv
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Ne,
+                a: 5,
+                b: 7,
+            }, // v8 = av != bv
+            Inst::ConstI64(1), // v9
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 3,
+                b: 9,
+            }, // v10 = i + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 3, // diff(av, bv)
+            then_args: vec![5, 7],
+            else_blk: 1, // loop(a, b, len, i+1)
+            else_args: vec![0, 1, 2, 10],
+        },
+    };
+    // diff(av=0, bv=1): return av - bv (signed i32 difference of two unsigned bytes).
+    let diff = Block {
+        params: vec![ValType::I32, ValType::I32],
+        insts: vec![Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Sub,
+            a: 0,
+            b: 1,
+        }], // v2
+        term: Terminator::Return(vec![2]),
+    };
+    // equal(): all bytes matched → 0.
+    let equal = Block {
+        params: vec![],
+        insts: vec![Inst::ConstI32(0)], // v0
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I32],
+        blocks: vec![entry, test, body, diff, equal],
     }
 }
 
@@ -8275,6 +8399,22 @@ fn lower_io_call(
         }
         // `free(ptr)`: the bump allocator never reclaims, so this is a no-op.
         "free" => Ok(true),
+        // `memcmp(a,b,n)` / `bcmp(a,b,n)`: the synthesized `__svm_memcmp` (counted unsigned byte
+        // compare). `bcmp` shares it — callers only test `!= 0`, which the `0`-iff-equal result keeps.
+        "memcmp" | "bcmp" => {
+            let Some(f) = ctx.helpers.memcmp else {
+                return Ok(false);
+            };
+            let a = ctx.operand(&c.arguments[0].0)?;
+            let b = ctx.operand(&c.arguments[1].0)?;
+            let n = ctx.operand(&c.arguments[2].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![a, b, n],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // `realloc(ptr, n)`: the synthesized `__svm_realloc` (malloc + header-sized copy).
         "realloc" => {
             let Some(f) = ctx.helpers.realloc else {

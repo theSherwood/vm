@@ -722,6 +722,55 @@ fn switch_sparse_i32() {
 }
 
 #[test]
+fn memcmp_synthesized_helper() {
+    // `memcmp(a, b, n)` with a **runtime** length (so clang emits a real `memcmp` call rather than
+    // folding it) → the synthesized `__svm_memcmp` counted-loop helper. `a = [1..8]`, `b` equal except
+    // `b[3] = x`, then the sign of `memcmp(a, b, n)` is returned. Covers equal, first-mismatch both
+    // directions, a short prefix that stops before the mismatch, and `n == 0`. Differential interp+JIT.
+    let src = "int f(int n, int x){ char a[8]; char b[8]; \
+               for (int i=0;i<8;i++){ a[i]=(char)(i+1); b[i]=(char)(i+1); } \
+               b[3]=(char)x; \
+               int r = __builtin_memcmp(a, b, (unsigned long)(unsigned)n); \
+               return (r>0)-(r<0); }";
+    check(
+        "mc_eq3",
+        src,
+        &[Value::I32(3), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // first 3 match
+    check(
+        "mc_eq8",
+        src,
+        &[Value::I32(8), Value::I32(4)],
+        &[Value::I32(0)],
+    ); // b[3]==a[3]==4
+    check(
+        "mc_lt",
+        src,
+        &[Value::I32(8), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // a[3]=4 < 99
+    check(
+        "mc_gt",
+        src,
+        &[Value::I32(8), Value::I32(0)],
+        &[Value::I32(1)],
+    ); // a[3]=4 > 0
+    check(
+        "mc_short",
+        src,
+        &[Value::I32(4), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // mismatch in range
+    check(
+        "mc_zero",
+        src,
+        &[Value::I32(0), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // n==0 → equal
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";
