@@ -1354,6 +1354,47 @@ pub fn compile_and_run_capture(
     Some((r, snap))
 }
 
+/// Like [`compile_and_run_capture`], but the guest window is backed by a **caller-provided**
+/// [`Region`] (a `Region::shared` over host memory) rather than an engine-`mmap`ped one — the
+/// substrate→engine bridge for the parallel-wasm backend (THREADS.md step 3). On wasm `back` spans the
+/// host's shared linear memory, so the root vCPU here and the per-vCPU Workers a later step spawns all
+/// execute over **one shared window**. Today still cooperative (the existing `drive`); only the
+/// backing changes from owned to borrowed — so a guest's result + final image are identical to
+/// [`compile_and_run_capture`], and its memory effects land in the caller's buffer. (The crate stays
+/// `#![forbid(unsafe_code)]`: the `unsafe` of borrowing host memory is in the embedder's
+/// `Region::shared` call that built `back`.)
+pub fn compile_and_run_capture_over(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    back: std::sync::Arc<super::Region>,
+) -> Option<Capture> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Err(Trap::Malformed), Vec::new()));
+    }
+    let mut host = Host::new();
+    let dom = Domain::new(c, host.jit_table_log2());
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation_over(
+            DEFAULT_RESERVED_LOG2,
+            mc.size_log2,
+            std::sync::Arc::clone(&back),
+        );
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        mm
+    });
+    let r = run(dom, func, args, fuel, &mut mem, &mut host);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .unwrap_or_default();
+    Some((r, snap))
+}
+
 /// Durability seam (Slice 1c-6): the bytecode mirror of [`crate::run_capture_reserved_with_host`] —
 /// seed the window with `init_mem` (which for a durable run carries the state word + shadow region),
 /// run `m`'s transformed entry over a caller-prepared `host` (the powerbox), and snapshot the window

@@ -72,10 +72,23 @@ property, so in practice:
   byte-for-byte across 20k random ops (so it can't drift from `Mapped`), and both pass under **Miri**
   (no UB / data race / provenance error). Compiles clean for `wasm32`; `Mapped` left untouched (zero
   regression to the existing TCB). The engine doesn't use it yet — that's Steps 3–4.
-- [ ] **Step 3 — the executor seam.** `Cooperative` | `Parallel` behind one interface
-  (`spawn`/`wait`/`notify`); the threads build runs either, host-selected, cooperative default.
-- [ ] **Step 4 — `thread.spawn` → Worker-spawn import + atomic futex**, then differential-test the
-  parallel backend against the cooperative oracle on the existing corpus.
+- [x] **Step 3 — engine over a caller-owned shared window (the substrate→engine bridge).** Reading
+  the engine reshaped this step: the bytecode `drive` *is* the cooperative executor (a one-thread
+  `tasks` loop), so a "Cooperative | Parallel executor seam" isn't a trait swapped inside `drive` —
+  the parallel executor is a *different driver* (per-Worker), which folds into Step 4 alongside the
+  host mode selection. The real prerequisite, done here, is letting the engine **run over the shared
+  backing**: `Mem::with_reservation_over(Arc<Region>)` + the public `bytecode::compile_and_run_capture_over`
+  take a caller-built `Region::shared` window instead of an engine-`mmap`ped one. The engine stays
+  `#![forbid(unsafe_code)]` (it accepts a pre-built `Arc<Region>`; the `unsafe` borrow lives in the
+  embedder's `Region::shared`); `Region` is now re-exported from `svm-interp`. Verified
+  (`bytecode_shared_window.rs`): a compute+memory guest over the caller-owned window is **byte-identical**
+  (result + final image) to the engine's own backing and its writes land in the caller's buffer, and
+  the 8-vCPU `thread.spawn`+atomics+futex kernel runs cooperatively over the shared window → **4000**.
+  This is the exact window the parallel mode will run every Worker over.
+- [ ] **Step 4 — the parallel driver + host mode selection.** A driver that runs each `thread.spawn`ed
+  vCPU on a Worker (`thread.spawn` → Worker-spawn import) over the shared window from Step 3, with the
+  futex on `memory.atomic.wait`/`notify`; selected by a host-set mode (`Cooperative` default |
+  `Parallel`). Then differential-test the parallel backend against the cooperative oracle on the corpus.
 
 ### Known wrinkles (surfaced for later steps)
 
