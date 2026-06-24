@@ -321,7 +321,7 @@ fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
         FBinOp::Div => a / b,
         FBinOp::Min => fmin32(a, b),
         FBinOp::Max => fmax32(a, b),
-        FBinOp::Copysign => a.copysign(b),
+        FBinOp::Copysign => libm::copysignf(a, b),
     }
 }
 fn fbin64(op: FBinOp, a: f64, b: f64) -> f64 {
@@ -332,17 +332,17 @@ fn fbin64(op: FBinOp, a: f64, b: f64) -> f64 {
         FBinOp::Div => a / b,
         FBinOp::Min => fmin64(a, b),
         FBinOp::Max => fmax64(a, b),
-        FBinOp::Copysign => a.copysign(b),
+        FBinOp::Copysign => libm::copysign(a, b),
     }
 }
 fn fun32(op: FUnOp, a: f32) -> f32 {
     match op {
-        FUnOp::Abs => a.abs(),
+        // `abs`/`copysign`/`sqrt`/`ceil`/`floor`/`trunc`/round-ties-even are not in `core` on the
+        // on-ramp's pinned `rustc 1.81` (they need libm); since this crate is `no_std`, route them
+        // through the `libm` crate. All are *correctly-rounded* (or exact) IEEE ops, so libm is
+        // bit-identical to the `std` methods the interpreter uses — the differential harness proves it.
+        FUnOp::Abs => libm::fabsf(a),
         FUnOp::Neg => -a,
-        // `sqrt`/`ceil`/`floor`/`trunc`/round-ties-even live in `std`, not `core` (they need libm);
-        // since this crate is `no_std` (to compile to svm-IR), route through the `libm` crate. These
-        // are all *correctly-rounded* IEEE ops, so libm is bit-identical to the `std` methods the
-        // interpreter uses — the differential harness (folds vs interp) is the proof.
         FUnOp::Sqrt => libm::sqrtf(a),
         FUnOp::Ceil => libm::ceilf(a),
         FUnOp::Floor => libm::floorf(a),
@@ -352,7 +352,7 @@ fn fun32(op: FUnOp, a: f32) -> f32 {
 }
 fn fun64(op: FUnOp, a: f64) -> f64 {
     match op {
-        FUnOp::Abs => a.abs(),
+        FUnOp::Abs => libm::fabs(a),
         FUnOp::Neg => -a,
         FUnOp::Sqrt => libm::sqrt(a),
         FUnOp::Ceil => libm::ceil(a),
