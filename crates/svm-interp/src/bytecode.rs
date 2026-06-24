@@ -1440,6 +1440,244 @@ pub fn compile_and_run_capture_over_parallel(
     Some((r, snap))
 }
 
+// === THREADS.md step 4c-wasm — the resumable per-vCPU primitive ==================================
+// `drive_parallel` runs a guest's vCPUs on native OS threads it spawns itself. The browser can't:
+// wasm32 has no `thread::spawn`, so a guest `thread.spawn` must bubble out to JS, which creates a
+// Worker that re-enters the engine to run that one vCPU. That needs a *resumable, single-vCPU* entry
+// the **host** orchestrates — pausing on each multi-vCPU event (`thread.spawn`/`join`,
+// `memory.wait`/`notify`) and resuming once the host has serviced it. `Program` + `Vcpu` are exactly
+// that primitive (platform-agnostic, no threads, no FFI): the wasm embedder drives them across Workers
+// with the real `memory.atomic.wait`/`notify` futex, and the native orchestration test drives them
+// across `std::thread`s as the differential proof.
+
+/// A compiled module, shareable **read-only** across vCPUs / threads / Workers (its [`Domain`] is
+/// `Sync`). Built once per run; each [`Vcpu`] borrows it. Also carries the memory declaration + data
+/// segments so each vCPU can build its window over the shared backing.
+pub struct VcpuProgram {
+    dom: Domain,
+    mem_size_log2: Option<u8>,
+    data: Vec<svm_ir::Data>,
+}
+
+impl VcpuProgram {
+    /// Compile `m` for the bytecode engine, or `None` if it uses an op outside the engine's subset.
+    pub fn compile(m: &Module) -> Option<VcpuProgram> {
+        let c = compile_module(&m.funcs)?;
+        let dom = Domain::new(c, Host::new().jit_table_log2());
+        Some(VcpuProgram {
+            dom,
+            mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
+            data: m.data.clone(),
+        })
+    }
+
+    /// Number of functions (a `thread.spawn` target is bounds-checked against this).
+    pub fn func_count(&self) -> usize {
+        self.dom.mods[0].progs.len()
+    }
+}
+
+/// A host-serviced pause point of a [`Vcpu`]. Everything the engine can't do alone on one thread
+/// becomes one of these; the host performs the effect (spawn a Worker, futex-wait, …) and resumes the
+/// vCPU with the result. Mirrors the cooperative `drive`'s `VcpuStop` arms, but handed to an external
+/// orchestrator instead of serviced in-process.
+pub enum VcpuEvent {
+    /// The vCPU finished with these results.
+    Done(Vec<Value>),
+    /// The vCPU trapped (a child-join trap propagates here too).
+    Trapped(Trap),
+    /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_handle`] with the
+    /// handle the guest will `join` it by (the host assigns handles densely per spawner: 0, 1, …).
+    Spawn { func: u32, sp: i64, arg: i64 },
+    /// `thread.join`: obtain child `handle`'s result, then call [`Vcpu::deliver_join`].
+    Join { handle: i32 },
+    /// `memory.wait`: run the futex wait on `addr`, then call [`Vcpu::deliver_code`] with the wasm code
+    /// (0 = woken, 1 = not-equal, 2 = timed-out).
+    Wait {
+        addr: u64,
+        expected: u64,
+        width: u32,
+        timeout: u64,
+    },
+    /// `memory.notify`: wake up to `count` waiters on `addr`, then call [`Vcpu::deliver_code`] with the
+    /// number actually woken.
+    Notify { addr: u64, count: i32 },
+}
+
+/// One **resumable** vCPU over a shared window. The host calls [`run`](Vcpu::run) to advance it until a
+/// [`VcpuEvent`], services the event, delivers the result (`deliver_*`), and runs again — so the same
+/// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope (as
+/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute; §14
+/// `instantiate` / §22 JIT install fail closed (they need a `&mut Domain`). Carries a deny-all `Host`.
+pub struct Vcpu<'p> {
+    prog: &'p VcpuProgram,
+    vt: VTask,
+    fibers: Vec<FiberState>,
+    fiber_sp: Vec<u64>,
+    fiber_meta: Vec<(i32, i64)>,
+    mem: Option<Mem>,
+    fuel: u64,
+    host: Host,
+    /// The dst register awaiting a `deliver_*` after a host-serviced event.
+    pending: Option<u32>,
+    /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
+    trap: Option<Trap>,
+}
+
+impl<'p> Vcpu<'p> {
+    /// The **root** vCPU: builds its window over `back` and **seeds + data-initialises** it (the once,
+    /// before any child shares it).
+    pub fn new_root(
+        prog: &'p VcpuProgram,
+        func: u32,
+        args: &[Value],
+        back: std::sync::Arc<super::Region>,
+        init_mem: &[u8],
+    ) -> Result<Vcpu<'p>, Trap> {
+        let mem = prog.mem_size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            mm.seed(init_mem);
+            mm.init_data(&prog.data);
+            mm
+        });
+        Vcpu::with_mem(prog, func, args, mem)
+    }
+
+    /// A `thread.spawn`ed **child** vCPU: shares `back` but does **not** re-seed (the window is already
+    /// live with the root's image + every vCPU's writes).
+    pub fn new_child(
+        prog: &'p VcpuProgram,
+        func: u32,
+        args: &[Value],
+        back: std::sync::Arc<super::Region>,
+    ) -> Result<Vcpu<'p>, Trap> {
+        let mem = prog
+            .mem_size_log2
+            .map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
+        Vcpu::with_mem(prog, func, args, mem)
+    }
+
+    fn with_mem(
+        prog: &'p VcpuProgram,
+        func: u32,
+        args: &[Value],
+        mem: Option<Mem>,
+    ) -> Result<Vcpu<'p>, Trap> {
+        if func as usize >= prog.dom.mods[0].progs.len() {
+            return Err(Trap::Malformed);
+        }
+        Ok(Vcpu {
+            vt: VTask::new(&prog.dom.mods[0], func as usize, args)?,
+            fibers: Vec::new(),
+            fiber_sp: Vec::new(),
+            fiber_meta: Vec::new(),
+            mem,
+            fuel: u64::MAX,
+            host: Host::new(),
+            prog,
+            pending: None,
+            trap: None,
+        })
+    }
+
+    /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
+    /// `deliver_*` the result of any `Spawn`/`Join`/`Wait`/`Notify` before calling `run` again.
+    pub fn run(&mut self) -> VcpuEvent {
+        if let Some(t) = self.trap.take() {
+            return VcpuEvent::Trapped(t);
+        }
+        debug_assert!(
+            self.pending.is_none(),
+            "deliver the last event before resuming"
+        );
+        let mut ctx = RunCtx {
+            table: &self.prog.dom.table,
+            fuel: &mut self.fuel,
+            mem: &mut self.mem,
+            durable: false,
+            host: &mut self.host,
+        };
+        match step_vcpu(
+            &mut self.vt,
+            &mut self.fibers,
+            &mut self.fiber_sp,
+            &mut self.fiber_meta,
+            &self.prog.dom,
+            &mut ctx,
+            u64::MAX,
+        ) {
+            Err(t) => VcpuEvent::Trapped(t),
+            Ok(VcpuStop::Done(vals)) => VcpuEvent::Done(vals),
+            Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
+                if func as usize >= self.prog.dom.mods[0].progs.len() {
+                    return VcpuEvent::Trapped(Trap::Malformed);
+                }
+                self.pending = Some(dst);
+                VcpuEvent::Spawn { func, sp, arg }
+            }
+            Ok(VcpuStop::Join { handle, dst }) => {
+                self.pending = Some(dst);
+                VcpuEvent::Join { handle }
+            }
+            Ok(VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            }) => {
+                self.pending = Some(dst);
+                VcpuEvent::Wait {
+                    addr: base,
+                    expected,
+                    width,
+                    timeout,
+                }
+            }
+            Ok(VcpuStop::Notify { base, count, dst }) => {
+                self.pending = Some(dst);
+                VcpuEvent::Notify { addr: base, count }
+            }
+            // §14 instantiate / §22 JIT need a `&mut Domain` the host-orchestrated driver can't share.
+            Ok(_) => VcpuEvent::Trapped(Trap::ThreadFault),
+        }
+    }
+
+    /// Deliver a `thread.spawn` handle (after `Spawn`).
+    pub fn deliver_handle(&mut self, handle: i32) {
+        self.deliver_code(handle);
+    }
+
+    /// Deliver a `Wait` wasm code or a `Notify` woken-count into the pending dst.
+    pub fn deliver_code(&mut self, v: i32) {
+        let dst = self.pending.take().expect("deliver with no pending event");
+        self.vt.active.set(dst, Reg::from_i32(v));
+    }
+
+    /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
+    /// child trap propagates (the joiner traps on its next `run`).
+    pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
+        let dst = self.pending.take().expect("deliver with no pending event");
+        match res {
+            Ok(vals) => {
+                let v = vals.first().copied().unwrap_or(Value::I64(0));
+                self.vt.active.set(dst, Reg::from_value(v));
+            }
+            Err(t) => self.trap = Some(t),
+        }
+    }
+
+    /// Snapshot this vCPU's window (its `[0, prefix_len)` span) after it finishes — the root's image
+    /// for capture. (The bytes also live in the shared backing the host handed in, so a wasm host can
+    /// read them straight from the `SharedArrayBuffer` instead.)
+    pub fn snapshot(&self, prefix_len: u64) -> Vec<u8> {
+        self.mem
+            .as_ref()
+            .map(|m| m.snapshot(prefix_len))
+            .unwrap_or_default()
+    }
+}
+
 /// Durability seam (Slice 1c-6): the bytecode mirror of [`crate::run_capture_reserved_with_host`] —
 /// seed the window with `init_mem` (which for a durable run carries the state word + shadow region),
 /// run `m`'s transformed entry over a caller-prepared `host` (the powerbox), and snapshot the window
