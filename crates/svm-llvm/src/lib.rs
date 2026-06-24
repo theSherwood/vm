@@ -592,6 +592,17 @@ fn translate_impl(
             // §7 named capability imports (`write`/`read`/`exit` …) the host resolves at load
             // (`resolve_capability_imports`); empty for a pure-compute (kernel) module.
             imports,
+            // First-class function exports: each defined function's name → its final `module.funcs`
+            // index, so a C-compiled module is name-addressable (`call("main")`) like the wasm path.
+            // Mirrors the out-of-band `Translated::exports` (the `.syms` sidecar source).
+            exports: defined
+                .iter()
+                .enumerate()
+                .map(|(i, f)| svm_ir::Export {
+                    name: f.name.clone(),
+                    func: base + i as u32,
+                })
+                .collect(),
             // §6 debug-info waist: the source-line half, mapped from each LLVM `!DILocation` (the
             // variable/type half is blocked on the `llvm-ir` metadata reader — see `DebugAcc`).
             // `None` for a non-`-g` build (no instruction carried a location).

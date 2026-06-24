@@ -133,12 +133,17 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
 - [x] **Dedup the layout constants** — `svm-llvm` now references `svm_ir::POWERBOX_*` with
   compile-time asserts pinning the C `_start` layout to the public ABI (one source of truth).
 
-### Phase 1 — first-class exports (decision #1)
-- [ ] `Module.exports: Vec<Export{name, funcidx}>` in `svm-ir`.
-- [ ] Text grammar (`svm-text`) + binary encode/decode (`svm-encode`).
-- [ ] Verifier: export funcidx in range, names unique.
-- [ ] `link` populates `Module.exports` from `LinkUnit` exports.
-- [ ] `Instance::call(name)` resolves through `Module.exports` (drop the ad-hoc map).
+### Phase 1 — first-class exports (decision #1) — done
+- [x] `Module.exports: Vec<Export{name, func}>` in `svm-ir` + `Module::resolve_export(name)`.
+- [x] Text grammar (`svm-text`): `export "<name>" <funcidx>`, parse + print + round-trip.
+- [x] Binary encode/decode (`svm-encode`): v3 export section (after imports), round-trip.
+- [x] Verifier: export funcidx in range (`ExportFuncOutOfRange`), names unique (`DuplicateExport`).
+- [x] `link` populates `Module.exports` from each unit's exports (declaration order, reindexed).
+- [x] `synth_powerbox_start` registers `"_start"` and shifts existing exports +1 (`offset_func_indices`).
+- [x] Producers populate exports: `svm-wasm` (wasm exports → table), `svm-llvm` (defined fns →
+      name-addressable C modules), `optimize_module` (carried through; 1:1 per-func).
+- [x] `Instance::call(name)` resolves through `Module::resolve_export` (the ad-hoc map is gone).
+- [x] Guest-JIT demos updated to emit the v3 blob format (version byte + empty export section).
 
 ### Phase 2 — name-based dynamic import binding (decision #2)
 - [ ] An `Imports`/host-capability registry keyed by name (grant closures or descriptors).

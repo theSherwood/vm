@@ -2388,10 +2388,17 @@ pub fn synth_powerbox_start(
     // into the reserved tail via `Memory.map`.
     let heap_base = seed_heap.then(|| 1u64 << size_log2);
 
-    // Every existing funcidx shifts up by one — the prepended `_start` becomes function 0.
-    shift_func_indices(&mut module, 1);
+    // Every existing funcidx (in code *and* in the export table) shifts up by one — the prepended
+    // `_start` becomes function 0.
+    offset_func_indices(&mut module, 1);
     let start = build_powerbox_start(entry + 1, &results, entry_sp, n_handles, heap_base);
     module.funcs.insert(0, start);
+    // Expose the bootstrap as a named export so an embedder reaches it by name (`call("_start")`),
+    // not by a magic funcidx. A frontend's own entry export (e.g. "main") survives, shifted above.
+    module.exports.push(Export {
+        name: "_start".to_string(),
+        func: 0,
+    });
     Ok(module)
 }
 
@@ -2465,28 +2472,6 @@ fn build_powerbox_start(
     }
 }
 
-/// Add `by` to every static funcidx reference in `module` — the four `FuncIdx`-bearing forms
-/// ([`Inst::Call`], [`Inst::RefFunc`], [`Inst::ThreadSpawn`], and the [`Terminator::ReturnCall`]
-/// tail call). Used when prepending a function shifts every existing index up.
-/// (`call_indirect`/`return_call_indirect` go through the table, not a static index, so they are
-/// untouched; `cont.new` takes a `funcref` *value* produced by `ref.func`, which is shifted there.)
-fn shift_func_indices(module: &mut Module, by: u32) {
-    for f in &mut module.funcs {
-        for b in &mut f.blocks {
-            for inst in &mut b.insts {
-                match inst {
-                    Inst::Call { func, .. }
-                    | Inst::RefFunc { func }
-                    | Inst::ThreadSpawn { func, .. } => *func += by,
-                    _ => {}
-                }
-            }
-            if let Terminator::ReturnCall { func, .. } = &mut b.term {
-                *func += by;
-            }
-        }
-    }
-}
 
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -2507,6 +2492,13 @@ pub struct Module {
     /// backend is a fail-closed error (resolution is mandatory first). Empty for modules that
     /// inline their capability calls (the legacy `cap.call`-only form).
     pub imports: Vec<Import>,
+    /// Named function **exports** (name → funcidx): the host-addressable entry points, the
+    /// runtime-`Module` analogue of [`LinkUnit::exports`]. Populated by [`link`] from each unit's
+    /// exports, or declared directly by a frontend (`export "name" <funcidx>` in the text IR). Lets
+    /// an embedder reach a function by name ([`resolve_export`]) instead of tracking funcidxs. The
+    /// verifier checks each `func` is in range and names are unique; both backends ignore the table
+    /// (they execute a funcidx). Empty for a module with no named entry points.
+    pub exports: Vec<Export>,
     /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
     /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
     /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
@@ -2514,6 +2506,18 @@ pub struct Module {
     /// interpreter debugger and (later) DWARF/DAP. Slice 1 carries the neutral core (source
     /// locations + variables); the per-producer rich blob is a later field.
     pub debug_info: Option<DebugInfo>,
+}
+
+impl Module {
+    /// Resolve a named [export](Module::exports) to its function index, or `None` if no export
+    /// carries `name`. The verifier guarantees export names are unique, so the first match is the
+    /// only match.
+    pub fn resolve_export(&self, name: &str) -> Option<FuncIdx> {
+        self.exports
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.func)
+    }
 }
 
 /// The neutral core of the debug-info waist (`DEBUGGING.md` §6): everything the interpreter
@@ -2723,6 +2727,17 @@ pub struct SsaLoc {
 pub struct Import {
     pub name: String,
     pub sig: FuncType,
+}
+
+/// A named function **export**: a `name` the host (or a linker) addresses a function by, mapping to
+/// its index in [`Module::funcs`]. The runtime-`Module` analogue of [`LinkUnit::exports`] — wasm-like
+/// name-addressable entry points, so an embedder can `call("main")` without tracking funcidxs. The
+/// verifier checks `func` is in range and names are unique; backends ignore exports (they run a
+/// funcidx). Empty for a module with no named entry points (e.g. a bare kernel run by index).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Export {
+    pub name: String,
+    pub func: FuncIdx,
 }
 
 /// A capability binding resolved from an import name at instantiation (§7): the concrete
@@ -2955,6 +2970,9 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
     let mut funcs_tab: std::collections::HashMap<String, FuncIdx> =
         std::collections::HashMap::new();
     let mut data_tab: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // The merged module's first-class export table — every unit's function exports, in declaration
+    // order (deterministic, unlike a HashMap walk), at their reindexed global funcidxs.
+    let mut exports: Vec<Export> = Vec::new();
     for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
         for (name, local) in &u.exports {
             if *local as usize >= u.module.funcs.len() {
@@ -2968,6 +2986,10 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             {
                 return Err(LinkError::DuplicateSymbol(name.clone()));
             }
+            exports.push(Export {
+                name: name.clone(),
+                func: fbase + local,
+            });
         }
         for (name, local_off) in &u.data_exports {
             if data_tab.insert(name.clone(), dbase + local_off).is_some()
@@ -3020,6 +3042,7 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             .max_by_key(|m| m.size_log2),
         data,
         imports: Vec::new(),
+        exports,
         // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
         debug_info: None,
     })
@@ -3064,6 +3087,10 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
                 *func += offset;
             }
         }
+    }
+    // Named exports point at funcidxs too, so they shift with the functions.
+    for e in &mut m.exports {
+        e.func += offset;
     }
 }
 
@@ -3131,6 +3158,7 @@ mod import_tests {
                     sig: sig_exit,
                 },
             ],
+            exports: vec![],
             debug_info: None,
         }
     }
@@ -3244,6 +3272,7 @@ mod powerbox_start_tests {
             memory: Some(Memory { size_log2: 10 }),
             data: vec![],
             imports: vec![],
+            exports: vec![],
             debug_info: None,
         }
     }
@@ -3279,6 +3308,21 @@ mod powerbox_start_tests {
                 .any(|i| matches!(i, Inst::Call { func: 1, .. })),
             "the entry's static call to the helper must be reindexed +1"
         );
+    }
+
+    #[test]
+    fn registers_start_export_and_shifts_existing_ones() {
+        let mut m = entry_module();
+        // A frontend exports its entry by name; after the prepend it must shift +1 and `_start`
+        // must be registered at funcidx 0.
+        m.exports = vec![Export {
+            name: "main".to_string(),
+            func: 1,
+        }];
+        let m = synth_powerbox_start(m, 1, 3, false).expect("synth");
+        assert_eq!(m.resolve_export("_start"), Some(0), "_start registered at 0");
+        assert_eq!(m.resolve_export("main"), Some(2), "the entry export shifted +1");
+        assert_eq!(m.resolve_export("absent"), None);
     }
 
     #[test]

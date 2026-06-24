@@ -2715,37 +2715,20 @@ fn diff_outcome(
 /// [`svm_jit::compile_and_run_with_host`] directly. This wrapper is the default for the common case.
 pub struct Instance {
     module: Module,
-    exports: HashMap<String, FuncIdx>,
 }
 
 /// Resolve `module`'s §7 named capability imports under the reference host policy
-/// ([`resolve_capability_imports`]), verify the result (the escape-freedom gate, §2a), and register
-/// the powerbox entry. Function 0 is registered under the export name `"_start"`; pass any additional
-/// named exports (name → funcidx, *after* the `_start` prepend) so they can be reached by name too.
+/// ([`resolve_capability_imports`]) and verify the result (the escape-freedom gate, §2a). Entry
+/// points are reached by name through the module's first-class [`svm_ir::Module::exports`] table — a
+/// `svm_ir::synth_powerbox_start` module registers its bootstrap as `"_start"`, and any frontend
+/// export (e.g. `"main"`) survives there too.
 ///
 /// Returns an `Err` (fail-closed) if an import is unbound or the module fails verification — exactly
 /// the gates a frontend's output must pass before it can run.
-pub fn instantiate_with_exports(
-    module: Module,
-    exports: impl IntoIterator<Item = (String, FuncIdx)>,
-) -> Result<Instance, String> {
+pub fn instantiate(module: Module) -> Result<Instance, String> {
     let resolved = resolve_capability_imports(module)?;
     svm_verify::verify_module(&resolved).map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
-    let mut tab: HashMap<String, FuncIdx> = HashMap::new();
-    tab.insert("_start".to_string(), 0);
-    for (name, idx) in exports {
-        tab.insert(name, idx);
-    }
-    Ok(Instance {
-        module: resolved,
-        exports: tab,
-    })
-}
-
-/// [`instantiate_with_exports`] with no extra named exports — the entry is reached as `"_start"`
-/// (function 0, the powerbox bootstrap). The common case for a `synth_powerbox_start` module.
-pub fn instantiate(module: Module) -> Result<Instance, String> {
-    instantiate_with_exports(module, std::iter::empty())
+    Ok(Instance { module: resolved })
 }
 
 impl Instance {
@@ -2762,9 +2745,9 @@ impl Instance {
     /// host capabilities (the escape hatch for pure functions). Either way the interpreter and the
     /// JIT run under identical inputs and must agree (interp == jit), or this returns an `Err`.
     pub fn call(&self, export: &str, args: &[Value]) -> Result<Run, String> {
-        let &fidx = self
-            .exports
-            .get(export)
+        let fidx = self
+            .module
+            .resolve_export(export)
             .ok_or_else(|| format!("no export named `{export}`"))?;
         let is_powerbox = fidx == 0 && is_powerbox_entry(&self.module);
         if is_powerbox {

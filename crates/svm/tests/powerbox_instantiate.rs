@@ -23,6 +23,7 @@ use svm_run::{instantiate, Outcome, Value};
 const HELLO: &str = "\
 memory 15
 data ro 16384 \"hello, powerbox\\n\"
+export \"entry\" 0
 func (i64) -> (i32) {
 block0(v0: i64):
   v1 = i64.const 0
@@ -37,10 +38,12 @@ block0(v0: i64):
 
 #[test]
 fn handwritten_ir_runs_through_the_powerbox_wrapper() {
-    // 1. A frontend emits IR (here, parsed from text) with a named `write` import and an entry.
+    // 1. A frontend emits IR (here, parsed from text) with a named `write` import and a named
+    //    export "entry" (funcidx 0) — first-class imports *and* exports, like wasm.
     let module = svm_text::parse_module(HELLO).expect("frontend IR parses");
     assert_eq!(module.imports.len(), 1, "one named import: \"write\"");
     assert_eq!(module.imports[0].name, "write");
+    assert_eq!(module.resolve_export("entry"), Some(0), "frontend export by name");
 
     // 2. Generalized synth_start: prepend the powerbox `_start` (stdout/stdin/exit — 3 handles), no
     //    heap. The entry is funcidx 0 before the prepend; it becomes funcidx 1 after.
@@ -50,6 +53,14 @@ fn handwritten_ir_runs_through_the_powerbox_wrapper() {
         with_start.funcs[0].params,
         vec![svm_ir::ValType::I32; 3],
         "function 0 is now the 3-handle powerbox _start"
+    );
+    // The frontend export shifted with the prepend, and `_start` is now a first-class export too —
+    // both reachable by name, no funcidx bookkeeping for the embedder.
+    assert_eq!(with_start.resolve_export("_start"), Some(0));
+    assert_eq!(
+        with_start.resolve_export("entry"),
+        Some(1),
+        "the frontend export shifted +1 past the prepended _start"
     );
 
     // 3. The thin wrapper: resolve the `write` import, verify, grant the powerbox, run interp + JIT.
@@ -105,5 +116,26 @@ block0(v0: i64):
     assert!(
         instantiate(with_start).is_err(),
         "an import with no host binding must fail closed at instantiate"
+    );
+}
+
+/// A first-class export pointing past the end of `funcs` is rejected by the verifier (the gate
+/// `instantiate` runs) — a dangling name is fail-closed, never a silent out-of-range dispatch.
+#[test]
+fn dangling_export_fails_verification() {
+    let src = "\
+memory 15
+export \"ghost\" 9
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 0
+  return v1
+}
+";
+    let module = svm_text::parse_module(src).expect("parse");
+    assert_eq!(module.resolve_export("ghost"), Some(9));
+    assert!(
+        instantiate(module).is_err(),
+        "an export funcidx past the functions must fail verification"
     );
 }

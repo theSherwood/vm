@@ -85,7 +85,7 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 2);  // format v2 (the import section below)
+  eb(buf, 3);  // format v3 (the import section + export section below)
   eb(buf, 1);  // memory present
   eb(buf, 16); // size_log2 = 16 (must match this module's 64 KiB window)
   eb(buf, 0);  // no data segments
@@ -105,6 +105,7 @@ static void emit_i64_pair_sig(char *buf) {
 static long emit_service(char *buf) {
   emit_header(buf);
   eb(buf, 0); // 0 imports
+  eb(buf, 0); // 0 exports (v3 export section)
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
@@ -135,6 +136,7 @@ static long emit_client(char *buf) {
   eb(buf, 1); // name length
   eb(buf, 'F');
   emit_i64_pair_sig(buf); // the import's op signature
+  eb(buf, 0);             // 0 exports (v3 export section)
   eb(buf, 1);             // 1 function
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block

@@ -96,6 +96,10 @@ pub enum VerifyError {
     /// top-byte-strip masks (`mask | 0xFF00_0000_0000_0000 == !0`) are allowed; the runtime also
     /// rejects a non-constant mask that violates this at execution.
     GcRootsMaskUnsafe { func: u32, block: u32, mask: u64 },
+    /// A named [`Module::exports`] entry points at a funcidx past the end of `funcs`.
+    ExportFuncOutOfRange { export: u32, func: u32 },
+    /// Two [`Module::exports`] entries share a name — exports must be uniquely addressable.
+    DuplicateExport { export: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -125,6 +129,20 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     let has_memory = m.memory.is_some();
     for (fi, f) in m.funcs.iter().enumerate() {
         verify_func(fi as u32, f, &m.funcs, has_memory)?;
+    }
+    // Named exports must point at a real function and be uniquely addressable (backends ignore the
+    // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
+    // fail-closed here).
+    for (ei, e) in m.exports.iter().enumerate() {
+        if e.func as usize >= m.funcs.len() {
+            return Err(VerifyError::ExportFuncOutOfRange {
+                export: ei as u32,
+                func: e.func,
+            });
+        }
+        if m.exports[..ei].iter().any(|o| o.name == e.name) {
+            return Err(VerifyError::DuplicateExport { export: ei as u32 });
+        }
     }
     Ok(())
 }
