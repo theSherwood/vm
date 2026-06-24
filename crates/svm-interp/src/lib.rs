@@ -1897,11 +1897,12 @@ fn drive(
         // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
         // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
         // dispatch (slice 3.2.1).
+        let root_word = shadow_region_base(root.vcpu_ctx);
         root.root_shadow_sp = thaw_root_sp.unwrap_or_else(|| {
             root.mem
                 .as_ref()
-                .map(|m| m.durable_get_sp())
-                .unwrap_or(SHADOW_BASE)
+                .map(|m| m.durable_get_sp(root_word))
+                .unwrap_or_else(|| shadow_frame_base(root.vcpu_ctx))
         });
         // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
         // ascending slot order, so the dense handle namespace matches the freeze (the root's
@@ -3477,9 +3478,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     // rewinding. Only at root context — a vCPU parked mid-fiber-resume keeps the fiber swap's own
     // bookkeeping (a no-op for the no-fiber slice, where `cur` is always `ROOT_FIBER`).
     if v.durable && v.cur == ROOT_FIBER {
+        // §12.8 4A.5: at root, the active spill context is this vCPU's own; its SP word lives in *its*
+        // region (`shadow_region_base(vcpu_ctx)`), not a shared offset.
+        v.durable_sp_ctx = v.vcpu_ctx;
+        let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_mut() {
             m.durable_set_state(v.dstate);
-            m.durable_set_sp(v.root_shadow_sp);
+            m.durable_set_sp(root_word, v.root_shadow_sp);
         }
     }
     let step = v.run(u64::MAX);
@@ -3487,9 +3492,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
     // from the live words below).
     if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
+        let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_ref() {
             v.dstate = m.durable_state();
-            v.root_shadow_sp = m.durable_get_sp();
+            v.root_shadow_sp = m.durable_get_sp(root_word);
         }
     }
     match step {
@@ -3515,8 +3521,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let self_sp = v
                     .mem
                     .as_ref()
-                    .map(|m| m.durable_get_sp())
-                    .unwrap_or(SHADOW_BASE);
+                    .map(|m| m.durable_get_sp(shadow_region_base(v.vcpu_ctx)))
+                    .unwrap_or_else(|| shadow_frame_base(v.vcpu_ctx));
                 if let Some((func, args)) = v.spawn_residue.clone() {
                     // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
                     // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
@@ -4141,6 +4147,17 @@ fn shadow_region_base(ctx_idx: usize) -> u64 {
     SHADOW_BASE + ctx_idx as u64 * SHADOW_STRIDE
 }
 
+/// Bytes reserved at each region's base for its **per-context shadow-SP word** (§12.8 4A.5): the SP
+/// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
+/// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
+const SHADOW_SP_WORD_LEN: u64 = 8;
+
+/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP word. The empty
+/// (no-frames) extent of a context's shadow stack.
+fn shadow_frame_base(ctx_idx: usize) -> u64 {
+    shadow_region_base(ctx_idx) + SHADOW_SP_WORD_LEN
+}
+
 /// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
 /// `cont.new` checks before handing out a new fiber's region.
 fn shadow_region_fits(ctx_idx: usize) -> bool {
@@ -4184,10 +4201,13 @@ fn fiber_handle_generation(handle: i64) -> u64 {
 /// shadow stacks are empty (frames are pushed only under `UNWINDING`), so a saved SP equals its
 /// region base — but saving/restoring the real word keeps this correct for the freeze/thaw
 /// choreography (slices 3.1.3–4), where a drained fiber carries a non-empty shadow stack.
+#[allow(clippy::too_many_arguments)] // an internal swap helper threading the per-context durable state
 fn shadow_switch(
     mem: &mut Option<Mem>,
     registry: &FiberRegistry,
     root_shadow_sp: &mut u64,
+    root_ctx: usize,
+    sp_ctx: &mut usize,
     durable: bool,
     out_ctx: usize,
     in_ctx: usize,
@@ -4195,21 +4215,38 @@ fn shadow_switch(
     if !durable {
         return;
     }
+    // The incoming context becomes the active spill context for `durable.shadow_base`.
+    *sp_ctx = if in_ctx == ROOT_FIBER {
+        root_ctx
+    } else {
+        shadow_context_index(in_ctx)
+    };
     let Some(m) = mem.as_mut() else { return };
+    // §12.8 4A.5: each context's SP word lives in its **own** region (`shadow_region_base`); the
+    // off-table root uses this vCPU's `root_ctx`, a fiber slot `s` its context `s + 1`. The save/load
+    // mirror the host-side caches — with per-context words the load is a redundant equal-write (the
+    // incoming region already holds its SP), retained for choreography parity with freeze/thaw.
+    let region_of = |ctx: usize| {
+        shadow_region_base(if ctx == ROOT_FIBER {
+            root_ctx
+        } else {
+            shadow_context_index(ctx)
+        })
+    };
     // Save the outgoing context's live SP to its host-side slot.
-    let sp = m.durable_get_sp();
+    let sp = m.durable_get_sp(region_of(out_ctx));
     if out_ctx == ROOT_FIBER {
         *root_shadow_sp = sp;
     } else {
         registry.set_saved_sp(out_ctx, sp);
     }
-    // Load the incoming context's SP into the active word.
+    // Load the incoming context's SP into its (own) region word.
     let in_sp = if in_ctx == ROOT_FIBER {
         *root_shadow_sp
     } else {
         registry.saved_sp(in_ctx)
     };
-    m.durable_set_sp(in_sp);
+    m.durable_set_sp(region_of(in_ctx), in_sp);
 }
 
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
@@ -4461,11 +4498,11 @@ impl FiberRegistry {
         let generation = if reuse.is_some() {
             t.free.pop();
             t.fibers[slot] = RegFiber::Pending { func, sp };
-            t.shadow[slot] = shadow_region_base(slot + 1); // reused region: empty stack at its base
+            t.shadow[slot] = shadow_frame_base(slot + 1); // reused region: empty stack at its frame base
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
             t.fibers.push(RegFiber::Pending { func, sp });
-            t.shadow.push(shadow_region_base(slot + 1));
+            t.shadow.push(shadow_frame_base(slot + 1));
             t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
             0
         };
@@ -4664,8 +4701,14 @@ struct VCpu {
     durable: bool,
     /// The root computation's saved shadow-SP (window offset) while it is parked resuming a fiber
     /// — the off-table root's slot in the per-context saved-SP table (a fiber's lives in the
-    /// registry's `shadow`). The root is context 0, so this starts at [`SHADOW_BASE`].
+    /// registry's `shadow`). The root is context 0, so this starts at [`shadow_frame_base`]`(0)` (its
+    /// in-region SP word at `SHADOW_BASE`, frames just past it).
     root_shadow_sp: u64,
+    /// §12.8 4A.5: the **active spill context** — whose region the running instrumented code addresses
+    /// via `durable.shadow_base`. The root's `vcpu_ctx` while at root, a fiber's `slot + 1` while a
+    /// fiber runs (maintained at the fiber switch), and the driven fiber's during `freeze_drive` (where
+    /// `cur` is the `ROOT_FIBER` sentinel but the spill must land in the fiber's region).
+    durable_sp_ctx: usize,
     /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
     /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
     frozen: Vec<FrozenFiber>,
@@ -4786,7 +4829,8 @@ impl VCpu {
             root_parked: None,
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: SHADOW_BASE,
+            root_shadow_sp: shadow_frame_base(0),
+            durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
             vcpu_ctx: 0,
@@ -4849,7 +4893,8 @@ impl VCpu {
             root_parked: None,
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: SHADOW_BASE,
+            root_shadow_sp: shadow_frame_base(0),
+            durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
             vcpu_ctx: 0,
@@ -5018,12 +5063,14 @@ impl VCpu {
     /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
     /// is a 3.1.5/3.2 follow-up.
     fn freeze_drive(&mut self) -> Result<(), Trap> {
-        // The root's post-unwind SP (context 0); restored at the end so the window is thaw-ready.
+        // §12.8 4A.5: this vCPU's root region word (where the root's SP lives); restored at the end so
+        // the window is thaw-ready (the root rewinds first).
+        let root_word = shadow_region_base(self.vcpu_ctx);
         let root_sp = self
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp())
-            .unwrap_or(SHADOW_BASE);
+            .map(|m| m.durable_get_sp(root_word))
+            .unwrap_or_else(|| shadow_frame_base(self.vcpu_ctx));
         while let Some((slot, mut frames)) = self.registry.take_parked_for_freeze() {
             // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
             let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
@@ -5034,8 +5081,13 @@ impl VCpu {
             if let Some(f) = frames.last_mut() {
                 f.vals.push(Reg::from_i64(0)); // placeholder resume value (inert; not spilled by Yield)
             }
+            // The fiber spills into *its* region: its SP word starts empty (frame base) and
+            // `durable.shadow_base` must resolve to its region during the unwind sub-run (where `cur`
+            // is the `ROOT_FIBER` sentinel), so set the active spill context explicitly.
+            let fctx = shadow_context_index(slot);
+            self.durable_sp_ctx = fctx;
             if let Some(m) = self.mem.as_mut() {
-                m.durable_set_sp(shadow_region_base(shadow_context_index(slot)));
+                m.durable_set_sp(shadow_region_base(fctx), shadow_frame_base(fctx));
             }
             self.frames = frames;
             self.cur = ROOT_FIBER;
@@ -5046,8 +5098,8 @@ impl VCpu {
             let shadow_sp = self
                 .mem
                 .as_ref()
-                .map(|m| m.durable_get_sp())
-                .unwrap_or(SHADOW_BASE);
+                .map(|m| m.durable_get_sp(shadow_region_base(fctx)))
+                .unwrap_or_else(|| shadow_frame_base(fctx));
             self.registry.set_saved_sp(slot, shadow_sp);
             self.frozen.push(FrozenFiber {
                 slot,
@@ -5058,8 +5110,9 @@ impl VCpu {
             });
         }
         // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
+        self.durable_sp_ctx = self.vcpu_ctx;
         if let Some(m) = self.mem.as_mut() {
-            m.durable_set_sp(root_sp);
+            m.durable_set_sp(root_word, root_sp);
         }
         Ok(())
     }
@@ -5181,9 +5234,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         parked_frames,
         durable,
         root_shadow_sp,
+        durable_sp_ctx, // §12.8 4A.5: active spill context, maintained at fiber switches
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
-        vcpu_ctx: _,
+        vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
@@ -5978,6 +6032,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::VcpuTlsSet { val } => {
                     *tls = get_i64(&frames[top].vals, *val)?;
                 }
+                // §12.8 4A.5 durable-runtime-internal: the active context's shadow-SP **word address** —
+                // the base of *its own* region (the SP word is the region's first 8 bytes), so concurrent
+                // vCPUs never share an SP word. The active context is the running fiber's (`cur + 1`) or,
+                // off-table, this vCPU's root context (`vcpu_ctx`). The transform reads no guest-mutable
+                // state, so a guest cannot redirect its own shadow stack.
+                Inst::DurableShadowBase => {
+                    frames[top]
+                        .vals
+                        .push(Reg::from_i64(shadow_region_base(*durable_sp_ctx) as i64));
+                }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
@@ -6040,7 +6104,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Re-point the active shadow-SP from the resumer's region to the target's
                     // (durable runs only) so a freeze that lands while the target runs spills into
                     // the target's own region — never the resumer's.
-                    shadow_switch(mem, registry, root_shadow_sp, durable, *cur, target);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        *cur,
+                        target,
+                    );
                     chain.push(target);
                     *cur = target;
                     *frames = new_frames;
@@ -6060,7 +6133,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     *cur = *chain.last().expect("chain keeps the root");
                     // Hand the active shadow-SP back to the resumer's region (durable runs only):
                     // the suspended fiber's SP is saved to its slot so a later resume restores it.
-                    shadow_switch(mem, registry, root_shadow_sp, durable, leaving, *cur);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -6191,7 +6273,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                  // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
                                                  // above, so its shadow stack lives in its own region; it carries its own state word
                                                  // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
-                        child.root_shadow_sp = shadow_region_base(child_ctx);
+                        child.root_shadow_sp = shadow_frame_base(child_ctx);
                         child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
@@ -6513,13 +6595,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // whereas a non-instrumented fiber that truly returned left it empty. Only the
                     // former is `Frozen` (an instrumented fiber always unwinds at a poll before its
                     // real return, so this never mis-classifies one that should be `Done`).
+                    let lctx = shadow_context_index(leaving);
+                    let region_base = shadow_region_base(lctx);
                     let shadow_sp = mem
                         .as_ref()
-                        .map(|m| m.durable_get_sp())
-                        .unwrap_or(SHADOW_BASE);
-                    let region_base = shadow_region_base(shadow_context_index(leaving));
+                        .map(|m| m.durable_get_sp(region_base))
+                        .unwrap_or_else(|| shadow_frame_base(lctx));
+                    // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word occupies
+                    // the region's first 8 bytes); an empty stack sits exactly at the frame base.
                     let freezing = durable
-                        && shadow_sp > region_base
+                        && shadow_sp > shadow_frame_base(lctx)
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
                     if freezing {
                         let (func, sp) = match popped.as_ref() {
@@ -6548,7 +6633,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Restore the resumer's active shadow-SP (durable runs only). The fiber is
                     // `Done`, so saving its SP is moot, but `shadow_switch` reads the live word
                     // before overwriting it — correct whether or not it had unwound frames.
-                    shadow_switch(mem, registry, root_shadow_sp, durable, leaving, *cur);
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -6655,6 +6749,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
         // loop (`run_inner`), never here.
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
+        // §12.8 4A.5 durable shadow base needs the running vCPU's context, so it's serviced in the
+        // eval loop (`run_inner`), never here.
+        Inst::DurableShadowBase => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
             IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?),
             IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?),
@@ -11025,15 +11122,15 @@ impl Mem {
     /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
     /// the current context's region (D-fiber-cont option A). Falls back to [`SHADOW_BASE`] if the
     /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
-    fn durable_get_sp(&self) -> u64 {
-        self.read_bytes_impl(SHADOW_SP_OFF, 8)
+    fn durable_get_sp(&self, sp_word: u64) -> u64 {
+        self.read_bytes_impl(sp_word, 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(SHADOW_BASE)
     }
 
-    fn durable_set_sp(&mut self, sp: u64) {
-        let _ = self.write_bytes_impl(SHADOW_SP_OFF, &sp.to_le_bytes());
+    fn durable_set_sp(&mut self, sp_word: u64, sp: u64) {
+        let _ = self.write_bytes_impl(sp_word, &sp.to_le_bytes());
     }
 
     /// The durable state word at [`STATE_OFF`] (the freeze driver's trigger). `STATE_NORMAL` if the

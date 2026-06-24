@@ -20,7 +20,7 @@
 
 use svm_durable::{
     arm_freeze_after, init_durable_window, read_state, transform_module, write_state, SHADOW_BASE,
-    SHADOW_SP_OFF, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
+    STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use svm_ir::{
@@ -422,11 +422,17 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
     }
 }
 
+// §12.8 4A.5: the root context's shadow-SP word is the first 8 bytes of its region (at `SHADOW_BASE`),
+// not the legacy global `SHADOW_SP_OFF`. Frames grow just past it, so an empty root stack reads
+// `SHADOW_BASE + 8`.
 fn read_sp(w: &[u8]) -> u64 {
     let mut b = [0u8; 8];
-    b.copy_from_slice(&w[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
+    b.copy_from_slice(&w[SHADOW_BASE as usize..SHADOW_BASE as usize + 8]);
     u64::from_le_bytes(b)
 }
+
+/// The empty (no-frames) root shadow-SP under the 4A.5 per-context layout.
+const ROOT_EMPTY_SP: u64 = SHADOW_BASE + 8;
 
 // ---- Fiber generator + freeze/thaw property (Phase 3.1 hardening) ----
 //
@@ -598,7 +604,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
     assert!(r_freeze.is_ok(), "freeze returns a placeholder, not a trap");
     assert_eq!(frozen.len(), 1, "the single fiber was flattened");
     assert!(
-        read_sp(&snap) >= SHADOW_BASE,
+        read_sp(&snap) >= ROOT_EMPTY_SP,
         "the root's shadow-SP is in-reserve"
     );
 
@@ -906,7 +912,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
         STATE_UNWINDING,
         "artifact is still UNWINDING (the stack unwound, did not complete)"
     );
-    assert!(read_sp(&snap) > SHADOW_BASE, "a shadow frame was pushed");
+    assert!(read_sp(&snap) > ROOT_EMPTY_SP, "a shadow frame was pushed");
 
     // --- (3) thaw on a fresh host whose clock *continues* from the freeze (D-scope: the
     // host clock is not in the artifact). The frozen suspend point's result must be

@@ -98,6 +98,11 @@ mod os_thread_rt;
 // (substrate-independent), so a plain non-fiber root has a TLS word too.
 mod vcpu_tls;
 
+// §12.8 4A.5 durable-runtime-internal per-OS-thread shadow-region base (`durable.shadow_base`): the
+// base of the region the running durable context spills into, so concurrent vCPUs each have their own
+// per-context shadow-SP word (retiring the shared `SHADOW_SP_OFF`). Runtime-private (no guest setter).
+mod durable_shadow;
+
 // Migratable-fiber ownership protocol (D57 / DESIGN.md §23): the loom-verified single-owner atomic
 // state machine that guarantees a stolen fiber is resumed by exactly one thread — the gating safety
 // core of stackful work-stealing, proven in isolation before the runtime integration + cross-thread
@@ -2392,7 +2397,7 @@ impl CompiledModule {
             frozen_vcpus_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
-            thaw_root_sp: DURABLE_SHADOW_BASE, // empty extent (context 0's region base)
+            thaw_root_sp: DURABLE_SHADOW_BASE + 8, // §12.8 4A.5: empty root extent = frame base (past the SP word)
             freeze_ctl: None,
             #[cfg(fiber_rt)]
             fiber_rt,
@@ -2787,6 +2792,10 @@ impl CompiledModule {
         // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
         // worker thread carries from a prior run before guest code can `vcpu.tls.get` it.
         vcpu_tls::seed(0);
+        // §12.8 4A.5: seed the durable shadow-base register to the root's region (context 0 =
+        // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
+        // shadow-SP word.
+        durable_shadow::seed(DURABLE_SHADOW_BASE);
         // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
         // guarded call (the guest is about to block in its loop), and retire it right after — so a
         // `request_freeze` can only ever store into the window while it is mapped (freed below).
@@ -2839,7 +2848,10 @@ impl CompiledModule {
             // active shadow-SP to context 0's region (root rewinds first on thaw), but the children
             // below overwrite the shared word with their own extents, so the root's must be read here
             // (its implicit residue, reported separately for a thaw to restore).
-            (*this).frozen_root_sp_out = fiber_rt::read_shadow_sp(mem_base as u64);
+            // §12.8 4A.5: the root's shadow-SP word lives in its own region (context 0); children no
+            // longer share it.
+            (*this).frozen_root_sp_out =
+                fiber_rt::read_shadow_sp(mem_base as u64, fiber_rt::shadow_region_base(0));
             // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
             // request, returning the handle) so the root could unwind first — matching the interp,
             // which enqueues a child and runs it only after the spawning vCPU yields. Now that the
@@ -3571,6 +3583,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
                 // (works for a plain non-fiber root), so supported on every target.
                 Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
+                // §12.8 4A.5 durable-runtime-internal: a baked thunk over a per-OS-thread word (like
+                // the TLS register), so supported on every target.
+                Inst::DurableShadowBase => {}
                 // `i64x2` min/max has no single-instruction lowering on the target ISAs, so Cranelift
                 // can't legalize it; bail to `Unsupported` (the interp oracle still covers it, and wasm
                 // never emits it — `i64x2` has no min/max op). `i8x16.mul` *is* now lowered (widen →
@@ -4329,6 +4344,19 @@ fn lower_block(
             tsig.returns.push(AbiParam::new(I64));
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, vcpu_tls::get as *const () as i64);
+            let call = b.ins().call_indirect(tref, thunk, &[]);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §12.8 4A.5 durable-runtime-internal: read the current context's shadow-region base from the
+        // per-OS-thread register (a baked thunk, like `vcpu.tls.get`; cannot fault, no window/trap
+        // context). The durable transform emits this to address this context's own shadow-SP word.
+        if let Inst::DurableShadowBase = inst {
+            let mut tsig = module.make_signature();
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, durable_shadow::get as *const () as i64);
             let call = b.ins().call_indirect(tref, thunk, &[]);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
