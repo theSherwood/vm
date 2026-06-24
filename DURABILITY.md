@@ -1073,6 +1073,95 @@ original site map is retained below for reference:
   empty-section path) → `SHADOW_BASE + 8`. Bump `FORMAT_VERSION` 4 → 5. Guard with the `durable_jit`
   cross-backend fuzz (byte-identical interp↔JIT) — the all-or-nothing oracle for this step.
 
+**Stage (ii) — concurrent multi-vCPU STW freeze (JIT). LANDED.** With per-context SP landed, children
+unwind *concurrently* into disjoint region words with no shared scratch and no lock. A new entry
+(`..._durable_mv_interruptible`) engages the concurrent path; `thread_spawn` reserves a per-context
+shadow context for a durable child spawned during NORMAL; `run_child` seeds the durable shadow-base
+register and, on a freeze-unwind (UNWINDING + spilled past its frame base), records the child's
+`FrozenVCpu` residue. **`join_all` is the coordinator-wait** — the per-context relocation made the 4A.4
+barrier's serialization unnecessary, so each child's freeze-unwind simply completes its OS thread and
+`join_all` blocks until all have; the concurrent residue is then drained (after the join) so the
+snapshot sees a fully-quiesced window. The quiesce barrier is retained as a loom-verified primitive.
+Pinned by `crates/svm/tests/durable_concurrent_jit.rs`: a root + two children all freeze mid-loop under
+an async `request_freeze` and the thaw reproduces the result (each total in its own guest-memory slot, so
+the round-trip is robust to which context froze when). The tests use a **spawn-before-freeze handshake**
+(the root signals via a host fn once children are spawned; the controller requests the freeze only then)
+— otherwise the async freeze fires before the root's `thread.spawn`s and the children are *deferred* to
+the single-worker path. (That handshake also surfaced a real bug, since fixed: a concurrent child never
+initialised its region's shadow-SP word, so on a freeze it spilled over the reserve header — `run_child`
+now seeds it to the frame base.)
+
+*Follow-up A — `thread.join` result across a concurrent freeze (LANDED).* A concurrent child that
+finishes *before* the freeze point delivers its result to the host-side Done cell, which the snapshot
+doesn't capture, so the root's later (post-freeze) `thread.join` couldn't resolve on thaw. Now
+`run_child` records every completed concurrent child; on a freeze the coordinator turns them into
+`completed_result` `FrozenVCpu` residue (`FORMAT_VERSION` 5→6), and the thaw delivers each result into
+the spawner's join table **without re-running** the child (its effects are already in the snapshot).
+Emitting *all* completed children keeps the per-parent table dense so every handle still resolves.
+Pinned by `concurrent_join_result_survives_a_freeze_before_the_join`.
+
+*Follow-up B.1 — concurrent child owns fibers (LANDED).* `run_child` now arms the child's fiber runtime
+durable (`set_durable_env`) and, on a freeze-unwind, runs its own `freeze_drive` over its parked fibers
+(the concurrent mirror of `run_child_inline`'s), draining the residue into the domain accumulator
+(collected after `join_all`). Pinned by `concurrent_child_owns_fiber_through_freeze_thaw`. **Scope:** this
+covers a child whose fiber is **cleanly parked** at the freeze point (the test's signal-after-park
+handshake). A child caught with its fiber still *mid-resume-chain* is the deferred path's slice-3.2 case
+and is **not yet verified** on the concurrent path — the test asserts the strong properties only on the
+clean shape and skips otherwise (an over-subscribed runner can land the freeze in the harder
+interleaving; that path is a follow-up, not a guaranteed-correct case today).
+
+*Follow-up B.2 — nested concurrent spawns (FAIL-CLOSED; full support remaining).* A *concurrent* child
+that itself `thread.spawn`s a grandchild would mis-attribute the grandchild's `parent_task`:
+`thread_spawn` reads the **shared** `Domain::cur_task`, which only the single-worker inline/thaw paths
+maintain — `run_child` never sets it, and it would race across concurrent spawners anyway. Rather than
+emit a silently-wrong artifact, a nested concurrent spawn now **fails closed** with a clean
+`ThreadFault` (a per-OS-thread `IN_CONCURRENT_CHILD` flag set in `run_child`, checked in `thread_spawn`),
+pinned by `nested_concurrent_spawn_fails_closed`. **Full support** needs a per-OS-thread spawning-task
+source (seed the child's task in `run_child`; read it in `thread_spawn` instead of the shared
+`cur_task`) + a nested concurrent test (root → child → grandchild, all frozen, thaw rebuilds the
+per-parent topology). Deferred nested spawns (slice 3.4) and concurrent *flat* spawns already work.
+
+*Also out of scope (documented limitation):* freezing a vCPU **blocked in `thread.join`/`thread.wait`**.
+Thread ops aren't may-suspend safepoints, so a vCPU parked in a join/wait doesn't observe a freeze — the
+natural "spawn then join" root can be frozen only while it is *running* (e.g. at a back-edge poll or
+`cap.call`), not while blocked. Making thread ops freeze-safepoints (unwind + re-issue on thaw) is a
+separate slice. Original map:
+
+- **Barrier adaptation (loom-verified, but NOT the live path).** The 4A.4 `quiesce_arrive` ran `unwind`
+  *under* the `quiesce` lock to serialize the (then-shared) active-SP scratch; with per-context SP that
+  serialization is unnecessary, so `unwind` now runs outside the lock and the lock guards only the join.
+  The O-A4 loom model is updated to per-context SP words
+  (`loom_quiesce_barrier_never_hangs_with_per_context_sp`). **However**, stage (ii) ultimately chose
+  `run_inner`'s existing `join_all` as the coordinator-wait (each child's freeze-unwind into its own
+  region completes its OS thread; `join_all` blocks until all do), so `arm_quiesce`/`quiesce_arrive`/
+  `quiesce_wait_all` are **unused in production** (`cfg(loom)`-only). They are retained as a verified
+  primitive for a possible future *park-in-place* quiesce (workers that stop without ending their OS
+  thread). The "Concurrent-durable entry + arming" bullet below describes that original barrier-based
+  design; the shipped design uses `join_all` instead.
+- **Concurrent-durable entry + arming.** A new multi-vCPU+interruptible entry (combining
+  `..._durable_mv` and `..._interruptible`) calls `arm_quiesce(runners)` before any worker can observe a
+  freeze, engaging `is_concurrent_durable()`. Single-worker paths stay byte-identical (`quiesce == 0`,
+  lock untouched).
+- **Concurrent children get shadow contexts + seeding.** Today `thread_spawn` only reserves a shadow
+  context on the *deferred* (single-worker) path (`defer_spawn` → `reserve_vcpu_context`); the concurrent
+  `run_child` path reserves none (non-durable children never freeze). For a concurrent **durable** run,
+  `thread_spawn` must `reserve_vcpu_context()` for the child and `run_child` must
+  `durable_shadow::seed(shadow_region_base(ctx))` before guest code (NORMAL never reads the SP word, so
+  this matters only once a freeze fires).
+- **Child freeze-unwind → residue → barrier.** On observing `UNWINDING` at a back-edge poll the child
+  unwinds into its own region and returns the placeholder; `run_child` detects the freeze-unwind (window
+  `UNWINDING` + child spilled past its frame base), records a `FrozenVCpu` (its task/parent/extent) into
+  the shared residue (under the existing lock), and calls `quiesce_arrive(|| {})` — the unwind already
+  happened in guest code, so the closure is empty (or records the extent). Coordinated so the child's OS
+  thread still completes and joins normally for teardown.
+- **Coordinator.** The root observes `UNWINDING`, unwinds, then (as coordinator) `quiesce_wait_all()` and
+  runs the **existing** single-worker `freeze_drive` + residue flatten + snapshot — untouched, since by
+  then every child has quiesced into its own region. Residue is canonically sorted before serialize
+  (§12.6), so the quiesce order can't change the artifact.
+- **Test.** Two children enter poll-free compute loops; `request_freeze` (or armed back-edge trigger on
+  all) → both unwind concurrently; the artifact is **byte-identical** to the single-worker (deferred)
+  freeze of the same program, and round-trips. Extend the O-A4 loom model if new shared state appears.
+
 ##### Context recycling plan (next sub-slice)
 
 Today neither backend recycles fiber slots or vCPU contexts (they grow monotonically), so a long-lived

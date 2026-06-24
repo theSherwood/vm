@@ -369,6 +369,12 @@ pub struct FrozenVCpu {
     pub func: i32,
     pub args: Vec<i64>,
     pub shadow_sp: u64,
+    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child — one
+    /// that finished before the freeze point, so its `thread.join` result must survive in the snapshot
+    /// (the host-side Done cell isn't captured otherwise). The thaw delivers this result into the
+    /// spawner's join table **without re-running** the child (no double side effects). `None` for a
+    /// normal frozen child (re-spawned + rewound on thaw); `shadow_sp`/`func`/`args` are then inert.
+    pub completed_result: Option<i64>,
 }
 
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
@@ -1209,6 +1215,63 @@ pub fn compile_and_run_capture_reserved_with_host_durable_mv(
     ))
 }
 
+/// [`compile_and_run_capture_reserved_with_host_durable_mv`] for a **genuinely-concurrent** freeze
+/// (DURABILITY.md §12.8 Phase 4 Slice A.5 stage ii): the root's `thread.spawn`ed children run as real
+/// OS threads (not the single-worker deferred model), and a [`FreezeController::request_freeze`] makes
+/// every context — root and children — self-unwind into its **own** per-context shadow-SP region
+/// concurrently (lock-free, since the stage-i relocation gave each its own SP word). The coordinator
+/// (root) joins the children via the existing `join_all` and then runs the unchanged freeze-drive +
+/// snapshot. Residue is canonically sorted at serialize, so the (racy) quiesce order can't change the
+/// artifact (§12.6). `request_freeze` may be called at most once, concurrently with this run.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable_mv`]; additionally `freeze`'s lifetime
+/// contract (call `request_freeze` at most once, concurrently with this run) must hold.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    vcpu_seed: &[FrozenVCpu],
+    root_sp: u64,
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    freeze: Arc<FreezeController>,
+) -> Result<DurableMvOutcome, JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.frozen_vcpu_seed = vcpu_seed.to_vec();
+    cm.thaw_root_sp = root_sp;
+    cm.durable = true;
+    cm.concurrent_durable = true;
+    cm.freeze_ctl = Some(freeze);
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((
+        outcome,
+        win,
+        std::mem::take(&mut cm.frozen_out),
+        std::mem::take(&mut cm.frozen_vcpus_out),
+        cm.frozen_root_sp_out,
+    ))
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
 /// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
 /// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
@@ -1558,6 +1621,11 @@ pub struct CompiledModule {
     /// word pointing at the running context's region (swapped on every fiber switch). `false` (the
     /// default) ⇒ an ordinary run that never touches the durable reserve. Set per-run at entry.
     durable: bool,
+    /// §12.8 4A.5 stage (ii): engage the **concurrent** durable path — children spawned during NORMAL
+    /// run as real OS threads with their own reserved shadow contexts and self-unwind concurrently on a
+    /// freeze (vs. the single-worker deferred model). Set by the concurrent multi-vCPU interruptible
+    /// entry; `false` everywhere else, so those paths are byte-identical.
+    concurrent_durable: bool,
     /// Durable **thaw** seed (slice 3.3.3): frozen fibers to re-create in the table before a
     /// `REWINDING` run, so a thaw `cont.resume` re-enters them. Empty for a freeze / ordinary run.
     frozen_seed: Vec<FrozenFiber>,
@@ -2418,6 +2486,7 @@ impl CompiledModule {
             data: m.data.clone(),
             restore_prots: Vec::new(),
             durable: false,
+            concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
@@ -2822,6 +2891,14 @@ impl CompiledModule {
         // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
         // shadow-SP word.
         durable_shadow::seed(DURABLE_SHADOW_BASE);
+        // §12.8 4A.5 stage (ii): engage the concurrent durable path before the guarded call (where the
+        // root may `thread.spawn` children) so each child reserves its own shadow context.
+        #[cfg(fiber_rt)]
+        if (*this).concurrent_durable {
+            if let Some(d) = &(*this).domain {
+                d.engage_concurrent_durable();
+            }
+        }
         // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
         // guarded call (the guest is about to block in its loop), and retire it right after — so a
         // `request_freeze` can only ever store into the window while it is mapped (freed below).
@@ -2887,7 +2964,11 @@ impl CompiledModule {
             // children), so the side-effect interleaving — and the frozen window — is byte-identical.
             if let Some(d) = &(*this).domain {
                 d.drive_frozen_spawns();
-                (*this).frozen_vcpus_out = d.take_frozen_vcpus();
+                // §12.8 4A.5 stage (ii): drains the **deferred** (single-worker) children now;
+                // **concurrent** children record their residue on their own OS threads, drained again
+                // after `join_all` below. `extend` (vs. assign) so both contribute. Canonical sort at
+                // serialize means the append order can't affect the artifact (§12.6).
+                (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
                 // Slice 3.4: a spawned child that owns fibers flattened them with its own
                 // `freeze_drive` (in `run_child_inline`) into the domain accumulator; merge that into
                 // the run residue alongside the root's. Sort-by-slot at serialize is canonical, so the
@@ -2906,6 +2987,21 @@ impl CompiledModule {
         #[cfg(fiber_rt)]
         if let Some(d) = &(*this).domain {
             d.join_all();
+            // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
+            // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
+            // coordinator-wait (every child finished). Collect that residue now — after the join, so the
+            // snapshot below captures a fully-quiesced window. No-op off the concurrent path.
+            if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+                (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
+                // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
+                // `thread.join` of a child that finished before the freeze point resolves on thaw.
+                (*this)
+                    .frozen_vcpus_out
+                    .extend(d.take_completed_children_residue());
+                // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
+                // `run_child` `freeze_drive`, recorded during `join_all` — drain after the join.
+                (*this).frozen_out.extend(d.take_frozen_fibers());
+            }
         }
         // §5 W3 Stage 3 — a trap that originated on a *spawned* vCPU stashed its backtrace capture in
         // that worker's thread-local, which dies with the worker; the worker handed it to the domain

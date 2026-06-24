@@ -3580,6 +3580,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             func: func as i32,
                             args,
                             shadow_sp: self_sp,
+                            completed_result: None, // interp runs durable single-worker
                         });
                 } else {
                     // The root: record its extent (the shared active-SP word will be overwritten by a
@@ -4361,6 +4362,11 @@ pub struct FrozenVCpu {
     /// Window offset of the child's flattened shadow-SP — the extent of its frozen continuation in its
     /// region; restored as the child's shadow-SP so its thaw re-entry rewinds from the right point.
     pub shadow_sp: u64,
+    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child (JIT
+    /// only — the interp runs durable single-worker, so it always records `None`). The thaw delivers the
+    /// result into the spawner's join table without re-running the child. `None` for a normal frozen
+    /// child (re-spawned + rewound).
+    pub completed_result: Option<i64>,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
