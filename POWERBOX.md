@@ -256,9 +256,16 @@ three-way stateful diff; session independence) + a C-ABI mirror (`svm_instance_s
 `svm_session_call_export`, `svm_session_stdout`, `svm_session_free`; `svm-capi` ABI test).
 
 **Slice-1 scope / deferred:** single-threaded guests only (a §12-thread guest is rejected by `start`);
-persistence covers the low `SNAP_CAP` window, so a `malloc` **heap in the reserved tail is not yet
-persisted**; the JIT recompiles per `call_export` (a per-funcidx `CompiledModule` cache is the obvious
+the JIT recompiles per `call_export` (a per-funcidx `CompiledModule` cache is the obvious
 optimization). F1 (converge runners) and F2 (name-addressable nested guests) remain open.
+
+**Punted: reactor durability / heap persistence (F11).** Deliberately *not* doing this now. Two
+related gaps: (a) persistence covers only the low `SNAP_CAP` window, so a `malloc` **heap living in the
+reserved tail above the mapped window is not persisted** across `call_export` (slice 1's accumulator is
+a BSS slot in the low window, which *is* persisted); (b) there is no freeze/thaw **snapshot of a live
+`Session`** (the DURABILITY.md §12 machinery is per-run, not per-session). Both are real for a
+long-lived heap-using reactor, but neither blocks the current model — revisit when a consumer needs a
+persistent guest heap or to snapshot/restore a session. Tracked as **F11**.
 
 ### Original spec (below, for reference)
 
@@ -371,6 +378,10 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   reactor `call_export` differential runs **all three** backends in lockstep across the call sequence,
   which exercises the bytecode engine directly under the powerbox. (Still worth a way to *assert* the
   bytecode engine ran vs fell back, rather than infer it.)
+- **F11 — reactor durability / heap persistence** (Phase 6 deferral, *punted*): persist a
+  `malloc` heap (reserved tail, above the `SNAP_CAP` low-window snapshot) across `call_export`, and
+  freeze/thaw a live `Session` (the DURABILITY.md §12 machinery is per-run, not per-session). Revisit
+  when a consumer needs a persistent guest heap or session snapshot/restore.
 
 ---
 
