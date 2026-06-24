@@ -554,3 +554,80 @@ fn breakpoint_runtime_parity_across_loop_iterations() {
     );
     assert_eq!(tw_res, Ok(vec![Value::I32(6)]));
 }
+
+// A caller (func 0) that calls a callee (func 1); the breakpoint lands inside the callee, so two
+// frames are live. No debug section needed — `read_ir_value`/`backtrace` and the bytecode reader both
+// type values from the IR (`func_value_types`), not from `debug.var`.
+const CALL_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = call 1(v0)
+  v3 = i32.add v2 v1
+  return v3
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 2
+  v2 = i32.mul v0 v1
+  return v2
+}
+"#;
+
+/// Cross-frame runtime parity (G3 follow-up — multi-function `DebugRun`): stopped at a breakpoint
+/// *inside a callee*, the tree-walker `Inspector` and the bytecode `DebugRun` must report the **same
+/// call-stack depth, the same per-frame location, and the same inspected locals in every frame** —
+/// the call stack a DAP `stackTrace`/`scopes`/`variables` exposes, now matched on the second engine.
+#[test]
+fn breakpoint_runtime_parity_across_call_frames() {
+    let m = parse_module(CALL_DBG).expect("parse");
+    let args = [Value::I32(5)];
+    // In the callee (func 1), block 0, inst 1 (`v2 = mul`).
+    let bp = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 1,
+    };
+
+    // Tree-walker: stop in the callee, capture the backtrace (innermost first).
+    let mut insp = Inspector::attach(&m, 0, &args, 100_000);
+    insp.set_breakpoint(bp);
+    match insp.run_until_stop() {
+        Stop::Break { pc, .. } => assert_eq!(pc, bp, "tree-walker stopped in the callee"),
+        other => panic!("expected the callee breakpoint, got {other:?}"),
+    }
+    let bt = insp.backtrace();
+
+    // Bytecode: the resumable session, same breakpoint.
+    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut fuel = 100_000u64;
+    assert_eq!(
+        dbg.run_to(&[bp], &mut fuel),
+        Some(bp),
+        "bytecode stopped in the callee"
+    );
+
+    assert_eq!(dbg.depth(), bt.len(), "call-stack depth diverges");
+    assert_eq!(dbg.depth(), 2, "callee called from caller");
+
+    // Each frame: same (module, func, block) and the same defined locals.
+    for (d, f) in bt.iter().enumerate() {
+        assert_eq!(
+            dbg.frame_pc(d).map(|p| (p.module, p.func, p.block)),
+            Some((f.pc.module, f.pc.func, f.pc.block)),
+            "frame {d} location diverges"
+        );
+        for (i, &tw) in f.vals.iter().enumerate() {
+            assert_eq!(
+                dbg.value_in_frame(d, i),
+                Some(tw),
+                "frame {d} local {i} diverges between engines"
+            );
+        }
+    }
+
+    // Concretely: callee frame holds (x=5, 2); caller frame holds (x=5, 10).
+    assert_eq!(&bt[0].vals[..2], &[Value::I32(5), Value::I32(2)]);
+    assert_eq!(&bt[1].vals[..2], &[Value::I32(5), Value::I32(10)]);
+}

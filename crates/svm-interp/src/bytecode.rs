@@ -1576,10 +1576,11 @@ pub struct DebugRun {
     mem: Option<Mem>,
     host: Host,
     vm: Vm,
-    /// Per-block slot base for the entry function (mirror of `compile_func`'s `base`).
-    block_base: Vec<u32>,
-    /// Per-block value types (`func_value_types`), for typing a slot's `Reg` back to a `Value`.
-    block_types: Vec<Vec<ValType>>,
+    /// Per-**function**, per-block slot base (mirror of `compile_func`'s `base`) — for reading a value
+    /// in any live call frame, not just the innermost.
+    fn_block_base: Vec<Vec<u32>>,
+    /// Per-function, per-block value types (`func_value_types`), for typing a slot's `Reg` to a `Value`.
+    fn_block_types: Vec<Vec<Vec<ValType>>>,
     /// Paused on a reported breakpoint — step past it before the next `run_to` so we make progress.
     at_bp: bool,
     done: Option<Result<Vec<Value>, Trap>>,
@@ -1588,18 +1589,28 @@ pub struct DebugRun {
 impl DebugRun {
     /// Open a debug session on `m`'s `func(args)`. `None` if the module is outside the engine's subset.
     pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<DebugRun> {
-        let f = m.funcs.get(func as usize)?;
+        m.funcs.get(func as usize)?;
         let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
-        let mut block_base = Vec::with_capacity(f.blocks.len());
-        let mut n = 0u32;
-        for b in &f.blocks {
-            block_base.push(n);
-            n += b.params.len() as u32;
-            for inst in &b.insts {
-                n += inst.result_count(&arities) as u32;
+        // Slot base + value types per (function, block), so any frame on the call stack is readable.
+        let mut fn_block_base = Vec::with_capacity(m.funcs.len());
+        let mut fn_block_types = Vec::with_capacity(m.funcs.len());
+        for g in &m.funcs {
+            let mut base = Vec::with_capacity(g.blocks.len());
+            let mut n = 0u32;
+            for b in &g.blocks {
+                base.push(n);
+                n += b.params.len() as u32;
+                for inst in &b.insts {
+                    n += inst.result_count(&arities) as u32;
+                }
             }
+            fn_block_base.push(base);
+            fn_block_types.push(svm_verify::func_value_types(
+                g,
+                &m.funcs,
+                m.memory.is_some(),
+            ));
         }
-        let block_types = svm_verify::func_value_types(f, &m.funcs, m.memory.is_some());
         let c = compile_module(&m.funcs)?;
         let mods = [c];
         let table = build_table(mods[0].progs.len(), 0);
@@ -1612,8 +1623,8 @@ impl DebugRun {
             mem,
             host,
             vm,
-            block_base,
-            block_types,
+            fn_block_base,
+            fn_block_types,
             at_bp: false,
             done: None,
         })
@@ -1679,13 +1690,67 @@ impl DebugRun {
         }
     }
 
-    /// The current stop's block-local SSA value `idx`, typed — the bytecode counterpart of
-    /// `Inspector::read_ir_value`. `None` if not paused at an instruction or `idx` is out of range.
+    /// Number of live call frames at the current stop (callers + the running activation) — the depth a
+    /// DAP `stackTrace` would report.
+    pub fn depth(&self) -> usize {
+        self.vm.stack.len() + 1
+    }
+
+    /// The `(module, func, block, window base)` of the frame `depth` levels from the top (0 = running
+    /// activation; each caller is resolved at its call site, `resume_pc - 1`). `None` past the stack or
+    /// when the top is paused on a non-instruction.
+    fn frame_at(&self, depth: usize) -> Option<(usize, usize, usize, usize)> {
+        if depth == 0 {
+            let pc = self.vm.cur_ir_pc(&self.mods[..])?;
+            return Some((self.vm.module, self.vm.cur, pc.block, self.vm.base));
+        }
+        // depth 1 = innermost caller = last stack entry; depth n = outermost.
+        let n = self.vm.stack.len();
+        let &(module, f, base, resume_pc, _) = self.vm.stack.get(n.checked_sub(depth)?)?;
+        let (block, _) = self.mods[module]
+            .progs
+            .get(f)?
+            .src
+            .get(resume_pc.checked_sub(1)?)
+            .copied()
+            .flatten()?;
+        Some((module, f, block as usize, base))
+    }
+
+    /// The `IrPc` of the frame `depth` levels from the top — the bytecode counterpart of a
+    /// `Inspector::backtrace` entry. `None` past the stack.
+    pub fn frame_pc(&self, depth: usize) -> Option<super::IrPc> {
+        let (module, func, block, _) = self.frame_at(depth)?;
+        let inst = if depth == 0 {
+            self.vm.cur_ir_pc(&self.mods[..])?.inst
+        } else {
+            0
+        };
+        Some(super::IrPc {
+            module: module as u32,
+            func: func as FuncIdx,
+            block,
+            inst,
+        })
+    }
+
+    /// Block-local SSA value `idx` in the frame `depth` levels from the top, typed — the bytecode
+    /// counterpart of `Inspector::read_ir_value`. `None` for a cross-module frame, a bad `idx`, or past
+    /// the stack. A not-yet-computed slot reads as its default; the caller compares only the defined
+    /// prefix (where `read_ir_value` returns `Some`).
+    pub fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
+        let (module, func, block, base) = self.frame_at(depth)?;
+        if module != 0 {
+            return None; // metadata is for module-0 functions
+        }
+        let off = *self.fn_block_base.get(func)?.get(block)? as usize;
+        let ty = *self.fn_block_types.get(func)?.get(block)?.get(idx)?;
+        Some(self.vm.regs[base + off + idx].to_value(ty))
+    }
+
+    /// The running frame's block-local SSA value `idx` ([`value_in_frame`] at depth 0).
     pub fn value(&self, idx: usize) -> Option<Value> {
-        let pc = self.vm.cur_ir_pc(&self.mods[..])?;
-        let off = *self.block_base.get(pc.block)? as usize;
-        let ty = *self.block_types.get(pc.block)?.get(idx)?;
-        Some(self.vm.regs[self.vm.base + off + idx].to_value(ty))
+        self.value_in_frame(0, idx)
     }
 
     /// The run result once finished (`None` while still running).

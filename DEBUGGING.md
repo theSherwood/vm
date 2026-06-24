@@ -130,12 +130,15 @@ different things depending on which pair you compare:
   the DAP server. The first prerequisite of the bytecode path **landed**: `bytecode::DebugRun` — a
   resumable debug session (`run_to` a breakpoint, stopping *before* the op like the tree-walker; `value`
   reads a block-local SSA value at the stop) — the engine-level control+inspection a DAP-over-bytecode
-  backend wires into. `breakpoint_runtime_parity_across_loop_iterations` proves the **runtime** half that
-  G1/G2's one-shot traces don't: the tree-walker `Inspector` and `DebugRun`, driven through the same
-  loop-body breakpoint, report identical stop locations and inspected `(i, acc)` at **every hit** (resume
-  included) and the same result. *Remaining:* wire `DebugRun` into the `svm-dap` server (a backend seam),
-  multi-function/cross-frame value reading, and the JIT path (Stage 5). The *static* source-map half is
-  already covered transitively by **G1**.
+  backend wires into. Two runtime parity tests prove the half G1/G2's one-shot traces don't:
+  `breakpoint_runtime_parity_across_loop_iterations` (the tree-walker `Inspector` and `DebugRun`, driven
+  through the same loop-body breakpoint, report identical stop locations and inspected `(i, acc)` at
+  **every hit** — resume included — and the same result) and `breakpoint_runtime_parity_across_call_frames`
+  (stopped *inside a callee*, both report the same **call-stack depth, per-frame location, and per-frame
+  locals** — the `stackTrace`/`scopes`/`variables` surface, now matched cross-frame via `DebugRun`'s
+  per-function slot metadata). *Remaining:* wire `DebugRun` into the `svm-dap` server (a backend seam, so
+  one DAP conversation replays against both engines), stepping verbs (step in/over/out), and the JIT path
+  (Stage 5). The *static* source-map half is already covered transitively by **G1**.
 
 ---
 
