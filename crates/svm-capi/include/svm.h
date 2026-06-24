@@ -96,6 +96,15 @@ typedef struct {
 SvmRun *svm_instance_run(SvmInstance *i, int32_t backend, const SvmRunConfig *config);
 SvmRun *svm_instance_run_diff(SvmInstance *i, const SvmRunConfig *config);
 
+/* ---- Reactor sessions (Phase 6): instantiate once, call exports repeatedly, state persists ---- */
+typedef struct SvmSession SvmSession;
+SvmSession *svm_instance_start(const SvmInstance *i, int32_t backend, const SvmRunConfig *config);
+/* Call `name` with n_args i64 args; write up to results_cap i64 results + *n_results. 0 = SVM_OK. */
+int32_t svm_session_call_export(SvmSession *s, const char *name, const int64_t *args, size_t n_args,
+                                int64_t *results, size_t results_cap, size_t *n_results);
+const uint8_t *svm_session_stdout(const SvmSession *s, size_t *len);
+void svm_session_free(SvmSession *s);
+
 /* ---- Run results ---- (pointers valid until svm_run_free). */
 const uint8_t *svm_run_stdout(const SvmRun *r, size_t *len);
 const uint8_t *svm_run_stderr(const SvmRun *r, size_t *len);

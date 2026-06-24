@@ -209,3 +209,72 @@ fn errors_are_fail_closed_not_panics() {
         assert!(!svm_last_error().is_null());
     }
 }
+
+const COUNTER: &str = "\
+memory 15
+export \"init\" 0
+export \"add\" 1
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 1024
+  v2 = i64.const 0
+  i64.store v1 v2
+  v3 = i32.const 0
+  return v3
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 1024
+  v3 = i64.load v2
+  v4 = i64.add v3 v1
+  i64.store v2 v4
+  return v4
+}
+";
+
+#[test]
+fn reactor_session_persists_state_across_calls_via_c_abi() {
+    unsafe {
+        let ir = CString::new(COUNTER).unwrap();
+        let m = svm_module_parse_text(ir.as_ptr());
+        assert_eq!(svm_module_synth_powerbox_start(m, 0, 0, false), SVM_OK);
+        let inst = svm_instantiate(m);
+        assert!(!inst.is_null());
+
+        let sess = svm_instance_start(inst, SVM_BACKEND_JIT, ptr::null());
+        assert!(
+            !sess.is_null(),
+            "start: {:?}",
+            CStr::from_ptr(svm_last_error())
+        );
+
+        let add = CString::new("add").unwrap();
+        let mut running = 0i64;
+        for x in [5i64, 3, 10, 100] {
+            running += x;
+            let args = [x];
+            let mut results = [0i64; 4];
+            let mut n = 0usize;
+            assert_eq!(
+                svm_session_call_export(
+                    sess,
+                    add.as_ptr(),
+                    args.as_ptr(),
+                    1,
+                    results.as_mut_ptr(),
+                    4,
+                    &mut n
+                ),
+                SVM_OK
+            );
+            assert_eq!(n, 1);
+            assert_eq!(
+                results[0], running,
+                "running total persists across C-ABI calls"
+            );
+        }
+
+        svm_session_free(sess);
+        svm_instance_free(inst); // start() did not consume the instance
+    }
+}

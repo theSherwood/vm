@@ -2312,6 +2312,24 @@ pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
 /// addrspace, ioring, blocking, jit — always granted as a contiguous prefix of this set.
 pub const POWERBOX_MAX_HANDLES: usize = 8;
 
+/// The powerbox data-stack base for `module`: the page-aligned offset just above its globals/data
+/// segments (and never below [`POWERBOX_STACK_PAGE`]) — the `sp` the synthesized `_start` passes to
+/// the entry. Exposed so an embedder driving exports directly (the reactor / `Session` model) can
+/// synthesize the same `sp` per call that `_start` would. Stable across [`synth_powerbox_start`]
+/// (which adds no data segments), so it returns the same value before and after the prepend.
+pub fn powerbox_entry_sp(module: &Module) -> u64 {
+    let data_end = module
+        .data
+        .iter()
+        .map(|d| d.offset + d.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    data_end
+        .max(POWERBOX_STACK_PAGE)
+        .div_ceil(POWERBOX_STACK_PAGE)
+        * POWERBOX_STACK_PAGE
+}
+
 /// Prepend the powerbox bootstrap `_start` (the new function 0) to an already-linked, possibly
 /// import-bearing `module`, reproducing the exact layout the C on-ramp (`svm-llvm`) bakes into its
 /// own `synth_start` — so a frontend that emits SVM-IR directly (and links it itself, e.g. via
@@ -2386,14 +2404,7 @@ pub fn synth_powerbox_start(
     // Globals/data segments live at/above STACK_PAGE; the data stack starts page-aligned above the
     // highest data segment (and never below STACK_PAGE), so a read-only global never shares a page
     // with the writable stash, and a stack write never lands on a read-only global's page (D40).
-    let data_end = module
-        .data
-        .iter()
-        .map(|d| d.offset + d.bytes.len() as u64)
-        .max()
-        .unwrap_or(0);
-    let globals_end = data_end.max(POWERBOX_STACK_PAGE);
-    let entry_sp = globals_end.div_ceil(POWERBOX_STACK_PAGE) * POWERBOX_STACK_PAGE;
+    let entry_sp = powerbox_entry_sp(&module);
 
     // The window must cover the stash + globals + a data-stack reserve. Grow the declared memory to
     // fit (never shrink); beyond the mapped window is the faulting guard region (§5).

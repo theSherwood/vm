@@ -620,5 +620,116 @@ pub unsafe extern "C" fn svm_run_free(r: *mut SvmRun) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Reactor sessions (Phase 6): instantiate once, call exports repeatedly with
+// persistent window state.
+// ----------------------------------------------------------------------------
+
+/// A live, stateful reactor session (opaque) — the C view of [`svm_run::Session`]. Built by
+/// `svm_instance_start`, freed by `svm_session_free`.
+pub struct SvmSession(svm_run::Session);
+
+/// Start a reactor session on `backend` under `config` (null ⇒ defaults): grant the powerbox once,
+/// run the bootstrap, and keep the window + host live for repeated `svm_session_call_export` calls.
+/// Does **not** consume `i` (the instance can start more sessions). Returns `NULL` on failure.
+///
+/// # Safety
+/// `i` is a live instance handle; `config` is null or a valid `SvmRunConfig`.
+#[no_mangle]
+pub unsafe extern "C" fn svm_instance_start(
+    i: *const SvmInstance,
+    backend: i32,
+    config: *const SvmRunConfig,
+) -> *mut SvmSession {
+    guard_ptr(|| {
+        let inst = i.as_ref().ok_or("svm_instance_start: null instance")?;
+        let backend = backend_of(backend)?;
+        let cfg = run_config(config);
+        let session = inst.0.start(backend, &cfg)?;
+        Ok(Box::into_raw(Box::new(SvmSession(session))))
+    })
+}
+
+/// Call exported function `name` with `n_args` `i64` arguments, writing up to `results_cap` `i64`
+/// results into `results` and the actual count into `*n_results`. The window (globals, stash, BSS) and
+/// capability handles persist from prior calls. Returns `SVM_OK`, or an error status (message in
+/// `svm_last_error`). Arguments are passed as raw `i64` slots (interpreted as `i64` values — the
+/// common case; floats can be passed by bit pattern).
+///
+/// # Safety
+/// `s` is a live session; `name` a valid C string; `args`/`results` describe readable/writable
+/// `n_args`/`results_cap` slots; `n_results` is a valid `size_t*` (or null).
+#[no_mangle]
+pub unsafe extern "C" fn svm_session_call_export(
+    s: *mut SvmSession,
+    name: *const c_char,
+    args: *const i64,
+    n_args: usize,
+    results: *mut i64,
+    results_cap: usize,
+    n_results: *mut usize,
+) -> i32 {
+    guard_status(|| {
+        let s = s.as_mut().ok_or("svm_session_call_export: null session")?;
+        if name.is_null() {
+            return Err("null export name".into());
+        }
+        let name = CStr::from_ptr(name)
+            .to_str()
+            .map_err(|_| "export name is not valid UTF-8".to_string())?;
+        let arg_slots = if n_args == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(args, n_args)
+        };
+        let vals: Vec<Value> = arg_slots.iter().map(|&x| Value::I64(x)).collect();
+        let out = s.0.call_export(name, &vals)?;
+        if !n_results.is_null() {
+            *n_results = out.len();
+        }
+        if !results.is_null() && results_cap > 0 {
+            let dst = std::slice::from_raw_parts_mut(results, results_cap);
+            for (d, v) in dst.iter_mut().zip(&out) {
+                *d = value_slot(v);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The session's captured stdout so far (valid until the next call / `svm_session_free`); writes `*len`.
+///
+/// # Safety
+/// `s` is a live session (or null); `len` a valid `size_t*` (or null).
+#[no_mangle]
+pub unsafe extern "C" fn svm_session_stdout(s: *const SvmSession, len: *mut usize) -> *const u8 {
+    match s.as_ref() {
+        Some(sess) => {
+            let out = sess.0.stdout();
+            if !len.is_null() {
+                *len = out.len();
+            }
+            out.as_ptr()
+        }
+        None => {
+            if !len.is_null() {
+                *len = 0;
+            }
+            ptr::null()
+        }
+    }
+}
+
+/// Free a session handle.
+///
+/// # Safety
+/// `s` is a live session handle from this library, or null.
+#[no_mangle]
+pub unsafe extern "C" fn svm_session_free(s: *mut SvmSession) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
+    }
+}
+
 #[cfg(test)]
 mod abi_tests;

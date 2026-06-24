@@ -15,8 +15,8 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
-    iface, run_with_host, run_with_host_fast, AsyncCounter, CapPageMap, GuestMem, Host, HostFn,
-    RegionBacking, StreamRole, Trap,
+    iface, run_capture_reserved_with_host, run_with_host, run_with_host_fast, AsyncCounter,
+    CapPageMap, GuestMem, Host, HostFn, RegionBacking, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -3229,6 +3229,295 @@ impl Instance {
             stdout: h.stdout,
             stderr: h.stderr,
         })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Phase 6 — the reactor model: a live, stateful Session you call exports into
+// ----------------------------------------------------------------------------
+
+/// The window span the reactor persists between calls. **Must match `svm_interp`/`svm_jit`'s private
+/// `SNAP_CAP`** — the tree-walker and bytecode engine snapshot exactly this span, and the JIT is told
+/// to (`run_raw`'s `snapshot_cap`), so the three round-trip the same bytes. (The cross-backend
+/// `Session` diff would fail loudly if these ever diverged.)
+const REACTOR_SNAP_CAP: usize = 1 << 18; // 256 KiB
+
+/// Compile + run a chosen export `fidx` on the JIT, seeded with `init_mem` and snapshotting the low
+/// [`REACTOR_SNAP_CAP`] window bytes — the JIT half of the reactor's per-call round-trip. Compiles per
+/// call (slice 1; a per-funcidx `CompiledModule` cache is a later optimization).
+fn jit_call_capture(
+    m: &Module,
+    fidx: FuncIdx,
+    slots: &[i64],
+    init_mem: &[u8],
+    host: &mut Host,
+    limits: &Limits,
+) -> Result<(JitOutcome, Vec<u8>), String> {
+    let quota = svm_jit::Quota {
+        max_fibers: limits.max_fibers,
+        max_vcpus: limits.max_vcpus,
+    };
+    let mut cm = CompiledModule::compile(
+        m,
+        fidx,
+        cap_thunk,
+        host as *mut Host as *mut c_void,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        Some(fast_cap_resolver),
+        quota,
+        CLI_JIT_TABLE_LOG2,
+    )
+    .map_err(|e| format!("JIT compile failed: {e:?}"))?;
+    host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+    // SAFETY: single-threaded reactor (start() rejects concurrent guests); `host`/`cm` outlive the
+    // run; `cm` is registered for any `Jit`-cap re-entry and unregistered before it's dropped.
+    let r = unsafe {
+        CompiledModule::run_raw(&mut cm, slots, Some(init_mem), Some(REACTOR_SNAP_CAP), None)
+    };
+    host.set_jit_native_ctx(0);
+    r.map_err(|e| format!("JIT run failed: {e:?}"))
+}
+
+/// Run export `fidx` on `backend`, seeded from `init_mem`, returning its outcome and the new window
+/// snapshot. `Bytecode` transparently falls back to the tree-walker for modules it doesn't support
+/// (so that arm matches `TreeWalk` exactly there). The shared per-call primitive for [`Session`].
+fn run_capture_on(
+    backend: Backend,
+    m: &Module,
+    fidx: FuncIdx,
+    args: &[Value],
+    init_mem: &[u8],
+    host: &mut Host,
+    limits: &Limits,
+) -> Result<(Outcome, Vec<u8>), String> {
+    let treewalk = |host: &mut Host| {
+        let mut fuel = limits.fuel.unwrap_or(DEFAULT_FUEL);
+        run_capture_reserved_with_host(
+            m,
+            fidx,
+            args,
+            &mut fuel,
+            init_mem,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            host,
+        )
+    };
+    match backend {
+        Backend::TreeWalk => {
+            let (r, snap) = treewalk(host);
+            Ok((outcome_from_interp(r)?, snap))
+        }
+        Backend::Bytecode => {
+            let mut fuel = limits.fuel.unwrap_or(DEFAULT_FUEL);
+            match svm_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                m,
+                fidx,
+                args,
+                &mut fuel,
+                init_mem,
+                svm_ir::DEFAULT_RESERVED_LOG2,
+                host,
+            ) {
+                Some((r, snap)) => Ok((outcome_from_interp(r)?, snap)),
+                None => {
+                    let (r, snap) = treewalk(host); // unsupported by the bytecode engine — fall back
+                    Ok((outcome_from_interp(r)?, snap))
+                }
+            }
+        }
+        Backend::Jit => {
+            let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
+            let (jo, snap) = jit_call_capture(m, fidx, &slots, init_mem, host, limits)?;
+            Ok((outcome_from_jit(&m.funcs[fidx as usize].results, jo)?, snap))
+        }
+    }
+}
+
+/// A **live, stateful instance** on one backend (the reactor model): the powerbox is granted once and
+/// the guest window (globals, the handle stash, BSS) **persists** across [`Session::call_export`]
+/// calls. Built by [`Instance::start`]. This is the "instantiate once, call exports many times" shape
+/// (wasm reactor / component model) that run-once [`Instance::run`] doesn't provide.
+///
+/// **Slice-1 scope:** single-threaded guests only; persistence covers the low [`REACTOR_SNAP_CAP`]
+/// window (globals/stash/BSS) — a `malloc` heap living in the reserved tail above the mapped window is
+/// **not** persisted yet. Exports use the convention `(i64 sp, <args…>) -> <results…>`: `call_export`
+/// supplies a fresh `sp` (the powerbox data-stack base) and appends the caller's `args`.
+pub struct Session {
+    module: Module,
+    backend: Backend,
+    host: Host,
+    /// The persisted window image (low `REACTOR_SNAP_CAP` bytes), round-tripped each call.
+    snap: Vec<u8>,
+    entry_sp: u64,
+    limits: Limits,
+}
+
+impl Session {
+    /// Call exported function `name` with `args`, returning its results. The window (globals, stash,
+    /// BSS) and granted capability handles persist from prior calls. `Err` on a missing export, a
+    /// trap, or an `Exit`.
+    pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>, String> {
+        let fidx = self
+            .module
+            .resolve_export(name)
+            .ok_or_else(|| format!("no export named `{name}`"))?;
+        // Reactor calling convention: export is `(i64 sp, <args…>)` — supply a fresh data-stack base
+        // above the persistent globals, then the caller's args.
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(Value::I64(self.entry_sp as i64));
+        call_args.extend_from_slice(args);
+        let (outcome, snap) = run_capture_on(
+            self.backend,
+            &self.module,
+            fidx,
+            &call_args,
+            &self.snap,
+            &mut self.host,
+            &self.limits,
+        )?;
+        self.snap = snap;
+        match outcome {
+            Outcome::Returned(v) => Ok(v),
+            Outcome::Exited(code) => Err(format!("export `{name}` called Exit({code})")),
+        }
+    }
+
+    /// The backend this session runs on.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+    /// Bytes the guest has written to stdout across all calls so far.
+    pub fn stdout(&self) -> &[u8] {
+        &self.host.stdout
+    }
+    /// Bytes the guest has written to stderr across all calls so far.
+    pub fn stderr(&self) -> &[u8] {
+        &self.host.stderr
+    }
+}
+
+/// A reactor [`Session`] mirrored across **all three backends** (tree-walker, bytecode engine, JIT),
+/// stepped in lockstep: every [`DiffSession::call_export`] runs the call on each and asserts they
+/// agree on results, captured stdout/stderr, and the persistent window prefix — the §18 oracle
+/// extended to a *stateful sequence* of calls (state desyncs are caught the moment they appear). This
+/// is the powerbox layer's first direct exercise of the bytecode engine (Followup F10).
+pub struct DiffSession {
+    sessions: Vec<Session>, // one per backend, in [TreeWalk, Bytecode, Jit] order
+    entry_sp: u64,
+}
+
+impl DiffSession {
+    /// Call `name` with `args` on all three backends in lockstep; return the agreed results, or `Err`
+    /// the moment any backend diverges (results, output, or persistent window state).
+    pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>, String> {
+        // The persistent window prefix `[0, entry_sp)` (stash + globals + BSS) must match across
+        // backends; the data stack above `entry_sp` is transient and backend-specific (the JIT's frame
+        // layout differs from the interpreters'), so it is excluded from the comparison.
+        let persist = (self.entry_sp as usize).min(REACTOR_SNAP_CAP);
+        let mut agreed: Option<(Vec<Value>, Vec<u8>, Vec<u8>)> = None;
+        for s in &mut self.sessions {
+            let backend = s.backend;
+            let results = s.call_export(name, args)?;
+            let prefix = s
+                .snap
+                .get(..persist.min(s.snap.len()))
+                .unwrap_or(&[])
+                .to_vec();
+            let stdout = s.host.stdout.clone();
+            match &agreed {
+                None => agreed = Some((results, prefix, stdout)),
+                Some((r0, w0, o0)) => {
+                    if *r0 != results {
+                        return Err(format!(
+                            "backend {backend:?} results diverge on `{name}`: {r0:?} vs {results:?}"
+                        ));
+                    }
+                    if *w0 != prefix {
+                        return Err(format!(
+                            "backend {backend:?} persistent window diverges on `{name}`"
+                        ));
+                    }
+                    if *o0 != stdout {
+                        return Err(format!("backend {backend:?} stdout diverges on `{name}`"));
+                    }
+                }
+            }
+        }
+        Ok(agreed.expect("at least one backend").0)
+    }
+
+    /// Captured stdout (identical across backends — asserted on every call).
+    pub fn stdout(&self) -> &[u8] {
+        self.sessions[0].stdout()
+    }
+}
+
+impl Instance {
+    /// Start a **reactor session** on `backend` under `config`: grant the powerbox once, run the
+    /// bootstrap `_start` (function 0) to stash handles + run the initializer, and keep the window +
+    /// host live for repeated [`Session::call_export`] calls. Slice 1 is single-threaded — a guest
+    /// using §12 threads is rejected (use [`Instance::run`]/[`Instance::run_diff`] for those).
+    pub fn start(&self, backend: Backend, config: &RunConfig) -> Result<Session, String> {
+        if self.module.funcs.iter().any(|f| f.uses_concurrency()) {
+            return Err(
+                "reactor Session is single-threaded (slice 1); use run/run_diff for concurrent guests"
+                    .into(),
+            );
+        }
+        let module = self
+            .window_override(config)
+            .unwrap_or_else(|| self.module.clone());
+        let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+
+        let mut host = Host::new();
+        host.stdin = config.stdin.clone();
+        host.set_quota(config.limits.quota());
+        let args = self.grant_caps(&mut host, win);
+
+        // Run `_start` (func 0) once: stash the granted handles into the window and run the
+        // initializer. Capture the resulting window image as the session's persistent state.
+        let (_init, snap) =
+            run_capture_on(backend, &module, 0, &args, &[], &mut host, &config.limits)?;
+        Ok(Session {
+            module,
+            backend,
+            host,
+            snap,
+            entry_sp,
+            limits: config.limits.clone(),
+        })
+    }
+
+    /// Start a reactor session mirrored across all three backends (the stateful differential oracle).
+    /// Fails if the backends disagree on the post-`_start` window.
+    pub fn start_diff(&self, config: &RunConfig) -> Result<DiffSession, String> {
+        let entry_sp = svm_ir::powerbox_entry_sp(&self.module);
+        let sessions = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit]
+            .into_iter()
+            .map(|b| self.start(b, config))
+            .collect::<Result<Vec<_>, _>>()?;
+        // The post-`_start` persistent window must already agree across backends.
+        let persist = (entry_sp as usize).min(REACTOR_SNAP_CAP);
+        let prefix = |s: &Session| {
+            s.snap
+                .get(..persist.min(s.snap.len()))
+                .unwrap_or(&[])
+                .to_vec()
+        };
+        let base = prefix(&sessions[0]);
+        for s in &sessions[1..] {
+            if prefix(s) != base {
+                return Err(format!(
+                    "backend {:?} window diverges from {:?} at start",
+                    s.backend, sessions[0].backend
+                ));
+            }
+        }
+        Ok(DiffSession { sessions, entry_sp })
     }
 }
 

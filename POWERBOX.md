@@ -236,7 +236,31 @@ capabilities** — so a named export that uses caps can't be called at all today
 
 ---
 
-## Phase 6 — the reactor model: a live instance you call into (spec)
+## Phase 6 — the reactor model: a live instance you call into — slice 1 done
+
+**Landed (slice 1).** `svm_run::Session` (a live, stateful instance) + `Instance::start(backend,
+config) -> Session` and `Session::call_export(name, args) -> results`: instantiate once, run `_start`
+once, then call exports repeatedly with the guest window (globals, the handle stash, BSS) **persisting**
+between calls. Persistence is by **round-tripping the low `SNAP_CAP` (256 KiB) window snapshot** each
+call — the span all three backends already snapshot — so no TCB-internal changes were needed; the
+capability handles persist because the stash lives in that window. Exports use `(i64 sp, args…)`:
+`call_export` synthesizes the `sp` ([`svm_ir::powerbox_entry_sp`], now public) and appends the args.
+
+**All-three-backend differential.** `Instance::start_diff -> DiffSession`; `DiffSession::call_export`
+steps the tree-walker, bytecode engine, and JIT in lockstep and asserts they agree on results,
+stdout/stderr, and the persistent window prefix `[0, entry_sp)` after every call (the transient data
+stack above `entry_sp` — backend-specific frame layout — is excluded). This is the powerbox layer's
+first direct exercise of the bytecode engine (Followup F10). Acceptance:
+`crates/svm/tests/powerbox_reactor.rs` (persistent accumulator across calls on each backend; the
+three-way stateful diff; session independence) + a C-ABI mirror (`svm_instance_start`,
+`svm_session_call_export`, `svm_session_stdout`, `svm_session_free`; `svm-capi` ABI test).
+
+**Slice-1 scope / deferred:** single-threaded guests only (a §12-thread guest is rejected by `start`);
+persistence covers the low `SNAP_CAP` window, so a `malloc` **heap in the reserved tail is not yet
+persisted**; the JIT recompiles per `call_export` (a per-funcidx `CompiledModule` cache is the obvious
+optimization). F1 (converge runners) and F2 (name-addressable nested guests) remain open.
+
+### Original spec (below, for reference)
 
 **Problem.** First-class exports (Phase 1) made entry points *addressable*, but you still can't really
 *call* them: every `call`/`run`/`run_diff` builds fresh hosts + a fresh window, runs `_start` once, and
