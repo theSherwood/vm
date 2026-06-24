@@ -61,6 +61,98 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 
 ---
 
+## 1b. Cross-engine debug parity
+
+The project has **three execution engines** but only **two debug modalities**, so "parity" means
+different things depending on which pair you compare:
+
+- **Tree-walker** (`svm-interp`, the default `run`/`Inspector` path) — the **reference debug engine and
+  correctness oracle**. The full `Inspector` surface (breakpoints + conditions, watchpoints, in/over/out
+  + reverse stepping, time-travel, multithreaded, the whole DAP server) runs here. When you debug *via
+  DAP*, you are always on the tree-walker.
+- **Bytecode** (`svm-interp::bytecode`, the perf rewrite reached by `run_with_host_fast`) — preserves the
+  `IrPc = (block, inst)` debug seam *by construction* (`Program::src` reverse map). `bytecode::ir_trace`
+  reproduces the tree-walker's `seek(0,1,…)` stepping-location sequence op-for-op, but only for
+  **single-vCPU, seam-free** runs; it **falls back to the tree-walker** for watchpoints, real
+  breakpoint-stops, concurrency/coroutines, and time-travel.
+- **JIT** (`svm-jit`) — a *different modality*: it emits **DWARF** for **gdb/lldb** (W5 Stages 0–4) and an
+  always-on trap-time source backtrace; it does **not** use the `Inspector`, and DAP-over-JIT (Stage 5)
+  is deferred. The unifying mechanism that keeps all three agreeing on *where in the source* a program
+  point is, is the §6 debug-info **narrow waist** (W4): every engine consumes the *same* neutral
+  `DebugInfo` (`debug.loc`/`debug.var`/types).
+
+**What is already protected by tests:**
+- *Bytecode ↔ tree-walker* — `bytecode_debug.rs` (stepping/breakpoint **locations** op-for-op:
+  straight-line/branch/loop/call/trap, results too) + `bytecode_diff.rs` and ~15 per-feature
+  `bytecode_*` suites (value/trap/memory exact-equality, tree-walker as oracle).
+- *JIT debug emission* — `jit_srcloc.rs` (`debug.loc` → `symbolize` → DWARF `.debug_line` round-trip),
+  `jit_trap_backtrace.rs`/`interp_trap_backtrace.rs`/`jit_per_fiber_trap.rs` (source backtraces),
+  in-crate `symbolize` tests, the `gdb_attach` example (gdb 15.1).
+- *Interp ↔ JIT value/trap parity* — a large cross-engine suite (`simd`, `fiber_fuzz`, `jit_*`,
+  `multivcpu_trap_origin`, `dynlink`, plus svm-llvm `cross_engine`/`corpus_diff`). This is **result**
+  parity, not **debug** parity.
+
+### Known gaps (the regression risks this section tracks)
+
+- **G1 — direct cross-engine *source-location* parity assertion. ✅ Landed (`crates/svm/tests/debug_parity.rs`).**
+  Compiles one `-g` module and checks the tree-walker's `source_loc`, the bytecode engine's `ir_trace`
+  location, **and** the JIT's `src_ranges`/`symbolize` agree on the same op→line mapping (straight-line,
+  loop with repeated lines, branch). The two interpreters must match **op-for-op**; the JIT's line set
+  matches exactly (full-coverage fixtures) or is a superset (a branch's not-taken arm stays mapped).
+  A drift in any single engine's debug-info threading now fails here. One **legitimate** divergence is
+  pinned (`jit_elides_const_only_source_line`): a line that belongs only to a folded single-use `const`
+  is stepped by both interpreters but has no JIT machine-code range — compiled code has no instruction
+  for a materialized immediate — while the invariant "the JIT never maps a line the interpreters don't
+  step" still holds.
+- **G2 — bytecode variable-value parity + the delegation boundary. ✅ Landed (`debug_parity.rs` +
+  `bytecode::ir_window_trace`/`ir_value_trace`).** A source variable holds the **same value on both
+  engines at every step**, proven through the real debugger APIs:
+  - *SSA-located* — `compile_func` gives each value a **stable, unique slot** (a "global slot per value";
+    *no* register reuse/coalescing), so a promoted scalar is directly inspectable on the bytecode engine
+    (`regs[base + i]` typed by `func_value_types` — the same storage the tree-walker's `read_ir_value`
+    reads). `ssa_var_value_parity_per_step` compares the per-step block-local value vectors op-for-op and
+    checks `read_var(a)`/`read_var(b)` against the bytecode slots. The bytecode tier is therefore **fully
+    inspectable, not precluded** (the earlier "precluded by design" framing was wrong — it is unbuilt as
+    a DAP backend, not blocked).
+  - *Window-located* — both engines drive the one `Mem`, so `window_var_value_parity_per_step` reads `x`
+    via `var_addr`/`read_var` at each `seek(t)` and matches the bytecode engine's per-step window snapshot.
+  - *Delegation boundary* — `bytecode_debug_trace_declines_outside_single_vcpu_scope` pins that the
+    single-vCPU debug-trace returns `None` for a thread-spawner (so a debugger falls back to the
+    tree-walker / Milestone-B scheduled Inspector); a later flip to `Some` is a boundary change to notice.
+  - *Residual:* watchpoints/conditional breakpoints/time-travel on the bytecode path stay delegated (no
+    independent implementation to regress); the per-step SSA reader is single-block-scoped (slot index ==
+    block-local index there — multi-block adds the per-block slot base).
+- **G3 — DAP-level cross-engine parity. ⏳ Foundation landed; full backend still feature work.** The DAP
+  server drives the `Inspector` (tree-walker) and nothing else, so the *full* gap — a DAP conversation
+  replayed against a second backend — needs that backend *built*, not just tested: **DAP-over-JIT** is W5
+  Stage 5 (unbuilt; open design fork — drive the JIT under DAP via `int3`/single-step, *or*
+  interpreter-steps-JIT-runs), and **DAP-over-bytecode** needs the bytecode debug primitive wired into
+  the DAP server. The first prerequisite of the bytecode path **landed**: `bytecode::DebugRun` — a
+  resumable debug session (`run_to` a breakpoint, stopping *before* the op like the tree-walker; `value`
+  reads a block-local SSA value at the stop) — the engine-level control+inspection a DAP-over-bytecode
+  backend wires into. Two runtime parity tests prove the half G1/G2's one-shot traces don't:
+  `breakpoint_runtime_parity_across_loop_iterations` (the tree-walker `Inspector` and `DebugRun`, driven
+  through the same loop-body breakpoint, report identical stop locations and inspected `(i, acc)` at
+  **every hit** — resume included — and the same result) and `breakpoint_runtime_parity_across_call_frames`
+  (stopped *inside a callee*, both report the same **call-stack depth, per-frame location, and per-frame
+  locals** — the `stackTrace`/`scopes`/`variables` surface, now matched cross-frame via `DebugRun`'s
+  per-function slot metadata). `DebugRun` also has the **stepping verbs** (`step`/`step_over`/`step_out`,
+  mirroring the tree-walker's `step_to_depth`); `stepping_parity_over_and_out_at_a_call` checks that
+  step-over (run a call to completion) and step-out (return from a frame) land at the same op and agree
+  on the call result. So the bytecode engine now has the full **forward-debug** primitive surface —
+  breakpoints, cross-frame inspection, backtrace, stepping — all parity-tested against the tree-walker.
+  *Remaining, and scope-bounded:* the `svm-dap` server calls 18 distinct `Inspector` methods;
+  `DebugRun` covers the forward-debug subset, but the rest — `seek`/`step_back` (reverse debugging),
+  `set_watchpoint` (data breakpoints), `select_task`/`threads`/`stopped_task` (multithreading) — are
+  **outside the bytecode engine's single-vCPU debug scope** (it delegates those to the tree-walker, per
+  G2). So a DAP-over-bytecode backend can only ever cover the *forward-debug subset*; wiring it in is a
+  server-side backend seam (abstract that subset, add a name→`VarLoc` variable read on `DebugRun`) whose
+  *correctness* is already guaranteed by the engine-level parity here — it is feature plumbing for users,
+  not a parity risk. The JIT path is Stage 5 (separate). The *static* source-map half is covered
+  transitively by **G1**.
+
+---
+
 ## 2. Workstreams
 
 Eight workstreams (W1–W8). Dependency graph (→ = "depends on"):
