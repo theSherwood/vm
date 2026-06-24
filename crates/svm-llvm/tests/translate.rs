@@ -1029,6 +1029,23 @@ fn funnel_shift_general_const() {
 }
 
 #[test]
+fn strlen_builtin() {
+    // A direct `strlen` call (not via `printf %s`) routes to the synthesized `__svm_strlen` NUL-scan
+    // helper — even in a `run`-only module with no `main` (the helper reads memory, needs no powerbox).
+    // Two calls (a base pointer and a `buf + k` offset) over a runtime-length string; bit-exact vs the
+    // native `cc` oracle on both backends. Found needed by Embench `slre`.
+    let src = "#include <string.h>\n\
+        int run(int seed) {\n\
+        \x20 const char *s = \"the quick brown fox jumps over the lazy dog\";\n\
+        \x20 const char *t = \"embench strlen test vector\";\n\
+        \x20 unsigned long total = strlen(s + (seed % 5)) + strlen(t + (seed % 3));\n\
+        \x20 return (int)(total & 0x7fffffff);\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("strlen_builtin", src, 7);
+}
+
+#[test]
 fn variable_length_memset_loop() {
     // A runtime-length zero-fill: clang's loop-idiom recognizer emits `llvm.memset.p0.i64` with a
     // non-constant length, which lowers to a call to the synthesized `__svm_memset` loop helper.

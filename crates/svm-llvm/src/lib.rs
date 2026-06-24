@@ -279,6 +279,10 @@ fn translate_impl(
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
+    // A direct `strlen` call routes to the same synthesized `__svm_strlen` byte loop that `printf %s`
+    // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
+    // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
+    let need_strlen = need_printf || calls_external(m, &defined_names, "strlen");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -373,9 +377,9 @@ fn translate_impl(
         memcpy: take(need_memcpy),
         malloc: take(need_malloc),
         utoa: take(need_printf),
-        // `%s` needs a runtime strlen; synthesized alongside `utoa` whenever `printf` is present
-        // (one small function — `%s`-free printf programs carry an unused helper, negligible).
-        strlen: take(need_printf),
+        // `%s` needs a runtime strlen (synthesized alongside `utoa` for any `printf`); a direct
+        // `strlen` call also routes here — `need_strlen` covers both (see above).
+        strlen: take(need_strlen),
         realloc: take(need_realloc),
         memmove: take(need_memmove),
         getenv: take(need_getenv),
@@ -534,6 +538,8 @@ fn translate_impl(
     }
     if need_printf {
         funcs.push(synth_utoa());
+    }
+    if need_strlen {
         funcs.push(synth_strlen());
     }
     if need_realloc {
@@ -8262,6 +8268,19 @@ fn lower_io_call(
         "printf" => {
             lower_printf(ctx, c)?;
             let r = ctx.push(Inst::ConstI32(0));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strlen(s)`: the synthesized `__svm_strlen` NUL-scan loop (also used by `printf %s`).
+        "strlen" => {
+            let Some(f) = ctx.helpers.strlen else {
+                return Ok(false); // no strlen helper synthesized → fail-closed
+            };
+            let p = ctx.operand(&c.arguments[0].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![p],
+            });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
