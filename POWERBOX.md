@@ -188,14 +188,23 @@ weaken the §3c type-check's closed-enum audit surface for only a diagnostics ga
 - [ ] (Optional, cosmetic) carry an optional human-readable **interface label** alongside a `HostFn`
       grant — untrusted, verifier-ignored, for diagnostics / `cap.self.*` only. Not a type_id.
 
-### Phase 5 — C bindings
-- [ ] A C ABI crate (`svm-capi` / `cdylib` + generated `svm.h`) over the embedding surface:
-      module load/parse, `instantiate`, bind imports (by name, via C function pointers as host
-      capabilities), `call` exports, set `Limits`, read back stdout/stderr/outcome.
-- [ ] Host-capability callback ABI: a C function pointer `(op, args*, n_args, results*, n_results,
-      mem*, trap_out)` bridged to `HostFn` (mirror the existing `cap_thunk` C signature).
-- [ ] Memory ownership + error model (out-params + status codes; no unwinding across the boundary).
-- [ ] A C smoke test mirroring the Rust acceptance test (imports `write`, exports an entry).
+### Phase 5 — C bindings — done
+- [x] `svm-capi` crate (`rlib` + `cdylib` + `staticlib`) + hand-written `include/svm.h` over the whole
+      surface: parse (text/binary), `synth_powerbox_start`, name-keyed imports (built-ins +
+      C-callback host caps), `instantiate`/`instantiate_with_imports`, `run`(backend)/`run_diff`,
+      `Limits`/`RunConfig` (fuel/deadline/quota/stdin/memory), and outcome + stdout/stderr readback.
+- [x] Host-capability callback ABI: a C `(ctx, op, args*, n_args, results*, results_cap) -> i32`
+      function pointer bridged to `HostFn` (return = result count, negative = trap). Compute-only this
+      slice (no guest-memory arg yet — memory-backed I/O goes through the built-in `Stream` caps);
+      a `GuestMem` shim for the callback is the documented follow-up.
+- [x] Memory/error model: opaque handles with explicit `*_free`; `instantiate*` consume their inputs;
+      status codes + a thread-local `svm_last_error()`; every entry point `catch_unwind`s so a panic
+      never crosses into C.
+- [x] Tests: a CI-portable Rust ABI test (`src/abi_tests.rs`) drives the `extern "C"` surface end to
+      end incl. a function-pointer host callback, all three backends, fuel/memory config, and
+      fail-closed paths. A real C program (`examples/hello.c` + `examples/README.md`) links the
+      staticlib and runs a guest on the JIT (verified locally: `Hello from C!` + return `42`); it's
+      the human-facing linkage proof, kept out of CI to avoid `cc`-link fragility.
 
 ---
 
