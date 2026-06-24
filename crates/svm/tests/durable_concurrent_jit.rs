@@ -358,10 +358,11 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
 
     // This test needs the async freeze to catch the child **mid-loop with its fiber already parked** —
     // the clean interleaving the child's signal-after-park handshake aims for. On a slow/over-subscribed
-    // runner the freeze can instead land while the child's fiber is still on its resume chain, or after
-    // the child finished — a different (valid) freeze shape that doesn't exercise B.1. Only assert the
-    // strong B.1 properties when the clean shape occurred; otherwise skip (the simpler concurrent tests
-    // above always exercise the core concurrent freeze).
+    // runner the freeze can instead land while the child's fiber is still on its resume chain (that
+    // mid-resume-chain case is now covered deterministically by
+    // `concurrent_child_owns_active_chain_fiber_through_freeze_thaw`), or after the child finished — a
+    // different (valid) freeze shape that doesn't exercise B.1's *parked* path. Only assert the strong
+    // B.1 properties when the clean shape occurred; otherwise skip.
     let clean = read_state(&fsnap) == STATE_UNWINDING
         && matches!(fout, JitOutcome::Returned(_))
         && fvcpus.len() == 1
@@ -378,6 +379,111 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
         le_i64(&tfinal, OFF_C1),
         K + 5,
         "child resumed its loop + its fiber's yielded value across the freeze",
+    );
+}
+
+// Follow-up B.1′ — a concurrent child whose fiber is caught **mid-resume-chain** (active, not cleanly
+// parked). B.1 covered a fiber *suspended* at the freeze point; here the **fiber itself** drives the
+// spawn-before-freeze handshake (it signals from inside the resume chain, then loops K), so the async
+// freeze deterministically lands while the fiber is *running on the chain* and the child is blocked in
+// its `cont.resume`. On the freeze the fiber unwinds back through the resume (recorded as active-chain
+// residue, like the single-vCPU slice-3.2 case), the child unwinds at its `cont.resume` re-issue, and
+// the root unwinds separately. The thaw re-issues the child's resume, which re-enters the fiber; the
+// fiber rewinds to its mid-loop point, finishes, and suspends 5 — so the child's loop + the fiber's
+// yielded value reproduce `K + 5`, and the root reproduces `K`.
+const SRC_CHILD_FIBER_ACTIVE: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65568
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 0
+  br block1(v0, v5)
+block1(v6: i32, v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v6, v9) block2(v6, v9)
+block2(v12: i32, v13: i64):
+  v14 = i32.const 0
+  v15 = cap.call 2 0 (i32) -> (i64) v12 (v14)
+  v16 = i64.const 65536
+  i64.store v16 v13
+  return v13
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = ref.func 2
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  v12 = i64.const 0
+  br block1(v7, v12)
+block1(v13: i64, v14: i64):
+  v15 = i64.const 1
+  v16 = i64.add v14 v15
+  v17 = i64.const 100000000
+  v18 = i64.lt_s v16 v17
+  br_if v18 block1(v13, v16) block2(v13, v16)
+block2(v19: i64, v20: i64):
+  v21 = i64.add v19 v20
+  v22 = i64.const 65544
+  i64.store v22 v21
+  return v21
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65568
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v14 = suspend v12
+  v15 = i64.const 1000
+  v16 = i64.add v14 v15
+  return v16
+}
+"#;
+
+#[test]
+fn concurrent_child_owns_active_chain_fiber_through_freeze_thaw() {
+    let inst = instrument(SRC_CHILD_FIBER_ACTIVE);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    // The fiber signals from inside the chain then loops K, so the freeze should land while it is active
+    // on the chain — the same residue shape as B.1 (one frozen child vCPU owning one frozen fiber). On a
+    // badly-scheduled runner the freeze can still miss (fiber finished, or never entered): only assert
+    // the strong active-chain properties when that clean shape occurred.
+    let clean = read_state(&fsnap) == STATE_UNWINDING
+        && matches!(fout, JitOutcome::Returned(_))
+        && fvcpus.len() == 1
+        && ffibers.len() == 1;
+    if !clean {
+        return;
+    }
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(le_i64(&tfinal, OFF_ROOT), K, "root total reproduced");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        2 * K,
+        "child re-entered its mid-resume-chain fiber, which finished its own K-loop and suspended the \
+         total, across the freeze (child's K + the fiber's K)",
     );
 }
 
