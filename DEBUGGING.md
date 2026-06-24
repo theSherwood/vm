@@ -61,6 +61,59 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 
 ---
 
+## 1b. Cross-engine debug parity
+
+The project has **three execution engines** but only **two debug modalities**, so "parity" means
+different things depending on which pair you compare:
+
+- **Tree-walker** (`svm-interp`, the default `run`/`Inspector` path) — the **reference debug engine and
+  correctness oracle**. The full `Inspector` surface (breakpoints + conditions, watchpoints, in/over/out
+  + reverse stepping, time-travel, multithreaded, the whole DAP server) runs here. When you debug *via
+  DAP*, you are always on the tree-walker.
+- **Bytecode** (`svm-interp::bytecode`, the perf rewrite reached by `run_with_host_fast`) — preserves the
+  `IrPc = (block, inst)` debug seam *by construction* (`Program::src` reverse map). `bytecode::ir_trace`
+  reproduces the tree-walker's `seek(0,1,…)` stepping-location sequence op-for-op, but only for
+  **single-vCPU, seam-free** runs; it **falls back to the tree-walker** for watchpoints, real
+  breakpoint-stops, concurrency/coroutines, and time-travel.
+- **JIT** (`svm-jit`) — a *different modality*: it emits **DWARF** for **gdb/lldb** (W5 Stages 0–4) and an
+  always-on trap-time source backtrace; it does **not** use the `Inspector`, and DAP-over-JIT (Stage 5)
+  is deferred. The unifying mechanism that keeps all three agreeing on *where in the source* a program
+  point is, is the §6 debug-info **narrow waist** (W4): every engine consumes the *same* neutral
+  `DebugInfo` (`debug.loc`/`debug.var`/types).
+
+**What is already protected by tests:**
+- *Bytecode ↔ tree-walker* — `bytecode_debug.rs` (stepping/breakpoint **locations** op-for-op:
+  straight-line/branch/loop/call/trap, results too) + `bytecode_diff.rs` and ~15 per-feature
+  `bytecode_*` suites (value/trap/memory exact-equality, tree-walker as oracle).
+- *JIT debug emission* — `jit_srcloc.rs` (`debug.loc` → `symbolize` → DWARF `.debug_line` round-trip),
+  `jit_trap_backtrace.rs`/`interp_trap_backtrace.rs`/`jit_per_fiber_trap.rs` (source backtraces),
+  in-crate `symbolize` tests, the `gdb_attach` example (gdb 15.1).
+- *Interp ↔ JIT value/trap parity* — a large cross-engine suite (`simd`, `fiber_fuzz`, `jit_*`,
+  `multivcpu_trap_origin`, `dynlink`, plus svm-llvm `cross_engine`/`corpus_diff`). This is **result**
+  parity, not **debug** parity.
+
+### Known gaps (the regression risks this section tracks)
+
+- **G1 — direct cross-engine *source-location* parity assertion. ✅ Landed (`crates/svm/tests/debug_parity.rs`).**
+  Compiles one `-g` module and checks the tree-walker's `source_loc`, the bytecode engine's `ir_trace`
+  location, **and** the JIT's `src_ranges`/`symbolize` agree on the same op→line mapping (straight-line,
+  loop with repeated lines, branch). The two interpreters must match **op-for-op**; the JIT's line set
+  matches exactly (full-coverage fixtures) or is a superset (a branch's not-taken arm stays mapped).
+  A drift in any single engine's debug-info threading now fails here. One **legitimate** divergence is
+  pinned (`jit_elides_const_only_source_line`): a line that belongs only to a folded single-use `const`
+  is stepped by both interpreters but has no JIT machine-code range — compiled code has no instruction
+  for a materialized immediate — while the invariant "the JIT never maps a line the interpreters don't
+  step" still holds.
+- **G2 — bytecode debug parity is single-vCPU *locations + results* only.** `bytecode_debug.rs` does not
+  cover *variable inspection* (`var_addr`/`read_var`) on the bytecode path, and watchpoints/conditional
+  breakpoints/time-travel are not independently implemented there (they delegate to the tree-walker) —
+  so the delegation boundary itself is untested end-to-end.
+- **G3 — DAP is tree-walker-only.** The DAP server (incl. the new data breakpoints, stepping, reverse
+  debugging) drives the `Inspector` exclusively; there is no DAP-over-bytecode or DAP-over-JIT, so there
+  is no DAP-level cross-engine parity to test yet (gated on W5 Stage 5).
+
+---
+
 ## 2. Workstreams
 
 Eight workstreams (W1–W8). Dependency graph (→ = "depends on"):
