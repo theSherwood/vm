@@ -168,6 +168,17 @@ fn main() {
         };
         let ok = nat_chk == 1 && tw == nat_chk && bcv == nat_chk && jitv == nat_chk;
 
+        // A miscompile is reported but **excluded from the perf geomean** — a wrong answer has no
+        // meaningful speed. (`edn` currently lands here: it translates but `fir_no_red_ld`'s `<2 x i16>`
+        // no-redundant-load pattern miscompiles — ISSUES.md I13.)
+        if !ok {
+            println!(
+                "{name:<16} {nat_ns:>12.1} {:>12}   {:>7}   MISCOMPILE (excluded) nat={nat_chk} tw={tw} bc={bcv} jit={jitv} — see ISSUES.md I13",
+                "—", "—"
+            );
+            continue;
+        }
+
         // JIT per-iter timing (native + jit, the comparability headline).
         let jit_ns = per_iter(large, |n| {
             black_box(svm_jit::compile_and_run(&t.module, e, &[sp, n]).unwrap());
@@ -175,13 +186,8 @@ fn main() {
 
         ratios.push((name, jit_ns / nat_ns));
         println!(
-            "{name:<16} {nat_ns:>12.1} {jit_ns:>12.1} {:>7.2}x   {}",
+            "{name:<16} {nat_ns:>12.1} {jit_ns:>12.1} {:>7.2}x   OK (all engines = native, verify=1)",
             jit_ns / nat_ns,
-            if ok {
-                "OK (all engines = native, verify=1)".to_string()
-            } else {
-                format!("MISMATCH nat={nat_chk} tw={tw} bc={bcv} jit={jitv}")
-            }
         );
     }
     if !ratios.is_empty() {

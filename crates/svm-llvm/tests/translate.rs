@@ -3961,6 +3961,29 @@ fn simd_autovec_avx2_elementwise() {
     check_avx_vs_native("simd_avx2_elem", src, 4);
 }
 
+/// `-O2 -mavx2` auto-vectorized **wide lane shifts** (`shl`/`lshr`/`ashr` on a `<8 x i32>` by a
+/// constant splat) — ISSUES.md I11. The legalization pass splits the `<8 x i32>` shift into two
+/// `v128` `VShift` chunks (the `wide_shift` arm in `lower_wide`); before that the on-ramp fail-closed
+/// on `lshr <8 x i32>` even though the v128 case worked. Mixes a logical and an arithmetic shift so
+/// both `ShrU`/`Shl` and `ShrS` are exercised. Byte-identical to the native scalar oracle.
+#[test]
+fn simd_autovec_avx2_wide_shifts() {
+    let src = "void sh(const int *a, int *c, int n);\n\
+        static int A[64], C[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) A[i] = (seed + i * 7) * 1103515245 + 12345;\n\
+        \x20 sh(A, C, 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += C[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        __attribute__((noinline)) void sh(const int *a, int *c, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) c[i] = ((unsigned) a[i] >> 5) ^ (a[i] << 3) ^ (a[i] >> 2);\n\
+        }\n\
+        int main(void) { return run(9); }\n";
+    check_avx_vs_native("simd_avx2_wide_shifts", src, 9);
+}
+
 // ============================================================================================
 // SIMD — the **other 128-bit lane shapes** (`i8x16`/`i16x8`/`i64x2`/`f64x2`), beyond the original
 // `i32x4`/`f32x4`. These use explicit `vector_size(16)` types compiled with vectorization *off*

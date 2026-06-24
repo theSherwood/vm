@@ -11660,6 +11660,60 @@ fn wide_float_binop(
     Ok(true)
 }
 
+/// Lower a wide integer lane **shift** (`shl`/`lshr`/`ashr` on a `<N×iM>` wider than 128 bits) by a
+/// **constant splat** amount → `VShift` per chunk + a scalar shift per tail lane. Mirrors the v128
+/// shift path in [`bin`] (the auto-vectorizer emits the amount as a uniform splat, e.g. edn's
+/// `lshr <8 x i32> v, <i32 15, …>`); a non-uniform amount stays fail-closed. `Ok(false)` if not wide.
+fn wide_shift(
+    ctx: &mut BlockCtx,
+    types: &Types,
+    dest: &Name,
+    a: &Operand,
+    amt: &Operand,
+    op: BinOp,
+) -> Result<bool, Error> {
+    let Some(layout) = wide_vec_layout(a.get_type(types).as_ref()) else {
+        return Ok(false);
+    };
+    let Some(amount) = const_splat_int(amt) else {
+        return unsup(format!(
+            "wide vector shift {op:?} with non-constant-splat amount"
+        ));
+    };
+    let vop = match op {
+        BinOp::Shl => svm_ir::VShiftOp::Shl,
+        BinOp::ShrU => svm_ir::VShiftOp::ShrU,
+        BinOp::ShrS => svm_ir::VShiftOp::ShrS,
+        other => return unsup(format!("wide_shift: non-shift op {other:?}")),
+    };
+    let pa = ctx.wide_operand(a, layout)?;
+    let tail_ty = int_ty(layout.shape.lane_val())?;
+    let mut out = Vec::with_capacity(layout.nparts());
+    for &chunk in pa.iter().take(layout.full_chunks) {
+        let amtv = ctx.push(Inst::ConstI32(amount as i32)); // `VShift` takes a scalar i32 amount
+        out.push(ctx.push(Inst::VShift {
+            shape: layout.shape,
+            op: vop,
+            a: chunk,
+            amt: amtv,
+        }));
+    }
+    for &lane in pa.iter().skip(layout.full_chunks) {
+        let amtv = match tail_ty {
+            IntTy::I32 => ctx.push(Inst::ConstI32(amount as i32)),
+            IntTy::I64 => ctx.const_i64(amount as i64),
+        };
+        out.push(ctx.push(Inst::IntBin {
+            ty: tail_ty,
+            op,
+            a: lane,
+            b: amtv,
+        }));
+    }
+    ctx.bind_wide(dest, out);
+    Ok(true)
+}
+
 /// Lower a wide integer lane **min/max** (`llvm.{s,u}{min,max}.vNiM`) per chunk (`VIntBin`). Tail
 /// lanes would need per-lane signed/unsigned compares (a rare odd-width corner) — `Unsupported`.
 fn wide_minmax(
@@ -11849,6 +11903,9 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             WIntChunk::Bit(Bit::Xor),
             BinOp::Xor,
         ),
+        I::Shl(x) => wide_shift(ctx, types, &x.dest, &x.operand0, &x.operand1, BinOp::Shl),
+        I::LShr(x) => wide_shift(ctx, types, &x.dest, &x.operand0, &x.operand1, BinOp::ShrU),
+        I::AShr(x) => wide_shift(ctx, types, &x.dest, &x.operand0, &x.operand1, BinOp::ShrS),
         I::FAdd(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Add),
         I::FSub(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Sub),
         I::FMul(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Mul),
