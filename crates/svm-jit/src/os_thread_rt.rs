@@ -317,17 +317,17 @@ impl Domain {
         self.concurrent_durable.load(Ordering::Acquire)
     }
 
-    /// **Concurrent durable STW** (Phase-4 Slice A, 4A.4) — a worker reaches the quiesce barrier. Runs
-    /// `unwind` while holding the `quiesce` lock, so the single shared active shadow-SP scratch has
-    /// exactly one owner for the whole set-SP → unwind → read-SP → record sequence (O-A4.1/.2/.3 — no
-    /// torn SP write, each context unwinds against its own region). Then decrements the runner count
-    /// and, when the last worker arrives, wakes the coordinator. The notify can't be lost: both the
-    /// decrement-to-zero and the coordinator's wait hold `quiesce`, so the coordinator either sees
+    /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
+    /// each context unwinds into its **own** region's shadow-SP word (per-context, no shared scratch
+    /// since the relocation), so `unwind` runs **concurrently, outside the lock** — workers no longer
+    /// serialize on a single active-SP word. The lock guards only the *join*: decrement the runner
+    /// count and, when the last worker arrives, wake the coordinator. The notify can't be lost: both
+    /// the decrement-to-zero and the coordinator's wait hold `quiesce`, so the coordinator either sees
     /// `runners == 0` before parking or is woken after (O-A4.4 — the same invariant as the futex).
     #[cfg_attr(not(loom), allow(dead_code))]
     pub(crate) fn quiesce_arrive(&self, unwind: impl FnOnce()) {
+        unwind(); // concurrent: each context spills into its own per-context region word (4A.5)
         let mut runners = lock(&self.quiesce);
-        unwind(); // single-owner critical section: the active-SP scratch
         *runners -= 1;
         if *runners == 0 {
             self.quiesce_cv.notify_all();
@@ -1268,47 +1268,33 @@ mod loom_tests {
         });
     }
 
-    /// O-A4 (Phase-4 Slice A, 4A.4): the multi-worker quiesce barrier — the R10 seam. `N` workers each
-    /// unwind under the `quiesce` lock (the single shared active shadow-SP scratch must have one owner
-    /// at a time) and arrive at the barrier; the coordinator waits for all of them. Under every
-    /// interleaving:
-    ///   * O-A4.1 — no two workers are inside the SP critical section at once (the `occupied` flag is
-    ///     never observed already set);
-    ///   * O-A4.2/.3 — each worker reads back exactly the extent it wrote (no torn/lost SP update; it
-    ///     never picks up a sibling's region);
+    /// O-A4 (Phase-4 Slice A): the multi-worker quiesce barrier — the R10 seam. §12.8 4A.5: each worker
+    /// unwinds into its **own** per-context region's shadow-SP word (no shared scratch since the
+    /// relocation), so the unwind runs concurrently *outside* the lock; the lock guards only the join.
+    /// `N` workers each unwind + arrive; the coordinator waits for all. Under every interleaving:
+    ///   * O-A4.2/.3 — each worker's own SP slot ends at exactly the extent it wrote (concurrent
+    ///     unwinds into disjoint per-context words never clobber a sibling);
     ///   * O-A4.4 — the coordinator never hangs (the last-arriver notify can't be lost — same property
     ///     as `loom_wait_notify_never_hangs`, here for the barrier).
     /// The single-vCPU async-request ordering (O-A3) is the degenerate `N = 1` case.
     #[test]
-    fn loom_quiesce_barrier_never_hangs_and_sp_swap_is_exclusive() {
+    fn loom_quiesce_barrier_never_hangs_with_per_context_sp() {
         loom::model(|| {
             const N: usize = 2;
             let dom = Arc::new(Domain::new(MAX_VCPUS));
             dom.arm_quiesce(N);
-            // The single shared active shadow-SP scratch + an "occupied" flag to catch any overlap of
-            // two unwind critical sections.
-            let sp = Arc::new(AtomicU64::new(0));
-            let occupied = Arc::new(AtomicU64::new(0));
+            // §12.8 4A.5: per-context SP words — each worker owns its own slot (no shared scratch).
+            let sps: Vec<Arc<AtomicU64>> = (0..N).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
             let workers: Vec<_> = (0..N)
                 .map(|i| {
-                    let (d, sp, occ) = (Arc::clone(&dom), Arc::clone(&sp), Arc::clone(&occupied));
+                    let (d, sp) = (Arc::clone(&dom), Arc::clone(&sps[i]));
                     loom::thread::spawn(move || {
                         let my_extent = (i as u64) + 1; // a distinct per-context extent
                         d.quiesce_arrive(|| {
-                            // O-A4.1: exactly one worker in the SP critical section at a time.
-                            assert_eq!(
-                                occ.swap(1, Ordering::AcqRel),
-                                0,
-                                "active-SP scratch double-owned"
-                            );
-                            sp.store(my_extent, Ordering::Release); // set own SP + "unwind"
-                            let read = sp.load(Ordering::Acquire); // read the extent back to record
-                            assert_eq!(
-                                read, my_extent,
-                                "SP write torn/lost (read a sibling's extent)"
-                            );
-                            occ.store(0, Ordering::Release);
+                            // The unwind runs concurrently with siblings: it touches only this
+                            // context's own region word, so there is no critical section to serialize.
+                            sp.store(my_extent, Ordering::Release);
                         });
                     })
                 })
@@ -1319,11 +1305,15 @@ mod loom_tests {
             for w in workers {
                 w.join().unwrap();
             }
-            assert_eq!(
-                occupied.load(Ordering::Acquire),
-                0,
-                "scratch released after all quiesced"
-            );
+            // O-A4.2/.3: each context's own word holds exactly its extent — concurrent unwinds into
+            // disjoint per-context words never clobbered a sibling.
+            for (i, sp) in sps.iter().enumerate() {
+                assert_eq!(
+                    sp.load(Ordering::Acquire),
+                    (i as u64) + 1,
+                    "a context's own per-context SP word was clobbered"
+                );
+            }
         });
     }
 }
