@@ -334,9 +334,17 @@ at a breakpoint in one thread and examine another's stack; the focus resets on t
 and stepping always drives the *stopped* thread. Tests (`debug_threads.rs`): a worker breakpoint
 fires once per spawned thread (distinct vCPUs); a W7 race witness replays to the lost update (1)
 *under the debugger*; single-stepping advances the stopped thread one op; `select_task` inspects a
-second live thread mid-stop and switches back. *Not yet:* watchpoints across threads as a headline
-test, and stepping that crosses a scheduler decision point (step-over-a-spawn). Those, plus W1
-record/replay, are the rest of Milestone B.
+second live thread mid-stop and switches back. **Watchpoints are cross-thread** — they live in the
+same run-shared `DebugShared` and every vCPU's per-op seam checks them, so a window-range watch fires
+in whichever thread touches the range, reporting that thread + the confined address + read/write
+(`cross_thread_watchpoints.rs`): a write-watch on a contended counter fires before *each* worker's
+store (attributed per thread) and a read-watch before each worker's *and* the root's load; while
+stopped at a watch you can read the value the thread is about to write and `select_task` another
+thread's stack; a watch on an untouched range never fires. *Not yet:* stepping that crosses a
+scheduler decision point (step-over-a-spawn) — which also blocks composing a watch with a **fixed
+`find_schedule` witness plan** (a watch pause perturbs the plan's decision-point sequence, so the
+headline above uses the live default schedule). That, plus W1 record/replay, is the rest of
+Milestone B.
 
 ---
 
