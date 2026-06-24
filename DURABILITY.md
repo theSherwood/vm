@@ -1068,9 +1068,24 @@ barrier's serialization unnecessary, so each child's freeze-unwind simply comple
 snapshot sees a fully-quiesced window. The quiesce barrier is retained as a loom-verified primitive.
 Pinned by `crates/svm/tests/durable_concurrent_jit.rs`: a root + two children all freeze mid-loop under
 an async `request_freeze` and the thaw reproduces the result (each total in its own guest-memory slot, so
-the round-trip is robust to which context froze when). *Follow-ups:* surviving a **`thread.join`** result
-across a concurrent freeze (a child that finishes before the freeze point — needs join-table capture);
-a concurrent child that itself owns fibers / nested concurrent spawns. Original map:
+the round-trip is robust to which context froze when). The tests use a **spawn-before-freeze handshake**
+(the root signals via a host fn once children are spawned; the controller requests the freeze only then)
+— otherwise the async freeze fires before the root's `thread.spawn`s and the children are *deferred* to
+the single-worker path. (That handshake also surfaced a real bug, since fixed: a concurrent child never
+initialised its region's shadow-SP word, so on a freeze it spilled over the reserve header — `run_child`
+now seeds it to the frame base.)
+
+*Follow-up A — `thread.join` result across a concurrent freeze (LANDED).* A concurrent child that
+finishes *before* the freeze point delivers its result to the host-side Done cell, which the snapshot
+doesn't capture, so the root's later (post-freeze) `thread.join` couldn't resolve on thaw. Now
+`run_child` records every completed concurrent child; on a freeze the coordinator turns them into
+`completed_result` `FrozenVCpu` residue (`FORMAT_VERSION` 5→6), and the thaw delivers each result into
+the spawner's join table **without re-running** the child (its effects are already in the snapshot).
+Emitting *all* completed children keeps the per-parent table dense so every handle still resolves.
+Pinned by `concurrent_join_result_survives_a_freeze_before_the_join`.
+
+*Remaining follow-up B:* a concurrent child that itself owns fibers (needs its own `freeze_drive` in
+`run_child`) / nested concurrent spawns. Original map:
 
 - **Barrier adaptation (LANDED).** The 4A.4 `quiesce_arrive` ran `unwind` *under* the `quiesce` lock to
   serialize the (then-shared) active-SP scratch. With per-context SP that serialization is unnecessary —
