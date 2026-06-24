@@ -1084,8 +1084,19 @@ the spawner's join table **without re-running** the child (its effects are alrea
 Emitting *all* completed children keeps the per-parent table dense so every handle still resolves.
 Pinned by `concurrent_join_result_survives_a_freeze_before_the_join`.
 
-*Remaining follow-up B:* a concurrent child that itself owns fibers (needs its own `freeze_drive` in
-`run_child`) / nested concurrent spawns. Original map:
+*Follow-up B.1 — concurrent child owns fibers (LANDED).* `run_child` now arms the child's fiber runtime
+durable (`set_durable_env`) and, on a freeze-unwind, runs its own `freeze_drive` over its parked fibers
+(the concurrent mirror of `run_child_inline`'s), draining the residue into the domain accumulator
+(collected after `join_all`). Pinned by `concurrent_child_owns_fiber_through_freeze_thaw`.
+
+*Follow-up B.2 — nested concurrent spawns (REMAINING).* A *concurrent* child that itself `thread.spawn`s
+a grandchild mis-attributes the grandchild's `parent_task`: `thread_spawn` reads the **shared**
+`Domain::cur_task` for the parent, which only the single-worker inline/thaw paths maintain — `run_child`
+never sets it, and it would race across concurrent spawners anyway. The fix is a **per-OS-thread
+spawning-task source** (a runtime-private thread-local seeded in `run_child` to the child's task, read by
+`thread_spawn` instead of the shared `cur_task`), plus a nested concurrent test (root → concurrent child
+→ concurrent grandchild, all frozen, thaw rebuilds the per-parent topology). Deferred nested spawns
+(slice 3.4) and concurrent *flat* spawns already work; this is the narrow remaining gap. Original map:
 
 - **Barrier adaptation (LANDED).** The 4A.4 `quiesce_arrive` ran `unwind` *under* the `quiesce` lock to
   serialize the (then-shared) active-SP scratch. With per-context SP that serialization is unnecessary —
