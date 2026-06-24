@@ -367,7 +367,10 @@ fn compute_may_suspend(m: &Module) -> Vec<bool> {
                 // stacks and is a freeze safepoint too (`cont.new` alone merely allocates).
                 matches!(
                     x,
-                    Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                    Inst::CapCall { .. }
+                        | Inst::ContResume { .. }
+                        | Inst::Suspend { .. }
+                        | Inst::ThreadJoin { .. }
                 )
             })
         }) {
@@ -413,6 +416,12 @@ enum SuspendKind {
     /// 3.1.3) — until that lands, a thaw that actually re-enters a suspended fiber still relies
     /// on the fiber side being wired.
     Resume { k: ValIdx, arg: ValIdx },
+    /// `thread.join` (§12.8 next slice): a vCPU blocked joining a child is a freeze safepoint too — the
+    /// `thread_join` thunk returns a sentinel on observing `UNWINDING`, the trailing poll unwinds, and
+    /// the join is **re-issued on thaw** (like a propagated call / `cont.resume`): by then the child has
+    /// been re-spawned and run to completion, so the re-executed join resolves immediately to its
+    /// recorded result. `handle` is the joined vCPU handle's block-local index (spilled + reloaded).
+    ThreadJoin { handle: ValIdx },
     /// `suspend` (fiber side): unwinds the fiber's stack like a leaf, and thaw **re-parks** the
     /// fiber — flips the state word to `NORMAL` (a parked fiber's suspend is the globally-deepest
     /// frozen frame) and re-executes `suspend` so control returns to the resumer awaiting a future
@@ -487,7 +496,10 @@ fn transform_func(
             .iter()
             .enumerate()
             .filter(|(_, inst)| match inst {
-                Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => true,
+                Inst::CapCall { .. }
+                | Inst::ContResume { .. }
+                | Inst::Suspend { .. }
+                | Inst::ThreadJoin { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
                 _ => false,
             })
@@ -686,7 +698,10 @@ fn transform_func(
                     },
                     Inst::ContResume { k, arg } => SuspendKind::Resume { k: *k, arg: *arg },
                     Inst::Suspend { value } => SuspendKind::Yield { value: *value },
-                    _ => unreachable!("suspend position is a cap.call / call / fiber op"),
+                    Inst::ThreadJoin { handle } => SuspendKind::ThreadJoin { handle: *handle },
+                    _ => unreachable!(
+                        "suspend position is a cap.call / call / fiber / thread.join op"
+                    ),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
                     (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
@@ -695,6 +710,7 @@ fn transform_func(
                     }
                     (SuspendKind::Resume { .. }, _) => 2, // (status, value)
                     (SuspendKind::Yield { .. }, _) => 1,  // the resume arg
+                    (SuspendKind::ThreadJoin { .. }, _) => 1, // the join result (i64)
                     _ => unreachable!(),
                 };
                 // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
@@ -706,7 +722,8 @@ fn transform_func(
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
                     | SuspendKind::Resume { .. }
-                    | SuspendKind::Yield { .. } => out - nres,
+                    | SuspendKind::Yield { .. }
+                    | SuspendKind::ThreadJoin { .. } => out - nres,
                     // Header polls are built separately (above), never from an in-block op.
                     SuspendKind::LoopHeader => unreachable!("loop-header point not from an op"),
                 };
@@ -748,6 +765,9 @@ fn transform_func(
                 }
                 if let SuspendKind::Yield { value } = &kind {
                     used[*value as usize] = true; // operand of the re-executed suspend
+                }
+                if let SuspendKind::ThreadJoin { handle } = &kind {
+                    used[*handle as usize] = true; // operand of the re-issued thread.join
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -917,6 +937,22 @@ fn transform_func(
                 ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
                 let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
                 ab.many(Inst::Suspend { value: v }, pt.nres)
+            }
+            // `thread.join` re-issue: reload the spilled vCPU handle and re-execute the join. By thaw the
+            // child has been re-spawned and run to completion, so the join resolves to its recorded result
+            // immediately (no block) — its result is *re-issued* (not reloaded), like `cont.resume`, so
+            // §12.6 holds (the child's side effects are replayed on its own rewind). But unlike a
+            // propagated call / resume, the join has **no in-thread callee** to flip the state word: the
+            // joined child rewinds as a *separate* vCPU (and the thaw driver resets the word to
+            // `REWINDING` afterward), so on this thread the join is the globally-deepest frozen frame —
+            // it flips the state to `NORMAL` itself, like a leaf, *before* re-issuing.
+            SuspendKind::ThreadJoin { handle } => {
+                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                let hh =
+                    reloaded[spill_slot(*handle as usize).expect("thread.join handle spilled")];
+                ab.many(Inst::ThreadJoin { handle: hh }, pt.nres)
             }
         };
 

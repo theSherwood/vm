@@ -351,13 +351,16 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   (back-edge polls, JIT parity, async `request_freeze`, the loom quiesce model) and **4A.5
   per-context shadow-SP → genuinely-concurrent multi-vCPU STW freeze** (`FORMAT_VERSION` 4→5→6;
   the shared shadow-SP word + its lock retired), plus follow-ups **A** (a `thread.join` result
-  survives a concurrent freeze) and **B.1** (a concurrent child flattens its own fibers).
+  survives a concurrent freeze), **B.1** (a concurrent child flattens its own fibers), and the
+  **blocked-in-`thread.join` freeze** (`thread.join` is now a may-suspend re-issue safepoint; a vCPU
+  parked in a join unwinds and the thaw re-issues the join).
   **Next slices (all detailed under "Phase 4 Slice A.5", and either fail-closed or documented today):**
   (1) **B.2 — full nested concurrent spawns** (a concurrent child spawning a grandchild; currently
   *fail-closed* with `ThreadFault` — needs a per-OS-thread spawning-task source);
   (2) **B.1′ — concurrent child-fiber freeze *mid-resume-chain*** (cleanly-parked is done; this
   interleaving is unverified — the likely Windows flake too);
-  (3) **freeze a vCPU blocked in `thread.join`/`wait`** (thread ops aren't may-suspend safepoints yet);
+  (3) **freeze a vCPU blocked in `thread.wait`** (the futex `atomic.wait` thunk doesn't yet return on
+  an in-flight freeze — folds into **4A.7** parked-vCPU below; the `thread.join` case is now done);
   (4) **4A.6** recycled-context async freeze (sparse-residue payoff); **4A.7** parked-vCPU /
   `Blocking.work` latency; and the non-STW Phase-4 items — handle hardening (drainable non-durable
   bindings), CoW clone, `SharedRegion` consistent-cut (R4).
@@ -995,10 +998,12 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 `Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
 
-**Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** are **landed** (merged, all-platform CI green). The
-remaining queue — **B.2** full nested concurrent spawns (fail-closed today), **B.1′** concurrent
-child-fiber freeze *mid-resume-chain*, freezing a vCPU **blocked in `thread.join`/`wait`**, then 4A.6 /
-4A.7 — is detailed in the *"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes below.
+**Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** + the **blocked-in-`thread.join` freeze** are
+**landed** (the first three merged, all-platform CI green; the blocked-in-join slice on
+`claude/durable-next-slices-tracker`). The remaining queue — **B.2** full nested concurrent spawns
+(fail-closed today), **B.1′** concurrent child-fiber freeze *mid-resume-chain*, freezing a vCPU
+**blocked in `thread.wait`** (futex), then 4A.6 / 4A.7 — is detailed in the *"Phase 4 Slice A.5 —
+per-context shadow-SP"* follow-up notes below.
 
 **Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
 full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
@@ -1139,11 +1144,24 @@ source (seed the child's task in `run_child`; read it in `thread_spawn` instead 
 `cur_task`) + a nested concurrent test (root → child → grandchild, all frozen, thaw rebuilds the
 per-parent topology). Deferred nested spawns (slice 3.4) and concurrent *flat* spawns already work.
 
-*Also out of scope (documented limitation):* freezing a vCPU **blocked in `thread.join`/`thread.wait`**.
-Thread ops aren't may-suspend safepoints, so a vCPU parked in a join/wait doesn't observe a freeze — the
-natural "spawn then join" root can be frozen only while it is *running* (e.g. at a back-edge poll or
-`cap.call`), not while blocked. Making thread ops freeze-safepoints (unwind + re-issue on thaw) is a
-separate slice. Original map:
+**Freezing a vCPU blocked in `thread.join` — done.** `thread.join` is now a may-suspend re-issue
+safepoint: `compute_may_suspend` counts it (so a "spawn then join" root is instrumented), the transform
+classifies it as `SuspendKind::ThreadJoin` (its result is *re-issued* on thaw like `cont.resume`, since
+the joined child replays its own side effects on its rewind — §12.6), and the `thread_join` runtime thunk
+now returns on observing `UNWINDING` so a vCPU **parked in the join** unwinds at the trailing safepoint
+rather than blocking the stop-the-world freeze. On thaw the join is re-issued; because the join has no
+in-thread callee to flip the state word (the child rewinds as a *separate* vCPU and the thaw driver
+resets the word to `REWINDING` afterward), the join is the globally-deepest frozen frame on its own
+thread, so — like a leaf — it flips the state to `NORMAL` itself before re-issuing. Pinned by
+`concurrent_freeze_while_root_blocked_in_join` (root parks in the join; the child drives the
+spawn-before-freeze handshake so the freeze lands while the root is blocked). Both the running-root path
+(follow-up A) and the blocked-root path are covered.
+
+*Still out of scope (documented limitation):* freezing a vCPU **blocked in `thread.wait`** (the futex
+`atomic.wait`). The `thread_wait` thunk doesn't yet return on an in-flight freeze, so a vCPU parked in a
+futex wait doesn't observe one — folds into the 4A.7 parked-vCPU slice (same `window_is_unwinding`
+return trick the join thunk now uses, plus the transform side if `atomic.wait` is to be a re-issue
+safepoint). Original map:
 
 - **Barrier adaptation (loom-verified, but NOT the live path).** The 4A.4 `quiesce_arrive` ran `unwind`
   *under* the `quiesce` lock to serialize the (then-shared) active-SP scratch; with per-context SP that

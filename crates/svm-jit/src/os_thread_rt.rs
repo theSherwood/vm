@@ -1271,6 +1271,16 @@ pub(crate) unsafe extern "C" fn thread_join(
     // (else `join_all` hangs on a vCPU that will never finish). When armed, re-check the interrupt
     // cell periodically; on a kill, return so the caller's next epoch poll traps `OutOfFuel`.
     let epoch_addr = dom.env().epoch_addr;
+    // §12.8 4A.5 (blocked-in-join freeze): a joiner parked here when a freeze begins must also return
+    // so its instrumented caller can unwind at the re-issue safepoint the `svm-durable` transform now
+    // emits after `thread.join`. On thaw the join is re-issued and re-parks on the (re-spawned) child.
+    // Gate on `durable` — only then is window offset 0 the reserved state word; a non-durable run's
+    // offset 0 is ordinary guest memory and could spuriously read `UNWINDING`.
+    let unwind_base = if dom.env().durable {
+        dom.env().mem_base
+    } else {
+        0
+    };
     let mut st = lock(&done.state);
     loop {
         if let Some((result, trap)) = *st {
@@ -1282,8 +1292,14 @@ pub(crate) unsafe extern "C" fn thread_join(
         if epoch_fired(epoch_addr) {
             return 0; // killed — unwind to guest code, which traps OutOfFuel at its next poll
         }
+        // SAFETY: on a durable run `mem_base` is the committed window base, offset 0 RW for the run.
+        if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
+            return 0; // freeze in progress — return so the join's trailing safepoint unwinds
+        }
+        // A timeout wait so the kill (`epoch_addr`) and freeze (`unwind_base`) re-checks above run
+        // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
         #[cfg(not(loom))]
-        if epoch_addr != 0 {
+        if epoch_addr != 0 || unwind_base != 0 {
             st = done
                 .cv
                 .wait_timeout(st, KILL_RECHECK)

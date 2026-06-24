@@ -377,6 +377,78 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
     );
 }
 
+// Blocked-in-join freeze: the root parks in `thread.join` and the freeze lands while it is **blocked**.
+// The root spawns a long-running child as a concurrent OS thread and *immediately* joins it (no safepoint
+// in between), so it parks in the join. The **child** drives the spawn-before-freeze handshake — it
+// signals after it starts looping, so the root is already parked when the freeze is requested. With
+// `thread.join` now a re-issue safepoint, the blocked root must unwind (the `thread_join` thunk returns
+// on observing UNWINDING; the trailing safepoint spills the handle and unwinds), and the thaw must
+// re-issue the join so it resolves the re-run child's result.
+const SRC_BLOCKED_JOIN: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = thread.join v4
+  v6 = i64.const 65536
+  i64.store v6 v5
+  return v5
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v13 = i64.const 65544
+  i64.store v13 v12
+  return v12
+}
+"#;
+
+#[test]
+fn concurrent_freeze_while_root_blocked_in_join() {
+    let inst = instrument(SRC_BLOCKED_JOIN);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The child finished and the root's join resolved before the freeze landed (rare): uninterrupted.
+        assert_eq!(le_i64(&fsnap, OFF_ROOT), K);
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder while the root was blocked in the join",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        K,
+        "the re-run child completed its loop across the freeze",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        K,
+        "the root's re-issued thread.join resolved the child's result after a blocked-in-join freeze",
+    );
+}
+
 // Follow-up B.2 guard: nested concurrent spawns aren't supported yet (the grandchild's `parent_task`
 // would be mis-attributed via the shared `cur_task`), so a *concurrent* durable child that itself
 // `thread.spawn`s must **fail closed** — a clean `ThreadFault`, not a silently-wrong artifact. Here the
