@@ -122,11 +122,20 @@ property, so in practice:
   join-value kernel → **46**, both **byte-identical** to `compile_and_run_capture` and **stable across
   50 real-race repeats** (a wrong driver would be flaky). New public entry
   `compile_and_run_capture_over_parallel` (the `Parallel` sibling of `compile_and_run_capture_over`).
-  **Scope:** the pure-threads subset (`thread.spawn`/`join` + atomics) — exactly the wasm backend's core
-  need. Because `Domain` is shared `&`-immutably, the cross-thread futex (`memory.wait`/`notify`), §14
-  `instantiate`, and §22 JIT install **fail closed** (`Trap::ThreadFault`) rather than run wrong; wiring
-  them — plus running the driver's Workers in real wasm (per-Worker stack/TLS from 4b, the
-  `atomic.wait`/`notify` futex, a shared locked `Host` for `cap.call`) — are the follow-ons below.
+- [x] **Step 4c-futex — the cross-thread `memory.wait`/`notify`.** The parallel driver now services the
+  **full threads model**, not just spawn/join: a native `Futex` (a per-address parked-token queue under
+  one bucket lock — the std-sync analogue of a kernel futex bucket, with the compare-and-park done under
+  the lock so a `notify` can't slip in and lose a wakeup) backs guest `memory.wait`/`notify` across the
+  real OS threads. In real wasm this role is `memory.atomic.wait`/`notify` directly; here it serves the
+  cooperative oracle's same semantics for genuinely parallel vCPUs (the not-equal fast path, the parked
+  path, and the timeout path). Differential-tested (`bytecode_parallel.rs`): the futex-handoff kernel →
+  **987654** (consumer either parks-and-is-woken or wins the not-equal race) and an 8-worker **barrier**
+  where the **root** genuinely parks until the last worker `notify`s it → **8**, both matching the oracle
+  and stable across 100/50 real-race repeats. So `Parallel` now covers `thread.spawn`/`join` +
+  `memory.wait`/`notify` + atomics + compute — the complete pure-threads model — genuinely in parallel.
+  Remaining fail-closed (need a `&mut Domain`/shared powerbox): §14 `instantiate`, §22 JIT install, and a
+  shared locked `Host` for `cap.call`; plus running the driver's vCPUs as real wasm Workers (per-Worker
+  stack/TLS from 4b) — the follow-ons below.
 
 ### Known wrinkles (surfaced for later steps)
 

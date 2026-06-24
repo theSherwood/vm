@@ -1403,13 +1403,12 @@ pub fn compile_and_run_capture_over(
 /// the host-selected `Parallel` mode; the cooperative [`compile_and_run_capture_over`] is its
 /// **deterministic oracle** (differential-tested in `bytecode_parallel.rs`).
 ///
-/// Scope of this first slice: the **pure-threads subset** — `thread.spawn`/`join` + atomics (the
-/// shapes the parallel-wasm backend most needs, and exactly what the 8-vCPU counter kernel uses). The
-/// `Domain` is shared `&`-immutably across threads, so events that need a `&mut Domain`/shared powerbox
-/// (`cont.*` fibers' cross-thread futex `memory.wait`/`notify`, §14 `instantiate`, §22 JIT install)
-/// **fail closed** (`Trap::ThreadFault`) here rather than run wrong; they are follow-on steps. Pure
-/// compute, atomics, and spawn/join run fully. Returns `None` only if the module is outside the
-/// engine's subset, same as the cooperative entry.
+/// Scope: the **full threads model** — `thread.spawn`/`join`, the `memory.wait`/`notify` futex
+/// (a genuine cross-thread [`Futex`], not a single-thread park queue), and atomics — plus pure compute.
+/// The `Domain` is shared `&`-immutably across threads, so the two events that need a `&mut
+/// Domain`/shared powerbox — §14 `instantiate` and §22 JIT install — **fail closed**
+/// (`Trap::ThreadFault`) here rather than run wrong; they are the remaining follow-ons. Returns `None`
+/// only if the module is outside the engine's subset, same as the cooperative entry.
 pub fn compile_and_run_capture_over_parallel(
     m: &Module,
     func: FuncIdx,
@@ -3354,17 +3353,100 @@ fn drive(
     }
 }
 
+/// THREADS.md step 4c — a **native futex**, the parallel driver's stand-in for wasm
+/// `memory.atomic.wait`/`notify`. A parked waiter enqueues a token (its own `woken` flag + `Condvar`)
+/// under its address key; `notify` wakes up to `count` of them FIFO. The compare-and-park runs under
+/// `buckets`, so a concurrent `notify` cannot slip between a waiter reading the futex word and parking
+/// (the std-sync analogue of the kernel's per-bucket futex lock) — no lost wakeups. In real wasm this
+/// role is played by `memory.atomic.wait`/`notify` directly; here it serves the cooperative oracle's
+/// same `wait`/`notify` semantics for genuinely parallel vCPUs.
+#[derive(Default)]
+struct Futex {
+    buckets: std::sync::Mutex<
+        std::collections::HashMap<u64, std::collections::VecDeque<std::sync::Arc<Waiter>>>,
+    >,
+}
+
+struct Waiter {
+    woken: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Futex {
+    /// `memory.wait`: compare the futex word at `base` to `expected` under the bucket lock; if it
+    /// already differs, return `WAIT_NOT_EQUAL` without parking (the fast path). Otherwise enqueue a
+    /// token and park on it until `notify` wakes it (`WAIT_WOKEN`) or `timeout` ns elapse
+    /// (`WAIT_TIMED_OUT`). Mirrors the cooperative `BlockedWait` arm; the per-token flag absorbs
+    /// spurious condvar wakeups.
+    fn wait(&self, mem: &Mem, base: u64, expected: u64, width: u32, timeout: u64) -> i32 {
+        let waiter = {
+            let mut buckets = self.buckets.lock().unwrap();
+            // Compare-under-lock: the futex word lives in the shared backing (`atomic_value` reads it).
+            if mem.atomic_value(base, width) != expected {
+                return super::WAIT_NOT_EQUAL;
+            }
+            let w = std::sync::Arc::new(Waiter {
+                woken: std::sync::Mutex::new(false),
+                cv: std::sync::Condvar::new(),
+            });
+            buckets
+                .entry(base)
+                .or_default()
+                .push_back(std::sync::Arc::clone(&w));
+            w
+        };
+        // Park on our own token (the bucket lock is released): woken by `notify`, or timed out.
+        let timeout = std::time::Duration::from_nanos(timeout);
+        let (flag, res) = waiter
+            .cv
+            .wait_timeout_while(waiter.woken.lock().unwrap(), timeout, |w| !*w)
+            .unwrap();
+        let woken = *flag;
+        drop(flag);
+        if woken {
+            super::WAIT_WOKEN
+        } else {
+            debug_assert!(res.timed_out());
+            // Timed out: de-enqueue our (possibly still-parked) token so a later `notify` skips it.
+            let mut buckets = self.buckets.lock().unwrap();
+            if let Some(q) = buckets.get_mut(&base) {
+                q.retain(|x| !std::sync::Arc::ptr_eq(x, &waiter));
+            }
+            super::WAIT_TIMED_OUT
+        }
+    }
+
+    /// `memory.notify`: wake up to `count` waiters parked on `base`, FIFO, and return how many were
+    /// woken (mirrors the cooperative `Notify` arm's count; the guest typically ignores it).
+    fn notify(&self, base: u64, count: i32) -> i32 {
+        let want = count as u32;
+        let mut buckets = self.buckets.lock().unwrap();
+        let mut woken = 0u32;
+        if let Some(q) = buckets.get_mut(&base) {
+            while woken < want {
+                let Some(w) = q.pop_front() else { break };
+                *w.woken.lock().unwrap() = true;
+                w.cv.notify_one();
+                woken += 1;
+            }
+        }
+        woken as i32
+    }
+}
+
 /// THREADS.md step 4c — the cross-thread `thread.spawn`/`join` rendezvous for the parallel driver.
 /// The cooperative `drive` keeps its child vCPUs in one `tasks` vec and wakes joiners inline; the
 /// parallel driver runs each vCPU on its **own OS thread**, so a joiner blocks here on a `Condvar`
 /// until the child it named publishes its result. One `id` namespace across the whole run (handed out
 /// by `next_id`); a child's result (value-or-trap) is delivered to the lowest-index waiter via the
-/// `done` map. `live` mirrors the cooperative `MAX_VCPUS` anti-bomb gate across threads.
+/// `done` map. `live` mirrors the cooperative `MAX_VCPUS` anti-bomb gate across threads. `futex` serves
+/// the guest's `memory.wait`/`notify` across threads.
 struct ThreadRegistry {
     done: std::sync::Mutex<std::collections::HashMap<u64, Result<Vec<Value>, Trap>>>,
     woken: std::sync::Condvar,
     next_id: std::sync::atomic::AtomicU64,
     live: std::sync::atomic::AtomicUsize,
+    futex: Futex,
 }
 
 impl ThreadRegistry {
@@ -3374,6 +3456,7 @@ impl ThreadRegistry {
             woken: std::sync::Condvar::new(),
             next_id: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::atomic::AtomicUsize::new(0),
+            futex: Futex::default(),
         }
     }
 
@@ -3510,8 +3593,27 @@ fn run_vcpu_parallel<'scope, 'env>(
                     Err(t) => return (Err(t), mem),
                 }
             }
-            // Outside the pure-threads subset (futex wait/notify, §14 instantiate, §22 JIT): the
-            // shared `&Domain` / per-thread host can't service these in parallel yet — fail closed.
+            Ok(VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            }) => {
+                // Genuine cross-thread futex: park on the shared address until another vCPU `notify`s
+                // (or the timeout fires). No memory ⇒ can't park ⇒ vacuously not-equal.
+                let r = match mem.as_ref() {
+                    Some(m) => reg.futex.wait(m, base, expected, width, timeout),
+                    None => super::WAIT_NOT_EQUAL,
+                };
+                vt.active.set(dst, Reg::from_i32(r));
+            }
+            Ok(VcpuStop::Notify { base, count, dst }) => {
+                let woken = reg.futex.notify(base, count);
+                vt.active.set(dst, Reg::from_i32(woken));
+            }
+            // Outside this driver's subset (§14 instantiate, §22 JIT): they need a `&mut Domain` /
+            // shared powerbox the parallel driver doesn't thread yet — fail closed rather than run wrong.
             Ok(_) => return (Err(Trap::ThreadFault), mem),
         }
     }
