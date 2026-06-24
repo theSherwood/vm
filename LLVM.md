@@ -1242,10 +1242,33 @@ back to that depth (the intervening frames discarded with **no per-frame work** 
 restores the data-SP, and resumes at the saved pc with the `setjmp` result set to `v`. O(1)-ish capture,
 O(depth-discarded) unwind, both only when called.
 
-**JIT (the hard part — sub-slice after).** Cranelift code runs on the real native control stack, so
-`longjmp` must restore the native SP to the `setjmp` point. The `cont.*` / `svm-fiber` machinery already
-does safe native-stack switching, so the primitive exists; the lowering rides it. Interp-first with the
-JIT fail-closed `Unsupported` is the established split (cf. fibers/`cap.self`).
+**JIT (the hard part — the remaining sub-slice; design below).** Cranelift code runs on the real native
+control stack, so `longjmp` must restore the native SP to the `setjmp` point. **Investigation result: the
+existing `svm-fiber` switch (`jump`/`make`, boost.context `fcontext`-style) does *not* fit** — it is an
+*asymmetric-coroutine* primitive (the captured `fctx` is a transient register block on the suspended
+stack, valid only *while* suspended; the moment you `jump` back and continue, that slot is reused/stale).
+`setjmp` needs the opposite: **capture-in-place and keep running**, then `longjmp` back later from a
+deeper frame. That is exactly C `setjmp`/`longjmp` and needs a **new arch-specific in-place
+context-save/restore primitive** (save callee-saved regs + SP + return address into a host-side buffer
+*without* switching; restore + jump later), one file per ABI — mirroring `svm-fiber`'s
+`switch_{x86_64_sysv,aarch64,x86_64_windows}.rs`, but `save`/`restore` rather than `swap`. Concretely:
+- **Host-side `jmp_buf` table (never the guest window).** The saved context holds **host** SP / return
+  address / callee-saved regs — leaking those into guest-readable memory would defeat ASLR. So store it
+  in a host-side table keyed by `(ctx, guest jmp_buf address)`, exactly like the tree-walker's per-vCPU
+  `setjmp_points` (the guest `jmp_buf` address is only the key). Lives next to / in `fiber_rt`.
+- **Cranelift lowering.** `Inst::SetJmp` → emit the in-place context-save (a tiny arch asm thunk, called
+  from JITted code, that saves *its caller's* resumable context into the table slot) returning `i32` 0;
+  `Inst::LongJmp` → a thunk that restores the slot's context and resumes it with the value (returns-twice
+  at the `SetJmp` site). The intervening native frames are abandoned by the SP restore (no unwinding — C
+  has no cleanups, and Cranelift frames have no destructors).
+- **Returns-twice / Cranelift.** The `SetJmp` is a call site, so Cranelift already spills caller-saved
+  values across it; callee-saved values are saved/restored *by the context primitive*; and clang already
+  spilled every `setjmp`-crossing local to memory at `-O2` (returns-twice at the LLVM level), so those
+  arrive as loads/stores in the IR, not long-lived SSA across the `SetJmp`. So the classic
+  optimizing-compiler-vs-`setjmp` hazard is largely defused — **to be proven** with a differential +
+  **ASan** (this is memory-unsafe native-stack manipulation; it gets the `svm-fiber`-grade test rigor).
+- Until it lands, the JIT stays fail-closed `Unsupported` (the established interp-first split, cf.
+  fibers/`cap.self`) and the tree-walker covers `setjmp`/`longjmp` — engines in sync, never divergent.
 
 **Returns-twice in SSA.** `setjmp`'s result (0 first time, `v` on `longjmp`) feeds a branch; the
 `longjmp` re-enters at the instruction after `setjmp`. The interp models this directly (set the result
