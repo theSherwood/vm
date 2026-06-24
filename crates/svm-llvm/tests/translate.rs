@@ -573,6 +573,155 @@ fn switch_with_gaps_via_global_table() {
 }
 
 #[test]
+fn switch_sparse_compare_chain() {
+    // Far-apart `i64` cases (span ≫ MAX_SWITCH_SPAN) — clang keeps a real `switch` instruction, which
+    // the on-ramp lowers to an **equality compare chain** of synthetic blocks (a dense `br_table`
+    // would be astronomically large). Rust's niche-optimized enum discriminants produce exactly these.
+    // Every case, the default, and several between-case misses must agree on interp and JIT.
+    let src = "long sw(long x){ switch(x){ \
+               case 0: return 11; \
+               case 1000000L: return 22; \
+               case 1000000000000L: return 33; \
+               case -2000000000000L: return 44; \
+               default: return 99; } }";
+    check("ssw_0", src, &[Value::I64(0)], &[Value::I64(11)]);
+    check("ssw_1m", src, &[Value::I64(1_000_000)], &[Value::I64(22)]);
+    check(
+        "ssw_1t",
+        src,
+        &[Value::I64(1_000_000_000_000)],
+        &[Value::I64(33)],
+    );
+    check(
+        "ssw_neg",
+        src,
+        &[Value::I64(-2_000_000_000_000)],
+        &[Value::I64(44)],
+    );
+    check("ssw_def1", src, &[Value::I64(5)], &[Value::I64(99)]);
+    check("ssw_def2", src, &[Value::I64(-1)], &[Value::I64(99)]);
+    check(
+        "ssw_def3",
+        src,
+        &[Value::I64(999_999_999_999)],
+        &[Value::I64(99)],
+    );
+    check(
+        "ssw_defmin",
+        src,
+        &[Value::I64(i64::MIN)],
+        &[Value::I64(99)],
+    );
+    check(
+        "ssw_defmax",
+        src,
+        &[Value::I64(i64::MAX)],
+        &[Value::I64(99)],
+    );
+}
+
+#[test]
+fn switch_sparse_threads_live_ins_and_phi() {
+    // The hard case for the compare chain: the case bodies read `a`/`b` (live-ins that must be threaded
+    // through the synthetic chain blocks to the case targets), and the cases converge on a common
+    // successor whose `r` is a φ (so the chain's targets carry a branch argument). Exercises the full
+    // arg/live-in/φ threading, not just `(SP, operand)`.
+    let src = "long sw2(long x, long a, long b){ long r; switch(x){ \
+               case 0: r = a + 1; break; \
+               case 1000000000000L: r = b * 2; break; \
+               case -3000000000000L: r = a - b; break; \
+               default: r = a + b; break; } return r * 3; }";
+    // (x, a, b) with a=10, b=4
+    check(
+        "sw2_c0",
+        src,
+        &[Value::I64(0), Value::I64(10), Value::I64(4)],
+        &[Value::I64(33)],
+    ); // (10+1)*3
+    check(
+        "sw2_c1",
+        src,
+        &[Value::I64(1_000_000_000_000), Value::I64(10), Value::I64(4)],
+        &[Value::I64(24)], // (4*2)*3
+    );
+    check(
+        "sw2_c2",
+        src,
+        &[
+            Value::I64(-3_000_000_000_000),
+            Value::I64(10),
+            Value::I64(4),
+        ],
+        &[Value::I64(18)], // (10-4)*3
+    );
+    check(
+        "sw2_def",
+        src,
+        &[Value::I64(7), Value::I64(10), Value::I64(4)],
+        &[Value::I64(42)], // (10+4)*3
+    );
+}
+
+#[test]
+fn switch_sparse_long_chain() {
+    // A six-case sparse switch → a five-block compare chain: stresses the synthetic-block indexing
+    // (each chain block branches to the next, the last to the default).
+    let src = "long swN(long x){ switch(x){ \
+               case 0: return 1; \
+               case 100000L: return 2; \
+               case 200000000L: return 3; \
+               case 300000000000L: return 4; \
+               case -400000000000L: return 5; \
+               case -500000L: return 6; \
+               default: return 0; } }";
+    check("swN_a", src, &[Value::I64(0)], &[Value::I64(1)]);
+    check("swN_b", src, &[Value::I64(100_000)], &[Value::I64(2)]);
+    check("swN_c", src, &[Value::I64(200_000_000)], &[Value::I64(3)]);
+    check(
+        "swN_d",
+        src,
+        &[Value::I64(300_000_000_000)],
+        &[Value::I64(4)],
+    );
+    check(
+        "swN_e",
+        src,
+        &[Value::I64(-400_000_000_000)],
+        &[Value::I64(5)],
+    );
+    check("swN_f", src, &[Value::I64(-500_000)], &[Value::I64(6)]);
+    check("swN_def", src, &[Value::I64(12345)], &[Value::I64(0)]);
+}
+
+#[test]
+fn switch_sparse_i32() {
+    // The `i32` (width ≤ 32) compare-chain path: far-apart 32-bit cases. Confirms the chain compares
+    // and materializes constants at `i32`, and a negative case round-trips.
+    let src = "int sw32(int x){ switch(x){ \
+               case 0: return 7; \
+               case 100000: return 8; \
+               case -200000: return 9; \
+               case 50000000: return 10; \
+               default: return -1; } }";
+    check("sw32_0", src, &[Value::I32(0)], &[Value::I32(7)]);
+    check("sw32_p", src, &[Value::I32(100_000)], &[Value::I32(8)]);
+    check("sw32_n", src, &[Value::I32(-200_000)], &[Value::I32(9)]);
+    check(
+        "sw32_big",
+        src,
+        &[Value::I32(50_000_000)],
+        &[Value::I32(10)],
+    );
+    check("sw32_def", src, &[Value::I32(1)], &[Value::I32(-1)]);
+    check(
+        "sw32_defmin",
+        src,
+        &[Value::I32(i32::MIN)],
+        &[Value::I32(-1)],
+    );
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";

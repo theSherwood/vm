@@ -171,28 +171,34 @@ and calls `specialize`, then `svm-llvm-translate`. Each gap, in the order hit, a
 3. ✅ **translator panic** — `translate_switch` computed `max - min + 1` in `i64`, which **overflowed**
    on a switch whose cases straddle the i64 range (a niche-discriminant match). **Fixed** to compute the
    span in `i128` → clean `Unsupported` instead of a panic.
-4. 🔜 **sparse switch** (current wall) — `Unsupported("sparse switch (span … > 4096)")`. Rust's
-   **niche-optimized enum layouts** (e.g. `drop_in_place::<Option<(u32, Option<Vec<(u64,u32)>>)>>` —
-   literally the specializer's memo value type) match the discriminant with `i64::MIN`-ish sentinels, so
-   the switch is dense in *cases* but astronomically sparse in *span* — a `br_table` can't represent it.
-   The on-ramp lowers switches to `br_table` only; it needs **sparse-switch lowering as a comparison
-   chain** (the code already flags this as "a later option"). This is a real but intricate SSA
-   transformation: synthesize a chain of blocks that thread the data-SP, the switch operand, **and**
-   every case-target's branch args (φ operands must be evaluated in the original switch block's context,
-   not the synthetic predecessors). TCB-adjacent, so it wants its own focused pass + differential tests.
-   *Niche optimization is pervasive in Rust, so this is unavoidable for translating real Rust — and is
-   the next slice.*
+4. ✅ **sparse switch** — Rust's **niche-optimized enum layouts** (e.g.
+   `drop_in_place::<Option<(u32, Option<Vec<(u64,u32)>>)>>`, the specializer's memo value type) match the
+   discriminant with `i64::MIN`-ish sentinels: dense in *cases*, astronomically sparse in *span*, so a
+   `br_table` can't represent it. **Implemented** `lower_sparse_switch` in `svm-llvm` — an equality
+   **compare chain** of synthetic blocks (appended after the real blocks, so existing indices are
+   unchanged) that thread the data-SP, the operand, and every case/default target's branch args
+   (computed once in the switch block's context, where φ/live-in resolution is valid). Heavily tested:
+   four new differential tests (`switch_sparse_*`) covering i64 cases at `i64::MIN/MAX`, threaded
+   live-ins + a φ successor, a 5-block chain, and the i32 path — all `interp == JIT`; full svm-llvm
+   suite (178 tests) green, dense `br_table` path untouched. The specializer probe now translates past
+   the switch.
+5. 🔜 **non-power-of-two integer load** (current wall) — `Unsupported("load of type i56 …")`. Rust's
+   niche layouts also produce odd-width integer accesses (e.g. loading a 7-byte `i56` discriminant
+   field). svm-IR has only `i32`/`i64` loads/stores, so the on-ramp must legalize a sub-word /
+   non-power-of-two integer memory access (load the enclosing aligned bytes, mask/shift to the width) —
+   the next slice. *Bounded and mechanical, the same flavor as the existing narrow-`i8`/`i16` handling.*
 
 **Earlier worry retired.** The core/alloc *panic* runtime symbols (`core::panicking::*`, bounds-check,
 `unwrap_failed`, `handle_alloc_error`, `raw_vec::handle_error`) that looked like a fundamental blocker
 are in fact **already shimmed** by the on-ramp (`is_rust_abort_call` → `trap`, under `-C panic=abort`).
-What may still need handling once the switch is past: the allocator shims (`__rust_alloc`/`dealloc`/
-`realloc` → the synthesized `malloc`/`free`), `bcmp` → `memcmp`, and `cell::panic_already_borrowed`
-(extend the abort-call list) — each small. So the remaining translate work is the **sparse-switch
-compare-chain** (substantial) plus a short tail of runtime-symbol shims, *not* `-Z build-std`.
+Likely still to handle further along: the allocator shims (`__rust_alloc`/`dealloc`/`realloc` → the
+synthesized `malloc`/`free`), `bcmp` → `memcmp`, and `cell::panic_already_borrowed` (extend the
+abort-call list) — each small. So the remaining translate work is a tail of **bounded on-ramp
+legalizations** (odd-width int memory, a few runtime-symbol shims), *not* `-Z build-std`.
 
 So Milestone 2's compile half is **done**, and the translate half is a **shrinking, enumerated gap
-list** being cleared in order — three down, sparse-switch lowering next.
+list** being cleared in order — four down (inline-asm, i128, switch-overflow panic, sparse switch),
+non-power-of-two integer loads next.
 
 **Why not `std`.** `std` is Rust's OS-abstraction layer (`core` + `alloc` + a `std::sys::<target>`
 platform backend for files/threads/time/net/startup). svm has none of those as ambient services (it
@@ -214,9 +220,10 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
    - **compile half: DONE** — the three crates compile to `no_std`/`panic=abort` LLVM-18 bitcode on
      `rustc 1.81` (`BTreeMap`, `libm` float folds, `not(test)` no_std, 1.81-clean).
    - **translate half: in progress** — gaps cleared in order: inline-asm (libm float folds gated off),
-     i128 (exotic SIMD folds rewritten to i64/u64), and a translator switch-span overflow panic
-     (fixed). **Next: sparse-switch compare-chain lowering** (niche-optimized enums make it necessary),
-     then a short tail of runtime-symbol shims. See "translation status" above.
+     i128 (exotic SIMD folds rewritten to i64/u64), a translator switch-span overflow panic (fixed),
+     and **sparse-switch compare-chain lowering** (implemented + heavily tested in `svm-llvm`). **Next:
+     non-power-of-two integer loads** (e.g. `i56` niche fields), then a short tail of runtime-symbol
+     shims. See "translation status" above.
 3. End-to-end in-sandbox demo: a guest specializes a toy interpreter against a script and runs the
    residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`). *Gated on Milestone 2's
    translate half.*

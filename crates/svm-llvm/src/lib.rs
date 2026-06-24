@@ -1449,6 +1449,9 @@ fn translate_func(
     }
 
     let mut blocks = Vec::with_capacity(f.basic_blocks.len());
+    // Synthetic blocks appended *after* all real blocks (so real block indices are unchanged): a
+    // sparse `switch` lowers to a comparison chain whose extra blocks land here (see `translate_switch`).
+    let mut aux_blocks: Vec<Block> = Vec::new();
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
         blocks.push(translate_block(
             bb,
@@ -1467,8 +1470,10 @@ fn translate_func(
             gbytes,
             helpers,
             dbg,
+            &mut aux_blocks,
         )?);
     }
+    blocks.extend(aux_blocks);
     Ok((
         Func {
             params,
@@ -10347,6 +10352,7 @@ fn translate_block(
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
     dbg: &mut DebugAcc,
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
@@ -10421,7 +10427,7 @@ fn translate_block(
     // and falls through to the ordinary `ret` here.)
     let term = match ctx.pending_tail.take() {
         Some(t) => t,
-        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params)?,
+        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params, aux_blocks)?,
     };
     Ok(Block {
         params,
@@ -13054,6 +13060,7 @@ fn translate_term(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     match term {
         LTerm::Ret(r) => match &r.return_operand {
@@ -13086,7 +13093,7 @@ fn translate_term(
                 else_args,
             })
         }
-        LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params),
+        LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params, aux_blocks),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
         other => unsup(format!("terminator {other:?}")),
     }
@@ -13108,6 +13115,7 @@ fn translate_switch(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     // `br_table`'s index is `i32`; an `i64` operand (e.g. a Rust enum discriminant) is handled by
     // folding its high 32 bits into the index below (an out-of-`[0,2^32)` value forces the default).
@@ -13148,9 +13156,19 @@ fn translate_switch(
     // bounded by `MAX_SWITCH_SPAN` it fits `i64`/`usize` for the table below.
     let span_wide = max as i128 - min as i128 + 1;
     if span_wide > MAX_SWITCH_SPAN as i128 {
-        return unsup(format!(
-            "sparse switch (span {span_wide} > {MAX_SWITCH_SPAN})"
-        ));
+        // Too sparse for a dense `br_table` (e.g. a niche-optimized enum discriminant with
+        // `i64::MIN`-ish sentinels): lower to an equality compare chain of synthetic blocks instead.
+        return lower_sparse_switch(
+            ctx,
+            sw,
+            bi,
+            f,
+            s,
+            block_params,
+            aux_blocks,
+            &cases,
+            default_blk,
+        );
     }
     let span = span_wide as i64;
 
@@ -13243,6 +13261,174 @@ fn translate_switch(
         idx,
         targets,
         default: (default_blk as u32, default_args),
+    })
+}
+
+/// The svm-IR types of a block's parameters, in the fan-out order `branch_args` supplies them: the
+/// data-SP and scalars one slot each (`i64` for the SP), a wide-vector value its `C` `v128` chunks then
+/// `T` lane scalars. Mirrors `translate_block`'s param materialization — used to type the synthetic
+/// blocks of a sparse-switch compare chain so their params line up with the edge args.
+fn block_param_types(param_ids: &[ValueId], s: &Scan) -> Vec<ValType> {
+    let mut types = Vec::new();
+    for &vid in param_ids {
+        if let Some(&layout) = s.wide.get(&vid) {
+            for _ in 0..layout.full_chunks {
+                types.push(ValType::V128);
+            }
+            let lane = layout.shape.lane_val();
+            for _ in 0..layout.tail_lanes {
+                types.push(lane);
+            }
+        } else {
+            types.push(if vid == SP { ValType::I64 } else { s.ty[vid] });
+        }
+    }
+    types
+}
+
+/// Lower a too-sparse `switch` to an **equality compare chain** (§3b). The switch block tests the
+/// operand against the first case (`br_if x == v0 → t0, else → c1`); each synthetic chain block tests
+/// the next case; the last falls through to the default. svm-IR has no first-class sparse jump, and
+/// Rust's niche-optimized enums (discriminants at `i64::MIN`-ish sentinels) produce exactly these
+/// astronomically-sparse switches. The chain blocks are appended to `aux_blocks` — *after* all real
+/// blocks, so existing block indices are unchanged — and thread, as block parameters, everything a
+/// downstream edge consumes: the data-SP (every block's param 0, §3d), the compared operand, and every
+/// case/default target's branch args. Those args are computed **once here**, in the switch block's
+/// context, because φ-operand / live-in resolution needs the real predecessor (`bi`), not the synthetic
+/// blocks; they are then threaded to wherever the chain consumes them.
+#[allow(clippy::too_many_arguments)]
+fn lower_sparse_switch(
+    ctx: &mut BlockCtx,
+    sw: &llvm_ir::terminator::Switch,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
+    cases: &[(i64, usize)],
+    default_blk: usize,
+) -> Result<Terminator, Error> {
+    let width = operand_bits(&sw.operand)?;
+    let cmp_ty = if width <= 32 { IntTy::I32 } else { IntTy::I64 };
+    let operand_ty = if width <= 32 {
+        ValType::I32
+    } else {
+        ValType::I64
+    };
+    let mk_const = |v: i64| {
+        if width <= 32 {
+            Inst::ConstI32(v as i32)
+        } else {
+            Inst::ConstI64(v)
+        }
+    };
+    let operand = ctx.operand(&sw.operand)?;
+
+    // Compute every target's branch args in *this* block's context (φ/live-in resolution needs the
+    // real predecessor `bi`). The returned ids are this-block-local.
+    let default_args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+    let mut case_args: Vec<Vec<ValIdx>> = Vec::with_capacity(cases.len());
+    for &(_, blk) in cases {
+        case_args.push(branch_args(ctx, bi, blk, f, s, block_params)?);
+    }
+
+    // The threaded value set `T`, in order: the data-SP (param 0 of every block), the operand, then
+    // every distinct value any edge consumes. A chain block's params are exactly `T` (this order), so a
+    // value's chain-block param index is its position in `T`.
+    let sp = ctx.sp()?;
+    let mut t_vals: Vec<ValIdx> = Vec::new();
+    let mut pos: HashMap<ValIdx, usize> = HashMap::new();
+    for &v in std::iter::once(&sp)
+        .chain(std::iter::once(&operand))
+        .chain(default_args.iter())
+        .chain(case_args.iter().flatten())
+    {
+        if let std::collections::hash_map::Entry::Vacant(e) = pos.entry(v) {
+            e.insert(t_vals.len());
+            t_vals.push(v);
+        }
+    }
+
+    // Type each threaded value by position: SP is `i64`, the operand its compare type, and every other
+    // value by the target parameter it feeds (`branch_args` and `block_param_types` agree in order).
+    let mut t_types: Vec<ValType> = vec![ValType::I32; t_vals.len()];
+    t_types[pos[&sp]] = ValType::I64;
+    t_types[pos[&operand]] = operand_ty;
+    for (args, target) in std::iter::once((&default_args, default_blk))
+        .chain(case_args.iter().zip(cases.iter().map(|&(_, b)| b)))
+    {
+        for (a, ty) in args.iter().zip(block_param_types(&block_params[target], s)) {
+            t_types[pos[a]] = ty;
+        }
+    }
+
+    // Identity edge: pass all of `T` through unchanged. Remap a this-block arg list to chain-block
+    // param indices (every arg is in `T`).
+    let pass_through: Vec<ValIdx> = (0..t_vals.len() as ValIdx).collect();
+    let remap =
+        |args: &[ValIdx]| -> Vec<ValIdx> { args.iter().map(|a| pos[a] as ValIdx).collect() };
+
+    // Synthetic blocks land after all real blocks and any chain from an earlier switch in this fn.
+    let base = (f.basic_blocks.len() + aux_blocks.len()) as u32;
+    let n = cases.len();
+    // Chain block for case `k` (1..n) has index `base + (k - 1)`; case 0 is the switch block itself.
+    let chain_blk = |k: usize| base + (k as u32 - 1);
+    let x_param = pos[&operand] as ValIdx;
+
+    for k in 1..n {
+        let (v, target) = cases[k];
+        // Block-local ids: params `0..t_vals.len()`, then the two pushed insts.
+        let cst = t_vals.len() as ValIdx;
+        let cond = cst + 1;
+        let insts = vec![
+            mk_const(v),
+            Inst::IntCmp {
+                ty: cmp_ty,
+                op: CmpOp::Eq,
+                a: x_param,
+                b: cst,
+            },
+        ];
+        // Match → target; else → next chain block (pass `T` on) or, for the last, the default.
+        let (else_blk, else_args) = if k + 1 < n {
+            (chain_blk(k + 1), pass_through.clone())
+        } else {
+            (default_blk as u32, remap(&default_args))
+        };
+        aux_blocks.push(Block {
+            params: t_types.clone(),
+            insts,
+            term: Terminator::BrIf {
+                cond,
+                then_blk: target as u32,
+                then_args: remap(&case_args[k]),
+                else_blk,
+                else_args,
+            },
+        });
+    }
+
+    // The switch block's own terminator: test case 0, else enter the chain (threading `T`). A single
+    // case can't exceed `MAX_SWITCH_SPAN`, so `n > 1` here, but handle `n == 1` for totality.
+    let (v0, target0) = cases[0];
+    let cst = ctx.push(mk_const(v0));
+    let cond = ctx.push(Inst::IntCmp {
+        ty: cmp_ty,
+        op: CmpOp::Eq,
+        a: operand,
+        b: cst,
+    });
+    let (else_blk, else_args) = if n > 1 {
+        (chain_blk(1), t_vals.clone())
+    } else {
+        (default_blk as u32, default_args.clone())
+    };
+    Ok(Terminator::BrIf {
+        cond,
+        then_blk: target0 as u32,
+        then_args: case_args[0].clone(),
+        else_blk,
+        else_args,
     })
 }
 
