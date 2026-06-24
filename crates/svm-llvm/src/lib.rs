@@ -1411,6 +1411,12 @@ struct Scan {
     /// SSA value; the layout drives the chunk/tail fan-out at block boundaries (`block_params`,
     /// `branch_args`) and the per-chunk lowering (`lower_wide`).
     wide: HashMap<ValueId, WideLayout>,
+    /// `ValueId` → the scalar field types of a **small by-value struct** (`{i64, ptr}`, `{i64, i64}`,
+    /// …). Like `wide`, these flow as several SSA values (one per field), not one scalar — recorded only
+    /// for **flat** structs (scalar fields). Drives the per-field fan-out at block boundaries so a
+    /// struct can cross a block edge (a `phi` of a struct, e.g. wikisort's `MakeRange` result); within a
+    /// block they are the same field-wise `agg` values built by `insertvalue`/multi-result `call`.
+    agg_layout: HashMap<ValueId, Vec<ValType>>,
     /// `ValueId` → the block it is defined in (parameters are defined in the entry block, 0).
     def_block: Vec<usize>,
     /// Block name → block index (entry is 0).
@@ -1612,6 +1618,7 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
         name2id: HashMap::new(),
         ty: Vec::new(),
         wide: HashMap::new(),
+        agg_layout: HashMap::new(),
         def_block: Vec::new(),
         block_idx: HashMap::new(),
         block_name: Vec::new(),
@@ -1648,7 +1655,16 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     }
                     // A small by-value struct (a call/`insertvalue` result) is tracked field-wise via
                     // the aggregate side-table, never used as a scalar — record a placeholder type.
-                    Err(_) if struct_field_vtypes(ty.as_ref(), types).is_some() => ValType::I64,
+                    Err(_) if struct_field_vtypes(ty.as_ref(), types).is_some() => {
+                        // A **flat** struct (scalar fields) records its field types so it can cross a
+                        // block edge (a struct φ — wikisort's `MakeRange` result): the per-field fan-out
+                        // mirrors `wide`. A *nested* struct keeps only the placeholder (block-local; it
+                        // fails-closed if it ever reaches a scalar or cross-block use).
+                        if let Some(Ok(ftys)) = struct_field_vtypes(ty.as_ref(), types) {
+                            s.agg_layout.insert(id, ftys);
+                        }
+                        ValType::I64
+                    }
                     // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
                     // `mask_lanes`, never used as a scalar — record a placeholder type.
                     Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
@@ -10219,6 +10235,36 @@ impl<'a> BlockCtx<'a> {
         None
     }
 
+    /// Resolve a struct-typed operand (field types `ftys`) to its per-field block-local indices, for
+    /// supplying a struct φ across a block edge ([`branch_args`]). A local reads its recorded `agg`
+    /// fields; a constant struct is materialized field-wise — `zeroinitializer`/`undef`/`poison` to
+    /// per-field zeros, an explicit `{…}` literal to its per-field constants.
+    fn agg_operand(&mut self, op: &Operand, ftys: &[ValType]) -> Result<Vec<ValIdx>, Error> {
+        match op {
+            Operand::LocalOperand { name, .. } => {
+                let vid = *self
+                    .s
+                    .name2id
+                    .get(name)
+                    .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
+                self.agg.get(&vid).cloned().ok_or_else(|| {
+                    Error::Unsupported(format!("struct value {vid} not available in block"))
+                })
+            }
+            Operand::ConstantOperand(c) => match c.as_ref() {
+                Constant::AggregateZero(_) | Constant::Undef(_) | Constant::Poison(_) => {
+                    Ok(ftys.iter().map(|&t| self.push(zero_inst(t))).collect())
+                }
+                Constant::Struct { values, .. } if values.len() == ftys.len() => values
+                    .iter()
+                    .map(|v| self.operand(&Operand::ConstantOperand(v.clone())))
+                    .collect(),
+                other => unsup(format!("struct φ constant incoming {other:?}")),
+            },
+            Operand::MetadataOperand => unsup("metadata struct operand"),
+        }
+    }
+
     /// The data-SP's block-local index (always parameter 0 of every block, §3d).
     fn sp(&self) -> Result<ValIdx, Error> {
         self.id(SP)
@@ -10737,6 +10783,9 @@ fn translate_block(
     let mut params: Vec<ValType> = Vec::with_capacity(param_ids.len());
     let mut scalar_seed: Vec<(ValueId, ValIdx)> = Vec::new();
     let mut wide_seed: Vec<(ValueId, Vec<ValIdx>)> = Vec::new();
+    // A **struct** param (a φ of a small by-value struct) fans out into one slot per field, seeded into
+    // the block-local `agg` table — the aggregate analog of `wide_seed`.
+    let mut agg_seed: Vec<(ValueId, Vec<ValIdx>)> = Vec::new();
     for &vid in param_ids {
         let start = params.len() as ValIdx;
         if let Some(&layout) = s.wide.get(&vid) {
@@ -10748,6 +10797,9 @@ fn translate_block(
                 params.push(lane);
             }
             wide_seed.push((vid, (start..params.len() as ValIdx).collect()));
+        } else if let Some(ftys) = s.agg_layout.get(&vid) {
+            params.extend_from_slice(ftys);
+            agg_seed.push((vid, (start..params.len() as ValIdx).collect()));
         } else {
             params.push(if vid == SP { ValType::I64 } else { s.ty[vid] });
             scalar_seed.push((vid, start));
@@ -10780,6 +10832,9 @@ fn translate_block(
     }
     for (vid, parts) in wide_seed {
         ctx.wide_vals.insert(vid, parts);
+    }
+    for (vid, parts) in agg_seed {
+        ctx.agg.insert(vid, parts);
     }
     ctx.next_val = params.len() as ValIdx;
 
@@ -14270,6 +14325,18 @@ fn branch_args(
                 // A threaded wide live-in: its parts are live-out of `from`, available here.
                 ctx.wide_vals.get(&pv).cloned().ok_or_else(|| {
                     Error::Unsupported(format!("wide value {pv} not available across edge"))
+                })?
+            };
+            args.extend(parts);
+        } else if let Some(ftys) = s.agg_layout.get(&pv) {
+            // A struct param takes one arg per field — the incoming struct's fields, in the same order
+            // the target's per-field fan-out expects (the aggregate analog of the wide branch above).
+            let parts = if let Some(&(op, _, _)) = phi_incoming.get(&pv) {
+                ctx.agg_operand(op, ftys)?
+            } else {
+                // A threaded struct live-in: its fields are live-out of `from`, available here.
+                ctx.agg.get(&pv).cloned().ok_or_else(|| {
+                    Error::Unsupported(format!("struct value {pv} not available across edge"))
                 })?
             };
             args.extend(parts);
