@@ -4558,7 +4558,8 @@ fn simd_vec2_i32_carried_widening_mul_i13() {
         .collect();
     assert_eq!(nat.len(), 2, "native printed two checksums");
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate (I13 root fix: no longer fail-closed)");
+    let t =
+        svm_llvm::translate_bc_path(&bc).expect("translate (I13 root fix: no longer fail-closed)");
     let module = &t.module;
     svm_verify::verify_module(module).expect("verify");
     let e = t
@@ -4569,9 +4570,15 @@ fn simd_vec2_i32_carried_widening_mul_i13() {
         .expect("run export");
     for (k, &expect) in [1i64, 7].iter().zip(&nat) {
         let mut fuel = 200_000_000u64;
-        let interp = svm_interp::run(module, e, &[Value::I64(t.entry_sp as i64), Value::I64(*k)], &mut fuel)
-            .expect("interp")[0];
-        let jit = match svm_jit::compile_and_run(module, e, &[t.entry_sp as i64, *k]).expect("jit") {
+        let interp = svm_interp::run(
+            module,
+            e,
+            &[Value::I64(t.entry_sp as i64), Value::I64(*k)],
+            &mut fuel,
+        )
+        .expect("interp")[0];
+        let jit = match svm_jit::compile_and_run(module, e, &[t.entry_sp as i64, *k]).expect("jit")
+        {
             JitOutcome::Returned(v) => v[0],
             o => panic!("jit outcome {o:?}"),
         };

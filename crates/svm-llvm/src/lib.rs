@@ -8965,10 +8965,14 @@ fn lower_int_intrinsic(
             } else {
                 let w = src_bits(args[0], types)?;
                 if w != 32 && w != 64 {
-                    return unsup(format!("general funnel shift `{name}` on i{w} (only i32/i64)"));
+                    return unsup(format!(
+                        "general funnel shift `{name}` on i{w} (only i32/i64)"
+                    ));
                 }
                 let Some(c) = const_int(args[2]) else {
-                    return unsup(format!("general funnel shift `{name}` (non-constant amount)"));
+                    return unsup(format!(
+                        "general funnel shift `{name}` (non-constant amount)"
+                    ));
                 };
                 let s = (c % w as u64) as i64;
                 let a = ctx.operand(args[0])?;
@@ -8982,7 +8986,11 @@ fn lower_int_intrinsic(
                     }
                 } else {
                     // fshl: a's bits go up by `s`, b supplies the low `w-s`; fshr is the mirror.
-                    let (lsh, rsh) = if is_fshl { (s, w as i64 - s) } else { (w as i64 - s, s) };
+                    let (lsh, rsh) = if is_fshl {
+                        (s, w as i64 - s)
+                    } else {
+                        (w as i64 - s, s)
+                    };
                     let kk = |ctx: &mut BlockCtx, n: i64| {
                         if ty == IntTy::I64 {
                             ctx.push(Inst::ConstI64(n))
