@@ -256,9 +256,9 @@ fn jit_elides_const_only_source_line() {
 // ---- G2: variable-value parity + the debug/fast delegation boundary -------------------------------
 
 // A window-located source variable `x` at the arg pointer (`v0 + 0`), written twice: 0 -> 11 -> 22.
-// Both engines drive the *same* `Mem`, so a window variable has a comparable value at every step —
-// unlike a register-allocated SSA value, whose bytecode slot is reused and has no stable cross-engine
-// identity (which is exactly why debugging stays on the tree-walker; DEBUGGING.md §1b G2).
+// Both engines drive the *same* `Mem`, so a window variable has a comparable value at every step. (An
+// SSA-located variable is *also* comparable — the bytecode engine gives each value a stable unique
+// slot, see `ssa_var_value_parity_per_step` — this fixture just exercises the window path.)
 const WINDOW_VAR_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
@@ -371,4 +371,95 @@ fn bytecode_debug_trace_declines_outside_single_vcpu_scope() {
         bytecode::ir_window_trace(&m, 0, &[], &mut fuel, 0, 4).is_none(),
         "the window-variable trace declines it too"
     );
+}
+
+// A single-block function with two SSA-located source variables: `a = v2` (x+1) and `b = v3` (a*a).
+// The bytecode engine gives each value a stable unique slot (no register reuse), so `v2`/`v3` are
+// directly inspectable there — `regs[base + i]` — exactly the storage the tree-walker indexes.
+const SSA_VAR_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 1
+  v2 = i32.add v0 v1
+  v3 = i32.mul v2 v2
+  v4 = i32.sub v3 v1
+  return v4
+}
+
+debug.file 0 "ssa.c"
+debug.fname 0 "f"
+debug.type 0 base "int" signed 4
+debug.var 0 "a" ssa 2 "int"
+debug.var 0 "b" ssa 3 "int"
+"#;
+
+/// SSA-value inspection parity (the correction to the earlier "precluded by design" claim): an
+/// SSA-located variable holds the **same typed value on both engines at every step**. The bytecode
+/// engine assigns a stable unique slot per value (no register reuse), so it is just as inspectable as
+/// the tree-walker here. Compares the per-step block-local value vectors op-for-op, then reads the
+/// named variables `a`/`b` through the real debugger API (`read_var`) and checks them against the
+/// bytecode slot values.
+#[test]
+fn ssa_var_value_parity_per_step() {
+    let m = parse_module(SSA_VAR_DBG).expect("parse");
+    let args = [Value::I32(5)];
+
+    // Bytecode engine: per-step typed SSA values (declining would be a fallback — `expect` pins it ran).
+    let mut fuel = 100_000u64;
+    let (bc, bc_res) = bytecode::ir_value_trace(&m, 0, &args, &mut fuel)
+        .expect("bytecode engine runs this single-block module");
+
+    // Tree-walker: per-step *defined* block-local values via `read_ir_value` (the debugger API).
+    let mut insp = Inspector::attach(&m, 0, &args, 100_000);
+    let mut tw: Vec<(IrPc, Vec<Value>)> = Vec::new();
+    let mut t = 0u64;
+    let tw_res = loop {
+        match insp.seek(t) {
+            Stop::Break { pc, .. } => {
+                let mut vals = Vec::new();
+                let mut i = 0usize;
+                while let Some(v) = insp.read_ir_value(0, i) {
+                    vals.push(v);
+                    i += 1;
+                }
+                tw.push((pc, vals));
+                t += 1;
+            }
+            Stop::Finished(r) => break r,
+            Stop::Blocked => panic!("single-threaded fixture must not block"),
+        }
+    };
+
+    assert_eq!(bc.len(), tw.len(), "step count diverges");
+    assert_eq!(bc_res, tw_res, "result diverges");
+    for (k, ((bpc, bvals), (tpc, tvals))) in bc.iter().zip(&tw).enumerate() {
+        assert_eq!(bpc, tpc, "step {k}: IrPc diverges");
+        // The tree-walker exposes only the values defined so far; they must equal the bytecode engine's
+        // slots over that prefix (later slots hold not-yet-computed defaults the debugger doesn't show).
+        assert_eq!(
+            &bvals[..tvals.len()],
+            &tvals[..],
+            "step {k}: SSA values diverge between engines"
+        );
+    }
+
+    // The debugger's variable API over the SSA locations: `a = v2 = 6`, `b = v3 = 36`, both defined at
+    // the last recorded step (before `v4`). They must match the bytecode slots 2 and 3.
+    let last = tw.len() - 1;
+    assert_eq!(tw[last].1.len(), 4, "v0..v3 defined at the last step");
+    let mut insp2 = Inspector::attach(&m, 0, &args, 100_000);
+    insp2.seek(last as u64);
+    assert_eq!(
+        insp2.read_var(0, "a", 4),
+        Some(VarValue::Value(bc[last].1[2])),
+        "read_var(a) matches the bytecode slot for v2"
+    );
+    assert_eq!(
+        insp2.read_var(0, "b", 4),
+        Some(VarValue::Value(bc[last].1[3])),
+        "read_var(b) matches the bytecode slot for v3"
+    );
+    // Concretely: x=5 -> a=6, b=36.
+    assert_eq!(bc[last].1[2], Value::I32(6));
+    assert_eq!(bc[last].1[3], Value::I32(36));
 }

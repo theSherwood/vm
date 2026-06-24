@@ -104,22 +104,34 @@ different things depending on which pair you compare:
   is stepped by both interpreters but has no JIT machine-code range — compiled code has no instruction
   for a materialized immediate — while the invariant "the JIT never maps a line the interpreters don't
   step" still holds.
-- **G2 — bytecode debug = single-vCPU; variable inspection + delegation boundary. ✅ Landed
-  (`debug_parity.rs` + `bytecode::ir_window_trace`).** *Variable-value parity:* register-allocated SSA
-  values have no stable cross-engine storage (the bytecode engine reuses slots), so they are inspected
-  only on the tree-walker — by design. But a **window-located** variable lives at a shared address in
-  the one `Mem` both engines drive, so its value *is* comparable per step: `window_var_value_parity_per_step`
-  reads `x` through the real debugger APIs (`var_addr`/`read_var`) at each `seek(t)` and asserts the
-  `(IrPc, bytes)` sequence equals the bytecode engine's per-step window snapshot — so the value the
-  debugger shows is exactly what the fast engine computes, op for op. *Delegation boundary:*
-  `bytecode_debug_trace_declines_outside_single_vcpu_scope` pins that the bytecode debug-trace returns
-  `None` for a module outside its seam-free scope (a thread-spawner), so a debugger falls back to the
-  tree-walker / Milestone-B scheduled Inspector — and that flipping to `Some` later is a boundary change
-  worth noticing. *Residual:* watchpoints/conditional breakpoints/time-travel on the bytecode path stay
-  delegated (no independent implementation to regress).
-- **G3 — DAP is tree-walker-only.** The DAP server (incl. the new data breakpoints, stepping, reverse
-  debugging) drives the `Inspector` exclusively; there is no DAP-over-bytecode or DAP-over-JIT, so there
-  is no DAP-level cross-engine parity to test yet (gated on W5 Stage 5).
+- **G2 — bytecode variable-value parity + the delegation boundary. ✅ Landed (`debug_parity.rs` +
+  `bytecode::ir_window_trace`/`ir_value_trace`).** A source variable holds the **same value on both
+  engines at every step**, proven through the real debugger APIs:
+  - *SSA-located* — `compile_func` gives each value a **stable, unique slot** (a "global slot per value";
+    *no* register reuse/coalescing), so a promoted scalar is directly inspectable on the bytecode engine
+    (`regs[base + i]` typed by `func_value_types` — the same storage the tree-walker's `read_ir_value`
+    reads). `ssa_var_value_parity_per_step` compares the per-step block-local value vectors op-for-op and
+    checks `read_var(a)`/`read_var(b)` against the bytecode slots. The bytecode tier is therefore **fully
+    inspectable, not precluded** (the earlier "precluded by design" framing was wrong — it is unbuilt as
+    a DAP backend, not blocked).
+  - *Window-located* — both engines drive the one `Mem`, so `window_var_value_parity_per_step` reads `x`
+    via `var_addr`/`read_var` at each `seek(t)` and matches the bytecode engine's per-step window snapshot.
+  - *Delegation boundary* — `bytecode_debug_trace_declines_outside_single_vcpu_scope` pins that the
+    single-vCPU debug-trace returns `None` for a thread-spawner (so a debugger falls back to the
+    tree-walker / Milestone-B scheduled Inspector); a later flip to `Some` is a boundary change to notice.
+  - *Residual:* watchpoints/conditional breakpoints/time-travel on the bytecode path stay delegated (no
+    independent implementation to regress); the per-step SSA reader is single-block-scoped (slot index ==
+    block-local index there — multi-block adds the per-block slot base).
+- **G3 — DAP-level cross-engine parity. ⏳ Prerequisite-blocked, *not* design-blocked.** The DAP server
+  drives the `Inspector` (tree-walker) and nothing else, so there is no second backend to compare against
+  — and building one is feature work, not a test: **DAP-over-JIT** is W5 Stage 5 (unbuilt; open design
+  fork — drive the JIT under DAP via `int3`/single-step, *or* interpreter-steps-JIT-runs), and
+  **DAP-over-bytecode** needs a bytecode `Inspector` (breakpoint-stops + the now-demonstrated value
+  reader wired up) — tractable given G2, just unbuilt for priority reasons (the tree-walker already does
+  full-fidelity debugging; the JIT covers native-speed debugging via gdb/DWARF). The *static* source-map
+  half of DAP parity is already covered transitively by **G1** (DAP binds breakpoints through the same
+  §6-derived map G1 proves consistent); the missing piece is **runtime** stepping/inspection *on* a
+  second engine.
 
 ---
 

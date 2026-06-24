@@ -1412,6 +1412,10 @@ pub type IrTrace = (Vec<super::IrPc>, Result<Vec<Value>, Trap>);
 /// paired with the watched window range's bytes at that point, plus the run result.
 pub type WindowTrace = (Vec<(super::IrPc, Vec<u8>)>, Result<Vec<Value>, Trap>);
 
+/// A per-step **SSA-value** trace ([`ir_value_trace`]): each executed instruction's [`crate::IrPc`]
+/// paired with the current frame's typed block-local SSA values, plus the run result.
+pub type ValueTrace = (Vec<(super::IrPc, Vec<Value>)>, Result<Vec<Value>, Trap>);
+
 /// Debug seam (Slice 1c-3): single-step `m`'s `func(args)` and record the [`crate::IrPc`] of each
 /// **instruction** executed (terminators are skipped, matching the tree-walker's `before_op`, which
 /// only stops at instructions), returning the location trace plus the result. `None` if the module is
@@ -1488,6 +1492,65 @@ pub fn ir_window_trace(
                 .and_then(|mm| mm.read_window(addr, len).ok())
                 .unwrap_or_default();
             trace.push((pc, bytes));
+        }
+        match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
+            Ok(Outcome::Suspended) => continue,
+            Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
+            Ok(_) => return None, // a seam — out of single-vCPU debug scope
+            Err(t) => return Some((trace, Err(t))),
+        }
+    }
+}
+
+/// Debug-seam **SSA-value inspection** support (DEBUGGING.md §1b G2). Like [`ir_trace`], but at each
+/// instruction step also records the current frame's typed block-local SSA values. `compile_func`
+/// assigns a **stable, unique slot per value** (no register reuse / coalescing — "global slot per
+/// value"), so an SSA value *is* directly inspectable: `regs[base + i]` typed by `func_value_types`,
+/// exactly the storage the tree-walker's `read_ir_value` reads. **Single-block functions only**, where
+/// the bytecode slot index equals the tree-walker's block-local value index (both `base`-0); `None`
+/// for a multi-block function (per-block slot base differs) or the out-of-subset / seam cases
+/// [`ir_trace`] declines. Paired with `Inspector::read_ir_value`/`read_var`, this proves SSA-located
+/// variables hold the same value on both engines — the bytecode tier is inspectable, not precluded.
+/// Test surface; not a production entry point.
+pub fn ir_value_trace(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> Option<ValueTrace> {
+    // Single-block scope keeps slot index == tree-walker block-local index (see doc).
+    if m.funcs.get(func as usize)?.blocks.len() != 1 {
+        return None;
+    }
+    let types0 =
+        svm_verify::func_value_types(&m.funcs[func as usize], &m.funcs, m.memory.is_some())
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Vec::new(), Err(Trap::Malformed)));
+    }
+    let mods = [c];
+    let table = build_table(mods[0].progs.len(), 0);
+    let mut mem = build_mem(m);
+    let mut host = Host::new();
+    let mut vm = match Vm::new(&mods[0], func as usize, args) {
+        Ok(v) => v,
+        Err(e) => return Some((Vec::new(), Err(e))),
+    };
+    let mut trace = Vec::new();
+    loop {
+        if let Some(pc) = vm.cur_ir_pc(&mods) {
+            // The block-0 register window typed per value — the same `(base + i, type)` resolution the
+            // tree-walker uses for `read_ir_value`. A not-yet-computed slot reads as its default `Reg`;
+            // the caller compares only the defined prefix (where `read_ir_value` returns `Some`).
+            let vals: Vec<Value> = types0
+                .iter()
+                .enumerate()
+                .map(|(i, &ty)| vm.regs[vm.base + i].to_value(ty))
+                .collect();
+            trace.push((pc, vals));
         }
         match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
             Ok(Outcome::Suspended) => continue,
