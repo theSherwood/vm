@@ -10789,11 +10789,6 @@ struct BlockCtx<'a> {
     /// `extractvalue`/`ret` (§3a multi-result). Assumed not to cross block boundaries (clang's
     /// register-coercion pattern produces and consumes them in one block).
     agg: HashMap<ValueId, Vec<ValIdx>>,
-    /// I14 tier 2: i128 SSA values arising in the **widening-multiply idiom**
-    /// (`zext i64 → mul i128 → lshr 64 → trunc`), tracked *symbolically* so a 128-bit value is never
-    /// materialized — see [`lower_i128_idiom`]. Like `agg`, assumed not to cross block boundaries (the
-    /// idiom is a local expression); a cross-block i128 finds nothing here and fails closed.
-    i128_sym: HashMap<ValueId, I128Sym>,
     /// Wide-vector SSA values (I2 step 1): value-id → its legalized parts, ordered
     /// `[chunk_0 … chunk_{C-1}, tail_0 … tail_{T-1}]` (`C` full `v128`s then `T` lane scalars, per
     /// the value's [`WideLayout`] in `s.wide`). The vector analog of `agg` — one LLVM value is
@@ -11430,7 +11425,6 @@ fn translate_block(
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
-        i128_sym: HashMap::new(),
         wide_vals: HashMap::new(),
         mask_lanes: HashMap::new(),
         next_val: 0,
@@ -11687,51 +11681,114 @@ fn lower_narrow_atomic_cas(
     Ok((old32, masked_exp32))
 }
 
-/// Symbolic form of an i128 value in the widening-multiply idiom (I14 tier 2). The `ValIdx`es are the
-/// i64 operands; nothing 128-bit is ever materialized — [`lower_i128_idiom`] emits a concrete i64 op
-/// only when a `trunc` consumes the value.
-#[derive(Clone, Copy)]
-enum I128Sym {
-    /// `zext i64 X to i128`: the value's low 64 bits are `X`, high bits zero.
-    Zext(ValIdx),
-    /// `mul i128 (zext a) (zext b)`: the full 64×64→128 product of `a` and `b`.
-    WideMul(ValIdx, ValIdx),
-    /// `lshr <widening product> 64`: the high 64 bits of `a*b`.
-    Hi(ValIdx, ValIdx),
+/// I14 tier 3 — read an i128 operand as its `(lo, hi)` i64 parts. A local i128 is an `agg` pair
+/// `[lo, hi]` (built by `lower_i128`, `load i128`, …); a constant i128 below 2⁶⁴ materializes as
+/// `(value, 0)`. A cross-block i128 (no `agg` entry here) or a wide/negative i128 constant fails
+/// closed — rare, and never a miscompile.
+fn i128_parts(ctx: &mut BlockCtx, op: &Operand) -> Result<(ValIdx, ValIdx), Error> {
+    if let Some(parts) = ctx.agg_of(op) {
+        if parts.len() == 2 {
+            return Ok((parts[0], parts[1]));
+        }
+    }
+    if let Operand::ConstantOperand(c) = op {
+        if let Constant::Int { bits: 128, value } = c.as_ref() {
+            let lo = ctx.const_i64(*value as i64);
+            let hi = ctx.const_i64(0);
+            return Ok((lo, hi));
+        }
+    }
+    unsup("i128 operand not available in this block (cross-block / unsupported i128 constant)")
 }
 
-/// The symbolic i128 form of an operand, or fail-closed if it isn't a tracked idiom value.
-fn i128_sym_of(ctx: &BlockCtx, op: &Operand) -> Result<I128Sym, Error> {
-    let Operand::LocalOperand { name, .. } = op else {
-        return unsup("i128 operand is not a local");
-    };
-    let vid = *ctx
-        .s
-        .name2id
-        .get(name)
-        .ok_or_else(|| Error::Unsupported(format!("unresolved i128 local {name:?}")))?;
-    ctx.i128_sym
-        .get(&vid)
-        .copied()
-        .ok_or_else(|| Error::Unsupported("i128 value outside the widening-multiply idiom".into()))
-}
-
-/// Record the symbolic i128 form of a destination value (no concrete op emitted).
-fn i128_set(ctx: &mut BlockCtx, dest: &Name, sym: I128Sym) {
+/// Bind a destination i128 value to its `(lo, hi)` parts (the unified `agg`-pair representation, shared
+/// with `load i128` / `icmp i128`).
+fn set_i128(ctx: &mut BlockCtx, dest: &Name, lo: ValIdx, hi: ValIdx) {
     if let Some(&vid) = ctx.s.name2id.get(dest) {
-        ctx.i128_sym.insert(vid, sym);
+        ctx.agg.insert(vid, vec![lo, hi]);
     }
 }
 
-/// The constant value of a scalar integer operand, if it is a constant.
-fn const_int_operand(op: &Operand) -> Option<u64> {
-    match op {
-        Operand::ConstantOperand(c) => match c.as_ref() {
-            Constant::Int { value, .. } => Some(*value),
-            _ => None,
-        },
-        _ => None,
+/// Emit an `i64` binary op.
+fn i64bin(ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx) -> ValIdx {
+    ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    })
+}
+
+/// Emit an `i64` comparison, zero-extended from its `i32` boolean result to an `i64` `0`/`1` — the form
+/// the carry/borrow chains add into a high word.
+fn i64cmp_ext(ctx: &mut BlockCtx, op: CmpOp, a: ValIdx, b: ValIdx) -> ValIdx {
+    let c = ctx.push(Inst::IntCmp {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    });
+    emit_ext(ctx, c, 32, 64, false)
+}
+
+/// An `i64` comparison (raw `i32` `0`/`1` result).
+fn icmp64(ctx: &mut BlockCtx, op: CmpOp, a: ValIdx, b: ValIdx) -> ValIdx {
+    ctx.push(Inst::IntCmp {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    })
+}
+
+/// An `i32` binary op (the boolean-combining width).
+fn bin32(ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx) -> ValIdx {
+    ctx.push(Inst::IntBin {
+        ty: IntTy::I32,
+        op,
+        a,
+        b,
+    })
+}
+
+/// Lower an i128 comparison (any predicate) on `(lo, hi)` pairs to an `i32` boolean. `eq`/`ne` is the
+/// AND of the word equalities; an ordering is `ahi <strict> bhi | (ahi == bhi & alo <op_u> blo)` — the
+/// high word carries the predicate's signedness, the low word is always unsigned.
+fn i128_icmp(
+    ctx: &mut BlockCtx,
+    pred: IntPredicate,
+    alo: ValIdx,
+    ahi: ValIdx,
+    blo: ValIdx,
+    bhi: ValIdx,
+) -> ValIdx {
+    use IntPredicate as P;
+    if matches!(pred, P::EQ | P::NE) {
+        let lo = icmp64(ctx, CmpOp::Eq, alo, blo);
+        let hi = icmp64(ctx, CmpOp::Eq, ahi, bhi);
+        let eq = bin32(ctx, BinOp::And, lo, hi);
+        if pred == P::EQ {
+            return eq;
+        }
+        let one = ctx.push(Inst::ConstI32(1));
+        return bin32(ctx, BinOp::Xor, eq, one);
     }
+    let (hi_op, lo_op) = match pred {
+        P::ULT => (CmpOp::LtU, CmpOp::LtU),
+        P::SLT => (CmpOp::LtS, CmpOp::LtU),
+        P::ULE => (CmpOp::LtU, CmpOp::LeU),
+        P::SLE => (CmpOp::LtS, CmpOp::LeU),
+        P::UGT => (CmpOp::GtU, CmpOp::GtU),
+        P::SGT => (CmpOp::GtS, CmpOp::GtU),
+        P::UGE => (CmpOp::GtU, CmpOp::GeU),
+        P::SGE => (CmpOp::GtS, CmpOp::GeU),
+        P::EQ | P::NE => unreachable!("handled above"),
+    };
+    let hi_strict = icmp64(ctx, hi_op, ahi, bhi);
+    let hi_eq = icmp64(ctx, CmpOp::Eq, ahi, bhi);
+    let lo_cmp = icmp64(ctx, lo_op, alo, blo);
+    let lo_and = bin32(ctx, BinOp::And, hi_eq, lo_cmp);
+    bin32(ctx, BinOp::Or, hi_strict, lo_and)
 }
 
 /// Emit an inline unsigned 64×64→64 **high-half multiply** (`umulhi`) via the 32×32 schoolbook
@@ -11779,58 +11836,209 @@ fn emit_umulhi(ctx: &mut BlockCtx, a: ValIdx, b: ValIdx) -> ValIdx {
 /// ([`I128Sym`]); a concrete i64 op is emitted only at the `trunc` — the source for a `zext`'s low half,
 /// `mul` for a product's low half, an inline [`emit_umulhi`] for its high half. Any i128 use outside this
 /// idiom fails closed (`Unsupported`) — never a miscompile. `Ok(true)` ⇒ handled an i128 idiom op.
-fn lower_i128_idiom(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<bool, Error> {
+/// Which double-word shift to lower.
+#[derive(Clone, Copy)]
+enum I128ShiftKind {
+    Shl,
+    LShr,
+    AShr,
+}
+
+/// Lower a bitwise i128 op lane-wise on the `(lo, hi)` pair.
+fn i128_bitwise(
+    ctx: &mut BlockCtx,
+    op0: &Operand,
+    op1: &Operand,
+    dest: &Name,
+    op: BinOp,
+) -> Result<bool, Error> {
+    let (alo, ahi) = i128_parts(ctx, op0)?;
+    let (blo, bhi) = i128_parts(ctx, op1)?;
+    let lo = i64bin(ctx, op, alo, blo);
+    let hi = i64bin(ctx, op, ahi, bhi);
+    set_i128(ctx, dest, lo, hi);
+    Ok(true)
+}
+
+/// Lower a **double-word** i128 shift by a runtime amount `n` (LLVM guarantees `n < 128`). Branchless,
+/// via the engine's `Select`: the within-word part `m = n & 63`, the cross-word carry (guarded for
+/// `m == 0`, where `64 - m == 64` would be a no-op shift, not a full one), and an `n >= 64` select that
+/// moves a whole word. `AShr` additionally fills with the sign word.
+fn i128_shift(
+    ctx: &mut BlockCtx,
+    op0: &Operand,
+    op1: &Operand,
+    dest: &Name,
+    kind: I128ShiftKind,
+) -> Result<bool, Error> {
+    let (lo, hi) = i128_parts(ctx, op0)?;
+    let (n, _n_hi) = i128_parts(ctx, op1)?; // shift count = low word (n < 128)
+    let c0 = ctx.const_i64(0);
+    let c63 = ctx.const_i64(63);
+    let c64 = ctx.const_i64(64);
+    let m = i64bin(ctx, BinOp::And, n, c63); // n mod 64
+    let inv = i64bin(ctx, BinOp::Sub, c64, m); // 64 - m (== 64 when m == 0)
+    let ge64 = ctx.push(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::GeU,
+        a: n,
+        b: c64,
+    });
+    let m_is0 = ctx.push(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::Eq,
+        a: m,
+        b: c0,
+    });
+    let sel = |ctx: &mut BlockCtx, cond: ValIdx, a: ValIdx, b: ValIdx| {
+        ctx.push(Inst::Select { cond, a, b })
+    };
+    let (res_lo, res_hi) = match kind {
+        // shl: low bits flow up into hi; n >= 64 moves lo into hi and zeroes lo.
+        I128ShiftKind::Shl => {
+            let lo_m = i64bin(ctx, BinOp::Shl, lo, m);
+            let hi_m = i64bin(ctx, BinOp::Shl, hi, m);
+            let carry_raw = i64bin(ctx, BinOp::ShrU, lo, inv);
+            let carry = sel(ctx, m_is0, c0, carry_raw);
+            let hi_lt64 = i64bin(ctx, BinOp::Or, hi_m, carry);
+            let res_lo = sel(ctx, ge64, c0, lo_m);
+            let res_hi = sel(ctx, ge64, lo_m, hi_lt64); // n>=64: hi = lo << (n-64) = lo << m
+            (res_lo, res_hi)
+        }
+        // lshr: high bits flow down into lo; n >= 64 moves hi into lo and zeroes hi.
+        I128ShiftKind::LShr => {
+            let lo_m = i64bin(ctx, BinOp::ShrU, lo, m);
+            let hi_m = i64bin(ctx, BinOp::ShrU, hi, m);
+            let carry_raw = i64bin(ctx, BinOp::Shl, hi, inv);
+            let carry = sel(ctx, m_is0, c0, carry_raw);
+            let lo_lt64 = i64bin(ctx, BinOp::Or, lo_m, carry);
+            let res_hi = sel(ctx, ge64, c0, hi_m);
+            let res_lo = sel(ctx, ge64, hi_m, lo_lt64); // n>=64: lo = hi >> (n-64) = hi >> m
+            (res_lo, res_hi)
+        }
+        // ashr: like lshr but hi shifts arithmetically and the fill is the sign word.
+        I128ShiftKind::AShr => {
+            let sign = i64bin(ctx, BinOp::ShrS, hi, c63);
+            let lo_m = i64bin(ctx, BinOp::ShrU, lo, m);
+            let hi_m = i64bin(ctx, BinOp::ShrS, hi, m);
+            let carry_raw = i64bin(ctx, BinOp::Shl, hi, inv);
+            let carry = sel(ctx, m_is0, c0, carry_raw);
+            let lo_lt64 = i64bin(ctx, BinOp::Or, lo_m, carry);
+            let res_hi = sel(ctx, ge64, sign, hi_m);
+            let res_lo = sel(ctx, ge64, hi_m, lo_lt64); // n>=64: lo = hi >>s (n-64) = hi >>s m
+            (res_lo, res_hi)
+        }
+    };
+    set_i128(ctx, dest, res_lo, res_hi);
+    Ok(true)
+}
+
+/// I14 tier 3 — general i128 legalization: every i128 SSA value is a materialized `(lo, hi)` i64 pair
+/// (the unified `agg`-pair representation, shared with `load i128` / `icmp i128`), and each i128 op
+/// lowers to 64-bit ops over the parts. Covers `zext`/`sext`/`trunc`, `and`/`or`/`xor`, `add`/`sub`
+/// (carry/borrow chains), `mul` (the schoolbook 64×64 expansion), and double-word `shl`/`lshr`/`ashr`.
+/// Cross-block i128 values (no `agg` entry in the new block), i128 call args/results, and wide/negative
+/// i128 constants fail closed — never a miscompile. `Ok(true)` ⇒ handled an i128 op.
+fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<bool, Error> {
     use Instruction as I;
     let is_i128 = |o: &Operand| int_bits(o.get_type(types).as_ref()) == Some(128);
     match instr {
-        // zext i64 X to i128 → the value's low 64 bits are X (high zero).
+        // zext iN X to i128 (N ≤ 64) → (zext(X, N→64), 0)
         I::ZExt(x) if int_bits(x.to_type.as_ref()) == Some(128) => {
-            if int_bits(x.operand.get_type(types).as_ref()) != Some(64) {
-                return unsup("i128 zext from non-i64 (widening-multiply idiom)");
-            }
+            let from = int_bits(x.operand.get_type(types).as_ref())
+                .filter(|&w| w <= 64)
+                .ok_or_else(|| Error::Unsupported("i128 zext from a non-integer source".into()))?;
             let src = ctx.operand(&x.operand)?;
-            i128_set(ctx, &x.dest, I128Sym::Zext(src));
+            let lo = if from == 64 {
+                src
+            } else {
+                emit_ext(ctx, src, from, 64, false)
+            };
+            let hi = ctx.const_i64(0);
+            set_i128(ctx, &x.dest, lo, hi);
             Ok(true)
         }
-        // mul i128 A B with both operands zext-of-i64 → a 64×64 widening product.
-        I::Mul(x) if is_i128(&x.operand0) => {
-            let I128Sym::Zext(a) = i128_sym_of(ctx, &x.operand0)? else {
-                return unsup("i128 mul operand is not a zext i64 (widening-multiply idiom)");
+        // sext iN X to i128 (N ≤ 64) → (sext(X, N→64), sign >>s 63)
+        I::SExt(x) if int_bits(x.to_type.as_ref()) == Some(128) => {
+            let from = int_bits(x.operand.get_type(types).as_ref())
+                .filter(|&w| w <= 64)
+                .ok_or_else(|| Error::Unsupported("i128 sext from a non-integer source".into()))?;
+            let src = ctx.operand(&x.operand)?;
+            let lo = if from == 64 {
+                src
+            } else {
+                emit_ext(ctx, src, from, 64, true)
             };
-            let I128Sym::Zext(b) = i128_sym_of(ctx, &x.operand1)? else {
-                return unsup("i128 mul operand is not a zext i64 (widening-multiply idiom)");
-            };
-            i128_set(ctx, &x.dest, I128Sym::WideMul(a, b));
+            let c63 = ctx.const_i64(63);
+            let hi = i64bin(ctx, BinOp::ShrS, lo, c63);
+            set_i128(ctx, &x.dest, lo, hi);
             Ok(true)
         }
-        // lshr i128 P, 64 with P a widening product → its high 64 bits.
-        I::LShr(x) if is_i128(&x.operand0) => {
-            if const_int_operand(&x.operand1) != Some(64) {
-                return unsup("i128 lshr by a non-64 amount (widening-multiply idiom)");
-            }
-            let I128Sym::WideMul(a, b) = i128_sym_of(ctx, &x.operand0)? else {
-                return unsup("i128 lshr of a non-product (widening-multiply idiom)");
-            };
-            i128_set(ctx, &x.dest, I128Sym::Hi(a, b));
-            Ok(true)
-        }
-        // trunc i128 V to i64 → materialize V's symbolic form as a concrete i64.
+        // trunc i128 V to iN (N ≤ 64) → the low word, masked when N < 64.
         I::Trunc(x) if is_i128(&x.operand) => {
-            if int_bits(x.to_type.as_ref()) != Some(64) {
-                return unsup("i128 trunc to a non-i64 width (widening-multiply idiom)");
-            }
-            let val = match i128_sym_of(ctx, &x.operand)? {
-                I128Sym::Zext(a) => a,
-                I128Sym::WideMul(a, b) => ctx.push(Inst::IntBin {
-                    ty: IntTy::I64,
-                    op: BinOp::Mul,
-                    a,
-                    b,
-                }),
-                I128Sym::Hi(a, b) => emit_umulhi(ctx, a, b),
+            let to = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("i128 trunc to non-int".into()))?;
+            let (lo, _hi) = i128_parts(ctx, &x.operand)?;
+            let v = if to >= 64 {
+                lo
+            } else {
+                emit_trunc(ctx, lo, 64, to)
             };
-            finish(ctx, &x.dest, val)?;
+            finish(ctx, &x.dest, v)?;
             Ok(true)
+        }
+        I::And(x) if is_i128(&x.operand0) => {
+            i128_bitwise(ctx, &x.operand0, &x.operand1, &x.dest, BinOp::And)
+        }
+        I::Or(x) if is_i128(&x.operand0) => {
+            i128_bitwise(ctx, &x.operand0, &x.operand1, &x.dest, BinOp::Or)
+        }
+        I::Xor(x) if is_i128(&x.operand0) => {
+            i128_bitwise(ctx, &x.operand0, &x.operand1, &x.dest, BinOp::Xor)
+        }
+        // add: lo = alo + blo; hi = ahi + bhi + carry, where carry = (lo <u alo).
+        I::Add(x) if is_i128(&x.operand0) => {
+            let (alo, ahi) = i128_parts(ctx, &x.operand0)?;
+            let (blo, bhi) = i128_parts(ctx, &x.operand1)?;
+            let lo = i64bin(ctx, BinOp::Add, alo, blo);
+            let carry = i64cmp_ext(ctx, CmpOp::LtU, lo, alo);
+            let hi0 = i64bin(ctx, BinOp::Add, ahi, bhi);
+            let hi = i64bin(ctx, BinOp::Add, hi0, carry);
+            set_i128(ctx, &x.dest, lo, hi);
+            Ok(true)
+        }
+        // sub: lo = alo - blo; hi = ahi - bhi - borrow, where borrow = (alo <u blo).
+        I::Sub(x) if is_i128(&x.operand0) => {
+            let (alo, ahi) = i128_parts(ctx, &x.operand0)?;
+            let (blo, bhi) = i128_parts(ctx, &x.operand1)?;
+            let lo = i64bin(ctx, BinOp::Sub, alo, blo);
+            let borrow = i64cmp_ext(ctx, CmpOp::LtU, alo, blo);
+            let hi0 = i64bin(ctx, BinOp::Sub, ahi, bhi);
+            let hi = i64bin(ctx, BinOp::Sub, hi0, borrow);
+            set_i128(ctx, &x.dest, lo, hi);
+            Ok(true)
+        }
+        // mul: lo = alo·blo; hi = umulhi(alo,blo) + alo·bhi + ahi·blo (mod 2⁶⁴).
+        I::Mul(x) if is_i128(&x.operand0) => {
+            let (alo, ahi) = i128_parts(ctx, &x.operand0)?;
+            let (blo, bhi) = i128_parts(ctx, &x.operand1)?;
+            let lo = i64bin(ctx, BinOp::Mul, alo, blo);
+            let mh = emit_umulhi(ctx, alo, blo);
+            let ab = i64bin(ctx, BinOp::Mul, alo, bhi);
+            let cd = i64bin(ctx, BinOp::Mul, ahi, blo);
+            let t = i64bin(ctx, BinOp::Add, mh, ab);
+            let hi = i64bin(ctx, BinOp::Add, t, cd);
+            set_i128(ctx, &x.dest, lo, hi);
+            Ok(true)
+        }
+        I::Shl(x) if is_i128(&x.operand0) => {
+            i128_shift(ctx, &x.operand0, &x.operand1, &x.dest, I128ShiftKind::Shl)
+        }
+        I::LShr(x) if is_i128(&x.operand0) => {
+            i128_shift(ctx, &x.operand0, &x.operand1, &x.dest, I128ShiftKind::LShr)
+        }
+        I::AShr(x) if is_i128(&x.operand0) => {
+            i128_shift(ctx, &x.operand0, &x.operand1, &x.dest, I128ShiftKind::AShr)
         }
         _ => Ok(false),
     }
@@ -11863,10 +12071,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         return Ok(());
     }
 
-    // I14 tier 2: the i128 widening-multiply idiom (`zext i64 → mul i128 → lshr 64 → trunc`) is
-    // recognized and lowered to 64-bit ops here — a 128-bit value is never materialized. `Ok(false)`
-    // ⇒ not an i128 idiom op (fall through); any i128 op outside the idiom fails closed.
-    if lower_i128_idiom(ctx, instr, types)? {
+    // I14 tier 3: general i128 ops lower to 64-bit ops over a materialized `(lo, hi)` pair here.
+    // `Ok(false)` ⇒ not an i128 op (fall through); an unsupported i128 shape fails closed.
+    if lower_i128(ctx, instr, types)? {
         return Ok(());
     }
 
@@ -12192,42 +12399,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             x.operand0.get_type(types).as_ref(),
             Type::IntegerType { bits: 128 }
         ) {
-            if !matches!(x.predicate, IntPredicate::EQ | IntPredicate::NE) {
-                return unsup(format!("i128 icmp {:?} (only eq/ne)", x.predicate));
-            }
-            let a = ctx
-                .agg_of(&x.operand0)
-                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
-            let b = ctx
-                .agg_of(&x.operand1)
-                .ok_or_else(|| Error::Unsupported("i128 icmp operand not a load pair".into()))?;
-            let lo = ctx.push(Inst::IntCmp {
-                ty: IntTy::I64,
-                op: CmpOp::Eq,
-                a: a[0],
-                b: b[0],
-            });
-            let hi = ctx.push(Inst::IntCmp {
-                ty: IntTy::I64,
-                op: CmpOp::Eq,
-                a: a[1],
-                b: b[1],
-            });
-            let mut r = ctx.push(Inst::IntBin {
-                ty: IntTy::I32,
-                op: BinOp::And,
-                a: lo,
-                b: hi,
-            });
-            if x.predicate == IntPredicate::NE {
-                let one = ctx.push(Inst::ConstI32(1));
-                r = ctx.push(Inst::IntBin {
-                    ty: IntTy::I32,
-                    op: BinOp::Xor,
-                    a: r,
-                    b: one,
-                });
-            }
+            let (alo, ahi) = i128_parts(ctx, &x.operand0)?;
+            let (blo, bhi) = i128_parts(ctx, &x.operand1)?;
+            let r = i128_icmp(ctx, x.predicate, alo, ahi, blo, bhi);
             if let Some(&vid) = ctx.s.name2id.get(&x.dest) {
                 ctx.idx_of.insert(vid, r);
             }
