@@ -339,6 +339,35 @@ fn translate_impl(
     for (i, f) in defined.iter().enumerate() {
         name2idx.insert(f.name.clone(), i as u32 + base);
     }
+    // LLVM **function aliases** (`@x = alias <ty>, ptr @y`): identical-code folding — both LLVM's
+    // own pass and Rust's cross-crate dedup — collapses functions with byte-identical bodies into one
+    // definition plus an alias to it (e.g. svm-ir's `VIntUnOp::index` and `VPMinMaxOp::index`, both
+    // 2-variant enum→byte, become one body + an alias). An alias has no body, so a `call`/`ref.func`
+    // to it would otherwise look like an undefined external. Register each alias whose aliasee is a
+    // defined function under that function's index, so it resolves like the function it names. A
+    // fixpoint loop covers alias→alias chains; aliases to data globals are skipped (aliasee ∉
+    // `name2idx`, which holds only functions).
+    loop {
+        let mut progressed = false;
+        for ga in &m.global_aliases {
+            let Name::Name(alias_name) = &ga.name else {
+                continue;
+            };
+            let alias_name = alias_name.to_string();
+            if name2idx.contains_key(&alias_name) {
+                continue;
+            }
+            if let Some(target) = alias_target_name(ga.aliasee.as_ref()) {
+                if let Some(&idx) = name2idx.get(&target) {
+                    name2idx.insert(alias_name, idx);
+                    progressed = true;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
     // Globals live low (from `DATA_BASE`); the data stack starts just above them. For a powerbox
     // program the writable **handle stash + allocator/format state** occupies the reserved low scratch
     // (page 0, below `STACK_PAGE`), so start the globals one page up (`STACK_PAGE`): a *read-only*
@@ -1891,6 +1920,20 @@ fn indirect_sig(c: &llvm_ir::instruction::Call, types: &Types) -> Result<svm_ir:
 }
 
 /// The callee name of a direct call, or `None` for an indirect/inline-asm call.
+/// The function symbol a global alias's `aliasee` names, unwrapping any `bitcast` constant-expr LLVM
+/// places around it. `None` if it is not a (wrapped) global reference (e.g. an alias to a data global,
+/// or a GEP expression — neither resolves to a function index).
+fn alias_target_name(c: &Constant) -> Option<String> {
+    match c {
+        Constant::GlobalReference {
+            name: Name::Name(s),
+            ..
+        } => Some(s.to_string()),
+        Constant::BitCast(bc) => alias_target_name(bc.operand.as_ref()),
+        _ => None,
+    }
+}
+
 fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
     match c.function.as_ref().right()? {
         Operand::ConstantOperand(cr) => match cr.as_ref() {
