@@ -574,6 +574,12 @@ pub struct PbOutcome {
     pub stderr: Vec<u8>,
 }
 
+/// The canonical names of the browser powerbox's capabilities, in grant order — the vocabulary a
+/// powerbox guest resolves against via `cap.self.resolve` (F7) / labels via `cap.self.label` (F9). The
+/// browser ABI grants `(stdout, stdin, exit, stderr, clock)` by arity (its set differs from `svm-run`'s
+/// fixed §3e prefix after slot 3, since the capabilities differ), so the names follow that order.
+const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clock"];
+
 /// Run `m`'s function 0 under the **browser powerbox**, seeding `stdin` and capturing the streams.
 ///
 /// Capabilities are granted by the entry's **arity** (so `hello.svm`'s 3-handle `(out, in, exit)`
@@ -608,6 +614,15 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
     if arity >= 5 {
         slots.push(Value::I32(host.grant_clock()));
+    }
+    // §7 register each granted capability under its canonical name (F7/F9, PR #118) so a guest can
+    // `cap.self.resolve` / `cap.self.label` it at runtime — mirroring `svm-run`'s powerbox so the
+    // browser stays a faithful twin. Names parallel the grant order above; only the `arity` actually
+    // granted are registered.
+    for (name, slot) in POWERBOX_CAP_NAMES.iter().zip(&slots) {
+        if let Value::I32(handle) = slot {
+            host.register_cap_name(name, *handle);
+        }
     }
     let mut fuel = u64::MAX;
     let (status, value, exit_code) =
@@ -1748,6 +1763,13 @@ pub mod live {
         }
         if arity >= 2 {
             slots.push(Value::I32(host.grant_host_fn(clock)));
+        }
+        // §7 register the live caps under canonical names (F7/F9, PR #118) so the guest can
+        // `cap.self.resolve`/`label` them at runtime, matching the fixed-powerbox path.
+        for (name, slot) in ["console", "clock"].iter().zip(&slots) {
+            if let Value::I32(handle) = slot {
+                host.register_cap_name(name, *handle);
+            }
         }
         let mut fuel = u64::MAX;
         match bytecode::compile_and_run_with_host(&m, 0, &slots, &mut fuel, &mut host) {
