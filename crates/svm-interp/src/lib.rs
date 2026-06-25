@@ -8810,6 +8810,12 @@ pub struct Host {
     /// recorded here instead. `None` ⇒ a single-vCPU thaw, which reads the extent from the window's
     /// active-SP word as before. Set by the freeze driver; consumed by `drive` on thaw.
     frozen_root_sp: Option<u64>,
+    /// §7 the **capability-name directory** (Followup F7): name → handle for the powerbox grants, so a
+    /// guest can resolve a capability by name at runtime (`cap.self` op 2) — dlopen-style discovery, the
+    /// dynamic counterpart to load-time name binding. Populated by the powerbox layer at grant time
+    /// (`svm_run`); empty for a bare `Host` (resolution then finds nothing — fail-closed). First match
+    /// wins on a duplicate name. A side table only — it never affects handle values or grant order.
+    cap_names: Vec<(String, i32)>,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -8918,6 +8924,7 @@ impl Host {
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
             frozen_root_sp: None,
+            cap_names: Vec::new(),
         }
     }
 
@@ -9054,6 +9061,22 @@ impl Host {
     /// This domain's spawn quota (the clamped value in effect).
     pub fn quota(&self) -> Quota {
         self.quota
+    }
+
+    /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
+    /// `cap.self`-resolve `name` to this handle at runtime. The powerbox layer (`svm_run`) calls this
+    /// for each granted handle; an embedder may add its own names. First registration of a name wins.
+    pub fn register_cap_name(&mut self, name: &str, handle: i32) {
+        self.cap_names.push((name.to_string(), handle));
+    }
+
+    /// Resolve a capability `name` to the handle it was registered under ([`Host::register_cap_name`]),
+    /// or `None` if no grant carries that name. The backing for the guest's `cap.self` op-2 resolve.
+    fn resolve_cap_name(&self, name: &str) -> Option<i32> {
+        self.cap_names
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| *h)
     }
 
     /// §4/§7 the JIT cap-path window page map (see [`Host::cap_pages`]) for window `base`, persistent
@@ -9873,8 +9896,31 @@ impl Host {
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
         // §7 reflection: the reserved pseudo-`type_id` has no handle to resolve — service it directly
-        // (read-only over this domain's own table). This is the JIT's entry point for `cap.self.*`.
+        // (read-only over this domain's own powerbox). This is the JIT's entry point for `cap.self.*`.
         if type_id == svm_ir::CAP_SELF_TYPE_ID {
+            // op 2 = `resolve(name_ptr, name_len) -> handle | -errno` (F7): look a capability **name**
+            // up in this domain's name directory (populated at powerbox grant) and return the handle
+            // it's bound to — runtime, in-guest, dlopen-style discovery, the dynamic counterpart to
+            // load-time name binding. Confers no authority: it only re-finds a handle the guest was
+            // already granted (a name with no grant is `-EINVAL`). Serviced here, not in the mem-less
+            // `self_dispatch`, because it must read the name from the window (fail-closed: `-EFAULT`
+            // out of bounds, `-EINVAL` on bad UTF-8 / unknown name).
+            if op == 2 {
+                let Some(mem) = mem else {
+                    return Ok(vec![EFAULT]);
+                };
+                let ptr = *args.first().unwrap_or(&0) as u64;
+                let len = *args.get(1).unwrap_or(&0) as u64;
+                let Some(bytes) = mem.read_bytes(ptr, len) else {
+                    return Ok(vec![EFAULT]);
+                };
+                let Ok(name) = std::str::from_utf8(&bytes) else {
+                    return Ok(vec![EINVAL]);
+                };
+                return Ok(vec![self
+                    .resolve_cap_name(name)
+                    .map_or(EINVAL, |h| h as i64)]);
+            }
             return self.self_dispatch(op, args);
         }
         match self.resolve(handle, type_id)? {
