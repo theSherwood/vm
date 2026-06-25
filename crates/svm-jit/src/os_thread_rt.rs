@@ -425,6 +425,12 @@ impl Domain {
         // Drain handles out of the lock first (joining holds no lock; a joining child may still touch
         // `threads` via nested ops, though by teardown all guest code has returned).
         let joins: Vec<_> = std::mem::take(&mut lock(&self.threads).joins);
+        // §12.8 concurrent-thaw stage 3: the thread calling `join_all` has finished its own guest code
+        // (it's tearing down), so it can never `notify` a still-parked vCPU. Count it as blocked while it
+        // joins — else a vCPU left parked in a genuine deadlock (e.g. a sibling that unwound, propagating
+        // a trap, before the parked one's own deadlock check fired) would see this joiner as a live,
+        // not-parked "potential notifier" (`live > parked`) and wait forever, hanging `join_all` too.
+        let _pg = ParkGuard::new(&self.parked);
         for j in joins {
             let _ = j.join();
         }
