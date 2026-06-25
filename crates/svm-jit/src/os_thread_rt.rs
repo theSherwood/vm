@@ -49,8 +49,7 @@ const WAIT_TIMED_OUT: i32 = 2;
 /// guest wait/join-deadlock as `Trap::ThreadFault`); it is **never** returned to the guest as a status.
 /// Lets the blanket thaw fail-closed go away: a re-issued wait now parks while a live sibling could
 /// notify (so a producer↔consumer pair frozen mid-rendezvous resolves) and fails closed only here, when
-/// no peer remains — without hanging. Real-build only (the loom model passes a always-live `peers_live`).
-#[cfg(not(loom))]
+/// no peer remains — without hanging. The loom model exercises this directly (see the deadlock test).
 const WAIT_DEADLOCK: i32 = 3;
 
 /// Max concurrently-live vCPUs per run (matches the interpreter's `MAX_VCPUS`): an anti-bomb ceiling
@@ -1558,6 +1557,15 @@ fn futex_wait(
                         .0;
                     continue;
                 }
+                // §12.8 concurrent-thaw stage 3: the same deadlock check, modeled under loom. loom has no
+                // timeouts (so the real-build `wait_timeout` re-check above is compiled out), but it *does*
+                // explore the peer-exit↔consumer-wait interleavings: a peer that goes non-live notifies
+                // this `cv`, and we re-evaluate `peers_live` on each wakeup, so an infinite wait with no
+                // possible notifier resolves to `WAIT_DEADLOCK` instead of blocking the model forever.
+                #[cfg(loom)]
+                if !peers_live() {
+                    break WAIT_DEADLOCK;
+                }
                 g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
             // loom's `Condvar` models no timeouts; the loom test only exercises the infinite-wait path
@@ -1663,6 +1671,51 @@ mod loom_tests {
             );
             producer.join().unwrap();
             assert!(status == WAIT_WOKEN || status == WAIT_NOT_EQUAL);
+        });
+    }
+
+    /// §12.8 concurrent-thaw stage 3: the mutual-deadlock detection must **resolve, never hang the
+    /// model**, when the last possible notifier exits. A consumer waits on a word that never changes; a
+    /// "peer" (its only possible notifier) goes non-live and signals the cv. Under every interleaving
+    /// (peer exits before *or* after the consumer parks) the consumer returns `WAIT_DEADLOCK`. This is
+    /// the loom analogue of the real-build `live > parked` quiescence check — here `peers_live` reads a
+    /// modeled live-peer flag. The peer flips the flag + wakes **under the futex lock**, exactly as
+    /// `futex_notify` serializes a wake, so the consumer's check-then-park can never miss the transition.
+    #[test]
+    fn loom_deadlock_detection_resolves_when_last_peer_exits() {
+        loom::model(|| {
+            let futex = Arc::new(Mutex::new(HashMap::<u64, FutexEntry>::new()));
+            let cv = Arc::new(Condvar::new());
+            // A loom atomic (explored by the model); `parked` below stays the std type `futex_wait` takes.
+            let peer_live = Arc::new(loom::sync::atomic::AtomicUsize::new(1)); // 1 ⇒ a peer could notify
+            const KEY: u64 = 0x2000;
+
+            let (f2, cv2, pl2) = (Arc::clone(&futex), Arc::clone(&cv), Arc::clone(&peer_live));
+            let peer = loom::thread::spawn(move || {
+                // The peer finishes its computation (can no longer notify). Serialize the state change +
+                // wake under the futex lock, like `futex_notify`, so the consumer can't lose it.
+                let _g = f2.lock().unwrap_or_else(|e| e.into_inner());
+                pl2.store(0, Ordering::SeqCst);
+                cv2.notify_all();
+            });
+
+            let parked = AtomicUsize::new(0);
+            let status = futex_wait(
+                &futex,
+                &cv,
+                KEY,
+                || true, // the guest word never changes (always still equals `expected`)
+                None,
+                0,
+                0,
+                &parked,
+                || peer_live.load(Ordering::SeqCst) > 0, // a live peer could still notify
+            );
+            peer.join().unwrap();
+            assert_eq!(
+                status, WAIT_DEADLOCK,
+                "no possible notifier left ⇒ deadlock detected, not an infinite block",
+            );
         });
     }
 

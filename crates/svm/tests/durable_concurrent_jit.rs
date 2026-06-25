@@ -80,8 +80,10 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
     let fc = Arc::clone(&freeze);
     let controller = std::thread::spawn(move || {
         // Wait until the children are spawned (so they run concurrently, not deferred), then freeze.
+        // `yield_now` (not a busy `spin_loop`): on a few-core CI runner the controller must not hog a
+        // core away from the vCPU threads it's waiting on — vital once a test loops this many times.
         while !spawned.load(Ordering::SeqCst) {
-            std::hint::spin_loop();
+            std::thread::yield_now();
         }
         fc.request_freeze();
     });
@@ -1099,4 +1101,56 @@ fn mutual_rendezvous_resolves_without_false_deadlock() {
         7,
         "child B passed its wait and stored its sentinel",
     );
+}
+
+#[test]
+fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
+    // §12.6 under the concurrent thaw: re-running the same freeze/thaw exercises different real OS-thread
+    // schedules — the freeze landing at different points, the children rewinding concurrently on thaw.
+    // Every run must reproduce the uninterrupted oracle (`K` for the root + both children), whether the
+    // freeze caught the children mid-loop (the thaw rewinds them) or after they finished (the residue
+    // carries their results). A schedule-dependent thaw bug would surface as a wrong total or a hang.
+    // Kept modest (the controller `yield_now`s rather than busy-spins, so this doesn't starve CI cores).
+    let inst = instrument(SRC_LOOPS);
+    for i in 0..10 {
+        let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+            continue; // unsupported shape / host alloc pressure: skip this iteration
+        };
+        if read_state(&fsnap) != STATE_UNWINDING {
+            // Everything finished before the freeze landed: the snapshot already holds the oracle.
+            assert_eq!(le_i64(&fsnap, OFF_ROOT), K, "iter {i}: root (no-freeze)");
+            assert_eq!(le_i64(&fsnap, OFF_C1), K, "iter {i}: child 1 (no-freeze)");
+            assert_eq!(le_i64(&fsnap, OFF_C2), K, "iter {i}: child 2 (no-freeze)");
+            continue;
+        }
+        assert!(
+            matches!(fout, JitOutcome::Returned(_)),
+            "iter {i}: freeze placeholder"
+        );
+        let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+        assert!(
+            matches!(tout, JitOutcome::Returned(_)),
+            "iter {i}: thaw returns"
+        );
+        assert_eq!(
+            read_state(&tfinal),
+            STATE_NORMAL,
+            "iter {i}: back to NORMAL"
+        );
+        assert_eq!(
+            le_i64(&tfinal, OFF_ROOT),
+            K,
+            "iter {i}: root total reproduced"
+        );
+        assert_eq!(
+            le_i64(&tfinal, OFF_C1),
+            K,
+            "iter {i}: child 1 total reproduced"
+        );
+        assert_eq!(
+            le_i64(&tfinal, OFF_C2),
+            K,
+            "iter {i}: child 2 total reproduced"
+        );
+    }
 }

@@ -1273,16 +1273,24 @@ per-context word set on all contexts at once — TBD in stage 1.
      closed with `ThreadFault` (the interp's join-deadlock) instead of hanging — general (helps fresh runs
      too). Tests: `mutual_wait_block_fails_closed_not_hangs` (cross-wait, no notify ⇒ `ThreadFault`) and
      `mutual_rendezvous_resolves_without_false_deadlock` (cross-notify 2-way barrier ⇒ resolves; the two
-     are never parked at once, so the check must not over-fire).
-     Interleaving determinism is otherwise covered by the stage-2
-     producer↔consumer-frozen-mid-rendezvous test and the existing per-shape concurrent freeze/thaw tests.
-   - *Remaining follow-up:* an **interleaving stress / generated fuzz.** A 20×-loop over the real
-     freeze/thaw harness was tried but reverted — its per-iteration *busy-spin* `FreezeController` (the
-     async-trigger handshake) starves few-core CI runners when repeated (a 45-min macOS hang), while a
-     single run is fine. A proper version needs a cheaper interleaving harness (yield/park the controller
-     spin, or a deterministic schedule injector) and ideally a **generated** random multi-vCPU module
-     generator (vs. today's hand-written shapes). Also open: the pure join↔join circular-deadlock case
-     (unlikely on a spawn DAG; the `live == parked` check catches every *wait*-involved deadlock today).
+     are never parked at once, so the check must not over-fire). `parked` must count **every** site a
+     vCPU can block — `atomic.wait`, `thread.join`, **and `join_all`** (run teardown): a vCPU in `join_all`
+     has finished its guest code and can never notify, so omitting it let a sibling that unwound (e.g.
+     propagating a trap, skipping its own joins) leave a waiter seeing `live > parked` forever (a flaky
+     ~1/6 hang until that was fixed).
+   - *Interleaving stress (landed).* `concurrent_freeze_thaw_is_deterministic_across_interleavings`
+     re-runs the multi-vCPU freeze/thaw 10× across different real OS-thread schedules, asserting the
+     uninterrupted oracle each time. The `concurrent_freeze` controller `yield_now`s rather than
+     busy-spins, so looping it doesn't starve few-core CI runners (the original 20×-busy-spin version was
+     reverted after a CI hang).
+   - *Loom model (landed).* `loom_deadlock_detection_resolves_when_last_peer_exits` model-checks the
+     quiescence detection: a consumer waits with a modeled live-peer flag; the peer goes non-live + wakes
+     under the futex lock; under every interleaving the consumer returns `WAIT_DEADLOCK`, never blocking
+     the model. (A loom-only check mirrors the real build's timed re-check, which loom's no-timeout model
+     can't poll.)
+   - *Remaining follow-up:* a **generated** random multi-vCPU module generator (vs. today's hand-written
+     shapes) for deeper fuzz coverage, and the pure join↔join circular-deadlock case (unlikely on a spawn
+     DAG; the `live == parked` check catches every *wait*-involved deadlock today).
 
 Original 4A map:
 
