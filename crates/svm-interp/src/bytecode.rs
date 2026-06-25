@@ -2500,7 +2500,7 @@ fn freeze_drive(
         .mem
         .as_ref()
         .map(|m| m.durable_get_sp(root_word))
-        .unwrap_or(super::SHADOW_BASE + 8);
+        .unwrap_or(super::SHADOW_BASE + super::REGION_HEADER_LEN);
     let mut frozen = Vec::new();
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
@@ -2517,7 +2517,7 @@ fn freeze_drive(
         if let Some(m) = ctx.mem.as_mut() {
             m.durable_set_sp(
                 super::shadow_region_base(slot + 1),
-                super::shadow_region_base(slot + 1) + 8,
+                super::shadow_region_base(slot + 1) + super::REGION_HEADER_LEN,
             );
         }
         // Deliver a placeholder resume value (inert; the thaw redelivers), then drive the fiber to its
@@ -2541,7 +2541,7 @@ fn freeze_drive(
             .mem
             .as_ref()
             .map(|m| m.durable_get_sp(super::shadow_region_base(slot + 1)))
-            .unwrap_or(super::SHADOW_BASE + 8);
+            .unwrap_or(super::SHADOW_BASE + super::REGION_HEADER_LEN);
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
             slot,
@@ -2879,11 +2879,11 @@ fn step_vcpu(
                 // A fresh fiber (registry slot `h`) is shadow context `h + 1`; its saved shadow-SP
                 // starts at its region base (empty shadow stack) — so a later switch into it points
                 // the active word there (DURABILITY.md §12.8).
-                fiber_sp.push(super::shadow_region_base(h as usize + 1) + 8); // §12.8 4A.5: empty = frame base (past the in-region SP word)
-                                                                              // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
-                                                                              // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
-                                                                              // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
-                                                                              // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
+                fiber_sp.push(super::shadow_region_base(h as usize + 1) + super::REGION_HEADER_LEN); // §12.8 4A.5: empty = frame base (past the in-region SP + thaw words)
+                                                                                                     // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
+                                                                                                     // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
+                                                                                                     // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
+                                                                                                     // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
                 let func_idx = (funcref as u32 as usize & dom.mods[0].table_mask) as i32;
                 fiber_meta.push((func_idx, sp));
                 vt.active.set(dst, Reg::from_i32(h));

@@ -66,7 +66,13 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// a `completed_result` flag (+ the i64 when set) — a concurrent child that finished before the freeze
 /// point but wasn't yet joined, so its `thread.join` result rides the artifact and the thaw delivers it
 /// without re-running the child. One extra `uleb` (0) per record otherwise, so a v5 record mis-parses.
-const FORMAT_VERSION: u16 = 6;
+/// v7 (§12.8 concurrent-thaw stage 1: per-context thaw state): the durable **thaw** state word
+/// (`REWINDING`/`NORMAL`) moved from the single global `STATE_OFF` (offset 0) into each context's own
+/// region (at `STATE_IN_REGION_OFF` = 8 past its shadow-SP word), with frames now starting another 8
+/// bytes later (`REGION_HEADER_LEN` 8→16). The **freeze** word (`UNWINDING`) stays global. The window
+/// image layout changed (in-region state word + an 8-byte frame shift), so a v6 artifact mis-thaws and
+/// is rejected.
+const FORMAT_VERSION: u16 = 7;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.

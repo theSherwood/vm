@@ -3,7 +3,7 @@
 //! (canonical re-serialize; identity-gated refusal) and the non-durable freeze refusal.
 
 use svm_durable::{
-    arm_freeze_after, init_durable_window, transform_module, write_state, STATE_REWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, transform_module, write_state,
     STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
@@ -138,7 +138,7 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
     // guest receives the clock as a handle argument; restore reinstated it at its original
     // slot/generation, so the same handle value (`(generation << 8) | slot`) still resolves.
     let mut win = window;
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let caps = thost.capture_durable_handles().expect("durable");
     let clk = ((caps[0].generation << 8) | caps[0].slot) as i32;
     let mut fuel = 100_000u64;
@@ -217,7 +217,7 @@ fn fiber_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: flip to REWINDING and re-enter. The root rewinds and re-issues cont.resume; the
     // re-seeded fiber re-enters its entry, rewinds, re-parks; forward execution then completes.
     let mut win = window;
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let mut fuel = 100_000u64;
     let (thawed, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut thost);
@@ -363,7 +363,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: REWINDING re-enter. The child is re-spawned and rewinds; the root rewinds, joins, sums.
     // Both clock reads reload (42, 43 → 95), not re-issue (which would use clock 1000+ → ≠ 95).
     let mut win = window;
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let clk = {
         let caps = thost.capture_durable_handles().expect("durable");
         ((caps[0].generation << 8) | caps[0].slot) as i32
@@ -504,7 +504,7 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
 
     // Thaw: the fiber re-seeds and re-parks, the child re-spawns and reloads its clock; result == 57.
     let mut win = window;
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let clk = {
         let caps = thost.capture_durable_handles().expect("durable");
         ((caps[0].generation << 8) | caps[0].slot) as i32
@@ -673,7 +673,7 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: the root rewinds and re-issues resume B; the gen-1 handle resolves to the re-seeded
     // fiber, which re-parks, and forward execution then resumes it to completion → 107.
     let mut win = window;
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let mut fuel = 100_000u64;
     let (thawed, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut thost);
@@ -807,7 +807,7 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
 
     // Thaw: the grandchild's handle resolves in the child's rebuilt table; all reads reload → 129.
     let mut win = window;
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let clk = {
         let caps = thost.capture_durable_handles().expect("durable");
         ((caps[0].generation << 8) | caps[0].slot) as i32
