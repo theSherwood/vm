@@ -1,0 +1,28 @@
+# The **richer guest-side Futamura `Jit` probe** (PEVAL.md Milestone 3, follow-up). A `no_std`
+# powerbox guest that builds a small accumulator-machine *interpreter* in svm-IR, then specializes it
+# against a fixed program supplied as a `SpecConfig` const-overlay — so the dispatch loop unrolls and
+# the program folds away — encodes the residual with `svm-encode`, and submits it to the §22 `Jit`
+# capability. Unlike `peval_jit` (which demonstrates inline + constant fold), this is a true partial
+# evaluation of an interpreter: the residual is the compiled program.
+#
+# Its own `[workspace]` keeps it out of the repo root workspace (which excludes `crates/svm-llvm`).
+[package]
+name = "peval-futamura"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+svm-peval = { path = "../../../../svm-peval", default-features = false }
+svm-ir = { path = "../../../../svm-ir" }
+svm-encode = { path = "../../../../svm-encode" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+overflow-checks = false
+
+[workspace]

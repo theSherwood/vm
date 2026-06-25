@@ -283,6 +283,19 @@ Two enablers landed with it:
   off the translated guest and passes it as `argv[1]`; the guest stamps the module's memory descriptor
   with it. The residual carries no data segments (the program is folded into the IR, not a segment).
 
+**A true in-sandbox Futamura projection (`peval_futamura.rs`).** Where `peval_jit` shows inline +
+constant-fold, this guest builds a small **accumulator-machine interpreter** in svm-IR (`interp(a,b)`:
+a `br_table`-dispatched loop reading a bytecode program from memory) and specializes it against a
+**fixed program** supplied as a `SpecConfig` **const-overlay** (the "program is constant" caller
+contract — *not* a data segment, so the residual stays data-segment-free for `Jit.compile`). The
+dispatch loop unrolls and every program read folds: the residual is a straight-line `(a,b)->result`
+with **no `br_table` (dispatch) and no `Load` (decode)** left — the interpreter is gone, only the
+compiled program (`((a*3)+b)*b+7`) remains — then encoded + `Jit.compile`d + invoked in-sandbox, `0`
+mismatches vs the oracle. The guest does *not* run the generic optimizer to merge the unrolled
+`br`-chain into one block: that pulls `String::clone` into the closure, whose body lives in the
+precompiled `alloc` rlib rather than the `--emit=llvm-bc` output (a build-std gap, not an on-ramp bug),
+so block-count minimization stays a host-side concern; the fold itself is the point.
+
 **How to reproduce by hand (for debugging a new translate gap on this lane).**
 - *Full probe* (now `peval_in_sandbox.rs`): a cargo crate depending on `svm-peval` (`default-features =
   false`) + `svm-ir`, whose `main` builds a module and calls `specialize`. Build to bitcode with
@@ -333,10 +346,14 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
      a guest specializes a module, encodes the residual, and `Jit.compile`s + invokes it **all
      in-sandbox**, checked against an oracle. Enablers: `svm-encode` → `no_std`, and the on-ramp now
      resolves LLVM function aliases (gap #12, identical-code folding). See "Milestone 3" above.
-   **Milestone 3 is complete.** Possible follow-ups: a richer Futamura flavor (specialize a small
-   interpreter against a program in a const-overlay so a dispatch loop folds away), and folding the
-   `rustc+1.81 → llvm-link → opt → translate` build into a reusable in-repo harness shared by the two
-   `peval_*` tests instead of duplicated per fixture.
+   - **Richer Futamura demo + test hardening: DONE** — `peval_futamura.rs` specializes a `br_table`
+     accumulator-machine *interpreter* against a const-overlay program in-sandbox (dispatch + decode
+     fold away) and JITs it; `llvm_alias.rs` is a lightweight always-on regression for the alias fix
+     (gap #12) gated only on `llvm-as-18`; and the `rustc+1.81 → llvm-link → opt → translate` build
+     plumbing now lives once in `tests/common/mod.rs`, shared by all three `peval_*` tests.
+   **Milestone 3 is complete.** The remaining nicety (host-side block-count minimization of the
+   in-sandbox residual) is blocked on building `alloc` from source (`-Zbuild-std`) so `String::clone`
+   et al. land in the bitcode — a toolchain workstream, not an on-ramp gap.
 
 ## Benchmarking
 
