@@ -9657,9 +9657,21 @@ fn lower_int_intrinsic(
         return Ok(Some(ctx.push(Inst::VIntBin { shape, op, a, b })));
     }
     let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
-    let cmp_select = |ctx: &mut BlockCtx, op: CmpOp| -> Result<ValIdx, Error> {
-        let a = ctx.operand(args[0])?;
-        let b = ctx.operand(args[1])?;
+    // A **narrow** (< i32) operand sits in an i32 container whose high bits are unspecified — e.g. a
+    // non-canonical `add i8 x, -1` (the narrow `bin` path doesn't mask power-of-two widths). min/max
+    // selects via an i32 compare, so — exactly like `ICmp` (§3b narrow-int hazard) — the operands must
+    // first be canonically extended: sign- for signed min/max, zero- for unsigned. Without this,
+    // `umin.i8(add i8 x,-1, y)` compares dirty containers and picks the wrong operand (a silent
+    // miscompile — found via Embench `qrduino`). The `Select` then runs on the canonical values, so the
+    // chosen result is canonical too.
+    let narrow = int_bits(args[0].get_type(types).as_ref()).filter(|&w| w < 32);
+    let cmp_select = |ctx: &mut BlockCtx, op: CmpOp, signed: bool| -> Result<ValIdx, Error> {
+        let mut a = ctx.operand(args[0])?;
+        let mut b = ctx.operand(args[1])?;
+        if let Some(w) = narrow {
+            a = emit_ext(ctx, a, w, 32, signed);
+            b = emit_ext(ctx, b, w, 32, signed);
+        }
         let cond = ctx.push(Inst::IntCmp { ty, op, a, b });
         Ok(ctx.push(Inst::Select { cond, a, b }))
     };
@@ -9668,10 +9680,10 @@ fn lower_int_intrinsic(
         Ok(ctx.push(Inst::IntUn { ty, op, a }))
     };
     let idx = match base {
-        "llvm.smax" => cmp_select(ctx, CmpOp::GtS)?,
-        "llvm.smin" => cmp_select(ctx, CmpOp::LtS)?,
-        "llvm.umax" => cmp_select(ctx, CmpOp::GtU)?,
-        "llvm.umin" => cmp_select(ctx, CmpOp::LtU)?,
+        "llvm.smax" => cmp_select(ctx, CmpOp::GtS, true)?,
+        "llvm.smin" => cmp_select(ctx, CmpOp::LtS, true)?,
+        "llvm.umax" => cmp_select(ctx, CmpOp::GtU, false)?,
+        "llvm.umin" => cmp_select(ctx, CmpOp::LtU, false)?,
         "llvm.ctlz" => unop(ctx, IntUnOp::Clz)?,
         "llvm.cttz" => unop(ctx, IntUnOp::Ctz)?,
         "llvm.ctpop" => unop(ctx, IntUnOp::Popcnt)?,
@@ -14224,17 +14236,21 @@ fn bin<'d>(
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
     let r = ctx.push(Inst::IntBin { ty, op, a, b });
-    // Keep an `iN` value (a non-power-of-two width `33..63` held in an `i64`) **canonical**: the
-    // de-normalizing ops (`add`/`sub`/`mul`/`shl`) can set bits `≥ N`, so mask the result back to its
-    // low `N` bits. Downstream `lshr`/`trunc`/unsigned-compare then see clean bits (§3b widen-and-
-    // mask); `and`/`or`/`xor`/`lshr`/`div`/`rem` of canonical inputs stay canonical (no extra mask).
-    // 32-/64-bit ops are exact in their container, so nothing to do.
+    // Keep a **narrow** `iN` value **canonical**: the de-normalizing ops (`add`/`sub`/`mul`/`shl`) can
+    // set bits `≥ N`, so mask the result back to its low `N` bits. Downstream `lshr`/`trunc`/unsigned-
+    // compare/min-max then see clean bits (§3b widen-and-mask); `and`/`or`/`xor`/`lshr`/`div`/`rem` of
+    // canonical inputs stay canonical (no extra mask). This covers **both** sub-32 widths held in an
+    // `i32` (`i8`/`i16`) *and* the `33..63` widths held in an `i64`. Previously only `33..63` was masked;
+    // a non-canonical `i8`/`i16` then silently miscompiled any width-sensitive consumer that read the
+    // dirty container without re-masking (e.g. `umin.i8` of an `add i8 x,-1` — found via Embench
+    // `qrduino`). 32-/64-bit ops are exact in their container, so nothing to do.
     let r = match width {
-        Some(w)
-            if (33..64).contains(&w)
-                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl) =>
-        {
-            mask_to_i64(ctx, r, w)
+        Some(w) if w < 64 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl) => {
+            if w <= 32 {
+                mask_to(ctx, r, w)
+            } else {
+                mask_to_i64(ctx, r, w)
+            }
         }
         _ => r,
     };

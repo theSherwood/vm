@@ -953,6 +953,53 @@ fn bitreverse_intrinsic() {
 }
 
 #[test]
+fn narrow_minmax_noncanonical() {
+    // Regression for a silent miscompile found via Embench `qrduino`. clang `-O2` lowers a
+    // `if (x > y) swap(x, y)` over `unsigned char` to `llvm.umin.i8`/`umax.i8`, and folds `trunc(c - 1)`
+    // into `add i8 (trunc c), -1` — a result whose i32 container is **non-canonical** (high bits set,
+    // because the narrow `bin` path didn't mask sub-32 widths). The min/max then did an unsigned i32
+    // compare on the dirty container and picked the wrong operand. `tri` is qrduino's triangular index
+    // (`setmask`/`ismasked`). Straight-line (no loop, to avoid auto-vectorization) with a runtime
+    // center `c` so the `c±1` i8 arithmetic is actually emitted rather than const-folded.
+    let src = "int run(int s);\n\
+               static unsigned tri(unsigned char x, unsigned char y){\n\
+                 unsigned bt;\n\
+                 if (x > y){ bt = x; x = y; y = bt; }\n\
+                 bt = y; bt *= y; bt += y; bt >>= 1; bt += x; return bt;\n\
+               }\n\
+               int run(int s){\n\
+                 unsigned char c = (unsigned char) s;\n\
+                 unsigned acc = 0;\n\
+                 acc += tri(c-1, c);   acc += tri(c, c-1);\n\
+                 acc += tri(c-1, c+1); acc += tri(c+1, c-1);\n\
+                 acc += tri(c-2, c);   acc += tri(c, c-2);\n\
+                 return (int)(acc & 0x7f);\n\
+               }\n\
+               int main(void){ return run(18); }";
+    check_vs_native("narrow_minmax", src, 18);
+}
+
+#[test]
+fn signed_narrow_minmax() {
+    // Companion to `narrow_minmax_noncanonical`: a `signed char` min reduction that `-O2` lowers to a
+    // scalar `llvm.smin.i8` whose operand is a *negative* i8 (here -100). Narrow values are held
+    // canonical (zero-extended low bits), so -100 sits in the container as 0x9C = 156; a naive signed
+    // i32 compare would treat it as positive and pick the wrong operand. The min/max lowering must
+    // **sign**-extend narrow operands for the signed predicates (mirroring `ICmp`'s §3b handling) — the
+    // producer-side narrow masking alone doesn't suffice for the signed case.
+    let src = "int run(int s);\n\
+               static signed char redmin(int s){\n\
+                 signed char d[6] = {10, -5, 3, -100, (signed char) s, -1};\n\
+                 signed char m = 100;\n\
+                 for (int i = 0; i < 6; i++) m = d[i] < m ? d[i] : m;\n\
+                 return m;\n\
+               }\n\
+               int run(int s){ return (int)(unsigned char) redmin(s); }\n\
+               int main(void){ return run(7); }";
+    check_vs_native("signed_minmax", src, 7);
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";
