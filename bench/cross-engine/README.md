@@ -310,8 +310,9 @@ Indicative (svm-jit ÷ native; **every engine bit-exact = native, `verify`=1**):
 | matmult-int | ~3.9× |
 
 **geomean ~1.6× native over 5 kernels**, all bit-identical across tree-walk / bytecode / JIT / native.
-The tail is the familiar one: `matmult-int` vectorizes, so it pays the 128-bit-vs-AVX2 SIMD-width gap
-(ISSUES I8), exactly like `corpus_diff`'s `matmul8`. Honestly skipped (real on-ramp coverage gaps, not
+The tail is the familiar one: `matmult-int` vectorizes, so vs native it pays both the 128-bit-vs-AVX2
+SIMD-*width* gap **and** the Cranelift-vs-TurboFan codegen gap (ISSUES I8 — svm-jit ≈ wasm(wasmtime),
+both Cranelift; V8 leads at the same width), exactly like `corpus_diff`'s `matmul8`. Honestly skipped (real on-ramp coverage gaps, not
 silent): `edn` (a wide-vector legalization edge — `<8 x i32>` in a context the I2 pass doesn't cover)
 and `aha-mont64` (`i128` 64×64→128 Montgomery multiply). This is real third-party code — so the suite
 doubles as a whole-stack differential test on programs we didn't write.
