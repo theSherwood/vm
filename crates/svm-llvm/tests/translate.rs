@@ -2587,12 +2587,13 @@ fn multi_value_struct_return() {
 
 #[test]
 fn unsupported_is_fail_closed() {
-    // i128 *division* is outside the subset (I14 tier 3 lowers i128 add/sub/mul/shift/bitwise, but not
-    // div/rem — `udiv i128` / the `__udivti3` libcall) — it must be a clean `Unsupported`, never a
-    // silent mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
+    // `long double` is `x86_fp80` on x86-64 — outside the f32/f64 scalar subset (`val_type` accepts
+    // only `FPType::{Single,Double}`). It must be a clean `Unsupported`, never a silent
+    // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint). (i128 div/rem, the prior subject
+    // here, is now supported via the `__svm_udivmod128` helper — see the `i128_*` tests.)
     let Some(bc) = compile_to_bc(
-        "i128div",
-        "unsigned __int128 dv(unsigned __int128 a, unsigned __int128 b){ return a / b; }",
+        "fp80add",
+        "long double f(long double a, long double b){ return a + b; }",
     ) else {
         return;
     };
@@ -6548,6 +6549,158 @@ fn i128_compares_all_predicates() {
                 Value::I64(bl as i64),
             ],
             &[Value::I32(r)],
+        );
+    }
+}
+
+/// **Cross-block i128** (I14 tail): an `__int128` accumulator carried across a loop backedge — `-O2`
+/// promotes it to a `phi i128` at the loop header, so its `(lo, hi)` pair must fan out as two block
+/// params over the edge (the struct-φ machinery, now extended to i128). The entry incoming is a
+/// **constant i128 `0`** (the `n == 0` case returns it untouched), exercising the constant-i128 φ path.
+/// An i128 LCG grows into the high word within a couple of iterations, so a torn backedge corrupts the
+/// result. Bit-exact interp == JIT vs a native `u128` oracle.
+#[test]
+fn i128_cross_block_loop_accumulator() {
+    let src = "unsigned long f(unsigned long n, unsigned long seed) {\n\
+        \x20 unsigned __int128 acc = 0;\n\
+        \x20 for (unsigned long i = 0; i < n; i++)\n\
+        \x20   acc = acc * 6364136223846793005ull + seed + i;\n\
+        \x20 return (unsigned long)acc ^ (unsigned long)(acc >> 64);\n\
+        }\n";
+    for (n, seed) in [
+        (0u64, 7u64),
+        (1, 7),
+        (5, 0xdead_beef),
+        (50, 0x1234_5678_9abc_def0),
+    ] {
+        let mut acc: u128 = 0;
+        for i in 0..n {
+            acc = acc
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(seed as u128)
+                .wrapping_add(i as u128);
+        }
+        let want = (acc as u64) ^ ((acc >> 64) as u64);
+        check(
+            "i128_xblock_lcg",
+            src,
+            &[Value::I64(n as i64), Value::I64(seed as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Cross-block i128** with **two** loop-carried values: an `__int128` Fibonacci pair. Both `a` and
+/// `b` are `phi i128` across the backedge (constant entry incomings `0` and `1` — the latter a
+/// non-zero low word), so two independent i128 `(lo, hi)` pairs must thread their four block params in
+/// the right order. i128 Fibonacci overflows 64 bits around n≈93, so n=100 populates the high word.
+#[test]
+fn i128_cross_block_fib_pair() {
+    let src = "unsigned long fib(unsigned long n) {\n\
+        \x20 unsigned __int128 a = 0, b = 1;\n\
+        \x20 for (unsigned long i = 0; i < n; i++) { unsigned __int128 t = a + b; a = b; b = t; }\n\
+        \x20 return (unsigned long)a ^ (unsigned long)(a >> 64);\n\
+        }\n";
+    for n in [0u64, 1, 2, 93, 100] {
+        let (mut a, mut b): (u128, u128) = (0, 1);
+        for _ in 0..n {
+            let t = a.wrapping_add(b);
+            a = b;
+            b = t;
+        }
+        let want = (a as u64) ^ ((a >> 64) as u64);
+        check(
+            "i128_xblock_fib",
+            src,
+            &[Value::I64(n as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Unsigned i128 div + rem** (I14 tail): `udiv i128` / `urem i128` lower to the synthesized 128÷128
+/// long-division helper (`__svm_udivmod128`), which returns both quotient and remainder. Folds both
+/// words of `q` and `r` into the result, so an error in any word shows. Bit-exact interp == JIT vs a
+/// `u128` oracle, across small/large/high-word-divisor/divisor>dividend cases.
+#[test]
+fn i128_udiv_urem() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 q = x / y;\n\
+        \x20 unsigned __int128 r = x % y;\n\
+        \x20 return ((unsigned long)q ^ (unsigned long)(q >> 64)) + ((unsigned long)r ^ (unsigned long)(r >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (0u64, 100u64, 0u64, 7u64),                         // small / small
+        (5, 0, 0, 3),                                       // high-word dividend / tiny divisor
+        (u64::MAX, u64::MAX, 0, 0xffff_ffff),               // near-max / 32-bit divisor
+        (0x1234, 0x5678_9abc_def0_1234, 0x12, 0x3456_789a), // both have high words
+        (0, 3, 0, 100),                                     // divisor > dividend → q=0, r=x
+        (
+            0xdead_beef_cafe,
+            0x1111_2222_3333_4444,
+            0xbeef,
+            0x9999_8888_7777_6666,
+        ), // general
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let q = x / y;
+        let r = x % y;
+        let want = ((q as u64) ^ ((q >> 64) as u64)).wrapping_add((r as u64) ^ ((r >> 64) as u64));
+        check(
+            "i128_udivrem",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Signed i128 div + rem** (I14 tail): `sdiv i128` / `srem i128` reuse the unsigned helper — the
+/// lowering abs-es the operands and re-signs (quotient negative iff signs differ; remainder takes the
+/// dividend's sign, C truncation toward zero). All four sign combinations, vs a native `i128` oracle.
+#[test]
+fn i128_sdiv_srem() {
+    let src = "long g(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 __int128 x = (__int128)(((unsigned __int128)ah << 64) | al);\n\
+        \x20 __int128 y = (__int128)(((unsigned __int128)bh << 64) | bl);\n\
+        \x20 __int128 q = x / y;\n\
+        \x20 __int128 r = x % y;\n\
+        \x20 return ((long)q ^ (long)(q >> 64)) + ((long)r ^ (long)(r >> 64));\n\
+        }\n";
+    let cases: [(i128, i128); 8] = [
+        (100, 7),
+        (-100, 7),
+        (100, -7),
+        (-100, -7),
+        (-(1i128 << 100), 3),                 // large negative / small positive
+        ((1i128 << 120) - 1, -(1i128 << 40)), // large positive / negative high-word divisor
+        (-12345678901234567890, 1_000_000_007), // negative / positive prime
+        (7, 100),                             // |dividend| < |divisor| → q=0, r=dividend
+    ];
+    for (x, y) in cases {
+        let (ah, al) = (((x as u128) >> 64) as u64, x as u128 as u64);
+        let (bh, bl) = (((y as u128) >> 64) as u64, y as u128 as u64);
+        let q = x.wrapping_div(y);
+        let r = x.wrapping_rem(y);
+        let want = ((q as i64) ^ ((q >> 64) as i64)).wrapping_add((r as i64) ^ ((r >> 64) as i64));
+        check(
+            "i128_sdivrem",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want)],
         );
     }
 }

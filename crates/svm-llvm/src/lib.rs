@@ -400,6 +400,8 @@ fn translate_impl(
     // `__cxa_end_catch` destroys the caught exception object via `__svm_eh_destroy` (gated on EH being
     // active, so the helper can address the EH region and the dtor funcref resolves through the table).
     let need_eh_destroy = need_eh && calls_external(m, &defined_names, "__cxa_end_catch");
+    // i128 `udiv`/`sdiv`/`urem`/`srem` lower to the synthesized 128÷128 long-division helper.
+    let need_idiv128 = uses_i128_divrem(m);
     // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
     // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
     // order below must match.
@@ -453,6 +455,7 @@ fn translate_impl(
         atomic_cas_narrow: take(need_narrow_atomic),
         memcmp: take(need_memcmp),
         eh_destroy: take(need_eh_destroy),
+        udivmod128: take(need_idiv128),
         float_scratch: float_scratch_base,
         eh_base,
         eh_typeids,
@@ -661,6 +664,11 @@ fn translate_impl(
     // only its arguments and indirect-calls the passed destructor funcref.
     if need_eh_destroy {
         funcs.push(synth_eh_destroy());
+    }
+    // `__svm_udivmod128` (after `__svm_eh_destroy` — matches the `take` order). Self-contained: it
+    // touches no memory, only its four i64 operands.
+    if need_idiv128 {
+        funcs.push(synth_udivmod128());
     }
     Ok(Translated {
         module: Module {
@@ -1810,10 +1818,14 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
                     // `mask_lanes`, never used as a scalar — record a placeholder type.
                     Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
-                    // An `i128` result (a `-O2` 16-byte struct-eq coalesce: `load i128` + `icmp`) is
-                    // held as a 2×`i64` aggregate pair, never a scalar — placeholder type, like a
-                    // struct. (Same-block only, the aggregate-side-table assumption.)
+                    // An `i128` result is held as a 2×`i64` aggregate pair `(lo, hi)` (the unified
+                    // `agg`-pair representation, shared with `load i128` / `icmp i128` / the tier-3
+                    // `lower_i128` ops). Recording an `[i64, i64]` `agg_layout` — exactly like a flat
+                    // 2-field struct — lets the value **cross block edges**: the per-field fan-out in
+                    // `block_params`/`branch_args` threads its `(lo, hi)` as two block params (an i128
+                    // loop-carried φ / live-across value), not just same-block.
                     Err(_) if matches!(ty.as_ref(), Type::IntegerType { bits: 128 }) => {
+                        s.agg_layout.insert(id, vec![ValType::I64, ValType::I64]);
                         ValType::I64
                     }
                     Err(e) => return Err(e),
@@ -3158,6 +3170,10 @@ struct Helpers {
     /// `__svm_getenv(name:i64) -> i64` — scan the §3e env strings for `name=`, returning the value
     /// pointer (just past the `=`) or NULL. Reads the blob in the reserved low scratch directly.
     getenv: Option<u32>,
+    /// `__svm_udivmod128(nlo, nhi, dlo, dhi) -> (qlo, qhi, rlo, rhi)` — unsigned 128÷128 quotient +
+    /// remainder (I14). Present only when the module has an i128 `udiv`/`sdiv`/`urem`/`srem`; signed
+    /// div/rem reuse it (the lowering abs-es the operands and re-signs the result).
+    udivmod128: Option<u32>,
     /// The bignum float-formatter helper family (all of `%f`/`%e`/`%g`): the ten big-integer
     /// primitives, the `dtoa_digits` engine, and the three formatters (`dtoa_sci`/`dtoa_gen`/
     /// `dtoa_fix`). Indices are interdependent (`dtoa_digits` calls the primitives; the formatters
@@ -3207,6 +3223,26 @@ fn uses_narrow_atomic(m: &LModule) -> bool {
             Instruction::AtomicRMW(r) => narrow(&r.value),
             Instruction::CmpXchg(cx) => narrow(&cx.expected),
             Instruction::Store(st) => st.atomicity.is_some() && narrow(&st.value),
+            _ => false,
+        })
+    })
+}
+
+/// Does the module have an i128 `udiv`/`sdiv`/`urem`/`srem`? (clang keeps these as IR ops at `-O2`;
+/// the on-ramp lowers them to the synthesized 128÷128 long-division helper, `__svm_udivmod128`.)
+fn uses_i128_divrem(m: &LModule) -> bool {
+    let is_i128 = |o: &Operand| {
+        matches!(
+            o.get_type(&m.types).as_ref(),
+            Type::IntegerType { bits: 128 }
+        )
+    };
+    m.functions.iter().flat_map(|f| &f.basic_blocks).any(|bb| {
+        bb.instrs.iter().any(|i| match i {
+            Instruction::UDiv(x) => is_i128(&x.operand0),
+            Instruction::SDiv(x) => is_i128(&x.operand0),
+            Instruction::URem(x) => is_i128(&x.operand0),
+            Instruction::SRem(x) => is_i128(&x.operand0),
             _ => false,
         })
     })
@@ -3970,6 +4006,128 @@ fn synth_utoa() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_udivmod128(n_lo, n_hi, d_lo, d_hi) -> (q_lo, q_hi, r_lo, r_hi)` — **unsigned
+/// 128÷128 division and remainder** in one pass (I14: `udiv`/`sdiv`/`urem`/`srem i128`; the on-ramp
+/// sees these as IR ops at `-O2` — the `__udivti3`-family libcall is a *backend* lowering it never
+/// gets). Classic binary long division over the `(lo, hi)` i64 pair: shift the 256-bit `[R:Q]`
+/// register left one bit per step (quotient in the low 128, remainder in the high 128, dividend
+/// seeded into `Q`); when the running remainder `R ≥ D`, subtract `D` and set the low quotient bit.
+/// After 128 steps `Q` is the quotient and `R` the remainder. Division by zero **traps** (matching
+/// the scalar `i64` divide), via an `i64 / 0` in the guard block.
+///
+/// ```text
+///   entry(nlo,nhi,dlo,dhi):  (dlo|dhi)==0 ? trap() : loop(0, nlo, nhi, 0, 0, dlo, dhi)
+///   trap():                  1 / 0   ; DivByZero, never returns
+///   loop(i, qlo,qhi, rlo,rhi, dlo,dhi):
+///     [R:Q] <<= 1 (256-bit)                                  ; bit i of the dividend enters R
+///     ge = R >=u D                                           ; 128-bit unsigned compare
+///     R = ge ? R - D : R ;  qlo |= ge                        ; conditional subtract + set bit
+///     i+1 < 128 ? loop(i+1, …) : done(qlo,qhi, rlo,rhi)
+///   done(qlo,qhi,rlo,rhi):   return (qlo,qhi,rlo,rhi)
+/// ```
+fn synth_udivmod128() -> Func {
+    use BinOp::{Add, And, Or, Shl, ShrU, Sub};
+    use CmpOp::{Eq, GeU, GtU, LtU};
+    let i64t = ValType::I64;
+    const LOOP: u32 = 2;
+    const DONE: u32 = 3;
+
+    // entry(nlo=0, nhi=1, dlo=2, dhi=3): trap on a zero divisor, else seed the loop.
+    let entry = {
+        let mut b = Bdr::new(4);
+        let dor = b.bin(Or, 2, 3); // dlo | dhi
+        let dz = b.cmpi(Eq, dor, 0); // divisor == 0?
+        let zero = b.k(0);
+        // ge/lt etc. read `dlo`/`dhi` (2,3) again in the loop; pass them through.
+        b.block(
+            vec![i64t; 4],
+            Terminator::BrIf {
+                cond: dz,
+                then_blk: 1,
+                then_args: vec![],
+                else_blk: LOOP,
+                // loop(i=0, qlo=nlo, qhi=nhi, rlo=0, rhi=0, dlo, dhi)
+                else_args: vec![zero, 0, 1, zero, zero, 2, 3],
+            },
+        )
+    };
+    // trap(): an `i64 / 0` raises DivByZero (i128 divide-by-zero, like the scalar path). Unreachable
+    // return keeps the block well-formed.
+    let trap = {
+        let mut b = Bdr::new(0);
+        let one = b.k(1);
+        let z = b.k(0);
+        let t = b.bin(svm_ir::BinOp::DivU, one, z); // traps
+        b.block(vec![], Terminator::Return(vec![t, t, t, t]))
+    };
+    // loop(i=0, qlo=1, qhi=2, rlo=3, rhi=4, dlo=5, dhi=6).
+    let lp = {
+        let mut b = Bdr::new(7);
+        // 256-bit left shift of [rhi:rlo:qhi:qlo] by one — each word's incoming bit0 is the prior
+        // (lower) word's outgoing top bit.
+        let car_rhi = b.bini(ShrU, 3, 63); // top bit of rlo → rhi bit0
+        let car_rlo = b.bini(ShrU, 2, 63); // top bit of qhi → rlo bit0
+        let car_qhi = b.bini(ShrU, 1, 63); // top bit of qlo → qhi bit0
+        let rhi_s = b.bini(Shl, 4, 1);
+        let nr_hi = b.bin(Or, rhi_s, car_rhi);
+        let rlo_s = b.bini(Shl, 3, 1);
+        let nr_lo = b.bin(Or, rlo_s, car_rlo);
+        let qhi_s = b.bini(Shl, 2, 1);
+        let nq_hi = b.bin(Or, qhi_s, car_qhi);
+        let nq_lo = b.bini(Shl, 1, 1);
+        // ge = nr >=u d : (nr_hi >u d_hi) | (nr_hi == d_hi & nr_lo >=u d_lo)
+        let gt_hi = b.cmp(GtU, nr_hi, 6);
+        let eq_hi = b.cmp(Eq, nr_hi, 6);
+        let ge_lo = b.cmp(GeU, nr_lo, 5);
+        let and1 = b.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: And,
+            a: eq_hi,
+            b: ge_lo,
+        });
+        let ge = b.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: Or,
+            a: gt_hi,
+            b: and1,
+        });
+        // nr - d (128-bit), used only when ge.
+        let diff_lo = b.bin(Sub, nr_lo, 5);
+        let borrow = b.cmp(LtU, nr_lo, 5);
+        let borrow64 = b.ext(borrow);
+        let thi = b.bin(Sub, nr_hi, 6);
+        let diff_hi = b.bin(Sub, thi, borrow64);
+        let r_lo2 = b.sel(ge, diff_lo, nr_lo);
+        let r_hi2 = b.sel(ge, diff_hi, nr_hi);
+        let q_lo_or1 = b.bini(Or, nq_lo, 1);
+        let q_lo2 = b.sel(ge, q_lo_or1, nq_lo);
+        // i + 1 < 128 ? loop : done
+        let i1 = b.bini(Add, 0, 1);
+        let cont = b.cmpi(LtU, i1, 128);
+        b.block(
+            vec![i64t; 7],
+            Terminator::BrIf {
+                cond: cont,
+                then_blk: LOOP,
+                then_args: vec![i1, q_lo2, nq_hi, r_lo2, r_hi2, 5, 6],
+                else_blk: DONE,
+                else_args: vec![q_lo2, nq_hi, r_lo2, r_hi2],
+            },
+        )
+    };
+    // done(qlo, qhi, rlo, rhi): return the pair-of-pairs.
+    let done = Block {
+        params: vec![i64t; 4],
+        insts: vec![],
+        term: Terminator::Return(vec![0, 1, 2, 3]),
+    };
+    Func {
+        params: vec![i64t; 4],
+        results: vec![i64t; 4],
+        blocks: vec![entry, trap, lp, done],
     }
 }
 
@@ -10974,7 +11132,16 @@ impl<'a> BlockCtx<'a> {
                     .iter()
                     .map(|v| self.operand(&Operand::ConstantOperand(v.clone())))
                     .collect(),
-                other => unsup(format!("struct φ constant incoming {other:?}")),
+                // A constant i128 φ incoming (e.g. the entry edge of `phi i128 [0, entry], [next, loop]`):
+                // materialize its `(lo, hi)` pair, mirroring `i128_parts`. `llvm-ir` 0.11.3 holds the
+                // value in a `u64`, so the high word is always 0 here (a ≥2⁶⁴ / negative i128 constant
+                // fails the bitcode parse upstream — see ISSUES.md I14 — so it never reaches us).
+                Constant::Int { bits: 128, value } if ftys.len() == 2 => {
+                    let lo = self.const_i64(*value as i64);
+                    let hi = self.const_i64(0);
+                    Ok(vec![lo, hi])
+                }
+                other => unsup(format!("aggregate φ constant incoming {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata struct operand"),
         }
@@ -12154,6 +12321,14 @@ fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             finish(ctx, &x.dest, v)?;
             Ok(true)
         }
+        // `freeze i128` — identity on the `(lo, hi)` pair (our IR is total: `undef`/`poison` already
+        // resolve to a defined 0 and no poison propagates, §3c). clang emits it on `udiv`/`urem`
+        // operands at `-O2`; without this arm the generic scalar `freeze` mishandles the i128 pair.
+        I::Freeze(x) if is_i128(&x.operand) => {
+            let (lo, hi) = i128_parts(ctx, &x.operand)?;
+            set_i128(ctx, &x.dest, lo, hi);
+            Ok(true)
+        }
         I::And(x) if is_i128(&x.operand0) => {
             i128_bitwise(ctx, &x.operand0, &x.operand1, &x.dest, BinOp::And)
         }
@@ -12207,8 +12382,120 @@ fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
         I::AShr(x) if is_i128(&x.operand0) => {
             i128_shift(ctx, &x.operand0, &x.operand1, &x.dest, I128ShiftKind::AShr)
         }
+        // div/rem: the synthesized 128÷128 long-division helper (`__svm_udivmod128`) returns both
+        // quotient and remainder; signed forms abs the operands and re-sign the result.
+        I::UDiv(x) if is_i128(&x.operand0) => {
+            i128_divrem(ctx, &x.operand0, &x.operand1, &x.dest, false, false)
+        }
+        I::SDiv(x) if is_i128(&x.operand0) => {
+            i128_divrem(ctx, &x.operand0, &x.operand1, &x.dest, true, false)
+        }
+        I::URem(x) if is_i128(&x.operand0) => {
+            i128_divrem(ctx, &x.operand0, &x.operand1, &x.dest, false, true)
+        }
+        I::SRem(x) if is_i128(&x.operand0) => {
+            i128_divrem(ctx, &x.operand0, &x.operand1, &x.dest, true, true)
+        }
         _ => Ok(false),
     }
+}
+
+/// Conditionally two's-complement negate an i128 `(lo, hi)` pair: returns `cond ? -value : value`.
+/// `-value = (0 - lo, 0 - hi - borrow)` with `borrow = (lo != 0)`, selected per word on `cond` (an
+/// `i32` boolean). Used for i128 signed div/rem (abs the operands, re-sign the result).
+fn i128_select_neg(ctx: &mut BlockCtx, lo: ValIdx, hi: ValIdx, cond: ValIdx) -> (ValIdx, ValIdx) {
+    let zero = ctx.const_i64(0);
+    let nlo = i64bin(ctx, BinOp::Sub, zero, lo);
+    let borrow = i64cmp_ext(ctx, CmpOp::LtU, zero, lo); // (0 <u lo) == (lo != 0)
+    let nhi0 = i64bin(ctx, BinOp::Sub, zero, hi);
+    let nhi = i64bin(ctx, BinOp::Sub, nhi0, borrow);
+    let rlo = ctx.push(Inst::Select {
+        cond,
+        a: nlo,
+        b: lo,
+    });
+    let rhi = ctx.push(Inst::Select {
+        cond,
+        a: nhi,
+        b: hi,
+    });
+    (rlo, rhi)
+}
+
+/// Lower an i128 `udiv`/`sdiv`/`urem`/`srem` via the synthesized 128÷128 helper. The helper is
+/// unsigned, so a signed op abs-es both operands first and re-signs the result: a quotient is
+/// negative iff the operand signs differ; a remainder takes the **dividend's** sign (C99 truncation
+/// toward zero). `Ok(true)` — an i128 op was handled.
+fn i128_divrem(
+    ctx: &mut BlockCtx,
+    op0: &Operand,
+    op1: &Operand,
+    dest: &Name,
+    signed: bool,
+    rem: bool,
+) -> Result<bool, Error> {
+    let udivmod = ctx.helpers.udivmod128.ok_or(Error::Unsupported(
+        "i128 div/rem helper not registered (uses_i128_divrem missed it)".into(),
+    ))?;
+    let (alo, ahi) = i128_parts(ctx, op0)?;
+    let (blo, bhi) = i128_parts(ctx, op1)?;
+    // For signed, the sign of an i128 is the sign of its high word (icmp slt hi, 0).
+    let (sign_a, sign_b) = if signed {
+        let za = ctx.const_i64(0);
+        let sa = ctx.push(Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtS,
+            a: ahi,
+            b: za,
+        });
+        let sb = ctx.push(Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtS,
+            a: bhi,
+            b: za,
+        });
+        (sa, sb)
+    } else {
+        (0, 0)
+    };
+    let (nlo, nhi, dlo, dhi) = if signed {
+        let (nlo, nhi) = i128_select_neg(ctx, alo, ahi, sign_a);
+        let (dlo, dhi) = i128_select_neg(ctx, blo, bhi, sign_b);
+        (nlo, nhi, dlo, dhi)
+    } else {
+        (alo, ahi, blo, bhi)
+    };
+    let parts = ctx.push_multi(
+        Inst::Call {
+            func: udivmod,
+            args: vec![nlo, nhi, dlo, dhi],
+        },
+        4,
+    );
+    // parts = [q_lo, q_hi, r_lo, r_hi]; pick the quotient or the remainder.
+    let (lo, hi) = if rem {
+        (parts[2], parts[3])
+    } else {
+        (parts[0], parts[1])
+    };
+    let (lo, hi) = if signed {
+        // quotient negative iff operand signs differ; remainder takes the dividend's sign.
+        let neg = if rem {
+            sign_a
+        } else {
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Xor,
+                a: sign_a,
+                b: sign_b,
+            })
+        };
+        i128_select_neg(ctx, lo, hi, neg)
+    } else {
+        (lo, hi)
+    };
+    set_i128(ctx, dest, lo, hi);
+    Ok(true)
 }
 
 fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<(), Error> {
