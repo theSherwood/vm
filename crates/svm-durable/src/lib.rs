@@ -112,8 +112,28 @@ pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// safepoints) so an ordinary or fiber-armed run is byte-identical (this slot stays 0). Lives in the
 /// reserve's `[24, 64)` gap.
 pub const ARM_BACKEDGE_OFF: u64 = 24;
+/// §12.8 concurrent-thaw stage 1: byte offset of the per-context **thaw** state word
+/// (`REWINDING`/`NORMAL`) **within a context's region** — just past the 8-byte in-region shadow-SP word
+/// at the region base, addressed via the `durable.shadow_base` register (like the SP word). Each frozen
+/// vCPU rewinds against its *own* thaw word, so the thaw can run them as concurrent OS threads with no
+/// shared word: one vCPU finishing its rewind (flipping its word to `NORMAL`) can't disturb a sibling
+/// still `REWINDING`, and a forward vCPU's callee prologue can't read another's `REWINDING`. The
+/// **freeze** state (`UNWINDING`) stays at the global [`STATE_OFF`] — a freeze is stop-the-world, so the
+/// single word is the natural broadcast every poll reads. Must equal `svm-interp`/`svm-jit`'s copy.
+pub const STATE_IN_REGION_OFF: u64 = 8;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a context region's base before its shadow frames —
+/// the 8-byte shadow-SP word plus the 4-byte thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to
+/// keep frames 8-aligned. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
+/// `svm-interp`/`svm-jit`'s copy.
+pub const REGION_HEADER_LEN: u64 = 16;
+
 /// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
 pub const SHADOW_BASE: u64 = 64;
+/// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)`
+/// (§12.8 4A.5). The transform itself never addresses a region (it emits `durable.shadow_base`-relative
+/// loads the runtime resolves), but the [`write_thaw_state`] host helper indexes a context's region.
+/// Must equal `svm-interp`/`svm-jit`'s `SHADOW_STRIDE`.
+pub const SHADOW_STRIDE: u64 = 1 << 12;
 /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
 /// state word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
 /// A durable module's declared window must be at least this large (it is counted against the
@@ -367,7 +387,11 @@ fn compute_may_suspend(m: &Module) -> Vec<bool> {
                 // stacks and is a freeze safepoint too (`cont.new` alone merely allocates).
                 matches!(
                     x,
-                    Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                    Inst::CapCall { .. }
+                        | Inst::ContResume { .. }
+                        | Inst::Suspend { .. }
+                        | Inst::ThreadJoin { .. }
+                        | Inst::MemoryWait { .. }
                 )
             })
         }) {
@@ -413,6 +437,26 @@ enum SuspendKind {
     /// 3.1.3) — until that lands, a thaw that actually re-enters a suspended fiber still relies
     /// on the fiber side being wired.
     Resume { k: ValIdx, arg: ValIdx },
+    /// `thread.join` (§12.8 next slice): a vCPU blocked joining a child is a freeze safepoint too — the
+    /// `thread_join` thunk returns a sentinel on observing `UNWINDING`, the trailing poll unwinds, and
+    /// the join is **re-issued on thaw** (like a propagated call / `cont.resume`): by then the child has
+    /// been re-spawned and run to completion, so the re-executed join resolves immediately to its
+    /// recorded result. `handle` is the joined vCPU handle's block-local index (spilled + reloaded).
+    ThreadJoin { handle: ValIdx },
+    /// `<ty>.atomic.wait` (§12.8 parked-vCPU slice): a vCPU blocked in a futex wait is a freeze
+    /// safepoint too — the `thread_wait` thunk returns on observing `UNWINDING`, the trailing poll
+    /// unwinds, and the wait is **re-issued on thaw** (like `thread.join`): the re-executed wait
+    /// re-checks the guest value, so a wake that landed as a value change (already in the snapshot, or
+    /// replayed by another re-run vCPU) resolves it immediately with `WAIT_NOT_EQUAL`. A re-issue that
+    /// would still *park* on the single-worker thaw can't be satisfied (no concurrent notifier) and
+    /// fails closed (`ThreadFault`, matching the interp's join-deadlock). `ty` reconstructs the op;
+    /// `addr`/`expected`/`timeout` are its block-local operands (spilled + reloaded).
+    MemoryWait {
+        ty: IntTy,
+        addr: ValIdx,
+        expected: ValIdx,
+        timeout: ValIdx,
+    },
     /// `suspend` (fiber side): unwinds the fiber's stack like a leaf, and thaw **re-parks** the
     /// fiber — flips the state word to `NORMAL` (a parked fiber's suspend is the globally-deepest
     /// frozen frame) and re-executes `suspend` so control returns to the resumer awaiting a future
@@ -487,7 +531,11 @@ fn transform_func(
             .iter()
             .enumerate()
             .filter(|(_, inst)| match inst {
-                Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => true,
+                Inst::CapCall { .. }
+                | Inst::ContResume { .. }
+                | Inst::Suspend { .. }
+                | Inst::ThreadJoin { .. }
+                | Inst::MemoryWait { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
                 _ => false,
             })
@@ -580,8 +628,8 @@ fn transform_func(
 
     // ---- PROLOGUE — dispatch on the state word ----
     let mut pb = Bb::new(f.params.clone());
-    let st_a = pb.one(Inst::ConstI64(STATE_OFF as i64));
-    let st = pb.one(load(LoadOp::I32, st_a, 0));
+    let (st_a, st_off) = pb.thaw_word_addr();
+    let st = pb.one(load(LoadOp::I32, st_a, st_off));
     let rw = pb.one(Inst::ConstI32(STATE_REWINDING));
     let is_rw = pb.one(icmp(IntTy::I32, CmpOp::Eq, st, rw));
     let prologue = pb.finish(Terminator::BrIf {
@@ -641,8 +689,8 @@ fn transform_func(
                 cont_seg: seg(b, 0), // re-enter the header body, past the poll
             });
             let mut psb = Bb::new(slot_types);
-            let st_a = psb.one(Inst::ConstI64(STATE_OFF as i64));
-            let st = psb.one(load(LoadOp::I32, st_a, 0));
+            let (st_a, st_off) = psb.freeze_word_addr();
+            let st = psb.one(load(LoadOp::I32, st_a, st_off));
             let unw = psb.one(Inst::ConstI32(STATE_UNWINDING));
             let is_unw = psb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
             let live: Vec<ValIdx> = (0..plen as u32).collect();
@@ -663,8 +711,8 @@ fn transform_func(
                 sb.insts.extend_from_slice(&blk.insts[seg_start..=pos]);
                 let out = bi.vend[pos];
                 sb.next = out as u32;
-                let st_a = sb.one(Inst::ConstI64(STATE_OFF as i64));
-                let st = sb.one(load(LoadOp::I32, st_a, 0));
+                let (st_a, st_off) = sb.freeze_word_addr();
+                let st = sb.one(load(LoadOp::I32, st_a, st_off));
                 let unw = sb.one(Inst::ConstI32(STATE_UNWINDING));
                 let is_unw = sb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
                 let gid = points.len() as u32;
@@ -686,7 +734,21 @@ fn transform_func(
                     },
                     Inst::ContResume { k, arg } => SuspendKind::Resume { k: *k, arg: *arg },
                     Inst::Suspend { value } => SuspendKind::Yield { value: *value },
-                    _ => unreachable!("suspend position is a cap.call / call / fiber op"),
+                    Inst::ThreadJoin { handle } => SuspendKind::ThreadJoin { handle: *handle },
+                    Inst::MemoryWait {
+                        ty,
+                        addr,
+                        expected,
+                        timeout,
+                    } => SuspendKind::MemoryWait {
+                        ty: *ty,
+                        addr: *addr,
+                        expected: *expected,
+                        timeout: *timeout,
+                    },
+                    _ => unreachable!(
+                        "suspend position is a cap.call / call / fiber / thread.join / atomic.wait op"
+                    ),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
                     (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
@@ -695,6 +757,8 @@ fn transform_func(
                     }
                     (SuspendKind::Resume { .. }, _) => 2, // (status, value)
                     (SuspendKind::Yield { .. }, _) => 1,  // the resume arg
+                    (SuspendKind::ThreadJoin { .. }, _) => 1, // the join result (i64)
+                    (SuspendKind::MemoryWait { .. }, _) => 1, // the wait status (i32)
                     _ => unreachable!(),
                 };
                 // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
@@ -706,7 +770,9 @@ fn transform_func(
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
                     | SuspendKind::Resume { .. }
-                    | SuspendKind::Yield { .. } => out - nres,
+                    | SuspendKind::Yield { .. }
+                    | SuspendKind::ThreadJoin { .. }
+                    | SuspendKind::MemoryWait { .. } => out - nres,
                     // Header polls are built separately (above), never from an in-block op.
                     SuspendKind::LoopHeader => unreachable!("loop-header point not from an op"),
                 };
@@ -748,6 +814,20 @@ fn transform_func(
                 }
                 if let SuspendKind::Yield { value } = &kind {
                     used[*value as usize] = true; // operand of the re-executed suspend
+                }
+                if let SuspendKind::ThreadJoin { handle } = &kind {
+                    used[*handle as usize] = true; // operand of the re-issued thread.join
+                }
+                if let SuspendKind::MemoryWait {
+                    addr,
+                    expected,
+                    timeout,
+                    ..
+                } = &kind
+                {
+                    used[*addr as usize] = true; // operands of the re-issued atomic.wait
+                    used[*expected as usize] = true;
+                    used[*timeout as usize] = true;
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -878,9 +958,9 @@ fn transform_func(
             // its cap.call result; the header reloads its block params and re-enters the body
             // (`cont_seg`). Neither produces an `op_results` value.
             SuspendKind::Leaf | SuspendKind::LoopHeader => {
-                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let (st_a, st_off) = ab.thaw_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 vec![]
             }
             SuspendKind::Propagated { callee, args } => {
@@ -912,11 +992,56 @@ fn transform_func(
             // value the *next* resume delivers, threads into the continuation exactly as a leaf's
             // reloaded cap.call result does.
             SuspendKind::Yield { value } => {
-                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let (st_a, st_off) = ab.thaw_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
                 ab.many(Inst::Suspend { value: v }, pt.nres)
+            }
+            // `thread.join` re-issue: reload the spilled vCPU handle and re-execute the join. By thaw the
+            // child has been re-spawned and run to completion, so the join resolves to its recorded result
+            // immediately (no block) — its result is *re-issued* (not reloaded), like `cont.resume`, so
+            // §12.6 holds (the child's side effects are replayed on its own rewind). But unlike a
+            // propagated call / resume, the join has **no in-thread callee** to flip the state word: the
+            // joined child rewinds as a *separate* vCPU (and the thaw driver resets the word to
+            // `REWINDING` afterward), so on this thread the join is the globally-deepest frozen frame —
+            // it flips the state to `NORMAL` itself, like a leaf, *before* re-issuing.
+            SuspendKind::ThreadJoin { handle } => {
+                let (st_a, st_off) = ab.thaw_word_addr();
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
+                let hh =
+                    reloaded[spill_slot(*handle as usize).expect("thread.join handle spilled")];
+                ab.many(Inst::ThreadJoin { handle: hh }, pt.nres)
+            }
+            // `atomic.wait` re-issue: like `thread.join`, the wait is the globally-deepest frozen frame
+            // on this thread (the notifier is a *separate* vCPU), so flip the state word to `NORMAL`
+            // itself, then reload the spilled `addr`/`expected`/`timeout` and re-execute the wait. The
+            // re-issued wait re-checks the value: a wake that landed as a value change resolves it with
+            // `WAIT_NOT_EQUAL` (no block); a would-park fails closed in the thunk (`ThreadFault`).
+            SuspendKind::MemoryWait {
+                ty,
+                addr,
+                expected,
+                timeout,
+            } => {
+                let (st_a, st_off) = ab.thaw_word_addr();
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
+                let aa = reloaded[spill_slot(*addr as usize).expect("atomic.wait addr spilled")];
+                let ee =
+                    reloaded[spill_slot(*expected as usize).expect("atomic.wait expected spilled")];
+                let tt =
+                    reloaded[spill_slot(*timeout as usize).expect("atomic.wait timeout spilled")];
+                ab.many(
+                    Inst::MemoryWait {
+                        ty: *ty,
+                        addr: aa,
+                        expected: ee,
+                        timeout: tt,
+                    },
+                    pt.nres,
+                )
             }
         };
 
@@ -968,18 +1093,53 @@ fn transform_func(
 
 /// A fresh durable window of `size` bytes: state = `NORMAL`, and the root context's per-context
 /// shadow-SP word (§12.8 4A.5) — the first 8 bytes of its region at `SHADOW_BASE` — set to its empty
-/// frame base (`SHADOW_BASE + 8`, just past the word). The legacy global `SHADOW_SP_OFF` is unused.
+/// frame base (`SHADOW_BASE + REGION_HEADER_LEN`, just past the SP + thaw words). The legacy global
+/// `SHADOW_SP_OFF` is unused; the per-context thaw words default to `NORMAL` (zero).
 pub fn init_durable_window(size: usize) -> Vec<u8> {
     let mut w = vec![0u8; size];
     write_state(&mut w, STATE_NORMAL);
     w[SHADOW_BASE as usize..SHADOW_BASE as usize + 8]
-        .copy_from_slice(&(SHADOW_BASE + 8).to_le_bytes());
+        .copy_from_slice(&(SHADOW_BASE + REGION_HEADER_LEN).to_le_bytes());
     w
 }
 
-/// Overwrite the state word in a window image (used to drive freeze/thaw).
+/// Window byte offset of context `ctx`'s **thaw** state word (§12.8 concurrent-thaw stage 1) — its
+/// region base plus [`STATE_IN_REGION_OFF`]. Per-context, so a thaw can set each frozen vCPU rewinding
+/// independently (vs. the global [`STATE_OFF`] freeze word).
+pub fn thaw_state_off(ctx: usize) -> u64 {
+    SHADOW_BASE + ctx as u64 * SHADOW_STRIDE + STATE_IN_REGION_OFF
+}
+
+/// Overwrite the global **freeze** state word (`UNWINDING`/`ARMED`/`NORMAL`) in a window image — the
+/// stop-the-world trigger every poll reads. Thaw (`REWINDING`) goes through [`write_thaw_state`].
 pub fn write_state(window: &mut [u8], state: i32) {
     window[STATE_OFF as usize..STATE_OFF as usize + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+/// Overwrite context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) — used to drive a
+/// thaw (the runtime sets each frozen context `REWINDING` before its rewinding re-entry).
+pub fn write_thaw_state(window: &mut [u8], ctx: usize, state: i32) {
+    let off = thaw_state_off(ctx) as usize;
+    window[off..off + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+/// Set up a window for a **thaw** of context `ctx` (§12.8 concurrent-thaw stage 1): clear the global
+/// **freeze** word back to `NORMAL` (the frozen artifact left it `UNWINDING`, but a thaw is not a
+/// freeze — leaving it would make the rewinding code's polls re-unwind) and set `ctx`'s per-context
+/// **thaw** word to `REWINDING`. Mirrors what the runtime does on a real snapshot-restore thaw (the
+/// interp's `drive` clear + per-context `REWINDING`; the JIT thaw driver).
+pub fn begin_thaw(window: &mut [u8], ctx: usize) {
+    write_state(window, STATE_NORMAL);
+    write_thaw_state(window, ctx, STATE_REWINDING);
+}
+
+/// Read context `ctx`'s per-context **thaw** state word — after a thaw, a completed rewind reads
+/// `NORMAL` (the deepest frame's re-issue flipped it).
+pub fn read_thaw_state(window: &[u8], ctx: usize) -> i32 {
+    let off = thaw_state_off(ctx) as usize;
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&window[off..off + 4]);
+    i32::from_le_bytes(b)
 }
 
 /// Arm a window to **freeze after `safepoints` further fiber safepoints** (the deterministic mid-run
@@ -1049,6 +1209,21 @@ impl Bb {
     /// Push a zero-result instruction (a store).
     fn zero(&mut self, i: Inst) {
         self.insts.push(i);
+    }
+    /// §12.8 concurrent-thaw stage 1: the **freeze** state word's address (`UNWINDING`), as
+    /// `(base, offset)` for a `load`. **Always global** ([`STATE_OFF`]) — a freeze is genuinely
+    /// stop-the-world, so the single word is the natural broadcast every context's poll reads (the arm
+    /// trigger / `request_freeze` set it). Read by the loop-header and in-block `UNWINDING` polls.
+    fn freeze_word_addr(&mut self) -> (ValIdx, u64) {
+        (self.one(Inst::ConstI64(STATE_OFF as i64)), 0)
+    }
+    /// §12.8 concurrent-thaw stage 1: the **thaw** state word's address (`REWINDING`/`NORMAL`), as
+    /// `(base, offset)` for a `load`/`store` — the running context's own region word
+    /// (`durable.shadow_base` + [`STATE_IN_REGION_OFF`], like the per-context shadow-SP word), so
+    /// concurrent vCPUs each rewind against their own (the relocation's whole point). Read by the
+    /// prologue's `REWINDING` dispatch and written `NORMAL` by the deepest frame's re-issue (thaw end).
+    fn thaw_word_addr(&mut self) -> (ValIdx, u64) {
+        (self.one(Inst::DurableShadowBase), STATE_IN_REGION_OFF)
     }
     fn finish(self, term: Terminator) -> Block {
         Block {
@@ -1171,6 +1346,10 @@ fn result_types(
         // runtime's (durable §12.8 slice 3.2.1), so the transform only needs to type them.
         ThreadSpawn { .. } => vec![ValType::I32],
         ThreadJoin { .. } => vec![ValType::I64],
+        // §12 futex ops: `atomic.wait` yields an `i32` status (woken / not-equal / timed-out),
+        // `atomic.notify` an `i32` woken count. `atomic.wait` is a may-suspend re-issue safepoint
+        // (the parked-vCPU slice); `atomic.notify` is copied verbatim into its segment.
+        MemoryWait { .. } | MemoryNotify { .. } => vec![ValType::I32],
         _ => return Err(TransformError::UnsupportedInst),
     })
 }

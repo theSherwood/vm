@@ -19,8 +19,8 @@
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use svm_durable::{
-    arm_freeze_after, init_durable_window, transform_module, transform_module_assume_confined,
-    write_state, STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, transform_module,
+    transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use svm_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,
@@ -342,7 +342,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
     // Restore (re-seeds the frozen fibers into a fresh host) → bridge the residue to the JIT.
     let mut thost = Host::new();
     let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let seed = jit_seed(thost.frozen_fibers());
     assert_eq!(seed.len(), 1, "the artifact carried one frozen fiber");
 
@@ -432,7 +432,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
     // Restore + bridge the residue to the JIT.
     let mut thost = Host::new();
     let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let seed = jit_seed(thost.frozen_fibers());
     assert_eq!(seed.len(), 1, "the artifact carried the active-chain fiber");
 
@@ -581,7 +581,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
     let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
     let mut thost = Host::new();
     let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let seed = jit_seed(thost.frozen_fibers());
     assert_eq!(seed.len(), 1, "the artifact carried the recycled fiber");
     assert_eq!(seed[0].generation, 1, "re-seeded at generation 1");

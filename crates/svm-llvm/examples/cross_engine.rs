@@ -31,8 +31,10 @@ const KERNELS: &[(&str, &str)] = &[
     ("vadd", "vadd"), // vectorizable: the on-ramp emits v128, svm-jit lowers 128-bit SIMD
 ];
 
-// `svm_jit::compile_and_run` recompiles the module on every call, so the timed loop must be long
-// enough that the run dominates compile jitter (frontend_bench uses the same large n for this reason).
+// Per-iteration compute is isolated by large/small-`n` subtraction. The JIT row compiles **once**
+// (`svm_jit::compile` → reuse `CompiledModule::run`), so its timed loop carries no Cranelift codegen;
+// the tree-walk + bytecode rows still re-drive their engine each call, but their per-iter cost dwarfs
+// that fixed setup, which the subtraction cancels anyway.
 const SMALL: i32 = 1_000;
 const LARGE: i32 = 2_000_000;
 
@@ -47,8 +49,11 @@ fn main() {
     let bc = std::env::temp_dir().join(format!("svm_llvm_xe_{}.bc", std::process::id()));
 
     // Vectorization ON (plain -O2 → SSE-width <4 x i32> → one v128): the on-ramp legalizes to v128
-    // (ISSUES.md I2) so `vadd` reaches svm-jit as real 128-bit SIMD. (No -mavx2: wider <8 x i32> splits
-    // into chunks svm-jit doesn't fully lower yet, and 128-bit is the SVM determinism width anyway.)
+    // (ISSUES.md I2) so `vadd` reaches svm-jit as real 128-bit SIMD. No -mavx2: a wider <8 x i32> *does*
+    // legalize + lower now (it splits into two 128-bit chunks — I2/I11), but the chunks stay 128-bit, so
+    // it buys no throughput over <4 x i32> while muddying the width comparison. 128-bit is the SVM
+    // determinism width anyway (ISSUES.md I8); host-native width would be an opt-in non-deterministic
+    // mode (see DESIGN.md §17).
     let ok = Command::new("clang")
         .args(["-O2", "-emit-llvm", "-c"])
         .arg(&kernels_c)
@@ -94,18 +99,26 @@ fn main() {
         });
         println!("svm-bytecode,{disp},{bcn:.4}");
 
-        let jit = per_iter(|n| {
-            let r = svm_jit::compile_and_run(&t.module, e, &[sp, n as i64]).expect("jit runs");
-            black_box(&r);
-        });
+        let jit = {
+            // Compile **once** and time many `run`s (DESIGN.md §22 compile/run split). The one-shot
+            // `compile_and_run` recompiles every call (~5–6 ms of Cranelift codegen), whose jitter
+            // swamps a fast vectorized loop's signal even through the large/small subtraction (the two
+            // min-over-reps compiles don't cancel exactly). Compiling once makes the JIT row honest —
+            // the `vadd` 128-bit-SIMD number, not compile noise.
+            let mut cm = svm_jit::compile(&t.module, e).expect("jit compiles");
+            per_iter(|n| {
+                let r = cm.run(&[sp, n as i64], None, None, None).expect("jit runs");
+                black_box(&r);
+            })
+        };
         println!("svm-jit,{disp},{jit:.4}");
     }
     let _ = std::fs::remove_file(&bc);
 }
 
 /// Per-iteration compute (ns), isolated by large/small-`n` subtraction, min over reps.
-fn per_iter(run_one: impl Fn(i32)) -> f64 {
-    let m = |n: i32| {
+fn per_iter(mut run_one: impl FnMut(i32)) -> f64 {
+    let mut m = |n: i32| {
         run_one(n); // warm up (JIT compile, caches)
         let mut best = f64::MAX;
         for _ in 0..9 {

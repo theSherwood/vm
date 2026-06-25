@@ -14,15 +14,15 @@ use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use svm_durable::{
-    init_durable_window, read_state, transform_module_assume_confined, write_state, STATE_NORMAL,
-    STATE_REWINDING, STATE_UNWINDING,
+    begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
+    STATE_UNWINDING,
 };
 use svm_interp::{Host, SHADOW_BASE};
 use svm_ir::{Memory, Module};
 use svm_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv,
     compile_and_run_capture_reserved_with_host_durable_mv_interruptible, FreezeController,
-    FrozenFiber, FrozenVCpu, JitError, JitOutcome,
+    FrozenFiber, FrozenVCpu, JitError, JitOutcome, TrapKind,
 };
 
 const SIZE_LOG2: u8 = 17;
@@ -36,6 +36,10 @@ const K: i64 = 100_000_000;
 const OFF_ROOT: i64 = 65536;
 const OFF_C1: i64 = 65544;
 const OFF_C2: i64 = 65552;
+// §12.8 parked-vCPU slice: the root `atomic.wait`s on the futex word at guest offset 65568 (4-byte
+// aligned; 65560 stays the clock/host-fn stash). `atomic.wait` status `1` = the value did not equal
+// `expected` (no / end-of wait) — wasm's `WAIT_NOT_EQUAL`.
+const WAIT_NOT_EQUAL: i64 = 1;
 
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
@@ -111,7 +115,7 @@ fn thaw(
     root_sp: u64,
 ) -> (JitOutcome, Vec<u8>) {
     let mut twin = snap.to_vec();
-    write_state(&mut twin, STATE_REWINDING);
+    begin_thaw(&mut twin, 0);
     let mut thost = Host::new();
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
@@ -354,10 +358,11 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
 
     // This test needs the async freeze to catch the child **mid-loop with its fiber already parked** —
     // the clean interleaving the child's signal-after-park handshake aims for. On a slow/over-subscribed
-    // runner the freeze can instead land while the child's fiber is still on its resume chain, or after
-    // the child finished — a different (valid) freeze shape that doesn't exercise B.1. Only assert the
-    // strong B.1 properties when the clean shape occurred; otherwise skip (the simpler concurrent tests
-    // above always exercise the core concurrent freeze).
+    // runner the freeze can instead land while the child's fiber is still on its resume chain (that
+    // mid-resume-chain case is now covered deterministically by
+    // `concurrent_child_owns_active_chain_fiber_through_freeze_thaw`), or after the child finished — a
+    // different (valid) freeze shape that doesn't exercise B.1's *parked* path. Only assert the strong
+    // B.1 properties when the clean shape occurred; otherwise skip.
     let clean = read_state(&fsnap) == STATE_UNWINDING
         && matches!(fout, JitOutcome::Returned(_))
         && fvcpus.len() == 1
@@ -377,11 +382,187 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
     );
 }
 
-// Follow-up B.2 guard: nested concurrent spawns aren't supported yet (the grandchild's `parent_task`
-// would be mis-attributed via the shared `cur_task`), so a *concurrent* durable child that itself
-// `thread.spawn`s must **fail closed** — a clean `ThreadFault`, not a silently-wrong artifact. Here the
-// root spawns a concurrent child that spawns a grandchild; the nested spawn traps, which propagates
-// through the child's (and root's) join, so the run traps instead of returning the grandchild's value.
+// Follow-up B.1′ — a concurrent child whose fiber is caught **mid-resume-chain** (active, not cleanly
+// parked). B.1 covered a fiber *suspended* at the freeze point; here the **fiber itself** drives the
+// spawn-before-freeze handshake (it signals from inside the resume chain, then loops K), so the async
+// freeze deterministically lands while the fiber is *running on the chain* and the child is blocked in
+// its `cont.resume`. On the freeze the fiber unwinds back through the resume (recorded as active-chain
+// residue, like the single-vCPU slice-3.2 case), the child unwinds at its `cont.resume` re-issue, and
+// the root unwinds separately. The thaw re-issues the child's resume, which re-enters the fiber; the
+// fiber rewinds to its mid-loop point, finishes, and suspends 5 — so the child's loop + the fiber's
+// yielded value reproduce `K + 5`, and the root reproduces `K`.
+const SRC_CHILD_FIBER_ACTIVE: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65568
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 0
+  br block1(v0, v5)
+block1(v6: i32, v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v6, v9) block2(v6, v9)
+block2(v12: i32, v13: i64):
+  v14 = i32.const 0
+  v15 = cap.call 2 0 (i32) -> (i64) v12 (v14)
+  v16 = i64.const 65536
+  i64.store v16 v13
+  return v13
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = ref.func 2
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  v12 = i64.const 0
+  br block1(v7, v12)
+block1(v13: i64, v14: i64):
+  v15 = i64.const 1
+  v16 = i64.add v14 v15
+  v17 = i64.const 100000000
+  v18 = i64.lt_s v16 v17
+  br_if v18 block1(v13, v16) block2(v13, v16)
+block2(v19: i64, v20: i64):
+  v21 = i64.add v19 v20
+  v22 = i64.const 65544
+  i64.store v22 v21
+  return v21
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65568
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v14 = suspend v12
+  v15 = i64.const 1000
+  v16 = i64.add v14 v15
+  return v16
+}
+"#;
+
+#[test]
+fn concurrent_child_owns_active_chain_fiber_through_freeze_thaw() {
+    let inst = instrument(SRC_CHILD_FIBER_ACTIVE);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    // The fiber signals from inside the chain then loops K, so the freeze should land while it is active
+    // on the chain — the same residue shape as B.1 (one frozen child vCPU owning one frozen fiber). On a
+    // badly-scheduled runner the freeze can still miss (fiber finished, or never entered): only assert
+    // the strong active-chain properties when that clean shape occurred.
+    let clean = read_state(&fsnap) == STATE_UNWINDING
+        && matches!(fout, JitOutcome::Returned(_))
+        && fvcpus.len() == 1
+        && ffibers.len() == 1;
+    if !clean {
+        return;
+    }
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(le_i64(&tfinal, OFF_ROOT), K, "root total reproduced");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        2 * K,
+        "child re-entered its mid-resume-chain fiber, which finished its own K-loop and suspended the \
+         total, across the freeze (child's K + the fiber's K)",
+    );
+}
+
+// Blocked-in-join freeze: the root parks in `thread.join` and the freeze lands while it is **blocked**.
+// The root spawns a long-running child as a concurrent OS thread and *immediately* joins it (no safepoint
+// in between), so it parks in the join. The **child** drives the spawn-before-freeze handshake — it
+// signals after it starts looping, so the root is already parked when the freeze is requested. With
+// `thread.join` now a re-issue safepoint, the blocked root must unwind (the `thread_join` thunk returns
+// on observing UNWINDING; the trailing safepoint spills the handle and unwinds), and the thaw must
+// re-issue the join so it resolves the re-run child's result.
+const SRC_BLOCKED_JOIN: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = thread.join v4
+  v6 = i64.const 65536
+  i64.store v6 v5
+  return v5
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v13 = i64.const 65544
+  i64.store v13 v12
+  return v12
+}
+"#;
+
+#[test]
+fn concurrent_freeze_while_root_blocked_in_join() {
+    let inst = instrument(SRC_BLOCKED_JOIN);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The child finished and the root's join resolved before the freeze landed (rare): uninterrupted.
+        assert_eq!(le_i64(&fsnap, OFF_ROOT), K);
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder while the root was blocked in the join",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        K,
+        "the re-run child completed its loop across the freeze",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        K,
+        "the root's re-issued thread.join resolved the child's result after a blocked-in-join freeze",
+    );
+}
+
+// Follow-up B.2: nested concurrent spawns now work — a *concurrent* durable child that itself
+// `thread.spawn`s attributes the grandchild's `parent_task` to itself via the per-OS-thread
+// spawning-task source (not the shared `cur_task`). Here the root spawns a concurrent child that spawns
+// a grandchild; with no freeze, the grandchild's value (42) flows back through both joins.
 const SRC_NESTED: &str = r#"
 func (i32) -> (i64) {
 block0(v0: i32):
@@ -405,13 +586,12 @@ block0(v0: i64, v1: i64):
 "#;
 
 #[test]
-fn nested_concurrent_spawn_fails_closed() {
+fn nested_concurrent_spawn_returns_grandchild_value() {
     let inst = instrument(SRC_NESTED);
     let mut host = Host::new();
     host.clock_ns = 42;
     let _clk = host.grant_clock();
-    // A controller is required by the entry but never triggered — the guard fires during NORMAL, at the
-    // child's nested `thread.spawn`, before any freeze.
+    // A controller is required by the entry but never triggered — this is a pure NORMAL nested spawn.
     let freeze = FreezeController::new();
     let res = compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
         &inst,
@@ -429,11 +609,261 @@ fn nested_concurrent_spawn_fails_closed() {
     );
     match res {
         Ok((out, ..)) => assert!(
-            matches!(out, JitOutcome::Trapped(_)),
-            "a nested concurrent spawn must fail closed (ThreadFault), not return the grandchild value",
+            matches!(out, JitOutcome::Returned(ref s) if s == &[42]),
+            "a nested concurrent spawn resolves the grandchild's value through both joins, got {out:?}",
         ),
         Err(JitError::Unsupported(_)) => {}
         Err(JitError::Backend(msg)) if msg.contains("Allocation error") => {}
-        Err(e) => panic!("nested-spawn guard run failed: {e:?}"),
+        Err(e) => panic!("nested-spawn run failed: {e:?}"),
     }
+}
+
+// Follow-up B.2 under a freeze: a **three-level** concurrent tree (root → child → grandchild, all real
+// OS threads) caught mid-flight. The grandchild drives the spawn-before-freeze handshake (it is the last
+// to start, so by the time it signals, root + child are already looping), then every level self-unwinds
+// into its own per-context region. The thaw rebuilds the **per-parent** join topology (grandchild under
+// child, child under root) from the frozen residue and reproduces the uninterrupted result.
+const SRC_NESTED_FREEZE: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 0
+  br block1(v4, v5)
+block1(v6: i32, v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v6, v9) block2(v6, v9)
+block2(v12: i32, v13: i64):
+  v14 = thread.join v12
+  v15 = i64.add v13 v14
+  v16 = i64.const 65536
+  i64.store v16 v15
+  return v15
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  v3 = thread.spawn 2 v2 v2
+  v4 = i64.const 0
+  br block1(v3, v4)
+block1(v5: i32, v6: i64):
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  v9 = i64.const 100000000
+  v10 = i64.lt_s v8 v9
+  br_if v10 block1(v5, v8) block2(v5, v8)
+block2(v11: i32, v12: i64):
+  v13 = thread.join v11
+  v14 = i64.add v12 v13
+  v15 = i64.const 65544
+  i64.store v15 v14
+  return v14
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v13 = i64.const 65552
+  i64.store v13 v12
+  return v12
+}
+"#;
+
+#[test]
+fn nested_concurrent_tree_freezes_and_thaws() {
+    let inst = instrument(SRC_NESTED_FREEZE);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // Everything finished before the freeze landed (rare): already correct.
+        assert_eq!(le_i64(&fsnap, OFF_C2), K, "grandchild");
+        assert_eq!(le_i64(&fsnap, OFF_C1), 2 * K, "child + grandchild");
+        assert_eq!(le_i64(&fsnap, OFF_ROOT), 3 * K, "root + child + grandchild");
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "concurrent freeze returns a placeholder",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(le_i64(&tfinal, OFF_C2), K, "grandchild total reproduced");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        2 * K,
+        "child's loop + its joined grandchild reproduced",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        3 * K,
+        "root's loop + child + grandchild reproduced across the nested concurrent freeze",
+    );
+}
+
+// §12.8 parked-vCPU slice — **freeze while a vCPU is blocked in `atomic.wait`, thaw resolves it.** The
+// root spawns a concurrent child and *immediately* parks in `atomic.wait` on `FLAG_OFF` (expected 0, no
+// timeout), so it is blocked when the freeze lands. The **child** drives the spawn-before-freeze
+// handshake, but only *after* it has stored `FLAG_OFF = 1` (a plain atomic store — **no** notify, so the
+// parked root is **not** woken): the controller therefore freezes with the value already changed in the
+// window. On thaw the root re-issues the wait, which re-checks the value, finds `1 != 0`, and resolves
+// immediately with `WAIT_NOT_EQUAL` — no re-park, no notifier needed. This is the thaw-able case: the
+// wake landed as a value change that rode the snapshot.
+const SRC_WAIT_WORKS: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 65568
+  v6 = i32.const 0
+  v7 = i64.const -1
+  v8 = i32.atomic.wait v5 v6 v7
+  v9 = i64.const 65536
+  i32.store v9 v8
+  v10 = i64.const 0
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  br block1(v2)
+block1(v3: i64):
+  v4 = i64.const 1
+  v5 = i64.add v3 v4
+  v6 = i64.const 100000000
+  v7 = i64.lt_s v5 v6
+  br_if v7 block1(v5) block2(v5)
+block2(v8: i64):
+  v9 = i64.const 65568
+  v10 = i32.const 1
+  i32.atomic.store v9 v10
+  v11 = i64.const 65560
+  v12 = i32.load v11
+  v13 = i32.const 0
+  v14 = cap.call 13 0 (i32) -> (i64) v12 (v13)
+  v15 = i64.const 65544
+  i64.store v15 v8
+  return v8
+}
+"#;
+
+#[test]
+fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
+    let inst = instrument(SRC_WAIT_WORKS);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The root's wait found the changed value and returned before the freeze landed (rare): its
+        // recorded status already rides the snapshot.
+        assert_eq!(le_i64(&fsnap, OFF_ROOT), WAIT_NOT_EQUAL);
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder while the root was blocked in the wait",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        K,
+        "the re-run child completed its loop across the freeze",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        WAIT_NOT_EQUAL,
+        "the root's re-issued atomic.wait re-checked the value (1 != 0) and resolved NOT_EQUAL on thaw",
+    );
+}
+
+// §12.8 parked-vCPU slice — **fail-closed thaw.** Same shape, but the child **never** changes
+// `FLAG_OFF`: it signals first (so the freeze lands while the root is parked), then just loops. The
+// value the root waits on is still `0` (== `expected`) in the snapshot, so the thaw's re-issued wait
+// would have to *park* again — which the single-worker thaw can't satisfy (no concurrent notifier). It
+// must therefore **fail closed** with `ThreadFault` (matching the interpreter, which surfaces a guest
+// wait/join-deadlock as `Trap::ThreadFault`) rather than hang. The full thaw of this case needs the
+// concurrent-thaw rework; until then, failing closed keeps the freeze safe and the run honest.
+const SRC_WAIT_DEADLOCK: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 65568
+  v6 = i32.const 0
+  v7 = i64.const -1
+  v8 = i32.atomic.wait v5 v6 v7
+  v9 = i64.const 65536
+  i32.store v9 v8
+  v10 = i64.const 0
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v13 = i64.const 65544
+  i64.store v13 v12
+  return v12
+}
+"#;
+
+#[test]
+fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
+    let inst = instrument(SRC_WAIT_DEADLOCK);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The freeze didn't catch the root parked (rare): nothing to assert about the wait.
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder while the root was blocked in the wait",
+    );
+
+    let (tout, _tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(
+        matches!(tout, JitOutcome::Trapped(TrapKind::ThreadFault)),
+        "a re-issued wait that would re-park on the single-worker thaw fails closed (ThreadFault), got {tout:?}",
+    );
 }

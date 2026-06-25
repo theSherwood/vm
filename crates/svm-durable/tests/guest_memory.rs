@@ -9,8 +9,9 @@
 //! [`transform_module`] still rejects the same guest (it can't prove the confinement).
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, transform_module_assume_confined,
-    write_state, TransformError, DURABLE_RESERVE, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
+    begin_thaw, init_durable_window, read_state, read_thaw_state, transform_module,
+    transform_module_assume_confined, write_state, TransformError, DURABLE_RESERVE, STATE_NORMAL,
+    STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -87,13 +88,17 @@ fn guest_memory_survives_freeze_thaw_via_confined_path() {
     // Thaw on a fresh host: the guest's stored 77 rides the restored window image, the cap
     // result (42) is reloaded, and the post-call reload reads 77 back.
     let mut win = snapshot.clone();
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let (thawed, final_win) = run(&inst, 0, &win);
     assert_eq!(
         thawed, baseline,
         "guest memory + durable state round-tripped"
     );
-    assert_eq!(read_state(&final_win), STATE_NORMAL, "thaw ends NORMAL");
+    assert_eq!(
+        read_thaw_state(&final_win, 0),
+        STATE_NORMAL,
+        "thaw ends NORMAL"
+    );
 }
 
 #[test]

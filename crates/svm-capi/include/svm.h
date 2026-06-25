@@ -43,6 +43,8 @@ typedef struct SvmModule SvmModule;
 typedef struct SvmImports SvmImports;
 typedef struct SvmInstance SvmInstance;
 typedef struct SvmRun SvmRun;
+/* The calling guest's linear-memory window, passed to a host-fn callback for that call only. */
+typedef struct SvmGuestMem SvmGuestMem;
 
 /* The last error message on this thread (or NULL). Valid until the next svm-capi call. */
 const char *svm_last_error(void);
@@ -65,13 +67,23 @@ int32_t svm_imports_provide_clock(SvmImports *i, const char *name);
 /*
  * A host-capability callback: compute up to results_cap outputs from n_args inputs for operation op.
  * Return the number of results written (>= 0), or a negative value to trap the capability call.
- * ctx is the opaque pointer registered alongside the callback.
+ * ctx is the opaque pointer registered alongside the callback. mem is the calling guest's window
+ * (NULL if the module declares none), accessible via svm_guest_read/svm_guest_write for this call
+ * only — do not retain it past the callback.
  */
 typedef int32_t (*SvmHostFn)(void *ctx, uint32_t op, const int64_t *args, size_t n_args,
-                             int64_t *results, size_t results_cap);
+                             int64_t *results, size_t results_cap, SvmGuestMem *mem);
 int32_t svm_imports_provide_host_fn(SvmImports *i, const char *name, uint32_t op, SvmHostFn fn,
                                     void *ctx);
 void svm_imports_free(SvmImports *i);
+
+/*
+ * Read/write the guest window from inside a host-fn callback, bounds-checked (fail-closed): each
+ * returns SVM_OK, or SVM_ERR_FAILED (nothing transferred) if mem/buf is NULL or [ptr, ptr+len) is
+ * not wholly within the window (and, for write, writable). The same §7 confinement the built-ins get.
+ */
+int32_t svm_guest_read(const SvmGuestMem *mem, uint64_t ptr, uint8_t *dst, size_t len);
+int32_t svm_guest_write(SvmGuestMem *mem, uint64_t ptr, const uint8_t *src, size_t len);
 
 /* ---- Instantiate (consume the module / imports) ---- */
 SvmInstance *svm_instantiate(SvmModule *m);                          /* fixed §3e powerbox */
@@ -95,6 +107,15 @@ typedef struct {
 /* ---- Run ---- */
 SvmRun *svm_instance_run(SvmInstance *i, int32_t backend, const SvmRunConfig *config);
 SvmRun *svm_instance_run_diff(SvmInstance *i, const SvmRunConfig *config);
+
+/* ---- Reactor sessions (Phase 6): instantiate once, call exports repeatedly, state persists ---- */
+typedef struct SvmSession SvmSession;
+SvmSession *svm_instance_start(const SvmInstance *i, int32_t backend, const SvmRunConfig *config);
+/* Call `name` with n_args i64 args; write up to results_cap i64 results + *n_results. 0 = SVM_OK. */
+int32_t svm_session_call_export(SvmSession *s, const char *name, const int64_t *args, size_t n_args,
+                                int64_t *results, size_t results_cap, size_t *n_results);
+const uint8_t *svm_session_stdout(const SvmSession *s, size_t *len);
+void svm_session_free(SvmSession *s);
 
 /* ---- Run results ---- (pointers valid until svm_run_free). */
 const uint8_t *svm_run_stdout(const SvmRun *r, size_t *len);

@@ -196,22 +196,69 @@ and calls `specialize`, then `svm-llvm-translate`. Each gap, in the order hit, a
 9. ✅ **i128 from a 16-byte struct-eq coalesce** — `-O2` compares `Known`'s `[u8;16]` payload as a
    single `load i128` + `icmp eq/ne i128`. Held as a **pair of i64 halves** in the aggregate
    side-table (load → two i64 loads; eq/ne → compare the halves). Same-block only.
-10. 🔜 **`memcmp`/`bcmp`** (current wall) — `Unsupported("call to external/undefined function memcmp")`.
-    Rust slice/`[u8]` equality and `BTreeMap` key ordering call these; the on-ramp synthesizes
-    `memcpy`/`memset`/`memmove` but not yet `memcmp`/`bcmp`. Next slice: a synthesized counted-loop
-    helper (`__svm_memcmp`), like the existing mem-loop helpers (`bcmp` ⇒ `memcmp` then `!= 0`).
+10. ✅ **`memcmp`/`bcmp`** — Rust slice/`[u8]` equality and `BTreeMap` key ordering call these; the
+    on-ramp synthesized `memcpy`/`memset`/`memmove` but not `memcmp`. Added `__svm_memcmp` (a counted
+    unsigned byte compare → `0`-if-equal-else-signed-difference), backing both `memcmp` and `bcmp`.
+11. ✅ **unordered/ordered float compare** — `fcmp uno`/`ord` (NaN tests from Rust float code) have no
+    single svm-ir op; expanded as `uno = (a!=a)|(b!=b)`, `ord = (a==a)&(b==b)` (`true`/`false` → const).
 
-**Earlier worry retired.** The core/alloc *panic* runtime symbols (`core::panicking::*`, bounds-check,
-`unwrap_failed`, `handle_alloc_error`, `raw_vec::handle_error`) that looked like a fundamental blocker
-are in fact **already shimmed** by the on-ramp (`is_rust_abort_call` → `trap`, under `-C panic=abort`).
-Likely still ahead: the allocator shims (`__rust_alloc`/`dealloc`/`realloc` → the synthesized
-`malloc`/`free`) and `cell::panic_already_borrowed` (extend the abort-call list) — each small. So the
-remaining translate work is a tail of **bounded on-ramp legalizations** (the `memcmp` helper, a few
-runtime-symbol shims), *not* `-Z build-std`.
+### Milestone 2 translate half — **DONE for the `specialize` closure.** ✅
 
-So Milestone 2's compile half is **done**, and the translate half is a **shrinking, enumerated gap
-list** being cleared in order — nine down (inline-asm, i128-SIMD, switch-overflow panic, sparse switch,
-i56 memory/extend, saturating arithmetic, fp-sat casts, vector ctpop, i128 struct-eq), `memcmp` next.
+With gaps 1–11 cleared, the probe **translates end-to-end with no `Unsupported`**, and the result
+**verifies**: the statically-reachable closure of `specialize()` — **102 functions** spanning
+`svm-peval` + `svm-ir` + `svm-verify` + the `core`/`alloc` monomorphizations — lowers to a valid svm-IR
+module (`svm_run::resolve_capability_imports` → `svm_verify::verify_module` both pass). So every
+legalization above produces *sound* IR, not merely non-erroring output. The specializer **is**
+translatable to svm-IR.
+
+*Scope/caveats.* (a) The closure is the **static** call graph from a powerbox `main` that calls
+`specialize` on a trivial module; it covers `specialize`'s machinery comprehensively (globaldce keeps
+all statically-reachable functions, input-independent), but a future change that pulls in a genuinely
+new code path could surface a new construct. (b) The pipeline is still the manual probe
+(`rustc +1.81` `--emit=llvm-bc` → `llvm-link-18` → `opt-18 internalize,globaldce` →
+`svm-llvm-translate`); folding it into an in-repo build is its own task. (c) The earlier worry about
+core/alloc *panic* runtime symbols was retired — they're shimmed to `trap` (`is_rust_abort_call`), and
+the allocator shims resolved through the synthesized `malloc`/`free`. **Next: Milestone 3** — actually
+*run* the translated residual in-sandbox via the §22 `Jit` capability.
+
+### Milestone 3 — the specializer **runs in-sandbox and produces the right answer.** ✅
+
+The run pipeline works end to end: **build → translate → verify → execute**. A powerbox `main` that
+builds a trivial module (`() -> i32` returning `42`), calls `svm_peval::specialize(&m, 0, &[])`, and
+returns `residual.funcs.len()` translates, verifies, **runs** on the reference interpreter, and returns
+the **correct** `1` (a one-function residual). The in-sandbox specializer is real *and* correct.
+
+**The corruption bug — found and fixed: the on-ramp sized an empty struct (a Rust ZST) as 1 byte, not
+0.** `struct_layout` in `svm-llvm` clamped a struct's total size with `off.max(1)`. A `Vec`/`RawVec`
+carries the zero-sized `alloc::alloc::Global` allocator marker (`%"alloc::alloc::Global" = type {}`), so
+the clamp inflated every `RawVec` by a byte → a 24-byte `Vec` laid out as **32** with `len` shifted from
+offset 16 to **24**. LLVM lays `type {}` out as **0** bytes — that is the layout every `getelementptr`
+is computed against — so every field offset/element stride through a `Vec`-bearing struct desynced from
+the GEPs. Concretely, an indexed `module.funcs[i].params.len()` read the **outer** `funcs.len()` (the
+byte at the wrong offset), so `specialize_with_config`'s `args.len() != f.params.len()` compared `0` to
+a garbage `1` → `ArityMismatch`; the same garbage flowing into a `Vec`/alloc capacity is what made a
+later `malloc` over-allocate → NULL → `handle_alloc_error` → `MemoryFault` (the symptom after the
+slice-panic shim let it advance further). One root cause, both symptoms. **Fix:** `struct_layout`
+returns `off` (an empty struct is size 0). Guarded by `rust_zst_struct_field_layout_matches_native` in
+`crates/svm-llvm/tests/translate.rs` — a `no_std` `Vec<Inner>` with `Inner { data: Vec<u64>, tag: u64 }`
+indexed and summed, byte-identical to native (it fails without the fix). A flat `Vec<u64>` (the existing
+heap/BTreeMap tests) never exercised a ZST-bearing *element*, which is why it slipped through.
+
+**One more translate gap cleared en route:** `core::cell::panic_already_borrowed` /
+`…_already_mutably_borrowed` — the `-> !` cold lang items the specializer's `RefCell<OutlineState>`
+borrows pull in — are now shimmed to `trap` (`is_rust_abort_call`), like the slice/alloc panic family.
+
+**How to reproduce (kept for future work on this lane).**
+- *Full probe:* a scratch cargo crate depending on `svm-peval` (`default-features = false`) + `svm-ir`,
+  whose `main` builds the trivial module and calls `specialize`, returning `residual.funcs.len()`. Build
+  to bitcode with `RUSTFLAGS=--emit=llvm-bc cargo +1.81.0 build --release --ignore-rust-version`, then
+  `llvm-link-18 target/release/deps/*.bc`, then `opt-18 -passes=internalize,globaldce
+  -internalize-public-api-list=main,malloc,free`, then `translate_bc_path` →
+  `svm_run::resolve_capability_imports` → `verify_module` → `run_powerbox`. (Scratch dir is ephemeral.)
+- *Fast isolations* (single crate, no `llvm-link`): `compile_rust_to_bc` → `translate_bc_path` →
+  `resolve_capability_imports` → `run_powerbox`, exactly as the `rust_*` tests do. To localize a layout
+  bug, dump the translated module with `svm_text::print_module` and diff a `getelementptr`'s LLVM byte
+  offsets (`llvm-dis-18`) against the emitted `add`/`mul` strides — they must agree.
 
 **Why not `std`.** `std` is Rust's OS-abstraction layer (`core` + `alloc` + a `std::sys::<target>`
 platform backend for files/threads/time/net/startup). svm has none of those as ambient services (it
@@ -232,14 +279,18 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
 2. `no_std`-ify `svm-peval` —
    - **compile half: DONE** — the three crates compile to `no_std`/`panic=abort` LLVM-18 bitcode on
      `rustc 1.81` (`BTreeMap`, `libm` float folds, `not(test)` no_std, 1.81-clean).
-   - **translate half: in progress** — nine on-ramp gaps cleared in order (inline-asm, i128 in SIMD
-     folds, switch-span overflow panic, sparse-switch compare chain, i56 memory + extend, saturating
-     arithmetic, fp-sat casts, vector ctpop, i128 struct-eq), each implemented + tested in `svm-llvm`.
-     **Next: a `memcmp`/`bcmp` synthesized helper**, then a short tail of runtime-symbol shims. See
-     "translation status" above.
-3. End-to-end in-sandbox demo: a guest specializes a toy interpreter against a script and runs the
-   residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`). *Gated on Milestone 2's
-   translate half.*
+   - **translate half: DONE** — eleven on-ramp gaps cleared (inline-asm, i128 in SIMD folds,
+     switch-span overflow panic, sparse-switch compare chain, i56 memory + extend, saturating
+     arithmetic, fp-sat casts, vector ctpop, i128 struct-eq, `memcmp`/`bcmp` helper, fcmp uno/ord),
+     each tested in `svm-llvm`. The reachable `specialize` closure (102 funcs) now **translates and
+     verifies**. See "Milestone 2 translate half — DONE" above.
+3. **Milestone 3: DONE** — the specializer **runs in-sandbox and returns the correct answer** (translate
+   → verify → execute). The corruption bug was the on-ramp sizing an empty struct (Rust ZST, e.g.
+   `Vec`/`RawVec`'s `Global` marker) as 1 byte instead of 0, desyncing every `Vec`-bearing struct's
+   field offsets from LLVM's GEPs; fixed in `struct_layout`, guarded by
+   `rust_zst_struct_field_layout_matches_native`. See "Milestone 3" above.
+   **Next:** fold the manual probe into an in-repo pipeline, then the end-to-end §22 `Jit` demo (a
+   guest specializes a toy interpreter and runs the residual; alongside `crates/svm-run/demos/jit/`).
 
 ## Benchmarking
 

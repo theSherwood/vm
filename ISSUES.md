@@ -236,18 +236,38 @@ into **128-bit chunks** (4×i32) and svm-jit emits 128-bit `paddd`/etc., while n
 (AVX2) or 512-bit `zmm` (AVX-512). So the SVM stack *does* vectorize (contrary to my earlier bench
 claim — see below), but at SSE width.
 
-**Measured, across the wasm comparison columns (ns/iter, the same C kernels):**
+**Measured (ns/iter, same C kernels, one machine; svm-jit timed *compile-once* — see the bench fix
+below). wasm is disambiguated into the full matrix — {wasm32, wasm64} × {V8/TurboFan, Wasmtime/Cranelift}
+— because the *backend* is the whole story:**
 
-| kernel | native AVX2 | wasm32 V8 | wasm32 Wasmtime | **svm-jit** | bytecode |
-|---|---|---|---|---|---|
-| `xorshift` (scalar serial) | 1.73 | 1.99 | 2.04 | **1.59** | 58.3 |
-| `vadd` (vectorizable)      | 0.042 | 0.098 | 0.147 | **0.083** | 37.6 |
+| kernel | native AVX2 (256b) | wasm32 V8 | wasm64 V8 | wasm32 Wasmtime | wasm64 Wasmtime | **svm-jit** | bytecode | tree-walk |
+|---|---|---|---|---|---|---|---|---|
+| `xorshift` (scalar serial) | 1.69 | 1.92 | 1.92 | 1.99 | 1.99 | **1.63** | 62.4 | 108.2 |
+| `vadd` (vectorizable)      | 0.041 | 0.096 | 0.096 | 0.147 | 0.147 | **0.18** | 47.5 | 52.5 |
 
-The key context: **wasm SIMD is itself fixed at 128 bits** (the spec's `v128`), so V8 and Wasmtime are
-*also* ~2–3.5× behind native AVX2 on `vadd` — the exact same cap svm-jit has. **svm-jit is not behind
-wasm; it is ahead** (0.083 vs V8 0.098 / Wasmtime 0.147), and on the representative *scalar* kernel it
-is the fastest engine measured, beating native. So relative to the VM's actual peer (wasm), there is no
-SIMD deficit — only native AVX2/AVX-512 leads, by the determinism-bound 128→256/512 margin.
+(wasm32 ≈ wasm64 within noise on both engines — the memory model doesn't move compute throughput here.
+Wasmtime's *Pulley* interpreter tier, measured but omitted, is ~16 / ~7 ns — an interpreter, not a peer
+of the JITs.)
+
+**Scalar: no deficit** — svm-jit (1.63) *beats* every engine including native (1.69).
+**Vectorized: it's the backend, not svm-jit.** The matrix makes this clear: **Wasmtime uses Cranelift —
+the same backend as svm-jit** — and lands `vadd` at 0.147, right next to svm-jit's 0.18 (the ~1.2×
+residual is on-ramp reduction shape + the bench's per-run window alloc). **V8/TurboFan**, also 128-bit,
+is ~2× faster than *both* Cranelift engines (0.096). So the vectorized gap splits cleanly:
+- **~2× width** (native AVX2 256-bit vs everyone else's 128-bit) — the determinism / opt-in-mode story.
+- **~2× backend** (Cranelift vs TurboFan vectorization quality) — and svm-jit ≈ Wasmtime, i.e. **svm-jit
+  is already at the Cranelift ceiling**.
+
+(This *corrects* an earlier note here that claimed svm-jit *beat* wasm on `vadd` at 0.083 — that lumped
+"wasm" as V8 only, predates the compile-once timing fix, and isn't reproducible.)
+
+**Is the residual 128-bit gap actionable? No — it's upstream Cranelift.** That svm-jit ≈ Wasmtime (same
+backend) is the proof: `opt_level` is already `"speed"`, and the on-ramp emits a minimal clean
+translation (clang's 2-accumulator unroll → one SSE op per lane op, no redundant moves). The ~2× vs V8
+is Cranelift's vector instruction selection/scheduling, which **D36/D49 deliberately don't own** — the
+same "we don't fork the backend" boundary as the wide-vector blocker. (`-O3` shrinks it a little via
+better-scheduled IR, but using a *different* `-O` for the SVM rows than native/wasm would make the
+comparison dishonest — the very thing the bench fix below removes.)
 
 **Root cause — deliberate, not a miss.** The chunk width is fixed at 128 bits and **never
 host-detected**, to preserve the interp↔JIT↔durable-fiber **determinism contract** (a frozen vector
@@ -265,13 +285,22 @@ hard to see in that harness: (a) `vsum`'s known-content array gets **closed-form
 per call, so a fast vectorized loop is swamped by compile jitter unless timed via `CompiledModule`
 (compile once, run many).
 
-**Fix sketch (deferred — needs a decision):**
-1. **Doc/bench:** drop `-fno-*-vectorize` from the on-ramp invocation in the bench (and LLVM.md §4) so
-   the SVM rows show the real 128-bit-SIMD number, not scalar; measure with a non-foldable kernel via
-   `CompiledModule` (compile-once).
-2. **Throughput (optional, contract change):** an *opt-in*, non-default "fast/non-deterministic" mode
-   that legalizes to the host vector width (256/512) — only for runs that don't need
-   freeze/thaw/oracle determinism. Default stays fixed-128.
+**Fix sketch:**
+1. **Doc/bench — LANDED.** The bench already vectorizes (`-fno-*-vectorize` gone) and `vsum`→`vadd` is
+   fold-resistant (runtime seed, no array). The remaining hazard — `svm_jit::compile_and_run` recompiling
+   per call, whose ~5–6 ms jitter swamped the ~0.1 ms vectorized signal even through the large/small
+   subtraction — is fixed: a new `svm_jit::compile(m, func) -> CompiledModule` (compile once, run many)
+   drives the JIT row in `examples/cross_engine.rs`. `vadd` now reports a clean ~0.18 ns/iter (≈0.5
+   cycle/element) — the honest 128-bit-SIMD number. (A wider `-mavx2 <8 x i32>` also legalizes + runs
+   correctly now via the two-chunk I2/I11 path, but the chunks stay 128-bit so it adds no throughput; the
+   bench keeps `-O2`/one-v128 to make the width comparison clean.)
+2. **Throughput — accepted as a future opt-in mode, gated on Cranelift.** A host-dependent
+   (non-deterministic) SIMD mode that legalizes to the host vector width (256/512) is now a
+   product-sanctioned direction (DESIGN.md §17): default stays fixed-128/deterministic, the mode is opt-in
+   for runs that don't need replay/freeze-thaw/oracle. The blocker is **not** determinism (explicitly
+   waived for that mode) but the backend — Cranelift's x64 has no YMM/ZMM register class, so there's
+   nothing to lower host-native ops to. Revisit when Cranelift grows upstream wide-vector support; until
+   then width-hungry work uses a host vectorized capability (§7/§13) or the GPU broker.
 
 ---
 
@@ -329,21 +358,33 @@ fail-closed, never miscompile).
 **Fix sketch (three tiers, by scope):**
 1. *(landed)* Harness sidestep: `-U__SIZEOF_INT128__` for kernels with a 64-bit fallback. Zero engine
    work; gets `aha-mont64` green. Not a capability.
-2. **Pattern-match the widening multiply** (the high-value slice, ~I13-sized): recognize `mul i128` of two
-   `zext i64` operands feeding `trunc` / `lshr 64`+`trunc` and lower it to a 64×64→128 primitive yielding
-   an `(lo, hi)` i64 pair (a `mul_hi`-style op on the JIT/interp if not already exposed). Covers
-   `aha-mont64` and the overwhelming majority of real `__int128` use (bignum, fixed-point, hashing,
-   mulhi). Self-contained in `svm-llvm`; anything beyond the mulhi idiom still fails closed.
-3. **General i128 legalization** (the real, larger fix): represent every i128 SSA value as a pair of i64
-   parts and thread it through the whole on-ramp — add/sub as carry chains, mul as the schoolbook 64×64
-   expansion, variable shifts as cross-word logic, compares, zext/trunc, loads/stores, **and**
-   phi/call/ret/block-params. Reuses the existing multi-part value-threading machinery (`wide_vals`,
-   `bind_wide`, the block-param fan-out, `branch_args`) that already splits wide vectors into parts — an
-   i128 is just a fixed 2-part case. Bigger mainly because of the carry/borrow/shift arithmetic and the
-   test surface (a differential fuzz over i128 ops: interp vs JIT vs a scalar oracle).
-
-Recommendation: tier 2 when a real-world i128 program (not just a benchmark) needs it; tier 3 only for
-genuine 128-bit *arithmetic* beyond widening multiply, which is rare.
+2. **Pattern-match the widening multiply** *(LANDED — `claude/onramp-i128`)*: the on-ramp now recognizes
+   the idiom (`zext i64 → mul i128 → lshr 64 → trunc`) and lowers it to 64-bit ops without ever
+   materializing a 128-bit value — `lower_i128_idiom` tracks each i128 SSA value symbolically (`Zext` /
+   `WideMul` / `Hi`) and emits a concrete op only at the `trunc`: `mul` for a product's low half, an inline
+   schoolbook `emit_umulhi` for its high half (the engine has no scalar high-multiply primitive, so the
+   32×32 expansion is emitted in IR — self-contained in `svm-llvm`, no new op across the stack). Covers
+   `aha-mont64`'s `mulul64` and the overwhelming majority of real `__int128` use (bignum, fixed-point,
+   hashing, mulhi). Anything beyond the idiom — a full i128 `add`/`sub`/variable-shift, or an `xor`/`and`/
+   `or i128` (which clang folds `(u128)…` bitwise combinations into) — still fails closed, never miscompiles.
+   Tests: `translate.rs::{i128_widening_mul_hi, i128_widening_mul_lo_and_hi}`, bit-exact (interp == JIT) vs a
+   `u128` oracle. *(The `embench` example still keeps `-U__SIZEOF_INT128__` for `aha-mont64`: `modul64`'s
+   `__int128` **variable** shift is outside this idiom, so a full-kernel `__int128` build needs more than
+   tier 2 — removing the sidestep should be validated against a real Embench checkout.)*
+3. **General i128 legalization** *(LANDED — `claude/onramp-i128-tier3`, supersedes tier 2)*: every i128
+   SSA value is now a materialized `(lo, hi)` i64 pair — the unified `agg`-pair representation already
+   used by `load i128` / `icmp i128`. `lower_i128` lowers each op to 64-bit ops over the parts:
+   `zext`/`sext` (any source ≤ 64) / `trunc`, `and`/`or`/`xor`, `add`/`sub` (carry/borrow via an
+   unsigned-overflow compare), `mul` (the schoolbook 64×64 with `emit_umulhi`), double-word
+   `shl`/`lshr`/`ashr` by a **runtime** amount (branchless via `Select`: within-word part + cross-word
+   carry guarded for `m==0` + an `n≥64` word move + sign fill for `ashr`), and `icmp` **all predicates**
+   (`hi <strict> | (hi == & lo <op_u>)`). i128 **function params/returns** ride clang's `{i64,i64}` ABI
+   split through the existing `agg` machinery. Tests (`translate.rs::i128_*`): add/sub carry, full
+   128×128 mul + bitwise, variable shifts across `[0,128)`, all compare predicates, and param/return —
+   each **bit-exact, interp == JIT, vs a native `i128`/`u128` oracle`. **Still fails closed** (correct,
+   never miscompiles): i128 **div/rem** (`udiv`/`__udivti3`), a **cross-block** i128 (loop-carried φ /
+   block-param — the `agg` table is same-block), and wide/negative i128 **constants** (≥ 2⁶⁴). Those are
+   the remaining tail if a real program needs them.
 
 ---
 

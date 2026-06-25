@@ -15,8 +15,8 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
-    iface, run_with_host, run_with_host_fast, AsyncCounter, CapPageMap, GuestMem, Host, HostFn,
-    RegionBacking, StreamRole, Trap,
+    iface, run_capture_reserved_with_host, run_with_host, run_with_host_fast, AsyncCounter,
+    CapPageMap, GuestMem, Host, HostFn, RegionBacking, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -2298,13 +2298,24 @@ fn typed(t: ValType, v: i64) -> Value {
     }
 }
 
-/// Compile `module`'s entry, register the live module for the `Jit` cap's mid-run re-entry, and run
-/// it over `slots` under the §5 kill-path armed by `interrupt`. A **concurrent** guest (`locked` is
-/// `Some`) runs the serialized [`cap_thunk_locked`] over a per-domain `Mutex<Host>` — so worker
-/// threads can `cap.call` (incl. threaded `Jit.compile`) without racing — and forgoes the
-/// single-threaded-only D45 fast path; a single-threaded guest keeps the unlocked [`cap_thunk`] +
-/// raw `*mut Host` + [`fast_cap_resolver`] exactly as before (zero lock cost). Exactly one of
-/// `locked` / `raw_host` is used.
+/// The raw result of a JIT compile→run: the outcome plus the §5 W3 trap diagnostics (source
+/// backtrace + trapping fiber, both empty/`None` unless the guest trapped under a `-g` module) and the
+/// captured low-window snapshot (`snapshot_cap` bytes; empty when no snapshot was requested).
+struct JitRun {
+    outcome: JitOutcome,
+    backtrace: Vec<JitFrameLoc>,
+    trap_fiber: Option<i64>,
+    snapshot: Vec<u8>,
+}
+
+/// Compile `module`'s function `func`, register the live module for the `Jit` cap's mid-run re-entry,
+/// and run it over `slots` under the §5 kill-path armed by `interrupt`, seeded with `init_mem` and
+/// (when `snapshot_cap` is `Some`) snapshotting the low `snapshot_cap` window bytes. A **concurrent**
+/// guest (`locked` is `Some`) runs the serialized [`cap_thunk_locked`] over a per-domain `Mutex<Host>`
+/// — so worker threads can `cap.call` (incl. threaded `Jit.compile`) without racing — and forgoes the
+/// single-threaded-only D45 fast path; a single-threaded guest keeps the unlocked [`cap_thunk`] + raw
+/// `*mut Host` + [`fast_cap_resolver`] exactly as before (zero lock cost). Exactly one of `locked` /
+/// `raw_host` is used. The single low-level JIT entry, shared by [`jit_run`].
 ///
 /// # Safety
 /// `raw_host` (when `locked` is `None`) is a live `*mut Host`; `interrupt` (when `Some`) outlives the
@@ -2312,19 +2323,21 @@ fn typed(t: ValType, v: i64) -> Value {
 #[allow(clippy::too_many_arguments)]
 unsafe fn powerbox_compile_run(
     module: &Module,
+    func: FuncIdx,
     locked: Option<&Mutex<Host>>,
     raw_host: *mut Host,
     slots: &[i64],
     interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
     quota: svm_jit::Quota,
     init_mem: Option<&[u8]>,
-) -> Result<(JitOutcome, Vec<JitFrameLoc>, Option<i64>), svm_jit::JitError> {
+    snapshot_cap: Option<usize>,
+) -> Result<JitRun, svm_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
     if let Some(m) = locked {
         let ctx = m as *const Mutex<Host> as *mut c_void;
         let mut cm = CompiledModule::compile(
             module,
-            0,
+            func,
             cap_thunk_locked,
             ctx,
             svm_ir::DEFAULT_RESERVED_LOG2,
@@ -2338,18 +2351,23 @@ unsafe fn powerbox_compile_run(
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
+        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(0);
         // §5 W3 — carry the trap-time source backtrace + trapping fiber (§23-D57) out (empty/`None`
         // unless the guest trapped and the module carried `-g`), so the kill message can name *which
         // fiber* was *where*.
-        return r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec(), cm.last_trap_fiber()));
+        return r.map(|(outcome, snapshot)| JitRun {
+            outcome,
+            backtrace: cm.last_trap_backtrace().to_vec(),
+            trap_fiber: cm.last_trap_fiber(),
+            snapshot,
+        });
     }
     let mut cm = CompiledModule::compile(
         module,
-        0,
+        func,
         cap_thunk,
         raw_host as *mut c_void,
         svm_ir::DEFAULT_RESERVED_LOG2,
@@ -2362,9 +2380,14 @@ unsafe fn powerbox_compile_run(
     )?;
     let host = &mut *raw_host;
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-    let r = CompiledModule::run_raw(&mut cm, slots, init_mem, None, None);
+    let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
     host.set_jit_native_ctx(0);
-    r.map(|(out, _)| (out, cm.last_trap_backtrace().to_vec(), cm.last_trap_fiber()))
+    r.map(|(outcome, snapshot)| JitRun {
+        outcome,
+        backtrace: cm.last_trap_backtrace().to_vec(),
+        trap_fiber: cm.last_trap_fiber(),
+        snapshot,
+    })
 }
 
 /// Run `module`'s entry (function 0) on the JIT under the MVP powerbox (§3e): a writable
@@ -2471,150 +2494,29 @@ fn run_powerbox_inner(
     deadline: Option<std::time::Duration>,
     quota: Quota,
 ) -> Result<Run, String> {
-    // Seed the §3e args buffer into the window's low bytes (applied before the module's data
-    // segments, which live at/above `POWERBOX_ARGS_END`, so the two never overlap). Empty `args` ⇒
-    // no seed (identical to the legacy path); the buffer is only read by a `main(int, char**)`.
-    let init_mem = if args.is_empty() && env.is_empty() {
-        None
-    } else {
-        let blob = build_args_blob(args, env)?;
-        let mut buf = vec![0u8; svm_ir::POWERBOX_ARGS_BASE as usize + blob.len()];
-        buf[svm_ir::POWERBOX_ARGS_BASE as usize..].copy_from_slice(&blob);
-        Some(buf)
+    // The fixed §3e powerbox preset, expressed over the converged [`Instance`] core (F1): the
+    // arity-based grant ([`grant_powerbox_prefix`]) and the JIT compile→run + §5 watchdog
+    // ([`run_jit`]) now live in exactly one place, shared with the frontend-independent embedding
+    // API. The `Instance` is built directly (not via [`instantiate`]) so this path does **not**
+    // re-resolve or re-verify — preserving its behaviour for already-validated frontend output
+    // (chibicc / svm-llvm), which emits inline `cap.call`s and a func-0 `_start` and runs JIT-only.
+    let inst = Instance {
+        module: module.clone(),
+        binding: None,
     };
-    let mut host = Host::new();
-    host.set_quota(quota);
-    host.stdin = stdin.to_vec();
-    // Guest-minted §13/§14 regions (`__vm_region_create` → `AddressSpace.create_region`) need an
-    // OS-shared-memory backing so the JIT can `map` them for real aliasing; install the factory
-    // unconditionally (inert if the guest never mints).
-    host.set_region_factory(new_shared_region);
-    // Grant in the powerbox's declared import order: stdout, stdin, exit, then Memory if the
-    // entry takes a 4th handle (§3e / D44) — so a `map`-growing guest heap has a handle to call —
-    // then an AddressSpace over the whole window if it takes a 5th (§14: the memory-management
-    // authority `create_region` mints from; attenuable; the carve source for nesting).
-    let arity = module.funcs.first().map_or(0, |f| f.params.len());
-    let mut slots = vec![
-        host.grant_stream(StreamRole::Out) as i64,
-        host.grant_stream(StreamRole::In) as i64,
-        host.grant_exit() as i64,
-    ];
-    if arity >= 4 {
-        slots.push(host.grant_memory() as i64);
-    }
-    if arity >= 5 {
-        let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        slots.push(host.grant_address_space(0, win) as i64);
-    }
-    // §9/§12 the async I/O ring: the IoRing + Blocking handles a chibicc `_start` always imports (the
-    // 6th/7th of the fixed 7-handle powerbox). The mock Blocking op is non-blocking here (`ZERO`).
-    if arity >= 6 {
-        slots.push(host.grant_io_ring() as i64);
-    }
-    if arity >= 7 {
-        slots.push(host.grant_blocking(std::time::Duration::ZERO, None) as i64);
-    }
-    // The guest-driven `Jit` capability (iface 11, DESIGN.md §22) — the 8th of the fixed chibicc
-    // powerbox. The canonical validator is the security hinge; the live `CompiledModule` is
-    // registered below, once it exists.
-    if arity >= 8 {
-        slots.push(grant_jit(&mut host, module, CLI_JIT_TABLE_LOG2) as i64);
-    }
-    // §15: the powerbox's spawn quota (default = the anti-bomb ceilings) — the JIT enforces the same
-    // fiber/vCPU caps as the interpreter would. (An embedder sets it on the `Host`; a `run_powerbox`
-    // quota arg is a follow-up.)
-    let hq = host.quota();
-    let quota = svm_jit::Quota {
-        max_fibers: hq.max_fibers,
-        max_vcpus: hq.max_vcpus,
+    let config = RunConfig {
+        limits: Limits {
+            fuel: None,
+            deadline,
+            max_fibers: quota.max_fibers,
+            max_vcpus: quota.max_vcpus,
+        },
+        stdin: stdin.to_vec(),
+        memory_size_log2: None,
+        args: args.iter().map(|s| s.to_vec()).collect(),
+        env: env.iter().map(|s| s.to_vec()).collect(),
     };
-    // The long-lived compile→run split (DESIGN.md §22): compile once, register the live module for
-    // the `Jit` cap's mid-run re-entry, run through one caller-managed pointer. A **concurrent**
-    // guest (`thread.spawn`) takes the serialized cap-thunk over a per-domain `Mutex<Host>` so its
-    // workers can `cap.call` (incl. threaded `Jit.compile`, DESIGN.md §22) safely; a single-threaded
-    // guest keeps the unlocked fast path verbatim (zero lock cost). See [`powerbox_compile_run`].
-    let concurrent = module.funcs.iter().any(|f| f.uses_concurrency());
-    //
-    // §5 fuel/epoch kill-path: when a `deadline` is given, arm the JIT's interrupt poll with a
-    // watchdog so a runaway guest is stopped after the deadline instead of hanging the process.
-    // The watchdog wakes early when the run finishes, so a fast program is never delayed.
-    let (interrupt, watchdog) = match deadline.filter(|d| !d.is_zero()) {
-        Some(d) => {
-            let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-            let wd = interrupt.clone();
-            let handle = std::thread::spawn(move || {
-                // Timed out (or the run dropped the sender) ⇒ request the kill.
-                if done_rx.recv_timeout(d).is_err() {
-                    wd.store(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
-            (Some(interrupt), Some((done_tx, handle)))
-        }
-        None => (None, None),
-    };
-    // SAFETY: `interrupt` (an `Arc<AtomicU64>`) outlives the run — dropped only after the watchdog
-    // is joined below; the host ctx (locked or raw) lives across the run; the thunk/ctx/resolver
-    // honour their contracts.
-    let jit = if concurrent {
-        let m = Mutex::new(std::mem::take(&mut host));
-        let r = unsafe {
-            powerbox_compile_run(
-                module,
-                Some(&m),
-                std::ptr::null_mut(),
-                &slots,
-                interrupt.as_ref(),
-                quota,
-                init_mem.as_deref(),
-            )
-        };
-        host = m.into_inner().unwrap_or_else(|e| e.into_inner());
-        r
-    } else {
-        unsafe {
-            powerbox_compile_run(
-                module,
-                None,
-                &mut host,
-                &slots,
-                interrupt.as_ref(),
-                quota,
-                init_mem.as_deref(),
-            )
-        }
-    };
-    if let Some((done_tx, handle)) = watchdog {
-        let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
-        let _ = handle.join();
-    }
-    let (jit, backtrace, trap_fiber) = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
-
-    let outcome = match jit {
-        JitOutcome::Returned(s) => {
-            let results = &module.funcs[0].results;
-            Outcome::Returned(s.iter().zip(results).map(|(&v, t)| typed(*t, v)).collect())
-        }
-        JitOutcome::Exited(code) => Outcome::Exited(code),
-        JitOutcome::Trapped(kind) => {
-            // §5 W3 — fold the trap-time source backtrace into the kill message (innermost frame
-            // first), and name the trapping **fiber** (§23-D57) when one was running. Empty/absent
-            // unless the module carried `-g`, in which case the message is unchanged.
-            let who = match trap_fiber {
-                Some(h) if h >= 0 => format!(" [fiber {h}]"),
-                _ => String::new(), // root computation (-1) or a clean/un-`-g` run
-            };
-            return Err(format!(
-                "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
-                format_backtrace(&backtrace)
-            ));
-        }
-    };
-    Ok(Run {
-        outcome,
-        stdout: host.stdout,
-        stderr: host.stderr,
-    })
+    inst.run(Backend::Jit, &config)
 }
 
 /// Run a bare (non-powerbox) kernel — `module`'s entry on the JIT with `args` and no host
@@ -2681,7 +2583,12 @@ fn grant_powerbox_prefix(h: &mut Host, n_handles: usize, win: u64) -> Vec<Value>
         ));
     }
     if n_handles >= 8 {
-        v.push(Value::I32(h.grant_jit(mem_log2)));
+        // Reserve the `call_indirect` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
+        // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room. This
+        // matches `run_powerbox_inner`'s grant exactly (the two paths are now one; see F1).
+        v.push(Value::I32(
+            h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
+        ));
     }
     v
 }
@@ -2815,6 +2722,30 @@ pub struct RunConfig {
     /// Override the module's linear-memory window `size_log2` for this run (must be ≥ what the program
     /// needs, or the guest faults). `None` ⇒ the module's declared size.
     pub memory_size_log2: Option<u8>,
+    /// The guest's program-arguments vector (`argv`): `args[0]` is conventionally the program name. A
+    /// `main(int, char**)` `_start` parses these (§3e / D44); a `main(void)` program leaves them
+    /// unread. Empty ⇒ no args buffer is seeded (identical to the legacy no-args run).
+    pub args: Vec<Vec<u8>>,
+    /// The guest's environment vector (`envp`), each entry `KEY=VALUE`. See [`RunConfig::args`].
+    pub env: Vec<Vec<u8>>,
+}
+
+impl RunConfig {
+    /// The §3e args buffer to seed the window's low bytes with (argv/env at `POWERBOX_ARGS_BASE`), or
+    /// `None` when neither `args` nor `env` is set. Seeded *before* the module's data segments (which
+    /// live at/above `POWERBOX_ARGS_END`), so the two never overlap. The single source for the
+    /// powerbox args layout (shared by `Instance::run`/`run_diff` and the `run_powerbox*` wrappers).
+    fn init_mem(&self) -> Result<Option<Vec<u8>>, String> {
+        if self.args.is_empty() && self.env.is_empty() {
+            return Ok(None);
+        }
+        let args: Vec<&[u8]> = self.args.iter().map(|v| v.as_slice()).collect();
+        let env: Vec<&[u8]> = self.env.iter().map(|v| v.as_slice()).collect();
+        let blob = build_args_blob(&args, &env)?;
+        let mut buf = vec![0u8; svm_ir::POWERBOX_ARGS_BASE as usize + blob.len()];
+        buf[svm_ir::POWERBOX_ARGS_BASE as usize..].copy_from_slice(&blob);
+        Ok(Some(buf))
+    }
 }
 
 /// Run `f` with the §5 kill-path armed when `deadline` is `Some`: a watchdog thread sets an interrupt
@@ -2844,55 +2775,144 @@ fn with_deadline<T>(
     }
 }
 
-/// Compile + run function 0 on the JIT under `limits` (quota + optional deadline watchdog), folding a
-/// guest trap into an `Err` (with the §5 W3 backtrace + trapping fiber). A concurrent guest serializes
-/// the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the unlocked fast path. Shared by
-/// the single-backend [`Instance::run`] and the [`Instance::run_diff`] oracle.
-fn run_jit(
+/// The single JIT compile→run path: run `func` on the JIT under `limits` (quota + optional deadline
+/// watchdog), seeded with `init_mem` and (when `snapshot_cap` is `Some`) returning the low-window
+/// snapshot, folding a guest trap into an `Err` (with the §5 W3 backtrace + trapping fiber). A
+/// concurrent guest serializes the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the
+/// unlocked fast path. Backs both the run-once [`run_jit`] (`func` 0, no snapshot) and the reactor
+/// per-call capture ([`run_capture_on`]'s `Jit` arm: an export `func`, `REACTOR_SNAP_CAP` snapshot).
+fn jit_run(
     m: &Module,
+    func: FuncIdx,
     slots: &[i64],
     host: &mut Host,
     limits: &Limits,
-) -> Result<JitOutcome, String> {
-    let quota = svm_jit::Quota {
-        max_fibers: limits.max_fibers,
-        max_vcpus: limits.max_vcpus,
-    };
+    init_mem: Option<&[u8]>,
+    snapshot_cap: Option<usize>,
+) -> Result<(JitOutcome, Vec<u8>), String> {
+    // One shared `Quota` type now (F6) — no interp→JIT facade conversion; reuse `Limits`' quota directly.
+    let quota = limits.quota();
     let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
     // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
-    // `with_deadline`); the thunk/ctx contracts hold exactly as in `run_powerbox_inner`.
-    let (jit, backtrace, trap_fiber) = with_deadline(limits.deadline, |interrupt| {
+    // `with_deadline`); `init_mem` (when `Some`) outlives the call; the thunk/ctx contracts hold.
+    let run = with_deadline(limits.deadline, |interrupt| {
         if concurrent {
             let locked = Mutex::new(std::mem::take(host));
             let r = unsafe {
                 powerbox_compile_run(
                     m,
+                    func,
                     Some(&locked),
                     std::ptr::null_mut(),
                     slots,
                     interrupt,
                     quota,
-                    None,
+                    init_mem,
+                    snapshot_cap,
                 )
             };
             *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
             r
         } else {
-            unsafe { powerbox_compile_run(m, None, host, slots, interrupt, quota, None) }
+            unsafe {
+                powerbox_compile_run(
+                    m,
+                    func,
+                    None,
+                    host,
+                    slots,
+                    interrupt,
+                    quota,
+                    init_mem,
+                    snapshot_cap,
+                )
+            }
         }
     })
     .map_err(|e| format!("JIT compile failed: {e:?}"))?;
-    if let JitOutcome::Trapped(kind) = jit {
-        let who = match trap_fiber {
+    if let JitOutcome::Trapped(kind) = run.outcome {
+        let who = match run.trap_fiber {
             Some(h) if h >= 0 => format!(" [fiber {h}]"),
             _ => String::new(),
         };
         return Err(format!(
             "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
-            format_backtrace(&backtrace)
+            format_backtrace(&run.backtrace)
         ));
     }
-    Ok(jit)
+    Ok((run.outcome, run.snapshot))
+}
+
+/// Compile + run function 0 on the JIT under `limits` (the run-once powerbox entry, no snapshot),
+/// folding a guest trap into an `Err`. A thin wrapper over [`jit_run`]. Shared by the single-backend
+/// [`Instance::run`] and the [`Instance::run_diff`] oracle.
+fn run_jit(
+    m: &Module,
+    slots: &[i64],
+    host: &mut Host,
+    limits: &Limits,
+    init_mem: Option<&[u8]>,
+) -> Result<JitOutcome, String> {
+    jit_run(m, 0, slots, host, limits, init_mem, None).map(|(outcome, _snap)| outcome)
+}
+
+/// Run an interpreter `backend` (`TreeWalk`/`Bytecode`) on `func`, seeding the window with `init_mem`
+/// when present (the §3e argv/env buffer) and discarding the run-once snapshot. With no `init_mem` it
+/// keeps the zero-overhead fast paths ([`run_with_host`] / [`run_with_host_fast`]); with one it routes
+/// through the capture-reserved variants (the only interp entries that seed). `Bytecode` falls back to
+/// the tree-walker for modules the engine doesn't lower (matching `TreeWalk` exactly there). Shared by
+/// [`Instance::run`] and the [`Instance::run_diff`] oracle so both seed args identically.
+fn run_interp(
+    backend: Backend,
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: Option<&[u8]>,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    match (backend, init_mem) {
+        (Backend::Jit, _) => unreachable!("run_interp is interpreter-only"),
+        (Backend::TreeWalk, None) => run_with_host(m, func, args, fuel, host),
+        (Backend::Bytecode, None) => run_with_host_fast(m, func, args, fuel, host),
+        (Backend::TreeWalk, Some(mem)) => {
+            run_capture_reserved_with_host(
+                m,
+                func,
+                args,
+                fuel,
+                mem,
+                svm_ir::DEFAULT_RESERVED_LOG2,
+                host,
+            )
+            .0
+        }
+        (Backend::Bytecode, Some(mem)) => {
+            match svm_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                m,
+                func,
+                args,
+                fuel,
+                mem,
+                svm_ir::DEFAULT_RESERVED_LOG2,
+                host,
+            ) {
+                Some((r, _snap)) => r,
+                None => {
+                    run_capture_reserved_with_host(
+                        m,
+                        func,
+                        args,
+                        fuel,
+                        mem,
+                        svm_ir::DEFAULT_RESERVED_LOG2,
+                        host,
+                    )
+                    .0
+                }
+            }
+        }
+    }
 }
 
 /// A host capability offered to a module's named import (wasm-style import matching, §7). It carries
@@ -3080,8 +3100,16 @@ impl Instance {
     /// name-bound registry (from [`instantiate_with_imports`]) if present, else the fixed §3e powerbox
     /// ([`instantiate`]) — and `args` must be empty. This is the easy default: [`Instance::run_diff`]
     /// with [`RunConfig::default`] (interpreter == JIT enforced). Any other export runs as a **bare
-    /// kernel** with `args` and no host capabilities (the escape hatch for pure functions). For a
-    /// single backend or non-default limits, use [`Instance::run`] / [`Instance::run_diff`].
+    /// kernel** with `args` and **no host capabilities** (the escape hatch for pure functions).
+    ///
+    /// Why a non-`_start` export gets no capabilities (decision F3): without `_start` having run, the
+    /// powerbox **handle stash** (window offset 0) is empty, so a granted handle would be unreachable
+    /// by the export anyway — granting caps to a one-shot kernel call would be a footgun, not a feature.
+    /// A cap-using export is meant to be reached through a [`Session`] ([`Instance::start`]): the
+    /// reactor runs `_start` once to stash the handles, then calls exports against the live window. So
+    /// the rule is: **pure function → `Instance::call`; cap-using export → `Session::call_export`.**
+    ///
+    /// For a single backend or non-default limits, use [`Instance::run`] / [`Instance::run_diff`].
     pub fn call(&self, export: &str, args: &[Value]) -> Result<Run, String> {
         let fidx = self
             .module
@@ -3117,6 +3145,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let init_mem = config.init_mem()?;
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
@@ -3126,16 +3155,20 @@ impl Instance {
         let outcome = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
                 let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
-                let r = if backend == Backend::Bytecode {
-                    run_with_host_fast(m, 0, &args, &mut fuel, &mut host)
-                } else {
-                    run_with_host(m, 0, &args, &mut fuel, &mut host)
-                };
+                let r = run_interp(
+                    backend,
+                    m,
+                    0,
+                    &args,
+                    &mut fuel,
+                    init_mem.as_deref(),
+                    &mut host,
+                );
                 outcome_from_interp(r)?
             }
             Backend::Jit => {
                 let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-                let jit = run_jit(m, &slots, &mut host, &config.limits)?;
+                let jit = run_jit(m, &slots, &mut host, &config.limits, init_mem.as_deref())?;
                 outcome_from_jit(&m.funcs[0].results, jit)?
             }
         };
@@ -3153,6 +3186,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let init_mem = config.init_mem()?;
 
         // Two hosts, granted identically (grants are deterministic, so the handle vectors match).
         let mut hi = Host::new();
@@ -3166,10 +3200,18 @@ impl Instance {
         debug_assert_eq!(args, args_j, "grants must be deterministic across backends");
 
         let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
-        let interp = run_with_host(m, 0, &args, &mut fuel, &mut hi);
+        let interp = run_interp(
+            Backend::TreeWalk,
+            m,
+            0,
+            &args,
+            &mut fuel,
+            init_mem.as_deref(),
+            &mut hi,
+        );
 
         let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-        let jit = run_jit(m, &slots, &mut hj, &config.limits)?;
+        let jit = run_jit(m, &slots, &mut hj, &config.limits, init_mem.as_deref())?;
 
         let outcome = diff_outcome(&m.funcs[0].results, interp, jit)?;
         if hi.stdout != hj.stdout {
@@ -3229,6 +3271,267 @@ impl Instance {
             stdout: h.stdout,
             stderr: h.stderr,
         })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Phase 6 — the reactor model: a live, stateful Session you call exports into
+// ----------------------------------------------------------------------------
+
+/// The window span the reactor persists between calls. **Must match `svm_interp`/`svm_jit`'s private
+/// `SNAP_CAP`** — the tree-walker and bytecode engine snapshot exactly this span, and the JIT is told
+/// to (`run_raw`'s `snapshot_cap`), so the three round-trip the same bytes. (The cross-backend
+/// `Session` diff would fail loudly if these ever diverged.)
+const REACTOR_SNAP_CAP: usize = 1 << 18; // 256 KiB
+
+/// Run export `fidx` on `backend`, seeded from `init_mem`, returning its outcome and the new window
+/// snapshot. `Bytecode` transparently falls back to the tree-walker for modules it doesn't support
+/// (so that arm matches `TreeWalk` exactly there). The shared per-call primitive for [`Session`].
+fn run_capture_on(
+    backend: Backend,
+    m: &Module,
+    fidx: FuncIdx,
+    args: &[Value],
+    init_mem: &[u8],
+    host: &mut Host,
+    limits: &Limits,
+) -> Result<(Outcome, Vec<u8>), String> {
+    let treewalk = |host: &mut Host| {
+        let mut fuel = limits.fuel.unwrap_or(DEFAULT_FUEL);
+        run_capture_reserved_with_host(
+            m,
+            fidx,
+            args,
+            &mut fuel,
+            init_mem,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            host,
+        )
+    };
+    match backend {
+        Backend::TreeWalk => {
+            let (r, snap) = treewalk(host);
+            Ok((outcome_from_interp(r)?, snap))
+        }
+        Backend::Bytecode => {
+            let mut fuel = limits.fuel.unwrap_or(DEFAULT_FUEL);
+            match svm_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                m,
+                fidx,
+                args,
+                &mut fuel,
+                init_mem,
+                svm_ir::DEFAULT_RESERVED_LOG2,
+                host,
+            ) {
+                Some((r, snap)) => Ok((outcome_from_interp(r)?, snap)),
+                None => {
+                    let (r, snap) = treewalk(host); // unsupported by the bytecode engine — fall back
+                    Ok((outcome_from_interp(r)?, snap))
+                }
+            }
+        }
+        Backend::Jit => {
+            let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
+            // Snapshot the low `REACTOR_SNAP_CAP` window so the next call resumes this state. The
+            // reactor is single-threaded (`start` rejects concurrent guests), so `jit_run` takes its
+            // unlocked fast path.
+            let (jo, snap) = jit_run(
+                m,
+                fidx,
+                &slots,
+                host,
+                limits,
+                Some(init_mem),
+                Some(REACTOR_SNAP_CAP),
+            )?;
+            Ok((outcome_from_jit(&m.funcs[fidx as usize].results, jo)?, snap))
+        }
+    }
+}
+
+/// A **live, stateful instance** on one backend (the reactor model): the powerbox is granted once and
+/// the guest window (globals, the handle stash, BSS) **persists** across [`Session::call_export`]
+/// calls. Built by [`Instance::start`]. This is the "instantiate once, call exports many times" shape
+/// (wasm reactor / component model) that run-once [`Instance::run`] doesn't provide.
+///
+/// **Slice-1 scope:** single-threaded guests only; persistence covers the low [`REACTOR_SNAP_CAP`]
+/// window (globals/stash/BSS) — a `malloc` heap living in the reserved tail above the mapped window is
+/// **not** persisted yet. Exports use the convention `(i64 sp, <args…>) -> <results…>`: `call_export`
+/// supplies a fresh `sp` (the powerbox data-stack base) and appends the caller's `args`.
+pub struct Session {
+    module: Module,
+    backend: Backend,
+    host: Host,
+    /// The persisted window image (low `REACTOR_SNAP_CAP` bytes), round-tripped each call.
+    snap: Vec<u8>,
+    entry_sp: u64,
+    limits: Limits,
+}
+
+impl Session {
+    /// Call exported function `name` with `args`, returning its results. The window (globals, stash,
+    /// BSS) and granted capability handles persist from prior calls. `Err` on a missing export, a
+    /// trap, or an `Exit`.
+    pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>, String> {
+        let fidx = self
+            .module
+            .resolve_export(name)
+            .ok_or_else(|| format!("no export named `{name}`"))?;
+        // Reactor calling convention: export is `(i64 sp, <args…>)` — supply a fresh data-stack base
+        // above the persistent globals, then the caller's args.
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(Value::I64(self.entry_sp as i64));
+        call_args.extend_from_slice(args);
+        let (outcome, snap) = run_capture_on(
+            self.backend,
+            &self.module,
+            fidx,
+            &call_args,
+            &self.snap,
+            &mut self.host,
+            &self.limits,
+        )?;
+        self.snap = snap;
+        match outcome {
+            Outcome::Returned(v) => Ok(v),
+            Outcome::Exited(code) => Err(format!("export `{name}` called Exit({code})")),
+        }
+    }
+
+    /// The backend this session runs on.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+    /// Bytes the guest has written to stdout across all calls so far.
+    pub fn stdout(&self) -> &[u8] {
+        &self.host.stdout
+    }
+    /// Bytes the guest has written to stderr across all calls so far.
+    pub fn stderr(&self) -> &[u8] {
+        &self.host.stderr
+    }
+}
+
+/// A reactor [`Session`] mirrored across **all three backends** (tree-walker, bytecode engine, JIT),
+/// stepped in lockstep: every [`DiffSession::call_export`] runs the call on each and asserts they
+/// agree on results, captured stdout/stderr, and the persistent window prefix — the §18 oracle
+/// extended to a *stateful sequence* of calls (state desyncs are caught the moment they appear). This
+/// is the powerbox layer's first direct exercise of the bytecode engine (Followup F10).
+pub struct DiffSession {
+    sessions: Vec<Session>, // one per backend, in [TreeWalk, Bytecode, Jit] order
+    entry_sp: u64,
+}
+
+impl DiffSession {
+    /// Call `name` with `args` on all three backends in lockstep; return the agreed results, or `Err`
+    /// the moment any backend diverges (results, output, or persistent window state).
+    pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>, String> {
+        // The persistent window prefix `[0, entry_sp)` (stash + globals + BSS) must match across
+        // backends; the data stack above `entry_sp` is transient and backend-specific (the JIT's frame
+        // layout differs from the interpreters'), so it is excluded from the comparison.
+        let persist = (self.entry_sp as usize).min(REACTOR_SNAP_CAP);
+        let mut agreed: Option<(Vec<Value>, Vec<u8>, Vec<u8>)> = None;
+        for s in &mut self.sessions {
+            let backend = s.backend;
+            let results = s.call_export(name, args)?;
+            let prefix = s
+                .snap
+                .get(..persist.min(s.snap.len()))
+                .unwrap_or(&[])
+                .to_vec();
+            let stdout = s.host.stdout.clone();
+            match &agreed {
+                None => agreed = Some((results, prefix, stdout)),
+                Some((r0, w0, o0)) => {
+                    if *r0 != results {
+                        return Err(format!(
+                            "backend {backend:?} results diverge on `{name}`: {r0:?} vs {results:?}"
+                        ));
+                    }
+                    if *w0 != prefix {
+                        return Err(format!(
+                            "backend {backend:?} persistent window diverges on `{name}`"
+                        ));
+                    }
+                    if *o0 != stdout {
+                        return Err(format!("backend {backend:?} stdout diverges on `{name}`"));
+                    }
+                }
+            }
+        }
+        Ok(agreed.expect("at least one backend").0)
+    }
+
+    /// Captured stdout (identical across backends — asserted on every call).
+    pub fn stdout(&self) -> &[u8] {
+        self.sessions[0].stdout()
+    }
+}
+
+impl Instance {
+    /// Start a **reactor session** on `backend` under `config`: grant the powerbox once, run the
+    /// bootstrap `_start` (function 0) to stash handles + run the initializer, and keep the window +
+    /// host live for repeated [`Session::call_export`] calls. Slice 1 is single-threaded — a guest
+    /// using §12 threads is rejected (use [`Instance::run`]/[`Instance::run_diff`] for those).
+    pub fn start(&self, backend: Backend, config: &RunConfig) -> Result<Session, String> {
+        if self.module.funcs.iter().any(|f| f.uses_concurrency()) {
+            return Err(
+                "reactor Session is single-threaded (slice 1); use run/run_diff for concurrent guests"
+                    .into(),
+            );
+        }
+        let module = self
+            .window_override(config)
+            .unwrap_or_else(|| self.module.clone());
+        let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+
+        let mut host = Host::new();
+        host.stdin = config.stdin.clone();
+        host.set_quota(config.limits.quota());
+        let args = self.grant_caps(&mut host, win);
+
+        // Run `_start` (func 0) once: stash the granted handles into the window and run the
+        // initializer. Capture the resulting window image as the session's persistent state.
+        let (_init, snap) =
+            run_capture_on(backend, &module, 0, &args, &[], &mut host, &config.limits)?;
+        Ok(Session {
+            module,
+            backend,
+            host,
+            snap,
+            entry_sp,
+            limits: config.limits.clone(),
+        })
+    }
+
+    /// Start a reactor session mirrored across all three backends (the stateful differential oracle).
+    /// Fails if the backends disagree on the post-`_start` window.
+    pub fn start_diff(&self, config: &RunConfig) -> Result<DiffSession, String> {
+        let entry_sp = svm_ir::powerbox_entry_sp(&self.module);
+        let sessions = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit]
+            .into_iter()
+            .map(|b| self.start(b, config))
+            .collect::<Result<Vec<_>, _>>()?;
+        // The post-`_start` persistent window must already agree across backends.
+        let persist = (entry_sp as usize).min(REACTOR_SNAP_CAP);
+        let prefix = |s: &Session| {
+            s.snap
+                .get(..persist.min(s.snap.len()))
+                .unwrap_or(&[])
+                .to_vec()
+        };
+        let base = prefix(&sessions[0]);
+        for s in &sessions[1..] {
+            if prefix(s) != base {
+                return Err(format!(
+                    "backend {:?} window diverges from {:?} at start",
+                    s.backend, sessions[0].backend
+                ));
+            }
+        }
+        Ok(DiffSession { sessions, entry_sp })
     }
 }
 

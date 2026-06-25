@@ -25,7 +25,6 @@ use core::ffi::c_void;
 use svm_interp::{
     run_scheduled, run_with_host, Host, Inspector, IrPc, StreamRole, Trap, Value, VarValue,
 };
-use svm_ir::ValType;
 use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
 use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
 use svm_text::parse_module as parse_module_raw;
@@ -183,128 +182,30 @@ struct CRun {
 /// and the JIT under identical mock powerboxes, assert they agree on the outcome *and* the
 /// observable host effects (stdout/stderr), and return both. So every C test is also a JIT
 /// differential test, capability effects included.
+///
+/// Driven through the public, frontend-independent embedding API (F1): [`svm_run::instantiate`]
+/// resolves + verifies (the resolve is a no-op here — [`parse_module`] already lowered the §7
+/// imports), and [`svm_run::Instance::run_diff`] runs `_start` on the tree-walker *and* the JIT under
+/// the fixed §3e powerbox and asserts they agree (results, stdout, stderr) — the same grant/compile/run
+/// core the CLI (`run_powerbox`) and embedders use, including the concurrent-guest `Mutex<Host>` path
+/// and the guest-driven `Jit` capability. A divergence/trap surfaces as an `Err`, re-panicked with the
+/// C source + IR for a legible failure.
 fn run_c_full(src: &str) -> CRun {
     let ir = c_to_ir(src);
     let m =
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
-    verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
-
-    // `_start(stdout, stdin, exit, memory, addrspace)` takes the powerbox handles. Grant them
-    // identically on both hosts (grants are deterministic, so the handle values match). The
-    // AddressSpace (§14) spans the whole declared window; the region factory backs guest-minted
-    // regions (`__vm_region_create`) with real OS shared memory so the JIT can `map` them.
-    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    let grant = |h: &mut Host| powerbox(h, win, std::time::Duration::ZERO);
-    let args = grant(&mut hi);
-    assert_eq!(args, grant(&mut hj), "grants are deterministic");
-
-    let mut fuel = 50_000_000u64;
-    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    // The long-lived compile→run split, with the live module registered so the guest-driven
-    // `Jit` capability (the `__vm_jit_*` builtins) works under the JIT backend too — for a
-    // guest that never uses it, behavior-identical to the one-shot `compile_and_run_with_host`.
-    //
-    // A **concurrent** guest (worker `cap.call`s — incl. threaded `Jit.compile`) takes the serialized
-    // `cap_thunk_locked` over a per-domain `Mutex<Host>` so its workers don't race on the `Host`,
-    // mirroring `run_powerbox` / `jit_cap::diff_run_t`; a single-threaded guest keeps the unlocked
-    // raw-`*mut Host` fast path verbatim. The interp side already serializes `Host` access across its
-    // M:N threads, so this makes the JIT side a sound differential oracle for concurrent guests too.
-    let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
-    let jit = if concurrent {
-        let locked = std::sync::Mutex::new(std::mem::take(&mut hj));
-        let ctx = &locked as *const std::sync::Mutex<Host> as *mut c_void;
-        let mut cm = svm_jit::CompiledModule::compile(
-            &m,
-            0,
-            svm_run::cap_thunk_locked,
-            ctx,
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            None,
-            None, // no D45 fast path: it derefs a raw `*mut Host`, not a `Mutex<Host>`
-            svm_jit::Quota::default(),
-            0,
-        )
-        .expect("jit compiles");
-        locked
-            .lock()
-            .unwrap()
-            .set_jit_native_ctx(&mut cm as *mut svm_jit::CompiledModule as usize);
-        // SAFETY: `cm` is the single caller-managed module for this run (its address registered
-        // above); the guest's worker `cap.call`s serialize through `locked`; `cm` is not moved
-        // during the run (the locked thunk's `Jit` handlers re-derive `&mut *cm` under the lock).
-        let out = unsafe { svm_jit::CompiledModule::run_raw(&mut cm, &slots, None, None, None) }
-            .expect("jit runs")
-            .0;
-        locked.lock().unwrap().set_jit_native_ctx(0);
-        drop(cm); // release the baked `&locked` ctx before reclaiming the host
-        hj = locked.into_inner().unwrap();
-        out
-    } else {
-        let mut cm = svm_jit::CompiledModule::compile(
-            &m,
-            0,
-            cap_thunk,
-            &mut hj as *mut Host as *mut c_void,
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            None,
-            None,
-            svm_jit::Quota::default(),
-            0,
-        )
-        .expect("jit compiles");
-        let cm_ptr: *mut svm_jit::CompiledModule = &mut cm;
-        hj.set_jit_native_ctx(cm_ptr as usize);
-        // SAFETY: the single caller-managed pointer for this run (the thunk's `Jit` handlers
-        // re-enter through the registered copy while the guest is suspended), on this thread.
-        let out = unsafe { svm_jit::CompiledModule::run_raw(cm_ptr, &slots, None, None, None) }
-            .expect("jit runs")
-            .0;
-        hj.set_jit_native_ctx(0);
-        out
+    let inst = svm_run::instantiate(m)
+        .unwrap_or_else(|e| panic!("instantiate failed: {e}\n--- IR ---\n{ir}"));
+    let run = inst
+        .run_diff(&svm_run::RunConfig::default())
+        .unwrap_or_else(|e| panic!("interp/JIT differential failed: {e}\n{src}\n--- IR ---\n{ir}"));
+    let outcome = match run.outcome {
+        svm_run::Outcome::Returned(v) => Outcome::Returned(v),
+        svm_run::Outcome::Exited(c) => Outcome::Exited(c),
     };
-
-    let typed = |s: &[i64]| -> Vec<Value> {
-        m.funcs[0]
-            .results
-            .iter()
-            .zip(s)
-            .map(|(t, &v)| match t {
-                ValType::I32 => Value::I32(v as i32),
-                ValType::I64 => Value::I64(v),
-                ValType::F32 => Value::F32(f32::from_bits(v as u32)),
-                ValType::F64 => Value::F64(f64::from_bits(v as u64)),
-                ValType::V128 => Value::V128([0; 16]),
-                ValType::Ref => Value::Ref(v as u64),
-            })
-            .collect()
-    };
-    let outcome = match (interp, jit) {
-        (Ok(want), JitOutcome::Returned(got)) => {
-            assert_eq!(
-                want,
-                typed(&got),
-                "interp/JIT result disagree:\n{src}\n{ir}"
-            );
-            Outcome::Returned(want)
-        }
-        (Err(Trap::Exit(want)), JitOutcome::Exited(got)) => {
-            assert_eq!(want, got, "interp/JIT exit code disagree:\n{src}");
-            Outcome::Exited(want)
-        }
-        (i, j) => panic!("interp/JIT outcome disagree for:\n{src}\ninterp={i:?} jit={j:?}\n{ir}"),
-    };
-    assert_eq!(hi.stdout, hj.stdout, "stdout differs:\n{src}");
-    assert_eq!(hi.stderr, hj.stderr, "stderr differs:\n{src}");
     CRun {
         outcome,
-        stdout: hi.stdout,
+        stdout: run.stdout,
     }
 }
 

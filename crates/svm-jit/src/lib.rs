@@ -516,27 +516,12 @@ pub type FastCapResolver = unsafe extern "C" fn(
     n_res: u32,
 ) -> *const core::ffi::c_void;
 
-/// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
-/// (`thread.spawn`) a JIT run may create, below the fixed anti-bomb ceilings. The runtimes clamp each
-/// to their hard ceiling (a quota only *tightens*); exceeding it is a clean `FiberFault`/`ThreadFault`,
-/// matching `svm_interp::Quota`. [`Default`] = the ceilings (an unconfigured run is unchanged). NB the
-/// JIT's vCPU table is **cumulative** (a joined slot isn't freed), so `max_vcpus` bounds *total* spawns
-/// over the run — stricter than the interpreter's concurrent-liveness cap, but containment holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quota {
-    /// Max fibers a run may create (`cont.new`); clamped to the fiber anti-bomb ceiling.
-    pub max_fibers: usize,
-    /// Max thread cells a run may create (`thread.spawn`); clamped to the vCPU anti-bomb ceiling.
-    pub max_vcpus: usize,
-}
-impl Default for Quota {
-    fn default() -> Self {
-        Quota {
-            max_fibers: 1 << 16,
-            max_vcpus: 1 << 16,
-        }
-    }
-}
+// §15 **spawn quota** — the single shared type lives in `svm-ir` (re-exported here and as
+// `svm_interp::Quota`), so a powerbox embedder sets it once and it binds all three backends
+// identically, with no facade conversion (Followup F6). NB the JIT's vCPU table is **cumulative** (a
+// joined slot isn't freed), so here `max_vcpus` bounds *total* spawns over the run — stricter than the
+// interpreter's concurrent-liveness cap, but containment holds either way.
+pub use svm_ir::Quota;
 
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
@@ -681,6 +666,29 @@ fn float_clif_ty(t: FloatTy) -> Type {
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
     // No host: an empty powerbox, so any `cap.call` is an inert CapFault (like `run`).
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
+}
+
+/// Compile `func` of `m` to a reusable [`CompiledModule`] with the default no-host policy (an empty
+/// powerbox — any `cap.call` is an inert CapFault, exactly like [`compile_and_run`]), so the caller can
+/// **compile once and [`CompiledModule::run`] many times** (DESIGN.md §22's long-lived split). The
+/// one-shot [`compile_and_run`] recompiles the whole module on *every* call (~ms of Cranelift codegen);
+/// a hot loop or a benchmark isolating per-iteration compute from compile jitter should compile here and
+/// reuse the returned module. For `cap.call` dispatch to a real host, call [`CompiledModule::compile`]
+/// directly with a thunk.
+pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> {
+    CompiledModule::compile(
+        m,
+        func,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0, // natural (non-B2-reserved) function-table size
+    )
 }
 
 /// Like [`compile_and_run`], but `cap.call`s dispatch through `cap_thunk` with the
@@ -2918,6 +2926,16 @@ impl CompiledModule {
             })
         };
 
+        // §12.8 parked-vCPU slice: a durable run that re-enters under `REWINDING` is a **thaw**. Mark the
+        // domain thawing so an `atomic.wait` re-issue that would park fails closed (`ThreadFault`) rather
+        // than hanging the single worker. Set before the children re-run (their waits fail closed too).
+        #[cfg(fiber_rt)]
+        if (*this).durable && fiber_rt::window_is_rewinding(window.base() as u64, 0) {
+            if let Some(d) = &(*this).domain {
+                d.engage_thawing();
+            }
+        }
+
         // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach + run the spawned children a
         // freeze flattened, *before* the root re-enters — the JIT's single-worker thaw (the root's
         // rewind skips its prologue `thread.spawn`, so the runtime reconstructs the children). Each
@@ -4797,7 +4815,9 @@ fn lower_block(
             timeout,
         } = inst
         {
-            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64) -> status:i32
+            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64, trap_out:i64) ->
+            // status:i32. `trap_out` carries the §12.8 thaw fail-closed (a re-issued wait that would
+            // park on the single worker traps `ThreadFault`); on a fresh run it is never written.
             let w = atomic_width(*ty);
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
@@ -4810,8 +4830,9 @@ fn lower_block(
             };
             let width = b.ins().iconst(I32, w as i64);
             let to = get(&vals, *timeout)?;
+            let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64] {
+            for t in [I64, I64, I64, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -4819,7 +4840,8 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, lower.thread.wait_thunk);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[sched, phys, exp, width, to]);
+                .call_indirect(tref, thunk, &[sched, phys, exp, width, to, trap_out]);
+            emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
             continue;

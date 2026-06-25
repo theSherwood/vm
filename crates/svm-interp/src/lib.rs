@@ -26,7 +26,12 @@ use svm_ir::{
     VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
-use svm_mem::{Region, RmwOp};
+use svm_mem::RmwOp;
+// Re-exported so an embedder can build a `Region::shared` over host memory (e.g. the wasm shared
+// linear memory) and hand it to `compile_and_run_capture_over` — the parallel-wasm window backing.
+// The `unsafe` of borrowing host memory lives in `svm_mem::Region::shared`, keeping this crate
+// `#![forbid(unsafe_code)]`.
+pub use svm_mem::Region;
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1816,7 +1821,20 @@ fn drive(
     // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
     // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
     let durable = host.is_durable();
-    // Durable **freeze/thaw** runs (the window's state word is `UNWINDING`/`REWINDING`, not `NORMAL`)
+    // §12.8 concurrent-thaw stage 1: a thaw restores the frozen window with the global **freeze** word
+    // still `UNWINDING` (the artifact froze there), while the per-context **thaw** word now carries the
+    // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
+    // re-unwind mid-thaw and `durable_load_dstate` reads the thaw — the real snapshot-restore path
+    // leaks the same `UNWINDING`. A freeze leaves the thaw word `NORMAL`, so this never fires on it.
+    if durable {
+        if let Some(m) = mem.as_mut() {
+            if m.durable_thaw_state(0) == STATE_REWINDING {
+                m.durable_set_state(STATE_NORMAL);
+            }
+        }
+    }
+    // Durable **freeze/thaw** runs (a freeze's global word is `UNWINDING`/`ARMED`, or a thaw's
+    // per-context word is `REWINDING`, not `NORMAL`)
     // serialize onto a single worker (DURABILITY.md §12.8 slice 3.2.1): the shared active shadow-SP
     // word is used by one vCPU at a time, so concurrent unwind/rewind can't race it, and the runtime
     // re-points it per vCPU on each dispatch. Ordinary runs — incl. a `NORMAL` durable run, which never
@@ -1824,7 +1842,11 @@ fn drive(
     let workers = if durable
         && mem
             .as_ref()
-            .map(|m| m.durable_state())
+            // §12.8 concurrent-thaw stage 1: serialize for a freeze (global word) *or* a thaw (the
+            // root re-enters under `REWINDING` in its own per-context thaw word — no longer the global
+            // word). The root's context is 0; `durable_load_dstate(0)` combines both words:
+            // non-`NORMAL` ⇒ freeze/thaw in progress.
+            .map(|m| m.durable_load_dstate(0))
             .unwrap_or(STATE_NORMAL)
             != STATE_NORMAL
     {
@@ -1883,11 +1905,13 @@ fn drive(
         ));
         root.durable = durable;
         // The root's own durable state word is the window's initial phase (NORMAL / UNWINDING freeze /
-        // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1).
+        // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1). §12.8 concurrent-thaw
+        // stage 1: combine the global freeze word with the root's per-context thaw word (a thaw seeds
+        // `REWINDING` into the latter).
         root.dstate = root
             .mem
             .as_ref()
-            .map(|m| m.durable_state())
+            .map(|m| m.durable_load_dstate(root.vcpu_ctx))
             .unwrap_or(STATE_NORMAL);
         // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
         // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
@@ -3167,39 +3191,11 @@ const MAX_VCPUS: usize = 1 << 16;
 /// multiple submits. Mirrors the [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings.
 const MAX_RING_BATCH: u64 = 1 << 16;
 
-/// §15 **spawn quota** — host-configurable ceilings on how many fibers / concurrently-live vCPUs a run
-/// may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings. The embedder sets it
-/// on the [`Host`] ([`Host::set_quota`]); a guest that exceeds it traps cleanly ([`Trap::FiberFault`] /
-/// [`Trap::ThreadFault`]) — DoS *containment* policy (§15/D48), not just the host-OOM backstop. The
-/// default is the hard ceilings, so an unconfigured run behaves exactly as before.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quota {
-    /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
-    /// capped at [`MAX_FIBERS`]. Per-run, not per-vCPU, since the fiber table is the run-shared
-    /// registry (D57 3b-i / DESIGN.md §23 (per-run quota)) — for a single-vCPU run the admitted creations are
-    /// unchanged (and match the JIT's per-vCPU count exactly).
-    pub max_fibers: usize,
-    /// Max concurrently-live vCPUs across the run (`thread.spawn`); capped at [`MAX_VCPUS`].
-    pub max_vcpus: usize,
-}
-impl Default for Quota {
-    fn default() -> Self {
-        Quota {
-            max_fibers: MAX_FIBERS,
-            max_vcpus: MAX_VCPUS,
-        }
-    }
-}
-impl Quota {
-    /// Clamp each limit to its hard anti-bomb ceiling (a quota can only *tighten*, never raise the
-    /// ceiling), and ensure at least 1 (the root vCPU always exists).
-    fn clamped(self) -> Quota {
-        Quota {
-            max_fibers: self.max_fibers.clamp(1, MAX_FIBERS),
-            max_vcpus: self.max_vcpus.clamp(1, MAX_VCPUS),
-        }
-    }
-}
+// §15 **spawn quota** — the single shared type lives in `svm-ir` (re-exported here and as
+// `svm_jit::Quota`), so a powerbox embedder sets it once and it binds all three backends identically,
+// with no facade conversion (Followup F6). The local `MAX_FIBERS`/`MAX_VCPUS` consts above mirror its
+// hard ceilings (also used here for fiber/vCPU table sizing); `Quota::clamped` enforces them.
+pub use svm_ir::Quota;
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
@@ -3527,7 +3523,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         v.durable_sp_ctx = v.vcpu_ctx;
         let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_mut() {
-            m.durable_set_state(v.dstate);
+            // §12.8 concurrent-thaw stage 1: route this vCPU's phase across the global freeze word and
+            // its own per-context thaw word, so its rewind can't disturb a sibling's.
+            m.durable_store_dstate(v.vcpu_ctx, v.dstate);
             m.durable_set_sp(root_word, v.root_shadow_sp);
         }
     }
@@ -3538,7 +3536,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
         let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_ref() {
-            v.dstate = m.durable_state();
+            // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
+            // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
+            v.dstate = m.durable_load_dstate(v.vcpu_ctx);
             v.root_shadow_sp = m.durable_get_sp(root_word);
         }
     }
@@ -4207,11 +4207,25 @@ fn shadow_region_base(ctx_idx: usize) -> u64 {
 /// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
 /// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
 const SHADOW_SP_WORD_LEN: u64 = 8;
+/// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
+/// within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte SP word, addressed via
+/// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) stays at the global
+/// [`STATE_OFF`]. Must equal `svm_durable::STATE_IN_REGION_OFF`.
+const STATE_IN_REGION_OFF: u64 = SHADOW_SP_WORD_LEN;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
+/// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
+/// `svm_durable::REGION_HEADER_LEN`.
+const REGION_HEADER_LEN: u64 = 16;
 
-/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP word. The empty
-/// (no-frames) extent of a context's shadow stack.
+/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP + thaw words. The
+/// empty (no-frames) extent of a context's shadow stack.
 fn shadow_frame_base(ctx_idx: usize) -> u64 {
-    shadow_region_base(ctx_idx) + SHADOW_SP_WORD_LEN
+    shadow_region_base(ctx_idx) + REGION_HEADER_LEN
+}
+
+/// Byte offset of context `ctx_idx`'s per-context **thaw** state word (§12.8 concurrent-thaw stage 1).
+fn thaw_state_off(ctx_idx: usize) -> u64 {
+    shadow_region_base(ctx_idx) + STATE_IN_REGION_OFF
 }
 
 /// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
@@ -4303,6 +4317,22 @@ fn shadow_switch(
         registry.saved_sp(in_ctx)
     };
     m.durable_set_sp(region_of(in_ctx), in_sp);
+    // §12.8 concurrent-thaw stage 1: carry the active **thaw** phase (`REWINDING`/`NORMAL`) from the
+    // outgoing context to the incoming one. Within a vCPU the rewind is sequential (a `cont.resume`
+    // resumer waits on its resumee), so the globally-deepest frame's flip to `NORMAL` must propagate
+    // back up through the switches — exactly as the former single global state word did (a resumer
+    // doesn't flip its own word; this carry does, on the return switch). The **freeze** word is global,
+    // so a non-thaw switch carries `NORMAL` (a no-op). Cross-*vCPU* concurrency uses distinct words and
+    // never routes through `shadow_switch`, so each vCPU's thaw stays independent.
+    let ctx_idx_of = |ctx: usize| {
+        if ctx == ROOT_FIBER {
+            root_ctx
+        } else {
+            shadow_context_index(ctx)
+        }
+    };
+    let phase = m.durable_thaw_state(ctx_idx_of(out_ctx));
+    m.durable_set_thaw_state(ctx_idx_of(in_ctx), phase);
 }
 
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
@@ -8902,12 +8932,14 @@ struct JitDomainState {
 const JIT_DEFAULT_MAX_UNITS: u32 = 4096;
 const JIT_DEFAULT_MAX_BLOB_BYTES: u64 = 1 << 26; // 64 MiB of cumulative submitted IR
 
-/// One §14 module grant: the verified module's functions, declared window size, and data segments —
-/// what spawning a child domain of it needs.
+/// One §14 module grant: the verified module's functions, declared window size, data segments — what
+/// spawning a child domain of it needs — and its first-class export table, so a parent can resolve a
+/// child entry **by name** (`Module` op 0, F2) instead of hardcoding its funcidx.
 struct ModuleGrant {
     funcs: Arc<[Func]>,
     memory_log2: Option<u8>,
     data: Arc<[Data]>,
+    exports: Arc<[svm_ir::Export]>,
 }
 
 impl Default for Host {
@@ -9436,6 +9468,7 @@ impl Host {
             funcs: m.funcs.clone().into(),
             memory_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone().into(),
+            exports: m.exports.clone().into(),
         });
         self.grant(iface::MODULE, Binding::Module(id))
     }
@@ -10065,10 +10098,38 @@ impl Host {
             // a `Yielder` cap.call slipped through (e.g. the JIT, which has no coroutine runtime) —
             // inert `CapFault`.
             Binding::Yielder => Err(Trap::CapFault),
-            // A §14 `Module` handle confers instantiation authority only (through the Instantiator's
-            // module ops); it has no callable ops — and crucially, the generic dispatch never exposes
-            // the grant's host-side data, so no host pointer is guest-reachable.
-            Binding::Module(_) => Err(Trap::CapFault),
+            // A §14 `Module` handle confers instantiation authority (through the Instantiator's module
+            // ops 5/6/7) plus one callable op:
+            //   op 0 `resolve_export(name_ptr, name_len) -> funcidx | -errno` (F2): look a name up in
+            //   the child module's first-class export table so a parent can address a child entry **by
+            //   name** rather than hardcoding its funcidx; the result is passed as the `entry` to the
+            //   Instantiator's module ops. The name is borrowed from the calling domain's window
+            //   (fail-closed: `-EFAULT` out of bounds, `-EINVAL` on bad UTF-8 / unknown name). Only the
+            //   funcidx (a small integer, already implicit in the granted module) crosses back — no
+            //   host pointer or grant-internal data is ever exposed.
+            Binding::Module(id) => match op {
+                0 => {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let ptr = *args.first().unwrap_or(&0) as u64;
+                    let len = *args.get(1).unwrap_or(&0) as u64;
+                    let Some(bytes) = mem.read_bytes(ptr, len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let Some(g) = self.modules.get(id as usize) else {
+                        return Ok(vec![EINVAL]);
+                    };
+                    let Ok(name) = std::str::from_utf8(&bytes) else {
+                        return Ok(vec![EINVAL]);
+                    };
+                    Ok(vec![match g.exports.iter().find(|e| e.name == name) {
+                        Some(e) => e.func as i64,
+                        None => EINVAL,
+                    }])
+                }
+                _ => Err(Trap::CapFault),
+            },
             // Guest-driven `Jit` (iface 11, DESIGN.md §22). This generic arm is the **reference**
             // path (an interpreter run, or a wiring-bug fallback): op 0 `compile` validates +
             // stores the unit and mints its handle; op 2 `release` revokes one. op 1 `invoke` can
@@ -10713,6 +10774,29 @@ impl Mem {
         }
     }
 
+    /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
+    /// [`Region::shared`] over the host's shared linear memory) rather than an engine-`mmap`ped one —
+    /// the substrate the parallel-wasm backend runs over (every per-vCPU Worker executes over the same
+    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`; reserved-tail
+    /// accesses beyond it read as zero (a confined guest stays in its prefix). The crate stays
+    /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
+    /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
+    fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
+        let reserved_log2 = reserved_log2.max(mapped_log2);
+        let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
+        let page = host_page_size();
+        Mem {
+            back,
+            window,
+            page,
+            space: Arc::new(RwLock::new(AddrSpace::default())),
+            has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
+            last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
+        }
+    }
+
     /// A fully-mapped **§14 sub-window**: a `1 << size_log2`-byte child window at absolute offset
     /// `base` inside a parent backing of `parent_bytes` bytes (the child runs over the parent's
     /// `Region`). The masking unit ([`svm_mask::Window::sub`], fuzzed as the escape hinge) confines
@@ -11288,10 +11372,50 @@ impl Mem {
             .unwrap_or(STATE_NORMAL)
     }
 
-    /// Set the durable state word at [`STATE_OFF`] — the runtime's per-vCPU state swap (slice 3.2.1),
-    /// so the single shared word reflects the running vCPU's own freeze phase.
+    /// Set the global durable **freeze** word at [`STATE_OFF`] (`UNWINDING`/`ARMED`/`NORMAL`) — the
+    /// stop-the-world trigger every poll reads.
     fn durable_set_state(&mut self, state: i32) {
         let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
+    }
+
+    /// Read context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) at
+    /// [`thaw_state_off`] (§12.8 concurrent-thaw stage 1). `STATE_NORMAL` if its page is uncommitted.
+    fn durable_thaw_state(&self, ctx: usize) -> i32 {
+        self.read_bytes_impl(thaw_state_off(ctx), 4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_le_bytes)
+            .unwrap_or(STATE_NORMAL)
+    }
+
+    /// Set context `ctx`'s per-context **thaw** state word.
+    fn durable_set_thaw_state(&mut self, ctx: usize, state: i32) {
+        let _ = self.write_bytes_impl(thaw_state_off(ctx), &state.to_le_bytes());
+    }
+
+    /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
+    /// stage 1): the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`) takes precedence; else
+    /// context `ctx`'s per-context **thaw** word (`REWINDING`/`NORMAL`). Mirror of [`Self::durable_store_dstate`].
+    fn durable_load_dstate(&self, ctx: usize) -> i32 {
+        let g = self.durable_state();
+        if g != STATE_NORMAL {
+            g
+        } else {
+            self.durable_thaw_state(ctx)
+        }
+    }
+
+    /// Store a vCPU's unified durable phase, routing `REWINDING` to context `ctx`'s own **thaw** word and
+    /// the freeze phases (`UNWINDING`/`ARMED`/`NORMAL`) to the global **freeze** word — so a rewinding
+    /// vCPU flipping its own word to `NORMAL` can't disturb a sibling still `REWINDING` (the relocation
+    /// the JIT needs for concurrent rewinds; the interp swaps it per dispatch, slice 3.2.1).
+    fn durable_store_dstate(&mut self, ctx: usize, dstate: i32) {
+        if dstate == STATE_REWINDING {
+            self.durable_set_state(STATE_NORMAL);
+            self.durable_set_thaw_state(ctx, STATE_REWINDING);
+        } else {
+            self.durable_set_state(dstate);
+            self.durable_set_thaw_state(ctx, STATE_NORMAL);
+        }
     }
 
     /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`): if the run

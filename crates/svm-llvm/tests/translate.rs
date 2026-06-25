@@ -200,6 +200,36 @@ fn check_traps(name: &str, src: &str, args: &[Value]) {
     }
 }
 
+/// `svm_jit::compile` (compile once) → reuse `CompiledModule::run` returns the same result as the
+/// one-shot `compile_and_run`, across multiple inputs. Guards the compile-once API the cross-engine
+/// bench relies on for honest JIT timing (its loop must carry no per-call Cranelift codegen).
+#[test]
+fn jit_compile_once_run_many() {
+    let Some(bc) = compile_to_bc("compile_once", "int run(int x){ return x * x + 1; }") else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let e = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    let sp = t.entry_sp as i64;
+    let mut cm = svm_jit::compile(&t.module, e).expect("compile once");
+    let val = |o: JitOutcome| match o {
+        JitOutcome::Returned(v) => v[0] as i32,
+        other => panic!("unexpected outcome {other:?}"),
+    };
+    for x in [3i64, 10, -4] {
+        let once = val(cm.run(&[sp, x], None, None, None).expect("run").0);
+        let one_shot = val(svm_jit::compile_and_run(&t.module, e, &[sp, x]).expect("one-shot"));
+        assert_eq!(once, one_shot, "compile-once vs one-shot at x={x}");
+        assert_eq!(once, (x * x + 1) as i32, "result at x={x}");
+    }
+}
+
 #[test]
 fn byval_small_struct_arg() {
     // A small struct passed by value — clang coerces it to an `i64` register. `run` packs {a,b}
@@ -804,6 +834,105 @@ fn switch_sparse_i32() {
         src,
         &[Value::I32(i32::MIN)],
         &[Value::I32(-1)],
+    );
+}
+
+#[test]
+fn memcmp_synthesized_helper() {
+    // `memcmp(a, b, n)` with a **runtime** length (so clang emits a real `memcmp` call rather than
+    // folding it) → the synthesized `__svm_memcmp` counted-loop helper. `a = [1..8]`, `b` equal except
+    // `b[3] = x`, then the sign of `memcmp(a, b, n)` is returned. Covers equal, first-mismatch both
+    // directions, a short prefix that stops before the mismatch, and `n == 0`. Differential interp+JIT.
+    let src = "int f(int n, int x){ char a[8]; char b[8]; \
+               for (int i=0;i<8;i++){ a[i]=(char)(i+1); b[i]=(char)(i+1); } \
+               b[3]=(char)x; \
+               int r = __builtin_memcmp(a, b, (unsigned long)(unsigned)n); \
+               return (r>0)-(r<0); }";
+    check(
+        "mc_eq3",
+        src,
+        &[Value::I32(3), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // first 3 match
+    check(
+        "mc_eq8",
+        src,
+        &[Value::I32(8), Value::I32(4)],
+        &[Value::I32(0)],
+    ); // b[3]==a[3]==4
+    check(
+        "mc_lt",
+        src,
+        &[Value::I32(8), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // a[3]=4 < 99
+    check(
+        "mc_gt",
+        src,
+        &[Value::I32(8), Value::I32(0)],
+        &[Value::I32(1)],
+    ); // a[3]=4 > 0
+    check(
+        "mc_short",
+        src,
+        &[Value::I32(4), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // mismatch in range
+    check(
+        "mc_zero",
+        src,
+        &[Value::I32(0), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // n==0 → equal
+}
+
+#[test]
+fn fcmp_unordered_ordered() {
+    // The NaN-test float predicates `fcmp uno`/`ord` have no single svm-ir op; the on-ramp expands
+    // them (`uno` = `a!=a | b!=b`, `ord` = `a==a & b==b`). `__builtin_isunordered` emits `uno`, its
+    // negation emits `ord` (verified). Runtime args incl. NaN prevent folding. Differential interp+JIT.
+    let src = "int f(int which, double a, double b){ switch(which){ \
+               case 0: return __builtin_isunordered(a, b); \
+               case 1: return !__builtin_isunordered(a, b); \
+               default: return 0; } }";
+    let nan = f64::NAN;
+    // uno (which==0): 1 iff either operand is NaN.
+    check(
+        "uno_a",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_b",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_both",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_none",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(0)],
+    );
+    // ord (which==1): 1 iff neither operand is NaN.
+    check(
+        "ord_nan",
+        src,
+        &[Value::I32(1), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(0)],
+    );
+    check(
+        "ord_none",
+        src,
+        &[Value::I32(1), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(1)],
     );
 }
 
@@ -2458,9 +2587,13 @@ fn multi_value_struct_return() {
 
 #[test]
 fn unsupported_is_fail_closed() {
-    // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
-    // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
-    let Some(bc) = compile_to_bc("i128", "__int128 big(__int128 a){ return a + 1; }") else {
+    // i128 *division* is outside the subset (I14 tier 3 lowers i128 add/sub/mul/shift/bitwise, but not
+    // div/rem — `udiv i128` / the `__udivti3` libcall) — it must be a clean `Unsupported`, never a
+    // silent mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
+    let Some(bc) = compile_to_bc(
+        "i128div",
+        "unsigned __int128 dv(unsigned __int128 a, unsigned __int128 b){ return a / b; }",
+    ) else {
         return;
     };
     match svm_llvm::translate_bc_path(&bc) {
@@ -3927,6 +4060,109 @@ fn main() {
         svm,
         nat,
         "heap Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+/// **`BTreeMap` through the on-ramp (`core::slice::index` panic shims).** A `no_std` program builds a
+/// `BTreeMap<u64,u64>` past one node's capacity (so it splits — exercising node slicing / element
+/// shifts), then sums `k + v` over an ordered iteration, byte-identical to the native `std` build.
+/// `BTreeMap`'s node code is littered with slice range accesses whose bounds-panic helpers
+/// (`slice_{start,end}_index_len_fail`) are external `-> !` lang items; the on-ramp shims the whole
+/// `slice…_fail` family to `trap` (`is_rust_abort_call`). Before that, this hit
+/// `Unsupported("call to external/undefined function …slice_end_index_len_fail…")`. This is the
+/// collection `svm-peval` uses for its memo tables.
+#[test]
+fn rust_btreemap_matches_native() {
+    let logic = "let mut mp: alloc::collections::BTreeMap<u64,u64> = alloc::collections::BTreeMap::new();\n\
+        for i in 0..40u64 { mp.insert(i.wrapping_mul(7) % 101, i.wrapping_mul(3)); }\n\
+        let mut s: u64 = 0; for (k, v) in &mp { s = s.wrapping_add(*k).wrapping_add(*v); }\n\
+        putdec(s); putdec(mp.len() as u64);\n\
+        putdec(*mp.get(&0).unwrap_or(&999));";
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\nextern crate alloc;\n\
+         use core::alloc::{{GlobalAlloc, Layout}};\n\
+         extern \"C\" {{ fn malloc(n: usize)->*mut u8; fn free(p:*mut u8); fn write(fd:i32,buf:*const u8,n:isize)->isize; }}\n\
+         struct G; unsafe impl GlobalAlloc for G {{ unsafe fn alloc(&self,l:Layout)->*mut u8{{malloc(l.size())}} unsafe fn dealloc(&self,p:*mut u8,_:Layout){{free(p)}} }}\n\
+         #[global_allocator] static A: G = G;\n\
+         #[panic_handler] fn ph(_:&core::panic::PanicInfo)->!{{loop{{}}}}\n\
+         fn putdec(x:u64){{let mut m=x;let mut b=[0u8;24];let mut i=24usize;if m==0{{i-=1;b[i]=b'0';}}while m>0{{i-=1;b[i]=b'0'+(m%10)as u8;m/=10;}}unsafe{{write(1,b.as_ptr().add(i),(24-i)as isize);write(1,b\"\\n\".as_ptr(),1);}}}}\n\
+         #[no_mangle] pub extern \"C\" fn main()->i32{{ {logic} 0 }}\n"
+    );
+    let native = format!(
+        "use std::collections::BTreeMap as _Unused; mod alloc {{ pub use std::collections; }}\n\
+         fn putdec(x:u64){{ println!(\"{{}}\", x); }}\n\
+         fn main(){{ {logic} }}\n"
+    );
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_btree", &onramp, b""),
+        rust_native_stdout("rs_btree", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "BTreeMap on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+/// **ZST struct field → element-stride/offset layout (PEVAL.md Milestone 3 corruption).** A `no_std`
+/// program builds a `Vec<Inner>` where `Inner { data: Vec<u64>, tag: u64 }` *contains a `Vec`*, then
+/// indexes the outer vector (`v[i].tag`, `v[i].data.len()`, `v[i].data[0]`) and sums. A `Vec`/`RawVec`
+/// carries the zero-sized `alloc::alloc::Global` allocator marker (`type {}`), so the element stride of
+/// `Vec<Inner>` and the offset of `Inner.tag`/`Inner.data.len()` both depend on the on-ramp sizing an
+/// **empty struct as 0 bytes**. A previous `struct_layout` clamped it to 1, inflating every `RawVec` by
+/// a byte (24-byte `Vec`s padded to 32, `len` shifted 16→24) and desyncing every field offset from
+/// LLVM's GEPs — so an indexed `v[i].data.len()` read garbage (it returned the *outer* `Vec::len()`).
+/// This is precisely the bug that made the in-sandbox `svm-peval` (all nested `Vec`/`BTreeMap`) read a
+/// corrupted length and trap; a flat `Vec<u64>` (existing tests) never exercised a ZST-bearing element.
+/// Differential: byte-identical to the same program as a native `std` binary.
+#[test]
+fn rust_zst_struct_field_layout_matches_native() {
+    let logic = "\
+        struct Inner { data: alloc::vec::Vec<u64>, tag: u64 }\n\
+        let mut outer: alloc::vec::Vec<Inner> = alloc::vec::Vec::new();\n\
+        for i in 0..6u64 {\n\
+            let mut d: alloc::vec::Vec<u64> = alloc::vec::Vec::new();\n\
+            d.push(i.wrapping_mul(10)); d.push(i.wrapping_mul(10).wrapping_add(1));\n\
+            outer.push(Inner { data: d, tag: i.wrapping_mul(100) });\n\
+        }\n\
+        let mut s: u64 = 0;\n\
+        for i in 0..outer.len() {\n\
+            s = s.wrapping_add(outer[i].tag);\n\
+            s = s.wrapping_add(outer[i].data.len() as u64);\n\
+            s = s.wrapping_add(outer[i].data[0]);\n\
+        }\n\
+        putdec(s); putdec(outer.len() as u64);";
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\nextern crate alloc;\n\
+         use core::alloc::{{GlobalAlloc, Layout}};\n\
+         extern \"C\" {{ fn malloc(n: usize)->*mut u8; fn free(p:*mut u8); fn write(fd:i32,buf:*const u8,n:isize)->isize; }}\n\
+         struct G; unsafe impl GlobalAlloc for G {{ unsafe fn alloc(&self,l:Layout)->*mut u8{{malloc(l.size())}} unsafe fn dealloc(&self,p:*mut u8,_:Layout){{free(p)}} }}\n\
+         #[global_allocator] static A: G = G;\n\
+         #[panic_handler] fn ph(_:&core::panic::PanicInfo)->!{{loop{{}}}}\n\
+         fn putdec(x:u64){{let mut m=x;let mut b=[0u8;24];let mut i=24usize;if m==0{{i-=1;b[i]=b'0';}}while m>0{{i-=1;b[i]=b'0'+(m%10)as u8;m/=10;}}unsafe{{write(1,b.as_ptr().add(i),(24-i)as isize);write(1,b\"\\n\".as_ptr(),1);}}}}\n\
+         #[no_mangle] pub extern \"C\" fn main()->i32{{ {logic} 0 }}\n"
+    );
+    let native = format!(
+        "mod alloc {{ pub use std::vec; }}\n\
+         fn putdec(x:u64){{ println!(\"{{}}\", x); }}\n\
+         fn main(){{ {logic} }}\n"
+    );
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_zst", &onramp, b""),
+        rust_native_stdout("rs_zst", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "ZST-struct layout on-ramp stdout {:?} vs native {:?}",
         String::from_utf8_lossy(&svm),
         String::from_utf8_lossy(&nat)
     );
@@ -5836,4 +6072,250 @@ int f(int n) {
     assert_eq!(read_x_at(5), 105, "inner shadow resolved inside the block");
     // Line 7 = `return x + n` (after the block): outer x = n + 1 = 6.
     assert_eq!(read_x_at(7), 6, "outer x resolved after the block");
+}
+
+/// I14 tier 2 — the i128 **widening-multiply** idiom (`(unsigned __int128)a * b >> 64`, a 64×64→128
+/// `mulhi`) now translates and runs on both engines, matching a `u128` oracle. This is the
+/// `aha-mont64 mulul64` core that previously fail-closed with `Unsupported("i128")`.
+#[test]
+fn i128_widening_mul_hi() {
+    let src = "unsigned long mulhi(unsigned long a, unsigned long b) {\n\
+        \x20 return (unsigned long)(((unsigned __int128)a * b) >> 64);\n\
+        }\n";
+    for (a, b) in [
+        (0x1234_5678_9abc_def0u64, 0xfedc_ba98_7654_3210u64),
+        (u64::MAX, u64::MAX),
+        (3, 5),
+        (1u64 << 63, 6),
+        (0xdead_beef_0000_0001, 0x0000_0001_cafe_babe),
+    ] {
+        let hi = (((a as u128) * (b as u128)) >> 64) as u64;
+        check(
+            "i128_mulhi",
+            src,
+            &[Value::I64(a as i64), Value::I64(b as i64)],
+            &[Value::I64(hi as i64)],
+        );
+    }
+}
+
+/// The full `mulul64` shape: one `unsigned __int128` product feeding **both** a low-half `trunc` and a
+/// high-half `lshr 64`+`trunc` — the same symbolic product consumed twice. The halves are combined
+/// through shifts (which don't distribute over `trunc`, so clang keeps them as the two separate i64
+/// truncs the real `mulul64` emits, rather than folding into an `xor i128`).
+#[test]
+fn i128_widening_mul_lo_and_hi() {
+    let src = "unsigned long mont(unsigned long a, unsigned long b) {\n\
+        \x20 unsigned __int128 p = (unsigned __int128)a * b;\n\
+        \x20 unsigned long lo = (unsigned long)p;\n\
+        \x20 unsigned long hi = (unsigned long)(p >> 64);\n\
+        \x20 return (hi ^ (lo >> 17)) + (lo ^ (hi >> 13));\n\
+        }\n";
+    for (a, b) in [
+        (0x1234_5678_9abc_def0u64, 0xfedc_ba98_7654_3210u64),
+        (u64::MAX, 7),
+        (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+    ] {
+        let p = (a as u128) * (b as u128);
+        let (lo, hi) = (p as u64, (p >> 64) as u64);
+        let want = (hi ^ (lo >> 17)).wrapping_add(lo ^ (hi >> 13));
+        check(
+            "i128_mont",
+            src,
+            &[Value::I64(a as i64), Value::I64(b as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+// ---- I14 tier 3: general i128 arithmetic (every i128 a materialized (lo, hi) pair) ----------------
+
+/// i128 `add`/`sub` with full carry/borrow across the word boundary. Builds two 128-bit values from
+/// four u64 halves, then folds both words of `x+y` and `x-y` into one i64 vs a `u128` oracle.
+#[test]
+fn i128_add_sub_carry() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 s = x + y;\n\
+        \x20 unsigned __int128 d = x - y;\n\
+        \x20 return ((unsigned long)s ^ (unsigned long)(s >> 64)) + ((unsigned long)d ^ (unsigned long)(d >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (1u64, 2u64, 3u64, 4u64),
+        (0, u64::MAX, 0, 1), // carry out of the low word
+        (5, 0, 9, u64::MAX), // borrow into the high word
+        (0xdead_beef, 0xffff_ffff_ffff_ffff, 0xcafe, 0x1),
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let s = x.wrapping_add(y);
+        let d = x.wrapping_sub(y);
+        let want = ((s as u64) ^ ((s >> 64) as u64)).wrapping_add((d as u64) ^ ((d >> 64) as u64));
+        check(
+            "i128_addsub",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// Full 128×128→128 `mul` (the schoolbook expansion, both operands genuinely 128-bit) + `and`/`or`/
+/// `xor`, vs a `u128` oracle.
+#[test]
+fn i128_mul_and_bitwise() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 p = x * y;\n\
+        \x20 unsigned __int128 m = (x & y) ^ (x | y);\n\
+        \x20 return ((unsigned long)p ^ (unsigned long)(p >> 64)) + ((unsigned long)m ^ (unsigned long)(m >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (0, 3, 0, 5),
+        (1, 2, 3, 4),
+        (
+            0xffff_ffff,
+            0xffff_ffff_ffff_ffff,
+            0x1234,
+            0x5678_9abc_def0_1234,
+        ),
+        (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let p = x.wrapping_mul(y);
+        let m = (x & y) ^ (x | y);
+        let want = ((p as u64) ^ ((p >> 64) as u64)).wrapping_add((m as u64) ^ ((m >> 64) as u64));
+        check(
+            "i128_mul",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// Double-word **variable** shifts: `shl` / logical `>>` / arithmetic `>>` by a runtime amount across
+/// the full `[0, 128)` range (including 0, `<64`, `==64`, `>64`) — the cross-word carry + `n>=64` word
+/// move that `aha-mont64`'s `modul64` needs. Vs a `u128`/`i128` oracle.
+#[test]
+fn i128_variable_shifts() {
+    let src = "unsigned long f(unsigned long h, unsigned long l, unsigned long s) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)h << 64) | l;\n\
+        \x20 unsigned n = (unsigned)s & 127;\n\
+        \x20 unsigned __int128 a = x << n;\n\
+        \x20 unsigned __int128 b = x >> n;\n\
+        \x20 __int128 c = ((__int128)x) >> n;\n\
+        \x20 unsigned __int128 r = a ^ b ^ (unsigned __int128)c;\n\
+        \x20 return (unsigned long)r ^ (unsigned long)(r >> 64);\n\
+        }\n";
+    let h = 0xfedc_ba98_7654_3210u64;
+    let l = 0x0123_4567_89ab_cdefu64;
+    for s in [0u64, 1, 17, 63, 64, 65, 100, 127] {
+        let x = ((h as u128) << 64) | l as u128;
+        let n = s as u32 & 127;
+        let a = x << n;
+        let b = x >> n;
+        let c = ((x as i128) >> n) as u128;
+        let r = a ^ b ^ c;
+        let want = (r as u64) ^ ((r >> 64) as u64);
+        check(
+            "i128_shifts",
+            src,
+            &[
+                Value::I64(h as i64),
+                Value::I64(l as i64),
+                Value::I64(s as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// i128 **parameter and return** (clang's `{i64,i64}` ABI split): `__int128 a + 1` reconstructs the
+/// value from its two i64 halves and re-splits the result. Confirms the param/return path + the
+/// carry across the word boundary compute correctly (not just translate).
+#[test]
+fn i128_param_and_return() {
+    let src = "__int128 big(__int128 a){ return a + 1; }\n";
+    for (lo, hi) in [
+        (0u64, 0u64),
+        (u64::MAX, 0x1234),
+        (41, 0),
+        (u64::MAX, u64::MAX),
+    ] {
+        let a = ((hi as u128) << 64) | lo as u128;
+        let r = a.wrapping_add(1);
+        check(
+            "i128_big",
+            src,
+            &[Value::I64(lo as i64), Value::I64(hi as i64)],
+            &[
+                Value::I64(r as u64 as i64),
+                Value::I64((r >> 64) as u64 as i64),
+            ],
+        );
+    }
+}
+
+/// i128 comparisons across **all predicates** (signed + unsigned ordering, eq/ne), each compared to a
+/// native `i128`/`u128` oracle. Packs the ten results into an int.
+#[test]
+fn i128_compares_all_predicates() {
+    let src = "int cmp(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 __int128 sx = (__int128)x, sy = (__int128)y;\n\
+        \x20 int r = 0;\n\
+        \x20 r |= (x <  y) << 0; r |= (x <= y) << 1; r |= (x >  y) << 2; r |= (x >= y) << 3;\n\
+        \x20 r |= (sx <  sy) << 4; r |= (sx <= sy) << 5; r |= (sx >  sy) << 6; r |= (sx >= sy) << 7;\n\
+        \x20 r |= (x == y) << 8; r |= (x != y) << 9;\n\
+        \x20 return r;\n\
+        }\n";
+    let cases = [
+        (1u64, 2u64, 1u64, 2u64),         // equal
+        (0, 1, 0, 2),                     // low differs
+        (1, 0, 2, 0),                     // high differs
+        (u64::MAX, 5, 0, 9),              // x huge (neg as signed), y small positive
+        (0x8000_0000_0000_0000, 0, 0, 1), // signedness boundary in the high word
+    ];
+    for (ah, al, bh, bl) in cases {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let (sx, sy) = (x as i128, y as i128);
+        let mut r = 0i32;
+        r |= (x < y) as i32;
+        r |= ((x <= y) as i32) << 1;
+        r |= ((x > y) as i32) << 2;
+        r |= ((x >= y) as i32) << 3;
+        r |= ((sx < sy) as i32) << 4;
+        r |= ((sx <= sy) as i32) << 5;
+        r |= ((sx > sy) as i32) << 6;
+        r |= ((sx >= sy) as i32) << 7;
+        r |= ((x == y) as i32) << 8;
+        r |= ((x != y) as i32) << 9;
+        check(
+            "i128_cmp",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I32(r)],
+        );
+    }
 }

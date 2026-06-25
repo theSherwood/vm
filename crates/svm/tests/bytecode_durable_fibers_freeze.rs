@@ -16,7 +16,7 @@
 //!      result and ends NORMAL.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
+    begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
     STATE_UNWINDING,
 };
 use svm_interp::{bytecode, run_capture_reserved_with_host, FrozenFiber, Host, Trap, Value};
@@ -140,7 +140,7 @@ fn check(src: &str) {
     // end NORMAL. The frozen point's results are reloaded, so the run reproduces the baseline.
     let thaw_fibers = rhost.frozen_fibers().to_vec();
     let mut thaw_win = rwin;
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let (thaw_tw, final_tw, _) = tw_run(&inst, &thaw_win, thaw_fibers.clone());
     let (thaw_bc, final_bc, _) = bc_run(&inst, &thaw_win, thaw_fibers);
     assert_eq!(
