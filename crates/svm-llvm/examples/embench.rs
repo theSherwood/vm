@@ -50,11 +50,11 @@ const BENCHES: &[(&str, &str, bool, i64)] = &[
         true,
         20_000,
     ),
+    ("slre", "src/slre/libslre.c", true, 20_000),
     // Not included (need harness/on-ramp work, not just a BENCHES row):
     //  - `statemate`: defines a global `unsigned long time;` that collides with `<time.h>`'s `time()`
     //    in the native-oracle build (the wrapper includes time.h); the SVM side translates fine, but
     //    without a buildable native oracle the differential can't be honest. Needs a per-kernel rename.
-    //  - `slre`: translates past `strlen` now but needs `__ctype_b_loc` (glibc locale ctype table).
     //  - `md5sum`/`xgboost`: the shared wrapper's `benchmark_body` arity doesn't match these kernels.
     //  - `picojpeg`/`qrduino`/`xgboost`: multi-`.c` kernels (the driver `#include`s a single file).
 ];

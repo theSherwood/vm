@@ -1419,6 +1419,38 @@ fn funnel_shift_general_const() {
     check_vs_native("funnel_general", src, 5);
 }
 
+/// The synthesized `<ctype.h>` tables (`__ctype_b_loc` flags + `__ctype_tolower_loc`/`toupper_loc` case
+/// maps) and the `__svm_memchr` byte scan — exercised against glibc by hashing every classifier and both
+/// case maps over the **whole 0..255 range** plus a `memchr`. The native oracle uses real glibc C-locale
+/// ctype; the SVM build uses the synthesized read-only tables — they must agree (bit-exact via the folded
+/// FNV hash in the exit byte). Found needed by Embench `slre`.
+#[test]
+fn ctype_and_memchr_builtins() {
+    let src = "#include <ctype.h>\n#include <string.h>\n\
+        int run(int seed) {\n\
+        \x20 unsigned int h = 2166136261u;\n\
+        \x20 for (int c = 0; c < 256; c++) {\n\
+        \x20   unsigned f = 0;\n\
+        \x20   f |= isalpha(c)?1u:0; f |= isdigit(c)?2u:0; f |= isspace(c)?4u:0;\n\
+        \x20   f |= isupper(c)?8u:0; f |= islower(c)?16u:0; f |= isxdigit(c)?32u:0;\n\
+        \x20   f |= ispunct(c)?64u:0; f |= isalnum(c)?128u:0; f |= isprint(c)?256u:0;\n\
+        \x20   f |= isgraph(c)?512u:0; f |= iscntrl(c)?1024u:0; f |= isblank(c)?2048u:0;\n\
+        \x20   h = (h ^ f) * 16777619u;\n\
+        \x20   h = (h ^ (unsigned)tolower(c)) * 16777619u;\n\
+        \x20   h = (h ^ (unsigned)toupper(c)) * 16777619u;\n\
+        \x20 }\n\
+        \x20 static const char buf[] = \"find the needle in here\";\n\
+        \x20 const char *p = memchr(buf, 'n', sizeof(buf));\n\
+        \x20 h ^= p ? (unsigned)(p - buf) : 999u;\n\
+        \x20 const char *q = memchr(buf, 'Z', sizeof(buf));\n\
+        \x20 h ^= q ? 1u : 7u;\n\
+        \x20 h ^= (unsigned) seed;\n\
+        \x20 return (int)(h & 0x7fffffff);\n\
+        }\n\
+        int main(void){ return run(5); }\n";
+    check_vs_native("ctype_memchr", src, 5);
+}
+
 #[test]
 fn strlen_builtin() {
     // A direct `strlen` call (not via `printf %s`) routes to the synthesized `__svm_strlen` NUL-scan
