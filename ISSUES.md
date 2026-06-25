@@ -371,16 +371,20 @@ fail-closed, never miscompile).
    `u128` oracle. *(The `embench` example still keeps `-U__SIZEOF_INT128__` for `aha-mont64`: `modul64`'s
    `__int128` **variable** shift is outside this idiom, so a full-kernel `__int128` build needs more than
    tier 2 — removing the sidestep should be validated against a real Embench checkout.)*
-3. **General i128 legalization** (the real, larger fix): represent every i128 SSA value as a pair of i64
-   parts and thread it through the whole on-ramp — add/sub as carry chains, mul as the schoolbook 64×64
-   expansion, variable shifts as cross-word logic, compares, zext/trunc, loads/stores, **and**
-   phi/call/ret/block-params. Reuses the existing multi-part value-threading machinery (`wide_vals`,
-   `bind_wide`, the block-param fan-out, `branch_args`) that already splits wide vectors into parts — an
-   i128 is just a fixed 2-part case. Bigger mainly because of the carry/borrow/shift arithmetic and the
-   test surface (a differential fuzz over i128 ops: interp vs JIT vs a scalar oracle).
-
-Recommendation: tier 2 when a real-world i128 program (not just a benchmark) needs it; tier 3 only for
-genuine 128-bit *arithmetic* beyond widening multiply, which is rare.
+3. **General i128 legalization** *(LANDED — `claude/onramp-i128-tier3`, supersedes tier 2)*: every i128
+   SSA value is now a materialized `(lo, hi)` i64 pair — the unified `agg`-pair representation already
+   used by `load i128` / `icmp i128`. `lower_i128` lowers each op to 64-bit ops over the parts:
+   `zext`/`sext` (any source ≤ 64) / `trunc`, `and`/`or`/`xor`, `add`/`sub` (carry/borrow via an
+   unsigned-overflow compare), `mul` (the schoolbook 64×64 with `emit_umulhi`), double-word
+   `shl`/`lshr`/`ashr` by a **runtime** amount (branchless via `Select`: within-word part + cross-word
+   carry guarded for `m==0` + an `n≥64` word move + sign fill for `ashr`), and `icmp` **all predicates**
+   (`hi <strict> | (hi == & lo <op_u>)`). i128 **function params/returns** ride clang's `{i64,i64}` ABI
+   split through the existing `agg` machinery. Tests (`translate.rs::i128_*`): add/sub carry, full
+   128×128 mul + bitwise, variable shifts across `[0,128)`, all compare predicates, and param/return —
+   each **bit-exact, interp == JIT, vs a native `i128`/`u128` oracle`. **Still fails closed** (correct,
+   never miscompiles): i128 **div/rem** (`udiv`/`__udivti3`), a **cross-block** i128 (loop-carried φ /
+   block-param — the `agg` table is same-block), and wide/negative i128 **constants** (≥ 2⁶⁴). Those are
+   the remaining tail if a real program needs them.
 
 ---
 
