@@ -808,6 +808,105 @@ fn switch_sparse_i32() {
 }
 
 #[test]
+fn memcmp_synthesized_helper() {
+    // `memcmp(a, b, n)` with a **runtime** length (so clang emits a real `memcmp` call rather than
+    // folding it) → the synthesized `__svm_memcmp` counted-loop helper. `a = [1..8]`, `b` equal except
+    // `b[3] = x`, then the sign of `memcmp(a, b, n)` is returned. Covers equal, first-mismatch both
+    // directions, a short prefix that stops before the mismatch, and `n == 0`. Differential interp+JIT.
+    let src = "int f(int n, int x){ char a[8]; char b[8]; \
+               for (int i=0;i<8;i++){ a[i]=(char)(i+1); b[i]=(char)(i+1); } \
+               b[3]=(char)x; \
+               int r = __builtin_memcmp(a, b, (unsigned long)(unsigned)n); \
+               return (r>0)-(r<0); }";
+    check(
+        "mc_eq3",
+        src,
+        &[Value::I32(3), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // first 3 match
+    check(
+        "mc_eq8",
+        src,
+        &[Value::I32(8), Value::I32(4)],
+        &[Value::I32(0)],
+    ); // b[3]==a[3]==4
+    check(
+        "mc_lt",
+        src,
+        &[Value::I32(8), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // a[3]=4 < 99
+    check(
+        "mc_gt",
+        src,
+        &[Value::I32(8), Value::I32(0)],
+        &[Value::I32(1)],
+    ); // a[3]=4 > 0
+    check(
+        "mc_short",
+        src,
+        &[Value::I32(4), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // mismatch in range
+    check(
+        "mc_zero",
+        src,
+        &[Value::I32(0), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // n==0 → equal
+}
+
+#[test]
+fn fcmp_unordered_ordered() {
+    // The NaN-test float predicates `fcmp uno`/`ord` have no single svm-ir op; the on-ramp expands
+    // them (`uno` = `a!=a | b!=b`, `ord` = `a==a & b==b`). `__builtin_isunordered` emits `uno`, its
+    // negation emits `ord` (verified). Runtime args incl. NaN prevent folding. Differential interp+JIT.
+    let src = "int f(int which, double a, double b){ switch(which){ \
+               case 0: return __builtin_isunordered(a, b); \
+               case 1: return !__builtin_isunordered(a, b); \
+               default: return 0; } }";
+    let nan = f64::NAN;
+    // uno (which==0): 1 iff either operand is NaN.
+    check(
+        "uno_a",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_b",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_both",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_none",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(0)],
+    );
+    // ord (which==1): 1 iff neither operand is NaN.
+    check(
+        "ord_nan",
+        src,
+        &[Value::I32(1), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(0)],
+    );
+    check(
+        "ord_none",
+        src,
+        &[Value::I32(1), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(1)],
+    );
+}
+
+#[test]
 fn bitreverse_intrinsic() {
     // A bit-reversal loop `-O2` folds into `llvm.bitreverse.i32`; lowered inline via the log-N
     // swap network. Checked against native `cc`.
@@ -3866,6 +3965,51 @@ fn main() {
         svm,
         nat,
         "heap Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+/// **`BTreeMap` through the on-ramp (`core::slice::index` panic shims).** A `no_std` program builds a
+/// `BTreeMap<u64,u64>` past one node's capacity (so it splits — exercising node slicing / element
+/// shifts), then sums `k + v` over an ordered iteration, byte-identical to the native `std` build.
+/// `BTreeMap`'s node code is littered with slice range accesses whose bounds-panic helpers
+/// (`slice_{start,end}_index_len_fail`) are external `-> !` lang items; the on-ramp shims the whole
+/// `slice…_fail` family to `trap` (`is_rust_abort_call`). Before that, this hit
+/// `Unsupported("call to external/undefined function …slice_end_index_len_fail…")`. This is the
+/// collection `svm-peval` uses for its memo tables.
+#[test]
+fn rust_btreemap_matches_native() {
+    let logic = "let mut mp: alloc::collections::BTreeMap<u64,u64> = alloc::collections::BTreeMap::new();\n\
+        for i in 0..40u64 { mp.insert(i.wrapping_mul(7) % 101, i.wrapping_mul(3)); }\n\
+        let mut s: u64 = 0; for (k, v) in &mp { s = s.wrapping_add(*k).wrapping_add(*v); }\n\
+        putdec(s); putdec(mp.len() as u64);\n\
+        putdec(*mp.get(&0).unwrap_or(&999));";
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\nextern crate alloc;\n\
+         use core::alloc::{{GlobalAlloc, Layout}};\n\
+         extern \"C\" {{ fn malloc(n: usize)->*mut u8; fn free(p:*mut u8); fn write(fd:i32,buf:*const u8,n:isize)->isize; }}\n\
+         struct G; unsafe impl GlobalAlloc for G {{ unsafe fn alloc(&self,l:Layout)->*mut u8{{malloc(l.size())}} unsafe fn dealloc(&self,p:*mut u8,_:Layout){{free(p)}} }}\n\
+         #[global_allocator] static A: G = G;\n\
+         #[panic_handler] fn ph(_:&core::panic::PanicInfo)->!{{loop{{}}}}\n\
+         fn putdec(x:u64){{let mut m=x;let mut b=[0u8;24];let mut i=24usize;if m==0{{i-=1;b[i]=b'0';}}while m>0{{i-=1;b[i]=b'0'+(m%10)as u8;m/=10;}}unsafe{{write(1,b.as_ptr().add(i),(24-i)as isize);write(1,b\"\\n\".as_ptr(),1);}}}}\n\
+         #[no_mangle] pub extern \"C\" fn main()->i32{{ {logic} 0 }}\n"
+    );
+    let native = format!(
+        "use std::collections::BTreeMap as _Unused; mod alloc {{ pub use std::collections; }}\n\
+         fn putdec(x:u64){{ println!(\"{{}}\", x); }}\n\
+         fn main(){{ {logic} }}\n"
+    );
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_btree", &onramp, b""),
+        rust_native_stdout("rs_btree", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "BTreeMap on-ramp stdout {:?} vs native {:?}",
         String::from_utf8_lossy(&svm),
         String::from_utf8_lossy(&nat)
     );
