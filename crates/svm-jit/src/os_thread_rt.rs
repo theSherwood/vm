@@ -498,6 +498,11 @@ struct DurableChild {
     ctx: usize,
     /// The child's entry function index — recorded in its residue so a thaw re-spawns it.
     func_idx: u32,
+    /// §12.8 concurrent-thaw stage 2: `None` on a fresh spawn (the child starts `NORMAL` at its entry,
+    /// region seeded to the empty frame base). `Some(extent)` on a **thaw** re-spawn: the child starts
+    /// `REWINDING` from its restored shadow extent (its region's SP word set to `extent`, its per-context
+    /// thaw word set `REWINDING`), so it rewinds its frozen frames concurrently with its siblings + root.
+    thaw_extent: Option<u64>,
 }
 
 /// §12.8 4A.5 follow-up A: a concurrent durable child that **finished** (didn't freeze). Recorded so a
@@ -573,8 +578,18 @@ fn run_child(a: SpawnArgs) {
     if let Some(dc) = &a.durable_child {
         let region = fiber_rt::shadow_region_base(dc.ctx);
         crate::durable_shadow::seed(region);
-        unsafe {
-            fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
+        match dc.thaw_extent {
+            // §12.8 concurrent-thaw stage 2: a **thaw** re-spawn rewinds from its restored extent — set
+            // its region's SP word to that extent and its own per-context thaw word `REWINDING`, so the
+            // prologue dispatches into the rewind (concurrent with siblings, no shared word).
+            Some(extent) => unsafe {
+                fiber_rt::write_shadow_sp(env.mem_base, region, extent);
+                fiber_rt::window_set_rewinding(env.mem_base, dc.ctx);
+            },
+            // A fresh spawn starts NORMAL at its entry, region empty (frame base).
+            None => unsafe {
+                fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
+            },
         };
         // §12.8 4A.5 follow-up B.2: record this OS thread's spawning task, so a *nested* `thread.spawn`
         // it makes attributes the grandchild's `parent_task` to **this** child (read per-OS-thread in
@@ -799,6 +814,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             parent,
             ctx,
             func_idx,
+            thaw_extent: None, // a fresh spawn starts NORMAL; only a thaw re-spawn rewinds
         })
     } else {
         None
@@ -1151,6 +1167,8 @@ impl Domain {
         // one). Each child is counted toward §15 live and keeps its Done cell + run params.
         struct Run {
             task: u64,
+            parent: u64,
+            func_idx: u32,
             ctx: usize,
             code: u64,
             sp: u64,
@@ -1183,6 +1201,8 @@ impl Domain {
             let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
             runs.push(Run {
                 task: v.task as u64,
+                parent: v.parent_task as u64,
+                func_idx: v.func as u32,
                 ctx: fiber_rt::shadow_context_of_sp(v.shadow_sp),
                 code: (*entry).code(),
                 sp: v.args.first().copied().unwrap_or(0) as u64,
@@ -1192,34 +1212,47 @@ impl Domain {
             });
         }
 
-        // (2) Run children in **descending** task order — children *before* parents — so a parent's
-        // re-executed `thread.join` finds an already-completed child (the JIT can't park-and-resume a
-        // parent on the single worker; the interp parks it instead). A `REWINDING` vCPU **reloads** its
-        // recorded side effects, so this order can't change the result (§12.6). Each runs under
-        // `REWINDING` from its restored extent, completes (a basic thaw doesn't re-freeze), frees its
-        // context, and publishes its result into its parent's table cell.
-        runs.sort_by_key(|r| std::cmp::Reverse(r.task));
-        for r in &runs {
-            // §12.8 concurrent-thaw stage 1: set *this child's own* thaw word REWINDING (per-context).
-            fiber_rt::window_set_rewinding(env.mem_base, r.ctx);
-            // §12.8 4A.5: restore this child's extent into its **own** region word and re-point
-            // `durable.shadow_base` so its rewinding code addresses its own region.
-            let child_region = fiber_rt::shadow_region_base(r.ctx);
-            fiber_rt::write_shadow_sp(env.mem_base, child_region, r.shadow_sp);
-            crate::durable_shadow::seed(child_region);
-            *lock(&self.cur_task) = r.task; // route its own grandchild joins to its table
-                                            // §12: seed the child's per-vCPU TLS register to its task id (matching the interp).
-            let (result, trap, _faulted) =
-                self.run_child_inline(env, r.code, r.sp, r.arg, r.task as i64);
-            *lock(&self.cur_task) = 0;
-            crate::durable_shadow::seed(fiber_rt::shadow_region_base(0)); // back to the root's region
-            if let Some(table) = self.fiber_table() {
-                table.free_vcpu_context(r.ctx);
+        // (2) §12.8 concurrent-thaw stage 2: **re-spawn each frozen vCPU on its own OS thread**, rewinding
+        // from its restored extent (`thaw_extent`) against its *own* per-context thaw word — concurrent
+        // with its siblings and the root, mirroring a fresh concurrent durable run (vs. the former inline
+        // serial "children before parents" loop). A re-issued `thread.join` blocks on the child's real
+        // `Done` cell (filled when its thread publishes its result); a re-issued `atomic.wait`/`notify`
+        // re-synchronises across the live threads (so a producer↔consumer pair frozen mid-rendezvous can
+        // thaw). The root re-enters and rewinds after this returns; `run_inner`'s `join_all` joins the
+        // children at run end. `run_child` does the per-context REWINDING setup, frees the context on a
+        // genuine finish, drops the §15 live count, and publishes the result + notifies.
+        for r in runs {
+            let args = SpawnArgs {
+                env,
+                code: r.code,
+                sp: r.sp,
+                arg: r.arg,
+                vcpu_id: r.task as i64,
+                durable_child: Some(DurableChild {
+                    task: r.task,
+                    parent: r.parent,
+                    ctx: r.ctx,
+                    func_idx: r.func_idx,
+                    thaw_extent: Some(r.shadow_sp), // rewind from the restored extent
+                }),
+                done: r.done,
+                dom: self as *const Domain,
+            };
+            match std::thread::Builder::new()
+                .name(format!("svm-thaw-{}", args.vcpu_id))
+                .spawn(move || run_child(args))
+            {
+                Ok(jh) => lock(&self.threads).joins.push(jh),
+                Err(_) => {
+                    // Thread creation failed: undo the §15 live count (taken above) and free the context.
+                    // A thaw that can't re-spawn its children is already fatal (the root's join will hang),
+                    // but keep the accounting consistent.
+                    lock(&self.threads).live -= 1;
+                    if let Some(table) = self.fiber_table() {
+                        table.free_vcpu_context(r.ctx);
+                    }
+                }
             }
-            lock(&self.threads).live -= 1;
-            let mut st = lock(&r.done.state);
-            *st = Some((result, trap));
-            r.done.cv.notify_all();
         }
         // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
         // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
@@ -1247,7 +1280,12 @@ pub(crate) unsafe extern "C" fn thread_join(
     // Durable single-worker (slice 3.4): resolve the handle in the **current** vCPU's per-vCPU table —
     // nested spawns give each spawning vCPU its own handle namespace. `dchildren` is populated only on
     // that path (freeze defer / thaw re-attach); when it's empty this is the global OS-thread table.
-    let cur = *lock(&dom.cur_task);
+    // §12.8 concurrent-thaw stage 2: on a concurrent durable child's OS thread, use *this* thread's task
+    // (set by `run_child`) — concurrent children would race the shared `cur_task`. The root's own thread
+    // has no `CONCURRENT_SPAWN_TASK`, so it falls back to `cur_task` (set to the root by the thaw driver).
+    let cur = CONCURRENT_SPAWN_TASK
+        .with(|c| c.get())
+        .unwrap_or_else(|| *lock(&dom.cur_task));
     let done = {
         let mut dc = lock(&dom.dchildren);
         if !dc.is_empty() {
