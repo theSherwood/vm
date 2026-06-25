@@ -227,6 +227,7 @@ node threads-engine.mjs   "$W" corpus/threads.svmbc 4000      # 4a: engine over 
 node threads-parallel.mjs "$W" corpus/threads.svmbc 4000 8    # 4b: 8 Workers, independent domains → 4000
 node threads-spawn.mjs    "$W" corpus/threads.svmbc 4000      # 4c-wasm: ONE guest's vCPUs across Workers
 node threads-spawn.mjs    "$W" corpus/futex.svmbc   987654    # 4c-wasm: the cross-Worker futex handoff
+node browser-test.mjs                                        # 4c-wasm in a REAL browser (Chromium): → 4000
 ```
 
 The threads-build flags (`+atomics` · `--shared-memory --import-memory --max-memory` · `build-std`)
