@@ -2557,9 +2557,13 @@ fn multi_value_struct_return() {
 
 #[test]
 fn unsupported_is_fail_closed() {
-    // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
-    // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
-    let Some(bc) = compile_to_bc("i128", "__int128 big(__int128 a){ return a + 1; }") else {
+    // i128 *division* is outside the subset (I14 tier 3 lowers i128 add/sub/mul/shift/bitwise, but not
+    // div/rem — `udiv i128` / the `__udivti3` libcall) — it must be a clean `Unsupported`, never a
+    // silent mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
+    let Some(bc) = compile_to_bc(
+        "i128div",
+        "unsigned __int128 dv(unsigned __int128 a, unsigned __int128 b){ return a / b; }",
+    ) else {
         return;
     };
     match svm_llvm::translate_bc_path(&bc) {
@@ -5971,6 +5975,198 @@ fn i128_widening_mul_lo_and_hi() {
             src,
             &[Value::I64(a as i64), Value::I64(b as i64)],
             &[Value::I64(want as i64)],
+        );
+    }
+}
+
+// ---- I14 tier 3: general i128 arithmetic (every i128 a materialized (lo, hi) pair) ----------------
+
+/// i128 `add`/`sub` with full carry/borrow across the word boundary. Builds two 128-bit values from
+/// four u64 halves, then folds both words of `x+y` and `x-y` into one i64 vs a `u128` oracle.
+#[test]
+fn i128_add_sub_carry() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 s = x + y;\n\
+        \x20 unsigned __int128 d = x - y;\n\
+        \x20 return ((unsigned long)s ^ (unsigned long)(s >> 64)) + ((unsigned long)d ^ (unsigned long)(d >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (1u64, 2u64, 3u64, 4u64),
+        (0, u64::MAX, 0, 1), // carry out of the low word
+        (5, 0, 9, u64::MAX), // borrow into the high word
+        (0xdead_beef, 0xffff_ffff_ffff_ffff, 0xcafe, 0x1),
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let s = x.wrapping_add(y);
+        let d = x.wrapping_sub(y);
+        let want = ((s as u64) ^ ((s >> 64) as u64)).wrapping_add((d as u64) ^ ((d >> 64) as u64));
+        check(
+            "i128_addsub",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// Full 128×128→128 `mul` (the schoolbook expansion, both operands genuinely 128-bit) + `and`/`or`/
+/// `xor`, vs a `u128` oracle.
+#[test]
+fn i128_mul_and_bitwise() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 p = x * y;\n\
+        \x20 unsigned __int128 m = (x & y) ^ (x | y);\n\
+        \x20 return ((unsigned long)p ^ (unsigned long)(p >> 64)) + ((unsigned long)m ^ (unsigned long)(m >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (0, 3, 0, 5),
+        (1, 2, 3, 4),
+        (
+            0xffff_ffff,
+            0xffff_ffff_ffff_ffff,
+            0x1234,
+            0x5678_9abc_def0_1234,
+        ),
+        (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let p = x.wrapping_mul(y);
+        let m = (x & y) ^ (x | y);
+        let want = ((p as u64) ^ ((p >> 64) as u64)).wrapping_add((m as u64) ^ ((m >> 64) as u64));
+        check(
+            "i128_mul",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// Double-word **variable** shifts: `shl` / logical `>>` / arithmetic `>>` by a runtime amount across
+/// the full `[0, 128)` range (including 0, `<64`, `==64`, `>64`) — the cross-word carry + `n>=64` word
+/// move that `aha-mont64`'s `modul64` needs. Vs a `u128`/`i128` oracle.
+#[test]
+fn i128_variable_shifts() {
+    let src = "unsigned long f(unsigned long h, unsigned long l, unsigned long s) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)h << 64) | l;\n\
+        \x20 unsigned n = (unsigned)s & 127;\n\
+        \x20 unsigned __int128 a = x << n;\n\
+        \x20 unsigned __int128 b = x >> n;\n\
+        \x20 __int128 c = ((__int128)x) >> n;\n\
+        \x20 unsigned __int128 r = a ^ b ^ (unsigned __int128)c;\n\
+        \x20 return (unsigned long)r ^ (unsigned long)(r >> 64);\n\
+        }\n";
+    let h = 0xfedc_ba98_7654_3210u64;
+    let l = 0x0123_4567_89ab_cdefu64;
+    for s in [0u64, 1, 17, 63, 64, 65, 100, 127] {
+        let x = ((h as u128) << 64) | l as u128;
+        let n = (s as u32 & 127) as u32;
+        let a = x << n;
+        let b = x >> n;
+        let c = ((x as i128) >> n) as u128;
+        let r = a ^ b ^ c;
+        let want = (r as u64) ^ ((r >> 64) as u64);
+        check(
+            "i128_shifts",
+            src,
+            &[
+                Value::I64(h as i64),
+                Value::I64(l as i64),
+                Value::I64(s as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// i128 **parameter and return** (clang's `{i64,i64}` ABI split): `__int128 a + 1` reconstructs the
+/// value from its two i64 halves and re-splits the result. Confirms the param/return path + the
+/// carry across the word boundary compute correctly (not just translate).
+#[test]
+fn i128_param_and_return() {
+    let src = "__int128 big(__int128 a){ return a + 1; }\n";
+    for (lo, hi) in [
+        (0u64, 0u64),
+        (u64::MAX, 0x1234),
+        (41, 0),
+        (u64::MAX, u64::MAX),
+    ] {
+        let a = ((hi as u128) << 64) | lo as u128;
+        let r = a.wrapping_add(1);
+        check(
+            "i128_big",
+            src,
+            &[Value::I64(lo as i64), Value::I64(hi as i64)],
+            &[
+                Value::I64(r as u64 as i64),
+                Value::I64((r >> 64) as u64 as i64),
+            ],
+        );
+    }
+}
+
+/// i128 comparisons across **all predicates** (signed + unsigned ordering, eq/ne), each compared to a
+/// native `i128`/`u128` oracle. Packs the ten results into an int.
+#[test]
+fn i128_compares_all_predicates() {
+    let src = "int cmp(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 __int128 sx = (__int128)x, sy = (__int128)y;\n\
+        \x20 int r = 0;\n\
+        \x20 r |= (x <  y) << 0; r |= (x <= y) << 1; r |= (x >  y) << 2; r |= (x >= y) << 3;\n\
+        \x20 r |= (sx <  sy) << 4; r |= (sx <= sy) << 5; r |= (sx >  sy) << 6; r |= (sx >= sy) << 7;\n\
+        \x20 r |= (x == y) << 8; r |= (x != y) << 9;\n\
+        \x20 return r;\n\
+        }\n";
+    let cases = [
+        (1u64, 2u64, 1u64, 2u64),         // equal
+        (0, 1, 0, 2),                     // low differs
+        (1, 0, 2, 0),                     // high differs
+        (u64::MAX, 5, 0, 9),              // x huge (neg as signed), y small positive
+        (0x8000_0000_0000_0000, 0, 0, 1), // signedness boundary in the high word
+    ];
+    for (ah, al, bh, bl) in cases {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let (sx, sy) = (x as i128, y as i128);
+        let mut r = 0i32;
+        r |= ((x < y) as i32) << 0;
+        r |= ((x <= y) as i32) << 1;
+        r |= ((x > y) as i32) << 2;
+        r |= ((x >= y) as i32) << 3;
+        r |= ((sx < sy) as i32) << 4;
+        r |= ((sx <= sy) as i32) << 5;
+        r |= ((sx > sy) as i32) << 6;
+        r |= ((sx >= sy) as i32) << 7;
+        r |= ((x == y) as i32) << 8;
+        r |= ((x != y) as i32) << 9;
+        check(
+            "i128_cmp",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I32(r)],
         );
     }
 }
