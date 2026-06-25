@@ -412,10 +412,25 @@ fail-closed, never miscompile).
    (`hi <strict> | (hi == & lo <op_u>)`). i128 **function params/returns** ride clang's `{i64,i64}` ABI
    split through the existing `agg` machinery. Tests (`translate.rs::i128_*`): add/sub carry, full
    128×128 mul + bitwise, variable shifts across `[0,128)`, all compare predicates, and param/return —
-   each **bit-exact, interp == JIT, vs a native `i128`/`u128` oracle`. **Still fails closed** (correct,
-   never miscompiles): i128 **div/rem** (`udiv`/`__udivti3`), a **cross-block** i128 (loop-carried φ /
-   block-param — the `agg` table is same-block), and wide/negative i128 **constants** (≥ 2⁶⁴). Those are
-   the remaining tail if a real program needs them.
+   each **bit-exact, interp == JIT, vs a native `i128`/`u128` oracle`.
+4. **Cross-block i128** *(LANDED — `claude/charming-johnson-pmlsnr`)*: an i128 SSA value now registers an
+   `[i64, i64]` `agg_layout` (like a flat 2-field struct), so its `(lo, hi)` pair **fans out as two
+   block params over an edge** — a **loop-carried `phi i128`** / live-across value — via the existing
+   struct-φ machinery (`block_params`/`branch_args`), not just same-block. `agg_operand` also
+   materializes a **constant i128 φ incoming** (`phi i128 [0, entry], …`) as `(lo, 0)`. Tests
+   (`translate.rs`): `i128_cross_block_loop_accumulator` (an i128 LCG accumulator across a backedge,
+   constant-0 entry) and `i128_cross_block_fib_pair` (two i128 φs — a Fibonacci pair — crossing
+   together), both bit-exact interp == JIT vs a `u128` oracle.
+
+   **Remaining tail (still fails closed — correct, never miscompiles):**
+   - i128 **div/rem** (`udiv`/`sdiv`/`urem`/`srem i128` — clang keeps these as IR ops at `-O2`; the
+     `__divti3`-family libcall is a *backend* lowering the on-ramp doesn't see). Needs an emitted
+     software 128÷128 routine (a shift-subtract loop / synthesized helper). The last real capability gap.
+   - **Wide / negative i128 constants (≥ 2⁶⁴ unsigned)** — **blocked upstream, not an on-ramp gap**:
+     `llvm-ir` 0.11.3 stores `Constant::Int.value` in a **`u64`** and **fails the whole bitcode parse**
+     when a `bits > 64` constant doesn't fit (rather than truncating). So such a constant never reaches
+     the on-ramp; supporting it would require forking/replacing the `llvm-ir` reader. Constants `< 2⁶⁴`
+     (incl. via the φ path above) already work.
 
 ---
 

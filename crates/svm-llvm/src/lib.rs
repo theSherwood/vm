@@ -1810,10 +1810,14 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
                     // `mask_lanes`, never used as a scalar — record a placeholder type.
                     Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
-                    // An `i128` result (a `-O2` 16-byte struct-eq coalesce: `load i128` + `icmp`) is
-                    // held as a 2×`i64` aggregate pair, never a scalar — placeholder type, like a
-                    // struct. (Same-block only, the aggregate-side-table assumption.)
+                    // An `i128` result is held as a 2×`i64` aggregate pair `(lo, hi)` (the unified
+                    // `agg`-pair representation, shared with `load i128` / `icmp i128` / the tier-3
+                    // `lower_i128` ops). Recording an `[i64, i64]` `agg_layout` — exactly like a flat
+                    // 2-field struct — lets the value **cross block edges**: the per-field fan-out in
+                    // `block_params`/`branch_args` threads its `(lo, hi)` as two block params (an i128
+                    // loop-carried φ / live-across value), not just same-block.
                     Err(_) if matches!(ty.as_ref(), Type::IntegerType { bits: 128 }) => {
+                        s.agg_layout.insert(id, vec![ValType::I64, ValType::I64]);
                         ValType::I64
                     }
                     Err(e) => return Err(e),
@@ -10974,7 +10978,16 @@ impl<'a> BlockCtx<'a> {
                     .iter()
                     .map(|v| self.operand(&Operand::ConstantOperand(v.clone())))
                     .collect(),
-                other => unsup(format!("struct φ constant incoming {other:?}")),
+                // A constant i128 φ incoming (e.g. the entry edge of `phi i128 [0, entry], [next, loop]`):
+                // materialize its `(lo, hi)` pair, mirroring `i128_parts`. `llvm-ir` 0.11.3 holds the
+                // value in a `u64`, so the high word is always 0 here (a ≥2⁶⁴ / negative i128 constant
+                // fails the bitcode parse upstream — see ISSUES.md I14 — so it never reaches us).
+                Constant::Int { bits: 128, value } if ftys.len() == 2 => {
+                    let lo = self.const_i64(*value as i64);
+                    let hi = self.const_i64(0);
+                    Ok(vec![lo, hi])
+                }
+                other => unsup(format!("aggregate φ constant incoming {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata struct operand"),
         }

@@ -6551,3 +6551,68 @@ fn i128_compares_all_predicates() {
         );
     }
 }
+
+/// **Cross-block i128** (I14 tail): an `__int128` accumulator carried across a loop backedge — `-O2`
+/// promotes it to a `phi i128` at the loop header, so its `(lo, hi)` pair must fan out as two block
+/// params over the edge (the struct-φ machinery, now extended to i128). The entry incoming is a
+/// **constant i128 `0`** (the `n == 0` case returns it untouched), exercising the constant-i128 φ path.
+/// An i128 LCG grows into the high word within a couple of iterations, so a torn backedge corrupts the
+/// result. Bit-exact interp == JIT vs a native `u128` oracle.
+#[test]
+fn i128_cross_block_loop_accumulator() {
+    let src = "unsigned long f(unsigned long n, unsigned long seed) {\n\
+        \x20 unsigned __int128 acc = 0;\n\
+        \x20 for (unsigned long i = 0; i < n; i++)\n\
+        \x20   acc = acc * 6364136223846793005ull + seed + i;\n\
+        \x20 return (unsigned long)acc ^ (unsigned long)(acc >> 64);\n\
+        }\n";
+    for (n, seed) in [
+        (0u64, 7u64),
+        (1, 7),
+        (5, 0xdead_beef),
+        (50, 0x1234_5678_9abc_def0),
+    ] {
+        let mut acc: u128 = 0;
+        for i in 0..n {
+            acc = acc
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(seed as u128)
+                .wrapping_add(i as u128);
+        }
+        let want = (acc as u64) ^ ((acc >> 64) as u64);
+        check(
+            "i128_xblock_lcg",
+            src,
+            &[Value::I64(n as i64), Value::I64(seed as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Cross-block i128** with **two** loop-carried values: an `__int128` Fibonacci pair. Both `a` and
+/// `b` are `phi i128` across the backedge (constant entry incomings `0` and `1` — the latter a
+/// non-zero low word), so two independent i128 `(lo, hi)` pairs must thread their four block params in
+/// the right order. i128 Fibonacci overflows 64 bits around n≈93, so n=100 populates the high word.
+#[test]
+fn i128_cross_block_fib_pair() {
+    let src = "unsigned long fib(unsigned long n) {\n\
+        \x20 unsigned __int128 a = 0, b = 1;\n\
+        \x20 for (unsigned long i = 0; i < n; i++) { unsigned __int128 t = a + b; a = b; b = t; }\n\
+        \x20 return (unsigned long)a ^ (unsigned long)(a >> 64);\n\
+        }\n";
+    for n in [0u64, 1, 2, 93, 100] {
+        let (mut a, mut b): (u128, u128) = (0, 1);
+        for _ in 0..n {
+            let t = a.wrapping_add(b);
+            a = b;
+            b = t;
+        }
+        let want = (a as u64) ^ ((a >> 64) as u64);
+        check(
+            "i128_xblock_fib",
+            src,
+            &[Value::I64(n as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
