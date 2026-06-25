@@ -5920,3 +5920,57 @@ int f(int n) {
     // Line 7 = `return x + n` (after the block): outer x = n + 1 = 6.
     assert_eq!(read_x_at(7), 6, "outer x resolved after the block");
 }
+
+/// I14 tier 2 — the i128 **widening-multiply** idiom (`(unsigned __int128)a * b >> 64`, a 64×64→128
+/// `mulhi`) now translates and runs on both engines, matching a `u128` oracle. This is the
+/// `aha-mont64 mulul64` core that previously fail-closed with `Unsupported("i128")`.
+#[test]
+fn i128_widening_mul_hi() {
+    let src = "unsigned long mulhi(unsigned long a, unsigned long b) {\n\
+        \x20 return (unsigned long)(((unsigned __int128)a * b) >> 64);\n\
+        }\n";
+    for (a, b) in [
+        (0x1234_5678_9abc_def0u64, 0xfedc_ba98_7654_3210u64),
+        (u64::MAX, u64::MAX),
+        (3, 5),
+        (1u64 << 63, 6),
+        (0xdead_beef_0000_0001, 0x0000_0001_cafe_babe),
+    ] {
+        let hi = (((a as u128) * (b as u128)) >> 64) as u64;
+        check(
+            "i128_mulhi",
+            src,
+            &[Value::I64(a as i64), Value::I64(b as i64)],
+            &[Value::I64(hi as i64)],
+        );
+    }
+}
+
+/// The full `mulul64` shape: one `unsigned __int128` product feeding **both** a low-half `trunc` and a
+/// high-half `lshr 64`+`trunc` — the same symbolic product consumed twice. The halves are combined
+/// through shifts (which don't distribute over `trunc`, so clang keeps them as the two separate i64
+/// truncs the real `mulul64` emits, rather than folding into an `xor i128`).
+#[test]
+fn i128_widening_mul_lo_and_hi() {
+    let src = "unsigned long mont(unsigned long a, unsigned long b) {\n\
+        \x20 unsigned __int128 p = (unsigned __int128)a * b;\n\
+        \x20 unsigned long lo = (unsigned long)p;\n\
+        \x20 unsigned long hi = (unsigned long)(p >> 64);\n\
+        \x20 return (hi ^ (lo >> 17)) + (lo ^ (hi >> 13));\n\
+        }\n";
+    for (a, b) in [
+        (0x1234_5678_9abc_def0u64, 0xfedc_ba98_7654_3210u64),
+        (u64::MAX, 7),
+        (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+    ] {
+        let p = (a as u128) * (b as u128);
+        let (lo, hi) = (p as u64, (p >> 64) as u64);
+        let want = (hi ^ (lo >> 17)).wrapping_add(lo ^ (hi >> 13));
+        check(
+            "i128_mont",
+            src,
+            &[Value::I64(a as i64), Value::I64(b as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
