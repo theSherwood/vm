@@ -1,4 +1,4 @@
-//! The **richer guest-side Futamura `Jit` probe** (PEVAL.md Milestone 3 follow-up). A `no_std`
+//! The **richer guest-side Futamura `Jit` probe** (DESIGN.md §20c follow-up). A `no_std`
 //! powerbox guest that, entirely in-sandbox:
 //!   1. builds a tiny **accumulator-machine interpreter** in svm-IR — `interp(a, b)` loops over a
 //!      bytecode program in memory (a `br_table` dispatch over opcodes), folding `b`/immediates into

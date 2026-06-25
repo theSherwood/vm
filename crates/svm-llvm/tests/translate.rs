@@ -4157,7 +4157,7 @@ fn rust_no_std_matches_native() {
 }
 
 // ============================================================================================
-// Milestone 1 (PEVAL.md) — `core + alloc` through the Rust on-ramp. The existing Rust lane proves
+// Milestone 1 (DESIGN.md §20c) — `core + alloc` through the Rust on-ramp. The existing Rust lane proves
 // `core` (a pure compute fn). This proves the next layer: a heap-allocating `no_std` program whose
 // `#[global_allocator]` is backed by the guest `malloc`/`free` (the same `vm_map`-growing bump
 // allocator the C/C++ heap tests use). `Vec`/`Box` from `alloc` lower to `__rust_alloc` →
@@ -4215,7 +4215,7 @@ fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> 
     )
 }
 
-/// **`core + alloc` through the Rust on-ramp (PEVAL.md Milestone 1).** A `no_std` Rust program with a
+/// **`core + alloc` through the Rust on-ramp (DESIGN.md §20c).** A `no_std` Rust program with a
 /// `#[global_allocator]` over the guest `malloc`/`free` builds a `Vec` that grows past its initial
 /// capacity (many `RawVec` reallocs → `malloc`/`free` churn → `vm_map` heap growth), boxes a value,
 /// and prints a heap-derived sum. The whole `alloc` stack (`RawVec`, the global-allocator shims
@@ -4342,7 +4342,7 @@ fn rust_btreemap_matches_native() {
     );
 }
 
-/// **ZST struct field → element-stride/offset layout (PEVAL.md Milestone 3 corruption).** A `no_std`
+/// **ZST struct field → element-stride/offset layout (DESIGN.md §20c corruption).** A `no_std`
 /// program builds a `Vec<Inner>` where `Inner { data: Vec<u64>, tag: u64 }` *contains a `Vec`*, then
 /// indexes the outer vector (`v[i].tag`, `v[i].data.len()`, `v[i].data[0]`) and sums. A `Vec`/`RawVec`
 /// carries the zero-sized `alloc::alloc::Global` allocator marker (`type {}`), so the element stride of

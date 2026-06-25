@@ -127,7 +127,7 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         };
         // Reject if `offset + len` overflows (`None`) or exceeds the window. Written as an explicit
         // match (not `is_none_or`, stabilized in 1.82) so this crate also compiles on the on-ramp's
-        // pinned `rustc 1.81` (LLVM-18) toolchain — see PEVAL.md Milestone 2.
+        // pinned `rustc 1.81` (LLVM-18) toolchain — see DESIGN.md §20c.
         let end = d.offset.checked_add(d.bytes.len() as u64);
         let out_of_window = match end {
             Some(e) => e > mem.size(),

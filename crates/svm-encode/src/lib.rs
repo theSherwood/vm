@@ -15,7 +15,7 @@
 #![forbid(unsafe_code)]
 // `no_std` + `alloc` so the encoder runs **in-sandbox**: a guest specializes a module with
 // `svm-peval` and serializes the residual here before submitting it to the §22 `Jit` capability
-// (PEVAL.md Milestone 3 — guest-side specialization). The test harness still gets `std`; dependents
+// (DESIGN.md §20c — guest-side specialization). The test harness still gets `std`; dependents
 // are unaffected (they bring their own `std`). Matches `svm-ir`/`svm-verify`/`svm-peval`.
 #![cfg_attr(not(test), no_std)]
 

@@ -65,7 +65,7 @@
 //!
 //! **`no_std` + `alloc`.** This crate compiles `no_std` (gated on `not(test)`; its own test harness
 //! gets `std`) so it can itself be translated to svm-IR through the Rust on-ramp and run *inside* svm
-//! (PEVAL.md Milestone 2). The transform is a pure `Module -> Module` — no I/O, threads, or time — so
+//! (DESIGN.md §20c). The transform is a pure `Module -> Module` — no I/O, threads, or time — so
 //! `core + alloc` suffices; the `std`-only float methods (`sqrt`/`ceil`/`floor`/`trunc`/round-ties-even
 //! /`fma`) route through the `libm` crate, which is bit-identical for these correctly-rounded ops.
 
@@ -713,7 +713,7 @@ fn simd_vsat_bin(shape: VShape, op: VSatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8;
     let bytes = shape.lane_bytes() as usize;
     let bits = bytes as u32 * 8;
     // Saturating add/sub exist only for 8/16-bit lanes (wasm), so every value and sum fits `i64` —
-    // no need for `i128` (which the svm-IR on-ramp can't translate; see PEVAL.md Milestone 2).
+    // no need for `i128` (which the svm-IR on-ramp can't translate; see DESIGN.md §20c).
     let max_u = (1i64 << bits) - 1;
     let max_s = (1i64 << (bits - 1)) - 1;
     let min_s = -(1i64 << (bits - 1));
@@ -793,7 +793,7 @@ fn simd_extmul(out: VShape, op: VWidenOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] 
         let rb = lane_read(&b, base + i, src_bytes);
         // Widening multiply: source lanes are ≤32-bit, so the 2× product fits 64 bits — `i64` for
         // signed, `u64` for unsigned (`u32×u32` can exceed `i64::MAX` but fits `u64`). `i128` was
-        // unnecessary, and the on-ramp can't translate it (PEVAL.md Milestone 2).
+        // unnecessary, and the on-ramp can't translate it (DESIGN.md §20c).
         let prod = if signed {
             lane_sext(ra, src_bytes).wrapping_mul(lane_sext(rb, src_bytes)) as u64
         } else {

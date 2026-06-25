@@ -1,4 +1,4 @@
-# The **in-sandbox `svm-peval` probe** (PEVAL.md Milestone 3 → the in-repo pipeline).
+# The **in-sandbox `svm-peval` probe** (DESIGN.md §20c → the in-repo pipeline).
 #
 # A `no_std`/`panic=abort` powerbox program that depends on `svm-peval` (`default-features = false`,
 # the in-svm build — no `libm`) and `svm-ir`, builds a small module, calls `svm_peval::specialize`,

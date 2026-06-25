@@ -1,4 +1,4 @@
-//! **The in-sandbox `svm-peval` pipeline (PEVAL.md Milestone 3), folded into a test.**
+//! **The in-sandbox `svm-peval` pipeline (DESIGN.md §20c), folded into a test.**
 //!
 //! The manual probe — `rustc +1.81 --emit=llvm-bc` → `llvm-link-18` → `opt-18 internalize,globaldce`
 //! → translate → verify → run — was a scratch-dir dance. This test runs it on the in-repo fixture
