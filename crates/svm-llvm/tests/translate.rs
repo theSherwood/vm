@@ -3705,6 +3705,178 @@ int main() {
     check_cpp_eh_vs_native("cpp_eh_rethrow_nested", src, b"");
 }
 
+/// **C++ exceptions — multiple catch clauses** — a single `try` with several typed handlers plus a
+/// catch-all: `catch (A&) / catch (B&) / catch (int) / catch (...)`. A `noinline` thrower raises one
+/// of four things by argument; the landingpad's selector is matched against each clause's
+/// `llvm.eh.typeid.for` in turn, falling through to `catch (...)`. Exercises the multi-clause
+/// selector-dispatch chain (the demo only had one typed clause) and class-typed exception objects
+/// caught by reference. Byte-identical to native `clang++` across all three engines.
+#[test]
+fn cpp_eh_multi_catch() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct A { int tag; };
+struct B { int tag; };
+
+__attribute__((noinline)) static int thrower(int x) {
+  if (x == 0) throw A{11};
+  if (x == 1) throw B{22};
+  if (x == 2) throw 7;
+  if (x == 3) throw "str";   // const char* — only the catch-all matches
+  return x;
+}
+
+static int classify(int x) {
+  try { return thrower(x); }
+  catch (A &a)  { return 1000 + a.tag; }
+  catch (B &b)  { return 2000 + b.tag; }
+  catch (int e) { return 3000 + e; }
+  catch (...)   { return 9999; }
+}
+
+int main() {
+  for (int i = 0; i <= 4; i++) puti(classify(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_multi_catch", src, b"");
+}
+
+/// **C++ exceptions — propagation through a cleanup frame** — a throw unwinds through an intermediate
+/// function that installs no handler but owns a local with a non-trivial destructor (`Guard`). clang
+/// gives that frame a **cleanup-only** landingpad (run the destructor, then `_Unwind_Resume` to keep
+/// unwinding); the exception is caught two frames up. Pins that cleanup landingpads fire during
+/// propagation and that the handler-stack depth is restored correctly across the resumed unwind —
+/// the `log` accumulator observes each `Guard` destructor exactly once. Byte-identical to native.
+#[test]
+fn cpp_eh_unwind_cleanup() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct Guard {
+  int *log; int id;
+  Guard(int *l, int i) : log(l), id(i) {}
+  ~Guard() { *log += id; }    // observable on unwind
+};
+
+__attribute__((noinline)) static int inner(int x) {
+  if (x < 0) throw x;
+  return x;
+}
+
+// No catch here: the throw propagates, but `g`'s destructor must run on the way out
+// (a cleanup-only landingpad → _Unwind_Resume).
+__attribute__((noinline)) static int middle(int x, int *log) {
+  Guard g(log, 10);
+  return inner(x);
+}
+
+// A second cleanup frame stacked on top, to pin nested cleanups during one unwind.
+__attribute__((noinline)) static int middle2(int x, int *log) {
+  Guard g(log, 3);
+  return middle(x, log);
+}
+
+static int outer(int x, int *log) {
+  try { return middle2(x, log); }
+  catch (int e) { return e; }
+}
+
+int main() {
+  int log = 0;
+  int r = outer(-5, &log);   // throws; unwinds through middle (+10) and middle2 (+3); caught
+  puti(r);                   // -5
+  puti(log);                 // 13
+  int log2 = 0;
+  int ok = outer(4, &log2);  // no throw: no destructors-on-unwind, normal return runs them once
+  puti(ok);                  // 4
+  puti(log2);                // 13 (both Guards destroyed on normal scope exit)
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_unwind_cleanup", src, b"");
+}
+
+/// **C++ exceptions — catch-by-value + destructor** — the path that forces `__cxa_end_catch` to stop
+/// being a no-op. The thrown type `E` has an observable copy-constructor (`+1`) and destructor
+/// (`+100`). `catch (E e)` copy-constructs a local from the exception object (`+1`), and on handler
+/// exit *two* destructors run: the local copy's (clang-emitted, `+100`) and the exception object's
+/// own (`__cxa_end_catch` → the synthesized `__svm_eh_destroy`, which runs the destructor funcref
+/// `__cxa_throw` registered, `+100`). `catch (E &e)` binds by reference (no copy, no local), so only
+/// the exception-object destructor runs (`+100`). Byte-identical to native `clang++` pins that the
+/// registered destructor fires exactly once per object across all three engines.
+#[test]
+fn cpp_eh_catch_by_value_dtor() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct E {
+  int *log; int v;
+  E(int *l, int val) : log(l), v(val) {}
+  E(const E &o) : log(o.log), v(o.v) { *log += 1; }   // copy-ctor: observable
+  ~E() { *log += 100; }                                // dtor: observable
+};
+
+__attribute__((noinline)) static void thrower(int *log, int val) {
+  throw E(log, val);
+}
+
+static int by_value(int *log, int val) {
+  try { thrower(log, val); }
+  catch (E e) { return e.v; }   // copy in, local dtor + exception-object dtor (end_catch) out
+  return -1;
+}
+
+static int by_ref(int *log, int val) {
+  try { thrower(log, val); }
+  catch (E &e) { return e.v; }  // no copy; only the exception-object dtor (end_catch) runs
+  return -1;
+}
+
+int main() {
+  int a = 0;
+  int r1 = by_value(&a, 42);
+  puti(r1);   // 42
+  puti(a);    // copy(+1) + local-dtor(+100) + end_catch-dtor(+100) = 201
+
+  int b = 0;
+  int r2 = by_ref(&b, 7);
+  puti(r2);   // 7
+  puti(b);    // end_catch-dtor(+100) = 100
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_catch_by_value_dtor", src, b"");
+}
+
 /// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common
 /// polymorphic base; a loop sums their areas through a base pointer (a virtual call per element →
 /// a vtable load + `call_indirect`), and the total is printed. Exercises vtables (function-pointer
