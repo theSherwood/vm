@@ -1274,12 +1274,14 @@ per-context word set on all contexts at once — TBD in stage 1.
      too). Tests: `mutual_wait_block_fails_closed_not_hangs` (cross-wait, no notify ⇒ `ThreadFault`) and
      `mutual_rendezvous_resolves_without_false_deadlock` (cross-notify 2-way barrier ⇒ resolves; the two
      are never parked at once, so the check must not over-fire).
-   - *Interleaving determinism stress.* `concurrent_freeze_thaw_is_deterministic_across_interleavings`
-     re-runs the multi-vCPU freeze/thaw 20× — each iteration a different real OS-thread schedule (freeze
-     landing at varied points, children rewinding concurrently) — asserting the uninterrupted oracle every
-     time. (Plus the stage-2 producer↔consumer-frozen-mid-rendezvous test.)
-   - *Remaining follow-up:* a **generated** concurrent-module fuzz (a random multi-vCPU module generator,
-     vs. today's hand-written shapes) for deeper coverage, and the pure join↔join circular-deadlock case
+     Interleaving determinism is otherwise covered by the stage-2
+     producer↔consumer-frozen-mid-rendezvous test and the existing per-shape concurrent freeze/thaw tests.
+   - *Remaining follow-up:* an **interleaving stress / generated fuzz.** A 20×-loop over the real
+     freeze/thaw harness was tried but reverted — its per-iteration *busy-spin* `FreezeController` (the
+     async-trigger handshake) starves few-core CI runners when repeated (a 45-min macOS hang), while a
+     single run is fine. A proper version needs a cheaper interleaving harness (yield/park the controller
+     spin, or a deterministic schedule injector) and ideally a **generated** random multi-vCPU module
+     generator (vs. today's hand-written shapes). Also open: the pure join↔join circular-deadlock case
      (unlikely on a spawn DAG; the `live == parked` check catches every *wait*-involved deadlock today).
 
 Original 4A map:
