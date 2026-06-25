@@ -12,7 +12,7 @@ feeds every engine — including the SVM ones, which run IR produced by the **re
 | `native` | `clang -O2` (C kernels), timed in-process |
 | `wasm32` / `wasm64` | `clang --target=wasm{32,64}` → run on Node/V8 (TurboFan, warmed up) |
 | `js(v8)` | the same kernels as pure JavaScript on V8 |
-| `svm-jit` | this repo's Cranelift JIT (`svm_jit::compile_and_run`), on **LLVM-frontend** IR |
+| `svm-jit` | this repo's Cranelift JIT (`svm_jit::compile` once → `CompiledModule::run`), on **LLVM-frontend** IR |
 | `svm-bytecode` | this repo's bytecode engine (`bytecode::compile_and_run`), on LLVM-frontend IR |
 | `svm-tree-walk` | this repo's tree-walking oracle (`svm_interp::run`), on LLVM-frontend IR |
 | `python` | CPython 3 |
@@ -74,9 +74,13 @@ Three more kernels go beyond the synthetic micros:
 ## Methodology
 
 - **Per-iteration isolation:** `(time(large n) − time(small n)) / Δn`, cancelling fixed per-run cost
-  (frame setup, JIT compile, V8 warmup, and the chase/array preludes). **Min over reps** rejects noise.
-  The non-SVM drivers use `n = 1000 → 201000`; the SVM driver uses `n = 1000 → 2_000_000` because
-  `svm_jit::compile_and_run` recompiles each call, so the run must dominate compile jitter.
+  (frame setup, V8 warmup, and the chase/array preludes). **Min over reps** rejects noise. The non-SVM
+  drivers use `n = 1000 → 201000`; the SVM driver uses `n = 1000 → 2_000_000`. The **svm-jit row
+  compiles once** (`svm_jit::compile` → reuse `CompiledModule::run`) so its timed loop carries no
+  Cranelift codegen — earlier it used `compile_and_run` (recompile every call), whose ~5–6 ms jitter
+  swamped a fast vectorized loop's signal (the two min-over-reps compiles don't cancel exactly through the
+  subtraction); the bytecode/tree-walk rows re-drive their engine each call, but that setup is cheap and
+  cancels.
 - **No closed-form folding:** the kernels resist folding by construction (i32-LCG / data-dependent
   loads), so native, wasm, and SVM all honestly execute every iteration — no inline-asm barriers (which
   the LLVM→SVM on-ramp rejects).
@@ -106,8 +110,10 @@ Indicative shape of the result (absolute numbers are machine-dependent):
 - **Break-even ≈ 10⁵–10⁶ iterations**: below that the bytecode engine is the right tier; the JIT's
   per-iter win (~1–2 ns vs ~30–70 ns) only repays its compile past ~75k–450k iterations.
 - This is the dominant inefficiency the steady-state table omits, and it directly motivates a
-  **compiled-module cache** (compile once, reuse across invocations) — today every `compile_and_run`
-  recompiles from scratch.
+  **compiled-module cache** (compile once, reuse across invocations). The compile-once *primitive* now
+  exists — `svm_jit::compile(m, func) → CompiledModule`, reused via `CompiledModule::run` (the
+  cross-engine svm-jit row uses it) — so amortizing compile across invocations is a caching policy on top,
+  not a missing capability; the one-shot `compile_and_run` remains for single-run callers.
 
 Caveat: a kernel with a large in-function *prelude* (e.g. `fnv`'s 4 KiB buffer fill) inflates the
 interpreters' `cold` (the prelude is fixed per-call work, not compile); the JIT runs that prelude in

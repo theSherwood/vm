@@ -1846,6 +1846,20 @@ IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stan
   vectors (SVE/RVV) are rejected** (runtime-variable width makes the one security-critical
   unit — the masked-access bounds proof — runtime-variable too; no Cranelift support;
   fragmented HW benefit).
+- **An opt-in *host-dependent* (non-deterministic) SIMD mode is an accepted future
+  direction.** The default stays **fixed-128, deterministic** (the replay / freeze-thaw /
+  byte-exact-oracle contract). But a guest/embedder that prioritizes raw throughput over
+  those guarantees may opt into legalizing to the **host-native vector width** (256/512),
+  accepting that results and snapshots become **host-dependent** (no cross-host replay, no
+  durable freeze-thaw across machines, excluded from the scalar-128 oracle differential) —
+  the same bargain a native binary already makes. This is a **product-sanctioned tradeoff**,
+  so the determinism objection is *not* the blocker for this mode. The actual blocker is the
+  same backend gap above: until **Cranelift grows an upstream wide-vector register class**,
+  the host-native arm has nothing to lower to (splitting to `v128` buys nothing). So the mode
+  is *designed-in but not buildable yet*; when Cranelift lands wide vectors it slots in as a
+  non-default flag (e.g. a `SimdWidth::HostNative` legalization policy in the on-ramp +
+  `svm-jit`), leaving the deterministic default untouched. Until then, width-hungry work uses
+  the host-provided vectorized capability *(a)* or the GPU broker *(b)* above.
 
 ### GPU = WebGPU via a sandboxed broker  [SETTLED]
 The VM does *not* execute GPU code, and the guest never touches the driver. GPU

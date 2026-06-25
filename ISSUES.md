@@ -265,13 +265,22 @@ hard to see in that harness: (a) `vsum`'s known-content array gets **closed-form
 per call, so a fast vectorized loop is swamped by compile jitter unless timed via `CompiledModule`
 (compile once, run many).
 
-**Fix sketch (deferred — needs a decision):**
-1. **Doc/bench:** drop `-fno-*-vectorize` from the on-ramp invocation in the bench (and LLVM.md §4) so
-   the SVM rows show the real 128-bit-SIMD number, not scalar; measure with a non-foldable kernel via
-   `CompiledModule` (compile-once).
-2. **Throughput (optional, contract change):** an *opt-in*, non-default "fast/non-deterministic" mode
-   that legalizes to the host vector width (256/512) — only for runs that don't need
-   freeze/thaw/oracle determinism. Default stays fixed-128.
+**Fix sketch:**
+1. **Doc/bench — LANDED.** The bench already vectorizes (`-fno-*-vectorize` gone) and `vsum`→`vadd` is
+   fold-resistant (runtime seed, no array). The remaining hazard — `svm_jit::compile_and_run` recompiling
+   per call, whose ~5–6 ms jitter swamped the ~0.1 ms vectorized signal even through the large/small
+   subtraction — is fixed: a new `svm_jit::compile(m, func) -> CompiledModule` (compile once, run many)
+   drives the JIT row in `examples/cross_engine.rs`. `vadd` now reports a clean ~0.18 ns/iter (≈0.5
+   cycle/element) — the honest 128-bit-SIMD number. (A wider `-mavx2 <8 x i32>` also legalizes + runs
+   correctly now via the two-chunk I2/I11 path, but the chunks stay 128-bit so it adds no throughput; the
+   bench keeps `-O2`/one-v128 to make the width comparison clean.)
+2. **Throughput — accepted as a future opt-in mode, gated on Cranelift.** A host-dependent
+   (non-deterministic) SIMD mode that legalizes to the host vector width (256/512) is now a
+   product-sanctioned direction (DESIGN.md §17): default stays fixed-128/deterministic, the mode is opt-in
+   for runs that don't need replay/freeze-thaw/oracle. The blocker is **not** determinism (explicitly
+   waived for that mode) but the backend — Cranelift's x64 has no YMM/ZMM register class, so there's
+   nothing to lower host-native ops to. Revisit when Cranelift grows upstream wide-vector support; until
+   then width-hungry work uses a host vectorized capability (§7/§13) or the GPU broker.
 
 ---
 
