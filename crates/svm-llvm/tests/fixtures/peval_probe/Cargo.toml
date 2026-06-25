@@ -1,0 +1,35 @@
+# The **in-sandbox `svm-peval` probe** (PEVAL.md Milestone 3 → the in-repo pipeline).
+#
+# A `no_std`/`panic=abort` powerbox program that depends on `svm-peval` (`default-features = false`,
+# the in-svm build — no `libm`) and `svm-ir`, builds a small module, calls `svm_peval::specialize`,
+# and prints a summary of the residual. The `peval_in_sandbox.rs` test in the parent crate compiles
+# this to LLVM-18 bitcode (`rustc +1.81`), links + `globaldce`s the `specialize` closure, translates
+# it to svm-IR, and runs it on the reference interpreter — the manual probe, folded into a test.
+#
+# Its own `[workspace]` keeps it out of the repo's root workspace (which excludes `crates/svm-llvm`);
+# it is built directly by the test, never as a workspace member.
+[package]
+name = "peval-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+# A `lib` (not a `bin`): `cargo build` emits the per-crate `.bc` with no final executable link (the
+# powerbox externs `malloc`/`free`/`write` are intentionally undefined — the on-ramp synthesizes
+# them), so the build exits cleanly. The `#[no_mangle] main` is kept by `globaldce`'s public-api list.
+crate-type = ["lib"]
+
+[dependencies]
+# The specializer, in its **in-svm** configuration: `default-features = false` drops `libm` (whose
+# `fma` brings untranslatable x86 inline-asm + i128), exactly as the in-sandbox build requires.
+svm-peval = { path = "../../../../svm-peval", default-features = false }
+svm-ir = { path = "../../../../svm-ir" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+overflow-checks = false
+
+# Empty workspace table: this fixture is its own root, not a member of the repo workspace.
+[workspace]
