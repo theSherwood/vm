@@ -954,3 +954,201 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify() {
         "the root's re-issued atomic.wait parked and was woken by the sibling's re-issued notify on thaw",
     );
 }
+
+// §12.8 concurrent-thaw stage 3 — **mutual deadlock fails closed (does not hang).** The root spawns two
+// children and joins both; child A waits forever on B's flag and child B waits forever on A's flag —
+// neither ever stores/notifies, so the three vCPUs (root in `thread.join`, A and B in `atomic.wait`) are
+// all blocked with nobody runnable to wake anyone. The stage-2 `live > 1` heuristic missed this (both
+// waiters stay *live*); stage 3's quiescence check (`live > parked`, counting wait + join parks) sees
+// `live == parked` and fails the waits closed with `ThreadFault` — which resolves the root's joins.
+// A fresh run suffices (the detection is general); the freeze/thaw path inherits it.
+const SRC_MUTUAL_BLOCK: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 0
+  v3 = thread.spawn 1 v2 v2
+  v4 = thread.spawn 2 v2 v2
+  v5 = thread.join v3
+  v6 = thread.join v4
+  v7 = i64.const 0
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65576
+  v3 = i32.const 0
+  v4 = i64.const -1
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.const 0
+  return v6
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65568
+  v3 = i32.const 0
+  v4 = i64.const -1
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.const 0
+  return v6
+}
+"#;
+
+/// A fresh (no freeze, no residue) concurrent durable multi-vCPU run — used to exercise the deadlock
+/// detection directly.
+fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
+    let mut host = Host::new();
+    host.clock_ns = 42;
+    let clk = host.grant_clock();
+    let _ = host.grant_host_fn(Box::new(|_op: u32, _a: &[i64], _m| Ok(vec![0])));
+    let (out, win, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
+        inst,
+        0,
+        &[clk as i64, 0],
+        &init_durable_window(WINDOW),
+        &[],
+        &[],
+        &[],
+        SHADOW_BASE + 8,
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut host as *mut Host as *mut c_void,
+    )
+    .expect("fresh concurrent mv run");
+    (out, win)
+}
+
+#[test]
+fn mutual_wait_block_fails_closed_not_hangs() {
+    let inst = instrument(SRC_MUTUAL_BLOCK);
+    let (out, _win) = run_mv_fresh(&inst);
+    assert!(
+        matches!(out, JitOutcome::Trapped(TrapKind::ThreadFault)),
+        "two vCPUs each waiting on the other's never-set flag is a mutual deadlock — must fail closed \
+         (ThreadFault) via quiescence detection, not hang; got {out:?}",
+    );
+}
+
+// §12.8 concurrent-thaw stage 3 — **mutual rendezvous resolves (the quiescence check must not
+// over-fire).** A 2-way barrier: child A stores+notifies `FlagA` then waits on `FlagB`; child B
+// stores+notifies `FlagB` then waits on `FlagA`. Each notifies *before* it waits, so the two can never
+// both be parked at once — at most one parks while the other runs to its notify (or the value is already
+// set ⇒ `NOT_EQUAL`, no park). `live > parked` therefore stays true and the run resolves: both children
+// reach the post-wait store (sentinel `7`) and the root's joins return. The live counterpart to the
+// mutual-*block* above — the same two-vCPU cross-wait, but with the notifies that make it resolve.
+const SRC_MUTUAL_RENDEZVOUS: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 0
+  v3 = thread.spawn 1 v2 v2
+  v4 = thread.spawn 2 v2 v2
+  v5 = thread.join v3
+  v6 = thread.join v4
+  v7 = i64.const 0
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65568
+  v3 = i32.const 1
+  i32.atomic.store v2 v3
+  v4 = i32.const 1
+  v5 = atomic.notify v2 v4
+  v6 = i64.const 65576
+  v7 = i32.const 0
+  v8 = i64.const -1
+  v9 = i32.atomic.wait v6 v7 v8
+  v10 = i64.const 65544
+  v11 = i64.const 7
+  i64.store v10 v11
+  return v11
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65576
+  v3 = i32.const 1
+  i32.atomic.store v2 v3
+  v4 = i32.const 1
+  v5 = atomic.notify v2 v4
+  v6 = i64.const 65568
+  v7 = i32.const 0
+  v8 = i64.const -1
+  v9 = i32.atomic.wait v6 v7 v8
+  v10 = i64.const 65552
+  v11 = i64.const 7
+  i64.store v10 v11
+  return v11
+}
+"#;
+
+#[test]
+fn mutual_rendezvous_resolves_without_false_deadlock() {
+    let inst = instrument(SRC_MUTUAL_RENDEZVOUS);
+    let (out, win) = run_mv_fresh(&inst);
+    assert!(
+        matches!(out, JitOutcome::Returned(_)),
+        "a cross-notifying 2-way barrier resolves — the quiescence check must not false-fire (both are \
+         never parked at once); got {out:?}",
+    );
+    assert_eq!(
+        le_i64(&win, OFF_C1),
+        7,
+        "child A passed its wait and stored its sentinel",
+    );
+    assert_eq!(
+        le_i64(&win, OFF_C2),
+        7,
+        "child B passed its wait and stored its sentinel",
+    );
+}
+
+#[test]
+fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
+    // §12.6 under the concurrent thaw: re-running the same freeze/thaw many times exercises different
+    // real OS-thread schedules — the freeze landing at different points, the children rewinding
+    // concurrently on thaw. Every run must reproduce the uninterrupted oracle (`K` for the root + both
+    // children), whether the freeze caught the children mid-loop (the thaw rewinds them) or after they
+    // finished (the residue carries their results). A schedule-dependent thaw bug would surface as a
+    // wrong total or a hang on some iteration.
+    let inst = instrument(SRC_LOOPS);
+    for i in 0..20 {
+        let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+            continue; // unsupported shape / host alloc pressure: skip this iteration
+        };
+        if read_state(&fsnap) != STATE_UNWINDING {
+            // Everything finished before the freeze landed: the snapshot already holds the oracle.
+            assert_eq!(le_i64(&fsnap, OFF_ROOT), K, "iter {i}: root (no-freeze)");
+            assert_eq!(le_i64(&fsnap, OFF_C1), K, "iter {i}: child 1 (no-freeze)");
+            assert_eq!(le_i64(&fsnap, OFF_C2), K, "iter {i}: child 2 (no-freeze)");
+            continue;
+        }
+        assert!(
+            matches!(fout, JitOutcome::Returned(_)),
+            "iter {i}: freeze placeholder"
+        );
+        let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+        assert!(
+            matches!(tout, JitOutcome::Returned(_)),
+            "iter {i}: thaw returns"
+        );
+        assert_eq!(
+            read_state(&tfinal),
+            STATE_NORMAL,
+            "iter {i}: back to NORMAL"
+        );
+        assert_eq!(
+            le_i64(&tfinal, OFF_ROOT),
+            K,
+            "iter {i}: root total reproduced"
+        );
+        assert_eq!(
+            le_i64(&tfinal, OFF_C1),
+            K,
+            "iter {i}: child 1 total reproduced"
+        );
+        assert_eq!(
+            le_i64(&tfinal, OFF_C2),
+            K,
+            "iter {i}: child 2 total reproduced"
+        );
+    }
+}

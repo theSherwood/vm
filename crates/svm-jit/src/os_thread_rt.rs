@@ -26,7 +26,7 @@
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime, SharedFiberTable};
 use crate::{mem, FnEntry, TrapKind};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 // loom swaps the synchronization primitives for its model-checked versions; `Arc` and `JoinHandle`
@@ -201,6 +201,12 @@ pub(crate) struct Domain {
     quiesce: Mutex<usize>,
     quiesce_cv: Condvar,
     concurrent_durable: AtomicBool,
+    /// §12.8 concurrent-thaw stage 3: count of vCPUs currently **blocked** (parked in `atomic.wait` or
+    /// `thread.join`). A `notify`/`join`-completer must be a *live, not-parked* vCPU, so an infinite wait
+    /// can never be satisfied once every live vCPU is parked (`live == parked`): `futex_wait`'s
+    /// `peers_live` (`live > parked`) then fails it closed (`ThreadFault`) instead of hanging — catching a
+    /// **mutual** wait/join deadlock (two vCPUs each blocked on the other), not just a lone waiter.
+    parked: AtomicUsize,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -262,6 +268,7 @@ impl Domain {
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
             concurrent_durable: AtomicBool::new(false),
+            parked: AtomicUsize::new(0),
         }
     }
 
@@ -1327,6 +1334,9 @@ pub(crate) unsafe extern "C" fn thread_join(
         0
     };
     let mut st = lock(&done.state);
+    // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
+    // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
+    let _pg = ParkGuard::new(&dom.parked);
     loop {
         if let Some((result, trap)) = *st {
             if trap != 0 {
@@ -1425,9 +1435,12 @@ pub(crate) unsafe extern "C" fn thread_wait(
         deadline,
         dom.env().epoch_addr,
         unwind_base,
-        // §12.8 concurrent-thaw stage 2: a notifier must be another *live* vCPU (`live` counts the root +
-        // unfinished spawns, including this waiter, so `> 1` ⇒ a peer exists).
-        || lock(&dom.threads).live > 1,
+        &dom.parked,
+        // §12.8 concurrent-thaw stage 3: a notifier must be a live vCPU that is **not** itself parked.
+        // `live` counts the root + unfinished spawns (incl. this waiter); `parked` counts those blocked in
+        // wait/join (incl. this waiter). `live > parked` ⇒ some live vCPU is still runnable and could
+        // notify; `live == parked` ⇒ every live vCPU is blocked (a lone or **mutual** deadlock).
+        || lock(&dom.threads).live > dom.parked.load(Ordering::Acquire),
     );
     // §12.8 concurrent-thaw stage 2: an infinite wait with no possible notifier left is a guest deadlock —
     // surface it as `ThreadFault` (matching the interpreter), never as a guest-visible wait status.
@@ -1451,6 +1464,23 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
     futex_notify(&dom.futex, &dom.futex_cv, phys, count as u32) as i32
 }
 
+/// §12.8 concurrent-thaw stage 3: RAII counter for [`Domain::parked`]. Increments while a vCPU is blocked
+/// (a `atomic.wait` park or a `thread.join` park) and decrements on **every** exit path (woken, freeze,
+/// kill, deadlock, child-done). The deadlock detector reads the count to distinguish "all live vCPUs are
+/// blocked" (quiescence ⇒ no notifier can run ⇒ deadlock) from "a notifier is still runnable".
+struct ParkGuard<'a>(&'a AtomicUsize);
+impl<'a> ParkGuard<'a> {
+    fn new(parked: &'a AtomicUsize) -> Self {
+        parked.fetch_add(1, Ordering::AcqRel);
+        ParkGuard(parked)
+    }
+}
+impl Drop for ParkGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Futex park core (shared by the thunk and the loom test). `still_eq` re-checks the guest value under
 /// the lock; returns a `WAIT_*` status. Spurious wakeups are spec-allowed, but the per-`key` generation
 /// makes a real `notify` distinguishable so the returned status is accurate.
@@ -1463,8 +1493,12 @@ fn futex_wait(
     deadline: Option<Instant>,
     epoch_addr: usize,
     unwind_base: u64,
-    // §12.8 concurrent-thaw stage 2: `true` while some *other* vCPU is live (could still `notify` this
-    // key). An infinite wait whose `peers_live()` is false can never be satisfied → [`WAIT_DEADLOCK`].
+    // §12.8 concurrent-thaw stage 3: count of vCPUs currently blocked (wait/join). This waiter joins it
+    // for its park (so `peers_live` sees it), via the `ParkGuard` below.
+    parked: &AtomicUsize,
+    // §12.8 concurrent-thaw stage 2/3: `true` while some live vCPU is **not** parked (could still run to
+    // a `notify`). An infinite wait whose `peers_live()` is false (every live vCPU is blocked) can never
+    // be satisfied → [`WAIT_DEADLOCK`].
     peers_live: impl Fn() -> bool,
 ) -> i32 {
     let mut g = lock(futex);
@@ -1476,6 +1510,9 @@ fn futex_wait(
         e.waiters += 1;
         e.generation
     };
+    // Count this vCPU as blocked for the duration of the park (dropped on every loop exit below), so a
+    // peer's `peers_live` — and the deadlock check below — see it.
+    let _pg = ParkGuard::new(parked);
     let status = loop {
         let cur = g.get(&key).map(|e| e.generation).unwrap_or(start_gen);
         if cur != start_gen {
@@ -1606,6 +1643,7 @@ mod loom_tests {
             // consumer: wait while the word is still 0. Must not hang: either it sees 1 (NOT_EQUAL) or
             // it parks and the notify wakes it (WOKEN). A finite deadline keeps the model bounded, but
             // the invariant is "doesn't time out".
+            let parked = AtomicUsize::new(0); // unread here: the model's `peers_live` is always true
             let status = futex_wait(
                 &futex,
                 &cv,
@@ -1614,6 +1652,7 @@ mod loom_tests {
                 None,
                 0,
                 0,
+                &parked,
                 || true, // loom models the producer↔consumer rendezvous; a peer is always live
             );
             producer.join().unwrap();

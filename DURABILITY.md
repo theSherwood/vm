@@ -1262,12 +1262,25 @@ per-context word set on all contexts at once — TBD in stage 1.
    shared `cur_task`, so a concurrent child's nested grandchild-join routes correctly. *Known gap:* a
    *mutual* block (two live vCPUs each waiting on the other) isn't caught by the `live`-count heuristic —
    the interp catches it via scheduler quiescence; a future cross-thread quiescence check would close it.
-3. **Determinism / equivalence (NEXT).** A concurrent thaw reintroduces real interleaving, so re-establish
-   §12.6: rewind reloads recorded side effects (deterministic, unaffected by order); only the forward-phase
-   re-issued waits/notifies interleave, and they re-synchronize to the same value handoff. The
-   producer↔consumer-both-frozen case landed with stage 2; still to add: a mutual-rendezvous test and
-   fuzzing the thaw interleaving like the existing concurrent-freeze tests (and ideally the mutual-block
-   deadlock-detection gap above).
+3. **Determinism / equivalence (LANDED).** A concurrent thaw reintroduces real interleaving; §12.6 holds:
+   rewind reloads recorded side effects (deterministic, unaffected by order), and only the forward-phase
+   re-issued waits/notifies interleave, re-synchronizing to the same value handoff. What landed:
+   - *Mutual-block deadlock detection.* The stage-2 `live > 1` heuristic only caught a *lone* waiter (it
+     missed a **mutual** block — two live vCPUs each blocked on the other). Replaced with a quiescence
+     check: `futex_wait`'s `peers_live` is now `live > parked`, where `Domain.parked` counts vCPUs blocked
+     in `atomic.wait` **or** `thread.join` (a `ParkGuard` RAII increments/decrements it at both park
+     sites). When every live vCPU is parked (`live == parked`) no notifier can run, so the wait fails
+     closed with `ThreadFault` (the interp's join-deadlock) instead of hanging — general (helps fresh runs
+     too). Tests: `mutual_wait_block_fails_closed_not_hangs` (cross-wait, no notify ⇒ `ThreadFault`) and
+     `mutual_rendezvous_resolves_without_false_deadlock` (cross-notify 2-way barrier ⇒ resolves; the two
+     are never parked at once, so the check must not over-fire).
+   - *Interleaving determinism stress.* `concurrent_freeze_thaw_is_deterministic_across_interleavings`
+     re-runs the multi-vCPU freeze/thaw 20× — each iteration a different real OS-thread schedule (freeze
+     landing at varied points, children rewinding concurrently) — asserting the uninterrupted oracle every
+     time. (Plus the stage-2 producer↔consumer-frozen-mid-rendezvous test.)
+   - *Remaining follow-up:* a **generated** concurrent-module fuzz (a random multi-vCPU module generator,
+     vs. today's hand-written shapes) for deeper coverage, and the pure join↔join circular-deadlock case
+     (unlikely on a spawn DAG; the `live == parked` check catches every *wait*-involved deadlock today).
 
 Original 4A map:
 
