@@ -3605,6 +3605,65 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
     );
 }
 
+/// Translate + verify a libc-using C++ program, then assert it **terminates** — the on-ramp traps
+/// (`std::terminate`) on an exception that no handler catches. Native `clang++` aborts with SIGABRT and
+/// a "terminate called…" stderr line, which is not byte-comparable to a guest trap, so this asserts the
+/// clean fault (a `Err` from the powerbox run) rather than diffing against native.
+fn check_cpp_eh_terminates(name: &str, src: &str) {
+    let Some(bc) = compile_cpp_to_bc_flags(name, src, &["-fno-rtti"]) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate C++ bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a libc-using C++ program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let r = svm_run::run_powerbox(&module, b"");
+    assert!(
+        r.is_err(),
+        "{name}: an uncaught exception must terminate (trap), got {r:?}"
+    );
+}
+
+/// **C++ exceptions — uncaught exception terminates** — the handler-stack-underflow guard. A `throw`
+/// with no enclosing `try` anywhere up the call chain must `std::terminate` (the on-ramp traps),
+/// *not* long-jump into a bogus checkpoint slot (`HSP-1` underflowing past the empty handler stack).
+/// Two shapes: a bare top-level `throw`, and a throw caught only by a *non-matching* clause (so the
+/// landingpad re-raises via `_Unwind_Resume` and the exception escapes `main`). Both must fault.
+#[test]
+fn cpp_eh_uncaught_terminates() {
+    let prelude = r#"
+extern "C" int write(int fd, const char *buf, long n);
+static void puti(int v) {
+  char b[16]; int i = 16; unsigned u = (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  write(1, b + i, 16 - i);
+}
+"#;
+    // (a) No handler at all: the throw propagates straight out of `main`.
+    let no_handler = format!("{prelude}\nint main() {{ puti(1); throw 5; return 0; }}\n");
+    check_cpp_eh_terminates("cpp_eh_uncaught_no_handler", &no_handler);
+
+    // (b) A handler exists but its clause does not match the thrown type, so the exception unwinds
+    //     through it (`_Unwind_Resume`) and escapes `main`.
+    let wrong_handler = format!(
+        "{prelude}
+__attribute__((noinline)) static void thrower() {{ throw 5; }}   // int
+int main() {{
+  puti(1);
+  try {{ thrower(); }}
+  catch (double d) {{ puti(999); }}   // double never matches the int → escapes
+  puti(2);
+  return 0;
+}}
+"
+    );
+    check_cpp_eh_terminates("cpp_eh_uncaught_wrong_handler", &wrong_handler);
+}
+
 /// **C++ exceptions first light** — `throw`/`try`/`catch` through the on-ramp, built on the
 /// setjmp/longjmp stack-transfer core. A `noinline` thrower raises an `int` (caught by `catch(int)`)
 /// or a `const char*` (caught by `catch(...)`); the caller `invoke`s it and routes via the

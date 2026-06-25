@@ -400,6 +400,8 @@ fn translate_impl(
     // `__cxa_end_catch` destroys the caught exception object via `__svm_eh_destroy` (gated on EH being
     // active, so the helper can address the EH region and the dtor funcref resolves through the table).
     let need_eh_destroy = need_eh && calls_external(m, &defined_names, "__cxa_end_catch");
+    // `__svm_eh_unwind` backs every throw/rethrow/resume — present whenever EH is active.
+    let need_eh_unwind = need_eh;
     // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
     // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
     // order below must match.
@@ -453,6 +455,7 @@ fn translate_impl(
         atomic_cas_narrow: take(need_narrow_atomic),
         memcmp: take(need_memcmp),
         eh_destroy: take(need_eh_destroy),
+        eh_unwind: take(need_eh_unwind),
         float_scratch: float_scratch_base,
         eh_base,
         eh_typeids,
@@ -661,6 +664,11 @@ fn translate_impl(
     // only its arguments and indirect-calls the passed destructor funcref.
     if need_eh_destroy {
         funcs.push(synth_eh_destroy());
+    }
+    // `__svm_eh_unwind` (after `__svm_eh_destroy` — matches the `take` order). Self-contained: it
+    // touches only the EH region addressed off the passed `base` and the handler checkpoints.
+    if need_eh_unwind {
+        funcs.push(synth_eh_unwind());
     }
     Ok(Translated {
         module: Module {
@@ -3155,6 +3163,10 @@ struct Helpers {
     /// `__cxa_end_catch` (indirect-call `dtor` on `exn` when non-null). Present only when the module
     /// catches a C++ exception (calls `__cxa_end_catch`).
     eh_destroy: Option<u32>,
+    /// `__svm_eh_unwind(base:i64)` — the throw/rethrow/resume tail: pop the innermost handler and
+    /// long-jump into its checkpoint, or trap (`std::terminate`) when the handler stack is empty (an
+    /// uncaught exception). Present whenever the module uses C++ EH.
+    eh_unwind: Option<u32>,
     /// `__svm_getenv(name:i64) -> i64` — scan the §3e env strings for `name=`, returning the value
     /// pointer (just past the `=`) or NULL. Reads the blob in the reserved low scratch directly.
     getenv: Option<u32>,
@@ -3449,6 +3461,102 @@ fn synth_eh_destroy() -> Func {
         params,
         results: vec![],
         blocks: vec![entry, call, done],
+    }
+}
+
+/// Synthesize `__svm_eh_unwind(base:i64)`: the throw/rethrow/resume tail. Pop the innermost active
+/// handler (`HSP-1`) and long-jump into its `invoke`-installed checkpoint — *unless* the handler
+/// stack is empty (`HSP == 0`: no enclosing `try` anywhere up the call chain, i.e. an uncaught
+/// exception), in which case trap (`std::terminate`). The empty-stack branch is why this is a helper:
+/// `__cxa_throw`/`__cxa_rethrow`/`_Unwind_Resume` lower in effect position and cannot branch inline,
+/// and a bare `HSP-1` would underflow to a bogus slot and long-jump into garbage.
+fn synth_eh_unwind() -> Func {
+    // block0(base=0): k = *(base+EH_HSP_O); if k == 0 -> terminate() else unwind(hsp_addr, k, base)
+    let entry = Block {
+        params: vec![ValType::I64],
+        insts: vec![
+            Inst::ConstI64(EH_HSP_O as i64), // v1
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 1,
+            }, // v2 = hsp_addr
+            Inst::Load {
+                op: LoadOp::I64,
+                addr: 2,
+                offset: 0,
+                align: 8,
+            }, // v3 = k (HSP)
+            Inst::ConstI64(0),               // v4
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 4,
+            }, // v5 = k == 0
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 1, // terminate()
+            then_args: vec![],
+            else_blk: 2, // unwind(hsp_addr, k, base)
+            else_args: vec![2, 3, 0],
+        },
+    };
+    // terminate(): an uncaught exception — trap (the on-ramp's `unreachable` is the clean fault).
+    let terminate = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Unreachable,
+    };
+    // unwind(hsp_addr=0, k=1, base=2): *(hsp_addr) = k-1; longjmp(base+EH_BUFS_O + (k-1)*EH_SLOT, 1).
+    let unwind = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(1), // v3
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 1,
+                b: 3,
+            }, // v4 = target = k - 1
+            Inst::Store {
+                op: StoreOp::I64,
+                addr: 0,
+                value: 4,
+                offset: 0,
+                align: 8,
+            }, // *(hsp_addr) = target
+            Inst::ConstI64(EH_BUFS_O as i64), // v5
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 2,
+                b: 5,
+            }, // v6 = bufs_base = base + EH_BUFS_O
+            Inst::ConstI64(EH_SLOT as i64), // v7
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Mul,
+                a: 4,
+                b: 7,
+            }, // v8 = off = target * EH_SLOT
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 6,
+                b: 8,
+            }, // v9 = buf = bufs_base + off
+            Inst::ConstI32(1), // v10
+            Inst::LongJmp { buf: 9, val: 10 },
+        ],
+        term: Terminator::Unreachable,
+    };
+    Func {
+        params: vec![ValType::I64],
+        results: vec![],
+        blocks: vec![entry, terminate, unwind],
     }
 }
 
@@ -11272,33 +11380,20 @@ impl<'a> BlockCtx<'a> {
     /// the landing pad. Emits `LongJmp` (a noreturn control op) as an effect; the caller supplies the
     /// trailing `unreachable`/dead terminator.
     fn eh_unwind(&mut self, base: u64) -> Result<(), Error> {
-        let hsp_addr = self.const_i64((base + EH_HSP_O) as i64);
-        let k = self.push(Inst::Load {
-            op: LoadOp::I64,
-            addr: hsp_addr,
-            offset: 0,
-            align: 8,
+        // Hand off to `__svm_eh_unwind(base)`: it pops the innermost handler and long-jumps into its
+        // checkpoint, or traps (`std::terminate`) when no handler remains (an uncaught exception). The
+        // empty-stack branch lives in the helper because this lowers in effect position — it cannot
+        // branch inline, and a bare `HSP-1` would underflow to a bogus slot. The caller still emits the
+        // trailing `unreachable` (the LLVM `unreachable` after the throw); the helper never returns.
+        let helper = self
+            .helpers
+            .eh_unwind
+            .ok_or_else(|| Error::Unsupported("EH unwinder helper not synthesized".into()))?;
+        let base_c = self.const_i64(base as i64);
+        self.push_effect(Inst::Call {
+            func: helper,
+            args: vec![base_c],
         });
-        let one = self.const_i64(1);
-        let target = self.push(Inst::IntBin {
-            ty: IntTy::I64,
-            op: BinOp::Sub,
-            a: k,
-            b: one,
-        });
-        self.push_effect(Inst::Store {
-            op: StoreOp::I64,
-            addr: hsp_addr,
-            value: target,
-            offset: 0,
-            align: 8,
-        });
-        let bufs = self.const_i64((base + EH_BUFS_O) as i64);
-        let slot = self.const_i64(EH_SLOT as i64);
-        let off = self.mul_i64(target, slot);
-        let buf = self.add_i64(bufs, off);
-        let val = self.push(Inst::ConstI32(1));
-        self.push_effect(Inst::LongJmp { buf, val });
         Ok(())
     }
 
