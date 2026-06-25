@@ -10181,7 +10181,10 @@ fn is_rust_abort_call(name: &str) -> bool {
     name.contains("panicking")
         || name.contains("unwrap_failed")
         || name.contains("expect_failed")
-        || name.contains("slice_index")
+        // The whole `core::slice::index` panic family — `slice_index_order_fail`,
+        // `slice_{start,end}_index_len_fail`, `slice_index_len_fail` — all `-> !`. Matching the
+        // narrower `slice_index` substring missed `slice_end_index_len_fail` (BTreeMap, slicing).
+        || (name.contains("slice") && name.contains("_fail"))
         || name.contains("panic_cannot_unwind")
         // `alloc`'s out-of-memory / capacity-overflow aborts (`alloc::raw_vec::handle_error`,
         // `alloc::alloc::handle_alloc_error`) — also `-> !` external lang items under `panic=abort`.

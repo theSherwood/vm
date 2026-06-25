@@ -3884,6 +3884,51 @@ fn main() {
     );
 }
 
+/// **`BTreeMap` through the on-ramp (`core::slice::index` panic shims).** A `no_std` program builds a
+/// `BTreeMap<u64,u64>` past one node's capacity (so it splits — exercising node slicing / element
+/// shifts), then sums `k + v` over an ordered iteration, byte-identical to the native `std` build.
+/// `BTreeMap`'s node code is littered with slice range accesses whose bounds-panic helpers
+/// (`slice_{start,end}_index_len_fail`) are external `-> !` lang items; the on-ramp shims the whole
+/// `slice…_fail` family to `trap` (`is_rust_abort_call`). Before that, this hit
+/// `Unsupported("call to external/undefined function …slice_end_index_len_fail…")`. This is the
+/// collection `svm-peval` uses for its memo tables.
+#[test]
+fn rust_btreemap_matches_native() {
+    let logic = "let mut mp: alloc::collections::BTreeMap<u64,u64> = alloc::collections::BTreeMap::new();\n\
+        for i in 0..40u64 { mp.insert(i.wrapping_mul(7) % 101, i.wrapping_mul(3)); }\n\
+        let mut s: u64 = 0; for (k, v) in &mp { s = s.wrapping_add(*k).wrapping_add(*v); }\n\
+        putdec(s); putdec(mp.len() as u64);\n\
+        putdec(*mp.get(&0).unwrap_or(&999));";
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\nextern crate alloc;\n\
+         use core::alloc::{{GlobalAlloc, Layout}};\n\
+         extern \"C\" {{ fn malloc(n: usize)->*mut u8; fn free(p:*mut u8); fn write(fd:i32,buf:*const u8,n:isize)->isize; }}\n\
+         struct G; unsafe impl GlobalAlloc for G {{ unsafe fn alloc(&self,l:Layout)->*mut u8{{malloc(l.size())}} unsafe fn dealloc(&self,p:*mut u8,_:Layout){{free(p)}} }}\n\
+         #[global_allocator] static A: G = G;\n\
+         #[panic_handler] fn ph(_:&core::panic::PanicInfo)->!{{loop{{}}}}\n\
+         fn putdec(x:u64){{let mut m=x;let mut b=[0u8;24];let mut i=24usize;if m==0{{i-=1;b[i]=b'0';}}while m>0{{i-=1;b[i]=b'0'+(m%10)as u8;m/=10;}}unsafe{{write(1,b.as_ptr().add(i),(24-i)as isize);write(1,b\"\\n\".as_ptr(),1);}}}}\n\
+         #[no_mangle] pub extern \"C\" fn main()->i32{{ {logic} 0 }}\n"
+    );
+    let native = format!(
+        "use std::collections::BTreeMap as _Unused; mod alloc {{ pub use std::collections; }}\n\
+         fn putdec(x:u64){{ println!(\"{{}}\", x); }}\n\
+         fn main(){{ {logic} }}\n"
+    );
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_btree", &onramp, b""),
+        rust_native_stdout("rs_btree", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "BTreeMap on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
 /// The statements both the on-ramp `no_std` program and the native `std` oracle run — each prints one
 /// value with `putdec`. Exercises the saturating-arithmetic intrinsics (`llvm.{u,s}{add,sub}.sat`, on
 /// i32/i64, both the clamped and the non-clamped path) and the saturating float→int casts
