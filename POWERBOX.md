@@ -193,10 +193,10 @@ weaken the §3c type-check's closed-enum audit surface for only a diagnostics ga
       surface: parse (text/binary), `synth_powerbox_start`, name-keyed imports (built-ins +
       C-callback host caps), `instantiate`/`instantiate_with_imports`, `run`(backend)/`run_diff`,
       `Limits`/`RunConfig` (fuel/deadline/quota/stdin/memory), and outcome + stdout/stderr readback.
-- [x] Host-capability callback ABI: a C `(ctx, op, args*, n_args, results*, results_cap) -> i32`
-      function pointer bridged to `HostFn` (return = result count, negative = trap). Compute-only this
-      slice (no guest-memory arg yet — memory-backed I/O goes through the built-in `Stream` caps);
-      a `GuestMem` shim for the callback is the documented follow-up.
+- [x] Host-capability callback ABI: a C `(ctx, op, args*, n_args, results*, results_cap, mem) -> i32`
+      function pointer bridged to `HostFn` (return = result count, negative = trap). The `mem` arg is
+      the calling guest's window as an opaque `SvmGuestMem*`, read/written through the bounds-checked
+      `svm_guest_read`/`svm_guest_write` accessors (F5, landed — was a compute-only follow-up).
 - [x] Memory/error model: opaque handles with explicit `*_free`; `instantiate*` consume their inputs;
       status codes + a thread-local `svm_last_error()`; every entry point `catch_unwind`s so a panic
       never crosses into C.
@@ -408,10 +408,17 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   `run_powerbox*` wrappers and `Instance::run`/`run_diff`), seeding all three backends run-once. The C
   ABI surface does not yet expose a setter for these (logged inline; a `svm_run_config_set_args` is the
   remaining bit).
-- **F5 — guest-memory access from C callbacks** (Phase 5 deferral): a bounds-checked `GuestMem` shim so
-  a C `HostFn` can read/write the window, not just compute on scalars.
-- **F6 — unify `Quota`** into one shared type (Phase 3 deferral): currently `svm_interp::Quota` and
-  `svm_jit::Quota` are structurally identical and converted at the facade.
+- **F5 — guest-memory access from C callbacks.** *Landed.* An `SvmHostFn` now receives the calling
+  guest's window as an opaque `SvmGuestMem*` (last param; `NULL` if the module declares none),
+  read/written through the **bounds-checked** `svm_guest_read` / `svm_guest_write` accessors — the raw
+  window pointer is never exposed, so a C callback gets the same §7 confinement (fail-closed
+  `SVM_ERR_FAILED` out of bounds / on a read-only/unmapped write) the built-in `Stream`/`Memory` caps
+  do. The shim wraps the live `GuestMem` borrow for the duration of one call only. Test:
+  `abi_tests::host_fn_reads_and_writes_guest_memory_via_c_abi` (`upcase` reads+uppercases+writes the
+  window, streamed back out, on all three backends); `svm.h` + `examples/hello.c` updated.
+- **F6 — unify `Quota`.** *Landed.* The §15 spawn quota is one type in `svm-ir`, re-exported as
+  `svm_interp::Quota` / `svm_jit::Quota`; the field-by-field facade conversion is gone (see the §F1
+  notes / `jit_run`). Values + clamping unchanged (both ceilings `1<<16`).
 - **F7 — runtime name→handle directory** (Phase 2 deferral): in-guest dlopen-style discovery, if a
   consumer needs it beyond compile-time name binding.
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
