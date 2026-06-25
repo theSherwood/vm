@@ -40,6 +40,8 @@ const OFF_C2: i64 = 65552;
 // aligned; 65560 stays the clock/host-fn stash). `atomic.wait` status `1` = the value did not equal
 // `expected` (no / end-of wait) — wasm's `WAIT_NOT_EQUAL`.
 const WAIT_NOT_EQUAL: i64 = 1;
+// `atomic.wait` status `0` = the waiter parked and a `notify` woke it — wasm's `WAIT_WOKEN`.
+const WAIT_WOKEN: i64 = 0;
 
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
@@ -801,13 +803,13 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
     );
 }
 
-// §12.8 parked-vCPU slice — **fail-closed thaw.** Same shape, but the child **never** changes
-// `FLAG_OFF`: it signals first (so the freeze lands while the root is parked), then just loops. The
-// value the root waits on is still `0` (== `expected`) in the snapshot, so the thaw's re-issued wait
-// would have to *park* again — which the single-worker thaw can't satisfy (no concurrent notifier). It
-// must therefore **fail closed** with `ThreadFault` (matching the interpreter, which surfaces a guest
-// wait/join-deadlock as `Trap::ThreadFault`) rather than hang. The full thaw of this case needs the
-// concurrent-thaw rework; until then, failing closed keeps the freeze safe and the run honest.
+// §12.8 parked-vCPU slice — **genuine-deadlock thaw fails closed.** Same shape, but the child **never**
+// notifies `FLAG`: it signals first (so the freeze lands while the root is parked), then just loops and
+// returns. On thaw (stage 2) the root re-issues its wait and **parks** (the value is still `0`), and the
+// child re-runs concurrently — but it never notifies, so once it finishes no live vCPU can ever wake the
+// root. `futex_wait`'s deadlock detection observes that its `peers_live()` went false and fails closed
+// with `ThreadFault` (matching the interpreter's join-deadlock) — instead of the old blanket thaw
+// fail-closed, and without hanging. (The sibling-notify counterpart resolves; see the next test.)
 const SRC_WAIT_DEADLOCK: &str = r#"
 func (i32, i32) -> (i64) {
 block0(v0: i32, v1: i32):
@@ -864,6 +866,91 @@ fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
     let (tout, _tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(
         matches!(tout, JitOutcome::Trapped(TrapKind::ThreadFault)),
-        "a re-issued wait that would re-park on the single-worker thaw fails closed (ThreadFault), got {tout:?}",
+        "a re-issued wait whose every notifier has exited fails closed (ThreadFault), got {tout:?}",
+    );
+}
+
+// §12.8 concurrent-thaw stage 2 — **producer↔consumer frozen mid-rendezvous, thaw resolves via a
+// sibling's re-issued notify.** The capability the old blanket thaw fail-closed rejected. Same setup as
+// the deadlock case (the freeze lands while the root is parked in `atomic.wait` on `FLAG=0`), but the
+// child (the producer) **does** complete the rendezvous: after the freeze handshake + a delay loop it
+// stores `FLAG=1` and `atomic.notify`s it. On thaw both vCPUs re-spawn and run concurrently: the root
+// re-issues its wait and **parks** (the value is still `0` in the snapshot), the child re-runs to its
+// re-issued `notify`, and that wakes the parked root — `WAIT_WOKEN`, no fail-closed, no hang. This is the
+// per-context thaw word (stage 1b) + concurrent driver (stage 2) paying off: the two rewinds run on
+// their own threads against their own words and re-synchronise on the real futex.
+const SRC_WAIT_NOTIFY: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v1
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v5 = i64.const 65568
+  v6 = i32.const 0
+  v7 = i64.const -1
+  v8 = i32.atomic.wait v5 v6 v7
+  v9 = i64.const 65536
+  i32.store v9 v8
+  v10 = i64.const 0
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 0
+  br block1(v6)
+block1(v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v9) block2(v9)
+block2(v12: i64):
+  v13 = i64.const 65568
+  v14 = i32.const 1
+  i32.atomic.store v13 v14
+  v15 = i32.const 1
+  v16 = atomic.notify v13 v15
+  v17 = i64.const 65544
+  i64.store v17 v12
+  return v12
+}
+"#;
+
+#[test]
+fn concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify() {
+    let inst = instrument(SRC_WAIT_NOTIFY);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The freeze didn't catch the root parked (rare): nothing to assert about the rendezvous.
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder while the root was blocked in the wait",
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(
+        matches!(tout, JitOutcome::Returned(_)),
+        "thaw resolves (the parked wait is woken by the sibling's re-issued notify), got {tout:?}",
+    );
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        K,
+        "the producer child completed its loop and notified on thaw",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        WAIT_WOKEN,
+        "the root's re-issued atomic.wait parked and was woken by the sibling's re-issued notify on thaw",
     );
 }

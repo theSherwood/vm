@@ -43,6 +43,15 @@ const WAIT_NOT_EQUAL: i32 = 1;
 // Only produced on the timed-wait path, which loom (no timeout model) compiles out.
 #[cfg_attr(loom, allow(dead_code))]
 const WAIT_TIMED_OUT: i32 = 2;
+/// §12.8 concurrent-thaw stage 2: an **internal** status — an infinite (no-timeout) wait whose every
+/// possible notifier has exited (`peers_live()` is false), so it can never be satisfied. The
+/// `atomic.wait` thunk intercepts it and traps `ThreadFault` (matching the interpreter, which surfaces a
+/// guest wait/join-deadlock as `Trap::ThreadFault`); it is **never** returned to the guest as a status.
+/// Lets the blanket thaw fail-closed go away: a re-issued wait now parks while a live sibling could
+/// notify (so a producer↔consumer pair frozen mid-rendezvous resolves) and fails closed only here, when
+/// no peer remains — without hanging. Real-build only (the loom model passes a always-live `peers_live`).
+#[cfg(not(loom))]
+const WAIT_DEADLOCK: i32 = 3;
 
 /// Max concurrently-live vCPUs per run (matches the interpreter's `MAX_VCPUS`): an anti-bomb ceiling
 /// so a thread-bomb traps (`ThreadFault`) instead of exhausting host memory.
@@ -192,14 +201,6 @@ pub(crate) struct Domain {
     quiesce: Mutex<usize>,
     quiesce_cv: Condvar,
     concurrent_durable: AtomicBool,
-    /// §12.8 parked-vCPU slice: set for the duration of a **thaw** run (the single worker re-executes
-    /// the frozen vCPUs under `REWINDING`). While set, an `atomic.wait` re-issue that would *park* can't
-    /// be satisfied — there is no concurrent notifier on the single worker — so it fails closed
-    /// (`ThreadFault`, the interp's join-deadlock) rather than hanging. A wait whose value already
-    /// changed (the wake landed as a store in the snapshot, or replayed by another re-run vCPU) still
-    /// resolves immediately with `WAIT_NOT_EQUAL` (no park), so the common case thaws. False on a fresh
-    /// run, where a parked wait is woken by a real concurrent `notify`.
-    thawing: AtomicBool,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -261,7 +262,6 @@ impl Domain {
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
             concurrent_durable: AtomicBool::new(false),
-            thawing: AtomicBool::new(false),
         }
     }
 
@@ -348,17 +348,6 @@ impl Domain {
     /// made that serialization unnecessary.
     pub(crate) fn engage_concurrent_durable(&self) {
         self.concurrent_durable.store(true, Ordering::Release);
-    }
-
-    /// Mark this run as a **thaw** (§12.8 parked-vCPU slice): the single worker re-executes the frozen
-    /// vCPUs under `REWINDING`, so an `atomic.wait` re-issue that would park fails closed instead of
-    /// hanging (no concurrent notifier). Set once at thaw setup, before the root re-enters.
-    pub(crate) fn engage_thawing(&self) {
-        self.thawing.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_thawing(&self) -> bool {
-        self.thawing.load(Ordering::Acquire)
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
@@ -1397,9 +1386,11 @@ unsafe fn read_phys(phys: u64, width: u32) -> u64 {
 ///
 /// §12.8 parked-vCPU slice: like `thread_join`, a waiter parked here when a freeze begins returns on
 /// observing `UNWINDING` (its instrumented caller then unwinds at the trailing re-issue safepoint). On a
-/// **thaw** the wait is re-issued: a wake that landed as a value change resolves it immediately
-/// (`WAIT_NOT_EQUAL`, no park); a re-issue that would still park can't be satisfied on the single worker
-/// (no concurrent notifier), so it fails closed via `trap_out` (`ThreadFault`, the interp's join-deadlock).
+/// **thaw** (stage 2) the wait is re-issued and runs concurrently with its re-spawned siblings: a wake
+/// that landed as a value change resolves immediately (`WAIT_NOT_EQUAL`, no park); a re-issue that parks
+/// is woken by a sibling's re-issued `notify` (the producer↔consumer rendezvous). A wait whose every
+/// possible notifier has exited fails closed via `trap_out` (`ThreadFault`) by the shared deadlock
+/// detection in [`futex_wait`] (no thaw-specific path; `WAIT_DEADLOCK` is intercepted below).
 ///
 /// # Safety
 /// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes; `trap_out` is the
@@ -1414,14 +1405,6 @@ pub(crate) unsafe extern "C" fn thread_wait(
 ) -> i32 {
     let dom = &*sched;
     let mask = width_mask(width);
-    // Thaw fail-closed: a re-issued wait that would *park* (value unchanged) has no concurrent notifier
-    // on the single-worker thaw, so it would deadlock. Fail closed with `ThreadFault` instead — matching
-    // the interpreter, which surfaces a guest wait/join-deadlock as `Trap::ThreadFault`. A wait whose
-    // value already changed falls through and resolves below as `WAIT_NOT_EQUAL` (no park).
-    if dom.is_thawing() && read_phys(phys, width) & mask == expected & mask {
-        store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
-        return 0;
-    }
     let deadline = if timeout < 0 {
         None
     } else {
@@ -1434,7 +1417,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
     } else {
         0
     };
-    futex_wait(
+    let status = futex_wait(
         &dom.futex,
         &dom.futex_cv,
         phys,
@@ -1442,7 +1425,18 @@ pub(crate) unsafe extern "C" fn thread_wait(
         deadline,
         dom.env().epoch_addr,
         unwind_base,
-    )
+        // §12.8 concurrent-thaw stage 2: a notifier must be another *live* vCPU (`live` counts the root +
+        // unfinished spawns, including this waiter, so `> 1` ⇒ a peer exists).
+        || lock(&dom.threads).live > 1,
+    );
+    // §12.8 concurrent-thaw stage 2: an infinite wait with no possible notifier left is a guest deadlock —
+    // surface it as `ThreadFault` (matching the interpreter), never as a guest-visible wait status.
+    #[cfg(not(loom))]
+    if status == WAIT_DEADLOCK {
+        store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+        return 0;
+    }
+    status
 }
 
 /// `atomic.notify` thunk: wake up to `count` vCPUs parked on confined `phys`; return the `i32` count
@@ -1460,6 +1454,7 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
 /// Futex park core (shared by the thunk and the loom test). `still_eq` re-checks the guest value under
 /// the lock; returns a `WAIT_*` status. Spurious wakeups are spec-allowed, but the per-`key` generation
 /// makes a real `notify` distinguishable so the returned status is accurate.
+#[allow(clippy::too_many_arguments)] // a futex park threads its full guest/kill/freeze/deadlock context
 fn futex_wait(
     futex: &Mutex<HashMap<u64, FutexEntry>>,
     cv: &Condvar,
@@ -1468,6 +1463,9 @@ fn futex_wait(
     deadline: Option<Instant>,
     epoch_addr: usize,
     unwind_base: u64,
+    // §12.8 concurrent-thaw stage 2: `true` while some *other* vCPU is live (could still `notify` this
+    // key). An infinite wait whose `peers_live()` is false can never be satisfied → [`WAIT_DEADLOCK`].
+    peers_live: impl Fn() -> bool,
 ) -> i32 {
     let mut g = lock(futex);
     if !still_eq() {
@@ -1503,6 +1501,14 @@ fn futex_wait(
                 // freeze even when no `notify` arrives.
                 #[cfg(not(loom))]
                 if epoch_addr != 0 || unwind_base != 0 {
+                    // §12.8 concurrent-thaw stage 2: deadlock detection. If no other vCPU is live, no
+                    // `notify` can ever arrive (a parked waiter can't notify itself, and a wasm wait
+                    // returns only on notify/timeout — not on a plain value change), so this infinite wait
+                    // can never be satisfied. Fail closed rather than re-check forever. Detected within
+                    // `KILL_RECHECK` of the last peer exiting (run_child drops `live` as each finishes).
+                    if !peers_live() {
+                        break WAIT_DEADLOCK;
+                    }
                     g = cv
                         .wait_timeout(g, KILL_RECHECK)
                         .unwrap_or_else(|e| e.into_inner())
@@ -1608,6 +1614,7 @@ mod loom_tests {
                 None,
                 0,
                 0,
+                || true, // loom models the producer↔consumer rendezvous; a peer is always live
             );
             producer.join().unwrap();
             assert!(status == WAIT_WOKEN || status == WAIT_NOT_EQUAL);
