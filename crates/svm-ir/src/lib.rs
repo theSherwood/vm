@@ -1725,6 +1725,18 @@ pub enum Inst {
         name_ptr: ValIdx,
         name_len: ValIdx,
     },
+    /// §7 capability **reflection** (`cap.self.label`): write the human-readable **label** of the
+    /// capability `handle` into the window at `buf_ptr` (up to `buf_cap` bytes), returning the label's
+    /// full byte length — `0` if the handle has no label. The reverse of [`Inst::CapSelfResolve`]: a
+    /// guest enumerating its handles (`cap.self.count`/`get`) can name each one for diagnostics /
+    /// discovery. Cosmetic and authority-neutral (a label is not a nominal type_id; the verifier
+    /// ignores it). If the label doesn't fit (`buf_cap < len`) nothing is written — the guest retries
+    /// with a buffer of the returned size. An out-of-window buffer is `-EFAULT`.
+    CapSelfLabel {
+        handle: ValIdx,
+        buf_ptr: ValIdx,
+        buf_cap: ValIdx,
+    },
     /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
     /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
     /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
@@ -2155,10 +2167,10 @@ impl Inst {
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
-            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`cap.self.resolve` append
+            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`resolve`/`label` append
             // one `i32`.
             Inst::CapSelfGet { .. } => 2,
-            Inst::CapSelfCount | Inst::CapSelfResolve { .. } => 1,
+            Inst::CapSelfCount | Inst::CapSelfResolve { .. } | Inst::CapSelfLabel { .. } => 1,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),

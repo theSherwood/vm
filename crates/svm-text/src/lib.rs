@@ -398,6 +398,11 @@ fn print_inst(inst: &Inst) -> String {
         Inst::CapSelfResolve { name_ptr, name_len } => {
             format!("cap.self.resolve v{name_ptr} v{name_len}")
         }
+        Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } => format!("cap.self.label v{handle} v{buf_ptr} v{buf_cap}"),
         Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
         Inst::DurableShadowBase => "durable.shadow_base".to_string(),
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
@@ -1740,6 +1745,16 @@ impl<'a> Parser<'a> {
             let name_ptr = self.value(names)?;
             let name_len = self.value(names)?;
             return Ok(Inst::CapSelfResolve { name_ptr, name_len });
+        }
+        if op == "cap.self.label" {
+            let handle = self.value(names)?;
+            let buf_ptr = self.value(names)?;
+            let buf_cap = self.value(names)?;
+            return Ok(Inst::CapSelfLabel {
+                handle,
+                buf_ptr,
+                buf_cap,
+            });
         }
         // §12 per-vCPU TLS register.
         if op == "vcpu.tls.get" {

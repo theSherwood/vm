@@ -261,6 +261,14 @@ enum Op {
         name_len: u32,
         dst: u32,
     },
+    /// §7 reflection `cap.self.label` — write the handle's label into the window `(handle, buf_ptr,
+    /// buf_cap)`, returning its length (one `i32`). Routed through `cap_dispatch_slots` (op 3).
+    CapSelfLabel {
+        handle: u32,
+        buf_ptr: u32,
+        buf_cap: u32,
+        dst: u32,
+    },
     /// §12 fiber create (`cont.new`): register a pending fiber `(funcref, sp)` in the driver's
     /// registry and write its handle to `dst`. No switch — handled by the driver.
     ContNew {
@@ -1086,6 +1094,16 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         Inst::CapSelfResolve { name_ptr, name_len } => Op::CapSelfResolve {
             name_ptr: g(*name_ptr),
             name_len: g(*name_len),
+            dst,
+        },
+        Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } => Op::CapSelfLabel {
+            handle: g(*handle),
+            buf_ptr: g(*buf_ptr),
+            buf_cap: g(*buf_cap),
             dst,
         },
         // §12 fibers — cooperative continuation switching, driven by the bytecode driver (no M:N
@@ -4311,6 +4329,28 @@ impl Vm {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let res =
                         host.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
+                    r!(*dst) = Reg::from_i32(res[0] as i32);
+                    pc += 1;
+                }
+                Op::CapSelfLabel {
+                    handle,
+                    buf_ptr,
+                    buf_cap,
+                    dst,
+                } => {
+                    // §7 reflection op 3 — write the handle's label into the window. Through the
+                    // generic dispatch (which has the window), identical to the tree-walker / JIT.
+                    let h = r!(*handle).i32() as i64;
+                    let ptr = r!(*buf_ptr).i64();
+                    let cap = r!(*buf_cap).i64();
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let res = host.cap_dispatch_slots(
+                        svm_ir::CAP_SELF_TYPE_ID,
+                        3,
+                        0,
+                        &[h, ptr, cap],
+                        gm,
+                    )?;
                     r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }

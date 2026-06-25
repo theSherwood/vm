@@ -1899,6 +1899,15 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
             *b = f(*b);
             *c = f(*c);
         }
+        Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } => {
+            *handle = f(*handle);
+            *buf_ptr = f(*buf_ptr);
+            *buf_cap = f(*buf_cap);
+        }
         Inst::AtomicCmpxchg {
             addr,
             expected,

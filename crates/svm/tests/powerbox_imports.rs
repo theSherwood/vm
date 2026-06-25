@@ -226,3 +226,85 @@ fn canonical_powerbox_names_resolve_to_stash_handles() {
         "resolve(\"exit\") returns the same handle _start stashed at slot 2"
     );
 }
+
+// --- F9: capability labels (the guest's `cap.self.label`, reverse of resolve) ----------------------
+//
+// `cap.self.label <handle> <buf_ptr> <buf_cap> -> i32` writes the handle's human-readable label into
+// the window and returns its full length (0 if unlabeled). A guest enumerating its handles
+// (`cap.self.count`/`get`) can name each one — for diagnostics / discovery. Cosmetic and
+// authority-neutral; routes through the generic seam (op 3 over `CAP_SELF_TYPE_ID`), so all three
+// backends agree.
+
+/// The guest reads the label of its `write` handle (`"write"`, its import name) into a scratch buffer
+/// and streams it back out — proving `cap.self.label` returns the registered name and the byte-write
+/// lands, on the tree-walker, bytecode engine, and JIT.
+const LABEL_SRC: &str = "\
+memory 15
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.const 2048
+  v4 = i64.const 64
+  v5 = cap.self.label v2 v3 v4
+  v6 = i64.extend_i32_s v5
+  v7 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v6)
+  v8 = i32.const 0
+  return v8
+}
+";
+
+#[test]
+fn label_a_handle_to_its_registered_name() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let module = svm_text::parse_module(LABEL_SRC).expect("parse");
+        let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+        let imports = Imports::new().provide("write", HostCap::stdout());
+        let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+        let run = instance
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
+        assert_eq!(
+            run.stdout, b"write",
+            "cap.self.label wrote the handle's registered name on {backend:?}"
+        );
+    }
+}
+
+/// When the label doesn't fit, `cap.self.label` writes nothing and returns the **full** length, so the
+/// guest can retry with a buffer that size. Here `buf_cap = 2 < len(\"write\") = 5`, so the entry
+/// returns 5 (and stdout stays empty — nothing was written).
+const LABEL_SMALL_SRC: &str = "\
+memory 15
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.const 2048
+  v4 = i64.const 2
+  v5 = cap.self.label v2 v3 v4
+  v6 = i64.const 0
+  v7 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v6)
+  return v5
+}
+";
+
+#[test]
+fn label_too_small_buffer_returns_full_length() {
+    let module = svm_text::parse_module(LABEL_SMALL_SRC).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+    let imports = Imports::new().provide("write", HostCap::stdout());
+    let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+    let run = instance.call("_start", &[]).expect("run");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(5)]),
+        "an undersized buffer yields the full label length (\"write\" = 5), writing nothing"
+    );
+    assert!(
+        run.stdout.is_empty(),
+        "nothing is written when it doesn't fit"
+    );
+}

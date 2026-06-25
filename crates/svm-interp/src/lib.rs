@@ -6083,6 +6083,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     drop(hg);
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                 }
+                // §7 reflection (`cap.self.label`): write the handle's label into the window (op 3),
+                // the reverse of resolve. Routed through the generic dispatch (which has the window).
+                Inst::CapSelfLabel {
+                    handle,
+                    buf_ptr,
+                    buf_cap,
+                } => {
+                    let h = get_i32(&frames[top].vals, *handle)? as i64;
+                    let ptr = get_i64(&frames[top].vals, *buf_ptr)?;
+                    let cap = get_i64(&frames[top].vals, *buf_cap)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r =
+                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 3, 0, &[h, ptr, cap], gm)?;
+                    drop(hg);
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
                 // §12 per-vCPU TLS register: read/write **this** vCPU's word (`tls`, destructured from
                 // `v` above), so a fiber that migrated here sees the current vCPU's value.
                 Inst::VcpuTlsGet => {
@@ -6846,9 +6863,10 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::CallImport { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
-        Inst::CapSelfCount | Inst::CapSelfGet { .. } | Inst::CapSelfResolve { .. } => {
-            return Err(Trap::Malformed)
-        }
+        Inst::CapSelfCount
+        | Inst::CapSelfGet { .. }
+        | Inst::CapSelfResolve { .. }
+        | Inst::CapSelfLabel { .. } => return Err(Trap::Malformed),
         // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
         // loop (`run_inner`), never here.
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
@@ -9094,6 +9112,17 @@ impl Host {
             .map(|(_, h)| *h)
     }
 
+    /// The human-readable **label** registered for `handle` (the reverse of [`Host::resolve_cap_name`]),
+    /// or `None` if the handle carries no label — the cosmetic name an embedder can use in diagnostics,
+    /// and the backing for the guest's `cap.self.label` reflection (Followup F9). Authority-neutral: a
+    /// label is not a nominal type_id and the verifier ignores it. First registration of a handle wins.
+    pub fn cap_label(&self, handle: i32) -> Option<&str> {
+        self.cap_names
+            .iter()
+            .find(|(_, h)| *h == handle)
+            .map(|(n, _)| n.as_str())
+    }
+
     /// §4/§7 the JIT cap-path window page map (see [`Host::cap_pages`]) for window `base`, persistent
     /// across this run's `cap.call`s so a guest-grown heap page stays borrowable. Returns a fresh empty
     /// map when the base changes (a new window / run reusing this `Host`), else the existing one.
@@ -9935,6 +9964,28 @@ impl Host {
                 return Ok(vec![self
                     .resolve_cap_name(name)
                     .map_or(EINVAL, |h| h as i64)]);
+            }
+            // op 3 = `label(handle, buf_ptr, buf_cap) -> len | 0 | -EFAULT` (F9): write the handle's
+            // human-readable label into the window (the reverse of op 2). Returns the label's full
+            // length (`0` if unlabeled); writes nothing if it doesn't fit (`buf_cap < len`) so the
+            // guest can retry with a buffer of the returned size. Authority-neutral reflection.
+            if op == 3 {
+                let h = *args.first().unwrap_or(&0) as i32;
+                let ptr = *args.get(1).unwrap_or(&0) as u64;
+                let cap = *args.get(2).unwrap_or(&0) as u64;
+                let Some(label) = self.cap_label(h).map(|s| s.to_string()) else {
+                    return Ok(vec![0]); // no label for this handle
+                };
+                let len = label.len() as u64;
+                if len <= cap {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    if mem.write_bytes(ptr, label.as_bytes()).is_none() {
+                        return Ok(vec![EFAULT]);
+                    }
+                }
+                return Ok(vec![len as i64]);
             }
             return self.self_dispatch(op, args);
         }

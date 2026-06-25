@@ -436,8 +436,19 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   round-trip).
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
-- **F9 — cosmetic interface labels** (Phase 4 deferral): an untrusted, verifier-ignored human-readable
-  label alongside a `HostFn` grant for diagnostics / `cap.self.*`. Not a nominal type_id.
+- **F9 — cosmetic capability labels.** *Landed.* The reverse of F7: a human-readable **label** for a
+  granted capability, surfaced for diagnostics and `cap.self` discovery. It reuses F7's `cap_names`
+  directory (a label *is* the registered name), exposed two ways: (1) host-side `Host::cap_label(handle)
+  -> Option<&str>` for embedder diagnostics; (2) guest-side first-class instruction **`cap.self.label
+  <handle> <buf_ptr> <buf_cap> -> i32`** (opcode `0x7F`; full text/binary/verify support) that writes
+  the handle's label into the window and returns its full length (`0` if unlabeled; writes nothing and
+  returns the needed length if it doesn't fit; `-EFAULT` on an out-of-window buffer). Lowered to op 3
+  over the reserved `CAP_SELF_TYPE_ID` in the generic `cap_dispatch_slots` seam, so **all three
+  backends** share one implementation. Cosmetic and authority-neutral — a label is *not* a nominal
+  type_id and the verifier ignores it. So a guest can `cap.self.count`/`get` to enumerate its handles
+  and `cap.self.label` to name each. Tests: `powerbox_imports.rs` (label→name emit on all three
+  backends; undersized-buffer returns full length, writes nothing) and `cap_self.rs` (text + binary
+  round-trip; `Host::cap_label` round-trip + misses).
 - **F10 — pin bytecode parity *in the powerbox layer*.** The bytecode engine is held to exact
   bug-for-bug parity with the tree-walker by the standalone `bytecode_diff.rs` gate, but the powerbox
   differential (`run_diff`) only diffs tree-walk vs JIT, and `Backend::Bytecode` (via

@@ -154,6 +154,7 @@ fn binary_round_trip() {
                \x20 v5 = i64.const 0\n\
                \x20 v6 = i64.const 4\n\
                \x20 v7 = cap.self.resolve v5 v6\n\
+               \x20 v8 = cap.self.label v3 v5 v6\n\
                \x20 return v1\n\
                }\n";
     let m = parse_module(src).expect("parse");
@@ -168,6 +169,26 @@ fn binary_round_trip() {
     assert_eq!(
         back, m,
         "cap.self.* must round-trip through the binary form"
+    );
+}
+
+/// `Host::cap_label` (F9) is the host-side reverse of the name directory: a registered handle resolves
+/// to its label, an unregistered/forged one to `None` — the accessor an embedder uses in diagnostics.
+#[test]
+fn host_cap_label_round_trips_and_misses() {
+    let mut h = Host::new();
+    let handle = h.grant_stream(StreamRole::Out);
+    assert_eq!(h.cap_label(handle), None, "a grant is unlabeled by default");
+    h.register_cap_name("stdout", handle);
+    assert_eq!(
+        h.cap_label(handle),
+        Some("stdout"),
+        "labeled after register"
+    );
+    assert_eq!(
+        h.cap_label(handle + 999),
+        None,
+        "a handle with no registered label resolves to None"
     );
 }
 
