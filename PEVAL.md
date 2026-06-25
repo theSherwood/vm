@@ -221,6 +221,50 @@ core/alloc *panic* runtime symbols was retired — they're shimmed to `trap` (`i
 the allocator shims resolved through the synthesized `malloc`/`free`. **Next: Milestone 3** — actually
 *run* the translated residual in-sandbox via the §22 `Jit` capability.
 
+### Milestone 3 — in progress: the specializer **runs** in-sandbox, one corruption bug open. 🔜
+
+The run pipeline works end to end: **build → translate → verify → execute**. A powerbox `main` that
+builds a trivial module (`() -> i32` returning `42`), calls `svm_peval::specialize(&m, 0, &[])`, and
+returns `residual.funcs.len()` translates, verifies, and **runs** on the reference interpreter (~8 s of
+real work — heap allocation + the actual specialization logic). So the in-sandbox specializer is real.
+
+**It does not yet produce the right answer — one memory-corruption bug remains.** Symptom history:
+- Originally returned `ArityMismatch`: inside `specialize_with_config`, `args.len() != f.params.len()`
+  was *true*, although reading both lengths **in `main`** gives `0`/`0` (correct). So a length is read
+  wrong *inside* the callee.
+- After the `core::slice::index` panic-shim fix (`slice…_fail` → `trap`, committed), the specializer
+  advances **past** the arity check and instead **traps with `MemoryFault`**. The backtrace points at
+  `alloc/src/alloc.rs:385` = `__rust_alloc_error_handler` — i.e. **an allocation returned NULL**: a
+  `malloc` of a corrupted/oversized length failed → `handle_alloc_error` → trap. Almost certainly the
+  *same* upstream corruption (a garbage length now flowing into a `Vec`/alloc capacity), not genuine
+  heap exhaustion (the heap grows fine — see below).
+
+**Ruled out** (each isolated as a standalone `no_std` Rust program, on-ramp output == native via the
+`rust_powerbox_stdout`/`rust_native_stdout` differential helpers): slice-argument ABI; `sret`
+large-struct returns; nested-`Vec`-`len()` read from a heap struct; the *exact* 3-hop signature shape
+`(&_, u32, &[_], &_) -> Big` forwarded `main → specialize → specialize_with_config`; `Result<Big, Enum>`
+`Ok`/`Err` discriminant across `sret`; heavy `Vec` allocation (50 000 pushes + reallocs + heap growth);
+and **`BTreeMap` in isolation** (insert past a node split + ordered iteration — now passes,
+`rust_btreemap_matches_native`). So the bug is a subtler interaction specific to the **real**
+`Module`/`SpecArg`/`SpecConfig` types, not the generic ABI/collection patterns.
+
+**How to reproduce / debug next session.**
+- *Full probe* (the failing case): a scratch cargo crate depending on `svm-peval` (`default-features =
+  false`) + `svm-ir`, whose `main` builds the trivial module and calls `specialize`. Build to bitcode
+  with `RUSTFLAGS=--emit=llvm-bc cargo +1.81.0 build --release --ignore-rust-version`, then
+  `llvm-link-18 target/release/deps/*.bc`, then `opt-18 -passes=internalize,globaldce
+  -internalize-public-api-list=main,malloc,free`, then `svm-llvm-translate` →
+  `svm_run::resolve_capability_imports` → `verify_module` → `run_powerbox`. (Scratch dir is ephemeral;
+  reconstruct it.)
+- *Fast isolations* (single crate, no `llvm-link`): `compile_rust_to_bc` → `translate_bc_path` →
+  `resolve_capability_imports` → `run_powerbox`, exactly as the `rust_*` tests in
+  `crates/svm-llvm/tests/translate.rs` do.
+- *Next concrete step:* temporarily instrument `specialize_with_config` (e.g. encode the observed
+  `args.len()`/`f.params.len()` into the return code, or bisect by disabling work after the arity
+  check) to catch the **first** corrupted read, then minimize it to a standalone differential. Suspect
+  a specific struct-field or `Vec`-capacity read on the real types that the generic isolations didn't
+  hit (e.g. an enum with a niche, a `#[repr]` quirk, or a multi-field `Vec<BigStruct>` stride).
+
 **Why not `std`.** `std` is Rust's OS-abstraction layer (`core` + `alloc` + a `std::sys::<target>`
 platform backend for files/threads/time/net/startup). svm has none of those as ambient services (it
 has capabilities), and rustc has no `std::sys::svm` backend, so a `std` build drags in unresolved
@@ -245,10 +289,12 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
      arithmetic, fp-sat casts, vector ctpop, i128 struct-eq, `memcmp`/`bcmp` helper, fcmp uno/ord),
      each tested in `svm-llvm`. The reachable `specialize` closure (102 funcs) now **translates and
      verifies**. See "Milestone 2 translate half — DONE" above.
-3. **Milestone 3 (next): end-to-end in-sandbox demo** — a guest specializes a toy interpreter against a
-   script and runs the residual via the §22 `Jit` cap (alongside `crates/svm-run/demos/jit/`). Now
-   unblocked. First step: fold the manual translate probe into an in-repo pipeline + actually execute a
-   translated `specialize`.
+3. **Milestone 3: in progress** — the specializer **runs** in-sandbox (translate → verify → execute),
+   but one **memory-corruption bug** remains: an oversized/garbage allocation length makes `malloc`
+   fail → `handle_alloc_error` → `MemoryFault` (was an `ArityMismatch` before the slice-panic fix). See
+   "Milestone 3 — in progress" above for the symptom history, what's ruled out, and how to repro/debug.
+   After that: fold the manual probe into an in-repo pipeline, then the end-to-end §22 `Jit` demo (a
+   guest specializes a toy interpreter and runs the residual; alongside `crates/svm-run/demos/jit/`).
 
 ## Benchmarking
 
