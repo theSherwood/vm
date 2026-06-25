@@ -2790,10 +2790,8 @@ fn jit_run(
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
 ) -> Result<(JitOutcome, Vec<u8>), String> {
-    let quota = svm_jit::Quota {
-        max_fibers: limits.max_fibers,
-        max_vcpus: limits.max_vcpus,
-    };
+    // One shared `Quota` type now (F6) — no interp→JIT facade conversion; reuse `Limits`' quota directly.
+    let quota = limits.quota();
     let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
     // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
     // `with_deadline`); `init_mem` (when `Some`) outlives the call; the thunk/ctx contracts hold.

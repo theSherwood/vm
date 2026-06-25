@@ -3167,39 +3167,11 @@ const MAX_VCPUS: usize = 1 << 16;
 /// multiple submits. Mirrors the [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings.
 const MAX_RING_BATCH: u64 = 1 << 16;
 
-/// §15 **spawn quota** — host-configurable ceilings on how many fibers / concurrently-live vCPUs a run
-/// may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings. The embedder sets it
-/// on the [`Host`] ([`Host::set_quota`]); a guest that exceeds it traps cleanly ([`Trap::FiberFault`] /
-/// [`Trap::ThreadFault`]) — DoS *containment* policy (§15/D48), not just the host-OOM backstop. The
-/// default is the hard ceilings, so an unconfigured run behaves exactly as before.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quota {
-    /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
-    /// capped at [`MAX_FIBERS`]. Per-run, not per-vCPU, since the fiber table is the run-shared
-    /// registry (D57 3b-i / DESIGN.md §23 (per-run quota)) — for a single-vCPU run the admitted creations are
-    /// unchanged (and match the JIT's per-vCPU count exactly).
-    pub max_fibers: usize,
-    /// Max concurrently-live vCPUs across the run (`thread.spawn`); capped at [`MAX_VCPUS`].
-    pub max_vcpus: usize,
-}
-impl Default for Quota {
-    fn default() -> Self {
-        Quota {
-            max_fibers: MAX_FIBERS,
-            max_vcpus: MAX_VCPUS,
-        }
-    }
-}
-impl Quota {
-    /// Clamp each limit to its hard anti-bomb ceiling (a quota can only *tighten*, never raise the
-    /// ceiling), and ensure at least 1 (the root vCPU always exists).
-    fn clamped(self) -> Quota {
-        Quota {
-            max_fibers: self.max_fibers.clamp(1, MAX_FIBERS),
-            max_vcpus: self.max_vcpus.clamp(1, MAX_VCPUS),
-        }
-    }
-}
+// §15 **spawn quota** — the single shared type lives in `svm-ir` (re-exported here and as
+// `svm_jit::Quota`), so a powerbox embedder sets it once and it binds all three backends identically,
+// with no facade conversion (Followup F6). The local `MAX_FIBERS`/`MAX_VCPUS` consts above mirror its
+// hard ceilings (also used here for fiber/vCPU table sizing); `Quota::clamped` enforces them.
+pub use svm_ir::Quota;
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
