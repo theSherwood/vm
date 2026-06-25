@@ -3102,8 +3102,16 @@ impl Instance {
     /// name-bound registry (from [`instantiate_with_imports`]) if present, else the fixed §3e powerbox
     /// ([`instantiate`]) — and `args` must be empty. This is the easy default: [`Instance::run_diff`]
     /// with [`RunConfig::default`] (interpreter == JIT enforced). Any other export runs as a **bare
-    /// kernel** with `args` and no host capabilities (the escape hatch for pure functions). For a
-    /// single backend or non-default limits, use [`Instance::run`] / [`Instance::run_diff`].
+    /// kernel** with `args` and **no host capabilities** (the escape hatch for pure functions).
+    ///
+    /// Why a non-`_start` export gets no capabilities (decision F3): without `_start` having run, the
+    /// powerbox **handle stash** (window offset 0) is empty, so a granted handle would be unreachable
+    /// by the export anyway — granting caps to a one-shot kernel call would be a footgun, not a feature.
+    /// A cap-using export is meant to be reached through a [`Session`] ([`Instance::start`]): the
+    /// reactor runs `_start` once to stash the handles, then calls exports against the live window. So
+    /// the rule is: **pure function → `Instance::call`; cap-using export → `Session::call_export`.**
+    ///
+    /// For a single backend or non-default limits, use [`Instance::run`] / [`Instance::run_diff`].
     pub fn call(&self, export: &str, args: &[Value]) -> Result<Run, String> {
         let fidx = self
             .module

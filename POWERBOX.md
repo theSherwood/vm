@@ -248,10 +248,15 @@ only the funcidx crosses back, never a host pointer.
 The CLI is unchanged — same `run_powerbox*` signatures, JIT-only, no re-verify/re-resolve of already-
 validated frontend output.
 
-**Test gaps:** we test the export *table* (`resolve_export`) and calling `_start` by name, but **not**
-calling a named non-`_start` export with args and checking results (host *or* nested). And
-`Instance::call("<name>", args)` for a non-`_start` export currently runs as a **bare kernel with no
-capabilities** — so a named export that uses caps can't be called at all today.
+**Resolved (F3).** The named non-`_start` export call path is now tested and its capability semantics
+locked. `Instance::call("<non-_start>", args)` resolves the name to its (possibly non-zero) funcidx and
+runs it as a **bare kernel** — args in, results out, interp == jit — with **no** powerbox caps
+(`powerbox_instantiate.rs::non_start_export_runs_as_bare_kernel`, `square` at funcidx 1). The decision:
+a non-`_start` export gets no caps run-once, because without `_start` the handle stash (window offset 0)
+is empty, so a granted handle would be unreachable anyway; a **cap-using export is reached through a
+reactor `Session`** (`Instance::start` runs `_start` once to stash handles, then `Session::call_export`
+calls exports against the live window). Rule: *pure function → `Instance::call`; cap-using export →
+`Session::call_export`*. (Name-addressable **nested** exports are F2, above.)
 
 ---
 
@@ -393,9 +398,11 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   `jit_separate_module.rs` (each resolves a *non-0* export). *Note:* the earlier "func-0-only" framing
   was imprecise — invocation was always by integer `entry`; the real gap was the absence of name→index
   resolution (exports were dropped at grant), which this closes.
-- **F3 — test the named-export call path.** Even before Phase 6, add a test for `Instance::call("<non-
-  _start>", args)` returning results; decide whether a non-`_start` export should get the powerbox caps
-  (it currently gets none — likely wrong once reactors exist).
+- **F3 — test the named-export call path.** *Landed.* Added
+  `powerbox_instantiate.rs::non_start_export_runs_as_bare_kernel` (a `square` kernel at funcidx 1 called
+  via `Instance::call`, returning results, interp == jit). **Decision locked:** a non-`_start` export
+  run-once gets **no** powerbox caps (without `_start` the handle stash is empty, so a granted handle is
+  unreachable) — cap-using exports go through a reactor `Session` instead. Documented on `Instance::call`.
 - **F4 — `argv`/env through `Instance`/`RunConfig`.** *Landed (with F1).* `RunConfig` now carries
   `args`/`env`; `RunConfig::init_mem` builds the §3e args buffer (the single source, shared by the
   `run_powerbox*` wrappers and `Instance::run`/`run_diff`), seeding all three backends run-once. The C
