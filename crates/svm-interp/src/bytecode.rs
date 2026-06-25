@@ -1280,7 +1280,14 @@ pub fn compile_and_run_with_host_traced(
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
     loop {
-        match vm.resume(&dom.mods, &dom.table, fuel, &mut mem, host, 1) {
+        match vm.resume(
+            &dom.mods,
+            &dom.table,
+            fuel,
+            &mut mem,
+            &mut HostCell::Excl(&mut *host),
+            1,
+        ) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
             Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new(), None)),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
@@ -1625,7 +1632,7 @@ impl<'p> Vcpu<'p> {
             fuel: &mut self.fuel,
             mem: &mut self.mem,
             durable: false,
-            host: &mut self.host,
+            host: HostCell::Excl(&mut self.host),
         };
         match step_vcpu(
             &mut self.vt,
@@ -1798,7 +1805,14 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
         if let Some(pc) = vm.cur_ir_pc(&mods) {
             trace.push(pc);
         }
-        match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
+        match vm.resume(
+            &mods,
+            &table,
+            fuel,
+            &mut mem,
+            &mut HostCell::Excl(&mut host),
+            1,
+        ) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
             Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
@@ -1847,7 +1861,14 @@ pub fn ir_window_trace(
                 .unwrap_or_default();
             trace.push((pc, bytes));
         }
-        match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
+        match vm.resume(
+            &mods,
+            &table,
+            fuel,
+            &mut mem,
+            &mut HostCell::Excl(&mut host),
+            1,
+        ) {
             Ok(Outcome::Suspended) => continue,
             Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
@@ -1906,7 +1927,14 @@ pub fn ir_value_trace(
                 .collect();
             trace.push((pc, vals));
         }
-        match vm.resume(&mods, &table, fuel, &mut mem, &mut host, 1) {
+        match vm.resume(
+            &mods,
+            &table,
+            fuel,
+            &mut mem,
+            &mut HostCell::Excl(&mut host),
+            1,
+        ) {
             Ok(Outcome::Suspended) => continue,
             Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
@@ -2007,7 +2035,14 @@ impl DebugRun {
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
-            match vm.resume(&mods[..], table, fuel, mem, host, 1) {
+            match vm.resume(
+                &mods[..],
+                table,
+                fuel,
+                mem,
+                &mut HostCell::Excl(&mut *host),
+                1,
+            ) {
                 Ok(Outcome::Suspended) => {}
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2030,7 +2065,14 @@ impl DebugRun {
                     return Some(pc);
                 }
             }
-            match vm.resume(&mods[..], table, fuel, mem, host, 1) {
+            match vm.resume(
+                &mods[..],
+                table,
+                fuel,
+                mem,
+                &mut HostCell::Excl(&mut *host),
+                1,
+            ) {
                 Ok(Outcome::Suspended) => continue,
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2067,7 +2109,14 @@ impl DebugRun {
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
-            match vm.resume(&mods[..], table, fuel, mem, host, 1) {
+            match vm.resume(
+                &mods[..],
+                table,
+                fuel,
+                mem,
+                &mut HostCell::Excl(&mut *host),
+                1,
+            ) {
                 Ok(Outcome::Suspended) => {}
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2639,7 +2688,7 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
             &coro.table,
             fuel,
             &mut coro.mem,
-            &mut coro.host,
+            &mut HostCell::Excl(&mut coro.host),
             budget,
         ) {
             Ok(Outcome::Done(vals)) => return Ok(CoStop::Done(vals)),
@@ -2744,7 +2793,14 @@ fn run_invoke(
     let mut vm = Vm::new(&dom.mods[module], 0, args)?;
     vm.module = module;
     loop {
-        match vm.resume(&dom.mods, &dom.table, fuel, mem, host, u64::MAX)? {
+        match vm.resume(
+            &dom.mods,
+            &dom.table,
+            fuel,
+            mem,
+            &mut HostCell::Excl(&mut *host),
+            u64::MAX,
+        )? {
             Outcome::Done(vals) => return Ok(vals),
             Outcome::Suspended => {}
             _ => return Err(Trap::CapFault),
@@ -2838,6 +2894,32 @@ enum VcpuStop {
     },
 }
 
+/// How the eval loop reaches the powerbox (THREADS.md 4c-host). The cooperative `drive` owns the host
+/// exclusively (`&mut Host`); the **parallel** driver shares one `Arc<Mutex<Host>>` across vCPU threads
+/// and takes the lock only for the duration of a single `cap.call` — so compute/atomics/futex between
+/// calls stay lock-free (genuine parallelism), exactly the tree-walker's model. Determinism is *not*
+/// lost: cooperative is uncontended and dispatches in the same fixed order as before (the oracle);
+/// parallel is the opt-in mode whose stateful-cap interleaving races, as real threads do.
+enum HostCell<'a> {
+    /// Single-owner exclusive access — the cooperative `drive`, the debugger, coroutines, §14 children.
+    Excl(&'a mut Host),
+    /// Shared behind a lock — the parallel driver's vCPUs; `with` takes the lock per host call.
+    Shared(&'a std::sync::Mutex<Host>),
+}
+
+impl HostCell<'_> {
+    /// Run `f` with exclusive access to the powerbox: directly (`Excl`) or under a brief lock
+    /// (`Shared`). `f`'s result is owned (no borrow escapes the lock), so the lock is held only across
+    /// the one host call.
+    #[inline]
+    fn with<R>(&mut self, f: impl FnOnce(&mut Host) -> R) -> R {
+        match self {
+            HostCell::Excl(h) => f(h),
+            HostCell::Shared(m) => f(&mut m.lock().unwrap_or_else(|e| e.into_inner())),
+        }
+    }
+}
+
 /// The per-vCPU execution environment a [`step_vcpu`] runs against: the dispatch `table` it uses
 /// (the shared domain table, or a §14 confined child's own natural table), its `fuel` budget, its
 /// linear `mem`, and its capability `host`. The root vCPU and its `thread.spawn` siblings share the
@@ -2847,7 +2929,7 @@ struct RunCtx<'a> {
     table: &'a Table,
     fuel: &'a mut u64,
     mem: &'a mut Option<Mem>,
-    host: &'a mut Host,
+    host: HostCell<'a>,
     /// DURABILITY.md §12.8: the domain is durable, so each fiber switch maintains the per-context
     /// shadow-SP word ([`shadow_switch`]). Read once from `Host::is_durable` by [`drive`].
     durable: bool,
@@ -2872,7 +2954,7 @@ fn step_vcpu(
             ctx.table,
             &mut *ctx.fuel,
             &mut *ctx.mem,
-            &mut *ctx.host,
+            &mut ctx.host,
             budget,
         )? {
             // Budget exhausted (sliced harness only): re-enter the same activation; its cursor is
@@ -3395,7 +3477,7 @@ fn drive(
                     fuel: &mut *fuel,
                     mem: &mut *mem,
                     durable: true,
-                    host: &mut *host,
+                    host: HostCell::Excl(&mut *host),
                 };
                 match freeze_drive(
                     &mut fibers,
@@ -3449,7 +3531,7 @@ fn drive(
                 fuel: &mut *fuel,
                 mem: &mut *mem,
                 durable: host.is_durable(),
-                host: &mut *host,
+                host: HostCell::Excl(&mut *host),
             },
             Some(k) => {
                 let e = &mut extra_envs[k];
@@ -3458,7 +3540,7 @@ fn drive(
                     fuel: &mut e.fuel,
                     mem: &mut e.mem,
                     durable: e.host.is_durable(),
-                    host: &mut e.host,
+                    host: HostCell::Excl(&mut e.host),
                 }
             }
         };
@@ -4216,7 +4298,7 @@ fn run_vcpu_parallel<'scope, 'env>(
             fuel: &mut fuel,
             mem: &mut mem,
             durable: false,
-            host: &mut host,
+            host: HostCell::Excl(&mut host),
         };
         // NLL ends `ctx`'s borrows of `mem`/`fuel` at this call, so the arms below may touch them.
         let stop = step_vcpu(
@@ -4454,7 +4536,7 @@ impl Vm {
         table: &Table,
         fuel: &mut u64,
         mem: &mut Option<Mem>,
-        host: &mut Host,
+        host: &mut HostCell,
         mut budget: u64,
     ) -> Result<Outcome, Trap> {
         let mut module = self.module;
@@ -4878,16 +4960,16 @@ impl Vm {
                 } => {
                     // Generic synchronous powerbox dispatch — the same path and ABI the tree-walker's
                     // generic `CapCall` arm uses (`cap_dispatch_slots`): handle as an i32, args/results
-                    // as i64 slots, results re-typed by the call's `sig.results`. The host is borrowed
-                    // exclusively here (single-threaded, no `thread.spawn` in a compiled module), so no
-                    // lock is needed.
+                    // as i64 slots, results re-typed by the call's `sig.results`. Via [`HostCell`] so a
+                    // parallel vCPU takes the shared-host lock only for this one call (4c-host); the
+                    // cooperative path is exclusive (uncontended), so order is unchanged.
                     let h = r!(*handle).i32();
                     let mut argv: Vec<i64> = Vec::with_capacity(args.len());
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let res = host.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    let res = host.with(|p| p.cap_dispatch_slots(*type_id, *op, h, &argv, gm))?;
                     for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
                         self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
                     }
@@ -4895,14 +4977,14 @@ impl Vm {
                 }
                 Op::CapSelfCount { dst } => {
                     // §7 reflection op 0 — same `self_dispatch` the tree-walker uses; one i32 result.
-                    let res = host.self_dispatch(0, &[])?;
+                    let res = host.with(|p| p.self_dispatch(0, &[]))?;
                     r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }
                 Op::CapSelfGet { idx, dst } => {
                     // §7 reflection op 1 — the idx-th held cap as (handle, type_id), two i32 results.
                     let i = r!(*idx).i32() as i64;
-                    let res = host.self_dispatch(1, &[i])?;
+                    let res = host.with(|p| p.self_dispatch(1, &[i]))?;
                     self.regs[base + *dst as usize] = Reg::from_i32(res[0] as i32);
                     self.regs[base + *dst as usize + 1] = Reg::from_i32(res[1] as i32);
                     pc += 1;
@@ -4917,8 +4999,9 @@ impl Vm {
                     let ptr = r!(*name_ptr).i64();
                     let len = r!(*name_len).i64();
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let res =
-                        host.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
+                    let res = host.with(|p| {
+                        p.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)
+                    })?;
                     r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }
@@ -4934,13 +5017,9 @@ impl Vm {
                     let ptr = r!(*buf_ptr).i64();
                     let cap = r!(*buf_cap).i64();
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let res = host.cap_dispatch_slots(
-                        svm_ir::CAP_SELF_TYPE_ID,
-                        3,
-                        0,
-                        &[h, ptr, cap],
-                        gm,
-                    )?;
+                    let res = host.with(|p| {
+                        p.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 3, 0, &[h, ptr, cap], gm)
+                    })?;
                     r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }
@@ -5014,7 +5093,8 @@ impl Vm {
                     quota,
                     dst,
                 } => {
-                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let ih = r!(*handle).i32();
+                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let entry = r!(*entry).i64();
                     let off = r!(*off).i64();
                     let size_log2 = r!(*size_log2).i64();
@@ -5046,7 +5126,8 @@ impl Vm {
                     quota,
                     dst,
                 } => {
-                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let ih = r!(*handle).i32();
+                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let mh = r!(*module_reg).i64() as i32;
                     let entry = r!(*entry).i64();
                     let off = r!(*off).i64();
@@ -5071,7 +5152,8 @@ impl Vm {
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
                 // (executor children live in the same `threads` handle namespace as `thread.spawn`).
                 Op::InstJoin { handle, child, dst } => {
-                    host.resolve_instantiator(r!(*handle).i32())?; // authority
+                    let ih = r!(*handle).i32();
+                    host.with(|p| p.resolve_instantiator(ih))?; // authority
                     let handle = r!(*child).i32();
                     let dst = *dst;
                     self.module = module;
@@ -5140,7 +5222,8 @@ impl Vm {
                     dst,
                     demand,
                 } => {
-                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let ih = r!(*handle).i32();
+                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let entry = r!(*entry).i64();
                     let off = r!(*off).i64();
                     let size_log2 = r!(*size_log2).i64();
@@ -5168,7 +5251,8 @@ impl Vm {
                     dst,
                     demand,
                 } => {
-                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let ih = r!(*handle).i32();
+                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let mh = r!(*module_reg).i64() as i32;
                     let entry = r!(*entry).i64();
                     let off = r!(*off).i64();
@@ -5195,7 +5279,8 @@ impl Vm {
                     value,
                     dst,
                 } => {
-                    host.resolve_instantiator(r!(*handle).i32())?; // authority
+                    let ih = r!(*handle).i32();
+                    host.with(|p| p.resolve_instantiator(ih))?; // authority
                     let ch = r!(*ch).i32();
                     let value = r!(*value).i64();
                     let dst = *dst;
@@ -5206,7 +5291,8 @@ impl Vm {
                     return Ok(Outcome::CoResume { ch, value, dst });
                 }
                 Op::CoYield { handle, value, dst } => {
-                    host.resolve_yielder(r!(*handle).i32())?; // authority
+                    let yh = r!(*handle).i32();
+                    host.with(|p| p.resolve_yielder(yh))?; // authority
                     let value = r!(*value).i64();
                     let dst = *dst;
                     self.module = module;
