@@ -112,6 +112,25 @@ pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// safepoints) so an ordinary or fiber-armed run is byte-identical (this slot stays 0). Lives in the
 /// reserve's `[24, 64)` gap.
 pub const ARM_BACKEDGE_OFF: u64 = 24;
+/// §12.8 concurrent-thaw stage 1: when `true`, the durable **state word** is read/written
+/// **per-context** — in each context's region (at [`STATE_IN_REGION_OFF`] past its shadow-SP word, via
+/// the `durable.shadow_base` register), mirroring the per-context shadow-SP relocation (4A.5 stage i) —
+/// instead of the single global [`STATE_OFF`]. A global state word forces a serial thaw (concurrent
+/// vCPUs would race the one word: one finishing its rewind flips it to `NORMAL` while another is still
+/// rewinding, and a forward vCPU's callee prologue would read another's `REWINDING`). Per-context state
+/// lets each frozen vCPU rewind against its own word, so the thaw can run them as concurrent OS threads
+/// and a re-issued `atomic.wait` re-synchronizes with a sibling's `notify` (lifting the parked-wait thaw
+/// fail-closed). **Off** today: the relocation also needs the freeze trigger to broadcast `UNWINDING` to
+/// every live context, the shadow frame-base shifted past the in-region state word, and a snapshot
+/// `FORMAT_VERSION` bump — staged separately. With it off, [`Bb::state_word_addr`] emits the global
+/// address, so an instrumented module is byte-identical to before.
+pub const STATE_PER_CONTEXT: bool = false;
+
+/// §12.8 concurrent-thaw stage 1: byte offset of the per-context state word **within a context's
+/// region** (when [`STATE_PER_CONTEXT`]) — just past the 8-byte in-region shadow-SP word at the region
+/// base. The shadow frame-base then starts past this word. Unused while [`STATE_PER_CONTEXT`] is off.
+pub const STATE_IN_REGION_OFF: u64 = 8;
+
 /// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
 pub const SHADOW_BASE: u64 = 64;
 /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
@@ -608,8 +627,8 @@ fn transform_func(
 
     // ---- PROLOGUE — dispatch on the state word ----
     let mut pb = Bb::new(f.params.clone());
-    let st_a = pb.one(Inst::ConstI64(STATE_OFF as i64));
-    let st = pb.one(load(LoadOp::I32, st_a, 0));
+    let (st_a, st_off) = pb.state_word_addr();
+    let st = pb.one(load(LoadOp::I32, st_a, st_off));
     let rw = pb.one(Inst::ConstI32(STATE_REWINDING));
     let is_rw = pb.one(icmp(IntTy::I32, CmpOp::Eq, st, rw));
     let prologue = pb.finish(Terminator::BrIf {
@@ -669,8 +688,8 @@ fn transform_func(
                 cont_seg: seg(b, 0), // re-enter the header body, past the poll
             });
             let mut psb = Bb::new(slot_types);
-            let st_a = psb.one(Inst::ConstI64(STATE_OFF as i64));
-            let st = psb.one(load(LoadOp::I32, st_a, 0));
+            let (st_a, st_off) = psb.state_word_addr();
+            let st = psb.one(load(LoadOp::I32, st_a, st_off));
             let unw = psb.one(Inst::ConstI32(STATE_UNWINDING));
             let is_unw = psb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
             let live: Vec<ValIdx> = (0..plen as u32).collect();
@@ -691,8 +710,8 @@ fn transform_func(
                 sb.insts.extend_from_slice(&blk.insts[seg_start..=pos]);
                 let out = bi.vend[pos];
                 sb.next = out as u32;
-                let st_a = sb.one(Inst::ConstI64(STATE_OFF as i64));
-                let st = sb.one(load(LoadOp::I32, st_a, 0));
+                let (st_a, st_off) = sb.state_word_addr();
+                let st = sb.one(load(LoadOp::I32, st_a, st_off));
                 let unw = sb.one(Inst::ConstI32(STATE_UNWINDING));
                 let is_unw = sb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
                 let gid = points.len() as u32;
@@ -938,9 +957,9 @@ fn transform_func(
             // its cap.call result; the header reloads its block params and re-enters the body
             // (`cont_seg`). Neither produces an `op_results` value.
             SuspendKind::Leaf | SuspendKind::LoopHeader => {
-                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let (st_a, st_off) = ab.state_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 vec![]
             }
             SuspendKind::Propagated { callee, args } => {
@@ -972,9 +991,9 @@ fn transform_func(
             // value the *next* resume delivers, threads into the continuation exactly as a leaf's
             // reloaded cap.call result does.
             SuspendKind::Yield { value } => {
-                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let (st_a, st_off) = ab.state_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
                 ab.many(Inst::Suspend { value: v }, pt.nres)
             }
@@ -987,9 +1006,9 @@ fn transform_func(
             // `REWINDING` afterward), so on this thread the join is the globally-deepest frozen frame —
             // it flips the state to `NORMAL` itself, like a leaf, *before* re-issuing.
             SuspendKind::ThreadJoin { handle } => {
-                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let (st_a, st_off) = ab.state_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let hh =
                     reloaded[spill_slot(*handle as usize).expect("thread.join handle spilled")];
                 ab.many(Inst::ThreadJoin { handle: hh }, pt.nres)
@@ -1005,9 +1024,9 @@ fn transform_func(
                 expected,
                 timeout,
             } => {
-                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let (st_a, st_off) = ab.state_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let aa = reloaded[spill_slot(*addr as usize).expect("atomic.wait addr spilled")];
                 let ee =
                     reloaded[spill_slot(*expected as usize).expect("atomic.wait expected spilled")];
@@ -1154,6 +1173,18 @@ impl Bb {
     /// Push a zero-result instruction (a store).
     fn zero(&mut self, i: Inst) {
         self.insts.push(i);
+    }
+    /// §12.8 concurrent-thaw stage 1: the durable **state word**'s address, as `(base, offset)` for a
+    /// `load`/`store`. Centralizes the single source of truth for *where* the state word lives so the
+    /// per-context relocation is one switch. With [`STATE_PER_CONTEXT`] off, the global [`STATE_OFF`]
+    /// (byte-identical to before); on, the running context's own region word (`durable.shadow_base` +
+    /// [`STATE_IN_REGION_OFF`]), so concurrent vCPUs each address their own — like the shadow-SP word.
+    fn state_word_addr(&mut self) -> (ValIdx, u64) {
+        if STATE_PER_CONTEXT {
+            (self.one(Inst::DurableShadowBase), STATE_IN_REGION_OFF)
+        } else {
+            (self.one(Inst::ConstI64(STATE_OFF as i64)), 0)
+        }
     }
     fn finish(self, term: Terminator) -> Block {
         Block {
