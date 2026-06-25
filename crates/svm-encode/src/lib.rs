@@ -13,6 +13,17 @@
 //! bytes (fuzzed in the `svm` crate). We therefore never pre-allocate from an
 //! untrusted count, and we reject counts that cannot fit in the remaining bytes.
 #![forbid(unsafe_code)]
+// `no_std` + `alloc` so the encoder runs **in-sandbox**: a guest specializes a module with
+// `svm-peval` and serializes the residual here before submitting it to the §22 `Jit` capability
+// (PEVAL.md Milestone 3 — guest-side specialization). The test harness still gets `std`; dependents
+// are unaffected (they bring their own `std`). Matches `svm-ir`/`svm-verify`/`svm-peval`.
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, Export,
