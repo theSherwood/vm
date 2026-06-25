@@ -329,11 +329,19 @@ fail-closed, never miscompile).
 **Fix sketch (three tiers, by scope):**
 1. *(landed)* Harness sidestep: `-U__SIZEOF_INT128__` for kernels with a 64-bit fallback. Zero engine
    work; gets `aha-mont64` green. Not a capability.
-2. **Pattern-match the widening multiply** (the high-value slice, ~I13-sized): recognize `mul i128` of two
-   `zext i64` operands feeding `trunc` / `lshr 64`+`trunc` and lower it to a 64×64→128 primitive yielding
-   an `(lo, hi)` i64 pair (a `mul_hi`-style op on the JIT/interp if not already exposed). Covers
-   `aha-mont64` and the overwhelming majority of real `__int128` use (bignum, fixed-point, hashing,
-   mulhi). Self-contained in `svm-llvm`; anything beyond the mulhi idiom still fails closed.
+2. **Pattern-match the widening multiply** *(LANDED — `claude/onramp-i128`)*: the on-ramp now recognizes
+   the idiom (`zext i64 → mul i128 → lshr 64 → trunc`) and lowers it to 64-bit ops without ever
+   materializing a 128-bit value — `lower_i128_idiom` tracks each i128 SSA value symbolically (`Zext` /
+   `WideMul` / `Hi`) and emits a concrete op only at the `trunc`: `mul` for a product's low half, an inline
+   schoolbook `emit_umulhi` for its high half (the engine has no scalar high-multiply primitive, so the
+   32×32 expansion is emitted in IR — self-contained in `svm-llvm`, no new op across the stack). Covers
+   `aha-mont64`'s `mulul64` and the overwhelming majority of real `__int128` use (bignum, fixed-point,
+   hashing, mulhi). Anything beyond the idiom — a full i128 `add`/`sub`/variable-shift, or an `xor`/`and`/
+   `or i128` (which clang folds `(u128)…` bitwise combinations into) — still fails closed, never miscompiles.
+   Tests: `translate.rs::{i128_widening_mul_hi, i128_widening_mul_lo_and_hi}`, bit-exact (interp == JIT) vs a
+   `u128` oracle. *(The `embench` example still keeps `-U__SIZEOF_INT128__` for `aha-mont64`: `modul64`'s
+   `__int128` **variable** shift is outside this idiom, so a full-kernel `__int128` build needs more than
+   tier 2 — removing the sidestep should be validated against a real Embench checkout.)*
 3. **General i128 legalization** (the real, larger fix): represent every i128 SSA value as a pair of i64
    parts and thread it through the whole on-ramp — add/sub as carry chains, mul as the schoolbook 64×64
    expansion, variable shifts as cross-word logic, compares, zext/trunc, loads/stores, **and**

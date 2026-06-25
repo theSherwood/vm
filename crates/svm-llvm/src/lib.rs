@@ -10262,6 +10262,11 @@ struct BlockCtx<'a> {
     /// `extractvalue`/`ret` (§3a multi-result). Assumed not to cross block boundaries (clang's
     /// register-coercion pattern produces and consumes them in one block).
     agg: HashMap<ValueId, Vec<ValIdx>>,
+    /// I14 tier 2: i128 SSA values arising in the **widening-multiply idiom**
+    /// (`zext i64 → mul i128 → lshr 64 → trunc`), tracked *symbolically* so a 128-bit value is never
+    /// materialized — see [`lower_i128_idiom`]. Like `agg`, assumed not to cross block boundaries (the
+    /// idiom is a local expression); a cross-block i128 finds nothing here and fails closed.
+    i128_sym: HashMap<ValueId, I128Sym>,
     /// Wide-vector SSA values (I2 step 1): value-id → its legalized parts, ordered
     /// `[chunk_0 … chunk_{C-1}, tail_0 … tail_{T-1}]` (`C` full `v128`s then `T` lane scalars, per
     /// the value's [`WideLayout`] in `s.wide`). The vector analog of `agg` — one LLVM value is
@@ -10898,6 +10903,7 @@ fn translate_block(
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
+        i128_sym: HashMap::new(),
         wide_vals: HashMap::new(),
         mask_lanes: HashMap::new(),
         next_val: 0,
@@ -11154,6 +11160,155 @@ fn lower_narrow_atomic_cas(
     Ok((old32, masked_exp32))
 }
 
+/// Symbolic form of an i128 value in the widening-multiply idiom (I14 tier 2). The `ValIdx`es are the
+/// i64 operands; nothing 128-bit is ever materialized — [`lower_i128_idiom`] emits a concrete i64 op
+/// only when a `trunc` consumes the value.
+#[derive(Clone, Copy)]
+enum I128Sym {
+    /// `zext i64 X to i128`: the value's low 64 bits are `X`, high bits zero.
+    Zext(ValIdx),
+    /// `mul i128 (zext a) (zext b)`: the full 64×64→128 product of `a` and `b`.
+    WideMul(ValIdx, ValIdx),
+    /// `lshr <widening product> 64`: the high 64 bits of `a*b`.
+    Hi(ValIdx, ValIdx),
+}
+
+/// The symbolic i128 form of an operand, or fail-closed if it isn't a tracked idiom value.
+fn i128_sym_of(ctx: &BlockCtx, op: &Operand) -> Result<I128Sym, Error> {
+    let Operand::LocalOperand { name, .. } = op else {
+        return unsup("i128 operand is not a local");
+    };
+    let vid = *ctx
+        .s
+        .name2id
+        .get(name)
+        .ok_or_else(|| Error::Unsupported(format!("unresolved i128 local {name:?}")))?;
+    ctx.i128_sym
+        .get(&vid)
+        .copied()
+        .ok_or_else(|| Error::Unsupported("i128 value outside the widening-multiply idiom".into()))
+}
+
+/// Record the symbolic i128 form of a destination value (no concrete op emitted).
+fn i128_set(ctx: &mut BlockCtx, dest: &Name, sym: I128Sym) {
+    if let Some(&vid) = ctx.s.name2id.get(dest) {
+        ctx.i128_sym.insert(vid, sym);
+    }
+}
+
+/// The constant value of a scalar integer operand, if it is a constant.
+fn const_int_operand(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::ConstantOperand(c) => match c.as_ref() {
+            Constant::Int { value, .. } => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Emit an inline unsigned 64×64→64 **high-half multiply** (`umulhi`) via the 32×32 schoolbook
+/// expansion: with `a = ah·2³² + al`, `b = bh·2³² + bl`, the high word of `a·b` is
+/// `ah·bh + (al·bh)>>32 + (ah·bl)>>32 + cross>>32` where `cross = (al·bl)>>32 + (al·bh & lo) + (ah·bl & lo)`.
+/// The engine has no scalar high-multiply primitive, so the i128 mulhi idiom lowers to this. Returns the
+/// block-local index holding the high 64 bits of `a*b`.
+fn emit_umulhi(ctx: &mut BlockCtx, a: ValIdx, b: ValIdx) -> ValIdx {
+    let mask = ctx.const_i64(0xFFFF_FFFF);
+    let sh = ctx.const_i64(32);
+    fn ibin(ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx) -> ValIdx {
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op,
+            a,
+            b,
+        })
+    }
+    let al = ibin(ctx, BinOp::And, a, mask);
+    let ah = ibin(ctx, BinOp::ShrU, a, sh);
+    let bl = ibin(ctx, BinOp::And, b, mask);
+    let bh = ibin(ctx, BinOp::ShrU, b, sh);
+    let ll = ibin(ctx, BinOp::Mul, al, bl);
+    let lh = ibin(ctx, BinOp::Mul, al, bh);
+    let hl = ibin(ctx, BinOp::Mul, ah, bl);
+    let hh = ibin(ctx, BinOp::Mul, ah, bh);
+    // cross = (ll >> 32) + (lh & lo) + (hl & lo) — bounded by 3·(2³²−1) < 2³⁴, so it cannot overflow i64.
+    let ll_hi = ibin(ctx, BinOp::ShrU, ll, sh);
+    let lh_lo = ibin(ctx, BinOp::And, lh, mask);
+    let hl_lo = ibin(ctx, BinOp::And, hl, mask);
+    let c1 = ibin(ctx, BinOp::Add, ll_hi, lh_lo);
+    let cross = ibin(ctx, BinOp::Add, c1, hl_lo);
+    // hi = hh + (lh >> 32) + (hl >> 32) + (cross >> 32)
+    let lh_hi = ibin(ctx, BinOp::ShrU, lh, sh);
+    let hl_hi = ibin(ctx, BinOp::ShrU, hl, sh);
+    let cross_hi = ibin(ctx, BinOp::ShrU, cross, sh);
+    let s1 = ibin(ctx, BinOp::Add, hh, lh_hi);
+    let s2 = ibin(ctx, BinOp::Add, s1, hl_hi);
+    ibin(ctx, BinOp::Add, s2, cross_hi)
+}
+
+/// I14 tier 2 — recognize the i128 **widening-multiply** idiom and lower it without ever materializing a
+/// 128-bit value. `-O2` clang emits `zext i64 → mul i128 → lshr 64 → trunc i64` for `(u128)a*b >> 64`
+/// (a 64×64→128 mulhi; the low half is a plain `mul i64`). Each i128 SSA value is tracked symbolically
+/// ([`I128Sym`]); a concrete i64 op is emitted only at the `trunc` — the source for a `zext`'s low half,
+/// `mul` for a product's low half, an inline [`emit_umulhi`] for its high half. Any i128 use outside this
+/// idiom fails closed (`Unsupported`) — never a miscompile. `Ok(true)` ⇒ handled an i128 idiom op.
+fn lower_i128_idiom(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<bool, Error> {
+    use Instruction as I;
+    let is_i128 = |o: &Operand| int_bits(o.get_type(types).as_ref()) == Some(128);
+    match instr {
+        // zext i64 X to i128 → the value's low 64 bits are X (high zero).
+        I::ZExt(x) if int_bits(x.to_type.as_ref()) == Some(128) => {
+            if int_bits(x.operand.get_type(types).as_ref()) != Some(64) {
+                return unsup("i128 zext from non-i64 (widening-multiply idiom)");
+            }
+            let src = ctx.operand(&x.operand)?;
+            i128_set(ctx, &x.dest, I128Sym::Zext(src));
+            Ok(true)
+        }
+        // mul i128 A B with both operands zext-of-i64 → a 64×64 widening product.
+        I::Mul(x) if is_i128(&x.operand0) => {
+            let I128Sym::Zext(a) = i128_sym_of(ctx, &x.operand0)? else {
+                return unsup("i128 mul operand is not a zext i64 (widening-multiply idiom)");
+            };
+            let I128Sym::Zext(b) = i128_sym_of(ctx, &x.operand1)? else {
+                return unsup("i128 mul operand is not a zext i64 (widening-multiply idiom)");
+            };
+            i128_set(ctx, &x.dest, I128Sym::WideMul(a, b));
+            Ok(true)
+        }
+        // lshr i128 P, 64 with P a widening product → its high 64 bits.
+        I::LShr(x) if is_i128(&x.operand0) => {
+            if const_int_operand(&x.operand1) != Some(64) {
+                return unsup("i128 lshr by a non-64 amount (widening-multiply idiom)");
+            }
+            let I128Sym::WideMul(a, b) = i128_sym_of(ctx, &x.operand0)? else {
+                return unsup("i128 lshr of a non-product (widening-multiply idiom)");
+            };
+            i128_set(ctx, &x.dest, I128Sym::Hi(a, b));
+            Ok(true)
+        }
+        // trunc i128 V to i64 → materialize V's symbolic form as a concrete i64.
+        I::Trunc(x) if is_i128(&x.operand) => {
+            if int_bits(x.to_type.as_ref()) != Some(64) {
+                return unsup("i128 trunc to a non-i64 width (widening-multiply idiom)");
+            }
+            let val = match i128_sym_of(ctx, &x.operand)? {
+                I128Sym::Zext(a) => a,
+                I128Sym::WideMul(a, b) => ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::Mul,
+                    a,
+                    b,
+                }),
+                I128Sym::Hi(a, b) => emit_umulhi(ctx, a, b),
+            };
+            finish(ctx, &x.dest, val)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<(), Error> {
     use Instruction as I;
     // The op's integer width, from operand0 (both operands share a type in LLVM binops).
@@ -11178,6 +11333,13 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     // `<N x i1>` boolean masks (vector `icmp`/`fcmp`/`select`/movemask) have no first-class svm-ir
     // type; they are held lane-wise and scalarized here. `Ok(false)` ⇒ not a mask op — fall through.
     if lower_mask(ctx, instr, types)? {
+        return Ok(());
+    }
+
+    // I14 tier 2: the i128 widening-multiply idiom (`zext i64 → mul i128 → lshr 64 → trunc`) is
+    // recognized and lowered to 64-bit ops here — a 128-bit value is never materialized. `Ok(false)`
+    // ⇒ not an i128 idiom op (fall through); any i128 op outside the idiom fails closed.
+    if lower_i128_idiom(ctx, instr, types)? {
         return Ok(());
     }
 
