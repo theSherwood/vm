@@ -174,7 +174,7 @@ and surface it (e.g. `JitFrameLoc`-adjacent or a `last_trap_fiber()` accessor) f
 
 _(I1 below is open-adjacent — its abort mechanism is fixed, but I3/I4 are residual same-family CI-abort
 flakes. I2 resolved below.)_
-### I7 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3)
+### I7 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3) — **fail-fast + diagnostics LANDED** (`claude/charming-johnson-pmlsnr`); root cause still open (awaiting a captured wedge)
 
 **Where:** the guest-built work-stealing schedulers run end-to-end through the `svm-run` binary —
 `crates/svm-run/demos/work_stealing/work_stealing.c` (stackless tasks) and
@@ -212,15 +212,46 @@ no actual program args (so a bare run is byte-identical to before) restored the 
 clean parallel iterations). So whatever the root cause, it is acutely sensitive to worker-thread
 start timing — a strong hint for a park/unpark or steal-loop wakeup race.
 
+**Investigation (this session — narrowed, not reproduced).** Reviewed every primitive on the demos'
+path and could **not** reproduce a wedge nor find a defect by inspection:
+- **Guest scheduler logic is hang-free by construction.** *Both* demos **busy-spin** the worker loop
+  (`while (atomic_load(&g_remaining) > 0) { …; if (!t) continue; }`) — they do **not** park idle
+  workers, so the "park/unpark of idle workers" in the original hypothesis isn't even a code path here.
+  `g_total`/`g_returns`/`g_remaining` are interleaving-invariant: every task is stepped exactly `STEPS`
+  times and is, on each iteration, either completed (decrement) or re-pushed — no task is dropped or
+  double-counted, so `g_remaining` always reaches 0 and every worker then exits. A *resume* bug would
+  surface as a wrong total or a `FiberFault` **trap** (non-zero exit), **not** a hang.
+- **The only blocking points are sound / loom-verified.** The guest `pthread_mutex` is a 2-state
+  futex lock whose `__vm_wait32` re-checks the word **under the futex lock** (the classic
+  unlock-between-cas-and-wait race cannot lose a wakeup — and the host `futex_wait` holds that lock
+  across `still_eq()` + `waiters++` + `cv.wait`, so a `notify` can't slip in between). `futex_wait`/
+  `futex_notify`, the fiber single-owner `Ownership::claim`/`suspend_to_pool` migration arbiter, and
+  `thread_join`/`run_child` (set-state-under-lock + `notify_all`) are all textbook-correct and several
+  are **loom-verified** (`loom_wait_notify_never_hangs`, `fiber_registry`). The §5 signal/`siglongjmp`
+  guard is **not exercised** by a fault-free demo run.
+- **Not reproducible here.** ~24 000 demo runs total — 800 (8-way) + 3 600 **pinned to one core**
+  (`taskset -c 0`, maximal startup-interleaving pressure) + 20 000 (8-way, both demos, with a
+  gdb-dumping watchdog) — plus **60 full `run.rs`-suite parallel iterations** (the CI load profile):
+  **0 hangs, 0 wrong outputs.** Consistent with the once-ever CI sighting (~1e-3–1e-4/run) — the
+  residual risk lives in something loom can't model (the cross-thread native stack switch, or runner
+  memory-pressure/scheduler pathology, the same I3/I4 family), or it was an environmental fluke.
+
 **Fix sketch:**
-1. Root-cause via thread backtraces of a hung process (reproduce by looping the `svm-run` binary on
-   the demo until it wedges, then attach a debugger) — confirm whether the stall is in the host
-   steal/park runtime or the guest scheduler, and fix the wakeup race.
-2. Interim blast-radius mitigation (independent of the root cause): the runner already honours
-   `SVM_DEADLINE_MS` (§5 detect-and-kill); have the demo smoke tests run the `svm-run` subprocess
-   under a deadline / `timeout` so a hang **fails fast** instead of blocking CI for hours, and add a
-   `timeout-minutes:` to the CI `check` job (it currently has none, so a wedged job sits until
-   GitHub's 6 h default).
+1. *(LANDED — fail-fast + diagnostics)* The demo smoke tests now run through `run_demo_failfast`
+   (`crates/svm-run/tests/run.rs`): the `svm-run` subprocess gets `SVM_DEADLINE_MS=30000` (so a
+   *guest-side* wedge — spinning **or** futex-parked, since `KILL_RECHECK` wakes a parked vCPU — is
+   §5 detect-and-killed and exits non-zero with the kill diagnostic), **plus** a 90 s host-side
+   process timeout backstop that, on expiry, **best-effort `gdb -p` dumps every thread's backtrace**
+   (the root-cause data this entry asks for) and SIGKILLs the child. A healthy run is milliseconds, so
+   neither bound trips normally (verified: all `run.rs` green, ~1 s). **Net: a recurrence can no
+   longer hang the named tests, and it self-captures the thread dump** needed to finish the root cause.
+   The CI `check` (30) / `cross-os` (45) jobs also carry a `timeout-minutes:` backstop now, so any
+   *other* unforeseen `cargo test --workspace` hang fails in minutes instead of GitHub's 6 h default.
+2. *(still open — needs a captured wedge)* Pin the root cause from the next dump (CI or a longer local
+   soak): if a worker is parked in `pthread_cond_wait`/futex at capture time it's a lost-wakeup in the
+   mutex/futex layer; if all workers are spinning in JIT code (`??` frames) with `g_remaining > 0` it's
+   a guest termination-detection / steal-loop livelock; if the stall is host-side (a Rust frame in
+   `os_thread_rt`/`fiber_rt`) it's the migration/teardown path. Then fix the specific race.
 
 ---
 
