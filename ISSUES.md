@@ -236,18 +236,30 @@ into **128-bit chunks** (4×i32) and svm-jit emits 128-bit `paddd`/etc., while n
 (AVX2) or 512-bit `zmm` (AVX-512). So the SVM stack *does* vectorize (contrary to my earlier bench
 claim — see below), but at SSE width.
 
-**Measured, across the wasm comparison columns (ns/iter, the same C kernels):**
+**Measured (ns/iter, same C kernels, one machine; svm-jit timed *compile-once* — see the bench fix
+below):**
 
-| kernel | native AVX2 | wasm32 V8 | wasm32 Wasmtime | **svm-jit** | bytecode |
+| kernel | native AVX2 (256b) | wasm V8 (128b) | **svm-jit (128b)** | bytecode | tree-walk |
 |---|---|---|---|---|---|
-| `xorshift` (scalar serial) | 1.73 | 1.99 | 2.04 | **1.59** | 58.3 |
-| `vadd` (vectorizable)      | 0.042 | 0.098 | 0.147 | **0.083** | 37.6 |
+| `xorshift` (scalar serial) | 1.69 | 1.92 | **1.63** | 62.4 | 108.2 |
+| `vadd` (vectorizable)      | 0.041 | 0.096 | **0.18** | 47.5 | 52.5 |
 
-The key context: **wasm SIMD is itself fixed at 128 bits** (the spec's `v128`), so V8 and Wasmtime are
-*also* ~2–3.5× behind native AVX2 on `vadd` — the exact same cap svm-jit has. **svm-jit is not behind
-wasm; it is ahead** (0.083 vs V8 0.098 / Wasmtime 0.147), and on the representative *scalar* kernel it
-is the fastest engine measured, beating native. So relative to the VM's actual peer (wasm), there is no
-SIMD deficit — only native AVX2/AVX-512 leads, by the determinism-bound 128→256/512 margin.
+**Scalar: no deficit** — svm-jit (1.63) slightly *beats* native (1.69) and beats wasm (1.92).
+**Vectorized: svm-jit trails — and by *more* than width alone.** Its 128-bit `vadd` is ~4.5× behind
+native AVX2; ~2× of that is pure width (128 vs 256-bit). But **wasm is also 128-bit and sits at 0.096 —
+twice as fast as svm-jit's 0.18**. So ~2× is the shared width/determinism gap and **another ~2× is
+128-bit codegen quality** V8 doesn't pay. (This *corrects* an earlier note here that claimed svm-jit
+*beat* wasm on `vadd` at 0.083 — that figure predates the compile-once timing fix and isn't reproducible;
+the honest same-machine number is ~0.18, behind V8.)
+
+**Is the residual 128-bit gap actionable? Investigated — no, it's upstream.** Cranelift `opt_level` is
+already `"speed"` (the maxed setting; the egraph mid-end runs GVN/LICM-via-remat). The on-ramp emits a
+**minimal, clean** translation: clang's 2-accumulator unroll → `i32x4.add`/`v128.xor`, each one SSE op,
+no redundant moves; the loop carries only the two index-vector adds it must. So the ~2× vs V8 is
+Cranelift's vector instruction selection/scheduling, which **D36/D49 deliberately don't own** — the same
+"we don't fork the backend" boundary as the wide-vector blocker, not an on-ramp inefficiency we can fix.
+(`-O3` shrinks the gap a little via better-scheduled IR, but using a *different* `-O` for the SVM rows
+than native/wasm would make the comparison dishonest — the very thing the bench fix below removes.)
 
 **Root cause — deliberate, not a miss.** The chunk width is fixed at 128 bits and **never
 host-detected**, to preserve the interp↔JIT↔durable-fiber **determinism contract** (a frozen vector
