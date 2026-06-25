@@ -11,107 +11,9 @@
 //! only added a unit-level test). It auto-skips when the toolchain (`rustc +1.81.0`, `llvm-link-18`,
 //! `opt-18`) is unavailable — the same posture as the `rust_*` tests in `translate.rs`.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use svm_ir::{BinOp, Block, Func, Inst, IntTy, Module, Terminator, ValType};
 
-/// The directory of the in-repo fixture crate (`tests/fixtures/peval_probe`).
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/peval_probe")
-}
-
-/// Is `cmd --version` runnable? Used to auto-skip when a pipeline tool is absent.
-fn tool_ok(cmd: &str, version_arg: &str) -> bool {
-    Command::new(cmd)
-        .arg(version_arg)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Build the fixture crate to LLVM-18 bitcode with `rustc +1.81.0` (the on-ramp's pinned toolchain),
-/// link every dependency's `.bc`, and `globaldce` down to the closure reachable from the powerbox
-/// `main`/`malloc`/`free`. Returns the legalized `.bc` path, or `None` if a tool is unavailable.
-///
-/// Mirrors the manual probe exactly: `RUSTFLAGS=--emit=llvm-bc cargo +1.81.0 build --release
-/// --ignore-rust-version` → `llvm-link-18 <deps>/*.bc` → `opt-18 internalize,globaldce`.
-fn build_probe_bc() -> Option<PathBuf> {
-    if !tool_ok("rustc", "--version")
-        || !Command::new("rustc")
-            .args(["+1.81.0", "--version"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        || !tool_ok("llvm-link-18", "--version")
-        || !tool_ok("opt-18", "--version")
-    {
-        eprintln!(
-            "note: skipping peval_in_sandbox (need `rustc +1.81.0`, `llvm-link-18`, `opt-18`)"
-        );
-        return None;
-    }
-
-    // A dedicated, out-of-tree target dir keeps the repo clean and isolates the bitcode artifacts.
-    let work = std::env::temp_dir().join(format!("peval_in_sandbox_{}", std::process::id()));
-    let target = work.join("target");
-    std::fs::create_dir_all(&target).expect("create target dir");
-
-    // Emit per-crate bitcode for the whole dependency closure. Building a `lib` crate-type means no
-    // final executable link, so cargo exits cleanly even though `malloc`/`free`/`write` are undefined
-    // (the on-ramp synthesizes them). We still tolerate a non-zero status and check for the `.bc`.
-    let status = Command::new("cargo")
-        .current_dir(fixture_dir())
-        .env("RUSTFLAGS", "--emit=llvm-bc")
-        .env("CARGO_TARGET_DIR", &target)
-        .args(["+1.81.0", "build", "--release", "--ignore-rust-version"])
-        .status()
-        .expect("run cargo build for the probe fixture");
-    if !status.success() {
-        eprintln!("note: probe `cargo build` returned {status} (tolerated if .bc emitted)");
-    }
-
-    let deps = target.join("release/deps");
-    let mut bcs: Vec<PathBuf> = std::fs::read_dir(&deps)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "bc").unwrap_or(false))
-        .collect();
-    bcs.sort();
-    if bcs.is_empty() {
-        eprintln!("note: skipping peval_in_sandbox (no .bc emitted — build failed before codegen)");
-        return None;
-    }
-
-    let linked = work.join("linked.bc");
-    let ok = Command::new("llvm-link-18")
-        .args(&bcs)
-        .arg("-o")
-        .arg(&linked)
-        .status()
-        .expect("run llvm-link-18")
-        .success();
-    assert!(ok, "llvm-link-18 failed");
-
-    let legalized = work.join("probe.bc");
-    let ok = Command::new("opt-18")
-        .args([
-            "-passes=internalize,globaldce",
-            "-internalize-public-api-list=main,malloc,free",
-        ])
-        .arg(&linked)
-        .arg("-o")
-        .arg(&legalized)
-        .status()
-        .expect("run opt-18")
-        .success();
-    assert!(ok, "opt-18 failed");
-    Some(legalized)
-}
+mod common;
 
 /// The module the fixture builds (kept in lockstep with `peval_probe`'s `build_module`): a single
 /// `() -> i32` whose body is the constant product `21 * 2`. A correct specializer folds it.
@@ -163,7 +65,7 @@ fn summary_bytes(m: &Module) -> Vec<u8> {
 /// `svm-peval` + `svm-ir` + `svm-verify` + `core`/`alloc`) translates, verifies, and executes.
 #[test]
 fn peval_specialize_runs_in_sandbox_and_matches_host() {
-    let Some(bc) = build_probe_bc() else {
+    let Some(bc) = common::build_fixture_bc("peval_probe") else {
         return; // toolchain unavailable — skip
     };
     let t =
