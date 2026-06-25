@@ -6076,7 +6076,7 @@ fn i128_variable_shifts() {
     let l = 0x0123_4567_89ab_cdefu64;
     for s in [0u64, 1, 17, 63, 64, 65, 100, 127] {
         let x = ((h as u128) << 64) | l as u128;
-        let n = (s as u32 & 127) as u32;
+        let n = s as u32 & 127;
         let a = x << n;
         let b = x >> n;
         let c = ((x as i128) >> n) as u128;
@@ -6147,7 +6147,7 @@ fn i128_compares_all_predicates() {
         let y = ((bh as u128) << 64) | bl as u128;
         let (sx, sy) = (x as i128, y as i128);
         let mut r = 0i32;
-        r |= ((x < y) as i32) << 0;
+        r |= (x < y) as i32;
         r |= ((x <= y) as i32) << 1;
         r |= ((x > y) as i32) << 2;
         r |= ((x >= y) as i32) << 3;
