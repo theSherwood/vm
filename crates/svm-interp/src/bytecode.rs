@@ -1458,7 +1458,31 @@ pub fn compile_and_run_capture_over_parallel(
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
-    let dom = Domain::new(c, Host::new().jit_table_log2());
+    let mut host = Host::new();
+    compile_and_run_capture_over_parallel_with_host(m, func, args, fuel, init_mem, back, &mut host)
+}
+
+/// Like [`compile_and_run_capture_over_parallel`], but runs over a **caller-prepared `host`** (the
+/// powerbox) shared by every parallel vCPU (THREADS.md 4c-host). A spawned vCPU's `cap.call` dispatches
+/// on the **same** host as the root, serialized per call by an internal lock — so host I/O from worker
+/// vCPUs works, with compute/atomics/futex still fully parallel. Determinism note: this is the **opt-in
+/// parallel** mode, so stateful-cap interleaving (e.g. `Clock.now` values, the order of distinct
+/// `stdout` writes) races as real threads do; the **cooperative** entries remain the deterministic
+/// oracle. The caller reads the host back (its `stdout`/state) after the run.
+pub fn compile_and_run_capture_over_parallel_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    back: std::sync::Arc<super::Region>,
+    host: &mut Host,
+) -> Option<Capture> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Err(Trap::Malformed), Vec::new()));
+    }
+    let dom = Domain::new(c, host.jit_table_log2());
     let mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation_over(
             DEFAULT_RESERVED_LOG2,
@@ -1469,7 +1493,7 @@ pub fn compile_and_run_capture_over_parallel(
         mm.init_data(&m.data);
         mm
     });
-    let (r, mem) = drive_parallel(dom, func, args, *fuel, mem);
+    let (r, mem) = drive_parallel(dom, func, args, *fuel, mem, host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -4264,13 +4288,22 @@ fn drive_parallel(
     args: &[Value],
     fuel: u64,
     mem: Option<Mem>,
+    host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
     let root_vt = match VTask::new(&dom.mods[0], entry as usize, args) {
         Ok(v) => v,
         Err(t) => return (Err(t), mem),
     };
     let reg = ThreadRegistry::new();
-    std::thread::scope(|scope| run_vcpu_parallel(scope, &dom, &reg, root_vt, mem, fuel))
+    // Share the caller's powerbox across every vCPU thread, then hand it back (so the caller reads its
+    // stdout / final state). `scope` joins all vCPUs before returning, so the borrow is sound and the
+    // `Mutex` is uncontended at unwrap.
+    let shared = std::sync::Mutex::new(std::mem::take(host));
+    let out = std::thread::scope(|scope| {
+        run_vcpu_parallel(scope, &dom, &reg, &shared, root_vt, mem, fuel)
+    });
+    *host = shared.into_inner().unwrap_or_else(|e| e.into_inner());
+    out
 }
 
 /// Run one vCPU of the parallel driver to completion on **this** OS thread, fanning each
@@ -4282,11 +4315,11 @@ fn run_vcpu_parallel<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
     reg: &'env ThreadRegistry,
+    host: &'env std::sync::Mutex<Host>,
     mut vt: VTask,
     mut mem: Option<Mem>,
     mut fuel: u64,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    let mut host = Host::new();
     let mut fibers: Vec<FiberState> = Vec::new();
     let mut fiber_sp: Vec<u64> = Vec::new();
     let mut fiber_meta: Vec<(i32, i64)> = Vec::new();
@@ -4298,7 +4331,9 @@ fn run_vcpu_parallel<'scope, 'env>(
             fuel: &mut fuel,
             mem: &mut mem,
             durable: false,
-            host: HostCell::Excl(&mut host),
+            // The powerbox is **shared** by every vCPU of the run (4c-host): `cap.call` takes the lock
+            // only for its own dispatch, so compute/atomics/futex between calls stay lock-free.
+            host: HostCell::Shared(host),
         };
         // NLL ends `ctx`'s borrows of `mem`/`fuel` at this call, so the arms below may touch them.
         let stop = step_vcpu(
@@ -4338,7 +4373,8 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // The child runs over its own `Mem` view of the **same** shared backing (real atomics).
                 let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                 scope.spawn(move || {
-                    let (r, _m) = run_vcpu_parallel(scope, dom, reg, child_vt, child_mem, fuel);
+                    let (r, _m) =
+                        run_vcpu_parallel(scope, dom, reg, host, child_vt, child_mem, fuel);
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
