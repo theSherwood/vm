@@ -1714,6 +1714,17 @@ pub enum Inst {
     CapSelfGet {
         idx: ValIdx,
     },
+    /// §7 capability **reflection** (`cap.self.resolve`): resolve a capability **name** to the handle
+    /// it was granted under, as `i32` (`-errno` on miss) — the runtime, in-guest counterpart to
+    /// load-time name binding (dlopen-style discovery). `name_ptr`/`name_len` (both `i64`) point at a
+    /// UTF-8 name in the window. Read-only and authority-neutral like the rest of `cap.self`: it only
+    /// re-finds a handle the domain already holds (an unknown / ungranted name is `-EINVAL`; an
+    /// out-of-window buffer is `-EFAULT`). Sugar over the reserved `CAP_SELF_TYPE_ID` op 2, which it
+    /// lowers to on every backend.
+    CapSelfResolve {
+        name_ptr: ValIdx,
+        name_len: ValIdx,
+    },
     /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
     /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
     /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
@@ -2144,9 +2155,10 @@ impl Inst {
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
-            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count` appends one `i32`.
+            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`cap.self.resolve` append
+            // one `i32`.
             Inst::CapSelfGet { .. } => 2,
-            Inst::CapSelfCount => 1,
+            Inst::CapSelfCount | Inst::CapSelfResolve { .. } => 1,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),

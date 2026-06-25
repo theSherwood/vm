@@ -1855,6 +1855,10 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         }
         | Inst::ContNew { func: a, sp: b }
         | Inst::ContResume { k: a, arg: b }
+        | Inst::CapSelfResolve {
+            name_ptr: a,
+            name_len: b,
+        }
         | Inst::LongJmp { buf: a, val: b }
         | Inst::ThreadSpawn { sp: a, arg: b, .. }
         | Inst::ReplaceLane { a, b, .. }

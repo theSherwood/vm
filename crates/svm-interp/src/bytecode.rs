@@ -254,6 +254,13 @@ enum Op {
         idx: u32,
         dst: u32,
     },
+    /// §7 reflection `cap.self.resolve` — resolve a name buffer `(name_ptr, name_len)` to its handle
+    /// (one `i32` result, `-errno` on miss). Routed through `cap_dispatch_slots` (op 2) like a cap.call.
+    CapSelfResolve {
+        name_ptr: u32,
+        name_len: u32,
+        dst: u32,
+    },
     /// §12 fiber create (`cont.new`): register a pending fiber `(funcref, sp)` in the driver's
     /// registry and write its handle to `dst`. No switch — handled by the driver.
     ContNew {
@@ -1076,6 +1083,11 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         // `self_dispatch`, the same path the tree-walker and the JIT thunk take.
         Inst::CapSelfCount => Op::CapSelfCount { dst },
         Inst::CapSelfGet { idx } => Op::CapSelfGet { idx: g(*idx), dst },
+        Inst::CapSelfResolve { name_ptr, name_len } => Op::CapSelfResolve {
+            name_ptr: g(*name_ptr),
+            name_len: g(*name_len),
+            dst,
+        },
         // §12 fibers — cooperative continuation switching, driven by the bytecode driver (no M:N
         // pool, no DPOR; single-vCPU). `cont.new` registers a pending fiber, `cont.resume` switches
         // in (two results), `suspend` switches back (one result).
@@ -4285,6 +4297,21 @@ impl Vm {
                     let res = host.self_dispatch(1, &[i])?;
                     self.regs[base + *dst as usize] = Reg::from_i32(res[0] as i32);
                     self.regs[base + *dst as usize + 1] = Reg::from_i32(res[1] as i32);
+                    pc += 1;
+                }
+                Op::CapSelfResolve {
+                    name_ptr,
+                    name_len,
+                    dst,
+                } => {
+                    // §7 reflection op 2 — resolve a name to its handle. Through the generic dispatch
+                    // (which has the window to read the name), identical to the tree-walker / JIT.
+                    let ptr = r!(*name_ptr).i64();
+                    let len = r!(*name_len).i64();
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let res =
+                        host.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
+                    r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }
                 // §12 fiber ops escape to `drive` (which owns the registry / resume chain). Each

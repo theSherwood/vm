@@ -6070,6 +6070,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                     frames[top].vals.push(Reg::from_i32(r[1] as i32));
                 }
+                // §7 reflection (`cap.self.resolve`): resolve a name buffer to its handle (op 2).
+                // Routed through the generic capability dispatch (which has the window to read the
+                // name) — the same code the JIT thunk / bytecode engine reach, so all three agree.
+                Inst::CapSelfResolve { name_ptr, name_len } => {
+                    let ptr = get_i64(&frames[top].vals, *name_ptr)?;
+                    let len = get_i64(&frames[top].vals, *name_len)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r =
+                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
+                    drop(hg);
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
                 // §12 per-vCPU TLS register: read/write **this** vCPU's word (`tls`, destructured from
                 // `v` above), so a fiber that migrated here sees the current vCPU's value.
                 Inst::VcpuTlsGet => {
@@ -6833,7 +6846,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::CallImport { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
-        Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
+        Inst::CapSelfCount | Inst::CapSelfGet { .. } | Inst::CapSelfResolve { .. } => {
+            return Err(Trap::Malformed)
+        }
         // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
         // loop (`run_inner`), never here.
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),

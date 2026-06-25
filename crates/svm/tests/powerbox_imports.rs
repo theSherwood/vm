@@ -121,12 +121,12 @@ block0(v0: i64):
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
 }
 
-// --- F7: runtime name → handle resolution (the guest's `cap.self` op 2) ---------------------------
+// --- F7: runtime name → handle resolution (the guest's `cap.self.resolve`) ------------------------
 //
-// `cap.call 4294967295 2 (i64, i64) -> (i32) <h> (name_ptr, name_len)` resolves a capability **name**
-// to the handle it was granted (4294967295 = the reserved `CAP_SELF_TYPE_ID`; the handle operand is
-// ignored, like every `cap.self` op). It confers no authority — it only re-finds a handle the guest
-// already holds — so it routes through the generic capability seam and works on all three backends.
+// `cap.self.resolve <name_ptr> <name_len> -> i32` resolves a capability **name** to the handle it was
+// granted (`-errno` on miss). It confers no authority — it only re-finds a handle the guest already
+// holds — and routes through the generic capability seam (op 2 over the reserved `CAP_SELF_TYPE_ID`),
+// so it works identically on the tree-walker, bytecode engine, and JIT.
 
 /// The guest resolves the name `"write"` (which it imported) to its handle **at runtime** — never
 /// reading the stash slot — then uses that resolved handle to emit a string. Proves the resolved
@@ -138,15 +138,14 @@ data ro 17000 \"write\"
 export \"entry\" 0
 func (i64) -> (i32) {
 block0(v0: i64):
-  v1 = i32.const 0
-  v2 = i64.const 17000
-  v3 = i64.const 5
-  v4 = cap.call 4294967295 2 (i64, i64) -> (i32) v1 (v2, v3)
-  v5 = i64.const 16384
-  v6 = i64.const 12
-  v7 = call.import \"write\" (i64, i64) -> (i64) v4 (v5, v6)
-  v8 = i32.const 0
-  return v8
+  v1 = i64.const 17000
+  v2 = i64.const 5
+  v3 = cap.self.resolve v1 v2
+  v4 = i64.const 16384
+  v5 = i64.const 12
+  v6 = call.import \"write\" (i64, i64) -> (i64) v3 (v4, v5)
+  v7 = i32.const 0
+  return v7
 }
 ";
 
@@ -176,11 +175,10 @@ data ro 17000 \"nope\"
 export \"entry\" 0
 func (i64) -> (i32) {
 block0(v0: i64):
-  v1 = i32.const 0
-  v2 = i64.const 17000
-  v3 = i64.const 4
-  v4 = cap.call 4294967295 2 (i64, i64) -> (i32) v1 (v2, v3)
-  return v4
+  v1 = i64.const 17000
+  v2 = i64.const 4
+  v3 = cap.self.resolve v1 v2
+  return v3
 }
 ";
 
@@ -206,14 +204,13 @@ data ro 16384 \"exit\"
 export \"entry\" 0
 func (i64) -> (i32) {
 block0(v0: i64):
-  v1 = i32.const 0
-  v2 = i64.const 16384
-  v3 = i64.const 4
-  v4 = cap.call 4294967295 2 (i64, i64) -> (i32) v1 (v2, v3)
-  v5 = i64.const 8
-  v6 = i32.load v5
-  v7 = i32.sub v4 v6
-  return v7
+  v1 = i64.const 16384
+  v2 = i64.const 4
+  v3 = cap.self.resolve v1 v2
+  v4 = i64.const 8
+  v5 = i32.load v4
+  v6 = i32.sub v3 v5
+  return v6
 }
 ";
 

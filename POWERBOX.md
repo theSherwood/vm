@@ -421,18 +421,19 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   `svm_interp::Quota` / `svm_jit::Quota`; the field-by-field facade conversion is gone (see the §F1
   notes / `jit_run`). Values + clamping unchanged (both ceilings `1<<16`).
 - **F7 — runtime name→handle directory.** *Landed.* A guest can resolve a capability **by name to its
-  handle at runtime** — dlopen-style discovery, the dynamic counterpart to load-time name binding. The
+  handle at runtime** — dlopen-style discovery, the dynamic counterpart to load-time name binding — via
+  a first-class IR instruction **`cap.self.resolve <name_ptr> <name_len> -> i32`** (a clean
+  counterpart to `cap.self.count`/`get`; opcode `0x7E`, full text + binary + verify support). The
   `Host` keeps a `cap_names` directory (name → handle), populated by the powerbox layer at grant time:
   a name-bound guest (`instantiate_with_imports`) resolves its own import names; a fixed §3e powerbox
   guest resolves the canonical names (`stdout`/`stdin`/`exit`/`memory`/`addrspace`/`ioring`/`blocking`/
-  `jit`). The guest calls it as `cap.self` **op 2** — `resolve(name_ptr, name_len) -> handle | -errno`
-  — serviced in the generic `cap_dispatch_slots` seam (where `mem` is available to read the name), so
-  **all three backends** get it from one implementation. Confers no authority (it only re-finds a
-  handle already granted; an ungranted name is `-EINVAL`), fail-closed on the untrusted name (`-EFAULT`
-  out of bounds, `-EINVAL` bad UTF-8 / unknown). Tests in `powerbox_imports.rs` (runtime resolve +
-  use on all three backends; unknown-name `-EINVAL`; canonical names match the stashed handles).
-  *Ergonomic follow-up:* a dedicated `cap.self.resolve` IR instruction would avoid the reserved-type_id
-  / dummy-handle form, but the `cap.self` instruction family is currently mem-less, so that's deferred.
+  `jit`). The instruction lowers to op 2 over the reserved `CAP_SELF_TYPE_ID` in the generic
+  `cap_dispatch_slots` seam (where `mem` is available to read the name), so **all three backends** get
+  it from one implementation. Confers no authority (it only re-finds a handle already granted; an
+  ungranted name is `-EINVAL`), fail-closed on the untrusted name (`-EFAULT` out of bounds, `-EINVAL`
+  bad UTF-8 / unknown). Tests: `powerbox_imports.rs` (runtime resolve + use on all three backends;
+  unknown-name `-EINVAL`; canonical names match the stashed handles) and `cap_self.rs` (text + binary
+  round-trip).
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic interface labels** (Phase 4 deferral): an untrusted, verifier-ignored human-readable

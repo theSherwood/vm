@@ -311,6 +311,19 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.push(ValType::I32); // type_id
                 continue;
             }
+            // §7 `cap.self.resolve` reads a name buffer `(ptr: i64, len: i64)` and appends the resolved
+            // handle (or `-errno`) as `i32`. Authority-neutral like the rest of `cap.self`.
+            if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*name_ptr, ValType::I64)?;
+                cx.expect(*name_len, ValType::I64)?;
+                types.push(ValType::I32); // handle | -errno
+                continue;
+            }
             // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
             // thread-entry type `(i64 sp, i64 arg) -> i64`, so — like `call` — it needs whole-module
             // info.
@@ -401,6 +414,7 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
                 types.push(ValType::I32); // handle
                 types.push(ValType::I32); // type_id
             }
+            Inst::CapSelfResolve { .. } => types.push(ValType::I32), // handle | -errno
             Inst::ThreadSpawn { .. } => types.push(ValType::I32),
             Inst::RefFunc { .. } => types.push(ValType::I32),
             Inst::CallImport { .. } => {} // unreachable in a verified module
@@ -533,7 +547,7 @@ fn check_inst(
             unreachable!("CallImport handled before check_inst's value match")
         }
         // §7 reflection appends its results in the multi-result section above; unreachable here.
-        Inst::CapSelfCount | Inst::CapSelfGet { .. } => {
+        Inst::CapSelfCount | Inst::CapSelfGet { .. } | Inst::CapSelfResolve { .. } => {
             unreachable!("cap.self.* handled before check_inst's value match")
         }
         // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
