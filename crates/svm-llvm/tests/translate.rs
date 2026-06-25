@@ -3479,7 +3479,6 @@ fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
 /// synthesized `__cxa_allocate_exception`/`__cxa_throw`/`__cxa_begin_catch`/`__cxa_end_catch`
 /// runtime — byte-identical to native `clang++` on all three engines.
 #[test]
-#[ignore = "C++ EH lowering in progress (invoke/landingpad/__cxa_* not yet translated)"]
 fn cpp_eh_throw_catch_int() {
     let src = r#"
 extern "C" int write(int fd, const char *buf, long n);
