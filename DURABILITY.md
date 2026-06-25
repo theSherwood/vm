@@ -1002,8 +1002,9 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 (full nested concurrent spawns) + the **blocked-in-`thread.wait` freeze** (bounded + fail-closed) +
 **B.1′** (concurrent child-fiber *mid-resume-chain*, verified) are **landed** (the first three merged,
 all-platform CI green; the rest on `claude/durable-next-slices-tracker`). The remaining queue — **lift
-the `atomic.wait` thaw fail-closed** (concurrent-thaw rework), then **4A.6 / 4A.7** — is detailed in the
-*"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes below.
+the `atomic.wait` thaw fail-closed** (concurrent-thaw rework: **design + 3-stage plan now written** under
+*"Concurrent thaw"* below; stage 1 = per-context thaw-state relocation, `FORMAT_VERSION` v6→v7), then
+**4A.6 / 4A.7** — is detailed in the *"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes below.
 
 **Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
 full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
@@ -1185,8 +1186,59 @@ interp, which surfaces a guest wait/join-deadlock as `Trap::ThreadFault`) via a 
 rather than deadlocking. Pinned by `concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed`
 (child changes the value without notifying → thaw resolves `NOT_EQUAL`) and
 `…_fails_closed_on_thaw` (value unchanged → thaw traps `ThreadFault`). **Lifting the fail-closed** — a
-re-park resolvable only by reordering — needs the concurrent-thaw rework (run frozen waiters as real OS
-threads so notify/wait re-synchronizes). Original 4A map:
+re-park resolvable only by reordering — needs the concurrent-thaw rework below.
+
+#### Concurrent thaw — design + staging (lifts the `atomic.wait` fail-closed)
+
+*Why the current thaw can't satisfy a re-parking wait.* `thaw_reattach_and_run` runs the frozen vCPUs
+**inline on one worker**, each rewound to completion before the next, in descending-task order. That is
+correct for everything *except* a wait that must re-park: an inline waiter has no concurrent vCPU to
+`notify` it, so it would deadlock — hence the fail-closed. Resolving it needs the waiter and its notifier
+to run **concurrently**, re-synchronizing through the real domain futex exactly as on a fresh run.
+
+*The blocker: the shared global state word.* The durable state word lives at a **single global window
+offset** (`STATE_OFF = 0`) — the prologue reads it (`REWINDING` ⇒ rewind-dispatch), every poll reads it
+(`UNWINDING` ⇒ unwind), and a re-issue writes it (`NORMAL`). The interp runs single-worker and
+*multiplexes* each vCPU's `dstate` through that one word (swapped in when the vCPU runs, saved back when
+it yields). The JIT could spawn the frozen vCPUs as real OS threads, but they would **race on the one
+word**: vCPU A finishing its rewind flips the global word to `NORMAL` while vCPU B is still rewinding (B
+then skips its rewind), and a forward vCPU calling a function would have the callee's prologue read
+another vCPU's `REWINDING` and spuriously rewind. So concurrent rewind is impossible while the state word
+is global. (The shadow-**SP** word was already relocated per-context in 4A.5 stage i — `shadow_switch`
+keeps each context's SP in its own region — and concurrent *freeze* works because all contexts unwind on
+the *same* global `UNWINDING` simultaneously; only thaw needs *independent* per-context state.)
+
+*The fix: a per-context thaw-state word (region-relative).* Move the state word from `ConstI64(STATE_OFF)`
+to a **shadow-base-relative** load in the transform, so each context reads/writes the state word in *its
+own* region (mirroring the SP word). Then each vCPU rewinds against its own word with no cross-talk, and
+the JIT can run them as concurrent OS threads. This is the only IR change; because the transform is
+**shared**, both backends pick it up — the interp's per-vCPU `dstate` then lives directly in its region
+word (its multiplex/`shadow_switch` swap of the state word simplifies away), and cross-backend artifact
+equality is preserved at freeze time (the per-context word holds the same value the global word did). It
+is a **snapshot-format change** (the state byte moves out of offset 0 into the regions) ⇒ `FORMAT_VERSION`
+bump + regenerate the cross-backend equality fixtures. The global `UNWINDING` freeze-trigger can stay a
+broadcast (the concurrent-freeze coordinator already visits every live context), or fold into the
+per-context word set on all contexts at once — TBD in stage 1.
+
+*Staging (each stage independently lands + tests green):*
+1. **Per-context thaw-state relocation.** Transform emits the state word region-relative; both backends
+   set/read it per-context; `FORMAT_VERSION` bump; keep the *inline* serial thaw (no behavior change yet)
+   and prove all existing freeze/thaw + cross-backend equality tests stay green. This is the foundational,
+   highest-surface slice — land it alone.
+2. **Concurrent JIT thaw driver.** Replace `thaw_reattach_and_run`'s inline loop with a concurrent
+   re-spawn (mirror `run_child`/stage ii): each frozen vCPU rewinds on its own OS thread against its own
+   state word, then runs forward concurrently; the root joins. A re-issued `atomic.wait` now parks on the
+   real futex and a sibling's `atomic.notify` wakes it — drop the `Domain.thawing` fail-closed. Watch the
+   **join ordering**: the inline path relied on "children before parents"; concurrently a parent's
+   re-issued `thread.join` must block on the real `Done` cell (which it already does on a fresh run), so
+   this should fall out, but a parent waiting on a child that is *itself* re-parking is the case to test.
+3. **Determinism / equivalence.** A concurrent thaw reintroduces real interleaving, so re-establish §12.6:
+   rewind reloads recorded side effects (deterministic, unaffected by order); only the forward-phase
+   re-issued waits/notifies interleave, and they re-synchronize to the same value handoff. Add a
+   producer↔consumer-both-frozen test (the case the fail-closed rejects today) and a mutual-rendezvous
+   test; fuzz the interleaving like the existing concurrent-freeze tests.
+
+Original 4A map:
 
 - **Barrier adaptation (loom-verified, but NOT the live path).** The 4A.4 `quiesce_arrive` ran `unwind`
   *under* the `quiesce` lock to serialize the (then-shared) active-SP scratch; with per-context SP that
