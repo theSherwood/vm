@@ -397,6 +397,9 @@ fn translate_impl(
                                                     // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
         calls_external(m, &defined_names, "memcmp") || calls_external(m, &defined_names, "bcmp");
+    // `__cxa_end_catch` destroys the caught exception object via `__svm_eh_destroy` (gated on EH being
+    // active, so the helper can address the EH region and the dtor funcref resolves through the table).
+    let need_eh_destroy = need_eh && calls_external(m, &defined_names, "__cxa_end_catch");
     // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
     // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
     // order below must match.
@@ -449,6 +452,7 @@ fn translate_impl(
         atomic_rmw_narrow: take(need_narrow_atomic),
         atomic_cas_narrow: take(need_narrow_atomic),
         memcmp: take(need_memcmp),
+        eh_destroy: take(need_eh_destroy),
         float_scratch: float_scratch_base,
         eh_base,
         eh_typeids,
@@ -652,6 +656,11 @@ fn translate_impl(
     // the two passed window addresses.
     if need_memcmp {
         funcs.push(synth_memcmp());
+    }
+    // `__svm_eh_destroy` (after `__svm_memcmp` — matches the `take` order). Self-contained: it reads
+    // only its arguments and indirect-calls the passed destructor funcref.
+    if need_eh_destroy {
+        funcs.push(synth_eh_destroy());
     }
     Ok(Translated {
         module: Module {
@@ -2072,10 +2081,15 @@ const EH_EXN_O: u64 = 8;
 /// Current exception type selector (`i32`): the typeinfo id of the in-flight exception (see
 /// `Helpers::eh_typeids`), set by `__cxa_throw`, read by `landingpad` / compared by `eh.typeid.for`.
 const EH_SEL_O: u64 = 16;
+/// The in-flight exception object's destructor (`i64` funcref, `0` for a trivially-destructible type):
+/// the third `__cxa_throw` argument, stashed so `__cxa_end_catch` can run it on the exception object
+/// when the handler completes (the `__svm_eh_destroy` helper guards the null case). `__cxa_rethrow`
+/// preserves it (it re-raises the same object).
+const EH_DTOR_O: u64 = 24;
 /// Start of the handler buf slots — one `EH_SLOT`-byte slot per active handler. The slots only need
 /// distinct guest addresses (the `SetJmp`/`LongJmp` ops key a host-side checkpoint by buf address),
 /// so the bytes themselves are never read as a `jmp_buf`.
-const EH_BUFS_O: u64 = 24;
+const EH_BUFS_O: u64 = 32;
 /// Bytes per handler buf slot (only its address matters; sized for alignment headroom).
 const EH_SLOT: u64 = 32;
 /// Maximum nesting depth of active `try` handlers (region is sized for this many buf slots).
@@ -3137,6 +3151,10 @@ struct Helpers {
     /// else the signed first-mismatch difference (`a[i] - b[i]`). Backs `memcmp` *and* `bcmp` (Rust's
     /// `[u8]`/slice equality and `BTreeMap` key ordering emit these).
     memcmp: Option<u32>,
+    /// `__svm_eh_destroy(sp:i64, exn:i64, dtor:i64)` — run an exception object's destructor for
+    /// `__cxa_end_catch` (indirect-call `dtor` on `exn` when non-null). Present only when the module
+    /// catches a C++ exception (calls `__cxa_end_catch`).
+    eh_destroy: Option<u32>,
     /// `__svm_getenv(name:i64) -> i64` — scan the §3e env strings for `name=`, returning the value
     /// pointer (just past the `=`) or NULL. Reads the blob in the reserved low scratch directly.
     getenv: Option<u32>,
@@ -3241,6 +3259,7 @@ fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>) {
                         }
                         Some(
                             "__cxa_begin_catch"
+                            | "__cxa_get_exception_ptr"
                             | "__cxa_end_catch"
                             | "__cxa_allocate_exception"
                             | "__cxa_rethrow"
@@ -3369,6 +3388,67 @@ fn synth_realloc(malloc_idx: u32, memcpy_idx: u32) -> Func {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![b0, null_case, have],
+    }
+}
+
+/// Synthesize `__svm_eh_destroy(sp:i64, exn:i64, dtor:i64)`: run an exception object's destructor on
+/// behalf of `__cxa_end_catch`. `dtor` is a `void(T*)` funcref (the third `__cxa_throw` argument) or
+/// `0` for a trivially-destructible type; when non-null it is indirect-called on the object `exn`,
+/// passing the helper's own data-SP as the destructor's frame base (the helper holds no frame, so the
+/// destructor sits directly above `__cxa_end_catch`'s). The null case returns immediately. This is
+/// the guard `__cxa_end_catch` cannot express inline — it lowers in effect position, where it has no
+/// way to branch — so the conditional indirect call is pushed into this helper instead.
+fn synth_eh_destroy() -> Func {
+    let params = vec![ValType::I64, ValType::I64, ValType::I64];
+    // block0(sp=0, exn=1, dtor=2): have = dtor != 0; br_if have call(sp,exn,dtor) done()
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![
+            Inst::ConstI64(0), // v3
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Ne,
+                a: 2,
+                b: 3,
+            }, // v4 = dtor != 0
+        ],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 1,
+            then_args: vec![0, 1, 2],
+            else_blk: 2,
+            else_args: vec![],
+        },
+    };
+    // call(sp=0, exn=1, dtor=2): the destructor's funcref index is the low 32 bits of `dtor`; call it
+    // `dtor(sp, exn)` (void — the `(data-SP, this)` calling convention), then return.
+    let call = Block {
+        params: params.clone(),
+        insts: vec![
+            Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: 2,
+            }, // v3 = funcref idx
+            Inst::CallIndirect {
+                ty: svm_ir::FuncType {
+                    params: vec![ValType::I64, ValType::I64],
+                    results: vec![],
+                },
+                idx: 3,
+                args: vec![0, 1], // (dtor_sp = sp, this = exn)
+            }, // void
+        ],
+        term: Terminator::Return(vec![]),
+    };
+    let done = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Return(vec![]),
+    };
+    Func {
+        params,
+        results: vec![],
+        blocks: vec![entry, call, done],
     }
 }
 
@@ -10428,31 +10508,25 @@ fn lower_setjmp_call(
     }
 }
 
-/// Lower the Itanium C++ exception-handling runtime (`__cxa_*`) and `llvm.eh.typeid.for`. Exception
-/// state lives in the reserved EH region ([`BlockCtx::eh_base`]):
-/// - `__cxa_allocate_exception(size)` → the fixed object scratch slot (`EH_EXNOBJ_O`).
-/// - `__cxa_throw(obj, ti, dtor)` → store the object ptr + the thrown type's selector, then unwind
-///   ([`BlockCtx::eh_unwind`]) into the enclosing `invoke`-installed handler (noreturn; the IR's
-///   trailing `unreachable` is dead).
-/// - `__cxa_rethrow()` / `_Unwind_Resume` → re-unwind with the current (already-stored) selector.
-/// - `__cxa_begin_catch(p)` → the caught object pointer (identity for a primitive/pointer catch).
-/// - `__cxa_end_catch()` → a no-op (no object destruction in the supported scope).
-/// - `llvm.eh.typeid.for(ti)` → the operand type's compile-time id (the selector the catch compares).
-fn lower_eh_call(
+/// The **noreturn EH unwinders** — `__cxa_throw` / `__cxa_rethrow` / `_Unwind_Resume` — shared by
+/// the `call` form ([`lower_eh_call`]) and the `invoke` form ([`lower_invoke`]). clang emits them as
+/// an `invoke` (rather than a `call`) whenever the throw/rethrow sits inside an active cleanup scope
+/// (e.g. a `catch` body, whose unwind edge runs `__cxa_end_catch`); in our setjmp/longjmp model they
+/// never return and long-jump straight into the enclosing handler, so *both* invoke successors are
+/// dead. `__cxa_throw` first stores the object ptr + the thrown type's selector; the bare re-unwinds
+/// reuse the already-stored `cur_exn`/`cur_sel`. Generic over the per-arg attribute so it accepts a
+/// `Call`'s and an `Invoke`'s `arguments` alike. `Ok(false)` ⇒ not an unwinder (fall through).
+fn lower_eh_unwinder<A>(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
     name: &str,
+    arguments: &[(Operand, A)],
 ) -> Result<bool, Error> {
+    // `eh_base()` is consulted only once the name is a known unwinder — a non-EH call/invoke must
+    // fall through to `Ok(false)` without requiring a reserved EH region.
     match name {
-        "__cxa_allocate_exception" => {
-            let base = ctx.eh_base()?;
-            let p = ctx.const_i64((base + EH_EXNOBJ_O) as i64);
-            ctx.bind_dest(&c.dest, p);
-            Ok(true)
-        }
         "__cxa_throw" => {
             let base = ctx.eh_base()?;
-            let exn = ctx.operand_i64(&c.arguments[0].0)?;
+            let exn = ctx.operand_i64(&arguments[0].0)?;
             let exn_addr = ctx.const_i64((base + EH_EXN_O) as i64);
             ctx.push_effect(Inst::Store {
                 op: StoreOp::I64,
@@ -10461,7 +10535,7 @@ fn lower_eh_call(
                 offset: 0,
                 align: 8,
             });
-            let tid = ctx.eh_typeid(&c.arguments[1].0)?;
+            let tid = ctx.eh_typeid(&arguments[1].0)?;
             let sel = ctx.push(Inst::ConstI32(tid as i32));
             let sel_addr = ctx.const_i64((base + EH_SEL_O) as i64);
             ctx.push_effect(Inst::Store {
@@ -10471,6 +10545,18 @@ fn lower_eh_call(
                 offset: 0,
                 align: 4,
             });
+            // The third argument is the object's destructor (a `void(T*)` funcref, or null for a
+            // trivially-destructible type). Stash it so `__cxa_end_catch` can run it on the exception
+            // object when the catching handler completes (`__svm_eh_destroy` guards the null case).
+            let dtor = ctx.operand_i64(&arguments[2].0)?;
+            let dtor_addr = ctx.const_i64((base + EH_DTOR_O) as i64);
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: dtor_addr,
+                value: dtor,
+                offset: 0,
+                align: 8,
+            });
             ctx.eh_unwind(base)?;
             Ok(true)
         }
@@ -10479,12 +10565,89 @@ fn lower_eh_call(
             ctx.eh_unwind(base)?;
             Ok(true)
         }
-        "__cxa_begin_catch" => {
+        _ => Ok(false),
+    }
+}
+
+/// Lower the Itanium C++ exception-handling runtime (`__cxa_*`) and `llvm.eh.typeid.for`. Exception
+/// state lives in the reserved EH region ([`BlockCtx::eh_base`]):
+/// - `__cxa_allocate_exception(size)` → the fixed object scratch slot (`EH_EXNOBJ_O`).
+/// - `__cxa_throw(obj, ti, dtor)` → store the object ptr + the thrown type's selector, then unwind
+///   ([`BlockCtx::eh_unwind`]) into the enclosing `invoke`-installed handler (noreturn; the IR's
+///   trailing `unreachable` is dead). When the throw sits in a cleanup scope clang emits it as an
+///   `invoke` instead — [`lower_invoke`] routes that form through the shared [`lower_eh_unwinder`].
+/// - `__cxa_rethrow()` / `_Unwind_Resume` → re-unwind with the current (already-stored) selector.
+/// - `__cxa_begin_catch(p)` → the caught object pointer (identity for a primitive/pointer catch).
+/// - `__cxa_end_catch()` → a no-op (no object destruction in the supported scope).
+/// - `llvm.eh.typeid.for(ti)` → the operand type's compile-time id (the selector the catch compares).
+fn lower_eh_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    // The noreturn unwinders (`__cxa_throw` / `__cxa_rethrow` / `_Unwind_Resume`) are shared with the
+    // `invoke` form; the IR's trailing `unreachable` is the dead terminator after the long-jump.
+    if lower_eh_unwinder(ctx, name, &c.arguments)? {
+        return Ok(true);
+    }
+    match name {
+        "__cxa_allocate_exception" => {
+            let base = ctx.eh_base()?;
+            let p = ctx.const_i64((base + EH_EXNOBJ_O) as i64);
+            ctx.bind_dest(&c.dest, p);
+            Ok(true)
+        }
+        // `__cxa_begin_catch(p)` officially enters the handler; `__cxa_get_exception_ptr(p)` fetches the
+        // object pointer *before* a catch-by-value copy-construct (which may itself throw). Both return
+        // the exception object pointer — identity in our model (it already points into the EH region).
+        "__cxa_begin_catch" | "__cxa_get_exception_ptr" => {
             let p = ctx.operand_i64(&c.arguments[0].0)?;
             ctx.bind_dest(&c.dest, p);
             Ok(true)
         }
-        "__cxa_end_catch" => Ok(true),
+        "__cxa_end_catch" => {
+            // The handler is complete: destroy the caught exception object by running its registered
+            // destructor (stashed at `EH_DTOR_O` by `__cxa_throw`; `0` for a trivially-destructible
+            // type). The null guard + indirect call live in the `__svm_eh_destroy` helper because this
+            // lowering runs in effect position and cannot branch. `need_eh_destroy` guarantees the
+            // helper exists whenever a module reaches here; fall back to a no-op if somehow absent.
+            let Some(helper) = ctx.helpers.eh_destroy else {
+                return Ok(true);
+            };
+            let base = ctx.eh_base()?;
+            let exn_addr = ctx.const_i64((base + EH_EXN_O) as i64);
+            let exn = ctx.push(Inst::Load {
+                op: LoadOp::I64,
+                addr: exn_addr,
+                offset: 0,
+                align: 8,
+            });
+            let dtor_addr = ctx.const_i64((base + EH_DTOR_O) as i64);
+            let dtor = ctx.push(Inst::Load {
+                op: LoadOp::I64,
+                addr: dtor_addr,
+                offset: 0,
+                align: 8,
+            });
+            let sp = ctx.sp()?;
+            let fs = ctx.const_i64(ctx.frame_size as i64);
+            let callee_sp = ctx.add_i64(sp, fs);
+            ctx.push_effect(Inst::Call {
+                func: helper,
+                args: vec![callee_sp, exn, dtor],
+            });
+            // Clear the dtor slot so a later `__cxa_end_catch` without an intervening throw cannot
+            // re-destroy the (now-dead) object; the next `__cxa_throw` re-stores it.
+            let zero = ctx.const_i64(0);
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: dtor_addr,
+                value: zero,
+                offset: 0,
+                align: 8,
+            });
+            Ok(true)
+        }
         "llvm.eh.typeid.for" => {
             let tid = ctx.eh_typeid(&c.arguments[0].0)?;
             let r = ctx.push(Inst::ConstI32(tid as i32));
@@ -14888,6 +15051,16 @@ fn lower_invoke(
         .ok_or_else(|| Error::Unsupported("invoke of inline asm".into()))?;
     let cname =
         global_name_of(op).ok_or_else(|| Error::Unsupported("invoke of indirect callee".into()))?;
+
+    // A noreturn EH unwinder (`__cxa_rethrow`/`_Unwind_Resume`/`__cxa_throw`) appears as an `invoke`
+    // when it sits in a cleanup scope (the unwind edge runs `__cxa_end_catch`). It is not a defined
+    // function we can `setjmp` around — it long-jumps straight into the enclosing handler — so emit
+    // the unwind inline and terminate `unreachable`: both the normal and unwind successors are dead
+    // (the skipped `__cxa_end_catch` cleanup is a no-op in the supported scope).
+    if lower_eh_unwinder(ctx, &cname, &inv.arguments)? {
+        return Ok(Terminator::Unreachable);
+    }
+
     let func = *ctx
         .name2idx
         .get(&cname)
