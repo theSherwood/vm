@@ -5125,6 +5125,26 @@ fn simd_autovec_avx2_fixed_point_shift() {
 // `VFloatBin`, `ExtractLane`) is exercised against the native oracle on both backends.
 // ============================================================================================
 
+/// `<2 x ptr>` — an SLP-vectorized pointer-pair copy (`load <2 x ptr>` → `store`, e.g. Embench
+/// `sglib-combined`'s linked-list/struct shuffles). A pointer lane is an `i64` window offset, so the
+/// on-ramp packs `<2 x ptr>` exactly like `<2 x i64>` (an `i64x2` v128) and the 16-byte move is a
+/// `V128Load`/`V128Store`. Compares pointer **identity** (portable: absolute addresses differ between
+/// native and svm, but "the copy preserved both pointers" does not).
+#[test]
+fn simd_ptr2_copy() {
+    let src = "struct N { int *a; int *b; };\n\
+        void cp(struct N *d, struct N *s);\n\
+        int run(int seed){\n\
+        \x20 int arr[4]; struct N s, d;\n\
+        \x20 s.a = &arr[seed & 3]; s.b = &arr[(seed + 1) & 3];\n\
+        \x20 cp(&d, &s);\n\
+        \x20 return (d.a == s.a && d.b == s.b) ? 7 : 0;\n\
+        }\n\
+        __attribute__((noinline)) void cp(struct N *d, struct N *s){ d->a = s->a; d->b = s->b; }\n\
+        int main(void){ return run(2); }\n";
+    check_vs_native("simd_ptr2_copy", src, 2);
+}
+
 /// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
 /// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
 #[test]

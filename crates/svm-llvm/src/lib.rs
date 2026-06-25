@@ -1110,6 +1110,10 @@ fn vec_lane_shape(ty: &Type) -> Option<svm_ir::VShape> {
         Type::IntegerType { bits: 16 } => VShape::I16x8,
         Type::IntegerType { bits: 32 } => VShape::I32x4,
         Type::IntegerType { bits: 64 } => VShape::I64x2,
+        // A pointer lane is an `i64` window offset (§3a/§10), so a pointer vector packs exactly like an
+        // `i64` vector — `<2 x ptr>` ≡ `<2 x i64>` (an `i64x2` v128). Lets a verbatim pointer-pair
+        // load/store (SLP-vectorized struct/list copy, e.g. Embench `sglib-combined`) ride the v128 path.
+        Type::PointerType { .. } => VShape::I64x2,
         Type::FPType(FPType::Single) => VShape::F32x4,
         Type::FPType(FPType::Double) => VShape::F64x2,
         _ => return None,
