@@ -314,6 +314,18 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   received `"live from wasm!\n"` and the guest returned the host clock value. wasm64 *runtime* of the
   live path needs a Wasmtime embedding to supply imports (the CLI can't); Node/wasm32 is the real
   browser path and passes. Follow-up: an `alloc`/`dealloc` ABI to replace the fixed scratch buffers.
+- [x] **Real-browser validation (Chromium via Playwright).** Everything above runs on Node
+  `worker_threads`; this proves it runs in an **actual browser**, which Node skips: a tiny COOP/COEP
+  server (`serve.mjs`) makes the page **cross-origin isolated** so `SharedArrayBuffer` / shared
+  `WebAssembly.Memory` are exposed, and `browser-test.mjs` drives the preinstalled Chromium against a
+  page (`web/index.html` + `main.js` + `worker.js`) that (1) runs the **powerbox** (`svm_run_pb` →
+  `"hello, powerbox!"`, single-threaded on the page) and (2) runs **one guest's `thread.spawn`ed vCPUs
+  across real Web Workers** over the shared memory — the browser twin of `threads-spawn.mjs`: the page
+  creates every Worker and never blocks (a browser bans main-thread `Atomics.wait`); each Worker sets
+  its own stack/TLS and services `thread.join` via `Atomics.wait` and the futex via
+  `Atomics.wait`/`notify`. Verified: **crossOriginIsolated**, powerbox PASS, and the 8-vCPU counter
+  kernel → **4000 across 9 Workers** (1 root + 8 spawned), stable across repeats. So the genuinely
+  multithreaded SVM-in-wasm runs end-to-end in a real browser, not just Node.
 
 ## Verification
 
@@ -322,8 +334,11 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`crates/svm/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 185/185
-  differential vs native on wasm32), `browser/wt` (the **same 119 on wasm64** via a Wasmtime
-  embedding), and `node browser/live.mjs` (host-import demo, `--features live`). The 16 embedded
-  `--invoke` probes under **Reproduce** spot-check each feature on wasm64 directly.
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 187/187
+  differential vs native on wasm32), `browser/wt` (wasm64 via a Wasmtime embedding), and
+  `node browser/live.mjs` (host-import demo, `--features live`). The 16 embedded `--invoke` probes under
+  **Reproduce** spot-check each feature on wasm64 directly.
+- **Runs in a real browser:** `node browser/browser-test.mjs` (Chromium via Playwright) — cross-origin
+  isolated, the powerbox prints `"hello, powerbox!"`, and one guest's vCPUs run across real Web Workers
+  → 4000. (Build the threads module + `gencorpus` first; see the header of `browser-test.mjs`.)
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

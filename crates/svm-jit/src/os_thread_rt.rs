@@ -43,6 +43,15 @@ const WAIT_NOT_EQUAL: i32 = 1;
 // Only produced on the timed-wait path, which loom (no timeout model) compiles out.
 #[cfg_attr(loom, allow(dead_code))]
 const WAIT_TIMED_OUT: i32 = 2;
+/// §12.8 concurrent-thaw stage 2: an **internal** status — an infinite (no-timeout) wait whose every
+/// possible notifier has exited (`peers_live()` is false), so it can never be satisfied. The
+/// `atomic.wait` thunk intercepts it and traps `ThreadFault` (matching the interpreter, which surfaces a
+/// guest wait/join-deadlock as `Trap::ThreadFault`); it is **never** returned to the guest as a status.
+/// Lets the blanket thaw fail-closed go away: a re-issued wait now parks while a live sibling could
+/// notify (so a producer↔consumer pair frozen mid-rendezvous resolves) and fails closed only here, when
+/// no peer remains — without hanging. Real-build only (the loom model passes a always-live `peers_live`).
+#[cfg(not(loom))]
+const WAIT_DEADLOCK: i32 = 3;
 
 /// Max concurrently-live vCPUs per run (matches the interpreter's `MAX_VCPUS`): an anti-bomb ceiling
 /// so a thread-bomb traps (`ThreadFault`) instead of exhausting host memory.
@@ -192,14 +201,6 @@ pub(crate) struct Domain {
     quiesce: Mutex<usize>,
     quiesce_cv: Condvar,
     concurrent_durable: AtomicBool,
-    /// §12.8 parked-vCPU slice: set for the duration of a **thaw** run (the single worker re-executes
-    /// the frozen vCPUs under `REWINDING`). While set, an `atomic.wait` re-issue that would *park* can't
-    /// be satisfied — there is no concurrent notifier on the single worker — so it fails closed
-    /// (`ThreadFault`, the interp's join-deadlock) rather than hanging. A wait whose value already
-    /// changed (the wake landed as a store in the snapshot, or replayed by another re-run vCPU) still
-    /// resolves immediately with `WAIT_NOT_EQUAL` (no park), so the common case thaws. False on a fresh
-    /// run, where a parked wait is woken by a real concurrent `notify`.
-    thawing: AtomicBool,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -261,7 +262,6 @@ impl Domain {
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
             concurrent_durable: AtomicBool::new(false),
-            thawing: AtomicBool::new(false),
         }
     }
 
@@ -348,17 +348,6 @@ impl Domain {
     /// made that serialization unnecessary.
     pub(crate) fn engage_concurrent_durable(&self) {
         self.concurrent_durable.store(true, Ordering::Release);
-    }
-
-    /// Mark this run as a **thaw** (§12.8 parked-vCPU slice): the single worker re-executes the frozen
-    /// vCPUs under `REWINDING`, so an `atomic.wait` re-issue that would park fails closed instead of
-    /// hanging (no concurrent notifier). Set once at thaw setup, before the root re-enters.
-    pub(crate) fn engage_thawing(&self) {
-        self.thawing.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_thawing(&self) -> bool {
-        self.thawing.load(Ordering::Acquire)
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
@@ -498,6 +487,11 @@ struct DurableChild {
     ctx: usize,
     /// The child's entry function index — recorded in its residue so a thaw re-spawns it.
     func_idx: u32,
+    /// §12.8 concurrent-thaw stage 2: `None` on a fresh spawn (the child starts `NORMAL` at its entry,
+    /// region seeded to the empty frame base). `Some(extent)` on a **thaw** re-spawn: the child starts
+    /// `REWINDING` from its restored shadow extent (its region's SP word set to `extent`, its per-context
+    /// thaw word set `REWINDING`), so it rewinds its frozen frames concurrently with its siblings + root.
+    thaw_extent: Option<u64>,
 }
 
 /// §12.8 4A.5 follow-up A: a concurrent durable child that **finished** (didn't freeze). Recorded so a
@@ -573,8 +567,18 @@ fn run_child(a: SpawnArgs) {
     if let Some(dc) = &a.durable_child {
         let region = fiber_rt::shadow_region_base(dc.ctx);
         crate::durable_shadow::seed(region);
-        unsafe {
-            fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
+        match dc.thaw_extent {
+            // §12.8 concurrent-thaw stage 2: a **thaw** re-spawn rewinds from its restored extent — set
+            // its region's SP word to that extent and its own per-context thaw word `REWINDING`, so the
+            // prologue dispatches into the rewind (concurrent with siblings, no shared word).
+            Some(extent) => unsafe {
+                fiber_rt::write_shadow_sp(env.mem_base, region, extent);
+                fiber_rt::window_set_rewinding(env.mem_base, dc.ctx);
+            },
+            // A fresh spawn starts NORMAL at its entry, region empty (frame base).
+            None => unsafe {
+                fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
+            },
         };
         // §12.8 4A.5 follow-up B.2: record this OS thread's spawning task, so a *nested* `thread.spawn`
         // it makes attributes the grandchild's `parent_task` to **this** child (read per-OS-thread in
@@ -799,6 +803,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             parent,
             ctx,
             func_idx,
+            thaw_extent: None, // a fresh spawn starts NORMAL; only a thaw re-spawn rewinds
         })
     } else {
         None
@@ -1151,6 +1156,8 @@ impl Domain {
         // one). Each child is counted toward §15 live and keeps its Done cell + run params.
         struct Run {
             task: u64,
+            parent: u64,
+            func_idx: u32,
             ctx: usize,
             code: u64,
             sp: u64,
@@ -1183,6 +1190,8 @@ impl Domain {
             let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
             runs.push(Run {
                 task: v.task as u64,
+                parent: v.parent_task as u64,
+                func_idx: v.func as u32,
                 ctx: fiber_rt::shadow_context_of_sp(v.shadow_sp),
                 code: (*entry).code(),
                 sp: v.args.first().copied().unwrap_or(0) as u64,
@@ -1192,34 +1201,47 @@ impl Domain {
             });
         }
 
-        // (2) Run children in **descending** task order — children *before* parents — so a parent's
-        // re-executed `thread.join` finds an already-completed child (the JIT can't park-and-resume a
-        // parent on the single worker; the interp parks it instead). A `REWINDING` vCPU **reloads** its
-        // recorded side effects, so this order can't change the result (§12.6). Each runs under
-        // `REWINDING` from its restored extent, completes (a basic thaw doesn't re-freeze), frees its
-        // context, and publishes its result into its parent's table cell.
-        runs.sort_by_key(|r| std::cmp::Reverse(r.task));
-        for r in &runs {
-            // §12.8 concurrent-thaw stage 1: set *this child's own* thaw word REWINDING (per-context).
-            fiber_rt::window_set_rewinding(env.mem_base, r.ctx);
-            // §12.8 4A.5: restore this child's extent into its **own** region word and re-point
-            // `durable.shadow_base` so its rewinding code addresses its own region.
-            let child_region = fiber_rt::shadow_region_base(r.ctx);
-            fiber_rt::write_shadow_sp(env.mem_base, child_region, r.shadow_sp);
-            crate::durable_shadow::seed(child_region);
-            *lock(&self.cur_task) = r.task; // route its own grandchild joins to its table
-                                            // §12: seed the child's per-vCPU TLS register to its task id (matching the interp).
-            let (result, trap, _faulted) =
-                self.run_child_inline(env, r.code, r.sp, r.arg, r.task as i64);
-            *lock(&self.cur_task) = 0;
-            crate::durable_shadow::seed(fiber_rt::shadow_region_base(0)); // back to the root's region
-            if let Some(table) = self.fiber_table() {
-                table.free_vcpu_context(r.ctx);
+        // (2) §12.8 concurrent-thaw stage 2: **re-spawn each frozen vCPU on its own OS thread**, rewinding
+        // from its restored extent (`thaw_extent`) against its *own* per-context thaw word — concurrent
+        // with its siblings and the root, mirroring a fresh concurrent durable run (vs. the former inline
+        // serial "children before parents" loop). A re-issued `thread.join` blocks on the child's real
+        // `Done` cell (filled when its thread publishes its result); a re-issued `atomic.wait`/`notify`
+        // re-synchronises across the live threads (so a producer↔consumer pair frozen mid-rendezvous can
+        // thaw). The root re-enters and rewinds after this returns; `run_inner`'s `join_all` joins the
+        // children at run end. `run_child` does the per-context REWINDING setup, frees the context on a
+        // genuine finish, drops the §15 live count, and publishes the result + notifies.
+        for r in runs {
+            let args = SpawnArgs {
+                env,
+                code: r.code,
+                sp: r.sp,
+                arg: r.arg,
+                vcpu_id: r.task as i64,
+                durable_child: Some(DurableChild {
+                    task: r.task,
+                    parent: r.parent,
+                    ctx: r.ctx,
+                    func_idx: r.func_idx,
+                    thaw_extent: Some(r.shadow_sp), // rewind from the restored extent
+                }),
+                done: r.done,
+                dom: self as *const Domain,
+            };
+            match std::thread::Builder::new()
+                .name(format!("svm-thaw-{}", args.vcpu_id))
+                .spawn(move || run_child(args))
+            {
+                Ok(jh) => lock(&self.threads).joins.push(jh),
+                Err(_) => {
+                    // Thread creation failed: undo the §15 live count (taken above) and free the context.
+                    // A thaw that can't re-spawn its children is already fatal (the root's join will hang),
+                    // but keep the accounting consistent.
+                    lock(&self.threads).live -= 1;
+                    if let Some(table) = self.fiber_table() {
+                        table.free_vcpu_context(r.ctx);
+                    }
+                }
             }
-            lock(&self.threads).live -= 1;
-            let mut st = lock(&r.done.state);
-            *st = Some((result, trap));
-            r.done.cv.notify_all();
         }
         // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
         // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
@@ -1247,7 +1269,12 @@ pub(crate) unsafe extern "C" fn thread_join(
     // Durable single-worker (slice 3.4): resolve the handle in the **current** vCPU's per-vCPU table —
     // nested spawns give each spawning vCPU its own handle namespace. `dchildren` is populated only on
     // that path (freeze defer / thaw re-attach); when it's empty this is the global OS-thread table.
-    let cur = *lock(&dom.cur_task);
+    // §12.8 concurrent-thaw stage 2: on a concurrent durable child's OS thread, use *this* thread's task
+    // (set by `run_child`) — concurrent children would race the shared `cur_task`. The root's own thread
+    // has no `CONCURRENT_SPAWN_TASK`, so it falls back to `cur_task` (set to the root by the thaw driver).
+    let cur = CONCURRENT_SPAWN_TASK
+        .with(|c| c.get())
+        .unwrap_or_else(|| *lock(&dom.cur_task));
     let done = {
         let mut dc = lock(&dom.dchildren);
         if !dc.is_empty() {
@@ -1359,9 +1386,11 @@ unsafe fn read_phys(phys: u64, width: u32) -> u64 {
 ///
 /// §12.8 parked-vCPU slice: like `thread_join`, a waiter parked here when a freeze begins returns on
 /// observing `UNWINDING` (its instrumented caller then unwinds at the trailing re-issue safepoint). On a
-/// **thaw** the wait is re-issued: a wake that landed as a value change resolves it immediately
-/// (`WAIT_NOT_EQUAL`, no park); a re-issue that would still park can't be satisfied on the single worker
-/// (no concurrent notifier), so it fails closed via `trap_out` (`ThreadFault`, the interp's join-deadlock).
+/// **thaw** (stage 2) the wait is re-issued and runs concurrently with its re-spawned siblings: a wake
+/// that landed as a value change resolves immediately (`WAIT_NOT_EQUAL`, no park); a re-issue that parks
+/// is woken by a sibling's re-issued `notify` (the producer↔consumer rendezvous). A wait whose every
+/// possible notifier has exited fails closed via `trap_out` (`ThreadFault`) by the shared deadlock
+/// detection in [`futex_wait`] (no thaw-specific path; `WAIT_DEADLOCK` is intercepted below).
 ///
 /// # Safety
 /// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes; `trap_out` is the
@@ -1376,14 +1405,6 @@ pub(crate) unsafe extern "C" fn thread_wait(
 ) -> i32 {
     let dom = &*sched;
     let mask = width_mask(width);
-    // Thaw fail-closed: a re-issued wait that would *park* (value unchanged) has no concurrent notifier
-    // on the single-worker thaw, so it would deadlock. Fail closed with `ThreadFault` instead — matching
-    // the interpreter, which surfaces a guest wait/join-deadlock as `Trap::ThreadFault`. A wait whose
-    // value already changed falls through and resolves below as `WAIT_NOT_EQUAL` (no park).
-    if dom.is_thawing() && read_phys(phys, width) & mask == expected & mask {
-        store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
-        return 0;
-    }
     let deadline = if timeout < 0 {
         None
     } else {
@@ -1396,7 +1417,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
     } else {
         0
     };
-    futex_wait(
+    let status = futex_wait(
         &dom.futex,
         &dom.futex_cv,
         phys,
@@ -1404,7 +1425,18 @@ pub(crate) unsafe extern "C" fn thread_wait(
         deadline,
         dom.env().epoch_addr,
         unwind_base,
-    )
+        // §12.8 concurrent-thaw stage 2: a notifier must be another *live* vCPU (`live` counts the root +
+        // unfinished spawns, including this waiter, so `> 1` ⇒ a peer exists).
+        || lock(&dom.threads).live > 1,
+    );
+    // §12.8 concurrent-thaw stage 2: an infinite wait with no possible notifier left is a guest deadlock —
+    // surface it as `ThreadFault` (matching the interpreter), never as a guest-visible wait status.
+    #[cfg(not(loom))]
+    if status == WAIT_DEADLOCK {
+        store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+        return 0;
+    }
+    status
 }
 
 /// `atomic.notify` thunk: wake up to `count` vCPUs parked on confined `phys`; return the `i32` count
@@ -1422,6 +1454,7 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
 /// Futex park core (shared by the thunk and the loom test). `still_eq` re-checks the guest value under
 /// the lock; returns a `WAIT_*` status. Spurious wakeups are spec-allowed, but the per-`key` generation
 /// makes a real `notify` distinguishable so the returned status is accurate.
+#[allow(clippy::too_many_arguments)] // a futex park threads its full guest/kill/freeze/deadlock context
 fn futex_wait(
     futex: &Mutex<HashMap<u64, FutexEntry>>,
     cv: &Condvar,
@@ -1430,6 +1463,9 @@ fn futex_wait(
     deadline: Option<Instant>,
     epoch_addr: usize,
     unwind_base: u64,
+    // §12.8 concurrent-thaw stage 2: `true` while some *other* vCPU is live (could still `notify` this
+    // key). An infinite wait whose `peers_live()` is false can never be satisfied → [`WAIT_DEADLOCK`].
+    peers_live: impl Fn() -> bool,
 ) -> i32 {
     let mut g = lock(futex);
     if !still_eq() {
@@ -1465,6 +1501,14 @@ fn futex_wait(
                 // freeze even when no `notify` arrives.
                 #[cfg(not(loom))]
                 if epoch_addr != 0 || unwind_base != 0 {
+                    // §12.8 concurrent-thaw stage 2: deadlock detection. If no other vCPU is live, no
+                    // `notify` can ever arrive (a parked waiter can't notify itself, and a wasm wait
+                    // returns only on notify/timeout — not on a plain value change), so this infinite wait
+                    // can never be satisfied. Fail closed rather than re-check forever. Detected within
+                    // `KILL_RECHECK` of the last peer exiting (run_child drops `live` as each finishes).
+                    if !peers_live() {
+                        break WAIT_DEADLOCK;
+                    }
                     g = cv
                         .wait_timeout(g, KILL_RECHECK)
                         .unwrap_or_else(|e| e.into_inner())
@@ -1570,6 +1614,7 @@ mod loom_tests {
                 None,
                 0,
                 0,
+                || true, // loom models the producer↔consumer rendezvous; a peer is always live
             );
             producer.join().unwrap();
             assert!(status == WAIT_WOKEN || status == WAIT_NOT_EQUAL);

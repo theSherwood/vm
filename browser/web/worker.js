@@ -1,0 +1,88 @@
+// THREADS/BROWSER step 4c-wasm in a REAL browser — the per-vCPU Web Worker. One guest vCPU runs here
+// through the engine's resumable `Vcpu` API (`svm_par_run` → a host-serviced event → deliver → run
+// again) over the ONE shared linear memory. This is the browser twin of `threads-spawn.mjs`'s
+// `worker()`: the only differences are init delivery (a `postMessage` instead of Node `workerData`)
+// and that a spawn request is posted to the page (which creates every Worker — no nested Workers).
+//
+// The host services events with genuine browser primitives: `thread.join` → `Atomics.wait` on the
+// child's completion slot; `memory.wait`/`notify` → `Atomics.wait`/`notify` on the futex word. A Worker
+// (not the page) is the only place a browser permits a blocking `Atomics.wait`.
+
+const STACK = 1 << 20; // per-Worker stack
+const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
+const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
+// Event codes — must match browser/src/lib.rs PAR_*.
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5;
+
+self.onmessage = async (e) => {
+  const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase } = e.data;
+  const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
+  ex.__stack_pointer.value = stackTop; // this Worker's private stack...
+  if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
+  const i32 = new Int32Array(memory.buffer);
+  const i64 = new BigInt64Array(memory.buffer);
+  const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
+
+  const v = role === 'root'
+    ? ex.svm_par_root(prog, win, winSize, func)
+    : ex.svm_par_child(prog, win, winSize, func, BigInt(sp), BigInt(arg));
+  if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
+
+  const handles = []; // local spawn handle (index) → child completion slot ptr
+
+  for (;;) {
+    const evc = ex.svm_par_run(v);
+    if (evc === DONE) {
+      const value = ex.svm_par_ev_a(v); // i64 → BigInt
+      i64[(slot + 8) >> 3] = value; // publish result...
+      Atomics.store(i32, slot >> 2, 1); // ...set done flag...
+      Atomics.notify(i32, slot >> 2); // ...and wake a joiner
+      if (role === 'root') self.postMessage({ kind: 'done', value: value.toString() });
+      ex.svm_par_free(v);
+      return;
+    }
+    if (evc === TRAP) {
+      Atomics.store(i32, slot >> 2, 2); // 2 = trapped
+      Atomics.notify(i32, slot >> 2);
+      if (role === 'root') self.postMessage({ kind: 'trap' });
+      ex.svm_par_free(v);
+      return;
+    }
+    if (evc === SPAWN) {
+      const cfunc = Number(ex.svm_par_ev_a(v)), csp = ex.svm_par_ev_b(v), carg = ex.svm_par_ev_c(v);
+      // Allocate the child's completion slot + stack + TLS, then ask the page to start its Worker.
+      const cslot = ex.svm_par_alloc(SLOT);
+      const cstackTop = ex.svm_par_alloc(STACK) + STACK;
+      const ctlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+      self.postMessage({
+        kind: 'spawn', func: cfunc, sp: csp.toString(), arg: carg.toString(),
+        slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
+      });
+      const handle = handles.length;
+      handles.push(cslot);
+      ex.svm_par_deliver_handle(v, handle);
+      continue;
+    }
+    if (evc === JOIN) {
+      const cslot = handles[Number(ex.svm_par_ev_a(v))];
+      Atomics.wait(i32, cslot >> 2, 0); // block until the child sets its done flag
+      const trapped = Atomics.load(i32, cslot >> 2) === 2;
+      ex.svm_par_deliver_join(v, i64[(cslot + 8) >> 3], trapped ? 1 : 0);
+      continue;
+    }
+    if (evc === WAIT) {
+      const addr = Number(ex.svm_par_ev_a(v));
+      const expected = Number(BigInt.asIntN(32, ex.svm_par_ev_b(v)));
+      const timeoutNs = ex.svm_par_ev_d(v);
+      const ms = timeoutNs <= 0n ? Infinity : Number(timeoutNs) / 1e6;
+      const r = Atomics.wait(i32, (win + addr) >> 2, expected, ms); // 'ok' | 'not-equal' | 'timed-out'
+      ex.svm_par_deliver_code(v, r === 'ok' ? 0 : r === 'not-equal' ? 1 : 2);
+      continue;
+    }
+    if (evc === NOTIFY) {
+      const addr = Number(ex.svm_par_ev_a(v)), count = Number(ex.svm_par_ev_b(v));
+      ex.svm_par_deliver_code(v, Atomics.notify(i32, (win + addr) >> 2, count));
+      continue;
+    }
+  }
+};

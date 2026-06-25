@@ -1246,18 +1246,28 @@ per-context word set on all contexts at once — TBD in stage 1.
      is not a freeze; the runtime (interp `drive`; the `begin_thaw` test helper / JIT driver) resets it to
      `NORMAL` so the rewinding code's polls don't re-unwind. The per-context thaw word carries the
      `REWINDING` phase instead.
-2. **Concurrent JIT thaw driver.** Replace `thaw_reattach_and_run`'s inline loop with a concurrent
-   re-spawn (mirror `run_child`/stage ii): each frozen vCPU rewinds on its own OS thread against its own
-   state word, then runs forward concurrently; the root joins. A re-issued `atomic.wait` now parks on the
-   real futex and a sibling's `atomic.notify` wakes it — drop the `Domain.thawing` fail-closed. Watch the
-   **join ordering**: the inline path relied on "children before parents"; concurrently a parent's
-   re-issued `thread.join` must block on the real `Done` cell (which it already does on a fresh run), so
-   this should fall out, but a parent waiting on a child that is *itself* re-parking is the case to test.
-3. **Determinism / equivalence.** A concurrent thaw reintroduces real interleaving, so re-establish §12.6:
-   rewind reloads recorded side effects (deterministic, unaffected by order); only the forward-phase
-   re-issued waits/notifies interleave, and they re-synchronize to the same value handoff. Add a
-   producer↔consumer-both-frozen test (the case the fail-closed rejects today) and a mutual-rendezvous
-   test; fuzz the interleaving like the existing concurrent-freeze tests.
+2. **Concurrent JIT thaw driver (LANDED).** `thaw_reattach_and_run` now **re-spawns each frozen vCPU on
+   its own OS thread** (via `run_child`, mirroring stage ii) instead of the inline serial loop: a child
+   carries a `DurableChild.thaw_extent = Some(extent)` so `run_child` starts it `REWINDING` from its
+   restored extent against its *own* per-context thaw word (stage 1b), concurrent with its siblings and
+   the root; the root re-enters, rewinds, and `run_inner`'s `join_all` joins the children at run end. The
+   `Domain.thawing` blanket fail-closed is gone — a re-issued `atomic.wait` parks on the real futex and a
+   sibling's re-issued `atomic.notify` wakes it (the `concurrent_freeze_..._thaws_via_sibling_notify`
+   test: a producer↔consumer pair frozen mid-rendezvous now resolves). Replacing the blanket fail-closed,
+   `futex_wait` gained **peer-aware deadlock detection**: an infinite wait whose `peers_live()` (`live > 1`)
+   has gone false can never be satisfied (a parked waiter can't notify itself; a wasm wait returns only on
+   notify/timeout), so it fails closed with `ThreadFault` (the interp's join-deadlock) within `KILL_RECHECK`
+   of the last peer exiting — general (helps fresh runs too), not thaw-specific. **Join ordering:**
+   `thread_join` resolves its per-vCPU table by the per-OS-thread task (`CONCURRENT_SPAWN_TASK`), not the
+   shared `cur_task`, so a concurrent child's nested grandchild-join routes correctly. *Known gap:* a
+   *mutual* block (two live vCPUs each waiting on the other) isn't caught by the `live`-count heuristic —
+   the interp catches it via scheduler quiescence; a future cross-thread quiescence check would close it.
+3. **Determinism / equivalence (NEXT).** A concurrent thaw reintroduces real interleaving, so re-establish
+   §12.6: rewind reloads recorded side effects (deterministic, unaffected by order); only the forward-phase
+   re-issued waits/notifies interleave, and they re-synchronize to the same value handoff. The
+   producer↔consumer-both-frozen case landed with stage 2; still to add: a mutual-rendezvous test and
+   fuzzing the thaw interleaving like the existing concurrent-freeze tests (and ideally the mutual-block
+   deadlock-detection gap above).
 
 Original 4A map:
 

@@ -2666,12 +2666,13 @@ fn multi_value_struct_return() {
 
 #[test]
 fn unsupported_is_fail_closed() {
-    // i128 *division* is outside the subset (I14 tier 3 lowers i128 add/sub/mul/shift/bitwise, but not
-    // div/rem — `udiv i128` / the `__udivti3` libcall) — it must be a clean `Unsupported`, never a
-    // silent mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
+    // `long double` is `x86_fp80` on x86-64 — outside the f32/f64 scalar subset (`val_type` accepts
+    // only `FPType::{Single,Double}`). It must be a clean `Unsupported`, never a silent
+    // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint). (i128 div/rem, the prior subject
+    // here, is now supported via the `__svm_udivmod128` helper — see the `i128_*` tests.)
     let Some(bc) = compile_to_bc(
-        "i128div",
-        "unsigned __int128 dv(unsigned __int128 a, unsigned __int128 b){ return a / b; }",
+        "fp80add",
+        "long double f(long double a, long double b){ return a + b; }",
     ) else {
         return;
     };
@@ -3722,6 +3723,238 @@ int main() {
 }
 "#;
     check_cpp_eh_vs_native("cpp_eh_throw_catch_int", src, b"");
+}
+
+/// **C++ exceptions — rethrow + cleanup unwind** — the paths the [`cpp_eh_throw_catch_int`] demo
+/// does *not* reach. `middle` catches an `int` and re-raises it with a bare `throw;`
+/// (`__cxa_rethrow`), which clang wraps in an `invoke` to a **cleanup-only landingpad** (calling
+/// `__cxa_end_catch` then `_Unwind_Resume` on the way out) — exercising `resume`/`_Unwind_Resume`
+/// and the preservation of the in-flight `cur_exn`/`cur_sel` across the rethrow. `relabel` instead
+/// throws a *fresh* exception from inside its catch (the first is fully caught, so the shared
+/// single-slot object/selector model is allowed to be overwritten). Both reach an outer handler;
+/// byte-identical to native `clang++` on all three engines pins the model.
+#[test]
+fn cpp_eh_rethrow_nested() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+__attribute__((noinline)) static int inner(int x) {
+  if (x < 0) throw x;            // raise an int
+  return x;
+}
+
+// Catch the int and re-raise the *same* exception with a bare `throw;`. clang lowers the rethrow
+// as an invoke whose unwind edge is a cleanup-only landingpad (__cxa_end_catch + _Unwind_Resume).
+__attribute__((noinline)) static int middle(int x) {
+  try { return inner(x); }
+  catch (int) { throw; }
+}
+
+// Catch the int, then throw a *fresh* exception from inside the handler (clobbers the single slot,
+// which is fine: the original is fully caught before the new one is raised).
+__attribute__((noinline)) static int relabel(int x) {
+  try { return inner(x); }
+  catch (int e) { throw e * 100; }
+}
+
+static int outer(int x) {
+  try { return middle(x); }
+  catch (int e) { return e - 7; }   // catches the rethrown int
+}
+
+static int outer2(int x) {
+  try { return relabel(x); }
+  catch (int e) { return e + 1; }   // catches the fresh int
+}
+
+int main() {
+  for (int i = -2; i <= 2; i++) puti(outer(i));
+  for (int i = -2; i <= 2; i++) puti(outer2(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_rethrow_nested", src, b"");
+}
+
+/// **C++ exceptions — multiple catch clauses** — a single `try` with several typed handlers plus a
+/// catch-all: `catch (A&) / catch (B&) / catch (int) / catch (...)`. A `noinline` thrower raises one
+/// of four things by argument; the landingpad's selector is matched against each clause's
+/// `llvm.eh.typeid.for` in turn, falling through to `catch (...)`. Exercises the multi-clause
+/// selector-dispatch chain (the demo only had one typed clause) and class-typed exception objects
+/// caught by reference. Byte-identical to native `clang++` across all three engines.
+#[test]
+fn cpp_eh_multi_catch() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct A { int tag; };
+struct B { int tag; };
+
+__attribute__((noinline)) static int thrower(int x) {
+  if (x == 0) throw A{11};
+  if (x == 1) throw B{22};
+  if (x == 2) throw 7;
+  if (x == 3) throw "str";   // const char* — only the catch-all matches
+  return x;
+}
+
+static int classify(int x) {
+  try { return thrower(x); }
+  catch (A &a)  { return 1000 + a.tag; }
+  catch (B &b)  { return 2000 + b.tag; }
+  catch (int e) { return 3000 + e; }
+  catch (...)   { return 9999; }
+}
+
+int main() {
+  for (int i = 0; i <= 4; i++) puti(classify(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_multi_catch", src, b"");
+}
+
+/// **C++ exceptions — propagation through a cleanup frame** — a throw unwinds through an intermediate
+/// function that installs no handler but owns a local with a non-trivial destructor (`Guard`). clang
+/// gives that frame a **cleanup-only** landingpad (run the destructor, then `_Unwind_Resume` to keep
+/// unwinding); the exception is caught two frames up. Pins that cleanup landingpads fire during
+/// propagation and that the handler-stack depth is restored correctly across the resumed unwind —
+/// the `log` accumulator observes each `Guard` destructor exactly once. Byte-identical to native.
+#[test]
+fn cpp_eh_unwind_cleanup() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct Guard {
+  int *log; int id;
+  Guard(int *l, int i) : log(l), id(i) {}
+  ~Guard() { *log += id; }    // observable on unwind
+};
+
+__attribute__((noinline)) static int inner(int x) {
+  if (x < 0) throw x;
+  return x;
+}
+
+// No catch here: the throw propagates, but `g`'s destructor must run on the way out
+// (a cleanup-only landingpad → _Unwind_Resume).
+__attribute__((noinline)) static int middle(int x, int *log) {
+  Guard g(log, 10);
+  return inner(x);
+}
+
+// A second cleanup frame stacked on top, to pin nested cleanups during one unwind.
+__attribute__((noinline)) static int middle2(int x, int *log) {
+  Guard g(log, 3);
+  return middle(x, log);
+}
+
+static int outer(int x, int *log) {
+  try { return middle2(x, log); }
+  catch (int e) { return e; }
+}
+
+int main() {
+  int log = 0;
+  int r = outer(-5, &log);   // throws; unwinds through middle (+10) and middle2 (+3); caught
+  puti(r);                   // -5
+  puti(log);                 // 13
+  int log2 = 0;
+  int ok = outer(4, &log2);  // no throw: no destructors-on-unwind, normal return runs them once
+  puti(ok);                  // 4
+  puti(log2);                // 13 (both Guards destroyed on normal scope exit)
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_unwind_cleanup", src, b"");
+}
+
+/// **C++ exceptions — catch-by-value + destructor** — the path that forces `__cxa_end_catch` to stop
+/// being a no-op. The thrown type `E` has an observable copy-constructor (`+1`) and destructor
+/// (`+100`). `catch (E e)` copy-constructs a local from the exception object (`+1`), and on handler
+/// exit *two* destructors run: the local copy's (clang-emitted, `+100`) and the exception object's
+/// own (`__cxa_end_catch` → the synthesized `__svm_eh_destroy`, which runs the destructor funcref
+/// `__cxa_throw` registered, `+100`). `catch (E &e)` binds by reference (no copy, no local), so only
+/// the exception-object destructor runs (`+100`). Byte-identical to native `clang++` pins that the
+/// registered destructor fires exactly once per object across all three engines.
+#[test]
+fn cpp_eh_catch_by_value_dtor() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct E {
+  int *log; int v;
+  E(int *l, int val) : log(l), v(val) {}
+  E(const E &o) : log(o.log), v(o.v) { *log += 1; }   // copy-ctor: observable
+  ~E() { *log += 100; }                                // dtor: observable
+};
+
+__attribute__((noinline)) static void thrower(int *log, int val) {
+  throw E(log, val);
+}
+
+static int by_value(int *log, int val) {
+  try { thrower(log, val); }
+  catch (E e) { return e.v; }   // copy in, local dtor + exception-object dtor (end_catch) out
+  return -1;
+}
+
+static int by_ref(int *log, int val) {
+  try { thrower(log, val); }
+  catch (E &e) { return e.v; }  // no copy; only the exception-object dtor (end_catch) runs
+  return -1;
+}
+
+int main() {
+  int a = 0;
+  int r1 = by_value(&a, 42);
+  puti(r1);   // 42
+  puti(a);    // copy(+1) + local-dtor(+100) + end_catch-dtor(+100) = 201
+
+  int b = 0;
+  int r2 = by_ref(&b, 7);
+  puti(r2);   // 7
+  puti(b);    // end_catch-dtor(+100) = 100
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_catch_by_value_dtor", src, b"");
 }
 
 /// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common
@@ -6395,6 +6628,158 @@ fn i128_compares_all_predicates() {
                 Value::I64(bl as i64),
             ],
             &[Value::I32(r)],
+        );
+    }
+}
+
+/// **Cross-block i128** (I14 tail): an `__int128` accumulator carried across a loop backedge — `-O2`
+/// promotes it to a `phi i128` at the loop header, so its `(lo, hi)` pair must fan out as two block
+/// params over the edge (the struct-φ machinery, now extended to i128). The entry incoming is a
+/// **constant i128 `0`** (the `n == 0` case returns it untouched), exercising the constant-i128 φ path.
+/// An i128 LCG grows into the high word within a couple of iterations, so a torn backedge corrupts the
+/// result. Bit-exact interp == JIT vs a native `u128` oracle.
+#[test]
+fn i128_cross_block_loop_accumulator() {
+    let src = "unsigned long f(unsigned long n, unsigned long seed) {\n\
+        \x20 unsigned __int128 acc = 0;\n\
+        \x20 for (unsigned long i = 0; i < n; i++)\n\
+        \x20   acc = acc * 6364136223846793005ull + seed + i;\n\
+        \x20 return (unsigned long)acc ^ (unsigned long)(acc >> 64);\n\
+        }\n";
+    for (n, seed) in [
+        (0u64, 7u64),
+        (1, 7),
+        (5, 0xdead_beef),
+        (50, 0x1234_5678_9abc_def0),
+    ] {
+        let mut acc: u128 = 0;
+        for i in 0..n {
+            acc = acc
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(seed as u128)
+                .wrapping_add(i as u128);
+        }
+        let want = (acc as u64) ^ ((acc >> 64) as u64);
+        check(
+            "i128_xblock_lcg",
+            src,
+            &[Value::I64(n as i64), Value::I64(seed as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Cross-block i128** with **two** loop-carried values: an `__int128` Fibonacci pair. Both `a` and
+/// `b` are `phi i128` across the backedge (constant entry incomings `0` and `1` — the latter a
+/// non-zero low word), so two independent i128 `(lo, hi)` pairs must thread their four block params in
+/// the right order. i128 Fibonacci overflows 64 bits around n≈93, so n=100 populates the high word.
+#[test]
+fn i128_cross_block_fib_pair() {
+    let src = "unsigned long fib(unsigned long n) {\n\
+        \x20 unsigned __int128 a = 0, b = 1;\n\
+        \x20 for (unsigned long i = 0; i < n; i++) { unsigned __int128 t = a + b; a = b; b = t; }\n\
+        \x20 return (unsigned long)a ^ (unsigned long)(a >> 64);\n\
+        }\n";
+    for n in [0u64, 1, 2, 93, 100] {
+        let (mut a, mut b): (u128, u128) = (0, 1);
+        for _ in 0..n {
+            let t = a.wrapping_add(b);
+            a = b;
+            b = t;
+        }
+        let want = (a as u64) ^ ((a >> 64) as u64);
+        check(
+            "i128_xblock_fib",
+            src,
+            &[Value::I64(n as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Unsigned i128 div + rem** (I14 tail): `udiv i128` / `urem i128` lower to the synthesized 128÷128
+/// long-division helper (`__svm_udivmod128`), which returns both quotient and remainder. Folds both
+/// words of `q` and `r` into the result, so an error in any word shows. Bit-exact interp == JIT vs a
+/// `u128` oracle, across small/large/high-word-divisor/divisor>dividend cases.
+#[test]
+fn i128_udiv_urem() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 q = x / y;\n\
+        \x20 unsigned __int128 r = x % y;\n\
+        \x20 return ((unsigned long)q ^ (unsigned long)(q >> 64)) + ((unsigned long)r ^ (unsigned long)(r >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (0u64, 100u64, 0u64, 7u64),                         // small / small
+        (5, 0, 0, 3),                                       // high-word dividend / tiny divisor
+        (u64::MAX, u64::MAX, 0, 0xffff_ffff),               // near-max / 32-bit divisor
+        (0x1234, 0x5678_9abc_def0_1234, 0x12, 0x3456_789a), // both have high words
+        (0, 3, 0, 100),                                     // divisor > dividend → q=0, r=x
+        (
+            0xdead_beef_cafe,
+            0x1111_2222_3333_4444,
+            0xbeef,
+            0x9999_8888_7777_6666,
+        ), // general
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let q = x / y;
+        let r = x % y;
+        let want = ((q as u64) ^ ((q >> 64) as u64)).wrapping_add((r as u64) ^ ((r >> 64) as u64));
+        check(
+            "i128_udivrem",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Signed i128 div + rem** (I14 tail): `sdiv i128` / `srem i128` reuse the unsigned helper — the
+/// lowering abs-es the operands and re-signs (quotient negative iff signs differ; remainder takes the
+/// dividend's sign, C truncation toward zero). All four sign combinations, vs a native `i128` oracle.
+#[test]
+fn i128_sdiv_srem() {
+    let src = "long g(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 __int128 x = (__int128)(((unsigned __int128)ah << 64) | al);\n\
+        \x20 __int128 y = (__int128)(((unsigned __int128)bh << 64) | bl);\n\
+        \x20 __int128 q = x / y;\n\
+        \x20 __int128 r = x % y;\n\
+        \x20 return ((long)q ^ (long)(q >> 64)) + ((long)r ^ (long)(r >> 64));\n\
+        }\n";
+    let cases: [(i128, i128); 8] = [
+        (100, 7),
+        (-100, 7),
+        (100, -7),
+        (-100, -7),
+        (-(1i128 << 100), 3),                 // large negative / small positive
+        ((1i128 << 120) - 1, -(1i128 << 40)), // large positive / negative high-word divisor
+        (-12345678901234567890, 1_000_000_007), // negative / positive prime
+        (7, 100),                             // |dividend| < |divisor| → q=0, r=dividend
+    ];
+    for (x, y) in cases {
+        let (ah, al) = (((x as u128) >> 64) as u64, x as u128 as u64);
+        let (bh, bl) = (((y as u128) >> 64) as u64, y as u128 as u64);
+        let q = x.wrapping_div(y);
+        let r = x.wrapping_rem(y);
+        let want = ((q as i64) ^ ((q >> 64) as i64)).wrapping_add((r as i64) ^ ((r >> 64) as i64));
+        check(
+            "i128_sdivrem",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want)],
         );
     }
 }

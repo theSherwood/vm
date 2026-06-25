@@ -2926,15 +2926,10 @@ impl CompiledModule {
             })
         };
 
-        // §12.8 parked-vCPU slice: a durable run that re-enters under `REWINDING` is a **thaw**. Mark the
-        // domain thawing so an `atomic.wait` re-issue that would park fails closed (`ThreadFault`) rather
-        // than hanging the single worker. Set before the children re-run (their waits fail closed too).
-        #[cfg(fiber_rt)]
-        if (*this).durable && fiber_rt::window_is_rewinding(window.base() as u64, 0) {
-            if let Some(d) = &(*this).domain {
-                d.engage_thawing();
-            }
-        }
+        // §12.8 concurrent-thaw stage 2: the parked-vCPU thaw no longer needs a `Domain.thawing` flag —
+        // the thaw re-spawns frozen vCPUs as concurrent OS threads (below), so a re-issued `atomic.wait`
+        // parks on the real futex and a sibling's re-issued `notify` wakes it; a wait with no possible
+        // notifier left fails closed via `futex_wait`'s shared deadlock detection (no thaw-specific path).
 
         // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach + run the spawned children a
         // freeze flattened, *before* the root re-enters — the JIT's single-worker thaw (the root's

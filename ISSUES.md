@@ -174,7 +174,7 @@ and surface it (e.g. `JitFrameLoc`-adjacent or a `last_trap_fiber()` accessor) f
 
 _(I1 below is open-adjacent — its abort mechanism is fixed, but I3/I4 are residual same-family CI-abort
 flakes. I2 resolved below.)_
-### I7 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3)
+### I7 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3) — **fail-fast + diagnostics LANDED** (`claude/charming-johnson-pmlsnr`); root cause still open (awaiting a captured wedge)
 
 **Where:** the guest-built work-stealing schedulers run end-to-end through the `svm-run` binary —
 `crates/svm-run/demos/work_stealing/work_stealing.c` (stackless tasks) and
@@ -212,15 +212,46 @@ no actual program args (so a bare run is byte-identical to before) restored the 
 clean parallel iterations). So whatever the root cause, it is acutely sensitive to worker-thread
 start timing — a strong hint for a park/unpark or steal-loop wakeup race.
 
+**Investigation (this session — narrowed, not reproduced).** Reviewed every primitive on the demos'
+path and could **not** reproduce a wedge nor find a defect by inspection:
+- **Guest scheduler logic is hang-free by construction.** *Both* demos **busy-spin** the worker loop
+  (`while (atomic_load(&g_remaining) > 0) { …; if (!t) continue; }`) — they do **not** park idle
+  workers, so the "park/unpark of idle workers" in the original hypothesis isn't even a code path here.
+  `g_total`/`g_returns`/`g_remaining` are interleaving-invariant: every task is stepped exactly `STEPS`
+  times and is, on each iteration, either completed (decrement) or re-pushed — no task is dropped or
+  double-counted, so `g_remaining` always reaches 0 and every worker then exits. A *resume* bug would
+  surface as a wrong total or a `FiberFault` **trap** (non-zero exit), **not** a hang.
+- **The only blocking points are sound / loom-verified.** The guest `pthread_mutex` is a 2-state
+  futex lock whose `__vm_wait32` re-checks the word **under the futex lock** (the classic
+  unlock-between-cas-and-wait race cannot lose a wakeup — and the host `futex_wait` holds that lock
+  across `still_eq()` + `waiters++` + `cv.wait`, so a `notify` can't slip in between). `futex_wait`/
+  `futex_notify`, the fiber single-owner `Ownership::claim`/`suspend_to_pool` migration arbiter, and
+  `thread_join`/`run_child` (set-state-under-lock + `notify_all`) are all textbook-correct and several
+  are **loom-verified** (`loom_wait_notify_never_hangs`, `fiber_registry`). The §5 signal/`siglongjmp`
+  guard is **not exercised** by a fault-free demo run.
+- **Not reproducible here.** ~24 000 demo runs total — 800 (8-way) + 3 600 **pinned to one core**
+  (`taskset -c 0`, maximal startup-interleaving pressure) + 20 000 (8-way, both demos, with a
+  gdb-dumping watchdog) — plus **60 full `run.rs`-suite parallel iterations** (the CI load profile):
+  **0 hangs, 0 wrong outputs.** Consistent with the once-ever CI sighting (~1e-3–1e-4/run) — the
+  residual risk lives in something loom can't model (the cross-thread native stack switch, or runner
+  memory-pressure/scheduler pathology, the same I3/I4 family), or it was an environmental fluke.
+
 **Fix sketch:**
-1. Root-cause via thread backtraces of a hung process (reproduce by looping the `svm-run` binary on
-   the demo until it wedges, then attach a debugger) — confirm whether the stall is in the host
-   steal/park runtime or the guest scheduler, and fix the wakeup race.
-2. Interim blast-radius mitigation (independent of the root cause): the runner already honours
-   `SVM_DEADLINE_MS` (§5 detect-and-kill); have the demo smoke tests run the `svm-run` subprocess
-   under a deadline / `timeout` so a hang **fails fast** instead of blocking CI for hours, and add a
-   `timeout-minutes:` to the CI `check` job (it currently has none, so a wedged job sits until
-   GitHub's 6 h default).
+1. *(LANDED — fail-fast + diagnostics)* The demo smoke tests now run through `run_demo_failfast`
+   (`crates/svm-run/tests/run.rs`): the `svm-run` subprocess gets `SVM_DEADLINE_MS=30000` (so a
+   *guest-side* wedge — spinning **or** futex-parked, since `KILL_RECHECK` wakes a parked vCPU — is
+   §5 detect-and-killed and exits non-zero with the kill diagnostic), **plus** a 90 s host-side
+   process timeout backstop that, on expiry, **best-effort `gdb -p` dumps every thread's backtrace**
+   (the root-cause data this entry asks for) and SIGKILLs the child. A healthy run is milliseconds, so
+   neither bound trips normally (verified: all `run.rs` green, ~1 s). **Net: a recurrence can no
+   longer hang the named tests, and it self-captures the thread dump** needed to finish the root cause.
+   The CI `check` (30) / `cross-os` (45) jobs also carry a `timeout-minutes:` backstop now, so any
+   *other* unforeseen `cargo test --workspace` hang fails in minutes instead of GitHub's 6 h default.
+2. *(still open — needs a captured wedge)* Pin the root cause from the next dump (CI or a longer local
+   soak): if a worker is parked in `pthread_cond_wait`/futex at capture time it's a lost-wakeup in the
+   mutex/futex layer; if all workers are spinning in JIT code (`??` frames) with `g_remaining > 0` it's
+   a guest termination-detection / steal-loop livelock; if the stall is host-side (a Rust frame in
+   `os_thread_rt`/`fiber_rt`) it's the migration/teardown path. Then fix the specific race.
 
 ---
 
@@ -381,10 +412,33 @@ fail-closed, never miscompile).
    (`hi <strict> | (hi == & lo <op_u>)`). i128 **function params/returns** ride clang's `{i64,i64}` ABI
    split through the existing `agg` machinery. Tests (`translate.rs::i128_*`): add/sub carry, full
    128×128 mul + bitwise, variable shifts across `[0,128)`, all compare predicates, and param/return —
-   each **bit-exact, interp == JIT, vs a native `i128`/`u128` oracle`. **Still fails closed** (correct,
-   never miscompiles): i128 **div/rem** (`udiv`/`__udivti3`), a **cross-block** i128 (loop-carried φ /
-   block-param — the `agg` table is same-block), and wide/negative i128 **constants** (≥ 2⁶⁴). Those are
-   the remaining tail if a real program needs them.
+   each **bit-exact, interp == JIT, vs a native `i128`/`u128` oracle`.
+4. **Cross-block i128** *(LANDED — `claude/charming-johnson-pmlsnr`)*: an i128 SSA value now registers an
+   `[i64, i64]` `agg_layout` (like a flat 2-field struct), so its `(lo, hi)` pair **fans out as two
+   block params over an edge** — a **loop-carried `phi i128`** / live-across value — via the existing
+   struct-φ machinery (`block_params`/`branch_args`), not just same-block. `agg_operand` also
+   materializes a **constant i128 φ incoming** (`phi i128 [0, entry], …`) as `(lo, 0)`. Tests
+   (`translate.rs`): `i128_cross_block_loop_accumulator` (an i128 LCG accumulator across a backedge,
+   constant-0 entry) and `i128_cross_block_fib_pair` (two i128 φs — a Fibonacci pair — crossing
+   together), both bit-exact interp == JIT vs a `u128` oracle.
+5. **i128 div/rem** *(LANDED — `claude/charming-johnson-pmlsnr`)*: `udiv`/`sdiv`/`urem`/`srem i128` (clang
+   keeps these as IR ops at `-O2`; the `__divti3`-family libcall is a *backend* lowering the on-ramp
+   never sees) now lower to a synthesized **`__svm_udivmod128`** helper — a binary long-division loop
+   over the `(lo, hi)` pair returning quotient **and** remainder in one pass (the first arithmetic synth
+   helper, alongside `__svm_memcpy`/`__svm_utoa`). Division by zero **traps** (`DivByZero`, matching the
+   scalar `i64` divide). Signed forms reuse it: the lowering abs-es the operands and re-signs (quotient
+   negative iff signs differ; remainder takes the dividend's sign — C truncation toward zero). A
+   `freeze i128` (clang emits it on the `udiv`/`urem` operands) is now an identity on the pair. Tests
+   (`translate.rs`): `i128_udiv_urem` (small/large/high-word-divisor/divisor>dividend) and
+   `i128_sdiv_srem` (all four sign combinations), each bit-exact interp == JIT vs a native `i128`/`u128`
+   oracle.
+
+   **Remaining tail — the one item left, blocked upstream (not an on-ramp gap):** wide / negative i128
+   **constants** (≥ 2⁶⁴ unsigned). `llvm-ir` 0.11.3 stores `Constant::Int.value` in a **`u64`** and
+   **fails the whole bitcode parse** when a `bits > 64` constant doesn't fit (rather than truncating), so
+   such a constant never reaches the on-ramp; supporting it would require forking/replacing the `llvm-ir`
+   reader. Constants `< 2⁶⁴` (incl. the loop-carried φ path) already work. With div/rem landed, **i128 is
+   otherwise feature-complete** in the on-ramp.
 
 ---
 

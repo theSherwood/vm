@@ -15,8 +15,10 @@ use svm_browser::{
     capture_exec, durable_run, dynlink_exec, instantiate_exec, jit_exec, powerbox_exec,
     reflect_exec, region_exec,
 };
-use svm_durable::{init_durable_window, transform_module, write_state, STATE_NORMAL,
-    STATE_REWINDING, STATE_UNWINDING};
+use svm_durable::{
+    init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
+    STATE_UNWINDING,
+};
 use svm_interp::{bytecode, Value};
 
 // Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
@@ -272,6 +274,27 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32):
   v6 = cap.call 0 1 (i64, i64) -> (i64) v3(v4, v5)
   v7 = i32.const 0
   return v7
+}
+"#;
+
+// `(out, in, exit)`: F7 name→handle resolution through the powerbox — `cap.self.resolve "stdout"`
+// re-finds the stdout handle **at runtime** (never reading the param slot), then writes through it.
+// Works only because the powerbox registers its caps under canonical names (PR #118); a regression in
+// either build diverges on stdout. The name "stdout" lives at offset 4096, the payload at 0.
+const PB_RESOLVE: &str = r#"
+memory 16
+data 0 "via resolve\n"
+data 4096 "stdout"
+func (i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i64.const 4096
+  v4 = i64.const 6
+  v5 = cap.self.resolve v3 v4
+  v6 = i64.const 0
+  v7 = i64.const 12
+  v8 = cap.call 0 1 (i64, i64) -> (i64) v5(v6, v7)
+  v9 = i32.const 0
+  return v9
 }
 "#;
 
@@ -1038,6 +1061,7 @@ fn main() {
         ("pb_clock", PB_CLOCK, &b""[..]),
         ("pb_exit", PB_EXIT, &b""[..]),
         ("pb_stderr", PB_STDERR, &b""[..]),
+        ("pb_resolve", PB_RESOLVE, &b""[..]),
     ];
     std::fs::create_dir_all("corpus").expect("mkdir corpus");
 
@@ -1058,7 +1082,11 @@ fn main() {
                 if j == 0 { "" } else { "," }
             ));
         }
-        json.push_str(if i + 1 == compute.len() { "]}\n" } else { "]},\n" });
+        json.push_str(if i + 1 == compute.len() {
+            "]}\n"
+        } else {
+            "]},\n"
+        });
     }
     json.push_str("],\n\"powerbox\":[\n");
     for (i, (name, src, stdin)) in powerbox.iter().enumerate() {
@@ -1174,7 +1202,11 @@ fn main() {
             json.push_str(if i + 1 == mods.len() { "]}\n" } else { "]},\n" });
         }
     };
-    emit_sweep("tailcall", &[("tail_fact", TAIL_FACT), ("tail_indirect", TAIL_INDIRECT)], ARGS);
+    emit_sweep(
+        "tailcall",
+        &[("tail_fact", TAIL_FACT), ("tail_indirect", TAIL_INDIRECT)],
+        ARGS,
+    );
     emit_sweep(
         "simd",
         &[
@@ -1198,8 +1230,10 @@ fn main() {
     );
     // Reflection corpus — §7 cap.self.* over the fixed 3-cap powerbox (run via svm_run_reflect).
     // SELF_COUNT takes no arg (→ 3); SELF_GET sweeps cap indices (0,1,2 valid; 3 out of range).
-    let reflect: &[(&str, &str, &[i64])] =
-        &[("self_count", SELF_COUNT, &[0]), ("self_get", SELF_GET, &[0, 1, 2, 3])];
+    let reflect: &[(&str, &str, &[i64])] = &[
+        ("self_count", SELF_COUNT, &[0]),
+        ("self_get", SELF_GET, &[0, 1, 2, 3]),
+    ];
     json.push_str("],\n\"reflect\":[\n");
     for (i, (name, src, args)) in reflect.iter().enumerate() {
         let (m, file) = emit(name, src);
@@ -1214,10 +1248,17 @@ fn main() {
                 if j == 0 { "" } else { "," }
             ));
         }
-        json.push_str(if i + 1 == reflect.len() { "]}\n" } else { "]},\n" });
+        json.push_str(if i + 1 == reflect.len() {
+            "]}\n"
+        } else {
+            "]},\n"
+        });
     }
     // Guest-JIT corpus — §22 install + cross-module call_indirect (interpreted); svm_run_jit.
-    let jit = [("jit_install", JIT_INSTALL), ("jit_uninstall", JIT_UNINSTALL)];
+    let jit = [
+        ("jit_install", JIT_INSTALL),
+        ("jit_uninstall", JIT_UNINSTALL),
+    ];
     json.push_str("],\n\"jit\":[\n");
     for (i, (name, src)) in jit.iter().enumerate() {
         let (m, file) = emit(name, src);
