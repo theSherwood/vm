@@ -1622,7 +1622,13 @@ fn struct_layout(
     if !packed {
         off = off.div_ceil(align) * align; // tail padding to the struct's alignment
     }
-    Ok((offsets, off.max(1), align))
+    // An **empty struct** is size 0 — LLVM lays `type {}` out as zero bytes regardless of source
+    // language (it is the layout every `getelementptr` offset is computed against). A Rust **ZST**
+    // field — `PhantomData`, `alloc::alloc::Global` (the `Vec`/`RawVec` allocator marker), a unit
+    // struct — must therefore contribute 0, not 1: clamping to 1 here inflated every `RawVec` by a
+    // byte (→ 24-byte `Vec`s padded to 32, `len` shifted 16→24), desyncing field offsets from the
+    // GEPs and corrupting every `Vec::len()`/element access through such a struct.
+    Ok((offsets, off, align))
 }
 
 /// The integer bit width of an LLVM type, or `None` if it is not an integer.
@@ -10517,6 +10523,10 @@ fn is_rust_abort_call(name: &str) -> bool {
         // `alloc::alloc::handle_alloc_error`) — also `-> !` external lang items under `panic=abort`.
         || name.contains("handle_error")
         || name.contains("alloc_error")
+        // `RefCell` borrow-conflict aborts (`core::cell::panic_already_borrowed` /
+        // `…_already_mutably_borrowed`) — `-> !` cold lang items the specializer's `RefCell<OutlineState>`
+        // borrows pull in. Like the slice/alloc family: external, never in the bitcode, lower to a trap.
+        || name.contains("panic_already")
 }
 
 /// Lower a `<setjmp.h>` non-local jump to the `SetJmp`/`LongJmp` core ops. `setjmp`/`_setjmp`/
