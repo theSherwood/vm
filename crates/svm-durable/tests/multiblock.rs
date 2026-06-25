@@ -14,7 +14,7 @@
 //! while the frozen reading is reloaded.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
+    init_durable_window, read_state, read_thaw_state, transform_module, write_state, begin_thaw, STATE_NORMAL,
     STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
@@ -67,13 +67,13 @@ fn assert_roundtrips(src: &str, expected: i64) {
     );
 
     let mut win = snapshot.clone();
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let (thawed, final_win, _) = run(&inst, clock_after, &win);
     assert_eq!(
         thawed, baseline,
         "thaw of a non-entry-block freeze equals the oracle"
     );
-    assert_eq!(read_state(&final_win), STATE_NORMAL, "thaw ends NORMAL");
+    assert_eq!(read_thaw_state(&final_win, 0), STATE_NORMAL, "thaw ends NORMAL");
 }
 
 // A conditional whose taken arm holds the cap.call: the suspend point is in block1, a

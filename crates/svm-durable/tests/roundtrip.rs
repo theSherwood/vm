@@ -10,7 +10,7 @@
 //! along in those bytes, DURABILITY.md §12.0).
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_REWINDING,
+    init_durable_window, read_state, transform_module, write_state, begin_thaw,
     STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
@@ -98,7 +98,7 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
     // artifact). Clock would now return 0 — so if thaw re-issued the call instead of
     // reloading the saved 42, the result would be 100, not 142.
     let mut win = snapshot.clone();
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let mut host = Host::new(); // clock_ns defaults to 0
     let clk = host.grant_clock();
     let mut fuel = 100_000u64;

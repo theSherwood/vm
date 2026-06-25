@@ -28,7 +28,7 @@
 
 use core::ffi::c_void;
 use svm_durable::{
-    init_durable_window, transform_module_assume_confined, write_state, STATE_REWINDING,
+    init_durable_window, transform_module_assume_confined, write_state, begin_thaw,
     STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value, DURABLE_RESERVE, SHADOW_BASE};
@@ -238,7 +238,7 @@ fn jit_thaws_its_own_multivcpu_freeze() {
     // JIT thaw on a host whose clock has *advanced* to 44: re-attach the child + restore the root's
     // extent, re-enter under REWINDING. Reload (42, 43) → 95; a re-issue would read {44, 45} → 99.
     let mut twin = fsnap.clone();
-    write_state(&mut twin, STATE_REWINDING);
+    begin_thaw(&mut twin, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 44;
@@ -322,7 +322,7 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
         })
         .collect();
     let mut twin = isnap.clone();
-    write_state(&mut twin, STATE_REWINDING);
+    begin_thaw(&mut twin, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 44;
@@ -518,7 +518,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
     let seed_fibers: Vec<JitFiber> = jfibers.clone();
     let seed_vcpus: Vec<JitVCpu> = jvcpus.clone();
     let mut twin = jsnap.clone();
-    write_state(&mut twin, STATE_REWINDING);
+    begin_thaw(&mut twin, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 99;
@@ -713,7 +713,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
     // (3) Thaw on the JIT with an advanced clock: rebuild the per-parent join tables, run children
     // before parents, reload all three clock reads → 129 (a re-issue would be 99+100+101 = 300).
     let mut twin = jsnap.clone();
-    write_state(&mut twin, STATE_REWINDING);
+    begin_thaw(&mut twin, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 99;

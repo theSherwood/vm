@@ -15,8 +15,7 @@
 //! and shift the result. The `Clock` advances by one per call, so this is exact.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module_assume_confined, write_state, STATE_NORMAL,
-    STATE_REWINDING,
+    init_durable_window, read_state, read_thaw_state, transform_module_assume_confined, begin_thaw, STATE_NORMAL,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -81,13 +80,13 @@ fn assert_resume_at_point(oracle: &str, freezable: &str, expected: i64) {
     // Thaw: restore the artifact, set REWINDING, and continue the clock from where freeze
     // left off (D-scope: the host clock is not in the artifact).
     let mut win = snapshot.clone();
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let (thawed, final_win, _) = run(&freezable, clock_after, &win);
     assert_eq!(
         thawed, baseline,
         "thaw at the frozen resume point equals the oracle"
     );
-    assert_eq!(read_state(&final_win), STATE_NORMAL, "thaw ends NORMAL");
+    assert_eq!(read_thaw_state(&final_win, 0), STATE_NORMAL, "thaw ends NORMAL");
 }
 
 // Two leaf cap.calls. Oracle: v2 = clock(42), v3 = clock(43), v4 = v2 + v3 = 85.

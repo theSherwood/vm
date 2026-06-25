@@ -1221,22 +1221,31 @@ broadcast (the concurrent-freeze coordinator already visits every live context),
 per-context word set on all contexts at once — TBD in stage 1.
 
 *Staging (each stage independently lands + tests green):*
-1. **Per-context thaw-state relocation.** Transform emits the state word region-relative; both backends
-   set/read it per-context; `FORMAT_VERSION` bump; keep the *inline* serial thaw (no behavior change yet)
-   and prove all existing freeze/thaw + cross-backend equality tests stay green. This is the foundational,
-   highest-surface slice — land it alone.
-   - *1a (landed):* the transform's state-word addressing is centralized behind one helper
-     (`Bb::state_word_addr`) gated by `svm_durable::STATE_PER_CONTEXT` (off ⇒ global `STATE_OFF`, on ⇒
-     `durable.shadow_base` + `STATE_IN_REGION_OFF`, like the per-context shadow-SP word). Off today, so the
-     IR is byte-identical and everything stays green. A probe (flip on) confirmed the **per-context IR
-     emission is valid** (the transform's own tests + `verify` pass); only the runtime catches up next.
-   - *1b (remaining):* flip the flag and make the runtime agree — shift the shadow frame-base past the
-     in-region state word; make `write_state`/`read_state`, the freeze trigger (`request_freeze` /
-     interp's `durable_tick_arm`), and both freeze/thaw drivers set/read the state word **per-context**
-     (the freeze broadcasts `UNWINDING` to every live context); rewrite the interp `dstate` multiplex;
-     bump `FORMAT_VERSION` and regenerate the cross-backend equality fixtures. The `svm-durable`
-     `backedge.rs` tests (which drive the state word via `write_state` at the global offset) are the first
-     to update and pinpoint the runtime touch points.
+1. **Per-context thaw-state relocation (LANDED).** The durable state word is split: the **freeze** state
+   (`UNWINDING`) stays at the single global `STATE_OFF` — a freeze is genuinely stop-the-world, so one word
+   is the natural broadcast every poll reads (the arm trigger / `request_freeze` are unchanged) — while the
+   **thaw** state (`REWINDING`/`NORMAL`) moves *per-context*, into each region at `STATE_IN_REGION_OFF` (8,
+   just past the in-region shadow-SP word), addressed via `durable.shadow_base` like the SP word. Each frozen
+   vCPU now rewinds against its **own** thaw word, so one finishing (flipping its word to `NORMAL`) can't
+   disturb a sibling still `REWINDING` — the prerequisite stage 2 needs to run rewinds concurrently. The
+   *inline* serial thaw is kept (no concurrency yet); all freeze/thaw + cross-backend equality + fuzz tests
+   stay green. Implementation notes:
+   - *Transform:* `Bb::freeze_word_addr` (global) for the `UNWINDING` polls; `Bb::thaw_word_addr`
+     (`durable.shadow_base` + `STATE_IN_REGION_OFF`) for the prologue's `REWINDING` dispatch and the
+     deepest frame's `NORMAL` re-issue. (Stage 1a centralized these behind one switched helper; 1b split it
+     and hardcoded per-context — no flag, git is the revert.)
+   - *Layout / format:* the shadow frame-base shifts past the in-region thaw word (`REGION_HEADER_LEN` 8→16,
+     8-aligned); `FORMAT_VERSION` 6→7 (a v6 artifact mis-thaws). Both backends shift identically, so
+     cross-backend equality holds.
+   - *Per-vCPU multiplex (interp):* `dstate` maps across the two words — `durable_load_dstate`/`store_dstate`
+     route `REWINDING` to the context's region word and the freeze phases to the global word. Fiber switches
+     (`shadow_switch`, and the JIT's fiber resume) **carry** the active thaw phase across the switch, so the
+     globally-deepest frame's `NORMAL` flip still propagates back up a `cont.resume` chain (a resumer doesn't
+     flip its own word; the carry does on the return switch).
+   - *Thaw entry clears the global freeze word:* a frozen artifact left `STATE_OFF = UNWINDING`, but a thaw
+     is not a freeze; the runtime (interp `drive`; the `begin_thaw` test helper / JIT driver) resets it to
+     `NORMAL` so the rewinding code's polls don't re-unwind. The per-context thaw word carries the
+     `REWINDING` phase instead.
 2. **Concurrent JIT thaw driver.** Replace `thaw_reattach_and_run`'s inline loop with a concurrent
    re-spawn (mirror `run_child`/stage ii): each frozen vCPU rewinds on its own OS thread against its own
    state word, then runs forward concurrently; the root joins. A re-issued `atomic.wait` now parks on the

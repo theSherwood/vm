@@ -14,8 +14,7 @@ use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use svm_durable::{
-    init_durable_window, read_state, transform_module_assume_confined, write_state, STATE_NORMAL,
-    STATE_REWINDING, STATE_UNWINDING,
+    init_durable_window, read_state, transform_module_assume_confined, begin_thaw, STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{Host, SHADOW_BASE};
 use svm_ir::{Memory, Module};
@@ -115,7 +114,7 @@ fn thaw(
     root_sp: u64,
 ) -> (JitOutcome, Vec<u8>) {
     let mut twin = snap.to_vec();
-    write_state(&mut twin, STATE_REWINDING);
+    begin_thaw(&mut twin, 0);
     let mut thost = Host::new();
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();

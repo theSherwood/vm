@@ -2862,7 +2862,7 @@ impl CompiledModule {
         // domain thawing so an `atomic.wait` re-issue that would park fails closed (`ThreadFault`) rather
         // than hanging the single worker. Set before the children re-run (their waits fail closed too).
         #[cfg(fiber_rt)]
-        if (*this).durable && fiber_rt::window_is_rewinding(window.base() as u64) {
+        if (*this).durable && fiber_rt::window_is_rewinding(window.base() as u64, 0) {
             if let Some(d) = &(*this).domain {
                 d.engage_thawing();
             }

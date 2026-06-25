@@ -1200,7 +1200,8 @@ impl Domain {
         // context, and publishes its result into its parent's table cell.
         runs.sort_by_key(|r| std::cmp::Reverse(r.task));
         for r in &runs {
-            fiber_rt::window_set_rewinding(env.mem_base);
+            // §12.8 concurrent-thaw stage 1: set *this child's own* thaw word REWINDING (per-context).
+            fiber_rt::window_set_rewinding(env.mem_base, r.ctx);
             // §12.8 4A.5: restore this child's extent into its **own** region word and re-point
             // `durable.shadow_base` so its rewinding code addresses its own region.
             let child_region = fiber_rt::shadow_region_base(r.ctx);
@@ -1225,7 +1226,8 @@ impl Domain {
         // §12.8 4A.5: the root's extent goes into context 0's own region word.
         fiber_rt::write_shadow_sp(env.mem_base, fiber_rt::shadow_region_base(0), root_sp);
         crate::durable_shadow::seed(fiber_rt::shadow_region_base(0));
-        fiber_rt::window_set_rewinding(env.mem_base);
+        fiber_rt::window_set_rewinding(env.mem_base, 0); // the root's own (ctx 0) thaw word
+
         *lock(&self.cur_task) = 0; // the root runs next (its joins resolve in its table)
     }
 }

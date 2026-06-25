@@ -121,6 +121,15 @@ const STATE_REWINDING: i32 = 2;
 const STATE_ARMED: i32 = 3;
 /// Window byte offset of the `i64` arm countdown (must match `svm-interp`'s `ARM_COUNTDOWN_OFF`).
 const ARM_COUNTDOWN_OFF: u64 = 16;
+/// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
+/// within its region — just past the 8-byte in-region shadow-SP word. The **freeze** word (`UNWINDING`)
+/// stays at the global [`STATE_OFF`] (stop-the-world); only the thaw word is per-context, so concurrent
+/// rewinds don't race. Must match `svm-interp`/`svm_durable::STATE_IN_REGION_OFF`.
+const STATE_IN_REGION_OFF: u64 = 8;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the 8-byte
+/// shadow-SP word plus the thaw state word at [`STATE_IN_REGION_OFF`] (padded to 8 for frame alignment).
+/// Frames grow up from here. Must match `svm-interp`/`svm_durable::REGION_HEADER_LEN`.
+const REGION_HEADER_LEN: u64 = 16;
 
 /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`), the JIT mirror
 /// of `svm_interp::Mem::durable_tick_arm`: if the run is `STATE_ARMED`, decrement the arm countdown
@@ -192,22 +201,36 @@ pub(crate) fn shadow_region_base(ctx: usize) -> u64 {
 /// The empty shadow-SP / frame base of a vCPU context `ctx`: just past its in-region SP word (§12.8
 /// 4A.5). Frames grow upward from here; the 8-byte SP word itself lives at `shadow_region_base(ctx)`.
 pub(crate) fn shadow_frame_base(ctx: usize) -> u64 {
-    shadow_region_base(ctx) + 8
+    shadow_region_base(ctx) + REGION_HEADER_LEN
 }
 
-/// Whether the durable state word is **not** `NORMAL` (a freeze/thaw is in progress) — the gate for
-/// running spawned children **inline** (single-worker, slice 3.3). `STATE_NORMAL` is 0 (matching
-/// `svm-interp`). # Safety: `mem_base` is a durable run's committed window base.
+/// Window byte offset of context `ctx`'s **thaw** state word (§12.8 concurrent-thaw stage 1) — its
+/// region base plus [`STATE_IN_REGION_OFF`]. Each context rewinds against its own, so concurrent thaws
+/// don't race (vs. the global [`STATE_OFF`] freeze word).
+fn thaw_word_off(ctx: usize) -> u64 {
+    shadow_region_base(ctx) + STATE_IN_REGION_OFF
+}
+
+/// Whether a freeze or thaw is in progress — the gate for running spawned children **inline**
+/// (single-worker, slice 3.3): the global [`STATE_OFF`] freeze word is non-`NORMAL` (a freeze), or the
+/// **active** context's per-context thaw word is non-`NORMAL` (a thaw — §12.8 concurrent-thaw stage 1).
+/// The active context is the seeded `durable.shadow_base`. `STATE_NORMAL` is 0 (matching `svm-interp`).
+/// # Safety: `mem_base` is a durable run's committed window base.
 pub(crate) unsafe fn window_is_durable_active(mem_base: u64) -> bool {
-    *((mem_base + STATE_OFF) as *const i32) != 0
+    if *((mem_base + STATE_OFF) as *const i32) != 0 {
+        return true; // a freeze (global, stop-the-world)
+    }
+    // a thaw: the running context's own thaw word (its region base is the seeded shadow-base register).
+    let active_region = crate::durable_shadow::get();
+    *((mem_base + active_region + STATE_IN_REGION_OFF) as *const i32) != 0
 }
 
-/// Set the durable state word to `REWINDING` — a thaw re-entry point (slice 3.3): a re-attached child
-/// (and the root) starts in `REWINDING` to rewind from its restored shadow extent, then the
-/// instrumented prologue flips the word to `NORMAL` and runs forward. # Safety: `mem_base` is a
-/// durable run's committed window base.
-pub(crate) unsafe fn window_set_rewinding(mem_base: u64) {
-    *((mem_base + STATE_OFF) as *mut i32) = STATE_REWINDING;
+/// Set context `ctx`'s per-context **thaw** state word to `REWINDING` — a thaw re-entry point (slice
+/// 3.3): a re-attached child (and the root) starts in `REWINDING` to rewind from its restored shadow
+/// extent, then the instrumented prologue flips *its own* word to `NORMAL` and runs forward (§12.8
+/// concurrent-thaw stage 1). # Safety: `mem_base` is a durable run's committed window base.
+pub(crate) unsafe fn window_set_rewinding(mem_base: u64, ctx: usize) {
+    *((mem_base + thaw_word_off(ctx)) as *mut i32) = STATE_REWINDING;
 }
 
 /// The durable vCPU shadow **context** a restored shadow-SP lives in — the inverse of
@@ -224,11 +247,13 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
     *((mem_base + STATE_OFF) as *const i32) == STATE_UNWINDING
 }
 
-/// Whether the durable state word is `REWINDING` (a thaw is in progress) at run entry — the gate the
-/// parked-vCPU slice uses to mark the [`Domain`] thawing (an `atomic.wait` re-issue then fails closed
-/// rather than parking on the single worker). # Safety: `mem_base` is a durable run's committed window base.
-pub(crate) unsafe fn window_is_rewinding(mem_base: u64) -> bool {
-    *((mem_base + STATE_OFF) as *const i32) == STATE_REWINDING
+/// Whether context `ctx`'s per-context **thaw** state word is `REWINDING` (a thaw is in progress) at run
+/// entry — the gate the parked-vCPU slice uses to mark the [`Domain`] thawing (an `atomic.wait` re-issue
+/// then fails closed rather than parking on the single worker). The root (`ctx` 0) re-enters first under
+/// `REWINDING`, so its word indicates the thaw (§12.8 concurrent-thaw stage 1).
+/// # Safety: `mem_base` is a durable run's committed window base.
+pub(crate) unsafe fn window_is_rewinding(mem_base: u64, ctx: usize) -> bool {
+    *((mem_base + thaw_word_off(ctx)) as *const i32) == STATE_REWINDING
 }
 
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
@@ -389,7 +414,7 @@ impl SharedFiberTable {
             running_on: AtomicU64::new(NOT_RUNNING),
             fiber: Mutex::new(Some(fiber)),
             // Fresh/reused: the shadow region starts empty (SP at the region base).
-            shadow_sp: AtomicU64::new(fiber_region_base(slot) + 8), // §12.8 4A.5: empty = frame base (past the SP word)
+            shadow_sp: AtomicU64::new(fiber_region_base(slot) + REGION_HEADER_LEN), // §12.8 4A.5: empty = frame base (past the SP + thaw words)
             func,
             sp,
         });
@@ -817,6 +842,12 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             slot.shadow_sp.load(Ordering::Relaxed),
         );
         crate::durable_shadow::seed(fiber_region);
+        // §12.8 concurrent-thaw stage 1: carry the active **thaw** phase (`REWINDING`/`NORMAL`) into the
+        // fiber's own region word. The resume is sequential (the resumer waits on the resumee), so the
+        // globally-deepest frame's flip to `NORMAL` propagates back up through the switches — exactly as
+        // the former single global state word did. Mirrors the interp's `shadow_switch` carry.
+        let phase = *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *const i32);
+        *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *mut i32) = phase;
         rtm.cur_shadow = Some(Arc::clone(&slot));
         Some((resumer, resumer_region))
     } else {
@@ -846,6 +877,10 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         };
         write_shadow_sp(mem_base, resumer_region, restore);
         crate::durable_shadow::seed(resumer_region);
+        // §12.8 concurrent-thaw stage 1: carry the thaw phase back to the resumer's word (the resumee
+        // flipped its own to `NORMAL` when its rewind completed — propagate that up). See the entry swap.
+        let phase = *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *const i32);
+        *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *mut i32) = phase;
         rtm.cur_shadow = resumer;
     }
     // Phase 3: publish the fiber's new state (clearing the seam assert *before* republishing).
@@ -868,7 +903,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word is the region's
             // first 8 bytes); an empty stack sits exactly at the frame base.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
-            if durable && flat_sp > fiber_region_base(slot_idx) + 8 && window_is_unwinding(mem_base)
+            if durable && flat_sp > fiber_region_base(slot_idx) + REGION_HEADER_LEN && window_is_unwinding(mem_base)
             {
                 (*current()).frozen.push(crate::FrozenFiber {
                     slot: slot_idx,

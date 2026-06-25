@@ -112,27 +112,28 @@ pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// safepoints) so an ordinary or fiber-armed run is byte-identical (this slot stays 0). Lives in the
 /// reserve's `[24, 64)` gap.
 pub const ARM_BACKEDGE_OFF: u64 = 24;
-/// §12.8 concurrent-thaw stage 1: when `true`, the durable **state word** is read/written
-/// **per-context** — in each context's region (at [`STATE_IN_REGION_OFF`] past its shadow-SP word, via
-/// the `durable.shadow_base` register), mirroring the per-context shadow-SP relocation (4A.5 stage i) —
-/// instead of the single global [`STATE_OFF`]. A global state word forces a serial thaw (concurrent
-/// vCPUs would race the one word: one finishing its rewind flips it to `NORMAL` while another is still
-/// rewinding, and a forward vCPU's callee prologue would read another's `REWINDING`). Per-context state
-/// lets each frozen vCPU rewind against its own word, so the thaw can run them as concurrent OS threads
-/// and a re-issued `atomic.wait` re-synchronizes with a sibling's `notify` (lifting the parked-wait thaw
-/// fail-closed). **Off** today: the relocation also needs the freeze trigger to broadcast `UNWINDING` to
-/// every live context, the shadow frame-base shifted past the in-region state word, and a snapshot
-/// `FORMAT_VERSION` bump — staged separately. With it off, [`Bb::state_word_addr`] emits the global
-/// address, so an instrumented module is byte-identical to before.
-pub const STATE_PER_CONTEXT: bool = false;
-
-/// §12.8 concurrent-thaw stage 1: byte offset of the per-context state word **within a context's
-/// region** (when [`STATE_PER_CONTEXT`]) — just past the 8-byte in-region shadow-SP word at the region
-/// base. The shadow frame-base then starts past this word. Unused while [`STATE_PER_CONTEXT`] is off.
+/// §12.8 concurrent-thaw stage 1: byte offset of the per-context **thaw** state word
+/// (`REWINDING`/`NORMAL`) **within a context's region** — just past the 8-byte in-region shadow-SP word
+/// at the region base, addressed via the `durable.shadow_base` register (like the SP word). Each frozen
+/// vCPU rewinds against its *own* thaw word, so the thaw can run them as concurrent OS threads with no
+/// shared word: one vCPU finishing its rewind (flipping its word to `NORMAL`) can't disturb a sibling
+/// still `REWINDING`, and a forward vCPU's callee prologue can't read another's `REWINDING`. The
+/// **freeze** state (`UNWINDING`) stays at the global [`STATE_OFF`] — a freeze is stop-the-world, so the
+/// single word is the natural broadcast every poll reads. Must equal `svm-interp`/`svm-jit`'s copy.
 pub const STATE_IN_REGION_OFF: u64 = 8;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a context region's base before its shadow frames —
+/// the 8-byte shadow-SP word plus the 4-byte thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to
+/// keep frames 8-aligned. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
+/// `svm-interp`/`svm-jit`'s copy.
+pub const REGION_HEADER_LEN: u64 = 16;
 
 /// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
 pub const SHADOW_BASE: u64 = 64;
+/// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)`
+/// (§12.8 4A.5). The transform itself never addresses a region (it emits `durable.shadow_base`-relative
+/// loads the runtime resolves), but the [`write_thaw_state`] host helper indexes a context's region.
+/// Must equal `svm-interp`/`svm-jit`'s `SHADOW_STRIDE`.
+pub const SHADOW_STRIDE: u64 = 1 << 12;
 /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
 /// state word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
 /// A durable module's declared window must be at least this large (it is counted against the
@@ -627,7 +628,7 @@ fn transform_func(
 
     // ---- PROLOGUE — dispatch on the state word ----
     let mut pb = Bb::new(f.params.clone());
-    let (st_a, st_off) = pb.state_word_addr();
+    let (st_a, st_off) = pb.thaw_word_addr();
     let st = pb.one(load(LoadOp::I32, st_a, st_off));
     let rw = pb.one(Inst::ConstI32(STATE_REWINDING));
     let is_rw = pb.one(icmp(IntTy::I32, CmpOp::Eq, st, rw));
@@ -688,7 +689,7 @@ fn transform_func(
                 cont_seg: seg(b, 0), // re-enter the header body, past the poll
             });
             let mut psb = Bb::new(slot_types);
-            let (st_a, st_off) = psb.state_word_addr();
+            let (st_a, st_off) = psb.freeze_word_addr();
             let st = psb.one(load(LoadOp::I32, st_a, st_off));
             let unw = psb.one(Inst::ConstI32(STATE_UNWINDING));
             let is_unw = psb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
@@ -710,7 +711,7 @@ fn transform_func(
                 sb.insts.extend_from_slice(&blk.insts[seg_start..=pos]);
                 let out = bi.vend[pos];
                 sb.next = out as u32;
-                let (st_a, st_off) = sb.state_word_addr();
+                let (st_a, st_off) = sb.freeze_word_addr();
                 let st = sb.one(load(LoadOp::I32, st_a, st_off));
                 let unw = sb.one(Inst::ConstI32(STATE_UNWINDING));
                 let is_unw = sb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
@@ -957,7 +958,7 @@ fn transform_func(
             // its cap.call result; the header reloads its block params and re-enters the body
             // (`cont_seg`). Neither produces an `op_results` value.
             SuspendKind::Leaf | SuspendKind::LoopHeader => {
-                let (st_a, st_off) = ab.state_word_addr();
+                let (st_a, st_off) = ab.thaw_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
                 ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 vec![]
@@ -991,7 +992,7 @@ fn transform_func(
             // value the *next* resume delivers, threads into the continuation exactly as a leaf's
             // reloaded cap.call result does.
             SuspendKind::Yield { value } => {
-                let (st_a, st_off) = ab.state_word_addr();
+                let (st_a, st_off) = ab.thaw_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
                 ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
@@ -1006,7 +1007,7 @@ fn transform_func(
             // `REWINDING` afterward), so on this thread the join is the globally-deepest frozen frame —
             // it flips the state to `NORMAL` itself, like a leaf, *before* re-issuing.
             SuspendKind::ThreadJoin { handle } => {
-                let (st_a, st_off) = ab.state_word_addr();
+                let (st_a, st_off) = ab.thaw_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
                 ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let hh =
@@ -1024,7 +1025,7 @@ fn transform_func(
                 expected,
                 timeout,
             } => {
-                let (st_a, st_off) = ab.state_word_addr();
+                let (st_a, st_off) = ab.thaw_word_addr();
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
                 ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let aa = reloaded[spill_slot(*addr as usize).expect("atomic.wait addr spilled")];
@@ -1092,18 +1093,53 @@ fn transform_func(
 
 /// A fresh durable window of `size` bytes: state = `NORMAL`, and the root context's per-context
 /// shadow-SP word (§12.8 4A.5) — the first 8 bytes of its region at `SHADOW_BASE` — set to its empty
-/// frame base (`SHADOW_BASE + 8`, just past the word). The legacy global `SHADOW_SP_OFF` is unused.
+/// frame base (`SHADOW_BASE + REGION_HEADER_LEN`, just past the SP + thaw words). The legacy global
+/// `SHADOW_SP_OFF` is unused; the per-context thaw words default to `NORMAL` (zero).
 pub fn init_durable_window(size: usize) -> Vec<u8> {
     let mut w = vec![0u8; size];
     write_state(&mut w, STATE_NORMAL);
     w[SHADOW_BASE as usize..SHADOW_BASE as usize + 8]
-        .copy_from_slice(&(SHADOW_BASE + 8).to_le_bytes());
+        .copy_from_slice(&(SHADOW_BASE + REGION_HEADER_LEN).to_le_bytes());
     w
 }
 
-/// Overwrite the state word in a window image (used to drive freeze/thaw).
+/// Window byte offset of context `ctx`'s **thaw** state word (§12.8 concurrent-thaw stage 1) — its
+/// region base plus [`STATE_IN_REGION_OFF`]. Per-context, so a thaw can set each frozen vCPU rewinding
+/// independently (vs. the global [`STATE_OFF`] freeze word).
+pub fn thaw_state_off(ctx: usize) -> u64 {
+    SHADOW_BASE + ctx as u64 * SHADOW_STRIDE + STATE_IN_REGION_OFF
+}
+
+/// Overwrite the global **freeze** state word (`UNWINDING`/`ARMED`/`NORMAL`) in a window image — the
+/// stop-the-world trigger every poll reads. Thaw (`REWINDING`) goes through [`write_thaw_state`].
 pub fn write_state(window: &mut [u8], state: i32) {
     window[STATE_OFF as usize..STATE_OFF as usize + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+/// Overwrite context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) — used to drive a
+/// thaw (the runtime sets each frozen context `REWINDING` before its rewinding re-entry).
+pub fn write_thaw_state(window: &mut [u8], ctx: usize, state: i32) {
+    let off = thaw_state_off(ctx) as usize;
+    window[off..off + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+/// Set up a window for a **thaw** of context `ctx` (§12.8 concurrent-thaw stage 1): clear the global
+/// **freeze** word back to `NORMAL` (the frozen artifact left it `UNWINDING`, but a thaw is not a
+/// freeze — leaving it would make the rewinding code's polls re-unwind) and set `ctx`'s per-context
+/// **thaw** word to `REWINDING`. Mirrors what the runtime does on a real snapshot-restore thaw (the
+/// interp's `drive` clear + per-context `REWINDING`; the JIT thaw driver).
+pub fn begin_thaw(window: &mut [u8], ctx: usize) {
+    write_state(window, STATE_NORMAL);
+    write_thaw_state(window, ctx, STATE_REWINDING);
+}
+
+/// Read context `ctx`'s per-context **thaw** state word — after a thaw, a completed rewind reads
+/// `NORMAL` (the deepest frame's re-issue flipped it).
+pub fn read_thaw_state(window: &[u8], ctx: usize) -> i32 {
+    let off = thaw_state_off(ctx) as usize;
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&window[off..off + 4]);
+    i32::from_le_bytes(b)
 }
 
 /// Arm a window to **freeze after `safepoints` further fiber safepoints** (the deterministic mid-run
@@ -1174,17 +1210,20 @@ impl Bb {
     fn zero(&mut self, i: Inst) {
         self.insts.push(i);
     }
-    /// §12.8 concurrent-thaw stage 1: the durable **state word**'s address, as `(base, offset)` for a
-    /// `load`/`store`. Centralizes the single source of truth for *where* the state word lives so the
-    /// per-context relocation is one switch. With [`STATE_PER_CONTEXT`] off, the global [`STATE_OFF`]
-    /// (byte-identical to before); on, the running context's own region word (`durable.shadow_base` +
-    /// [`STATE_IN_REGION_OFF`]), so concurrent vCPUs each address their own — like the shadow-SP word.
-    fn state_word_addr(&mut self) -> (ValIdx, u64) {
-        if STATE_PER_CONTEXT {
-            (self.one(Inst::DurableShadowBase), STATE_IN_REGION_OFF)
-        } else {
-            (self.one(Inst::ConstI64(STATE_OFF as i64)), 0)
-        }
+    /// §12.8 concurrent-thaw stage 1: the **freeze** state word's address (`UNWINDING`), as
+    /// `(base, offset)` for a `load`. **Always global** ([`STATE_OFF`]) — a freeze is genuinely
+    /// stop-the-world, so the single word is the natural broadcast every context's poll reads (the arm
+    /// trigger / `request_freeze` set it). Read by the loop-header and in-block `UNWINDING` polls.
+    fn freeze_word_addr(&mut self) -> (ValIdx, u64) {
+        (self.one(Inst::ConstI64(STATE_OFF as i64)), 0)
+    }
+    /// §12.8 concurrent-thaw stage 1: the **thaw** state word's address (`REWINDING`/`NORMAL`), as
+    /// `(base, offset)` for a `load`/`store` — the running context's own region word
+    /// (`durable.shadow_base` + [`STATE_IN_REGION_OFF`], like the per-context shadow-SP word), so
+    /// concurrent vCPUs each rewind against their own (the relocation's whole point). Read by the
+    /// prologue's `REWINDING` dispatch and written `NORMAL` by the deepest frame's re-issue (thaw end).
+    fn thaw_word_addr(&mut self) -> (ValIdx, u64) {
+        (self.one(Inst::DurableShadowBase), STATE_IN_REGION_OFF)
     }
     fn finish(self, term: Terminator) -> Block {
         Block {

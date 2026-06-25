@@ -17,8 +17,8 @@
 use core::ffi::c_void;
 use std::sync::Arc;
 use svm_durable::{
-    arm_freeze_after_backedges, init_durable_window, read_state, transform_module, write_state,
-    DURABLE_RESERVE, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after_backedges, init_durable_window, read_state, transform_module, write_state, begin_thaw,
+    DURABLE_RESERVE, STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -169,7 +169,7 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
     // The interp-frozen artifact thaws on the JIT to the oracle (clock did not advance before the
     // header freeze, so the continuation clock is unchanged).
     let mut thaw = snap_i.clone();
-    write_state(&mut thaw, STATE_REWINDING);
+    begin_thaw(&mut thaw, 0);
     let (tj, final_j) = jit(&inst, clock, &thaw).expect("JIT thaw compiles");
     assert_eq!(
         jit_i64(&tj),
@@ -235,7 +235,7 @@ fn jit_async_freeze(
 // Thaw a frozen window on the JIT via the durable entry (REWINDING); returns (result, final window).
 fn jit_durable_thaw(inst: &Module, clock: i64, snap: &[u8]) -> (JitOutcome, Vec<u8>) {
     let mut win = snap.to_vec();
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let mut h = Host::new();
     h.clock_ns = clock;
     let clk = h.grant_clock();
@@ -323,7 +323,7 @@ fn interp_mid_loop_freeze_thaws_on_the_jit() {
     // the real mid-loop accumulator and reload the baked-in clock — not re-issue the cap.call
     // (which would now read 0 and give the wrong total).
     let mut thaw = snap.clone();
-    write_state(&mut thaw, STATE_REWINDING);
+    begin_thaw(&mut thaw, 0);
     let (tj, final_j) = jit(&inst, 0, &thaw).expect("JIT thaw compiles");
     assert_eq!(
         jit_i64(&tj),

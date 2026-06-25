@@ -19,8 +19,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use svm_durable::{
-    arm_freeze_after_backedges, init_durable_window, read_state, transform_module, write_state,
-    STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
+    STATE_UNWINDING,
 };
 use svm_interp::{run, run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -185,7 +185,7 @@ fn main() {
     // THAW: restore the snapshot on a fresh host, rewind the frame to the checkpoint, run to the end.
     let thaw = best(15, || {
         let mut img = snap.clone();
-        write_state(&mut img, STATE_REWINDING);
+        begin_thaw(&mut img, 0);
         let mut fuel = u64::MAX;
         let mut host = Host::new();
         host.set_durable(true);

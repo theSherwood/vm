@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use svm_durable::{
-    init_durable_window, transform_module_assume_confined, write_state, STATE_REWINDING,
+    init_durable_window, transform_module_assume_confined, write_state, begin_thaw,
     STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
@@ -123,7 +123,7 @@ fn durable_overhead_probe() {
                 &mut h,
             );
             let mut win = snap;
-            write_state(&mut win, STATE_REWINDING);
+            begin_thaw(&mut win, 0);
             let mut h2 = Host::new();
             h2.clock_ns = h.clock_ns;
             let clk2 = h2.grant_clock();
