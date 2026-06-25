@@ -1110,6 +1110,10 @@ fn vec_lane_shape(ty: &Type) -> Option<svm_ir::VShape> {
         Type::IntegerType { bits: 16 } => VShape::I16x8,
         Type::IntegerType { bits: 32 } => VShape::I32x4,
         Type::IntegerType { bits: 64 } => VShape::I64x2,
+        // A pointer lane is an `i64` window offset (§3a/§10), so a pointer vector packs exactly like an
+        // `i64` vector — `<2 x ptr>` ≡ `<2 x i64>` (an `i64x2` v128). Lets a verbatim pointer-pair
+        // load/store (SLP-vectorized struct/list copy, e.g. Embench `sglib-combined`) ride the v128 path.
+        Type::PointerType { .. } => VShape::I64x2,
         Type::FPType(FPType::Single) => VShape::F32x4,
         Type::FPType(FPType::Double) => VShape::F64x2,
         _ => return None,
@@ -8942,6 +8946,7 @@ fn lower_int_intrinsic(
             | "llvm.fshl"
             | "llvm.fshr"
             | "llvm.bswap"
+            | "llvm.bitreverse"
             | "llvm.uadd.sat"
             | "llvm.usub.sat"
             | "llvm.sadd.sat"
@@ -9125,6 +9130,12 @@ fn lower_int_intrinsic(
             let bits = src_bits(args[0], types)?;
             let v = ctx.operand(args[0])?;
             emit_bswap(ctx, v, ty, (bits / 8).max(1) as u64)
+        }
+        // `llvm.bitreverse` — reverse the value's bits inline (no SVM op), via the log-N swap network.
+        "llvm.bitreverse" => {
+            let bits = src_bits(args[0], types)?;
+            let v = ctx.operand(args[0])?;
+            emit_bitreverse(ctx, v, ty, bits)?
         }
         // Saturating add/sub (`llvm.{u,s}{add,sub}.sat`): the wrapping op, then clamp on over/underflow
         // via `select`. Rust's `saturating_add`/`sub` (and slice/capacity math) emit these. Only the
@@ -9461,6 +9472,72 @@ fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
         });
     }
     acc.unwrap_or(v)
+}
+
+/// Reverse the low `bits` bits of `v` (a power-of-2 width: 8/16/32/64) with the classic log-N swap
+/// network: `((v & m_s) << s) | ((v >> s) & m_s)` for s = 1,2,…,bits/2, where `m_s` selects the
+/// even-indexed `s`-bit groups (`s` ones, `s` zeros, repeating). The on-ramp keeps narrow integers
+/// zero-extended in their container (§3b), so a 16-bit value reverses cleanly into the low 16 bits.
+/// Lowers `llvm.bitreverse.{i8,i16,i32,i64}`; a non-power-of-2 width is `Unsupported` (fail-closed).
+fn emit_bitreverse(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, bits: u32) -> Result<ValIdx, Error> {
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return unsup(format!("llvm.bitreverse.i{bits} (non-power-of-2 width)"));
+    }
+    let kof = |ctx: &mut BlockCtx, k: u64| {
+        ctx.push(if ty == IntTy::I64 {
+            Inst::ConstI64(k as i64)
+        } else {
+            Inst::ConstI32(k as i32)
+        })
+    };
+    let mut cur = v;
+    let mut s = 1u32;
+    while s < bits {
+        // `m_s`: `s` ones then `s` zeros, repeating across the low `bits` bits.
+        let mut mask = 0u64;
+        let mut i = 0u32;
+        while i < bits {
+            for b in i..(i + s).min(bits) {
+                mask |= 1u64 << b;
+            }
+            i += 2 * s;
+        }
+        let m = kof(ctx, mask);
+        let sc = kof(ctx, s as u64);
+        // (v & m_s) << s  |  (v >> s) & m_s
+        let lo = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::And,
+            a: cur,
+            b: m,
+        });
+        let lo = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::Shl,
+            a: lo,
+            b: sc,
+        });
+        let hi = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::ShrU,
+            a: cur,
+            b: sc,
+        });
+        let hi = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::And,
+            a: hi,
+            b: m,
+        });
+        cur = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::Or,
+            a: lo,
+            b: hi,
+        });
+        s *= 2;
+    }
+    Ok(cur)
 }
 
 /// Lower a call to an external **libm math** function that has a direct SVM float op (`sqrt`,
@@ -11998,14 +12075,17 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             };
             let v0 = ctx.operand(&sv.operand0)?;
             let v1 = ctx.operand(&sv.operand1)?;
-            if let Some(shape) = vec128_shape(vty.as_ref()) {
+            // The v128 fast-path is a same-width permute (result lane count == input lane count) →
+            // one `i8x16.shuffle`. A width-changing shuffle (clang's auto-vectorizer emits these to
+            // widen/narrow/concat, e.g. `<16 x i8>` → `<8 x i8>`) falls through to the generic
+            // scalarize path below, which gathers lanes per the mask into the result's own shape.
+            if let Some(shape) =
+                vec128_shape(vty.as_ref()).filter(|s| mask.len() == s.lanes() as usize)
+            {
                 let n = shape.lanes() as u64; // lanes per input vector
                 let lb = shape.lane_bytes() as u64; // bytes per lane
-                if mask.len() != n as usize {
-                    return unsup("shufflevector: result lane count != input lane count");
-                }
-                // `lb`-byte lanes; source lane `src` (0..2n over the `a ++ b` concat) → concat byte
-                // base (src<n ? lb*src : 16 + lb*(src-n)). An undef/oob mask lane reads lane 0 of `a`.
+                                                    // `lb`-byte lanes; source lane `src` (0..2n over the `a ++ b` concat) → concat byte
+                                                    // base (src<n ? lb*src : 16 + lb*(src-n)). An undef/oob mask lane reads lane 0 of `a`.
                 let mut lanes = [0u8; 16];
                 for (k, &src) in mask.iter().enumerate() {
                     let base = if src < n {

@@ -808,6 +808,22 @@ fn switch_sparse_i32() {
 }
 
 #[test]
+fn bitreverse_intrinsic() {
+    // A bit-reversal loop `-O2` folds into `llvm.bitreverse.i32`; lowered inline via the log-N
+    // swap network. Checked against native `cc`.
+    let src = "unsigned br(unsigned x);\n\
+               int run(int s){\n\
+                 unsigned acc = 0;\n\
+                 for (int i = 0; i < 6; i++) acc = acc*7 + br((unsigned)(s + i) * 2654435761u);\n\
+                 return (int)(acc & 0x7fffffff);\n\
+               }\n\
+               unsigned br(unsigned x){\n\
+                 unsigned r = 0; for (int i = 0; i < 32; i++){ r = (r << 1) | (x & 1u); x >>= 1; } return r;\n\
+               }";
+    check_vs_native("bitreverse", src, 5);
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";
@@ -1123,12 +1139,23 @@ fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&s
 /// "matches native clang" exit criterion applied to an actual library. The file is compiled *in
 /// place* so its same-directory `#include "…"`s resolve.
 fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
+    check_demo_vs_native_flags(name, rel, stdin, &[]);
+}
+
+/// Like [`check_demo_vs_native`] but threads `extra` clang flags into the **bitcode** compile only
+/// — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
+/// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
+/// the vector lane (§17/D58) is outside the scalar on-ramp's scope, and exact integer code gives
+/// the identical bytes scalar-vs-vectorized, so the on-ramp consumes scalar bitcode while the
+/// oracle keeps vectorizing — the same split the Rust lane uses (`rust_*` helper, LLVM.md).
+fn check_demo_vs_native_flags(name: &str, rel: &str, stdin: &[u8], extra: &[&str]) {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos")
         .join(rel);
     let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.bc", std::process::id(), name));
     let status = Command::new("clang")
         .args(["-O2", "-emit-llvm", "-c"])
+        .args(extra)
         .arg(&path)
         .arg("-o")
         .arg(&bc)
@@ -1556,6 +1583,43 @@ fn demo_perlin_vs_native() {
     // stb_perlin: float-heavy noise (`fmuladd`/`fabs` intrinsics, int↔float, a const gradient table).
     // The float coverage (slice F) + `llvm.abs` (slice M) carry it — matching native `clang`.
     check_demo_vs_native("perlin", "perlin/perlin_demo.c", b"");
+}
+
+#[test]
+fn demo_monocypher_vs_native() {
+    // Monocypher 4.0.2 (public domain): modern crypto — BLAKE2b, ChaCha20, Poly1305, and an X25519
+    // ECDH known-answer test. The crypto / 64-bit-carry shakedown: AEAD bit-mixing plus the curve's
+    // 25.5-bit-limb field arithmetic (`i32 × i32 → i64` products with carry propagation) stress the
+    // 64-bit shift/rotate/multiply paths hard. Outputs are hex (no float formatting); the X25519
+    // section also self-validates (both ECDH sides must agree, exit code = mismatch count).
+    // Byte-identical to native `clang`. Compiled with auto-vectorization off for the on-ramp
+    // (the crypto hot loops clang would SIMD-vectorize are the §17 vector lane, not the scalar
+    // arithmetic this demo targets); the native oracle keeps vectorizing — exact integer crypto
+    // agrees scalar-vs-vectorized. Mirrors the Rust lane.
+    check_demo_vs_native_flags(
+        "monocypher",
+        "monocypher/monocypher_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_stb_image_vs_native() {
+    // Sean Barrett's stb_image (public domain), PNG-only: decode an embedded 24×24 RGBA PNG and
+    // write the raw decoded pixels. A real-parser shakedown — stb's built-in zlib inflate
+    // (Huffman + LZ77), the PNG row unfilters (None/Sub/Up/Average/Paeth — the test image cycles
+    // all five, hitting the narrow `unsigned char` predictor arithmetic, the slice-U class), the
+    // chunk/CRC walk, and heap traffic through the on-ramp's synthesized malloc/realloc/free. The
+    // native build decodes the same bytes → byte-exact oracle. Vectorization off for the on-ramp
+    // (the inflate/unfilter loops clang would SIMD-vectorize are the §17 lane); exact integer
+    // decoding agrees scalar-vs-vectorized.
+    check_demo_vs_native_flags(
+        "stb_image",
+        "stb_image/stb_image_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
 }
 
 #[test]
@@ -5146,6 +5210,26 @@ fn simd_autovec_avx2_fixed_point_shift() {
 // `<N x T>` loads/ops, not scalarize them. Each `vec128_shape` op (load/store, `VIntBin`,
 // `VFloatBin`, `ExtractLane`) is exercised against the native oracle on both backends.
 // ============================================================================================
+
+/// `<2 x ptr>` — an SLP-vectorized pointer-pair copy (`load <2 x ptr>` → `store`, e.g. Embench
+/// `sglib-combined`'s linked-list/struct shuffles). A pointer lane is an `i64` window offset, so the
+/// on-ramp packs `<2 x ptr>` exactly like `<2 x i64>` (an `i64x2` v128) and the 16-byte move is a
+/// `V128Load`/`V128Store`. Compares pointer **identity** (portable: absolute addresses differ between
+/// native and svm, but "the copy preserved both pointers" does not).
+#[test]
+fn simd_ptr2_copy() {
+    let src = "struct N { int *a; int *b; };\n\
+        void cp(struct N *d, struct N *s);\n\
+        int run(int seed){\n\
+        \x20 int arr[4]; struct N s, d;\n\
+        \x20 s.a = &arr[seed & 3]; s.b = &arr[(seed + 1) & 3];\n\
+        \x20 cp(&d, &s);\n\
+        \x20 return (d.a == s.a && d.b == s.b) ? 7 : 0;\n\
+        }\n\
+        __attribute__((noinline)) void cp(struct N *d, struct N *s){ d->a = s->a; d->b = s->b; }\n\
+        int main(void){ return run(2); }\n";
+    check_vs_native("simd_ptr2_copy", src, 2);
+}
 
 /// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
 /// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
