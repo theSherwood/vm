@@ -516,27 +516,12 @@ pub type FastCapResolver = unsafe extern "C" fn(
     n_res: u32,
 ) -> *const core::ffi::c_void;
 
-/// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
-/// (`thread.spawn`) a JIT run may create, below the fixed anti-bomb ceilings. The runtimes clamp each
-/// to their hard ceiling (a quota only *tightens*); exceeding it is a clean `FiberFault`/`ThreadFault`,
-/// matching `svm_interp::Quota`. [`Default`] = the ceilings (an unconfigured run is unchanged). NB the
-/// JIT's vCPU table is **cumulative** (a joined slot isn't freed), so `max_vcpus` bounds *total* spawns
-/// over the run — stricter than the interpreter's concurrent-liveness cap, but containment holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quota {
-    /// Max fibers a run may create (`cont.new`); clamped to the fiber anti-bomb ceiling.
-    pub max_fibers: usize,
-    /// Max thread cells a run may create (`thread.spawn`); clamped to the vCPU anti-bomb ceiling.
-    pub max_vcpus: usize,
-}
-impl Default for Quota {
-    fn default() -> Self {
-        Quota {
-            max_fibers: 1 << 16,
-            max_vcpus: 1 << 16,
-        }
-    }
-}
+// §15 **spawn quota** — the single shared type lives in `svm-ir` (re-exported here and as
+// `svm_interp::Quota`), so a powerbox embedder sets it once and it binds all three backends
+// identically, with no facade conversion (Followup F6). NB the JIT's vCPU table is **cumulative** (a
+// joined slot isn't freed), so here `max_vcpus` bounds *total* spawns over the run — stricter than the
+// interpreter's concurrent-liveness cap, but containment holds either way.
+pub use svm_ir::Quota;
 
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the

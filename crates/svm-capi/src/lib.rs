@@ -11,10 +11,11 @@
 //! ([`svm_last_error`]), and owns memory through explicit `*_free` calls. Handles are opaque pointers;
 //! `instantiate*` **consume** the module/imports handles passed to them.
 //!
-//! **Host-capability callbacks** are compute-only in this slice: `(op, args) -> results`, no direct
-//! guest-memory access (a guest reaches memory-backed I/O through the built-in `Stream` caps, whose
-//! Rust implementations read/write the window). A C callback that needs the window is a follow-up
-//! (it requires a bounds-checked `GuestMem` shim across the ABI).
+//! **Host-capability callbacks** receive the calling guest's linear-memory window as an opaque
+//! `SvmGuestMem*` (its last parameter; `NULL` if the module declares no memory), readable/writable
+//! through the **bounds-checked** [`svm_guest_read`] / [`svm_guest_write`] accessors (Followup F5). The
+//! shim is valid only for the duration of one callback — never retain the pointer past the call. A
+//! callback that only computes on its scalar args can ignore it.
 
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -22,7 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::time::Duration;
 
-use svm_interp::{HostFn, Trap};
+use svm_interp::{GuestMem, HostFn, Trap};
 use svm_run::{
     instantiate, instantiate_with_imports, Backend, HostCap, Imports, Instance, Limits, Outcome,
     Run, RunConfig, Value,
@@ -205,6 +206,8 @@ pub unsafe extern "C" fn svm_module_free(m: *mut SvmModule) {
 /// A C host-capability callback: compute `n_results` (≤ buffer capacity) outputs from `n_args` inputs
 /// for operation `op`. Return the number of results written (`>= 0`), or a negative value to **trap**
 /// the capability call (fail-closed). `ctx` is the opaque pointer registered alongside the callback.
+/// `mem` is the calling guest's linear-memory window (`NULL` if the module declares none), readable /
+/// writable through [`svm_guest_read`] / [`svm_guest_write`] — valid only for this call (F5).
 pub type SvmHostFn = extern "C" fn(
     ctx: *mut c_void,
     op: u32,
@@ -212,7 +215,80 @@ pub type SvmHostFn = extern "C" fn(
     n_args: usize,
     results: *mut i64,
     results_cap: usize,
+    mem: *mut SvmGuestMem,
 ) -> i32;
+
+/// An opaque handle to the calling guest's linear-memory window, handed to an [`SvmHostFn`] for the
+/// duration of one call. Access it **only** through [`svm_guest_read`] / [`svm_guest_write`] (each
+/// bounds-checked against the window, fail-closed) — the raw window pointer is never exposed, so a C
+/// callback gets exactly the §7 confinement the built-in `Stream`/`Memory` caps do. The wrapped
+/// borrow is live only during the callback; retaining the pointer past it is a use-after-free.
+///
+/// Holds a raw `*mut dyn GuestMem` (no lifetime param, so it appears in the C ABI as a plain opaque
+/// pointer). The pointee is the live window borrow for the in-flight callback; the accessors below
+/// reconstitute it only while C is calling back into us (single-threaded w.r.t. this borrow).
+pub struct SvmGuestMem {
+    mem: *mut dyn GuestMem,
+}
+
+/// Copy `len` bytes from guest window offset `ptr` into `dst`. Returns [`SVM_OK`] on success, or
+/// [`SVM_ERR_FAILED`] (nothing copied) if `mem`/`dst` is null or `[ptr, ptr+len)` is not wholly within
+/// the window — the same bounds check the built-in capabilities apply (fail-closed, never an over-read).
+///
+/// # Safety
+/// `mem` is an `SvmGuestMem*` handed to the current [`SvmHostFn`] call (or null); `dst` points to at
+/// least `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn svm_guest_read(
+    mem: *const SvmGuestMem,
+    ptr: u64,
+    dst: *mut u8,
+    len: usize,
+) -> i32 {
+    let Some(shim) = mem.as_ref() else {
+        return SVM_ERR_FAILED;
+    };
+    if dst.is_null() {
+        return SVM_ERR_FAILED;
+    }
+    let m = &*shim.mem;
+    match m.read_bytes(ptr, len as u64) {
+        Some(bytes) => {
+            // `read_bytes` guarantees `bytes.len() == len` on success.
+            ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
+            SVM_OK
+        }
+        None => SVM_ERR_FAILED,
+    }
+}
+
+/// Copy `len` bytes from `src` into the guest window at offset `ptr`. Returns [`SVM_OK`] on success, or
+/// [`SVM_ERR_FAILED`] (nothing written) if `mem`/`src` is null or `[ptr, ptr+len)` is not a wholly
+/// in-window, writable range (a read-only / unmapped page fails closed, exactly like the built-ins).
+///
+/// # Safety
+/// `mem` is an `SvmGuestMem*` handed to the current [`SvmHostFn`] call (or null); `src` points to at
+/// least `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn svm_guest_write(
+    mem: *mut SvmGuestMem,
+    ptr: u64,
+    src: *const u8,
+    len: usize,
+) -> i32 {
+    let Some(shim) = mem.as_mut() else {
+        return SVM_ERR_FAILED;
+    };
+    if src.is_null() {
+        return SVM_ERR_FAILED;
+    }
+    let data = std::slice::from_raw_parts(src, len);
+    let m = &mut *shim.mem;
+    match m.write_bytes(ptr, data) {
+        Some(()) => SVM_OK,
+        None => SVM_ERR_FAILED,
+    }
+}
 
 /// A `Send`/`Sync` carrier for the callback's opaque `ctx` so the grant closure can cross threads (a
 /// concurrent guest's workers may invoke the cap). The embedder is responsible for `ctx` being safe to
@@ -300,11 +376,23 @@ pub unsafe extern "C" fn svm_imports_provide_host_fn(
     // `make` is called once per backend host; each builds a fresh `HostFn` that trampolines into `f`.
     let cap = HostCap::host_fn(op, move || -> HostFn {
         let ctx = ctx;
-        Box::new(move |op, args, _mem| {
+        Box::new(move |op, args, mem| {
             // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
             // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
             let ctx = ctx;
             let mut buf = [0i64; SVM_MAX_RESULTS];
+            // Wrap the guest window (if any) so the C callback can read/write it bounds-checked, via
+            // `svm_guest_read`/`svm_guest_write`. The shim lives on this stack frame for the call only;
+            // the pointer it hands C is dangling the instant `f` returns (documented contract).
+            let mut shim = mem.map(|m| SvmGuestMem {
+                // SAFETY: erase the borrow's lifetime to carry it through the opaque C handle. The
+                // pointer is dereferenced (by `svm_guest_read`/`write`) only during this in-flight
+                // callback, while `m`'s borrow is live and otherwise untouched — no aliasing.
+                mem: unsafe { std::mem::transmute::<&mut dyn GuestMem, *mut dyn GuestMem>(m) },
+            });
+            let mem_ptr = shim
+                .as_mut()
+                .map_or(ptr::null_mut(), |s| s as *mut SvmGuestMem);
             let n = f(
                 ctx.0,
                 op,
@@ -312,6 +400,7 @@ pub unsafe extern "C" fn svm_imports_provide_host_fn(
                 args.len(),
                 buf.as_mut_ptr(),
                 buf.len(),
+                mem_ptr,
             );
             if n < 0 {
                 return Err(Trap::CapFault);
@@ -443,6 +532,9 @@ unsafe fn run_config(c: *const SvmRunConfig) -> RunConfig {
         },
         stdin,
         memory_size_log2: (c.memory_set != 0).then_some(c.memory_size_log2),
+        // argv/env are not part of the current C config surface (the C tests run arg-less programs);
+        // an `svm_run_config_set_args`-style setter is a later C-ABI follow-up.
+        ..RunConfig::default()
     }
 }
 
@@ -617,6 +709,117 @@ pub unsafe extern "C" fn svm_run_result(r: *const SvmRun, idx: usize) -> i64 {
 pub unsafe extern "C" fn svm_run_free(r: *mut SvmRun) {
     if !r.is_null() {
         drop(Box::from_raw(r));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Reactor sessions (Phase 6): instantiate once, call exports repeatedly with
+// persistent window state.
+// ----------------------------------------------------------------------------
+
+/// A live, stateful reactor session (opaque) — the C view of [`svm_run::Session`]. Built by
+/// `svm_instance_start`, freed by `svm_session_free`.
+pub struct SvmSession(svm_run::Session);
+
+/// Start a reactor session on `backend` under `config` (null ⇒ defaults): grant the powerbox once,
+/// run the bootstrap, and keep the window + host live for repeated `svm_session_call_export` calls.
+/// Does **not** consume `i` (the instance can start more sessions). Returns `NULL` on failure.
+///
+/// # Safety
+/// `i` is a live instance handle; `config` is null or a valid `SvmRunConfig`.
+#[no_mangle]
+pub unsafe extern "C" fn svm_instance_start(
+    i: *const SvmInstance,
+    backend: i32,
+    config: *const SvmRunConfig,
+) -> *mut SvmSession {
+    guard_ptr(|| {
+        let inst = i.as_ref().ok_or("svm_instance_start: null instance")?;
+        let backend = backend_of(backend)?;
+        let cfg = run_config(config);
+        let session = inst.0.start(backend, &cfg)?;
+        Ok(Box::into_raw(Box::new(SvmSession(session))))
+    })
+}
+
+/// Call exported function `name` with `n_args` `i64` arguments, writing up to `results_cap` `i64`
+/// results into `results` and the actual count into `*n_results`. The window (globals, stash, BSS) and
+/// capability handles persist from prior calls. Returns `SVM_OK`, or an error status (message in
+/// `svm_last_error`). Arguments are passed as raw `i64` slots (interpreted as `i64` values — the
+/// common case; floats can be passed by bit pattern).
+///
+/// # Safety
+/// `s` is a live session; `name` a valid C string; `args`/`results` describe readable/writable
+/// `n_args`/`results_cap` slots; `n_results` is a valid `size_t*` (or null).
+#[no_mangle]
+pub unsafe extern "C" fn svm_session_call_export(
+    s: *mut SvmSession,
+    name: *const c_char,
+    args: *const i64,
+    n_args: usize,
+    results: *mut i64,
+    results_cap: usize,
+    n_results: *mut usize,
+) -> i32 {
+    guard_status(|| {
+        let s = s.as_mut().ok_or("svm_session_call_export: null session")?;
+        if name.is_null() {
+            return Err("null export name".into());
+        }
+        let name = CStr::from_ptr(name)
+            .to_str()
+            .map_err(|_| "export name is not valid UTF-8".to_string())?;
+        let arg_slots = if n_args == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(args, n_args)
+        };
+        let vals: Vec<Value> = arg_slots.iter().map(|&x| Value::I64(x)).collect();
+        let out = s.0.call_export(name, &vals)?;
+        if !n_results.is_null() {
+            *n_results = out.len();
+        }
+        if !results.is_null() && results_cap > 0 {
+            let dst = std::slice::from_raw_parts_mut(results, results_cap);
+            for (d, v) in dst.iter_mut().zip(&out) {
+                *d = value_slot(v);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The session's captured stdout so far (valid until the next call / `svm_session_free`); writes `*len`.
+///
+/// # Safety
+/// `s` is a live session (or null); `len` a valid `size_t*` (or null).
+#[no_mangle]
+pub unsafe extern "C" fn svm_session_stdout(s: *const SvmSession, len: *mut usize) -> *const u8 {
+    match s.as_ref() {
+        Some(sess) => {
+            let out = sess.0.stdout();
+            if !len.is_null() {
+                *len = out.len();
+            }
+            out.as_ptr()
+        }
+        None => {
+            if !len.is_null() {
+                *len = 0;
+            }
+            ptr::null()
+        }
+    }
+}
+
+/// Free a session handle.
+///
+/// # Safety
+/// `s` is a live session handle from this library, or null.
+#[no_mangle]
+pub unsafe extern "C" fn svm_session_free(s: *mut SvmSession) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
     }
 }
 

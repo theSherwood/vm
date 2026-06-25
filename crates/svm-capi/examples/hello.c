@@ -14,11 +14,13 @@
 #include <stdio.h>
 #include <string.h>
 
-/* A host-defined capability: meaning(x) = x + 40. Reached by the guest as call.import "meaning". */
+/* A host-defined capability: meaning(x) = x + 40. Reached by the guest as call.import "meaning".
+ * This one only computes on its scalar args, so it ignores the guest-window handle (mem). */
 static int32_t meaning(void *ctx, uint32_t op, const int64_t *args, size_t n_args,
-                       int64_t *results, size_t cap) {
+                       int64_t *results, size_t cap, SvmGuestMem *mem) {
   (void)ctx;
   (void)op;
+  (void)mem;
   if (n_args < 1 || cap < 1) return -1; /* trap the cap call, fail-closed */
   results[0] = args[0] + 40;
   return 1; /* one result written */

@@ -2327,6 +2327,75 @@ pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
 /// addrspace, ioring, blocking, jit — always granted as a contiguous prefix of this set.
 pub const POWERBOX_MAX_HANDLES: usize = 8;
 
+/// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
+/// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
+/// [`Quota`] can only *tighten* below this, never raise it.
+pub const MAX_FIBERS: usize = 1 << 16;
+
+/// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
+/// `ThreadFault` past it. The interpreter bounds *concurrently-live* vCPUs; the JIT's table is
+/// cumulative, so there it bounds *total* spawns (stricter, but containment holds either way).
+pub const MAX_VCPUS: usize = 1 << 16;
+
+/// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
+/// (`thread.spawn`) a run may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb
+/// ceilings. The **single** quota type shared by both runtimes (re-exported as `svm_interp::Quota` and
+/// `svm_jit::Quota`), so a powerbox embedder sets it once and it binds the tree-walker, bytecode
+/// engine, and JIT identically (no facade conversion). The embedder sets it on the `Host`
+/// (`Host::set_quota`, which [`Quota::clamped`]s it); a guest that exceeds it traps cleanly
+/// (`FiberFault`/`ThreadFault`) — DoS *containment* policy (§15/D48), not just the host-OOM backstop.
+/// [`Default`] is the hard ceilings, so an unconfigured run is unchanged.
+///
+/// `max_vcpus` semantics differ slightly by backend (documented at the ceilings): the interpreter
+/// counts concurrent liveness, the JIT counts cumulative spawns. The *type* is one; the runtimes apply
+/// it per their model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quota {
+    /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
+    /// clamped to [`MAX_FIBERS`]. Per-run, not per-vCPU (the fiber table is the run-shared registry).
+    pub max_fibers: usize,
+    /// Max vCPUs a run may create (`thread.spawn`); clamped to [`MAX_VCPUS`].
+    pub max_vcpus: usize,
+}
+
+impl Default for Quota {
+    fn default() -> Quota {
+        Quota {
+            max_fibers: MAX_FIBERS,
+            max_vcpus: MAX_VCPUS,
+        }
+    }
+}
+
+impl Quota {
+    /// Clamp each limit to its hard anti-bomb ceiling (a quota can only *tighten*, never raise the
+    /// ceiling), and to ≥ 1 (the root vCPU/computation always exists).
+    pub fn clamped(self) -> Quota {
+        Quota {
+            max_fibers: self.max_fibers.clamp(1, MAX_FIBERS),
+            max_vcpus: self.max_vcpus.clamp(1, MAX_VCPUS),
+        }
+    }
+}
+
+/// The powerbox data-stack base for `module`: the page-aligned offset just above its globals/data
+/// segments (and never below [`POWERBOX_STACK_PAGE`]) — the `sp` the synthesized `_start` passes to
+/// the entry. Exposed so an embedder driving exports directly (the reactor / `Session` model) can
+/// synthesize the same `sp` per call that `_start` would. Stable across [`synth_powerbox_start`]
+/// (which adds no data segments), so it returns the same value before and after the prepend.
+pub fn powerbox_entry_sp(module: &Module) -> u64 {
+    let data_end = module
+        .data
+        .iter()
+        .map(|d| d.offset + d.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    data_end
+        .max(POWERBOX_STACK_PAGE)
+        .div_ceil(POWERBOX_STACK_PAGE)
+        * POWERBOX_STACK_PAGE
+}
+
 /// Prepend the powerbox bootstrap `_start` (the new function 0) to an already-linked, possibly
 /// import-bearing `module`, reproducing the exact layout the C on-ramp (`svm-llvm`) bakes into its
 /// own `synth_start` — so a frontend that emits SVM-IR directly (and links it itself, e.g. via
@@ -2401,14 +2470,7 @@ pub fn synth_powerbox_start(
     // Globals/data segments live at/above STACK_PAGE; the data stack starts page-aligned above the
     // highest data segment (and never below STACK_PAGE), so a read-only global never shares a page
     // with the writable stash, and a stack write never lands on a read-only global's page (D40).
-    let data_end = module
-        .data
-        .iter()
-        .map(|d| d.offset + d.bytes.len() as u64)
-        .max()
-        .unwrap_or(0);
-    let globals_end = data_end.max(POWERBOX_STACK_PAGE);
-    let entry_sp = globals_end.div_ceil(POWERBOX_STACK_PAGE) * POWERBOX_STACK_PAGE;
+    let entry_sp = powerbox_entry_sp(&module);
 
     // The window must cover the stash + globals + a data-stack reserve. Grow the declared memory to
     // fit (never shrink); beyond the mapped window is the faulting guard region (§5).

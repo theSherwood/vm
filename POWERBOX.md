@@ -193,10 +193,10 @@ weaken the §3c type-check's closed-enum audit surface for only a diagnostics ga
       surface: parse (text/binary), `synth_powerbox_start`, name-keyed imports (built-ins +
       C-callback host caps), `instantiate`/`instantiate_with_imports`, `run`(backend)/`run_diff`,
       `Limits`/`RunConfig` (fuel/deadline/quota/stdin/memory), and outcome + stdout/stderr readback.
-- [x] Host-capability callback ABI: a C `(ctx, op, args*, n_args, results*, results_cap) -> i32`
-      function pointer bridged to `HostFn` (return = result count, negative = trap). Compute-only this
-      slice (no guest-memory arg yet — memory-backed I/O goes through the built-in `Stream` caps);
-      a `GuestMem` shim for the callback is the documented follow-up.
+- [x] Host-capability callback ABI: a C `(ctx, op, args*, n_args, results*, results_cap, mem) -> i32`
+      function pointer bridged to `HostFn` (return = result count, negative = trap). The `mem` arg is
+      the calling guest's window as an opaque `SvmGuestMem*`, read/written through the bounds-checked
+      `svm_guest_read`/`svm_guest_write` accessors (F5, landed — was a compute-only follow-up).
 - [x] Memory/error model: opaque handles with explicit `*_free`; `instantiate*` consume their inputs;
       status codes + a thread-local `svm_last_error()`; every entry point `catch_unwind`s so a panic
       never crosses into C.
@@ -216,27 +216,82 @@ rather than converged:
 | Path | Backends | Caps | Used by |
 |---|---|---|---|
 | `Instance::{call,run,run_diff}` (this work) | all 3 | fixed or name-bound | new tests, C ABI |
-| `run_powerbox*` → `run_powerbox_inner` | JIT | fixed 8-handle powerbox | **the CLI** (`svm-run` bin) |
+| `run_powerbox*` → `run_powerbox_inner` → `Instance::run` (F1) | JIT | fixed 8-handle powerbox | **the CLI** (`svm-run` bin) |
 | `run_kernel` | bare | none | kernels / bench |
-| `run_c_full` (test) | interp+JIT | fixed | chibicc suite |
+| `run_c_full` (test) → `Instance::run_diff` (F1) | interp+JIT | fixed | chibicc suite |
 | `JitSession` | JIT | fixed | guest-JIT REPL |
-| §14 nested (`Instantiator`/`Module`) | interp+JIT | object-cap | `instantiator.rs`, `separate_module.rs` |
+| §14 nested (`Instantiator`/`Module`, name-addressable F2) | all 3 | object-cap | `instantiator.rs`, `separate_module.rs` |
 
-Two consequences worth fixing (Phase 6 / followups):
-- The new `Instance` layer **did not replace** `run_powerbox_inner`; the powerbox-grant logic is now
-  **duplicated** (`grant_caps` vs the hardcoded grant in `run_powerbox_inner`), and the CLI still uses
-  the old path.
-- The §14 nested path is **func-0-only and ignores `Module.exports`** — a child/separate-module guest
-  cannot be called by name.
+**Resolved (F2).** The §14 nested path can now address a child's entry **by name**: a `Module`
+capability (iface 8) gained one callable op — `op 0 resolve_export(name_ptr, name_len) -> funcidx |
+-errno` — backed by `Module.exports` (now retained in the host's `ModuleGrant`, previously dropped at
+`grant_module`). A parent resolves a name to a funcidx, then passes it as the `entry` to the existing
+Instantiator module ops (5/6/7). It lives in the generic `cap_dispatch_slots` seam, so **all three
+backends** get it from one implementation (tree-walker generic `CapCall`; bytecode generic `Op::CapCall`;
+JIT `cap_thunk`) — verified by name-addressed-child tests in `separate_module.rs`,
+`bytecode_separate_module.rs`, and `jit_separate_module.rs` (each picks a *non-0* export). The name is
+borrowed from the caller's window, fail-closed (`-EFAULT` out of bounds, `-EINVAL` bad UTF-8 / unknown);
+only the funcidx crosses back, never a host pointer.
 
-**Test gaps:** we test the export *table* (`resolve_export`) and calling `_start` by name, but **not**
-calling a named non-`_start` export with args and checking results (host *or* nested). And
-`Instance::call("<name>", args)` for a non-`_start` export currently runs as a **bare kernel with no
-capabilities** — so a named export that uses caps can't be called at all today.
+**Resolved (F1).** The run paths are converged onto one core:
+- `run_powerbox_inner` no longer carries its own grant/compile/watchdog: it builds an `Instance` (fixed
+  powerbox preset) and delegates to `Instance::run(Backend::Jit, config)`, so the powerbox-grant logic
+  lives in exactly one place (`grant_powerbox_prefix`, shared with the embedding API). The `Jit`-cap
+  grant on both paths now reserves the install table at the same `CLI_JIT_TABLE_LOG2` (previously
+  `grant_powerbox_prefix` reserved `0`, which would have starved a `Jit.install` guest).
+- The JIT half is one path too: `powerbox_compile_run` (now `func` + `snapshot_cap` parameterized,
+  returning a `JitRun`) under a single `jit_run` mid-level entry; `run_jit` and the reactor's per-call
+  capture are thin callers (the bespoke `jit_call_capture` is gone).
+- `run_c_full` (the chibicc differential harness) drives through `svm_run::instantiate` +
+  `Instance::run_diff` — the test suite exercises the same core as the CLI/embedders.
+
+The CLI is unchanged — same `run_powerbox*` signatures, JIT-only, no re-verify/re-resolve of already-
+validated frontend output.
+
+**Resolved (F3).** The named non-`_start` export call path is now tested and its capability semantics
+locked. `Instance::call("<non-_start>", args)` resolves the name to its (possibly non-zero) funcidx and
+runs it as a **bare kernel** — args in, results out, interp == jit — with **no** powerbox caps
+(`powerbox_instantiate.rs::non_start_export_runs_as_bare_kernel`, `square` at funcidx 1). The decision:
+a non-`_start` export gets no caps run-once, because without `_start` the handle stash (window offset 0)
+is empty, so a granted handle would be unreachable anyway; a **cap-using export is reached through a
+reactor `Session`** (`Instance::start` runs `_start` once to stash handles, then `Session::call_export`
+calls exports against the live window). Rule: *pure function → `Instance::call`; cap-using export →
+`Session::call_export`*. (Name-addressable **nested** exports are F2, above.)
 
 ---
 
-## Phase 6 — the reactor model: a live instance you call into (spec)
+## Phase 6 — the reactor model: a live instance you call into — slice 1 done
+
+**Landed (slice 1).** `svm_run::Session` (a live, stateful instance) + `Instance::start(backend,
+config) -> Session` and `Session::call_export(name, args) -> results`: instantiate once, run `_start`
+once, then call exports repeatedly with the guest window (globals, the handle stash, BSS) **persisting**
+between calls. Persistence is by **round-tripping the low `SNAP_CAP` (256 KiB) window snapshot** each
+call — the span all three backends already snapshot — so no TCB-internal changes were needed; the
+capability handles persist because the stash lives in that window. Exports use `(i64 sp, args…)`:
+`call_export` synthesizes the `sp` ([`svm_ir::powerbox_entry_sp`], now public) and appends the args.
+
+**All-three-backend differential.** `Instance::start_diff -> DiffSession`; `DiffSession::call_export`
+steps the tree-walker, bytecode engine, and JIT in lockstep and asserts they agree on results,
+stdout/stderr, and the persistent window prefix `[0, entry_sp)` after every call (the transient data
+stack above `entry_sp` — backend-specific frame layout — is excluded). This is the powerbox layer's
+first direct exercise of the bytecode engine (Followup F10). Acceptance:
+`crates/svm/tests/powerbox_reactor.rs` (persistent accumulator across calls on each backend; the
+three-way stateful diff; session independence) + a C-ABI mirror (`svm_instance_start`,
+`svm_session_call_export`, `svm_session_stdout`, `svm_session_free`; `svm-capi` ABI test).
+
+**Slice-1 scope / deferred:** single-threaded guests only (a §12-thread guest is rejected by `start`);
+the JIT recompiles per `call_export` (a per-funcidx `CompiledModule` cache is the obvious
+optimization). F1 (converge runners) and F2 (name-addressable nested guests) remain open.
+
+**Punted: reactor durability / heap persistence (F11).** Deliberately *not* doing this now. Two
+related gaps: (a) persistence covers only the low `SNAP_CAP` window, so a `malloc` **heap living in the
+reserved tail above the mapped window is not persisted** across `call_export` (slice 1's accumulator is
+a BSS slot in the low window, which *is* persisted); (b) there is no freeze/thaw **snapshot of a live
+`Session`** (the DURABILITY.md §12 machinery is per-run, not per-session). Both are real for a
+long-lived heap-using reactor, but neither blocks the current model — revisit when a consumer needs a
+persistent guest heap or to snapshot/restore a session. Tracked as **F11**.
+
+### Original spec (below, for reference)
 
 **Problem.** First-class exports (Phase 1) made entry points *addressable*, but you still can't really
 *call* them: every `call`/`run`/`run_diff` builds fresh hosts + a fresh window, runs `_start` once, and
@@ -293,15 +348,21 @@ impl Session {
    per-export trampoline (the JIT compiles function 0; calling an arbitrary export needs an
    entry-by-index run over the live window — check `CompiledModule` supports invoking a chosen funcidx,
    or extend it). This is the main implementation cost.
-4. **Differential.** `call_export` differential (interp vs JIT) must run *both* sessions in lockstep
-   across the *sequence* of calls (state diverges if they desync), not per-call in isolation.
+4. **Differential — all three backends.** The `call_export` differential runs a **tree-walker, a
+   bytecode-engine, and a JIT** session in lockstep across the *sequence* of calls (state diverges if
+   they desync, so it must be per-sequence, not per-call), asserting all three agree on results, the
+   persisted window, and captured output after every call. This is the powerbox layer's first direct
+   exercise of the bytecode engine (Followup F10) — note that for a module the bytecode engine doesn't
+   support, its session transparently falls back to the tree-walker, so that arm degenerates to a
+   second tree-walk; a `start` should report which engine each session actually used.
 5. **Concurrency / durability.** Out of scope for the first slice (single-threaded reactor); note the
    interaction with §12 threads and durability snapshots as later work.
 
 ### Acceptance (first slice)
 A hand-written module that exports `add(i64 sp, i64 x) -> i64` accumulating into a persistent global,
 called via `Session::call_export("add", …)` several times, returns the running total (proving window
-state persists), with interp == jit across the call sequence. Plus a C-ABI mirror (`svm_session_*`).
+state persists), with **all three backends** (tree-walk, bytecode, JIT) agreeing across the call
+sequence. Plus a C-ABI mirror (`svm_session_*`).
 
 ### Scope notes
 - Keep `command`-mode `Instance::run`/`run_diff` unchanged (the program use case).
@@ -312,27 +373,70 @@ state persists), with interp == jit across the call sequence. Plus a C-ABI mirro
 
 ## Followups / known gaps (logged, not yet scheduled)
 
-- **F1 — converge the host runners.** Fold `run_powerbox_inner` and `run_c_full` onto the `Instance`
-  layer (or factor one shared powerbox-grant/run core) so the powerbox-grant logic isn't duplicated and
-  the CLI/tests use one interface. Do this alongside or after Phase 6.
-- **F2 — name-addressable nested guests.** Thread `Module.exports` through the §14 `Module`-capability
-  path so a parent can call a child's export by name, not just func 0 — consistent with host-driven
-  calls. (Today nested children are func-0-only.)
-- **F3 — test the named-export call path.** Even before Phase 6, add a test for `Instance::call("<non-
-  _start>", args)` returning results; decide whether a non-`_start` export should get the powerbox caps
-  (it currently gets none — likely wrong once reactors exist).
-- **F4 — `argv`/env through `Instance`/`RunConfig`.** `synth_powerbox_start` is `main(void)`-only; the
-  older `run_powerbox_with_args` supports the §3e args buffer. Thread it through the new layer.
-- **F5 — guest-memory access from C callbacks** (Phase 5 deferral): a bounds-checked `GuestMem` shim so
-  a C `HostFn` can read/write the window, not just compute on scalars.
-- **F6 — unify `Quota`** into one shared type (Phase 3 deferral): currently `svm_interp::Quota` and
-  `svm_jit::Quota` are structurally identical and converted at the facade.
+- **F1 — converge the host runners.** *Landed.* Three convergences, all behind unchanged public
+  signatures and verified against the full suite (workspace + the 88-test `c_frontend` + svm-llvm's
+  8-handle chibicc/`Jit.install` programs):
+  1. `run_powerbox_inner` delegates to `Instance::run(Backend::Jit, config)` — the powerbox-grant
+     logic (`grant_powerbox_prefix`) and the JIT compile→run + §5 watchdog are no longer duplicated;
+     the `Jit`-cap install-table reservation is aligned across both paths.
+  2. `argv`/env flow through `RunConfig` (closing **F4**) and seed all three backends (run-once) via a
+     shared `run_interp`/`init_mem` path.
+  3. One JIT run path: `powerbox_compile_run` is parameterized by `func` + `snapshot_cap` and returns a
+     `JitRun`; `jit_run` is the single mid-level entry (deadline watchdog + concurrent `Mutex<Host>` +
+     trap folding). `run_jit` (run-once, func 0, no snapshot) and the reactor's per-call capture (an
+     export func + `REACTOR_SNAP_CAP` snapshot) are now thin callers of it — the bespoke
+     `jit_call_capture` is gone.
+  4. The test-only `run_c_full` (chibicc interp+JIT differential harness) is folded onto
+     `svm_run::instantiate` + `Instance::run_diff` — every C test now exercises the same grant/run core
+     the CLI and embedders use, not a hand-rolled compile/run.
+- **F2 — name-addressable nested guests.** *Landed.* `Module.exports` is retained in the host's
+  `ModuleGrant`, and the `Module` capability (iface 8) gained `op 0 resolve_export(name_ptr, name_len)
+  -> funcidx | -errno`. A parent resolves a child export name to a funcidx, then passes it as the
+  `entry` to the existing Instantiator module ops (5/6/7). Implemented once in the generic
+  `cap_dispatch_slots` seam → works on all three backends; fail-closed on the new untrusted-name surface
+  (`-EFAULT`/`-EINVAL`). Tests: `separate_module.rs`, `bytecode_separate_module.rs`,
+  `jit_separate_module.rs` (each resolves a *non-0* export). *Note:* the earlier "func-0-only" framing
+  was imprecise — invocation was always by integer `entry`; the real gap was the absence of name→index
+  resolution (exports were dropped at grant), which this closes.
+- **F3 — test the named-export call path.** *Landed.* Added
+  `powerbox_instantiate.rs::non_start_export_runs_as_bare_kernel` (a `square` kernel at funcidx 1 called
+  via `Instance::call`, returning results, interp == jit). **Decision locked:** a non-`_start` export
+  run-once gets **no** powerbox caps (without `_start` the handle stash is empty, so a granted handle is
+  unreachable) — cap-using exports go through a reactor `Session` instead. Documented on `Instance::call`.
+- **F4 — `argv`/env through `Instance`/`RunConfig`.** *Landed (with F1).* `RunConfig` now carries
+  `args`/`env`; `RunConfig::init_mem` builds the §3e args buffer (the single source, shared by the
+  `run_powerbox*` wrappers and `Instance::run`/`run_diff`), seeding all three backends run-once. The C
+  ABI surface does not yet expose a setter for these (logged inline; a `svm_run_config_set_args` is the
+  remaining bit).
+- **F5 — guest-memory access from C callbacks.** *Landed.* An `SvmHostFn` now receives the calling
+  guest's window as an opaque `SvmGuestMem*` (last param; `NULL` if the module declares none),
+  read/written through the **bounds-checked** `svm_guest_read` / `svm_guest_write` accessors — the raw
+  window pointer is never exposed, so a C callback gets the same §7 confinement (fail-closed
+  `SVM_ERR_FAILED` out of bounds / on a read-only/unmapped write) the built-in `Stream`/`Memory` caps
+  do. The shim wraps the live `GuestMem` borrow for the duration of one call only. Test:
+  `abi_tests::host_fn_reads_and_writes_guest_memory_via_c_abi` (`upcase` reads+uppercases+writes the
+  window, streamed back out, on all three backends); `svm.h` + `examples/hello.c` updated.
+- **F6 — unify `Quota`.** *Landed.* The §15 spawn quota is one type in `svm-ir`, re-exported as
+  `svm_interp::Quota` / `svm_jit::Quota`; the field-by-field facade conversion is gone (see the §F1
+  notes / `jit_run`). Values + clamping unchanged (both ceilings `1<<16`).
 - **F7 — runtime name→handle directory** (Phase 2 deferral): in-guest dlopen-style discovery, if a
   consumer needs it beyond compile-time name binding.
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic interface labels** (Phase 4 deferral): an untrusted, verifier-ignored human-readable
   label alongside a `HostFn` grant for diagnostics / `cap.self.*`. Not a nominal type_id.
+- **F10 — pin bytecode parity *in the powerbox layer*.** The bytecode engine is held to exact
+  bug-for-bug parity with the tree-walker by the standalone `bytecode_diff.rs` gate, but the powerbox
+  differential (`run_diff`) only diffs tree-walk vs JIT, and `Backend::Bytecode` (via
+  `run_with_host_fast`) can *silently fall back* to the tree-walker for unsupported modules — so the
+  powerbox tests don't prove the bytecode engine actually executed. **Folded into Phase 6**: the
+  reactor `call_export` differential runs **all three** backends in lockstep across the call sequence,
+  which exercises the bytecode engine directly under the powerbox. (Still worth a way to *assert* the
+  bytecode engine ran vs fell back, rather than infer it.)
+- **F11 — reactor durability / heap persistence** (Phase 6 deferral, *punted*): persist a
+  `malloc` heap (reserved tail, above the `SNAP_CAP` low-window snapshot) across `call_export`, and
+  freeze/thaw a live `Session` (the DURABILITY.md §12 machinery is per-run, not per-session). Revisit
+  when a consumer needs a persistent guest heap or session snapshot/restore.
 
 ---
 

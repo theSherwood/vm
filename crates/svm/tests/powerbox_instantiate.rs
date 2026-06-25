@@ -81,6 +81,53 @@ fn handwritten_ir_runs_through_the_powerbox_wrapper() {
     );
 }
 
+/// A module with a **non-`_start`** named export that is a pure kernel — `square(x) = x*x` at funcidx
+/// **1** (func 0 is an unused stub, so the export's funcidx is non-zero) — to exercise
+/// [`svm_run::Instance::call`] on a non-`_start` export: it resolves the name to its funcidx and runs
+/// it as a **bare kernel** (args in, results out, interp == jit), with no powerbox capabilities.
+const KERNEL: &str = "\
+memory 15
+export \"square\" 1
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 0
+  return v1
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.mul v0 v0
+  return v1
+}
+";
+
+/// F3: `Instance::call("<non-_start>", args)` resolves a named export to its (non-zero) funcidx and
+/// runs it as a pure kernel — returning results, with **no** capabilities granted. The decision: a
+/// non-`_start` export gets no powerbox caps run-once (the stash is empty without `_start`); a
+/// cap-using export is reached through a reactor `Session` instead. Here we pin the pure-kernel path.
+#[test]
+fn non_start_export_runs_as_bare_kernel() {
+    let module = svm_text::parse_module(KERNEL).expect("parse");
+    assert_eq!(
+        module.resolve_export("square"),
+        Some(1),
+        "the kernel export lives at a non-zero funcidx"
+    );
+    let instance = instantiate(module).expect("instantiate");
+    // Call the named kernel with an arg; results come back, interp == jit asserted inside the wrapper.
+    let run = instance
+        .call("square", &[Value::I32(7)])
+        .expect("call a non-_start kernel export by name");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(49)]),
+        "square(7) via Instance::call on a non-zero export funcidx"
+    );
+    assert!(
+        run.stdout.is_empty() && run.stderr.is_empty(),
+        "a bare-kernel export produces no powerbox output (no caps granted)"
+    );
+}
+
 /// The wrapper rejects caller args to the powerbox entry (the handles are auto-granted, not supplied
 /// by the caller) and an unknown export name — fail-closed, like the rest of the load path.
 #[test]

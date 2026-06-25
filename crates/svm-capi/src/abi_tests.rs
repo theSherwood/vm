@@ -13,6 +13,7 @@ extern "C" fn add_seven(
     n_args: usize,
     results: *mut i64,
     cap: usize,
+    _mem: *mut SvmGuestMem,
 ) -> i32 {
     if n_args < 1 || cap < 1 {
         return -1;
@@ -29,6 +30,7 @@ extern "C" fn triple(
     n_args: usize,
     results: *mut i64,
     cap: usize,
+    _mem: *mut SvmGuestMem,
 ) -> i32 {
     if n_args < 1 || cap < 1 {
         return -1;
@@ -207,5 +209,177 @@ fn errors_are_fail_closed_not_panics() {
         let inst = svm_instantiate_with_imports(m, imports);
         assert!(inst.is_null(), "unbound imports must fail closed");
         assert!(!svm_last_error().is_null());
+    }
+}
+
+const COUNTER: &str = "\
+memory 15
+export \"init\" 0
+export \"add\" 1
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 1024
+  v2 = i64.const 0
+  i64.store v1 v2
+  v3 = i32.const 0
+  return v3
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 1024
+  v3 = i64.load v2
+  v4 = i64.add v3 v1
+  i64.store v2 v4
+  return v4
+}
+";
+
+#[test]
+fn reactor_session_persists_state_across_calls_via_c_abi() {
+    unsafe {
+        let ir = CString::new(COUNTER).unwrap();
+        let m = svm_module_parse_text(ir.as_ptr());
+        assert_eq!(svm_module_synth_powerbox_start(m, 0, 0, false), SVM_OK);
+        let inst = svm_instantiate(m);
+        assert!(!inst.is_null());
+
+        let sess = svm_instance_start(inst, SVM_BACKEND_JIT, ptr::null());
+        assert!(
+            !sess.is_null(),
+            "start: {:?}",
+            CStr::from_ptr(svm_last_error())
+        );
+
+        let add = CString::new("add").unwrap();
+        let mut running = 0i64;
+        for x in [5i64, 3, 10, 100] {
+            running += x;
+            let args = [x];
+            let mut results = [0i64; 4];
+            let mut n = 0usize;
+            assert_eq!(
+                svm_session_call_export(
+                    sess,
+                    add.as_ptr(),
+                    args.as_ptr(),
+                    1,
+                    results.as_mut_ptr(),
+                    4,
+                    &mut n
+                ),
+                SVM_OK
+            );
+            assert_eq!(n, 1);
+            assert_eq!(
+                results[0], running,
+                "running total persists across C-ABI calls"
+            );
+        }
+
+        svm_session_free(sess);
+        svm_instance_free(inst); // start() did not consume the instance
+    }
+}
+
+// A C-ABI host capability that touches the guest window (F5): `upcase(ptr, len)` reads `len` bytes
+// from the window via `svm_guest_read`, uppercases ASCII, and writes them back via `svm_guest_write`.
+extern "C" fn upcase(
+    _ctx: *mut c_void,
+    _op: u32,
+    args: *const i64,
+    n_args: usize,
+    results: *mut i64,
+    cap: usize,
+    mem: *mut SvmGuestMem,
+) -> i32 {
+    if n_args < 2 || cap < 1 {
+        return -1;
+    }
+    unsafe {
+        let ptr = *args as u64;
+        let len = *args.add(1) as usize;
+        if len > 64 {
+            return -1;
+        }
+        let mut buf = [0u8; 64];
+        if svm_guest_read(mem, ptr, buf.as_mut_ptr(), len) != SVM_OK {
+            return -1; // out-of-window read → trap, fail-closed
+        }
+        for b in &mut buf[..len] {
+            b.make_ascii_uppercase();
+        }
+        if svm_guest_write(mem, ptr, buf.as_ptr(), len) != SVM_OK {
+            return -1; // out-of-window / read-only write → trap, fail-closed
+        }
+        *results = len as i64;
+    }
+    1
+}
+
+// `_start` stashes (upcase@0, write@4); the entry writes "abc" to window offset 2048, calls
+// `upcase` to uppercase it in place, then streams the now-"ABC" bytes to stdout.
+const UPCASE_IR: &str = "\
+memory 15
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 2048
+  v2 = i32.const 97
+  i32.store8 v1 v2
+  v3 = i64.const 2049
+  v4 = i32.const 98
+  i32.store8 v3 v4
+  v5 = i64.const 2050
+  v6 = i32.const 99
+  i32.store8 v5 v6
+  v7 = i64.const 0
+  v8 = i32.load v7
+  v9 = i64.const 2048
+  v10 = i64.const 3
+  v11 = call.import \"upcase\" (i64, i64) -> (i64) v8 (v9, v10)
+  v12 = i64.const 4
+  v13 = i32.load v12
+  v14 = i64.const 2048
+  v15 = i64.const 3
+  v16 = call.import \"write\" (i64, i64) -> (i64) v13 (v14, v15)
+  v17 = i32.const 0
+  return v17
+}
+";
+
+#[test]
+fn host_fn_reads_and_writes_guest_memory_via_c_abi() {
+    unsafe {
+        for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
+            let ir = CString::new(UPCASE_IR).unwrap();
+            let m = svm_module_parse_text(ir.as_ptr());
+            assert_eq!(svm_module_synth_powerbox_start(m, 0, 2, false), SVM_OK);
+            let imports = svm_imports_new();
+            let n_up = CString::new("upcase").unwrap();
+            let n_write = CString::new("write").unwrap();
+            assert_eq!(
+                svm_imports_provide_host_fn(imports, n_up.as_ptr(), 0, upcase, ptr::null_mut()),
+                SVM_OK
+            );
+            assert_eq!(
+                svm_imports_provide_stdout(imports, n_write.as_ptr()),
+                SVM_OK
+            );
+            let inst = svm_instantiate_with_imports(m, imports);
+            assert!(!inst.is_null(), "instantiate (backend {backend})");
+
+            let run = svm_instance_run(inst, backend, ptr::null());
+            assert!(!run.is_null(), "run backend {backend}");
+
+            let mut len = 0usize;
+            let p = svm_run_stdout(run, &mut len);
+            let out = std::slice::from_raw_parts(p, len);
+            assert_eq!(
+                out, b"ABC",
+                "the C host fn read+upcased+wrote the guest window on backend {backend}"
+            );
+            svm_run_free(run);
+            svm_instance_free(inst);
+        }
     }
 }
