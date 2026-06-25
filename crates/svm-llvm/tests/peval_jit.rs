@@ -13,91 +13,7 @@
 //!
 //! Auto-skips when the toolchain (`rustc +1.81.0`, `llvm-link-18`, `opt-18`) is unavailable.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/peval_jit")
-}
-
-fn tool_ok(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Build the fixture crate's dependency closure to LLVM-18 bitcode (`rustc +1.81`), link it, and
-/// `globaldce` down to the powerbox `main`. Returns the legalized `.bc`, or `None` if a tool is
-/// missing. Mirrors the manual probe (and `peval_in_sandbox.rs`).
-fn build_probe_bc() -> Option<PathBuf> {
-    if !tool_ok("rustc", &["+1.81.0", "--version"])
-        || !tool_ok("llvm-link-18", &["--version"])
-        || !tool_ok("opt-18", &["--version"])
-    {
-        eprintln!("note: skipping peval_jit (need `rustc +1.81.0`, `llvm-link-18`, `opt-18`)");
-        return None;
-    }
-
-    let work = std::env::temp_dir().join(format!("peval_jit_{}", std::process::id()));
-    let target = work.join("target");
-    std::fs::create_dir_all(&target).expect("create target dir");
-
-    let status = Command::new("cargo")
-        .current_dir(fixture_dir())
-        .env("RUSTFLAGS", "--emit=llvm-bc")
-        .env("CARGO_TARGET_DIR", &target)
-        .args(["+1.81.0", "build", "--release", "--ignore-rust-version"])
-        .status()
-        .expect("run cargo build for the peval_jit fixture");
-    if !status.success() {
-        eprintln!("note: peval_jit `cargo build` returned {status} (tolerated if .bc emitted)");
-    }
-
-    let deps = target.join("release/deps");
-    let mut bcs: Vec<PathBuf> = std::fs::read_dir(&deps)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "bc").unwrap_or(false))
-        .collect();
-    bcs.sort();
-    if bcs.is_empty() {
-        eprintln!("note: skipping peval_jit (no .bc emitted)");
-        return None;
-    }
-
-    let linked = work.join("linked.bc");
-    assert!(
-        Command::new("llvm-link-18")
-            .args(&bcs)
-            .arg("-o")
-            .arg(&linked)
-            .status()
-            .expect("run llvm-link-18")
-            .success(),
-        "llvm-link-18 failed"
-    );
-
-    let legalized = work.join("peval_jit.bc");
-    assert!(
-        Command::new("opt-18")
-            .args([
-                "-passes=internalize,globaldce",
-                "-internalize-public-api-list=main,malloc,free",
-            ])
-            .arg(&linked)
-            .arg("-o")
-            .arg(&legalized)
-            .status()
-            .expect("run opt-18")
-            .success(),
-        "opt-18 failed"
-    );
-    Some(legalized)
-}
+mod common;
 
 /// **Guest specializes a module and JITs the residual, all in-sandbox.** The guest builds
 /// `entry(a,b) -> helper(a,b) = a*3 + b*5 + 7`, specializes it (inlining + folding), encodes the
@@ -106,7 +22,7 @@ fn build_probe_bc() -> Option<PathBuf> {
 /// memory-match precondition.
 #[test]
 fn peval_guest_specializes_and_jits_in_sandbox() {
-    let Some(bc) = build_probe_bc() else {
+    let Some(bc) = common::build_fixture_bc("peval_jit") else {
         return; // toolchain unavailable — skip
     };
     let t = svm_llvm::translate_bc_path(&bc).expect("translate the peval-jit guest to svm-IR");
