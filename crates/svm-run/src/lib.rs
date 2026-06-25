@@ -2590,8 +2590,30 @@ fn grant_powerbox_prefix(h: &mut Host, n_handles: usize, win: u64) -> Vec<Value>
             h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
         ));
     }
+    // §7 register the granted prefix under canonical names (F7) so a fixed-powerbox guest can also
+    // `cap.self`-resolve its capabilities by name, not only by stash slot. Names parallel the grant
+    // order above; only the `n_handles` actually granted are registered.
+    for (name, slot) in POWERBOX_CAP_NAMES.iter().zip(&v) {
+        if let Value::I32(handle) = slot {
+            h.register_cap_name(name, *handle);
+        }
+    }
     v
 }
+
+/// The canonical names of the eight fixed §3e powerbox capabilities, in grant order — the vocabulary a
+/// fixed-powerbox guest resolves against via `cap.self` (F7). A name-bound guest
+/// ([`instantiate_with_imports`]) instead resolves its own import names.
+const POWERBOX_CAP_NAMES: [&str; 8] = [
+    "stdout",
+    "stdin",
+    "exit",
+    "memory",
+    "addrspace",
+    "ioring",
+    "blocking",
+    "jit",
+];
 
 /// Reconcile the interpreter's `Result<Vec<Value>, Trap>` with the JIT's [`JitOutcome`] for an entry
 /// whose results are `results`: assert the two backends agree (the differential oracle of
@@ -3246,9 +3268,16 @@ impl Instance {
                 // Inert unless a granted cap needs them (region-backed / Jit caps).
                 h.set_region_factory(new_shared_region);
                 h.set_jit_validator(jit_blob_validator);
+                // Grant in import order, and register each grant under the guest's own import name in
+                // the §7 capability-name directory (F7) so the guest can `cap.self`-resolve it at
+                // runtime — the same names it wrote as `call.import "<name>"`.
                 b.order
                     .iter()
-                    .map(|name| Value::I32((b.imports.map[name].grant)(h, win)))
+                    .map(|name| {
+                        let handle = (b.imports.map[name].grant)(h, win);
+                        h.register_cap_name(name, handle);
+                        Value::I32(handle)
+                    })
                     .collect()
             }
             None => grant_powerbox_prefix(h, self.module.funcs[0].params.len(), win),

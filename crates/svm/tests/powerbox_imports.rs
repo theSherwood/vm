@@ -8,7 +8,9 @@
 //! Gated `#![cfg(unix)]` like the other JIT differential suites.
 #![cfg(unix)]
 
-use svm_run::{instantiate_with_imports, HostCap, Imports, Outcome, Value};
+use svm_run::{
+    instantiate, instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig, Value,
+};
 
 /// Two **arbitrary-named** host-function imports — `add_seven` and `triple` — each its own handle but
 /// the same nominal interface (`HOST_FN`), distinguished object-capability-style by which handle the
@@ -117,4 +119,113 @@ block0(v0: i64):
     let run = instance.call("_start", &[]).expect("run");
     assert_eq!(run.stdout, b"hi via registry\n");
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+}
+
+// --- F7: runtime name → handle resolution (the guest's `cap.self` op 2) ---------------------------
+//
+// `cap.call 4294967295 2 (i64, i64) -> (i32) <h> (name_ptr, name_len)` resolves a capability **name**
+// to the handle it was granted (4294967295 = the reserved `CAP_SELF_TYPE_ID`; the handle operand is
+// ignored, like every `cap.self` op). It confers no authority — it only re-finds a handle the guest
+// already holds — so it routes through the generic capability seam and works on all three backends.
+
+/// The guest resolves the name `"write"` (which it imported) to its handle **at runtime** — never
+/// reading the stash slot — then uses that resolved handle to emit a string. Proves the resolved
+/// handle is the real, working capability, on the tree-walker, bytecode engine, and JIT.
+const RESOLVE_SRC: &str = "\
+memory 15
+data ro 16384 \"via resolve\\n\"
+data ro 17000 \"write\"
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 0
+  v2 = i64.const 17000
+  v3 = i64.const 5
+  v4 = cap.call 4294967295 2 (i64, i64) -> (i32) v1 (v2, v3)
+  v5 = i64.const 16384
+  v6 = i64.const 12
+  v7 = call.import \"write\" (i64, i64) -> (i64) v4 (v5, v6)
+  v8 = i32.const 0
+  return v8
+}
+";
+
+#[test]
+fn resolve_capability_by_name_at_runtime() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let module = svm_text::parse_module(RESOLVE_SRC).expect("parse");
+        let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+        let imports = Imports::new().provide("write", HostCap::stdout());
+        let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+        let run = instance
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
+        assert_eq!(
+            run.stdout, b"via resolve\n",
+            "the name-resolved write handle works on {backend:?}"
+        );
+        assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+    }
+}
+
+/// An unknown name resolves to `-EINVAL` (-22) — fail-closed, the new untrusted-name surface never
+/// traps or invents a handle. (The directory is empty here; a bad name fails regardless.)
+const RESOLVE_BOGUS_SRC: &str = "\
+memory 15
+data ro 17000 \"nope\"
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 0
+  v2 = i64.const 17000
+  v3 = i64.const 4
+  v4 = cap.call 4294967295 2 (i64, i64) -> (i32) v1 (v2, v3)
+  return v4
+}
+";
+
+#[test]
+fn resolve_unknown_name_is_fail_closed() {
+    let module = svm_text::parse_module(RESOLVE_BOGUS_SRC).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 0, false).expect("synth (0 handles)");
+    let instance = instantiate_with_imports(with_start, Imports::new()).expect("instantiate");
+    let run = instance.call("_start", &[]).expect("run");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(-22)]),
+        "an unknown capability name resolves to -EINVAL"
+    );
+}
+
+/// The fixed §3e powerbox registers **canonical** names (no named imports): the guest resolves `"exit"`
+/// and checks it equals the handle `_start` stashed at slot 2 — proving canonical registration and that
+/// resolve returns the very handle the stash holds.
+const CANON_SRC: &str = "\
+memory 15
+data ro 16384 \"exit\"
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 0
+  v2 = i64.const 16384
+  v3 = i64.const 4
+  v4 = cap.call 4294967295 2 (i64, i64) -> (i32) v1 (v2, v3)
+  v5 = i64.const 8
+  v6 = i32.load v5
+  v7 = i32.sub v4 v6
+  return v7
+}
+";
+
+#[test]
+fn canonical_powerbox_names_resolve_to_stash_handles() {
+    let module = svm_text::parse_module(CANON_SRC).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 3, false).expect("synth (3 handles)");
+    let instance = instantiate(with_start).expect("instantiate");
+    let run = instance.call("_start", &[]).expect("run");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(0)]),
+        "resolve(\"exit\") returns the same handle _start stashed at slot 2"
+    );
 }

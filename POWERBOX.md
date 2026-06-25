@@ -158,8 +158,9 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
       the fixed powerbox; both share one differential body (`run_entry0_diff`). Acceptance:
       `crates/svm/tests/powerbox_imports.rs` (arbitrary-named host-fn caps, unbound fail-closed,
       standard names as a preset), interp == jit.
-- [ ] (Deferred) a runtime name→handle directory capability for true dynamic/dlopen-style lookup —
-      compile-time name binding covers wasm parity; revisit if a consumer needs in-guest discovery.
+- [x] A runtime name→handle directory (F7): the guest resolves a capability name to its handle at
+      runtime via `cap.self` op 2 (dlopen-style), over the `Host` `cap_names` directory populated at
+      grant. Compile-time name binding remains the default; this adds dynamic in-guest discovery.
 - [ ] (Deferred) full dynamic stash sizing (heap base above an arbitrary-N stash) to lift the
       ≤8-with-heap / ≤32-without cap; not needed until a frontend wants >8 named caps *and* a heap.
 
@@ -419,8 +420,19 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
 - **F6 — unify `Quota`.** *Landed.* The §15 spawn quota is one type in `svm-ir`, re-exported as
   `svm_interp::Quota` / `svm_jit::Quota`; the field-by-field facade conversion is gone (see the §F1
   notes / `jit_run`). Values + clamping unchanged (both ceilings `1<<16`).
-- **F7 — runtime name→handle directory** (Phase 2 deferral): in-guest dlopen-style discovery, if a
-  consumer needs it beyond compile-time name binding.
+- **F7 — runtime name→handle directory.** *Landed.* A guest can resolve a capability **by name to its
+  handle at runtime** — dlopen-style discovery, the dynamic counterpart to load-time name binding. The
+  `Host` keeps a `cap_names` directory (name → handle), populated by the powerbox layer at grant time:
+  a name-bound guest (`instantiate_with_imports`) resolves its own import names; a fixed §3e powerbox
+  guest resolves the canonical names (`stdout`/`stdin`/`exit`/`memory`/`addrspace`/`ioring`/`blocking`/
+  `jit`). The guest calls it as `cap.self` **op 2** — `resolve(name_ptr, name_len) -> handle | -errno`
+  — serviced in the generic `cap_dispatch_slots` seam (where `mem` is available to read the name), so
+  **all three backends** get it from one implementation. Confers no authority (it only re-finds a
+  handle already granted; an ungranted name is `-EINVAL`), fail-closed on the untrusted name (`-EFAULT`
+  out of bounds, `-EINVAL` bad UTF-8 / unknown). Tests in `powerbox_imports.rs` (runtime resolve +
+  use on all three backends; unknown-name `-EINVAL`; canonical names match the stashed handles).
+  *Ergonomic follow-up:* a dedicated `cap.self.resolve` IR instruction would avoid the reserved-type_id
+  / dummy-handle form, but the `cap.self` instruction family is currently mem-less, so that's deferred.
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic interface labels** (Phase 4 deferral): an untrusted, verifier-ignored human-readable
@@ -443,8 +455,8 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
 ## Open questions
 
 - Phase 2: do we want the **runtime** name→handle directory (true dynamic lookup the *guest* can
-  query), or is compile-time name binding at `instantiate` enough? The latter covers wasm parity;
-  the former enables dlopen-style discovery. Current lean: compile-time binding first, runtime
-  directory as a follow-up if a consumer needs it.
+  query), or is compile-time name binding at `instantiate` enough? **Resolved: both.** Compile-time
+  name binding stays the default (wasm parity); the runtime directory shipped as **F7** (`cap.self`
+  op 2) for in-guest dlopen-style discovery.
 - Phase 5: which C consumers drive the priority — JACL's runtime, or external embedders? That
   decides whether the C ABI leads or trails the Rust facade.
