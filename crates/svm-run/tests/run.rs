@@ -585,10 +585,9 @@ fn cli_deadline_kills_runaway_c_program() {
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn demo_mn_scheduler_runs() {
-    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
-        .arg(demo("mn_sched/mn_sched.c"))
-        .output()
-        .expect("spawn svm-run");
+    // Fail-fast like the work-stealing siblings (ISSUES.md I7): a threaded/fiber scheduler is the
+    // same wedge class, so don't let a hang block on a bare unbounded `.output()`.
+    let out = run_demo_failfast("mn_sched/mn_sched.c");
     let err = String::from_utf8_lossy(&out.stderr);
     if err.contains("chibicc") {
         eprintln!(
