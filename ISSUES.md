@@ -236,18 +236,38 @@ into **128-bit chunks** (4×i32) and svm-jit emits 128-bit `paddd`/etc., while n
 (AVX2) or 512-bit `zmm` (AVX-512). So the SVM stack *does* vectorize (contrary to my earlier bench
 claim — see below), but at SSE width.
 
-**Measured, across the wasm comparison columns (ns/iter, the same C kernels):**
+**Measured (ns/iter, same C kernels, one machine; svm-jit timed *compile-once* — see the bench fix
+below). wasm is disambiguated into the full matrix — {wasm32, wasm64} × {V8/TurboFan, Wasmtime/Cranelift}
+— because the *backend* is the whole story:**
 
-| kernel | native AVX2 | wasm32 V8 | wasm32 Wasmtime | **svm-jit** | bytecode |
-|---|---|---|---|---|---|
-| `xorshift` (scalar serial) | 1.73 | 1.99 | 2.04 | **1.59** | 58.3 |
-| `vadd` (vectorizable)      | 0.042 | 0.098 | 0.147 | **0.083** | 37.6 |
+| kernel | native AVX2 (256b) | wasm32 V8 | wasm64 V8 | wasm32 Wasmtime | wasm64 Wasmtime | **svm-jit** | bytecode | tree-walk |
+|---|---|---|---|---|---|---|---|---|
+| `xorshift` (scalar serial) | 1.69 | 1.92 | 1.92 | 1.99 | 1.99 | **1.63** | 62.4 | 108.2 |
+| `vadd` (vectorizable)      | 0.041 | 0.096 | 0.096 | 0.147 | 0.147 | **0.18** | 47.5 | 52.5 |
 
-The key context: **wasm SIMD is itself fixed at 128 bits** (the spec's `v128`), so V8 and Wasmtime are
-*also* ~2–3.5× behind native AVX2 on `vadd` — the exact same cap svm-jit has. **svm-jit is not behind
-wasm; it is ahead** (0.083 vs V8 0.098 / Wasmtime 0.147), and on the representative *scalar* kernel it
-is the fastest engine measured, beating native. So relative to the VM's actual peer (wasm), there is no
-SIMD deficit — only native AVX2/AVX-512 leads, by the determinism-bound 128→256/512 margin.
+(wasm32 ≈ wasm64 within noise on both engines — the memory model doesn't move compute throughput here.
+Wasmtime's *Pulley* interpreter tier, measured but omitted, is ~16 / ~7 ns — an interpreter, not a peer
+of the JITs.)
+
+**Scalar: no deficit** — svm-jit (1.63) *beats* every engine including native (1.69).
+**Vectorized: it's the backend, not svm-jit.** The matrix makes this clear: **Wasmtime uses Cranelift —
+the same backend as svm-jit** — and lands `vadd` at 0.147, right next to svm-jit's 0.18 (the ~1.2×
+residual is on-ramp reduction shape + the bench's per-run window alloc). **V8/TurboFan**, also 128-bit,
+is ~2× faster than *both* Cranelift engines (0.096). So the vectorized gap splits cleanly:
+- **~2× width** (native AVX2 256-bit vs everyone else's 128-bit) — the determinism / opt-in-mode story.
+- **~2× backend** (Cranelift vs TurboFan vectorization quality) — and svm-jit ≈ Wasmtime, i.e. **svm-jit
+  is already at the Cranelift ceiling**.
+
+(This *corrects* an earlier note here that claimed svm-jit *beat* wasm on `vadd` at 0.083 — that lumped
+"wasm" as V8 only, predates the compile-once timing fix, and isn't reproducible.)
+
+**Is the residual 128-bit gap actionable? No — it's upstream Cranelift.** That svm-jit ≈ Wasmtime (same
+backend) is the proof: `opt_level` is already `"speed"`, and the on-ramp emits a minimal clean
+translation (clang's 2-accumulator unroll → one SSE op per lane op, no redundant moves). The ~2× vs V8
+is Cranelift's vector instruction selection/scheduling, which **D36/D49 deliberately don't own** — the
+same "we don't fork the backend" boundary as the wide-vector blocker. (`-O3` shrinks it a little via
+better-scheduled IR, but using a *different* `-O` for the SVM rows than native/wasm would make the
+comparison dishonest — the very thing the bench fix below removes.)
 
 **Root cause — deliberate, not a miss.** The chunk width is fixed at 128 bits and **never
 host-detected**, to preserve the interp↔JIT↔durable-fiber **determinism contract** (a frozen vector
@@ -265,13 +285,22 @@ hard to see in that harness: (a) `vsum`'s known-content array gets **closed-form
 per call, so a fast vectorized loop is swamped by compile jitter unless timed via `CompiledModule`
 (compile once, run many).
 
-**Fix sketch (deferred — needs a decision):**
-1. **Doc/bench:** drop `-fno-*-vectorize` from the on-ramp invocation in the bench (and LLVM.md §4) so
-   the SVM rows show the real 128-bit-SIMD number, not scalar; measure with a non-foldable kernel via
-   `CompiledModule` (compile-once).
-2. **Throughput (optional, contract change):** an *opt-in*, non-default "fast/non-deterministic" mode
-   that legalizes to the host vector width (256/512) — only for runs that don't need
-   freeze/thaw/oracle determinism. Default stays fixed-128.
+**Fix sketch:**
+1. **Doc/bench — LANDED.** The bench already vectorizes (`-fno-*-vectorize` gone) and `vsum`→`vadd` is
+   fold-resistant (runtime seed, no array). The remaining hazard — `svm_jit::compile_and_run` recompiling
+   per call, whose ~5–6 ms jitter swamped the ~0.1 ms vectorized signal even through the large/small
+   subtraction — is fixed: a new `svm_jit::compile(m, func) -> CompiledModule` (compile once, run many)
+   drives the JIT row in `examples/cross_engine.rs`. `vadd` now reports a clean ~0.18 ns/iter (≈0.5
+   cycle/element) — the honest 128-bit-SIMD number. (A wider `-mavx2 <8 x i32>` also legalizes + runs
+   correctly now via the two-chunk I2/I11 path, but the chunks stay 128-bit so it adds no throughput; the
+   bench keeps `-O2`/one-v128 to make the width comparison clean.)
+2. **Throughput — accepted as a future opt-in mode, gated on Cranelift.** A host-dependent
+   (non-deterministic) SIMD mode that legalizes to the host vector width (256/512) is now a
+   product-sanctioned direction (DESIGN.md §17): default stays fixed-128/deterministic, the mode is opt-in
+   for runs that don't need replay/freeze-thaw/oracle. The blocker is **not** determinism (explicitly
+   waived for that mode) but the backend — Cranelift's x64 has no YMM/ZMM register class, so there's
+   nothing to lower host-native ops to. Revisit when Cranelift grows upstream wide-vector support; until
+   then width-hungry work uses a host vectorized capability (§7/§13) or the GPU broker.
 
 ---
 

@@ -668,6 +668,29 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitO
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
 }
 
+/// Compile `func` of `m` to a reusable [`CompiledModule`] with the default no-host policy (an empty
+/// powerbox — any `cap.call` is an inert CapFault, exactly like [`compile_and_run`]), so the caller can
+/// **compile once and [`CompiledModule::run`] many times** (DESIGN.md §22's long-lived split). The
+/// one-shot [`compile_and_run`] recompiles the whole module on *every* call (~ms of Cranelift codegen);
+/// a hot loop or a benchmark isolating per-iteration compute from compile jitter should compile here and
+/// reuse the returned module. For `cap.call` dispatch to a real host, call [`CompiledModule::compile`]
+/// directly with a thunk.
+pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> {
+    CompiledModule::compile(
+        m,
+        func,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0, // natural (non-B2-reserved) function-table size
+    )
+}
+
 /// Like [`compile_and_run`], but `cap.call`s dispatch through `cap_thunk` with the
 /// caller's `cap_ctx` (the powerbox host). The thunk + ctx addresses are baked into the
 /// compiled code as constants — valid because the module is compiled, run once, then

@@ -200,6 +200,36 @@ fn check_traps(name: &str, src: &str, args: &[Value]) {
     }
 }
 
+/// `svm_jit::compile` (compile once) → reuse `CompiledModule::run` returns the same result as the
+/// one-shot `compile_and_run`, across multiple inputs. Guards the compile-once API the cross-engine
+/// bench relies on for honest JIT timing (its loop must carry no per-call Cranelift codegen).
+#[test]
+fn jit_compile_once_run_many() {
+    let Some(bc) = compile_to_bc("compile_once", "int run(int x){ return x * x + 1; }") else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let e = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    let sp = t.entry_sp as i64;
+    let mut cm = svm_jit::compile(&t.module, e).expect("compile once");
+    let val = |o: JitOutcome| match o {
+        JitOutcome::Returned(v) => v[0] as i32,
+        other => panic!("unexpected outcome {other:?}"),
+    };
+    for x in [3i64, 10, -4] {
+        let once = val(cm.run(&[sp, x], None, None, None).expect("run").0);
+        let one_shot = val(svm_jit::compile_and_run(&t.module, e, &[sp, x]).expect("one-shot"));
+        assert_eq!(once, one_shot, "compile-once vs one-shot at x={x}");
+        assert_eq!(once, (x * x + 1) as i32, "result at x={x}");
+    }
+}
+
 #[test]
 fn byval_small_struct_arg() {
     // A small struct passed by value — clang coerces it to an `i64` register. `run` packs {a,b}
