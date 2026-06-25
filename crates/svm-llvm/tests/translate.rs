@@ -821,6 +821,22 @@ fn fcmp_unordered_ordered() {
 }
 
 #[test]
+fn bitreverse_intrinsic() {
+    // A bit-reversal loop `-O2` folds into `llvm.bitreverse.i32`; lowered inline via the log-N
+    // swap network. Checked against native `cc`.
+    let src = "unsigned br(unsigned x);\n\
+               int run(int s){\n\
+                 unsigned acc = 0;\n\
+                 for (int i = 0; i < 6; i++) acc = acc*7 + br((unsigned)(s + i) * 2654435761u);\n\
+                 return (int)(acc & 0x7fffffff);\n\
+               }\n\
+               unsigned br(unsigned x){\n\
+                 unsigned r = 0; for (int i = 0; i < 32; i++){ r = (r << 1) | (x & 1u); x >>= 1; } return r;\n\
+               }";
+    check_vs_native("bitreverse", src, 5);
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";
@@ -1136,12 +1152,23 @@ fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&s
 /// "matches native clang" exit criterion applied to an actual library. The file is compiled *in
 /// place* so its same-directory `#include "…"`s resolve.
 fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
+    check_demo_vs_native_flags(name, rel, stdin, &[]);
+}
+
+/// Like [`check_demo_vs_native`] but threads `extra` clang flags into the **bitcode** compile only
+/// — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
+/// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
+/// the vector lane (§17/D58) is outside the scalar on-ramp's scope, and exact integer code gives
+/// the identical bytes scalar-vs-vectorized, so the on-ramp consumes scalar bitcode while the
+/// oracle keeps vectorizing — the same split the Rust lane uses (`rust_*` helper, LLVM.md).
+fn check_demo_vs_native_flags(name: &str, rel: &str, stdin: &[u8], extra: &[&str]) {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos")
         .join(rel);
     let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.bc", std::process::id(), name));
     let status = Command::new("clang")
         .args(["-O2", "-emit-llvm", "-c"])
+        .args(extra)
         .arg(&path)
         .arg("-o")
         .arg(&bc)
@@ -1253,6 +1280,44 @@ fn funnel_shift_rotate() {
         &[Value::I32(0x12345678), Value::I32(8)],
         &[Value::I32(0x78123456u32 as i32)],
     );
+}
+
+#[test]
+fn funnel_shift_general_const() {
+    // A **non-rotate** funnel shift with a constant amount — clang's canonical form for a double-word
+    // shift `(hi << k) | (lo >> (64 - k))` (the `fshl.i64(hi, lo, k)` Embench `aha-mont64`'s `modul64`
+    // emits). Distinct operands, so this is the general path: `(a << s) | (b >>u (w - s))`. Three
+    // amounts (1, 5, 63 — `(lo>>1)|(hi<<63)` canonicalizes to `fshl(.,.,63)`) and the full 64-bit result
+    // is folded down into the exit byte, so an error in *any* bit flips it. Bit-exact vs native `cc`.
+    let src = "int run(int seed) {\n\
+        \x20 unsigned long hi = (unsigned long) seed * 0x9E3779B97F4A7C15UL + 1;\n\
+        \x20 unsigned long lo = (unsigned long) seed * 0xC2B2AE3D27D4EB4FUL + 7;\n\
+        \x20 unsigned long a = (hi << 1)  | (lo >> 63);\n\
+        \x20 unsigned long b = (hi << 5)  | (lo >> 59);\n\
+        \x20 unsigned long c = (lo >> 1)  | (hi << 63);\n\
+        \x20 unsigned long r = a ^ (b * 3) ^ c;\n\
+        \x20 r ^= r >> 32; r ^= r >> 16; r ^= r >> 8;\n\
+        \x20 return (int)(r & 0xff);\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("funnel_general", src, 5);
+}
+
+#[test]
+fn strlen_builtin() {
+    // A direct `strlen` call (not via `printf %s`) routes to the synthesized `__svm_strlen` NUL-scan
+    // helper — even in a `run`-only module with no `main` (the helper reads memory, needs no powerbox).
+    // Two calls (a base pointer and a `buf + k` offset) over a runtime-length string; bit-exact vs the
+    // native `cc` oracle on both backends. Found needed by Embench `slre`.
+    let src = "#include <string.h>\n\
+        int run(int seed) {\n\
+        \x20 const char *s = \"the quick brown fox jumps over the lazy dog\";\n\
+        \x20 const char *t = \"embench strlen test vector\";\n\
+        \x20 unsigned long total = strlen(s + (seed % 5)) + strlen(t + (seed % 3));\n\
+        \x20 return (int)(total & 0x7fffffff);\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("strlen_builtin", src, 7);
 }
 
 #[test]
@@ -1531,6 +1596,43 @@ fn demo_perlin_vs_native() {
     // stb_perlin: float-heavy noise (`fmuladd`/`fabs` intrinsics, int↔float, a const gradient table).
     // The float coverage (slice F) + `llvm.abs` (slice M) carry it — matching native `clang`.
     check_demo_vs_native("perlin", "perlin/perlin_demo.c", b"");
+}
+
+#[test]
+fn demo_monocypher_vs_native() {
+    // Monocypher 4.0.2 (public domain): modern crypto — BLAKE2b, ChaCha20, Poly1305, and an X25519
+    // ECDH known-answer test. The crypto / 64-bit-carry shakedown: AEAD bit-mixing plus the curve's
+    // 25.5-bit-limb field arithmetic (`i32 × i32 → i64` products with carry propagation) stress the
+    // 64-bit shift/rotate/multiply paths hard. Outputs are hex (no float formatting); the X25519
+    // section also self-validates (both ECDH sides must agree, exit code = mismatch count).
+    // Byte-identical to native `clang`. Compiled with auto-vectorization off for the on-ramp
+    // (the crypto hot loops clang would SIMD-vectorize are the §17 vector lane, not the scalar
+    // arithmetic this demo targets); the native oracle keeps vectorizing — exact integer crypto
+    // agrees scalar-vs-vectorized. Mirrors the Rust lane.
+    check_demo_vs_native_flags(
+        "monocypher",
+        "monocypher/monocypher_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_stb_image_vs_native() {
+    // Sean Barrett's stb_image (public domain), PNG-only: decode an embedded 24×24 RGBA PNG and
+    // write the raw decoded pixels. A real-parser shakedown — stb's built-in zlib inflate
+    // (Huffman + LZ77), the PNG row unfilters (None/Sub/Up/Average/Paeth — the test image cycles
+    // all five, hitting the narrow `unsigned char` predictor arithmetic, the slice-U class), the
+    // chunk/CRC walk, and heap traffic through the on-ramp's synthesized malloc/realloc/free. The
+    // native build decodes the same bytes → byte-exact oracle. Vectorization off for the on-ramp
+    // (the inflate/unfilter loops clang would SIMD-vectorize are the §17 lane); exact integer
+    // decoding agrees scalar-vs-vectorized.
+    check_demo_vs_native_flags(
+        "stb_image",
+        "stb_image/stb_image_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
 }
 
 #[test]
@@ -4978,19 +5080,40 @@ fn simd_autovec_avx2_wide_shifts() {
     check_avx_vs_native("simd_avx2_wide_shifts", src, 9);
 }
 
-/// ISSUES.md I13 — a `<2 x i16>` carried across a loop (Embench `edn`'s `fir_no_red_ld` "no-redundant
-/// -load" FIR) round-trips its 16-bit lanes incorrectly through the per-part block-param fan-out, a
-/// *silent miscompile*. Until the tiny-tail-lane representation is fixed, the on-ramp **fail-closes**
-/// on a φ carrying a ≤2-lane sub-32-bit vector. This pins that it stays a clean `Unsupported` (never a
-/// wrong answer); the 4-lane `<4 x i16>` carry stays supported (`demo_clay_vs_native`).
+/// ISSUES.md I13 (root fix, isolated) — `<2 x i32>` lane arithmetic carried as a packed `i64` must be
+/// lane-wise for **every** cross-lane-unsafe op, not just `mul`: `add`/`sub` carry across the 32-bit lane
+/// boundary and `shl`/`lshr`/`ashr` shift bits between lanes. This uses an explicit `vector_size(8)`
+/// `<2 x i32>` so clang emits the ops directly (`add`, `mul`, `shl`), with large lane values chosen so a
+/// packed-`i64` op would visibly corrupt the high lane. Bit-exact vs the native `cc` oracle on both
+/// backends (and interp == JIT).
 #[test]
-fn simd_tiny_i16_carry_phi_fails_closed_i13() {
-    let src = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
-        static short X[256], H[256]; static long Y[256];\n\
+fn simd_vec2_i32_lane_arith_add_shift_i13() {
+    let src = "typedef int v2 __attribute__((vector_size(8)));\n\
         int run(int seed) {\n\
-        \x20 for (int i = 0; i < 256; i++) { X[i] = seed + i; H[i] = seed * 2 - i; Y[i] = 0; }\n\
-        \x20 fir_no_red_ld(X, H, Y); long a = 0; for (int i = 0; i < 256; i++) a += Y[i]; return (int) a;\n\
+        \x20 v2 a = {seed * 7 + 100000, seed + 30000};\n\
+        \x20 v2 b = {seed + 3, seed * 5 + 70000};\n\
+        \x20 v2 c = (a + b) * b;\n\
+        \x20 v2 d = c << 2;\n\
+        \x20 v2 e = d - a;\n\
+        \x20 return e[0] + e[1];\n\
         }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("i13_vec2_addshift", src, 4);
+}
+
+/// ISSUES.md I13 (root fix) — Embench `edn`'s `fir_no_red_ld` ("no-redundant-load" FIR) carries a
+/// `<2 x i16>` across the loop and auto-vectorizes the deinterleaved widening multiply to **`<2 x i32>`
+/// lane arithmetic**. A 2-lane 32-bit vector is held as a *packed* `i64` (lane 0 low, lane 1 high), and
+/// the lane `mul` was lowered as a single `i64` multiply on that packed image — which cross-contaminates
+/// the lanes (the low product's carry and the lane0×lane1 cross term corrupt lane 1). That was a silent
+/// miscompile (previously fail-closed by a φ guard). The fix lowers `<2 x i32>` integer arithmetic
+/// lane-wise. This pins the kernel **bit-exact (full 64-bit checksum)** vs the native `cc` oracle on
+/// both backends — and forces the `mul` lowering to be per-lane `i32`, never a packed `i64.mul`.
+#[test]
+fn simd_vec2_i32_carried_widening_mul_i13() {
+    // `run(long n)` runs the FIR `n` times over a seeded buffer and folds a weighted 64-bit checksum —
+    // wide enough that a corrupted high lane changes the result well beyond a low-byte coincidence.
+    let kernel = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
         void fir_no_red_ld(const short x[], const short h[], long y[]) {\n\
         \x20 long i, j, sum0, sum1; short x0, x1, h0, h1;\n\
         \x20 for (j = 0; j < 100; j += 2) { sum0 = 0; sum1 = 0; x0 = x[j];\n\
@@ -4999,15 +5122,74 @@ fn simd_tiny_i16_carry_phi_fails_closed_i13() {
         \x20     x0 = x[j+i+2]; h1 = h[i+1]; sum0 += x1*h1; sum1 += x0*h1; }\n\
         \x20   y[j] = sum0 >> 15; y[j+1] = sum1 >> 15; }\n\
         }\n\
-        int main(void) { return run(3); }\n";
-    let Some(bc) = compile_to_bc("i13_tiny_i16_carry", src) else {
+        long run(long n) {\n\
+        \x20 long acc = 0;\n\
+        \x20 for (long t = 0; t < n; t++) {\n\
+        \x20   short X[132], H[32]; long Y[100];\n\
+        \x20   for (int i=0;i<132;i++) X[i]=(short)((i*7+t*3+1)%97 - 48);\n\
+        \x20   for (int i=0;i<32;i++) H[i]=(short)((i*5+t+1)%31 - 15);\n\
+        \x20   for (int i=0;i<100;i++) Y[i]=0;\n\
+        \x20   fir_no_red_ld(X,H,Y);\n\
+        \x20   for (int i=0;i<100;i++) acc += Y[i]*(i+1);\n\
+        \x20 }\n\
+        \x20 return acc;\n\
+        }\n";
+    let main = "long run(long);\n#include <stdio.h>\n\
+        int main(void){ printf(\"%ld %ld\\n\", run(1), run(7)); return 0; }\n";
+    let Some(bc) = compile_to_bc("i13_vec2_fir", kernel) else {
         return; // clang unavailable
     };
-    // Must fail-close, not translate (a translated module here would silently miscompile).
-    assert!(
-        svm_llvm::translate_bc_path(&bc).is_err(),
-        "I13: a carried <2 x i16> must fail-close (Unsupported), not translate-and-miscompile"
-    );
+    // Native oracle: full 64-bit results for n=1 and n=7 via stdout.
+    let dir = std::env::temp_dir();
+    let csrc = dir.join(format!("svm_llvm_i13_{}.c", std::process::id()));
+    let exe = dir.join(format!("svm_llvm_i13_{}", std::process::id()));
+    std::fs::write(&csrc, format!("{kernel}{main}")).expect("write C");
+    match Command::new("cc").arg(&csrc).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping i13 (cc unavailable)");
+            return;
+        }
+    }
+    let out = Command::new(&exe).output().expect("run native");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let nat: Vec<i64> = s
+        .split_whitespace()
+        .map(|w| w.parse().expect("native i64"))
+        .collect();
+    assert_eq!(nat.len(), 2, "native printed two checksums");
+
+    let t =
+        svm_llvm::translate_bc_path(&bc).expect("translate (I13 root fix: no longer fail-closed)");
+    let module = &t.module;
+    svm_verify::verify_module(module).expect("verify");
+    let e = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    for (k, &expect) in [1i64, 7].iter().zip(&nat) {
+        let mut fuel = 200_000_000u64;
+        let interp = svm_interp::run(
+            module,
+            e,
+            &[Value::I64(t.entry_sp as i64), Value::I64(*k)],
+            &mut fuel,
+        )
+        .expect("interp")[0];
+        let jit = match svm_jit::compile_and_run(module, e, &[t.entry_sp as i64, *k]).expect("jit")
+        {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("jit outcome {o:?}"),
+        };
+        let interp = match interp {
+            Value::I64(x) => x,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(interp, jit, "I13 n={k}: interp vs jit");
+        assert_eq!(interp, expect, "I13 n={k}: svm vs native cc");
+    }
 }
 
 /// `-O2 -mavx2` auto-vectorized **fixed-point DSP** kernel (Embench `edn`'s `vec_mpy` shape):
@@ -5041,6 +5223,26 @@ fn simd_autovec_avx2_fixed_point_shift() {
 // `<N x T>` loads/ops, not scalarize them. Each `vec128_shape` op (load/store, `VIntBin`,
 // `VFloatBin`, `ExtractLane`) is exercised against the native oracle on both backends.
 // ============================================================================================
+
+/// `<2 x ptr>` — an SLP-vectorized pointer-pair copy (`load <2 x ptr>` → `store`, e.g. Embench
+/// `sglib-combined`'s linked-list/struct shuffles). A pointer lane is an `i64` window offset, so the
+/// on-ramp packs `<2 x ptr>` exactly like `<2 x i64>` (an `i64x2` v128) and the 16-byte move is a
+/// `V128Load`/`V128Store`. Compares pointer **identity** (portable: absolute addresses differ between
+/// native and svm, but "the copy preserved both pointers" does not).
+#[test]
+fn simd_ptr2_copy() {
+    let src = "struct N { int *a; int *b; };\n\
+        void cp(struct N *d, struct N *s);\n\
+        int run(int seed){\n\
+        \x20 int arr[4]; struct N s, d;\n\
+        \x20 s.a = &arr[seed & 3]; s.b = &arr[(seed + 1) & 3];\n\
+        \x20 cp(&d, &s);\n\
+        \x20 return (d.a == s.a && d.b == s.b) ? 7 : 0;\n\
+        }\n\
+        __attribute__((noinline)) void cp(struct N *d, struct N *s){ d->a = s->a; d->b = s->b; }\n\
+        int main(void){ return run(2); }\n";
+    check_vs_native("simd_ptr2_copy", src, 2);
+}
 
 /// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
 /// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
