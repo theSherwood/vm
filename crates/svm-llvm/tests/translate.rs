@@ -4045,6 +4045,64 @@ fn rust_btreemap_matches_native() {
     );
 }
 
+/// **ZST struct field → element-stride/offset layout (PEVAL.md Milestone 3 corruption).** A `no_std`
+/// program builds a `Vec<Inner>` where `Inner { data: Vec<u64>, tag: u64 }` *contains a `Vec`*, then
+/// indexes the outer vector (`v[i].tag`, `v[i].data.len()`, `v[i].data[0]`) and sums. A `Vec`/`RawVec`
+/// carries the zero-sized `alloc::alloc::Global` allocator marker (`type {}`), so the element stride of
+/// `Vec<Inner>` and the offset of `Inner.tag`/`Inner.data.len()` both depend on the on-ramp sizing an
+/// **empty struct as 0 bytes**. A previous `struct_layout` clamped it to 1, inflating every `RawVec` by
+/// a byte (24-byte `Vec`s padded to 32, `len` shifted 16→24) and desyncing every field offset from
+/// LLVM's GEPs — so an indexed `v[i].data.len()` read garbage (it returned the *outer* `Vec::len()`).
+/// This is precisely the bug that made the in-sandbox `svm-peval` (all nested `Vec`/`BTreeMap`) read a
+/// corrupted length and trap; a flat `Vec<u64>` (existing tests) never exercised a ZST-bearing element.
+/// Differential: byte-identical to the same program as a native `std` binary.
+#[test]
+fn rust_zst_struct_field_layout_matches_native() {
+    let logic = "\
+        struct Inner { data: alloc::vec::Vec<u64>, tag: u64 }\n\
+        let mut outer: alloc::vec::Vec<Inner> = alloc::vec::Vec::new();\n\
+        for i in 0..6u64 {\n\
+            let mut d: alloc::vec::Vec<u64> = alloc::vec::Vec::new();\n\
+            d.push(i.wrapping_mul(10)); d.push(i.wrapping_mul(10).wrapping_add(1));\n\
+            outer.push(Inner { data: d, tag: i.wrapping_mul(100) });\n\
+        }\n\
+        let mut s: u64 = 0;\n\
+        for i in 0..outer.len() {\n\
+            s = s.wrapping_add(outer[i].tag);\n\
+            s = s.wrapping_add(outer[i].data.len() as u64);\n\
+            s = s.wrapping_add(outer[i].data[0]);\n\
+        }\n\
+        putdec(s); putdec(outer.len() as u64);";
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\nextern crate alloc;\n\
+         use core::alloc::{{GlobalAlloc, Layout}};\n\
+         extern \"C\" {{ fn malloc(n: usize)->*mut u8; fn free(p:*mut u8); fn write(fd:i32,buf:*const u8,n:isize)->isize; }}\n\
+         struct G; unsafe impl GlobalAlloc for G {{ unsafe fn alloc(&self,l:Layout)->*mut u8{{malloc(l.size())}} unsafe fn dealloc(&self,p:*mut u8,_:Layout){{free(p)}} }}\n\
+         #[global_allocator] static A: G = G;\n\
+         #[panic_handler] fn ph(_:&core::panic::PanicInfo)->!{{loop{{}}}}\n\
+         fn putdec(x:u64){{let mut m=x;let mut b=[0u8;24];let mut i=24usize;if m==0{{i-=1;b[i]=b'0';}}while m>0{{i-=1;b[i]=b'0'+(m%10)as u8;m/=10;}}unsafe{{write(1,b.as_ptr().add(i),(24-i)as isize);write(1,b\"\\n\".as_ptr(),1);}}}}\n\
+         #[no_mangle] pub extern \"C\" fn main()->i32{{ {logic} 0 }}\n"
+    );
+    let native = format!(
+        "mod alloc {{ pub use std::vec; }}\n\
+         fn putdec(x:u64){{ println!(\"{{}}\", x); }}\n\
+         fn main(){{ {logic} }}\n"
+    );
+    let (Some(svm), Some(nat)) = (
+        rust_powerbox_stdout("rs_zst", &onramp, b""),
+        rust_native_stdout("rs_zst", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        svm,
+        nat,
+        "ZST-struct layout on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&svm),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
 /// The statements both the on-ramp `no_std` program and the native `std` oracle run — each prints one
 /// value with `putdec`. Exercises the saturating-arithmetic intrinsics (`llvm.{u,s}{add,sub}.sat`, on
 /// i32/i64, both the clamped and the non-clamped path) and the saturating float→int casts
