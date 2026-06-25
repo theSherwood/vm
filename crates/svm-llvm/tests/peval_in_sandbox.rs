@@ -68,12 +68,7 @@ fn build_probe_bc() -> Option<PathBuf> {
         .current_dir(fixture_dir())
         .env("RUSTFLAGS", "--emit=llvm-bc")
         .env("CARGO_TARGET_DIR", &target)
-        .args([
-            "+1.81.0",
-            "build",
-            "--release",
-            "--ignore-rust-version",
-        ])
+        .args(["+1.81.0", "build", "--release", "--ignore-rust-version"])
         .status()
         .expect("run cargo build for the probe fixture");
     if !status.success() {
@@ -171,13 +166,13 @@ fn peval_specialize_runs_in_sandbox_and_matches_host() {
     let Some(bc) = build_probe_bc() else {
         return; // toolchain unavailable — skip
     };
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate the in-sandbox specializer to svm-IR");
+    let t =
+        svm_llvm::translate_bc_path(&bc).expect("translate the in-sandbox specializer to svm-IR");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "the probe must produce a powerbox entry"
     );
-    let module =
-        svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
     svm_verify::verify_module(&module).expect("verify the translated specializer");
 
     let run = svm_run::run_powerbox_with_deadline(
