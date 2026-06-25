@@ -261,6 +261,28 @@ host-side (a differential: in-sandbox == host — both fold to a single `const 4
 regression-proofs the *whole* ≈100-function `specialize` closure end-to-end in-sandbox, not just the
 unit ZST-layout test. It skips cleanly when `rustc +1.81.0` / `llvm-link-18` / `opt-18` are absent.
 
+**The end-to-end §22 `Jit` capstone — DONE.** `crates/svm-llvm/tests/peval_jit.rs`
+(`peval_guest_specializes_and_jits_in_sandbox`, fixture `tests/fixtures/peval_jit`) closes the loop:
+a `no_std` powerbox guest, *entirely in-sandbox*, builds a module (`entry(a,b) → helper(a,b) =
+a*3 + b*5 + 7`), **specializes** it with `svm-peval` (inlining the call + folding the constants into
+one function), **encodes** the residual with `svm-encode`, submits the blob to the §22 `Jit`
+capability (`__vm_jit_compile`), and **invokes** the Cranelift-compiled residual (`__vm_jit_invoke2`)
+over an input grid against a plain-Rust oracle — `0` mismatches. This is the guest-side Futamura loop
+the whole lane was built for: **specialize → encode → Jit.compile → invoke**, no host involvement
+beyond the capability the powerbox already grants; verification (not the producer) is the trust hinge.
+Two enablers landed with it:
+- **`svm-encode` → `no_std`** (the encoder must run in-sandbox to serialize the residual).
+- **On-ramp resolves LLVM function aliases** (gap #12). Identical-code folding (LLVM's pass *and*
+  Rust's cross-crate dedup) collapses byte-identical function bodies — e.g. svm-ir's
+  `VIntUnOp::index` and `VPMinMaxOp::index`, both 2-variant enum→byte — into one definition plus an
+  `@x = alias … @y`. The on-ramp built `name2idx` only from `define`s, so a `call`/`ref.func` to an
+  alias looked like an undefined external. Now each function alias is registered under its aliasee's
+  index (fixpoint for alias→alias chains; data-global aliases skipped). `svm-llvm:alias_target_name`.
+- *Memory-match note:* the `Jit.compile` gate requires the residual's `memory.size_log2` to equal the
+  guest's own window (and **no** data segments). The window is layout-dependent, so the test reads it
+  off the translated guest and passes it as `argv[1]`; the guest stamps the module's memory descriptor
+  with it. The residual carries no data segments (the program is folded into the IR, not a segment).
+
 **How to reproduce by hand (for debugging a new translate gap on this lane).**
 - *Full probe* (now `peval_in_sandbox.rs`): a cargo crate depending on `svm-peval` (`default-features =
   false`) + `svm-ir`, whose `main` builds a module and calls `specialize`. Build to bitcode with
@@ -307,8 +329,14 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
      crate → bitcode → link → `globaldce` → translate → verify → run, asserting the in-sandbox residual
      equals the host specialization. Regression-proofs the whole closure; auto-skips without the
      `rustc 1.81`/`llvm-18` toolchain. See "Milestone 3" above.
-   **Next:** the end-to-end §22 `Jit` demo — a guest specializes a toy interpreter *from inside the
-   sandbox* and runs the residual via the `Jit` capability (alongside `crates/svm-run/demos/jit/`).
+   - **§22 `Jit` capstone: DONE** — `peval_jit.rs` (`peval_guest_specializes_and_jits_in_sandbox`):
+     a guest specializes a module, encodes the residual, and `Jit.compile`s + invokes it **all
+     in-sandbox**, checked against an oracle. Enablers: `svm-encode` → `no_std`, and the on-ramp now
+     resolves LLVM function aliases (gap #12, identical-code folding). See "Milestone 3" above.
+   **Milestone 3 is complete.** Possible follow-ups: a richer Futamura flavor (specialize a small
+   interpreter against a program in a const-overlay so a dispatch loop folds away), and folding the
+   `rustc+1.81 → llvm-link → opt → translate` build into a reusable in-repo harness shared by the two
+   `peval_*` tests instead of duplicated per fixture.
 
 ## Benchmarking
 
