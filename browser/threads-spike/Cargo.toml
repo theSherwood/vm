@@ -1,0 +1,18 @@
+# Spike: prove Rust→wasm **shared-memory atomics work across OS threads** (Web Workers / Node
+# worker_threads) — the foundational unknown for genuine multithreaded SVM-in-wasm (step 1 of the
+# plan in BROWSER.md / THREADS.md). Deliberately tiny + `no_std` + no deps: this isolates the wasm
+# threads build (shared imported memory + `+atomics`) from the engine, so a failure is unambiguous.
+[workspace]
+
+[package]
+name = "threads-spike"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"

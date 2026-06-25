@@ -26,7 +26,12 @@ use svm_ir::{
     VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
-use svm_mem::{Region, RmwOp};
+use svm_mem::RmwOp;
+// Re-exported so an embedder can build a `Region::shared` over host memory (e.g. the wasm shared
+// linear memory) and hand it to `compile_and_run_capture_over` — the parallel-wasm window backing.
+// The `unsafe` of borrowing host memory lives in `svm_mem::Region::shared`, keeping this crate
+// `#![forbid(unsafe_code)]`.
+pub use svm_mem::Region;
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -10706,6 +10711,29 @@ impl Mem {
         let page = host_page_size();
         Mem {
             back: Arc::new(Region::new(window.reserved(), page)),
+            window,
+            page,
+            space: Arc::new(RwLock::new(AddrSpace::default())),
+            has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
+            last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
+        }
+    }
+
+    /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
+    /// [`Region::shared`] over the host's shared linear memory) rather than an engine-`mmap`ped one —
+    /// the substrate the parallel-wasm backend runs over (every per-vCPU Worker executes over the same
+    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`; reserved-tail
+    /// accesses beyond it read as zero (a confined guest stays in its prefix). The crate stays
+    /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
+    /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
+    fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
+        let reserved_log2 = reserved_log2.max(mapped_log2);
+        let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
+        let page = host_page_size();
+        Mem {
+            back,
             window,
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
