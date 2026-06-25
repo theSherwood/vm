@@ -10385,31 +10385,25 @@ fn lower_setjmp_call(
     }
 }
 
-/// Lower the Itanium C++ exception-handling runtime (`__cxa_*`) and `llvm.eh.typeid.for`. Exception
-/// state lives in the reserved EH region ([`BlockCtx::eh_base`]):
-/// - `__cxa_allocate_exception(size)` → the fixed object scratch slot (`EH_EXNOBJ_O`).
-/// - `__cxa_throw(obj, ti, dtor)` → store the object ptr + the thrown type's selector, then unwind
-///   ([`BlockCtx::eh_unwind`]) into the enclosing `invoke`-installed handler (noreturn; the IR's
-///   trailing `unreachable` is dead).
-/// - `__cxa_rethrow()` / `_Unwind_Resume` → re-unwind with the current (already-stored) selector.
-/// - `__cxa_begin_catch(p)` → the caught object pointer (identity for a primitive/pointer catch).
-/// - `__cxa_end_catch()` → a no-op (no object destruction in the supported scope).
-/// - `llvm.eh.typeid.for(ti)` → the operand type's compile-time id (the selector the catch compares).
-fn lower_eh_call(
+/// The **noreturn EH unwinders** — `__cxa_throw` / `__cxa_rethrow` / `_Unwind_Resume` — shared by
+/// the `call` form ([`lower_eh_call`]) and the `invoke` form ([`lower_invoke`]). clang emits them as
+/// an `invoke` (rather than a `call`) whenever the throw/rethrow sits inside an active cleanup scope
+/// (e.g. a `catch` body, whose unwind edge runs `__cxa_end_catch`); in our setjmp/longjmp model they
+/// never return and long-jump straight into the enclosing handler, so *both* invoke successors are
+/// dead. `__cxa_throw` first stores the object ptr + the thrown type's selector; the bare re-unwinds
+/// reuse the already-stored `cur_exn`/`cur_sel`. Generic over the per-arg attribute so it accepts a
+/// `Call`'s and an `Invoke`'s `arguments` alike. `Ok(false)` ⇒ not an unwinder (fall through).
+fn lower_eh_unwinder<A>(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
     name: &str,
+    arguments: &[(Operand, A)],
 ) -> Result<bool, Error> {
+    // `eh_base()` is consulted only once the name is a known unwinder — a non-EH call/invoke must
+    // fall through to `Ok(false)` without requiring a reserved EH region.
     match name {
-        "__cxa_allocate_exception" => {
-            let base = ctx.eh_base()?;
-            let p = ctx.const_i64((base + EH_EXNOBJ_O) as i64);
-            ctx.bind_dest(&c.dest, p);
-            Ok(true)
-        }
         "__cxa_throw" => {
             let base = ctx.eh_base()?;
-            let exn = ctx.operand_i64(&c.arguments[0].0)?;
+            let exn = ctx.operand_i64(&arguments[0].0)?;
             let exn_addr = ctx.const_i64((base + EH_EXN_O) as i64);
             ctx.push_effect(Inst::Store {
                 op: StoreOp::I64,
@@ -10418,7 +10412,7 @@ fn lower_eh_call(
                 offset: 0,
                 align: 8,
             });
-            let tid = ctx.eh_typeid(&c.arguments[1].0)?;
+            let tid = ctx.eh_typeid(&arguments[1].0)?;
             let sel = ctx.push(Inst::ConstI32(tid as i32));
             let sel_addr = ctx.const_i64((base + EH_SEL_O) as i64);
             ctx.push_effect(Inst::Store {
@@ -10434,6 +10428,38 @@ fn lower_eh_call(
         "__cxa_rethrow" | "_Unwind_Resume" => {
             let base = ctx.eh_base()?;
             ctx.eh_unwind(base)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Lower the Itanium C++ exception-handling runtime (`__cxa_*`) and `llvm.eh.typeid.for`. Exception
+/// state lives in the reserved EH region ([`BlockCtx::eh_base`]):
+/// - `__cxa_allocate_exception(size)` → the fixed object scratch slot (`EH_EXNOBJ_O`).
+/// - `__cxa_throw(obj, ti, dtor)` → store the object ptr + the thrown type's selector, then unwind
+///   ([`BlockCtx::eh_unwind`]) into the enclosing `invoke`-installed handler (noreturn; the IR's
+///   trailing `unreachable` is dead). When the throw sits in a cleanup scope clang emits it as an
+///   `invoke` instead — [`lower_invoke`] routes that form through the shared [`lower_eh_unwinder`].
+/// - `__cxa_rethrow()` / `_Unwind_Resume` → re-unwind with the current (already-stored) selector.
+/// - `__cxa_begin_catch(p)` → the caught object pointer (identity for a primitive/pointer catch).
+/// - `__cxa_end_catch()` → a no-op (no object destruction in the supported scope).
+/// - `llvm.eh.typeid.for(ti)` → the operand type's compile-time id (the selector the catch compares).
+fn lower_eh_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    // The noreturn unwinders (`__cxa_throw` / `__cxa_rethrow` / `_Unwind_Resume`) are shared with the
+    // `invoke` form; the IR's trailing `unreachable` is the dead terminator after the long-jump.
+    if lower_eh_unwinder(ctx, name, &c.arguments)? {
+        return Ok(true);
+    }
+    match name {
+        "__cxa_allocate_exception" => {
+            let base = ctx.eh_base()?;
+            let p = ctx.const_i64((base + EH_EXNOBJ_O) as i64);
+            ctx.bind_dest(&c.dest, p);
             Ok(true)
         }
         "__cxa_begin_catch" => {
@@ -14845,6 +14871,16 @@ fn lower_invoke(
         .ok_or_else(|| Error::Unsupported("invoke of inline asm".into()))?;
     let cname =
         global_name_of(op).ok_or_else(|| Error::Unsupported("invoke of indirect callee".into()))?;
+
+    // A noreturn EH unwinder (`__cxa_rethrow`/`_Unwind_Resume`/`__cxa_throw`) appears as an `invoke`
+    // when it sits in a cleanup scope (the unwind edge runs `__cxa_end_catch`). It is not a defined
+    // function we can `setjmp` around — it long-jumps straight into the enclosing handler — so emit
+    // the unwind inline and terminate `unreachable`: both the normal and unwind successors are dead
+    // (the skipped `__cxa_end_catch` cleanup is a no-op in the supported scope).
+    if lower_eh_unwinder(ctx, &cname, &inv.arguments)? {
+        return Ok(Terminator::Unreachable);
+    }
+
     let func = *ctx
         .name2idx
         .get(&cname)

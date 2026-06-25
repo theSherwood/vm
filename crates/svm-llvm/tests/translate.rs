@@ -3645,6 +3645,66 @@ int main() {
     check_cpp_eh_vs_native("cpp_eh_throw_catch_int", src, b"");
 }
 
+/// **C++ exceptions — rethrow + cleanup unwind** — the paths the [`cpp_eh_throw_catch_int`] demo
+/// does *not* reach. `middle` catches an `int` and re-raises it with a bare `throw;`
+/// (`__cxa_rethrow`), which clang wraps in an `invoke` to a **cleanup-only landingpad** (calling
+/// `__cxa_end_catch` then `_Unwind_Resume` on the way out) — exercising `resume`/`_Unwind_Resume`
+/// and the preservation of the in-flight `cur_exn`/`cur_sel` across the rethrow. `relabel` instead
+/// throws a *fresh* exception from inside its catch (the first is fully caught, so the shared
+/// single-slot object/selector model is allowed to be overwritten). Both reach an outer handler;
+/// byte-identical to native `clang++` on all three engines pins the model.
+#[test]
+fn cpp_eh_rethrow_nested() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+__attribute__((noinline)) static int inner(int x) {
+  if (x < 0) throw x;            // raise an int
+  return x;
+}
+
+// Catch the int and re-raise the *same* exception with a bare `throw;`. clang lowers the rethrow
+// as an invoke whose unwind edge is a cleanup-only landingpad (__cxa_end_catch + _Unwind_Resume).
+__attribute__((noinline)) static int middle(int x) {
+  try { return inner(x); }
+  catch (int) { throw; }
+}
+
+// Catch the int, then throw a *fresh* exception from inside the handler (clobbers the single slot,
+// which is fine: the original is fully caught before the new one is raised).
+__attribute__((noinline)) static int relabel(int x) {
+  try { return inner(x); }
+  catch (int e) { throw e * 100; }
+}
+
+static int outer(int x) {
+  try { return middle(x); }
+  catch (int e) { return e - 7; }   // catches the rethrown int
+}
+
+static int outer2(int x) {
+  try { return relabel(x); }
+  catch (int e) { return e + 1; }   // catches the fresh int
+}
+
+int main() {
+  for (int i = -2; i <= 2; i++) puti(outer(i));
+  for (int i = -2; i <= 2; i++) puti(outer2(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_rethrow_nested", src, b"");
+}
+
 /// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common
 /// polymorphic base; a loop sums their areas through a base pointer (a virtual call per element →
 /// a vtable load + `call_indirect`), and the total is printed. Exercises vtables (function-pointer
