@@ -421,16 +421,24 @@ fail-closed, never miscompile).
    (`translate.rs`): `i128_cross_block_loop_accumulator` (an i128 LCG accumulator across a backedge,
    constant-0 entry) and `i128_cross_block_fib_pair` (two i128 φs — a Fibonacci pair — crossing
    together), both bit-exact interp == JIT vs a `u128` oracle.
+5. **i128 div/rem** *(LANDED — `claude/charming-johnson-pmlsnr`)*: `udiv`/`sdiv`/`urem`/`srem i128` (clang
+   keeps these as IR ops at `-O2`; the `__divti3`-family libcall is a *backend* lowering the on-ramp
+   never sees) now lower to a synthesized **`__svm_udivmod128`** helper — a binary long-division loop
+   over the `(lo, hi)` pair returning quotient **and** remainder in one pass (the first arithmetic synth
+   helper, alongside `__svm_memcpy`/`__svm_utoa`). Division by zero **traps** (`DivByZero`, matching the
+   scalar `i64` divide). Signed forms reuse it: the lowering abs-es the operands and re-signs (quotient
+   negative iff signs differ; remainder takes the dividend's sign — C truncation toward zero). A
+   `freeze i128` (clang emits it on the `udiv`/`urem` operands) is now an identity on the pair. Tests
+   (`translate.rs`): `i128_udiv_urem` (small/large/high-word-divisor/divisor>dividend) and
+   `i128_sdiv_srem` (all four sign combinations), each bit-exact interp == JIT vs a native `i128`/`u128`
+   oracle.
 
-   **Remaining tail (still fails closed — correct, never miscompiles):**
-   - i128 **div/rem** (`udiv`/`sdiv`/`urem`/`srem i128` — clang keeps these as IR ops at `-O2`; the
-     `__divti3`-family libcall is a *backend* lowering the on-ramp doesn't see). Needs an emitted
-     software 128÷128 routine (a shift-subtract loop / synthesized helper). The last real capability gap.
-   - **Wide / negative i128 constants (≥ 2⁶⁴ unsigned)** — **blocked upstream, not an on-ramp gap**:
-     `llvm-ir` 0.11.3 stores `Constant::Int.value` in a **`u64`** and **fails the whole bitcode parse**
-     when a `bits > 64` constant doesn't fit (rather than truncating). So such a constant never reaches
-     the on-ramp; supporting it would require forking/replacing the `llvm-ir` reader. Constants `< 2⁶⁴`
-     (incl. via the φ path above) already work.
+   **Remaining tail — the one item left, blocked upstream (not an on-ramp gap):** wide / negative i128
+   **constants** (≥ 2⁶⁴ unsigned). `llvm-ir` 0.11.3 stores `Constant::Int.value` in a **`u64`** and
+   **fails the whole bitcode parse** when a `bits > 64` constant doesn't fit (rather than truncating), so
+   such a constant never reaches the on-ramp; supporting it would require forking/replacing the `llvm-ir`
+   reader. Constants `< 2⁶⁴` (incl. the loop-carried φ path) already work. With div/rem landed, **i128 is
+   otherwise feature-complete** in the on-ramp.
 
 ---
 
