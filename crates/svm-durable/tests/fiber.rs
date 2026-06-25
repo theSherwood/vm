@@ -11,8 +11,8 @@
 //! 3.1.4–5) — so these tests pin verification + NORMAL-inertness + the arm wiring, structurally.
 
 use svm_durable::{
-    init_durable_window, transform_module, transform_module_assume_confined, write_state,
-    STATE_REWINDING, STATE_UNWINDING,
+    begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
+    write_state, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_STRIDE};
 use svm_ir::{Inst, Memory, Module, Terminator};
@@ -293,7 +293,7 @@ block0(v0: i64, v1: i64):
 
     // Thaw: restore the captured window (REWINDING), re-seed the fiber, re-enter the root.
     let mut thaw_win = frozen_win;
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.set_frozen_fibers(frozen);
@@ -408,7 +408,7 @@ block0(v0: i64, v1: i64):
     // not re-issue the clock (which would yield clock_after + 5). Re-seed the fiber and re-enter.
     let r_thaw = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;

@@ -166,6 +166,41 @@ block2():
 }
 "#;
 
+// Futex handoff: the root spawns a producer, then `memory.wait`s on the flag at mem[0]; the producer
+// writes the payload at mem[8], sets the flag, and `memory.notify`s it. The root then reads the
+// payload → 987654 on every interleaving. Exercises the wasm parallel driver's wait/notify path
+// (Atomics.wait/notify across Workers), not just spawn/join.
+const FUTEX: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v3 v3
+  v0 = i64.const 0
+  v1 = i32.const 0
+  v2 = i64.const 1000000000
+  v5 = i32.atomic.wait v0 v1 v2
+  v6 = i64.const 8
+  v7 = i64.atomic.load.acquire v6
+  v8 = thread.join v4
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
+  v1 = i64.const 8
+  v2 = i64.const 987654
+  i64.atomic.store.release v1 v2
+  v3 = i64.const 0
+  v4 = i32.const 1
+  i32.atomic.store.release v3 v4
+  v5 = i64.const 0
+  v6 = i32.const 1
+  v7 = atomic.notify v5 v6
+  v8 = i64.const 0
+  return v8
+}
+"#;
+
 // ---- powerbox guests: exercise the real capability set (streams / clock / exit) ----------------
 // Granted by entry arity (see `powerbox_exec`): 1 Stream(Out) · 2 Stream(In) · 3 Exit ·
 // 4 Stream(Err) · 5 Clock. I/O is deterministic (stdout/stderr buffers, monotonic clock), so the
@@ -993,6 +1028,7 @@ fn main() {
         ("mem", MEM, 1),
         ("divtrap", DIVTRAP, 1),
         ("threads", THREADS, 0),
+        ("futex", FUTEX, 0),
         ("unsup", UNSUP, 0), // fail-closed: bytecode engine rejects it → STATUS_UNSUPPORTED
     ];
     // Powerbox corpus — (name, source, stdin): each runs once under the real capability set.

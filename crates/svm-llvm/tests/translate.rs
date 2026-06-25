@@ -3538,12 +3538,19 @@ int main(void) {
 /// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA and auto-vectorization (the on-ramp
 /// ingests the SIMD output). Returns `None` (skip) if `clang++` is unavailable.
 fn compile_cpp_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+    compile_cpp_to_bc_flags(name, src, &["-fno-exceptions", "-fno-rtti"])
+}
+
+/// Like [`compile_cpp_to_bc`] but with caller-chosen flags — used by the EH tests, which keep
+/// exceptions on (drop `-fno-exceptions`) so `invoke`/`landingpad`/`__cxa_*` reach the on-ramp.
+fn compile_cpp_to_bc_flags(name: &str, src: &str, extra: &[&str]) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let cc = dir.join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
     let bc = dir.join(format!("svm_llvm_cpp_{}_{}.bc", std::process::id(), name));
     std::fs::write(&cc, src).expect("write C++ source");
     let status = Command::new("clang++")
-        .args(["-O2", "-emit-llvm", "-c", "-fno-exceptions", "-fno-rtti"])
+        .args(["-O2", "-emit-llvm", "-c"])
+        .args(extra)
         .arg(&cc)
         .arg("-o")
         .arg(&bc)
@@ -3564,6 +3571,20 @@ fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
     let Some(bc) = compile_cpp_to_bc(name, src) else {
         return;
     };
+    check_cpp_bc_vs_native(name, &bc, stdin);
+}
+
+/// The C++ **exception-handling** differential: same as [`check_cpp_vs_native`] but compiled with
+/// exceptions *on* (only `-fno-rtti`), so `invoke`/`landingpad`/`resume` + the `__cxa_*` runtime
+/// reach the on-ramp. The native oracle links the default (exceptions-on) `clang++`.
+fn check_cpp_eh_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_cpp_to_bc_flags(name, src, &["-fno-rtti"]) else {
+        return;
+    };
+    check_cpp_bc_vs_native(name, &bc, stdin);
+}
+
+fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
     let cc = std::env::temp_dir().join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
     let exe = std::env::temp_dir().join(format!("svm_llvm_cppnat_{}_{}", std::process::id(), name));
     match Command::new("clang++")
@@ -3590,7 +3611,7 @@ fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
     };
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate C++ bitcode");
+    let t = svm_llvm::translate_bc_path(bc).expect("translate C++ bitcode");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "{name}: a libc-using C++ program must produce a powerbox entry"
@@ -3614,6 +3635,46 @@ fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
         svm_code, native_code,
         "{name}: svm exit {svm_code} vs native {native_code}"
     );
+}
+
+/// **C++ exceptions first light** — `throw`/`try`/`catch` through the on-ramp, built on the
+/// setjmp/longjmp stack-transfer core. A `noinline` thrower raises an `int` (caught by `catch(int)`)
+/// or a `const char*` (caught by `catch(...)`); the caller `invoke`s it and routes via the
+/// landingpad selector. Exercises `invoke`/`landingpad`/`resume`, `llvm.eh.typeid.for`, and the
+/// synthesized `__cxa_allocate_exception`/`__cxa_throw`/`__cxa_begin_catch`/`__cxa_end_catch`
+/// runtime — byte-identical to native `clang++` on all three engines.
+#[test]
+fn cpp_eh_throw_catch_int() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+__attribute__((noinline)) static int thrower(int x) {
+  if (x < 0) throw x;
+  if (x == 5) throw "five";
+  return x * 2;
+}
+
+static int classify(int x) {
+  try { return thrower(x); }
+  catch (int e) { return e - 1000; }
+  catch (...)   { return 999; }
+}
+
+int main() {
+  for (int i = -2; i <= 6; i++) puti(classify(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_throw_catch_int", src, b"");
 }
 
 /// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common

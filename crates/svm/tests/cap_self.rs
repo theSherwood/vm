@@ -141,22 +141,54 @@ fn get_out_of_range_traps() {
     );
 }
 
-/// The reflection intrinsics survive the binary form (`svm-encode`) — opcodes 0x7A/0x7B round-trip.
+/// The reflection intrinsics survive the binary form (`svm-encode`) — opcodes 0x7A/0x7B/0x7E
+/// (`count`/`get`/`resolve`) round-trip, through text and binary.
 #[test]
 fn binary_round_trip() {
-    let src = "func (i32) -> (i32) {\n\
+    let src = "memory 15\n\
+               func (i32) -> (i32) {\n\
                block0(v0: i32):\n\
                \x20 v1 = cap.self.count\n\
                \x20 v2 = i32.const 0\n\
                \x20 v3, v4 = cap.self.get v2\n\
+               \x20 v5 = i64.const 0\n\
+               \x20 v6 = i64.const 4\n\
+               \x20 v7 = cap.self.resolve v5 v6\n\
+               \x20 v8 = cap.self.label v3 v5 v6\n\
                \x20 return v1\n\
                }\n";
     let m = parse_module(src).expect("parse");
+    // Text print → re-parse is identity (covers `cap.self.resolve`'s grammar).
+    assert_eq!(
+        parse_module(&svm_text::print_module(&m)).expect("reparse"),
+        m,
+        "cap.self.* must round-trip through the text form"
+    );
     let bytes = svm_encode::encode_module(&m);
     let back = svm_encode::decode_module(&bytes).expect("decode");
     assert_eq!(
         back, m,
         "cap.self.* must round-trip through the binary form"
+    );
+}
+
+/// `Host::cap_label` (F9) is the host-side reverse of the name directory: a registered handle resolves
+/// to its label, an unregistered/forged one to `None` — the accessor an embedder uses in diagnostics.
+#[test]
+fn host_cap_label_round_trips_and_misses() {
+    let mut h = Host::new();
+    let handle = h.grant_stream(StreamRole::Out);
+    assert_eq!(h.cap_label(handle), None, "a grant is unlabeled by default");
+    h.register_cap_name("stdout", handle);
+    assert_eq!(
+        h.cap_label(handle),
+        Some("stdout"),
+        "labeled after register"
+    );
+    assert_eq!(
+        h.cap_label(handle + 999),
+        None,
+        "a handle with no registered label resolves to None"
     );
 }
 

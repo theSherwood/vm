@@ -95,6 +95,8 @@ mod op {
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
     pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, sig, handle, arg idx-list
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
+    pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
+    pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -470,6 +472,21 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::CapSelfGet { idx } => {
             out.push(op::CAP_SELF_GET);
             write_uleb(out, *idx as u64);
+        }
+        Inst::CapSelfResolve { name_ptr, name_len } => {
+            out.push(op::CAP_SELF_RESOLVE);
+            write_uleb(out, *name_ptr as u64);
+            write_uleb(out, *name_len as u64);
+        }
+        Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } => {
+            out.push(op::CAP_SELF_LABEL);
+            write_uleb(out, *handle as u64);
+            write_uleb(out, *buf_ptr as u64);
+            write_uleb(out, *buf_cap as u64);
         }
         Inst::VcpuTlsGet => out.push(op::VCPU_TLS_GET),
         Inst::DurableShadowBase => out.push(op::DURABLE_SHADOW_BASE),
@@ -1811,6 +1828,15 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         },
         op::CAP_SELF_COUNT => Inst::CapSelfCount,
         op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
+        op::CAP_SELF_RESOLVE => Inst::CapSelfResolve {
+            name_ptr: c.idx()?,
+            name_len: c.idx()?,
+        },
+        op::CAP_SELF_LABEL => Inst::CapSelfLabel {
+            handle: c.idx()?,
+            buf_ptr: c.idx()?,
+            buf_cap: c.idx()?,
+        },
         op::VCPU_TLS_GET => Inst::VcpuTlsGet,
         op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
         op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,

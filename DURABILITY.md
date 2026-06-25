@@ -346,8 +346,24 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   on the interpreter (§12.8, `svm-durable/tests/fiber.rs` + `svm-snapshot/tests/roundtrip.rs`).
   Remaining: 3.2 multi-vCPU + per-context layout, 3.3 JIT parity (replicate the swap in the JIT
   fiber-switch path). (Dispatch table is a no-op — §12.4.) Single-vCPU durability is a coherent MVP.
-- **[ ] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
-  durability quality + cheap clone. Incremental, off critical path.
+- **[~] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
+  durability quality + cheap clone. Off critical path. **Slice A (async STW) landed:** 4A.1–4A.4
+  (back-edge polls, JIT parity, async `request_freeze`, the loom quiesce model) and **4A.5
+  per-context shadow-SP → genuinely-concurrent multi-vCPU STW freeze** (`FORMAT_VERSION` 4→5→6;
+  the shared shadow-SP word + its lock retired), plus follow-ups **A** (a `thread.join` result
+  survives a concurrent freeze), **B.1** (a concurrent child flattens its own fibers), the
+  **blocked-in-`thread.join` freeze** (`thread.join` is now a may-suspend re-issue safepoint; a vCPU
+  parked in a join unwinds and the thaw re-issues the join), and **B.2** (full nested concurrent
+  spawns — a concurrent child can `thread.spawn` a grandchild; the per-OS-thread spawning-task source
+  attributes the grandchild's `parent_task` correctly and the thaw rebuilds the nested topology).
+  the **blocked-in-`thread.wait`** freeze (futex `atomic.wait` is now a may-suspend re-issue safepoint —
+  bounded + fail-closed), and **B.1′** (a concurrent child-fiber caught *mid-resume-chain*, verified
+  deterministically). **Next slices (all detailed under "Phase 4 Slice A.5"):**
+  (1) **lift the `atomic.wait` thaw fail-closed** — a re-issued wait that would re-park needs the
+  concurrent-thaw rework (run frozen waiters as real OS threads) to re-synchronize notify/wait;
+  (2) **4A.6** recycled-context async freeze (sparse-residue payoff); **4A.7** parked-vCPU /
+  `Blocking.work` latency; and the non-STW Phase-4 items — handle hardening (drainable non-durable
+  bindings), CoW clone, `SharedRegion` consistent-cut (R4).
 
 ---
 
@@ -982,6 +998,14 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 `Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
 
+**Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** + the **blocked-in-`thread.join` freeze** + **B.2**
+(full nested concurrent spawns) + the **blocked-in-`thread.wait` freeze** (bounded + fail-closed) +
+**B.1′** (concurrent child-fiber *mid-resume-chain*, verified) are **landed** (the first three merged,
+all-platform CI green; the rest on `claude/durable-next-slices-tracker`). The remaining queue — **lift
+the `atomic.wait` thaw fail-closed** (concurrent-thaw rework: **design + 3-stage plan now written** under
+*"Concurrent thaw"* below; stage 1 = per-context thaw-state relocation, `FORMAT_VERSION` v6→v7), then
+**4A.6 / 4A.7** — is detailed in the *"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes below.
+
 **Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,
 full `Blocking.work` offload cancellation (R2), `SharedRegion` consistent-cut (R4).
 
@@ -1105,27 +1129,137 @@ durable (`set_durable_env`) and, on a freeze-unwind, runs its own `freeze_drive`
 (the concurrent mirror of `run_child_inline`'s), draining the residue into the domain accumulator
 (collected after `join_all`). Pinned by `concurrent_child_owns_fiber_through_freeze_thaw`. **Scope:** this
 covers a child whose fiber is **cleanly parked** at the freeze point (the test's signal-after-park
-handshake). A child caught with its fiber still *mid-resume-chain* is the deferred path's slice-3.2 case
-and is **not yet verified** on the concurrent path — the test asserts the strong properties only on the
-clean shape and skips otherwise (an over-subscribed runner can land the freeze in the harder
-interleaving; that path is a follow-up, not a guaranteed-correct case today).
+handshake).
 
-*Follow-up B.2 — nested concurrent spawns (FAIL-CLOSED; full support remaining).* A *concurrent* child
-that itself `thread.spawn`s a grandchild would mis-attribute the grandchild's `parent_task`:
-`thread_spawn` reads the **shared** `Domain::cur_task`, which only the single-worker inline/thaw paths
-maintain — `run_child` never sets it, and it would race across concurrent spawners anyway. Rather than
-emit a silently-wrong artifact, a nested concurrent spawn now **fails closed** with a clean
-`ThreadFault` (a per-OS-thread `IN_CONCURRENT_CHILD` flag set in `run_child`, checked in `thread_spawn`),
-pinned by `nested_concurrent_spawn_fails_closed`. **Full support** needs a per-OS-thread spawning-task
-source (seed the child's task in `run_child`; read it in `thread_spawn` instead of the shared
-`cur_task`) + a nested concurrent test (root → child → grandchild, all frozen, thaw rebuilds the
-per-parent topology). Deferred nested spawns (slice 3.4) and concurrent *flat* spawns already work.
+*Follow-up B.1′ — concurrent child-fiber caught mid-resume-chain (LANDED).* The harder interleaving — a
+freeze that lands while the child's fiber is still **active on the resume chain** (not yet suspended) —
+is now verified on the concurrent path. The existing machinery already covered it: when the resumed
+fiber unwinds under `UNWINDING`, the fiber runtime's `cont.resume` return path records it as active-chain
+residue (the same `rt.frozen` path slice 3.2 uses for the root), the child unwinds at its `cont.resume`
+re-issue safepoint, and the thaw re-issues that resume to re-enter the fiber, which rewinds to its
+in-flight point and runs forward. No code change was needed — it was a verification gap. Pinned
+deterministically by `concurrent_child_owns_active_chain_fiber_through_freeze_thaw`: the **fiber itself**
+drives the spawn-before-freeze handshake (it signals from inside the chain, then loops `K`), so the async
+freeze reliably lands mid-fiber with the child blocked in `cont.resume`; the thaw reproduces the
+uninterrupted `K` (root) and `2K` (child's loop + the fiber's own `K`-loop total it suspends). B.1 now
+asserts only its *parked* shape and defers the active shape to this test.
 
-*Also out of scope (documented limitation):* freezing a vCPU **blocked in `thread.join`/`thread.wait`**.
-Thread ops aren't may-suspend safepoints, so a vCPU parked in a join/wait doesn't observe a freeze — the
-natural "spawn then join" root can be frozen only while it is *running* (e.g. at a back-edge poll or
-`cap.call`), not while blocked. Making thread ops freeze-safepoints (unwind + re-issue on thaw) is a
-separate slice. Original map:
+*Follow-up B.2 — nested concurrent spawns (done).* A *concurrent* child that itself `thread.spawn`s a
+grandchild attributes the grandchild's `parent_task` via a **per-OS-thread spawning-task source**
+(`CONCURRENT_SPAWN_TASK`, seeded to the child's task in `run_child`, read in `thread_spawn`) — *not* the
+shared `Domain::cur_task`, which only the single-worker inline/thaw paths maintain and which would race
+across concurrent spawners. The earlier `IN_CONCURRENT_CHILD` fail-closed guard is retired. During NORMAL
+the nested spawn/join resolves through the flat global thread table (dense global handles); on a freeze
+each level self-unwinds into its own per-context region and records a `FrozenVCpu` with the correct
+`parent_task`, and the thaw's per-parent rebuild (slice 3.4) reconstructs the topology and runs the tree
+in descending-task order so each `thread.join` resolves. Pinned by
+`nested_concurrent_spawn_returns_grandchild_value` (NORMAL, returns the grandchild's 42 through both
+joins) and `nested_concurrent_tree_freezes_and_thaws` (root → child → grandchild, all real OS threads,
+caught mid-flight; the grandchild drives the spawn-before-freeze handshake; the thaw reproduces
+`K`/`2K`/`3K`). Deferred nested spawns (slice 3.4) and concurrent *flat* spawns already worked.
+
+**Freezing a vCPU blocked in `thread.join` — done.** `thread.join` is now a may-suspend re-issue
+safepoint: `compute_may_suspend` counts it (so a "spawn then join" root is instrumented), the transform
+classifies it as `SuspendKind::ThreadJoin` (its result is *re-issued* on thaw like `cont.resume`, since
+the joined child replays its own side effects on its rewind — §12.6), and the `thread_join` runtime thunk
+now returns on observing `UNWINDING` so a vCPU **parked in the join** unwinds at the trailing safepoint
+rather than blocking the stop-the-world freeze. On thaw the join is re-issued; because the join has no
+in-thread callee to flip the state word (the child rewinds as a *separate* vCPU and the thaw driver
+resets the word to `REWINDING` afterward), the join is the globally-deepest frozen frame on its own
+thread, so — like a leaf — it flips the state to `NORMAL` itself before re-issuing. Pinned by
+`concurrent_freeze_while_root_blocked_in_join` (root parks in the join; the child drives the
+spawn-before-freeze handshake so the freeze lands while the root is blocked). Both the running-root path
+(follow-up A) and the blocked-root path are covered.
+
+**Freezing a vCPU blocked in `thread.wait` — done (bounded + fail-closed).** The futex `atomic.wait` is
+now a may-suspend re-issue safepoint, mirroring `thread.join`: `compute_may_suspend` counts `MemoryWait`,
+the transform classifies it as `SuspendKind::MemoryWait` (re-issued on thaw — reload `addr`/`expected`/
+`timeout`, flip the state word to `NORMAL`, re-execute), and the `thread_wait` thunk returns on observing
+`UNWINDING` (the same `window_is_unwinding` trick the join thunk uses) so a vCPU parked in a futex wait
+unwinds at the trailing safepoint instead of hanging the stop-the-world freeze. **Before this, a freeze
+requested while any vCPU was parked in a wait would deadlock `join_all`** — the parked thread only woke on
+notify / timeout / kill. *Thaw* re-checks the value: a wake that landed as a value change (in the
+snapshot, or replayed by another re-run vCPU) resolves the re-issued wait immediately with
+`WAIT_NOT_EQUAL` — no re-park, no notifier. A re-issue that would still *park* can't be satisfied on the
+single-worker thaw (no concurrent notifier), so it **fails closed** with `ThreadFault` (matching the
+interp, which surfaces a guest wait/join-deadlock as `Trap::ThreadFault`) via a `Domain.thawing` flag,
+rather than deadlocking. Pinned by `concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed`
+(child changes the value without notifying → thaw resolves `NOT_EQUAL`) and
+`…_fails_closed_on_thaw` (value unchanged → thaw traps `ThreadFault`). **Lifting the fail-closed** — a
+re-park resolvable only by reordering — needs the concurrent-thaw rework below.
+
+#### Concurrent thaw — design + staging (lifts the `atomic.wait` fail-closed)
+
+*Why the current thaw can't satisfy a re-parking wait.* `thaw_reattach_and_run` runs the frozen vCPUs
+**inline on one worker**, each rewound to completion before the next, in descending-task order. That is
+correct for everything *except* a wait that must re-park: an inline waiter has no concurrent vCPU to
+`notify` it, so it would deadlock — hence the fail-closed. Resolving it needs the waiter and its notifier
+to run **concurrently**, re-synchronizing through the real domain futex exactly as on a fresh run.
+
+*The blocker: the shared global state word.* The durable state word lives at a **single global window
+offset** (`STATE_OFF = 0`) — the prologue reads it (`REWINDING` ⇒ rewind-dispatch), every poll reads it
+(`UNWINDING` ⇒ unwind), and a re-issue writes it (`NORMAL`). The interp runs single-worker and
+*multiplexes* each vCPU's `dstate` through that one word (swapped in when the vCPU runs, saved back when
+it yields). The JIT could spawn the frozen vCPUs as real OS threads, but they would **race on the one
+word**: vCPU A finishing its rewind flips the global word to `NORMAL` while vCPU B is still rewinding (B
+then skips its rewind), and a forward vCPU calling a function would have the callee's prologue read
+another vCPU's `REWINDING` and spuriously rewind. So concurrent rewind is impossible while the state word
+is global. (The shadow-**SP** word was already relocated per-context in 4A.5 stage i — `shadow_switch`
+keeps each context's SP in its own region — and concurrent *freeze* works because all contexts unwind on
+the *same* global `UNWINDING` simultaneously; only thaw needs *independent* per-context state.)
+
+*The fix: a per-context thaw-state word (region-relative).* Move the state word from `ConstI64(STATE_OFF)`
+to a **shadow-base-relative** load in the transform, so each context reads/writes the state word in *its
+own* region (mirroring the SP word). Then each vCPU rewinds against its own word with no cross-talk, and
+the JIT can run them as concurrent OS threads. This is the only IR change; because the transform is
+**shared**, both backends pick it up — the interp's per-vCPU `dstate` then lives directly in its region
+word (its multiplex/`shadow_switch` swap of the state word simplifies away), and cross-backend artifact
+equality is preserved at freeze time (the per-context word holds the same value the global word did). It
+is a **snapshot-format change** (the state byte moves out of offset 0 into the regions) ⇒ `FORMAT_VERSION`
+bump + regenerate the cross-backend equality fixtures. The global `UNWINDING` freeze-trigger can stay a
+broadcast (the concurrent-freeze coordinator already visits every live context), or fold into the
+per-context word set on all contexts at once — TBD in stage 1.
+
+*Staging (each stage independently lands + tests green):*
+1. **Per-context thaw-state relocation (LANDED).** The durable state word is split: the **freeze** state
+   (`UNWINDING`) stays at the single global `STATE_OFF` — a freeze is genuinely stop-the-world, so one word
+   is the natural broadcast every poll reads (the arm trigger / `request_freeze` are unchanged) — while the
+   **thaw** state (`REWINDING`/`NORMAL`) moves *per-context*, into each region at `STATE_IN_REGION_OFF` (8,
+   just past the in-region shadow-SP word), addressed via `durable.shadow_base` like the SP word. Each frozen
+   vCPU now rewinds against its **own** thaw word, so one finishing (flipping its word to `NORMAL`) can't
+   disturb a sibling still `REWINDING` — the prerequisite stage 2 needs to run rewinds concurrently. The
+   *inline* serial thaw is kept (no concurrency yet); all freeze/thaw + cross-backend equality + fuzz tests
+   stay green. Implementation notes:
+   - *Transform:* `Bb::freeze_word_addr` (global) for the `UNWINDING` polls; `Bb::thaw_word_addr`
+     (`durable.shadow_base` + `STATE_IN_REGION_OFF`) for the prologue's `REWINDING` dispatch and the
+     deepest frame's `NORMAL` re-issue. (Stage 1a centralized these behind one switched helper; 1b split it
+     and hardcoded per-context — no flag, git is the revert.)
+   - *Layout / format:* the shadow frame-base shifts past the in-region thaw word (`REGION_HEADER_LEN` 8→16,
+     8-aligned); `FORMAT_VERSION` 6→7 (a v6 artifact mis-thaws). Both backends shift identically, so
+     cross-backend equality holds.
+   - *Per-vCPU multiplex (interp):* `dstate` maps across the two words — `durable_load_dstate`/`store_dstate`
+     route `REWINDING` to the context's region word and the freeze phases to the global word. Fiber switches
+     (`shadow_switch`, and the JIT's fiber resume) **carry** the active thaw phase across the switch, so the
+     globally-deepest frame's `NORMAL` flip still propagates back up a `cont.resume` chain (a resumer doesn't
+     flip its own word; the carry does on the return switch).
+   - *Thaw entry clears the global freeze word:* a frozen artifact left `STATE_OFF = UNWINDING`, but a thaw
+     is not a freeze; the runtime (interp `drive`; the `begin_thaw` test helper / JIT driver) resets it to
+     `NORMAL` so the rewinding code's polls don't re-unwind. The per-context thaw word carries the
+     `REWINDING` phase instead.
+2. **Concurrent JIT thaw driver.** Replace `thaw_reattach_and_run`'s inline loop with a concurrent
+   re-spawn (mirror `run_child`/stage ii): each frozen vCPU rewinds on its own OS thread against its own
+   state word, then runs forward concurrently; the root joins. A re-issued `atomic.wait` now parks on the
+   real futex and a sibling's `atomic.notify` wakes it — drop the `Domain.thawing` fail-closed. Watch the
+   **join ordering**: the inline path relied on "children before parents"; concurrently a parent's
+   re-issued `thread.join` must block on the real `Done` cell (which it already does on a fresh run), so
+   this should fall out, but a parent waiting on a child that is *itself* re-parking is the case to test.
+3. **Determinism / equivalence.** A concurrent thaw reintroduces real interleaving, so re-establish §12.6:
+   rewind reloads recorded side effects (deterministic, unaffected by order); only the forward-phase
+   re-issued waits/notifies interleave, and they re-synchronize to the same value handoff. Add a
+   producer↔consumer-both-frozen test (the case the fail-closed rejects today) and a mutual-rendezvous
+   test; fuzz the interleaving like the existing concurrent-freeze tests.
+
+Original 4A map:
 
 - **Barrier adaptation (loom-verified, but NOT the live path).** The 4A.4 `quiesce_arrive` ran `unwind`
   *under* the `quiesce` lock to serialize the (then-shared) active-SP scratch; with per-context SP that

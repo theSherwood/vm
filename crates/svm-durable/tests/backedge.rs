@@ -18,8 +18,8 @@
 //! reloaded, not recomputed, and that the pre-loop `cap.call` is not re-issued.
 
 use svm_durable::{
-    arm_freeze_after_backedges, init_durable_window, read_state, transform_module, write_state,
-    STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
+    STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use svm_ir::Memory;
@@ -106,7 +106,7 @@ fn freeze_inside_a_poll_free_loop_round_trips() {
     // instead of reloaded — or the pre-loop cap.call re-issued — the seed would be 0 and the
     // result would differ. It must reproduce the oracle.
     let mut win = snapshot.clone();
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0);
     let (thawed, _) = run(&inst, 0, &win);
     assert_eq!(
         thawed, baseline,
@@ -143,7 +143,7 @@ fn freeze_at_a_later_back_edge_lands_deeper_in_the_loop() {
         // of the resulting image must reproduce the oracle.
         let mut win = snapshot.clone();
         if read_state(&win) == STATE_UNWINDING {
-            write_state(&mut win, STATE_REWINDING);
+            begin_thaw(&mut win, 0);
             let (thawed, _) = run(&inst, 0, &win);
             assert_eq!(
                 thawed, baseline,

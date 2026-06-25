@@ -30,8 +30,8 @@ use durgen::{
     gen_loop_module, gen_module, gen_recycle_fiber_module, Gen, RecycleModule, SIZE_LOG2, WINDOW,
 };
 use svm_durable::{
-    arm_freeze_after, init_durable_window, read_state, transform_module, write_state,
-    DURABLE_RESERVE, SHADOW_SP_OFF, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,
+    DURABLE_RESERVE, SHADOW_SP_OFF, STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Trap, Value};
 use svm_ir::{Module, ValType};
@@ -229,7 +229,7 @@ fn check_xbackend(m: &Module, clock_v: i64) {
     // frozen point's result reloaded, not re-issued — a re-issue would consume the next tick)
     // and end NORMAL. This crosses both the backend boundary and the serialize/restore one.
     let mut thaw_win = rwin;
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let Some((j_thaw, final_j, _, _)) = jit_run(&inst, clock_after, &thaw_win) else {
         return;
     };
@@ -355,7 +355,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     // handle resolves to the re-seeded fiber, which re-parks; forward execution reproduces `base`.
     let mut thost = Host::new();
     let mut thaw_win = restore(&art_i, &inst, &mut thost).expect("recycled artifact restores");
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let seed: Vec<JitFrozen> = thost
         .frozen_fibers()
         .iter()

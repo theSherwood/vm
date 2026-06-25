@@ -39,13 +39,30 @@ struct Bench {
 }
 
 const fn b(name: &'static str, src: &'static str, beebs: bool, large: i64) -> Bench {
-    Bench { name, src, extra: &[], beebs, tail: "", large }
+    Bench {
+        name,
+        src,
+        extra: &[],
+        beebs,
+        tail: "",
+        large,
+    }
 }
 
 const BENCHES: &[Bench] = &[
-    b("matmult-int", "src/matmult-int/matmult-int.c", false, 200_000),
+    b(
+        "matmult-int",
+        "src/matmult-int/matmult-int.c",
+        false,
+        200_000,
+    ),
     b("crc32", "src/crc32/crc_32.c", true, 20_000),
-    b("nettle-sha256", "src/nettle-sha256/nettle-sha256.c", false, 20_000),
+    b(
+        "nettle-sha256",
+        "src/nettle-sha256/nettle-sha256.c",
+        false,
+        20_000,
+    ),
     b("edn", "src/edn/libedn.c", false, 50_000),
     b("ud", "src/ud/libud.c", false, 200_000),
     b("aha-mont64", "src/aha-mont64/mont64.c", false, 200_000),
@@ -55,7 +72,12 @@ const BENCHES: &[Bench] = &[
     b("nettle-aes", "src/nettle-aes/nettle-aes.c", false, 20_000),
     b("tarfind", "src/tarfind/tarfind.c", true, 50_000),
     b("wikisort", "src/wikisort/libwikisort.c", true, 2_000),
-    b("sglib-combined", "src/sglib-combined/combined.c", true, 20_000),
+    b(
+        "sglib-combined",
+        "src/sglib-combined/combined.c",
+        true,
+        20_000,
+    ),
     b("slre", "src/slre/libslre.c", true, 20_000),
     // md5sum: single file, but benchmark_body takes a third `len` arg — splice in MSG_SIZE (defined in
     // md5.c, in scope at the call site).
@@ -118,7 +140,14 @@ fn main() {
     );
     let mut ratios = Vec::new();
     for bench in BENCHES {
-        let &Bench { name, src: rel, extra, beebs, tail, large } = bench;
+        let &Bench {
+            name,
+            src: rel,
+            extra,
+            beebs,
+            tail,
+            large,
+        } = bench;
         // Every translation unit (the benchmark .c plus any library .c) must be present.
         let missing = std::iter::once(rel)
             .chain(extra.iter().copied())

@@ -16,7 +16,7 @@
 //!   4. thawing the bytecode artifact (REWINDING) reproduces the uninterrupted result and ends NORMAL.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
+    begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
     STATE_UNWINDING,
 };
 use svm_interp::{bytecode, run_capture_reserved_with_host, Host, Trap, Value};
@@ -137,7 +137,7 @@ fn check(src: &str) {
     // frozen point's result is *reloaded* (not re-issued), so the run reproduces the baseline and ends
     // NORMAL.
     let mut thaw_win = rwin;
-    write_state(&mut thaw_win, STATE_REWINDING);
+    begin_thaw(&mut thaw_win, 0);
     let (thaw_res, final_win, _, _) = bc_run(&inst, clock_after, &thaw_win);
     assert_eq!(
         thaw_res,

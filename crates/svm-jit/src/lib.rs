@@ -2926,6 +2926,16 @@ impl CompiledModule {
             })
         };
 
+        // §12.8 parked-vCPU slice: a durable run that re-enters under `REWINDING` is a **thaw**. Mark the
+        // domain thawing so an `atomic.wait` re-issue that would park fails closed (`ThreadFault`) rather
+        // than hanging the single worker. Set before the children re-run (their waits fail closed too).
+        #[cfg(fiber_rt)]
+        if (*this).durable && fiber_rt::window_is_rewinding(window.base() as u64, 0) {
+            if let Some(d) = &(*this).domain {
+                d.engage_thawing();
+            }
+        }
+
         // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach + run the spawned children a
         // freeze flattened, *before* the root re-enters — the JIT's single-worker thaw (the root's
         // rewind skips its prologue `thread.spawn`, so the runtime reconstructs the children). Each
@@ -3793,7 +3803,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::SimdWidthBytes => {}
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
-                Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
+                Inst::CapSelfCount
+                | Inst::CapSelfGet { .. }
+                | Inst::CapSelfResolve { .. }
+                | Inst::CapSelfLabel { .. } => {}
                 // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
                 // (works for a plain non-fiber root), so supported on every target.
                 Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
@@ -4530,6 +4543,58 @@ fn lower_block(
             ubs.resize(vals.len(), UB_TOP);
             continue;
         }
+        // §7 `cap.self.resolve` — op 2 over the reserved `CAP_SELF_TYPE_ID`, with a `(name_ptr,
+        // name_len)` buffer (the thunk reads the window to resolve the name, like any cap op). One
+        // i32 result; the handle operand is unused (constant 0), as for count/get.
+        if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
+            let h0 = b.ins().iconst(I32, 0);
+            let sig = FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let call_args = [*name_ptr, *name_len];
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                2,
+                &sig,
+                h0,
+                &call_args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §7 `cap.self.label` — op 3 over `CAP_SELF_TYPE_ID`: `(handle, buf_ptr, buf_cap)` → label len
+        // (the thunk writes the label into the window). One i32 result; cap.call handle unused (0).
+        if let Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } = inst
+        {
+            let h0 = b.ins().iconst(I32, 0);
+            let sig = FuncType {
+                params: vec![ValType::I32, ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let call_args = [*handle, *buf_ptr, *buf_cap];
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                3,
+                &sig,
+                h0,
+                &call_args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
         // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
         // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `cap.call`. A thunk that
         // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
@@ -4805,7 +4870,9 @@ fn lower_block(
             timeout,
         } = inst
         {
-            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64) -> status:i32
+            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64, trap_out:i64) ->
+            // status:i32. `trap_out` carries the §12.8 thaw fail-closed (a re-issued wait that would
+            // park on the single worker traps `ThreadFault`); on a fresh run it is never written.
             let w = atomic_width(*ty);
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
@@ -4818,8 +4885,9 @@ fn lower_block(
             };
             let width = b.ins().iconst(I32, w as i64);
             let to = get(&vals, *timeout)?;
+            let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64] {
+            for t in [I64, I64, I64, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -4827,7 +4895,8 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, lower.thread.wait_thunk);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[sched, phys, exp, width, to]);
+                .call_indirect(tref, thunk, &[sched, phys, exp, width, to, trap_out]);
+            emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
             continue;

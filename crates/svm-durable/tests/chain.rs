@@ -9,8 +9,8 @@
 //! continue" branch that the single-frame transform never hit.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
-    STATE_UNWINDING,
+    begin_thaw, init_durable_window, read_state, read_thaw_state, transform_module, write_state,
+    STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -70,7 +70,7 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
 
     // Thaw on a fresh host (clock now 0): reload, do not re-issue the cap.call.
     let mut win = snapshot.clone();
-    write_state(&mut win, STATE_REWINDING);
+    begin_thaw(&mut win, 0); // §12.8 stage 1: thaw the root (ctx 0) per-context
     let (thawed, final_win) = run(inst, 0, &win);
     assert_eq!(
         thawed,
@@ -78,7 +78,7 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
         "thaw equals the uninterrupted run"
     );
     assert_eq!(
-        read_state(&final_win),
+        read_thaw_state(&final_win, 0),
         STATE_NORMAL,
         "the deepest frame flipped the state back to NORMAL exactly once"
     );

@@ -17,6 +17,12 @@ jobs:
   check:
     name: build · test · fmt · clippy
     runs-on: ubuntu-latest
+    # Backstop for an unforeseen liveness hang (e.g. ISSUES.md I7): bound the job to minutes, not
+    # GitHub's 6 h default, so a wedged `cargo test --workspace` fails the run instead of sitting
+    # stuck for hours. The named work-stealing demos already fail-fast in-test (run.rs); this covers
+    # anything else. Generous vs. a healthy cold-cache run (fmt + clippy + build + test + windows
+    # cross-check), tight vs. a hang.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -36,6 +42,8 @@ jobs:
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Same I7 backstop as `check` (windows/macOS runners are slower, so a wider bound).
+    timeout-minutes: 45
     # continue-on-error: true # TODO: drop once green to make parity gating (the windows guard is unverified)
     strategy:
       fail-fast: false

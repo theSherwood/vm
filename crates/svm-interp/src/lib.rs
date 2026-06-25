@@ -26,7 +26,12 @@ use svm_ir::{
     VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
-use svm_mem::{Region, RmwOp};
+use svm_mem::RmwOp;
+// Re-exported so an embedder can build a `Region::shared` over host memory (e.g. the wasm shared
+// linear memory) and hand it to `compile_and_run_capture_over` — the parallel-wasm window backing.
+// The `unsafe` of borrowing host memory lives in `svm_mem::Region::shared`, keeping this crate
+// `#![forbid(unsafe_code)]`.
+pub use svm_mem::Region;
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1816,7 +1821,20 @@ fn drive(
     // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
     // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
     let durable = host.is_durable();
-    // Durable **freeze/thaw** runs (the window's state word is `UNWINDING`/`REWINDING`, not `NORMAL`)
+    // §12.8 concurrent-thaw stage 1: a thaw restores the frozen window with the global **freeze** word
+    // still `UNWINDING` (the artifact froze there), while the per-context **thaw** word now carries the
+    // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
+    // re-unwind mid-thaw and `durable_load_dstate` reads the thaw — the real snapshot-restore path
+    // leaks the same `UNWINDING`. A freeze leaves the thaw word `NORMAL`, so this never fires on it.
+    if durable {
+        if let Some(m) = mem.as_mut() {
+            if m.durable_thaw_state(0) == STATE_REWINDING {
+                m.durable_set_state(STATE_NORMAL);
+            }
+        }
+    }
+    // Durable **freeze/thaw** runs (a freeze's global word is `UNWINDING`/`ARMED`, or a thaw's
+    // per-context word is `REWINDING`, not `NORMAL`)
     // serialize onto a single worker (DURABILITY.md §12.8 slice 3.2.1): the shared active shadow-SP
     // word is used by one vCPU at a time, so concurrent unwind/rewind can't race it, and the runtime
     // re-points it per vCPU on each dispatch. Ordinary runs — incl. a `NORMAL` durable run, which never
@@ -1824,7 +1842,11 @@ fn drive(
     let workers = if durable
         && mem
             .as_ref()
-            .map(|m| m.durable_state())
+            // §12.8 concurrent-thaw stage 1: serialize for a freeze (global word) *or* a thaw (the
+            // root re-enters under `REWINDING` in its own per-context thaw word — no longer the global
+            // word). The root's context is 0; `durable_load_dstate(0)` combines both words:
+            // non-`NORMAL` ⇒ freeze/thaw in progress.
+            .map(|m| m.durable_load_dstate(0))
             .unwrap_or(STATE_NORMAL)
             != STATE_NORMAL
     {
@@ -1883,11 +1905,13 @@ fn drive(
         ));
         root.durable = durable;
         // The root's own durable state word is the window's initial phase (NORMAL / UNWINDING freeze /
-        // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1).
+        // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1). §12.8 concurrent-thaw
+        // stage 1: combine the global freeze word with the root's per-context thaw word (a thaw seeds
+        // `REWINDING` into the latter).
         root.dstate = root
             .mem
             .as_ref()
-            .map(|m| m.durable_state())
+            .map(|m| m.durable_load_dstate(root.vcpu_ctx))
             .unwrap_or(STATE_NORMAL);
         // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
         // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
@@ -3499,7 +3523,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         v.durable_sp_ctx = v.vcpu_ctx;
         let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_mut() {
-            m.durable_set_state(v.dstate);
+            // §12.8 concurrent-thaw stage 1: route this vCPU's phase across the global freeze word and
+            // its own per-context thaw word, so its rewind can't disturb a sibling's.
+            m.durable_store_dstate(v.vcpu_ctx, v.dstate);
             m.durable_set_sp(root_word, v.root_shadow_sp);
         }
     }
@@ -3510,7 +3536,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
         let root_word = shadow_region_base(v.vcpu_ctx);
         if let Some(m) = v.mem.as_ref() {
-            v.dstate = m.durable_state();
+            // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
+            // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
+            v.dstate = m.durable_load_dstate(v.vcpu_ctx);
             v.root_shadow_sp = m.durable_get_sp(root_word);
         }
     }
@@ -4179,11 +4207,25 @@ fn shadow_region_base(ctx_idx: usize) -> u64 {
 /// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
 /// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
 const SHADOW_SP_WORD_LEN: u64 = 8;
+/// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
+/// within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte SP word, addressed via
+/// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) stays at the global
+/// [`STATE_OFF`]. Must equal `svm_durable::STATE_IN_REGION_OFF`.
+const STATE_IN_REGION_OFF: u64 = SHADOW_SP_WORD_LEN;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
+/// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
+/// `svm_durable::REGION_HEADER_LEN`.
+const REGION_HEADER_LEN: u64 = 16;
 
-/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP word. The empty
-/// (no-frames) extent of a context's shadow stack.
+/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP + thaw words. The
+/// empty (no-frames) extent of a context's shadow stack.
 fn shadow_frame_base(ctx_idx: usize) -> u64 {
-    shadow_region_base(ctx_idx) + SHADOW_SP_WORD_LEN
+    shadow_region_base(ctx_idx) + REGION_HEADER_LEN
+}
+
+/// Byte offset of context `ctx_idx`'s per-context **thaw** state word (§12.8 concurrent-thaw stage 1).
+fn thaw_state_off(ctx_idx: usize) -> u64 {
+    shadow_region_base(ctx_idx) + STATE_IN_REGION_OFF
 }
 
 /// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
@@ -4275,6 +4317,22 @@ fn shadow_switch(
         registry.saved_sp(in_ctx)
     };
     m.durable_set_sp(region_of(in_ctx), in_sp);
+    // §12.8 concurrent-thaw stage 1: carry the active **thaw** phase (`REWINDING`/`NORMAL`) from the
+    // outgoing context to the incoming one. Within a vCPU the rewind is sequential (a `cont.resume`
+    // resumer waits on its resumee), so the globally-deepest frame's flip to `NORMAL` must propagate
+    // back up through the switches — exactly as the former single global state word did (a resumer
+    // doesn't flip its own word; this carry does, on the return switch). The **freeze** word is global,
+    // so a non-thaw switch carries `NORMAL` (a no-op). Cross-*vCPU* concurrency uses distinct words and
+    // never routes through `shadow_switch`, so each vCPU's thaw stays independent.
+    let ctx_idx_of = |ctx: usize| {
+        if ctx == ROOT_FIBER {
+            root_ctx
+        } else {
+            shadow_context_index(ctx)
+        }
+    };
+    let phase = m.durable_thaw_state(ctx_idx_of(out_ctx));
+    m.durable_set_thaw_state(ctx_idx_of(in_ctx), phase);
 }
 
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
@@ -6070,6 +6128,36 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                     frames[top].vals.push(Reg::from_i32(r[1] as i32));
                 }
+                // §7 reflection (`cap.self.resolve`): resolve a name buffer to its handle (op 2).
+                // Routed through the generic capability dispatch (which has the window to read the
+                // name) — the same code the JIT thunk / bytecode engine reach, so all three agree.
+                Inst::CapSelfResolve { name_ptr, name_len } => {
+                    let ptr = get_i64(&frames[top].vals, *name_ptr)?;
+                    let len = get_i64(&frames[top].vals, *name_len)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r =
+                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
+                    drop(hg);
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
+                // §7 reflection (`cap.self.label`): write the handle's label into the window (op 3),
+                // the reverse of resolve. Routed through the generic dispatch (which has the window).
+                Inst::CapSelfLabel {
+                    handle,
+                    buf_ptr,
+                    buf_cap,
+                } => {
+                    let h = get_i32(&frames[top].vals, *handle)? as i64;
+                    let ptr = get_i64(&frames[top].vals, *buf_ptr)?;
+                    let cap = get_i64(&frames[top].vals, *buf_cap)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r =
+                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 3, 0, &[h, ptr, cap], gm)?;
+                    drop(hg);
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
                 // §12 per-vCPU TLS register: read/write **this** vCPU's word (`tls`, destructured from
                 // `v` above), so a fiber that migrated here sees the current vCPU's value.
                 Inst::VcpuTlsGet => {
@@ -6833,7 +6921,10 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::CallImport { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
-        Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
+        Inst::CapSelfCount
+        | Inst::CapSelfGet { .. }
+        | Inst::CapSelfResolve { .. }
+        | Inst::CapSelfLabel { .. } => return Err(Trap::Malformed),
         // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
         // loop (`run_inner`), never here.
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
@@ -8810,6 +8901,12 @@ pub struct Host {
     /// recorded here instead. `None` ⇒ a single-vCPU thaw, which reads the extent from the window's
     /// active-SP word as before. Set by the freeze driver; consumed by `drive` on thaw.
     frozen_root_sp: Option<u64>,
+    /// §7 the **capability-name directory** (Followup F7): name → handle for the powerbox grants, so a
+    /// guest can resolve a capability by name at runtime (`cap.self` op 2) — dlopen-style discovery, the
+    /// dynamic counterpart to load-time name binding. Populated by the powerbox layer at grant time
+    /// (`svm_run`); empty for a bare `Host` (resolution then finds nothing — fail-closed). First match
+    /// wins on a duplicate name. A side table only — it never affects handle values or grant order.
+    cap_names: Vec<(String, i32)>,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -8918,6 +9015,7 @@ impl Host {
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
             frozen_root_sp: None,
+            cap_names: Vec::new(),
         }
     }
 
@@ -9054,6 +9152,33 @@ impl Host {
     /// This domain's spawn quota (the clamped value in effect).
     pub fn quota(&self) -> Quota {
         self.quota
+    }
+
+    /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
+    /// `cap.self`-resolve `name` to this handle at runtime. The powerbox layer (`svm_run`) calls this
+    /// for each granted handle; an embedder may add its own names. First registration of a name wins.
+    pub fn register_cap_name(&mut self, name: &str, handle: i32) {
+        self.cap_names.push((name.to_string(), handle));
+    }
+
+    /// Resolve a capability `name` to the handle it was registered under ([`Host::register_cap_name`]),
+    /// or `None` if no grant carries that name. The backing for the guest's `cap.self` op-2 resolve.
+    fn resolve_cap_name(&self, name: &str) -> Option<i32> {
+        self.cap_names
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| *h)
+    }
+
+    /// The human-readable **label** registered for `handle` (the reverse of [`Host::resolve_cap_name`]),
+    /// or `None` if the handle carries no label — the cosmetic name an embedder can use in diagnostics,
+    /// and the backing for the guest's `cap.self.label` reflection (Followup F9). Authority-neutral: a
+    /// label is not a nominal type_id and the verifier ignores it. First registration of a handle wins.
+    pub fn cap_label(&self, handle: i32) -> Option<&str> {
+        self.cap_names
+            .iter()
+            .find(|(_, h)| *h == handle)
+            .map(|(n, _)| n.as_str())
     }
 
     /// §4/§7 the JIT cap-path window page map (see [`Host::cap_pages`]) for window `base`, persistent
@@ -9873,8 +9998,53 @@ impl Host {
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
         // §7 reflection: the reserved pseudo-`type_id` has no handle to resolve — service it directly
-        // (read-only over this domain's own table). This is the JIT's entry point for `cap.self.*`.
+        // (read-only over this domain's own powerbox). This is the JIT's entry point for `cap.self.*`.
         if type_id == svm_ir::CAP_SELF_TYPE_ID {
+            // op 2 = `resolve(name_ptr, name_len) -> handle | -errno` (F7): look a capability **name**
+            // up in this domain's name directory (populated at powerbox grant) and return the handle
+            // it's bound to — runtime, in-guest, dlopen-style discovery, the dynamic counterpart to
+            // load-time name binding. Confers no authority: it only re-finds a handle the guest was
+            // already granted (a name with no grant is `-EINVAL`). Serviced here, not in the mem-less
+            // `self_dispatch`, because it must read the name from the window (fail-closed: `-EFAULT`
+            // out of bounds, `-EINVAL` on bad UTF-8 / unknown name).
+            if op == 2 {
+                let Some(mem) = mem else {
+                    return Ok(vec![EFAULT]);
+                };
+                let ptr = *args.first().unwrap_or(&0) as u64;
+                let len = *args.get(1).unwrap_or(&0) as u64;
+                let Some(bytes) = mem.read_bytes(ptr, len) else {
+                    return Ok(vec![EFAULT]);
+                };
+                let Ok(name) = std::str::from_utf8(&bytes) else {
+                    return Ok(vec![EINVAL]);
+                };
+                return Ok(vec![self
+                    .resolve_cap_name(name)
+                    .map_or(EINVAL, |h| h as i64)]);
+            }
+            // op 3 = `label(handle, buf_ptr, buf_cap) -> len | 0 | -EFAULT` (F9): write the handle's
+            // human-readable label into the window (the reverse of op 2). Returns the label's full
+            // length (`0` if unlabeled); writes nothing if it doesn't fit (`buf_cap < len`) so the
+            // guest can retry with a buffer of the returned size. Authority-neutral reflection.
+            if op == 3 {
+                let h = *args.first().unwrap_or(&0) as i32;
+                let ptr = *args.get(1).unwrap_or(&0) as u64;
+                let cap = *args.get(2).unwrap_or(&0) as u64;
+                let Some(label) = self.cap_label(h).map(|s| s.to_string()) else {
+                    return Ok(vec![0]); // no label for this handle
+                };
+                let len = label.len() as u64;
+                if len <= cap {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    if mem.write_bytes(ptr, label.as_bytes()).is_none() {
+                        return Ok(vec![EFAULT]);
+                    }
+                }
+                return Ok(vec![len as i64]);
+            }
             return self.self_dispatch(op, args);
         }
         match self.resolve(handle, type_id)? {
@@ -10716,6 +10886,29 @@ impl Mem {
         }
     }
 
+    /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
+    /// [`Region::shared`] over the host's shared linear memory) rather than an engine-`mmap`ped one —
+    /// the substrate the parallel-wasm backend runs over (every per-vCPU Worker executes over the same
+    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`; reserved-tail
+    /// accesses beyond it read as zero (a confined guest stays in its prefix). The crate stays
+    /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
+    /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
+    fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
+        let reserved_log2 = reserved_log2.max(mapped_log2);
+        let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
+        let page = host_page_size();
+        Mem {
+            back,
+            window,
+            page,
+            space: Arc::new(RwLock::new(AddrSpace::default())),
+            has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
+            last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
+        }
+    }
+
     /// A fully-mapped **§14 sub-window**: a `1 << size_log2`-byte child window at absolute offset
     /// `base` inside a parent backing of `parent_bytes` bytes (the child runs over the parent's
     /// `Region`). The masking unit ([`svm_mask::Window::sub`], fuzzed as the escape hinge) confines
@@ -11291,10 +11484,50 @@ impl Mem {
             .unwrap_or(STATE_NORMAL)
     }
 
-    /// Set the durable state word at [`STATE_OFF`] — the runtime's per-vCPU state swap (slice 3.2.1),
-    /// so the single shared word reflects the running vCPU's own freeze phase.
+    /// Set the global durable **freeze** word at [`STATE_OFF`] (`UNWINDING`/`ARMED`/`NORMAL`) — the
+    /// stop-the-world trigger every poll reads.
     fn durable_set_state(&mut self, state: i32) {
         let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
+    }
+
+    /// Read context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) at
+    /// [`thaw_state_off`] (§12.8 concurrent-thaw stage 1). `STATE_NORMAL` if its page is uncommitted.
+    fn durable_thaw_state(&self, ctx: usize) -> i32 {
+        self.read_bytes_impl(thaw_state_off(ctx), 4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_le_bytes)
+            .unwrap_or(STATE_NORMAL)
+    }
+
+    /// Set context `ctx`'s per-context **thaw** state word.
+    fn durable_set_thaw_state(&mut self, ctx: usize, state: i32) {
+        let _ = self.write_bytes_impl(thaw_state_off(ctx), &state.to_le_bytes());
+    }
+
+    /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
+    /// stage 1): the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`) takes precedence; else
+    /// context `ctx`'s per-context **thaw** word (`REWINDING`/`NORMAL`). Mirror of [`Self::durable_store_dstate`].
+    fn durable_load_dstate(&self, ctx: usize) -> i32 {
+        let g = self.durable_state();
+        if g != STATE_NORMAL {
+            g
+        } else {
+            self.durable_thaw_state(ctx)
+        }
+    }
+
+    /// Store a vCPU's unified durable phase, routing `REWINDING` to context `ctx`'s own **thaw** word and
+    /// the freeze phases (`UNWINDING`/`ARMED`/`NORMAL`) to the global **freeze** word — so a rewinding
+    /// vCPU flipping its own word to `NORMAL` can't disturb a sibling still `REWINDING` (the relocation
+    /// the JIT needs for concurrent rewinds; the interp swaps it per dispatch, slice 3.2.1).
+    fn durable_store_dstate(&mut self, ctx: usize, dstate: i32) {
+        if dstate == STATE_REWINDING {
+            self.durable_set_state(STATE_NORMAL);
+            self.durable_set_thaw_state(ctx, STATE_REWINDING);
+        } else {
+            self.durable_set_state(dstate);
+            self.durable_set_thaw_state(ctx, STATE_NORMAL);
+        }
     }
 
     /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`): if the run

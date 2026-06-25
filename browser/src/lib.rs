@@ -16,6 +16,12 @@
 //! Status of the last run is read separately via [`svm_status`] (a single `i64` return can't
 //! disambiguate an error from a guest result of the same value).
 
+// Every `#[no_mangle] extern "C"` export here is a wasm-host FFI boundary that, by construction,
+// dereferences host-provided pointers (module bytes, the shared window, vCPU handles); each documents
+// its host contract in a `SAFETY:` note. That is exactly the pattern `not_unsafe_ptr_arg_deref` warns
+// about, so allow it crate-wide for these boundary functions.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::alloc::Layout;
 
 use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
@@ -279,6 +285,269 @@ pub extern "C" fn svm_run(ptr: *const u8, len: usize, arg: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
     run_at(ptr, len, &[])
+}
+
+// ---- shared-memory window: run the engine over a caller-owned region of *this* linear memory ----
+//
+// THREADS.md step 4. `svm_run` runs over a window the engine backs internally; `svm_run_shared` runs
+// over a window the **host** carves out of this module's linear memory (`[win_ptr, win_size)`, via
+// `svm_alloc`). Built as a wasm threads module (shared memory + `+atomics`), that linear memory is
+// the host's `SharedArrayBuffer`, so the window lives in shared memory — the substrate the parallel
+// mode's per-vCPU Workers will all execute over. Today still cooperative (one thread); the only
+// change from `svm_run` is *where the guest window lives*. Stateless (no `static mut`), so two
+// Workers running it over **disjoint** windows don't race on engine ABI globals.
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 over the guest window
+/// `[win_ptr, win_ptr+win_size)` of this module's linear memory (a `Region::shared`; `win_size` must
+/// cover the module's `memory` size). Returns the guest's `i64` result, or `i64::MIN` on
+/// decode/unsupported/trap/non-`i64`. The host reads the guest's memory effects directly from the
+/// window region afterward.
+#[no_mangle]
+pub extern "C" fn svm_run_shared(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    win_ptr: *mut u8,
+    win_size: usize,
+    arg: i64,
+) -> i64 {
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return i64::MIN;
+    };
+    // SAFETY: the host guarantees `[win_ptr, win_size)` is a live `svm_alloc`ed region of this linear
+    // memory used solely as this guest window for the call. The `unsafe` borrow lives here in the
+    // embedder; the engine stays `#![forbid(unsafe_code)]` and just takes the `Arc<Region>`.
+    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    let args: &[Value] = if arity >= 1 { &[Value::I64(arg)] } else { &[] };
+    let mut fuel = u64::MAX;
+    match bytecode::compile_and_run_capture_over(&m, 0, args, &mut fuel, &[], back) {
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            Some(Value::I32(x)) => *x as i64,
+            _ => i64::MIN,
+        },
+        _ => i64::MIN,
+    }
+}
+
+// ==== THREADS.md step 4c-wasm — the host-orchestrated parallel driver =============================
+//
+// wasm32 has no `thread::spawn`, so one guest's `thread.spawn`ed vCPUs are distributed across **Web
+// Workers** by the JS host: each Worker runs **one** vCPU via the engine's resumable `Vcpu` API
+// (`svm_par_run` → an event the host services → deliver the result → run again) over the **one** shared
+// linear-memory window. The host services the events with real cross-Worker primitives: `thread.spawn`
+// → start a Worker, `thread.join` → `Atomics.wait` on the child's completion slot, `memory.wait`/
+// `notify` → `Atomics.wait`/`notify` on the futex word — so this is genuinely parallel, the native
+// `bytecode_vcpu_orchestration.rs` test being its differential oracle.
+//
+// `VcpuProgram` is compiled once and shared **read-only** across Workers by pointer (it is `Sync`, and
+// under `--shared-memory` every Worker's instance sees the same linear memory, so a `Box::leak`ed
+// program built by one Worker is valid in all). Each `Vcpu` is `'static` here: the program outlives the
+// run (never freed), so the borrow is sound — the `unsafe` of asserting that lives in this embedder.
+
+/// Allocate `len` bytes **16-aligned** (so windows / futex words / completion slots are naturally
+/// aligned for `Atomics` / the engine's hardware atomics, which `svm_alloc`'s align-1 does not
+/// guarantee). Leaked for the run (the parallel demo never frees; the process exits). Null on `len==0`.
+#[no_mangle]
+pub extern "C" fn svm_par_alloc(len: usize) -> *mut u8 {
+    match Layout::from_size_align(len, 16) {
+        Ok(layout) if len != 0 => unsafe { std::alloc::alloc_zeroed(layout) },
+        _ => core::ptr::null_mut(),
+    }
+}
+
+/// Event codes returned by [`svm_par_run`] — the host switches on these (operands via `svm_par_ev_*`).
+pub const PAR_DONE: i32 = 0;
+pub const PAR_TRAP: i32 = 1;
+pub const PAR_SPAWN: i32 = 2;
+pub const PAR_JOIN: i32 = 3;
+pub const PAR_WAIT: i32 = 4;
+pub const PAR_NOTIFY: i32 = 5;
+
+/// A boxed resumable vCPU plus the operands of its last [`svm_par_run`] event (flattened to four
+/// `i64`s the host reads via [`svm_par_ev_a`]–[`svm_par_ev_d`]).
+pub struct ParVcpu {
+    inner: bytecode::Vcpu<'static>,
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+}
+
+fn first_i64(vals: &[Value]) -> i64 {
+    match vals.first() {
+        Some(Value::I64(x)) => *x,
+        Some(Value::I32(x)) => *x as i64,
+        _ => 0,
+    }
+}
+
+/// Compile the module at `[mod_ptr, mod_len)` into a shareable [`bytecode::VcpuProgram`], returned as a
+/// leaked pointer (lives for the run; shared read-only across Workers). Null on decode/unsupported.
+#[no_mangle]
+pub extern "C" fn svm_par_compile(mod_ptr: *const u8, mod_len: usize) -> *mut bytecode::VcpuProgram {
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return core::ptr::null_mut();
+    };
+    match bytecode::VcpuProgram::compile(&m) {
+        Some(p) => Box::into_raw(Box::new(p)),
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// Borrow a `*mut VcpuProgram` as `&'static` (the program outlives the run). SAFETY: the host keeps it
+/// alive for the whole run and never frees it before the last `Vcpu` over it.
+unsafe fn prog_ref(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::VcpuProgram {
+    &*prog
+}
+
+/// Build the **root** vCPU (function `func`) over the shared window `[win_ptr, win_size)`; it seeds +
+/// data-initialises the window (the once). Returns a boxed [`ParVcpu`] pointer, null on a bad func.
+#[no_mangle]
+pub extern "C" fn svm_par_root(
+    prog: *mut bytecode::VcpuProgram,
+    win_ptr: *mut u8,
+    win_size: usize,
+    func: u32,
+) -> *mut ParVcpu {
+    // SAFETY: the host guarantees `[win_ptr, win_size)` is a live shared window for the run.
+    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    match bytecode::Vcpu::new_root(unsafe { prog_ref(prog) }, func, &[], back, &[]) {
+        Ok(inner) => Box::into_raw(Box::new(ParVcpu {
+            inner,
+            a: 0,
+            b: 0,
+            c: 0,
+            d: 0,
+        })),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Build a `thread.spawn`ed **child** vCPU (`func(sp, arg)`) over the **same** shared window — it does
+/// not re-seed (the window is already live). Called on the child's Worker. Null on a bad func.
+#[no_mangle]
+pub extern "C" fn svm_par_child(
+    prog: *mut bytecode::VcpuProgram,
+    win_ptr: *mut u8,
+    win_size: usize,
+    func: u32,
+    sp: i64,
+    arg: i64,
+) -> *mut ParVcpu {
+    // SAFETY: the host guarantees `[win_ptr, win_size)` is the same live shared window.
+    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    let args = [Value::I64(sp), Value::I64(arg)];
+    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    match bytecode::Vcpu::new_child(unsafe { prog_ref(prog) }, func, &args, back) {
+        Ok(inner) => Box::into_raw(Box::new(ParVcpu {
+            inner,
+            a: 0,
+            b: 0,
+            c: 0,
+            d: 0,
+        })),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Advance the vCPU until it finishes, traps, or hits a host-serviced event; returns a `PAR_*` code.
+/// The host reads operands via `svm_par_ev_a`–`d`, services the event, calls the matching `deliver`,
+/// then calls `svm_par_run` again.
+#[no_mangle]
+pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
+    // SAFETY: `v` is a live `ParVcpu` from `svm_par_root`/`svm_par_child`, owned by this Worker.
+    let v = unsafe { &mut *v };
+    match v.inner.run() {
+        bytecode::VcpuEvent::Done(vals) => {
+            v.a = first_i64(&vals);
+            PAR_DONE
+        }
+        bytecode::VcpuEvent::Trapped(_) => PAR_TRAP,
+        bytecode::VcpuEvent::Spawn { func, sp, arg } => {
+            v.a = func as i64;
+            v.b = sp;
+            v.c = arg;
+            PAR_SPAWN
+        }
+        bytecode::VcpuEvent::Join { handle } => {
+            v.a = handle as i64;
+            PAR_JOIN
+        }
+        bytecode::VcpuEvent::Wait {
+            addr,
+            expected,
+            width,
+            timeout,
+        } => {
+            v.a = addr as i64;
+            v.b = expected as i64;
+            v.c = width as i64;
+            v.d = timeout as i64;
+            PAR_WAIT
+        }
+        bytecode::VcpuEvent::Notify { addr, count } => {
+            v.a = addr as i64;
+            v.b = count as i64;
+            PAR_NOTIFY
+        }
+    }
+}
+
+macro_rules! par_ev_getter {
+    ($name:ident, $field:ident) => {
+        /// Read an operand of the last [`svm_par_run`] event.
+        #[no_mangle]
+        pub extern "C" fn $name(v: *mut ParVcpu) -> i64 {
+            // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+            unsafe { (*v).$field }
+        }
+    };
+}
+par_ev_getter!(svm_par_ev_a, a);
+par_ev_getter!(svm_par_ev_b, b);
+par_ev_getter!(svm_par_ev_c, c);
+par_ev_getter!(svm_par_ev_d, d);
+
+/// Deliver a `thread.spawn` handle (after `PAR_SPAWN`).
+#[no_mangle]
+pub extern "C" fn svm_par_deliver_handle(v: *mut ParVcpu, handle: i32) {
+    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
+    unsafe { (*v).inner.deliver_handle(handle) };
+}
+
+/// Deliver a `memory.wait` code / `memory.notify` count (after `PAR_WAIT` / `PAR_NOTIFY`).
+#[no_mangle]
+pub extern "C" fn svm_par_deliver_code(v: *mut ParVcpu, code: i32) {
+    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
+    unsafe { (*v).inner.deliver_code(code) };
+}
+
+/// Deliver a joined child's result (after `PAR_JOIN`): `val` is its first return value, or — if
+/// `is_trap != 0` — the child trapped and the joiner traps on its next `svm_par_run`.
+#[no_mangle]
+pub extern "C" fn svm_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) {
+    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
+    let v = unsafe { &mut *v };
+    if is_trap != 0 {
+        v.inner.deliver_join(Err(Trap::ThreadFault));
+    } else {
+        v.inner.deliver_join(Ok(vec![Value::I64(val)]));
+    }
+}
+
+/// Free a finished vCPU.
+#[no_mangle]
+pub extern "C" fn svm_par_free(v: *mut ParVcpu) {
+    if !v.is_null() {
+        // SAFETY: `v` came from `Box::into_raw` in `svm_par_root`/`svm_par_child` and is freed once.
+        drop(unsafe { Box::from_raw(v) });
+    }
 }
 
 // ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------

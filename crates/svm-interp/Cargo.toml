@@ -25,3 +25,9 @@ svm-verify.workspace = true
 # from its dependency graph — see `host_page_size`.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 page_size = "0.6"
+
+# Test-only: parse SVM text kernels for the parallel-driver Miri check (THREADS.md step 4c). Pure
+# parser (only depends on `svm-ir`), so it keeps the test crate Miri-buildable — unlike the `svm`
+# integration-test crate, which pulls in the Cranelift JIT that Miri can't compile.
+[dev-dependencies]
+svm-text.workspace = true

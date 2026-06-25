@@ -173,8 +173,8 @@ use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncName, IToF, Inst, IntTy, IntUnOp, Loc, Module, Ordering, SsaLoc, Terminator,
-    TypeDef, ValIdx, ValType, VarInfo, VarLoc,
+    FloatTy, Func, FuncName, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, SsaLoc,
+    StoreOp, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 pub mod blockaddr;
@@ -291,6 +291,12 @@ fn translate_impl(
     // stashed stdout handle. Synthesized for any `printf` program (dead if no `%f` appears — scanning
     // the formats to tighten this is a later refinement).
     let need_dtoa = need_printf;
+    // C++ exception handling (Itanium ABI on-ramp). `need_eh` reserves the EH state region + drives
+    // the `invoke`/`landingpad`/`resume`/`__cxa_*` lowering; the typeinfo-id table assigns each
+    // `@_ZTI*` referenced by a throw or `llvm.eh.typeid.for` a distinct nonzero id so the thrown-type
+    // selector and the catch-clause `eh.typeid.for` agree. Needs the powerbox window (so `&& has_main`).
+    let (uses_eh, eh_typeids) = scan_eh(m);
+    let need_eh = uses_eh && has_main;
     let need_narrow_atomic = uses_narrow_atomic(m);
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
@@ -384,6 +390,16 @@ fn translate_impl(
     // The float scratch sits just above the data-stack reserve (computed here so it can ride in
     // `Helpers` to the printf lowering, and drive the window sizing + helper append below).
     let float_scratch_base = need_dtoa.then_some(entry_sp + STACK_RESERVE);
+    // The C++ EH region sits just above the float scratch (or directly above the stack reserve when
+    // there is no float scratch), reserved only when `need_eh`. Rides in `Helpers` to the
+    // `invoke`/`landingpad`/`resume`/`__cxa_*` lowerings.
+    let eh_base = need_eh.then(|| {
+        let mut b = entry_sp + STACK_RESERVE;
+        if need_dtoa {
+            b += FLOAT_SCRATCH_SIZE;
+        }
+        b
+    });
     let helpers = Helpers {
         memset: take(need_memset),
         memcpy: take(need_memcpy),
@@ -417,6 +433,8 @@ fn translate_impl(
         ctype_b_loc: ctype.b_loc,
         ctype_tolower_loc: ctype.tolower_loc,
         ctype_toupper_loc: ctype.toupper_loc,
+        eh_base,
+        eh_typeids,
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
@@ -495,7 +513,7 @@ fn translate_impl(
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
     // stash / heap state live in the reserved low window).
-    let need_window = any_frame || !globals.is_empty() || synth || ctype.any();
+    let need_window = any_frame || !globals.is_empty() || synth || ctype.any() || eh_base.is_some();
     let memory = need_window.then(|| {
         // Reserve stack when any function (or the argv `_start`) uses the data stack.
         let mut top = if any_frame || wants_argv {
@@ -506,6 +524,9 @@ fn translate_impl(
         .max(1);
         if let Some(fsb) = float_scratch_base {
             top = top.max(fsb + FLOAT_SCRATCH_SIZE);
+        }
+        if let Some(eb) = eh_base {
+            top = top.max(eb + EH_REGION_SIZE);
         }
         let log2 = (64 - (top - 1).leading_zeros()) as u8;
         svm_ir::Memory { size_log2: log2 }
@@ -1935,6 +1956,19 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
             }
         }
         term_local_uses(&bb.term)?; // validate terminator support
+                                    // An `invoke`'s result is defined by the *terminator* (not an instruction), so assign it an
+                                    // id + type here — the callee's (non-void) return type. The normal-edge successor then
+                                    // threads it like any cross-block value (it is recorded as a def of this block in liveness).
+        if let LTerm::Invoke(inv) = &bb.term {
+            if let Type::FuncType { result_type, .. } = inv.function_ty.as_ref() {
+                if !matches!(result_type.as_ref(), Type::VoidType) {
+                    let id = s.ty.len();
+                    s.name2id.insert(inv.result.clone(), id);
+                    s.ty.push(val_type(result_type)?);
+                    s.def_block.push(bi);
+                }
+            }
+        }
     }
     Ok(s)
 }
@@ -2031,6 +2065,9 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         }
         // A φ's operands are edge uses, handled in liveness via `PhiUses`.
         I::Phi(_) => Vec::new(),
+        // A `landingpad` reads only the reserved EH slots (the current exception/selector), no LLVM
+        // value operands — its `{ptr,i32}` result is bound field-wise in `translate_inst`.
+        I::LandingPad(_) => Vec::new(),
         other => return unsup(format!("instruction {other:?}")),
     };
     Ok(r)
@@ -2151,6 +2188,34 @@ const FMT_BUF_END: u64 = 128;
 /// reserved only when `need_dtoa`. Sized for the bignum formatters (three 40-limb big integers, the
 /// digit buffer, content, padded field, and scalar locals — see the `FMT_*_O` offsets).
 const FLOAT_SCRATCH_SIZE: u64 = 2304;
+
+// ── C++ exception-handling (Itanium ABI on-ramp) reserved scratch ──────────────────────────────
+// EH state rides in a fixed window region just above the float scratch (`eh_base`, reserved only
+// when `need_eh`). The window is freshly mapped and zero-filled, so the handler stack pointer and
+// the current-exception slots start at 0 with no explicit init. Offsets are relative to `eh_base`.
+/// Handler-stack pointer (`i32`): the count of active `try` handlers, indexing the buf slots below.
+const EH_HSP_O: u64 = 0;
+/// Current in-flight exception object pointer (`i64`), set by `__cxa_throw`, read by `landingpad`.
+const EH_EXN_O: u64 = 8;
+/// Current exception type selector (`i32`): the typeinfo id of the in-flight exception (see
+/// `Helpers::eh_typeids`), set by `__cxa_throw`, read by `landingpad` / compared by `eh.typeid.for`.
+const EH_SEL_O: u64 = 16;
+/// Start of the handler buf slots — one `EH_SLOT`-byte slot per active handler. The slots only need
+/// distinct guest addresses (the `SetJmp`/`LongJmp` ops key a host-side checkpoint by buf address),
+/// so the bytes themselves are never read as a `jmp_buf`.
+const EH_BUFS_O: u64 = 24;
+/// Bytes per handler buf slot (only its address matters; sized for alignment headroom).
+const EH_SLOT: u64 = 32;
+/// Maximum nesting depth of active `try` handlers (region is sized for this many buf slots).
+const EH_NHANDLERS: u64 = 64;
+/// A fixed scratch slot `__cxa_allocate_exception` hands back to hold the thrown object (the boxed
+/// `int` / `const char*`). One in-flight exception at a time (non-reentrant, no nested allocate
+/// before the matching throw lands) — sufficient for the on-ramp's single-threaded EH.
+const EH_EXNOBJ_O: u64 = EH_BUFS_O + EH_SLOT * EH_NHANDLERS;
+/// Bytes of the exception-object scratch (covers a pointer / small scalar payload).
+const EH_EXNOBJ_SIZE: u64 = 64;
+/// Total bytes of the reserved EH region.
+const EH_REGION_SIZE: u64 = EH_EXNOBJ_O + EH_EXNOBJ_SIZE;
 
 /// Which stash slot a capability call reads its handle from.
 #[derive(Clone, Copy)]
@@ -3180,7 +3245,7 @@ fn synth_malloc(vm_map_import: u32) -> Func {
 /// `llvm.memset`/`memcpy` calls one of these instead of an inline unroll — the first use of the
 /// synthesized-multi-block-helper machinery (a real CFG with a counted loop, like a tiny libc). The
 /// helpers take no data-SP (they touch only the passed window addresses). `None` when not needed.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Helpers {
     /// `__svm_memset(dst:i64, byte:i32, len:i64)` — fill `len` bytes at `dst` with `byte`'s low byte.
     memset: Option<u32>,
@@ -3240,6 +3305,15 @@ struct Helpers {
     ctype_b_loc: Option<u64>,
     ctype_tolower_loc: Option<u64>,
     ctype_toupper_loc: Option<u64>,
+    /// Base window address of the reserved C++ exception-handling region (the handler stack + the
+    /// current-exception slots + the per-handler buf slots), reserved only when `need_eh`. The
+    /// `invoke`/`landingpad`/`resume`/`__cxa_*` lowerings address their state at `+EH_*_O` off this.
+    eh_base: Option<u64>,
+    /// Module-global typeinfo-id table: each `@_ZTI*` typeinfo global referenced by a `__cxa_throw`
+    /// or `llvm.eh.typeid.for` is assigned a small distinct nonzero id (1-based, in first-seen
+    /// order). The throw stores the thrown type's id into the selector slot; `eh.typeid.for` returns
+    /// the same id, so clang's emitted catch dispatch compares them and selects the right handler.
+    eh_typeids: HashMap<String, u32>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
@@ -3265,6 +3339,59 @@ fn calls_external(m: &LModule, defined: &HashMap<String, u32>, want: &str) -> bo
                 if callee_name(c).is_some_and(|n| n == want && !defined.contains_key(&n)))
         })
     })
+}
+
+/// Scan the module for C++ exception-handling constructs. Returns `(uses_eh, typeinfo_ids)`:
+/// `uses_eh` is set by any `invoke`/`resume` terminator, any `landingpad`, or any call into the
+/// Itanium `__cxa_*` / `llvm.eh.typeid.for` runtime. The id table interns each typeinfo global —
+/// the `@_ZTI*` operand of `__cxa_throw` (arg 1) or `llvm.eh.typeid.for` (arg 0) — to a distinct
+/// 1-based id in first-seen order, so a thrown type's stored selector matches the catch clause's
+/// `eh.typeid.for` exactly when (and only when) the types are the same.
+fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>) {
+    let mut uses = false;
+    let mut ids: HashMap<String, u32> = HashMap::new();
+    let intern = |op: &Operand, ids: &mut HashMap<String, u32>| {
+        if let Some(n) = global_name_of(op) {
+            let next = ids.len() as u32 + 1;
+            ids.entry(n).or_insert(next);
+        }
+    };
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            if matches!(bb.term, LTerm::Invoke(_) | LTerm::Resume(_)) {
+                uses = true;
+            }
+            for i in &bb.instrs {
+                match i {
+                    Instruction::LandingPad(_) => uses = true,
+                    Instruction::Call(c) => match callee_name(c).as_deref() {
+                        Some("__cxa_throw") => {
+                            uses = true;
+                            if let Some((op, _)) = c.arguments.get(1) {
+                                intern(op, &mut ids);
+                            }
+                        }
+                        Some("llvm.eh.typeid.for") => {
+                            uses = true;
+                            if let Some((op, _)) = c.arguments.first() {
+                                intern(op, &mut ids);
+                            }
+                        }
+                        Some(
+                            "__cxa_begin_catch"
+                            | "__cxa_end_catch"
+                            | "__cxa_allocate_exception"
+                            | "__cxa_rethrow"
+                            | "_Unwind_Resume",
+                        ) => uses = true,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+    (uses, ids)
 }
 
 /// Does the module call the heap allocator (`malloc`/`calloc`)? (`free` is a no-op; `realloc` is
@@ -10569,6 +10696,73 @@ fn lower_setjmp_call(
     }
 }
 
+/// Lower the Itanium C++ exception-handling runtime (`__cxa_*`) and `llvm.eh.typeid.for`. Exception
+/// state lives in the reserved EH region ([`BlockCtx::eh_base`]):
+/// - `__cxa_allocate_exception(size)` → the fixed object scratch slot (`EH_EXNOBJ_O`).
+/// - `__cxa_throw(obj, ti, dtor)` → store the object ptr + the thrown type's selector, then unwind
+///   ([`BlockCtx::eh_unwind`]) into the enclosing `invoke`-installed handler (noreturn; the IR's
+///   trailing `unreachable` is dead).
+/// - `__cxa_rethrow()` / `_Unwind_Resume` → re-unwind with the current (already-stored) selector.
+/// - `__cxa_begin_catch(p)` → the caught object pointer (identity for a primitive/pointer catch).
+/// - `__cxa_end_catch()` → a no-op (no object destruction in the supported scope).
+/// - `llvm.eh.typeid.for(ti)` → the operand type's compile-time id (the selector the catch compares).
+fn lower_eh_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    match name {
+        "__cxa_allocate_exception" => {
+            let base = ctx.eh_base()?;
+            let p = ctx.const_i64((base + EH_EXNOBJ_O) as i64);
+            ctx.bind_dest(&c.dest, p);
+            Ok(true)
+        }
+        "__cxa_throw" => {
+            let base = ctx.eh_base()?;
+            let exn = ctx.operand_i64(&c.arguments[0].0)?;
+            let exn_addr = ctx.const_i64((base + EH_EXN_O) as i64);
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: exn_addr,
+                value: exn,
+                offset: 0,
+                align: 8,
+            });
+            let tid = ctx.eh_typeid(&c.arguments[1].0)?;
+            let sel = ctx.push(Inst::ConstI32(tid as i32));
+            let sel_addr = ctx.const_i64((base + EH_SEL_O) as i64);
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I32,
+                addr: sel_addr,
+                value: sel,
+                offset: 0,
+                align: 4,
+            });
+            ctx.eh_unwind(base)?;
+            Ok(true)
+        }
+        "__cxa_rethrow" | "_Unwind_Resume" => {
+            let base = ctx.eh_base()?;
+            ctx.eh_unwind(base)?;
+            Ok(true)
+        }
+        "__cxa_begin_catch" => {
+            let p = ctx.operand_i64(&c.arguments[0].0)?;
+            ctx.bind_dest(&c.dest, p);
+            Ok(true)
+        }
+        "__cxa_end_catch" => Ok(true),
+        "llvm.eh.typeid.for" => {
+            let tid = ctx.eh_typeid(&c.arguments[0].0)?;
+            let r = ctx.push(Inst::ConstI32(tid as i32));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// The local value operands a terminator uses (the branch condition / returned value). Validates
 /// terminator support. Branch *arguments* are synthesized from block parameters, not from here.
 fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
@@ -10584,6 +10778,16 @@ fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
         // `indirectbr`'s address operand is a use (the loaded label → the `br_table` index).
         LTerm::IndirectBr(ib) => Ok(one(&ib.operand)),
         LTerm::Unreachable(_) => Ok(Vec::new()),
+        // An `invoke` uses its argument operands (and, for an indirect callee, the function pointer);
+        // the result is bound in the synthetic call block. Its two edges' block-args come from block
+        // parameters, like any branch.
+        LTerm::Invoke(inv) => {
+            let mut v = inv.function.as_ref().right().map(one).unwrap_or_default();
+            v.extend(inv.arguments.iter().flat_map(|(o, _)| one(o)));
+            Ok(v)
+        }
+        // `resume` re-throws the current (slot-held) exception — no scalar operand use.
+        LTerm::Resume(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
 }
@@ -10629,6 +10833,13 @@ fn liveness(f: &Function, s: &Scan) -> Result<Vec<HashSet<ValueId>>, Error> {
                 if s.def_block[vid] != bi {
                     uevar[bi].insert(vid);
                 }
+            }
+        }
+        // An `invoke`'s (non-void) result is defined by this block (the synthetic call block on the
+        // normal edge), so record it as a def here — it threads out to the normal successor.
+        if let LTerm::Invoke(inv) = &bb.term {
+            if let Some(vid) = id(&inv.result) {
+                defs[bi].insert(vid);
             }
         }
         for t in term_succs(&bb.term, s)? {
@@ -10708,6 +10919,11 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
         // edges then supply them).
         LTerm::IndirectBr(ib) => ib.possible_dests.iter().map(b).collect(),
         LTerm::Ret(_) | LTerm::Unreachable(_) => Ok(Vec::new()),
+        // An `invoke`'s two edges (normal return / unwind to the landing pad) are both successors —
+        // liveness threads each target's live-ins out of this block.
+        LTerm::Invoke(inv) => Ok(vec![b(&inv.return_label)?, b(&inv.exception_label)?]),
+        // `resume` leaves the function (re-throws to the runtime), so it has no successors.
+        LTerm::Resume(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
 }
@@ -11135,6 +11351,62 @@ impl<'a> BlockCtx<'a> {
         })
     }
 
+    /// The reserved C++ EH region's base window address (`Helpers::eh_base`), or `Unsupported` if an
+    /// EH op was reached without the region having been reserved (a gating bug — should never fire).
+    fn eh_base(&self) -> Result<u64, Error> {
+        self.helpers
+            .eh_base
+            .ok_or_else(|| Error::Unsupported("C++ EH op without a reserved EH region".into()))
+    }
+
+    /// The compile-time typeinfo id of a typeinfo-global operand (the `@_ZTI*` of a `__cxa_throw` /
+    /// `llvm.eh.typeid.for`), interned by [`scan_eh`]. A `catch(...)` clause's `null` operand, or any
+    /// typeinfo not seen by the scan, is a clean `Unsupported`.
+    fn eh_typeid(&self, op: &Operand) -> Result<u32, Error> {
+        let name = global_name_of(op)
+            .ok_or_else(|| Error::Unsupported("EH typeinfo operand is not a global".into()))?;
+        self.helpers
+            .eh_typeids
+            .get(&name)
+            .copied()
+            .ok_or_else(|| Error::Unsupported(format!("unregistered EH typeinfo `@{name}`")))
+    }
+
+    /// The throw/rethrow/resume tail: pop the innermost active handler (`HSP-1`) and long-jump into
+    /// its `invoke`-installed checkpoint, making that `SetJmp` return nonzero so control resumes at
+    /// the landing pad. Emits `LongJmp` (a noreturn control op) as an effect; the caller supplies the
+    /// trailing `unreachable`/dead terminator.
+    fn eh_unwind(&mut self, base: u64) -> Result<(), Error> {
+        let hsp_addr = self.const_i64((base + EH_HSP_O) as i64);
+        let k = self.push(Inst::Load {
+            op: LoadOp::I64,
+            addr: hsp_addr,
+            offset: 0,
+            align: 8,
+        });
+        let one = self.const_i64(1);
+        let target = self.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Sub,
+            a: k,
+            b: one,
+        });
+        self.push_effect(Inst::Store {
+            op: StoreOp::I64,
+            addr: hsp_addr,
+            value: target,
+            offset: 0,
+            align: 8,
+        });
+        let bufs = self.const_i64((base + EH_BUFS_O) as i64);
+        let slot = self.const_i64(EH_SLOT as i64);
+        let off = self.mul_i64(target, slot);
+        let buf = self.add_i64(bufs, off);
+        let val = self.push(Inst::ConstI32(1));
+        self.push_effect(Inst::LongJmp { buf, val });
+        Ok(())
+    }
+
     /// An operand widened to the host word `i64` (the §7/§3e capability-call ABI): a pointer or
     /// `i64` is already there; a narrow `i32` is zero-extended (addresses/lengths/indices are
     /// non-negative window quantities). Float/vector operands are a clean `Unsupported`.
@@ -11418,7 +11690,7 @@ fn translate_block(
         caps,
         cstrs,
         gbytes,
-        helpers: *helpers,
+        helpers: helpers.clone(),
         types,
         func_idx: bc_func_idx,
         blockaddrs: ba,
@@ -12071,6 +12343,33 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         return Ok(());
     }
 
+    // A `landingpad` binds the `{ptr,i32}` exception aggregate from the reserved EH slots: field 0
+    // the in-flight exception object pointer (`cur_exn`), field 1 the type selector (`cur_sel`) the
+    // unwinding throw stored. clang's `extractvalue 0/1` then reads them back through the `agg` table
+    // (the same field-wise model as a multi-result call), and the catch dispatch compares the
+    // selector against each clause's `llvm.eh.typeid.for`.
+    if let I::LandingPad(lp) = instr {
+        let base = ctx.eh_base()?;
+        let exn_addr = ctx.const_i64((base + EH_EXN_O) as i64);
+        let exn = ctx.push(Inst::Load {
+            op: LoadOp::I64,
+            addr: exn_addr,
+            offset: 0,
+            align: 8,
+        });
+        let sel_addr = ctx.const_i64((base + EH_SEL_O) as i64);
+        let sel = ctx.push(Inst::Load {
+            op: LoadOp::I32,
+            addr: sel_addr,
+            offset: 0,
+            align: 4,
+        });
+        if let Some(&vid) = ctx.s.name2id.get(&lp.dest) {
+            ctx.agg.insert(vid, vec![exn, sel]);
+        }
+        return Ok(());
+    }
+
     // I14 tier 3: general i128 ops lower to 64-bit ops over a materialized `(lo, hi)` pair here.
     // `Ok(false)` ⇒ not an i128 op (fall through); an unsupported i128 shape fails closed.
     if lower_i128(ctx, instr, types)? {
@@ -12252,6 +12551,11 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // to the `SetJmp`/`LongJmp` core ops. Gated external (a guest-defined function shadows it).
         if let Some(name) = callee_name(c) {
             if !ctx.name2idx.contains_key(&name) && lower_setjmp_call(ctx, c, &name)? {
+                return Ok(());
+            }
+            // The C++ EH runtime (`__cxa_*` / `llvm.eh.typeid.for`) — see `lower_eh_call`. `__cxa_throw`
+            // is a plain `call` (a thrower with no local handler), lowered inline to a store + unwind.
+            if !ctx.name2idx.contains_key(&name) && lower_eh_call(ctx, c, &name)? {
                 return Ok(());
             }
         }
@@ -14802,8 +15106,257 @@ fn translate_term(
         LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params, aux_blocks),
         LTerm::IndirectBr(ib) => translate_indirectbr(ctx, ib, bi, f, s, block_params),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
+        LTerm::Invoke(inv) => lower_invoke(ctx, inv, bi, f, s, block_params, aux_blocks),
+        // `resume` re-throws the current (slot-held) exception into the next outer handler — the same
+        // unwind as a rethrow. `eh_unwind` ends in `LongJmp` (noreturn), so the terminator is dead.
+        LTerm::Resume(_) => {
+            let base = ctx.eh_base()?;
+            ctx.eh_unwind(base)?;
+            Ok(Terminator::Unreachable)
+        }
         other => unsup(format!("terminator {other:?}")),
     }
+}
+
+/// Lower an `invoke F(args) to %ok unwind %lpad` (the `try`-body call) onto the setjmp/longjmp core.
+///
+/// This block installs a handler and tests its `setjmp`; the call runs in a synthetic block reached
+/// only on the first (zero) return:
+/// ```text
+///   B:      d   = load HSP;  r = setjmp(BUFS + d*SLOT)
+///           br (r == 0) -> Bcall(T)            else -> %lpad(lpad-args)
+///   Bcall:  store HSP = d+1;  result = call F(sp+frame, args…);  store HSP = d
+///           br -> %ok(ok-args, result substituted in)
+/// ```
+/// A `__cxa_throw` deeper in `F` long-jumps back to this `setjmp`, which then returns nonzero and
+/// routes to `%lpad`. `HSP` is the handler-stack depth: pushed around the call, popped on normal
+/// return, and left at `d` by the throw's unwind — so `%lpad` always sees the outer depth.
+///
+/// `T` (the synthetic block's threaded params) is the data-SP, the call-argument values, and every
+/// value `%ok` needs *except* the call result (defined inside `Bcall`). Only a direct call to a
+/// defined function with a scalar/void result is supported (a struct return / indirect invoke is a
+/// clean `Unsupported`).
+fn lower_invoke(
+    ctx: &mut BlockCtx,
+    inv: &llvm_ir::terminator::Invoke,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+    aux_blocks: &mut Vec<Block>,
+) -> Result<Terminator, Error> {
+    use std::collections::hash_map::Entry;
+    let base = ctx.eh_base()?;
+
+    // Resolve the callee — a direct call to a defined function only.
+    let op = inv
+        .function
+        .as_ref()
+        .right()
+        .ok_or_else(|| Error::Unsupported("invoke of inline asm".into()))?;
+    let cname =
+        global_name_of(op).ok_or_else(|| Error::Unsupported("invoke of indirect callee".into()))?;
+    let func = *ctx
+        .name2idx
+        .get(&cname)
+        .ok_or_else(|| Error::Unsupported(format!("invoke of external/undefined `{cname}`")))?;
+
+    // The callee's parameter + result types (for typing the threaded args and the result).
+    let (param_tys, result_ty) = match inv.function_ty.as_ref() {
+        Type::FuncType {
+            result_type,
+            param_types,
+            ..
+        } => (param_types.clone(), result_type.clone()),
+        other => return unsup(format!("invoke through non-function type {other}")),
+    };
+    let n_results = match result_ty.as_ref() {
+        Type::VoidType => 0usize,
+        t if struct_field_vtypes(t, ctx.types).is_some() => {
+            return unsup("invoke returning a by-value struct");
+        }
+        _ => 1,
+    };
+
+    // Values computed in *this* block (B-local): the data-SP and each call argument.
+    let sp = ctx.sp()?;
+    let mut arg_vals: Vec<ValIdx> = Vec::with_capacity(inv.arguments.len());
+    for (a, _) in &inv.arguments {
+        arg_vals.push(ctx.operand(a)?);
+    }
+
+    let ok_blk = s.block_idx[&inv.return_label];
+    let lpad_blk = s.block_idx[&inv.exception_label];
+
+    // The unwind edge is taken directly from B — resolve its args in B's context.
+    let lpad_args = branch_args(ctx, bi, lpad_blk, f, s, block_params)?;
+
+    // The normal edge feeds `%ok`, whose args may include the invoke result — directly (a live-in) or
+    // as a φ incoming (when `return_label` is itself a φ block). The result is defined only in `Bcall`,
+    // so resolve `%ok`'s args in B's context with the result temporarily bound to a fresh dummy const;
+    // every `ok_args` slot that comes back equal to that dummy's id is a result slot (handles a result
+    // used zero, one, or several times), filled with the real result inside `Bcall` and kept out of `T`.
+    let result_vid = ctx.s.name2id.get(&inv.result).copied();
+    let saved = if n_results == 1 {
+        result_vid.map(|rv| {
+            let dummy = ctx.const_i64(0);
+            (rv, dummy, ctx.idx_of.insert(rv, dummy))
+        })
+    } else {
+        None
+    };
+    let ok_args = branch_args(ctx, bi, ok_blk, f, s, block_params)?;
+    if let Some((rv, _, prev)) = saved {
+        match prev {
+            Some(old) => {
+                ctx.idx_of.insert(rv, old);
+            }
+            None => {
+                ctx.idx_of.remove(&rv);
+            }
+        }
+    }
+    let dummy_idx = saved.map(|(_, d, _)| d);
+    let is_result = |a: ValIdx| Some(a) == dummy_idx;
+
+    // Build the threaded set `T` (deduped, ordered): SP, then each call arg, then every `%ok` arg
+    // except the result slots. A value's index in `T` is its parameter index in `Bcall`.
+    let mut t_vals: Vec<ValIdx> = Vec::new();
+    let mut pos: HashMap<ValIdx, usize> = HashMap::new();
+    let add = |t: &mut Vec<ValIdx>, p: &mut HashMap<ValIdx, usize>, v: ValIdx| {
+        if let Entry::Vacant(e) = p.entry(v) {
+            e.insert(t.len());
+            t.push(v);
+        }
+    };
+    add(&mut t_vals, &mut pos, sp);
+    for &a in &arg_vals {
+        add(&mut t_vals, &mut pos, a);
+    }
+    for &a in &ok_args {
+        if !is_result(a) {
+            add(&mut t_vals, &mut pos, a);
+        }
+    }
+
+    // Type each `T` member: SP is `i64`, a call arg by the callee's parameter type, an `%ok` arg by
+    // the block parameter it feeds (`branch_args` / `block_param_types` agree in order).
+    let mut t_types: Vec<ValType> = vec![ValType::I64; t_vals.len()];
+    t_types[pos[&sp]] = ValType::I64;
+    for (k, &a) in arg_vals.iter().enumerate() {
+        t_types[pos[&a]] = val_type(param_tys[k].as_ref())?;
+    }
+    let ok_param_types = block_param_types(&block_params[ok_blk], s);
+    for (i, &a) in ok_args.iter().enumerate() {
+        if !is_result(a) {
+            t_types[pos[&a]] = ok_param_types[i];
+        }
+    }
+
+    // ── Build the synthetic call block `Bcall` (block-local indices: params `0..P`, then pushed
+    // result-producing insts; a `store` produces no value and does not advance the index). ──
+    let p = t_vals.len() as ValIdx;
+    let sp_param = pos[&sp] as ValIdx;
+    let mut insts: Vec<Inst> = Vec::new();
+    // callee SP = sp + frame_size.
+    insts.push(Inst::ConstI64(ctx.frame_size as i64)); // p
+    insts.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: sp_param,
+        b: p,
+    }); // p+1  (callee_sp)
+    let callee_sp = p + 1;
+    // push HSP: d = load HSP; store HSP = d + 1.
+    insts.push(Inst::ConstI64((base + EH_HSP_O) as i64)); // p+2 (hsp_addr)
+    let hsp_addr = p + 2;
+    insts.push(Inst::Load {
+        op: LoadOp::I64,
+        addr: hsp_addr,
+        offset: 0,
+        align: 8,
+    }); // p+3 (d)
+    let d = p + 3;
+    insts.push(Inst::ConstI64(1)); // p+4 (one)
+    let one = p + 4;
+    insts.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: d,
+        b: one,
+    }); // p+5 (d+1)
+    let dp = p + 5;
+    insts.push(Inst::Store {
+        op: StoreOp::I64,
+        addr: hsp_addr,
+        value: dp,
+        offset: 0,
+        align: 8,
+    }); // no result
+        // the call: args = [callee_sp, arg params…].
+    let mut cargs: Vec<ValIdx> = vec![callee_sp];
+    for &a in &arg_vals {
+        cargs.push(pos[&a] as ValIdx);
+    }
+    insts.push(Inst::Call { func, args: cargs }); // p+6 (result, if any)
+    let result = p + 6;
+    // pop HSP back to `d` (normal return).
+    insts.push(Inst::Store {
+        op: StoreOp::I64,
+        addr: hsp_addr,
+        value: d,
+        offset: 0,
+        align: 8,
+    }); // no result
+        // Br -> %ok, remapping each arg: a result slot to the local call `result`, every other to its
+        // `Bcall` parameter index.
+    let ok_remapped: Vec<ValIdx> = ok_args
+        .iter()
+        .map(|&a| {
+            if is_result(a) {
+                result
+            } else {
+                pos[&a] as ValIdx
+            }
+        })
+        .collect();
+    let bcall_idx = (f.basic_blocks.len() + aux_blocks.len()) as u32;
+    aux_blocks.push(Block {
+        params: t_types,
+        insts,
+        term: Terminator::Br {
+            target: ok_blk as u32,
+            args: ok_remapped,
+        },
+    });
+
+    // ── This block's terminator: install the handler and branch on the `setjmp` return. ──
+    let d_addr = ctx.const_i64((base + EH_HSP_O) as i64);
+    let depth = ctx.push(Inst::Load {
+        op: LoadOp::I64,
+        addr: d_addr,
+        offset: 0,
+        align: 8,
+    });
+    let bufs = ctx.const_i64((base + EH_BUFS_O) as i64);
+    let slot = ctx.const_i64(EH_SLOT as i64);
+    let off = ctx.mul_i64(depth, slot);
+    let buf = ctx.add_i64(bufs, off);
+    let r = ctx.push(Inst::SetJmp { buf });
+    let zero = ctx.push(Inst::ConstI32(0));
+    let cond = ctx.push(Inst::IntCmp {
+        ty: IntTy::I32,
+        op: CmpOp::Eq,
+        a: r,
+        b: zero,
+    });
+    Ok(Terminator::BrIf {
+        cond,
+        then_blk: bcall_idx,
+        then_args: t_vals,
+        else_blk: lpad_blk as u32,
+        else_args: lpad_args,
+    })
 }
 
 /// Lower an `indirectbr` (computed `goto`, `goto *p`) to a `br_table` (the §computed-goto half). The

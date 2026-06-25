@@ -12,8 +12,7 @@
 //! a thaw on a host whose clock has moved on must reload each saved reading, not re-issue it.
 
 use svm_durable::{
-    init_durable_window, transform_module_assume_confined, write_state, STATE_REWINDING,
-    STATE_UNWINDING,
+    begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -132,7 +131,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
     // 43), not re-issue (which would give 44, 45 → 99). Re-spawn the child + re-enter under REWINDING.
     let r_thaw = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;
@@ -275,7 +274,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
     // clock_after). The fiber re-seeds and the child re-spawns into non-overlapping regions.
     let r_thaw = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;
@@ -416,7 +415,7 @@ fn child_owns_fiber_through_freeze_thaw() {
     // re-seeds and the child re-spawns; forward execution reproduces the uninterrupted 147.
     let r_thaw = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;
@@ -563,7 +562,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
     // (which would read 99,100,101 → 300).
     let r_thaw = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 99;

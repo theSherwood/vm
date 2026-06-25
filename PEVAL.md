@@ -248,13 +248,26 @@ heap/BTreeMap tests) never exercised a ZST-bearing *element*, which is why it sl
 `…_already_mutably_borrowed` — the `-> !` cold lang items the specializer's `RefCell<OutlineState>`
 borrows pull in — are now shimmed to `trap` (`is_rust_abort_call`), like the slice/alloc panic family.
 
-**How to reproduce (kept for future work on this lane).**
-- *Full probe:* a scratch cargo crate depending on `svm-peval` (`default-features = false`) + `svm-ir`,
-  whose `main` builds the trivial module and calls `specialize`, returning `residual.funcs.len()`. Build
-  to bitcode with `RUSTFLAGS=--emit=llvm-bc cargo +1.81.0 build --release --ignore-rust-version`, then
+**The manual probe is now an in-repo test (the pipeline slice — DONE).**
+`crates/svm-llvm/tests/peval_in_sandbox.rs` (`peval_specialize_runs_in_sandbox_and_matches_host`)
+folds the whole dance into one auto-skipping test: it builds the in-repo fixture
+`tests/fixtures/peval_probe` (a `no_std` powerbox crate depending on `svm-peval`
+`default-features = false` + `svm-ir`) to LLVM-18 bitcode with `rustc +1.81`, `llvm-link-18`s the
+dependency closure, `opt-18 internalize,globaldce`s down to the powerbox `main`, then
+`translate_bc_path` → `resolve_capability_imports` → `verify_module` → `run_powerbox`. The fixture
+builds a small foldable module (`() -> i32` = `21 * 2`), calls `specialize`, and prints the residual
+summary (`funcs`/`blocks`/`insts`); the test asserts it equals the **same** specialization run
+host-side (a differential: in-sandbox == host — both fold to a single `const 42`). This
+regression-proofs the *whole* ≈100-function `specialize` closure end-to-end in-sandbox, not just the
+unit ZST-layout test. It skips cleanly when `rustc +1.81.0` / `llvm-link-18` / `opt-18` are absent.
+
+**How to reproduce by hand (for debugging a new translate gap on this lane).**
+- *Full probe* (now `peval_in_sandbox.rs`): a cargo crate depending on `svm-peval` (`default-features =
+  false`) + `svm-ir`, whose `main` builds a module and calls `specialize`. Build to bitcode with
+  `RUSTFLAGS=--emit=llvm-bc cargo +1.81.0 build --release --ignore-rust-version`, then
   `llvm-link-18 target/release/deps/*.bc`, then `opt-18 -passes=internalize,globaldce
   -internalize-public-api-list=main,malloc,free`, then `translate_bc_path` →
-  `svm_run::resolve_capability_imports` → `verify_module` → `run_powerbox`. (Scratch dir is ephemeral.)
+  `svm_run::resolve_capability_imports` → `verify_module` → `run_powerbox`.
 - *Fast isolations* (single crate, no `llvm-link`): `compile_rust_to_bc` → `translate_bc_path` →
   `resolve_capability_imports` → `run_powerbox`, exactly as the `rust_*` tests do. To localize a layout
   bug, dump the translated module with `svm_text::print_module` and diff a `getelementptr`'s LLVM byte
@@ -289,8 +302,13 @@ on `svm-llvm` coverage (`setjmp`/`longjmp`, scale), tracked in `LLVM.md`, not he
    `Vec`/`RawVec`'s `Global` marker) as 1 byte instead of 0, desyncing every `Vec`-bearing struct's
    field offsets from LLVM's GEPs; fixed in `struct_layout`, guarded by
    `rust_zst_struct_field_layout_matches_native`. See "Milestone 3" above.
-   **Next:** fold the manual probe into an in-repo pipeline, then the end-to-end §22 `Jit` demo (a
-   guest specializes a toy interpreter and runs the residual; alongside `crates/svm-run/demos/jit/`).
+   - **in-repo pipeline: DONE** — the manual probe is now `peval_in_sandbox.rs`
+     (`peval_specialize_runs_in_sandbox_and_matches_host`): builds the `tests/fixtures/peval_probe`
+     crate → bitcode → link → `globaldce` → translate → verify → run, asserting the in-sandbox residual
+     equals the host specialization. Regression-proofs the whole closure; auto-skips without the
+     `rustc 1.81`/`llvm-18` toolchain. See "Milestone 3" above.
+   **Next:** the end-to-end §22 `Jit` demo — a guest specializes a toy interpreter *from inside the
+   sandbox* and runs the residual via the `Jit` capability (alongside `crates/svm-run/demos/jit/`).
 
 ## Benchmarking
 

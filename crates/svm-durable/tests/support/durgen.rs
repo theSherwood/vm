@@ -19,8 +19,8 @@
 #![allow(dead_code)] // not every helper is used by both includers
 
 use svm_durable::{
-    arm_freeze_after, init_durable_window, read_state, transform_module, write_state, SHADOW_BASE,
-    STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, read_state, read_thaw_state,
+    transform_module, write_state, SHADOW_BASE, STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use svm_ir::{
@@ -614,7 +614,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
     // (3) thaw: re-seed the fiber residue, flip to REWINDING, re-enter; must equal the baseline.
     let (r_thaw, final_win) = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.set_frozen_fibers(frozen);
@@ -627,7 +627,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
         "thawed fiber run must equal the uninterrupted run"
     );
     assert_eq!(
-        read_state(&final_win),
+        read_thaw_state(&final_win, 0),
         STATE_NORMAL,
         "thaw must flip the state word back to NORMAL"
     );
@@ -818,7 +818,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
     // (3) thaw: re-seed the residue (at its generation), re-enter under REWINDING; equals baseline.
     let (r_thaw, final_win) = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.set_frozen_fibers(frozen);
@@ -831,7 +831,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
         "thawed recycled-fiber run must equal the uninterrupted run"
     );
     assert_eq!(
-        read_state(&final_win),
+        read_thaw_state(&final_win, 0),
         STATE_NORMAL,
         "thaw must flip the state word back to NORMAL"
     );
@@ -924,7 +924,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
     // suspend points re-perform against the continued clock, matching the baseline. ---
     let (r_thaw, final_win) = {
         let mut win = snap.clone();
-        write_state(&mut win, STATE_REWINDING);
+        begin_thaw(&mut win, 0);
         let mut h = Host::new();
         h.clock_ns = clock_after;
         let clk = h.grant_clock();
@@ -945,7 +945,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
         "thawed run must equal the uninterrupted run (frozen result reloaded, not re-issued)"
     );
     assert_eq!(
-        read_state(&final_win),
+        read_thaw_state(&final_win, 0),
         STATE_NORMAL,
         "thaw must flip the state word back to NORMAL"
     );
