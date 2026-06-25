@@ -244,6 +244,92 @@ fn byval_two_eightbyte_struct() {
     );
 }
 
+/// A **struct `phi`** — a small by-value struct (`{i64, i64}`) carried across a loop backedge,
+/// zero-initialized on the entry edge and rebuilt by `insertvalue` on the backedge, read by
+/// `extractvalue`. The aggregate side-table is block-local, so this exercises the **cross-block
+/// aggregate threading** (per-field block-param fan-out + `branch_args` field materialization) that
+/// makes Embench `wikisort`'s `MakeRange` result translate. Authored as IR because clang's SROA
+/// scalarizes such a carried struct into per-field `i64` φs in C, so a struct φ can't be coaxed from a
+/// small C kernel. `run(n)` accumulates `a=Σi`, `b=Σ2i` over `i∈[0,n)`, returns `a+b = 3·n·(n−1)/2`.
+#[test]
+fn struct_phi_cross_block() {
+    let ir = "\
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-pc-linux-gnu\"\n\
+define i64 @run(i64 %n) {\n\
+entry:\n\
+  br label %loop\n\
+loop:\n\
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]\n\
+  %acc = phi { i64, i64 } [ zeroinitializer, %entry ], [ %accnext, %body ]\n\
+  %cmp = icmp slt i64 %i, %n\n\
+  br i1 %cmp, label %body, label %exit\n\
+body:\n\
+  %a = extractvalue { i64, i64 } %acc, 0\n\
+  %b = extractvalue { i64, i64 } %acc, 1\n\
+  %anew = add i64 %a, %i\n\
+  %ti = mul i64 %i, 2\n\
+  %bnew = add i64 %b, %ti\n\
+  %t = insertvalue { i64, i64 } undef, i64 %anew, 0\n\
+  %accnext = insertvalue { i64, i64 } %t, i64 %bnew, 1\n\
+  %inext = add i64 %i, 1\n\
+  br label %loop\n\
+exit:\n\
+  %ra = extractvalue { i64, i64 } %acc, 0\n\
+  %rb = extractvalue { i64, i64 } %acc, 1\n\
+  %r = add i64 %ra, %rb\n\
+  ret i64 %r\n\
+}\n";
+    let dir = std::env::temp_dir();
+    let ll = dir.join(format!("svm_structphi_{}.ll", std::process::id()));
+    let bc = dir.join(format!("svm_structphi_{}.bc", std::process::id()));
+    std::fs::write(&ll, ir).expect("write IR");
+    // Assemble the textual IR with clang (no extra tool dependency beyond the one tests already need).
+    match Command::new("clang")
+        .args(["-x", "ir", "-c", "-emit-llvm"])
+        .arg(&ll)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping struct_phi_cross_block (clang unavailable)");
+            return;
+        }
+    }
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate struct-φ IR");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let run = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    for n in [5i64, 7] {
+        let expect = 3 * n * (n - 1) / 2;
+        let mut fuel = 10_000_000u64;
+        let interp = match svm_interp::run(
+            &t.module,
+            run,
+            &[Value::I64(t.entry_sp as i64), Value::I64(n)],
+            &mut fuel,
+        )
+        .expect("interp")[0]
+        {
+            Value::I64(x) => x,
+            other => panic!("unexpected {other:?}"),
+        };
+        let jit =
+            match svm_jit::compile_and_run(&t.module, run, &[t.entry_sp as i64, n]).expect("jit") {
+                JitOutcome::Returned(v) => v[0],
+                o => panic!("jit outcome {o:?}"),
+            };
+        assert_eq!(interp, jit, "struct-φ n={n}: interp vs jit");
+        assert_eq!(interp, expect, "struct-φ n={n}: result");
+    }
+}
+
 #[test]
 fn byval_sse_struct() {
     // A `{double, double}` struct — two SSE eightbytes, coerced to `(double, double)`.
