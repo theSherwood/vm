@@ -1855,6 +1855,10 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         }
         | Inst::ContNew { func: a, sp: b }
         | Inst::ContResume { k: a, arg: b }
+        | Inst::CapSelfResolve {
+            name_ptr: a,
+            name_len: b,
+        }
         | Inst::LongJmp { buf: a, val: b }
         | Inst::ThreadSpawn { sp: a, arg: b, .. }
         | Inst::ReplaceLane { a, b, .. }
@@ -1894,6 +1898,15 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
             *a = f(*a);
             *b = f(*b);
             *c = f(*c);
+        }
+        Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } => {
+            *handle = f(*handle);
+            *buf_ptr = f(*buf_ptr);
+            *buf_cap = f(*buf_cap);
         }
         Inst::AtomicCmpxchg {
             addr,

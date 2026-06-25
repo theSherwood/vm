@@ -8,7 +8,9 @@
 //! Gated `#![cfg(unix)]` like the other JIT differential suites.
 #![cfg(unix)]
 
-use svm_run::{instantiate_with_imports, HostCap, Imports, Outcome, Value};
+use svm_run::{
+    instantiate, instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig, Value,
+};
 
 /// Two **arbitrary-named** host-function imports — `add_seven` and `triple` — each its own handle but
 /// the same nominal interface (`HOST_FN`), distinguished object-capability-style by which handle the
@@ -117,4 +119,192 @@ block0(v0: i64):
     let run = instance.call("_start", &[]).expect("run");
     assert_eq!(run.stdout, b"hi via registry\n");
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+}
+
+// --- F7: runtime name → handle resolution (the guest's `cap.self.resolve`) ------------------------
+//
+// `cap.self.resolve <name_ptr> <name_len> -> i32` resolves a capability **name** to the handle it was
+// granted (`-errno` on miss). It confers no authority — it only re-finds a handle the guest already
+// holds — and routes through the generic capability seam (op 2 over the reserved `CAP_SELF_TYPE_ID`),
+// so it works identically on the tree-walker, bytecode engine, and JIT.
+
+/// The guest resolves the name `"write"` (which it imported) to its handle **at runtime** — never
+/// reading the stash slot — then uses that resolved handle to emit a string. Proves the resolved
+/// handle is the real, working capability, on the tree-walker, bytecode engine, and JIT.
+const RESOLVE_SRC: &str = "\
+memory 15
+data ro 16384 \"via resolve\\n\"
+data ro 17000 \"write\"
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 17000
+  v2 = i64.const 5
+  v3 = cap.self.resolve v1 v2
+  v4 = i64.const 16384
+  v5 = i64.const 12
+  v6 = call.import \"write\" (i64, i64) -> (i64) v3 (v4, v5)
+  v7 = i32.const 0
+  return v7
+}
+";
+
+#[test]
+fn resolve_capability_by_name_at_runtime() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let module = svm_text::parse_module(RESOLVE_SRC).expect("parse");
+        let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+        let imports = Imports::new().provide("write", HostCap::stdout());
+        let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+        let run = instance
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
+        assert_eq!(
+            run.stdout, b"via resolve\n",
+            "the name-resolved write handle works on {backend:?}"
+        );
+        assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+    }
+}
+
+/// An unknown name resolves to `-EINVAL` (-22) — fail-closed, the new untrusted-name surface never
+/// traps or invents a handle. (The directory is empty here; a bad name fails regardless.)
+const RESOLVE_BOGUS_SRC: &str = "\
+memory 15
+data ro 17000 \"nope\"
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 17000
+  v2 = i64.const 4
+  v3 = cap.self.resolve v1 v2
+  return v3
+}
+";
+
+#[test]
+fn resolve_unknown_name_is_fail_closed() {
+    let module = svm_text::parse_module(RESOLVE_BOGUS_SRC).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 0, false).expect("synth (0 handles)");
+    let instance = instantiate_with_imports(with_start, Imports::new()).expect("instantiate");
+    let run = instance.call("_start", &[]).expect("run");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(-22)]),
+        "an unknown capability name resolves to -EINVAL"
+    );
+}
+
+/// The fixed §3e powerbox registers **canonical** names (no named imports): the guest resolves `"exit"`
+/// and checks it equals the handle `_start` stashed at slot 2 — proving canonical registration and that
+/// resolve returns the very handle the stash holds.
+const CANON_SRC: &str = "\
+memory 15
+data ro 16384 \"exit\"
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 16384
+  v2 = i64.const 4
+  v3 = cap.self.resolve v1 v2
+  v4 = i64.const 8
+  v5 = i32.load v4
+  v6 = i32.sub v3 v5
+  return v6
+}
+";
+
+#[test]
+fn canonical_powerbox_names_resolve_to_stash_handles() {
+    let module = svm_text::parse_module(CANON_SRC).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 3, false).expect("synth (3 handles)");
+    let instance = instantiate(with_start).expect("instantiate");
+    let run = instance.call("_start", &[]).expect("run");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(0)]),
+        "resolve(\"exit\") returns the same handle _start stashed at slot 2"
+    );
+}
+
+// --- F9: capability labels (the guest's `cap.self.label`, reverse of resolve) ----------------------
+//
+// `cap.self.label <handle> <buf_ptr> <buf_cap> -> i32` writes the handle's human-readable label into
+// the window and returns its full length (0 if unlabeled). A guest enumerating its handles
+// (`cap.self.count`/`get`) can name each one — for diagnostics / discovery. Cosmetic and
+// authority-neutral; routes through the generic seam (op 3 over `CAP_SELF_TYPE_ID`), so all three
+// backends agree.
+
+/// The guest reads the label of its `write` handle (`"write"`, its import name) into a scratch buffer
+/// and streams it back out — proving `cap.self.label` returns the registered name and the byte-write
+/// lands, on the tree-walker, bytecode engine, and JIT.
+const LABEL_SRC: &str = "\
+memory 15
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.const 2048
+  v4 = i64.const 64
+  v5 = cap.self.label v2 v3 v4
+  v6 = i64.extend_i32_s v5
+  v7 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v6)
+  v8 = i32.const 0
+  return v8
+}
+";
+
+#[test]
+fn label_a_handle_to_its_registered_name() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let module = svm_text::parse_module(LABEL_SRC).expect("parse");
+        let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+        let imports = Imports::new().provide("write", HostCap::stdout());
+        let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+        let run = instance
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
+        assert_eq!(
+            run.stdout, b"write",
+            "cap.self.label wrote the handle's registered name on {backend:?}"
+        );
+    }
+}
+
+/// When the label doesn't fit, `cap.self.label` writes nothing and returns the **full** length, so the
+/// guest can retry with a buffer that size. Here `buf_cap = 2 < len(\"write\") = 5`, so the entry
+/// returns 5 (and stdout stays empty — nothing was written).
+const LABEL_SMALL_SRC: &str = "\
+memory 15
+export \"entry\" 0
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.const 2048
+  v4 = i64.const 2
+  v5 = cap.self.label v2 v3 v4
+  v6 = i64.const 0
+  v7 = call.import \"write\" (i64, i64) -> (i64) v2 (v3, v6)
+  return v5
+}
+";
+
+#[test]
+fn label_too_small_buffer_returns_full_length() {
+    let module = svm_text::parse_module(LABEL_SMALL_SRC).expect("parse");
+    let with_start = svm_ir::synth_powerbox_start(module, 0, 1, false).expect("synth");
+    let imports = Imports::new().provide("write", HostCap::stdout());
+    let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+    let run = instance.call("_start", &[]).expect("run");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(5)]),
+        "an undersized buffer yields the full label length (\"write\" = 5), writing nothing"
+    );
+    assert!(
+        run.stdout.is_empty(),
+        "nothing is written when it doesn't fit"
+    );
 }

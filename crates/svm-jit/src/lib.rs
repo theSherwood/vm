@@ -3803,7 +3803,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::SimdWidthBytes => {}
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
-                Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
+                Inst::CapSelfCount
+                | Inst::CapSelfGet { .. }
+                | Inst::CapSelfResolve { .. }
+                | Inst::CapSelfLabel { .. } => {}
                 // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
                 // (works for a plain non-fiber root), so supported on every target.
                 Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
@@ -4535,6 +4538,58 @@ fn lower_block(
                 &sig,
                 h0,
                 call_args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §7 `cap.self.resolve` — op 2 over the reserved `CAP_SELF_TYPE_ID`, with a `(name_ptr,
+        // name_len)` buffer (the thunk reads the window to resolve the name, like any cap op). One
+        // i32 result; the handle operand is unused (constant 0), as for count/get.
+        if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
+            let h0 = b.ins().iconst(I32, 0);
+            let sig = FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let call_args = [*name_ptr, *name_len];
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                2,
+                &sig,
+                h0,
+                &call_args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §7 `cap.self.label` — op 3 over `CAP_SELF_TYPE_ID`: `(handle, buf_ptr, buf_cap)` → label len
+        // (the thunk writes the label into the window). One i32 result; cap.call handle unused (0).
+        if let Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } = inst
+        {
+            let h0 = b.ins().iconst(I32, 0);
+            let sig = FuncType {
+                params: vec![ValType::I32, ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let call_args = [*handle, *buf_ptr, *buf_cap];
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                3,
+                &sig,
+                h0,
+                &call_args,
                 &mut vals,
             )?;
             ubs.resize(vals.len(), UB_TOP);
