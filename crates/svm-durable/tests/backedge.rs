@@ -18,7 +18,8 @@
 //! reloaded, not recomputed, and that the pre-loop `cap.call` is not re-issued.
 
 use svm_durable::{
-    arm_freeze_after_backedges, init_durable_window, read_state, transform_module, begin_thaw, STATE_UNWINDING,
+    arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
+    STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use svm_ir::Memory;

@@ -19,8 +19,8 @@
 #![allow(dead_code)] // not every helper is used by both includers
 
 use svm_durable::{
-    arm_freeze_after, init_durable_window, read_state, read_thaw_state, transform_module, write_state, begin_thaw, SHADOW_BASE,
-    STATE_NORMAL, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, read_state, read_thaw_state,
+    transform_module, write_state, SHADOW_BASE, STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use svm_ir::{

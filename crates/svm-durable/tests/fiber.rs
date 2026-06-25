@@ -11,8 +11,8 @@
 //! 3.1.4–5) — so these tests pin verification + NORMAL-inertness + the arm wiring, structurally.
 
 use svm_durable::{
-    init_durable_window, transform_module, transform_module_assume_confined, write_state,
-    begin_thaw, STATE_UNWINDING,
+    begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
+    write_state, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_STRIDE};
 use svm_ir::{Inst, Memory, Module, Terminator};

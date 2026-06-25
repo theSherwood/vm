@@ -11,8 +11,7 @@
 use std::time::Instant;
 
 use svm_durable::{
-    init_durable_window, transform_module_assume_confined, write_state, begin_thaw,
-    STATE_UNWINDING,
+    begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};

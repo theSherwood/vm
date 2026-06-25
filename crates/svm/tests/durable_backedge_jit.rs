@@ -17,8 +17,8 @@
 use core::ffi::c_void;
 use std::sync::Arc;
 use svm_durable::{
-    arm_freeze_after_backedges, init_durable_window, read_state, transform_module, write_state, begin_thaw,
-    DURABLE_RESERVE, STATE_NORMAL, STATE_UNWINDING,
+    arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
+    write_state, DURABLE_RESERVE, STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};

@@ -19,8 +19,8 @@
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use svm_durable::{
-    arm_freeze_after, init_durable_window, transform_module, transform_module_assume_confined,
-    write_state, begin_thaw, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, transform_module,
+    transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use svm_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,

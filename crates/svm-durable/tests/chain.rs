@@ -9,8 +9,8 @@
 //! continue" branch that the single-frame transform never hit.
 
 use svm_durable::{
-    init_durable_window, read_state, read_thaw_state, transform_module, write_state,
-    begin_thaw, STATE_NORMAL, STATE_UNWINDING,
+    begin_thaw, init_durable_window, read_state, read_thaw_state, transform_module, write_state,
+    STATE_NORMAL, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};

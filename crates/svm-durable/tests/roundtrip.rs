@@ -10,8 +10,7 @@
 //! along in those bytes, DURABILITY.md §12.0).
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, begin_thaw,
-    STATE_UNWINDING,
+    begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::Memory;

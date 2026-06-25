@@ -903,7 +903,9 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word is the region's
             // first 8 bytes); an empty stack sits exactly at the frame base.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
-            if durable && flat_sp > fiber_region_base(slot_idx) + REGION_HEADER_LEN && window_is_unwinding(mem_base)
+            if durable
+                && flat_sp > fiber_region_base(slot_idx) + REGION_HEADER_LEN
+                && window_is_unwinding(mem_base)
             {
                 (*current()).frozen.push(crate::FrozenFiber {
                     slot: slot_idx,

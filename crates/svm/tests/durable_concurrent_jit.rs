@@ -14,7 +14,8 @@ use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use svm_durable::{
-    init_durable_window, read_state, transform_module_assume_confined, begin_thaw, STATE_NORMAL, STATE_UNWINDING,
+    begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
+    STATE_UNWINDING,
 };
 use svm_interp::{Host, SHADOW_BASE};
 use svm_ir::{Memory, Module};
