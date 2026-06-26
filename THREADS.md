@@ -144,13 +144,22 @@ property, so in practice:
 
 #### Remaining follow-ons (each its own project)
 
-- [ ] **4c-host — a shared `Host` for `cap.call` under parallelism.** The hard one: the `Host` is
-  heavily **stateful** (a mutable `clock_ns` counter, `Vec` `stdout`/`stderr`, record/replay tape
-  cursors), and `cap.call` is serviced **inline inside `resume`** (not bubbled to the driver like
-  `Spawn`/`Join`). So sharing it has a real fork: (a) one `Arc<Mutex<Host>>` locked across each step —
-  *correct but serializes all execution*, or (b) make each capability individually thread-safe — *true
-  parallelism, but breaks the deterministic differential story for stateful caps* (a parallel `Clock.now`
-  / interleaved `stdout` has no single oracle answer). Needs a design decision before coding.
+- [x] **4c-host — a shared `Host` for `cap.call` under parallelism.** Done by **mirroring the
+  tree-walker**, which already shares one `Arc<Mutex<Host>>` across a run's vCPUs and locks it *per
+  `cap.call`* (compute between calls is lock-free). The bytecode engine assumed exclusive `&mut Host`;
+  a small `HostCell { Excl(&mut Host) | Shared(&Mutex<Host>) }` with one `with(|h| …)` accessor now
+  threads through `resume`/`RunCtx`/every caller (commit A, zero behavior change — the full suite stays
+  green). The parallel driver then shares one `Mutex<Host>` across its vCPU threads (`HostCell::Shared`,
+  commit B), so a spawned vCPU's `cap.call` dispatches on the **same** powerbox, taking the lock only
+  for its own dispatch — host I/O from workers works while compute/atomics/futex stay parallel. New
+  entry `compile_and_run_capture_over_parallel_with_host`. **Determinism is preserved as a mode choice,
+  not lost:** cooperative (the default) stays the deterministic oracle (it already shares one host, in
+  fixed order); parallel is the opt-in whose order-sensitive stateful-cap interleaving races, as real
+  threads do. Differential-tested (`bytecode_parallel_caps.rs`): 8 worker vCPUs each `cap.call`-write
+  the same line + bump a shared counter → result + (schedule-independent) stdout byte-identical to the
+  oracle across 50 real-race repeats; Miri (`parallel_miri.rs`) confirms the shared-host access is
+  race/UB-free. (Scope: caps `cap_dispatch_slots` handles — streams/clock/exit/reflection — over the
+  native driver; the wasm-Worker shared-`Host` and order-sensitive-cap demos are follow-ons.)
 - [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel.** These mutate the `Domain`
   (`&mut`), which the parallel driver shares `&`-immutably. Needs the domain's installable parts behind
   their own synchronization (or to route these events back to a single owner).
@@ -208,8 +217,9 @@ cd ..
 cargo test -p svm-mem shared                          # Region::Shared cross-thread atomics + fuzz
 cargo test -p svm --test bytecode_shared_window       # engine over a caller-owned shared window
 cargo test -p svm --test bytecode_parallel            # 4c: native parallel driver vs oracle
+cargo test -p svm --test bytecode_parallel_caps       # 4c-host: shared-powerbox cap.call vs oracle
 cargo test -p svm --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
-cargo +nightly miri test -p svm-interp --test parallel_miri  # 4c: parallel driver is race/UB-free
+cargo +nightly miri test -p svm-interp --test parallel_miri  # 4c: parallel driver + shared host race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (tiny spike)
 cd browser/threads-spike && cargo +nightly build --release && node threads-futex.mjs && cd ..
