@@ -1620,6 +1620,84 @@ ordinal correlation and per-pc `SsaLoc.inst`) are a follow-up of limited yield.
 **Fallback order if `llvm-ir` bites:** `inkwell` (maintained, version-tracking wrapper) →
 hand-rolled `.ll` parser over `opt -S` (zero libLLVM link, but a rot-prone parser we own).
 
+**Q1a — The `llvm-ir` version-lag bottleneck, and the textual-IR exit (forward-looking).** Two of the
+on-ramp's limitations share one root — binding to `llvm-ir`'s LLVM-C reader, which is **lossy**
+(collapses every integer constant to a `u64`, truncating wide/negative `i128` literals — ISSUES.md I14,
+now fail-closed by `wideint`) and **version-locked** (tops out at LLVM 19). The second is the bigger
+long-term drag: the reader pins the whole on-ramp to LLVM 18, and forces pinning *old producers* to feed
+it — CI installs **rustc 1.81 (LLVM 18.1)** because the container's default `rustc` emits **LLVM 21**
+bitcode `llvm-ir` can't read (slice AH). As of this writing rustc is on LLVM **21**, the container's
+clang on **18**, `llvm-ir` caps at **19** — a gap that widens every LLVM release (~2/yr). `llvm-ir` is
+maintained but slow (last release Feb 2025; commits through Jan 2026; single maintainer), and
+forking/vendoring it fixes only the *constant* loss while **inheriting the version ceiling** — reaching
+LLVM 21 would mean adding 20/21 support to the fork (real LLVM-C-API work) *and* getting `llvm-21-dev`
+into the container. So a fork is a bandaid, not an exit.
+
+The exit already named in the fallback list — **a hand-rolled `.ll` textual reader** (`clang -S` /
+`llvm-dis`, zero libLLVM link) — addresses *both* at once: textual IR prints **full-width constants**
+(no truncation, no `wideint` guard) and is **far more version-stable** than the bitcode format or the
+C/C++ API (new LLVM versions *add* syntax rather than break existing syntax), so we'd ingest 20/21/22 by
+reading text instead of chasing a binding. It would also **collapse today's 3–4 libLLVM re-parses**
+(`from_bc_path` + `di` + `blockaddr` + `wideint`, each its own context) into **one** text pass carrying
+everything (instructions, `!DILocation`, `blockaddress`, full constants), and **remove the libLLVM build
+dependency entirely** (the reason `svm-llvm` is excluded from the workspace).
+
+*Tradeoffs, so the next person can weigh it:*
+- **Speed.** `.ll` is bigger than `.bc` (≈3–10× bytes) and text-parsing is slower per byte than bitcode
+  decode, so the *parse sub-step* is slower — but parse is a small fraction of an **AOT, once-per-program**
+  translate (the ~17 k-line emit walk dominates), `clang -S` costs ≈ `clang -c`, and one text pass
+  replaces four libLLVM parses. Net end-to-end is plausibly a wash or better; **measure before assuming**.
+- **Prior art.** In-process consumers (rustc's codegen, the real backends) use the C++ API on in-memory
+  IR — not our cross-process case. Out-of-process / cross-language consumers split: **bind the C API +
+  bitcode** (`llvm-ir`, `inkwell` — version-locked + lossy, our exact pain) vs. **parse `.ll` text**
+  (e.g. Go's `llir/llvm`, pure-Go, chosen precisely to avoid the CGo/libLLVM binding and tracking LLVM by
+  grammar updates). The textual route is the established way to be version-tolerant and dependency-free.
+- **Work, vs. forking `llvm-ir`.** Forking is *less upfront* (vendor + ~6-line patch) but doesn't solve
+  the version problem and keeps the libLLVM dep + the multi-parse. A textual reader is *more upfront* — a
+  tokenizer + parser for the **~52 instruction kinds** the on-ramp handles, plus types / constants / the
+  DI metadata it reads — but **bounded by current coverage** (the on-ramp fail-closes on anything it
+  doesn't translate, so the parser only needs *what we emit*, and grows incrementally), and **less
+  ongoing** for version bumps. By horizon: stay on LLVM 18 → forking is cheaper; track current Rust/clang
+  long-term → the textual reader wins (and `llvm-ir` may not even support the version you need).
+
+**Status: IN PROGRESS** (decided to build it now — `llvm-ir` kept biting, both on constants and the
+version ceiling). See the handoff block below for the plan + current state.
+
+**Q1b — Textual `.ll` reader: migration plan & handoff.** Replacing the `llvm-ir`/libLLVM binding
+with a dependency-free textual-`.ll` reader. Approach, validation, and the staged sequence:
+
+- **Approach.** Keep the ~17k-line translator (`lib.rs`) unchanged; replace *only* the input layer.
+  A new `crates/svm-llvm/src/ll/` module: `ast.rs` mirrors the slice of `llvm-ir`'s data model the
+  translator consumes (same variant/field names, same `get_type`/`try_get_result`/`named_struct_def`
+  methods) but **owned by us** — no FFI, no version lock — with the **I14 fix baked in** (`Constant::Int`
+  is a full `u128`). `lex.rs` tokenizes; `parse.rs` is a recursive-descent reader → `ast::Module`. The
+  translator's `use llvm_ir::…` becomes `use crate::ll::…` (mechanical). One text pass also absorbs
+  what `di.rs`/`blockaddr.rs`/`wideint.rs` re-walk today (4 libLLVM parses → 1, no libLLVM link).
+- **Validation oracle = `llvm-ir` itself.** A differential parity check (`assert_ll_parity`): compile
+  each test to *both* `.bc` and `.ll`, translate both, assert identical svm-ir. Keep `llvm-ir` as a
+  dev-dep until parity holds across the corpus; only then flip the default and drop it. The existing
+  215-test suite + this parity check are the regression gate. The translator's matches are the exact
+  spec — complete the `Instruction`/`Constant`/`Terminator` enums by compiling `lib.rs` against `crate::ll`.
+- **Staging (≈4 PRs).** (1) AST + lexer + core parser + parity harness, no flip. (2) widen to full
+  non-`-g` parity (SIMD/AVX, C++ EH, structs, i128, blockaddress — the last two come free in text).
+  (3) debug-info metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing
+  `di.rs` — the hardest, separable slice (the 6 `-g` tests + the DAP test). (4) flip + drop `llvm-ir`/
+  `llvm-sys`/`di.rs`/`blockaddr.rs`/`wideint.rs` + the rustc-1.81 pin; prove version-tolerance *here*
+  by feeding `rustc 1.94`'s LLVM-21 `.ll` (`rustc --emit=llvm-ir`) through the parser. (CI `ci.yml`
+  edits need `workflow` scope the bot lacks → manual follow-up.)
+- **Current state (this branch, `claude/charming-johnson-pmlsnr`).** PR1 *foundation* committed: the
+  `ll` module compiles (fmt+clippy green), wired into `lib.rs` as a **dormant** module (no behavior
+  change). `ast.rs` has the type system (`Type`/`TypeRef`/`Types` interner/`Typed`), constants (with
+  the `u128` fix), operands, predicates, module structure, and a *seed* of the instruction/terminator
+  enums. `lex.rs`/`parse.rs` are stubbed (token set + entry points only).
+- **Next steps, in order.** (a) implement `lex::lex` (names `%`/`@`/`!`, full-width int/float literals,
+  types, strings, punctuation). (b) implement `parse::parse_module` simplest-first; grow the AST enums
+  by compiling `lib.rs` against `crate::ll`. (c) add `translate_ll_path` (`lib.rs`) + `assert_ll_parity`
+  (`tests/translate.rs`, alongside `compile_to_bc`/`check`); iterate to parity on a representative slice,
+  then widen. Reference shapes: the `llvm-ir` 0.11.3 source in the cargo registry cache
+  (`…/llvm-ir-0.11.3/src/{instruction,constant,types,terminator}.rs`) — copy the *data definitions*, not
+  the `from_llvm` FFI.
+
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
 gives `mem2reg`/SROA (the two-stack split for free, §3a); `-fno-*-vectorize` keeps SIMD out
