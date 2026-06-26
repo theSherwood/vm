@@ -394,3 +394,187 @@ double pow(double x, double y) {
     z = libm_set_hi(z, (unsigned)j);
   return s * z;
 }
+
+/* ── sin/cos (fdlibm __kernel_sin/__kernel_cos + medium-path argument reduction) ──────────────────
+ *
+ * Reduce x to r in [-pi/4, pi/4] plus a quadrant n (mod 4); each kernel is a minimax polynomial over
+ * [-pi/4, pi/4]. The reduction is fdlibm's **medium path**, accurate for |x| <= 2^20*(pi/2) ~ 1.65e6
+ * (the bound where `n*pio2_1` stays an exact double product) — covering all realistic use. We drop
+ * fdlibm's `npio2_hw[]` fast-path table (a pure optimization: always running the cancellation-
+ * correction iterations is equally correct), so there is no big table to transcribe. For |x| beyond
+ * the bound the reduction is **reduced precision** (a documented limitation; the full Payne-Hanek
+ * `__kernel_rem_pio2` table is future work) but the functions stay total. */
+
+static double libm_kernel_sin(double x, double y, int iy) {
+  static const double half = 5.00000000000000000000e-01, S1 = -1.66666666666666324348e-01,
+                      S2 = 8.33333333332248946124e-03, S3 = -1.98412698298579493134e-04,
+                      S4 = 2.75573137070700676789e-06, S5 = -2.50507602534068634195e-08,
+                      S6 = 1.58969099521155010221e-10;
+  double z, r, v;
+  int ix = (int)libm_hi(x) & 0x7fffffff;
+  if (ix < 0x3e400000) {       /* |x| < 2**-27 */
+    if ((int)x == 0) return x; /* generate inexact */
+  }
+  z = x * x;
+  v = z * x;
+  r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)));
+  if (iy == 0) return x + v * (S1 + z * r);
+  return x - ((z * (half * y - v * r) - y) - v * S1);
+}
+
+static double libm_kernel_cos(double x, double y) {
+  static const double one = 1.00000000000000000000e+00, C1 = 4.16666666666666019037e-02,
+                      C2 = -1.38888888888741095749e-03, C3 = 2.48015872894767294178e-05,
+                      C4 = -2.75573143513906633035e-07, C5 = 2.08757232129817482790e-09,
+                      C6 = -1.13596475577881948265e-11;
+  double a, hz, z, r, qx;
+  int ix = (int)libm_hi(x) & 0x7fffffff;
+  if (ix < 0x3e400000) { /* |x| < 2**-27 */
+    if ((int)x == 0) return one;
+  }
+  z = x * x;
+  r = z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))));
+  if (ix < 0x3FD33333) /* |x| < 0.3 */
+    return one - (0.5 * z - (z * r - x * y));
+  if (ix > 0x3fe90000)
+    qx = 0.28125; /* x > 0.78125 */
+  else
+    qx = libm_words((unsigned)(ix - 0x00200000), 0); /* x/4 */
+  hz = 0.5 * z - qx;
+  a = one - qx;
+  return a - (hz - (z * r - x * y));
+}
+
+/* Reduce x: write r = y[0]+y[1] in [-pi/4, pi/4], return the quadrant count n (n & 3 = quadrant). */
+static int libm_rem_pio2(double x, double *y) {
+  static const double half = 0.5, invpio2 = 6.36619772367581382433e-01,
+                      pio2_1 = 1.57079632673412561417e+00, pio2_1t = 6.07710050650619224932e-11,
+                      pio2_2 = 6.07710050630396597660e-11, pio2_2t = 2.02226624879595063154e-21,
+                      pio2_3 = 2.02226624871116645580e-21, pio2_3t = 8.47842766036889956997e-32,
+                      toint = 6755399441055744.0; /* 2^52+2^51, round-to-nearest magic */
+  double z, w, t, r, fn;
+  int i, j, n, hx, ix;
+  unsigned high;
+
+  hx = (int)libm_hi(x);
+  ix = hx & 0x7fffffff;
+  if (ix <= 0x3fe921fb) { /* |x| <= pi/4: no reduction */
+    y[0] = x;
+    y[1] = 0;
+    return 0;
+  }
+  if (ix < 0x4002d97c) { /* |x| < 3pi/4: n = +-1 */
+    if (hx > 0) {
+      z = x - pio2_1;
+      if (ix != 0x3ff921fb) {
+        y[0] = z - pio2_1t;
+        y[1] = (z - y[0]) - pio2_1t;
+      } else {
+        z -= pio2_2;
+        y[0] = z - pio2_2t;
+        y[1] = (z - y[0]) - pio2_2t;
+      }
+      return 1;
+    }
+    z = x + pio2_1;
+    if (ix != 0x3ff921fb) {
+      y[0] = z + pio2_1t;
+      y[1] = (z - y[0]) + pio2_1t;
+    } else {
+      z += pio2_2;
+      y[0] = z + pio2_2t;
+      y[1] = (z - y[0]) + pio2_2t;
+    }
+    return -1;
+  }
+  if (ix <= 0x413921fb) {                       /* |x| <= 2^20*(pi/2): medium, full accuracy */
+    t = libm_words((unsigned)ix, libm_lo(x));   /* |x| */
+    n = (int)(t * invpio2 + half);
+    fn = (double)n;
+    r = t - fn * pio2_1;
+    w = fn * pio2_1t; /* 1st round, ~85-bit */
+    j = ix >> 20;
+    y[0] = r - w;
+    high = libm_hi(y[0]);
+    i = j - (int)((high >> 20) & 0x7ff);
+    if (i > 16) { /* 2nd iteration, ~118-bit */
+      t = r;
+      w = fn * pio2_2;
+      r = t - w;
+      w = fn * pio2_2t - ((t - r) - w);
+      y[0] = r - w;
+      high = libm_hi(y[0]);
+      i = j - (int)((high >> 20) & 0x7ff);
+      if (i > 49) { /* 3rd iteration, ~151-bit */
+        t = r;
+        w = fn * pio2_3;
+        r = t - w;
+        w = fn * pio2_3t - ((t - r) - w);
+        y[0] = r - w;
+      }
+    }
+    y[1] = (r - y[0]) - w;
+    if (hx < 0) {
+      y[0] = -y[0];
+      y[1] = -y[1];
+      return -n;
+    }
+    return n;
+  }
+  /* |x| > 2^20*(pi/2): out of the validated domain — a reduced-precision reduction (1 extra part)
+   * so the function is total. Realistic Lua never reaches here; the full Payne-Hanek table is the
+   * future addition that would restore <=2 ULP for huge arguments. */
+  t = libm_words((unsigned)ix, libm_lo(x)); /* |x| */
+  fn = (t * invpio2 + toint) - toint;       /* nearest integer (degrades past 2^52) */
+  r = t - fn * pio2_1;
+  w = fn * pio2_1t;
+  z = r - w;
+  w = fn * pio2_2 - ((r - z) - w);
+  r = z - w;
+  y[0] = r;
+  y[1] = (z - r) - w;
+  z = fn * 0.25;
+  n = (int)(fn - 4.0 * (double)(long long)z); /* fn mod 4 */
+  if (hx < 0) {
+    y[0] = -y[0];
+    y[1] = -y[1];
+    n = (4 - n) & 3;
+  }
+  return n & 3;
+}
+
+double sin(double x) {
+  double y[2], z = 0.0;
+  int n, ix = (int)libm_hi(x) & 0x7fffffff;
+  if (ix <= 0x3fe921fb) return libm_kernel_sin(x, z, 0); /* |x| < pi/4 */
+  if (ix >= 0x7ff00000) return x - x;                    /* sin(Inf or NaN) = NaN */
+  n = libm_rem_pio2(x, y);
+  switch (n & 3) {
+    case 0:
+      return libm_kernel_sin(y[0], y[1], 1);
+    case 1:
+      return libm_kernel_cos(y[0], y[1]);
+    case 2:
+      return -libm_kernel_sin(y[0], y[1], 1);
+    default:
+      return -libm_kernel_cos(y[0], y[1]);
+  }
+}
+
+double cos(double x) {
+  double y[2], z = 0.0;
+  int n, ix = (int)libm_hi(x) & 0x7fffffff;
+  if (ix <= 0x3fe921fb) return libm_kernel_cos(x, z); /* |x| < pi/4 */
+  if (ix >= 0x7ff00000) return x - x;                 /* cos(Inf or NaN) = NaN */
+  n = libm_rem_pio2(x, y);
+  switch (n & 3) {
+    case 0:
+      return libm_kernel_cos(y[0], y[1]);
+    case 1:
+      return -libm_kernel_sin(y[0], y[1], 1);
+    case 2:
+      return -libm_kernel_cos(y[0], y[1]);
+    default:
+      return libm_kernel_sin(y[0], y[1], 1);
+  }
+}

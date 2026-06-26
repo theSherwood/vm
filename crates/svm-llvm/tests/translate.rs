@@ -2141,15 +2141,25 @@ fn libc_localeconv_c_locale() {
 }
 
 #[test]
-fn demo_libm_exp_log_pow_vs_native() {
-    // The bundled **guest `libm`** (`demos/libm/libm.c`, fdlibm `exp`/`log`/`pow`): a program that
-    // needs the transcendentals brings them as ordinary guest C — no host math capability, no
-    // translator intrinsic — and a guest definition shadows the libc-name binding the on-ramp would
-    // otherwise synthesize. The driver evaluates `exp`/`log`/`pow` over runtime grids and writes each
-    // result's raw f64 image; since the math is guest code, native `cc` compiles the same source, so
-    // the bytes are identical across the tree-walker, the bytecode VM, the JIT, and native. `pow`
-    // also exercises `sqrt` (→ the SVM `f64.sqrt` op, for `y=0.5`) and `scalbn` (→ `__svm_ldexp`).
-    check_demo_vs_native("libm_exp_log_pow", "libm/libm_demo.c", b"");
+fn demo_libm_vs_native() {
+    // The bundled **guest `libm`** (`demos/libm/libm.c`, fdlibm `exp`/`log`/`pow`/`sin`/`cos`): a
+    // program that needs the transcendentals brings them as ordinary guest C — no host math
+    // capability, no translator intrinsic — and a guest definition shadows the libc-name binding the
+    // on-ramp would otherwise synthesize. The driver evaluates each over runtime grids and writes the
+    // raw f64 image; since the math is guest code, native `cc` compiles the same source, so the bytes
+    // are identical across the tree-walker, the bytecode VM, the JIT, and native. `pow` also exercises
+    // `sqrt` (→ the SVM `f64.sqrt` op, `y=0.5`) and `scalbn` (→ `__svm_ldexp`).
+    //
+    // Built with `-fno-vectorize -fno-slp-vectorize`: clang would auto-SIMD some of the polynomial
+    // evaluation into `<2 x double>` (the §17 vector lane, outside this scalar on-ramp's scope), and
+    // exact IEEE arithmetic gives the identical bytes scalar-vs-vectorized — so the on-ramp consumes
+    // scalar bitcode while the native oracle keeps vectorizing (the split the corpus demos use).
+    check_demo_vs_native_flags(
+        "libm",
+        "libm/libm_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
 }
 
 #[test]
@@ -2162,6 +2172,7 @@ fn libm_guest_exp_log_accurate_vs_system() {
     let probe = "#include <math.h>\n\
         #include <stdint.h>\n\
         double svm_exp(double); double svm_log(double); double svm_pow(double,double);\n\
+        double svm_sin(double); double svm_cos(double);\n\
         static int ulp_ok(double a, double b){\n\
           if (a==b) return 1;\n\
           if (a!=a && b!=b) return 1; /* both NaN */\n\
@@ -2175,9 +2186,15 @@ fn libm_guest_exp_log_accurate_vs_system() {
           double ls[] = {1.0,2.0,0.5,2.718281828459045,10.0,1e10,1e-10,0.001,1e300,123456.789};\n\
           double pb[] = {2.0,3.0,-2.0,-2.0,10.0,0.5,9.0,-1.0,1.5,2.0,-3.0,0.5,7.0};\n\
           double pe[] = {10.0,3.0,3.0,4.0,-2.0,0.5,0.5,2.0,2.5,0.5,3.0,-1.0,2.0};\n\
+          /* sin/cos: generic O(1)-result args (avoid exact multiples of pi where the residual is\n\
+             pathologically tiny), spanning every quadrant up to the medium-path bound (~1.6e6). */\n\
+          double ts[] = {0.3,0.5,0.7853981633974483,1.0,1.5,2.0,2.5,3.0,5.0,10.0,100.0,\n\
+                         1000.0,12345.678,1e5,1e6,-0.5,-3.0,-100.0};\n\
           for (unsigned i=0;i<sizeof xs/sizeof*xs;i++) if(!ulp_ok(svm_exp(xs[i]), exp(xs[i]))) return 1;\n\
           for (unsigned i=0;i<sizeof ls/sizeof*ls;i++) if(!ulp_ok(svm_log(ls[i]), log(ls[i]))) return 2;\n\
           for (unsigned i=0;i<sizeof pb/sizeof*pb;i++) if(!ulp_ok(svm_pow(pb[i],pe[i]), pow(pb[i],pe[i]))) return 3;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(svm_sin(ts[i]), sin(ts[i]))) return 4;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(svm_cos(ts[i]), cos(ts[i]))) return 5;\n\
           return 0;\n\
         }";
     let dir = std::env::temp_dir();
@@ -2196,6 +2213,8 @@ fn libm_guest_exp_log_accurate_vs_system() {
             "-Dexp=svm_exp",
             "-Dlog=svm_log",
             "-Dpow=svm_pow",
+            "-Dsin=svm_sin",
+            "-Dcos=svm_cos",
             "-c",
         ])
         .arg(&libm)
@@ -2226,7 +2245,7 @@ fn libm_guest_exp_log_accurate_vs_system() {
         .unwrap();
     assert_eq!(
         code, 0,
-        "guest libm vs system: failing stage {code} (1=exp, 2=log, 3=pow)"
+        "guest libm vs system: failing stage {code} (1=exp, 2=log, 3=pow, 4=sin, 5=cos)"
     );
 }
 

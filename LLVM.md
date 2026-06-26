@@ -1206,12 +1206,18 @@ for a real implementation, split by whether it needs a *host-libm decision*:
   (genuinely accurate, not poly approximations), using only IEEE `+−*/`, compares, and union word
   access. A guest definition **shadows** the on-ramp's would-be `pow`/`exp`/`log` trap stubs, so
   `llvm-link lua_core.bc libm.bc` makes them real. `pow` reuses `sqrt` (→ the SVM `f64.sqrt` op) and
-  `scalbn` (→ `__svm_ldexp`). Two gates: `demo_libm_exp_log_pow_vs_native` (raw-f64-image differential,
-  all three engines == native — byte-identical *because* the math is guest code, unfused on both
-  lanes) and `libm_guest_exp_log_accurate_vs_system` (a native-only `-D`-renamed build vs the system
-  `<math.h>`, ≤2 ULP — validates the fdlibm transcription, which a same-source differential cannot).
-  **Remaining:** `sin`/`cos`/`tan` + inverses/hyperbolics (range reduction), then `llvm-link` the
-  guest libm into the Lua build so the Lua-core `pow` is real end to end.
+  `scalbn` (→ `__svm_ldexp`); **`sin`/`cos`** add fdlibm's `__kernel_sin`/`__kernel_cos` + the
+  **medium-path** argument reduction (accurate for `|x| ≤ 2²⁰·π/2 ≈ 1.65e6`, the bound where `n·pio2_1`
+  stays an exact product — covering all realistic use; the `npio2_hw` fast-path table is dropped since
+  always running the cancellation-correction is equally correct, and the full Payne-Hanek
+  `__kernel_rem_pio2` table for astronomically large args is the documented future addition).
+  Two gates: `demo_libm_vs_native` (raw-f64-image differential, all three engines == native —
+  byte-identical *because* the math is guest code, unfused on both lanes; built `-fno-*-vectorize` so
+  the on-ramp takes scalar bitcode while the oracle vectorizes, the corpus-demo split) and
+  `libm_guest_exp_log_accurate_vs_system` (a native-only `-D`-renamed build vs the system `<math.h>`,
+  ≤2 ULP — validates the fdlibm transcription, which a same-source differential cannot).
+  **Remaining:** `tan` + inverses/hyperbolics, the Payne-Hanek table for huge `sin`/`cos` args, then
+  `llvm-link` the guest libm into the Lua build so the Lua-core `pow` is real end to end.
 
 After the float-number surface lands, `print`/stdlib graduates first-light to a script that does I/O.
 

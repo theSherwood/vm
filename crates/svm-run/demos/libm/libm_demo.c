@@ -50,5 +50,25 @@ int main(void) {
     for (int b = 0; b < 8; b++) out[o++] = (unsigned char)(u.u >> (8 * b));
   }
   write(1, out, o);
+
+  /* sin/cos: the |x|<pi/4 fast path, every quadrant, exact multiples of pi/2 (the residual/quadrant
+   * logic), and large arguments through the medium-path reduction. The byte diff is exact regardless
+   * of accuracy (both lanes run the same guest reduction). */
+  volatile double ts[] = {0.0,  0.3,  0.7853981633974483, 1.5707963267948966, 3.141592653589793,
+                          4.71238898038469, 6.283185307179586, 1.0, 2.0, 5.0, 10.0, 100.0,
+                          1000.0, 12345.678, 1e6, -0.5, -3.0, -1000.0};
+  int nt = (int)(sizeof ts / sizeof ts[0]);
+  o = 0;
+  for (int i = 0; i < nt; i++) {
+    libm_du u;
+    u.d = sin(ts[i]);
+    for (int b = 0; b < 8; b++) out[o++] = (unsigned char)(u.u >> (8 * b));
+  }
+  for (int i = 0; i < nt; i++) {
+    libm_du u;
+    u.d = cos(ts[i]);
+    for (int b = 0; b < 8; b++) out[o++] = (unsigned char)(u.u >> (8 * b));
+  }
+  write(1, out, o);
   return 0;
 }
