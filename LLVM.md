@@ -1185,8 +1185,15 @@ for a real implementation, split by whether it needs a *host-libm decision*:
     decision** — the earlier "`pow`/`fmod` need host-libm delegation" framing was imprecise: only the
     *transcendentals* do. Test `libc_fmod_bit_exact` (a 10×8 grid incl. subnormals, a large quotient,
     and the `y==0`/`x==inf`→NaN paths), all three engines == native.
-  - **`localeconv`/`__errno_location`** — a static C-locale `lconv` struct (`decimal_point="."`) +
-    a fixed window slot for `errno`.
+  - **`localeconv`** — **DONE.** `build_locale_data` lays a read-only C-locale `lconv` struct as
+    module data (`decimal_point="."`, the other strings `""`, the numeric/monetary `char` fields
+    `CHAR_MAX`), and `localeconv()` returns its address (a `synth_const_i64`). No powerbox needed
+    (the struct rides in the globals region like the ctype tables). Test `libc_localeconv_c_locale`,
+    all three engines == native's C locale.
+  - **`__errno_location`** — a writable `errno` int slot. Deferred and **bundled with `strtod`**: it
+    needs the powerbox page-0 layout (a writable persistent slot), which entangles it with the
+    powerbox test harness, and it is only ever *set* by `strtod` (`ERANGE`) — so it lands where it is
+    exercised end to end.
 - **Hard but decision-free:** **`strtod`** (string→double) — correctly-rounded decimal→`f64`, the parse
   direction of the existing bignum dtoa. The single keystone for *float* Lua (every float literal hits
   it); a sizeable bignum slice of its own.

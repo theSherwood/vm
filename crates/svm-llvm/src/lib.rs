@@ -436,6 +436,10 @@ fn translate_impl(
     // `__ctype_b_loc`/`__ctype_tolower_loc`/`__ctype_toupper_loc`, e.g. Embench `slre`). Placed after the
     // globals (and below the data stack) so a `run`-only module needs no `_start` to initialize them.
     let ctype = build_ctype_data(m, &defined_names, &mut data, &mut globals_end);
+    // Synthesize the C-locale `lconv` struct (+ its `"."`/`""` strings) as read-only module data when
+    // the program calls `localeconv` (Lua's locale-aware number parsing reads `decimal_point`). Placed
+    // after the globals like the ctype tables — no `_start` needed. `Some(addr)` of the struct.
+    let locale_addr = build_locale_data(m, &defined_names, &mut data, &mut globals_end);
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -528,8 +532,8 @@ fn translate_impl(
         fmod: take(need_fmod),
         frexp: take(need_frexp),
         strtod_stub: take(need_strtod),
-        localeconv_stub: take(need_localeconv),
         errno_stub: take(need_errno),
+        localeconv: take(need_localeconv),
         time_zero: take(need_time),
         float_scratch: float_scratch_base,
         ctype_b_loc: ctype.b_loc,
@@ -616,7 +620,12 @@ fn translate_impl(
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
     // stash / heap state live in the reserved low window).
-    let need_window = any_frame || !globals.is_empty() || synth || ctype.any() || eh_base.is_some();
+    let need_window = any_frame
+        || !globals.is_empty()
+        || synth
+        || ctype.any()
+        || eh_base.is_some()
+        || locale_addr.is_some();
     let memory = need_window.then(|| {
         // Reserve stack when any function (or the argv `_start`) uses the data stack.
         let mut top = if any_frame || wants_argv {
@@ -796,8 +805,9 @@ fn translate_impl(
         ));
     }
     if need_localeconv {
-        // localeconv(void) -> struct lconv*.
-        funcs.push(synth_trap_stub(vec![], vec![ValType::I64]));
+        // localeconv(void) -> struct lconv* — return the address of the synthesized C-locale struct.
+        let addr = locale_addr.expect("locale data built when need_localeconv");
+        funcs.push(synth_const_i64(vec![], addr as i64));
     }
     if need_errno {
         // __errno_location(void) -> int*.
@@ -1415,6 +1425,64 @@ fn build_ctype_data(
         addrs.toupper_loc = Some(case_table(false, data, end));
     }
     addrs
+}
+
+/// Synthesize the C/POSIX-locale `struct lconv` as **read-only module data** for a program that calls
+/// `localeconv` (Lua reads `decimal_point` in its locale-aware number parsing). Returns `Some(addr)` of
+/// the struct, or `None` if unused. The struct's pointer fields hold absolute window addresses of the
+/// `"."`/`""` strings laid out alongside it (resolved at translate time, so no runtime relocation).
+///
+/// The LP64 glibc layout is ten `char*` fields (80 bytes) followed by fourteen `char` fields (offsets
+/// 80..=93). The C locale sets `decimal_point="."`, every other string `""`, and every numeric/monetary
+/// `char` field to `CHAR_MAX` (127, "unspecified"), matching what native `localeconv` returns with no
+/// `setlocale`.
+fn build_locale_data(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    data: &mut Vec<svm_ir::Data>,
+    end: &mut u64,
+) -> Option<u64> {
+    if !calls_external(m, defined, "localeconv") {
+        return None;
+    }
+    // Read-only region — page-isolate from any preceding writable global (D40), like `build_ctype_data`.
+    *end = end.div_ceil(STACK_PAGE) * STACK_PAGE;
+    // The `"."` and `""` strings.
+    let dot = *end;
+    data.push(svm_ir::Data {
+        offset: dot,
+        readonly: true,
+        bytes: vec![b'.', 0],
+    });
+    let empty = dot + 2;
+    data.push(svm_ir::Data {
+        offset: empty,
+        readonly: true,
+        bytes: vec![0],
+    });
+    // The struct itself, 8-aligned (its first field is a pointer).
+    let s = (empty + 1).div_ceil(8) * 8;
+    let mut bytes = vec![0u8; 96];
+    // Ten `char*` fields: decimal_point → ".", the rest → "".
+    for (i, &p) in [
+        dot, empty, empty, empty, empty, empty, empty, empty, empty, empty,
+    ]
+    .iter()
+    .enumerate()
+    {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&p.to_le_bytes());
+    }
+    // Fourteen `char` fields (offsets 80..=93) = CHAR_MAX (the C-locale "unspecified" sentinel).
+    for b in bytes.iter_mut().take(94).skip(80) {
+        *b = 127;
+    }
+    data.push(svm_ir::Data {
+        offset: s,
+        readonly: true,
+        bytes,
+    });
+    *end = s + 96;
+    Some(s)
 }
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
@@ -3535,11 +3603,15 @@ struct Helpers {
     /// inf/nan: `*eptr=0`, returns `x+x`).
     frexp: Option<u32>,
     /// More fail-closed stubs: `strtod` (string→double — not exercised by an integer-only path),
-    /// `localeconv`/`__errno_location` (locale + errno). Translate, trap if run. (`snprintf` is real —
-    /// it reuses the `printf` engine, see [`lower_snprintf`].)
+    /// Fail-closed trap stubs: `strtod` (string→double — the bignum parse slice) and
+    /// `__errno_location` (a writable `errno` slot — bundled with `strtod`, which is where it is set;
+    /// it needs the powerbox page-0 layout, so it stays stubbed until then). Translate, trap if run.
     strtod_stub: Option<u32>,
-    localeconv_stub: Option<u32>,
     errno_stub: Option<u32>,
+    /// `localeconv()` → the address of a synthesized read-only C-locale `lconv` struct
+    /// (`decimal_point="."`, the other strings `""`, the numeric/monetary `char` fields `CHAR_MAX`),
+    /// laid out as module data by [`build_locale_data`]. A `synth_const_i64` returning that address.
+    localeconv: Option<u32>,
     /// `time(t)` — the RNG seed source in `makeseed`; executed during state creation but the seed does
     /// not affect a deterministic script's result, so a constant `0` suffices (a real `Clock` cap later).
     time_zero: Option<u32>,
@@ -11219,9 +11291,9 @@ fn lower_io_call(
             lower_snprintf(ctx, c)?;
             Ok(true)
         }
-        // `localeconv()` / `__errno_location()`: fail-closed trap stubs (locale + errno, no-arg → ptr).
+        // `localeconv()`: returns the synthesized read-only C-locale `lconv` struct address.
         "localeconv" => {
-            let Some(f) = ctx.helpers.localeconv_stub else {
+            let Some(f) = ctx.helpers.localeconv else {
                 return Ok(false);
             };
             let r = ctx.push(Inst::Call {

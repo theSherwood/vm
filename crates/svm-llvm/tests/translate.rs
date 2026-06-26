@@ -2119,6 +2119,28 @@ fn libc_fmod_bit_exact() {
 }
 
 #[test]
+fn libc_localeconv_c_locale() {
+    // `localeconv()` returns the synthesized read-only C-locale `lconv` struct. Read `decimal_point`
+    // (".", plus its NUL), an empty string field (`thousands_sep`/`grouping` → ""), and two of the
+    // `char` fields (`frac_digits`/`p_sign_posn` → CHAR_MAX). With no `setlocale`, native runs in the
+    // "C" locale, so every field matches the synthesized struct — same byte on all three engines.
+    let src = "#include <locale.h>\n\
+        int run(int seed){\n\
+          struct lconv *lc = localeconv();\n\
+          int acc = 0;\n\
+          acc += (unsigned char)lc->decimal_point[0];\n\
+          acc += (unsigned char)lc->decimal_point[1];\n\
+          acc += (unsigned char)lc->thousands_sep[0];\n\
+          acc += (unsigned char)lc->grouping[0];\n\
+          acc += (lc->frac_digits & 0xff);\n\
+          acc += (lc->p_sign_posn & 0xff);\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_localeconv", src, 0);
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
