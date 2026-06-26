@@ -4167,6 +4167,19 @@ pub const STATE_REWINDING: i32 = 2;
 /// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
 /// the instrumented IR (which tests only `UNWINDING`/`REWINDING`). Must equal `svm_durable::STATE_ARMED`.
 pub const STATE_ARMED: i32 = 3;
+
+/// §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). Reads the global durable **freeze** word at
+/// [`STATE_OFF`] from the live window image: `true` iff an async stop-the-world freeze has already
+/// landed ([`STATE_UNWINDING`]). A durable vCPU about to enter a host `Blocking` call consults this and
+/// fails **closed** rather than starting an un-checkpointable, latency-unbounded offload (R6); cancelling
+/// an *already in-flight* call is deferred (R2). `false` for a non-durable / malformed window (no word),
+/// so the caller also gates on [`Host::is_durable`].
+fn freeze_has_landed(mem: Option<&dyn GuestMem>) -> bool {
+    mem.and_then(|m| m.read_bytes(STATE_OFF, 4))
+        .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+        .map(|b| i32::from_le_bytes(b) == STATE_UNWINDING)
+        .unwrap_or(false)
+}
 /// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
 /// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
 /// `svm_durable::ARM_COUNTDOWN_OFF`.
@@ -10320,6 +10333,18 @@ impl Host {
             // on the offload pool. Either way the result is the same deterministic transform.
             Binding::Blocking(idx) => match op {
                 0 => {
+                    // §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). If an async STW freeze has
+                    // already landed (the global freeze word reads `UNWINDING`), a durable vCPU must
+                    // not *enter* a new blocking host call: it can't be checkpointed and would extend
+                    // snapshot latency by the whole call (R6). Fail **closed** — the freeze refuses —
+                    // mirroring the `thread.wait` deadlock fail-closed (`Trap::ThreadFault`). Gated on
+                    // `is_durable` so a non-durable guest's byte at window offset 0 can't spuriously
+                    // refuse; cancelling an *already in-flight* call is deferred (R2). Both backends
+                    // funnel through here (the JIT via `svm-run`'s `cap_thunk`), so the refusal is
+                    // backend-agnostic by construction.
+                    if self.is_durable() && freeze_has_landed(mem.as_deref()) {
+                        return Err(Trap::ThreadFault);
+                    }
                     let arg = *args.first().unwrap_or(&0);
                     Ok(vec![self.blockings[idx as usize].run(arg)])
                 }
