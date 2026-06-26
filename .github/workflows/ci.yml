@@ -330,3 +330,41 @@ jobs:
           EMBENCH_STRICT: "1"
         run: cargo run --release --example embench --manifest-path crates/svm-llvm/Cargo.toml
 
+  cross-engine-differential:
+    # Soundness gate for the cross-engine bench harness (crates/svm-llvm/examples/cross_engine.rs).
+    # It runs each kernel's LLVM-frontend IR on the bytecode engine *compiled to wasm* (the
+    # `svm-bytecode-wasm` row, via browser/bench.mjs on Node) and cross-checks every result against
+    # native bytecode. The harness prints `MISCOMPILE` on a mismatch but doesn't itself exit non-zero,
+    # so this step greps for it — and asserts the row actually ran, so a missing cdylib/node can't pass
+    # silently. Linux-only, like `svm-llvm` (the on-ramp links libLLVM). The perf numbers it also prints
+    # are informational — the perf signal is the separate non-gating `bench` job.
+    name: cross-engine differential (svm-bytecode-wasm vs native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            crates/svm-llvm
+            browser
+      - name: install LLVM 18 (libLLVM for the on-ramp + clang for the kernels)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - run: rustup target add wasm32-unknown-unknown
+      - name: build the svm-browser wasm32 cdylib (so the svm-bytecode-wasm row runs)
+        run: cargo build --release --lib --target wasm32-unknown-unknown --manifest-path browser/Cargo.toml
+      - name: cross-engine differential (MISCOMPILE ⇒ red)
+        run: |
+          set -o pipefail
+          cargo run --release --example cross_engine --manifest-path crates/svm-llvm/Cargo.toml 2>&1 | tee xe.log
+          if grep -q MISCOMPILE xe.log; then
+            echo "::error::cross-engine differential found a MISCOMPILE"; exit 1
+          fi
+          if ! grep -q '^svm-bytecode-wasm,' xe.log; then
+            echo "::error::svm-bytecode-wasm row did not run (node or svm-browser cdylib missing?)"; exit 1
+          fi
+
