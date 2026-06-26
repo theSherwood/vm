@@ -1936,6 +1936,71 @@ fn libc_strcpy_strspn_strpbrk() {
 }
 
 #[test]
+fn cross_block_i1_mask() {
+    // A `<2 x i1>` mask defined in one block and `extractelement`-d in *both* successors — the shape
+    // clang's SLP vectorizer emits for fused byte-tests (Lua's GC `atomic`). Regression for masks
+    // crossing block boundaries: they are now held in the `agg` table with an `[i32; N]` layout, so
+    // the per-lane fan-out in `block_params`/`branch_args` threads them across edges. Hand-written
+    // LLVM so the cross-block shape is guaranteed regardless of the optimizer. Expected per seed:
+    // a=seed&0xff; lane0=(a&1==0), lane1=(a&2==0); l0 ? (lane1?1:2) : (lane1?4:8).
+    let ll = "\
+target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-linux-gnu\"\n\
+define i32 @run(i32 %seed) {\n\
+entry:\n\
+  %a = trunc i32 %seed to i8\n\
+  %v0 = insertelement <2 x i8> undef, i8 %a, i64 0\n\
+  %v = insertelement <2 x i8> %v0, i8 %a, i64 1\n\
+  %m = and <2 x i8> %v, <i8 1, i8 2>\n\
+  %mask = icmp eq <2 x i8> %m, zeroinitializer\n\
+  %l0 = extractelement <2 x i1> %mask, i64 0\n\
+  br i1 %l0, label %then, label %else\n\
+then:\n\
+  %l1t = extractelement <2 x i1> %mask, i64 1\n\
+  %rt = select i1 %l1t, i32 1, i32 2\n\
+  br label %done\n\
+else:\n\
+  %l1e = extractelement <2 x i1> %mask, i64 1\n\
+  %re = select i1 %l1e, i32 4, i32 8\n\
+  br label %done\n\
+done:\n\
+  %r = phi i32 [ %rt, %then ], [ %re, %else ]\n\
+  ret i32 %r\n\
+}\n";
+    let dir = std::env::temp_dir();
+    let llf = dir.join(format!("svm_mask_{}.ll", std::process::id()));
+    let bcf = dir.join(format!("svm_mask_{}.bc", std::process::id()));
+    std::fs::write(&llf, ll).unwrap();
+    match Command::new("llvm-as").arg(&llf).arg("-o").arg(&bcf).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping cross_block_i1_mask (llvm-as unavailable)");
+            return;
+        }
+    }
+    let t = svm_llvm::translate_bc_path(&bcf).expect("translate mask bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    for (seed, expect) in [(0i32, 1i32), (1, 4), (2, 2), (3, 8)] {
+        let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+        let mut fuel = 1_000_000u64;
+        let tw = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+        assert_eq!(tw.first(), Some(&Value::I32(expect)), "tree-walker seed={seed}");
+        let mut bf = 1_000_000u64;
+        let bc = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bf)
+            .expect("bytecode compile")
+            .expect("bytecode run");
+        assert_eq!(bc.first(), Some(&Value::I32(expect)), "bytecode seed={seed}");
+        let slots: Vec<i64> = full.iter().map(to_slot).collect();
+        match svm_jit::compile_and_run(&module, 0, &slots) {
+            Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, expect, "JIT seed={seed}"),
+            Ok(o) => panic!("unexpected JIT outcome {o:?}"),
+            Err(e) => panic!("JIT error {e:?}"),
+        }
+    }
+}
+
+#[test]
 fn libc_abort_translates() {
     // C `abort()` on an unexecuted error path: it must *translate* (drop → the following `unreachable`
     // traps) even though the clean run never reaches it. `seed` is a runtime parameter, so clang keeps

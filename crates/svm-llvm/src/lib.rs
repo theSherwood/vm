@@ -2098,9 +2098,17 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                         }
                         ValType::I64
                     }
-                    // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
-                    // `mask_lanes`, never used as a scalar — record a placeholder type.
-                    Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
+                    // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is held lane-wise as `N` `i32`
+                    // `0`/`1` scalars in the `agg` side-table — exactly like a flat `N`-field struct, so
+                    // recording an `[i32; N]` `agg_layout` lets the mask **cross block edges** via the
+                    // per-field fan-out in `block_params`/`branch_args` (clang's auto-vectorizer can
+                    // produce a mask in one block and `extractelement` its lanes in successors — e.g.
+                    // Lua's GC fuses two byte-tests into a `<2 x i8>` compare). Placeholder scalar `i32`.
+                    Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => {
+                        let n = i1_vector_lanes(ty.as_ref()).unwrap();
+                        s.agg_layout.insert(id, vec![ValType::I32; n]);
+                        ValType::I32
+                    }
                     // An `i128` result is held as a 2×`i64` aggregate pair `(lo, hi)` (the unified
                     // `agg`-pair representation, shared with `load i128` / `icmp i128` / the tier-3
                     // `lower_i128` ops). Recording an `[i64, i64]` `agg_layout` — exactly like a flat
@@ -12628,12 +12636,6 @@ struct BlockCtx<'a> {
     /// several IR values — but, unlike `agg`, these *do* cross block boundaries (a vectorized loop's
     /// wide accumulator), fanned out into per-part block params by `block_params`/`branch_args`.
     wide_vals: HashMap<ValueId, Vec<ValIdx>>,
-    /// Scalarized boolean-mask SSA values (`<N x i1>`, from a vector `icmp`/`fcmp`): value-id → its
-    /// `N` per-lane `i1` scalars (each `0`/`1` in an `i32` container). svm-ir has no first-class
-    /// `<N x i1>` type, so a mask is held lane-wise — `select` selects per lane, `extractelement`
-    /// reads a lane, `bitcast … to iN` ORs the lanes into a bitmap. Like `agg`, assumed not to cross
-    /// block boundaries (clang produces and consumes a mask in one block).
-    mask_lanes: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
     /// Set true only while lowering a block's final instruction when it is a tail-position call
     /// (`tail`/`musttail` + the block's `ret` returns exactly its result). The direct/indirect call
@@ -12705,6 +12707,15 @@ impl<'a> BlockCtx<'a> {
                     let hi = self.const_i64(0);
                     Ok(vec![lo, hi])
                 }
+                // A constant `<N x i1>` **mask** φ incoming (the mask analog of the cases above): its
+                // per-lane `i1`s materialize as `i32` `0`/`1` consts, one per `agg` field.
+                Constant::Vector(elems) if elems.len() == ftys.len() => Ok(elems
+                    .iter()
+                    .map(|e| {
+                        let bit = matches!(e.as_ref(), Constant::Int { value: 1, .. }) as i32;
+                        self.push(Inst::ConstI32(bit))
+                    })
+                    .collect()),
                 other => unsup(format!("aggregate φ constant incoming {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata struct operand"),
@@ -13311,7 +13322,6 @@ fn translate_block(
         idx_of: HashMap::new(),
         agg: HashMap::new(),
         wide_vals: HashMap::new(),
-        mask_lanes: HashMap::new(),
         next_val: 0,
         tail_return: false,
         pending_tail: None,
@@ -15688,7 +15698,7 @@ fn mask_operand(ctx: &mut BlockCtx, op: &Operand, n: usize) -> Result<Vec<ValIdx
                 .name2id
                 .get(name)
                 .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
-            ctx.mask_lanes.get(&vid).cloned().ok_or_else(|| {
+            ctx.agg.get(&vid).cloned().ok_or_else(|| {
                 Error::Unsupported(format!("mask value {vid} not available in block"))
             })
         }
@@ -15900,10 +15910,12 @@ fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
     }
 }
 
-/// Record `dest`'s scalarized mask lanes (the `<N x i1>` analog of [`BlockCtx::bind_wide`]).
+/// Record `dest`'s scalarized mask lanes. A mask's `N` lanes live in the `agg` table (an `[i32; N]`
+/// `agg_layout` is recorded in `scan_func`), so the value crosses block edges via the per-field
+/// fan-out in `block_params`/`branch_args` — the `<N x i1>` analog of [`BlockCtx::bind_wide`].
 fn bind_mask(ctx: &mut BlockCtx, dest: &Name, lanes: Vec<ValIdx>) {
     if let Some(&vid) = ctx.s.name2id.get(dest) {
-        ctx.mask_lanes.insert(vid, lanes);
+        ctx.agg.insert(vid, lanes);
     }
 }
 

@@ -1214,11 +1214,18 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    `Unsupported("varargs call without reserved scratch")`. Fixed by reserving ≥1 slot whenever a
    function makes any varargs call; regression test `varargs_zero_variadic`.
 
-**Next Lua blocker (past the libc layer):** with the libc batch above in place, the Lua-core
-translation advances into the VM/runtime functions and hits `Unsupported("value N not available in
-block")` — a **liveness / block-param threading** miss in a large Lua function (the generic `id()`
-value resolution), *not* a libc gap. This is the next investigation: a translator-internals
-threading issue surfaced by Lua's real control flow, independent of the varargs/libc work.
+**Cross-block `<N x i1>` masks — DONE (translator bug Lua surfaced).** With the libc batch in place the
+Lua-core translation reached the GC `atomic` function and failed with `Unsupported("value N not
+available in block")`. Root cause: clang's SLP vectorizer fuses two adjacent byte-tests (a `GCObject`'s
+`marked`/`tt` fields) into a `<2 x i8>` load+`and`+`icmp`, producing a **`<2 x i1>` mask** in one block
+and `extractelement`-ing its lanes in *successor* blocks. The on-ramp held masks lane-wise in a
+**block-local** `mask_lanes` table ("assumed not to cross block boundaries"). Fixed by unifying masks
+into the **`agg` side-table** with an `[i32; N]` `agg_layout` (exactly like the i128 `(lo,hi)` pair), so
+a mask fans out into per-lane block params and threads across edges via the existing
+`block_params`/`branch_args` machinery; `agg_operand` also learned the constant-`<N x i1>` φ-incoming
+case. `mask_lanes` is gone. Regression test `cross_block_i1_mask` (hand-written LLVM, all three engines
+× 4 seeds). 222 translate tests green. After this, the Lua-core translation advances past `atomic` to
+the next libc gap (`pow`).
 
 **Sequencing:** (slice 1 — **DONE**) varargs ABI + standalone differential tests; (slice 2 — in
 progress) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test
