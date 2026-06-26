@@ -13,12 +13,21 @@
 //! expected output) — so this is a benchmark *and* a whole-stack differential on real third-party code.
 //!
 //! **Cross-engine (svm-jit vs V8 vs Wasmtime).** The headline `svm-jit` ratio is reported alongside two
-//! external JITs running the *same* kernel: each wrapper also compiles to a self-contained **wasm32**
-//! module (`run` export, no imports — via the freestanding shim in `bench/embench/wasm/`, `-mbulk-memory`
-//! so memcpy/memset are wasm instructions, `--gc-sections` to drop dead `printf`/libc), timed on **V8**
-//! (Node, `bench/embench/wasm/run.mjs`) and **Wasmtime** (in-process Cranelift — the same backend
-//! svm-jit uses — via `bench/cross-engine/wasmtime-rs`'s `embench_one` bin). Both are optional: a missing
-//! `node`/runner just leaves that column blank. All engines' `verify` is still checked against native.
+//! external JITs running the *same* kernel, each compiled at **both wasm memory widths**: a self-contained
+//! `wasm32` *and* `wasm64`/memory64 module (`run` export, no imports — via the freestanding shim in
+//! `bench/embench/wasm/`, `-mbulk-memory` so memcpy/memset are wasm instructions, `--gc-sections` to drop
+//! dead `printf`/libc), each timed on **V8** (Node, `bench/embench/wasm/run.mjs`) and **Wasmtime**
+//! (in-process Cranelift — the same backend svm-jit uses — via `bench/cross-engine/wasmtime-rs`'s
+//! `embench_one` bin) → the `v8/w32`, `v8/w64`, `wt/w32`, `wt/w64` columns. Each is optional: a missing
+//! `node`/runner or failed build just leaves that one column blank. All engines' `verify` is checked
+//! against native at every width.
+//!
+//! **Why two widths.** svm-jit consumes the *host* `-O2` bitcode, where `long` is 64-bit (LP64). `wasm32`
+//! makes `long` 32-bit (ILP32), which lets LLVM's wasm frontend auto-vectorize kernels svm-jit can't
+//! (e.g. matmult's `long[][]` → `<4 x i32>`) — so `wasm32` is a *different program* and flatters the wasm
+//! engines. `wasm64` keeps `long` 64-bit, matching the host widths exactly: `wt/w64` is therefore the
+//! honest Cranelift-vs-Cranelift comparison (same IR widths, same backend). Under wasm64 `long run(long)`
+//! is `i64(i64)`; the runners auto-detect the arg width (V8 needs BigInt, Wasmtime needs `Val::I64`).
 
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -177,14 +186,19 @@ fn main() {
     let have_wt = wt_bin.exists();
 
     println!(
-        "{:<16} {:>11} {:>9} {:>9} {:>9}   correctness   (×native)",
-        "benchmark", "native(ns)", "svm-jit", "v8", "wasmtime"
+        "{:<16} {:>11} {:>8} {:>8} {:>8} {:>8} {:>8}   correctness   (×native)",
+        "benchmark", "native(ns)", "svm-jit", "v8/w32", "v8/w64", "wt/w32", "wt/w64"
     );
-    // Per-engine perf ratios vs native (geomean at the end). svm-jit always present; v8/wasmtime only
-    // for kernels whose wasm built and whose runner is available.
+    // Per-engine perf ratios vs native (geomean at the end). svm-jit always present; the V8/Wasmtime
+    // columns appear per kernel whose wasm built and whose runner is available, at BOTH memory widths:
+    // `w32` is wasm32 (`long` 32-bit, often auto-vectorized — not the program svm-jit runs) and `w64` is
+    // wasm64/memory64 (`long` 64-bit, LP64 — the same widths as the host bitcode svm-jit consumes, so
+    // `wt/w64` is the apples-to-apples Cranelift-vs-Cranelift comparison).
     let mut jit_ratios = Vec::new();
-    let mut v8_ratios = Vec::new();
-    let mut wt_ratios = Vec::new();
+    let mut v8_32_ratios = Vec::new();
+    let mut v8_64_ratios = Vec::new();
+    let mut wt_32_ratios = Vec::new();
+    let mut wt_64_ratios = Vec::new();
     for bench in BENCHES {
         let &Bench {
             name,
@@ -318,60 +332,73 @@ fn main() {
             svm_jit::JitOutcome::Returned(v) => v[0],
             o => panic!("jit: {o:?}"),
         };
-        // wasm32 build (shared shim) for the V8 + Wasmtime rows. Same kernel flags as the native/SVM
-        // builds via `common`; adds the freestanding-wasm shim + bulk-memory (memcpy/memset → wasm
-        // instructions) and exports only `run` (so dead `printf`/`main`/libc references get DCE'd).
-        let wasm = dir.join(format!("emb_{name}.wasm"));
-        let mut wc = Command::new("clang");
-        common(&mut wc);
-        wc.args([
-            "--target=wasm32",
-            "-msimd128",
-            "-mbulk-memory",
-            "-DSVM_BUILD",
-            "-fno-builtin-memcmp",
-            "-fno-builtin-bcmp",
-            "-fno-builtin-strlen",
-            "-fno-builtin-strchr",
-            "-fno-builtin-strcmp",
-            "-nostdlib",
-            "-Wl,--no-entry",
-            "-Wl,--export=run",
-            "-Wl,--gc-sections",
-        ])
-        .arg("-include")
-        .arg(wasm_dir.join("defs.h"))
-        .arg("-isystem")
-        .arg(wasm_dir.join("include"))
-        .arg(&wrapper)
-        .arg("-o")
-        .arg(&wasm)
-        .stderr(std::process::Stdio::null());
-        let wasm_ok = wc.status().map(|s| s.success()).unwrap_or(false);
-        let v8 = if wasm_ok && have_node {
-            time_wasm(Command::new("node").arg(&run_mjs), &wasm, large)
-        } else {
-            None
+        // wasm builds (shared freestanding shim) for the V8 + Wasmtime rows, at BOTH memory widths.
+        // Same kernel flags as the native/SVM builds via `common`; adds the shim + bulk-memory
+        // (memcpy/memset → wasm instructions) and exports only `run` (so dead `printf`/`main`/libc get
+        // DCE'd). wasm32: `long` is 32-bit (ILP32) — LLVM's wasm frontend frequently auto-vectorizes
+        // such kernels (e.g. matmult's `long` arrays → `<4 x i32>`), so it is *not* the same program
+        // svm-jit runs. wasm64 (memory64): `long` is 64-bit (LP64), exactly the widths of the host
+        // bitcode svm-jit consumes — the honest cross-engine comparison.
+        let build_wasm = |target: &str, out: &std::path::Path| {
+            let mut wc = Command::new("clang");
+            common(&mut wc);
+            wc.arg(format!("--target={target}"))
+                .args([
+                    "-msimd128",
+                    "-mbulk-memory",
+                    "-DSVM_BUILD",
+                    "-fno-builtin-memcmp",
+                    "-fno-builtin-bcmp",
+                    "-fno-builtin-strlen",
+                    "-fno-builtin-strchr",
+                    "-fno-builtin-strcmp",
+                    "-nostdlib",
+                    "-Wl,--no-entry",
+                    "-Wl,--export=run",
+                    "-Wl,--gc-sections",
+                ])
+                .arg("-include")
+                .arg(wasm_dir.join("defs.h"))
+                .arg("-isystem")
+                .arg(wasm_dir.join("include"))
+                .arg(&wrapper)
+                .arg("-o")
+                .arg(out)
+                .stderr(std::process::Stdio::null());
+            wc.status().map(|s| s.success()).unwrap_or(false)
         };
-        let wt = if wasm_ok && have_wt {
-            time_wasm(&mut Command::new(&wt_bin), &wasm, large)
-        } else {
-            None
-        };
+        let wasm32 = dir.join(format!("emb_{name}.32.wasm"));
+        let wasm64 = dir.join(format!("emb_{name}.64.wasm"));
+        let w32_ok = build_wasm("wasm32", &wasm32);
+        let w64_ok = build_wasm("wasm64", &wasm64);
+        // The runners auto-detect the `run` arg width (i32 vs i64), so the same node/wasmtime driver
+        // times either module. A missing build or runner just leaves that one column blank.
+        let v8_32 = (w32_ok && have_node)
+            .then(|| time_wasm(Command::new("node").arg(&run_mjs), &wasm32, large))
+            .flatten();
+        let v8_64 = (w64_ok && have_node)
+            .then(|| time_wasm(Command::new("node").arg(&run_mjs), &wasm64, large))
+            .flatten();
+        let wt_32 = (w32_ok && have_wt)
+            .then(|| time_wasm(&mut Command::new(&wt_bin), &wasm32, large))
+            .flatten();
+        let wt_64 = (w64_ok && have_wt)
+            .then(|| time_wasm(&mut Command::new(&wt_bin), &wasm64, large))
+            .flatten();
 
         // Correctness: every engine that ran must match native's verify=1 (1 = Embench-correct). An
-        // absent wasm engine (no tool / build) doesn't gate; one that ran and disagrees does. (`edn`'s
-        // old I13 lane-arithmetic miscompile is fixed; this stays a guard against any future regression.)
-        let wasm_bad = v8.is_some_and(|(_, c)| c != 1) || wt.is_some_and(|(_, c)| c != 1);
+        // absent wasm engine/width (no tool / build) doesn't gate; one that ran and disagrees does.
+        // (`edn`'s old I13 lane-arithmetic miscompile is fixed; this stays a guard against regression.)
+        let wasm_bad = [v8_32, v8_64, wt_32, wt_64]
+            .iter()
+            .any(|e| e.is_some_and(|(_, c)| c != 1));
         let ok = nat_chk == 1 && tw == nat_chk && bcv == nat_chk && jitv == nat_chk && !wasm_bad;
         if !ok {
+            let chk = |e: Option<(f64, i64)>| e.map_or(-1, |(_, c)| c);
             println!(
-                "{name:<16} {nat_ns:>11.1} {:>9} {:>9} {:>9}   MISCOMPILE nat={nat_chk} tw={tw} bc={bcv} jit={jitv} v8={} wt={}",
-                "—",
-                "—",
-                "—",
-                v8.map_or(-1, |(_, c)| c),
-                wt.map_or(-1, |(_, c)| c),
+                "{name:<16} {nat_ns:>11.1} {:>8} {:>8} {:>8} {:>8} {:>8}   MISCOMPILE nat={nat_chk} tw={tw} bc={bcv} jit={jitv} v8/w32={} v8/w64={} wt/w32={} wt/w64={}",
+                "—", "—", "—", "—", "—",
+                chk(v8_32), chk(v8_64), chk(wt_32), chk(wt_64),
             );
             continue;
         }
@@ -381,45 +408,45 @@ fn main() {
             black_box(svm_jit::compile_and_run(&t.module, e, &[sp, n]).unwrap());
         });
         jit_ratios.push((name, jit_ns / nat_ns));
-        if let Some((ns, _)) = v8 {
-            v8_ratios.push((name, ns / nat_ns));
-        }
-        if let Some((ns, _)) = wt {
-            wt_ratios.push((name, ns / nat_ns));
+        for (slot, e) in [
+            (&mut v8_32_ratios, v8_32),
+            (&mut v8_64_ratios, v8_64),
+            (&mut wt_32_ratios, wt_32),
+            (&mut wt_64_ratios, wt_64),
+        ] {
+            if let Some((ns, _)) = e {
+                slot.push((name, ns / nat_ns));
+            }
         }
         let ratio = |x: Option<(f64, i64)>| {
             x.map_or_else(|| "—".to_string(), |(ns, _)| format!("{:.2}x", ns / nat_ns))
         };
         println!(
-            "{name:<16} {nat_ns:>11.1} {:>9} {:>9} {:>9}   OK (verify=1)",
+            "{name:<16} {nat_ns:>11.1} {:>8} {:>8} {:>8} {:>8} {:>8}   OK (verify=1)",
             format!("{:.2}x", jit_ns / nat_ns),
-            ratio(v8),
-            ratio(wt),
+            ratio(v8_32),
+            ratio(v8_64),
+            ratio(wt_32),
+            ratio(wt_64),
         );
     }
     let geomean =
         |rs: &[(&str, f64)]| (rs.iter().map(|(_, r)| r.ln()).sum::<f64>() / rs.len() as f64).exp();
     if !jit_ratios.is_empty() {
         println!("\nvs native `clang -O2`, geomean over the kernels each engine ran:");
+        let line = |label: &str, rs: &[(&str, f64)]| {
+            if !rs.is_empty() {
+                println!("  {label:<14} {:.2}x   ({} kernels)", geomean(rs), rs.len());
+            }
+        };
+        line("svm-jit", &jit_ratios);
+        line("v8 (wasm32)", &v8_32_ratios);
+        line("v8 (wasm64)", &v8_64_ratios);
+        line("wasmtime w32", &wt_32_ratios);
+        line("wasmtime w64", &wt_64_ratios);
         println!(
-            "  svm-jit   {:.2}x   ({} kernels)",
-            geomean(&jit_ratios),
-            jit_ratios.len()
+            "\n  svm-jit consumes host LP64 bitcode (`long` 64-bit); `wasmtime w64` runs the same\n  widths on the same Cranelift backend — the honest cross-engine comparison. `wasm32` columns\n  show how much the wasm frontend gains from 32-bit `long` auto-vectorization on these kernels."
         );
-        if !v8_ratios.is_empty() {
-            println!(
-                "  v8        {:.2}x   ({} kernels)",
-                geomean(&v8_ratios),
-                v8_ratios.len()
-            );
-        }
-        if !wt_ratios.is_empty() {
-            println!(
-                "  wasmtime  {:.2}x   ({} kernels)",
-                geomean(&wt_ratios),
-                wt_ratios.len()
-            );
-        }
     }
 }
 
