@@ -179,6 +179,7 @@ use svm_ir::{
 
 pub mod blockaddr;
 pub mod di;
+pub mod wideint;
 
 /// Why a translation could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +221,16 @@ pub struct Translated {
 /// `llvm-sys` walk ([`di`]) over the same file and correlated to the IR ([`di::read_debug`]).
 pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let path = path.as_ref();
+    // I14 fail-closed guard: `llvm-ir` 0.11.3 truncates a `bits > 64` integer constant to its low
+    // word, so a wide/negative `i128` literal would silently miscompile. We can't recover the high
+    // word from the truncated AST, so reject such a module up front (clean `Unsupported`, never a
+    // miscompile). Constants that fit in `[0, 2^64)` round-trip exactly and are unaffected.
+    if let Some(c) = path.to_str().and_then(wideint::out_of_range_constant) {
+        return unsup(format!(
+            "wide integer constant `{c}`: a ≥2⁶⁴ / negative i128 literal is not supported \
+             (`llvm-ir` truncates it; fail-closed to avoid a miscompile — ISSUES.md I14)"
+        ));
+    }
     let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
     let di = path.to_str().and_then(di::read_debug);
     // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).

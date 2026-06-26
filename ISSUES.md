@@ -433,12 +433,24 @@ fail-closed, never miscompile).
    `i128_sdiv_srem` (all four sign combinations), each bit-exact interp == JIT vs a native `i128`/`u128`
    oracle.
 
-   **Remaining tail — the one item left, blocked upstream (not an on-ramp gap):** wide / negative i128
-   **constants** (≥ 2⁶⁴ unsigned). `llvm-ir` 0.11.3 stores `Constant::Int.value` in a **`u64`** and
-   **fails the whole bitcode parse** when a `bits > 64` constant doesn't fit (rather than truncating), so
-   such a constant never reaches the on-ramp; supporting it would require forking/replacing the `llvm-ir`
-   reader. Constants `< 2⁶⁴` (incl. the loop-carried φ path) already work. With div/rem landed, **i128 is
-   otherwise feature-complete** in the on-ramp.
+6. **Wide / negative i128 constants — fail-closed guard** *(LANDED — `claude/charming-johnson-pmlsnr`;
+   this was first a silent-miscompile soundness bug)*. `llvm-ir` 0.11.3 reads every integer constant
+   through `LLVMConstIntGetZExtValue`, a **`u64`** — for a `bits > 64` literal it **silently truncates**
+   to the low 64 bits on a *no-asserts* libLLVM (Ubuntu's `llvm-18` is `--assertion-mode OFF`; an
+   asserts build would instead abort). The on-ramp then materialized `(low64, 0)`, **miscompiling** any
+   i128 literal outside `[0, 2⁶⁴)` — verified: `x % (2⁶⁴+1)` ran as `x % 1 = 0`. (An earlier revision of
+   this entry wrongly said it "fails the parse"; that only holds on an asserts-enabled LLVM.) The
+   truncation is irreversible by the time we hold the AST, so the fix is a **fail-closed guard**
+   ([`wideint`], an `llvm-sys` re-walk like [`blockaddr`]/[`di`]): a module holding an i128 constant
+   `≥ 2⁶⁴` / negative is rejected with a clean `Unsupported` — never a miscompile. Constants in
+   `[0, 2⁶⁴)` (incl. the loop-carried-φ entry `0`) round-trip from the exact low word and still run.
+   Tests (`translate.rs`): `i128_wide_constant_fails_closed`, `i128_small_constant_still_runs`.
+
+   *Supporting* (not just rejecting) wide constants would need the high word, i.e. patching `llvm-ir` —
+   considered (a ~6-line vendored fork works) but **rejected as not worth vendoring ~12 k lines** of a
+   third-party crate for a rare case; the guard restores soundness in ~80 lines of our own code. If wide
+   i128 literals ever show up in real corpora, revisit the fork. With this, **i128 is feature-complete**
+   in the on-ramp modulo that fail-closed case.
 
 ---
 
