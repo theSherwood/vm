@@ -524,61 +524,135 @@ impl Compiled {
     }
 }
 
-/// One slot of a domain's `call_indirect` dispatch table: `(module, func)`, where module 0 is the
-/// primary program and `k ≥ 1` is `mods[k]` (an installed §22 unit). `None` is a trapping padding
-/// slot. The flat analogue of the tree-walker's [`crate::DomainTable`] (`module<<32 | func`).
-type Table = Vec<Option<(u32, u32)>>;
-
-/// Build a dispatch table of `2^table_log2` (at least `next_power_of_two(n_funcs)`) slots: the first
-/// `n_funcs` map to `(module 0, i)`, the rest are trapping padding (fillable by `install`).
-fn build_table(n_funcs: usize, table_log2: u8) -> Table {
-    build_table_for(n_funcs, table_log2, 0)
+/// THREADS.md 4c-domain — a domain's `call_indirect` dispatch table, **shareable + installable across
+/// parallel vCPUs** (mirrors the tree-walker's [`crate::DomainTable`]). Each slot packs `(module, func)`
+/// (`module<<32 | func`, [`super::pack_slot`]); `module == TABLE_EMPTY` is trapping padding. Dispatch is
+/// one `Acquire` load; `install` does a `Release` store, so a vCPU that observes a filled slot also
+/// observes the unit pushed into the [`ModuleSource`] before it (the install serializes under the
+/// source lock). Built once per domain (root / §14 child / coroutine); only the root's is installed into.
+struct SharedSlots {
+    slots: Box<[std::sync::atomic::AtomicU64]>,
 }
 
-/// [`build_table`] but for an arbitrary `module` index — the natural table a §14 separate-**module**
-/// child uses, whose funcs live at `dom.mods[module]` (not module 0).
-fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> Table {
-    let len = (1usize << table_log2)
-        .max(n_funcs.next_power_of_two())
-        .max(1);
-    (0..len)
-        .map(|i| (i < n_funcs).then_some((module, i as u32)))
-        .collect()
+impl SharedSlots {
+    /// `2^table_log2` (at least `next_power_of_two(n_funcs)`) slots: the first `n_funcs` map to
+    /// `(module, i)` (module 0 for the primary's natural table; a `k≥1` for a §14 separate-module
+    /// child), the rest are trapping padding (fillable by [`Domain::install`]).
+    fn new(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
+        let len = (1usize << table_log2).max(n_funcs.next_power_of_two()).max(1);
+        let slots = (0..len)
+            .map(|i| {
+                std::sync::atomic::AtomicU64::new(if i < n_funcs {
+                    super::pack_slot(module, i as u32)
+                } else {
+                    super::pack_slot(super::TABLE_EMPTY, 0)
+                })
+            })
+            .collect();
+        SharedSlots { slots }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Dispatch-path read: one `Acquire` load, paired with [`Domain::install`]'s `Release` store.
+    #[inline]
+    fn slot(&self, i: usize) -> super::TableSlot {
+        super::unpack_slot(self.slots[i].load(std::sync::atomic::Ordering::Acquire))
+    }
 }
 
-/// A running domain: its compiled modules (`mods[0]` = primary, `mods[k≥1]` = installed §22 units)
-/// plus the shared `call_indirect` dispatch table. `install` appends a unit and fills a padding slot;
-/// `uninstall` clears one. Owned by [`drive`]; vCPUs read it, and `install`/`uninstall` mutate it
-/// between op steps (cooperative single-thread, so no atomics — unlike the tree-walker's `DomainTable`).
+/// THREADS.md 4c-domain — a domain's compiled modules, **shared (`Arc`) and append-only** so installed
+/// §22 units / §14 separate-module children are visible to every parallel vCPU without invalidating
+/// references the way a growing `Vec<Compiled>` would: the modules live behind `Arc<Compiled>` (stable
+/// address) inside a `Mutex<Vec<_>>` touched only on install or a reader's local-cache miss. `mods[0]`
+/// is the primary; `k≥1` is an installed unit. A §14 child / coroutine shares the root's `ModuleSource`
+/// (so its table's module indices resolve) but carries its own [`SharedSlots`].
+struct ModuleSource {
+    mods: std::sync::Mutex<Vec<std::sync::Arc<Compiled>>>,
+}
+
+impl ModuleSource {
+    fn new(primary: Compiled) -> ModuleSource {
+        ModuleSource {
+            mods: std::sync::Mutex::new(vec![std::sync::Arc::new(primary)]),
+        }
+    }
+
+    /// A fresh clone of the module `Arc`s — a vCPU's lock-free local cache (cheap refcount bumps),
+    /// refreshed on a miss. The lock acquire pairs with `install`'s push, so the snapshot sees it.
+    fn snapshot(&self) -> Vec<std::sync::Arc<Compiled>> {
+        self.mods.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Build a §14 child / coroutine's natural dispatch table over its `module` in the shared source.
+fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
+    SharedSlots::new(n_funcs, table_log2, module)
+}
+
+/// Build the primary's natural module-0 dispatch table.
+fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
+    SharedSlots::new(n_funcs, table_log2, 0)
+}
+
+/// A running domain (THREADS.md 4c-domain): its shared [`ModuleSource`] (`mods[0]` = primary, `k≥1` =
+/// installed §22 units / §14 child modules) plus its own [`SharedSlots`] `call_indirect` dispatch table.
+/// Both parts are interior-mutable + thread-safe, so a **parallel** driver can share `&Domain` across
+/// vCPU threads and still `install`; the cooperative path is single-threaded (uncontended atomics/lock,
+/// so dispatch order — hence determinism — is unchanged). A §14 child / coroutine shares the root's
+/// `source` (its table's module indices resolve there) but carries its own `table`.
 struct Domain {
-    mods: Vec<Compiled>,
-    table: Table,
+    source: std::sync::Arc<ModuleSource>,
+    table: SharedSlots,
 }
 
 impl Domain {
     fn new(primary: Compiled, table_log2: u8) -> Domain {
-        let table = build_table(primary.progs.len(), table_log2);
+        let table = SharedSlots::new(primary.progs.len(), table_log2, 0);
         Domain {
-            mods: vec![primary],
+            source: std::sync::Arc::new(ModuleSource::new(primary)),
             table,
         }
     }
 
-    /// `Jit.install`: append `unit` (its module id = `mods.len()`), fill the first padding slot with
-    /// `(module, 0)`, and return that slot — or `None` if the table is full (`-ENOSPC`).
-    fn install(&mut self, unit: Compiled) -> Option<usize> {
-        let slot = self.table.iter().position(|e| e.is_none())?;
-        let module = self.mods.len() as u32;
-        self.mods.push(unit);
-        self.table[slot] = Some((module, 0));
+    /// A §14 child / coroutine domain over a sub-table of the **shared** `source` (the root's modules)
+    /// with its own dispatch `table`. `source` is cloned (`Arc`) so installed/granted modules resolve.
+    fn child(source: std::sync::Arc<ModuleSource>, table: SharedSlots) -> Domain {
+        Domain { source, table }
+    }
+
+    /// `Jit.install`: append `unit` to the shared source and fill the first padding slot with
+    /// `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit is not
+    /// appended). `&self` (interior-mutable) so a shared `&Domain` can install. The whole op serializes
+    /// under the source lock, and the slot store is `Release`, so a reader that observes the slot also
+    /// observes the pushed unit.
+    fn install(&self, unit: Compiled) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        let mut mods = self.source.mods.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self
+            .table
+            .slots
+            .iter()
+            .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
+        mods.push(std::sync::Arc::new(unit));
+        let module = (mods.len() - 1) as u32;
+        self.table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
         Some(slot)
     }
 
     /// `Jit.uninstall`: clear a filled padding slot (`≥ n_real`) back to trapping, returning success.
-    /// A real-function slot (`< n_real`), out-of-range, or already-empty slot is rejected.
-    fn uninstall(&mut self, slot: usize, n_real: usize) -> bool {
-        if slot >= n_real && slot < self.table.len() && self.table[slot].is_some() {
-            self.table[slot] = None;
+    /// A real-function slot (`< n_real`), out-of-range, or already-empty slot is rejected. The unit
+    /// stays in `source` (append-only); only the slot is reclaimed. Serialized under the source lock.
+    fn uninstall(&self, slot: usize, n_real: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let _g = self.source.mods.lock().unwrap_or_else(|e| e.into_inner());
+        if slot >= n_real
+            && slot < self.table.slots.len()
+            && (self.table.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != super::TABLE_EMPTY
+        {
+            self.table.slots[slot].store(super::pack_slot(super::TABLE_EMPTY, 0), Ordering::Release);
             true
         } else {
             false
@@ -4568,8 +4642,7 @@ impl Vm {
     /// is also what a future blocking-op / debug-stop seam will do before yielding.
     fn resume(
         &mut self,
-        mods: &[Compiled],
-        table: &Table,
+        dom: &Domain,
         fuel: &mut u64,
         mem: &mut Option<Mem>,
         host: &mut HostCell,
@@ -4579,9 +4652,25 @@ impl Vm {
         let mut cur = self.cur;
         let mut base = self.base;
         let mut pc = self.pc;
-        // The current module's compiled program, re-bound only when an activation crosses modules
-        // (cross-module `call_indirect` / its return) — so the per-op hot path is unchanged.
-        let mut c: &Compiled = &mods[module];
+        // THREADS.md 4c-domain: the shared module source is read through a per-vCPU **lock-free local
+        // cache** (`Arc` clones), refreshed only on a miss (a unit installed since the last sync). The
+        // active module is held as an owned `Arc<Compiled>` (`c`) — independent of `local`, so a refresh
+        // can't invalidate it — re-resolved only when an activation crosses modules (so the per-op hot
+        // path, `c.*` via `Arc` deref, is unchanged). `resolve!` returns the `Arc` for a module index.
+        let mut local: Vec<std::sync::Arc<Compiled>> = dom.source.snapshot();
+        macro_rules! resolve {
+            ($m:expr) => {{
+                let m = $m as usize;
+                if m >= local.len() {
+                    local = dom.source.snapshot(); // miss: a module installed since last sync
+                }
+                match local.get(m) {
+                    Some(a) => std::sync::Arc::clone(a),
+                    None => return Err(Trap::Malformed), // forged/stale module index (defensive)
+                }
+            }};
+        }
+        let mut c: std::sync::Arc<Compiled> = resolve!(module);
 
         macro_rules! r {
             ($i:expr) => {
@@ -4854,7 +4943,7 @@ impl Vm {
                     cur = point.cur;
                     base = point.base;
                     pc = point.pc;
-                    c = &mods[module];
+                    c = resolve!(module);
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
@@ -4884,17 +4973,19 @@ impl Vm {
                     // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
                     // padding slot or a signature mismatch is an inert IndirectCallType trap. The
                     // target may be an installed §22 unit (a different module) — a cross-module call.
-                    let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
-                    let (tmod, tfunc) = match table[slot] {
-                        Some(e) => (e.0 as usize, e.1 as usize),
-                        None => return Err(Trap::IndirectCallType),
-                    };
-                    let (cp, cr) = &mods[tmod].sigs[tfunc];
+                    let slot = (r!(*idx).i32() as u32 as usize) & (dom.table.len() - 1);
+                    let ts = dom.table.slot(slot);
+                    if ts.module == super::TABLE_EMPTY {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                    let tm = resolve!(tmod);
+                    let (cp, cr) = &tm.sigs[tfunc];
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
                     let nb = base + c.progs[cur].nslots as usize;
-                    let need = nb + mods[tmod].progs[tfunc].nslots as usize;
+                    let need = nb + tm.progs[tfunc].nslots as usize;
                     if self.regs.len() < need {
                         self.regs.resize(need, Reg::default());
                     }
@@ -4905,7 +4996,7 @@ impl Vm {
                         .push((module, cur, base, pc + 1, base + *dst as usize));
                     if tmod != module {
                         module = tmod;
-                        c = &mods[tmod];
+                        c = tm;
                     }
                     cur = tfunc;
                     base = nb;
@@ -4927,7 +5018,7 @@ impl Vm {
                         }
                         if cmod != module {
                             module = cmod;
-                            c = &mods[cmod];
+                            c = resolve!(cmod);
                         }
                         cur = cprog;
                         base = cbase;
@@ -4959,16 +5050,18 @@ impl Vm {
                     want_params,
                     want_results,
                 } => {
-                    let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
-                    let (tmod, tfunc) = match table[slot] {
-                        Some(e) => (e.0 as usize, e.1 as usize),
-                        None => return Err(Trap::IndirectCallType),
-                    };
-                    let (cp, cr) = &mods[tmod].sigs[tfunc];
+                    let slot = (r!(*idx).i32() as u32 as usize) & (dom.table.len() - 1);
+                    let ts = dom.table.slot(slot);
+                    if ts.module == super::TABLE_EMPTY {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                    let tm = resolve!(tmod);
+                    let (cp, cr) = &tm.sigs[tfunc];
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
-                    let need = base + mods[tmod].progs[tfunc].nslots as usize;
+                    let need = base + tm.progs[tfunc].nslots as usize;
                     if self.regs.len() < need {
                         self.regs.resize(need, Reg::default());
                     }
@@ -4981,7 +5074,7 @@ impl Vm {
                     }
                     if tmod != module {
                         module = tmod;
-                        c = &mods[tmod];
+                        c = tm;
                     }
                     cur = tfunc;
                     pc = 0;
