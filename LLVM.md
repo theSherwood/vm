@@ -584,9 +584,10 @@ Notes:
   (constant) format string at translate time and lowers each conversion to int→string / float→string
   helpers → `Stream.write`; only the bytes cross the boundary. `%f` pulls in float formatting (defer
   to demo 3/6 if demo 1 stays integer/hex). Non-constant format strings stay `Unsupported`.
-- **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
-  `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
-  already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
+- **transcendentals/libm**: a **guest** `libm` (guest code, not a host math capability) — keeps math
+  in the sandbox. `sqrt` lowers to the SVM op (slice F); `exp`/`log`/`pow` now have fdlibm
+  implementations in `crates/svm-run/demos/libm/libm.c` (a guest def shadows the on-ramp's trap stub);
+  `sin`/`cos`/… are the remaining additions. See the "Transcendentals → a guest `libm`" bullet above.
 - **`argc`/`argv`**: **DONE** — see *Slice BE* below. `envp`/`getenv`: **DONE** — see *Slice BF*.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
@@ -1197,10 +1198,20 @@ for a real implementation, split by whether it needs a *host-libm decision*:
 - **Hard but decision-free:** **`strtod`** (string→double) — correctly-rounded decimal→`f64`, the parse
   direction of the existing bignum dtoa. The single keystone for *float* Lua (every float literal hits
   it); a sizeable bignum slice of its own.
-- **Needs a host-libm decision:** **`pow`** and the other transcendentals (`sin`/`cos`/`exp`/`log`) —
-  bit-exact vs native requires the *same* libm (synthesis can't match a specific libm's last-ULP
-  rounding). Either delegate to a host math capability or bundle a guest `libm` (the §"transcendentals"
-  note prefers guest code to keep math in the sandbox).
+- **Transcendentals → a guest `libm` (DECIDED — keep math in the sandbox).** `pow`/`exp`/`log`/
+  `sin`/… can't be synthesized bit-exact to a *specific* host libm, and a host math capability would
+  leak math out of the sandbox — so they ride as **guest code** (the §"transcendentals" preference,
+  the way the raytrace demo bundled `sin`/`exp`). **Started:** `crates/svm-run/demos/libm/libm.c` is a
+  small self-contained guest libm — faithful **fdlibm** transcriptions of `exp`, `log`, and **`pow`**
+  (genuinely accurate, not poly approximations), using only IEEE `+−*/`, compares, and union word
+  access. A guest definition **shadows** the on-ramp's would-be `pow`/`exp`/`log` trap stubs, so
+  `llvm-link lua_core.bc libm.bc` makes them real. `pow` reuses `sqrt` (→ the SVM `f64.sqrt` op) and
+  `scalbn` (→ `__svm_ldexp`). Two gates: `demo_libm_exp_log_pow_vs_native` (raw-f64-image differential,
+  all three engines == native — byte-identical *because* the math is guest code, unfused on both
+  lanes) and `libm_guest_exp_log_accurate_vs_system` (a native-only `-D`-renamed build vs the system
+  `<math.h>`, ≤2 ULP — validates the fdlibm transcription, which a same-source differential cannot).
+  **Remaining:** `sin`/`cos`/`tan` + inverses/hyperbolics (range reduction), then `llvm-link` the
+  guest libm into the Lua build so the Lua-core `pow` is real end to end.
 
 After the float-number surface lands, `print`/stdlib graduates first-light to a script that does I/O.
 

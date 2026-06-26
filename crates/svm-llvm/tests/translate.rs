@@ -2141,6 +2141,96 @@ fn libc_localeconv_c_locale() {
 }
 
 #[test]
+fn demo_libm_exp_log_pow_vs_native() {
+    // The bundled **guest `libm`** (`demos/libm/libm.c`, fdlibm `exp`/`log`/`pow`): a program that
+    // needs the transcendentals brings them as ordinary guest C — no host math capability, no
+    // translator intrinsic — and a guest definition shadows the libc-name binding the on-ramp would
+    // otherwise synthesize. The driver evaluates `exp`/`log`/`pow` over runtime grids and writes each
+    // result's raw f64 image; since the math is guest code, native `cc` compiles the same source, so
+    // the bytes are identical across the tree-walker, the bytecode VM, the JIT, and native. `pow`
+    // also exercises `sqrt` (→ the SVM `f64.sqrt` op, for `y=0.5`) and `scalbn` (→ `__svm_ldexp`).
+    check_demo_vs_native("libm_exp_log_pow", "libm/libm_demo.c", b"");
+}
+
+#[test]
+fn libm_guest_exp_log_accurate_vs_system() {
+    // Accuracy gate (native only): the byte-identical differential above proves the on-ramp *executes*
+    // the guest libm faithfully, but — same source on both lanes — it cannot catch a transcription
+    // error (both lanes would be equally wrong). So compile `libm.c` with its symbols renamed
+    // (`-Dexp=svm_exp -Dlog=svm_log`) and compare against the system `<math.h>` over a grid, asserting
+    // each result is within 2 ULP. This validates the fdlibm transcription against a real libm.
+    let probe = "#include <math.h>\n\
+        #include <stdint.h>\n\
+        double svm_exp(double); double svm_log(double); double svm_pow(double,double);\n\
+        static int ulp_ok(double a, double b){\n\
+          if (a==b) return 1;\n\
+          if (a!=a && b!=b) return 1; /* both NaN */\n\
+          int64_t ia, ib; __builtin_memcpy(&ia,&a,8); __builtin_memcpy(&ib,&b,8);\n\
+          if (ia<0) ia = (int64_t)0x8000000000000000ULL - ia;\n\
+          if (ib<0) ib = (int64_t)0x8000000000000000ULL - ib;\n\
+          int64_t d = ia>ib ? ia-ib : ib-ia; return d <= 2;\n\
+        }\n\
+        int main(void){\n\
+          double xs[] = {0.0,0.5,1.0,2.0,3.14159265,10.0,-1.0,-5.0,100.0,0.001,709.0,-700.0};\n\
+          double ls[] = {1.0,2.0,0.5,2.718281828459045,10.0,1e10,1e-10,0.001,1e300,123456.789};\n\
+          double pb[] = {2.0,3.0,-2.0,-2.0,10.0,0.5,9.0,-1.0,1.5,2.0,-3.0,0.5,7.0};\n\
+          double pe[] = {10.0,3.0,3.0,4.0,-2.0,0.5,0.5,2.0,2.5,0.5,3.0,-1.0,2.0};\n\
+          for (unsigned i=0;i<sizeof xs/sizeof*xs;i++) if(!ulp_ok(svm_exp(xs[i]), exp(xs[i]))) return 1;\n\
+          for (unsigned i=0;i<sizeof ls/sizeof*ls;i++) if(!ulp_ok(svm_log(ls[i]), log(ls[i]))) return 2;\n\
+          for (unsigned i=0;i<sizeof pb/sizeof*pb;i++) if(!ulp_ok(svm_pow(pb[i],pe[i]), pow(pb[i],pe[i]))) return 3;\n\
+          return 0;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_libm_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("svm_libm_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("svm_libm_acc_{}", std::process::id()));
+    let libm =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/libm/libm.c");
+    std::fs::write(&c, probe).expect("write probe");
+    // Compile the guest libm with its symbols renamed (`exp`→`svm_exp`, `log`→`svm_log`) so the probe
+    // can hold both it *and* the system `exp`/`log` for comparison.
+    let built = Command::new("cc")
+        .args([
+            "-O2",
+            "-fno-builtin",
+            "-Dexp=svm_exp",
+            "-Dlog=svm_log",
+            "-Dpow=svm_pow",
+            "-c",
+        ])
+        .arg(&libm)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping libm accuracy (cc unavailable)");
+            return;
+        }
+    }
+    // Link the probe (its own `exp`/`log` are the system libm) against the renamed guest object.
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest libm vs system: failing stage {code} (1=exp, 2=log, 3=pow)"
+    );
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
