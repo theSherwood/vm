@@ -61,7 +61,8 @@ fn restore_rejects_overflowing_address_space_binding() {
     let window = vec![0u8; WINDOW];
     let mut host = Host::new();
     // base + size wraps u64; the checked add must reject rather than alias back into the window.
-    host.grant_address_space(u64::MAX & !(WINDOW as u64 - 1), WINDOW as u64);
+    // The largest window-aligned base (`!(WINDOW-1)`) + WINDOW overflows u64.
+    host.grant_address_space(!(WINDOW as u64 - 1), WINDOW as u64);
     let art = freeze(&m, &window, &host).expect("freeze");
     let mut rhost = Host::new();
     assert_eq!(

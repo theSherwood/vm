@@ -175,35 +175,6 @@ fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
         && base.checked_add(size).is_some_and(|end| end <= mapped)
 }
 
-#[cfg(test)]
-mod binding_window_tests {
-    use super::*;
-
-    #[test]
-    fn rejects_only_out_of_window_or_malformed_address_bindings() {
-        let mapped = 1u64 << 18; // 256 KiB window
-        let ok = |base, size| {
-            binding_in_window(&DurableBinding::Instantiator { base, size }, mapped)
-                && binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped)
-        };
-        // Legitimate sub-ranges: the whole window, an aligned interior carve, the top slot.
-        assert!(ok(0, mapped));
-        assert!(ok(1 << 12, 1 << 12));
-        assert!(ok(mapped - (1 << 12), 1 << 12));
-        // Out of window, off the top, and base+size overflow.
-        assert!(!ok(mapped, 1 << 12));
-        assert!(!ok(mapped - (1 << 12), 1 << 13));
-        assert!(!ok(u64::MAX & !((1 << 12) - 1), 1 << 12));
-        // Malformed: zero size, non-power-of-two size, base not a multiple of size.
-        assert!(!ok(0, 0));
-        assert!(!ok(0, 3 << 12));
-        assert!(!ok(1 << 11, 1 << 12));
-        // Address-payload-free bindings always pass (nothing to confine).
-        assert!(binding_in_window(&DurableBinding::Exit, mapped));
-        assert!(binding_in_window(&DurableBinding::Memory, mapped));
-    }
-}
-
 /// Serialize a quiesced durable domain into a §12 artifact: the `window` image (the shadow
 /// state rides along) bound to `module`'s digest, plus `host`'s re-grantable handle table.
 /// Refuses if a live handle isn't durable (§12.5). Every page is treated as `Rw` (the flat
@@ -721,4 +692,33 @@ fn digest256(bytes: &[u8]) -> [u8; 32] {
         out[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod binding_window_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_only_out_of_window_or_malformed_address_bindings() {
+        let mapped = 1u64 << 18; // 256 KiB window
+        let ok = |base, size| {
+            binding_in_window(&DurableBinding::Instantiator { base, size }, mapped)
+                && binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped)
+        };
+        // Legitimate sub-ranges: the whole window, an aligned interior carve, the top slot.
+        assert!(ok(0, mapped));
+        assert!(ok(1 << 12, 1 << 12));
+        assert!(ok(mapped - (1 << 12), 1 << 12));
+        // Out of window, off the top, and base+size overflow (top size-aligned base).
+        assert!(!ok(mapped, 1 << 12));
+        assert!(!ok(mapped - (1 << 12), 1 << 13));
+        assert!(!ok(!((1u64 << 12) - 1), 1 << 12));
+        // Malformed: zero size, non-power-of-two size, base not a multiple of size.
+        assert!(!ok(0, 0));
+        assert!(!ok(0, 3 << 12));
+        assert!(!ok(1 << 11, 1 << 12));
+        // Address-payload-free bindings always pass (nothing to confine).
+        assert!(binding_in_window(&DurableBinding::Exit, mapped));
+        assert!(binding_in_window(&DurableBinding::Memory, mapped));
+    }
 }
