@@ -1,4 +1,4 @@
-//! The guest-side Futamura `Jit` probe (PEVAL.md Milestone 3 capstone). A `no_std`/`panic=abort`
+//! The guest-side Futamura `Jit` probe (DESIGN.md §20c capstone). A `no_std`/`panic=abort`
 //! powerbox program that, **entirely in-sandbox**:
 //!   1. builds a small two-function module (`entry(a,b)` calls `helper(a,b) = a*3 + b*5 + 7`),
 //!   2. specializes it with `svm-peval` (inlining the call, folding the constants into one function),

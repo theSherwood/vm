@@ -228,6 +228,132 @@ fn sum_program() -> [(u8, i64); 6] {
     ]
 }
 
+// ---- The `peval_futamura` demo's shape: a two-input accumulator-machine interpreter -----------
+// `calc(a, b)` seeds `acc = a` and folds `b`/immediates per the program; the same calculator the
+// in-sandbox `peval_futamura` demo specializes. Opcodes (a `br_table` dispatch):
+const C_ADDB: u8 = 0; //        acc += b
+const C_MULB: u8 = 1; //        acc *= b
+const C_ADDK: u8 = 2; // imm    acc += imm
+const C_MULK: u8 = 3; // imm    acc *= imm
+const C_END: u8 = 4; //         return acc
+
+/// `calc(a, b) -> i64`: a `br_table`-dispatched accumulator loop over a program (9-byte encoding,
+/// shared with [`build_interpreter`]). The program is **not** a data segment — it rides a
+/// `SpecConfig` const-overlay at address 0, exactly as the `peval_futamura` guest ships it to the
+/// `Jit` capability (so the residual is data-segment-free). State threaded: `(acc, b, pc)`.
+fn build_calc_interpreter() -> Module {
+    let t = || ValType::I64;
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let mul = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a,
+        b,
+    };
+    let load = |op, addr, offset| Inst::Load {
+        op,
+        addr,
+        offset,
+        align: 0,
+    };
+
+    // 0 — entry(a, b): acc = a, pc = 0.
+    let entry = Block {
+        params: vec![t(), t()],         // 0: a, 1: b
+        insts: vec![Inst::ConstI64(0)], // 2: pc
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2], // header(acc=a, b, pc=0)
+        },
+    };
+    // 1 — header(acc, b, pc): decode + dispatch. pc is advanced here; op-blocks pass it through.
+    let header = Block {
+        params: vec![t(), t(), t()], // 0: acc, 1: b, 2: pc
+        insts: vec![
+            Inst::ConstI64(0),          // 3: base
+            add(3, 2),                  // 4: addr = base + pc
+            load(LoadOp::I32_8U, 4, 0), // 5: op (i32, used directly as the br_table index)
+            load(LoadOp::I64, 4, 1),    // 6: imm
+            Inst::ConstI64(9),          // 7
+            add(2, 7),                  // 8: npc = pc + 9
+        ],
+        term: Terminator::BrTable {
+            idx: 5,
+            targets: vec![
+                (2, vec![0, 1, 8]),    // C_ADDB -> addb(acc, b, npc)
+                (3, vec![0, 1, 8]),    // C_MULB -> mulb(acc, b, npc)
+                (4, vec![0, 1, 8, 6]), // C_ADDK -> addk(acc, b, npc, imm)
+                (5, vec![0, 1, 8, 6]), // C_MULK -> mulk(acc, b, npc, imm)
+            ],
+            default: (6, vec![0]), // C_END (and any other) -> end(acc)
+        },
+    };
+    let addb = Block {
+        params: vec![t(), t(), t()],
+        insts: vec![add(0, 1)], // 3 = acc + b
+        term: Terminator::Br {
+            target: 1,
+            args: vec![3, 1, 2],
+        },
+    };
+    let mulb = Block {
+        params: vec![t(), t(), t()],
+        insts: vec![mul(0, 1)],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![3, 1, 2],
+        },
+    };
+    let addk = Block {
+        params: vec![t(), t(), t(), t()], // ..., 3: imm
+        insts: vec![add(0, 3)],           // 4 = acc + imm
+        term: Terminator::Br {
+            target: 1,
+            args: vec![4, 1, 2],
+        },
+    };
+    let mulk = Block {
+        params: vec![t(), t(), t(), t()],
+        insts: vec![mul(0, 3)],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![4, 1, 2],
+        },
+    };
+    let end = Block {
+        params: vec![t()],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+
+    Module {
+        funcs: vec![Func {
+            params: vec![t(), t()],
+            results: vec![t()],
+            blocks: vec![entry, header, addb, mulb, addk, mulk, end],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        // No data segment: the program is a const-overlay (see `calc_program` / `demo_corpus`).
+        ..Default::default()
+    }
+}
+
+/// The `peval_futamura` program: `((a*3) + b) * b + 7`, as `(opcode, immediate)` pairs.
+fn calc_program() -> [(u8, i64); 5] {
+    [
+        (C_MULK, 3),
+        (C_ADDB, 0),
+        (C_MULB, 0),
+        (C_ADDK, 7),
+        (C_END, 0),
+    ]
+}
+
 fn interp_run(m: &Module, input: i64) -> i64 {
     let mut fuel = u64::MAX;
     match svm_interp::run(m, 0, &[Value::I64(input)], &mut fuel) {
@@ -587,6 +713,131 @@ fn size_corpus() {
             "expected the residual to be smaller than the interpreter"
         );
     }
+}
+
+/// `entry(a, b) -> helper(a, b) = a*3 + b*5 + 7`, reached through a direct `call` — the `peval_jit`
+/// demo's shape. Specialization inlines the call and folds the constants into one function.
+fn build_inline_demo() -> Module {
+    let t = || ValType::I64;
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let mul = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a,
+        b,
+    };
+    let entry = Func {
+        params: vec![t(), t()],
+        results: vec![t()],
+        blocks: vec![Block {
+            params: vec![t(), t()],
+            insts: vec![Inst::Call {
+                func: 1,
+                args: vec![0, 1],
+            }],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let helper = Func {
+        params: vec![t(), t()],
+        results: vec![t()],
+        blocks: vec![Block {
+            params: vec![t(), t()],
+            insts: vec![
+                Inst::ConstI64(3), // 2
+                mul(0, 2),         // 3 = a*3
+                Inst::ConstI64(5), // 4
+                mul(1, 4),         // 5 = b*5
+                add(3, 5),         // 6
+                Inst::ConstI64(7), // 7
+                add(6, 7),         // 8 = a*3 + b*5 + 7
+            ],
+            term: Terminator::Return(vec![8]),
+        }],
+    };
+    Module {
+        funcs: vec![entry, helper],
+        ..Default::default()
+    }
+}
+
+/// **Benchmark the in-sandbox demos' specialization (size).** The two guest-side demos —
+/// `peval_jit` (inline + constant-fold) and `peval_futamura` (a `br_table` accumulator-machine
+/// interpreter specialized against its program) — measured host-side: interpreter → residual →
+/// optimized residual. Run-time isn't the story for these *straight-line* shapes (no runtime loop, so
+/// the win is dropping the dispatch/decode, not a tighter hot loop — cf. `gain_spectrum`); the size
+/// reduction is. A non-`#[ignore]` test so it also guards the demos' specialization from regressing.
+#[test]
+fn demo_corpus() {
+    let jit_i = build_inline_demo();
+    verify_module(&jit_i).expect("inline-demo verifies");
+    let jit_r = specialize(&jit_i, 0, &[SpecArg::Dynamic, SpecArg::Dynamic]).expect("specializes");
+
+    let calc_i = build_calc_interpreter();
+    verify_module(&calc_i).expect("calc interp verifies");
+    let calc_cfg = SpecConfig {
+        const_overlays: vec![(0, encode_program(&calc_program()))],
+        ..Default::default()
+    };
+    let calc_r =
+        specialize_with_config(&calc_i, 0, &[SpecArg::Dynamic, SpecArg::Dynamic], &calc_cfg)
+            .expect("specializes against the const-overlay program");
+
+    // (label, interp, residual, is_interpreter — only the interpreter shape has a dispatch to fold)
+    let corpus: [(&str, &Module, &Module, bool); 2] = [
+        ("peval_jit: inline a*3+b*5+7", &jit_i, &jit_r, false),
+        ("peval_futamura: calc ((a*3)+b)*b+7", &calc_i, &calc_r, true),
+    ];
+
+    println!(
+        "\n=== in-sandbox demo specialization (i=interpreter, r=residual, o=optimized) ===\n{:<38} {:>12} {:>12} {:>16} {:>7}",
+        "demo", "blocks i/r/o", "insts i/r/o", "bytes i/r/o", "bytes"
+    );
+    for (name, interp, residual, is_interp) in corpus {
+        verify_module(residual).expect("residual verifies");
+        let opt = optimize_module(residual);
+        verify_module(&opt).expect("optimized residual verifies");
+
+        let (i, r, o) = (sizes(interp), sizes(residual), sizes(&opt));
+        println!(
+            "{:<38} {:>12} {:>12} {:>16} {:>6.0}%",
+            name,
+            format!("{}/{}/{}", i.blocks, r.blocks, o.blocks),
+            format!("{}/{}/{}", i.insts, r.insts, o.insts),
+            format!("{}/{}/{}", i.bytes, r.bytes, o.bytes),
+            100.0 * o.bytes as f64 / i.bytes as f64,
+        );
+        csv("demo_corpus", name, "interp_bytes", i.bytes as f64);
+        csv("demo_corpus", name, "opt_bytes", o.bytes as f64);
+        csv(
+            "demo_corpus",
+            name,
+            "opt_pct",
+            100.0 * o.bytes as f64 / i.bytes as f64,
+        );
+
+        // The interpreter shape must have its dispatch (br_table + decode loads) folded away — the
+        // defining property the demo proves in-sandbox, measured here.
+        if is_interp {
+            assert!(
+                !has_dispatch(residual),
+                "{name}: dispatch (br_table / load) survived specialization"
+            );
+        }
+    }
+
+    // The futamura interpreter (7 blocks) collapses to one straight-line residual block, smaller than
+    // the interpreter — the dispatch table and opcode decode are gone, only the compiled program left.
+    assert_eq!(optimize_module(&calc_r).funcs[0].blocks.len(), 1);
+    assert!(
+        sizes(&optimize_module(&calc_r)).bytes < sizes(&calc_i).bytes,
+        "expected the specialized program to be smaller than the interpreter"
+    );
 }
 
 // ===========================================================================================

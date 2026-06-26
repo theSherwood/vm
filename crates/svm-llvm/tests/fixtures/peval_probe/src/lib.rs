@@ -1,4 +1,4 @@
-//! The in-sandbox `svm-peval` probe (PEVAL.md Milestone 3). A `no_std`/`panic=abort` powerbox program
+//! The in-sandbox `svm-peval` probe (DESIGN.md §20c). A `no_std`/`panic=abort` powerbox program
 //! that builds a small module, calls `svm_peval::specialize`, and prints a summary of the residual
 //! (`funcs`, total `blocks`, total `insts`) — one decimal per line. The `peval_in_sandbox.rs` test
 //! compiles this to svm-IR and runs it, asserting the printed summary equals the **same** specialization

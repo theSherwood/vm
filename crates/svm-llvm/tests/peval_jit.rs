@@ -1,4 +1,4 @@
-//! **The end-to-end §22 `Jit` demo (PEVAL.md Milestone 3 capstone), as a test.**
+//! **The end-to-end §22 `Jit` demo (DESIGN.md §20c capstone), as a test.**
 //!
 //! Builds the in-repo fixture `tests/fixtures/peval_jit` — a `no_std` powerbox guest that, entirely
 //! in-sandbox, *specializes* a module with `svm-peval`, *encodes* the residual with `svm-encode`, and

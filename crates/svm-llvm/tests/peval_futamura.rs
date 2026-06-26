@@ -1,4 +1,4 @@
-//! **The richer in-sandbox Futamura `Jit` demo (PEVAL.md Milestone 3 follow-up), as a test.**
+//! **The richer in-sandbox Futamura `Jit` demo (DESIGN.md §20c follow-up), as a test.**
 //!
 //! Builds the in-repo fixture `tests/fixtures/peval_futamura` — a `no_std` powerbox guest that, in
 //! sandbox, builds a small accumulator-machine *interpreter* in svm-IR, **specializes it against a

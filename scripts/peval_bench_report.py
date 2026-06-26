@@ -44,6 +44,12 @@ BENCHES = [
          "--", "--ignored", "--nocapture"],
     ),
     (
+        "demo_corpus",
+        REPO,
+        ["cargo", "test", "-p", "svm-peval", "--test", "bench", "demo_corpus",
+         "--", "--nocapture"],
+    ),
+    (
         "peval_corpus",
         REPO / "crates" / "svm-llvm",
         ["cargo", "test", "--test", "peval_corpus", "corpus_metric_matrix",
@@ -58,6 +64,8 @@ DESCRIPTIONS = {
                      "work — JIT run-time speedup, compile excluded (svm-peval).",
     "roi_futamura_loop": "End-to-end Futamura ROI: sum 1..N as a register-machine loop, all four "
                          "execution configs (svm-peval).",
+    "demo_corpus": "The in-sandbox guest demos (peval_jit, peval_futamura), measured host-side: the "
+                   "size win of specializing each (interpreter → residual → optimized) (svm-peval).",
     "peval_corpus": "Real clang-compiled interpreters (Brainfuck + Lisp) across a range of guest "
                     "programs: size, PE/compile time, and run-time speedup (svm-llvm).",
 }

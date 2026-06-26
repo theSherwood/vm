@@ -2042,7 +2042,7 @@ the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
 
 ---
 
-### 20c. The partial-evaluation on-ramp (`crates/svm-peval`)  [BUILT — first Futamura projection, Stages 0–2 + AOT]
+### 20c. The partial-evaluation on-ramp (`crates/svm-peval`)  [BUILT — first Futamura projection, host-side + guest-side (in-sandbox)]
 
 A guest that wants to run JS/Python/Lisp/a DSL ships an **interpreter** (compiled to our IR
 via the C or LLVM on-ramp) and pays interpreter overhead forever, or hand-writes a per-language
@@ -2093,10 +2093,17 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
     residuals come out as tight straight-line/looped code, not `br`-chains.
 - **AOT, by construction.** Nothing is runtime-coupled: `specialize → verify → encode_module`
   produces a shippable artifact; load it with `decode_module` and run or `svm_jit::compile_and_run`
-  it with zero specialization cost at run time (the host-side/offline architecture). The
-  guest-side variant (ship the engine inside the sandbox on the §22 `Jit` capability, for
-  dynamic-language IC-style recompilation) is the deferred higher-ceiling option; the residual IR
-  and the back half are shared.
+  it with zero specialization cost at run time (the host-side/offline architecture).
+- **Guest-side, in-sandbox — built.** The engine also runs *inside* the sandbox: `svm-peval`
+  compiles to svm-IR through the Rust→svm-IR on-ramp (`no_std` + `alloc`, `default-features = false`
+  to drop `libm`), so an ordinary guest can `specialize → encode_module → §22 Jit.compile → invoke`
+  a residual without leaving its domain — the first Futamura projection performed in-sandbox by an
+  untrusted program, the residual re-verified before it runs (zero new escape-TCB; the trust hinge is
+  verification, not the producer). Demonstrated end-to-end by `crates/svm-llvm/tests/peval_jit.rs`
+  (a guest specializes + JITs a module) and `peval_futamura.rs` (a guest specializes a `br_table`
+  interpreter against its program — dispatch + decode fold away — and JITs the result); the
+  `specialize` closure's in-sandbox translate+run is regression-pinned by `peval_in_sandbox.rs`. The
+  residual IR and the JIT back half are shared with the host-side path.
 - **Measured ROI** (register-machine bytecode, runtime-controlled loop, release): removing
   dispatch by specialization is **~5–6×** on either backend (apples-to-apples, same backend); the
   end-to-end software-interpreted → compiled-native path is **~470×**. Lean-ISA dispatch-overhead
@@ -2111,11 +2118,10 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   heap alongside); cross-function `call` inlining — direct **and** constant-index
   `call_indirect`/`return_call_indirect`/`ref.func` (resolved through the identity module-0 table) —
   with static + dynamic control flow, recursion, and loops; and opt-in **outlining** (specialize a
-  callee to a shared residual function, for dynamic-depth recursion / bounded size). **Remaining
-  enhancements (not gaps):** the **exotic SIMD ops** (saturating add/sub, widen/narrow, lane
-  convert, dot, pairwise, pmin/pmax, avgr, popcnt, any/all-true, bitmask, q15) still pass through
-  unfolded, and the guest-side engine (ship the specializer inside the sandbox on the §22 `Jit`
-  capability for dynamic-language IC-style recompilation; the residual IR and back half are shared).
+  callee to a shared residual function, for dynamic-depth recursion / bounded size); **and the
+  guest-side, in-sandbox engine** (above). **Remaining enhancement (not a gap):** the **exotic SIMD
+  ops** (saturating add/sub, widen/narrow, lane convert, dot, pairwise, pmin/pmax, avgr, popcnt,
+  any/all-true, bitmask, q15) still pass through unfolded.
 
 ---
 
