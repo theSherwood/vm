@@ -6938,3 +6938,61 @@ fn i128_sdiv_srem() {
         );
     }
 }
+
+/// **Wide / negative i128 *constants* fail closed** (I14). `llvm-ir` 0.11.3 truncates a `bits > 64`
+/// integer constant to its low word (a silent miscompile on a no-asserts libLLVM — `x % (2⁶⁴+1)` would
+/// run as `x % 1`), so the [`svm_llvm::wideint`] guard rejects any module holding an i128 literal
+/// outside `[0, 2⁶⁴)` with a clean `Unsupported` — never a wrong answer. Both a ≥2⁶⁴ literal (clang
+/// folds `0xFFFF…FFFF + 2` to `i128 18446744073709551617`) and a negative one (`add i128 %x, -5`).
+#[test]
+fn i128_wide_constant_fails_closed() {
+    for (name, src) in [
+        (
+            "i128_widec",
+            "unsigned long f(unsigned long lo, unsigned long hi){\n\
+             unsigned __int128 x = ((unsigned __int128)hi<<64)|lo;\n\
+             return (unsigned long)(x % ((unsigned __int128)0xFFFFFFFFFFFFFFFFULL + 2));\n }\n",
+        ),
+        (
+            "i128_negc",
+            "long g(unsigned long lo, unsigned long hi){\n\
+             __int128 x = (__int128)(((unsigned __int128)hi<<64)|lo);\n\
+             __int128 r = x + (__int128)(-5);\n\
+             return (long)((unsigned long)r) ^ (long)(r>>64);\n }\n",
+        ),
+    ] {
+        let Some(bc) = compile_to_bc(name, src) else {
+            return;
+        };
+        match svm_llvm::translate_bc_path(&bc) {
+            Err(svm_llvm::Error::Unsupported(m)) => {
+                assert!(m.contains("wide integer constant"), "{name}: {m}")
+            }
+            other => panic!("{name}: expected a fail-closed Unsupported, got {other:?}"),
+        }
+    }
+}
+
+/// A **small** i128 constant (`< 2⁶⁴`, incl. the loop-carried-φ entry value `0`) is *not* tripped by
+/// the wide-constant guard — it round-trips exactly from the low word and still translates + runs.
+#[test]
+fn i128_small_constant_still_runs() {
+    // An i128 accumulator seeded from the constant `0`, plus a small i128 literal addend.
+    let src = "unsigned long f(unsigned long n){\n\
+        unsigned __int128 acc = 0;\n\
+        for (unsigned long i=0;i<n;i++) acc = acc*3 + 1000000;\n\
+        return (unsigned long)acc ^ (unsigned long)(acc>>64);\n }\n";
+    for n in [0u64, 1, 5, 40] {
+        let mut acc: u128 = 0;
+        for _ in 0..n {
+            acc = acc.wrapping_mul(3).wrapping_add(1_000_000);
+        }
+        let want = (acc as u64) ^ ((acc >> 64) as u64);
+        check(
+            "i128_smallc",
+            src,
+            &[Value::I64(n as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
