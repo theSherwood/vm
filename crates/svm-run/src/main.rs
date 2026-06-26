@@ -155,7 +155,8 @@ fn load_module(path: &Path) -> Result<Module, String> {
 /// whatever the frontend emits.
 fn compile_c(path: &Path) -> Result<String, String> {
     let chibicc = locate_chibicc()?;
-    let ir_out = fresh_temp_ir()?;
+    let dir = fresh_temp_dir()?;
+    let ir_out = dir.join("out.svm");
     let result = (|| {
         let ok = Command::new(&chibicc)
             .args([
@@ -175,30 +176,38 @@ fn compile_c(path: &Path) -> Result<String, String> {
         }
         fs::read_to_string(&ir_out).map_err(|e| format!("read frontend IR: {e}"))
     })();
-    // Don't leak the intermediate IR file regardless of outcome.
-    let _ = fs::remove_file(&ir_out);
+    // Don't leak the intermediate dir (and its IR file) regardless of outcome.
+    let _ = fs::remove_dir_all(&dir);
     result
 }
 
-/// Create a fresh, **unpredictably-named** temp file for the frontend's IR output and return its path.
-/// The previous `svm_run_<pid>.svm` name was predictable, so a local attacker could pre-plant a symlink
-/// there and redirect chibicc's write. The name now carries an OS-RNG-seeded suffix (via `RandomState`,
-/// whose seed is process-secret), and the file is created with `create_new` (`O_EXCL`), which fails
-/// rather than following a pre-existing path. `$SVM_CHIBICC`/`.c` compilation is a trusted-operator
-/// path (the binary it runs is operator-chosen); this just removes the predictable-temp footgun.
-fn fresh_temp_ir() -> Result<PathBuf, String> {
+/// Create a fresh, **owner-only** temp *directory* to hold the frontend's IR output, returning its
+/// path. chibicc's `-cc1-output` (and our read-back) reopen the IR **by path**, which follows
+/// symlinks — so an unpredictable filename + `O_EXCL` on the *file* still left a swap window between
+/// our create and chibicc's reopen. Containing the IR in a private directory closes it: the name is
+/// OS-RNG-seeded (`RandomState`, process-secret seed), the directory is created **non-recursively**
+/// (`mkdir(2)` — which returns `EEXIST` rather than following a pre-planted symlink at that path),
+/// and on unix it is mode `0700`, so a different-uid attacker cannot traverse it to place or swap
+/// `out.svm`. `$SVM_CHIBICC`/`.c` compilation is a trusted-operator path (the binary it runs is
+/// operator-chosen); this removes the residual reopen-by-path TOCTOU on top of that.
+fn fresh_temp_dir() -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let rnd = RandomState::new().hash_one((process::id(), nanos));
-    let out = env::temp_dir().join(format!("svm_run_{rnd:016x}.svm"));
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&out)
-        .map_err(|e| format!("create temp IR file: {e}"))?;
-    Ok(out)
+    let dir = env::temp_dir().join(format!("svm_run_{rnd:016x}"));
+    let mut b = fs::DirBuilder::new();
+    // Non-recursive create: fails (EEXIST) on any pre-existing path — including a planted symlink —
+    // rather than following it. On unix, restrict to owner so the inner file can't be swapped.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(&dir)
+        .map_err(|e| format!("create temp IR dir: {e}"))?;
+    Ok(dir)
 }
 
 /// Find the chibicc binary: `$SVM_CHIBICC`, else the in-repo `frontend/chibicc/chibicc` (built

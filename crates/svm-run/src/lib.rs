@@ -2094,6 +2094,13 @@ pub fn run_powerbox_with_deadline_and_quota(
     deadline: Option<std::time::Duration>,
     quota: Quota,
 ) -> Result<Run, String> {
+    // Escape gate (fail-closed, §2a): re-verify here so a library embedder calling this entry point
+    // directly cannot bypass the verifier the CLI (`main.rs`) and guest-driven JIT (`jit_blob_validator`)
+    // paths enforce. A verified module is the precondition for escape-freedom; verification is
+    // idempotent and cheap relative to compile+run, so re-checking an already-verified module is free
+    // insurance rather than a footgun on the public API.
+    svm_verify::verify_module(module)
+        .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
     let mut host = Host::new();
     host.set_quota(quota);
     host.stdin = stdin.to_vec();
@@ -2213,6 +2220,10 @@ pub fn run_powerbox_with_deadline_and_quota(
 /// function rather than a program (e.g. the benchmark kernels). `Err` on compile failure,
 /// a guest trap, or an `Exit` (a kernel should not call one).
 pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
+    // Escape gate (fail-closed, §2a): like the powerbox entry point, verify before running so a
+    // direct library caller can't skip the verifier. Idempotent vs an already-verified module.
+    svm_verify::verify_module(module)
+        .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
     match compile_and_run(module, 0, args).map_err(|e| format!("JIT compile failed: {e:?}"))? {
         JitOutcome::Returned(s) => {
             let results = &module.funcs[0].results;
