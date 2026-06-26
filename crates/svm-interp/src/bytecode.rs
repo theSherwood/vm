@@ -2900,20 +2900,13 @@ fn run_invoke(
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
-    host: &mut Host,
+    host: &mut HostCell,
 ) -> Result<Vec<Value>, Trap> {
     let unit = dom.source.get(module).ok_or(Trap::Malformed)?;
     let mut vm = Vm::new(&unit, 0, args)?;
     vm.module = module;
     loop {
-        match vm.resume(
-            &dom.source,
-            &dom.table,
-            fuel,
-            mem,
-            &mut HostCell::Excl(&mut *host),
-            u64::MAX,
-        )? {
+        match vm.resume(&dom.source, &dom.table, fuel, mem, host, u64::MAX)? {
             Outcome::Done(vals) => return Ok(vals),
             Outcome::Suspended => {}
             _ => return Err(Trap::CapFault),
@@ -4218,7 +4211,7 @@ fn drive(
                     .map(|(ty, s)| slot_to_val(*ty, *s))
                     .collect();
                 let umod = dom.source.push(unit);
-                match run_invoke(&dom, umod, &child_args, fuel, mem, host) {
+                match run_invoke(&dom, umod, &child_args, fuel, mem, &mut HostCell::Excl(host)) {
                     Ok(vals) => {
                         for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
                             let re = slot_to_val(*ty, val_to_slot(*v));
@@ -4506,8 +4499,114 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let woken = reg.futex.notify(base, count);
                 vt.active.set(dst, Reg::from_i32(woken));
             }
-            // Outside this driver's subset (§14 instantiate, §22 JIT): they need a `&mut Domain` /
-            // shared powerbox the parallel driver doesn't thread yet — fail closed rather than run wrong.
+            // §22 guest-JIT (THREADS.md 4c-domain): install/uninstall/invoke against the **shared**
+            // [`Domain`] — `install`/`uninstall`/`push` are interior-mutable (Release/Acquire-paired
+            // with the dispatch reads), so a worker vCPU drives them on `&Domain` while compute/atomics
+            // on the other vCPUs stay lock-free. The result (slot / `-ENOSPC` / value) is
+            // schedule-independent for the disciplined guest the oracle is differentially run against.
+            Ok(VcpuStop::JitInstall { h, code, dst }) => {
+                // Resolve authority + the unit's funcs under the host lock (a forged/cross-domain
+                // handle is an inert CapFault → trap), then compile + install. Compiling can fail only
+                // if the unit uses an op the engine doesn't lower yet (the one place a guest unit can
+                // outrun coverage — no tree-walker fallback mid-run).
+                let funcs = {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.resolve_jit_domain(h).and_then(|domain| {
+                        let (cd, cu) = g.resolve_jit_code(code)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                    }) {
+                        Ok(f) => f,
+                        Err(t) => return (Err(t), mem),
+                    }
+                };
+                let res = match compile_module(&funcs) {
+                    Some(unit) => match dom.install(unit) {
+                        Some(slot) => slot as i64,
+                        None => super::ENOSPC,
+                    },
+                    None => return (Err(Trap::Malformed), mem), // unit op outside coverage
+                };
+                vt.active.set(dst, Reg::from_i64(res));
+            }
+            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Err(t) = g.resolve_jit_domain(h) {
+                        return (Err(t), mem); // authority check
+                    }
+                }
+                let n_real = dom.source.primary().progs.len();
+                let res = if dom.uninstall(slot as usize, n_real) {
+                    0
+                } else {
+                    super::EINVAL
+                };
+                vt.active.set(dst, Reg::from_i64(res));
+            }
+            Ok(VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            }) => {
+                // Resolve unit funcs (authority + cross-domain) and compile, as for install.
+                let funcs = {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.resolve_jit_domain(h).and_then(|domain| {
+                        let (cd, cu) = g.resolve_jit_code(code)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                    }) {
+                        Ok(f) => f,
+                        Err(t) => return (Err(t), mem),
+                    }
+                };
+                let unit = match compile_module(&funcs) {
+                    Some(u) => u,
+                    None => return (Err(Trap::Malformed), mem),
+                };
+                // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
+                let arity_ok = unit
+                    .sigs
+                    .first()
+                    .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+                if !arity_ok {
+                    return (Err(Trap::CapFault), mem);
+                }
+                // Marshal args via the slot ABI, push the unit as a transient module, run it over the
+                // **shared** powerbox (its `cap.call`s serialize per-call, like every other vCPU's).
+                let child_args: Vec<Value> = params
+                    .iter()
+                    .zip(argv.iter())
+                    .map(|(ty, s)| slot_to_val(*ty, *s))
+                    .collect();
+                let umod = dom.source.push(unit);
+                match run_invoke(
+                    dom,
+                    umod,
+                    &child_args,
+                    &mut fuel,
+                    &mut mem,
+                    &mut HostCell::Shared(host),
+                ) {
+                    Ok(vals) => {
+                        for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+                            let re = slot_to_val(*ty, val_to_slot(*v));
+                            vt.active.set(dst + i as u32, Reg::from_value(re));
+                        }
+                    }
+                    Err(t) => return (Err(t), mem),
+                }
+            }
+            // Outside this driver's subset (§14 instantiate): needs a confined executor child the
+            // parallel driver doesn't thread yet — fail closed rather than run wrong.
             Ok(_) => return (Err(Trap::ThreadFault), mem),
         }
     }

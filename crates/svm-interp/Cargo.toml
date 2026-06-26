@@ -31,3 +31,6 @@ page_size = "0.6"
 # integration-test crate, which pulls in the Cranelift JIT that Miri can't compile.
 [dev-dependencies]
 svm-text.workspace = true
+# Test-only: name `svm_ir::Func` in the JIT Miri check's blob validator (THREADS.md 4c-domain). Pure
+# IR types (no platform surface), so it keeps the test crate Miri-buildable.
+svm-ir.workspace = true
