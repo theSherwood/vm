@@ -380,8 +380,13 @@ fn translate_impl(
     // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
     // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
-    let (globals, data, globals_end, cstrs, gbytes) =
+    let (globals, mut data, mut globals_end, cstrs, gbytes) =
         globals_layout(m, &name2idx, globals_base, ba)?;
+    // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
+    // module image** when the program calls the ctype locators (`isalpha`/`isspace`/`tolower`/… lower to
+    // `__ctype_b_loc`/`__ctype_tolower_loc`/`__ctype_toupper_loc`, e.g. Embench `slre`). Placed after the
+    // globals (and below the data stack) so a `run`-only module needs no `_start` to initialize them.
+    let ctype = build_ctype_data(m, &defined_names, &mut data, &mut globals_end);
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -397,6 +402,9 @@ fn translate_impl(
                                                     // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
         calls_external(m, &defined_names, "memcmp") || calls_external(m, &defined_names, "bcmp");
+    // `memchr(s, c, n)` (string/buffer scans — e.g. Embench `slre`) → the synthesized `__svm_memchr`
+    // byte loop. Like `memcmp`, a pure address helper (no powerbox/`has_main`).
+    let need_memchr = calls_external(m, &defined_names, "memchr");
     // `__cxa_end_catch` destroys the caught exception object via `__svm_eh_destroy` (gated on EH being
     // active, so the helper can address the EH region and the dtor funcref resolves through the table).
     let need_eh_destroy = need_eh && calls_external(m, &defined_names, "__cxa_end_catch");
@@ -454,9 +462,13 @@ fn translate_impl(
         atomic_rmw_narrow: take(need_narrow_atomic),
         atomic_cas_narrow: take(need_narrow_atomic),
         memcmp: take(need_memcmp),
+        memchr: take(need_memchr),
         eh_destroy: take(need_eh_destroy),
         udivmod128: take(need_idiv128),
         float_scratch: float_scratch_base,
+        ctype_b_loc: ctype.b_loc,
+        ctype_tolower_loc: ctype.tolower_loc,
+        ctype_toupper_loc: ctype.toupper_loc,
         eh_base,
         eh_typeids,
     };
@@ -537,7 +549,7 @@ fn translate_impl(
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
     // stash / heap state live in the reserved low window).
-    let need_window = any_frame || !globals.is_empty() || synth || eh_base.is_some();
+    let need_window = any_frame || !globals.is_empty() || synth || ctype.any() || eh_base.is_some();
     let memory = need_window.then(|| {
         // Reserve stack when any function (or the argv `_start`) uses the data stack.
         let mut top = if any_frame || wants_argv {
@@ -660,7 +672,10 @@ fn translate_impl(
     if need_memcmp {
         funcs.push(synth_memcmp());
     }
-    // `__svm_eh_destroy` (after `__svm_memcmp` — matches the `take` order). Self-contained: it reads
+    if need_memchr {
+        funcs.push(synth_memchr());
+    }
+    // `__svm_eh_destroy` (after `__svm_memchr` — matches the `take` order). Self-contained: it reads
     // only its arguments and indirect-calls the passed destructor funcref.
     if need_eh_destroy {
         funcs.push(synth_eh_destroy());
@@ -1115,6 +1130,162 @@ fn globals_layout(
         }
     }
     Ok((addr, segs, off, cstrs, gbytes))
+}
+
+/// The pointer-cell window addresses the synthesized glibc ctype locators return (`None` = the program
+/// doesn't call that locator). See [`build_ctype_data`].
+#[derive(Default, Clone, Copy)]
+struct CtypeAddrs {
+    b_loc: Option<u64>,
+    tolower_loc: Option<u64>,
+    toupper_loc: Option<u64>,
+}
+
+impl CtypeAddrs {
+    /// Did any ctype table get synthesized? (If so the module gained read-only data and therefore needs
+    /// a window declared, even if the program itself laid out no globals.)
+    fn any(self) -> bool {
+        self.b_loc.is_some() || self.tolower_loc.is_some() || self.toupper_loc.is_some()
+    }
+}
+
+/// The C-locale `<ctype.h>` flag word for byte `c`, in **glibc's little-endian bit layout** — the exact
+/// values `clang` masks against (`_ISdigit=0x0800`, `_ISxdigit=0x1000`, `_ISspace=0x2000`, …).
+fn ctype_flags(c: u8) -> u16 {
+    let (upper, lower, digit) = (
+        c.is_ascii_uppercase(),
+        c.is_ascii_lowercase(),
+        c.is_ascii_digit(),
+    );
+    let alpha = upper || lower;
+    let graph = c.is_ascii_graphic();
+    let space = matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let mut f = 0u16;
+    if upper {
+        f |= 0x0100;
+    }
+    if lower {
+        f |= 0x0200;
+    }
+    if alpha {
+        f |= 0x0400;
+    }
+    if digit {
+        f |= 0x0800;
+    }
+    if c.is_ascii_hexdigit() {
+        f |= 0x1000;
+    }
+    if space {
+        f |= 0x2000;
+    }
+    if graph || c == b' ' {
+        f |= 0x4000; // print = graph ∪ space-char ' '
+    }
+    if graph {
+        f |= 0x8000;
+    }
+    if matches!(c, b' ' | b'\t') {
+        f |= 0x0001; // blank
+    }
+    if c.is_ascii_control() {
+        f |= 0x0002; // cntrl
+    }
+    if c.is_ascii_punctuation() {
+        f |= 0x0004; // punct
+    }
+    if alpha || digit {
+        f |= 0x0008; // alnum
+    }
+    f
+}
+
+/// C-locale `tolower`/`toupper` of an `i32` table index in glibc's `-128..=255` range — identity outside
+/// `0..=255` and for non-cased bytes.
+fn ctype_case_map(v: i32, to_lower: bool) -> i32 {
+    if !(0..=255).contains(&v) {
+        return v;
+    }
+    let c = v as u8;
+    if to_lower && c.is_ascii_uppercase() {
+        v + 32
+    } else if !to_lower && c.is_ascii_lowercase() {
+        v - 32
+    } else {
+        v
+    }
+}
+
+/// Synthesize the C-locale **ctype tables** as read-only data in the module image, for programs that call
+/// the glibc ctype locators (`<ctype.h>`'s `isalpha`/`isspace`/`tolower`/… lower to
+/// `(*__ctype_b_loc())[c] & _ISxxx` / `(*__ctype_tolower_loc())[c]`). Each table spans glibc's index range
+/// `-128..=255` (384 entries) and the locator returns a pointer **into** it at index 0, so a signed *or*
+/// unsigned `char` indexes it safely. Flags are `u16` (glibc LE bit layout); case maps are `i32`. The
+/// tables and their indirection pointer cells are appended after the globals as read-only segments (no
+/// runtime init — works for a `run`-only module), and `*end` is advanced past them.
+fn build_ctype_data(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    data: &mut Vec<svm_ir::Data>,
+    end: &mut u64,
+) -> CtypeAddrs {
+    let need_b = calls_external(m, defined, "__ctype_b_loc");
+    let need_tl = calls_external(m, defined, "__ctype_tolower_loc");
+    let need_tu = calls_external(m, defined, "__ctype_toupper_loc");
+    if !(need_b || need_tl || need_tu) {
+        return CtypeAddrs::default();
+    }
+    // Read-only region — page-isolate from any preceding writable global (D40).
+    *end = end.div_ceil(STACK_PAGE) * STACK_PAGE;
+
+    // Append a read-only `elem`-byte-per-entry table + its indirection pointer cell (which holds
+    // `table + 128*elem`, the index-0 base a signed/unsigned char offsets from); return the cell address.
+    fn emit_ctype(bytes: Vec<u8>, elem: u64, data: &mut Vec<svm_ir::Data>, end: &mut u64) -> u64 {
+        let table = end.div_ceil(elem) * elem;
+        data.push(svm_ir::Data {
+            offset: table,
+            readonly: true,
+            bytes,
+        });
+        *end = table + 384 * elem;
+        let cell = end.div_ceil(8) * 8;
+        data.push(svm_ir::Data {
+            offset: cell,
+            readonly: true,
+            bytes: (table + 128 * elem).to_le_bytes().to_vec(),
+        });
+        *end = cell + 8;
+        cell
+    }
+
+    let mut addrs = CtypeAddrs::default();
+    if need_b {
+        let mut b = Vec::with_capacity(384 * 2);
+        for j in 0..384i32 {
+            let v = j - 128;
+            let f = if (0..=255).contains(&v) {
+                ctype_flags(v as u8)
+            } else {
+                0
+            };
+            b.extend_from_slice(&f.to_le_bytes());
+        }
+        addrs.b_loc = Some(emit_ctype(b, 2, data, end));
+    }
+    let case_table = |to_lower: bool, data: &mut Vec<svm_ir::Data>, end: &mut u64| -> u64 {
+        let mut b = Vec::with_capacity(384 * 4);
+        for j in 0..384i32 {
+            b.extend_from_slice(&ctype_case_map(j - 128, to_lower).to_le_bytes());
+        }
+        emit_ctype(b, 4, data, end)
+    };
+    if need_tl {
+        addrs.tolower_loc = Some(case_table(true, data, end));
+    }
+    if need_tu {
+        addrs.toupper_loc = Some(case_table(false, data, end));
+    }
+    addrs
 }
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
@@ -3163,6 +3334,9 @@ struct Helpers {
     /// else the signed first-mismatch difference (`a[i] - b[i]`). Backs `memcmp` *and* `bcmp` (Rust's
     /// `[u8]`/slice equality and `BTreeMap` key ordering emit these).
     memcmp: Option<u32>,
+    /// `__svm_memchr(s:i64, c:i32, n:i64) -> i64` — first occurrence of `(unsigned char)c` in the first
+    /// `n` bytes at `s`, or NULL. Backs `memchr` (string/buffer scans).
+    memchr: Option<u32>,
     /// `__svm_eh_destroy(sp:i64, exn:i64, dtor:i64)` — run an exception object's destructor for
     /// `__cxa_end_catch` (indirect-call `dtor` on `exn` when non-null). Present only when the module
     /// catches a C++ exception (calls `__cxa_end_catch`).
@@ -3201,6 +3375,13 @@ struct Helpers {
     /// Base window address of the reserved float scratch (`= float_scratch_base`), so the printf
     /// lowering can `emit_write` the field a bignum formatter fills at `+FMT_OUT_O`.
     float_scratch: Option<u64>,
+    /// Window address of the **pointer cell** each glibc ctype locator returns: `__ctype_b_loc()` →
+    /// `&(ptr to the u16 flags table, base at index 0)`, `__ctype_tolower_loc()` / `__ctype_toupper_loc()`
+    /// → `&(ptr to the i32 case-map table)`. The tables + cells are synthesized as read-only data in the
+    /// module image (no runtime init — works for a `run`-only module), so the locator lowers to a const.
+    ctype_b_loc: Option<u64>,
+    ctype_tolower_loc: Option<u64>,
+    ctype_toupper_loc: Option<u64>,
     /// Base window address of the reserved C++ exception-handling region (the handler stack + the
     /// current-exception slots + the per-handler buf slots), reserved only when `need_eh`. The
     /// `invoke`/`landingpad`/`resume`/`__cxa_*` lowerings address their state at `+EH_*_O` off this.
@@ -3756,6 +3937,104 @@ fn synth_memcmp() -> Func {
         params,
         results: vec![ValType::I32],
         blocks: vec![entry, test, body, diff, equal],
+    }
+}
+
+/// Synthesize `__svm_memchr(s:i64, c:i32, n:i64) -> i64`: scan the first `n` bytes at `s` for the byte
+/// `(unsigned char)c`, returning a pointer to it or NULL. A counted forward byte loop.
+///
+/// ```text
+///   entry(s, c, n):       end = s + n          → loop(s, end, c)
+///   loop(cur, end, c):    cur == end ? notfound : body
+///   body(cur, end, c):    *cur == (c & 0xff) ? found(cur) : loop(cur+1, end, c)
+///   found(p):             return p
+///   notfound:             return 0
+/// ```
+fn synth_memchr() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64, ValType::I32, ValType::I64]; // s, c, n (matches the call ABI)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Add,
+            a: 0,
+            b: 2,
+        }], // v3 = end = s + n
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 3, 1], // loop(cur=s, end, c)
+        },
+    };
+    let loop_params = vec![ValType::I64, ValType::I64, ValType::I32]; // cur, end, c
+    let test = Block {
+        params: loop_params.clone(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::Eq,
+            a: 0,
+            b: 1,
+        }], // v3 = cur == end
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 4, // notfound
+            then_args: vec![],
+            else_blk: 2, // body
+            else_args: vec![0, 1, 2],
+        },
+    };
+    let body = Block {
+        params: loop_params,
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 0,
+                offset: 0,
+                align: 0,
+            }, // v3 = *cur
+            Inst::ConstI32(0xff), // v4
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 2,
+                b: 4,
+            }, // v5 = c & 0xff
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 5,
+            }, // v6 = *cur == (c & 0xff)
+            Inst::ConstI64(1),    // v7
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 7,
+            }, // v8 = cur + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 3, // found(cur)
+            then_args: vec![0],
+            else_blk: 1, // loop(cur+1, end, c)
+            else_args: vec![8, 1, 2],
+        },
+    };
+    let found = Block {
+        params: vec![ValType::I64], // p
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    let notfound = Block {
+        params: vec![],
+        insts: vec![Inst::ConstI64(0)], // v0
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, test, body, found, notfound],
     }
 }
 
@@ -8932,6 +9211,38 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `memchr(s, c, n)`: the synthesized `__svm_memchr` byte scan → pointer or NULL.
+        "memchr" => {
+            let Some(f) = ctx.helpers.memchr else {
+                return Ok(false); // helper not synthesized → fail-closed
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let ch = ctx.operand(&c.arguments[1].0)?;
+            let n = ctx.operand(&c.arguments[2].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, ch, n],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `<ctype.h>` locators: `isalpha`/`isspace`/`tolower`/… lower to a load through the pointer cell
+        // these return (`(*__ctype_b_loc())[c] & _ISxxx`, `(*__ctype_tolower_loc())[c]`). The tables +
+        // cells are synthesized as read-only data (`build_ctype_data`), so the call is just a const of the
+        // cell's window address. No args.
+        "__ctype_b_loc" | "__ctype_tolower_loc" | "__ctype_toupper_loc" => {
+            let cell = match name {
+                "__ctype_b_loc" => ctx.helpers.ctype_b_loc,
+                "__ctype_tolower_loc" => ctx.helpers.ctype_tolower_loc,
+                _ => ctx.helpers.ctype_toupper_loc,
+            };
+            let Some(addr) = cell else {
+                return Ok(false); // table not synthesized → fail-closed
+            };
+            let r = ctx.push(Inst::ConstI64(addr as i64));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // `getenv(name)`: the synthesized `__svm_getenv` scans the §3e env strings for `name=`.
         "getenv" => {
             let Some(f) = ctx.helpers.getenv else {
@@ -9627,9 +9938,21 @@ fn lower_int_intrinsic(
         return Ok(Some(ctx.push(Inst::VIntBin { shape, op, a, b })));
     }
     let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
-    let cmp_select = |ctx: &mut BlockCtx, op: CmpOp| -> Result<ValIdx, Error> {
-        let a = ctx.operand(args[0])?;
-        let b = ctx.operand(args[1])?;
+    // A **narrow** (< i32) operand sits in an i32 container whose high bits are unspecified — e.g. a
+    // non-canonical `add i8 x, -1` (the narrow `bin` path doesn't mask power-of-two widths). min/max
+    // selects via an i32 compare, so — exactly like `ICmp` (§3b narrow-int hazard) — the operands must
+    // first be canonically extended: sign- for signed min/max, zero- for unsigned. Without this,
+    // `umin.i8(add i8 x,-1, y)` compares dirty containers and picks the wrong operand (a silent
+    // miscompile — found via Embench `qrduino`). The `Select` then runs on the canonical values, so the
+    // chosen result is canonical too.
+    let narrow = int_bits(args[0].get_type(types).as_ref()).filter(|&w| w < 32);
+    let cmp_select = |ctx: &mut BlockCtx, op: CmpOp, signed: bool| -> Result<ValIdx, Error> {
+        let mut a = ctx.operand(args[0])?;
+        let mut b = ctx.operand(args[1])?;
+        if let Some(w) = narrow {
+            a = emit_ext(ctx, a, w, 32, signed);
+            b = emit_ext(ctx, b, w, 32, signed);
+        }
         let cond = ctx.push(Inst::IntCmp { ty, op, a, b });
         Ok(ctx.push(Inst::Select { cond, a, b }))
     };
@@ -9638,10 +9961,10 @@ fn lower_int_intrinsic(
         Ok(ctx.push(Inst::IntUn { ty, op, a }))
     };
     let idx = match base {
-        "llvm.smax" => cmp_select(ctx, CmpOp::GtS)?,
-        "llvm.smin" => cmp_select(ctx, CmpOp::LtS)?,
-        "llvm.umax" => cmp_select(ctx, CmpOp::GtU)?,
-        "llvm.umin" => cmp_select(ctx, CmpOp::LtU)?,
+        "llvm.smax" => cmp_select(ctx, CmpOp::GtS, true)?,
+        "llvm.smin" => cmp_select(ctx, CmpOp::LtS, true)?,
+        "llvm.umax" => cmp_select(ctx, CmpOp::GtU, false)?,
+        "llvm.umin" => cmp_select(ctx, CmpOp::LtU, false)?,
         "llvm.ctlz" => unop(ctx, IntUnOp::Clz)?,
         "llvm.cttz" => unop(ctx, IntUnOp::Ctz)?,
         "llvm.ctpop" => unop(ctx, IntUnOp::Popcnt)?,
@@ -14406,17 +14729,21 @@ fn bin<'d>(
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
     let r = ctx.push(Inst::IntBin { ty, op, a, b });
-    // Keep an `iN` value (a non-power-of-two width `33..63` held in an `i64`) **canonical**: the
-    // de-normalizing ops (`add`/`sub`/`mul`/`shl`) can set bits `≥ N`, so mask the result back to its
-    // low `N` bits. Downstream `lshr`/`trunc`/unsigned-compare then see clean bits (§3b widen-and-
-    // mask); `and`/`or`/`xor`/`lshr`/`div`/`rem` of canonical inputs stay canonical (no extra mask).
-    // 32-/64-bit ops are exact in their container, so nothing to do.
+    // Keep a **narrow** `iN` value **canonical**: the de-normalizing ops (`add`/`sub`/`mul`/`shl`) can
+    // set bits `≥ N`, so mask the result back to its low `N` bits. Downstream `lshr`/`trunc`/unsigned-
+    // compare/min-max then see clean bits (§3b widen-and-mask); `and`/`or`/`xor`/`lshr`/`div`/`rem` of
+    // canonical inputs stay canonical (no extra mask). This covers **both** sub-32 widths held in an
+    // `i32` (`i8`/`i16`) *and* the `33..63` widths held in an `i64`. Previously only `33..63` was masked;
+    // a non-canonical `i8`/`i16` then silently miscompiled any width-sensitive consumer that read the
+    // dirty container without re-masking (e.g. `umin.i8` of an `add i8 x,-1` — found via Embench
+    // `qrduino`). 32-/64-bit ops are exact in their container, so nothing to do.
     let r = match width {
-        Some(w)
-            if (33..64).contains(&w)
-                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl) =>
-        {
-            mask_to_i64(ctx, r, w)
+        Some(w) if w < 64 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl) => {
+            if w <= 32 {
+                mask_to(ctx, r, w)
+            } else {
+                mask_to_i64(ctx, r, w)
+            }
         }
         _ => r,
     };

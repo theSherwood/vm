@@ -13,8 +13,16 @@
  * call `benchmark_body` directly with our own `n`. `main` is compiled only for the native build
  * (timing harness); the SVM build defines SVM_BUILD so the bitcode carries no libc-calling `main`.
  *
- * Required -D: BENCH_SRC="\"<abs path to the benchmark .c>\"". Optional: BEEBS_SRC for benchmarks that
- * use the BEEBS rand/heap (e.g. crc32). Always pass -DNDEBUG (drops asserts → no __assert_fail extern).
+ * Required -D: BENCH_SRC="\"<abs path to the benchmark .c>\"" (the file defining benchmark_body /
+ * initialise_benchmark). Optional:
+ *   - BEEBS_SRC       — for benchmarks that use the BEEBS rand/heap (e.g. crc32).
+ *   - BENCH_EXTRA1/2  — extra "\"...\""-quoted .c paths for *multi-translation-unit* kernels
+ *                       (picojpeg/qrduino/xgboost): the library .c files are `#include`d here too, so the
+ *                       whole kernel compiles as one TU → the SVM bitcode is a single module (no
+ *                       llvm-link) and the native/SVM builds stay identical for an honest differential.
+ *   - BENCH_TAIL_ARGS — extra trailing args spliced into the benchmark_body() call for kernels whose
+ *                       arity differs (e.g. md5sum takes a third `len`: pass -DBENCH_TAIL_ARGS=", MSG_SIZE").
+ * Always pass -DNDEBUG (drops asserts → no __assert_fail extern).
  */
 #ifndef GLOBAL_SCALE_FACTOR
 #define GLOBAL_SCALE_FACTOR 1
@@ -27,8 +35,20 @@
 #endif
 
 #include BENCH_SRC
+#ifdef BENCH_EXTRA1
+#include BENCH_EXTRA1
+#endif
+#ifdef BENCH_EXTRA2
+#include BENCH_EXTRA2
+#endif
 #ifdef BEEBS_SRC
 #include BEEBS_SRC
+#endif
+
+/* Trailing args for kernels whose benchmark_body() arity differs from the (lsf, gsf) norm. Empty by
+ * default; md5sum sets -DBENCH_TAIL_ARGS=", MSG_SIZE". MSG_SIZE et al. are in scope here (post-include). */
+#ifndef BENCH_TAIL_ARGS
+#define BENCH_TAIL_ARGS
 #endif
 
 /* `verify_benchmark` compares result arrays with memcmp, which clang lowers to a `memcmp`/`bcmp`
@@ -57,7 +77,7 @@ long
 run (long n)
 {
   initialise_benchmark ();
-  int r = benchmark_body ((unsigned int) n, (unsigned int) GLOBAL_SCALE_FACTOR);
+  int r = benchmark_body ((unsigned int) n, (unsigned int) GLOBAL_SCALE_FACTOR BENCH_TAIL_ARGS);
   return (long) verify_benchmark (r);
 }
 
