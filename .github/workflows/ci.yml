@@ -299,3 +299,34 @@ jobs:
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
           node browser-test.mjs
 
+  embench-differential:
+    # Whole-stack differential on the real Embench-IoT suite — every engine's `verify` must equal
+    # native's (1). EMBENCH_STRICT makes a MISCOMPILE or an on-ramp build/translate failure fail the
+    # job. This is the net that caught the qrduino soundness bug, so it gates every PR.
+    name: embench differential (all engines · wasm32/wasm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            crates/svm-llvm
+            bench/cross-engine/wasmtime-rs
+      - name: install LLVM 18 (libLLVM for the on-ramp + clang for the kernels & wasm)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
+        run: |
+          curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
+          echo "EMBENCH=/tmp/embench-iot-master" >> "$GITHUB_ENV"
+      - name: build the in-process Wasmtime runner (populates the wt/* columns)
+        run: cargo build --release --bin embench_one --manifest-path bench/cross-engine/wasmtime-rs/Cargo.toml
+      - name: embench differential (strict — MISCOMPILE or on-ramp failure ⇒ red)
+        env:
+          EMBENCH_STRICT: "1"
+        run: cargo run --release --example embench --manifest-path crates/svm-llvm/Cargo.toml
+
