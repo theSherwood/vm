@@ -675,6 +675,150 @@ block0(v0: i32, v1: i32, v2: i32, v3: i32):
 }
 "#;
 
+// ---- §22 guest-JIT **across Workers** (THREADS.md 4c-domain C2) ----------------------------------
+// The root gets `(jit, code)` from the shared powerbox, packs both into the single `thread.spawn` arg
+// (`(code << 32) | jit`), spawns 8 worker vCPUs, joins them, and returns the shared counter at mem[8].
+// Each worker drives the host-compiled unit `JIT_SERVICE(6, 7) = 6*7 + 100 = 142` on the shared
+// `Domain` and atomically adds it → 8 × 142 = 1136. Schedule-independent (every worker computes 142),
+// so the counter matches the cooperative oracle regardless of how the Workers interleave. `THREADS_JIT`
+// macro-expands to the shared root + a worker body; the two kernels differ only in the worker.
+
+// Worker `invoke`s the unit: `cap.call 11 1` (op 1) runs `service(6,7)` over the shared window → 142.
+const THREADS_JIT_INVOKE: &str = r#"memory 16
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  vje = i64.extend_i32_u v0
+  vce = i64.extend_i32_u v1
+  vc32 = i64.const 32
+  vchi = i64.shl vce vc32
+  vpacked = i64.or vchi vje
+  vi0 = i64.const 0
+  br block1(vi0, vpacked)
+block1(vi: i64, vp: i64):
+  vn = i64.const 8
+  vlt = i64.lt_u vi vn
+  br_if vlt block2(vi, vp) block3()
+block2(vi2: i64, vp2: i64):
+  vsp = i64.const 0
+  vt = thread.spawn 1 vsp vp2
+  v4 = i64.const 4
+  v5 = i64.mul vi2 v4
+  v6 = i64.const 16
+  v7 = i64.add v6 v5
+  i32.store v7 vt
+  v8 = i64.const 1
+  v9 = i64.add vi2 v8
+  br block1(v9, vp2)
+block3():
+  vj0 = i64.const 0
+  br block4(vj0)
+block4(vj: i64):
+  vn2 = i64.const 8
+  vlt2 = i64.lt_u vj vn2
+  br_if vlt2 block5(vj) block6()
+block5(vj2: i64):
+  v13 = i64.const 4
+  v14 = i64.mul vj2 v13
+  v15 = i64.const 16
+  v16 = i64.add v15 v14
+  v17 = i32.load v16
+  v18 = thread.join v17
+  v19 = i64.const 1
+  v20 = i64.add vj2 v19
+  br block4(v20)
+block6():
+  v21 = i64.const 8
+  v22 = i64.atomic.load v21
+  return v22
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, vp: i64):
+  vmask = i64.const 4294967295
+  vjit64 = i64.and vp vmask
+  vjit = i32.wrap_i64 vjit64
+  vsh = i64.const 32
+  vcode = i64.shr_u vp vsh
+  va = i32.const 6
+  vb = i32.const 7
+  vr = cap.call 11 1 (i64, i32, i32) -> (i32) vjit (vcode, va, vb)
+  vr64 = i64.extend_i32_u vr
+  vc8 = i64.const 8
+  vold = i64.atomic.rmw.add vc8 vr64
+  vret = i64.const 0
+  return vret
+}
+"#;
+
+// Worker `install`s the unit into the **shared** dispatch table (op 3 → a freshly raced slot) and
+// `call_indirect`s its own slot — genuine concurrent installs visible across Workers via the shared
+// `Domain`; `service(6,7) = 142`.
+const THREADS_JIT_INSTALL: &str = r#"memory 16
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  vje = i64.extend_i32_u v0
+  vce = i64.extend_i32_u v1
+  vc32 = i64.const 32
+  vchi = i64.shl vce vc32
+  vpacked = i64.or vchi vje
+  vi0 = i64.const 0
+  br block1(vi0, vpacked)
+block1(vi: i64, vp: i64):
+  vn = i64.const 8
+  vlt = i64.lt_u vi vn
+  br_if vlt block2(vi, vp) block3()
+block2(vi2: i64, vp2: i64):
+  vsp = i64.const 0
+  vt = thread.spawn 1 vsp vp2
+  v4 = i64.const 4
+  v5 = i64.mul vi2 v4
+  v6 = i64.const 16
+  v7 = i64.add v6 v5
+  i32.store v7 vt
+  v8 = i64.const 1
+  v9 = i64.add vi2 v8
+  br block1(v9, vp2)
+block3():
+  vj0 = i64.const 0
+  br block4(vj0)
+block4(vj: i64):
+  vn2 = i64.const 8
+  vlt2 = i64.lt_u vj vn2
+  br_if vlt2 block5(vj) block6()
+block5(vj2: i64):
+  v13 = i64.const 4
+  v14 = i64.mul vj2 v13
+  v15 = i64.const 16
+  v16 = i64.add v15 v14
+  v17 = i32.load v16
+  v18 = thread.join v17
+  v19 = i64.const 1
+  v20 = i64.add vj2 v19
+  br block4(v20)
+block6():
+  v21 = i64.const 8
+  v22 = i64.atomic.load v21
+  return v22
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, vp: i64):
+  vmask = i64.const 4294967295
+  vjit64 = i64.and vp vmask
+  vjit = i32.wrap_i64 vjit64
+  vsh = i64.const 32
+  vcode = i64.shr_u vp vsh
+  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vslot32 = i32.wrap_i64 vslot
+  va = i32.const 6
+  vb = i32.const 7
+  vr = call_indirect (i32, i32) -> (i32) vslot32 (va, vb)
+  vr64 = i64.extend_i32_u vr
+  vc8 = i64.const 8
+  vold = i64.atomic.rmw.add vc8 vr64
+  vret = i64.const 0
+  return vret
+}
+"#;
+
 // ---- durability (freeze / thaw, single-fiber, IR-driven) ---------------------------------------
 // From `crates/svm/tests/bytecode_durable.rs`. A program with two clock reads (each an unwind point);
 // the first value is live across the second, so a freeze after the first spills it to the shadow
@@ -1268,6 +1412,12 @@ fn main() {
             if i + 1 == jit.len() { "\n" } else { ",\n" },
         ));
     }
+    // §22 guest-JIT **across Workers** (THREADS.md 4c-domain C2) — emit the kernels for the
+    // threads-spawn / browser parallel-JIT proof. Their ground truth (8 × service(6,7) = 1136) is
+    // asserted in the JS host (like the threads kernel's 4000), not the corpus JSON: they need the
+    // multi-Worker shared powerbox the single-vCPU corpus differential doesn't set up.
+    emit("threads_jit_invoke", THREADS_JIT_INVOKE);
+    emit("threads_jit_install", THREADS_JIT_INSTALL);
     // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
     // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
     {

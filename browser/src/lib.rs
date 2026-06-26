@@ -405,6 +405,102 @@ unsafe fn prog_ref(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::VcpuP
     &*prog
 }
 
+// ---- §22 guest-JIT across Workers: a Rust-side shared powerbox (THREADS.md 4c-domain C2) ---------
+// The powerbox (a `Host` with the `Jit` cap + the host-compiled unit) is built once and **leaked** into
+// the shared linear memory; its pointer is published in a process-wide `static` which — under
+// `--shared-memory` — lives in that shared memory, so every Worker's instance reads the same value
+// (the same mechanism the `Box::leak`ed `VcpuProgram` uses, but a `static` instead of a JS-threaded
+// pointer). A worker vCPU's `Jit.install`/`uninstall`/`invoke` is then serviced **inside**
+// [`svm_par_run`] against this powerbox + the shared `Domain` — so the JS host services no new events
+// (it never sees a JIT op, needs no new glue). During the run the powerbox is read-only (the unit is
+// compiled at setup, before any spawn), so the concurrent `&Host` reads need no lock; the install/
+// dispatch mutation lives in the `Domain`, which is already interior-mutable + thread-safe.
+
+/// The shared §22 powerbox: a `Host` with the `Jit` cap granted + [`JIT_SERVICE`] host-compiled, plus
+/// the handles the root guest receives as `(jit, code)`.
+struct ParPowerbox {
+    host: Host,
+    jit: i32,
+    code: i32,
+}
+
+/// The leaked [`ParPowerbox`] pointer (or `0`), shared across Workers via shared linear memory.
+static PAR_PB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `2^4 = 16` dispatch-table slots — the `Jit` table reservation matched by [`svm_par_compile_jit`]
+/// and the powerbox grant so guest `install` lands in range (mirrors [`jit_exec`]).
+const PAR_JIT_TABLE_LOG2: u8 = 4;
+
+/// Build the **shared powerbox** for a §22-JIT run: grant the `Jit` cap (16-slot table) on a fresh
+/// `Host`, host-compile [`JIT_SERVICE`] into it, then leak it and publish the pointer for every Worker.
+/// `guest`'s declared memory sizes the domain (the validator's memory-match precondition). Returns `1`
+/// on success, `0` on decode / parse / compile failure. Call **once** (on the main thread) before the
+/// run; the published pointer outlives it.
+#[no_mangle]
+pub extern "C" fn svm_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i32 {
+    // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return 0;
+    };
+    let service = match svm_text::parse_module(JIT_SERVICE) {
+        Ok(s) => svm_encode::encode_module(&s),
+        Err(_) => return 0,
+    };
+    let mut host = Host::new();
+    let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
+    host.set_jit_validator(browser_jit_validator);
+    let code = match host.jit_compile(jit, &service) {
+        Ok(Ok(c)) => c.handle,
+        _ => return 0,
+    };
+    let pb = Box::into_raw(Box::new(ParPowerbox { host, jit, code }));
+    PAR_PB.store(pb as usize, std::sync::atomic::Ordering::Release);
+    1
+}
+
+/// Borrow the published powerbox (`None` until [`svm_par_powerbox`] ran). The pointer is published with
+/// `Release`; this `Acquire` load pairs with it so the `Host` it built is visible to this Worker.
+fn par_pb() -> Option<&'static ParPowerbox> {
+    let p = PAR_PB.load(std::sync::atomic::Ordering::Acquire) as *const ParPowerbox;
+    // SAFETY: once published the powerbox is leaked (never freed) and read-only for the run, so the
+    // shared `&'static` is sound (concurrent `&self` reads only).
+    unsafe { p.as_ref() }
+}
+
+/// Resolve a code-handle's unit funcs under authority `handle` against the powerbox (the `install` /
+/// `invoke` service): a forged / cross-domain / wrong-type handle is an inert `CapFault` → trap.
+fn par_resolve_unit(
+    pb: &ParPowerbox,
+    handle: i32,
+    code: i32,
+) -> Result<std::sync::Arc<[svm_ir::Func]>, Trap> {
+    let domain = pb.host.resolve_jit_domain(handle)?;
+    let (cd, cu) = pb.host.resolve_jit_code(code)?;
+    if cd != domain {
+        return Err(Trap::CapFault);
+    }
+    pb.host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+}
+
+/// Like [`svm_par_compile`], but reserve the `Jit` dispatch table (matching the powerbox grant) so a
+/// guest `install` lands in range. Use this (not [`svm_par_compile`]) for a §22-JIT run.
+#[no_mangle]
+pub extern "C" fn svm_par_compile_jit(
+    mod_ptr: *const u8,
+    mod_len: usize,
+) -> *mut bytecode::VcpuProgram {
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return core::ptr::null_mut();
+    };
+    match bytecode::VcpuProgram::compile_with_jit_table(&m, PAR_JIT_TABLE_LOG2) {
+        Some(p) => Box::into_raw(Box::new(p)),
+        None => core::ptr::null_mut(),
+    }
+}
+
 /// Build the **root** vCPU (function `func`) over the shared window `[win_ptr, win_size)`; it seeds +
 /// data-initialises the window (the once). Returns a boxed [`ParVcpu`] pointer, null on a bad func.
 #[no_mangle]
@@ -416,8 +512,15 @@ pub extern "C" fn svm_par_root(
 ) -> *mut ParVcpu {
     // SAFETY: the host guarantees `[win_ptr, win_size)` is a live shared window for the run.
     let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    // A §22-JIT run seeds the root with `(jit, code)` handles from the shared powerbox (so the guest
+    // can thread them to its workers); a plain run gets no args. (The signature is unchanged, so the
+    // existing JS host needs no edit — it just calls `svm_par_powerbox` first for a JIT run.)
+    let args: Vec<Value> = match par_pb() {
+        Some(pb) => vec![Value::I32(pb.jit), Value::I32(pb.code)],
+        None => Vec::new(),
+    };
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match bytecode::Vcpu::new_root(unsafe { prog_ref(prog) }, func, &[], back, &[]) {
+    match bytecode::Vcpu::new_root(unsafe { prog_ref(prog) }, func, &args, back, &[]) {
         Ok(inner) => Box::into_raw(Box::new(ParVcpu {
             inner,
             a: 0,
@@ -463,46 +566,63 @@ pub extern "C" fn svm_par_child(
 pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
     // SAFETY: `v` is a live `ParVcpu` from `svm_par_root`/`svm_par_child`, owned by this Worker.
     let v = unsafe { &mut *v };
-    match v.inner.run() {
-        bytecode::VcpuEvent::Done(vals) => {
-            v.a = first_i64(&vals);
-            PAR_DONE
+    // Loop so §22 JIT events (serviced in-Rust against the shared powerbox) never surface to the JS
+    // host — it only ever sees the multi-vCPU events `spawn`/`join`/`wait`/`notify` (+ `done`/`trap`).
+    loop {
+        match v.inner.run() {
+            bytecode::VcpuEvent::Done(vals) => {
+                v.a = first_i64(&vals);
+                return PAR_DONE;
+            }
+            bytecode::VcpuEvent::Trapped(_) => return PAR_TRAP,
+            bytecode::VcpuEvent::Spawn { func, sp, arg } => {
+                v.a = func as i64;
+                v.b = sp;
+                v.c = arg;
+                return PAR_SPAWN;
+            }
+            bytecode::VcpuEvent::Join { handle } => {
+                v.a = handle as i64;
+                return PAR_JOIN;
+            }
+            bytecode::VcpuEvent::Wait {
+                addr,
+                expected,
+                width,
+                timeout,
+            } => {
+                v.a = addr as i64;
+                v.b = expected as i64;
+                v.c = width as i64;
+                v.d = timeout as i64;
+                return PAR_WAIT;
+            }
+            bytecode::VcpuEvent::Notify { addr, count } => {
+                v.a = addr as i64;
+                v.b = count as i64;
+                return PAR_NOTIFY;
+            }
+            // §22 guest-JIT serviced in-Rust against the shared powerbox + `Domain` (THREADS.md
+            // 4c-domain C2): resolve the unit (the powerbox holds authority) and deliver it; the vCPU
+            // installs / invokes against the shared `Domain`, then we loop. Without a powerbox (a
+            // non-JIT run) a JIT op is fail-closed, exactly as before this seam existed.
+            bytecode::VcpuEvent::JitInstall { handle, code } => match par_pb() {
+                Some(pb) => v.inner.deliver_jit_install(par_resolve_unit(pb, handle, code)),
+                None => return PAR_TRAP,
+            },
+            bytecode::VcpuEvent::JitUninstall { handle, .. } => match par_pb() {
+                Some(pb) => v
+                    .inner
+                    .deliver_jit_uninstall(pb.host.resolve_jit_domain(handle).map(|_| ())),
+                None => return PAR_TRAP,
+            },
+            bytecode::VcpuEvent::JitInvoke {
+                handle, code, ..
+            } => match par_pb() {
+                Some(pb) => v.inner.deliver_jit_invoke(par_resolve_unit(pb, handle, code)),
+                None => return PAR_TRAP,
+            },
         }
-        bytecode::VcpuEvent::Trapped(_) => PAR_TRAP,
-        bytecode::VcpuEvent::Spawn { func, sp, arg } => {
-            v.a = func as i64;
-            v.b = sp;
-            v.c = arg;
-            PAR_SPAWN
-        }
-        bytecode::VcpuEvent::Join { handle } => {
-            v.a = handle as i64;
-            PAR_JOIN
-        }
-        bytecode::VcpuEvent::Wait {
-            addr,
-            expected,
-            width,
-            timeout,
-        } => {
-            v.a = addr as i64;
-            v.b = expected as i64;
-            v.c = width as i64;
-            v.d = timeout as i64;
-            PAR_WAIT
-        }
-        bytecode::VcpuEvent::Notify { addr, count } => {
-            v.a = addr as i64;
-            v.b = count as i64;
-            PAR_NOTIFY
-        }
-        // §22 guest-JIT is serviced through the resumable API (proven natively by
-        // `bytecode_vcpu_orchestration_jit.rs`), but the browser JS/Worker glue for resolving a unit
-        // from the powerbox over the FFI is a separate slice — until then a browser guest's JIT op is
-        // fail-closed (a clean trap), exactly as before this seam existed.
-        bytecode::VcpuEvent::JitInstall { .. }
-        | bytecode::VcpuEvent::JitUninstall { .. }
-        | bytecode::VcpuEvent::JitInvoke { .. } => PAR_TRAP,
     }
 }
 
