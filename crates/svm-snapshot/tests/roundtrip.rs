@@ -255,6 +255,29 @@ fn freeze_refuses_a_non_durable_handle() {
     }
 }
 
+/// §12.5 handle hardening: draining the non-durable handle turns the refusal above into a successful
+/// serialize. `Host::drain_non_durable` closes the out-of-line `IoRing` (the guest relinquishes that
+/// authority), leaving only the re-grantable `Clock`, so the domain becomes snapshottable.
+#[test]
+fn freeze_succeeds_after_draining_a_non_durable_handle() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    host.grant_io_ring(); // non-durable — blocks the freeze until drained
+    let win = init_durable_window(WINDOW);
+    assert!(
+        matches!(
+            freeze(&inst, &win, &host),
+            Err(FreezeError::NonDurableHandle(_))
+        ),
+        "the live io_ring refuses the freeze"
+    );
+
+    let drained = host.drain_non_durable();
+    assert_eq!(drained.len(), 1, "the io_ring was drained");
+    freeze(&inst, &win, &host).expect("a drained domain serializes");
+}
+
 // Multi-vCPU (slice 3.2.1): the root spawns a child over the shared window; both read the (advancing)
 // clock once, then the root joins and sums. Frozen mid-run, the artifact must carry each vCPU's
 // continuation (its own window shadow region) + the control-section residue (spawned vCPUs + the
