@@ -14,6 +14,7 @@ feeds every engine — including the SVM ones, which run IR produced by the **re
 | `js(v8)` | the same kernels as pure JavaScript on V8 |
 | `svm-jit` | this repo's Cranelift JIT (`svm_jit::compile` once → `CompiledModule::run`), on **LLVM-frontend** IR |
 | `svm-bytecode` | this repo's bytecode engine (`bytecode::compile_and_run`), on LLVM-frontend IR |
+| `svm-bytecode-wasm` | the **same bytecode engine compiled to wasm** (the `BROWSER.md` `svm-browser` cdylib) running the same IR on Node/V8 — the cost of double-sandboxing the interpreter (optional: needs `node`) |
 | `svm-tree-walk` | this repo's tree-walking oracle (`svm_interp::run`), on LLVM-frontend IR |
 | `python` | CPython 3 |
 | `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `svm-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
@@ -144,6 +145,38 @@ still **~3–9× behind Pulley** — real headroom in the bytecode dispatch loop
 dispatch overhead), not an algorithmic gap. Both SVM interpreters are the same order of magnitude as a
 production wasm interpreter, and both are ~20–50× off the JIT (cf. the steady-state table) — which is
 why the JIT exists and why the break-even analysis above matters for tier selection.
+
+## SVM-in-wasm — the interpreter inside the wasm sandbox
+
+`BROWSER.md` proves the bytecode engine *runs correctly* compiled to wasm, but never measures what that
+*costs*. The `svm-bytecode-wasm` row closes that: it times the **exact same bytecode engine, compiled
+to wasm** (the `svm-browser` cdylib), running the **same LLVM-frontend IR** as the native `svm-bytecode`
+row, on Node/V8. The two rows are byte-identical engines on byte-identical IR — so their ratio *is* the
+overhead of double-sandboxing the interpreter inside the wasm host (V8's sandbox over SVM's own). The
+driver feeds each kernel through `browser/bench.mjs` (which `svm_alloc`s the encoded module once and
+times `svm_run_bench(func, sp, n)` by the same large/small-`n` subtraction) and **cross-checks every
+result against native bytecode** — a verify mismatch is reported as a `MISCOMPILE`, so the row doubles as
+a wasm-vs-native differential.
+
+Indicative shape (per-iter ns; absolute numbers machine-dependent; `wasm/native` = the sandbox tax):
+
+| kernel | `svm-bytecode` | `svm-bytecode-wasm` | wasm/native |
+|---|--:|--:|--:|
+| alu | ~55 | ~70 | ~1.3× |
+| xorshift | ~67 | ~87 | ~1.3× |
+| fnv | ~121 | ~164 | ~1.4× |
+| fma | ~28 | ~34 | ~1.2× |
+| chase | ~88 | ~172 | ~1.9× |
+| chase_rand | ~101 | ~348 | ~3.4× |
+
+Reading: **pure-compute kernels pay only ~1.2–1.4×** to run the interpreter inside wasm — V8 JITs the
+dispatch loop well, so the engine's own work is barely taxed. The **dependent-load memory kernels pay
+much more** (`chase` ~1.9×, `chase_rand` ~3.4×): every guest load now goes through *two* memory
+indirections — SVM's mask/guard confinement *and* wasm's linear-memory bounds — and the chase chain is
+serial, so that latency can't be hidden by ILP. That's the honest picture of the browser path's cost: a
+modest tax on compute, a real one on pointer-chasing workloads. (Optional row: it needs `node` and the
+`svm-browser` wasm32 cdylib — the driver builds it once on demand, or skips the row with a note. wasm32
+on V8 is the actual browser target; no Wasmtime/`build-std` required.)
 
 ## End-to-end real programs
 

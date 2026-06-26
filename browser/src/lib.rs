@@ -287,6 +287,84 @@ pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
     run_at(ptr, len, &[])
 }
 
+/// **Benchmark entry: run an arbitrary kernel function under the LLVM-frontend ABI.** Decode the
+/// module at `[mod_ptr, mod_len)`, run function `func` on the bytecode engine with the frontend's
+/// `(sp, n)` calling convention — `(sp, n)` for a ≥2-param entry, `(n)` for a 1-param one — under a
+/// deny-all `Host`, and return its first result widened to `i64` (`0` on any non-`OK` status; read
+/// [`svm_status`]). Each argument is coerced to its declared `ValType` so a 32-bit `n` param (the
+/// `cross_engine` kernels) and a 64-bit one (the `embench` kernels, `long n`) both run correctly.
+///
+/// This is the seam the cross-engine benchmark uses to time the **bytecode engine running inside
+/// wasm** (`crates/svm-llvm/examples/cross_engine.rs`'s `svm-bytecode-wasm` row, driven via
+/// `browser/bench.mjs`) on the *same* LLVM-frontend IR the native `svm-bytecode` row runs — isolating
+/// the cost of the wasm sandbox over the interpreter. `svm_run`/`svm_run0` only reach function 0 with
+/// a fixed arity, so a dedicated entry is needed to drive a kernel exported at an arbitrary index.
+#[no_mangle]
+pub extern "C" fn svm_run_bench(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    func: u32,
+    sp: i64,
+    n: i64,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let Some(f) = m.funcs.get(func as usize) else {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    };
+    // Frontend ABI: the entry is `func(sp, n)`; a 1-param entry (e.g. a hand-written text kernel)
+    // takes just `n`. Coerce each value to the declared param type (i32 vs i64 `n`); pad any extra
+    // params with 0 of their type.
+    let supplied: &[i64] = if f.params.len() >= 2 { &[sp, n] } else { &[n] };
+    let args: Vec<Value> = f
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let raw = supplied.get(i).copied().unwrap_or(0);
+            match ty {
+                svm_ir::ValType::I32 => Value::I32(raw as i32),
+                _ => Value::I64(raw),
+            }
+        })
+        .collect();
+    let mut fuel = u64::MAX;
+    let mut host = Host::new(); // deny-all powerbox (compute-only)
+    match bytecode::compile_and_run_with_host(&m, func, &args, &mut fuel, &mut host) {
+        None => {
+            set(STATUS_UNSUPPORTED);
+            0
+        }
+        Some(Err(_)) => {
+            set(STATUS_TRAP);
+            0
+        }
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => {
+                set(STATUS_OK);
+                *x
+            }
+            Some(Value::I32(x)) => {
+                set(STATUS_OK);
+                *x as i64
+            }
+            _ => {
+                set(STATUS_BAD_RESULT);
+                0
+            }
+        },
+    }
+}
+
 // ---- shared-memory window: run the engine over a caller-owned region of *this* linear memory ----
 //
 // THREADS.md step 4. `svm_run` runs over a window the engine backs internally; `svm_run_shared` runs

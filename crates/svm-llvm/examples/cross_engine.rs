@@ -76,6 +76,42 @@ fn main() {
             .1
     };
 
+    // **svm-in-wasm row** (BROWSER.md): time the bytecode engine *itself compiled to wasm* running
+    // the same LLVM-frontend IR on V8 (Node), so the gap to the native `svm-bytecode` row is exactly
+    // the cost of double-sandboxing the interpreter inside the wasm host. Optional — needs `node` and
+    // the `svm-browser` wasm32 cdylib (built here once on demand; skipped with a note if either is
+    // absent). The whole module is encoded once; `browser/bench.mjs` runs a given function index per
+    // kernel. (wasm32/Node is the real browser target — see BROWSER.md; no wasmtime/build-std needed.)
+    let browser = root.join("browser");
+    let wasm = browser.join("target/wasm32-unknown-unknown/release/svm_browser.wasm");
+    let bench_mjs = browser.join("bench.mjs");
+    let have_node = Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if have_node && !wasm.exists() {
+        eprintln!("note: building the svm-browser wasm32 cdylib for the svm-bytecode-wasm row (one-time)…");
+        let _ = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--lib",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--manifest-path",
+            ])
+            .arg(browser.join("Cargo.toml"))
+            .status();
+    }
+    let svmbc = std::env::temp_dir().join(format!("svm_xe_{}.svmbc", std::process::id()));
+    let wasm_row = have_node
+        && wasm.exists()
+        && std::fs::write(&svmbc, svm_encode::encode_module(&t.module)).is_ok();
+    if !wasm_row {
+        eprintln!("note: svm-bytecode-wasm row skipped (needs `node` + the svm-browser wasm32 cdylib; see BROWSER.md)");
+    }
+
     for &(disp, sym) in KERNELS {
         let e = idx(sym);
 
@@ -112,8 +148,66 @@ fn main() {
             })
         };
         println!("svm-jit,{disp},{jit:.4}");
+
+        // svm-in-wasm: shell out to `browser/bench.mjs` (V8) for the same kernel `e`, then check its
+        // result@SMALL against native bytecode (a verify mismatch is a soundness bug, reported loud).
+        if wasm_row {
+            let out = Command::new("node")
+                .arg(&bench_mjs)
+                .arg(&wasm)
+                .arg(&svmbc)
+                .arg(e.to_string())
+                .arg(sp.to_string())
+                .arg(SMALL.to_string())
+                .arg(LARGE.to_string())
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    let mut it = s.lines();
+                    if let (Some(ns), Some(res)) = (
+                        it.next().and_then(|l| l.trim().parse::<f64>().ok()),
+                        it.next().and_then(|l| l.trim().parse::<i64>().ok()),
+                    ) {
+                        let mut fuel = u64::MAX;
+                        let want = as_i64(
+                            bytecode::compile_and_run(
+                                &t.module,
+                                e,
+                                &[Value::I64(sp), Value::I32(SMALL)],
+                                &mut fuel,
+                            )
+                            .expect("bytecode")
+                            .unwrap()[0],
+                        );
+                        if res != want {
+                            eprintln!(
+                                "svm-bytecode-wasm MISCOMPILE on {disp}: wasm={res} native-bytecode={want}"
+                            );
+                        }
+                        println!("svm-bytecode-wasm,{disp},{ns:.4}");
+                    }
+                }
+                Ok(out) => eprintln!(
+                    "note: svm-bytecode-wasm {disp} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(err) => eprintln!("note: svm-bytecode-wasm {disp} failed to launch node: {err}"),
+            }
+        }
     }
     let _ = std::fs::remove_file(&bc);
+    let _ = std::fs::remove_file(&svmbc);
+}
+
+/// Widen a kernel's first result to `i64` for the cross-engine correctness check (kernels return
+/// `i32` or `i64`).
+fn as_i64(v: Value) -> i64 {
+    match v {
+        Value::I32(x) => x as i64,
+        Value::I64(x) => x,
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 /// Per-iteration compute (ns), isolated by large/small-`n` subtraction, min over reps.
