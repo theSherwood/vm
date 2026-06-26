@@ -1000,6 +1000,45 @@ fn signed_narrow_minmax() {
 }
 
 #[test]
+fn funnel_shift_i16() {
+    // `-O2` folds `(a << 1) | (b >> 15)` over `unsigned short` into `llvm.fshl.i16` — a *general*
+    // funnel shift (distinct operands), constant amount, at a sub-32 width. The on-ramp lowers it as
+    // `(a << s) | (b >>u (w - s))` in the i32 container and masks the result back to 16 bits (the value
+    // is narrower than its container). Found via Embench `picojpeg`.
+    let src = "int run(int s);\n\
+               static unsigned short fl(unsigned short a, unsigned short b){\n\
+                 return (unsigned short)((a << 1) | (b >> 15));\n\
+               }\n\
+               int run(int s){\n\
+                 unsigned short a = (unsigned short)(s * 40503u);\n\
+                 unsigned short b = (unsigned short)(s * 12345u + 7u);\n\
+                 unsigned short r = fl(a, b);\n\
+                 return (int)(r ^ (r >> 8)) & 0xff;\n\
+               }\n\
+               int main(void){ return run(3); }";
+    check_vs_native("funnel_i16", src, 3);
+}
+
+#[test]
+fn vector_mask_sext() {
+    // A byte-array compare-to-mask that `-O2` vectorizes to `icmp slt <16 x i8>` → `sext <16 x i1> to
+    // <16 x i8>`. The `<N x i1>` source is a lane-wise mask (`mask_lanes`, not a packed vector), so the
+    // vector-convert path resolves it via `mask_operand` and sign-extends each `0`/`1` lane to `0`/`-1`.
+    // Found via Embench `picojpeg` (a `select` mask materialized to a byte vector).
+    let src = "int run(int s);\n\
+               static signed char a[64], b[64], out[64];\n\
+               int run(int s){\n\
+                 for (int i = 0; i < 64; i++){ a[i] = (signed char)(s*7 + i*13); b[i] = (signed char)(s*3 + i*5 - 40); }\n\
+                 for (int i = 0; i < 64; i++) out[i] = -(signed char)(a[i] < b[i]);\n\
+                 int acc = 0;\n\
+                 for (int i = 0; i < 64; i++) acc = acc*3 + (out[i] & 0xff);\n\
+                 return acc & 0x7f;\n\
+               }\n\
+               int main(void){ return run(9); }";
+    check_vs_native("mask_sext", src, 9);
+}
+
+#[test]
 fn float_arithmetic_and_fmuladd() {
     // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
     let src = "double fa(double a, double b){ return a*b + a/b - b; }";
