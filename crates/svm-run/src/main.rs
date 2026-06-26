@@ -411,6 +411,9 @@ fn fresh_temp_dir() -> Result<PathBuf, String> {
         .unwrap_or(0);
     let rnd = RandomState::new().hash_one((process::id(), nanos));
     let dir = env::temp_dir().join(format!("svm_run_{rnd:016x}"));
+    // `mut` is used only on unix (the `mode` call below); on other targets the cfg block is empty,
+    // so silence the would-be `unused_mut` warning there rather than under `-D warnings` failing CI.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut b = fs::DirBuilder::new();
     // Non-recursive create: fails (EEXIST) on any pre-existing path — including a planted symlink —
     // rather than following it. On unix, restrict to owner so the inner file can't be swapped.
