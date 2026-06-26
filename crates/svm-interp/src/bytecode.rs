@@ -1611,9 +1611,21 @@ pub struct VcpuProgram {
 
 impl VcpuProgram {
     /// Compile `m` for the bytecode engine, or `None` if it uses an op outside the engine's subset.
+    /// The dispatch table is natural-sized (no §22 `install` room); use [`compile_with_jit_table`] to
+    /// reserve padding slots for guest-driven install.
+    ///
+    /// [`compile_with_jit_table`]: VcpuProgram::compile_with_jit_table
     pub fn compile(m: &Module) -> Option<VcpuProgram> {
+        Self::compile_with_jit_table(m, 0)
+    }
+
+    /// Like [`compile`](VcpuProgram::compile), but reserve a `call_indirect` table of `2^table_log2`
+    /// slots for §22 `Jit.install` — pass the **same** value the embedder gave `grant_jit_with_table`
+    /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
+    /// cooperative oracle uses. `0` ⇒ natural size (no install room).
+    pub fn compile_with_jit_table(m: &Module, table_log2: u8) -> Option<VcpuProgram> {
         let c = compile_module(&m.funcs)?;
-        let dom = Domain::new(c, Host::new().jit_table_log2());
+        let dom = Domain::new(c, table_log2);
         Some(VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
@@ -1652,13 +1664,53 @@ pub enum VcpuEvent {
     /// `memory.notify`: wake up to `count` waiters on `addr`, then call [`Vcpu::deliver_code`] with the
     /// number actually woken.
     Notify { addr: u64, count: i32 },
+    /// §22 `Jit.install`: the host (which holds the powerbox) resolves authority for `handle` +
+    /// code-handle `code`, returning the unit's funcs — then calls [`Vcpu::deliver_jit_install`]. The
+    /// vCPU compiles + installs into the **shared** [`Domain`] (visible to every vCPU/Worker via the
+    /// interior-mutable table) and writes the slot (or `-ENOSPC`) to the awaiting dst.
+    JitInstall { handle: i32, code: i32 },
+    /// §22 `Jit.uninstall`: the host checks authority for `handle`, then calls
+    /// [`Vcpu::deliver_jit_uninstall`]; the vCPU clears the shared table `slot` (`0`/`EINVAL` → dst).
+    JitUninstall { handle: i32, slot: i64 },
+    /// §22 `Jit.invoke`: the host resolves the unit's funcs (authority + cross-domain), then calls
+    /// [`Vcpu::deliver_jit_invoke`]; the vCPU compiles, arity-checks, and runs the unit synchronously
+    /// over its window, writing the results to the awaiting dst.
+    JitInvoke {
+        handle: i32,
+        code: i32,
+        argv: Box<[i64]>,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
+    },
+}
+
+/// A §22 JIT op awaiting the host's [`VcpuEvent::JitInstall`]/`JitUninstall`/`JitInvoke` reply — the
+/// vCPU-side residue (dst + the op's parameters) carried across the host round-trip, so the matching
+/// `deliver_jit_*` can finish the op against the shared [`Domain`].
+enum PendingJit {
+    Install {
+        dst: u32,
+    },
+    Uninstall {
+        slot: i64,
+        dst: u32,
+    },
+    Invoke {
+        argv: Box<[i64]>,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
+        dst: u32,
+    },
 }
 
 /// One **resumable** vCPU over a shared window. The host calls [`run`](Vcpu::run) to advance it until a
 /// [`VcpuEvent`], services the event, delivers the result (`deliver_*`), and runs again — so the same
 /// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope (as
-/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute; §14
-/// `instantiate` / §22 JIT install fail closed (they need a `&mut Domain`). Carries a deny-all `Host`.
+/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, plus
+/// §22 guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
+/// [`Domain`] (THREADS.md 4c-domain). §14 `instantiate` still fails closed. Carries a deny-all `Host`,
+/// so an *invoked* unit that itself makes a `cap.call` is out of scope (the invoke runs over this empty
+/// powerbox) — the powerbox-backed unit is the orchestrator's job, like every other host capability.
 pub struct Vcpu<'p> {
     prog: &'p VcpuProgram,
     vt: VTask,
@@ -1670,6 +1722,9 @@ pub struct Vcpu<'p> {
     host: Host,
     /// The dst register awaiting a `deliver_*` after a host-serviced event.
     pending: Option<u32>,
+    /// A §22 JIT op awaiting its `deliver_jit_*` (carries the op's dst + parameters across the
+    /// host round-trip). Distinct from `pending` because the reply payload is richer than one register.
+    pending_jit: Option<PendingJit>,
     /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
     trap: Option<Trap>,
 }
@@ -1726,6 +1781,7 @@ impl<'p> Vcpu<'p> {
             host: Host::new(),
             prog,
             pending: None,
+            pending_jit: None,
             trap: None,
         })
     }
@@ -1788,7 +1844,40 @@ impl<'p> Vcpu<'p> {
                 self.pending = Some(dst);
                 VcpuEvent::Notify { addr: base, count }
             }
-            // §14 instantiate / §22 JIT need a `&mut Domain` the host-orchestrated driver can't share.
+            // §22 guest-JIT — the host resolves the unit (it holds the powerbox), the vCPU installs /
+            // invokes it against the **shared** [`Domain`]. The op's residue is parked in `pending_jit`
+            // until the matching `deliver_jit_*`.
+            Ok(VcpuStop::JitInstall { h, code, dst }) => {
+                self.pending_jit = Some(PendingJit::Install { dst });
+                VcpuEvent::JitInstall { handle: h, code }
+            }
+            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                self.pending_jit = Some(PendingJit::Uninstall { slot, dst });
+                VcpuEvent::JitUninstall { handle: h, slot }
+            }
+            Ok(VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            }) => {
+                self.pending_jit = Some(PendingJit::Invoke {
+                    argv: argv.clone(),
+                    params: params.clone(),
+                    results: results.clone(),
+                    dst,
+                });
+                VcpuEvent::JitInvoke {
+                    handle: h,
+                    code,
+                    argv,
+                    params,
+                    results,
+                }
+            }
+            // §14 instantiate needs a confined executor child the host-orchestrated driver can't share.
             Ok(_) => VcpuEvent::Trapped(Trap::ThreadFault),
         }
     }
@@ -1812,6 +1901,118 @@ impl<'p> Vcpu<'p> {
             Ok(vals) => {
                 let v = vals.first().copied().unwrap_or(Value::I64(0));
                 self.vt.active.set(dst, Reg::from_value(v));
+            }
+            Err(t) => self.trap = Some(t),
+        }
+    }
+
+    /// Deliver the resolved unit funcs for a `JitInstall` (the host resolved authority + code-handle):
+    /// `Err` (forged / cross-domain / wrong-type handle) propagates as a trap; `Ok(funcs)` is compiled
+    /// and installed into the **shared** [`Domain`] (so every vCPU/Worker can `call_indirect` it), the
+    /// slot — or `-ENOSPC` if the table is full / `Malformed` if the unit is outside engine coverage —
+    /// written to the awaiting dst.
+    pub fn deliver_jit_install(&mut self, funcs: Result<std::sync::Arc<[Func]>, Trap>) {
+        let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
+            panic!("deliver_jit_install with no pending install");
+        };
+        let funcs = match funcs {
+            Ok(f) => f,
+            Err(t) => {
+                self.trap = Some(t);
+                return;
+            }
+        };
+        let res = match compile_module(&funcs) {
+            Some(unit) => match self.prog.dom.install(unit) {
+                Some(slot) => slot as i64,
+                None => super::ENOSPC,
+            },
+            None => {
+                self.trap = Some(Trap::Malformed); // unit op outside coverage
+                return;
+            }
+        };
+        self.vt.active.set(dst, Reg::from_i64(res));
+    }
+
+    /// Deliver the authority check for a `JitUninstall`: `Err` propagates as a trap; `Ok(())` clears the
+    /// shared table `slot` (`0` on success, `EINVAL` for a real-func / out-of-range / already-empty slot).
+    pub fn deliver_jit_uninstall(&mut self, authorized: Result<(), Trap>) {
+        let Some(PendingJit::Uninstall { slot, dst }) = self.pending_jit.take() else {
+            panic!("deliver_jit_uninstall with no pending uninstall");
+        };
+        if let Err(t) = authorized {
+            self.trap = Some(t);
+            return;
+        }
+        let n_real = self.prog.dom.source.primary().progs.len();
+        let res = if self.prog.dom.uninstall(slot as usize, n_real) {
+            0
+        } else {
+            super::EINVAL
+        };
+        self.vt.active.set(dst, Reg::from_i64(res));
+    }
+
+    /// Deliver the resolved unit funcs for a `JitInvoke`: `Err` propagates as a trap; `Ok(funcs)` is
+    /// compiled, arity-checked against the call signature (`CapFault` on mismatch), then run
+    /// synchronously over this vCPU's window — its results marshalled to the awaiting dst. The invoked
+    /// unit runs over this vCPU's (deny-all) powerbox, so a unit that itself makes a `cap.call` faults;
+    /// a powerbox-backed unit is the orchestrator's responsibility (see [`Vcpu`]).
+    pub fn deliver_jit_invoke(&mut self, funcs: Result<std::sync::Arc<[Func]>, Trap>) {
+        let Some(PendingJit::Invoke {
+            argv,
+            params,
+            results,
+            dst,
+        }) = self.pending_jit.take()
+        else {
+            panic!("deliver_jit_invoke with no pending invoke");
+        };
+        let funcs = match funcs {
+            Ok(f) => f,
+            Err(t) => {
+                self.trap = Some(t);
+                return;
+            }
+        };
+        let unit = match compile_module(&funcs) {
+            Some(u) => u,
+            None => {
+                self.trap = Some(Trap::Malformed);
+                return;
+            }
+        };
+        let arity_ok = unit
+            .sigs
+            .first()
+            .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+        if !arity_ok {
+            self.trap = Some(Trap::CapFault);
+            return;
+        }
+        let child_args: Vec<Value> = params
+            .iter()
+            .zip(argv.iter())
+            .map(|(ty, s)| slot_to_val(*ty, *s))
+            .collect();
+        // `self.prog` is a `Copy` shared reference — copy it out so the `&prog.dom` borrow is
+        // independent of the disjoint `&mut self.fuel/mem/host` the invoke needs.
+        let prog = self.prog;
+        let umod = prog.dom.source.push(unit);
+        match run_invoke(
+            &prog.dom,
+            umod,
+            &child_args,
+            &mut self.fuel,
+            &mut self.mem,
+            &mut HostCell::Excl(&mut self.host),
+        ) {
+            Ok(vals) => {
+                for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+                    let re = slot_to_val(*ty, val_to_slot(*v));
+                    self.vt.active.set(dst + i as u32, Reg::from_value(re));
+                }
             }
             Err(t) => self.trap = Some(t),
         }
