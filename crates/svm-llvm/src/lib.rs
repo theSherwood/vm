@@ -304,6 +304,14 @@ fn translate_impl(
     let need_strpbrk = calls_external(m, &defined_names, "strpbrk");
     let need_ldexp = calls_external(m, &defined_names, "ldexp")
         || calls_external(m, &defined_names, "scalbn");
+    let need_pow = calls_external(m, &defined_names, "pow");
+    let need_fmod = calls_external(m, &defined_names, "fmod");
+    let need_frexp = calls_external(m, &defined_names, "frexp");
+    let need_strtod = calls_external(m, &defined_names, "strtod");
+    let need_snprintf = calls_external(m, &defined_names, "snprintf");
+    let need_localeconv = calls_external(m, &defined_names, "localeconv");
+    let need_errno = calls_external(m, &defined_names, "__errno_location");
+    let need_time = calls_external(m, &defined_names, "time");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -499,6 +507,14 @@ fn translate_impl(
         strspn: take(need_strspn),
         strpbrk: take(need_strpbrk),
         ldexp: take(need_ldexp),
+        pow_stub: take(need_pow),
+        fmod_stub: take(need_fmod),
+        frexp_stub: take(need_frexp),
+        strtod_stub: take(need_strtod),
+        snprintf_stub: take(need_snprintf),
+        localeconv_stub: take(need_localeconv),
+        errno_stub: take(need_errno),
+        time_zero: take(need_time),
         float_scratch: float_scratch_base,
         ctype_b_loc: ctype.b_loc,
         ctype_tolower_loc: ctype.tolower_loc,
@@ -743,6 +759,36 @@ fn translate_impl(
     }
     if need_ldexp {
         funcs.push(synth_ldexp());
+    }
+    if need_pow {
+        funcs.push(synth_trap_stub(vec![ValType::F64, ValType::F64], vec![ValType::F64]));
+    }
+    if need_fmod {
+        funcs.push(synth_trap_stub(vec![ValType::F64, ValType::F64], vec![ValType::F64]));
+    }
+    if need_frexp {
+        // frexp(double, int*) -> double — the exponent out-param is a pointer (i64).
+        funcs.push(synth_trap_stub(vec![ValType::F64, ValType::I64], vec![ValType::F64]));
+    }
+    if need_strtod {
+        // strtod(const char*, char**) -> double.
+        funcs.push(synth_trap_stub(vec![ValType::I64, ValType::I64], vec![ValType::F64]));
+    }
+    if need_snprintf {
+        // snprintf is varargs; the trap stub takes no args (the dispatch ignores them) → i32.
+        funcs.push(synth_trap_stub(vec![], vec![ValType::I32]));
+    }
+    if need_localeconv {
+        // localeconv(void) -> struct lconv*.
+        funcs.push(synth_trap_stub(vec![], vec![ValType::I64]));
+    }
+    if need_errno {
+        // __errno_location(void) -> int*.
+        funcs.push(synth_trap_stub(vec![], vec![ValType::I64]));
+    }
+    if need_time {
+        // time(time_t*) -> time_t — returns 0 (seed value is result-irrelevant; see synth_const_i64).
+        funcs.push(synth_const_i64(vec![ValType::I64], 0));
     }
     Ok(Translated {
         module: Module {
@@ -3460,6 +3506,20 @@ struct Helpers {
     strpbrk: Option<u32>,
     /// `__svm_ldexp(x:f64, n:i32) -> f64` — `x · 2^n` (the `scalbn` algorithm), bit-exact to libc.
     ldexp: Option<u32>,
+    /// Fail-closed trap stubs for not-yet-implemented libm transcendentals (bit-exact `pow`/`fmod`
+    /// require matching a specific host libm — see `synth_trap_stub`). Translate, trap if called.
+    pow_stub: Option<u32>,
+    fmod_stub: Option<u32>,
+    frexp_stub: Option<u32>,
+    /// More fail-closed stubs: `strtod`/`snprintf` (string⇄double conv + formatting — not exercised by
+    /// an integer-only path), `localeconv`/`__errno_location` (locale + errno). Translate, trap if run.
+    strtod_stub: Option<u32>,
+    snprintf_stub: Option<u32>,
+    localeconv_stub: Option<u32>,
+    errno_stub: Option<u32>,
+    /// `time(t)` — the RNG seed source in `makeseed`; executed during state creation but the seed does
+    /// not affect a deterministic script's result, so a constant `0` suffices (a real `Clock` cap later).
+    time_zero: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
@@ -5301,6 +5361,40 @@ fn synth_strpbrk() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, outer, inner, inner_done, found, retnull],
+    }
+}
+
+/// Synthesize a **fail-closed trap stub** `(params) -> results` whose body is a single `Unreachable`
+/// block — for a libm/libc function the on-ramp does not yet implement exactly. The stub *translates*
+/// (so a module that merely references the function on an **unexecuted** path still lowers — e.g. Lua's
+/// `^`/`pow` when a script does no float exponentiation) but **traps if ever called**. Bit-exact
+/// transcendentals (`pow`/`fmod`/…) require matching a specific host libm — an architecture decision
+/// (host-libm delegation) tracked separately; until then this keeps the module honest and translating.
+fn synth_trap_stub(params: Vec<ValType>, results: Vec<ValType>) -> Func {
+    Func {
+        params: params.clone(),
+        results,
+        blocks: vec![Block {
+            params,
+            insts: vec![],
+            term: Terminator::Unreachable,
+        }],
+    }
+}
+
+/// Synthesize `(params) -> i64` that ignores its arguments and returns the constant `val` — for a
+/// libc function whose *value* does not affect a deterministic result (e.g. `time()` as the `makeseed`
+/// RNG source: the seed only perturbs hash iteration order, not computed results).
+fn synth_const_i64(params: Vec<ValType>, val: i64) -> Func {
+    let nparams = params.len() as u32;
+    Func {
+        params: params.clone(),
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params,
+            insts: vec![Inst::ConstI64(val)], // value index `nparams`
+            term: Terminator::Return(vec![nparams]),
+        }],
     }
 }
 
@@ -10332,6 +10426,101 @@ fn lower_io_call(
             let r = ctx.push(Inst::Call {
                 func: f,
                 args: vec![x, n],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // Not-yet-implemented libm transcendentals: route to their fail-closed trap stubs (translate,
+        // trap if executed — see `synth_trap_stub`). `pow`/`fmod` take `(f64,f64)`, `frexp` `(f64,ptr)`.
+        "pow" => {
+            let Some(f) = ctx.helpers.pow_stub else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let y = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, y],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "fmod" => {
+            let Some(f) = ctx.helpers.fmod_stub else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let y = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, y],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "frexp" => {
+            let Some(f) = ctx.helpers.frexp_stub else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let e = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, e],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strtod(nptr, endptr)`: fail-closed trap stub (string→double — not on an integer path).
+        "strtod" => {
+            let Some(f) = ctx.helpers.strtod_stub else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let e = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, e],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `snprintf(buf, n, fmt, …)`: a varargs call — caught here (before the general varargs
+        // marshaling) and routed to a no-arg fail-closed trap stub (number formatting not exercised).
+        "snprintf" => {
+            let Some(f) = ctx.helpers.snprintf_stub else {
+                return Ok(false);
+            };
+            let r = ctx.push(Inst::Call { func: f, args: vec![] });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `localeconv()` / `__errno_location()`: fail-closed trap stubs (locale + errno, no-arg → ptr).
+        "localeconv" => {
+            let Some(f) = ctx.helpers.localeconv_stub else {
+                return Ok(false);
+            };
+            let r = ctx.push(Inst::Call { func: f, args: vec![] });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__errno_location" => {
+            let Some(f) = ctx.helpers.errno_stub else {
+                return Ok(false);
+            };
+            let r = ctx.push(Inst::Call { func: f, args: vec![] });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `time(t)`: returns 0 (the `makeseed` RNG source — value-irrelevant for a deterministic run).
+        "time" => {
+            let Some(f) = ctx.helpers.time_zero else {
+                return Ok(false);
+            };
+            let t = ctx.operand(&c.arguments[0].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![t],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)

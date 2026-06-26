@@ -1153,11 +1153,26 @@ Picking a target is really picking the *gap* it drives to completion. Current st
 - **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
   synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
 
-### Lua first light — recon + sequenced plan (IN PROGRESS)
-**Goal.** Run a pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
-through the on-ramp, exit-identical to native Lua — exercising the **lexer, parser, code generator, GC,
-and the VDBE-style bytecode VM** (computed `goto` + `setjmp` error handling, both already done). No
-stdlib / `print` / float output needed for first light (the result returns as the process exit code).
+### Lua first light — ACHIEVED ✅ (all three engines)
+**Goal (met).** A pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
+runs through the on-ramp **identical to native Lua on the tree-walker, bytecode, *and* JIT**
+(`Returned([I32(55)])` on each). It exercises the real **lexer, parser, code generator, GC, and the
+bytecode VM** (computed `goto` dispatch + `setjmp` error handling). The first whole real-world
+interpreter on the on-ramp. Reproduce: build `lua_core.bc` (recipe below) → `examples/run_lua.rs`
+(`run_lua <bc> [tree-walk|bytecode|jit]`, runs through the powerbox with Memory granted).
+
+**What it took (this branch):** the varargs ABI (keystone), the libc string batch + `abort`, exact
+`ldexp`, the cross-block `<N x i1>` mask fix (a real translator bug Lua surfaced), and **fail-closed
+stubs** for the libc the integer-only path never executes: `pow`/`fmod`/`frexp`/`strtod`/`snprintf`/
+`localeconv`/`__errno_location` trap if called (bit-exact transcendentals need a host-libm decision —
+below), and `time()` returns `0` (the `makeseed` RNG seed is result-irrelevant). These stubs translate
+so the module lowers and the executed path is fully real; replacing them is what graduates first light
+to *general* Lua (float arithmetic, `string.format`, error messages).
+
+**Next (post-first-light):** real `pow`/`fmod` (a **host-libm delegation** decision — bit-exact vs
+native requires the *same* libm; synthesis can't match a specific libm's last-ULP rounding), `strtod`
++ `snprintf` (reuse the bignum dtoa), `localeconv`/`errno` (real C-locale struct + a window slot), then
+`print`/stdlib for a script that does I/O. Each is now a localized swap of a stub for an implementation.
 
 **Build recipe (reproducible).** Lua's core (no standard libraries, no `lauxlib`) + a tiny C-API harness
 that drives `lua_newstate`/`lua_load`/`lua_pcall`/`lua_tointeger` with its own allocator (`realloc`) and
