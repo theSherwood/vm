@@ -3,12 +3,14 @@
 //!
 //! Built simplest-first (LLVM.md §8 Q1b), growing under the differential parity check against the
 //! bitcode reader (`assert_ll_parity`, `tests/translate.rs`). Covered so far: `define` functions with
-//! integer/float types, the **single-block** instruction set — integer + float **binops**,
-//! **conversions** (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`), **`icmp`/`fcmp`**, **`select`**,
-//! **`fneg`/`freeze`** — over `%local`/constant-int operands, and the `ret`/`br`/`condbr`/
-//! `unreachable` terminators. Top-level cruft the on-ramp ignores (target/datalayout lines, attribute
-//! groups, module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier): `phi`
-//! + multi-block label resolution, `call`, memory (`getelementptr`/`load`/`store`/`alloca`), globals,
+//! integer/float types; the instruction set — integer + float **binops**, **conversions**
+//! (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`), **`icmp`/`fcmp`**, **`select`**, **`fneg`/`freeze`**,
+//! and **`phi`** — over `%local`/constant-int operands; the `ret`/`br`/`condbr`/`unreachable`
+//! terminators; and **multi-block** CFGs with LLVM's implicit slot numbering (so an unlabeled entry and
+//! the phi/branch refs into it resolve to the same `Name`s the bitcode reader assigns). Top-level cruft
+//! the on-ramp ignores (target/datalayout lines, attribute
+//! groups, module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier):
+//! `call`, memory (`getelementptr`/`load`/`store`/`alloca`), globals,
 //! `switch`, aggregates, vectors, and float/non-trivial constants. Anything unhandled is a clean
 //! [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
 
@@ -235,7 +237,7 @@ impl Parser {
             self.pos += 1;
         }
         self.expect(&Token::LBrace)?;
-        let basic_blocks = self.basic_blocks()?;
+        let basic_blocks = self.basic_blocks(parameters.len())?;
         self.expect(&Token::RBrace)?;
         Ok(Function {
             name,
@@ -333,12 +335,14 @@ impl Parser {
 
     // ---- basic blocks --------------------------------------------------------------------------
 
-    fn basic_blocks(&mut self) -> PResult<Vec<BasicBlock>> {
+    fn basic_blocks(&mut self, start_unnamed: usize) -> PResult<Vec<BasicBlock>> {
         let mut blocks = Vec::new();
-        // The entry block may omit a label. Track the implicit number for unnamed blocks: LLVM numbers
-        // the entry block 0 when it is unnamed, continuing the value counter — but for the core slice we
-        // rely on explicit textual labels / the entry having no label (named `Number(0)`).
-        let mut next_unnamed = 0usize;
+        // LLVM's implicit slot counter is shared across (unnamed) parameters, blocks, and value-producing
+        // instructions, in textual order. So an unlabeled entry block takes the number *after* the
+        // parameters — `start_unnamed` is the parameter count. Getting this right is what makes an
+        // unlabeled entry referenced as `%N` in a `phi`/`br` resolve to the same `Name` the bitcode
+        // reader assigns (e.g. 2 params ⇒ entry is `%2`, first instruction `%3`).
+        let mut next_unnamed = start_unnamed;
         while !matches!(self.peek(), Some(Token::RBrace) | None) {
             let name = self.block_label(&mut next_unnamed);
             let mut instrs = Vec::new();
@@ -445,6 +449,7 @@ impl Parser {
             "select" => Instruction::Select(self.select_inst(dest)?),
             "fneg" => Instruction::FNeg(self.fneg_inst(dest)?),
             "freeze" => Instruction::Freeze(self.freeze_inst(dest)?),
+            "phi" => Instruction::Phi(self.phi_inst(dest)?),
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
@@ -678,6 +683,33 @@ impl Parser {
             operand,
             to_type: ty,
             dest,
+            debugloc: None,
+        })
+    }
+
+    /// `phi <ty> [ <val0>, %<blk0> ], [ <val1>, %<blk1> ], …` — each incoming value is paired with the
+    /// predecessor block it arrives from. The block refs are names the *terminators* of those blocks
+    /// also use, so correct implicit block numbering (params counted, see [`Self::basic_blocks`]) is
+    /// what makes the pairs resolve identically to the bitcode reader.
+    fn phi_inst(&mut self, dest: Name) -> PResult<Phi> {
+        self.pos += 1; // `phi`
+        let to_type = self.type_()?;
+        let mut incoming_values = Vec::new();
+        loop {
+            self.expect(&Token::LBracket)?;
+            let val = self.value_as_operand(&to_type)?;
+            self.expect(&Token::Comma)?;
+            let block = self.label_name()?;
+            self.expect(&Token::RBracket)?;
+            incoming_values.push((val, block));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(Phi {
+            incoming_values,
+            dest,
+            to_type,
             debugloc: None,
         })
     }

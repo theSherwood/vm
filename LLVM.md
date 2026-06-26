@@ -1782,20 +1782,24 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     handles**: `ll_parity_trivial_add` (header + flagged binop + `ret`), `ll_parity_arith_chain`
     (binop chain with `±` immediates), `ll_parity_bitwise_shifts` (`shl`/`lshr`/`or`). The textual path
     is proven end-to-end through the unified (`ll`-consuming) translator.
-  - **Parser — single-block instruction set landed.** `parse.rs` now covers (each with an
-    `assert_ll_parity` test on real `clang -O2` output): integer **+ float binops**, **conversions**
-    (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`, with `nneg`/flag skipping), **`icmp`/`fcmp`** (full
-    predicate sets + fast-math-flag skipping), **`select`**, **`fneg`/`freeze`**. Six parity tests green
-    (`add`, arith chain, shifts, `sext`-widen, `icmp`+`zext`, `fadd`). Constant operands: int (full
-    width) + `true`/`false`; **float constants are deferred** (LLVM's `0x…` hex-float image needs exact
-    bit parsing — a small dedicated slice).
-- **Next step (resume here): multi-block + `phi`, then `call`, then memory.** The growth frontier, each
-  a `clang -O2` shape + an `assert_ll_parity` test: **`phi` + multi-block label resolution** (a
-  `for`-loop sum — `icmp`/`br i1`/labels/`phi`; the terminators already parse, `phi` + cross-block value
-  refs are the work), **`call`** (e.g. `llvm.smax`, the `?:`-max lowering; needs the callee/arg-list
-  grammar + the `Either` callee), then **`getelementptr`/`load`/`store`/`alloca`** (memory), **globals +
-  initializers**, **float/hex constants**, **`switch`**, **structs/aggregates**, **SIMD vectors**, **C++
-  EH** (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
+  - **Parser — single-block instruction set + multi-block/`phi` landed.** `parse.rs` now covers (each
+    with an `assert_ll_parity` test on real `clang -O2` output): integer **+ float binops**,
+    **conversions** (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`, with `nneg`/flag skipping),
+    **`icmp`/`fcmp`** (full predicate sets + fast-math-flag skipping), **`select`**, **`fneg`/`freeze`**,
+    **`phi`**, and **multi-block CFGs**. The multi-block enabler was **LLVM implicit slot numbering**:
+    the unnamed counter is shared across (unnamed) params + blocks + value instructions, so `basic_blocks`
+    seeds `next_unnamed` at the parameter count — an unlabeled entry then takes `%{nparams}` and the
+    phi/branch refs into it match the bitcode reader's `Name`s. Eight parity tests green (`add`, arith
+    chain, shifts, `sext`-widen, `icmp`+`zext`, `fadd`, a `for`-loop sum, an `if/else` diamond). Constant
+    operands: int (full width) + `true`/`false`; **float constants are deferred** (LLVM's `0x…` hex-float
+    image needs exact bit parsing — a small dedicated slice).
+- **Next step (resume here): `call`, then memory.** The growth frontier, each a `clang -O2` shape + an
+  `assert_ll_parity` test: **`call`** (e.g. `llvm.smax`, the `?:`-max lowering; needs the callee/arg-list
+  grammar + the `Either` callee — start with direct `@func` calls, then intrinsics), then
+  **`getelementptr`/`load`/`store`/`alloca`** (memory — also the first instrs *without* a `%dest`, so
+  `instruction()`'s dest-first assumption needs a void-result branch), **globals + initializers**,
+  **float/hex constants**, **`switch`**, **structs/aggregates**, **SIMD vectors**, **C++ EH**
+  (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
   full-width constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then
   PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:

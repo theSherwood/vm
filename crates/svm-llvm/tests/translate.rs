@@ -7400,3 +7400,23 @@ fn ll_parity_float_add() {
         "float a(float x, float y){ return x + y; }",
     );
 }
+
+#[test]
+fn ll_parity_phi_loop() {
+    // A `for`-loop sum: multi-block CFG with an unlabeled entry, `icmp`/`br i1`/labels, and a `phi`
+    // merging the two predecessors. Exercises implicit block numbering (the phi's `%entry`/`%body`
+    // refs must resolve to the same names the bitcode reader assigns).
+    assert_ll_parity(
+        "ll_parity_loop",
+        "int sum(int n){ int s = 0; for (int i = 0; i < n; i++) s += i; return s; }",
+    );
+}
+
+#[test]
+fn ll_parity_branch_phi() {
+    // An explicit `if`/`else` returning different values — a diamond CFG whose join is a `phi`.
+    assert_ll_parity(
+        "ll_parity_diamond",
+        "int pick(int c, int a, int b){ if (c) return a + 1; else return b - 1; }",
+    );
+}
