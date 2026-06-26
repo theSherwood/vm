@@ -120,7 +120,14 @@ async function main() {
   const guest = readFileSync(GUEST);
   const gptr = ex.svm_par_alloc(guest.length);
   u8().set(guest, gptr);
-  const prog = ex.svm_par_compile(gptr, guest.length);
+  // §22-JIT mode (SVM_JIT=1): build the Rust-side shared powerbox (sets a process-wide static visible
+  // to every Worker) and reserve the dispatch table. The worker loop below is unchanged — JIT events
+  // are serviced entirely in-Rust against the shared powerbox + Domain (the host never sees them).
+  const jitMode = process.env.SVM_JIT === '1';
+  if (jitMode && ex.svm_par_powerbox(gptr, guest.length) !== 1) {
+    console.log('FAIL: svm_par_powerbox returned 0 (powerbox build failed)'); process.exit(1);
+  }
+  const prog = jitMode ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
   if (prog === 0) { console.log('FAIL: svm_par_compile returned null (decode/unsupported)'); process.exit(1); }
 
   // The one shared guest window every vCPU runs over.

@@ -45,9 +45,9 @@ try {
   page.on('pageerror', (e) => console.log(`  [pageerror] ${e.message}`));
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
-  // Wait until both work items leave 'pending' (or time out).
+  // Wait until every work item leaves 'pending' (or time out).
   await page.waitForFunction(
-    () => ['powerbox', 'threads'].every((id) => document.getElementById(id).dataset.status !== 'pending'),
+    () => ['powerbox', 'threads', 'jit'].every((id) => document.getElementById(id).dataset.status !== 'pending'),
     { timeout: 30_000 },
   );
 
@@ -55,15 +55,19 @@ try {
   const isolated = await read('isolated');
   const powerbox = await read('powerbox');
   const threads = await read('threads');
+  const jit = await read('jit');
 
   console.log(`\n  ${isolated.text}`);
   console.log(`  ${powerbox.text}`);
-  console.log(`  ${threads.text}\n`);
+  console.log(`  ${threads.text}`);
+  console.log(`  ${jit.text}\n`);
 
-  const ok = isolated.status === 'true' && powerbox.status === 'pass' && threads.status === 'pass';
+  const ok = isolated.status === 'true' && powerbox.status === 'pass' &&
+    threads.status === 'pass' && jit.status === 'pass';
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: SVM runs in a real browser — powerbox + genuine multi-Worker ` +
-    `parallelism over a shared WebAssembly.Memory under cross-origin isolation`);
+    `parallelism (incl. §22 guest-JIT on a shared Domain) over a shared WebAssembly.Memory under ` +
+    `cross-origin isolation`);
 } catch (e) {
   failed = true;
   console.log(`FAIL: ${e.message}`);

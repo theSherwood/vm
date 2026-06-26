@@ -160,8 +160,8 @@ property, so in practice:
   oracle across 50 real-race repeats; Miri (`parallel_miri.rs`) confirms the shared-host access is
   race/UB-free. (Scope: caps `cap_dispatch_slots` handles — streams/clock/exit/reflection — over the
   native driver; the wasm-Worker shared-`Host` and order-sensitive-cap demos are follow-ons.)
-- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(§22 landed: A/B/C1 done;
-  C2 browser glue + §14 remain)*. These mutate the `Domain` (`&mut`), which the parallel driver
+- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(§22 fully landed: A/B/C1/C2
+  done — incl. JIT across real Web Workers; only §14 remains)*. These mutate the `Domain` (`&mut`), which the parallel driver
   shares `&`-immutably, so they fail closed today. **Motivation:** web *interpreter playgrounds* — a
   guest that JITs/`eval`s user code (§22) or sandboxes sub-programs (§14) **and** runs in parallel.
   **Design (chosen: full-unify, mirroring the tree-walker's proven `DomainTable`).** The bytecode engine's
@@ -203,10 +203,20 @@ property, so in practice:
     the native model of the JS/Worker host — drives 8 vCPUs invoking / installing on the shared domain
     to the oracle's result). Invoked units run over the vCPU's deny-all powerbox (a `cap.call`ing unit
     is out of scope, like every host capability on this path).
-  - [ ] **C2 — the browser glue**: wire `svm_par_*` so a guest JITs **across Web Workers**, with a
-    Node/Chromium test. Open design question: where the powerbox lives across Workers (Rust-side in
-    shared linear memory vs JS-side) and how a `JitInstall`/`Invoke` event triggers unit resolution
-    over the wasm boundary. Until then the browser path fail-closes JIT (`svm_par_run` → `PAR_TRAP`).
+  - [x] **C2 — the browser glue (Rust-side powerbox)**: a guest now JITs **across real Web Workers**.
+    The powerbox (a `Host` with the `Jit` cap + the host-compiled unit) is built once and **leaked**
+    into the shared linear memory; its pointer is published in a process-wide `static` which — under
+    `--shared-memory` — *is* shared, so every Worker's instance reads it (the same sharing the leaked
+    `VcpuProgram` already relies on, minus the JS hand-off). A worker vCPU's `Jit.install`/`uninstall`/
+    `invoke` is serviced **inside `svm_par_run`** against this powerbox + the shared `Domain`, so the JS
+    host services no new events — the only new glue is one `svm_par_powerbox(guest)` + `svm_par_compile_jit`
+    call on setup (`browser/src/lib.rs`). During the run the powerbox is read-only (the unit is compiled
+    before any spawn), so the concurrent `&Host` reads need no lock; the install/dispatch mutation lives
+    in the `Domain` (already interior-mutable + thread-safe). Proven: `threads-spawn.mjs` runs the
+    install/invoke kernels on **9 Workers** → 1136 (8 × `service(6,7)=142`), and `browser-test.mjs`
+    asserts the same in **real Chromium** (the `#jit` work item). Validates std `Mutex<Vec<Arc<…>>>`
+    (the `Domain`'s `ModuleSource`) working cross-Worker on wasm atomics. (Invoked units still run over
+    the vCPU's deny-all powerbox — a `cap.call`ing unit is out of scope, the C1 limitation.)
   - [ ] **§14 `instantiate` in parallel** — a follow-on after §22 (children get their own confined
     `Domain`; the cooperative driver's single `extra_envs` vec doesn't map onto per-thread vCPUs —
     separate slice).

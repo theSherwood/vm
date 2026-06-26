@@ -57,12 +57,15 @@ async function main() {
     set('powerbox', 'fail', `powerbox: error ${e}`);
   }
 
-  // --- 2) one guest's vCPUs across real Web Workers ----------------------------------------------
-  try {
-    const guest = await fetchBytes('/corpus/threads.svmbc');
+  // Run one guest's `thread.spawn`ed vCPUs across real Web Workers over the one shared window; returns
+  // `{ value, started }`. `jit` ⇒ build the Rust-side shared powerbox + reserve the JIT dispatch table
+  // (the worker loop is identical — §22 JIT is serviced in-Rust, so the page services no new events).
+  async function runAcrossWorkers(guestPath, jit) {
+    const guest = await fetchBytes(guestPath);
     const gptr = ex.svm_par_alloc(guest.length);
     u8().set(guest, gptr);
-    const prog = ex.svm_par_compile(gptr, guest.length);
+    if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
+    const prog = jit ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
     if (prog === 0) throw new Error('svm_par_compile null');
     const winSize = 1 << 16;
     const win = ex.svm_par_alloc(winSize);
@@ -93,17 +96,38 @@ async function main() {
       const rootTlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
     });
-
-    const t0 = performance.now();
     const value = await done;
-    const ms = (performance.now() - t0).toFixed(0);
     for (const w of workers) w.terminate();
+    return { value, started };
+  }
+
+  // --- 2) one guest's vCPUs across real Web Workers ----------------------------------------------
+  try {
+    const t0 = performance.now();
+    const { value, started } = await runAcrossWorkers('/corpus/threads.svmbc', false);
+    const ms = (performance.now() - t0).toFixed(0);
     const ok = value === 4000n;
     set('threads', ok ? 'pass' : 'fail',
       `threads: ${started} Workers (1 root + ${started - 1} spawned) → ${value} (want 4000) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`threads → ${value} across ${started} Workers in ${ms}ms`);
   } catch (e) {
     set('threads', 'fail', `threads: error ${e}`);
+  }
+
+  // --- 3) §22 guest-JIT across real Web Workers (THREADS.md 4c-domain C2) -------------------------
+  // Each worker vCPU `install`s a host-compiled unit into the **shared** Domain and `call_indirect`s
+  // its own raced slot — `service(6,7) = 142`, folded to 8 × 142 = 1136. The powerbox is Rust-side
+  // (a leaked `Host` in shared memory); JIT is serviced inside `svm_par_run`, so no new page glue.
+  try {
+    const t0 = performance.now();
+    const { value, started } = await runAcrossWorkers('/corpus/threads_jit_install.svmbc', true);
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = value === 1136n;
+    set('jit', ok ? 'pass' : 'fail',
+      `jit: ${started} Workers each install+call a unit on the shared Domain → ${value} (want 1136) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`jit → ${value} across ${started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('jit', 'fail', `jit: error ${e}`);
   }
 }
 
