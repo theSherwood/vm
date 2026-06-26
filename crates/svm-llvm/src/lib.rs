@@ -526,7 +526,7 @@ fn translate_impl(
         ldexp: take(need_ldexp),
         pow_stub: take(need_pow),
         fmod_stub: take(need_fmod),
-        frexp_stub: take(need_frexp),
+        frexp: take(need_frexp),
         strtod_stub: take(need_strtod),
         localeconv_stub: take(need_localeconv),
         errno_stub: take(need_errno),
@@ -783,17 +783,14 @@ fn translate_impl(
         ));
     }
     if need_fmod {
+        // Exact-synthesizable but a large loop-nest CFG — stubbed pending its own slice (see `Helpers`).
         funcs.push(synth_trap_stub(
             vec![ValType::F64, ValType::F64],
             vec![ValType::F64],
         ));
     }
     if need_frexp {
-        // frexp(double, int*) -> double — the exponent out-param is a pointer (i64).
-        funcs.push(synth_trap_stub(
-            vec![ValType::F64, ValType::I64],
-            vec![ValType::F64],
-        ));
+        funcs.push(synth_frexp());
     }
     if need_strtod {
         // strtod(const char*, char**) -> double.
@@ -3530,11 +3527,17 @@ struct Helpers {
     strpbrk: Option<u32>,
     /// `__svm_ldexp(x:f64, n:i32) -> f64` — `x · 2^n` (the `scalbn` algorithm), bit-exact to libc.
     ldexp: Option<u32>,
-    /// Fail-closed trap stubs for not-yet-implemented libm transcendentals (bit-exact `pow`/`fmod`
-    /// require matching a specific host libm — see `synth_trap_stub`). Translate, trap if called.
+    /// Fail-closed trap stub for `pow` (and the other libm transcendentals): bit-exact vs native
+    /// requires matching a specific host libm, so it stays a `synth_trap_stub` pending that decision.
     pow_stub: Option<u32>,
+    /// Fail-closed trap stub for `fmod`. Exact-synthesizable (the remainder is always representable, so
+    /// glibc/musl's bit-twiddling algorithm is bit-exact with no libm dependency) — a sizeable
+    /// loop-nest CFG slated as the next exact slice; stubbed until then.
     fmod_stub: Option<u32>,
-    frexp_stub: Option<u32>,
+    /// `__svm_frexp(x:f64, eptr:i64) -> f64` — split `x` into mantissa∈[0.5,1) and exponent; writes the
+    /// exponent to `*eptr` (an `int`). Pure bit ops, bit-exact to glibc `frexp` (incl. zero/subnormal/
+    /// inf/nan: `*eptr=0`, returns `x+x`).
+    frexp: Option<u32>,
     /// More fail-closed stubs: `strtod` (string→double — not exercised by an integer-only path),
     /// `localeconv`/`__errno_location` (locale + errno). Translate, trap if run. (`snprintf` is real —
     /// it reuses the `printf` engine, see [`lower_snprintf`].)
@@ -5636,6 +5639,196 @@ fn synth_ldexp() -> Func {
         params,
         results: vec![ValType::F64],
         blocks: vec![entry, chk_lo, hi1, hi2, lo1, lo2, finish],
+    }
+}
+
+/// Synthesize `__svm_frexp(x:f64, eptr:i64) -> f64` — split `x = m·2^e` with `m ∈ [0.5, 1)`, writing
+/// `e` (an `int`) to `*eptr`. Bit-exact to glibc `__frexp`:
+/// ```c
+/// int ex = 0x7ff & (ix >> 52); int e = 0;
+/// if (ex != 0x7ff && x != 0.0) {        // finite, nonzero
+///     e = ex - 1022;
+///     if (ex == 0) { x *= 0x1p54; ix = bits(x); ex = 0x7ff & (ix>>52); e = ex - 1022 - 54; }
+///     ix = (ix & 0x800fffffffffffff) | 0x3fe0000000000000; x = bits_to_f64(ix);
+/// } else x += x;                        // zero/inf/nan: e stays 0, x+x signals on sNaN
+/// *eptr = e; return x;
+/// ```
+/// Five blocks: classify → (finite | special); finite → (subnormal-normalize | mantissa-pack).
+fn synth_frexp() -> Func {
+    use svm_ir::StoreOp;
+    let reinterp_to_f = |a: u32| Inst::Cast {
+        op: CastOp::ReinterpI64F64,
+        a,
+    };
+    let reinterp_to_i = |a: u32| Inst::Cast {
+        op: CastOp::ReinterpF64I64,
+        a,
+    };
+    let shru = |a: u32, b: u32| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::ShrU,
+        a,
+        b,
+    };
+    let and = |a: u32, b: u32| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a,
+        b,
+    };
+    let sub = |a: u32, b: u32| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Sub,
+        a,
+        b,
+    };
+
+    // block0 entry(x=v0:f64, eptr=v1:i64): classify finite-and-nonzero vs special (zero/inf/nan).
+    let entry = Block {
+        params: vec![ValType::F64, ValType::I64],
+        insts: vec![
+            reinterp_to_i(0),      // v2 = ix (raw bits of x)
+            Inst::ConstI64(52),    // v3
+            shru(2, 3),            // v4 = ix >> 52
+            Inst::ConstI64(0x7ff), // v5
+            and(4, 5),             // v6 = ex (biased exponent)
+            Inst::ConstI64(0x7ff), // v7
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Ne,
+                a: 6,
+                b: 7,
+            }, // v8 = (ex != 0x7ff)  → i32 0/1
+            Inst::ConstI64(0x7fff_ffff_ffff_ffff), // v9 = abs mask
+            and(2, 9),             // v10 = |ix| (sign cleared)
+            Inst::ConstI64(0),     // v11
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Ne,
+                a: 10,
+                b: 11,
+            }, // v12 = (x != 0)  → i32 0/1
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 8,
+                b: 12,
+            }, // v13 = finite && nonzero
+        ],
+        term: Terminator::BrIf {
+            cond: 13,
+            then_blk: 1, // finite(x, ix, ex, eptr)
+            then_args: vec![0, 2, 6, 1],
+            else_blk: 2, // special(x, eptr)
+            else_args: vec![0, 1],
+        },
+    };
+
+    // block1 finite(x=v0:f64, ix=v1:i64, ex=v2:i64, eptr=v3:i64): subnormal → normalize; else pack.
+    let finite = Block {
+        params: vec![ValType::F64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 4,
+            }, // v5 = (ex == 0) subnormal?  → i32
+            Inst::ConstI64(1022), // v6
+            sub(2, 6),         // v7 = e = ex - 1022
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 3, // sub(x, eptr)
+            then_args: vec![0, 3],
+            else_blk: 4, // pack(ix, e, eptr)
+            else_args: vec![1, 7, 3],
+        },
+    };
+
+    // block2 special(x=v0:f64, eptr=v1:i64): *eptr = 0; return x + x (quiets/signals NaN, ±0/±inf pass).
+    let special = Block {
+        params: vec![ValType::F64, ValType::I64],
+        insts: vec![
+            Inst::ConstI32(0), // v2
+            Inst::Store {
+                op: StoreOp::I32,
+                addr: 1,
+                value: 2,
+                offset: 0,
+                align: 0,
+            }, // *eptr = 0 (no value)
+            Inst::FBin {
+                ty: FloatTy::F64,
+                op: FBinOp::Add,
+                a: 0,
+                b: 0,
+            }, // v3 = x + x
+        ],
+        term: Terminator::Return(vec![3]),
+    };
+
+    // block3 sub(x=v0:f64, eptr=v1:i64): scale by 2^54 into the normal range, recompute ex and e.
+    let sub_blk = Block {
+        params: vec![ValType::F64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(0x4350_0000_0000_0000), // v2 = bits(2^54)
+            reinterp_to_f(2),                      // v3 = 2^54
+            Inst::FBin {
+                ty: FloatTy::F64,
+                op: FBinOp::Mul,
+                a: 0,
+                b: 3,
+            }, // v4 = x · 2^54
+            reinterp_to_i(4),                      // v5 = ix2
+            Inst::ConstI64(52),                    // v6
+            shru(5, 6),                            // v7 = ix2 >> 52
+            Inst::ConstI64(0x7ff),                 // v8
+            and(7, 8),                             // v9 = ex2
+            Inst::ConstI64(1076),                  // v10 = 1022 + 54
+            sub(9, 10),                            // v11 = e2 = ex2 - 1076
+        ],
+        term: Terminator::Br {
+            target: 4, // pack(ix2, e2, eptr)
+            args: vec![5, 11, 1],
+        },
+    };
+
+    // block4 pack(ix=v0:i64, e=v1:i64, eptr=v2:i64): set the biased exponent to 0x3fe (m ∈ [0.5,1)),
+    // store e (as int), return the reconstructed mantissa.
+    let pack = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(0x800f_ffff_ffff_ffffu64 as i64), // v3 = sign|mantissa mask
+            and(0, 3),                                       // v4 = ix & mask
+            Inst::ConstI64(0x3fe0_0000_0000_0000),           // v5 = exponent field for 0.5
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Or,
+                a: 4,
+                b: 5,
+            }, // v6 = packed bits
+            reinterp_to_f(6),                                // v7 = mantissa f64
+            Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: 1,
+            }, // v8 = (int)e
+            Inst::Store {
+                op: StoreOp::I32,
+                addr: 2,
+                value: 8,
+                offset: 0,
+                align: 0,
+            }, // *eptr = e (no value)
+        ],
+        term: Terminator::Return(vec![7]),
+    };
+
+    Func {
+        params: vec![ValType::F64, ValType::I64],
+        results: vec![ValType::F64],
+        blocks: vec![entry, finite, special, sub_blk, pack],
     }
 }
 
@@ -10468,8 +10661,8 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // Not-yet-implemented libm transcendentals: route to their fail-closed trap stubs (translate,
-        // trap if executed — see `synth_trap_stub`). `pow`/`fmod` take `(f64,f64)`, `frexp` `(f64,ptr)`.
+        // `pow` (and the other transcendentals): fail-closed trap stub — bit-exact vs native needs a
+        // matching host libm (the host-libm decision, LLVM.md). `frexp`/`fmod` are real below.
         "pow" => {
             let Some(f) = ctx.helpers.pow_stub else {
                 return Ok(false);
@@ -10483,6 +10676,7 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `fmod(x, y)`: fail-closed trap stub for now (exact-synthesizable — its own slice, see `Helpers`).
         "fmod" => {
             let Some(f) = ctx.helpers.fmod_stub else {
                 return Ok(false);
@@ -10496,8 +10690,9 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `frexp(x, eptr)`: the synthesized `__svm_frexp` — mantissa/exponent split, writes `*eptr`.
         "frexp" => {
-            let Some(f) = ctx.helpers.frexp_stub else {
+            let Some(f) = ctx.helpers.frexp else {
                 return Ok(false);
             };
             let x = ctx.operand(&c.arguments[0].0)?;

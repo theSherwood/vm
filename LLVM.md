@@ -1174,7 +1174,10 @@ direction, via the printf engine — merged). What's left, each a localized swap
 for a real implementation, split by whether it needs a *host-libm decision*:
 
 - **Exact, decision-free (synthesizable bit-for-bit, no libm dependency):**
-  - **`frexp`** — pure bit ops (extract exponent + mantissa, write `*e`); exact.
+  - **`frexp`** — **DONE.** `synth_frexp` (5 blocks): pure bit ops extracting exponent + mantissa,
+    writing `*e`; bit-exact to glibc incl. the subnormal (`×2^54` renormalize) and special (zero/
+    inf/nan → `*e=0`, return `x+x`) paths. Test `libc_frexp_bit_exact` (a grid incl. a subnormal
+    and ±inf), all three engines == native.
   - **`fmod`** — the remainder is mathematically *exact* (always representable), so glibc/musl's
     integer bit-twiddling algorithm synthesizes bit-for-bit. **No `frem` op and no libm decision** —
     the earlier "`pow`/`fmod` need host-libm delegation" framing was imprecise: only the

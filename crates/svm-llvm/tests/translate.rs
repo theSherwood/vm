@@ -2059,6 +2059,37 @@ fn libc_ldexp_bit_exact() {
 }
 
 #[test]
+fn libc_frexp_bit_exact() {
+    // The synthesized `__svm_frexp` over a grid spanning the normal range, a power-of-two boundary,
+    // ±0, a negative value, a subnormal (`1e-310`), and the special path (±inf). For each input both
+    // the returned mantissa's raw f64 bits and the written exponent are folded into the checksum, so
+    // the result *and* the `*e` out-param are pinned bit-identical to libc `frexp` on all three
+    // engines. `volatile` inputs keep the calls past `-O2`.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {1.0, 0.5, 3.14159265358979, 1e300, 1e-300,\n\
+                                    0.0, -2.5, 1024.0, 1e-310, 1.0/0.0};\n\
+          volatile double neg = -1.0/0.0;\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) {\n\
+            int e; double m = frexp(xs[i], &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL;\n\
+          }\n\
+          { int e; double m = frexp(neg, &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL; }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_frexp", src, 0);
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
