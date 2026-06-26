@@ -116,6 +116,22 @@ impl AsRef<Type> for TypeRef {
     }
 }
 
+/// Deref to the pointed-to [`Type`], mirroring `llvm_ir::types::TypeRef`: the translator passes
+/// `&TypeRef` where `&Type` is expected (deref coercion) all over.
+impl std::ops::Deref for TypeRef {
+    type Target = Type;
+    fn deref(&self) -> &Type {
+        &self.0
+    }
+}
+
+/// Display delegates to the pointed-to [`Type`] (mirrors `llvm_ir::types::TypeRef: Display`).
+impl std::fmt::Display for TypeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
 /// An LLVM type. The pointer form is the **opaque** LLVM-15+ shape (just an address space) — our pin
 /// is LLVM 18. Mirrors `llvm_ir::types::Type` (the `llvm-18` feature subset; names kept verbatim).
 #[allow(non_camel_case_types)]
@@ -158,6 +174,67 @@ pub enum Type {
     MetadataType,
     LabelType,
     TokenType,
+}
+
+/// A concise textual form, used by the translator only in fail-closed error messages (`unsup("type
+/// {ty}")`). Not the canonical LLVM syntax — just legible. Mirrors that `llvm_ir::Type: Display`.
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Type::VoidType => write!(f, "void"),
+            Type::IntegerType { bits } => write!(f, "i{bits}"),
+            Type::PointerType { addr_space } if *addr_space == 0 => write!(f, "ptr"),
+            Type::PointerType { addr_space } => write!(f, "ptr addrspace({addr_space})"),
+            Type::FPType(fp) => write!(f, "{}", fp.name()),
+            Type::FuncType {
+                result_type,
+                is_var_arg,
+                ..
+            } => write!(
+                f,
+                "{result_type} (…{})",
+                if *is_var_arg { ", ..." } else { "" }
+            ),
+            Type::VectorType {
+                element_type,
+                num_elements,
+                scalable,
+            } if *scalable => write!(f, "<vscale x {num_elements} x {}>", element_type.as_ref()),
+            Type::VectorType {
+                element_type,
+                num_elements,
+                ..
+            } => write!(f, "<{num_elements} x {}>", element_type.as_ref()),
+            Type::ArrayType {
+                element_type,
+                num_elements,
+            } => write!(f, "[{num_elements} x {}]", element_type.as_ref()),
+            Type::StructType { element_types, .. } => {
+                write!(f, "{{ {} fields }}", element_types.len())
+            }
+            Type::NamedStructType { name } => write!(f, "%{name}"),
+            Type::X86_MMXType => write!(f, "x86_mmx"),
+            Type::X86_AMXType => write!(f, "x86_amx"),
+            Type::MetadataType => write!(f, "metadata"),
+            Type::LabelType => write!(f, "label"),
+            Type::TokenType => write!(f, "token"),
+        }
+    }
+}
+
+impl FPType {
+    /// The LLVM keyword for this float type (for diagnostics).
+    pub fn name(self) -> &'static str {
+        match self {
+            FPType::Half => "half",
+            FPType::BFloat => "bfloat",
+            FPType::Single => "float",
+            FPType::Double => "double",
+            FPType::FP128 => "fp128",
+            FPType::X86_FP80 => "x86_fp80",
+            FPType::PPC_FP128 => "ppc_fp128",
+        }
+    }
 }
 
 /// The definition of a named struct. Mirrors `llvm_ir::types::NamedStructDef`: `Defined` carries a
@@ -285,6 +362,15 @@ impl ConstantRef {
 }
 impl AsRef<Constant> for ConstantRef {
     fn as_ref(&self) -> &Constant {
+        &self.0
+    }
+}
+
+/// Deref to the pointed-to [`Constant`], mirroring `llvm_ir::constant::ConstantRef` (the translator
+/// passes `&ConstantRef` where `&Constant` is expected).
+impl std::ops::Deref for ConstantRef {
+    type Target = Constant;
+    fn deref(&self) -> &Constant {
         &self.0
     }
 }
@@ -1009,6 +1095,67 @@ impl Instruction {
             Instruction::LandingPad(i) => Some(&i.dest),
             Instruction::CatchPad(i) => Some(&i.dest),
             Instruction::CleanupPad(i) => Some(&i.dest),
+        }
+    }
+}
+
+impl HasDebugLoc for Instruction {
+    fn get_debug_loc(&self) -> &Option<DebugLoc> {
+        match self {
+            Instruction::Add(i)
+            | Instruction::Sub(i)
+            | Instruction::Mul(i)
+            | Instruction::UDiv(i)
+            | Instruction::SDiv(i)
+            | Instruction::URem(i)
+            | Instruction::SRem(i)
+            | Instruction::And(i)
+            | Instruction::Or(i)
+            | Instruction::Xor(i)
+            | Instruction::Shl(i)
+            | Instruction::LShr(i)
+            | Instruction::AShr(i)
+            | Instruction::FAdd(i)
+            | Instruction::FSub(i)
+            | Instruction::FMul(i)
+            | Instruction::FDiv(i)
+            | Instruction::FRem(i) => i.get_debug_loc(),
+            Instruction::FNeg(i)
+            | Instruction::Trunc(i)
+            | Instruction::ZExt(i)
+            | Instruction::SExt(i)
+            | Instruction::FPTrunc(i)
+            | Instruction::FPExt(i)
+            | Instruction::FPToUI(i)
+            | Instruction::FPToSI(i)
+            | Instruction::UIToFP(i)
+            | Instruction::SIToFP(i)
+            | Instruction::PtrToInt(i)
+            | Instruction::IntToPtr(i)
+            | Instruction::BitCast(i)
+            | Instruction::AddrSpaceCast(i)
+            | Instruction::Freeze(i) => i.get_debug_loc(),
+            Instruction::ExtractElement(i) => i.get_debug_loc(),
+            Instruction::InsertElement(i) => i.get_debug_loc(),
+            Instruction::ShuffleVector(i) => i.get_debug_loc(),
+            Instruction::ExtractValue(i) => i.get_debug_loc(),
+            Instruction::InsertValue(i) => i.get_debug_loc(),
+            Instruction::Alloca(i) => i.get_debug_loc(),
+            Instruction::Load(i) => i.get_debug_loc(),
+            Instruction::Store(i) => i.get_debug_loc(),
+            Instruction::Fence(i) => i.get_debug_loc(),
+            Instruction::CmpXchg(i) => i.get_debug_loc(),
+            Instruction::AtomicRMW(i) => i.get_debug_loc(),
+            Instruction::GetElementPtr(i) => i.get_debug_loc(),
+            Instruction::ICmp(i) => i.get_debug_loc(),
+            Instruction::FCmp(i) => i.get_debug_loc(),
+            Instruction::Phi(i) => i.get_debug_loc(),
+            Instruction::Select(i) => i.get_debug_loc(),
+            Instruction::Call(i) => i.get_debug_loc(),
+            Instruction::VAArg(i) => i.get_debug_loc(),
+            Instruction::LandingPad(i) => i.get_debug_loc(),
+            Instruction::CatchPad(i) => i.get_debug_loc(),
+            Instruction::CleanupPad(i) => i.get_debug_loc(),
         }
     }
 }

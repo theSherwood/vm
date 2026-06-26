@@ -27,6 +27,10 @@ llvm-ir = { version = "0.11.3", features = ["llvm-18"] }
 # static `.a`s (`llvm-18-dev` provides headers + the dylib, not Polly/static archives). Build/dev
 # only — never linked into the runtime crates (LLVM.md §8 Q4).
 llvm-sys = { version = "181", features = ["prefer-dynamic"] }
+# `llvm-ir` types a `call`/`invoke` callee as `either::Either<InlineAssembly, Operand>`; the bitcode→
+# `ll` conversion shim (`from_llvm_ir.rs`) matches on it. Already in the tree via `llvm-ir`; named
+# directly here. Build/dev only (the shim is part of the off-runtime-path bitcode lane).
+either = "1"
 
 [dev-dependencies]
 svm-verify = { path = "../svm-verify" }

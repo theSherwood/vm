@@ -1732,10 +1732,13 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
   `llvm-sys`/`di.rs`/`blockaddr.rs`/`wideint.rs` + the rustc-1.81 pin; prove version-tolerance *here*
   by feeding `rustc 1.94`'s LLVM-21 `.ll` (`rustc --emit=llvm-ir`) through the parser. (CI `ci.yml`
   edits need `workflow` scope the bot lacks → manual follow-up.)
-- **Current state (branch `claude/ll-translator-swap`, off latest `main`).** The lexer + parser-core-slice
-  landed via PR #151 (merged to `main`); this branch carries the AST expansion on top. The `ll` module
-  compiles (fmt+clippy green), wired into `lib.rs` as a **dormant** module (no behavior change — the
-  bitcode reader is still the only live path). Done so far:
+- **Current state (branch `claude/ll-translator-swap`, off latest `main`; PR #158).** The lexer +
+  parser-core-slice landed via PR #151 (merged to `main`); this branch carries the AST expansion **and
+  the translator type-swap + conversion shim** on top. **The translator now consumes the owned `ll`
+  AST** — `lib.rs`'s `Instruction`/`Constant`/`Terminator`/`Type`/`Operand`/`Types` are
+  `crate::ll::ast::*`, fed on the bitcode path by [`from_llvm_ir`]; the textual reader will feed it
+  directly. **All 223 tests pass** (the whole bitcode corpus translates byte-identically through the
+  `ll` AST), fmt + clippy (`-D warnings`) green. Done so far:
   - `ast.rs` — **the data model + type system are now complete** (the swap prerequisite, "until the AST
     enums are complete"). The full **`Instruction`** set (all 48 LLVM-18 variants), the full
     **`Terminator`** set (all 12), and the **`Constant`** set incl. the const-expr ops the on-ramp folds,
@@ -1757,23 +1760,30 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     skipping top-level cruft (target/datalayout, attribute groups, module metadata, `declare`) via a
     balanced-delimiter scan. The I14 fix is proven end-to-end (`full_width_i128_constant_survives`
     round-trips `i128::MAX`). Out-of-slice constructs fail closed (clean `ParseError`).
-- **Next step (resume here): the translator type-swap (Q1b step c) + the bc→ll conversion shim.** Change
-  `lib.rs`'s `use llvm_ir::…` → `use crate::ll::…` (and the ~10 fully-qualified `llvm_ir::…` sites:
-  `constant::GetElementPtr`, `TypeRef`, `types::NamedStructDef`, `instruction::{Call,GetElementPtr,
-  RMWBinOp}`, `terminator::{Invoke,IndirectBr,Switch}` — see `grep -n llvm_ir:: src/lib.rs`). The AST is
-  now complete (above), so the translator's matches should resolve against `crate::ll`; any remaining
-  errors flag a missed field. **The newly-identified requirement:** `translate_impl` then takes a
-  `crate::ll::Module`, so the **bitcode path decouples** — `translate_bc_path` reads an `llvm_ir::Module`
-  via `from_bc_path`. Add a conversion shim `from_llvm_ir.rs` (`llvm_ir::Module` → `crate::ll::Module`,
-  a mechanical field-by-field map; `llvm-ir` stays a dev-dep) so the existing 215 bitcode tests keep
-  passing through the swapped `translate_impl` and become the parity oracle. (When `llvm-ir` is finally
-  dropped — PR4 — the shim goes with it.)
-- **Then (step c cont.):** add `translate_ll_path` (`lib.rs`: `parse_module` → `translate_impl`) +
-  `assert_ll_parity(c_src)` (`tests/translate.rs`, alongside `compile_to_bc`/`check`): compile each test
-  to both `.bc` and `.ll`, translate both, assert identical svm-ir. Grow `parse.rs` (lockstep with the
-  parity check) to the full AST. Keep `llvm-ir` the default + dev-dep; iterate to parity on the core
-  slice, then widen (PR2: SIMD/EH/structs/i128/blockaddress; PR3: debug metadata replacing `di.rs`; PR4:
-  flip + drop `llvm-ir`/`llvm-sys`/the side-readers + the rustc-1.81 pin).
+  - **`from_llvm_ir.rs` (the bc→ll conversion shim) — DONE.** `translate_impl` now takes a
+    `crate::ll::Module`, so the bitcode path decouples: `translate_bc_path` reads an `llvm_ir::Module`
+    via `from_bc_path`, then `from_llvm_ir::convert_module` maps it field-for-field to the `ll` AST.
+    **Faithful + fail-closed**: it drops the `nuw`/`nsw`/attribute/calling-conv fields the translator
+    ignores, and rejects (clean `Unsupported`) anything outside the modeled subset — a non-folded const
+    expression (`Xor`/`Shl`/`ICmp`/… as a constant), funclet EH (`catchpad`/`cleanupret`/`callbr`), a
+    target-ext type. That is **zero-regression** because `translate_impl` already lowers *every* defined
+    function + global initializer eagerly and rejects those same forms via its `const_eval`/`const_bytes`
+    `other => unsup` arms, so a program that translates today converts losslessly and one that doesn't
+    fails the same way. `llvm-ir`/`llvm-sys` stay normal deps (+ `either`, named directly for the callee
+    `Either`); the shim is **transient** — it goes when they're dropped (PR4). The swap also needed a few
+    `ll::ast` additions the translator relies on: `Deref` for `TypeRef`/`ConstantRef` (deref coercion),
+    `Display` for `Type`/`TypeRef` (error messages), `HasDebugLoc` for `Instruction`; and `Constant::Int`
+    being `u128` (I14) forced `as u64` casts at the ~7 size/priority/switch read sites (all ≤64-bit).
+- **Next step (resume here): `translate_ll_path` + the `assert_ll_parity` harness + grow `parse.rs`.**
+  Add `pub fn translate_ll_path(path)` / a `translate_ll_str(src)` (`lib.rs`: `ll::parse_module` →
+  `translate`) and `assert_ll_parity(c_src)` (`tests/translate.rs`, alongside `compile_to_bc`/`check`):
+  compile each test C to **both** `.bc` and `.ll` (`clang -S -emit-llvm`), translate both, assert
+  identical svm-ir (`==` on the `Module`, or on `svm_text::print_module`). Then grow `parse.rs` (lockstep
+  with the parity check, which now has a real consumer since the translator is on `ll`) from the core
+  slice to the full AST. Keep `llvm-ir` the default; iterate to parity on the core slice, then widen
+  (PR2: SIMD/EH/structs/i128/blockaddress — the last two come free in text; PR3: debug metadata replacing
+  `di.rs`; PR4: flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the
+  rustc-1.81 pin, proving version-tolerance by feeding an LLVM-21 `.ll`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`

@@ -674,6 +674,7 @@ dependencies = [
 name = "svm-llvm"
 version = "0.0.0"
 dependencies = [
+ "either",
  "llvm-ir",
  "llvm-sys",
  "svm-dap",
