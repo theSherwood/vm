@@ -61,6 +61,56 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
     );
 }
 
+/// Lay a single 64-byte `Blocking.work` SQE at window offset `at`, matching the `io_ring.submit`
+/// layout: `u32 type_id | u32 op | i32 handle | u32 n_args | i64 args[4] | i64 user_data | i64 pad`.
+fn write_blocking_sqe(mem: &mut VecMem, at: u64, blocking_handle: i32, arg: i64) {
+    mem.write_bytes(at, &iface::BLOCKING.to_le_bytes()).unwrap(); // type_id = Blocking
+    mem.write_bytes(at + 4, &0u32.to_le_bytes()).unwrap(); // op 0 = work
+    mem.write_bytes(at + 8, &blocking_handle.to_le_bytes())
+        .unwrap();
+    mem.write_bytes(at + 12, &1u32.to_le_bytes()).unwrap(); // n_args = 1
+    mem.write_bytes(at + 16, &arg.to_le_bytes()).unwrap(); // args[0]
+}
+
+/// A *batched* `io_ring.submit` that would offload a `Blocking` SQE onto the pool also fails closed
+/// under a landed freeze: the submit thread would otherwise park on the pool (no poll site) and stall
+/// the STW for the whole batch. The refused batch never touches the pool; with no freeze the same
+/// submit offloads and reports its one completion.
+#[test]
+fn io_ring_blocking_offload_fails_closed_once_a_freeze_has_landed() {
+    let mut host = Host::new();
+    host.set_durable(true);
+    let bh = host.grant_blocking(Duration::ZERO, None);
+    let rh = host.grant_io_ring();
+
+    // [0..4) freeze word; one Blocking SQE at 256; CQE region at 512 (all inside the window).
+    let mut mem = VecMem(vec![0u8; 4096]);
+    let (sq, cq) = (256u64, 512u64);
+    write_blocking_sqe(&mut mem, sq, bh, 7);
+    let submit = [sq as i64, 1, cq as i64];
+
+    set_state(&mut mem, STATE_UNWINDING);
+    let refused = host.cap_dispatch_slots(iface::IO_RING, 0, rh, &submit, Some(&mut mem));
+    assert!(
+        matches!(refused, Err(Trap::ThreadFault)),
+        "freeze landed → blocking offload batch must fail closed, got {refused:?}",
+    );
+    assert_eq!(
+        host.blocking_state(bh)
+            .expect("blocking handle")
+            .max_active(),
+        0,
+        "the refused batch never ran on the offload pool",
+    );
+
+    set_state(&mut mem, STATE_NORMAL);
+    let ran = host.cap_dispatch_slots(iface::IO_RING, 0, rh, &submit, Some(&mut mem));
+    assert!(
+        matches!(&ran, Ok(v) if v.len() == 1 && v[0] == 1),
+        "no freeze → submit offloads the one SQE, got {ran:?}",
+    );
+}
+
 /// The gate is conditioned on a **durable** domain: a non-durable run's byte at window offset 0 is
 /// ordinary guest data, not a freeze word, and must never spuriously refuse a blocking call.
 #[test]

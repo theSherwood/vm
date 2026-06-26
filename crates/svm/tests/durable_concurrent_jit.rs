@@ -69,6 +69,10 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
     let spawned = Arc::new(AtomicBool::new(false));
     let sig = Arc::clone(&spawned);
     let mut host = Host::new();
+    // Declare durability on the *Host* (the JIT signals it to its own runtime via `set_durable_env`,
+    // but the shared `cap_dispatch_slots` reads `Host::is_durable` — e.g. the §12.8 4A.7 `Blocking`
+    // fail-closed gate). The interpreter durable path already requires this; the JIT path now matches.
+    host.set_durable(true);
     host.clock_ns = 42;
     let clk = host.grant_clock();
     // The root calls this once it has spawned its children; it flips the flag the controller waits on.

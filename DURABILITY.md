@@ -887,14 +887,22 @@ host call"). The cut: once an async freeze has **landed** (the global freeze wor
 vCPU **refuses to enter** a new blocking host call — `cap_dispatch_slots` fails closed with `Trap::ThreadFault`
 (mirroring the `thread.wait` deadlock fail-closed) instead of starting an un-checkpointable offload. So snapshot
 latency excludes *new* host calls once a freeze is requested (narrowing R6); cancelling an *already in-flight*
-call is the full offload-cancellation story, still deferred (R2). The gate is gated on `is_durable` (a non-durable
-guest's byte at window offset 0 is ordinary data, not a freeze word) and lives in the **shared** capability
+call is the full offload-cancellation story, still deferred (R2). Both the **direct** `Blocking.work` cap.call and
+a **batched** `io_ring.submit` that would offload `Blocking` SQEs onto the pool are gated (each parks a vCPU with
+no poll site); an all-inline submit parks nothing and is unaffected. The refusal lives in the **shared** capability
 dispatch that *both* backends funnel a `cap.call` through (the JIT via `svm-run`'s `cap_thunk`), so it is
-backend-agnostic by construction. A live `Blocking` handle was already non-durable at serialize (§12.5,
+backend-agnostic. It is gated on `Host::is_durable` (a non-durable guest's byte at window offset 0 is ordinary
+data, not a freeze word): durability is now declared on the *Host* for durable runs on **both** backends — the
+interpreter already required it, and the JIT's `concurrent_freeze` harness now sets it too (the JIT otherwise
+signals durability only to its own runtime via `set_durable_env`; `svm-jit` has no `svm_interp` dependency, so the
+gate reads the Host flag the embedder sets). A live `Blocking` handle was already non-durable at serialize (§12.5,
 `capture_durable_handles`); this adds the **run-time** refusal so the STW doesn't stall before reaching that gate.
-Pinned by `svm-interp/tests/blocking_freeze_refusal.rs` (a freeze-landed `Blocking.work` cap.call fails closed; a
-`NORMAL` one runs; a non-durable run never spuriously refuses) — deterministic, and covering the JIT's blocking
-path via the shared dispatch without racing an async controller against a real OS thread.
+Pinned by `svm-interp/tests/blocking_freeze_refusal.rs` (a freeze-landed direct call *and* a batched offload submit
+both fail closed; `NORMAL` runs; a non-durable run never spuriously refuses) — deterministic, covering the JIT's
+blocking path via the shared dispatch without racing an async controller against a real OS thread. *(A
+deterministic full-run JIT test can't reach the gate: any earlier safepoint poll unwinds the vCPU before it
+re-reaches a `Blocking` dispatch, so the gate is hit only via the genuine async race — exercised in isolation by
+the unit tests, which drive the exact shared code path the JIT uses.)*
 
 Remaining for 3.2: **nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and
 **JIT multi-vCPU parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze —

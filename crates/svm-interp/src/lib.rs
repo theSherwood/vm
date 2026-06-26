@@ -10485,6 +10485,16 @@ impl Host {
         // that never offloads spawns no threads). Each job writes its result by index; the submit
         // thread parks until the whole batch posts completion, then we copy results back in order.
         if !offload.is_empty() {
+            // §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). A batched submit *parks* the vCPU
+            // thread on the pool until the whole offload completes — no poll site. If an async STW
+            // freeze has already landed, fail **closed** rather than start the batch (the same
+            // fail-closed as a direct `Blocking.work` cap.call); the submit thread would otherwise
+            // stall the freeze for the whole batch (R6). Cancelling in-flight pool work is deferred
+            // (R2). Only the *offloadable* (blocking) batch is gated — an all-inline submit already
+            // ran above and parks nothing.
+            if self.is_durable() && freeze_has_landed(Some(&*m)) {
+                return Err(Trap::ThreadFault);
+            }
             let results: Arc<Vec<AtomicI64>> =
                 Arc::new(offload.iter().map(|_| AtomicI64::new(0)).collect());
             let mut jobs: Vec<OffloadJob> = Vec::with_capacity(offload.len());
