@@ -5046,9 +5046,108 @@ fn run_vcpu_parallel<'scope, 'env>(
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
             }
-            // Still outside this driver's subset (§14 `spawn_coroutine_module`): builds an inline
-            // coroutine over a granted module — a later slice.
-            Ok(_) => return (Err(Trap::ThreadFault), mem),
+            // §14 `Instantiator.spawn_coroutine_module` (op 6 / demand op 7) — a separate-module
+            // **coroutine**: resolve + compile + push the granted module (as for `instantiate_module`),
+            // materialize its data segments, then build a `Coro` (Yielder-only powerbox) and register
+            // it in **this** vCPU's coroutine set. Unlike instantiate, a coroutine is driven **inline**
+            // by `resume` (no thread) — so once built it runs on this vCPU exactly as a same-module
+            // coroutine already does in this driver; only the build (which needs the granted module)
+            // escaped here.
+            Ok(VcpuStop::SpawnCoroutineModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                dst,
+                demand,
+            }) => {
+                let (cfuncs, cmem_log2, cdata) = {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.resolve_module(mh) {
+                        Ok(grant) => (grant.funcs.clone(), grant.memory_log2, grant.data.clone()),
+                        Err(t) => return (Err(t), mem),
+                    }
+                };
+                let child_compiled = match compile_module(&cfuncs) {
+                    Some(c) => c,
+                    None => return (Err(Trap::Malformed), mem),
+                };
+                // A coroutine entry is `(i64 yielder) -> (i64)`; the carve must equal the module's
+                // declared memory (§14 transparency).
+                let ok_entry = child_compiled
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
+                let child_size = if (0..64).contains(&size_log2) {
+                    1u64 << size_log2
+                } else {
+                    0
+                };
+                let off_u = off as u64;
+                let fits = child_size != 0
+                    && child_size <= isz
+                    && off_u & (child_size - 1) == 0
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                if !ok_entry || !fits || !mod_ok {
+                    vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
+                let pbase = mem.as_ref().map_or(0, |m| m.window.base());
+                let abs_base = pbase + ibase + off_u;
+                let child_mem = {
+                    if let Some(m) = mem.as_ref() {
+                        for d in cdata.iter() {
+                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                                for (k, &b) in d.bytes.iter().enumerate() {
+                                    m.set_byte(abs_base + d.offset + k as u64, b);
+                                }
+                            }
+                        }
+                    }
+                    mem.as_ref().map(|m| {
+                        let cm = m.nested_view(abs_base, size_log2 as u8);
+                        if demand {
+                            // op 7: every page starts unmapped — the data segments are in the shared
+                            // backing but supplied lazily as the child first touches them.
+                            cm.demand_page();
+                        }
+                        cm
+                    })
+                };
+                // Yielder-only powerbox (its single entry arg): it holds no Instantiator, so its own
+                // spawn/resume CapFaults inside `Vm::resume`.
+                let mut child_host = Host::new();
+                let cy = child_host.grant_yielder();
+                let progs_len = child_compiled.progs.len();
+                let cm = dom.source.push(child_compiled);
+                let child_table = build_table_for(progs_len, 0, cm as u32);
+                let cunit = dom.source.get(cm);
+                let mut child_vm = match cunit
+                    .and_then(|u| Vm::new(&u, entry as usize, &[Value::I64(cy as i64)]).ok())
+                {
+                    Some(v) => v,
+                    None => {
+                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                };
+                child_vm.module = cm;
+                // The coroutine lives in this vCPU's coroutine set, driven inline by `resume`.
+                vt.coroutines.push(Some(Coro {
+                    vm: child_vm,
+                    mem: child_mem,
+                    host: child_host,
+                    table: child_table,
+                    awaiting: None,
+                    fault_yields: demand,
+                    faulted_page: None,
+                }));
+                let h = (vt.coroutines.len() - 1) as i32;
+                vt.active.set(dst, Reg::from_i32(h));
+            }
         }
     }
 }

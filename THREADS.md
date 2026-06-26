@@ -160,8 +160,9 @@ property, so in practice:
   oracle across 50 real-race repeats; Miri (`parallel_miri.rs`) confirms the shared-host access is
   race/UB-free. (Scope: caps `cap_dispatch_slots` handles — streams/clock/exit/reflection — over the
   native driver; the wasm-Worker shared-`Host` and order-sensitive-cap demos are follow-ons.)
-- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(§22 fully landed: A/B/C1/C2
-  done — incl. JIT across real Web Workers; only §14 remains)*. These mutate the `Domain` (`&mut`), which the parallel driver
+- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(§22 fully landed: A/B/C1/C2 —
+  incl. JIT across real Web Workers. §14 in `drive_parallel`: A/B/C done — instantiate, instantiate_module,
+  spawn_coroutine_module; only the resumable-`Vcpu`/browser path §14-D remains)*. These mutate the `Domain` (`&mut`), which the parallel driver
   shares `&`-immutably, so they fail closed today. **Motivation:** web *interpreter playgrounds* — a
   guest that JITs/`eval`s user code (§22) or sandboxes sub-programs (§14) **and** runs in parallel.
   **Design (chosen: full-unify, mirroring the tree-walker's proven `DomainTable`).** The bytecode engine's
@@ -238,8 +239,15 @@ property, so in practice:
       children, each compiled+pushed, data materialized, run, joined → oracle's value) and a
       `instantiate_module` case in `parallel_instantiate_miri.rs` (data-materialization + cross-thread
       access over the pushed module, race/UB-clean).
-    - [ ] **§14-C — `spawn_coroutine_module` (op 6/7)**: build the `Coro` (inline-driven) + demand
-      paging.
+    - [x] **§14-C — `spawn_coroutine_module` (op 6/7)**: resolve + compile + push the granted module,
+      materialize its data segments (demand-page for op 7), and build the `Coro` in the vCPU's
+      coroutine set — driven **inline** by `resume` (no thread), so it then runs exactly as a
+      same-module coroutine already does in this driver. With this, **every** multi-vCPU `VcpuStop` is
+      handled in `run_vcpu_parallel` (the fail-closed catch-all is gone). Proven by the
+      `spawn_coroutine_module` kernel in `bytecode_parallel_instantiate.rs` (8 module coroutines built
+      + resumed by the root vCPU under the parallel driver → the cooperative oracle's value). (A
+      coroutine is single-vCPU by construction — `compile_module` rejects coroutine + `thread.spawn` in
+      one module — so there is no cross-thread case to Miri-check here.)
     - [ ] **§14-D — the resumable `Vcpu` / browser path** (like §22 C1/C2), if wanted.
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same

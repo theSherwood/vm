@@ -361,3 +361,62 @@ fn parallel_instantiate_module_fanout_matches_oracle() {
         );
     }
 }
+
+// ===== §14-C — `spawn_coroutine_module` (op 6): separate-module coroutines, driven inline ==========
+// A coroutine is **inline** (single-vCPU, no thread — and a module mixing coroutine ops with
+// `thread.spawn` is rejected by `compile_module` by design), so "under the parallel driver" means the
+// driver's vCPU services the build + resume. This kernel runs the root vCPU through `drive_parallel`,
+// exercising the parallel `spawn_coroutine_module` arm 8× and `resume` 8×; the differential vs the
+// cooperative oracle is what proves the arm is correct (not fail-closed) there.
+
+/// Root `(instantiator, module) -> sum`: `spawn_coroutine_module` the granted module 8 times (one
+/// coroutine per 4 KiB carve at `64 KiB + i*4 KiB`), `resume` each to completion, and sum the returned
+/// values. Each module coroutine returns 75 (its data byte) ⇒ 8 × 75 = 600.
+const COROUTINE_MODULE: &str = r#"memory 17
+func (i32, i32) -> (i64) {
+block0(vinst0: i32, vmod0: i32):
+  vmod64 = i64.extend_i32_s vmod0
+  vi0 = i64.const 0
+  vs0 = i64.const 0
+  br block1(vi0, vs0, vinst0, vmod64)
+block1(vi: i64, vs: i64, vinst: i32, vmod: i64):
+  vn = i64.const 8
+  vlt = i64.lt_u vi vn
+  br_if vlt block2(vi, vs, vinst, vmod) block3(vs)
+block2(vi2: i64, vs2: i64, vinst2: i32, vmod2: i64):
+  v4096 = i64.const 4096
+  vofflo = i64.mul vi2 v4096
+  v64k = i64.const 65536
+  voff = i64.add v64k vofflo
+  ventry = i64.const 0
+  vslog = i64.const 12
+  vcoro = cap.call 6 6 (i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog)
+  vrv = i64.const 0
+  vstatus, vval = cap.call 6 3 (i32, i64) -> (i32, i64) vinst2 (vcoro, vrv)
+  vsnew = i64.add vs2 vval
+  v1 = i64.const 1
+  vinext = i64.add vi2 v1
+  br block1(vinext, vsnew, vinst2, vmod2)
+block3(vs3: i64):
+  return vs3
+}
+"#;
+
+/// 8 separate-module coroutines built + resumed by the root vCPU under the parallel driver (via the
+/// parallel `spawn_coroutine_module` arm) — the folded sum matches the cooperative oracle.
+#[test]
+fn parallel_coroutine_module_matches_oracle() {
+    let want = run_cooperative_mod(COROUTINE_MODULE);
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(600)]),
+        "oracle: 8 × coroutine-module(75) = 600"
+    );
+    for i in 0..50 {
+        assert_eq!(
+            run_parallel_mod(COROUTINE_MODULE),
+            want,
+            "parallel spawn_coroutine_module != oracle (run {i})"
+        );
+    }
+}
