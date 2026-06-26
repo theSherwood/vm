@@ -4243,6 +4243,7 @@ fn build_clif(
         .map(|v| BlockArg::from(*v))
         .collect();
     emit_epoch_check(&mut b, &lower);
+    emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
@@ -5892,6 +5893,39 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
     b.switch_to_block(cont);
     // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
 }
+
+/// PROTOTYPE (feature `stack-check`): a per-prologue software stack-limit check — the recurring cost
+/// of replacing the hardware guard page with a software guard (the arena/software-guard fiber model).
+/// Modeled exactly on [`emit_epoch_check`]: load a per-fiber stack limit from a host-owned cell, get
+/// the current SP, and `brif` to a cold trap when `SP < limit` (the stack grew past its low bound).
+///
+/// To measure the *cost* (not enforce), the prototype reads a process-global `AtomicU64` kept at 0, so
+/// `SP < 0` is never true and the check never traps — but the **atomic** load is opaque to the
+/// optimizer (like the epoch poll), so the load + compare + branch are really emitted in every
+/// prologue and the cost is faithful. A real deployment would source the limit per-fiber (written on
+/// switch-in) and keep enforcement escape-grade; this emitted check alone is NOT a security boundary.
+#[cfg(feature = "stack-check")]
+fn emit_stack_check(b: &mut FunctionBuilder, lower: &Lower) {
+    use std::sync::atomic::AtomicU64;
+    // Host-owned limit cell. 0 here ⇒ benign (never traps); a real build writes each fiber's
+    // `usable_low` on switch-in. `static` so its address is stable to bake as an `iconst`.
+    static STACK_LIMIT_CELL: AtomicU64 = AtomicU64::new(0);
+    let cont = b.create_block();
+    let trap_blk = b.create_block();
+    let addr = b
+        .ins()
+        .iconst(I64, &STACK_LIMIT_CELL as *const AtomicU64 as i64);
+    // Atomic load: a host cell the optimizer must not hoist/fold (same reasoning as the epoch poll).
+    let limit = b.ins().atomic_load(I64, atomic_flags(), addr);
+    let sp = b.ins().get_stack_pointer(I64);
+    let lt = b.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
+    b.ins().brif(lt, trap_blk, &[], cont, &[]);
+    b.switch_to_block(trap_blk);
+    emit_trap(b, lower, TrapKind::OutOfFuel); // never taken in the prototype; reuse a cold kind
+    b.switch_to_block(cont);
+}
+#[cfg(not(feature = "stack-check"))]
+fn emit_stack_check(_b: &mut FunctionBuilder, _lower: &Lower) {}
 
 /// A zero constant of CLIF type `t` (for a trapping path's dummy return).
 fn zero_of(b: &mut FunctionBuilder, t: Type) -> Value {
