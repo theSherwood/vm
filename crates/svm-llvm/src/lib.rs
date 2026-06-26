@@ -293,10 +293,16 @@ fn translate_impl(
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
+    // `snprintf(buf, size, fmt, …)` reuses the entire `printf` format engine ([`lower_format`]) with
+    // output redirected into `buf` (the [`FmtSink`] path of `emit_write`) — so it needs the same
+    // synthesized helpers: `utoa` (`%d`), the bignum `dtoa` family (`%f`/`%g`/`%e`), `strlen` (`%s`),
+    // and `memcpy` (the per-segment buffer copy). Unlike `printf` it writes no stdout, so it needs no
+    // `write` import / powerbox `main`.
+    let need_snprintf = calls_external(m, &defined_names, "snprintf");
     // A direct `strlen` call routes to the same synthesized `__svm_strlen` byte loop that `printf %s`
     // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
     // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
-    let need_strlen = need_printf || calls_external(m, &defined_names, "strlen");
+    let need_strlen = need_printf || need_snprintf || calls_external(m, &defined_names, "strlen");
     // `strcmp` plus its C-locale alias `strcoll` share one synthesized byte-compare helper; `strchr`
     // its own byte scan (the §varargs/libc batch for real-program targets like Lua).
     let need_strcmp =
@@ -311,7 +317,6 @@ fn translate_impl(
     let need_fmod = calls_external(m, &defined_names, "fmod");
     let need_frexp = calls_external(m, &defined_names, "frexp");
     let need_strtod = calls_external(m, &defined_names, "strtod");
-    let need_snprintf = calls_external(m, &defined_names, "snprintf");
     let need_localeconv = calls_external(m, &defined_names, "localeconv");
     let need_errno = calls_external(m, &defined_names, "__errno_location");
     let need_time = calls_external(m, &defined_names, "time");
@@ -322,7 +327,7 @@ fn translate_impl(
     // `%f` formatting (`__svm_dtoa_fixed`) rides on `printf`: it writes via the same `write` import and
     // stashed stdout handle. Synthesized for any `printf` program (dead if no `%f` appears — scanning
     // the formats to tighten this is a later refinement).
-    let need_dtoa = need_printf;
+    let need_dtoa = need_printf || need_snprintf;
     // C++ exception handling (Itanium ABI on-ramp). `need_eh` reserves the EH state region + drives
     // the `invoke`/`landingpad`/`resume`/`__cxa_*` lowering; the typeinfo-id table assigns each
     // `@_ZTI*` referenced by a throw or `llvm.eh.typeid.for` a distinct nonzero id so the thrown-type
@@ -360,8 +365,17 @@ fn translate_impl(
         .global_vars
         .iter()
         .any(|g| name_str(&g.name) == "llvm.global_ctors");
-    let needs_powerbox_entry =
-        !imports.is_empty() || need_malloc || uses_blocking || has_global_ctors || need_getenv;
+    // `snprintf` writes the format scratch (`FMT_BUF`, via `utoa`/`dtoa`) — page 0 of the **writable**
+    // low scratch. It must force the powerbox layout so the globals start one page up (`STACK_PAGE`,
+    // below): otherwise a read-only global (the constant format string) shares page 0 with `FMT_BUF`
+    // and D40 page-granular protection makes `utoa`'s scratch writes fault. (`printf` already forces
+    // this via its `write` import; `snprintf` has no import of its own, hence the explicit term.)
+    let needs_powerbox_entry = !imports.is_empty()
+        || need_malloc
+        || uses_blocking
+        || has_global_ctors
+        || need_getenv
+        || need_snprintf;
     let synth = needs_powerbox_entry && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
@@ -432,9 +446,9 @@ fn translate_impl(
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
     let (need_memset, need_memcpy0, need_memmove) = needs_mem_helpers(m);
-    let need_memcpy = need_memcpy0 || need_realloc; // `realloc` copies via `__svm_memcpy`
-                                                    // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
-                                                    // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
+    let need_memcpy = need_memcpy0 || need_realloc || need_snprintf; // `realloc`/`snprintf` copy via `__svm_memcpy`
+                                                                     // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
+                                                                     // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
         calls_external(m, &defined_names, "memcmp") || calls_external(m, &defined_names, "bcmp");
     // `memchr(s, c, n)` (string/buffer scans — e.g. Embench `slre`) → the synthesized `__svm_memchr`
@@ -475,7 +489,7 @@ fn translate_impl(
         memset: take(need_memset),
         memcpy: take(need_memcpy),
         malloc: take(need_malloc),
-        utoa: take(need_printf),
+        utoa: take(need_printf || need_snprintf),
         // `%s` needs a runtime strlen (synthesized alongside `utoa` for any `printf`); a direct
         // `strlen` call also routes here — `need_strlen` covers both (see above).
         strlen: take(need_strlen),
@@ -514,7 +528,6 @@ fn translate_impl(
         fmod_stub: take(need_fmod),
         frexp_stub: take(need_frexp),
         strtod_stub: take(need_strtod),
-        snprintf_stub: take(need_snprintf),
         localeconv_stub: take(need_localeconv),
         errno_stub: take(need_errno),
         time_zero: take(need_time),
@@ -664,7 +677,7 @@ fn translate_impl(
     if need_malloc {
         funcs.push(synth_malloc(caps["vm_map"]));
     }
-    if need_printf {
+    if need_printf || need_snprintf {
         funcs.push(synth_utoa());
     }
     if need_strlen {
@@ -788,10 +801,6 @@ fn translate_impl(
             vec![ValType::I64, ValType::I64],
             vec![ValType::F64],
         ));
-    }
-    if need_snprintf {
-        // snprintf is varargs; the trap stub takes no args (the dispatch ignores them) → i32.
-        funcs.push(synth_trap_stub(vec![], vec![ValType::I32]));
     }
     if need_localeconv {
         // localeconv(void) -> struct lconv*.
@@ -3526,10 +3535,10 @@ struct Helpers {
     pow_stub: Option<u32>,
     fmod_stub: Option<u32>,
     frexp_stub: Option<u32>,
-    /// More fail-closed stubs: `strtod`/`snprintf` (string⇄double conv + formatting — not exercised by
-    /// an integer-only path), `localeconv`/`__errno_location` (locale + errno). Translate, trap if run.
+    /// More fail-closed stubs: `strtod` (string→double — not exercised by an integer-only path),
+    /// `localeconv`/`__errno_location` (locale + errno). Translate, trap if run. (`snprintf` is real —
+    /// it reuses the `printf` engine, see [`lower_snprintf`].)
     strtod_stub: Option<u32>,
-    snprintf_stub: Option<u32>,
     localeconv_stub: Option<u32>,
     errno_stub: Option<u32>,
     /// `time(t)` — the RNG seed source in `makeseed`; executed during state creation but the seed does
@@ -9727,6 +9736,20 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
             b'd' | b'i' => int(10, true),
             b'u' => int(10, false),
             b'x' => int(16, false),
+            // `%p`: a pointer as `0x`-prefixed lowercase hex of the address (glibc form) — i.e. `%#x`
+            // of the `i64` pointer. (glibc prints `(nil)` for a null pointer; that edge prints `0x0`
+            // here — a documented minor divergence. Lua uses `%p` to tag objects in error/debug text.)
+            b'p' => {
+                let mut f = flags;
+                f.alt = true;
+                FmtSeg::Int {
+                    base: 16,
+                    signed: false,
+                    width,
+                    prec,
+                    flags: f,
+                }
+            }
             b'c' => FmtSeg::Char,
             b's' => FmtSeg::Str { width, prec },
             // Fixed-notation float (`%f`). Exact (correctly-rounded) decimal conversion via the
@@ -10500,17 +10523,11 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // `snprintf(buf, n, fmt, …)`: a varargs call — caught here (before the general varargs
-        // marshaling) and routed to a no-arg fail-closed trap stub (number formatting not exercised).
+        // `snprintf(buf, size, fmt, …)`: a varargs call — caught here (before the general varargs
+        // marshaling) and lowered through the shared `printf` format engine with output redirected
+        // into `buf` (§printf / [`lower_snprintf`]).
         "snprintf" => {
-            let Some(f) = ctx.helpers.snprintf_stub else {
-                return Ok(false);
-            };
-            let r = ctx.push(Inst::Call {
-                func: f,
-                args: vec![],
-            });
-            ctx.bind_dest(&c.dest, r);
+            lower_snprintf(ctx, c)?;
             Ok(true)
         }
         // `localeconv()` / `__errno_location()`: fail-closed trap stubs (locale + errno, no-arg → ptr).
@@ -10601,7 +10618,21 @@ fn lower_io_call(
 /// Lower a `printf(fmt, …)` call (the constant format engine — see the `"printf"` arm). Emits the
 /// `Stream.write`s for the literals and conversions in order, consuming the variadic args.
 fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<(), Error> {
-    let gname = global_name_of(&c.arguments[0].0)
+    // `printf(fmt, …)`: format to stdout. `fmt` is arg 0; the conversion arguments start at arg 1.
+    lower_format(ctx, c, 0, 1)
+}
+
+/// The shared `printf`-family format engine: parse the **constant** format at `c.arguments[fmt_idx]`
+/// and emit each segment, taking conversion arguments from `c.arguments[arg_base..]`. Output goes to
+/// stdout, or — when `ctx.fmt_sink` is set (`snprintf`) — into a destination buffer (the redirected
+/// [`BlockCtx::emit_write`]). Used by both `printf` (no sink) and `snprintf` (sink set by the caller).
+fn lower_format(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    fmt_idx: usize,
+    arg_base: usize,
+) -> Result<(), Error> {
+    let gname = global_name_of(&c.arguments[fmt_idx].0)
         .ok_or_else(|| Error::Unsupported("printf: non-constant format string".into()))?;
     let fmt_addr = *ctx
         .globals
@@ -10619,7 +10650,7 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
         .helpers
         .utoa
         .ok_or_else(|| Error::Unsupported("printf: utoa helper missing".into()))?;
-    let mut argi = 1; // arg 0 is the format string; varargs follow
+    let mut argi = arg_base; // conversion arguments follow the format string
     for seg in segs {
         match seg {
             FmtSeg::Lit { off, len } => {
@@ -10826,6 +10857,75 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
             }
         }
     }
+    Ok(())
+}
+
+/// `snprintf(buf, size, fmt, …)` — reuse the `printf` format engine ([`lower_format`]) with output
+/// redirected into `buf` via the [`FmtSink`] path of [`BlockCtx::emit_write`], then NUL-terminate
+/// within `size` and return the would-be length (C semantics — the count that *would* have been
+/// written, excluding the NUL). `buf`/`size` are runtime values; `fmt` is the constant string at
+/// argument 2 (e.g. Lua's number formats `%lld`/`%.14g` and the `%d`/`%s` error-message conversions).
+/// A `size` of 0 is not faithfully supported (Lua always passes an adequate buffer); every other size
+/// is bounded so `buf[..size]` is never overrun.
+fn lower_snprintf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<(), Error> {
+    let dest = ctx.operand_i64(&c.arguments[0].0)?;
+    let size = ctx.operand_i64(&c.arguments[1].0)?;
+    let zero = ctx.const_i64(0);
+    ctx.fmt_sink = Some(FmtSink {
+        dest,
+        size,
+        offset: zero,
+    });
+    let res = lower_format(ctx, c, 2, 3);
+    let sink = ctx.fmt_sink.take(); // clear the sink even if formatting failed
+    res?;
+    let offset = sink.expect("snprintf sink present").offset; // would-be length
+                                                              // NUL-terminate at min(offset, max(0, size - 1)).
+    let one = ctx.const_i64(1);
+    let size_m1 = ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Sub,
+        a: size,
+        b: one,
+    });
+    let zero2 = ctx.const_i64(0);
+    let neg = ctx.push(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LtS,
+        a: size_m1,
+        b: zero2,
+    });
+    let cap = ctx.push(Inst::Select {
+        cond: neg,
+        a: zero2,
+        b: size_m1,
+    }); // max(0, size-1)
+    let off_lt = ctx.push(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LtU,
+        a: offset,
+        b: cap,
+    });
+    let nul_pos = ctx.push(Inst::Select {
+        cond: off_lt,
+        a: offset,
+        b: cap,
+    });
+    let nul_addr = ctx.add_i64(dest, nul_pos);
+    let zbyte = ctx.push(Inst::ConstI32(0));
+    ctx.push_effect(Inst::Store {
+        op: svm_ir::StoreOp::I32_8,
+        addr: nul_addr,
+        value: zbyte,
+        offset: 0,
+        align: 0,
+    });
+    // Return value: the would-be length, as `int` (low 32 bits).
+    let ret = ctx.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: offset,
+    });
+    ctx.bind_dest(&c.dest, ret);
     Ok(())
 }
 
@@ -12858,6 +12958,20 @@ struct BlockCtx<'a> {
     /// A `ReturnCall(Indirect)` terminator produced by the tail-position call above; consumed by
     /// `translate_block` in place of lowering the `ret`.
     pending_tail: Option<Terminator>,
+    /// When set (during `snprintf` lowering), the shared format engine's [`BlockCtx::emit_write`]
+    /// copies each formatted run into this destination buffer (bounded by `size`, advancing `offset`)
+    /// instead of writing it to `Stream`/stdout — so `snprintf` reuses the entire `printf` formatter.
+    fmt_sink: Option<FmtSink>,
+}
+
+/// The `snprintf` destination for the redirected [`BlockCtx::emit_write`] sink (§printf): the buffer
+/// base, its `size` bound, and the running write `offset` (a runtime SSA value threaded across the
+/// per-segment writes; its final value is `snprintf`'s return — the would-be length).
+#[derive(Clone, Copy)]
+struct FmtSink {
+    dest: ValIdx,
+    size: ValIdx,
+    offset: ValIdx,
 }
 
 impl<'a> BlockCtx<'a> {
@@ -13028,6 +13142,67 @@ impl<'a> BlockCtx<'a> {
     /// Emit a `Stream.write(buf, len)` on the stdout handle (a `CallImport`); returns the result
     /// (bytes written). Used by `write` and every stdio output wrapper.
     fn emit_write(&mut self, buf: ValIdx, len: ValIdx) -> Result<ValIdx, Error> {
+        // `snprintf` redirect (§printf): copy this formatted run into the destination buffer instead
+        // of writing it to stdout. Bounded so `dest[..size]` (with room for the trailing NUL) is never
+        // overrun; `offset` advances by the FULL `len` (C `snprintf` returns the would-be length).
+        if let Some(sink) = self.fmt_sink {
+            let memcpy = self
+                .helpers
+                .memcpy
+                .ok_or_else(|| Error::Unsupported("snprintf: memcpy helper missing".into()))?;
+            let one = self.const_i64(1);
+            let cap = self.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: sink.size,
+                b: one,
+            }); // size - 1 (last index is reserved for the NUL)
+            let off_lt_cap = self.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::LtS,
+                a: sink.offset,
+                b: cap,
+            });
+            let room_raw = self.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: cap,
+                b: sink.offset,
+            });
+            let zero = self.const_i64(0);
+            let room = self.push(Inst::Select {
+                cond: off_lt_cap,
+                a: room_raw,
+                b: zero,
+            }); // max(0, (size-1) - offset)
+            let len_lt_room = self.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::LtU,
+                a: len,
+                b: room,
+            });
+            let ncopy = self.push(Inst::Select {
+                cond: len_lt_room,
+                a: len,
+                b: room,
+            }); // min(len, room)
+            let dst = self.add_i64(sink.dest, sink.offset);
+            self.push_effect(Inst::Call {
+                func: memcpy,
+                args: vec![dst, buf, ncopy],
+            });
+            let new_off = self.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: sink.offset,
+                b: len,
+            });
+            self.fmt_sink = Some(FmtSink {
+                offset: new_off,
+                ..sink
+            });
+            return Ok(new_off);
+        }
         let import = self.import_of("write")?;
         let handle = self.stash_load(STASH_STDOUT);
         Ok(self.push(Inst::CallImport {
@@ -13538,6 +13713,7 @@ fn translate_block(
         next_val: 0,
         tail_return: false,
         pending_tail: None,
+        fmt_sink: None,
     };
     for (vid, pos) in scalar_seed {
         ctx.idx_of.insert(vid, pos);
