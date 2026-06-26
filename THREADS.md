@@ -160,9 +160,42 @@ property, so in practice:
   oracle across 50 real-race repeats; Miri (`parallel_miri.rs`) confirms the shared-host access is
   race/UB-free. (Scope: caps `cap_dispatch_slots` handles — streams/clock/exit/reflection — over the
   native driver; the wasm-Worker shared-`Host` and order-sensitive-cap demos are follow-ons.)
-- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel.** These mutate the `Domain`
-  (`&mut`), which the parallel driver shares `&`-immutably. Needs the domain's installable parts behind
-  their own synchronization (or to route these events back to a single owner).
+- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(in progress — §22 first; a
+  shell-like SVM language wants §14 too)*. These mutate the `Domain` (`&mut`), which the parallel driver
+  shares `&`-immutably, so they fail closed today. **Motivation:** web *interpreter playgrounds* — a
+  guest that JITs/`eval`s user code (§22) or sandboxes sub-programs (§14) **and** runs in parallel.
+  **Design (chosen: full-unify, mirroring the tree-walker's proven `DomainTable`).** The bytecode engine's
+  `Domain { mods: Vec<Compiled>, table: Vec<Option<(u32,u32)>> }` (mutated by `&mut`) becomes:
+
+  ```rust
+  struct SharedTable {                       // mirrors tree-walker `DomainTable`
+      slots: Box<[AtomicU64]>,               // dispatch: 1 Acquire load; install: Release store (pack_slot)
+      units: Mutex<Vec<Arc<Compiled>>>,      // installed §22 units; touched only on install / cache-miss
+  }
+  struct Domain { primary: Arc<Compiled>, table: SharedTable }   // used by root, §14 child, AND coroutine
+  ```
+
+  Reuse the crate-private `super::{pack_slot, unpack_slot, TableSlot, TABLE_EMPTY, INVOKE_MODULE}`.
+  `install(&self, Arc<Compiled>)`/`uninstall(&self,…)` go interior-mutable (so a shared `&Domain` can
+  install). Dispatch is lock-free: `table.slot(i)` Acquire-loads, pairing with the install Release.
+
+  **Plan (one big suite-gated commit for A, then B/C):**
+  - **A — convert the engine to the unified `Domain`** (behavior-preserving; the whole `bytecode_*`
+    suite gates it). `resume`'s hot loop: `c: &Compiled` → `c: Arc<Compiled>` (clone on the rare
+    module-crossing), resolved via a per-vCPU `local_units: Vec<Arc<Compiled>>` cache refreshed from
+    `units_snapshot()` on a miss; `mods: &[Compiled]` param → `dom: &Domain`. Update every `resume`
+    caller, `step_vcpu`, `drive`'s `JitInstall`/`JitUninstall` arms (now `dom.table.install(...)`),
+    `run_invoke` (already runs an installed unit over the shared table), child/coro construction (build
+    a `Domain`), and the `vm_trap_bt`/`cur_ir_pc` helpers. `INVOKE_MODULE`/child handled as today.
+    *Cost:* dispatch gains a `Relaxed`/`Acquire` atomic load — ~free on x86/ARM; child/coro pay an
+    uncontended atomic/`Arc` cost. Cooperative order (hence determinism) is unchanged.
+  - **B — un-fail-close `JitInstall`/`JitUninstall`/`JitInvoke` in `drive_parallel`/the resumable
+    `Vcpu`**, dispatching to the shared `Domain`. Differential test: a guest that `thread.spawn`s and
+    JITs a unit → parallel result matches the cooperative oracle; Miri for race-freedom.
+  - **C — un-fail-close the browser path** (`svm_par_*`) so a guest JITs **across Web Workers**; a
+    Node/Chromium test proves it.
+  - **§14 `instantiate` in parallel** is a follow-on after §22 (children get their own confined `Domain`;
+    the cooperative driver's single `extra_envs` vec doesn't map onto per-thread vCPUs — separate slice).
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
   `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
