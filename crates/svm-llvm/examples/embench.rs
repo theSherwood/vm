@@ -104,7 +104,10 @@ const BENCHES: &[Bench] = &[
         extra: &["src/xgboost/xgboost.c"],
         beebs: false,
         tail: "",
-        large: 20_000,
+        // ~1 ms/iter (a full GBDT inference) — 1000× the other kernels, so `large` is sized far smaller
+        // to keep each run a few hundred ms (× 4 engines × ~10 reps). `large=20_000` was a ~20 s/run
+        // mis-size that only barely fit the old native+svm timing.
+        large: 400,
     },
     Bench {
         name: "qrduino",
