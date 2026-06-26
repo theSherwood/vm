@@ -24,6 +24,7 @@ use svm_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv_interruptible, FreezeController,
     FrozenFiber, FrozenVCpu, JitError, JitOutcome, TrapKind,
 };
+use svm_snapshot::{freeze as codec_freeze, restore as codec_restore};
 
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -1285,5 +1286,108 @@ fn recycled_context_freeze_residue_is_sparse() {
         le_i64(&tfinal, OFF_C1),
         K,
         "child B total reproduced on thaw"
+    );
+}
+
+// §12.8 4A.6 codec follow-up — the recycled-context artifact through the **svm-snapshot §12 codec**.
+// `recycled_context_freeze_residue_is_sparse` (above) checks the *in-memory* residue shape; this drives
+// the **same real concurrent freeze residue** (B frozen + A completed, A's context recycled) through the
+// serialize/restore codec and asserts the **§12.6 invariant 1 (canonical re-freeze)**: serialize → restore
+// → re-serialize is **byte-identical**, with the recycled vCPU residue (`completed_result` included) and the
+// sparse window image (recycled regions zero-elided) surviving intact.
+//
+// The codec is `svm_interp::Host`-based, and the interp can't *produce* a recycled residue — it runs durable
+// single-worker, so `completed_result` is always `None` (svm-interp lib.rs) and no sibling context is freed
+// at a freeze. So we bridge the JIT residue (field-identical mirror types) into a fresh codec-ready host that
+// grants only the **durable clock**: the concurrent harness's signalling host-fn is a non-durable handle the
+// codec would refuse (`FreezeError::NonDurableHandle`), and the children's clock reads already reloaded into
+// the window image, so a clean clock-only handle table is a faithful artifact for the canonical-re-freeze check.
+#[test]
+fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
+    let inst = instrument(SRC_RECYCLE);
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The freeze didn't catch the loops (rare): nothing recycled-sparse to serialize.
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder"
+    );
+    assert_eq!(
+        fvcpus.len(),
+        2,
+        "recycled residue we serialize: B frozen + A completed"
+    );
+    assert!(
+        fvcpus.iter().any(|v| v.completed_result == Some(1007)),
+        "A's join result (7 + 1000) is in the residue we serialize",
+    );
+
+    // Bridge the real JIT residue into a fresh codec-ready interp host. `svm_jit` and `svm_interp` frozen
+    // residue types are field-identical mirrors; the codec reads its control section from the host's
+    // `frozen_*` fields + the window image.
+    let i_fibers: Vec<svm_interp::FrozenFiber> = ffibers
+        .iter()
+        .map(|f| svm_interp::FrozenFiber {
+            slot: f.slot,
+            func: f.func,
+            sp: f.sp,
+            shadow_sp: f.shadow_sp,
+            generation: f.generation,
+        })
+        .collect();
+    let i_vcpus: Vec<svm_interp::FrozenVCpu> = fvcpus
+        .iter()
+        .map(|v| svm_interp::FrozenVCpu {
+            task: v.task,
+            parent_task: v.parent_task,
+            func: v.func,
+            args: v.args.clone(),
+            shadow_sp: v.shadow_sp,
+            completed_result: v.completed_result,
+        })
+        .collect();
+
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let _ = fhost.grant_clock(); // the only durable handle; mirrors the real domain's clock
+    fhost.set_frozen_fibers(i_fibers);
+    fhost.set_frozen_vcpus(i_vcpus);
+    fhost.set_frozen_root_sp(froot_sp);
+
+    // Serialize the real §12 artifact carrying the recycled residue + sparse window image.
+    let artifact = codec_freeze(&inst, &fsnap, &fhost).expect("recycled artifact serializes");
+    assert!(
+        artifact.len() < WINDOW,
+        "sparse window image — recycled (freed) sibling regions are zero-elided: {} < {WINDOW}",
+        artifact.len(),
+    );
+
+    // Restore into a fresh host; the residue (completed_result included) + root extent re-seed.
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = codec_restore(&artifact, &inst, &mut thost).expect("recycled artifact restores");
+    assert_eq!(
+        thost.frozen_vcpus().len(),
+        2,
+        "restore re-seeded both residue records (B frozen + A completed)",
+    );
+    assert!(
+        thost
+            .frozen_vcpus()
+            .iter()
+            .any(|v| v.completed_result == Some(1007)),
+        "A's completed-child result survived the codec round-trip",
+    );
+
+    // §12.6 invariant 1 — canonical: re-serializing the freshly-restored domain reproduces the recycled
+    // artifact byte-for-byte (sparse window image + recycled vCPU residue, completed_result included).
+    assert_eq!(
+        codec_freeze(&inst, &window, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze of a restored recycled-context domain is byte-identical",
     );
 }
