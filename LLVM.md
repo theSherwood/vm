@@ -1153,6 +1153,54 @@ Picking a target is really picking the *gap* it drives to completion. Current st
 - **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
   synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
 
+### Lua first light — recon + sequenced plan (IN PROGRESS)
+**Goal.** Run a pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
+through the on-ramp, exit-identical to native Lua — exercising the **lexer, parser, code generator, GC,
+and the VDBE-style bytecode VM** (computed `goto` + `setjmp` error handling, both already done). No
+stdlib / `print` / float output needed for first light (the result returns as the process exit code).
+
+**Build recipe (reproducible).** Lua's core (no standard libraries, no `lauxlib`) + a tiny C-API harness
+that drives `lua_newstate`/`lua_load`/`lua_pcall`/`lua_tointeger` with its own allocator (`realloc`) and
+string reader — this keeps the file-I/O surface (`fopen`/`fread`/`fprintf` from `lauxlib`'s loaders)
+*out* of the module:
+```
+CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
+      lstate lstring ltable ltm lundump lvm lzio"          # NOT: the lib*.c, lauxlib, lua.c, luac.c
+for f in $CORE harness; do clang -O2 -emit-llvm -c -Ilua-5.4.7/src $f.c -o $f.bc; done
+llvm-link *.bc -o lua_core.bc                              # one module → svm-llvm-translate
+```
+The full `luaL_*` build pulls in ~39 externals (file I/O dominates); the core-only build above is **21
+externals + 4 defined-varargs functions** — the true first-light surface.
+
+**Gap inventory (core-only `lua_core.bc`), in dependency order:**
+1. **Varargs *definition* ABI — the keystone.** `luaG_runerror` / `luaO_pushfstring` / `lua_pushfstring`
+   / `lua_gc` are defined `(...)` functions; clang `-O2` lowers `va_start`/`va_arg` into the **System V
+   AMD64 `__va_list_tag` dance** (`gp_offset`/`fp_offset`/`reg_save_area`/`overflow_arg_area`). The
+   on-ramp rejects defined varargs functions outright (`translate_func`). These are reached via the
+   error-reporting paths in the *static* call graph (so reachability pruning can't drop them) even when
+   a clean script never executes them. **Tractable model:** give a varargs def a hidden trailing
+   `__vararg_area: i64` param; lower `llvm.va_start` to write the tag with `gp_offset=48`,
+   `fp_offset=176` (≥ thresholds → clang's lowered `va_arg` *always* takes the `overflow_arg_area`
+   branch, so **no `reg_save_area` to synthesize**), `overflow_arg_area = __vararg_area`; at a varargs
+   *call* site marshal the variadic args into a contiguous 8-byte-slot stack buffer and pass its
+   pointer as the hidden param. `va_end`→no-op, `va_copy`→struct copy. (Lua's variadic args are all
+   ≤8 bytes — int/ptr/double/ptrdiff — so 8-byte slots suffice; wider-than-8 by-value is a follow-on.)
+2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). Reuses the
+   bignum dtoa float formatter + the varargs-call marshaling from (1). Reachable.
+3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
+   decimal→`f64` (the parse direction of the existing Ryū/Dragon dtoa). Reachable.
+4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
+   `memcmp`/`strlen`): `strchr` `strcmp` `strcpy` `strpbrk` `strspn`, `strcoll`→`strcmp` (C locale =
+   byte compare), `fmod` `pow` `frexp` `ldexp` (float math — recognize like `sqrt`/`fmin`, or
+   synthesize), `localeconv` (a static C-locale struct: `decimal_point="."`), `__errno_location` (a
+   fixed window slot — `strtod` sets `ERANGE`), `abort`→trap, `time`→stub/`Clock` cap (RNG seed in
+   `lstate` `makeseed`). Already covered: `_setjmp`/`longjmp`, `free`(no-op), `realloc`, `bcmp`→`memcmp`,
+   `strlen`.
+
+**Sequencing:** (slice 1) varargs ABI + a standalone `my_sum(int n, ...)` differential unit test; (slice
+2) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test (native
+exit vs on-ramp exit, all engines). Each slice is independently testable against native.
+
 ### SQLite — the north star (in-memory, then disk via the powerbox)
 SQLite is the gold-standard target (≈600:1 test-to-code ratio, ships as one amalgamation `.c`). Two
 phases, both worth doing:
