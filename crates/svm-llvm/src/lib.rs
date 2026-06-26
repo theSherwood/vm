@@ -294,6 +294,11 @@ fn translate_impl(
     // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
     // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
     let need_strlen = need_printf || calls_external(m, &defined_names, "strlen");
+    // `strcmp` plus its C-locale alias `strcoll` share one synthesized byte-compare helper; `strchr`
+    // its own byte scan (the §varargs/libc batch for real-program targets like Lua).
+    let need_strcmp = calls_external(m, &defined_names, "strcmp")
+        || calls_external(m, &defined_names, "strcoll");
+    let need_strchr = calls_external(m, &defined_names, "strchr");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -482,6 +487,9 @@ fn translate_impl(
         eh_destroy: take(need_eh_destroy),
         eh_unwind: take(need_eh_unwind),
         udivmod128: take(need_idiv128),
+        // The libc string batch — appended last; the matching `funcs.push` order below mirrors this.
+        strcmp: take(need_strcmp),
+        strchr: take(need_strchr),
         float_scratch: float_scratch_base,
         ctype_b_loc: ctype.b_loc,
         ctype_tolower_loc: ctype.tolower_loc,
@@ -707,6 +715,13 @@ fn translate_impl(
     // touches no memory, only its four i64 operands.
     if need_idiv128 {
         funcs.push(synth_udivmod128());
+    }
+    // The libc string batch — appended last, mirroring the `take()` order in `Helpers` above.
+    if need_strcmp {
+        funcs.push(synth_strcmp());
+    }
+    if need_strchr {
+        funcs.push(synth_strchr());
     }
     Ok(Translated {
         module: Module {
@@ -3397,6 +3412,12 @@ struct Helpers {
     utoa: Option<u32>,
     /// `__svm_strlen(p:i64) -> i64` — the NUL-terminated byte length, for `printf` `%s`.
     strlen: Option<u32>,
+    /// `__svm_strcmp(a:i64, b:i64) -> i32` — NUL-terminated lexicographic byte compare (unsigned-char
+    /// difference at the first mismatch). Backs `strcmp` and, in the C locale, `strcoll`.
+    strcmp: Option<u32>,
+    /// `__svm_strchr(s:i64, c:i32) -> i64` — first `(unsigned char)c` in `s`, or NULL (`c==0` → the
+    /// terminating NUL). Backs `strchr`.
+    strchr: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
@@ -4730,6 +4751,186 @@ fn synth_strlen() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_strcmp(a:i64, b:i64) -> i32` — the lexicographic NUL-terminated byte compare.
+/// Returns `0` when the strings are equal, else the signed difference of the first mismatching bytes
+/// as **unsigned `char`s** (`(unsigned char)a[i] - (unsigned char)b[i]`, matching glibc). Backs
+/// `strcmp` and (in the C locale) `strcoll`.
+fn synth_strcmp() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64, ValType::I64]; // a, b
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1], // loop(a, b)
+        },
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I64], // pa, pb
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 0,
+                offset: 0,
+                align: 0,
+            }, // v2 = ca = *pa
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 1,
+                offset: 0,
+                align: 0,
+            }, // v3 = cb = *pb
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: 2,
+                b: 3,
+            }, // v4 = ca - cb
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 3,
+            }, // v5 = ca == cb
+            Inst::ConstI32(0), // v6
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Ne,
+                a: 2,
+                b: 6,
+            }, // v7 = ca != 0
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 5,
+                b: 7,
+            }, // v8 = equal-and-not-end → keep going
+            Inst::ConstI64(1), // v9
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 9,
+            }, // v10 = pa + 1
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 9,
+            }, // v11 = pb + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 1,
+            then_args: vec![10, 11], // loop(pa+1, pb+1)
+            else_blk: 2,
+            else_args: vec![4], // done(ca - cb)
+        },
+    };
+    let done = Block {
+        params: vec![ValType::I32], // diff
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I32],
+        blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_strchr(s:i64, c:i32) -> i64` — the first occurrence of `(unsigned char)c` in the
+/// NUL-terminated string `s`, or NULL. When `c == 0` this returns a pointer to the terminating NUL (C
+/// semantics): the byte test fires on the NUL itself.
+fn synth_strchr() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64, ValType::I32]; // s, c
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![
+            Inst::ConstI32(255), // v2
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 1,
+                b: 2,
+            }, // v3 = cc = c & 0xff
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 3], // loop(s, cc)
+        },
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I32], // p, cc
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 0,
+                offset: 0,
+                align: 0,
+            }, // v2 = ch = *p
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 1,
+            }, // v3 = ch == cc
+            Inst::ConstI32(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 4,
+            }, // v5 = ch == 0
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: 3,
+                b: 5,
+            }, // v6 = done = hit || end
+            Inst::ConstI64(1), // v7
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 7,
+            }, // v8 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 2,
+            then_args: vec![0, 1, 2], // finish(p, cc, ch)
+            else_blk: 1,
+            else_args: vec![8, 1], // loop(p+1, cc)
+        },
+    };
+    let finish = Block {
+        params: vec![ValType::I64, ValType::I32, ValType::I32], // p, cc, ch
+        insts: vec![
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 1,
+            }, // v3 = hit = ch == cc
+            Inst::ConstI64(0), // v4 = NULL
+            Inst::Select {
+                cond: 3,
+                a: 0,
+                b: 4,
+            }, // v5 = hit ? p : NULL
+        ],
+        term: Terminator::Return(vec![5]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, lp, finish],
     }
 }
 
@@ -9460,6 +9661,35 @@ fn lower_io_call(
             let r = ctx.push(Inst::Call {
                 func: f,
                 args: vec![p],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strcmp(a, b)` / `strcoll(a, b)`: the synthesized `__svm_strcmp` byte compare. `strcoll` is
+        // locale-sensitive in general, but the on-ramp runs in the C locale, where it is `strcmp`.
+        "strcmp" | "strcoll" => {
+            let Some(f) = ctx.helpers.strcmp else {
+                return Ok(false); // helper not synthesized → fail-closed
+            };
+            let a = ctx.operand(&c.arguments[0].0)?;
+            let b = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![a, b],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strchr(s, c)`: the synthesized `__svm_strchr` byte scan → pointer or NULL.
+        "strchr" => {
+            let Some(f) = ctx.helpers.strchr else {
+                return Ok(false); // helper not synthesized → fail-closed
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let ch = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, ch],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)

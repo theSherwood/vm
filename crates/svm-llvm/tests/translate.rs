@@ -1856,6 +1856,38 @@ fn varargs_many_and_copy() {
 }
 
 #[test]
+fn libc_strcmp_strchr_strcoll() {
+    // The synthesized `__svm_strcmp`/`__svm_strchr` byte loops (libc batch). The string pointers are
+    // read through `volatile` so clang's `-O2` cannot constant-fold the calls away — the helpers are
+    // genuinely exercised. `strcoll` aliases `strcmp` in the C locale. `run` packs six predicate bits
+    // (sign of three compares, two `strchr` hits + one miss, and the `strcoll` equality) into a byte;
+    // matching native cc on all three engines pins the synthesized loops.
+    let src = "#include <string.h>\n\
+        int run(int seed){\n\
+          const char *volatile pa = \"hello\";\n\
+          const char *volatile pb = \"help\";\n\
+          const char *a = pa; const char *b = pb;\n\
+          int r1 = strcmp(a,b);\n\
+          int r2 = strcmp(a,a);\n\
+          int r3 = strcmp(b,a);\n\
+          const char *f = strchr(a,'l');\n\
+          const char *g = strchr(a,'z');\n\
+          const char *h = strchr(a,0);\n\
+          int acc = 0;\n\
+          acc += (r1 < 0) ? 1 : 0;\n\
+          acc += (r2 == 0) ? 2 : 0;\n\
+          acc += (r3 > 0) ? 4 : 0;\n\
+          acc += (f == a + 2) ? 8 : 0;\n\
+          acc += (g == 0) ? 16 : 0;\n\
+          acc += (h == a + 5) ? 32 : 0;\n\
+          acc += (strcoll(a,a) == 0) ? 64 : 0;\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_strcmp_strchr", src, 0);
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
