@@ -55,31 +55,44 @@
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
 //! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
 };
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
-    InstBuilder, JumpTableData, MemFlags, StackSlotData, StackSlotKind, Type, UserFuncName, Value,
+    InstBuilder, JumpTableData, MemFlags, SigRef, SourceLoc, StackSlotData, StackSlotKind, Type,
+    UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::LabelValueLoc;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
+use std::sync::Arc;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
-mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
+mod dwarf;
+pub mod gdb; // W5 JIT/DWARF tier (Stage 2c): in-memory ELF wrapper + the GDB JIT registration interface
+mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler // W5 JIT/DWARF tier: synthesize DWARF from the Stage 1 machine-address → source map
 
 // JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
 // `suspend`, on top of the `svm-fiber` stack-switch substrate. Available where `svm_fiber::supported()`.
 #[cfg(fiber_rt)]
 mod fiber_rt;
+
+// JIT `setjmp`/`longjmp` runtime (LLVM.md §"JIT `longjmp`", Option B): a host-side `jmp_buf` table +
+// `extern "C"` slot thunks, with libc `_setjmp`/`_longjmp` called inline from JITted code. Unix-only
+// among the fiber_rt targets (`setjmp_rt` cfg); elsewhere the JIT keeps bailing `Unsupported` and the
+// interpreters cover it.
+#[cfg(setjmp_rt)]
+mod setjmp_rt;
 
 // 1:1 OS-thread executor for `thread.spawn`/`thread.join` + the `wait`/`notify` futex (§12): the VM
 // exposes these as *primitives*, not a scheduler — a spawned vCPU is one real OS thread; any M:N model
@@ -87,6 +100,15 @@ mod fiber_rt;
 // loom-verified. Available where `svm_fiber::supported()` (x86-64 unix).
 #[cfg(fiber_rt)]
 mod os_thread_rt;
+
+// §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
+// (substrate-independent), so a plain non-fiber root has a TLS word too.
+mod vcpu_tls;
+
+// §12.8 4A.5 durable-runtime-internal per-OS-thread shadow-region base (`durable.shadow_base`): the
+// base of the region the running durable context spills into, so concurrent vCPUs each have their own
+// per-context shadow-SP word (retiring the shared `SHADOW_SP_OFF`). Runtime-private (no guest setter).
+mod durable_shadow;
 
 // Migratable-fiber ownership protocol (D57 / DESIGN.md §23): the loom-verified single-owner atomic
 // state machine that guarantees a stolen fiber is resumed by exactly one thread — the gating safety
@@ -309,6 +331,71 @@ pub enum JitOutcome {
     Exited(i32),
 }
 
+/// Per-page protection to re-establish on a guest window before a run — the durable-restore
+/// step (DURABILITY.md §12.3). One entry per [`DURABLE_SNAPSHOT_PAGE`]-byte page of the window's
+/// backed prefix; pages beyond the prefix (or a `Rw` entry) are left at the default RW. Lets a
+/// thawed guest fault on a restored `Ro`/`Unmapped` page exactly as the frozen one would,
+/// matching the interpreter (`svm-interp`'s `apply_prots`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowProt {
+    Rw,
+    Ro,
+    Unmapped,
+}
+
+/// The host-side residue of a fiber the durable freeze driver flattened (DURABILITY.md §12.8) — the
+/// JIT mirror of `svm_interp::FrozenFiber`. Its continuation lives in its in-window shadow region;
+/// this carries what a thaw must re-seed: the registry slot (= guest handle), entry funcref +
+/// data-stack base (to re-enter it), and the flattened shadow-SP extent. A durable **freeze** run
+/// returns one per flattened fiber; a **thaw** run is handed them back to re-create the fibers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FrozenFiber {
+    pub slot: usize,
+    pub func: i32,
+    pub sp: i64,
+    pub shadow_sp: u64,
+    /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
+    /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `svm_interp::FrozenFiber`
+    /// (48-bit field — the `i64` handle's generation bits).
+    pub generation: u64,
+}
+
+/// The host-side residue of a **spawned vCPU** (a `thread.spawn` child) flattened by a multi-vCPU
+/// durable freeze (DURABILITY.md §12.8 slice 3.3) — the JIT mirror of `svm_interp::FrozenVCpu`. Its
+/// continuation lives in its own in-window shadow region (`shadow_region_base(task)`); this carries
+/// what a thaw must re-attach: its task id (= shadow context index + spawn order), entry function +
+/// spawn args (to re-enter it), and the flattened shadow-SP extent. A multi-vCPU **freeze** returns
+/// one per flattened child; a **thaw** is handed them back to re-create the children.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FrozenVCpu {
+    pub task: usize,
+    /// The task that **spawned** this child (slice 3.4: nested spawns) — `0` for the root's direct
+    /// children, a child's task for a grandchild. Thaw rebuilds the per-parent join tables from this so
+    /// a grandchild's reloaded handle resolves in its parent's table. Mirror of `svm_interp`'s field.
+    pub parent_task: usize,
+    pub func: i32,
+    pub args: Vec<i64>,
+    pub shadow_sp: u64,
+    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child — one
+    /// that finished before the freeze point, so its `thread.join` result must survive in the snapshot
+    /// (the host-side Done cell isn't captured otherwise). The thaw delivers this result into the
+    /// spawner's join table **without re-running** the child (no double side effects). `None` for a
+    /// normal frozen child (re-spawned + rewound on thaw); `shadow_sp`/`func`/`args` are then inert.
+    pub completed_result: Option<i64>,
+}
+
+/// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
+/// `svm-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
+/// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host
+/// page, so protecting it protects (at most) its host page — exact on a 4 KiB-page host.
+pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
+
+/// Window offset of durable shadow **context 0** (the root vCPU's region base) — an *empty* shadow-SP
+/// extent. Must match `svm-interp`'s / `fiber_rt`'s `SHADOW_BASE`; duplicated here (not under
+/// `cfg(fiber_rt)`) for the durable run-state defaults. The cross-backend artifact-equality property
+/// catches any drift.
+const DURABLE_SHADOW_BASE: u64 = 64;
+
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -337,6 +424,10 @@ pub enum TrapKind {
     /// lowering polls that cell at loop back-edges and function entries and traps here. Matches the
     /// interpreter's `Trap::OutOfFuel` — both report "the host bounded this run".
     OutOfFuel = 11,
+    /// A `longjmp` to a `jmp_buf` that was never `setjmp`'d (a stale/forged token) — caught by the
+    /// host `setjmp` table's lookup before the (skipped) `_longjmp` (§3b totality). Matches the
+    /// interpreters' `Trap::Malformed` for the same condition (LLVM.md §"JIT `longjmp`").
+    SetjmpFault = 12,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -356,6 +447,7 @@ impl TrapKind {
             9 => TrapKind::FiberFault,
             10 => TrapKind::ThreadFault,
             11 => TrapKind::OutOfFuel,
+            12 => TrapKind::SetjmpFault,
             _ => return None,
         })
     }
@@ -424,27 +516,12 @@ pub type FastCapResolver = unsafe extern "C" fn(
     n_res: u32,
 ) -> *const core::ffi::c_void;
 
-/// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
-/// (`thread.spawn`) a JIT run may create, below the fixed anti-bomb ceilings. The runtimes clamp each
-/// to their hard ceiling (a quota only *tightens*); exceeding it is a clean `FiberFault`/`ThreadFault`,
-/// matching `svm_interp::Quota`. [`Default`] = the ceilings (an unconfigured run is unchanged). NB the
-/// JIT's vCPU table is **cumulative** (a joined slot isn't freed), so `max_vcpus` bounds *total* spawns
-/// over the run — stricter than the interpreter's concurrent-liveness cap, but containment holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quota {
-    /// Max fibers a run may create (`cont.new`); clamped to the fiber anti-bomb ceiling.
-    pub max_fibers: usize,
-    /// Max thread cells a run may create (`thread.spawn`); clamped to the vCPU anti-bomb ceiling.
-    pub max_vcpus: usize,
-}
-impl Default for Quota {
-    fn default() -> Self {
-        Quota {
-            max_fibers: 1 << 16,
-            max_vcpus: 1 << 16,
-        }
-    }
-}
+// §15 **spawn quota** — the single shared type lives in `svm-ir` (re-exported here and as
+// `svm_interp::Quota`), so a powerbox embedder sets it once and it binds all three backends
+// identically, with no facade conversion (Followup F6). NB the JIT's vCPU table is **cumulative** (a
+// joined slot isn't freed), so here `max_vcpus` bounds *total* spawns over the run — stricter than the
+// interpreter's concurrent-liveness cap, but containment holds either way.
+pub use svm_ir::Quota;
 
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
@@ -523,6 +600,8 @@ fn clif_ty(t: ValType) -> Type {
         // §17/D58: a `v128` SSA value is canonically held as `I8X16`; lane ops bitcast to the
         // shape-specific vector type and back.
         ValType::V128 => I8X16,
+        // An opaque `ref` lowers exactly as `i64` (GC forward-compat reservation, GC.md §6).
+        ValType::Ref => I64,
     }
 }
 
@@ -587,6 +666,29 @@ fn float_clif_ty(t: FloatTy) -> Type {
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
     // No host: an empty powerbox, so any `cap.call` is an inert CapFault (like `run`).
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
+}
+
+/// Compile `func` of `m` to a reusable [`CompiledModule`] with the default no-host policy (an empty
+/// powerbox — any `cap.call` is an inert CapFault, exactly like [`compile_and_run`]), so the caller can
+/// **compile once and [`CompiledModule::run`] many times** (DESIGN.md §22's long-lived split). The
+/// one-shot [`compile_and_run`] recompiles the whole module on *every* call (~ms of Cranelift codegen);
+/// a hot loop or a benchmark isolating per-iteration compute from compile jitter should compile here and
+/// reuse the returned module. For `cap.call` dispatch to a real host, call [`CompiledModule::compile`]
+/// directly with a thunk.
+pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> {
+    CompiledModule::compile(
+        m,
+        func,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0, // natural (non-B2-reserved) function-table size
+    )
 }
 
 /// Like [`compile_and_run`], but `cap.call`s dispatch through `cap_thunk` with the
@@ -886,6 +988,310 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
     )
 }
 
+/// [`compile_and_run_capture_reserved_with_host`] that first **re-establishes** a captured
+/// per-page protection map on the window — the durable-restore step (DURABILITY.md §12.3): a
+/// thawed guest faults on a restored `Ro`/`Unmapped` page exactly as the frozen one would,
+/// matching `svm-interp`. `init_prots[i]` is the protection of the backed-prefix page at
+/// `[i*DURABLE_SNAPSHOT_PAGE, …)`; pages beyond `init_prots` (or `Rw`) keep the default RW.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_prots(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None, // no sub-window
+        None, // no module resolver
+        None, // no interrupt
+        None, // no fast cap resolver
+        Quota::default(),
+        0, // one-shot path: natural table size
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.run(args, Some(init_mem), Some(SNAP_CAP), None)
+}
+
+/// An async **freeze controller** (DURABILITY.md Phase-4 Slice A, 4A.3): a caller-owned handle a
+/// *controller thread* uses to request a stop-the-world freeze of an in-flight durable JIT run. The
+/// run publishes its live window base here once the window is mapped ([`CompiledModule::run`]);
+/// [`Self::request_freeze`] then stores `UNWINDING` into the window's state word, which the guest's
+/// loop-header back-edge poll (4A.1) observes at its next iteration and begins unwinding — closing
+/// the R6 latency caveat for a poll-free compute loop with no deterministic countdown.
+///
+/// This is the real async trigger (vs. the deterministic `arm_freeze_after_backedges` test oracle,
+/// which the interpreter keeps because its window is private/synchronous). The interpreter has no
+/// equivalent — only the JIT's window is a shared mmap a second thread can reach.
+///
+/// # Lifetime contract
+/// [`Self::request_freeze`] may be called **at most once**, concurrently with an in-flight run whose
+/// loop does not terminate on its own before the request lands — so the window the published base
+/// points at is provably still mapped when the store happens (the store is what ends the run). After
+/// the run returns, the base is retired to a sentinel and `request_freeze` becomes a no-op. A request
+/// that races a run which finishes first is therefore a safe no-op, not a use-after-free.
+pub struct FreezeController {
+    /// `0` = window not live yet (spin); `usize::MAX` = run ended (no-op); else the live window base.
+    base: AtomicUsize,
+}
+
+impl FreezeController {
+    /// A fresh controller, shareable with a run and a controller thread.
+    pub fn new() -> Arc<Self> {
+        Arc::new(FreezeController {
+            base: AtomicUsize::new(0),
+        })
+    }
+
+    /// Request a freeze: spin until the run publishes its window base, then store `UNWINDING` into the
+    /// state word. A no-op if the run already ended (the base was retired). At most one call.
+    pub fn request_freeze(&self) {
+        loop {
+            match self.base.load(Ordering::Acquire) {
+                0 => std::hint::spin_loop(), // window not mapped yet
+                usize::MAX => return,        // run ended before the request landed
+                base => {
+                    // STATE_OFF = 0, STATE_UNWINDING = 1 (must match `svm-interp`/`svm-durable`). An
+                    // aligned atomic i32 store the guest's back-edge poll loads (defined under §12
+                    // races); release-ordered after the run's acquire-published base.
+                    // SAFETY: per the lifetime contract the window at `base` is mapped here (the run
+                    // is blocked in its non-terminating loop until this store lands).
+                    unsafe { (*(base as *const AtomicI32)).store(1, Ordering::Release) };
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Run-side: publish the live window base (the run is now blocked in the guest).
+    fn publish(&self, base: usize) {
+        self.base.store(base, Ordering::Release);
+    }
+
+    /// Run-side: retire the base once the guest returns, so a late `request_freeze` is a no-op.
+    fn retire(&self) {
+        self.base.store(usize::MAX, Ordering::Release);
+    }
+}
+
+/// [`compile_and_run_capture_reserved_with_host_prots`] for a **durable** run (DURABILITY.md §12.8):
+/// arms the per-fiber shadow-SP swap so a freeze that lands while a fiber runs spills into that
+/// fiber's own shadow region (D-fiber-cont option A), drives the freeze (flattening parked fibers),
+/// and round-trips the fiber residue.
+///
+/// - **Freeze:** pass empty `init_prots` + empty `seed`; returns the [`FrozenFiber`] residue of every
+///   fiber the driver flattened (for the snapshot's Section 2).
+/// - **Thaw:** pass the captured page-protection map as `init_prots` and the frozen fibers as `seed`;
+///   they are re-created in the fiber table before the `REWINDING` re-entry. Returns an empty residue.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.durable = true;
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
+}
+
+/// [`compile_and_run_capture_reserved_with_host_durable`] wired for an **async freeze** (Phase-4
+/// Slice A, 4A.3): publishes the live window base into `freeze` so a controller thread can
+/// [`FreezeController::request_freeze`] mid-run — the real bounded-latency stop-the-world trigger for
+/// a poll-free compute loop (vs. the deterministic `arm_freeze_after_backedges` test oracle). The
+/// guest observes the controller's `UNWINDING` write at its next loop-header back-edge poll and
+/// unwinds, exactly as a freeze-from-start or armed freeze does — so the artifact round-trips
+/// identically; only the *trigger* differs.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable`]; additionally `freeze`'s lifetime
+/// contract (call `request_freeze` at most once, concurrently with this run) must hold.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_interruptible(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    freeze: Arc<FreezeController>,
+) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.durable = true;
+    cm.freeze_ctl = Some(freeze);
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
+}
+
+/// The result of a **multi-vCPU** durable freeze/thaw run (slice 3.3): `(outcome, window image,
+/// flattened-fiber residue, spawned-vCPU residue, root vCPU's flattened shadow-SP extent)`. On a thaw
+/// the two residue vectors are empty and the extent is inert.
+pub type DurableMvOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64);
+
+/// [`compile_and_run_capture_reserved_with_host_durable`] for a **multi-vCPU** durable domain
+/// (DURABILITY.md §12.8 slice 3.3) — the full freeze + thaw of a domain whose root has `thread.spawn`ed
+/// children. A durable run is single-worker, so children run **inline** (deferred during a freeze until
+/// the root unwinds; re-attached + run before the root re-enters on a thaw).
+///
+/// - **Freeze** (`vcpu_seed` empty): returns the flattened fibers, the spawned-vCPU residue (each
+///   [`FrozenVCpu`]: entry func, `(sp, arg)` operands, flattened shadow-SP), **and the root vCPU's
+///   flattened extent** (`root_sp`, reported separately because the shared active-SP word ends at the
+///   last child's extent) — everything a snapshot needs to record the whole multi-vCPU domain.
+/// - **Thaw** (`vcpu_seed` = the frozen children, `root_sp` = the root's restored extent): re-attaches
+///   and runs the children, then re-enters the root under `REWINDING`. Returns empty residue.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_mv(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    vcpu_seed: &[FrozenVCpu],
+    root_sp: u64,
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<DurableMvOutcome, JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.frozen_vcpu_seed = vcpu_seed.to_vec();
+    cm.thaw_root_sp = root_sp;
+    cm.durable = true;
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((
+        outcome,
+        win,
+        std::mem::take(&mut cm.frozen_out),
+        std::mem::take(&mut cm.frozen_vcpus_out),
+        cm.frozen_root_sp_out,
+    ))
+}
+
+/// [`compile_and_run_capture_reserved_with_host_durable_mv`] for a **genuinely-concurrent** freeze
+/// (DURABILITY.md §12.8 Phase 4 Slice A.5 stage ii): the root's `thread.spawn`ed children run as real
+/// OS threads (not the single-worker deferred model), and a [`FreezeController::request_freeze`] makes
+/// every context — root and children — self-unwind into its **own** per-context shadow-SP region
+/// concurrently (lock-free, since the stage-i relocation gave each its own SP word). The coordinator
+/// (root) joins the children via the existing `join_all` and then runs the unchanged freeze-drive +
+/// snapshot. Residue is canonically sorted at serialize, so the (racy) quiesce order can't change the
+/// artifact (§12.6). `request_freeze` may be called at most once, concurrently with this run.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable_mv`]; additionally `freeze`'s lifetime
+/// contract (call `request_freeze` at most once, concurrently with this run) must hold.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    vcpu_seed: &[FrozenVCpu],
+    root_sp: u64,
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    freeze: Arc<FreezeController>,
+) -> Result<DurableMvOutcome, JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.frozen_vcpu_seed = vcpu_seed.to_vec();
+    cm.thaw_root_sp = root_sp;
+    cm.durable = true;
+    cm.concurrent_durable = true;
+    cm.freeze_ctl = Some(freeze);
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((
+        outcome,
+        win,
+        std::mem::take(&mut cm.frozen_out),
+        std::mem::take(&mut cm.frozen_vcpus_out),
+        cm.frozen_root_sp_out,
+    ))
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
 /// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
 /// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
@@ -996,6 +1402,170 @@ pub struct DefinedFn {
     pub type_id: u32,
 }
 
+/// `(func, block, inst) → index into the module's `debug_info.locs`` — the source-loc lookup the
+/// JIT codegen consults to stamp each emitted op with a `cranelift SourceLoc` (W5 JIT/DWARF tier,
+/// Stage 0). Built once per compile only when the module carries `-g` debug info.
+type SrcLocMap = std::collections::HashMap<(u32, u32, u32), u32>;
+
+/// Per-function captured `MachSrcLoc` ranges before address resolution: `(func index, [(start
+/// offset, end offset, `debug_info.locs` index)])`, relative to the function's start until
+/// `finalize` resolves the base address (W5 JIT/DWARF Stage 1).
+type RawSrcLocs = Vec<(u32, Vec<(u32, u32, u32)>)>;
+
+/// One source variable's machine-location ranges before address resolution (W5 JIT/DWARF Stage 3a):
+/// `[(start offset, end offset, location)]`, relative to its function's start until `finalize`.
+type VarLocRanges = Vec<(u32, u32, VarMachineLoc)>;
+
+/// Per-function captured value-label ranges before address resolution (Stage 3a): `(func index,
+/// [(value-label id, ranges)])`.
+type RawVarLocs = Vec<(u32, Vec<(u32, VarLocRanges)>)>;
+
+/// A machine-address → source range in finalized JIT code (W5 JIT/DWARF tier, Stage 1): the absolute
+/// `[lo, hi)` code range a source position covers, resolved after `finalize` from Cranelift's
+/// per-function `MachSrcLoc` ranges (relative offsets) + the function's finalized base address.
+/// Strippable host-side tooling, untrusted-for-escape (§2a) — never read by running guest code.
+#[derive(Clone, Copy, Debug)]
+pub struct SrcRange {
+    pub lo: u64,
+    pub hi: u64,
+    pub func: u32,
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// A symbolized JIT code address (W5 JIT/DWARF tier): the source position [`CompiledModule::
+/// symbolize`] resolves a machine `pc` to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JitFrameLoc {
+    pub func: u32,
+    /// The source function name (`debug_info.func_names`), or `None` when the module carried no name
+    /// for `func` — renderers fall back to `fn{func}`.
+    pub func_name: Option<String>,
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Symbolize a captured trap stack into source frames (§5 W3 Stage 1): the innermost frame from the
+/// faulting `pc`, then one per **return address** in `rets` (the frame-pointer chain the guard
+/// handler walked while the guest stack was intact), stopping at the first that isn't guest code per
+/// `sym`. A return address points at the instruction *after* the call, so callers are symbolized at
+/// `ret - 1` — landing inside the call instruction, the caller's real source position (the standard
+/// backtrace adjustment); the innermost `pc` is the faulting instruction itself, symbolized
+/// directly. Adjacent duplicate positions are collapsed, as in [`CompiledModule::fiber_backtrace`].
+/// Pure (the handler already did the stack reads): the seed for [`CompiledModule::trap_backtrace`].
+fn symbolize_capture(
+    pc: usize,
+    rets: &[usize],
+    sym: impl Fn(usize) -> Option<JitFrameLoc>,
+) -> Vec<JitFrameLoc> {
+    let mut frames: Vec<JitFrameLoc> = Vec::new();
+    if let Some(loc) = sym(pc) {
+        frames.push(loc);
+    }
+    for &ret in rets {
+        match sym(ret.wrapping_sub(1)) {
+            Some(loc) => {
+                if frames.last() != Some(&loc) {
+                    frames.push(loc);
+                }
+            }
+            None => break, // reached the host boundary (the outermost guest frame's caller) — stop.
+        }
+    }
+    frames
+}
+
+#[cfg(test)]
+mod trap_capture_tests {
+    use super::{symbolize_capture, JitFrameLoc};
+
+    fn loc(func: u32, line: u32) -> JitFrameLoc {
+        JitFrameLoc {
+            func,
+            func_name: None,
+            file: "f.c".into(),
+            line,
+            col: 0,
+        }
+    }
+
+    #[test]
+    fn symbolizes_pc_directly_callers_at_ret_minus_one_and_stops_at_host() {
+        // pc → func2; ret0-1 → func1; ret1-1 → func0; ret2-1 → host (None, stop). A guest entry
+        // is fed `pc` directly but callers via `ret - 1` (the byte inside the call instruction).
+        let sym = |a: usize| match a {
+            0x100 => Some(loc(2, 5)),  // pc (faulting instruction)
+            0x199 => Some(loc(1, 10)), // ret0 (0x19a) - 1
+            0x299 => Some(loc(0, 20)), // ret1 (0x29a) - 1
+            _ => None,
+        };
+        let frames = symbolize_capture(0x100, &[0x19a, 0x29a, 0x999], sym);
+        assert_eq!(
+            frames,
+            vec![loc(2, 5), loc(1, 10), loc(0, 20)],
+            "three guest frames, host trimmed"
+        );
+    }
+
+    #[test]
+    fn collapses_adjacent_duplicate_positions() {
+        // A recursive self-call: the same source position on consecutive frames collapses to one.
+        let sym = |a: usize| match a {
+            0x10 | 0x1f | 0x2f => Some(loc(0, 7)),
+            _ => None,
+        };
+        let frames = symbolize_capture(0x10, &[0x20, 0x30, 0x40], sym);
+        assert_eq!(
+            frames,
+            vec![loc(0, 7)],
+            "duplicate adjacent positions collapse"
+        );
+    }
+}
+
+/// `(func, block) → [(block-local value index, value-label id)]` — the source variables to stamp
+/// with a Cranelift `ValueLabel` during lowering (W5 JIT/DWARF Stage 3a). Built once per compile from
+/// the §6 `debug_info.vars`' SSA-resident `VarLoc`s, only when the module carries `-g`. The label id
+/// is the variable's index into [`CompiledModule::var_locs`]; the block-local value index maps onto
+/// the JIT's per-block value map (see [`lower_block`]).
+type VarLabelMap = std::collections::HashMap<(u32, u32), Vec<(u32, u32)>>;
+
+/// Where a source variable's value physically lives over a machine-code range (W5 JIT/DWARF Stage
+/// 3a) — Cranelift's `LabelValueLoc` translated to DWARF terms, the bridge to a `DW_AT_location`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VarMachineLoc {
+    /// In machine register `dwarf_reg` (a DWARF register number, via `map_regalloc_reg_to_dwarf`) —
+    /// emits `DW_OP_regN` (Stage 3c).
+    Reg(u16),
+    /// At canonical-frame-address + `off` — emits `DW_OP_call_frame_cfa` + offset / `DW_OP_fbreg`.
+    CfaOffset(i64),
+}
+
+/// One `[lo, hi)` absolute machine-code range over which a source variable lives in [`VarMachineLoc`]
+/// (W5 JIT/DWARF Stage 3a) — one entry of a DWARF location list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarRange {
+    pub lo: u64,
+    pub hi: u64,
+    pub loc: VarMachineLoc,
+}
+
+/// A source variable's machine-location list in finalized JIT code (W5 JIT/DWARF Stage 3a): the
+/// `value_labels_ranges` Cranelift produced for the CLIF value that backs it, resolved to absolute
+/// pcs. Empty `ranges` ⇒ the optimizer dropped the value everywhere (gdb will show `<optimized
+/// out>`). Host-side tooling, off the runtime path (§2a).
+#[derive(Clone, Debug)]
+pub struct VarMachineInfo {
+    pub func: u32,
+    pub name: String,
+    /// The variable's structured type as a `debug_info.types` index (Stage 3b), or `None` when the
+    /// module carried only a render-name. The Stage 3c `DW_TAG_variable` points `DW_AT_type` at it.
+    pub type_id: Option<u32>,
+    pub ranges: Vec<VarRange>,
+}
+
 pub struct CompiledModule {
     /// The padded function table `call_indirect` dispatches through. Its address is threaded as
     /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
@@ -1020,6 +1590,7 @@ pub struct CompiledModule {
     fiber: FiberEnv,
     thread: ThreadEnv,
     inst: InstEnv,
+    setjmp: SetjmpEnv,
     mask: u64,
     cap_mapped: u64,
     sub_base: u64,
@@ -1035,10 +1606,26 @@ pub struct CompiledModule {
     /// only grows, and restarts near zero in a freshly-compacted module. An embedder watermarks on
     /// [`Self::extra_byte_count`] to auto-compact (DESIGN.md §22).
     extra_bytes: usize,
+    /// Finalized machine-code bytes of the **base module** (every function body lowered by
+    /// [`CompiledModule::compile`], summed at define time from Cranelift's `code_buffer`). The
+    /// analogue of [`Self::extra_bytes`] for the initial compile — a byte-accurate measure of the
+    /// module's emitted code size, exposed via [`Self::code_byte_count`]. Excludes the small
+    /// buffer-ABI trampoline and any later `define_extra` units (those are in `extra_bytes`).
+    base_bytes: usize,
     /// The in-flight run's window fault range, published by `run_code_raw` for the duration of
     /// the guarded call so a mid-run [`Self::invoke_extra`] can arm its nested recovery.
     /// `None` ⇒ no run in flight (invoke is rejected).
     live_fault_range: Option<(usize, usize)>,
+    /// The source backtrace of the most recent [`Self::run`] that **trapped** (§5 W3 Stage 1):
+    /// innermost guest frame first, symbolized from the trap site the guard handler captured.
+    /// Empty after a non-trapping run (or a trap with no usable frame). Read via
+    /// [`Self::last_trap_backtrace`]; host-side, off the runtime path (§2a).
+    last_trap_backtrace: Vec<JitFrameLoc>,
+    /// The guest **fiber handle** running when the most recent [`Self::run`] trapped (§5 W3 / §23-D57
+    /// per-fiber attribution): `Some(handle)` for a trap inside a fiber (named even if it had migrated
+    /// across vCPU threads — captured at the trap instant, not inferred from the thread), `Some(-1)`
+    /// for the root computation, `None` after a clean run. Read via [`Self::last_trap_fiber`].
+    last_trap_fiber: Option<i64>,
     // --- the per-run window *plan* (the window itself is allocated in `run`; the mask and
     // --- extents are baked into the code, so they were fixed at compile time).
     win_mapped: usize,
@@ -1048,6 +1635,44 @@ pub struct CompiledModule {
     /// Initialized data segments, owned so a run can seed a fresh window (the module may
     /// outlive the borrowed `IrModule`).
     data: Vec<Data>,
+    /// Per-page protections to re-establish on the window before a run — the durable-restore
+    /// step (DURABILITY.md §12.3). Empty ⇒ none (the common path); set per-run by `run_inner`.
+    restore_prots: Vec<WindowProt>,
+    /// This run is **durable** (DURABILITY.md §12.8): the fiber runtime keeps the active shadow-SP
+    /// word pointing at the running context's region (swapped on every fiber switch). `false` (the
+    /// default) ⇒ an ordinary run that never touches the durable reserve. Set per-run at entry.
+    durable: bool,
+    /// §12.8 4A.5 stage (ii): engage the **concurrent** durable path — children spawned during NORMAL
+    /// run as real OS threads with their own reserved shadow contexts and self-unwind concurrently on a
+    /// freeze (vs. the single-worker deferred model). Set by the concurrent multi-vCPU interruptible
+    /// entry; `false` everywhere else, so those paths are byte-identical.
+    concurrent_durable: bool,
+    /// Durable **thaw** seed (slice 3.3.3): frozen fibers to re-create in the table before a
+    /// `REWINDING` run, so a thaw `cont.resume` re-enters them. Empty for a freeze / ordinary run.
+    frozen_seed: Vec<FrozenFiber>,
+    /// Durable **freeze** residue (slice 3.3.3): the fibers the freeze driver flattened this run,
+    /// read back by the durable entry point. Empty unless a freeze flattened fibers.
+    frozen_out: Vec<FrozenFiber>,
+    /// Durable **freeze** residue (slice 3.3): the spawned vCPUs that unwound under the freeze (each
+    /// run inline single-worker by `thread.spawn`). Drained from the `Domain` after the root unwinds,
+    /// read back by the durable entry point. Empty unless a freeze caught a live child.
+    frozen_vcpus_out: Vec<FrozenVCpu>,
+    /// Durable **freeze** residue (slice 3.3): the **root** vCPU's flattened shadow-SP extent, captured
+    /// after the freeze driver (before the children overwrite the shared active-SP word). The root's
+    /// continuation rides in the window image like everyone's, but the active-SP word ends at the last
+    /// child's extent, so the root's own extent is reported separately for a thaw to restore. `0` on a
+    /// non-freeze run.
+    frozen_root_sp_out: u64,
+    /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
+    /// under `REWINDING`. Empty for a freeze / ordinary run.
+    frozen_vcpu_seed: Vec<FrozenVCpu>,
+    /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
+    /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
+    thaw_root_sp: u64,
+    /// Async freeze controller (Phase-4 Slice A, 4A.3): if set, the run publishes its live window base
+    /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
+    /// can write `UNWINDING` into the running window. `None` for every non-interruptible run.
+    freeze_ctl: Option<Arc<FreezeController>>,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -1057,6 +1682,10 @@ pub struct CompiledModule {
     /// Kept alive because its address is baked into the module's `Instantiator` cap.call sites.
     #[cfg(fiber_rt)]
     _nursery: Option<Box<instantiator_rt::Nursery>>,
+    /// Kept alive because its address (`setjmp.rt_addr`) is baked into the module's `SetJmp`/`LongJmp`
+    /// sites (LLVM.md §"JIT `longjmp`"). Holds the per-run host `jmp_buf` table.
+    #[cfg(setjmp_rt)]
+    _setjmp_rt: Option<Box<setjmp_rt::SetjmpRuntime>>,
     #[cfg(fiber_rt)]
     call_tramp: Option<fiber_rt::FiberCallTramp>,
     /// `(fiber_type_id, fiber_mask)` when the module uses `cont.*` — the per-vCPU fiber config
@@ -1067,12 +1696,236 @@ pub struct CompiledModule {
     /// vCPU's runtime are built over — one handle namespace + one §15 fiber quota per domain.
     #[cfg(fiber_rt)]
     fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>>,
+    /// Machine-address → source map for finalized code (W5 JIT/DWARF Stage 1), sorted by `lo`.
+    /// Empty unless the module carried `-g` debug info. Host-side tooling, off the runtime path.
+    src_ranges: Vec<SrcRange>,
+    /// Source file paths (from `debug_info.files`), indexed by [`SrcRange::file`].
+    src_files: Vec<String>,
+    /// Source function names (`func → name`, from `debug_info.func_names`): for [`Self::symbolize`],
+    /// the DWARF `DW_AT_name`, and kill messages. Empty unless the module carried `-g` names.
+    func_names: std::collections::HashMap<u32, String>,
+    /// Per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a), resolved from Cranelift's
+    /// `value_labels_ranges` after finalize. Empty unless the module carried `-g` vars. Host-side
+    /// tooling, off the runtime path.
+    var_locs: Vec<VarMachineInfo>,
+    /// The §6 structured type graph (`debug_info.types`), emitted as `DW_TAG_*_type` DIEs (W5
+    /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
+    debug_types: Vec<svm_ir::TypeDef>,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it.
     module: JITModule,
 }
 
 impl CompiledModule {
+    /// Symbolize a finalized-code machine address to its source position (W5 JIT/DWARF Stage 1), or
+    /// `None` if `pc` is outside any source-mapped op (a non-`-g` build, a trampoline, a prologue
+    /// gap). The [`SrcRange`] map is sorted and disjoint, so this is a binary search. Host-side
+    /// tooling, off the running guest's path (§2a) — the seed for trap symbolization + DWARF emit.
+    pub fn symbolize(&self, pc: usize) -> Option<JitFrameLoc> {
+        let pc = pc as u64;
+        let i = self.src_ranges.partition_point(|r| r.lo <= pc);
+        let r = self.src_ranges[..i].last().filter(|r| pc < r.hi)?;
+        Some(JitFrameLoc {
+            func: r.func,
+            func_name: self.func_names.get(&r.func).cloned(),
+            file: self
+                .src_files
+                .get(r.file as usize)
+                .cloned()
+                .unwrap_or_default(),
+            line: r.line,
+            col: r.col,
+        })
+    }
+
+    /// The finalized machine-address → source map (W5 JIT/DWARF Stage 1), sorted by address. Empty
+    /// unless the module carried `-g`. For tooling/tests and the forthcoming DWARF line-program emit.
+    pub fn src_ranges(&self) -> &[SrcRange] {
+        &self.src_ranges
+    }
+
+    /// A backtrace of a **suspended fiber** (W5 JIT/DWARF Stage 4c — the W3-JIT fiber-rooted stack
+    /// walk). Rooted at a fiber *handle* (§23/D57 migratable fibers, not the OS thread), it scans the
+    /// parked fiber's live control stack `[ctx, top)` low→high (innermost frame first) and symbolizes
+    /// every word that lands in this module's JIT'd guest code — each is a return address, i.e. a
+    /// guest call frame. A conservative scan (like the GC-root walk) rather than a frame-pointer
+    /// chase, so it is robust to the host runtime glue sitting between the guest frames and the
+    /// suspend switch. Adjacent duplicate positions are collapsed. Empty if `handle` names no parked
+    /// fiber or the module carried no `-g`. Host-side tooling, off the running guest's path (§2a).
+    #[cfg(fiber_rt)]
+    pub fn fiber_backtrace(&self, handle: i64) -> Vec<JitFrameLoc> {
+        let Some(table) = self.fiber_table.as_ref() else {
+            return Vec::new();
+        };
+        table
+            .with_parked_stack(handle, |stack| {
+                let mut frames: Vec<JitFrameLoc> = Vec::new();
+                for w in stack.chunks_exact(8) {
+                    let pc = u64::from_le_bytes(w.try_into().unwrap()) as usize;
+                    if let Some(loc) = self.symbolize(pc) {
+                        if frames.last() != Some(&loc) {
+                            frames.push(loc);
+                        }
+                    }
+                }
+                frames
+            })
+            .unwrap_or_default()
+    }
+
+    /// Symbolize a JIT **trap** into a source backtrace (§5 W3 Stage 1): the innermost frame from the
+    /// faulting `pc`, then one frame per guest caller from `rets` — the frame-pointer chain's return
+    /// addresses the SIGSEGV/SIGBUS handler walked *while the guest stack was intact* and stashed
+    /// (`mem::take_trap_frame`); the walk can't run on the host side because the trap unwinds back
+    /// onto the same stack the host then reuses. Callers are symbolized at `ret - 1` (inside the call
+    /// instruction); adjacent duplicate positions are collapsed, as in [`Self::fiber_backtrace`].
+    /// Empty when the module carried no `-g` (nothing symbolizes) or the capture is host-only. The
+    /// engine stashes the last run's trap in [`Self::last_trap_backtrace`]. Pure host-side tooling,
+    /// off the running guest's path (§2a).
+    pub fn trap_backtrace(&self, pc: usize, rets: &[usize]) -> Vec<JitFrameLoc> {
+        symbolize_capture(pc, rets, |a| self.symbolize(a))
+    }
+
+    /// The source backtrace of this module's most recent [`Self::run`] that **trapped** (§5 W3 Stage
+    /// 1): innermost guest frame first, symbolized from the trap site captured during that run. Empty
+    /// when the last run returned/exited, the trap carried no usable frame (an explicit-check trap —
+    /// Stage 2 — or a platform whose handler doesn't decode the fault frame), or the module carried
+    /// no `-g`. Host-side, off the runtime path (§2a) — fold it into a kill/trap report.
+    pub fn last_trap_backtrace(&self) -> &[JitFrameLoc] {
+        &self.last_trap_backtrace
+    }
+
+    /// The guest **fiber** that was running when this module's most recent [`Self::run`] trapped (§5 W3
+    /// / §23-D57 per-fiber attribution): `Some(handle)` for a trap inside a fiber, `Some(-1)` for the
+    /// root computation (no fiber), `None` after a clean run. The handle is captured at the trap
+    /// instant, so it names the right fiber even under work-stealing migration (where the fiber may have
+    /// resumed on a different vCPU thread than it last suspended on). Pairs with
+    /// [`Self::last_trap_backtrace`] to render *which fiber* trapped *where*; host-side, off the runtime
+    /// path (§2a).
+    pub fn last_trap_fiber(&self) -> Option<i64> {
+        self.last_trap_fiber
+    }
+
+    /// The per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a): for each `-g` source
+    /// variable whose value the JIT could track, the `[lo, hi)` machine ranges over which it lives in
+    /// a register or CFA-relative slot. The seed for the Stage 3c `DW_AT_location` loclists. Empty
+    /// without `-g`; a variable with empty `ranges` was optimized out everywhere.
+    pub fn var_locations(&self) -> &[VarMachineInfo] {
+        &self.var_locs
+    }
+
+    /// The synthesized DWARF `.debug_line` section for this module's finalized code (W5 JIT/DWARF
+    /// Stage 2): a line-number program over the JIT'd machine addresses, for gdb/lldb (via the
+    /// forthcoming GDB JIT registration) to resolve addresses to source lines. Empty without `-g`.
+    pub fn debug_line_section(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        dwarf::debug_line(&self.src_ranges, &self.src_files)
+    }
+
+    /// The synthesized `(.debug_info, .debug_abbrev, .debug_loc)` for this module's finalized code (W5
+    /// JIT/DWARF Stages 2b/3b/3c): a compile unit holding the §6 `TypeDef` graph as `DW_TAG_*_type`
+    /// DIEs (3b) and one `DW_TAG_subprogram` per function (2b), each carrying its source variables as
+    /// `DW_TAG_variable` children with `.debug_loc` location lists (3c). All empty without `-g`.
+    fn synth_debug_info(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        if self.src_ranges.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        dwarf::debug_info(
+            &self.func_extents(),
+            &self.debug_types,
+            &self.var_locs,
+            &self.func_names,
+        )
+    }
+
+    /// The synthesized DWARF `(.debug_info, .debug_abbrev)` (W5 JIT/DWARF Stages 2b/3b/3c) — a compile
+    /// unit with the §6 type DIEs, one `DW_TAG_subprogram` per function, and a `DW_TAG_variable` per
+    /// tracked source variable (its `DW_AT_location` referring into [`Self::debug_loc_section`]). Both
+    /// empty without `-g`.
+    pub fn debug_info_sections(&self) -> (Vec<u8>, Vec<u8>) {
+        let (info, abbrev, _) = self.synth_debug_info();
+        (info, abbrev)
+    }
+
+    /// The synthesized DWARF `.debug_loc` (W5 JIT/DWARF Stage 3c): the variable location lists the
+    /// `DW_TAG_variable` DIEs' `DW_AT_location`s point into — one `DW_OP_reg{N}` entry per
+    /// register-resident machine range. Empty without `-g` (or when no variable is register-resident).
+    pub fn debug_loc_section(&self) -> Vec<u8> {
+        self.synth_debug_info().2
+    }
+
+    /// The synthesized DWARF `.debug_frame` CFI (W5 JIT/DWARF Stage 4a): one CIE with the JIT's
+    /// uniform frame-pointer unwind rules + one FDE per function, so gdb can unwind a stopped JIT
+    /// frame (`bt`) and compute the CFA the subprograms' `DW_AT_frame_base` refers to. Empty without
+    /// `-g`.
+    pub fn debug_frame_section(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        dwarf::debug_frame(&self.func_extents())
+    }
+
+    /// Each function's machine `[low_pc, high_pc)` extent, derived as the span (min `lo`, max `hi`)
+    /// of its source-mapped ranges, sorted by start address. The basis for both the `.debug_info`
+    /// subprograms (Stage 2b) and the ELF `.symtab`/`.text` extent (Stage 2c). Empty without `-g`.
+    fn func_extents(&self) -> Vec<(u32, u64, u64)> {
+        let mut per_fn: std::collections::BTreeMap<u32, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for r in &self.src_ranges {
+            let e = per_fn.entry(r.func).or_insert((r.lo, r.hi));
+            e.0 = e.0.min(r.lo);
+            e.1 = e.1.max(r.hi);
+        }
+        let mut funcs: Vec<(u32, u64, u64)> = per_fn
+            .into_iter()
+            .map(|(f, (lo, hi))| (f, lo, hi))
+            .collect();
+        funcs.sort_by_key(|&(_, lo, _)| lo);
+        funcs
+    }
+
+    /// The in-memory ELF object that wraps this module's finalized code + synthesized DWARF for the
+    /// GDB JIT interface (W5 JIT/DWARF Stage 2c): an `SHT_NOBITS` `.text` at the live code address,
+    /// the `.debug_line`/`.debug_info`/`.debug_abbrev` sections, and a `.symtab` naming each
+    /// function. This is the `symfile` [`Self::register_with_gdb`] hands to gdb. Empty without `-g`.
+    pub fn elf_object(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        let funcs = self.func_extents();
+        let code_base = funcs.iter().map(|f| f.1).min().unwrap_or(0);
+        let code_end = funcs.iter().map(|f| f.2).max().unwrap_or(0);
+        let (info, abbrev, loc) = self.synth_debug_info();
+        let line = self.debug_line_section();
+        let frame = self.debug_frame_section();
+        gdb::build_elf(
+            code_base,
+            code_end.saturating_sub(code_base),
+            &funcs,
+            &self.func_names,
+            &info,
+            &abbrev,
+            &line,
+            &loc,
+            &frame,
+        )
+    }
+
+    /// Register this module's code with a live gdb/lldb via the GDB JIT interface (W5 JIT/DWARF
+    /// Stage 2c) — the **headline milestone**: with the returned guard held, gdb can bind a
+    /// source-line breakpoint inside the JIT'd code and show the guest source frame. The returned
+    /// [`gdb::GdbRegistration`] **unregisters on drop**; hold it as long as the code is debuggable.
+    /// `None` for a non-`-g` module (nothing to register). Host-side tooling, off the runtime path.
+    pub fn register_with_gdb(&self) -> Option<gdb::GdbRegistration> {
+        let elf = self.elf_object();
+        if elf.is_empty() {
+            return None;
+        }
+        Some(gdb::GdbRegistration::register(elf))
+    }
+
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
     /// declare + define every function, the entry's buffer-ABI trampoline, finalize once, and
     /// build the function table. Everything *baked into code* — the confinement mask, the
@@ -1255,23 +2108,38 @@ impl CompiledModule {
         // namespace + a per-domain §15 quota, matching the interpreter's run-shared registry). This is
         // the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
         // builds its own over the same table from `fiber_cfg` (`os_thread_rt`). Created whenever the
-        // module uses `cont.*`.
+        // module uses `cont.*` **or** `thread.spawn` — a threaded module needs the table for the
+        // durable vCPU-context allocator (slice 3.3), even when it uses no fibers (the table is then
+        // dormant: a fiber-free module never resumes a fiber, so the root's runtime just routes the
+        // durable shadow-SP swap).
         #[cfg(fiber_rt)]
-        let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> = if uses_fibers {
-            Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
-                quota.max_fibers,
-            )))
+        let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> =
+            if uses_fibers || uses_threads {
+                Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
+                    quota.max_fibers,
+                )))
+            } else {
+                None
+            };
+        // The *root* vCPU's fiber runtime is built only when the module actually uses `cont.*` — a
+        // fiber-free module (even a threaded one) never resumes a fiber, so it needs no execution
+        // context, and the durable shadow-SP word it does use is driven by the instrumented IR
+        // directly (the multi-vCPU deferred/thaw spawn paths go through the `Domain`, not this
+        // runtime). The *table* is still created for `uses_threads` above (the durable vCPU-context
+        // allocator); only the per-vCPU runtime is fiber-gated, so a thread-only run publishes no
+        // `CURRENT_RT` and allocates no idle runtime (matching the pre-slice-3.3 behavior).
+        #[cfg(fiber_rt)]
+        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
+            fiber_table.as_ref().map(|t| {
+                Box::new(fiber_rt::FiberRuntime::new(
+                    std::sync::Arc::clone(t),
+                    fiber_type_id,
+                    fiber_mask,
+                ))
+            })
         } else {
             None
         };
-        #[cfg(fiber_rt)]
-        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = fiber_table.as_ref().map(|t| {
-            Box::new(fiber_rt::FiberRuntime::new(
-                std::sync::Arc::clone(t),
-                fiber_type_id,
-                fiber_mask,
-            ))
-        });
         // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
         #[cfg(fiber_rt)]
         let fiber = if uses_fibers {
@@ -1279,6 +2147,7 @@ impl CompiledModule {
                 new_thunk: fiber_rt::fiber_new as *const () as i64,
                 resume_thunk: fiber_rt::fiber_resume as *const () as i64,
                 suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+                roots_thunk: fiber_rt::gc_roots as *const () as i64,
             }
         } else {
             FiberEnv::null()
@@ -1343,18 +2212,111 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let inst = InstEnv::null();
 
+        // `setjmp`/`longjmp` (LLVM.md §"JIT `longjmp`", Option B): when the module uses them, stand up
+        // the per-run host `jmp_buf` table whose stable address is baked into the `SetJmp`/`LongJmp`
+        // sites. Owned by the `CompiledModule` (`_setjmp_rt`), so it outlives every (re-)run. Unix-only
+        // (the `setjmp_rt` cfg); elsewhere `ensure_supported` has already rejected the ops.
+        #[cfg(setjmp_rt)]
+        let uses_setjmp = module_uses_setjmp(m);
+        // Fail-closed (guard against cross-stack corruption): the per-run `jmp_buf` table is keyed by
+        // the guest buffer address and shared across the run's native stacks, so a module that mixes
+        // `setjmp` with fibers/threads could let one stack's `setjmp` overwrite another's saved native
+        // SP (a `longjmp` would then restore into the wrong stack). The on-ramp never emits that combo,
+        // but a hand-crafted IR module could — so decline the JIT and let the interpreters (which key
+        // `setjmp_points` per-vCPU) cover it. Per-fiber JIT keying is a documented follow-on.
+        #[cfg(setjmp_rt)]
+        if uses_setjmp && (uses_fibers || uses_threads) {
+            return Err(JitError::Unsupported(
+                "setjmp/longjmp combined with fibers/threads is not supported on the JIT yet",
+            ));
+        }
+        #[cfg(setjmp_rt)]
+        let setjmp_runtime: Option<Box<setjmp_rt::SetjmpRuntime>> = if uses_setjmp {
+            Some(Box::new(setjmp_rt::SetjmpRuntime::new()))
+        } else {
+            None
+        };
+        #[cfg(setjmp_rt)]
+        let setjmp = if let Some(r) = &setjmp_runtime {
+            SetjmpEnv {
+                rt_addr: (&**r as *const setjmp_rt::SetjmpRuntime) as i64,
+                slot_thunk: setjmp_rt::rt_setjmp_slot as *const () as i64,
+                lookup_thunk: setjmp_rt::rt_setjmp_lookup as *const () as i64,
+                setjmp_addr: setjmp_rt::setjmp_addr(),
+                longjmp_addr: setjmp_rt::longjmp_addr(),
+            }
+        } else {
+            SetjmpEnv::null()
+        };
+        #[cfg(not(setjmp_rt))]
+        let setjmp = SetjmpEnv::null();
+
+        // W5 JIT/DWARF tier (Stages 0–1): when the module carries `-g` debug info, build the
+        // `(func,block,inst) → debug_info.locs` index lookup that stamps each op with a `SourceLoc`,
+        // and capture each function's `MachSrcLoc` ranges (relative offsets) to resolve to a
+        // machine-address → source map after finalize. Off the runtime path; absent ⇒ no-op.
+        let srcloc_map: Option<SrcLocMap> = m.debug_info.as_ref().map(|di| {
+            di.locs
+                .iter()
+                .enumerate()
+                .map(|(i, l)| ((l.func, l.block, l.inst), i as u32))
+                .collect()
+        });
+        let mut raw_srclocs: RawSrcLocs = Vec::new();
+
+        // W5 JIT/DWARF Stage 3a: assign each SSA-resident source variable a `ValueLabel` and record
+        // the `(func, block) → [(block-local value, label)]` points `lower_block` stamps. Only the
+        // SSA forms (`Ssa`/`SsaList`) map to a Cranelift value-location; the window/fixed *memory*
+        // forms are left to Stage 3c (a DWARF memory expression, not a value label). `var_meta[label]`
+        // names the variable a label belongs to. Empty unless the module carries `-g` vars.
+        let mut var_meta: Vec<(u32, String, Option<u32>)> = Vec::new();
+        let mut var_label_map: VarLabelMap = std::collections::HashMap::new();
+        if let Some(di) = m.debug_info.as_ref() {
+            for v in &di.vars {
+                let points: Vec<(u32, u32)> = match &v.loc {
+                    // A function-wide SSA index ≈ the block-0 local index (parameters, single-block
+                    // promoted scalars — the cases where the two numberings coincide).
+                    svm_ir::VarLoc::Ssa { value } => vec![(0, *value)],
+                    svm_ir::VarLoc::SsaList(locs) => {
+                        locs.iter().map(|l| (l.block, l.value)).collect()
+                    }
+                    // `Window`/`WindowVia`/`Fixed` are memory locations — no value label here.
+                    _ => continue,
+                };
+                let label = var_meta.len() as u32;
+                var_meta.push((v.func, v.name.clone(), v.type_id));
+                for (block, value) in points {
+                    var_label_map
+                        .entry((v.func, block))
+                        .or_default()
+                        .push((value, label));
+                }
+            }
+        }
+        let var_labels = (!var_label_map.is_empty()).then_some(&var_label_map);
+        let mut raw_var_locs: RawVarLocs = Vec::new();
+
         // Define each function body. `clear_context` after each define resets the cached
         // CFG/domtree so the next function never compiles against a stale CFG.
         let mut ctx = module.make_context();
-        for (f, id) in m.funcs.iter().zip(&ids) {
+        let mut base_bytes = 0usize;
+        for (fi, (f, id)) in m.funcs.iter().zip(&ids).enumerate() {
+            // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in `lower_block`)
+            // takes effect and `value_labels_ranges` is populated. Gated on `-g` vars ⇒ no effect on
+            // an ordinary build. Must be set on the fresh `ctx.func` before lowering populates it.
+            if var_labels.is_some() {
+                ctx.func.collect_debug_info();
+            }
             build_clif(
                 &mut module,
                 &ids,
+                &m.funcs,
                 &distinct,
                 cap,
                 fiber,
                 thread,
                 inst,
+                setjmp,
                 &mut ctx.func,
                 f,
                 mask,
@@ -1362,10 +2324,60 @@ impl CompiledModule {
                 sub_base,
                 epoch_addr,
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
+                fi as u32,
+                srcloc_map.as_ref(),
+                var_labels,
             )?;
             module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            base_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
+            if srcloc_map.is_some() {
+                if let Some(cc) = ctx.compiled_code() {
+                    let ranges: Vec<(u32, u32, u32)> = cc
+                        .buffer
+                        .get_srclocs_sorted()
+                        .iter()
+                        .filter(|s| !s.loc.is_default())
+                        .map(|s| (s.start, s.end, s.loc.bits()))
+                        .collect();
+                    if !ranges.is_empty() {
+                        raw_srclocs.push((fi as u32, ranges));
+                    }
+                }
+            }
+            // Stage 3a: capture this function's value-label ranges, translating each Cranelift
+            // `LabelValueLoc` to DWARF terms now (the ISA is in hand; a `Reg` we cannot map is
+            // dropped — that sub-range simply has no location, like an optimized-out gap).
+            if var_labels.is_some() {
+                if let Some(cc) = ctx.compiled_code() {
+                    let isa = module.isa();
+                    let mut per_label: Vec<(u32, VarLocRanges)> = Vec::new();
+                    for (label, ranges) in &cc.value_labels_ranges {
+                        let mut out: VarLocRanges = Vec::new();
+                        for r in ranges {
+                            if r.end <= r.start {
+                                continue;
+                            }
+                            let loc = match r.loc {
+                                LabelValueLoc::Reg(reg) => match isa.map_regalloc_reg_to_dwarf(reg)
+                                {
+                                    Ok(d) => VarMachineLoc::Reg(d),
+                                    Err(_) => continue,
+                                },
+                                LabelValueLoc::CFAOffset(off) => VarMachineLoc::CfaOffset(off),
+                            };
+                            out.push((r.start, r.end, loc));
+                        }
+                        if !out.is_empty() {
+                            per_label.push((label.as_u32(), out));
+                        }
+                    }
+                    if !per_label.is_empty() {
+                        raw_var_locs.push((fi as u32, per_label));
+                    }
+                }
+            }
             module.clear_context(&mut ctx);
         }
 
@@ -1399,6 +2411,78 @@ impl CompiledModule {
         module
             .finalize_definitions()
             .map_err(|e| JitError::Backend(e.to_string()))?;
+
+        // W5 JIT/DWARF Stage 1: now that code is finalized, resolve each captured `MachSrcLoc` range
+        // (relative to its function's start) to an absolute machine address, building the sorted
+        // `machine-pc → source` map `symbolize` consults. Empty without `-g`.
+        let (src_ranges, src_files, func_names) = match m.debug_info.as_ref() {
+            Some(di) => {
+                let mut ranges = Vec::new();
+                for (fi, rs) in &raw_srclocs {
+                    let base = module.get_finalized_function(ids[*fi as usize]) as u64;
+                    for &(start, end, loc) in rs {
+                        if let Some(l) = di.locs.get(loc as usize) {
+                            ranges.push(SrcRange {
+                                lo: base + start as u64,
+                                hi: base + end as u64,
+                                func: l.func,
+                                file: l.file,
+                                line: l.line,
+                                col: l.col,
+                            });
+                        }
+                    }
+                }
+                ranges.sort_by_key(|r| r.lo);
+                // §6 function names (`func → name`), for `symbolize`, the DWARF `DW_AT_name`, and kill
+                // messages — `compute` instead of `fn3`.
+                let names = di
+                    .func_names
+                    .iter()
+                    .map(|f| (f.func, f.name.clone()))
+                    .collect();
+                (ranges, di.files.clone(), names)
+            }
+            None => (Vec::new(), Vec::new(), std::collections::HashMap::new()),
+        };
+
+        // W5 JIT/DWARF Stage 3a: resolve the captured value-label ranges (relative offsets) to
+        // absolute machine pcs and group them per source variable. A variable whose label produced
+        // no range (the optimizer dropped its value everywhere) still gets a `VarMachineInfo` with
+        // empty `ranges` — Stage 3c emits that as a `<optimized out>` location.
+        let var_locs: Vec<VarMachineInfo> = if var_meta.is_empty() {
+            Vec::new()
+        } else {
+            let mut by_label: std::collections::HashMap<u32, Vec<VarRange>> =
+                std::collections::HashMap::new();
+            for (fi, per_label) in &raw_var_locs {
+                let base = module.get_finalized_function(ids[*fi as usize]) as u64;
+                for (label, ranges) in per_label {
+                    let entry = by_label.entry(*label).or_default();
+                    for &(s, e, loc) in ranges {
+                        entry.push(VarRange {
+                            lo: base + s as u64,
+                            hi: base + e as u64,
+                            loc,
+                        });
+                    }
+                }
+            }
+            var_meta
+                .iter()
+                .enumerate()
+                .map(|(label, (func, name, type_id))| {
+                    let mut ranges = by_label.remove(&(label as u32)).unwrap_or_default();
+                    ranges.sort_by_key(|r| r.lo);
+                    VarMachineInfo {
+                        func: *func,
+                        name: name.clone(),
+                        type_id: *type_id,
+                        ranges,
+                    }
+                })
+                .collect()
+        };
 
         // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
         // to seed the thread `Domain`'s `Env`, which spawned vCPUs use to call their entry).
@@ -1449,6 +2533,7 @@ impl CompiledModule {
             fiber,
             thread,
             inst,
+            setjmp,
             mask,
             cap_mapped,
             sub_base,
@@ -1456,18 +2541,33 @@ impl CompiledModule {
             fn_table_mask: (table_len as u64) - 1,
             next_extra: 0,
             extra_bytes: 0,
+            base_bytes,
             live_fault_range: None,
+            last_trap_backtrace: Vec::new(),
+            last_trap_fiber: None,
             win_mapped,
             win_reserved,
             win_size,
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
+            restore_prots: Vec::new(),
+            durable: false,
+            concurrent_durable: false,
+            frozen_seed: Vec::new(),
+            frozen_out: Vec::new(),
+            frozen_vcpus_out: Vec::new(),
+            frozen_root_sp_out: 0,
+            frozen_vcpu_seed: Vec::new(),
+            thaw_root_sp: DURABLE_SHADOW_BASE + 8, // §12.8 4A.5: empty root extent = frame base (past the SP word)
+            freeze_ctl: None,
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
             domain,
             #[cfg(fiber_rt)]
             _nursery: nursery,
+            #[cfg(setjmp_rt)]
+            _setjmp_rt: setjmp_runtime,
             #[cfg(fiber_rt)]
             call_tramp,
             #[cfg(fiber_rt)]
@@ -1478,6 +2578,15 @@ impl CompiledModule {
             },
             #[cfg(fiber_rt)]
             fiber_table,
+            src_ranges,
+            src_files,
+            func_names,
+            var_locs,
+            debug_types: m
+                .debug_info
+                .as_ref()
+                .map(|di| di.types.clone())
+                .unwrap_or_default(),
             module,
         })
     }
@@ -1698,6 +2807,25 @@ impl CompiledModule {
                     }
                 }
             }
+            // Durable restore (DURABILITY.md §12.3): re-establish captured per-page protections
+            // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
+            // exactly as the frozen one would — matching `svm-interp`'s `apply_prots`. Applied
+            // after the init copy + data segments; `Rw` and tail pages keep the default.
+            for (i, &p) in t.restore_prots.iter().enumerate() {
+                let off = (i * DURABLE_SNAPSHOT_PAGE) as u64;
+                if off >= t.win_mapped as u64 {
+                    break;
+                }
+                match p {
+                    WindowProt::Ro => {
+                        window.protect_ro(t.sub_base + off, DURABLE_SNAPSHOT_PAGE as u64)
+                    }
+                    WindowProt::Unmapped => {
+                        window.protect_none(t.sub_base + off, DURABLE_SNAPSHOT_PAGE as u64)
+                    }
+                    WindowProt::Rw => {}
+                }
+            }
             let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
             (window, win_size, t.mask, fn_table_ptr)
         };
@@ -1728,6 +2856,7 @@ impl CompiledModule {
                     t.fiber_cfg,
                     t.fiber_table.clone(), // the domain-shared table spawned vCPUs build over
                     t.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
+                    t.durable, // slice 3.3: run spawned children inline (single-worker) under a freeze/thaw
                 );
             }
             // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
@@ -1753,15 +2882,69 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let _ = &async_hooks;
 
+        // Set if a durable thaw re-seed (below) hit a control-stack alloc failure (I1): the trap cell
+        // already carries the `FiberFault`, so we skip the root re-entry and report it post-run.
+        // (Only the `fiber_rt` build re-seeds, so it's never mutated otherwise.)
+        #[cfg_attr(not(fiber_rt), allow(unused_mut))]
+        let mut seed_faulted = false;
+
         // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
         // thread-local for the duration of the entry; spawned vCPUs publish their own.
         #[cfg(fiber_rt)]
         let prev_rt = {
+            // The OS-thread stack pointer in *this* (`run_inner`) frame — above the guarded guest
+            // call below and every guest root frame it pushes — is the high bound for `gc.roots`'
+            // scan of the root computation's frames. Captured via a local's address here (not a
+            // sub-call) so it provably dominates the guest's frames.
+            let entry_probe = 0u8;
+            let entry_sp = std::hint::black_box(&entry_probe as *const u8 as usize);
             let t = &mut *this;
-            t.fiber_rt
-                .as_mut()
-                .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime))
+            let durable = t.durable;
+            // Durable **thaw** (slice 3.3.3): re-create the frozen fibers in the run-shared table
+            // before the root re-enters under REWINDING, so a thaw `cont.resume` resolves + re-enters
+            // them. Done before `set_current` (and the run), while the window/table/trap cell are set.
+            let seed = std::mem::take(&mut t.frozen_seed);
+            t.fiber_rt.as_mut().map(|rt| {
+                rt.set_root_entry_sp(entry_sp);
+                // Arm the durable fiber-switch swap for the root vCPU (DURABILITY.md §12.8): the
+                // window base is known now. (Spawned vCPUs are multi-vCPU durability, Phase 3.2.)
+                rt.set_durable_env(mem_base as u64, durable);
+                if durable && !seed.is_empty() {
+                    // A thaw re-seed that the OS refuses (I1) writes a `FiberFault` to the trap cell
+                    // and returns false; the post-run trap read below reports it. We still publish
+                    // the runtime and fall through — the guest re-entry simply won't resolve the
+                    // missing fibers — rather than abort the host.
+                    seed_faulted = !fiber_rt::seed_frozen_fibers(
+                        &mut **rt as *mut fiber_rt::FiberRuntime,
+                        &seed,
+                        mem_base as u64,
+                        fn_table_ptr as u64,
+                        trap_cell.as_ptr() as u64,
+                    );
+                }
+                fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime)
+            })
         };
+
+        // §12.8 concurrent-thaw stage 2: the parked-vCPU thaw no longer needs a `Domain.thawing` flag —
+        // the thaw re-spawns frozen vCPUs as concurrent OS threads (below), so a re-issued `atomic.wait`
+        // parks on the real futex and a sibling's re-issued `notify` wakes it; a wait with no possible
+        // notifier left fails closed via `futex_wait`'s shared deadlock detection (no thaw-specific path).
+
+        // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach + run the spawned children a
+        // freeze flattened, *before* the root re-enters — the JIT's single-worker thaw (the root's
+        // rewind skips its prologue `thread.spawn`, so the runtime reconstructs the children). Each
+        // child rewinds from its restored extent, runs forward to completion, and publishes its result
+        // so the root's re-executed `thread.join` resolves; the root's active shadow-SP is then set to
+        // its restored extent. Done after the fiber seed (the table is live) and `set_env`.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !(*this).frozen_vcpu_seed.is_empty() {
+            let seed = std::mem::take(&mut (*this).frozen_vcpu_seed);
+            let root_sp = (*this).thaw_root_sp;
+            if let Some(d) = &(*this).domain {
+                d.thaw_reattach_and_run(&seed, root_sp);
+            }
+        }
 
         // Publish the live window's fault range so a mid-run `invoke_extra` (from a cap.call
         // handler) can arm its nested recovery against this run's window.
@@ -1774,15 +2957,98 @@ impl CompiledModule {
         // the guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call;
         // the module owns the executable pages until `*this` drops (after every spawned vCPU is
         // joined below).
-        let faulted = mem::run_guarded(
-            &window,
-            code,
-            args.as_ptr(),
-            results.as_mut_ptr(),
-            mem_base,
-            fn_table_ptr,
-            trap_cell.as_ptr(),
-        );
+        // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
+        // worker thread carries from a prior run before guest code can `vcpu.tls.get` it.
+        vcpu_tls::seed(0);
+        // §12.8 4A.5: seed the durable shadow-base register to the root's region (context 0 =
+        // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
+        // shadow-SP word.
+        durable_shadow::seed(DURABLE_SHADOW_BASE);
+        // §12.8 4A.5 stage (ii): engage the concurrent durable path before the guarded call (where the
+        // root may `thread.spawn` children) so each child reserves its own shadow context.
+        #[cfg(fiber_rt)]
+        if (*this).concurrent_durable {
+            if let Some(d) = &(*this).domain {
+                d.engage_concurrent_durable();
+            }
+        }
+        // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
+        // guarded call (the guest is about to block in its loop), and retire it right after — so a
+        // `request_freeze` can only ever store into the window while it is mapped (freed below).
+        if let Some(fc) = &(*this).freeze_ctl {
+            fc.publish(mem_base as usize);
+        }
+        let faulted = if seed_faulted {
+            // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
+            false
+        } else {
+            mem::run_guarded(
+                &window,
+                code,
+                args.as_ptr(),
+                results.as_mut_ptr(),
+                mem_base,
+                fn_table_ptr,
+                trap_cell.as_ptr(),
+            )
+        };
+        if let Some(fc) = &(*this).freeze_ctl {
+            fc.retire();
+        }
+
+        // §5 W3 — the **root vCPU's** trap-time backtrace capture (this run thread's thread-local): a
+        // memory fault's SIGSEGV/SIGBUS-handler walk (Stage 1) or an explicit trap's helper walk
+        // (Stage 2). Taken raw now (and cleared, so a clean run stays empty); symbolized after
+        // `join_all` below, where it is reconciled with any **spawned vCPU's** capture (Stage 3 —
+        // collected into the domain because a worker's thread-local dies with the worker).
+        let root_trap_cap = mem::take_trap_frame();
+
+        // Durable freeze driver (DURABILITY.md §12.8 slice 3.3.2): on a durable **freeze** run
+        // (state word UNWINDING) the root has now unwound into context 0's shadow region; flatten
+        // every still-parked fiber into its own region before the window is snapshotted, so the
+        // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
+        // flattening fiber touches only the committed reserve, so it's sound outside the guard.
+        // This drives the **root's** own fibers; a spawned child flattens *its* fibers in
+        // `run_child_inline` (slice 3.4), merged below. Skipped on a fault or a non-freeze run. The
+        // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
+        // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving — then the
+        // deferred children run (`drive_frozen_spawns`).
+        #[cfg(fiber_rt)]
+        if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+            if let Some(rt) = (*this).fiber_rt.as_mut() {
+                let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
+                fiber_rt::freeze_drive(rt, trap_cell.as_ptr() as u64);
+                (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
+            }
+            // Slice 3.3: capture the **root's** flattened extent now — the freeze driver restored the
+            // active shadow-SP to context 0's region (root rewinds first on thaw), but the children
+            // below overwrite the shared word with their own extents, so the root's must be read here
+            // (its implicit residue, reported separately for a thaw to restore).
+            // §12.8 4A.5: the root's shadow-SP word lives in its own region (context 0); children no
+            // longer share it.
+            (*this).frozen_root_sp_out =
+                fiber_rt::read_shadow_sp(mem_base as u64, fiber_rt::shadow_region_base(0));
+            // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
+            // request, returning the handle) so the root could unwind first — matching the interp,
+            // which enqueues a child and runs it only after the spawning vCPU yields. Now that the
+            // root has unwound and its fibers are flattened, run the deferred children **inline**
+            // (single-worker) in spawn order: each unwinds into its own top-down context and records a
+            // `FrozenVCpu`. This reproduces the interp's dispatch order (root → root's fibers →
+            // children), so the side-effect interleaving — and the frozen window — is byte-identical.
+            if let Some(d) = &(*this).domain {
+                d.drive_frozen_spawns();
+                // §12.8 4A.5 stage (ii): drains the **deferred** (single-worker) children now;
+                // **concurrent** children record their residue on their own OS threads, drained again
+                // after `join_all` below. `extend` (vs. assign) so both contribute. Canonical sort at
+                // serialize means the append order can't affect the artifact (§12.6).
+                (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
+                // Slice 3.4: a spawned child that owns fibers flattened them with its own
+                // `freeze_drive` (in `run_child_inline`) into the domain accumulator; merge that into
+                // the run residue alongside the root's. Sort-by-slot at serialize is canonical, so the
+                // append order doesn't affect the artifact.
+                (*this).frozen_out.extend(d.take_frozen_fibers());
+            }
+        }
 
         // ---- Teardown: transient references again. ----
         (*this).live_fault_range = None;
@@ -1794,7 +3060,31 @@ impl CompiledModule {
         #[cfg(fiber_rt)]
         if let Some(d) = &(*this).domain {
             d.join_all();
+            // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
+            // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
+            // coordinator-wait (every child finished). Collect that residue now — after the join, so the
+            // snapshot below captures a fully-quiesced window. No-op off the concurrent path.
+            if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+                (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
+                // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
+                // `thread.join` of a child that finished before the freeze point resolves on thaw.
+                (*this)
+                    .frozen_vcpus_out
+                    .extend(d.take_completed_children_residue());
+                // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
+                // `run_child` `freeze_drive`, recorded during `join_all` — drain after the join.
+                (*this).frozen_out.extend(d.take_frozen_fibers());
+            }
         }
+        // §5 W3 Stage 3 — a trap that originated on a *spawned* vCPU stashed its backtrace capture in
+        // that worker's thread-local, which dies with the worker; the worker handed it to the domain
+        // before finishing, so collect it now (all vCPUs are joined). Used only when the root vCPU
+        // itself didn't trap (`root_trap_cap` below takes precedence — the entry's own trap is the
+        // primary one in the common single-vCPU case).
+        #[cfg(fiber_rt)]
+        let worker_trap_cap = (*this).domain.as_ref().and_then(|d| d.take_trap_capture());
+        #[cfg(not(fiber_rt))]
+        let worker_trap_cap: Option<(usize, Vec<usize>, i64)> = None;
         // §9/§12 async ring: now that every vCPU is joined, drain the offload pool and drop the futex hook
         // (which holds the `Domain` pointer) before the window is freed below — so no worker
         // can still write the window counter or call into a dead `Domain`.
@@ -1826,6 +3116,21 @@ impl CompiledModule {
         // The window dies with this run; the code, function table, and runtimes stay alive in
         // `*this` for the next `run` / `define_extra` / drop.
         drop(window);
+
+        // Publish the trap-time backtrace + fiber for `last_trap_backtrace`/`last_trap_fiber`: the root
+        // vCPU's own capture if it trapped, else a spawned vCPU's (Stage 3). The fiber handle (§23-D57)
+        // rides along, captured at the trap instant. Symbolizing is pure (reads the address map), so it
+        // is fine here after teardown. Reset on a clean run (every successful run resets both).
+        match root_trap_cap.or(worker_trap_cap) {
+            Some((pc, rets, fiber)) => {
+                (*this).last_trap_backtrace = (*this).trap_backtrace(pc, &rets);
+                (*this).last_trap_fiber = Some(fiber);
+            }
+            None => {
+                (*this).last_trap_backtrace = Vec::new();
+                (*this).last_trap_fiber = None;
+            }
+        };
 
         // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
         // synchronization point); Relaxed suffices.
@@ -1898,11 +3203,13 @@ impl CompiledModule {
             build_clif(
                 &mut self.module,
                 &ids,
+                funcs,
                 &self.distinct,
                 self.cap,
                 self.fiber,
                 self.thread,
                 self.inst,
+                self.setjmp,
                 &mut ctx.func,
                 f,
                 self.mask,
@@ -1910,6 +3217,9 @@ impl CompiledModule {
                 self.sub_base,
                 self.epoch_addr,
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+                0,
+                None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
+                None, // …nor value-label points (Stage 3a)
             )?;
             self.module
                 .define_function(*id, &mut ctx)
@@ -2057,6 +3367,14 @@ impl CompiledModule {
     /// [`crate::CompiledModule`] / `tests/jit_compaction.rs`.
     pub fn extra_byte_count(&self) -> usize {
         self.extra_bytes
+    }
+
+    /// Finalized machine-code bytes of the **base module** — every function body emitted by the
+    /// initial [`CompiledModule::compile`], summed from Cranelift's `code_buffer` at define time.
+    /// The byte-accurate "how big is the JIT'd code" measure (excludes the tiny buffer-ABI
+    /// trampoline and later `define_extra` units — those are [`Self::extra_byte_count`]).
+    pub fn code_byte_count(&self) -> usize {
+        self.base_bytes
     }
 
     /// Whether a run is in flight on this module (a guarded call published its window fault range).
@@ -2230,6 +3548,13 @@ fn compile_child(
                 "a §14 JIT child using fibers/threads is not supported yet",
             ));
         }
+        // Likewise `setjmp`/`longjmp`: the child gets a null `SetjmpEnv` (no per-child `setjmp` table
+        // yet), so reject rather than bake a null table address into a `SetJmp` site.
+        if f.uses_setjmp() {
+            return Err(JitError::Unsupported(
+                "a §14 JIT child using setjmp/longjmp is not supported yet",
+            ));
+        }
     }
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
     let mask = child_size - 1;
@@ -2270,11 +3595,13 @@ fn compile_child(
         build_clif(
             &mut module,
             &ids,
+            funcs,
             &distinct,
             cap,
             FiberEnv::null(),
             ThreadEnv::null(),
             InstEnv::null(), // a JIT child cannot itself nest yet (its Instantiator cap.call → CapFault)
+            SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
             &mut ctx.func,
             f,
             mask,
@@ -2282,6 +3609,9 @@ fn compile_child(
             0,                 // top-level confinement over the child's own window
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
+            0,
+            None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
+            None, // …nor value-label points (Stage 3a)
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -2337,6 +3667,32 @@ fn natural_sig(module: &mut JITModule, f: &Func) -> cranelift_codegen::ir::Signa
     sig_from(module, &f.params, &f.results)
 }
 
+/// Max function results returned **in registers**. Above this the JIT spills results to a
+/// caller-provided memory **return-area (sret) pointer** — like wasm engines do for multi-value —
+/// so a many-result function compiles **uniformly on every target**. (Cranelift's `Tail` calling
+/// convention caps register returns at a per-ABI budget: x86-64 fits 8, aarch64 fewer, so returning
+/// the count in registers was the one place a *valid* module compiled on one supported target and was
+/// rejected on another.) `4` keeps every real signature — including the §12 `(sp,arg)->i64` fiber/
+/// thread entry and the multi-result test cases — on the fast register path, while being safely
+/// within the tightest target's budget; only `>4`-result functions take the sret path. The decision
+/// is by result **count**, a property of the function *type*, so it is identical at every call site —
+/// direct, `call_indirect` (its type id pins the same choice), and tail calls.
+const MAX_REG_RESULTS: usize = 4;
+
+/// Whether a function with these results returns via the memory return-area pointer (sret) rather
+/// than registers — see [`MAX_REG_RESULTS`].
+fn uses_sret(results: &[ValType]) -> bool {
+    results.len() > MAX_REG_RESULTS
+}
+
+/// The sret return-area uses 8-byte slots (`encode_slot`/`decode_slot`, the buffer-ABI encoding), so
+/// a `v128` result cannot be carried through it. A `>4`-result signature containing a `v128` is
+/// therefore rejected uniformly (`Unsupported`) rather than miscompiled — an exotic non-case (`v128`
+/// buffer slots are already out of MVP scope, §17), and the interpreter still covers it.
+fn sret_blocked_by_v128(results: &[ValType]) -> bool {
+    uses_sret(results) && results.iter().any(|t| matches!(t, ValType::V128))
+}
+
 /// The natural signature for an explicit param/result list (shared by `natural_sig`
 /// and the `call_indirect` signature import).
 fn sig_from(
@@ -2351,11 +3707,20 @@ fn sig_from(
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
     sig.params.push(AbiParam::new(I64)); // trap_out (host-owned trap cell)
+    let sret = uses_sret(results);
+    if sret {
+        // The return-area pointer: the callee writes its results here (8-byte slots) instead of
+        // returning them in registers, so the result count is target-independent. Placed right
+        // after the context pointers, before the user params — the order every call site mirrors.
+        sig.params.push(AbiParam::new(I64));
+    }
     for p in params {
         sig.params.push(AbiParam::new(clif_ty(*p)));
     }
-    for r in results {
-        sig.returns.push(AbiParam::new(clif_ty(*r)));
+    if !sret {
+        for r in results {
+            sig.returns.push(AbiParam::new(clif_ty(*r)));
+        }
     }
     sig
 }
@@ -2363,6 +3728,27 @@ fn sig_from(
 /// Reject functions using any op outside the integer slice, so `build_clif` can lower
 /// the remainder totally. Keeping the check separate keeps the lowering readable.
 fn ensure_supported(f: &Func) -> Result<(), JitError> {
+    // The sret return-area (used for `>MAX_REG_RESULTS` results) carries 8-byte slots, so a
+    // many-result signature containing a `v128` can't pass through it — reject uniformly on every
+    // target (the interpreter still covers it). This function's own results + any indirect
+    // call/tail-call target type; direct callees are checked as their own definitions.
+    if sret_blocked_by_v128(&f.results) {
+        return Err(JitError::Unsupported("v128 in a many-result signature"));
+    }
+    for blk in &f.blocks {
+        if let Terminator::ReturnCallIndirect { ty, .. } = &blk.term {
+            if sret_blocked_by_v128(&ty.results) {
+                return Err(JitError::Unsupported("v128 in a many-result signature"));
+            }
+        }
+        for inst in &blk.insts {
+            if let Inst::CallIndirect { ty, .. } = inst {
+                if sret_blocked_by_v128(&ty.results) {
+                    return Err(JitError::Unsupported("v128 in a many-result signature"));
+                }
+            }
+        }
+    }
     for blk in &f.blocks {
         for inst in &blk.insts {
             match inst {
@@ -2375,6 +3761,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Eqz { .. }
                 | Inst::FBin { .. }
                 | Inst::FUn { .. }
+                | Inst::Fma { .. }
                 | Inst::FCmp { .. }
                 | Inst::FToISat { .. }
                 | Inst::FToITrap { .. }
@@ -2411,11 +3798,67 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::SimdWidthBytes => {}
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
-                Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
-                // `i8x16.mul` has no single-instruction lowering on the target ISAs, so Cranelift
-                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it).
+                Inst::CapSelfCount
+                | Inst::CapSelfGet { .. }
+                | Inst::CapSelfResolve { .. }
+                | Inst::CapSelfLabel { .. } => {}
+                // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
+                // (works for a plain non-fiber root), so supported on every target.
+                Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
+                // §12.8 4A.5 durable-runtime-internal: a baked thunk over a per-OS-thread word (like
+                // the TLS register), so supported on every target.
+                Inst::DurableShadowBase => {}
+                // `i64x2` min/max has no single-instruction lowering on the target ISAs, so Cranelift
+                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it, and wasm
+                // never emits it — `i64x2` has no min/max op). `i8x16.mul` *is* now lowered (widen →
+                // `i16x8` multiply → low-byte pack; see the `VIntBin` lowering), so it stays supported.
                 Inst::VIntBin { shape, op, .. }
-                    if !(*shape == VShape::I8x16 && *op == VIntBinOp::Mul) => {}
+                    if !matches!(
+                        (*shape, *op),
+                        (
+                            VShape::I64x2,
+                            VIntBinOp::MinS
+                                | VIntBinOp::MinU
+                                | VIntBinOp::MaxS
+                                | VIntBinOp::MaxU
+                        )
+                    ) => {}
+                // Lane compares lower to a single Cranelift `icmp`/`fcmp` (legalize on every target).
+                Inst::VIntCmp { .. } | Inst::VFloatCmp { .. } => {}
+                // Lane shifts lower to vector `ishl`/`ushr`/`sshr`; Cranelift legalizes every shape
+                // (incl. `i8x16`, which has no native per-byte shift on x86 — it emits a sequence).
+                Inst::VShift { .. } => {}
+                // Lane `abs`/`neg` lower to vector `iabs`/`ineg`; Cranelift legalizes every shape.
+                Inst::VIntUn { .. } => {}
+                // `i8x16.popcnt` lowers to a vector `popcnt` (native `cnt` on aarch64, a byte
+                // shuffle sequence on x86 — Cranelift legalizes both).
+                Inst::VPopcnt { .. } => {}
+                // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
+                Inst::VAvgr { .. } => {}
+                // `i32x4.dot_i16x8_s` / `i16x8.dot_i8x16_s` → `swiden_low/high` + `imul` +
+                // `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } | Inst::VDotI8 { .. } => {}
+                // Extended multiply → widen low/high both operands + `imul` on the wide shape.
+                // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
+                Inst::VExtMul { .. } => {}
+                // Extended pairwise add → `swiden/uwiden` low+high + `iadd_pairwise` (all legalize).
+                Inst::VExtAddPairwise { .. } => {}
+                // Q15 rounding multiply → native `sqmul_round_sat`.
+                Inst::VQ15MulrSat { .. } => {}
+                // Fused multiply-add (relaxed_madd/nmadd) → vector `fma` (one rounding; the same
+                // correctly-rounded result the interp's `mul_add` gives, so the differential holds).
+                Inst::VFma { .. } => {}
+                // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
+                Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
+                // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
+                // `sadd_sat`/`uadd_sat`/`ssub_sat`/`usub_sat`.
+                Inst::VSatBin { .. } => {}
+                // Widen lowers to `swiden_low`/`uwiden_low`/`*_high`; narrow to `snarrow`/`unarrow`.
+                Inst::VWiden { .. } | Inst::VNarrow { .. } => {}
+                // Int↔float / float↔float conversions → Cranelift `fcvt_*` / `fvdemote`/`fvpromote_low`.
+                Inst::VConvert { .. } => {}
+                // pmin/pmax lower to a single `fcmp` plus `bitselect` (both legalize on every target).
+                Inst::VPMinMax { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -2426,7 +3869,16 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::ThreadJoin { .. }
                 | Inst::MemoryWait { .. }
                 | Inst::MemoryNotify { .. }
+                // §GC `gc.roots`: scans the live fiber stacks via the fiber runtime — supported only
+                // where the stack-switch substrate exists (else it bails like the other fiber ops and
+                // the interpreter covers it).
+                | Inst::GcRoots { .. }
                     if cfg!(fiber_rt) => {}
+                // `setjmp`/`longjmp` (LLVM.md §"JIT `longjmp`", Option B): libc `_setjmp`/`_longjmp`
+                // called inline from JITted code with a host-side `jmp_buf` table. Supported on the
+                // `setjmp_rt` targets (unix among `fiber_rt`); elsewhere bail so the interpreters cover
+                // it (module-granular fallback).
+                Inst::SetJmp { .. } | Inst::LongJmp { .. } if cfg!(setjmp_rt) => {}
                 _ => return Err(JitError::Unsupported("instruction")),
             }
         }
@@ -2461,6 +3913,9 @@ struct FiberEnv {
     new_thunk: i64,
     resume_thunk: i64,
     suspend_thunk: i64,
+    /// The `gc.roots` thunk (conservative root enumeration over the live fiber stacks). `0` when the
+    /// module uses no fibers / `gc.roots`, or the target has no stack-switch support.
+    roots_thunk: i64,
 }
 
 impl FiberEnv {
@@ -2469,6 +3924,7 @@ impl FiberEnv {
             new_thunk: 0,
             resume_thunk: 0,
             suspend_thunk: 0,
+            roots_thunk: 0,
         }
     }
 }
@@ -2527,6 +3983,33 @@ impl InstEnv {
     }
 }
 
+/// The per-run `setjmp` table address + the four thunk/libc addresses baked into the module's
+/// `SetJmp`/`LongJmp` sites (LLVM.md §"JIT `longjmp`", Option B). All `0` (`null`) when the module uses
+/// no `setjmp`, or the target lacks the `setjmp_rt` runtime (non-unix / non-`fiber_rt`), in which case
+/// `ensure_supported` has already rejected any `SetJmp`/`LongJmp`. `rt_addr` is the per-run
+/// `SetjmpRuntime` (owned by the `CompiledModule`); `setjmp_addr`/`longjmp_addr` are libc `_setjmp`/
+/// `_longjmp`, called inline in the guest frame.
+#[derive(Clone, Copy)]
+struct SetjmpEnv {
+    rt_addr: i64,
+    slot_thunk: i64,
+    lookup_thunk: i64,
+    setjmp_addr: i64,
+    longjmp_addr: i64,
+}
+
+impl SetjmpEnv {
+    fn null() -> SetjmpEnv {
+        SetjmpEnv {
+            rt_addr: 0,
+            slot_thunk: 0,
+            lookup_thunk: 0,
+            setjmp_addr: 0,
+            longjmp_addr: 0,
+        }
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
@@ -2559,6 +4042,10 @@ struct Lower<'a> {
     /// The §14 nesting runtime + thunk addresses for `Instantiator` `cap.call` lowering (`null` ⇒
     /// `Instantiator` cap.calls take the ordinary `cap.call` path — an inert `CapFault`).
     inst: InstEnv,
+    /// The per-run `setjmp` table + libc `_setjmp`/`_longjmp` addresses for `SetJmp`/`LongJmp` lowering
+    /// (`null` ⇒ the module has no `setjmp`, or the target lacks the runtime and `ensure_supported`
+    /// already rejected the ops).
+    setjmp: SetjmpEnv,
     /// Address of the host-owned **interrupt cell** (`AtomicU64`) for the §5 fuel/epoch kill-path.
     /// `0` ⇒ no kill-path is armed for this compile (the checks are not emitted — guest code is
     /// byte-identical to the un-armed build). When non-zero, the lowering polls `*epoch_addr` at
@@ -2568,8 +4055,50 @@ struct Lower<'a> {
     epoch_addr: i64,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
+    /// The functions of this compilation unit, indexed like [`Self::ids`], so a **direct** `call`
+    /// can read its callee's result types to decide the sret ABI (see [`uses_sret`]). `call_indirect`
+    /// uses its own carried type instead.
+    funcs: &'a [Func],
     /// Distinct module signatures, for `call_indirect` type ids.
     distinct: &'a [FuncType],
+    /// The current function's **return-area pointer** variable when it returns via sret
+    /// ([`uses_sret`] of its results), else `None`. A `Return` stores results through it; a tail
+    /// call forwards it (the tail callee shares the caller's result type, so its sret-ness matches).
+    sret_var: Option<Variable>,
+    /// `-g` source-loc lookup (W5 JIT/DWARF Stage 0): `(func, block, inst) → debug_info.locs` index.
+    /// `None` ⇒ no debug info, so no `SourceLoc`s are stamped (codegen is byte-identical to before).
+    srclocs: Option<&'a SrcLocMap>,
+    /// This function's index, the `func` half of the [`Self::srclocs`] key.
+    func_idx: u32,
+    /// `-g` value-label points (W5 JIT/DWARF Stage 3a): `(func, block) → [(block-local value, label)]`
+    /// — the source variables whose backing CLIF value `lower_block` stamps with a `ValueLabel`, so
+    /// Cranelift records its machine-location ranges. `None` ⇒ no `-g` vars (no labels, codegen
+    /// unchanged).
+    var_labels: Option<&'a VarLabelMap>,
+    /// §5 W3 Stage 2 explicit-trap backtrace: `Some((sigref, addr))` to bake a call to the
+    /// trap-capture helper (`svm_capture_explicit_trap`) into every [`emit_trap`] site, so an
+    /// explicit trap (div-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) records a source
+    /// backtrace before it unwinds — the way memory faults do via the signal handler. `None` without
+    /// `-g` (the backtrace would be empty) or where the helper isn't linked (a target with no trap
+    /// runtime), leaving the trap path byte-identical to before.
+    trap_capture: Option<(SigRef, i64)>,
+}
+
+/// The address of the §5 W3 explicit-trap capture helper (`svm_capture_explicit_trap` in
+/// `trap_capture.c`): baked into each [`emit_trap`] site under `-g`. The helper takes the trapping
+/// frame pointer as an argument (the JIT threads it in via Cranelift `get_frame_pointer`), so it works
+/// on every target the shim compiles for — **unix and windows** (MSVC has no `__builtin_frame_address`,
+/// but the passed `fp` + `_ReturnAddress` sidestep it). `0` on a target with no trap runtime.
+#[cfg(any(unix, windows))]
+fn trap_capture_addr() -> i64 {
+    extern "C" {
+        fn svm_capture_explicit_trap(fp: usize);
+    }
+    svm_capture_explicit_trap as unsafe extern "C" fn(usize) as usize as i64
+}
+#[cfg(not(any(unix, windows)))]
+fn trap_capture_addr() -> i64 {
+    0
 }
 
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
@@ -2586,11 +4115,13 @@ struct Lower<'a> {
 fn build_clif(
     module: &mut JITModule,
     ids: &[FuncId],
+    funcs: &[Func],
     distinct: &[FuncType],
     cap: CapEnv,
     fiber: FiberEnv,
     thread: ThreadEnv,
     inst: InstEnv,
+    setjmp: SetjmpEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -2598,6 +4129,9 @@ fn build_clif(
     sub_base: u64,
     epoch_addr: i64,
     fn_table_mask: u64,
+    func_idx: u32,
+    srclocs: Option<&SrcLocMap>,
+    var_labels: Option<&VarLabelMap>,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -2616,10 +4150,14 @@ fn build_clif(
             b.append_block_param(blocks[i], clif_ty(*p));
         }
     }
+    let sret = uses_sret(&f.results);
     let entry = b.create_block();
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
     b.append_block_param(entry, I64); // trap_out
+    if sret {
+        b.append_block_param(entry, I64); // return-area pointer (results spilled here, not returned)
+    }
     for p in &f.params {
         b.append_block_param(entry, clif_ty(*p));
     }
@@ -2636,10 +4174,31 @@ fn build_clif(
     b.def_var(fn_table_var, fn_table_base);
     let trap_var = b.declare_var(I64);
     b.def_var(trap_var, trap_out);
+    // The return-area pointer (when sret) is likewise needed in the `Return`/tail-call blocks.
+    let sret_var = if sret {
+        let var = b.declare_var(I64);
+        b.def_var(var, b.block_params(entry)[3]);
+        Some(var)
+    } else {
+        None
+    };
+    // §5 W3 Stage 2: under `-g`, import the trap-capture helper's `(i64) -> ()` host-C signature (it
+    // takes the trapping frame pointer) and bake its address, so `emit_trap` can record an explicit
+    // trap's source backtrace before unwinding. Disabled without `-g` or where the helper isn't linked.
+    let trap_capture = match trap_capture_addr() {
+        addr if srclocs.is_some() && addr != 0 => {
+            let mut sig = module.make_signature(); // host C ABI
+            sig.params.push(AbiParam::new(I64)); // the trapping frame pointer
+            Some((b.import_signature(sig), addr))
+        }
+        _ => None,
+    };
     let lower = Lower {
         mem_var,
         fn_table_var,
         trap_var,
+        sret_var,
+        funcs,
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
         mapped,
@@ -2649,16 +4208,23 @@ fn build_clif(
         fiber,
         thread,
         inst,
+        setjmp,
         epoch_addr,
         ids,
         distinct,
+        srclocs,
+        func_idx,
+        var_labels,
+        trap_capture,
     };
 
-    // Jump into IR block 0 passing the function parameters (entry params after the
-    // three context pointers). A §5 kill-path check guards the *entry* (caught before any work):
-    // this is what stops unbounded recursion and tail-call loops — each (re-)entry polls the
-    // interrupt cell. Intra-function loops are caught by the per-back-edge check in `lower_block`.
-    let entry_args: Vec<BlockArg> = b.block_params(entry)[3..]
+    // Jump into IR block 0 passing the function parameters (entry params after the three context
+    // pointers, plus the sret pointer when present). A §5 kill-path check guards the *entry* (caught
+    // before any work): this is what stops unbounded recursion and tail-call loops — each (re-)entry
+    // polls the interrupt cell. Intra-function loops are caught by the per-back-edge check in
+    // `lower_block`.
+    let pbase = 3 + usize::from(sret);
+    let entry_args: Vec<BlockArg> = b.block_params(entry)[pbase..]
         .iter()
         .map(|v| BlockArg::from(*v))
         .collect();
@@ -2666,7 +4232,7 @@ fn build_clif(
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, blocks[i], &blocks, &lower)?;
+        lower_block(module, &mut b, blk, i, blocks[i], &blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -2700,8 +4266,14 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
     let fn_table_base = b.block_params(blk)[3];
     let trap_out = b.block_params(blk)[4];
 
-    // Decode args (context pointers first), call the entry, store results.
+    // Decode args (context pointers first), call the entry, store results. When the entry returns
+    // via sret, hand it `results_ptr` directly as the return-area pointer — it writes its results
+    // (8-byte `encode_slot` slots) straight into the buffer Rust reads, so no register read-back.
+    let sret = uses_sret(&entry.results);
     let mut call_args = vec![mem_base, fn_table_base, trap_out];
+    if sret {
+        call_args.push(results_ptr);
+    }
     for (i, p) in entry.params.iter().enumerate() {
         let slot = b
             .ins()
@@ -2710,11 +4282,13 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
     }
     let callee = module.declare_func_in_func(entry_id, b.func);
     let call = b.ins().call(callee, &call_args);
-    let rets: Vec<Value> = b.inst_results(call).to_vec();
-    for (i, r) in rets.iter().enumerate() {
-        let slot = encode_slot(&mut b, *r);
-        b.ins()
-            .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
+    if !sret {
+        let rets: Vec<Value> = b.inst_results(call).to_vec();
+        for (i, r) in rets.iter().enumerate() {
+            let slot = encode_slot(&mut b, *r);
+            b.ins()
+                .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
+        }
     }
     b.ins().return_(&[]);
     b.seal_all_blocks();
@@ -2739,7 +4313,12 @@ fn module_uses_fibers(m: &IrModule) -> bool {
             blk.insts.iter().any(|i| {
                 matches!(
                     i,
-                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                    Inst::ContNew { .. }
+                        | Inst::ContResume { .. }
+                        | Inst::Suspend { .. }
+                        // `gc.roots` walks the fiber runtime's live stacks, so it needs the runtime
+                        // stood up even if the module never explicitly creates a fiber.
+                        | Inst::GcRoots { .. }
                 )
             })
         })
@@ -2761,6 +4340,19 @@ fn module_uses_threads(m: &IrModule) -> bool {
                         | Inst::MemoryNotify { .. }
                 )
             })
+        })
+    })
+}
+
+/// Whether `m` contains any `setjmp`/`longjmp` op, so `run_inner` knows to stand up the per-run
+/// [`setjmp_rt::SetjmpRuntime`] whose address is baked into those sites.
+#[cfg(setjmp_rt)]
+fn module_uses_setjmp(m: &IrModule) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|blk| {
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
         })
     })
 }
@@ -2820,6 +4412,7 @@ fn lower_block(
     module: &mut JITModule,
     b: &mut FunctionBuilder,
     blk: &Block,
+    block_idx: usize,
     cb: cranelift_codegen::ir::Block,
     blocks: &[cranelift_codegen::ir::Block],
     lower: &Lower,
@@ -2833,22 +4426,37 @@ fn lower_block(
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
     let size = lower.mask.wrapping_add(1);
 
-    for inst in &blk.insts {
+    for (inst_idx, inst) in blk.insts.iter().enumerate() {
+        // W5 JIT/DWARF Stage 0: stamp the ops this IR instruction lowers to with a `SourceLoc`
+        // (= its `debug_info.locs` index), so the finalized code's address map carries source
+        // positions. Only when the module has `-g` debug info; otherwise codegen is unchanged.
+        if let Some(map) = lower.srclocs {
+            if let Some(&loc) = map.get(&(lower.func_idx, block_idx as u32, inst_idx as u32)) {
+                b.set_srcloc(SourceLoc::new(loc));
+            }
+        }
         // `call`/`call_indirect` append 0..N results — handle before the single-value
         // match (which produces exactly one value).
         if let Inst::Call { func, args } = inst {
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
             let callee = module.declare_func_in_func(callee_id, b.func);
+            let results = &lower
+                .funcs
+                .get(*func as usize)
+                .ok_or(JitError::Malformed)?
+                .results;
             let mut cargs = ctx_args(b, lower);
+            let sret = sret_call_slot(b, &mut cargs, results);
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
             let call = b.ins().call(callee, &cargs);
             // A trap raised inside the callee leaves the trap cell set and returns zeros; propagate
             // it here so it unwinds immediately (else the caller would run on with bogus results,
-            // and a later successful `cap.call` could reset the cell, masking the trap).
+            // and a later successful `cap.call` could reset the cell, masking the trap). On the sret
+            // path this also returns *before* reading the unwritten return-area slots.
             emit_trap_propagate(b, lower);
-            vals.extend_from_slice(b.inst_results(call));
+            read_call_results(b, call, sret, results, &mut vals);
             ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
@@ -2856,13 +4464,14 @@ fn lower_block(
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
+            let sret = sret_call_slot(b, &mut cargs, &ty.results);
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
             let call = b.ins().call_indirect(sig, code, &cargs);
             // Propagate a callee trap immediately (see the direct-call case above).
             emit_trap_propagate(b, lower);
-            vals.extend_from_slice(b.inst_results(call));
+            read_call_results(b, call, sret, &ty.results, &mut vals);
             ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
@@ -2929,6 +4538,58 @@ fn lower_block(
             ubs.resize(vals.len(), UB_TOP);
             continue;
         }
+        // §7 `cap.self.resolve` — op 2 over the reserved `CAP_SELF_TYPE_ID`, with a `(name_ptr,
+        // name_len)` buffer (the thunk reads the window to resolve the name, like any cap op). One
+        // i32 result; the handle operand is unused (constant 0), as for count/get.
+        if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
+            let h0 = b.ins().iconst(I32, 0);
+            let sig = FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let call_args = [*name_ptr, *name_len];
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                2,
+                &sig,
+                h0,
+                &call_args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §7 `cap.self.label` — op 3 over `CAP_SELF_TYPE_ID`: `(handle, buf_ptr, buf_cap)` → label len
+        // (the thunk writes the label into the window). One i32 result; cap.call handle unused (0).
+        if let Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } = inst
+        {
+            let h0 = b.ins().iconst(I32, 0);
+            let sig = FuncType {
+                params: vec![ValType::I32, ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let call_args = [*handle, *buf_ptr, *buf_cap];
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                3,
+                &sig,
+                h0,
+                &call_args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
         // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
         // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `cap.call`. A thunk that
         // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
@@ -2944,7 +4605,7 @@ fn lower_block(
             for t in [I64, I64, I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
-            tsig.returns.push(AbiParam::new(I32));
+            tsig.returns.push(AbiParam::new(I64)); // i64 fiber handle (16-bit slot + 48-bit generation)
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
             let call = b
@@ -2956,7 +4617,7 @@ fn lower_block(
             continue;
         }
         if let Inst::ContResume { k, arg } = inst {
-            // fiber_resume(handle:i32, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
+            // fiber_resume(handle:i64, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
             // Results are appended (status:i32, value:i64) to match the IR's two-result shape.
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
@@ -2965,7 +4626,7 @@ fn lower_block(
             let av = get(&vals, *arg)?;
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I32, I64, I64, I64] {
+            for t in [I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -2995,6 +4656,156 @@ fn lower_block(
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.suspend_thunk);
             let call = b.ins().call_indirect(tref, thunk, &[v, trap_out]);
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // `setjmp` (LLVM.md §"JIT `longjmp`", Option B): two calls. First a host thunk returns the
+        // stable host `jmp_buf` slot for this guest `buf` address (`rt_setjmp_slot`); then `_setjmp` is
+        // called **inline in this guest frame** — the frame a later `longjmp` returns to — so it saves
+        // *this* frame's SP/return-addr. The libc `_setjmp` address is baked directly (not wrapped in a
+        // Rust thunk, whose frame would be gone by `longjmp` time — UB). Result is the `i32` 0 (direct)
+        // / long-jump value (re-entry). The slot alloc is infallible, so no trap-propagate.
+        if let Inst::SetJmp { buf } = inst {
+            let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
+                                          // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
+            let mut s1 = module.make_signature();
+            for t in [I64, I64] {
+                s1.params.push(AbiParam::new(t));
+            }
+            s1.returns.push(AbiParam::new(I64));
+            let r1 = b.import_signature(s1);
+            let slot_thunk = b.ins().iconst(I64, lower.setjmp.slot_thunk);
+            let rt_addr = b.ins().iconst(I64, lower.setjmp.rt_addr);
+            let c1 = b.ins().call_indirect(r1, slot_thunk, &[rt_addr, bufv]);
+            let slot = b.inst_results(c1)[0];
+            // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
+            let mut s2 = module.make_signature();
+            s2.params.push(AbiParam::new(I64));
+            s2.returns.push(AbiParam::new(I32));
+            let r2 = b.import_signature(s2);
+            let setjmp_fn = b.ins().iconst(I64, lower.setjmp.setjmp_addr);
+            let c2 = b.ins().call_indirect(r2, setjmp_fn, &[slot]);
+            vals.push(b.inst_results(c2)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // `longjmp` (LLVM.md §"JIT `longjmp`"): look up the host `jmp_buf` slot for this `buf` (set by a
+        // prior `setjmp`); a miss writes the trap cell and `emit_trap_propagate` bails *before* the
+        // (skipped) `_longjmp`. Otherwise `_longjmp(slot, val)` restores the saved frame and never
+        // returns — the IR's trailing `unreachable` terminator caps the block (the call isn't marked
+        // noreturn, but the dead fall-through is terminated by it). No result.
+        if let Inst::LongJmp { buf, val } = inst {
+            let bufv = get(&vals, *buf)?;
+            let valv = get(&vals, *val)?; // i32 long-jump value (0 → 1 is applied by libc `_longjmp`)
+            let trap_out = b.use_var(lower.trap_var);
+            // slot = rt_setjmp_lookup(rt_addr, buf, trap_out) -> *mut jmp_buf (null + trap on miss)
+            let mut s1 = module.make_signature();
+            for t in [I64, I64, I64] {
+                s1.params.push(AbiParam::new(t));
+            }
+            s1.returns.push(AbiParam::new(I64));
+            let r1 = b.import_signature(s1);
+            let lookup_thunk = b.ins().iconst(I64, lower.setjmp.lookup_thunk);
+            let rt_addr = b.ins().iconst(I64, lower.setjmp.rt_addr);
+            let c1 = b
+                .ins()
+                .call_indirect(r1, lookup_thunk, &[rt_addr, bufv, trap_out]);
+            let slot = b.inst_results(c1)[0];
+            emit_trap_propagate(b, lower); // bail on a miss (forged/stale token) before `_longjmp`
+                                           // _longjmp(slot, val) — inline, noreturn.
+            let mut s2 = module.make_signature();
+            s2.params.push(AbiParam::new(I64));
+            s2.params.push(AbiParam::new(I32));
+            let r2 = b.import_signature(s2);
+            let longjmp_fn = b.ins().iconst(I64, lower.setjmp.longjmp_addr);
+            b.ins().call_indirect(r2, longjmp_fn, &[slot, valv]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §12 per-vCPU TLS register: baked thunks over a per-OS-thread word (no window/trap context —
+        // a pure thread-local access that cannot fault). `get` reads the *current* vCPU's word, so it
+        // is correct after a fiber migrates here.
+        if let Inst::VcpuTlsGet = inst {
+            let mut tsig = module.make_signature();
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, vcpu_tls::get as *const () as i64);
+            let call = b.ins().call_indirect(tref, thunk, &[]);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §12.8 4A.5 durable-runtime-internal: read the current context's shadow-region base from the
+        // per-OS-thread register (a baked thunk, like `vcpu.tls.get`; cannot fault, no window/trap
+        // context). The durable transform emits this to address this context's own shadow-SP word.
+        if let Inst::DurableShadowBase = inst {
+            let mut tsig = module.make_signature();
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, durable_shadow::get as *const () as i64);
+            let call = b.ins().call_indirect(tref, thunk, &[]);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::VcpuTlsSet { val } = inst {
+            let v = get(&vals, *val)?;
+            let mut tsig = module.make_signature();
+            tsig.params.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, vcpu_tls::set as *const () as i64);
+            b.ins().call_indirect(tref, thunk, &[v]);
+            continue;
+        }
+        if let Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } = inst
+        {
+            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base,
+            // trap_out) -> i64 count. The thunk walks the live fiber stacks (runtime via the
+            // thread-local), masks each word with `payload_mask` (§GC tagged pointers; distinct from
+            // the window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
+            // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it with
+            // the same `mask`/`mapped`/`sub_base` as `mask_addr`, so a forged buffer faults (below).
+            let lo = get(&vals, *heap_lo)?;
+            let hi = get(&vals, *heap_hi)?;
+            let payload_mask = get(&vals, *mask)?;
+            let dst = get(&vals, *buf)?;
+            let cap_v = get(&vals, *cap)?;
+            let mem_base = b.use_var(lower.mem_var);
+            let maskv = b.ins().iconst(I64, lower.mask as i64);
+            let mappedv = b.ins().iconst(I64, lower.mapped as i64);
+            let subv = b.ins().iconst(I64, lower.sub_base as i64);
+            let trap_out = b.use_var(lower.trap_var);
+            let mut tsig = module.make_signature();
+            for _ in 0..10 {
+                tsig.params.push(AbiParam::new(I64));
+            }
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.fiber.roots_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[
+                    lo,
+                    hi,
+                    payload_mask,
+                    dst,
+                    cap_v,
+                    mem_base,
+                    maskv,
+                    mappedv,
+                    subv,
+                    trap_out,
+                ],
+            );
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
@@ -3054,7 +4865,9 @@ fn lower_block(
             timeout,
         } = inst
         {
-            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64) -> status:i32
+            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64, trap_out:i64) ->
+            // status:i32. `trap_out` carries the §12.8 thaw fail-closed (a re-issued wait that would
+            // park on the single worker traps `ThreadFault`); on a fresh run it is never written.
             let w = atomic_width(*ty);
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
@@ -3067,8 +4880,9 @@ fn lower_block(
             };
             let width = b.ins().iconst(I32, w as i64);
             let to = get(&vals, *timeout)?;
+            let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64] {
+            for t in [I64, I64, I64, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -3076,7 +4890,8 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, lower.thread.wait_thunk);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[sched, phys, exp, width, to]);
+                .call_indirect(tref, thunk, &[sched, phys, exp, width, to, trap_out]);
+            emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
             continue;
@@ -3167,6 +4982,11 @@ fn lower_block(
             Inst::FUn { op, a, .. } => {
                 let x = get(&vals, *a)?;
                 float_un(b, *op, x)
+            }
+            Inst::Fma { a, b: rb, c, .. } => {
+                // Scalar fused multiply-add — `a·b + c`, one rounding (matches the interp's `mul_add`).
+                let (x, y, z) = (get(&vals, *a)?, get(&vals, *rb)?, get(&vals, *c)?);
+                b.ins().fma(x, y, z)
             }
             Inst::FCmp { op, a, b: rb, .. } => {
                 let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
@@ -3307,8 +5127,331 @@ fn lower_block(
                 let r = match op {
                     VIntBinOp::Add => b.ins().iadd(x, y),
                     VIntBinOp::Sub => b.ins().isub(x, y),
+                    // x86 has no per-byte multiply (no `PMULLB`), so Cranelift can't legalize an
+                    // `imul` on `i8x16`. Emulate it: widen each half to `i16x8` and multiply (the low
+                    // byte of an `i16` product equals the low byte of the `i8` product, and that low
+                    // byte is sign-independent), mask each product to its low byte, then pack the two
+                    // halves back with unsigned-saturating narrow (every lane is ≤ 0xFF so nothing
+                    // saturates — it's an exact low-byte truncation). Matches the interp's wrapping mul.
+                    VIntBinOp::Mul if *shape == VShape::I8x16 => {
+                        let (xl, yl) = (b.ins().uwiden_low(x), b.ins().uwiden_low(y));
+                        let (xh, yh) = (b.ins().uwiden_high(x), b.ins().uwiden_high(y));
+                        let pl = b.ins().imul(xl, yl);
+                        let ph = b.ins().imul(xh, yh);
+                        let m = b.ins().iconst(I16, 0x00ff);
+                        let mask = b.ins().splat(I16X8, m);
+                        let pl = b.ins().band(pl, mask);
+                        let ph = b.ins().band(ph, mask);
+                        b.ins().unarrow(pl, ph)
+                    }
                     VIntBinOp::Mul => b.ins().imul(x, y),
+                    VIntBinOp::MinS => b.ins().smin(x, y),
+                    VIntBinOp::MinU => b.ins().umin(x, y),
+                    VIntBinOp::MaxS => b.ins().smax(x, y),
+                    VIntBinOp::MaxU => b.ins().umax(x, y),
                 };
+                vcast(b, r, I8X16)
+            }
+            Inst::VIntCmp {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Vector `icmp` yields a per-lane all-ones/all-zeros mask of the lane width — exactly
+                // the wasm/interp semantics — so this is a single instruction on the right vector type.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let cc = match op {
+                    VICmpOp::Eq => IntCC::Equal,
+                    VICmpOp::Ne => IntCC::NotEqual,
+                    VICmpOp::LtS => IntCC::SignedLessThan,
+                    VICmpOp::LtU => IntCC::UnsignedLessThan,
+                    VICmpOp::GtS => IntCC::SignedGreaterThan,
+                    VICmpOp::GtU => IntCC::UnsignedGreaterThan,
+                    VICmpOp::LeS => IntCC::SignedLessThanOrEqual,
+                    VICmpOp::LeU => IntCC::UnsignedLessThanOrEqual,
+                    VICmpOp::GeS => IntCC::SignedGreaterThanOrEqual,
+                    VICmpOp::GeU => IntCC::UnsignedGreaterThanOrEqual,
+                };
+                let r = b.ins().icmp(cc, x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VShift { shape, op, a, amt } => {
+                // One scalar shift amount, masked to the lane bit-width (the wasm rule), broadcast
+                // across the lanes by Cranelift's vector `ishl`/`ushr`/`sshr`.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let bits = (shape.lane_bytes() * 8) as i64;
+                let sh = b.ins().band_imm(get(&vals, *amt)?, bits - 1);
+                let r = match op {
+                    VShiftOp::Shl => b.ins().ishl(x, sh),
+                    VShiftOp::ShrU => b.ins().ushr(x, sh),
+                    VShiftOp::ShrS => b.ins().sshr(x, sh),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VIntUn { shape, op, a } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let r = match op {
+                    VIntUnOp::Abs => b.ins().iabs(x),
+                    VIntUnOp::Neg => b.ins().ineg(x),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VPopcnt { a } => {
+                // Canonical vectors are already I8X16, matching the op's fixed shape.
+                b.ins().popcnt(get(&vals, *a)?)
+            }
+            Inst::VAvgr { shape, a, b: rb } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = b.ins().avg_round(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VDot { a, b: rb } => {
+                // Widen each i16x8 operand to two i32x4 halves, multiply lane-wise, then
+                // horizontally add adjacent products: `iadd_pairwise([a0b0,a1b1,a2b2,a3b3],
+                // [a4b4,..]) = [a0b0+a1b1, a2b2+a3b3, a4b4+a5b5, a6b6+a7b7]` — the wasm dot result.
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
+            Inst::VDotI8 { a, b: rb } => {
+                // The i8→i16 signed dot, same shape as `VDot` one width down: widen each i8x16 to
+                // two i16x8 halves, multiply, pairwise-add. (Deterministic relaxed_dot_i8x16_i7x16_s.)
+                let x = vcast(b, get(&vals, *a)?, I8X16);
+                let y = vcast(b, get(&vals, *rb)?, I8X16);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtMul {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Widen the same (low/high, sign) half of both operands to the wide shape, then
+                // multiply lane-wise — the wasm extmul.
+                let (low, signed) = op.parts();
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let y = vcast(b, get(&vals, *rb)?, src);
+                let (wx, wy) = match (low, signed) {
+                    (true, true) => (b.ins().swiden_low(x), b.ins().swiden_low(y)),
+                    (false, true) => (b.ins().swiden_high(x), b.ins().swiden_high(y)),
+                    (true, false) => (b.ins().uwiden_low(x), b.ins().uwiden_low(y)),
+                    (false, false) => (b.ins().uwiden_high(x), b.ins().uwiden_high(y)),
+                };
+                let r = b.ins().imul(wx, wy);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtAddPairwise { shape, signed, a } => {
+                // Widen the low and high halves of the source, then pairwise-add: the two halves'
+                // pairwise sums concatenate to `out[i] = w(a[2i]) + w(a[2i+1])`.
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let (lo, hi) = if *signed {
+                    (b.ins().swiden_low(x), b.ins().swiden_high(x))
+                } else {
+                    (b.ins().uwiden_low(x), b.ins().uwiden_high(x))
+                };
+                let r = b.ins().iadd_pairwise(lo, hi);
+                vcast(b, r, I8X16)
+            }
+            Inst::VQ15MulrSat { a, b: rb } => {
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let r = b.ins().sqmul_round_sat(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VFma {
+                shape,
+                neg,
+                a,
+                b: rb,
+                c,
+            } => {
+                let ty = vec_ty(*shape);
+                let xa = vcast(b, get(&vals, *a)?, ty);
+                // `nmadd` is `−a·b + c`: negate the product by negating `a`.
+                let x = if *neg { b.ins().fneg(xa) } else { xa };
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let z = vcast(b, get(&vals, *c)?, ty);
+                let r = b.ins().fma(x, y, z);
+                vcast(b, r, I8X16)
+            }
+            Inst::VSatBin {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = match op {
+                    VSatBinOp::AddS => b.ins().sadd_sat(x, y),
+                    VSatBinOp::AddU => b.ins().uadd_sat(x, y),
+                    VSatBinOp::SubS => b.ins().ssub_sat(x, y),
+                    VSatBinOp::SubU => b.ins().usub_sat(x, y),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VWiden { shape, op, a } => {
+                // The source is the half-width shape; widen low/high → the wide result.
+                let src_ty = vec_ty(shape.narrower().expect("verifier ensures a narrower shape"));
+                let x = vcast(b, get(&vals, *a)?, src_ty);
+                let (low, signed) = op.parts();
+                let r = match (low, signed) {
+                    (true, true) => b.ins().swiden_low(x),
+                    (false, true) => b.ins().swiden_high(x),
+                    (true, false) => b.ins().uwiden_low(x),
+                    (false, false) => b.ins().uwiden_high(x),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VNarrow {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // The sources are the wider shape; `snarrow`/`unarrow` saturate `a`'s lanes then
+                // `b`'s into the narrow result.
+                let src_ty = vec_ty(shape.wider().expect("verifier ensures a wider source"));
+                let x = vcast(b, get(&vals, *a)?, src_ty);
+                let y = vcast(b, get(&vals, *rb)?, src_ty);
+                let r = match op {
+                    VNarrowOp::S => b.ins().snarrow(x, y),
+                    VNarrowOp::U => b.ins().unarrow(x, y),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VConvert { op, a } => {
+                let raw = get(&vals, *a)?;
+                let r = match op {
+                    VCvtOp::F32x4ConvertI32x4S => {
+                        let x = vcast(b, raw, I32X4);
+                        b.ins().fcvt_from_sint(F32X4, x)
+                    }
+                    VCvtOp::F32x4ConvertI32x4U => {
+                        let x = vcast(b, raw, I32X4);
+                        b.ins().fcvt_from_uint(F32X4, x)
+                    }
+                    VCvtOp::I32x4TruncSatF32x4S => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fcvt_to_sint_sat(I32X4, x)
+                    }
+                    VCvtOp::I32x4TruncSatF32x4U => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fcvt_to_uint_sat(I32X4, x)
+                    }
+                    VCvtOp::F32x4DemoteF64x2Zero => {
+                        let x = vcast(b, raw, F64X2);
+                        b.ins().fvdemote(x)
+                    }
+                    VCvtOp::F64x2PromoteLowF32x4 => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fvpromote_low(x)
+                    }
+                    // Lane-count changes (2↔4). Widen/narrow through the i64x2 intermediate, the
+                    // same recipe Cranelift's own wasm frontend uses.
+                    VCvtOp::F64x2ConvertLowI32x4S => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().swiden_low(x); // low 2 i32 → i64x2
+                        b.ins().fcvt_from_sint(F64X2, w)
+                    }
+                    VCvtOp::F64x2ConvertLowI32x4U => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().uwiden_low(x); // low 2 u32 → i64x2
+                        b.ins().fcvt_from_uint(F64X2, w)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2SZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_sint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        // snarrow packs [conv | zero] → i32x4: low 2 lanes = conv, high 2 = 0.
+                        b.ins().snarrow(conv, zero)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2UZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_uint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        b.ins().uunarrow(conv, zero)
+                    }
+                };
+                vcast(b, r, I8X16)
+            }
+            // Boolean reductions → an `i32`. `vany_true`/`vall_true` yield an `I8` bool (zero/one),
+            // widened to `i32`; `vhigh_bits` produces the bitmask directly into an `i32`.
+            Inst::VAnyTrue { a } => {
+                let x = get(&vals, *a)?; // shape-agnostic; the canonical I8X16 view is fine
+                let t = b.ins().vany_true(x);
+                b.ins().uextend(I32, t)
+            }
+            Inst::VAllTrue { shape, a } => {
+                let x = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                let t = b.ins().vall_true(x);
+                b.ins().uextend(I32, t)
+            }
+            Inst::VBitmask { shape, a } => {
+                let x = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                b.ins().vhigh_bits(I32, x)
+            }
+            Inst::VFloatCmp {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Vector `fcmp` yields a per-lane all-ones/all-zeros mask — the wasm/interp semantics.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let cc = match op {
+                    VFCmpOp::Eq => FloatCC::Equal,
+                    VFCmpOp::Ne => FloatCC::NotEqual,
+                    VFCmpOp::Lt => FloatCC::LessThan,
+                    VFCmpOp::Gt => FloatCC::GreaterThan,
+                    VFCmpOp::Le => FloatCC::LessThanOrEqual,
+                    VFCmpOp::Ge => FloatCC::GreaterThanOrEqual,
+                };
+                let r = b.ins().fcmp(cc, x, y);
                 vcast(b, r, I8X16)
             }
             Inst::VFloatBin {
@@ -3330,6 +5473,29 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, ty);
                 let r = float_un(b, vf_un(*op), x);
                 vcast(b, r, I8X16)
+            }
+            Inst::VPMinMax {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // pmin(a,b) = b < a ? b : a ; pmax(a,b) = a < b ? b : a.
+                // Both select the second operand `b` where a one-sided `<` holds — only the
+                // compare operand order differs. `fcmp` yields the lane mask (`I32X4`/`I64X2`),
+                // which we blend in the canonical `I8X16` domain so `bitselect`'s three args
+                // share a type. This matches the interp's NaN/-0 propagation (no IEEE min/max).
+                let ty = vec_ty(*shape);
+                let xc = get(&vals, *a)?;
+                let yc = get(&vals, *rb)?;
+                let x = vcast(b, xc, ty);
+                let y = vcast(b, yc, ty);
+                let mask = match op {
+                    VPMinMaxOp::Pmin => b.ins().fcmp(FloatCC::LessThan, y, x),
+                    VPMinMaxOp::Pmax => b.ins().fcmp(FloatCC::LessThan, x, y),
+                };
+                let m = vcast(b, mask, I8X16);
+                b.ins().bitselect(m, yc, xc)
             }
             Inst::VBitBin { op, a, b: rb } => {
                 // Whole-vector — operate on the canonical I8X16 directly.
@@ -3468,6 +5634,22 @@ fn lower_block(
         ubs.push(u);
     }
 
+    // W5 JIT/DWARF Stage 3a: now that this block's value map is fully populated, stamp the CLIF
+    // values backing source variables with their `ValueLabel`, so Cranelift records the
+    // machine-location ranges (`value_labels_ranges`) `compile` reads back. `set_val_label` is inert
+    // unless `collect_debug_info` was enabled (it is, exactly when `var_labels` is `Some`), so
+    // non-`-g` codegen is untouched. The label association drives liveness-based range computation;
+    // the block-local `value` index maps straight onto `vals`.
+    if let Some(map) = lower.var_labels {
+        if let Some(points) = map.get(&(lower.func_idx, block_idx as u32)) {
+            for &(value, label) in points {
+                if let Some(&v) = vals.get(value as usize) {
+                    b.set_val_label(v, ValueLabel::from_u32(label));
+                }
+            }
+        }
+    }
+
     match &blk.term {
         Terminator::Br { target, args } => {
             let ba = map_args(&vals, args)?;
@@ -3519,18 +5701,35 @@ fn lower_block(
             b.ins().br_table(index, jt);
         }
         Terminator::Return(outs) => {
-            // Natural ABI: return the result values directly (CLIF multi-return).
             let rets: Vec<Value> = outs
                 .iter()
                 .map(|o| get(&vals, *o))
                 .collect::<Result<_, _>>()?;
-            b.ins().return_(&rets);
+            if let Some(sret_var) = lower.sret_var {
+                // sret ABI: write each result into the caller-provided return-area (8-byte slots,
+                // `encode_slot`-encoded like the buffer ABI), then return void.
+                let ptr = b.use_var(sret_var);
+                for (i, r) in rets.iter().enumerate() {
+                    let slot = encode_slot(b, *r);
+                    b.ins()
+                        .store(MemFlags::trusted(), slot, ptr, (i * 8) as i32);
+                }
+                b.ins().return_(&[]);
+            } else {
+                // Natural ABI: return the result values directly (CLIF multi-return).
+                b.ins().return_(&rets);
+            }
         }
         Terminator::ReturnCall { func, args } => {
             // Tail call (§3b): replace this frame with the callee, threading the context.
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
             let callee = module.declare_func_in_func(callee_id, b.func);
             let mut cargs = ctx_args(b, lower);
+            // The tail callee shares this function's result type (verifier-enforced), so its sret-ness
+            // matches ours: when we return via sret, forward our own return-area pointer.
+            if let Some(sret_var) = lower.sret_var {
+                cargs.push(b.use_var(sret_var));
+            }
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
@@ -3541,6 +5740,11 @@ fn lower_block(
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
+            // `ty.results` equals this function's results (tail-call contract), so sret-ness matches:
+            // forward our return-area pointer when we return via sret.
+            if let Some(sret_var) = lower.sret_var {
+                cargs.push(b.use_var(sret_var));
+            }
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
@@ -3563,6 +5767,48 @@ fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
     ]
 }
 
+/// For a callee whose `results` use the sret ABI ([`uses_sret`]), allocate a stack **return-area**,
+/// push its address onto `cargs` (right after the context pointers, before the user args — the order
+/// [`sig_from`] lays out), and return the slot; else push nothing and return `None`.
+fn sret_call_slot(
+    b: &mut FunctionBuilder,
+    cargs: &mut Vec<Value>,
+    results: &[ValType],
+) -> Option<cranelift_codegen::ir::StackSlot> {
+    if !uses_sret(results) {
+        return None;
+    }
+    let ss = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        (results.len() * 8) as u32,
+        3, // 8-byte aligned slots
+    ));
+    let addr = b.ins().stack_addr(I64, ss, 0);
+    cargs.push(addr);
+    Some(ss)
+}
+
+/// Append a call's results to `vals`: from registers ([`FunctionBuilder::inst_results`]) on the
+/// normal path, or by loading the sret return-area's 8-byte slots ([`decode_slot`]-encoded, matching
+/// the storing `Return`) on the sret path.
+fn read_call_results(
+    b: &mut FunctionBuilder,
+    call: cranelift_codegen::ir::Inst,
+    sret: Option<cranelift_codegen::ir::StackSlot>,
+    results: &[ValType],
+    vals: &mut Vec<Value>,
+) {
+    match sret {
+        None => vals.extend_from_slice(b.inst_results(call)),
+        Some(ss) => {
+            for (i, r) in results.iter().enumerate() {
+                let raw = b.ins().stack_load(I64, ss, (i * 8) as i32);
+                vals.push(decode_slot(b, raw, *r));
+            }
+        }
+    }
+}
+
 /// Lower a trap (§5 detect-and-kill): store the kind code into the host trap cell, then
 /// `return` dummy zero results so the run unwinds to the trampoline, which reports the
 /// trap. (The reference JIT detects traps this way; production uses hardware faults.)
@@ -3571,11 +5817,36 @@ fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
 /// every trap in the entry function (or its dispatch), so that suffices; propagating a
 /// trap *out of a callee* would need a post-call check, added when a case needs it.
 fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
+    // §5 W3 Stage 2: record a source backtrace for this explicit trap *before* it unwinds — the trap
+    // stores its kind and returns, and that return propagates up tearing down every guest frame, so
+    // the helper must walk the frame-pointer chain from this live site now. The current op's
+    // `SourceLoc` is in effect, so the call inherits it and symbolizes to the trapping op's line.
+    // Only present under `-g` (else the backtrace would be empty); the trap path is otherwise
+    // unchanged.
+    if let Some((sigref, addr)) = lower.trap_capture {
+        // Pass the trapping function's frame pointer so the helper can walk the caller chain without
+        // `__builtin_frame_address` (which MSVC lacks); it pairs `fp` with its own return address (the
+        // trap site) for the innermost frame.
+        let fp = b.ins().get_frame_pointer(I64);
+        let helper = b.ins().iconst(I64, addr);
+        b.ins().call_indirect(sigref, helper, &[fp]);
+    }
     let cell = b.use_var(lower.trap_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
     b.ins().store(MemFlags::trusted(), code, cell, 0);
-    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
-    b.ins().return_(&zeros);
+    emit_trap_return(b, lower);
+}
+
+/// Emit the function `return` on a trap / early-exit path: **void** for an sret function (its results
+/// flow through the return-area pointer, left unwritten — the trap cell is set, so the caller returns
+/// before reading them), else dummy zeros of the result types (the register-ABI convention).
+fn emit_trap_return(b: &mut FunctionBuilder, lower: &Lower) {
+    if lower.sret_var.is_some() {
+        b.ins().return_(&[]);
+    } else {
+        let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
+        b.ins().return_(&zeros);
+    }
 }
 
 /// Emit the §5 fuel/epoch **kill-path** check: if the host has set the interrupt cell non-zero
@@ -3665,8 +5936,7 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     b.ins().brif(trapped, trapret, &[], cont, &[]);
     b.switch_to_block(trapret);
     b.seal_block(trapret);
-    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
-    b.ins().return_(&zeros);
+    emit_trap_return(b, lower);
     b.switch_to_block(cont);
     b.seal_block(cont);
 }
@@ -4205,7 +6475,7 @@ fn guard_atomic_align(b: &mut FunctionBuilder, lower: &Lower, phys: Value, width
 /// Decode an `i64` calling-convention slot to a value of IR type `ty`.
 fn decode_slot(b: &mut FunctionBuilder, slot: Value, ty: ValType) -> Value {
     match ty {
-        ValType::I64 => slot,
+        ValType::I64 | ValType::Ref => slot, // `ref` is an opaque i64 in the cap ABI
         ValType::I32 => b.ins().ireduce(I32, slot),
         ValType::F32 => {
             let i = b.ins().ireduce(I32, slot);
@@ -4252,6 +6522,10 @@ fn vf_un(op: VFloatUnOp) -> FUnOp {
         VFloatUnOp::Abs => FUnOp::Abs,
         VFloatUnOp::Neg => FUnOp::Neg,
         VFloatUnOp::Sqrt => FUnOp::Sqrt,
+        VFloatUnOp::Ceil => FUnOp::Ceil,
+        VFloatUnOp::Floor => FUnOp::Floor,
+        VFloatUnOp::Trunc => FUnOp::Trunc,
+        VFloatUnOp::Nearest => FUnOp::Nearest,
     }
 }
 

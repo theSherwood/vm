@@ -32,6 +32,8 @@ enum Prot {
     Rw,
     /// Read-only (the D40 const data segment; a later write faults).
     Ro,
+    /// Inaccessible — any access faults into the guard (a durable-restored `Unmapped` page).
+    None,
 }
 
 #[inline]
@@ -186,6 +188,20 @@ impl GuestWindow {
         unsafe { pal::protect(self.base.add(start), end - start, Prot::Ro) };
     }
 
+    /// Map the whole pages touched by `[offset, offset+len)` **inaccessible** — a durable-restored
+    /// `Unmapped` page (DURABILITY.md §12.3): any later access faults into the guarded range,
+    /// exactly as on the frozen guest. The snapshot's `read_low` re-commits it RW before reading.
+    pub(crate) fn protect_none(&self, offset: u64, len: u64) {
+        if self.mapped == 0 || len == 0 {
+            return;
+        }
+        let page = pal::page_size();
+        let start = (offset as usize / page) * page;
+        let end = round_up((offset + len) as usize, page);
+        // SAFETY: as `protect_ro` — `[base+start, base+end)` is within the backed region.
+        unsafe { pal::protect(self.base.add(start), end - start, Prot::None) };
+    }
+
     /// The address range a fault must land in to be attributed to this window (the whole
     /// reservation, so the inaccessible tail + guard page are covered). `(0, 0)` when there is no
     /// window.
@@ -233,6 +249,18 @@ pub(crate) unsafe fn run_guarded(
 #[cfg(fiber_rt)]
 pub(crate) fn install_guard() {
     pal::install_guard();
+}
+
+/// The trap stack the guard handler captured at the most recent caught memory fault on this thread,
+/// read-and-cleared (§5 W3 trap-time backtrace): the faulting `pc` and the frame-pointer chain's raw
+/// return addresses (the handler walked them while the guest stack was intact). `None` if nothing
+/// was captured (no fault since the last take, or an arch the handler doesn't decode). The host
+/// symbolizes them via [`CompiledModule::trap_backtrace`].
+/// Returns `(faulting pc, return-address chain, fiber handle)` — the fiber handle is the guest fiber
+/// that was running when the trap fired (per-fiber attribution, §5 W3 / §23-D57), or `-1` for the root
+/// computation (no fiber).
+pub(crate) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
+    pal::take_trap_frame()
 }
 
 /// Run an `Entry`-shaped `code` with faults in `[lo, hi)` caught (detect-and-kill), for a window
@@ -432,6 +460,23 @@ mod pal {
             lo: usize,
             hi: usize,
         ) -> i32;
+        fn svm_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
+        fn svm_take_trap_fiber() -> i64;
+    }
+
+    /// Read and clear the trap stack the SIGSEGV/SIGBUS handler captured at the most recent caught
+    /// guard fault (§5 W3 trap-time backtrace): the faulting `pc`, the frame-pointer chain's raw
+    /// return addresses, and the fiber running at the trap (§23-D57; `-1` = root). `None` if none was
+    /// captured. Must match `SVM_TRAP_MAXFRAMES` in the shim.
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
+        const MAX: usize = 64;
+        let mut pc = 0usize;
+        let mut rets = [0usize; MAX];
+        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot `rets` buffer; the
+        // fiber pairs with the same capture (read right after, before any other trap can overwrite it).
+        let n = unsafe { svm_take_trap_frame(&mut pc, rets.as_mut_ptr(), MAX as i32) };
+        let fiber = unsafe { svm_take_trap_fiber() };
+        (n >= 0).then(|| (pc, rets[..n as usize].to_vec(), fiber))
     }
 
     pub(super) fn page_size() -> usize {
@@ -482,6 +527,7 @@ mod pal {
         let p = match prot {
             Prot::Rw => libc::PROT_READ | libc::PROT_WRITE,
             Prot::Ro => libc::PROT_READ,
+            Prot::None => libc::PROT_NONE,
         };
         libc::mprotect(base as *mut c_void, len, p);
     }
@@ -691,6 +737,7 @@ mod pal {
         let flags: PAGE_PROTECTION_FLAGS = match prot {
             Prot::Rw => PAGE_READWRITE,
             Prot::Ro => PAGE_READONLY,
+            Prot::None => PAGE_NOACCESS,
         };
         let mut old: PAGE_PROTECTION_FLAGS = 0;
         VirtualProtect(base as *const c_void, len, flags, &mut old);
@@ -767,6 +814,71 @@ mod pal {
         static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
         // Set by the VEH before it restores the context, read after RtlCaptureContext returns.
         static TRIPPED: Cell<bool> = const { Cell::new(false) };
+        // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
+        // captures from the access-violation `CONTEXT` *before* it overwrites that context with the
+        // recovery one. Read + cleared by `take_trap_frame`. A fixed buffer (no allocation in the VEH).
+        static TRAP_VALID: Cell<bool> = const { Cell::new(false) };
+        static TRAP_PC: Cell<usize> = const { Cell::new(0) };
+        static TRAP_RETS: Cell<[usize; TRAP_MAXFRAMES]> = const { Cell::new([0; TRAP_MAXFRAMES]) };
+        static TRAP_N: Cell<usize> = const { Cell::new(0) };
+        // Per-fiber attribution (§5 W3 / §23-D57): the fiber running when the fault fired, snapshotted
+        // in the VEH (the C current-fiber TLS the fiber runtime maintains). `-1` = root (no fiber).
+        static TRAP_FIBER: Cell<i64> = const { Cell::new(-1) };
+    }
+
+    /// Max trap-backtrace frames captured (matches the unix shim's `SVM_TRAP_MAXFRAMES`).
+    const TRAP_MAXFRAMES: usize = 64;
+
+    /// Walk the frame-pointer chain from `fp` into `out`, returning the count — the Rust analog of the
+    /// unix shim's `svm_walk_fp_chain` (DEBUGGING.md §5/W3). The JIT's `preserve_frame_pointers` gives
+    /// every guest frame a `{ saved_fp, ret_addr }` record (`*fp` = caller's saved fp, `*(fp+1)` = its
+    /// return address). Bounded — aligned, non-null, strictly-increasing links, a span backstop, the
+    /// frame cap — so a corrupt chain terminates instead of looping or reading wild memory.
+    ///
+    /// # Safety
+    /// `fp` must be a live frame pointer of guest JIT code (the faulting `CONTEXT`'s `Rbp`); reads the
+    /// intact-at-fault guest stack. Called only from the VEH, before anything unwinds.
+    unsafe fn walk_fp_chain(fp: usize, out: &mut [usize; TRAP_MAXFRAMES]) -> usize {
+        const SPAN: usize = 8 * 1024 * 1024; // don't chase a corrupt chain off the stack
+        let align = core::mem::size_of::<usize>() - 1;
+        let (mut cur, start) = (fp, fp);
+        let mut n = 0;
+        while n < TRAP_MAXFRAMES
+            && cur != 0
+            && cur & align == 0
+            && cur >= start
+            && cur - start < SPAN
+        {
+            let next = *(cur as *const usize);
+            let ret = *((cur + core::mem::size_of::<usize>()) as *const usize);
+            out[n] = ret;
+            n += 1;
+            if next <= cur {
+                break; // frame pointers grow toward the base; a non-increasing link is the end
+            }
+            cur = next;
+        }
+        n
+    }
+
+    /// Capture the trap-time backtrace from the faulting `CONTEXT` (§5/W3): the faulting `Rip` is the
+    /// innermost frame (symbolized directly by the host), and the `Rbp` chain gives the callers. Called
+    /// from the VEH while the guest stack is still intact, before the recovery context is restored.
+    ///
+    /// # Safety
+    /// `ctx` is the live faulting context for an in-window access violation in guest JIT code.
+    unsafe fn capture_trap_frame(ctx: &CONTEXT) {
+        let mut rets = [0usize; TRAP_MAXFRAMES];
+        let n = walk_fp_chain(ctx.Rbp as usize, &mut rets);
+        TRAP_PC.with(|c| c.set(ctx.Rip as usize));
+        TRAP_RETS.with(|c| c.set(rets));
+        TRAP_N.with(|c| c.set(n));
+        // Snapshot the running fiber at fault time (the C trap-capture TLS the fiber runtime maintains).
+        extern "C" {
+            fn svm_current_fiber() -> i64;
+        }
+        TRAP_FIBER.with(|c| c.set(unsafe { svm_current_fiber() }));
+        TRAP_VALID.with(|c| c.set(true));
     }
 
     #[cfg(fiber_rt)]
@@ -798,6 +910,9 @@ mod pal {
             if let Some(f) = GUARD.with(|g| g.get()) {
                 if addr >= f.lo && addr < f.hi {
                     TRIPPED.with(|t| t.set(true));
+                    // §5 W3: capture the trap-time backtrace from the faulting context *before* the
+                    // `copy_nonoverlapping` below overwrites it with the recovery context.
+                    capture_trap_frame(&*ep.ContextRecord);
                     // Restore the captured context → resume right after RtlCaptureContext in
                     // `run_guarded` (the unix siglongjmp analogue). The abandoned JIT frames hold no
                     // Rust destructors.
@@ -837,6 +952,34 @@ mod pal {
             let h = unsafe { AddVectoredExceptionHandler(1, Some(veh)) };
             assert!(!h.is_null(), "svm-jit: AddVectoredExceptionHandler failed");
         });
+    }
+
+    /// Read and clear the most recent caught trap's stack (§5/W3): the faulting `pc` + the
+    /// frame-pointer chain's return addresses. Two capture paths feed it on Windows — a **memory
+    /// fault** lands in the VEH (Rust thread-local, above), and an **explicit-check trap** (div-by-zero
+    /// etc.) lands in the shared `trap_capture.c` helper (its C thread-local, `svm_take_trap_frame`).
+    /// A run trips at most one, so check the Rust capture first and fall back to the C one. `None` if
+    /// neither captured.
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
+        if TRAP_VALID.with(|c| c.get()) {
+            TRAP_VALID.with(|c| c.set(false));
+            let pc = TRAP_PC.with(|c| c.get());
+            let n = TRAP_N.with(|c| c.get());
+            let rets = TRAP_RETS.with(|c| c.get());
+            let fiber = TRAP_FIBER.with(|c| c.get());
+            return Some((pc, rets[..n].to_vec(), fiber));
+        }
+        // Explicit-check trap: the C helper (`trap_capture.c`) stashed it in its own thread-local.
+        extern "C" {
+            fn svm_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
+            fn svm_take_trap_fiber() -> i64;
+        }
+        const MAX: usize = 64;
+        let (mut pc, mut rets) = (0usize, [0usize; MAX]);
+        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot buffer.
+        let n = unsafe { svm_take_trap_frame(&mut pc, rets.as_mut_ptr(), MAX as i32) };
+        let fiber = unsafe { svm_take_trap_fiber() };
+        (n >= 0).then(|| (pc, rets[..n as usize].to_vec(), fiber))
     }
 
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
@@ -919,6 +1062,9 @@ mod pal {
         _hi: usize,
     ) -> bool {
         false
+    }
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
+        None
     }
 }
 

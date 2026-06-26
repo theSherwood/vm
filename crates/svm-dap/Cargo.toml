@@ -1,0 +1,25 @@
+[package]
+name = "svm-dap"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Interpreter-backed Debug Adapter Protocol server (DEBUGGING.md W5): a thin translation of DAP
+# requests onto the `svm-interp` `Inspector`, so an editor (VS Code) sets source breakpoints and
+# inspects source variables while the interpreter is the stepping engine — no DWARF, no JIT. JSON
+# is hand-rolled (no serde), matching the workspace's minimal-dependency, escape-TCB-light ethos.
+
+[lib]
+name = "svm_dap"
+path = "src/lib.rs"
+
+[dependencies]
+svm-ir.workspace = true
+svm-text.workspace = true
+svm-interp.workspace = true
+
+[[bin]]
+name = "svm-dap"
+path = "src/main.rs"

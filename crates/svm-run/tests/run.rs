@@ -126,6 +126,108 @@ fn demo(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Run a demo through the `svm-run` binary with a hard wall-clock timeout, so the rare
+/// work-stealing **wedge** (ISSUES.md I7 — a liveness flake in the guest scheduler / fiber-steal
+/// path, seen once on Linux CI where it hung the job for >1 h) fails *fast* with a captured thread
+/// dump instead of blocking CI for hours. Two layers:
+///   1. `SVM_DEADLINE_MS` arms the §5 detect-and-kill, so a *guest-side* wedge — a spinning **or**
+///      futex-parked worker (`KILL_RECHECK` wakes a parked vCPU) — is unwound and the process exits
+///      non-zero with the runner's own kill diagnostic.
+///   2. A host-side process timeout is the backstop for any stall the guest kill can't reach: on
+///      expiry it best-effort dumps every thread's backtrace (`gdb -p` — the exact root-cause data
+///      I7 asks for) and then SIGKILLs the child.
+///
+/// A healthy demo finishes in milliseconds, far under either bound, so this never trips normally.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn run_demo_failfast(rel: &str) -> std::process::Output {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    // A wedge is pathological; a healthy run is ~milliseconds. The guest deadline sits well inside
+    // the process timeout so a guest-side wedge fails with the graceful kill message before the
+    // hard backstop fires.
+    const GUEST_DEADLINE_MS: u64 = 30_000;
+    const HARD_TIMEOUT: Duration = Duration::from_secs(90);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(demo(rel))
+        .env("SVM_DEADLINE_MS", GUEST_DEADLINE_MS.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn svm-run");
+    let pid = child.id();
+
+    // Drain the pipes on their own threads so a chatty child can't deadlock on a full pipe buffer.
+    let mut so = child.stdout.take().expect("stdout pipe");
+    let mut se = child.stderr.take().expect("stderr pipe");
+    let h_out = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = so.read_to_end(&mut v);
+        v
+    });
+    let h_err = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = se.read_to_end(&mut v);
+        v
+    });
+
+    // Wait for exit on a helper thread; the main thread enforces the timeout, keeping the ability to
+    // SIGKILL the child by pid if it wedges (a moved-in `Child::wait` would surrender that).
+    let (tx, rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+
+    match rx.recv_timeout(HARD_TIMEOUT) {
+        Ok(status) => {
+            let status = status.expect("wait svm-run");
+            let stdout = h_out.join().expect("join stdout reader");
+            let stderr = h_err.join().expect("join stderr reader");
+            let _ = waiter.join();
+            std::process::Output {
+                status,
+                stdout,
+                stderr,
+            }
+        }
+        Err(_) => {
+            // Wedged. Capture every thread's backtrace before killing — the root-cause data I7 asks
+            // for ("attach gdb and dump all thread backtraces"). Best-effort: gdb may be absent or
+            // ptrace-restricted on a given runner, in which case we still SIGKILL and fail.
+            match Command::new("gdb")
+                .args([
+                    "-p",
+                    &pid.to_string(),
+                    "-batch",
+                    "-nx",
+                    "-ex",
+                    "set pagination off",
+                    "-ex",
+                    "info threads",
+                    "-ex",
+                    "thread apply all bt",
+                ])
+                .output()
+            {
+                Ok(o) => eprintln!(
+                    "I7 WEDGE thread dump for {rel} (pid {pid}):\n{}\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr),
+                ),
+                Err(e) => eprintln!("I7 WEDGE: gdb dump unavailable ({e}); killing pid {pid}"),
+            }
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let _ = waiter.join();
+            panic!(
+                "demo {rel} WEDGED (> {HARD_TIMEOUT:?}) — the ISSUES.md I7 work-stealing liveness \
+                 flake. Fail-fast tripped (this used to hang CI for hours); see the thread dump above."
+            );
+        }
+    }
+}
+
 #[test]
 fn runs_shipped_demo() {
     let src = std::fs::read_to_string(demo("hello.svm")).expect("read hello.svm");
@@ -351,6 +453,62 @@ fn deadline_kills_runaway_powerbox_guest() {
     );
 }
 
+/// §5 W3 — a trap's kill message carries the **source backtrace** when the module was built with
+/// `-g`: a powerbox guest that divides by zero is detect-and-killed, and the error names the div's
+/// `file:line:col in <fn>`. Cross-platform: the explicit-trap capture (`trap_capture.c`'s
+/// `svm_capture_explicit_trap`, threaded the trapping frame pointer via `get_frame_pointer`) runs on
+/// unix **and** windows, so the source frame is present on every target.
+#[test]
+fn trap_kill_message_carries_a_source_backtrace() {
+    let m = load(
+        "func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i32.const 0\n\
+         \x20 v4 = i32.div_s v0 v3\n\
+         \x20 return v4\n\
+         }\n\
+         debug.file 0 \"guest.c\"\n\
+         debug.fname 0 \"divide\"\n\
+         debug.loc 0 0 1 0 7 5\n",
+    );
+    let err = run_powerbox_with_deadline(&m, b"", None).expect_err("div-by-zero must be killed");
+    assert!(err.contains("DivByZero"), "names the trap kind: {err}");
+    assert!(
+        err.contains("guest.c:7:5 in divide"),
+        "the kill message carries the trap-time source backtrace + function name: {err}"
+    );
+}
+
+/// §5 W3 — a **memory-fault** kill message carries the source backtrace on **every** platform: the
+/// capture is the SIGSEGV/SIGBUS handler on unix and the Vectored Exception Handler on Windows, so an
+/// out-of-bounds store that the §5 guard catches names the store's `file:line` cross-platform. (The
+/// explicit-check-trap path — `trap_kill_message_carries_a_source_backtrace`, div-by-zero — is
+/// unix-only; see ISSUES I3.) An 8-byte store at 65532 in a 64 KiB window overruns into the guard.
+#[test]
+fn memfault_kill_message_carries_a_source_backtrace() {
+    let m = load(
+        "memory 16\n\
+         func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i64.const 65532\n\
+         \x20 v4 = i64.const 0\n\
+         \x20 i64.store v3 v4\n\
+         \x20 v5 = i32.const 0\n\
+         \x20 return v5\n\
+         }\n\
+         debug.file 0 \"mem.c\"\n\
+         debug.fname 0 \"store_oob\"\n\
+         debug.loc 0 0 2 0 9 5\n",
+    );
+    let err = run_powerbox_with_deadline(&m, b"", None)
+        .expect_err("the overrun must be detect-and-killed");
+    assert!(err.contains("MemoryFault"), "names the trap kind: {err}");
+    assert!(
+        err.contains("mem.c:9:5 in store_oob"),
+        "the kill message carries the trap-time source backtrace + function name: {err}"
+    );
+}
+
 /// Arming the kill-path must not penalize a well-behaved guest: a fast program finishes normally —
 /// and *quickly* — because the watchdog wakes the instant the run completes (it never blocks the
 /// full deadline).
@@ -453,10 +611,9 @@ fn cli_deadline_kills_runaway_c_program() {
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn demo_mn_scheduler_runs() {
-    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
-        .arg(demo("mn_sched/mn_sched.c"))
-        .output()
-        .expect("spawn svm-run");
+    // Fail-fast like the work-stealing siblings (ISSUES.md I7): a threaded/fiber scheduler is the
+    // same wedge class, so don't let a hang block on a bare unbounded `.output()`.
+    let out = run_demo_failfast("mn_sched/mn_sched.c");
     let err = String::from_utf8_lossy(&out.stderr);
     if err.contains("chibicc") {
         eprintln!(
@@ -476,10 +633,7 @@ fn demo_mn_scheduler_runs() {
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn demo_work_stealing_runs() {
-    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
-        .arg(demo("work_stealing/work_stealing.c"))
-        .output()
-        .expect("spawn svm-run");
+    let out = run_demo_failfast("work_stealing/work_stealing.c");
     let err = String::from_utf8_lossy(&out.stderr);
     if err.contains("chibicc") {
         eprintln!(
@@ -505,10 +659,7 @@ fn demo_work_stealing_runs() {
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn demo_steal_fibers_runs() {
-    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
-        .arg(demo("steal_fibers/steal_fibers.c"))
-        .output()
-        .expect("spawn svm-run");
+    let out = run_demo_failfast("steal_fibers/steal_fibers.c");
     let err = String::from_utf8_lossy(&out.stderr);
     if err.contains("chibicc") {
         eprintln!(

@@ -22,8 +22,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_scheduled, run_with_host, Host, StreamRole, Trap, Value};
-use svm_ir::ValType;
+use svm_interp::{
+    run_scheduled, run_with_host, Host, Inspector, IrPc, StreamRole, Trap, Value, VarValue,
+};
 use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
 use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
 use svm_text::parse_module as parse_module_raw;
@@ -47,6 +48,7 @@ fn to_slot(v: Value) -> i64 {
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x as i64,
     }
 }
 
@@ -121,6 +123,33 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
+/// Like [`c_to_ir`] but with `-g`: emit the debug-info section (and, as `-Og`, disable SSA
+/// promotion so locals keep stable window slots — DEBUGGING.md §6/W6).
+fn c_to_ir_g(src: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("svm_cfeg_{}_{id}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let irfile = base.with_extension("svm");
+    std::fs::write(&cfile, src).unwrap();
+    let status = Command::new(chibicc())
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "-g",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run chibicc");
+    assert!(status.success(), "chibicc -g failed on:\n{src}");
+    std::fs::read_to_string(&irfile).unwrap()
+}
+
 /// Count `Load`/`Store` instructions that live **outside each function's entry block**
 /// (`blocks[0]`). The frontend's one-time setup — `_start` writing globals/strings, and a
 /// function's `__va_area__`/spill prologue — all lands in entry blocks, so this isolates
@@ -153,127 +182,30 @@ struct CRun {
 /// and the JIT under identical mock powerboxes, assert they agree on the outcome *and* the
 /// observable host effects (stdout/stderr), and return both. So every C test is also a JIT
 /// differential test, capability effects included.
+///
+/// Driven through the public, frontend-independent embedding API (F1): [`svm_run::instantiate`]
+/// resolves + verifies (the resolve is a no-op here — [`parse_module`] already lowered the §7
+/// imports), and [`svm_run::Instance::run_diff`] runs `_start` on the tree-walker *and* the JIT under
+/// the fixed §3e powerbox and asserts they agree (results, stdout, stderr) — the same grant/compile/run
+/// core the CLI (`run_powerbox`) and embedders use, including the concurrent-guest `Mutex<Host>` path
+/// and the guest-driven `Jit` capability. A divergence/trap surfaces as an `Err`, re-panicked with the
+/// C source + IR for a legible failure.
 fn run_c_full(src: &str) -> CRun {
     let ir = c_to_ir(src);
     let m =
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
-    verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
-
-    // `_start(stdout, stdin, exit, memory, addrspace)` takes the powerbox handles. Grant them
-    // identically on both hosts (grants are deterministic, so the handle values match). The
-    // AddressSpace (§14) spans the whole declared window; the region factory backs guest-minted
-    // regions (`__vm_region_create`) with real OS shared memory so the JIT can `map` them.
-    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    let grant = |h: &mut Host| powerbox(h, win, std::time::Duration::ZERO);
-    let args = grant(&mut hi);
-    assert_eq!(args, grant(&mut hj), "grants are deterministic");
-
-    let mut fuel = 50_000_000u64;
-    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    // The long-lived compile→run split, with the live module registered so the guest-driven
-    // `Jit` capability (the `__vm_jit_*` builtins) works under the JIT backend too — for a
-    // guest that never uses it, behavior-identical to the one-shot `compile_and_run_with_host`.
-    //
-    // A **concurrent** guest (worker `cap.call`s — incl. threaded `Jit.compile`) takes the serialized
-    // `cap_thunk_locked` over a per-domain `Mutex<Host>` so its workers don't race on the `Host`,
-    // mirroring `run_powerbox` / `jit_cap::diff_run_t`; a single-threaded guest keeps the unlocked
-    // raw-`*mut Host` fast path verbatim. The interp side already serializes `Host` access across its
-    // M:N threads, so this makes the JIT side a sound differential oracle for concurrent guests too.
-    let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
-    let jit = if concurrent {
-        let locked = std::sync::Mutex::new(std::mem::take(&mut hj));
-        let ctx = &locked as *const std::sync::Mutex<Host> as *mut c_void;
-        let mut cm = svm_jit::CompiledModule::compile(
-            &m,
-            0,
-            svm_run::cap_thunk_locked,
-            ctx,
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            None,
-            None, // no D45 fast path: it derefs a raw `*mut Host`, not a `Mutex<Host>`
-            svm_jit::Quota::default(),
-            0,
-        )
-        .expect("jit compiles");
-        locked
-            .lock()
-            .unwrap()
-            .set_jit_native_ctx(&mut cm as *mut svm_jit::CompiledModule as usize);
-        // SAFETY: `cm` is the single caller-managed module for this run (its address registered
-        // above); the guest's worker `cap.call`s serialize through `locked`; `cm` is not moved
-        // during the run (the locked thunk's `Jit` handlers re-derive `&mut *cm` under the lock).
-        let out = unsafe { svm_jit::CompiledModule::run_raw(&mut cm, &slots, None, None, None) }
-            .expect("jit runs")
-            .0;
-        locked.lock().unwrap().set_jit_native_ctx(0);
-        drop(cm); // release the baked `&locked` ctx before reclaiming the host
-        hj = locked.into_inner().unwrap();
-        out
-    } else {
-        let mut cm = svm_jit::CompiledModule::compile(
-            &m,
-            0,
-            cap_thunk,
-            &mut hj as *mut Host as *mut c_void,
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            None,
-            None,
-            svm_jit::Quota::default(),
-            0,
-        )
-        .expect("jit compiles");
-        let cm_ptr: *mut svm_jit::CompiledModule = &mut cm;
-        hj.set_jit_native_ctx(cm_ptr as usize);
-        // SAFETY: the single caller-managed pointer for this run (the thunk's `Jit` handlers
-        // re-enter through the registered copy while the guest is suspended), on this thread.
-        let out = unsafe { svm_jit::CompiledModule::run_raw(cm_ptr, &slots, None, None, None) }
-            .expect("jit runs")
-            .0;
-        hj.set_jit_native_ctx(0);
-        out
+    let inst = svm_run::instantiate(m)
+        .unwrap_or_else(|e| panic!("instantiate failed: {e}\n--- IR ---\n{ir}"));
+    let run = inst
+        .run_diff(&svm_run::RunConfig::default())
+        .unwrap_or_else(|e| panic!("interp/JIT differential failed: {e}\n{src}\n--- IR ---\n{ir}"));
+    let outcome = match run.outcome {
+        svm_run::Outcome::Returned(v) => Outcome::Returned(v),
+        svm_run::Outcome::Exited(c) => Outcome::Exited(c),
     };
-
-    let typed = |s: &[i64]| -> Vec<Value> {
-        m.funcs[0]
-            .results
-            .iter()
-            .zip(s)
-            .map(|(t, &v)| match t {
-                ValType::I32 => Value::I32(v as i32),
-                ValType::I64 => Value::I64(v),
-                ValType::F32 => Value::F32(f32::from_bits(v as u32)),
-                ValType::F64 => Value::F64(f64::from_bits(v as u64)),
-                ValType::V128 => Value::V128([0; 16]),
-            })
-            .collect()
-    };
-    let outcome = match (interp, jit) {
-        (Ok(want), JitOutcome::Returned(got)) => {
-            assert_eq!(
-                want,
-                typed(&got),
-                "interp/JIT result disagree:\n{src}\n{ir}"
-            );
-            Outcome::Returned(want)
-        }
-        (Err(Trap::Exit(want)), JitOutcome::Exited(got)) => {
-            assert_eq!(want, got, "interp/JIT exit code disagree:\n{src}");
-            Outcome::Exited(want)
-        }
-        (i, j) => panic!("interp/JIT outcome disagree for:\n{src}\ninterp={i:?} jit={j:?}\n{ir}"),
-    };
-    assert_eq!(hi.stdout, hj.stdout, "stdout differs:\n{src}");
-    assert_eq!(hi.stderr, hj.stderr, "stderr differs:\n{src}");
     CRun {
         outcome,
-        stdout: hi.stdout,
+        stdout: run.stdout,
     }
 }
 
@@ -1787,8 +1719,8 @@ fn c_ssa_promotion_eliminates_loop_body_memory_ops() {
 // Prototypes for the three intercepted fiber builtins, shared by the C tests below. A fiber
 // body is an ordinary `long f(long)`; the guest hands each fiber its own data stack.
 const FIBER_DECLS: &str = "\
-int  __vm_fiber_new(long (*f)(long), void *stack);\n\
-long __vm_fiber_resume(int k, long arg, int *done);\n\
+long __vm_fiber_new(long (*f)(long), void *stack);\n\
+long __vm_fiber_resume(long k, long arg, int *done);\n\
 long __vm_fiber_suspend(long value);\n";
 
 #[cfg(unix)]
@@ -1806,7 +1738,7 @@ fn c_fiber_generator_yields_then_returns() {
         \x20 return start + 3;\n\
         }}\n\
         int main() {{\n\
-        \x20 int k = __vm_fiber_new(counter, stack0);\n\
+        \x20 long k = __vm_fiber_new(counter, stack0);\n\
         \x20 int done = 0;\n\
         \x20 long sum = 0;\n\
         \x20 long v = __vm_fiber_resume(k, 100, &done);\n\
@@ -1834,7 +1766,7 @@ fn c_fiber_round_trips_resume_arguments() {
         \x20 return got * 2;\n\
         }}\n\
         int main() {{\n\
-        \x20 int k = __vm_fiber_new(echo, st);\n\
+        \x20 long k = __vm_fiber_new(echo, st);\n\
         \x20 int done = 0;\n\
         \x20 __vm_fiber_resume(k, 0, &done);\n\
         \x20 long r = __vm_fiber_resume(k, 77, &done);\n\
@@ -1862,8 +1794,8 @@ fn c_two_fibers_are_independent() {
         }}\n\
         int main() {{\n\
         \x20 int da = 0, db = 0;\n\
-        \x20 int a = __vm_fiber_new(acc, sa);\n\
-        \x20 int b = __vm_fiber_new(acc, sb);\n\
+        \x20 long a = __vm_fiber_new(acc, sa);\n\
+        \x20 long b = __vm_fiber_new(acc, sb);\n\
         \x20 long s = 0;\n\
         \x20 s += __vm_fiber_resume(a, 10, &da);\n\
         \x20 s += __vm_fiber_resume(b, 3, &db);\n\
@@ -1889,7 +1821,7 @@ fn c_cooperative_threads_round_robin() {
         "{FIBER_DECLS}\
         #define NT 3\n\
         static char stacks[NT][4096];\n\
-        static int  handles[NT];\n\
+        static long handles[NT];\n\
         static int  finished[NT];\n\
         static int  started[NT];\n\
         static long results[NT];\n\
@@ -2227,6 +2159,61 @@ fn c_guest_jit_demo() {
     );
 }
 
+/// Guest-side **dynamic linking** in C (DESIGN.md §22, `demos/jit/jit_link.c`): a guest emits two
+/// units — a self-contained `service` it installs, and a `client` that references the service **by
+/// name** (an unresolved import `F`) — builds a symbol table binding `"F"` to the install slot, and
+/// `__vm_jit_compile_linked`s the client against it. The host resolves the import by name and
+/// re-verifies, so the client reaches the installed service through the table: `client(5,2) = 127`.
+/// This is `vm_dlopen`/`vm_dlsym` done in guest C. `run_c_full` enforces interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_link_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_link.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.ends_with("client(5, 2) = 127  [linked by name: service(5,2)+100]\n"),
+        "the guest-linked client must reach the installed service by name on both backends:\n{out}"
+    );
+}
+
+/// The guest-side **`vm_dlopen` loader** in C (DESIGN.md §22, `demos/jit/jit_dlopen.c`): the
+/// ergonomic `vm_dlopen`/`vm_dlsym`/`vm_dlclose` library (`<vm_dl.h>` — a name→slot registry over the
+/// `Jit` cap) used to build functions that compose **by name**. The guest loads `add` and `mul`, then
+/// `poly = add(mul(a,a), b)` which imports both by name; `poly(5,2)=27`, `poly(3,4)=13`; then
+/// `vm_dlclose("poly")` unloads it. The guest-C twin of `dynlink_repl.rs`. `run_c_full` enforces
+/// interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_dlopen_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_dlopen.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("poly(5, 2) = 27\n")
+            && out.contains("poly(3, 4) = 13\n")
+            && out.ends_with("linked by name via vm_dlopen/vm_dlsym/vm_dlclose\n"),
+        "the guest vm_dlopen loader must compose symbols by name on both backends:\n{out}"
+    );
+}
+
+/// **Hot reload** over the guest `vm_dlopen` loader (DESIGN.md §22, `demos/jit/jit_hotreload.c`):
+/// redefining a symbol gives it a new slot, but units already linked to the old one keep their
+/// binding. The guest loads `f` (a+100), then `g` calling `f` by name, hot-reloads `f` (a+200), then
+/// loads `h` calling `f` by name: `g(5)=105` (pinned to the old `f`), `h(5)=205` (sees the new one).
+/// Proves the slot model's live-patch behaviour. `run_c_full` enforces interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_hotreload_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_hotreload.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("g(5) = 105") && out.contains("h(5) = 205"),
+        "an old caller must keep its binding across a hot reload, on both backends:\n{out}"
+    );
+}
+
 /// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, DESIGN.md §22), run as a
 /// full interp≡JIT **differential**: `NWORKERS` guest threads each emit a distinct unit, `Jit.compile`
 /// it **concurrently**, and invoke the native code, checking it against a C reference. Because the
@@ -2554,5 +2541,397 @@ fn reflection_enumerates_granted_capabilities() {
             )
         }
         other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+// ---- W4 chibicc debug emission: read C locals by name on real frontend output ----
+
+/// Read an i32 source variable, whether it's a promoted SSA value or a window slot.
+fn as_i32_var(v: Option<VarValue>) -> i32 {
+    match v {
+        Some(VarValue::Value(Value::I32(n))) => n,
+        Some(VarValue::Bytes(b)) => i32::from_le_bytes(b.try_into().expect("4 bytes")),
+        other => panic!("expected an i32 var, got {other:?}"),
+    }
+}
+
+#[test]
+fn chibicc_g_emits_named_locals_resolved_by_the_inspector() {
+    // No `main` ⇒ no `_start`/powerbox; `compute` is function 0. `-g` now keeps SSA promotion and
+    // emits a location list (`ssalist`), so a promoted scalar is debuggable *as optimized* — the
+    // interpreter resolves its holding SSA value per pc. (`return t + s` gives a final op where
+    // both `s` and `t` are already live to inspect.)
+    let src = r#"
+int compute(int a, int b) {
+  int s = a + b;
+  int t = s + 100;
+  return t + s;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(
+        ir.contains("debug.var 0 \"s\" ssalist"),
+        "emits a location-list debug.var for the promoted s:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+
+    // Drive `compute(5, 3)` directly: v0 is the data-SP (a window base with frame headroom),
+    // then the two i32 params.
+    let sp = 32768i64;
+    let mut insp = Inspector::attach(
+        &m,
+        0,
+        &[Value::I64(sp), Value::I32(5), Value::I32(3)],
+        1_000_000,
+    );
+
+    // Break at the last op (the `t + s` add): `s` and `t` are both already live there.
+    let last = m.funcs[0].blocks[0].insts.len() - 1;
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: last,
+    });
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
+
+    // Read the C locals by their source names: s = a + b = 8, t = s + 100 = 108, params a/b.
+    assert_eq!(as_i32_var(insp.read_var(0, "s", 4)), 8);
+    assert_eq!(as_i32_var(insp.read_var(0, "t", 4)), 108);
+    assert_eq!(as_i32_var(insp.read_var(0, "a", 4)), 5);
+    assert_eq!(as_i32_var(insp.read_var(0, "b", 4)), 3);
+    assert_eq!(insp.read_var(0, "nonesuch", 4), None);
+}
+
+#[test]
+fn chibicc_g_emits_function_names() {
+    // `-g` emits the §6 function-name table (`debug.fname <func> "<name>"`), so a backtrace / gdb
+    // `bt` / kill message reads the C name instead of `fn{N}`.
+    let src = r#"
+int helper(int x) { return x + 1; }
+int compute(int a) { return helper(a) * 2; }
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(
+        ir.contains("debug.fname"),
+        "emits the function-name table:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+    let names: Vec<&str> = m
+        .debug_info
+        .as_ref()
+        .expect("debug info")
+        .func_names
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"helper") && names.contains(&"compute"),
+        "func_names carries the C names, got {names:?}"
+    );
+}
+
+#[test]
+fn chibicc_g_emits_module_scoped_globals_read_in_any_frame() {
+    // chibicc as a *second* producer of the §6 module-scoped-global primitive (slice 28): a source
+    // global lives at a fixed window address and is inspectable by name in every frame.
+    let src = r#"
+int counter = 7;
+struct P { int a; int b; } origin = { 3, 4 };
+int bump(int n) { counter = counter + n; return counter + origin.a; }
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(
+        ir.contains("debug.var global \"counter\" fixed"),
+        "emits a fixed-address global debug.var for `counter`:\n{ir}"
+    );
+    assert!(
+        ir.contains("debug.var global \"origin\" fixed"),
+        "emits a fixed-address global for the struct `origin`:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+
+    // `bump` is function 0 (no `main` ⇒ no `_start`). At entry the data segment holds counter = 7;
+    // read it by name through the global scope (frame-independent `Fixed` address).
+    let sp = 1i64 << 20;
+    let mut insp = Inspector::attach(&m, 0, &[Value::I64(sp), Value::I32(10)], 1_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
+    assert_eq!(
+        as_i32_var(insp.read_var(0, "counter", 4)),
+        7,
+        "global read in bump's frame"
+    );
+}
+
+#[test]
+fn chibicc_g_resolves_shadowed_locals_by_scope() {
+    // C shadowing: an inner block redeclares `x`. chibicc emits two `debug.var 0 "x"` lines, each
+    // with a `scope <start> <end>` source-line range; reading `x` by name resolves to the one **in
+    // scope at the stopped pc** (the inner shadow inside the block, the outer one after it) — not
+    // just the first declared (DEBUGGING.md §6 lexical-scope resolution).
+    let src = r#"
+int f(int n) {
+  int x = n + 1;
+  {
+    int x = n + 100;
+    n = n + x;
+  }
+  return x + n;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    // Both shadows emitted under the same name+func, each carrying a distinct lexical scope.
+    assert_eq!(
+        ir.matches("debug.var 0 \"x\"").count(),
+        2,
+        "both shadows emitted:\n{ir}"
+    );
+    assert!(
+        ir.contains(" scope "),
+        "shadows carry source-line scopes:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+
+    let pc_for_line = |line: u32| {
+        let l = m
+            .debug_info
+            .as_ref()
+            .unwrap()
+            .locs
+            .iter()
+            .find(|l| l.line == line)
+            .unwrap_or_else(|| panic!("no loc for line {line}"));
+        IrPc {
+            module: 0,
+            func: l.func,
+            block: l.block as usize,
+            inst: l.inst as usize,
+        }
+    };
+    let sp = 32768i64;
+    let read_x_at = |line: u32| {
+        let mut insp = Inspector::attach(&m, 0, &[Value::I64(sp), Value::I32(5)], 1_000_000);
+        insp.set_breakpoint(pc_for_line(line));
+        assert!(matches!(
+            insp.run_until_stop(),
+            svm_interp::Stop::Break { .. }
+        ));
+        as_i32_var(insp.read_var(0, "x", 4))
+    };
+
+    // Inside the inner block (line 6, `n = n + x`): the inner `x = n + 100 = 105` is in scope.
+    assert_eq!(read_x_at(6), 105, "inner shadow resolved inside the block");
+    // After the block (line 8, `return x + n`): the outer `x = n + 1 = 6` is back in scope.
+    assert_eq!(read_x_at(8), 6, "outer x resolved after the block");
+}
+
+#[test]
+fn chibicc_g_maps_breakpoints_to_source_lines() {
+    // Raw string starts with a newline, so: line 2 = signature, 3 = `int s`, 4 = `int t`,
+    // 5 = `return t + s` (its add is the block's last op, so it's a real step point on line 5).
+    let src = r#"
+int compute(int a, int b) {
+  int s = a + b;
+  int t = s + 100;
+  return t + s;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(ir.contains("debug.loc 0 "), "emits debug.loc rows:\n{ir}");
+    assert!(ir.contains("debug.file 0 "), "emits a debug.file");
+    let m = parse_module(&ir).expect("parse");
+
+    let sp = 32768i64;
+    let mut insp = Inspector::attach(
+        &m,
+        0,
+        &[Value::I64(sp), Value::I32(5), Value::I32(3)],
+        1_000_000,
+    );
+
+    // The last op of the single block is the return's value load → the `return t` line (5).
+    let last = m.funcs[0].blocks[0].insts.len() - 1;
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: last,
+    };
+    insp.set_breakpoint(bp);
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
+
+    let loc = insp.source_loc(bp).expect("source loc at the return");
+    assert_eq!(loc.line, 5, "last block op maps to `return t`");
+    assert!(
+        loc.file.ends_with(".c"),
+        "file is the C source: {}",
+        loc.file
+    );
+    // The backtrace frame carries the same source line.
+    assert_eq!(insp.backtrace()[0].source.as_ref().map(|s| s.line), Some(5));
+    // And `t` is still readable by name (= s + 100 = 108).
+    assert_eq!(as_i32_var(insp.read_var(0, "t", 4)), 108);
+}
+
+#[test]
+fn chibicc_g_emits_structured_types_with_field_offsets() {
+    use svm_ir::{Encoding, TypeDef};
+
+    // A struct local carries its layout through the §6 `TypeRef` waist: the type table records
+    // `struct Point { int x; int y; }` with field offsets, an array records its element + count,
+    // and a pointer records its pointee — the data aggregate inspection (struct/array expansion,
+    // `a.b` / `arr[i]`) needs.
+    let src = r#"
+struct Point { int x; int y; };
+int dist(int ax, int ay) {
+  struct Point p;
+  int row[4];
+  struct Point *pp;
+  p.x = ax;
+  p.y = ay;
+  pp = &p;
+  row[0] = pp->x;
+  return p.x + p.y + row[0];
+}
+"#;
+    let ir = c_to_ir_g(src);
+    // Producer side: the structured directives are present in the text.
+    assert!(
+        ir.contains("debug.type") && ir.contains(" agg \"struct Point\""),
+        "emits an aggregate type named by its tag:\n{ir}"
+    );
+    assert!(
+        ir.contains("debug.field") && ir.contains("\"y\" 4"),
+        "emits field `y` at offset 4:\n{ir}"
+    );
+
+    // ABI side: parse and walk the structured types.
+    let m = parse_module(&ir).expect("parse");
+    let di = m.debug_info.as_ref().expect("debug info");
+    // The test is about the structured *type* table; a var's `loc` (window for the aggregates, a
+    // promoted `ssalist` for the pointer) is incidental, so resolve only via its `type_id`.
+    let resolve = |name: &str| -> &TypeDef {
+        let v = di
+            .vars
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("var {name}"));
+        let tid = v
+            .type_id
+            .unwrap_or_else(|| panic!("{name} carries a structured type"));
+        &di.types[tid as usize]
+    };
+
+    // `struct Point p` — an aggregate with x@0, y@4, both 4-byte signed ints, size 8.
+    let TypeDef::Aggregate { name, size, fields } = resolve("p") else {
+        panic!("p is a struct");
+    };
+    assert_eq!(name, "struct Point"); // render name carries the C tag
+    assert_eq!(*size, 8);
+    assert_eq!(fields.len(), 2);
+    assert_eq!((fields[0].name.as_str(), fields[0].offset), ("x", 0));
+    assert_eq!((fields[1].name.as_str(), fields[1].offset), ("y", 4));
+    for f in fields {
+        let TypeDef::Base { encoding, size, .. } = &di.types[f.ty as usize] else {
+            panic!("field {} is a base type", f.name);
+        };
+        assert_eq!((*encoding, *size), (Encoding::Signed, 4));
+    }
+
+    // `int row[4]` — an array of 4 elements; element resolves to a 4-byte int.
+    let TypeDef::Array { elem, count, name } = resolve("row") else {
+        panic!("row is an array");
+    };
+    assert_eq!(name, "int[4]", "composite array render name");
+    assert_eq!(*count, 4);
+    assert!(matches!(
+        &di.types[*elem as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point *pp` — a pointer (named `struct Point *`) whose pointee is the same aggregate.
+    let TypeDef::Pointer {
+        pointee,
+        size,
+        name,
+    } = resolve("pp")
+    else {
+        panic!("pp is a pointer");
+    };
+    assert_eq!(name, "struct Point *", "composite pointer render name");
+    assert_eq!(*size, 8, "pointer width");
+    assert!(
+        matches!(&di.types[*pointee as usize], TypeDef::Aggregate { name, .. } if name == "struct Point"),
+        "pp points at the struct"
+    );
+}
+
+#[test]
+fn chibicc_g_location_list_tracks_a_loop_accumulator_across_blocks() {
+    // The headline of the `ssalist` producer: a promoted accumulator/counter changes value across
+    // the loop's blocks (a different block parameter each iteration), and a mid-body write. The
+    // emitted location list must resolve each to the right value at the loop-body breakpoint — i.e.
+    // chibicc can debug the *optimized* (promoted) build, no `-Og`. Line 5 is `acc = acc + i;`.
+    let src = r#"
+int run(int n) {
+  int acc = 0;
+  for (int i = 0; i < n; i = i + 1) {
+    acc = acc + i;
+  }
+  return acc;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    let m = parse_module(&ir).expect("parse");
+    let di = m.debug_info.as_ref().expect("debug info");
+
+    // Breakpoint at the loop body (line 5), found via the emitted source map — its first IR pc.
+    let bl = di
+        .locs
+        .iter()
+        .filter(|l| l.line == 5)
+        .min_by_key(|l| (l.block, l.inst))
+        .expect("line 5 (loop body) is mapped");
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: bl.block as usize,
+        inst: bl.inst as usize,
+    };
+    let mut insp = Inspector::attach(&m, 0, &[Value::I64(32768), Value::I32(3)], 1_000_000);
+    insp.set_breakpoint(bp);
+
+    // Before `acc = acc + i` each iteration, (i, acc) = (0,0), (1,0), (2,1) — read by name from the
+    // location lists as the promoted values shift across the loop blocks.
+    for (expect_i, expect_acc) in [(0, 0), (1, 0), (2, 1)] {
+        assert!(matches!(
+            insp.run_until_stop(),
+            svm_interp::Stop::Break { .. }
+        ));
+        assert_eq!(
+            as_i32_var(insp.read_var(0, "i", 4)),
+            expect_i,
+            "i per iteration"
+        );
+        assert_eq!(
+            as_i32_var(insp.read_var(0, "acc", 4)),
+            expect_acc,
+            "acc per iteration"
+        );
     }
 }

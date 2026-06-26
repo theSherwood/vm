@@ -5,8 +5,9 @@
 //! genuine multi-threading needs the spawn convention (slice 2). The memories are declared `shared`
 //! (the threads-proposal flag the transpiler now accepts).
 //!
-//! Narrow atomics (`*.atomic.rmw8`/`load16_u`/…) have no IR form and are a clean `Unsupported` — the
-//! `narrow_atomics_rejected` test pins that decision.
+//! Narrow atomics (`*.atomic.rmw8`/`load16_u`/…) have no direct IR form (SVM atomics are 32/64-bit
+//! only); the transpiler emulates them with a CAS loop on the containing 32-bit word. The
+//! `narrow_*` tests pin that lowering's value math on both backends.
 
 use svm_interp::Value;
 
@@ -179,19 +180,165 @@ fn fence_is_transparent() {
     assert_eq!(run(wat, "f", &[]), 42);
 }
 
-/// Narrow atomics have no IR form (SVM atomics are 32/64-bit only) — they're a clean `Unsupported`,
-/// not a miscompile. Pins the "reject for now" decision (CAS-loop emulation is a possible follow-up).
+// ---- narrow (8/16-bit, and i64's 32-bit) atomics: word-CAS emulation ----
+//
+// SVM IR atomics are 32/64-bit only; the narrow forms emulate via a CAS loop on the containing
+// 32-bit word. These single-threaded tests pin the *value* math (sub-word extract, splice preserving
+// neighbours, the rmw old-value contract, wrapping at the sub-word width, cmpxchg success/failure) —
+// each runs on **both** backends via `run`, so a sub-word lowering divergence also fails here.
+
+/// Narrow atomic loads extract the correctly-positioned little-endian sub-word and zero-extend.
 #[test]
-fn narrow_atomics_rejected() {
+fn narrow_load_extracts_subword() {
+    let prog = |op: &str, addr: u32| {
+        format!(
+            r#"(module (memory 1 1 shared)
+                 (func (export "f") (result i32)
+                   (i32.store (i32.const 4) (i32.const 0xAABBCCDD))
+                   ({op} (i32.const {addr}))))"#
+        )
+    };
+    assert_eq!(run(&prog("i32.atomic.load8_u", 4), "f", &[]), 0xDD);
+    assert_eq!(run(&prog("i32.atomic.load8_u", 5), "f", &[]), 0xCC);
+    assert_eq!(run(&prog("i32.atomic.load8_u", 7), "f", &[]), 0xAA); // shift 24
+    assert_eq!(run(&prog("i32.atomic.load16_u", 4), "f", &[]), 0xCCDD);
+    assert_eq!(run(&prog("i32.atomic.load16_u", 6), "f", &[]), 0xAABB); // shift 16
+}
+
+/// A narrow store splices the sub-word in **without disturbing neighbouring bytes** in the word.
+#[test]
+fn narrow_store_preserves_neighbors() {
+    // word 0xAABBCCDD; store byte 0x11 at addr 1 → bytes [DD,11,BB,AA] = 0xAABB11DD; read full word.
     let wat = r#"
-      (module
-        (memory 1 1 shared)
+      (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.atomic.rmw8.add_u (i32.const 0) (i32.const 1))))"#;
-    let wasm = wat::parse_str(wat).expect("assemble wat");
-    match svm_wasm::transpile(&wasm) {
-        Err(svm_wasm::Error::Unsupported(_)) => {}
-        Err(e) => panic!("expected narrow atomic Unsupported, got a different error: {e:?}"),
-        Ok(_) => panic!("expected narrow atomic to be Unsupported, but it transpiled"),
-    }
+          (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
+          (i32.atomic.store8 (i32.const 1) (i32.const 0x11))
+          (i32.atomic.load (i32.const 0))))"#;
+    assert_eq!(run(wat, "f", &[]) as u32, 0xAABB11DD);
+    // store16 at addr 2 → bytes [DD,CC,99,88] = 0x8899CCDD.
+    let wat2 = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i32)
+          (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
+          (i32.atomic.store16 (i32.const 2) (i32.const 0x8899))
+          (i32.atomic.load (i32.const 0))))"#;
+    assert_eq!(run(wat2, "f", &[]) as u32, 0x8899CCDD);
+}
+
+/// `rmw8.add` returns the **old** sub-word and stores the wrapped (mod 256) sum; neighbours intact.
+#[test]
+fn narrow_rmw8_add_old_value_and_wrap() {
+    // byte at addr 1 = 0xF0; add 0x25 → 0x15 (wraps). Returns old (0xF0); the word becomes 0xAABB15DD.
+    let wat = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i32)
+          (i32.store (i32.const 0) (i32.const 0xAABBF0DD))
+          (i32.atomic.rmw8.add_u (i32.const 1) (i32.const 0x25))))"#;
+    assert_eq!(run(wat, "f", &[]), 0xF0, "rmw returns the old sub-word");
+    let wat_mem = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i32)
+          (i32.store (i32.const 0) (i32.const 0xAABBF0DD))
+          (drop (i32.atomic.rmw8.add_u (i32.const 1) (i32.const 0x25)))
+          (i32.atomic.load (i32.const 0))))"#;
+    assert_eq!(
+        run(wat_mem, "f", &[]) as u32,
+        0xAABB15DD,
+        "wrapped + spliced"
+    );
+}
+
+/// Every narrow rmw op (sub/and/or/xor/xchg) updates the sub-word correctly, leaving neighbours.
+#[test]
+fn narrow_rmw16_all_ops() {
+    let prog = |op: &str, arg: u32| {
+        format!(
+            r#"(module (memory 1 1 shared)
+                 (func (export "f") (result i32)
+                   (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
+                   (drop ({op} (i32.const 0) (i32.const {arg})))
+                   (i32.atomic.load (i32.const 0))))"#
+        )
+    };
+    // halfword at addr 0 = 0xCCDD; high half (0xAABB) must survive every op.
+    assert_eq!(
+        run(&prog("i32.atomic.rmw16.sub_u", 0x00DD), "f", &[]) as u32,
+        0xAABBCC00
+    );
+    assert_eq!(
+        run(&prog("i32.atomic.rmw16.and_u", 0x0FF0), "f", &[]) as u32,
+        0xAABB0CD0
+    );
+    assert_eq!(
+        run(&prog("i32.atomic.rmw16.or_u", 0x1001), "f", &[]) as u32,
+        0xAABBDCDD
+    );
+    assert_eq!(
+        run(&prog("i32.atomic.rmw16.xor_u", 0xFFFF), "f", &[]) as u32,
+        0xAABB3322
+    );
+    assert_eq!(
+        run(&prog("i32.atomic.rmw16.xchg_u", 0x1234), "f", &[]) as u32,
+        0xAABB1234
+    );
+}
+
+/// Narrow cmpxchg: a matching `expected` swaps and returns the old sub-word; a mismatch leaves memory
+/// unchanged and returns the current sub-word (the wasm contract).
+#[test]
+fn narrow_cmpxchg8_success_and_failure() {
+    // success: byte 0x42, expect 0x42 → store 0x99, return 0x42.
+    let ok = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i32)
+          (i32.store (i32.const 0) (i32.const 0x42))
+          (i32.atomic.rmw8.cmpxchg_u (i32.const 0) (i32.const 0x42) (i32.const 0x99))))"#;
+    assert_eq!(run(ok, "f", &[]), 0x42, "match returns old");
+    let ok_mem = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i32)
+          (i32.store (i32.const 0) (i32.const 0x42))
+          (drop (i32.atomic.rmw8.cmpxchg_u (i32.const 0) (i32.const 0x42) (i32.const 0x99)))
+          (i32.atomic.load8_u (i32.const 0))))"#;
+    assert_eq!(run(ok_mem, "f", &[]), 0x99, "match swaps");
+    // failure: byte 0x42, expect 0x00 → no store, return current 0x42.
+    let fail_mem = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i32)
+          (i32.store (i32.const 0) (i32.const 0x42))
+          (drop (i32.atomic.rmw8.cmpxchg_u (i32.const 0) (i32.const 0x00) (i32.const 0x99)))
+          (i32.atomic.load8_u (i32.const 0))))"#;
+    assert_eq!(run(fail_mem, "f", &[]), 0x42, "mismatch leaves memory");
+}
+
+/// The i64 narrow forms: the 8/16-bit lanes go through the same word-CAS (result zero-extended to
+/// i64), and the **32-bit** form is word-sized (a native i32 atomic, zero-extended).
+#[test]
+fn narrow_i64_forms() {
+    // i64.atomic.load8_u zero-extends the byte into i64.
+    let load8 = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i64)
+          (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
+          (i64.atomic.load8_u (i32.const 3))))"#; // byte 3 = 0xAA
+    assert_eq!(run(load8, "f", &[]), 0xAA);
+    // i64.atomic.rmw32.add_u: word-sized add, old value zero-extended.
+    let rmw32 = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i64)
+          (i32.store (i32.const 0) (i32.const 0x10000000))
+          (i64.atomic.rmw32.add_u (i32.const 0) (i64.const 0x00000005))))"#;
+    assert_eq!(
+        run(rmw32, "f", &[]),
+        0x10000000,
+        "returns old, zero-extended"
+    );
+    let rmw32_mem = r#"
+      (module (memory 1 1 shared)
+        (func (export "f") (result i64)
+          (i32.store (i32.const 0) (i32.const 0x10000000))
+          (drop (i64.atomic.rmw32.add_u (i32.const 0) (i64.const 0x00000005)))
+          (i64.atomic.load32_u (i32.const 0))))"#;
+    assert_eq!(run(rmw32_mem, "f", &[]), 0x10000005);
 }

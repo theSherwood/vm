@@ -1,0 +1,40 @@
+[package]
+name = "svm-peval"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# `libm-floats` (default) folds the float ops that need libm — `sqrt`/`ceil`/`floor`/`trunc`/
+# round-ties-even/`fma` (not in `core`; std-only). libm's `fma` pulls **x86 inline-asm** (CPU
+# detection) and **i128** (extended precision), neither of which the svm-IR on-ramp can translate, so
+# the *in-svm* build (compiling this crate to svm-IR) turns the feature **off** (`default-features =
+# false`): those ops then pass through unfolded — sound, the residual just computes them at runtime.
+# `abs`/`copysign` are folded in pure `core` (exact bit ops), so they fold in every build. Host builds
+# (tests, benches, the host-driven specializer, every dependent) keep the default and fold everything.
+default = ["libm-floats"]
+libm-floats = ["dep:libm"]
+
+[dependencies]
+# The IR definition this pass transforms.
+svm-ir.workspace = true
+# Per-SSA-value types (`func_value_types`): needed to type the caller values threaded across an
+# inlined call boundary when a dynamic-control-flow callee is specialized into residual blocks.
+svm-verify.workspace = true
+# `sqrt`/`ceil`/`floor`/`trunc`/round-ties-even/`fma` are not in `core` (std-only); the float folds use
+# libm for them. Optional (see the `libm-floats` feature): the in-svm svm-IR build drops it because
+# libm's `fma` brings untranslatable x86 inline-asm + i128. Correctly-rounded, so bit-identical to the
+# std methods the interpreter uses (verified by the differential harness).
+libm = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# The differential harness: re-verify the optimized module, then run original vs
+# optimized through the reference interpreter and assert byte-identical results/traps.
+svm-verify.workspace = true
+svm-interp.workspace = true
+# The AOT pipeline proof (tests/aot.rs): serialize a residual to bytes and back, and
+# compile it to native code — the "ship a specialized artifact" path.
+svm-encode.workspace = true
+svm-jit.workspace = true

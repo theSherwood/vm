@@ -1,0 +1,16 @@
+[package]
+name = "wasmtime-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (the repo workspace excludes `bench/`), so this fetches/builds Wasmtime independently.
+[workspace]
+
+[dependencies]
+# `pulley` adds Wasmtime's portable bytecode *interpreter* backend (selected via target("pulley64")) —
+# a same-compiled-bytecode interpreter baseline for the SVM bytecode engine, alongside the Cranelift JIT.
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "pulley"] }
+
+[profile.release]
+opt-level = 3

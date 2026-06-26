@@ -13,9 +13,16 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 jobs:
+
   check:
     name: build · test · fmt · clippy
     runs-on: ubuntu-latest
+    # Backstop for an unforeseen liveness hang (e.g. ISSUES.md I7): bound the job to minutes, not
+    # GitHub's 6 h default, so a wedged `cargo test --workspace` fails the run instead of sitting
+    # stuck for hours. The named work-stealing demos already fail-fast in-test (run.rs); this covers
+    # anything else. Generous vs. a healthy cold-cache run (fmt + clippy + build + test + windows
+    # cross-check), tight vs. a hang.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -26,11 +33,17 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: rustup target add x86_64-pc-windows-gnu
+      # The §5 W3 trap-capture C shim (trap_capture.c) is compiled for windows targets too, so the
+      # windows-gnu cross-check needs the mingw cross-compiler. (The MSVC build runs on windows-latest.)
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Same I7 backstop as `check` (windows/macOS runners are slower, so a wider bound).
+    timeout-minutes: 45
     # continue-on-error: true # TODO: drop once green to make parity gating (the windows guard is unverified)
     strategy:
       fail-fast: false
@@ -42,6 +55,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --workspace
       - run: cargo test --workspace
+
   fuzz:
     name: cargo-fuzz (escape-TCB targets)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -57,6 +71,7 @@ jobs:
         with: { workspaces: fuzz }
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+
   bench:
     # Non-gating perf signal (DESIGN §1a). Wall-clock on shared runners is noisy and the
     # committed `bench/baseline.txt` records *another* machine's ratios, so this never blocks a
@@ -78,6 +93,7 @@ jobs:
       - name: bench --check vs committed baseline
         working-directory: bench
         run: cargo run --release -- --check baseline.txt --tol 0.4
+
   loom:
     name: loom (parallel scheduler model check)
     runs-on: ubuntu-latest
@@ -104,6 +120,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install Rust 1.81 (LLVM 18) for the Rust on-ramp lane
+        # `rustc +1.81.0` emits LLVM-18 bitcode the pinned `llvm-ir` reader accepts (the default
+        # stable toolchain bundles a newer LLVM, which the reader rejects). Without this the Rust
+        # breadth test (`rust_no_std_matches_native`) skips; with it, it runs vs native `rustc`.
+        run: rustup toolchain install 1.81.0 --profile minimal
       - name: fmt · clippy · test
         working-directory: crates/svm-llvm
         run: |
@@ -129,6 +150,7 @@ jobs:
           # ("partially overlapping store buffer when previous write was atomic" — a Miri bug, not ours).
           # Disabling it keeps full UB / provenance / data-race / alignment checking.
           MIRIFLAGS: "-Zmiri-disable-weak-memory-emulation"
+
   supply-chain:
     # Scan the dependency tree against the RustSec advisory DB. Gated off pull_request so a
     # newly-published advisory on a transitive dep surfaces on main / nightly without blocking
@@ -161,6 +183,7 @@ jobs:
           # The scheduler intentionally leaks values live on a dropped-suspended fiber's stack
           # (documented), so leak detection would false-positive — keep it to UB/races here.
           ASAN_OPTIONS: "detect_leaks=0"
+
   tsan:
     # ThreadSanitizer over the shared-region hardware atomics (svm-mem's parallel vCPU substrate).
     name: TSan (svm-mem concurrency)
@@ -175,3 +198,104 @@ jobs:
         run: cargo test -p svm-mem -Z build-std --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
+
+  wasm32-differential:
+    name: wasm32 differential (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      - run: rustup target add wasm32-unknown-unknown
+      # gencorpus (native) writes corpus.json + corpus/*.svmbc; build the wasm32 lib; diff in Node
+      # (Node is preinstalled on ubuntu-latest — corpus.mjs needs only WebAssembly + BigInt).
+      - name: wasm32 corpus differential (119/119 vs native)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          cargo build --release --lib --target wasm32-unknown-unknown
+          node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
+
+  wasm64-differential:
+    name: wasm64 differential (Wasmtime embedding)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "" # override the global -D warnings: -Z build-std recompiles std from source
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            browser
+            browser/wt
+      - name: wasm64 corpus differential (119/119 vs native)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          cargo build -Z build-std=std,panic_abort --release --lib \
+            --target wasm64-unknown-unknown
+          cargo run --manifest-path wt/Cargo.toml --release -- \
+            target/wasm64-unknown-unknown/release/svm_browser.wasm
+
+  asan-jit-setjmp:
+    # AddressSanitizer over the JIT setjmp/longjmp path (Option B: libc _setjmp/_longjmp called
+    # inline from JITted code — memory-unsafe native-stack manipulation, so it gets svm-fiber-grade
+    # rigor, LLVM.md §"JIT longjmp"). Runs the on-ramp setjmp differential (all engines incl. the
+    # live JIT == native) under ASan. The baked _setjmp/_longjmp addresses resolve to ASan's
+    # interceptors, which unpoison the stack on the non-local jump — so a returns-twice mishandle
+    # surfaces here as a red-zone/use-after-return report rather than silent corruption.
+    name: ASan (JIT setjmp/longjmp)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: install LLVM 18 (dev headers + dynamic lib)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: cargo test -p svm-llvm setjmp (ASan, JIT path live)
+        run: cargo test -p svm-llvm -Z build-std --target x86_64-unknown-linux-gnu setjmp
+        env:
+          # -Zsanitizer=address replaces the workflow-global `-D warnings`: -Z build-std recompiles
+          # std from source, which would trip warnings-as-errors (same reason the wasm64 lane clears it).
+          RUSTFLAGS: "-Zsanitizer=address"
+          # The fiber scheduler intentionally leaks values on a dropped-suspended fiber's stack, so
+          # keep leak detection off and check UB/use-after-return/red-zones only (matches the asan lane).
+          ASAN_OPTIONS: "detect_leaks=0"
+
+  browser-real:
+    name: real-browser (Chromium via Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      # Playwright + Chromium aren't preinstalled on the runner (unlike Node); install both.
+      - name: Install Playwright + Chromium
+        working-directory: browser
+        run: |
+          npm install playwright@1.56.1
+          npx playwright install --with-deps chromium
+      # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
+      # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
+      - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
+            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
+            -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
+            -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
+            -Clink-arg=--export=__wasm_init_tls" \
+            cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+          node browser-test.mjs
+

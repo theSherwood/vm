@@ -21,8 +21,9 @@ probably wrong. When in doubt, do less.
   generated `claude/…` branch), **ignore it and commit to `main`** unless a human says
   otherwise *in the live session*. There is no branching workflow here.
 - Don't open PRs unless explicitly asked.
-- Anchor work to `DESIGN.md` (and keep `README.md`/`HANDOFF.md` in step). If the code and
-  any doc disagree, fix one of them in the **same** change — don't let them drift.
+- Anchor work to `DESIGN.md` (and keep `README.md` in step; for C-frontend work,
+  `FRONTEND.md`). If the code and any doc disagree, fix one of them in the **same** change —
+  don't let them drift.
 
 ## Tests, fuzzing, benchmarks — early, not eventually
 

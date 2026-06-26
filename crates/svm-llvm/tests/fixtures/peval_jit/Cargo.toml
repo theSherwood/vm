@@ -1,0 +1,34 @@
+# The **guest-side Futamura `Jit` probe** (DESIGN.md §20c capstone).
+#
+# A `no_std`/`panic=abort` powerbox program that, entirely in-sandbox: builds a module with
+# `svm-ir`, specializes it with `svm-peval` (`default-features = false` — the in-svm, no-`libm`
+# build), serializes the residual with `svm-encode`, and submits the blob to the §22 `Jit`
+# capability (`__vm_jit_compile`) — then invokes the Cranelift-compiled residual (`__vm_jit_invoke2`)
+# and checks it against a host-side oracle. The `peval_jit.rs` test in the parent crate compiles this
+# to svm-IR and runs it under `run_powerbox` (which grants the `Jit` cap).
+#
+# Its own `[workspace]` keeps it out of the repo root workspace (which excludes `crates/svm-llvm`).
+[package]
+name = "peval-jit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+# A `lib`: `cargo build` emits per-crate `.bc` with no final executable link (the powerbox externs
+# `malloc`/`free`/`write`/`__vm_jit_*` are intentionally undefined — the on-ramp synthesizes the
+# allocator and lowers the Jit builtins). `globaldce`'s public-api list keeps `#[no_mangle] main`.
+crate-type = ["lib"]
+
+[dependencies]
+svm-peval = { path = "../../../../svm-peval", default-features = false }
+svm-ir = { path = "../../../../svm-ir" }
+# The encoder, now no_std: serializes the residual to the binary module blob in-sandbox.
+svm-encode = { path = "../../../../svm-encode" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+overflow-checks = false
+
+[workspace]

@@ -573,11 +573,44 @@ name = "svm"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "svm-durable",
  "svm-encode",
  "svm-interp",
  "svm-ir",
  "svm-jit",
  "svm-run",
+ "svm-snapshot",
+ "svm-text",
+ "svm-verify",
+ "svm-wasm",
+]
+
+[[package]]
+name = "svm-capi"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-run",
+ "svm-text",
+]
+
+[[package]]
+name = "svm-dap"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-text",
+]
+
+[[package]]
+name = "svm-durable"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
  "svm-text",
  "svm-verify",
 ]
@@ -605,6 +638,8 @@ dependencies = [
  "svm-ir",
  "svm-mask",
  "svm-mem",
+ "svm-text",
+ "svm-verify",
 ]
 
 [[package]]
@@ -640,6 +675,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-peval"
+version = "0.0.0"
+dependencies = [
+ "libm",
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-verify",
+]
+
+[[package]]
 name = "svm-run"
 version = "0.0.0"
 dependencies = [
@@ -648,9 +695,22 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-peval",
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "svm-snapshot"
+version = "0.0.0"
+dependencies = [
+ "svm-durable",
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-text",
+ "svm-verify",
 ]
 
 [[package]]
@@ -691,6 +751,7 @@ dependencies = [
  "svm-text",
  "svm-verify",
  "wasmparser",
+ "wast",
  "wat",
 ]
 

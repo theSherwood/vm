@@ -22,9 +22,11 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
-    Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
-    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, Export, FBinOp,
+    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, Import, Inst, IntTy,
+    IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef,
+    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -75,6 +77,13 @@ pub fn print_module(m: &Module) -> String {
         }
         s.push('\n');
     }
+    // First-class function exports, one per line, in declaration order: `export "<name>" <funcidx>`.
+    if !m.exports.is_empty() {
+        for e in &m.exports {
+            let _ = writeln!(s, "export \"{}\" {}", e.name, e.func);
+        }
+        s.push('\n');
+    }
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     for (i, f) in m.funcs.iter().enumerate() {
         if i > 0 {
@@ -82,7 +91,130 @@ pub fn print_module(m: &Module) -> String {
         }
         print_func(&mut s, f, &fn_results);
     }
+    print_debug_info(&mut s, m);
     s
+}
+
+/// Print the frontend-neutral debug-info waist (DEBUGGING.md §6) as module-level directives after
+/// the functions: `debug.file <idx> "<path>"`, `debug.loc <fn> <bb> <i> <file> <line> <col>`,
+/// the structured type table (`debug.type` / `debug.field`), and
+/// `debug.var <fn> "<name>" win|ssa <n> "<type>" [<type_id>]`. Absent ⇒ nothing printed.
+fn print_debug_info(s: &mut String, m: &Module) {
+    let Some(di) = &m.debug_info else { return };
+    if di.files.is_empty()
+        && di.locs.is_empty()
+        && di.types.is_empty()
+        && di.vars.is_empty()
+        && di.blobs.is_empty()
+    {
+        return;
+    }
+    s.push('\n');
+    for (i, f) in di.files.iter().enumerate() {
+        let _ = writeln!(s, "debug.file {i} \"{f}\"");
+    }
+    for fname in &di.func_names {
+        let _ = writeln!(s, "debug.fname {} \"{}\"", fname.func, fname.name);
+    }
+    for l in &di.locs {
+        let _ = writeln!(
+            s,
+            "debug.loc {} {} {} {} {} {}",
+            l.func, l.block, l.inst, l.file, l.line, l.col
+        );
+    }
+    // Type table: `debug.type <id> <kind> ...` (declaration order ⇒ dense ids), with an aggregate's
+    // members on following `debug.field <type_id> "<name>" <off> <field_ty>` lines.
+    for (id, t) in di.types.iter().enumerate() {
+        match t {
+            TypeDef::Base {
+                name,
+                encoding,
+                size,
+            } => {
+                let enc = match encoding {
+                    Encoding::Signed => "signed",
+                    Encoding::Unsigned => "unsigned",
+                    Encoding::Float => "float",
+                    Encoding::Bool => "bool",
+                };
+                let _ = writeln!(s, "debug.type {id} base \"{name}\" {enc} {size}");
+            }
+            TypeDef::Pointer {
+                name,
+                pointee,
+                size,
+            } => {
+                let _ = writeln!(s, "debug.type {id} ptr \"{name}\" {pointee} {size}");
+            }
+            TypeDef::Array { name, elem, count } => {
+                let _ = writeln!(s, "debug.type {id} array \"{name}\" {elem} {count}");
+            }
+            TypeDef::Aggregate { name, size, fields } => {
+                let _ = writeln!(s, "debug.type {id} agg \"{name}\" {size}");
+                for f in fields {
+                    let _ = writeln!(s, "debug.field {id} \"{}\" {} {}", f.name, f.offset, f.ty);
+                }
+            }
+            TypeDef::Opaque { name, size } => {
+                let _ = writeln!(s, "debug.type {id} opaque \"{name}\" {size}");
+            }
+        }
+    }
+    for v in &di.vars {
+        // `debug.var <fn> "<name>" <loc> "<ty>" [<type_id>]`, where `<fn>` is a function index or
+        // `global` (a module-scoped global, visible in every frame) and `<loc>` is `win <off>`,
+        // `ssa <value>`, `ssalist <n> <b0> <i0> <v0> …` (the location list, S2),
+        // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset), or
+        // `fixed <addr>` (a global's absolute window address).
+        if v.func == svm_ir::GLOBAL_SCOPE {
+            let _ = write!(s, "debug.var global \"{}\" ", v.name);
+        } else {
+            let _ = write!(s, "debug.var {} \"{}\" ", v.func, v.name);
+        }
+        match &v.loc {
+            VarLoc::Window { off } => {
+                let _ = write!(s, "win {off}");
+            }
+            VarLoc::Ssa { value } => {
+                let _ = write!(s, "ssa {value}");
+            }
+            VarLoc::SsaList(locs) => {
+                let _ = write!(s, "ssalist {}", locs.len());
+                for l in locs {
+                    let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
+                }
+            }
+            VarLoc::WindowVia { base, off } => {
+                let _ = write!(s, "winvia {}", base.len());
+                for l in base {
+                    let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
+                }
+                let _ = write!(s, " {off}");
+            }
+            VarLoc::Fixed { addr } => {
+                let _ = write!(s, "fixed {addr}");
+            }
+        }
+        let _ = write!(s, " \"{}\"", v.ty);
+        if let Some(tid) = v.type_id {
+            let _ = write!(s, " {tid}");
+        }
+        // Optional lexical scope (§6 shadowing): `scope <start_line> <end_line>`.
+        if let Some((a, b)) = v.scope {
+            let _ = write!(s, " scope {a} {b}");
+        }
+        s.push('\n');
+    }
+    // Opaque per-producer rich blobs (§6): `debug.blob "<producer>" "<escaped bytes>"`.
+    for b in &di.blobs {
+        let _ = writeln!(
+            s,
+            "debug.blob \"{}\" \"{}\"",
+            b.producer,
+            escape_bytes(&b.bytes)
+        );
+    }
 }
 
 /// Escape data-segment bytes for the text form: printable ASCII verbatim (except `\` and `"`),
@@ -152,6 +284,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ConstF64(bits) => format!("f64.const {:?}", f64::from_bits(*bits)),
         Inst::FBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
+        Inst::Fma { ty, a, b, c } => format!("{}.fma v{a} v{b} v{c}", ty.prefix()),
         Inst::FCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
         Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
@@ -262,10 +395,31 @@ fn print_inst(inst: &Inst) -> String {
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => "cap.self.count".to_string(),
         Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
+        Inst::CapSelfResolve { name_ptr, name_len } => {
+            format!("cap.self.resolve v{name_ptr} v{name_len}")
+        }
+        Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } => format!("cap.self.label v{handle} v{buf_ptr} v{buf_cap}"),
+        Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
+        Inst::DurableShadowBase => "durable.shadow_base".to_string(),
+        Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
+        Inst::SetJmp { buf } => format!("setjmp v{buf}"),
+        Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
+        // §GC conservative root enumeration.
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } => format!("gc.roots v{heap_lo} v{heap_hi} v{mask} v{buf} v{cap}"),
         // §12 real threads (OS-thread vCPUs over shared memory).
         Inst::ThreadSpawn { func, sp, arg } => format!("thread.spawn {func} v{sp} v{arg}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
@@ -309,13 +463,61 @@ fn print_inst(inst: &Inst) -> String {
             format!("{}.replace_lane {lane} v{a} v{b}", shape.name())
         }
         Inst::VIntBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VIntCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VShift { shape, op, a, amt } => {
+            format!("{}.{} v{a} v{amt}", shape.name(), op.name())
+        }
+        Inst::VFloatCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VPMinMax { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VIntUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VSatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VWiden { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VNarrow { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VConvert { op, a } => format!("{} v{a}", op.name()),
         Inst::VBitBin { op, a, b } => format!("v128.{} v{a} v{b}", op.name()),
         Inst::VNot { a } => format!("v128.not v{a}"),
         Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
         Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
         Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
+        Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
+        Inst::VAvgr { shape, a, b } => format!("{}.avgr_u v{a} v{b}", shape.name()),
+        Inst::VDot { a, b } => format!("i32x4.dot_i16x8_s v{a} v{b}"),
+        Inst::VDotI8 { a, b } => format!("i16x8.dot_i8x16_s v{a} v{b}"),
+        Inst::VExtMul { shape, op, a, b } => {
+            let (low, signed) = op.parts();
+            let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
+            format!(
+                "{}.extmul_{}_{src}_{} v{a} v{b}",
+                shape.name(),
+                if low { "low" } else { "high" },
+                if signed { "s" } else { "u" },
+            )
+        }
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
+            format!(
+                "{}.extadd_pairwise_{src}_{} v{a}",
+                shape.name(),
+                if *signed { "s" } else { "u" },
+            )
+        }
+        Inst::VQ15MulrSat { a, b } => format!("i16x8.q15mulr_sat_s v{a} v{b}"),
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => format!(
+            "{}.{} v{a} v{b} v{c}",
+            shape.name(),
+            if *neg { "fnma" } else { "fma" }
+        ),
+        Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
+        Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
+        Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
         Inst::SimdWidthBytes => "simd.width_bytes".to_string(),
     }
 }
@@ -663,8 +865,201 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let mut funcs = Vec::new();
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
+    let mut exports: Vec<Export> = Vec::new();
+    let mut dbg_files: Vec<String> = Vec::new();
+    let mut dbg_locs: Vec<Loc> = Vec::new();
+    let mut dbg_types: Vec<TypeDef> = Vec::new();
+    let mut dbg_vars: Vec<VarInfo> = Vec::new();
+    let mut dbg_blobs: Vec<ProducerBlob> = Vec::new();
+    let mut dbg_func_names: Vec<FuncName> = Vec::new();
     while !p.at_end() {
         match p.peek() {
+            // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
+            // debug_info`. `debug.file <idx> "<path>"` (dense indices); `debug.loc <fn> <bb> <i>
+            // <file> <line> <col>`; `debug.var <fn> "<name>" win|ssa <n> "<type>"`.
+            Some(Tok::Ident(s)) if s == "debug.file" => {
+                p.next()?;
+                let idx = p.parse_int()?;
+                if idx < 0 || idx as usize != dbg_files.len() {
+                    return err("debug.file indices must be dense and in declaration order");
+                }
+                let path = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.file path is not valid UTF-8".into()))?;
+                dbg_files.push(path);
+            }
+            // `debug.fname <func> "<name>"` — the §6 function-name table (sparse `func → name`).
+            Some(Tok::Ident(s)) if s == "debug.fname" => {
+                p.next()?;
+                let func = p.parse_u32()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.fname name is not valid UTF-8".into()))?;
+                dbg_func_names.push(FuncName { func, name });
+            }
+            Some(Tok::Ident(s)) if s == "debug.loc" => {
+                p.next()?;
+                dbg_locs.push(Loc {
+                    func: p.parse_u32()?,
+                    block: p.parse_u32()?,
+                    inst: p.parse_u32()?,
+                    file: p.parse_u32()?,
+                    line: p.parse_u32()?,
+                    col: p.parse_u32()?,
+                });
+            }
+            // Structured type table (DEBUGGING.md §6 `TypeRef`): `debug.type <id> <kind> ...` with
+            // dense ids in declaration order; an aggregate's members follow on `debug.field` lines.
+            Some(Tok::Ident(s)) if s == "debug.type" => {
+                p.next()?;
+                let id = p.parse_int()?;
+                if id < 0 || id as usize != dbg_types.len() {
+                    return err("debug.type ids must be dense and in declaration order");
+                }
+                let kind = p.parse_ident()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.type name is not valid UTF-8".into()))?;
+                let t = match kind.as_str() {
+                    "base" => {
+                        let encoding = match p.parse_ident()?.as_str() {
+                            "signed" => Encoding::Signed,
+                            "unsigned" => Encoding::Unsigned,
+                            "float" => Encoding::Float,
+                            "bool" => Encoding::Bool,
+                            e => return err(format!("unknown debug.type base encoding: {e}")),
+                        };
+                        TypeDef::Base {
+                            name,
+                            encoding,
+                            size: p.parse_u32()?,
+                        }
+                    }
+                    "ptr" => TypeDef::Pointer {
+                        name,
+                        pointee: p.parse_u32()?,
+                        size: p.parse_u32()?,
+                    },
+                    "array" => TypeDef::Array {
+                        name,
+                        elem: p.parse_u32()?,
+                        count: p.parse_u32()?,
+                    },
+                    "agg" => TypeDef::Aggregate {
+                        name,
+                        size: p.parse_u32()?,
+                        fields: Vec::new(),
+                    },
+                    "opaque" => TypeDef::Opaque {
+                        name,
+                        size: p.parse_u32()?,
+                    },
+                    k => return err(format!("unknown debug.type kind: {k}")),
+                };
+                dbg_types.push(t);
+            }
+            Some(Tok::Ident(s)) if s == "debug.field" => {
+                p.next()?;
+                let ty_id = p.parse_int()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.field name is not valid UTF-8".into()))?;
+                let offset = p.parse_u32()?;
+                let field_ty = p.parse_u32()?;
+                match dbg_types.get_mut(ty_id as usize) {
+                    Some(TypeDef::Aggregate { fields, .. }) => fields.push(Field {
+                        name,
+                        offset,
+                        ty: field_ty,
+                    }),
+                    _ => return err("debug.field references a non-aggregate (or undeclared) type"),
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.var" => {
+                p.next()?;
+                // `<fn>` is a function index, or `global` for a module-scoped global.
+                let func = match p.peek() {
+                    Some(Tok::Ident(s)) if s == "global" => {
+                        p.next()?;
+                        svm_ir::GLOBAL_SCOPE
+                    }
+                    _ => p.parse_u32()?,
+                };
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.var name is not valid UTF-8".into()))?;
+                let loc = match p.parse_ident()?.as_str() {
+                    "win" => VarLoc::Window {
+                        off: p.parse_int()?,
+                    },
+                    "ssa" => VarLoc::Ssa {
+                        value: p.parse_u32()?,
+                    },
+                    "ssalist" => {
+                        let n = p.parse_u32()?;
+                        let mut locs = Vec::new();
+                        for _ in 0..n {
+                            locs.push(svm_ir::SsaLoc {
+                                block: p.parse_u32()?,
+                                inst: p.parse_u32()?,
+                                value: p.parse_u32()?,
+                            });
+                        }
+                        VarLoc::SsaList(locs)
+                    }
+                    "winvia" => {
+                        let n = p.parse_u32()?;
+                        let mut base = Vec::new();
+                        for _ in 0..n {
+                            base.push(svm_ir::SsaLoc {
+                                block: p.parse_u32()?,
+                                inst: p.parse_u32()?,
+                                value: p.parse_u32()?,
+                            });
+                        }
+                        VarLoc::WindowVia {
+                            base,
+                            off: p.parse_int()?,
+                        }
+                    }
+                    "fixed" => VarLoc::Fixed {
+                        addr: p.parse_u64()?,
+                    },
+                    k => {
+                        return err(format!(
+                            "debug.var location kind must be win, ssa, ssalist, winvia, or fixed, got {k}"
+                        ))
+                    }
+                };
+                let ty = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.var type is not valid UTF-8".into()))?;
+                // Optional trailing structured type id (a bare integer). Directives that follow
+                // start with an `Ident`, and a func body opens with `(`/`func`, so an `Int` here is
+                // unambiguously the type ref.
+                let type_id = match p.peek() {
+                    Some(Tok::Int(_)) => Some(p.parse_u32()?),
+                    _ => None,
+                };
+                // Optional lexical scope (§6 shadowing): `scope <start_line> <end_line>`.
+                let scope = match p.peek() {
+                    Some(Tok::Ident(s)) if s == "scope" => {
+                        p.next()?;
+                        Some((p.parse_u32()?, p.parse_u32()?))
+                    }
+                    _ => None,
+                };
+                dbg_vars.push(VarInfo {
+                    func,
+                    name,
+                    ty,
+                    loc,
+                    type_id,
+                    scope,
+                });
+            }
+            // Opaque per-producer rich blob (§6): `debug.blob "<producer>" "<bytes>"`.
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                let producer = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.blob producer is not valid UTF-8".into()))?;
+                let bytes = p.parse_str()?;
+                dbg_blobs.push(ProducerBlob { producer, bytes });
+            }
             // Module-level `memory <size_log2>` declaration.
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
@@ -708,14 +1103,44 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     bytes,
                 });
             }
+            // First-class function export: `export "<name>" <funcidx>`.
+            Some(Tok::Ident(s)) if s == "export" => {
+                p.next()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
+                let n = p.parse_int()?;
+                let func = u32::try_from(n)
+                    .map_err(|_| ParseError(format!("export funcidx out of range: {n}")))?;
+                exports.push(Export { name, func });
+            }
             _ => funcs.push(p.parse_func()?),
         }
     }
+    let debug_info = if dbg_files.is_empty()
+        && dbg_locs.is_empty()
+        && dbg_types.is_empty()
+        && dbg_vars.is_empty()
+        && dbg_blobs.is_empty()
+        && dbg_func_names.is_empty()
+    {
+        None
+    } else {
+        Some(DebugInfo {
+            files: dbg_files,
+            locs: dbg_locs,
+            types: dbg_types,
+            vars: dbg_vars,
+            blobs: dbg_blobs,
+            func_names: dbg_func_names,
+        })
+    };
     Ok(Module {
         funcs,
         memory,
         data,
         imports: std::mem::take(&mut p.imports),
+        exports,
+        debug_info,
     })
 }
 
@@ -753,6 +1178,12 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_int()?;
                 p.parse_str()?;
             }
+            // `export "<name>" <funcidx>` — skip past it in the header prescan.
+            Some(Tok::Ident(s)) if s == "export" => {
+                p.next()?;
+                p.parse_str()?;
+                p.parse_int()?;
+            }
             Some(Tok::Ident(s)) if s == "func" => {
                 p.next()?;
                 let _params = p.parse_type_list()?;
@@ -767,6 +1198,90 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                         _ => {}
                     }
                 }
+            }
+            // Debug-info directives (DEBUGGING.md §6) — skip in the header prescan; they carry no
+            // function arities. Consume exactly each directive's tokens to stay aligned.
+            Some(Tok::Ident(s)) if s == "debug.file" => {
+                p.next()?;
+                p.parse_int()?;
+                p.parse_str()?;
+            }
+            Some(Tok::Ident(s)) if s == "debug.fname" => {
+                p.next()?;
+                p.parse_int()?; // func index
+                p.parse_str()?; // name
+            }
+            Some(Tok::Ident(s)) if s == "debug.loc" => {
+                p.next()?;
+                for _ in 0..6 {
+                    p.parse_int()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.type" => {
+                p.next()?;
+                p.parse_int()?; // id
+                let kind = p.parse_ident()?;
+                p.parse_str()?; // name
+                                // Trailing operands vary by kind; consume them as bare integers.
+                let n = match kind.as_str() {
+                    "base" => {
+                        p.next()?; // encoding ident
+                        1 // size
+                    }
+                    "ptr" => 2,    // pointee, size
+                    "array" => 2,  // elem, count
+                    "agg" => 1,    // size
+                    "opaque" => 1, // size
+                    _ => return err("unknown debug.type kind in prescan"),
+                };
+                for _ in 0..n {
+                    p.parse_int()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.field" => {
+                p.next()?;
+                p.parse_int()?; // type id
+                p.parse_str()?; // name
+                p.parse_int()?; // offset
+                p.parse_int()?; // field type
+            }
+            Some(Tok::Ident(s)) if s == "debug.var" => {
+                p.next()?;
+                // func: a numeric index or the `global` keyword.
+                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "global") {
+                    p.next()?;
+                } else {
+                    p.parse_int()?;
+                }
+                p.parse_str()?; // name
+                                // Location: `win <off>` / `ssa <value>` / `fixed <addr>` (one int),
+                                // or `ssalist <n>` / `winvia <n>` + 3n ints (+ a trailing offset).
+                let kind = p.parse_ident()?;
+                if kind == "ssalist" || kind == "winvia" {
+                    let n = p.parse_int()?;
+                    for _ in 0..n.max(0) * 3 {
+                        p.parse_int()?;
+                    }
+                    if kind == "winvia" {
+                        p.parse_int()?; // the trailing offset
+                    }
+                } else {
+                    p.parse_int()?; // win off / ssa value / fixed addr
+                }
+                p.parse_str()?; // type
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?; // optional structured type id
+                }
+                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "scope") {
+                    p.next()?;
+                    p.parse_int()?; // start line
+                    p.parse_int()?; // end line
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                p.parse_str()?; // producer
+                p.parse_str()?; // bytes
             }
             _ => return err("expected `func` or `memory`"),
         }
@@ -1226,6 +1741,32 @@ impl<'a> Parser<'a> {
             let idx = self.value(names)?;
             return Ok(Inst::CapSelfGet { idx });
         }
+        if op == "cap.self.resolve" {
+            let name_ptr = self.value(names)?;
+            let name_len = self.value(names)?;
+            return Ok(Inst::CapSelfResolve { name_ptr, name_len });
+        }
+        if op == "cap.self.label" {
+            let handle = self.value(names)?;
+            let buf_ptr = self.value(names)?;
+            let buf_cap = self.value(names)?;
+            return Ok(Inst::CapSelfLabel {
+                handle,
+                buf_ptr,
+                buf_cap,
+            });
+        }
+        // §12 per-vCPU TLS register.
+        if op == "vcpu.tls.get" {
+            return Ok(Inst::VcpuTlsGet);
+        }
+        if op == "durable.shadow_base" {
+            return Ok(Inst::DurableShadowBase);
+        }
+        if op == "vcpu.tls.set" {
+            let val = self.value(names)?;
+            return Ok(Inst::VcpuTlsSet { val });
+        }
         if op == "call_indirect" {
             let params = self.parse_type_list()?;
             self.expect(&Tok::Arrow)?;
@@ -1293,6 +1834,30 @@ impl<'a> Parser<'a> {
         if op == "suspend" {
             return Ok(Inst::Suspend {
                 value: self.value(names)?,
+            });
+        }
+        if op == "setjmp" {
+            return Ok(Inst::SetJmp {
+                buf: self.value(names)?,
+            });
+        }
+        if op == "longjmp" {
+            let buf = self.value(names)?;
+            let val = self.value(names)?;
+            return Ok(Inst::LongJmp { buf, val });
+        }
+        if op == "gc.roots" {
+            let heap_lo = self.value(names)?;
+            let heap_hi = self.value(names)?;
+            let mask = self.value(names)?;
+            let buf = self.value(names)?;
+            let cap = self.value(names)?;
+            return Ok(Inst::GcRoots {
+                heap_lo,
+                heap_hi,
+                mask,
+                buf,
+                cap,
             });
         }
         // §12 real threads.
@@ -1401,6 +1966,38 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        if op == "v128.any_true" {
+            return Ok(Inst::VAnyTrue {
+                a: self.value(names)?,
+            });
+        }
+        if op == "i8x16.popcnt" {
+            return Ok(Inst::VPopcnt {
+                a: self.value(names)?,
+            });
+        }
+        if op == "i32x4.dot_i16x8_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDot { a, b });
+        }
+        if op == "i16x8.dot_i8x16_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDotI8 { a, b });
+        }
+        if op == "i16x8.q15mulr_sat_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VQ15MulrSat { a, b });
+        }
+        // Conversions are whole-instruction mnemonics (source/result shapes differ).
+        if let Some(o) = VCvtOp::from_name(op.as_str()) {
+            return Ok(Inst::VConvert {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
         if op == "v128.bitselect" {
             let a = self.value(names)?;
             let b = self.value(names)?;
@@ -1463,6 +2060,18 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        if suffix == "all_true" {
+            return Ok(Inst::VAllTrue {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        if suffix == "bitmask" {
+            return Ok(Inst::VBitmask {
+                shape,
+                a: self.value(names)?,
+            });
+        }
         // `extract_lane[_s|_u] <lane> v<a>` — the sign suffix is only meaningful for narrow
         // integer shapes; accept (and ignore) it elsewhere only if absent.
         if let Some(rest) = suffix.strip_prefix("extract_lane") {
@@ -1505,10 +2114,107 @@ impl<'a> Parser<'a> {
                     a: self.value(names)?,
                 });
             }
+            if let Some(o) = VFCmpOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VFloatCmp { shape, op: o, a, b });
+            }
+            if let Some(o) = VPMinMaxOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VPMinMax { shape, op: o, a, b });
+            }
+            if suffix == "fma" || suffix == "fnma" {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                let c = self.value(names)?;
+                return Ok(Inst::VFma {
+                    shape,
+                    neg: suffix == "fnma",
+                    a,
+                    b,
+                    c,
+                });
+            }
         } else if let Some(o) = VIntBinOp::from_name(suffix) {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::VIntBin { shape, op: o, a, b });
+        } else if let Some(o) = VICmpOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VIntCmp { shape, op: o, a, b });
+        } else if let Some(o) = VShiftOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let amt = self.value(names)?;
+            return Ok(Inst::VShift {
+                shape,
+                op: o,
+                a,
+                amt,
+            });
+        } else if let Some(o) = VIntUnOp::from_name(suffix) {
+            return Ok(Inst::VIntUn {
+                shape,
+                op: o,
+                a: self.value(names)?,
+            });
+        } else if let Some(o) = VSatBinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VSatBin { shape, op: o, a, b });
+        } else if let Some(o) = VWidenOp::from_name(suffix) {
+            return Ok(Inst::VWiden {
+                shape,
+                op: o,
+                a: self.value(names)?,
+            });
+        } else if let Some(o) = VNarrowOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VNarrow { shape, op: o, a, b });
+        } else if suffix == "avgr_u" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VAvgr { shape, a, b });
+        } else if let Some(rest) = suffix.strip_prefix("extmul_") {
+            // rest = "<low|high>_<src-shape>_<s|u>"; the src shape is redundant (= shape.narrower).
+            let parts: Vec<&str> = rest.split('_').collect();
+            if let [half, _src, sign] = parts[..] {
+                let widen = match (half, sign) {
+                    ("low", "s") => Some(VWidenOp::LowS),
+                    ("low", "u") => Some(VWidenOp::LowU),
+                    ("high", "s") => Some(VWidenOp::HighS),
+                    ("high", "u") => Some(VWidenOp::HighU),
+                    _ => None,
+                };
+                if let Some(op_w) = widen {
+                    let a = self.value(names)?;
+                    let b = self.value(names)?;
+                    return Ok(Inst::VExtMul {
+                        shape,
+                        op: op_w,
+                        a,
+                        b,
+                    });
+                }
+            }
+        } else if let Some(rest) = suffix.strip_prefix("extadd_pairwise_") {
+            // rest = "<src-shape>_<s|u>"; src shape is redundant (= shape.narrower).
+            if let Some(sign) = rest.rsplit('_').next() {
+                let signed = match sign {
+                    "s" => Some(true),
+                    "u" => Some(false),
+                    _ => None,
+                };
+                if let Some(signed) = signed {
+                    return Ok(Inst::VExtAddPairwise {
+                        shape,
+                        signed,
+                        a: self.value(names)?,
+                    });
+                }
+            }
         }
         err(format!("unknown opcode `{op}`"))
     }
@@ -1596,6 +2302,12 @@ impl<'a> Parser<'a> {
                 op: o,
                 a: self.value(names)?,
             });
+        }
+        if suffix == "fma" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            let c = self.value(names)?;
+            return Ok(Inst::Fma { ty, a, b, c });
         }
         if let Some(o) = FCmpOp::from_name(suffix) {
             let a = self.value(names)?;
@@ -1708,6 +2420,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a non-negative integer that fits in `u32` (debug-info indices/lines).
+    fn parse_u32(&mut self) -> Result<u32, ParseError> {
+        let v = self.parse_int()?;
+        u32::try_from(v).map_err(|_| ParseError(format!("expected a u32, found {v}")))
+    }
+
+    /// Parse a non-negative integer as `u64` (a global's fixed window address).
+    fn parse_u64(&mut self) -> Result<u64, ParseError> {
+        let v = self.parse_int()?;
+        u64::try_from(v)
+            .map_err(|_| ParseError(format!("expected a non-negative address, found {v}")))
+    }
+
+    /// Parse a bare identifier token (e.g. a `debug.var` location kind).
+    fn parse_ident(&mut self) -> Result<String, ParseError> {
+        match self.next()? {
+            Tok::Ident(s) => Ok(s.clone()),
+            other => err(format!("expected an identifier, found {other:?}")),
+        }
+    }
+
     /// Parse a byte-string literal (data-segment bytes).
     fn parse_str(&mut self) -> Result<Vec<u8>, ParseError> {
         match self.next()? {
@@ -1798,6 +2531,31 @@ block0(v0: i32):
     }
 
     #[test]
+    fn exports_round_trip() {
+        let src = "\
+export \"main\" 1
+export \"helper\" 0
+
+func (i64) -> (i64) {
+block0(v0: i64):
+  return v0
+}
+
+func (i64) -> (i64) {
+block0(v0: i64):
+  return v0
+}
+";
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.exports.len(), 2);
+        assert_eq!(m.resolve_export("main"), Some(1));
+        assert_eq!(m.resolve_export("helper"), Some(0));
+        // Print → re-parse is identity (exports preserved in declaration order).
+        let m2 = parse_module(&print_module(&m)).expect("reparse");
+        assert_eq!(m, m2, "export syntax must round-trip");
+    }
+
+    #[test]
     fn resolves_to_capcalls_and_clears_imports() {
         let m = parse_module(SRC).expect("parse");
         let r = svm_ir::resolve_imports(&m, |n| match n {
@@ -1858,5 +2616,41 @@ block0(v0: i32):
         assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
         // Canonical print → re-parse is identity (printer emits the indexed form + decls).
         assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
+    }
+
+    #[test]
+    fn debug_fnames_round_trip() {
+        // The §6 function-name table parses, populates `debug_info.func_names`, and survives a
+        // print → re-parse round trip (the `debug.fname <func> "<name>"` directive).
+        let src = "\
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+debug.file 0 \"a.c\"
+debug.fname 0 \"compute\"
+debug.fname 1 \"helper\"
+debug.loc 0 0 0 0 7 5
+";
+        let m = parse_module(src).expect("parse debug.fname");
+        let di = m.debug_info.as_ref().expect("module carries debug info");
+        assert_eq!(di.func_names.len(), 2);
+        assert_eq!(
+            (di.func_names[0].func, di.func_names[0].name.as_str()),
+            (0, "compute")
+        );
+        assert_eq!(
+            (di.func_names[1].func, di.func_names[1].name.as_str()),
+            (1, "helper")
+        );
+        assert_eq!(
+            parse_module(&print_module(&m)).unwrap(),
+            m,
+            "print → re-parse is identity"
+        );
     }
 }

@@ -101,7 +101,7 @@ mod switch_tests {
 
     #[test]
     fn switch_roundtrip_accumulates() {
-        let stack = Stack::new(64 * 1024);
+        let stack = Stack::new(64 * 1024).unwrap();
         let mut ctx = unsafe { make(&stack, summer) };
         for (payload, want) in [(5u64, 5u64), (10, 15), (100, 115), (1, 116)] {
             let t = unsafe { jump(ctx, payload) };
@@ -129,7 +129,7 @@ mod switch_tests {
     #[cfg(not(feature = "asan"))]
     #[test]
     fn runs_on_the_fiber_stack() {
-        let stack = Stack::new(64 * 1024);
+        let stack = Stack::new(64 * 1024).unwrap();
         let (lo, hi) = stack.usable_range();
         let ctx = unsafe { make(&stack, report_sp) };
         let t = unsafe { jump(ctx, 0) };
@@ -157,7 +157,7 @@ mod switch_tests {
 
     #[test]
     fn recursion_on_fiber_stack() {
-        let stack = Stack::new(256 * 1024);
+        let stack = Stack::new(256 * 1024).unwrap();
         let ctx = unsafe { make(&stack, fibber) };
         let t = unsafe { jump(ctx, 25) };
         assert_eq!(t.data, 75025); // fib(25)
@@ -166,7 +166,7 @@ mod switch_tests {
     /// Stress: many back-and-forth switches must stay consistent (no register/stack drift).
     #[test]
     fn many_switches_are_stable() {
-        let stack = Stack::new(64 * 1024);
+        let stack = Stack::new(64 * 1024).unwrap();
         let mut ctx = unsafe { make(&stack, summer) };
         let mut expect = 0u64;
         for i in 0..100_000u64 {
@@ -180,8 +180,8 @@ mod switch_tests {
     /// Two independent fibers interleaved through the same resumer keep separate state.
     #[test]
     fn two_fibers_independent() {
-        let sa = Stack::new(64 * 1024);
-        let sb = Stack::new(64 * 1024);
+        let sa = Stack::new(64 * 1024).unwrap();
+        let sb = Stack::new(64 * 1024).unwrap();
         let mut a = unsafe { make(&sa, summer) };
         let mut b = unsafe { make(&sb, summer) };
         let ta = unsafe { jump(a, 3) };

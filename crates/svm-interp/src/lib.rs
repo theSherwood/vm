@@ -8,6 +8,10 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
+/// Phase-1b bytecode-dispatch engine (see `INTERP_PERF.md`) — a flat, operand-resolved execution
+/// path, not yet the default; gated by the equality harness against this interpreter.
+pub mod bytecode;
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -15,12 +19,19 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
-    VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
+    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
+    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SsaLoc,
+    StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
+    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
-use svm_mem::{Region, RmwOp};
+use svm_mem::RmwOp;
+// Re-exported so an embedder can build a `Region::shared` over host memory (e.g. the wasm shared
+// linear memory) and hand it to `compile_and_run_capture_over` — the parallel-wasm window backing.
+// The `unsafe` of borrowing host memory lives in `svm_mem::Region::shared`, keeping this crate
+// `#![forbid(unsafe_code)]`.
+pub use svm_mem::Region;
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -32,6 +43,111 @@ pub enum Value {
     /// A `v128` SIMD vector (§17/D58): 16 raw little-endian bytes. Lane interpretation is
     /// per-op, never per-value — so the value carries only the bytes.
     V128([u8; 16]),
+    /// An opaque 64-bit `ref` (GC.md §6 forward-compat reservation). Operationally identical to
+    /// `I64` — a distinct variant only so type confusion is compile-caught; it carries raw bits.
+    Ref(u64),
+}
+
+/// A raw value **slot** — the interpreter's in-frame storage for one live SSA value, replacing
+/// the 24-byte tagged [`Value`] on the hot path. A scalar lives in `lo` as its bit pattern in the
+/// low bits (mirroring the JIT / cap `val_to_slot` ABI, so `Reg::i64` equals `val_to_slot`); a
+/// `v128` uses both words (little-endian: `lo` = bytes 0..8, `hi` = bytes 8..16). Reads are
+/// **op-directed** — the executing instruction's static type says how to interpret the slot, so
+/// there is no per-value tag to match and no `Result` to thread. `Value` stays the public type;
+/// conversions happen only at the API / capability / debugger boundaries.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct Reg {
+    lo: u64,
+    hi: u64,
+}
+
+impl Reg {
+    #[inline]
+    fn from_i32(x: i32) -> Reg {
+        Reg {
+            lo: x as i64 as u64,
+            hi: 0,
+        } // sign-extend, matching `val_to_slot`
+    }
+    #[inline]
+    fn from_i64(x: i64) -> Reg {
+        Reg {
+            lo: x as u64,
+            hi: 0,
+        }
+    }
+    #[inline]
+    fn from_f32(x: f32) -> Reg {
+        Reg {
+            lo: x.to_bits() as u64,
+            hi: 0,
+        }
+    }
+    #[inline]
+    fn from_f64(x: f64) -> Reg {
+        Reg {
+            lo: x.to_bits(),
+            hi: 0,
+        }
+    }
+    #[inline]
+    fn from_v128(b: [u8; 16]) -> Reg {
+        Reg {
+            lo: u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+            hi: u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
+        }
+    }
+    #[inline]
+    fn i32(self) -> i32 {
+        self.lo as i32
+    }
+    #[inline]
+    fn i64(self) -> i64 {
+        self.lo as i64
+    }
+    #[inline]
+    fn f32(self) -> f32 {
+        f32::from_bits(self.lo as u32)
+    }
+    #[inline]
+    fn f64(self) -> f64 {
+        f64::from_bits(self.lo)
+    }
+    #[inline]
+    fn v128(self) -> [u8; 16] {
+        let lo = self.lo.to_le_bytes();
+        let hi = self.hi.to_le_bytes();
+        [
+            lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3],
+            hi[4], hi[5], hi[6], hi[7],
+        ]
+    }
+    /// Boundary in: pack a typed [`Value`] (entry args, host results) into a slot.
+    #[inline]
+    fn from_value(v: Value) -> Reg {
+        match v {
+            Value::I32(x) => Reg::from_i32(x),
+            Value::I64(x) => Reg::from_i64(x),
+            Value::F32(x) => Reg::from_f32(x),
+            Value::F64(x) => Reg::from_f64(x),
+            Value::V128(b) => Reg::from_v128(b),
+            Value::Ref(x) => Reg { lo: x, hi: 0 },
+        }
+    }
+    /// Boundary out: reconstruct a typed [`Value`] (API results, debugger reads). The type comes
+    /// from the function/cap signature or the debugger's value-type lookup — the slot itself is
+    /// untyped.
+    #[inline]
+    fn to_value(self, ty: ValType) -> Value {
+        match ty {
+            ValType::I32 => Value::I32(self.i32()),
+            ValType::I64 => Value::I64(self.i64()),
+            ValType::F32 => Value::F32(self.f32()),
+            ValType::F64 => Value::F64(self.f64()),
+            ValType::V128 => Value::V128(self.v128()),
+            ValType::Ref => Value::Ref(self.lo),
+        }
+    }
 }
 
 /// Reasons execution stopped without producing results.
@@ -96,6 +212,1489 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     run_with_host(m, func, args, fuel, &mut host)
 }
 
+/// A traced run's outcome: the result, the **trap-time backtrace** (innermost frame first, as `IrPc`s;
+/// empty on a clean finish), and the **trapping fiber** (§5 W3 / §23-D57 — `Some(handle)` for a fiber,
+/// `Some(-1)` for the root, `None` on a clean finish). Returned by [`run_traced`] /
+/// [`run_with_host_traced`] and the `*_fast_traced` fast-path counterparts.
+pub type TracedRun = (Result<Vec<Value>, Trap>, Vec<IrPc>, Option<i64>);
+
+/// Like [`run`], but also return the guest's **trap-time backtrace** (innermost frame first, as
+/// `IrPc`s; empty on a clean finish) and the trapping fiber — see [`run_with_host_traced`].
+pub fn run_traced(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> TracedRun {
+    let mut host = Host::new();
+    run_with_host_traced(m, func, args, fuel, &mut host)
+}
+
+/// The **fast** interpreter entry (INTERP_PERF.md Slice 1c): run on the [`bytecode`] engine when the
+/// module is eligible, else fall back to the tree-walker [`run`]. The two are bit-for-bit equivalent
+/// on the eligible set (the `bytecode_diff` harness gates this), so this is a transparent speedup.
+///
+/// `run` itself stays the tree-walker — it is the reference **oracle** the JIT (and the bytecode
+/// engine) are differentially checked against, so it must not change. Speed-sensitive callers that
+/// are *not* themselves the oracle use `run_fast`.
+pub fn run_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> Result<Vec<Value>, Trap> {
+    let mut host = Host::new();
+    run_with_host_fast(m, func, args, fuel, &mut host)
+}
+
+// ===========================================================================================
+// Debugging — interpreter-rooted stepping/breakpoints (DEBUGGING.md W2/W8, Milestone A slice 1).
+// Designs: S1 (location model = `IrPc`), S3 (logical-time = the probe's op count), S4 (the per-op
+// seam in `run_inner`), S5 (driver-style `Inspector`). Single-threaded guests only for now; debug
+// of multithreaded guests is Milestone B (it rides the `Policy` scheduler seam — S4).
+// ===========================================================================================
+
+/// A program location (DEBUGGING.md S1): which op of which block of which function, in which
+/// module space (`0` = the guest's own program; `≥1` = an installed `Jit` unit, §22). This is the
+/// granularity breakpoints and backtraces use; mapping it to source is W4 (the §3a debug-info
+/// side-table), not yet built.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct IrPc {
+    pub module: u32,
+    pub func: FuncIdx,
+    pub block: usize,
+    pub inst: usize,
+}
+
+/// Why an [`Inspector`] paused the guest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopReason {
+    /// Reached an op carrying a breakpoint.
+    Breakpoint,
+    /// Completed a single-step (`Inspector::step`).
+    Step,
+    /// About to execute an op that accesses a watched window range. Reported *before* the access
+    /// takes effect (`addr`/`write` describe the access); `step` once to apply it and observe the
+    /// new bytes. `addr` is the confined window offset the op touches.
+    Watchpoint { addr: u64, write: bool },
+    /// About to execute a capability call (§3c) — the host-boundary stop, enabled by
+    /// [`Inspector::set_cap_call_stops`]. The handle/args are live in the frame (read them via
+    /// [`Inspector::read_ir_value`]); `step` once to perform the call and see its results. This is
+    /// the boundary W1 record/replay will hook (DEBUGGING.md S5).
+    CapCall { type_id: u32, op: u32 },
+}
+
+/// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WatchKind {
+    /// Reads only.
+    Read,
+    /// Writes / RMW / `notify` only (the common case — "what changes this?").
+    Write,
+    /// Either.
+    ReadWrite,
+}
+
+impl WatchKind {
+    fn fires_on(self, write: bool) -> bool {
+        match self {
+            WatchKind::Read => !write,
+            WatchKind::Write => write,
+            WatchKind::ReadWrite => true,
+        }
+    }
+}
+
+/// Handle for a set watchpoint, used to clear it (`Inspector::clear_watchpoint`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct WatchId(u32);
+
+/// The outcome of resuming an [`Inspector`] ([`Inspector::run_until_stop`] / [`Inspector::step`]).
+#[derive(Clone, Debug)]
+pub enum Stop {
+    /// Paused *before* the op at `pc`; the guest state is live and inspectable.
+    Break { reason: StopReason, pc: IrPc },
+    /// The guest ran to completion (or trapped); no more stepping is possible.
+    Finished(Result<Vec<Value>, Trap>),
+    /// The (single-threaded) guest parked on `thread.join`/`atomic.wait` with nothing to wake it —
+    /// out of scope for slice 1 (multithreaded debugging is Milestone B).
+    Blocked,
+}
+
+/// One activation on the paused guest's call stack (innermost first), as reported by
+/// [`Inspector::backtrace`]. `vals` are the frame's live SSA values by index — the interpreter
+/// holds them directly (DEBUGGING.md S2), so a promoted local resolves to `vals[value_idx]` with no
+/// Cranelift machinery.
+#[derive(Clone, Debug)]
+pub struct FrameInfo {
+    pub pc: IrPc,
+    pub vals: Vec<Value>,
+    /// The source location of `pc`, if the module carries debug info (DEBUGGING.md §6/W4).
+    pub source: Option<SourceLoc>,
+}
+
+/// The source-level types of `frame`'s block-local SSA values, so the debugger can reconstruct a
+/// typed [`Value`] from an (untyped) storage [`Reg`]. Reuses the verifier's assignment (single
+/// source of truth). Only the guest's own program (module 0) is typed here — installed §22 units
+/// resolve against a different function space, so their values fall back to a raw `i64` view.
+fn frame_value_types(v: &VCpu, frame: &Frame) -> Vec<ValType> {
+    if frame.module != 0 {
+        return Vec::new();
+    }
+    match v.funcs.get(frame.func as usize) {
+        Some(f) => svm_verify::func_value_types(f, &v.funcs, v.mem.is_some())
+            .into_iter()
+            .nth(frame.block)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Reconstruct a typed [`Value`] for block-local value `idx` of `frame` (debugger boundary). A
+/// value whose type can't be derived (a §22 unit frame, or an out-of-range index on an unverified
+/// module) reads back as a raw `i64` — total, never panics.
+fn frame_value(frame: &Frame, types: &[ValType], idx: usize) -> Option<Value> {
+    let slot = frame.vals.get(idx)?;
+    Some(slot.to_value(types.get(idx).copied().unwrap_or(ValType::I64)))
+}
+
+/// A watched window range (DEBUGGING.md W2). Stop when an op accesses `[addr, addr+len)` with a
+/// matching read/write kind.
+struct Watch {
+    id: WatchId,
+    addr: u64,
+    len: u64,
+    kind: WatchKind,
+}
+
+/// Debug state **shared by every vCPU** of a debugged run (DEBUGGING.md W2/Milestone B):
+/// breakpoints and watchpoints are global — a breakpoint fires in whichever thread reaches it, a
+/// watchpoint on whichever thread touches the range. (Logical time and the pending single-step are
+/// *per-vCPU*; they live in [`DebugCtx`].) Behind a `Mutex` only because a vCPU must stay `Send`
+/// for the real worker pool; a debugged run is driven cooperatively on one thread, so the lock is
+/// always uncontended.
+struct DebugShared {
+    breakpoints: BTreeSet<IrPc>,
+    /// Window-range watchpoints. Empty in the common case, so the hot loop skips the (confining)
+    /// `access_of` computation entirely when none are armed (S4 cost gating).
+    watchpoints: Vec<Watch>,
+    next_watch: u32,
+    /// Pause before every `cap.call` (the host boundary, DEBUGGING.md S5).
+    cap_stops: bool,
+    /// While `true`, the per-op seam ignores breakpoints/watchpoints/steps (clock still ticks) — set
+    /// during a scheduled-mode time-travel `seek` so it fast-forwards to a target turn without
+    /// stopping (DEBUGGING.md W1). Breakpoints stay armed for the run that follows.
+    suppress_stops: bool,
+}
+
+impl DebugShared {
+    fn new() -> DebugShared {
+        DebugShared {
+            breakpoints: BTreeSet::new(),
+            watchpoints: Vec::new(),
+            next_watch: 0,
+            cap_stops: false,
+            suppress_stops: false,
+        }
+    }
+
+    /// A `cap.call`-boundary stop, if armed and `inst` is one.
+    fn cap_stop(&self, inst: &Inst) -> Option<StopReason> {
+        match inst {
+            Inst::CapCall { type_id, op, .. } if self.cap_stops => Some(StopReason::CapCall {
+                type_id: *type_id,
+                op: *op,
+            }),
+            _ => None,
+        }
+    }
+
+    /// First watchpoint the `access` hits (overlapping bytes + matching read/write kind), if any.
+    fn watch_hit(&self, access: MemAccess) -> Option<(u64, bool)> {
+        let MemAccess::Range { base, width, write } = access else {
+            return None;
+        };
+        let end = base.saturating_add(width as u64);
+        self.watchpoints.iter().find_map(|w| {
+            let w_end = w.addr.saturating_add(w.len);
+            let overlaps = base < w_end && w.addr < end;
+            (overlaps && w.kind.fires_on(write)).then_some((base, write))
+        })
+    }
+}
+
+/// Per-vCPU debug state, consulted by the per-op hook in [`run_inner`] (DEBUGGING.md S4). Present
+/// only while an [`Inspector`] drives the vCPU. The breakpoint/watchpoint sets it consults are
+/// **shared** across the run's vCPUs (see [`DebugShared`]); `clock`/`step_target` are this vCPU's.
+struct DebugCtx {
+    /// The run-wide breakpoint/watchpoint state (shared with the [`Inspector`] and sibling vCPUs).
+    shared: Arc<Mutex<DebugShared>>,
+    /// S3 logical time: the number of ops this vCPU has executed. Monotonic; the coordinate a
+    /// future `seek` (W1) and step-back will target.
+    clock: u64,
+    /// `clock` value at the most recent stop. Suppresses an immediate re-trigger at the op we just
+    /// paused on, so a `continue`/`step` first *steps off* the current breakpoint.
+    resume_clock: u64,
+    /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
+    step_target: Option<u64>,
+    /// Depth-aware stepping (DEBUGGING.md W2): when `Some(d)`, stop at the next op (after stepping
+    /// off the current one) whose call depth is `<= d`. `d` = current depth runs over (skips into and
+    /// out of) any call the current op makes (step-**over**); `d` = current depth − 1 runs until this
+    /// function returns (step-**out**).
+    step_max_depth: Option<usize>,
+    /// Time-travel seek (DEBUGGING.md W1): when `Some(t)`, fast-forward this fresh re-execution to
+    /// logical time `t` — pausing exactly at `clock == t` and **ignoring** breakpoints/watchpoints
+    /// along the way (we are replaying to a known coordinate, not hunting for stops).
+    seek_target: Option<u64>,
+}
+
+impl DebugCtx {
+    fn new(shared: Arc<Mutex<DebugShared>>) -> DebugCtx {
+        DebugCtx {
+            shared,
+            clock: 0,
+            resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
+            step_target: None,
+            step_max_depth: None,
+            seek_target: None,
+        }
+    }
+
+    fn shared(&self) -> std::sync::MutexGuard<'_, DebugShared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn watches_armed(&self) -> bool {
+        !self.shared().watchpoints.is_empty()
+    }
+
+    /// Decide whether to pause *before* the op at `pc`. `access` is the op's memory effect (only
+    /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise); `inst` is
+    /// the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op has not run,
+    /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
+    /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
+    fn before_op(
+        &mut self,
+        pc: IrPc,
+        inst: &Inst,
+        access: MemAccess,
+        depth: usize,
+    ) -> Option<StopReason> {
+        // Time-travel seek (W1): replay straight to logical time `t`, past any breakpoints.
+        if let Some(t) = self.seek_target {
+            if self.clock >= t {
+                self.seek_target = None;
+                self.resume_clock = self.clock; // a subsequent step/continue first steps off here
+                return Some(StopReason::Step);
+            }
+            self.clock += 1;
+            return None;
+        }
+        let just_resumed = self.clock == self.resume_clock;
+        let reason = if just_resumed {
+            None
+        } else {
+            let sh = self.shared();
+            if sh.suppress_stops {
+                None // scheduled-seek fast-forward: run past stops (clock still ticks below)
+            } else if sh.breakpoints.contains(&pc) {
+                Some(StopReason::Breakpoint)
+            } else if let Some((addr, write)) = sh.watch_hit(access) {
+                Some(StopReason::Watchpoint { addr, write })
+            } else if let Some(r) = sh.cap_stop(inst) {
+                Some(r)
+            } else if self.step_target == Some(self.clock) {
+                Some(StopReason::Step)
+            } else if matches!(self.step_max_depth, Some(d) if depth <= d) {
+                // Step-over/out: we have stepped off the original op and the call depth is back at
+                // (or below) the target, so a call we ran over has returned.
+                Some(StopReason::Step)
+            } else {
+                None
+            }
+        };
+        match reason {
+            Some(r) => {
+                self.resume_clock = self.clock;
+                self.step_target = None;
+                self.step_max_depth = None;
+                Some(r)
+            }
+            None => {
+                self.clock += 1;
+                None
+            }
+        }
+    }
+}
+
+/// A host-side, **observe-only** debugger for a single-threaded guest on the reference interpreter
+/// (DEBUGGING.md W8/S5). It *owns and pumps* the run — `run_until_stop`/`step` drive the guest to
+/// the next breakpoint/step, then `backtrace`/`read_ir_value`/`read_window` inspect the paused
+/// state. It is a *host* capability shaped like §15 `Monitor`: it never widens the guest's
+/// authority, and attaching with no breakpoints is behavior-identical to [`run`] (S7).
+///
+/// Single vCPU (multithreaded guests are Milestone B). The module must be **import-resolved** (no
+/// `CallImport` left — run `svm_run::resolve_capability_imports` first), as the interpreter only
+/// runs concrete `cap.call`s. The §3a source mapping (W4) and time-travel (W1) are later slices.
+pub struct Inspector {
+    /// The vCPU under inspection in **single-threaded** mode (`attach`/`attach_with_host`). `None`
+    /// in scheduled mode, where the threads live in the scheduler and the stopped one is held by the
+    /// [`SchedDriver`] — see [`Inspector::cur`].
+    v: Option<Box<VCpu>>,
+    /// Present in **scheduled** (multithreaded) mode (`attach_scheduled`): the cooperative driver +
+    /// its deterministic schedule, owned across `run_until_stop`/`step` calls (DEBUGGING.md
+    /// Milestone B).
+    sched: Option<SchedState>,
+    /// The shared powerbox: capabilities the guest may call. The driver owns it for the run; while
+    /// the guest is paused it is uncontended, so [`host`](Inspector::host) can lock it to read
+    /// effects (captured stdout, clock, grants).
+    host: Arc<Mutex<Host>>,
+    /// The frontend-neutral debug-info waist (DEBUGGING.md §6), cloned from the module. `None` ⇒
+    /// the debugger reports IR locations only ([`IrPc`]/SSA indices); present ⇒ it can resolve
+    /// source locations and named variables.
+    debug_info: Option<DebugInfo>,
+    /// The run-wide breakpoint/watchpoint state, shared with every driven vCPU (so a breakpoint
+    /// fires in whichever thread reaches it — DEBUGGING.md Milestone B). The [`Inspector`] mutates
+    /// it through `set_breakpoint`/`set_watchpoint`/`set_cap_call_stops`.
+    shared: Arc<Mutex<DebugShared>>,
+    /// Which thread (vCPU) read-inspection (`backtrace`/`read_*`/`clock`) targets in scheduled mode
+    /// (DEBUGGING.md Milestone B `select_fiber`). `None` ⇒ the thread that stopped; `Some(id)` ⇒ a
+    /// thread the user `select_task`ed. Reset to `None` on each resume. Stepping always drives the
+    /// stopped thread, regardless of focus.
+    focus: Option<TaskId>,
+    /// The recorded inputs needed to **re-execute** the run from scratch for time-travel `seek` (W1).
+    /// Present in single-threaded mode; `None` in scheduled mode (seek pending there).
+    seek_init: Option<SeekInit>,
+    finished: Option<Result<Vec<Value>, Trap>>,
+    /// Time-travel **checkpoint ladder** (W1): snapshots of the sole vCPU at ascending `clock`s,
+    /// captured during single-threaded `seek` replays so a later `seek`/`step_back` restarts from the
+    /// nearest one (`clock ≤ t`) instead of clock 0 — turning a backward sweep from O(t²) into
+    /// ~O(t·stride). Kept sorted by `clock`. Empty in scheduled mode or once `checkpointing` is off.
+    checkpoints: Vec<SeekCheckpoint>,
+    /// Whether this run is eligible for checkpointing — the single-threaded, **root-only, non-fiber,
+    /// non-durable, simple-memory** subset where `frames` + window bytes fully capture the
+    /// continuation. Starts `true`; the first replay that observes state outside the subset clears it
+    /// (and the ladder), after which `seek` is exactly the original replay-from-clock-0 path.
+    checkpointing: bool,
+}
+
+/// Capture a checkpoint at most every this many ops. Small enough that `step_back` replays a bounded
+/// tail, large enough that the per-checkpoint snapshot (frames + window bytes) amortizes well.
+const SEEK_CHECKPOINT_STRIDE: u64 = 1024;
+
+/// The run-mutable host substate a time-travel checkpoint restores — see [`Host::replay_substate`].
+#[derive(Clone)]
+struct HostReplaySubstate {
+    stdin_pos: usize,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    clock_ns: i64,
+    cap_cursor: usize,
+    cap_record: Vec<CapRecord>,
+}
+
+/// A single-threaded time-travel **checkpoint** (W1): the full re-executable state of the sole vCPU at
+/// logical time `clock`, so [`Inspector::seek`] can restart a replay here rather than from clock 0.
+/// Captured only for the root-only / non-fiber / non-durable / simple-memory subset (see
+/// [`Inspector::checkpoint_of`]), where `frames` plus the window bytes fully determine the
+/// continuation.
+struct SeekCheckpoint {
+    clock: u64,
+    frames: Vec<Frame>,
+    fuel: u64,
+    /// Mapped window bytes (`Mem::snapshot`), reseeded via `Mem::seed` on restore; `None` for a
+    /// memoryless run.
+    mem: Option<Vec<u8>>,
+    host: HostReplaySubstate,
+}
+
+/// The inputs a single-threaded run was started with, kept so [`Inspector::seek`] can re-execute it
+/// deterministically from `clock 0` (DEBUGGING.md W1 stateless re-execution). All fields are cheap
+/// to clone (shared `Arc`s + `Copy`), so a `seek`/`step_back` per keystroke is fine.
+#[derive(Clone)]
+struct SeekInit {
+    funcs: Arc<[Func]>,
+    func: FuncIdx,
+    args: Arc<[Value]>,
+    fuel: u64,
+    memory: Option<Memory>,
+    data: Arc<[Data]>,
+    /// `Some(plan)` ⇒ this was a **scheduled** (multithreaded) run; `seek(t)` re-executes the plan
+    /// for `t` scheduler turns (the global logical-time coordinate). `None` ⇒ single-threaded, where
+    /// `seek(t)` targets the sole vCPU's op clock.
+    schedule: Option<Arc<[u64]>>,
+    /// The fuzzing seed, if the scheduled run was [`attach_scheduled_seeded`]. `seek` re-applies it
+    /// so the same random interleaving is reproduced.
+    ///
+    /// [`attach_scheduled_seeded`]: Inspector::attach_scheduled_seeded
+    seed: Option<u64>,
+}
+
+/// Scheduled (multithreaded) execution state owned by an [`Inspector`] across pumps (Milestone B).
+struct SchedState {
+    /// The deterministic cooperative scheduler holding every vCPU not currently selected.
+    det: Arc<DetSched>,
+    /// The schedule source, reused as the picker: an empty plan ⇒ the deterministic default order
+    /// (smallest runnable `TaskId` each turn); a `Witness::plan` ⇒ replay that exact interleaving.
+    dpor: Dpor,
+    /// The re-entrant driver; while stopped, the offending vCPU is parked in `driver.held` and is
+    /// the inspection target ([`Inspector::cur`]).
+    driver: SchedDriver,
+    /// The root vCPU's id, whose outcome is the guest's result.
+    root_id: TaskId,
+}
+
+/// A resolved source location ([`Inspector::source_loc`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SourceLoc {
+    pub file: String,
+    pub line: u32,
+    /// 0 means "no column".
+    pub col: u32,
+}
+
+/// Resolve an [`IrPc`] to its source position using `m`'s `-g` debug info (nearest-preceding `loc`
+/// within the block), or `None` without debug info / for an installed §22 unit (`pc.module != 0`).
+/// The free counterpart of [`Inspector::source_loc`]; pairs with [`run_with_host_traced`] to render
+/// an interpreter trap-time backtrace to source (the symmetric analog of the JIT's `JitFrameLoc`).
+pub fn source_loc(m: &Module, pc: IrPc) -> Option<SourceLoc> {
+    source_loc_in(m.debug_info.as_ref()?, pc)
+}
+
+/// The `-g` source name of function `func` in module 0 (`debug_info.func_names`), or `None` when the
+/// module carried no name for it — renderers fall back to `fn{func}`. Pairs with [`source_loc`] to
+/// render an interpreter trap-time backtrace with function names (the analog of the JIT's
+/// `JitFrameLoc::func_name`).
+pub fn func_name(m: &Module, func: FuncIdx) -> Option<&str> {
+    let di = m.debug_info.as_ref()?;
+    di.func_names
+        .iter()
+        .find(|f| f.func == func)
+        .map(|f| f.name.as_str())
+}
+
+/// The nearest-preceding-`loc` resolution shared by [`source_loc`] and [`Inspector::source_loc`]
+/// (DEBUGGING.md §6/W4 S2): the latest `loc` in `pc`'s block at or before `pc.inst`.
+fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
+    if pc.module != 0 {
+        return None;
+    }
+    let l = di
+        .locs
+        .iter()
+        .filter(|l| l.func == pc.func && l.block as usize == pc.block && l.inst as usize <= pc.inst)
+        .max_by_key(|l| l.inst)?;
+    let file = di.files.get(l.file as usize)?.clone();
+    Some(SourceLoc {
+        file,
+        line: l.line,
+        col: l.col,
+    })
+}
+
+/// The value of a source variable ([`Inspector::read_var`]). A promoted scalar resolves to a live
+/// SSA [`Value`]; a window-resident variable resolves to its raw little-endian bytes (the S2
+/// `Window` location — the caller interprets them per the variable's type).
+#[derive(Clone, PartialEq, Debug)]
+pub enum VarValue {
+    Value(Value),
+    Bytes(Vec<u8>),
+}
+
+/// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
+/// guest passed and the result slots the host returned, for a **nondeterministic input** capability
+/// (e.g. `Clock`). Replayed verbatim so a re-execution (time-travel `seek`) sees identical host
+/// inputs without a live host.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CapRecord {
+    pub type_id: u32,
+    pub op: u32,
+    pub handle: i32,
+    pub args: Vec<i64>,
+    /// The result slots the host returned (`Err` for a cap that trapped, e.g. `exit`).
+    pub result: Result<Vec<i64>, Trap>,
+    /// Bytes the cap wrote **into the guest window** as `(ptr, bytes)` — e.g. a stdin `read` filling
+    /// its buffer. Re-applied on replay so a buffer-filling input cap reproduces faithfully. Empty
+    /// for slot-only caps (`Clock`).
+    pub mem_writes: Vec<(u64, Vec<u8>)>,
+}
+
+/// An append-only log of the capability **inputs** crossing into a guest, captured during a run so a
+/// later re-execution reproduces them without a live host (DEBUGGING.md W1). Records the slot-only
+/// input caps (`Clock`) and buffer-filling ones (stdin `read`); RNG / host-fns and the `SchedTape`
+/// are follow-ups.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct CapTape {
+    pub records: Vec<CapRecord>,
+}
+
+/// Whether a capability is a **nondeterministic input** whose result a re-execution must replay
+/// (rather than re-derive). Deterministic / structural caps (window `Memory` ops, `SharedRegion`,
+/// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Inputs: `Clock`
+/// (op 0 `now`), `Stream` op 0 (stdin `read`), and **any host-fn** (`iface::HOST_FN`) — the
+/// embedder's escape hatch (RNG, a real clock, external I/O), whose closure is *gone* on the fresh
+/// replay powerbox, so only the tape can reproduce it.
+fn is_recorded_input(type_id: u32, op: u32) -> bool {
+    type_id == iface::CLOCK || (type_id == iface::STREAM && op == 0) || type_id == iface::HOST_FN
+}
+
+/// A [`GuestMem`] wrapper that records every `write_bytes` a capability makes into the guest window
+/// (DEBUGGING.md W1), so a buffer-filling input cap (stdin `read`) can be replayed by re-applying the
+/// captured bytes. Every other operation delegates unchanged to the real window.
+struct RecordingMem<'a> {
+    inner: &'a mut dyn GuestMem,
+    writes: Vec<(u64, Vec<u8>)>,
+}
+
+impl GuestMem for RecordingMem<'_> {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        self.inner.read_bytes(ptr, len)
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let r = self.inner.write_bytes(ptr, data);
+        if r.is_some() {
+            self.writes.push((ptr, data.to_vec()));
+        }
+        r
+    }
+    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.inner.map(offset, len, prot)
+    }
+    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
+        self.inner.unmap(offset, len)
+    }
+    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.inner.protect(offset, len, prot)
+    }
+    fn map_region(
+        &mut self,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        self.inner
+            .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn page_size(&self) -> i64 {
+        self.inner.page_size()
+    }
+    fn region_page_size(&self) -> i64 {
+        self.inner.region_page_size()
+    }
+    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
+        self.inner.async_counter(counter_addr)
+    }
+}
+
+impl Inspector {
+    /// Attach to `m`'s `func(args)` with `fuel` and an **empty powerbox** (any `cap.call` faults),
+    /// paused before the first op. Set breakpoints, then
+    /// [`run_until_stop`](Inspector::run_until_stop) or [`step`](Inspector::step).
+    pub fn attach(m: &Module, func: FuncIdx, args: &[Value], fuel: u64) -> Inspector {
+        Inspector::attach_with_host(m, func, args, fuel, Host::new())
+    }
+
+    /// Like [`attach`](Inspector::attach), but with a caller-prepared [`Host`] (the powerbox):
+    /// `grant_*` the capabilities the guest needs, pass their handle indices in `args`, then debug a
+    /// capability-using guest (§3c/§3e). Read effects back through [`host`](Inspector::host) while
+    /// paused or after [`Stop::Finished`]. `m` must be import-resolved (see the type docs).
+    pub fn attach_with_host(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        mut host: Host,
+    ) -> Inspector {
+        let funcs: Arc<[Func]> = m.funcs.to_vec().into();
+        let args: Arc<[Value]> = args.into();
+        let data: Arc<[Data]> = m.data.clone().into();
+        host.record_caps(); // W1: tape the cap inputs so `seek` can re-execute faithfully
+        let host = Arc::new(Mutex::new(host));
+        let shared = Arc::new(Mutex::new(DebugShared::new()));
+        let root = Self::fresh_single_root(
+            Arc::clone(&funcs),
+            func,
+            &args,
+            fuel,
+            m.memory,
+            &data,
+            Arc::clone(&host),
+            Arc::clone(&shared),
+            None,
+        );
+        Inspector {
+            v: Some(root),
+            sched: None,
+            host,
+            debug_info: m.debug_info.clone(),
+            shared,
+            focus: None,
+            seek_init: Some(SeekInit {
+                funcs,
+                func,
+                args,
+                fuel,
+                memory: m.memory,
+                data,
+                schedule: None,
+                seed: None,
+            }),
+            finished: None,
+            checkpoints: Vec::new(),
+            checkpointing: true,
+        }
+    }
+
+    /// Build a fresh single-threaded root vCPU over `funcs`/`func`/`args` with its own scheduler (no
+    /// workers run — the driver pumps it directly). `seek_target` fast-forwards a time-travel replay
+    /// to a logical time and pauses there (W1); `None` for a normal attach. Shared by `attach` and
+    /// `seek` so both build identical initial state.
+    #[allow(clippy::too_many_arguments)]
+    fn fresh_single_root(
+        funcs: Arc<[Func]>,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        memory: Option<Memory>,
+        data: &[Data],
+        host: Arc<Mutex<Host>>,
+        shared: Arc<Mutex<DebugShared>>,
+        seek_target: Option<u64>,
+    ) -> Box<VCpu> {
+        let mem = memory.map(|mc| {
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            mm.init_data(data);
+            mm
+        });
+        let quota = Quota::default();
+        let sched = Arc::new(Scheduler::new(quota.max_vcpus, MAX_WORKERS));
+        let dt = Arc::new(DomainTable::new(&funcs, 0));
+        let mut root = VCpu::new(
+            funcs,
+            func,
+            args,
+            mem,
+            host,
+            fuel,
+            0,
+            0,
+            SchedRef::Real(sched),
+            quota,
+            dt,
+        );
+        let mut d = DebugCtx::new(shared);
+        d.seek_target = seek_target;
+        root.debug = Some(Box::new(d));
+        Box::new(root)
+    }
+
+    /// Attach to a **multithreaded** guest and debug a chosen interleaving (DEBUGGING.md Milestone
+    /// B). The run is driven cooperatively on this thread under a fixed `schedule` — a
+    /// [`Witness::plan`] from [`find_schedule`] to step a specific (e.g. failing) interleaving, or an
+    /// empty `Vec` for the deterministic default order (smallest runnable thread each turn). Unlike
+    /// the single-threaded [`attach`](Inspector::attach), this drives every `thread.spawn`ed vCPU on
+    /// one OS thread, so the schedule is reproducible and breakpoints/steps are exact and
+    /// race-free. Breakpoints fire in whichever thread reaches them; [`stopped_task`] reports which.
+    /// Inspection becomes available after the first [`run_until_stop`]/[`step`]. `m` must be
+    /// import-resolved.
+    ///
+    /// [`stopped_task`]: Inspector::stopped_task
+    pub fn attach_scheduled(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        schedule: Vec<u64>,
+    ) -> Inspector {
+        Self::scheduled_impl(m, func, args, fuel, schedule, None)
+    }
+
+    /// Like [`attach_scheduled`](Inspector::attach_scheduled), but drive a **random** interleaving
+    /// from `seed` instead of a fixed plan — schedule fuzzing (DEBUGGING.md W1). Each turn picks a
+    /// random runnable thread, so different seeds explore different interleavings (and may surface
+    /// different race outcomes). The interleaving that ran is captured: [`sched_tape`] returns it as
+    /// a portable plan you can `attach_scheduled` to replay deterministically (or share as a repro).
+    /// `seek`/`step_back` reproduce this exact random run (same seed).
+    ///
+    /// [`sched_tape`]: Inspector::sched_tape
+    pub fn attach_scheduled_seeded(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        seed: u64,
+    ) -> Inspector {
+        Self::scheduled_impl(m, func, args, fuel, Vec::new(), Some(seed))
+    }
+
+    fn scheduled_impl(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        schedule: Vec<u64>,
+        seed: Option<u64>,
+    ) -> Inspector {
+        let funcs: Arc<[Func]> = m.funcs.to_vec().into();
+        let args_arc: Arc<[Value]> = args.into();
+        let data: Arc<[Data]> = m.data.clone().into();
+        let schedule: Arc<[u64]> = schedule.into();
+        let mut host0 = Host::new();
+        host0.record_caps(); // W1: tape cap inputs so scheduled `seek` re-executes faithfully
+        let host = Arc::new(Mutex::new(host0));
+        let shared = Arc::new(Mutex::new(DebugShared::new()));
+        let sched = Self::fresh_scheduled(
+            Arc::clone(&funcs),
+            func,
+            args,
+            fuel,
+            m.memory,
+            &data,
+            Arc::clone(&shared),
+            Arc::clone(&host),
+            &schedule,
+            seed,
+            None,
+        );
+        Inspector {
+            v: None,
+            sched: Some(sched),
+            host,
+            debug_info: m.debug_info.clone(),
+            shared,
+            focus: None,
+            seek_init: Some(SeekInit {
+                funcs,
+                func,
+                args: args_arc,
+                fuel,
+                memory: m.memory,
+                data,
+                schedule: Some(schedule),
+                seed,
+            }),
+            finished: None,
+            // Scheduled (multithreaded) seek targets the global turn coordinate and is not
+            // checkpointed in this slice — checkpointing is the single-threaded path only.
+            checkpoints: Vec::new(),
+            checkpointing: false,
+        }
+    }
+
+    /// Build a fresh scheduled (multithreaded) run: a `DetSched` holding the root vCPU (debug +
+    /// `memop`), to be driven under `schedule` (a plan, or empty for the deterministic default
+    /// order). `turn_limit` stops the driver at that turn boundary for a time-travel `seek`. Shared
+    /// by `attach_scheduled` and the scheduled branch of `seek` so both build identical state.
+    #[allow(clippy::too_many_arguments)]
+    fn fresh_scheduled(
+        funcs: Arc<[Func]>,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        memory: Option<Memory>,
+        data: &[Data],
+        shared: Arc<Mutex<DebugShared>>,
+        host: Arc<Mutex<Host>>,
+        schedule: &[u64],
+        seed: Option<u64>,
+        turn_limit: Option<u64>,
+    ) -> SchedState {
+        let mem = memory.map(|mc| {
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            mm.init_data(data);
+            mm
+        });
+        let det = Arc::new(DetSched::new(0, MAX_VCPUS));
+        let root_id = {
+            let mut s = det.lock();
+            let id = s.next_task;
+            s.next_task += 1;
+            s.live += 1;
+            let dt = Arc::new(DomainTable::new(&funcs, 0));
+            let mut root = VCpu::new(
+                Arc::clone(&funcs),
+                func,
+                args,
+                mem,
+                Arc::clone(&host),
+                fuel,
+                0,
+                id,
+                SchedRef::Det(Arc::clone(&det)),
+                Quota::default(),
+                dt,
+            );
+            root.memop = true; // one visible op per turn — the granularity steps/breakpoints align to
+            root.debug = Some(Box::new(DebugCtx::new(Arc::clone(&shared))));
+            s.runnable.push(Box::new(root));
+            id
+        };
+        let mut dpor = Dpor::new(schedule.to_vec(), Vec::new());
+        // Seeded fuzzing extends the schedule randomly past the (usually empty) plan; mixing the raw
+        // seed avoids the xorshift zero fixpoint, and is applied identically here for `seek` to
+        // reproduce the same random schedule.
+        dpor.rng = seed.map(|s| s ^ 0x9E37_79B9_7F4A_7C15);
+        SchedState {
+            det,
+            dpor,
+            driver: SchedDriver {
+                turn_limit,
+                ..Default::default()
+            },
+            root_id,
+        }
+    }
+
+    /// Time-travel to logical time `t` (DEBUGGING.md W1): re-execute the run from the start and pause
+    /// at `t`, so `backtrace`/`read_*` show the guest exactly **as it was**. The coordinate `t` is
+    /// the sole vCPU's op [`clock`](Inspector::clock) in single-threaded mode, and the global
+    /// scheduler-[`turn`](Inspector::turn) count in scheduled (multithreaded) mode — where the result
+    /// is a *global snapshot* and every thread is inspectable via [`threads`]/[`select_task`].
+    /// Stateless re-execution (the §18 explorer's trick): exact for a deterministic guest, and
+    /// faithful for nondeterministic *inputs* via the replayed [`CapTape`]. Breakpoints are preserved
+    /// but ignored during the fast-forward. `Stop::Blocked` if the run can't be re-executed.
+    ///
+    /// [`threads`]: Inspector::threads
+    /// [`select_task`]: Inspector::select_task
+    pub fn seek(&mut self, t: u64) -> Stop {
+        let Some(init) = self.seek_init.clone() else {
+            return Stop::Blocked;
+        };
+        // A fresh powerbox seeded to *replay* the recorded cap inputs (W1) and keep recording past
+        // `t`, so re-execution reproduces nondeterministic inputs (e.g. `Clock`, stdin `read`).
+        let tape: Arc<[CapRecord]> = self.cap_tape().records.into();
+        let mut fresh = Host::new();
+        fresh.replay_caps(tape);
+        fresh.record_caps();
+        let host = Arc::new(Mutex::new(fresh));
+
+        match &init.schedule {
+            // Scheduled (multithreaded): replay the plan for `t` scheduler turns, landing at a global
+            // turn-`t` snapshot. No vCPU is "stopped"; focus the thread that ran the last turn.
+            Some(schedule) => {
+                let mut sched = Self::fresh_scheduled(
+                    init.funcs,
+                    init.func,
+                    &init.args,
+                    init.fuel,
+                    init.memory,
+                    &init.data,
+                    Arc::clone(&self.shared),
+                    Arc::clone(&host),
+                    schedule,
+                    init.seed,
+                    Some(t),
+                );
+                self.shared().suppress_stops = true; // fast-forward past breakpoints
+                let (focus, finished, pc) = {
+                    let SchedState {
+                        det,
+                        dpor,
+                        driver,
+                        root_id,
+                    } = &mut sched;
+                    let mut policy = Policy::Dpor(dpor);
+                    let _ = driver.run(det, &mut policy);
+                    driver.turn_limit = None; // continuing from here runs forward normally
+                    let focus = dpor.trace.last().map(|e| e.tid).unwrap_or(*root_id);
+                    let finished = det.lock().results.get(root_id).map(|o| o.result.clone());
+                    let pc = det.lock().find_vcpu(focus).and_then(Self::pc_of);
+                    (focus, finished, pc)
+                };
+                self.shared().suppress_stops = false;
+                self.v = None;
+                self.host = host;
+                self.focus = Some(focus);
+                self.finished = finished.clone();
+                self.sched = Some(sched);
+                match finished {
+                    Some(r) => Stop::Finished(r),
+                    None => Stop::Break {
+                        reason: StopReason::Step,
+                        pc: pc.unwrap_or(IrPc {
+                            module: 0,
+                            func: 0,
+                            block: 0,
+                            inst: 0,
+                        }),
+                    },
+                }
+            }
+            // Single-threaded: re-execute the sole vCPU to op `clock == t` — restarting from the
+            // nearest checkpoint ≤ t (W1) instead of clock 0 when this run is checkpointable.
+            None => self.seek_single(&init, host, t),
+        }
+    }
+
+    /// Single-threaded `seek` (DEBUGGING.md W1): drive the sole vCPU to logical time `t`, restarting
+    /// from the nearest **checkpoint** (`clock ≤ t`) rather than clock 0 when the run is in the
+    /// checkpointable subset, and laying down fresh checkpoints (every [`SEEK_CHECKPOINT_STRIDE`] ops)
+    /// along the way. This bounds `seek`/`step_back` to the checkpoint stride instead of O(t). For a
+    /// run outside the subset it is exactly the original replay-from-clock-0 (`checkpointing` is off,
+    /// no checkpoint is found, none is captured).
+    fn seek_single(&mut self, init: &SeekInit, host: Arc<Mutex<Host>>, t: u64) -> Stop {
+        // Nearest checkpoint at or before `t` (the ladder is kept sorted by `clock`).
+        let start = if self.checkpointing {
+            self.checkpoints.iter().rev().find(|c| c.clock <= t)
+        } else {
+            None
+        };
+        let mut root = Self::fresh_single_root(
+            init.funcs.clone(),
+            init.func,
+            &init.args,
+            init.fuel,
+            init.memory,
+            &init.data,
+            Arc::clone(&host),
+            Arc::clone(&self.shared),
+            None, // the seek target is set per chunk by the drive loop below
+        );
+        if let Some(cp) = start {
+            root.restore_continuation(cp.frames.clone(), cp.fuel, cp.mem.as_deref(), cp.clock);
+            host.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .restore_replay_substate(&cp.host);
+        }
+        self.host = host;
+        self.finished = None;
+        self.focus = None;
+
+        let stop = self.drive_to(&mut root, t);
+        self.v = Some(root);
+        stop
+    }
+
+    /// Drive `root` forward to logical time `t`, pausing at each [`SEEK_CHECKPOINT_STRIDE`] boundary to
+    /// snapshot a checkpoint (so a later `seek`/`step_back` restarts nearby), then on to `t`. With
+    /// checkpointing off it is a single straight run to `t`. The chunking is transparent: each chunk
+    /// runs purely the `seek_target` replay branch of [`DebugCtx::before_op`], so the cumulative effect
+    /// equals one run from the start point to `t`.
+    fn drive_to(&mut self, root: &mut VCpu, t: u64) -> Stop {
+        loop {
+            let clock = root.debug_clock();
+            // Next pause: the upcoming stride boundary (strictly after `clock`), capped at `t`.
+            let next = if self.checkpointing && clock < t {
+                (clock / SEEK_CHECKPOINT_STRIDE + 1) * SEEK_CHECKPOINT_STRIDE
+            } else {
+                t
+            }
+            .min(t);
+            root.dbg_seek_to(next);
+            match root.run(u64::MAX) {
+                Step::Done(r) => {
+                    self.finished = Some(r.clone());
+                    return Stop::Finished(r);
+                }
+                Step::Park(_) | Step::Yield => return Stop::Blocked,
+                Step::Pause(_, pc) => {
+                    if root.debug_clock() >= t {
+                        return Stop::Break {
+                            reason: StopReason::Step,
+                            pc,
+                        };
+                    }
+                    // Reached a stride boundary short of `t`: record a checkpoint and continue. If the
+                    // continuation has left the checkpointable subset (a fiber/thread/coroutine/durable
+                    // op, or non-pristine memory), abandon checkpointing for this run.
+                    self.maybe_checkpoint(root);
+                }
+            }
+        }
+    }
+
+    /// Snapshot `root` into the checkpoint ladder at its current `clock`, if checkpointing is still on
+    /// and the continuation is [`VCpu::checkpointable`]; otherwise disable checkpointing and drop the
+    /// ladder (the run is outside the snapshottable subset, so `seek` reverts to replay-from-0). A
+    /// `clock` already present in the ladder is not duplicated.
+    fn maybe_checkpoint(&mut self, root: &VCpu) {
+        if !self.checkpointing {
+            return;
+        }
+        let clock = root.debug_clock();
+        let host_sub = {
+            let h = self.host.lock().unwrap_or_else(|e| e.into_inner());
+            // Leave the subset (and drop the ladder) if the continuation or the host has grown state a
+            // checkpoint can't faithfully restore.
+            if !root.checkpointable() || !h.checkpoint_safe() {
+                drop(h);
+                self.checkpointing = false;
+                self.checkpoints.clear();
+                return;
+            }
+            h.replay_substate()
+        };
+        if self.checkpoints.iter().any(|c| c.clock == clock) {
+            return;
+        }
+        let host = host_sub;
+        let cp = SeekCheckpoint {
+            clock,
+            frames: root.frames.clone(),
+            fuel: root.fuel,
+            mem: root.mem.as_ref().map(|m| m.window_snapshot()),
+            host,
+        };
+        // Keep the ladder sorted by `clock` (boundaries are usually appended in order, but a fresh
+        // replay-from-0 can fill gaps below an existing entry).
+        let at = self.checkpoints.partition_point(|c| c.clock < clock);
+        self.checkpoints.insert(at, cp);
+    }
+
+    /// The current call frame's pc, if any (innermost frame).
+    fn pc_of(v: &VCpu) -> Option<IrPc> {
+        v.frames.last().map(|f| IrPc {
+            module: f.module,
+            func: f.func,
+            block: f.block,
+            inst: f.inst,
+        })
+    }
+
+    /// The global scheduler-turn count — the coordinate scheduled-mode [`seek`](Inspector::seek)
+    /// targets (DEBUGGING.md W1). One turn per visible-op decision across all threads. `0` in
+    /// single-threaded mode (which uses the op [`clock`](Inspector::clock) instead).
+    pub fn turn(&self) -> u64 {
+        self.sched.as_ref().map(|s| s.driver.turns).unwrap_or(0)
+    }
+
+    /// The **`SchedTape`** (DEBUGGING.md W1): the interleaving this scheduled run actually executed,
+    /// as the ordered `TaskId` choice at each visible-op decision. Empty in single-threaded mode or
+    /// before any turn runs. It is a portable, replayable artifact — `attach_scheduled` it to
+    /// reproduce the exact interleaving deterministically (no seed needed), e.g. to share a race
+    /// repro found by [`attach_scheduled_seeded`](Inspector::attach_scheduled_seeded). Under
+    /// sequential consistency the schedule *is* the memory order, so this fully pins the run.
+    pub fn sched_tape(&self) -> Vec<u64> {
+        self.sched
+            .as_ref()
+            .map(|s| s.dpor.trace.iter().map(|e| e.tid).collect())
+            .unwrap_or_default()
+    }
+
+    /// Step **backward** one unit of logical time (DEBUGGING.md W1): the global `turn` in scheduled
+    /// mode, the op `clock` single-threaded. At time 0 this re-seeks to the initial state.
+    pub fn step_back(&mut self) -> Stop {
+        let now = if self.sched.is_some() {
+            self.turn()
+        } else {
+            self.clock()
+        };
+        self.seek(now.saturating_sub(1))
+    }
+
+    /// The vCPU currently under inspection (the paused thread in scheduled mode, the sole vCPU in
+    /// single-threaded mode). `None` in scheduled mode before the first stop, or once finished.
+    fn cur(&self) -> Option<&VCpu> {
+        match &self.sched {
+            Some(s) => s.driver.held.as_ref().map(|h| h.v.as_ref()),
+            None => self.v.as_deref(),
+        }
+    }
+
+    fn cur_mut(&mut self) -> Option<&mut VCpu> {
+        match &mut self.sched {
+            Some(s) => s.driver.held.as_mut().map(|h| h.v.as_mut()),
+            None => self.v.as_deref_mut(),
+        }
+    }
+
+    /// The id of the thread (vCPU) currently stopped, in scheduled mode (DEBUGGING.md Milestone B).
+    /// `None` in single-threaded mode, before the first stop, or once finished.
+    pub fn stopped_task(&self) -> Option<u64> {
+        self.sched
+            .as_ref()
+            .and_then(|s| s.driver.held.as_ref().map(|h| h.v.id))
+    }
+
+    /// Every live thread (vCPU) id, sorted — the stopped thread plus every other thread the
+    /// scheduler is holding (runnable or parked on join/wait/spin). Single-threaded mode reports the
+    /// sole vCPU; once a thread finishes it drops out (only its outcome remains).
+    pub fn threads(&self) -> Vec<u64> {
+        match &self.sched {
+            None => self.cur().map(|v| vec![v.id]).unwrap_or_default(),
+            Some(s) => {
+                let mut ids = s.det.lock().live_ids();
+                // The stopped thread is held *out* of the scheduler, so add it back.
+                if let Some(h) = s.driver.held.as_ref() {
+                    if !ids.contains(&h.v.id) {
+                        ids.push(h.v.id);
+                        ids.sort_unstable();
+                    }
+                }
+                ids
+            }
+        }
+    }
+
+    /// Focus read-inspection (`backtrace`/`read_*`/`clock`) on thread `id` (DEBUGGING.md Milestone B
+    /// `select_fiber`): while stopped, look at *any* live thread, not just the one that hit the
+    /// breakpoint. Returns `false` (leaving the focus unchanged) if `id` is not a live thread.
+    /// Stepping still drives the stopped thread; the focus resets on the next resume.
+    pub fn select_task(&mut self, id: u64) -> bool {
+        if self.threads().contains(&id) {
+            self.focus = Some(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The thread read-inspection currently targets: the `select_task` focus, else the stopped
+    /// (scheduled) or sole (single-threaded) thread.
+    pub fn focused_task(&self) -> Option<u64> {
+        self.focus.or_else(|| self.cur().map(|v| v.id))
+    }
+
+    /// Run `f` against the focused thread's vCPU (the `select_task` target, else the stopped/sole
+    /// thread), resolving it wherever the scheduler parks it. `None` if there is no such live thread.
+    fn with_focused<R>(&self, f: impl FnOnce(&VCpu) -> R) -> Option<R> {
+        match (&self.sched, self.focus) {
+            // A selected thread other than the stopped one lives inside the scheduler.
+            (Some(s), Some(id)) if Some(id) != s.driver.held.as_ref().map(|h| h.v.id) => {
+                s.det.lock().find_vcpu(id).map(f)
+            }
+            // Otherwise it's the stopped (held) / sole vCPU.
+            _ => self.cur().map(f),
+        }
+    }
+
+    /// Lock the powerbox to inspect host-side effects (e.g. `host().stdout`). Safe while the guest
+    /// is paused or finished — it is not executing, so the lock is uncontended.
+    pub fn host(&self) -> std::sync::MutexGuard<'_, Host> {
+        self.host.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The recorded capability-input trace so far (DEBUGGING.md W1) — the `Clock` (and, later, other
+    /// input) crossings this run has made. This is what [`seek`](Inspector::seek) replays to
+    /// re-execute a nondeterministic guest faithfully, and the artifact a host can capture from a
+    /// live run.
+    pub fn cap_tape(&self) -> CapTape {
+        self.host().cap_tape()
+    }
+
+    fn dbg(&mut self) -> &mut DebugCtx {
+        self.cur_mut()
+            .and_then(|v| v.debug.as_mut())
+            .expect("an Inspector-driven vCPU always carries debug state")
+    }
+
+    /// The run-wide (cross-vCPU) breakpoint/watchpoint state. Uncontended while the guest is paused.
+    fn shared(&self) -> std::sync::MutexGuard<'_, DebugShared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Add a breakpoint at `pc` (idempotent). Applies to every thread (DEBUGGING.md Milestone B).
+    pub fn set_breakpoint(&mut self, pc: IrPc) {
+        self.shared().breakpoints.insert(pc);
+    }
+
+    /// Remove a breakpoint; returns whether one was present.
+    pub fn clear_breakpoint(&mut self, pc: IrPc) -> bool {
+        self.shared().breakpoints.remove(&pc)
+    }
+
+    /// Watch window range `[addr, addr+len)` for accesses of `kind`; the run pauses *before* the
+    /// op that accesses it ([`StopReason::Watchpoint`]). Because the window is one contiguous buffer
+    /// (DEBUGGING.md W2), this catches every code path — no per-op instrumentation needed. Returns a
+    /// handle for [`clear_watchpoint`](Inspector::clear_watchpoint). A zero-length watch never fires.
+    pub fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> WatchId {
+        let mut d = self.shared();
+        let id = WatchId(d.next_watch);
+        d.next_watch += 1;
+        d.watchpoints.push(Watch {
+            id,
+            addr,
+            len,
+            kind,
+        });
+        id
+    }
+
+    /// Remove a watchpoint; returns whether one was present.
+    pub fn clear_watchpoint(&mut self, id: WatchId) -> bool {
+        let mut d = self.shared();
+        let before = d.watchpoints.len();
+        d.watchpoints.retain(|x| x.id != id);
+        d.watchpoints.len() != before
+    }
+
+    /// Enable/disable pausing before every `cap.call` ([`StopReason::CapCall`]) — the host-boundary
+    /// stop. Useful for tracing a guest's capability use and the boundary W1 record/replay hooks.
+    pub fn set_cap_call_stops(&mut self, on: bool) {
+        self.shared().cap_stops = on;
+    }
+
+    /// Resume until the next breakpoint, completion, or block.
+    pub fn run_until_stop(&mut self) -> Stop {
+        if let Some(r) = &self.finished {
+            return Stop::Finished(r.clone());
+        }
+        self.focus = None; // a `select_task` focus lasts only until the guest moves again
+        if self.sched.is_some() {
+            return self.pump_sched();
+        }
+        match self.v.as_mut().unwrap().run(u64::MAX) {
+            Step::Pause(reason, pc) => Stop::Break { reason, pc },
+            Step::Done(r) => {
+                self.finished = Some(r.clone());
+                Stop::Finished(r)
+            }
+            Step::Park(_) | Step::Yield => Stop::Blocked,
+        }
+    }
+
+    /// Drive the cooperative multithreaded scheduler to the next stop (DEBUGGING.md Milestone B).
+    fn pump_sched(&mut self) -> Stop {
+        // `Done` means scheduler quiescence: read the root's outcome (a result ⇒ finished; absent ⇒
+        // a join-deadlock / all-asleep, i.e. blocked). A `Paused` keeps the offending vCPU held.
+        let outcome = {
+            let s = self.sched.as_mut().unwrap();
+            let SchedState {
+                det,
+                dpor,
+                driver,
+                root_id,
+            } = s;
+            let mut policy = Policy::Dpor(dpor);
+            match driver.run(det, &mut policy) {
+                DriverStop::Paused { reason, pc, .. } => return Stop::Break { reason, pc },
+                DriverStop::Done => det.lock().results.remove(root_id),
+                // Normal pumping never sets a turn limit (only `seek` does, on its own driver).
+                DriverStop::TurnLimit => unreachable!("turn limit only set during seek"),
+            }
+        };
+        match outcome {
+            Some(o) => {
+                self.finished = Some(o.result.clone());
+                Stop::Finished(o.result)
+            }
+            None => Stop::Blocked,
+        }
+    }
+
+    /// Execute exactly one op of the currently-stopped thread, then pause before the next (or
+    /// finish/block). In scheduled mode before the first stop, resumes to the first stop instead.
+    pub fn step(&mut self) -> Stop {
+        if self.finished.is_some() || self.cur().is_none() {
+            return self.run_until_stop();
+        }
+        let d = self.dbg();
+        d.step_target = Some(d.clock + 1);
+        self.run_until_stop()
+    }
+
+    /// **Step over** (DEBUGGING.md W2): execute the current op and stop at the next one in this
+    /// frame — running any call it makes to completion rather than descending into it. (Op-level: a
+    /// non-call advances one op, like [`step`](Inspector::step); a `call` runs the whole callee.)
+    pub fn step_over(&mut self) -> Stop {
+        self.step_to_depth(|depth| depth)
+    }
+
+    /// **Step out** (DEBUGGING.md W2): run until the current function returns, stopping at the op in
+    /// the caller that the call returned to. From the outermost frame this runs to completion.
+    pub fn step_out(&mut self) -> Stop {
+        self.step_to_depth(|depth| depth.saturating_sub(1))
+    }
+
+    /// Shared driver for step-over/out: step off the current op, then stop at the next op whose call
+    /// depth is `<= target(current_depth)`.
+    fn step_to_depth(&mut self, target: impl Fn(usize) -> usize) -> Stop {
+        if self.finished.is_some() || self.cur().is_none() {
+            return self.run_until_stop();
+        }
+        let depth = self.cur().map(|v| v.frames.len()).unwrap_or(0);
+        let d = self.dbg();
+        d.resume_clock = d.clock; // step off the current op even on the very first step
+        d.step_max_depth = Some(target(depth));
+        d.step_target = None;
+        self.run_until_stop()
+    }
+
+    /// The guest's result once it has [`Stop::Finished`]; `None` while still running.
+    pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
+        self.finished.as_ref()
+    }
+
+    /// Logical time (DEBUGGING.md S3): ops executed so far on the focused thread ([`select_task`],
+    /// else the stopped/sole thread).
+    ///
+    /// [`select_task`]: Inspector::select_task
+    pub fn clock(&self) -> u64 {
+        self.with_focused(|v| v.debug.as_ref().map(|d| d.clock).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// The number of time-travel **checkpoints** currently cached (DEBUGGING.md W1) — snapshots of the
+    /// sole vCPU at ascending logical times that let `seek`/`step_back` restart from the nearest one
+    /// instead of clock 0. `0` for a run that hasn't been seeked far enough to lay one down, or one
+    /// outside the checkpointable subset (multithreaded, or using fibers / a stateful host capability),
+    /// which falls back to replay-from-0. Introspection / test hook; does not affect results.
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    /// The focused thread's call stack, innermost frame first ([`select_task`] chooses the thread;
+    /// by default the stopped/sole one). Empty once the guest has finished (or, in scheduled mode,
+    /// before the first stop). Each frame carries its source location when the module has debug info
+    /// (DEBUGGING.md §6/W4).
+    ///
+    /// [`select_task`]: Inspector::select_task
+    pub fn backtrace(&self) -> Vec<FrameInfo> {
+        self.with_focused(|v| {
+            v.frames
+                .iter()
+                .rev()
+                .map(|f| {
+                    let pc = IrPc {
+                        module: f.module,
+                        func: f.func,
+                        block: f.block,
+                        inst: f.inst,
+                    };
+                    let types = frame_value_types(v, f);
+                    let vals = f
+                        .vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| s.to_value(types.get(i).copied().unwrap_or(ValType::I64)))
+                        .collect();
+                    FrameInfo {
+                        pc,
+                        vals,
+                        source: self.source_loc(pc),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// The source location of an [`IrPc`], if the module carries debug info (DEBUGGING.md §6/W4).
+    /// Locations are recorded per statement, so this uses **nearest-preceding** within the same
+    /// `(func, block)` — the op's row is the last `debug.loc` at or before it (DWARF line-table
+    /// semantics). Only the guest's own program (module 0) has source; installed §22 units return
+    /// `None`.
+    pub fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
+        source_loc_in(self.debug_info.as_ref()?, pc)
+    }
+
+    /// The `-g` source name of function `func` (`debug_info.func_names`), or `None` when the module
+    /// carried no name for it — renderers (the DAP stack trace) fall back to `func{N}`. The method
+    /// counterpart of the free [`func_name`], for callers that hold an `Inspector` (DEBUGGING.md §6).
+    pub fn func_name(&self, func: FuncIdx) -> Option<&str> {
+        self.debug_info
+            .as_ref()?
+            .func_names
+            .iter()
+            .find(|f| f.func == func)
+            .map(|f| f.name.as_str())
+    }
+
+    /// Resolve a source variable by `name` in the frame `frame_from_top` levels up (0 = innermost)
+    /// and read its current value — the W4→S2 bridge: `Ssa` reads the frame's value table, `Window`
+    /// reads `width` bytes from `data-SP + off`. Returns `None` if there is no debug info, no such
+    /// variable in that frame's function, or the read is out of range. `width` is the byte width to
+    /// read for a window variable (its type size); ignored for SSA variables.
+    pub fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
+        let di = self.debug_info.as_ref()?;
+        self.with_focused(|v| {
+            let n = v.frames.len();
+            let idx = n.checked_sub(1 + frame_from_top)?;
+            let frame = v.frames.get(idx)?;
+            // A var belongs to a function; match on the frame's function (module-0 program only).
+            if frame.module != 0 {
+                return None;
+            }
+            let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
+            // Resolve a location list (S2) at the frame's current pc (nearest-preceding within the
+            // stopped block). `None` ⇒ no covering entry, the var isn't live here.
+            let resolve = |locs: &[SsaLoc]| loclist_value(locs, frame.block, frame.inst);
+            // Read `width` window bytes at `base + off`, directly (not via `read_window`, to avoid
+            // re-locking).
+            let window_read = |base: u64, off: i64| -> Option<VarValue> {
+                let bytes = v
+                    .mem
+                    .as_ref()?
+                    .read_window(base.wrapping_add(off as u64), width)
+                    .ok()?;
+                Some(VarValue::Bytes(bytes))
+            };
+            let types = frame_value_types(v, frame);
+            match &var.loc {
+                VarLoc::Ssa { value } => {
+                    frame_value(frame, &types, *value as usize).map(VarValue::Value)
+                }
+                VarLoc::SsaList(locs) => {
+                    frame_value(frame, &types, resolve(locs)? as usize).map(VarValue::Value)
+                }
+                VarLoc::Window { off } => {
+                    // Address = data-SP (block param v0) + off.
+                    window_read(frame.vals.first()?.i64() as u64, *off)
+                }
+                VarLoc::WindowVia { base, off } => {
+                    // Address = (the per-pc base SSA value, e.g. a wasm frame pointer) + off.
+                    let base_val = frame.vals.get(resolve(base)? as usize)?;
+                    window_read(base_val.i64() as u64, *off)
+                }
+                // A module-scoped global at a fixed absolute window address (frame-independent).
+                VarLoc::Fixed { addr } => window_read(*addr, 0),
+            }
+        })
+        .flatten()
+    }
+
+    /// The window address of a memory-located source variable (`Window` / `WindowVia`), resolved at
+    /// the focused thread's frame `frame_from_top` levels up — the base a debugger uses to expand an
+    /// aggregate or take a member's address. `None` for an SSA-valued var (no memory address) or an
+    /// unmapped/not-yet-live one.
+    pub fn var_addr(&self, frame_from_top: usize, name: &str) -> Option<u64> {
+        let di = self.debug_info.as_ref()?;
+        self.with_focused(|v| {
+            let n = v.frames.len();
+            let frame = v.frames.get(n.checked_sub(1 + frame_from_top)?)?;
+            if frame.module != 0 {
+                return None;
+            }
+            let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
+            let base = match &var.loc {
+                VarLoc::Window { off } => frame.vals.first()?.i64() as u64 + *off as u64,
+                VarLoc::WindowVia { base, off } => {
+                    let idx = loclist_value(base, frame.block, frame.inst)?;
+                    frame.vals.get(idx as usize)?.i64() as u64 + *off as u64
+                }
+                VarLoc::Fixed { addr } => *addr,
+                VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
+            };
+            Some(base)
+        })
+        .flatten()
+    }
+    /// by index, so a promoted local is a direct lookup — no debug-build mode needed (DEBUGGING.md
+    /// W6).
+    pub fn read_ir_value(&self, frame_from_top: usize, value_idx: usize) -> Option<Value> {
+        self.with_focused(|v| {
+            let n = v.frames.len();
+            let idx = n.checked_sub(1 + frame_from_top)?;
+            let frame = v.frames.get(idx)?;
+            let types = frame_value_types(v, frame);
+            frame_value(frame, &types, value_idx)
+        })
+        .flatten()
+    }
+
+    /// Read `len` bytes from confined window address `addr` of the focused thread ([`select_task`])
+    /// — the S2 `Window` resolution + raw inspection. Uses the same confinement as a guest load, so
+    /// an out-of-window read faults rather than escaping. Empty if the guest declared no memory.
+    ///
+    /// [`select_task`]: Inspector::select_task
+    pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        self.with_focused(|v| match v.mem.as_ref() {
+            Some(m) => m.read_window(addr, len),
+            None => Ok(Vec::new()),
+        })
+        .unwrap_or(Ok(Vec::new()))
+    }
+}
+
 /// Like [`run`], but with a caller-provided [`Host`] (the powerbox): grant the entry
 /// function's capabilities into `host`, pass their handle indices in `args`, then read
 /// effects (`host.stdout`, etc.) back afterwards. This is how a capability-using guest
@@ -107,8 +1706,24 @@ pub fn run_with_host(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
+    run_with_host_traced(m, func, args, fuel, host).0
+}
+
+/// Like [`run_with_host`], but also return the guest's **trap-time backtrace** — the call stack
+/// (innermost frame first, as `IrPc`s) at the point a trap was raised, or empty if the run finished
+/// cleanly (DEBUGGING.md §5 / W3; the interpreter counterpart to the JIT's `last_trap_backtrace`).
+/// The interpreter reifies its call stack and doesn't unwind it on a trap, so this is the exact frame
+/// chain. Resolve each `IrPc` to source with [`source_loc`]. Useful for kill diagnostics and for the
+/// interp↔JIT differential fuzzer to report *where* a divergence/trap occurred.
+pub fn run_with_host_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> TracedRun {
     if m.funcs.get(func as usize).is_none() {
-        return Err(Trap::Malformed);
+        return (Err(Trap::Malformed), Vec::new(), None);
     }
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
@@ -119,6 +1734,64 @@ pub fn run_with_host(
         mm
     });
     drive(&m.funcs, func, args, fuel, &mut mem, host)
+}
+
+/// Host-carrying counterpart of [`run_fast`]: try the [`bytecode`] engine first, fall back to the
+/// tree-walker [`run_with_host`]. The bytecode engine drives no runtime seams yet (no scheduler,
+/// powerbox, fibers, threads, durability), so it is used only when the run needs none of them:
+///
+/// * the host is **not durable** (durability needs the shadow-stack swap in [`drive`]), and
+/// * [`bytecode::compile_and_run`] accepts the module — it returns `None` for any op that needs a
+///   seam (capability / thread / fiber / continuation / `memory.wait` ops), so an accepted module is
+///   pure compute + memory + (direct/indirect) calls, which a granted-capability host never affects.
+///
+/// On the `None` fallback path `compile_and_run` rejects the module *before* executing, so `fuel` is
+/// untouched and the tree-walker runs with the full budget.
+pub fn run_with_host_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    if !host.is_durable() {
+        if let Some(result) = bytecode::compile_and_run_with_host(m, func, args, fuel, host) {
+            return result;
+        }
+    }
+    run_with_host(m, func, args, fuel, host)
+}
+
+/// Trap-time-backtrace counterpart of [`run_with_host_fast`]: the [`run_with_host_traced`] semantics
+/// (return the guest's trap-time call stack — innermost frame first, as [`IrPc`]s; empty on a clean
+/// finish, resolvable with [`source_loc`]) on whichever backend runs. The [`bytecode`] engine carries
+/// its own backtrace ([`bytecode::compile_and_run_with_host_traced`]); when it declines the module —
+/// a durable host, an out-of-subset op, or a step that reaches a concurrency seam (backtraces are
+/// single-vCPU scope, DEBUGGING.md S4) — this falls back to the tree-walker [`run_with_host_traced`],
+/// so the backtrace is always *some* faithful engine's, never dropped. Both backends resolve to the
+/// same source program points (the bytecode engine reports tree-walker-identical [`IrPc`]s, gated by
+/// `bytecode_traced.rs`), so a kill diagnostic reads the same regardless of which one ran.
+pub fn run_with_host_fast_traced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> TracedRun {
+    if !host.is_durable() {
+        if let Some(result) = bytecode::compile_and_run_with_host_traced(m, func, args, fuel, host)
+        {
+            return result;
+        }
+    }
+    run_with_host_traced(m, func, args, fuel, host)
+}
+
+/// Capability-free [`run_with_host_fast_traced`] (an empty powerbox), the traced counterpart of
+/// [`run_fast`] — mirrors [`run_traced`] on the fast path.
+pub fn run_fast_traced(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> TracedRun {
+    let mut host = Host::new();
+    run_with_host_fast_traced(m, func, args, fuel, &mut host)
 }
 
 /// Run the entry vCPU on the M:N executor: submit the root, become a worker on the calling thread,
@@ -133,7 +1806,7 @@ fn drive(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
-) -> Result<Vec<Value>, Trap> {
+) -> TracedRun {
     let funcs: Arc<[Func]> = funcs.to_vec().into();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -145,6 +1818,51 @@ fn drive(
     // B2 `install`: the table reservation the root vCPU builds its dispatch table with (must
     // equal the JIT's `table_reserve_log2`). Read before the host is moved into the Arc below.
     let jit_table_log2 = host.jit_table_log2();
+    // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
+    // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
+    let durable = host.is_durable();
+    // §12.8 concurrent-thaw stage 1: a thaw restores the frozen window with the global **freeze** word
+    // still `UNWINDING` (the artifact froze there), while the per-context **thaw** word now carries the
+    // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
+    // re-unwind mid-thaw and `durable_load_dstate` reads the thaw — the real snapshot-restore path
+    // leaks the same `UNWINDING`. A freeze leaves the thaw word `NORMAL`, so this never fires on it.
+    if durable {
+        if let Some(m) = mem.as_mut() {
+            if m.durable_thaw_state(0) == STATE_REWINDING {
+                m.durable_set_state(STATE_NORMAL);
+            }
+        }
+    }
+    // Durable **freeze/thaw** runs (a freeze's global word is `UNWINDING`/`ARMED`, or a thaw's
+    // per-context word is `REWINDING`, not `NORMAL`)
+    // serialize onto a single worker (DURABILITY.md §12.8 slice 3.2.1): the shared active shadow-SP
+    // word is used by one vCPU at a time, so concurrent unwind/rewind can't race it, and the runtime
+    // re-points it per vCPU on each dispatch. Ordinary runs — incl. a `NORMAL` durable run, which never
+    // touches the reserve — keep full multi-worker parallelism.
+    let workers = if durable
+        && mem
+            .as_ref()
+            // §12.8 concurrent-thaw stage 1: serialize for a freeze (global word) *or* a thaw (the
+            // root re-enters under `REWINDING` in its own per-context thaw word — no longer the global
+            // word). The root's context is 0; `durable_load_dstate(0)` combines both words:
+            // non-`NORMAL` ⇒ freeze/thaw in progress.
+            .map(|m| m.durable_load_dstate(0))
+            .unwrap_or(STATE_NORMAL)
+            != STATE_NORMAL
+    {
+        1
+    } else {
+        workers
+    };
+    // Thaw seeding (slice 3.1.5): fibers a freeze flattened, to re-create in the registry before the
+    // root re-enters under REWINDING. Taken (cleared) here; empty for a freeze or ordinary run.
+    let thaw_fibers = std::mem::take(&mut host.frozen_fibers);
+    // Thaw seeding (slice 3.2.1): spawned vCPUs a freeze flattened, re-attached by the root's rewound
+    // `thread.spawn` (in ascending task order). Taken here; empty for a freeze or ordinary run.
+    let thaw_vcpus = std::mem::take(&mut host.frozen_vcpus);
+    // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
+    // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
+    let thaw_root_sp = host.frozen_root_sp.take();
     let sched = Arc::new(Scheduler::new(quota.max_vcpus, workers));
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
@@ -172,7 +1890,7 @@ fn drive(
                        // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
                        // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
         let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
-        let root = Box::new(VCpu::new(
+        let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
             entry,
             args,
@@ -183,8 +1901,123 @@ fn drive(
             id,
             SchedRef::Real(Arc::clone(&sched)),
             quota,
-            dt,
+            Arc::clone(&dt),
         ));
+        root.durable = durable;
+        // The root's own durable state word is the window's initial phase (NORMAL / UNWINDING freeze /
+        // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1). §12.8 concurrent-thaw
+        // stage 1: combine the global freeze word with the root's per-context thaw word (a thaw seeds
+        // `REWINDING` into the latter).
+        root.dstate = root
+            .mem
+            .as_ref()
+            .map(|m| m.durable_load_dstate(root.vcpu_ctx))
+            .unwrap_or(STATE_NORMAL);
+        // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
+        // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
+        // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
+        // dispatch (slice 3.2.1).
+        let root_word = shadow_region_base(root.vcpu_ctx);
+        root.root_shadow_sp = thaw_root_sp.unwrap_or_else(|| {
+            root.mem
+                .as_ref()
+                .map(|m| m.durable_get_sp(root_word))
+                .unwrap_or_else(|| shadow_frame_base(root.vcpu_ctx))
+        });
+        // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
+        // ascending slot order, so the dense handle namespace matches the freeze (the root's
+        // re-issued `cont.resume` names handle 0, …). Each fiber's flattened shadow-SP goes back in
+        // the `shadow` table so the swap re-points to it when the root re-enters it under REWINDING.
+        {
+            let mut seed: Vec<FrozenFiber> = thaw_fibers;
+            seed.sort_by_key(|f| f.slot);
+            for (expected, ff) in seed.into_iter().enumerate() {
+                let got = root
+                    .registry
+                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation);
+                debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
+                debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
+            }
+        }
+        // Thaw re-spawn (slice 3.2.1): reconstruct the spawned vCPUs a freeze flattened. The root's
+        // rewind *skips* its prologue `thread.spawn` (the REWINDING prologue jumps straight to the
+        // resume ARM), so a child that existed before the freeze point is **not** re-created by the
+        // root — the runtime re-creates it here, under `REWINDING`, with its flattened shadow-SP
+        // restored, so it rewinds from its frozen point and runs forward. Children re-spawn in
+        // ascending task (= spawn) order; their regions return via the restored shadow-SP, and the
+        // root's `threads` (join) table is rebuilt to map each handle slot to its child — so the root's
+        // re-executed `thread.join` (after its checkpoint) resolves. As of slice 3.2.2 the root may
+        // also own fibers (top-down vCPU contexts vs. up-growing fiber contexts no longer collide).
+        // Only the root's *direct* children are handled (flat spawns); nested spawns and a *spawned*
+        // child owning fibers (per-child freeze_drive) are follow-ups.
+        {
+            let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
+            // Ascending task = ascending spawn order across the whole tree, and a parent's id is always
+            // < its children's (it was spawned first), so this order re-attaches **parents before
+            // children** — essential for nested spawns (slice 3.4): a grandchild's handle is rebuilt
+            // into its *parent child's* table, which must already exist.
+            vseed.sort_by_key(|f| f.task);
+            // Per-piece rebuild (none of "top `n`, densely" holds with recycling / nesting):
+            //   • context — *derived* from the restored shadow-SP (`(sp − SHADOW_BASE) / STRIDE`), since
+            //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
+            //     post-thaw spawn lands in a genuinely-free context.
+            //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze is byte-identical.
+            //   • join handle — appended into the **parent's** `threads` in ascending-task (= spawn)
+            //     order, so the guest's reloaded handle resolves in the table of whoever spawned it
+            //     (the root for a direct child, a re-spawned child for a grandchild).
+            let mut vcpu_mask: u16 = 0;
+            // Re-spawned children held by task id so a grandchild can attach to its (already re-spawned)
+            // parent; the root is mutated directly. `BTreeMap` keeps the enqueue order ascending-task.
+            let mut children: std::collections::BTreeMap<TaskId, Box<VCpu>> =
+                std::collections::BTreeMap::new();
+            for ff in vseed {
+                let cid = ff.task as TaskId;
+                s.next_task = s.next_task.max(cid + 1);
+                s.live += 1;
+                let ctx = ((ff.shadow_sp - SHADOW_BASE) / SHADOW_STRIDE) as usize;
+                vcpu_mask |= 1 << ctx;
+                let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
+                let mut child = Box::new(VCpu::new(
+                    Arc::clone(&funcs),
+                    ff.func as FuncIdx,
+                    &[
+                        Value::I64(ff.args.first().copied().unwrap_or(0)),
+                        Value::I64(ff.args.get(1).copied().unwrap_or(0)),
+                    ],
+                    child_mem,
+                    Arc::clone(&host_shared),
+                    *fuel,
+                    0,
+                    cid,
+                    SchedRef::Real(Arc::clone(&sched)),
+                    quota,
+                    Arc::clone(&dt),
+                ));
+                child.registry = Arc::clone(&root.registry);
+                child.durable = true;
+                child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
+                child.root_shadow_sp = ff.shadow_sp;
+                child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
+                child.parent_task = ff.parent_task as TaskId;
+                child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
+                // Append the handle into the spawning vCPU's join table (root, or a re-spawned child).
+                let parent = ff.parent_task as TaskId;
+                if parent == id {
+                    root.threads.push(Some(cid));
+                } else if let Some(p) = children.get_mut(&parent) {
+                    p.threads.push(Some(cid));
+                }
+                // (A parent not in the set can't happen on a dense freeze — every live ancestor unwinds
+                // too; a missing handle would surface as a clean `ThreadFault`, not a mis-attach.)
+                children.insert(cid, child);
+            }
+            // Seed the registry's vCPU-context occupancy from the re-spawned children (recycling).
+            root.registry.seed_vcpu_mask(vcpu_mask);
+            // Enqueue every re-spawned child, parents first (ascending task via the `BTreeMap`).
+            for (_, child) in children {
+                s.runnable.push_back(child);
+            }
+        }
         s.runnable.push_back(root);
         id
     };
@@ -202,11 +2035,11 @@ fn drive(
         h.quiesce_pool();
         h.clear_async_notify();
     }
-    let out = sched
-        .lock()
-        .results
-        .remove(&root_id)
-        .expect("root vCPU finished");
+    let (out, trap_origin) = {
+        let mut s = sched.lock();
+        let out = s.results.remove(&root_id).expect("root vCPU finished");
+        (out, s.trap_origin.take())
+    };
     *fuel = out.fuel;
     *mem = out.mem;
     // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is uniquely
@@ -215,7 +2048,11 @@ fn drive(
         .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    out.result
+    // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
+    // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
+    // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
+    let (trap_bt, trap_fiber) = trap_origin.unwrap_or((out.trap_bt, out.trap_fiber));
+    (out.result, trap_bt, trap_fiber)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -260,7 +2097,7 @@ pub fn run_capture_reserved(
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -297,7 +2134,7 @@ pub fn run_capture_reserved_with_host(
         mm.init_data(&m.data);
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -306,6 +2143,65 @@ pub fn run_capture_reserved_with_host(
         .map(|mm| mm.snapshot_window(SNAP_CAP))
         .unwrap_or_default();
     (r, snap)
+}
+
+/// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `svm-snapshot`'s
+/// `PAGE`). Protections are captured at this fixed size — independent of the host page size — so
+/// an artifact is portable across hosts. A 4 KiB codec page sits within one host page (host
+/// pages are `≥ 4 KiB`), so each codec page's protection is that of its containing host page.
+pub const DURABLE_SNAPSHOT_PAGE: u64 = 4096;
+
+/// Per-page protection of a captured window region, for the durable snapshot (DURABILITY.md
+/// §12.3). A faithful view of the interpreter's page model; `Backed` is the §13
+/// `SharedRegion`-aliased case a durable snapshot must reject (D-region — freeze refuses).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CapturedProt {
+    /// Read/write (the default for a committed prefix page).
+    Rw,
+    /// Read-only — e.g. a D40 `readonly` data segment, or a guest `protect`.
+    Ro,
+    /// Unmapped / uncommitted — any access faults.
+    Unmapped,
+    /// A §13 `SharedRegion`-aliased page — not snapshottable in v1 (D-region).
+    Backed,
+}
+
+/// [`run_capture_reserved_with_host`] that **seeds** an initial per-page protection map (the
+/// durable-restore step — re-establishing `Ro`/`Unmapped` pages so a thawed guest faults exactly
+/// as the frozen one would) and **returns** the post-run protection map (the durable-freeze step),
+/// both one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). Pass
+/// `init_prots = None` to capture only (every page starts at its default). A `Backed` entry in
+/// `init_prots` is ignored — a §13 shared-region alias is not restorable (D-region; freeze refuses
+/// it), so the embedder re-grants the region instead.
+#[allow(clippy::too_many_arguments)]
+pub fn run_capture_reserved_with_host_prots(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    init_prots: Option<&[CapturedProt]>,
+    reserved_log2: u8,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>, Vec<CapturedProt>) {
+    if m.funcs.get(func as usize).is_none() {
+        return (Err(Trap::Malformed), Vec::new(), Vec::new());
+    }
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        if let Some(prots) = init_prots {
+            mm.apply_prots(prots);
+        }
+        mm
+    });
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (snap, prots) = mem
+        .as_ref()
+        .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
+        .unwrap_or_default();
+    (r, snap, prots)
 }
 
 /// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
@@ -335,7 +2231,7 @@ pub fn run_capture_sub(
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
         mm
     });
-    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_parent(parent_bytes))
@@ -493,12 +2389,18 @@ impl MemAccess {
 /// decision point (mirrors what `load`/`store`/`atomic_*`/`prepare_wait` confine to). A confinement
 /// failure (out-of-reserved) ⇒ [`MemAccess::None`]: the op will trap and the thread ends, contributing
 /// no ordering constraint.
-fn access_of(inst: &Inst, vals: &[Value], mem: &Option<Mem>) -> MemAccess {
+fn access_of(inst: &Inst, vals: &[Reg], mem: &Option<Mem>) -> MemAccess {
     // Fiber ops touch the run-shared registry, not the window — classified before the memory
     // check (a module with no linear memory can still race on fibers via handles in args).
+    // `gc.roots` reads every fiber's frames, so it is conservatively dependent on all of them too
+    // (it is meant to run under stop-the-world quiescence — GC.md §2 — so this only matters to the
+    // adversarial concurrency explorer, which should still order it against every fiber op).
     if matches!(
         inst,
-        Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+        Inst::ContNew { .. }
+            | Inst::ContResume { .. }
+            | Inst::Suspend { .. }
+            | Inst::GcRoots { .. }
     ) {
         return MemAccess::Fiber;
     }
@@ -506,7 +2408,7 @@ fn access_of(inst: &Inst, vals: &[Value], mem: &Option<Mem>) -> MemAccess {
         return MemAccess::None;
     };
     let range = |addr: ValIdx, offset: u64, width: u32, write: bool| -> MemAccess {
-        match get(vals, addr).and_then(as_i64) {
+        match get(vals, addr).map(|s| s.i64()) {
             Ok(a) => match m.confine_checked(a as u64, offset, width) {
                 Ok(base) => MemAccess::Range { base, width, write },
                 Err(_) => MemAccess::None,
@@ -567,6 +2469,11 @@ struct Dpor {
     trace: Vec<SchedEvent>,
     pending: Option<(TaskId, Vec<TaskId>)>,
     blocked: bool,
+    /// `Some(state)` ⇒ extend the schedule *randomly* (seeded fuzzing for the debugger's
+    /// `SchedTape`, DEBUGGING.md W1) instead of the deterministic smallest-id greedy. Only set by the
+    /// `Inspector` (which runs one schedule); the explorer leaves it `None` so its DPOR backtracking
+    /// stays deterministic. The executed choices still land in `trace`, so the run replays exactly.
+    rng: Option<u64>,
 }
 
 impl Dpor {
@@ -579,6 +2486,7 @@ impl Dpor {
             trace: Vec::new(),
             pending: None,
             blocked: false,
+            rng: None,
         }
     }
 
@@ -590,12 +2498,33 @@ impl Dpor {
             // Forced replay (incl. a race-woken thread): the planned choice overrides the sleep set.
             self.plan[self.depth]
         } else {
-            // Greedy extension: the smallest enabled thread that is not asleep here.
-            match enabled
-                .iter()
-                .copied()
-                .find(|t| !self.sleep.contains_key(t))
-            {
+            // Extension past the plan: the smallest enabled, non-asleep thread (deterministic), or —
+            // when seeded for fuzzing — a random one. Either way the choice is recorded in `trace`.
+            let chosen = if let Some(state) = &mut self.rng {
+                let avail: Vec<TaskId> = enabled
+                    .iter()
+                    .copied()
+                    .filter(|t| !self.sleep.contains_key(t))
+                    .collect();
+                if avail.is_empty() {
+                    None
+                } else {
+                    // xorshift* (matches `DetState::rng`).
+                    let mut x = *state;
+                    x ^= x >> 12;
+                    x ^= x << 25;
+                    x ^= x >> 27;
+                    *state = x;
+                    let r = x.wrapping_mul(0x2545F4914F6CDD1D);
+                    Some(avail[(r as usize) % avail.len()])
+                }
+            } else {
+                enabled
+                    .iter()
+                    .copied()
+                    .find(|t| !self.sleep.contains_key(t))
+            };
+            match chosen {
                 Some(t) => t,
                 None => {
                     self.blocked = true;
@@ -677,19 +2606,116 @@ pub fn explore_all(
     fuel: u64,
     max_schedules: u64,
 ) -> Exhaustive {
+    let mut outcomes: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    let (schedules, complete) =
+        explore_core(m, func, args, fuel, max_schedules, |_idx, result, _plan| {
+            if !outcomes.contains(result) {
+                outcomes.push(result.clone());
+            }
+            false // never stop early: enumerate the whole (reduced) interleaving tree
+        });
+    Exhaustive {
+        outcomes,
+        schedules,
+        complete,
+    }
+}
+
+/// A replayable witness schedule (DEBUGGING.md W7): the exact sequence of scheduling choices
+/// (`TaskId` per visible-op decision point) that produced `outcome`, recovered from the DPOR
+/// explorer. Feed `plan` to [`replay_schedule`] to reproduce `outcome` deterministically (or, later,
+/// to a multithreaded `Inspector` to *step* that interleaving — Milestone B).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Witness {
+    /// The scheduling choice (`TaskId`) at each decision point, in order.
+    pub plan: Vec<u64>,
+    /// The terminal outcome this schedule produced.
+    pub outcome: Result<Vec<Value>, Trap>,
+    /// Which explored schedule (1-based) yielded it.
+    pub schedule_index: u64,
+}
+
+/// Model-check `func` across interleavings and return the **first** schedule whose outcome
+/// satisfies `pred`, as a replayable [`Witness`] (DEBUGGING.md W7) — e.g. find a deadlock
+/// (`|o| matches!(o, Err(Trap::ThreadFault))`), any trap, or a specific bad result. Explores with
+/// DPOR (sound reduction) up to `max_schedules`. `None` means no explored schedule matched — and if
+/// the search ran to completion (didn't hit `max_schedules`), no such schedule exists. Unlike
+/// [`explore_all`] (which reports the *set* of outcomes), this hands back a concrete, reproducible
+/// interleaving you can replay and inspect.
+pub fn find_schedule(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    max_schedules: u64,
+    pred: impl Fn(&Result<Vec<Value>, Trap>) -> bool,
+) -> Option<Witness> {
+    let mut found: Option<Witness> = None;
+    explore_core(m, func, args, fuel, max_schedules, |idx, result, plan| {
+        if pred(result) {
+            found = Some(Witness {
+                plan: plan.to_vec(),
+                outcome: result.clone(),
+                schedule_index: idx,
+            });
+            true // stop: we have our witness
+        } else {
+            false
+        }
+    });
+    found
+}
+
+/// Re-run a witness schedule deterministically (DEBUGGING.md W7 → W1): drive the interpreter with
+/// `plan` (a [`Witness::plan`]) so the same interleaving — hence the same outcome — is reproduced.
+/// A failing interleaving found by [`find_schedule`] is thus replayable on demand.
+pub fn replay_schedule(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    plan: &[u64],
+) -> Result<Vec<Value>, Trap> {
     if m.funcs.get(func as usize).is_none() {
-        return Exhaustive {
-            outcomes: vec![Err(Trap::Malformed)],
-            schedules: 1,
-            complete: true,
-        };
+        return Err(Trap::Malformed);
+    }
+    let funcs: Arc<[Func]> = m.funcs.clone().into();
+    // The plan forces each scheduling choice (`Dpor::pick`); an empty `prior` is fine — sleep sets
+    // only affect *exploration*, never a forced replay.
+    let mut dpor = Dpor::new(plan.to_vec(), Vec::new());
+    run_one_schedule(
+        &funcs,
+        &m.memory,
+        &m.data,
+        func,
+        args,
+        fuel,
+        Policy::Dpor(&mut dpor),
+    )
+}
+
+/// The DPOR exploration engine shared by [`explore_all`] and [`find_schedule`] (DEBUGGING.md W7).
+/// Runs schedules under dynamic partial-order reduction; for each non-redundant (non-sleep-blocked)
+/// schedule it calls `on_outcome(schedule_index, &outcome, &executed_plan)`, where `executed_plan`
+/// is the sequence of `TaskId` choices that produced `outcome` — a replayable witness (feed it to
+/// [`replay_schedule`]). Returning `true` stops the search early (so `complete` is then `false`).
+/// Returns `(schedules_run, complete)`.
+fn explore_core(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    max_schedules: u64,
+    mut on_outcome: impl FnMut(u64, &Result<Vec<Value>, Trap>, &[TaskId]) -> bool,
+) -> (u64, bool) {
+    if m.funcs.get(func as usize).is_none() {
+        on_outcome(1, &Err(Trap::Malformed), &[]);
+        return (1, true);
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
 
     let mut stack: Vec<DporSlot> = Vec::new();
-    let mut outcomes: Vec<Result<Vec<Value>, Trap>> = Vec::new();
     let mut schedules = 0u64;
-    let complete;
 
     loop {
         // Replay the current path (`chosen` per depth), extending with the default choice past its end.
@@ -709,11 +2735,15 @@ pub fn explore_all(
         );
         schedules += 1;
         // A sleep-blocked run is a redundant prefix (its completions were reached elsewhere): keep its
-        // trace for race/backtrack bookkeeping, but don't record an outcome from its truncated tail.
-        if !dpor.blocked && !outcomes.contains(&result) {
-            outcomes.push(result);
-        }
+        // trace for race/backtrack bookkeeping, but don't surface an outcome from its truncated tail.
+        let blocked = dpor.blocked;
         let trace = dpor.trace;
+        if !blocked {
+            let executed: Vec<TaskId> = trace.iter().map(|e| e.tid).collect();
+            if on_outcome(schedules, &result, &executed) {
+                return (schedules, false); // caller asked to stop (e.g. found a witness)
+            }
+        }
 
         // Sync the path stack with the trace just produced. Slots for the replayed prefix already
         // exist (their `chosen` matches by construction); push fresh slots for newly reached depths;
@@ -777,21 +2807,9 @@ pub fn explore_all(
                 stack[d].chosen = p;
                 stack.truncate(d + 1);
             }
-            Some(_) => {
-                complete = false;
-                break;
-            }
-            None => {
-                complete = true;
-                break;
-            }
+            Some(_) => return (schedules, false), // hit `max_schedules` with work left
+            None => return (schedules, true),     // interleaving tree exhausted
         }
-    }
-
-    Exhaustive {
-        outcomes,
-        schedules,
-        complete,
     }
 }
 
@@ -917,6 +2935,7 @@ fn run_one_schedule(
 /// stack — rather than recursing on the host stack — is what makes fibers possible: a
 /// fiber's continuation is exactly its `Vec<Frame>`, which `suspend` pauses and
 /// `cont.resume` restarts.
+#[derive(Clone)]
 struct Frame {
     /// The function this activation is executing — stored as an **index** (not a borrow) so a
     /// `Frame` (hence a whole vCPU continuation) is self-contained and movable between worker
@@ -934,8 +2953,28 @@ struct Frame {
     /// Index of the **next** instruction to execute within that block. Saved across a
     /// nested call so the caller resumes just past the `call` when the callee returns.
     inst: usize,
-    /// Block-local SSA values produced so far (entry = the call arguments).
-    vals: Vec<Value>,
+    /// Block-local SSA values produced so far (entry = the call arguments), as raw [`Reg`]s.
+    vals: Vec<Reg>,
+}
+
+/// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call (see [`VCpu::setjmp_points`]). Since
+/// `Frame::vals` is **replaced per block** (block-param SSA), the value state at the `setjmp` point can
+/// not be reconstructed from the live (later-block) frame, so it is snapshotted here. `longjmp` truncates
+/// the call stack to `depth` (the intervening frames discarded — C has no cleanups), overwrites the
+/// surviving `setjmp` frame with `(block, inst, vals)`, sets `vals[result_idx]` to the long-jump value,
+/// and resumes. The data-stack pointer rides in `vals[0]` (the §3d SP block-param), so restoring `vals`
+/// restores it.
+#[derive(Clone)]
+struct SetJmpPoint {
+    /// Call-stack length at `setjmp` (the `setjmp` frame is at index `depth - 1`).
+    depth: usize,
+    /// The `setjmp` frame's block, and the instruction index just *after* the `setjmp`.
+    block: usize,
+    inst: usize,
+    /// The `setjmp` frame's value array at the `setjmp` point (its result slot included).
+    vals: Vec<Reg>,
+    /// Index in `vals` of the `setjmp` result — overwritten with the long-jump value on re-entry.
+    result_idx: usize,
 }
 
 /// One slot of a vCPU's **`call_indirect` dispatch table** — the explicit, module-aware
@@ -1152,39 +3191,11 @@ const MAX_VCPUS: usize = 1 << 16;
 /// multiple submits. Mirrors the [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings.
 const MAX_RING_BATCH: u64 = 1 << 16;
 
-/// §15 **spawn quota** — host-configurable ceilings on how many fibers / concurrently-live vCPUs a run
-/// may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings. The embedder sets it
-/// on the [`Host`] ([`Host::set_quota`]); a guest that exceeds it traps cleanly ([`Trap::FiberFault`] /
-/// [`Trap::ThreadFault`]) — DoS *containment* policy (§15/D48), not just the host-OOM backstop. The
-/// default is the hard ceilings, so an unconfigured run behaves exactly as before.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quota {
-    /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
-    /// capped at [`MAX_FIBERS`]. Per-run, not per-vCPU, since the fiber table is the run-shared
-    /// registry (D57 3b-i / DESIGN.md §23 (per-run quota)) — for a single-vCPU run the admitted creations are
-    /// unchanged (and match the JIT's per-vCPU count exactly).
-    pub max_fibers: usize,
-    /// Max concurrently-live vCPUs across the run (`thread.spawn`); capped at [`MAX_VCPUS`].
-    pub max_vcpus: usize,
-}
-impl Default for Quota {
-    fn default() -> Self {
-        Quota {
-            max_fibers: MAX_FIBERS,
-            max_vcpus: MAX_VCPUS,
-        }
-    }
-}
-impl Quota {
-    /// Clamp each limit to its hard anti-bomb ceiling (a quota can only *tighten*, never raise the
-    /// ceiling), and ensure at least 1 (the root vCPU always exists).
-    fn clamped(self) -> Quota {
-        Quota {
-            max_fibers: self.max_fibers.clamp(1, MAX_FIBERS),
-            max_vcpus: self.max_vcpus.clamp(1, MAX_VCPUS),
-        }
-    }
-}
+// §15 **spawn quota** — the single shared type lives in `svm-ir` (re-exported here and as
+// `svm_jit::Quota`), so a powerbox embedder sets it once and it binds all three backends identically,
+// with no facade conversion (Followup F6). The local `MAX_FIBERS`/`MAX_VCPUS` consts above mirror its
+// hard ceilings (also used here for fiber/vCPU table sizing); `Quota::clamped` enforces them.
+pub use svm_ir::Quota;
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
@@ -1222,6 +3233,42 @@ struct Outcome {
     result: Result<Vec<Value>, Trap>,
     mem: Option<Mem>,
     fuel: u64,
+    /// The vCPU's **trap-time call stack** (innermost frame first), as `IrPc`s — captured from the
+    /// live frames when (and only when) `result` is a trap, before the vCPU is dropped (DEBUGGING.md
+    /// §5 / W3, the interpreter counterpart to the JIT's `last_trap_backtrace`). Empty on a clean
+    /// finish. Resolved to source by the run wrapper via [`source_loc`]; host-side, off the hot path.
+    trap_bt: Vec<IrPc>,
+    /// The guest **fiber handle** running on this vCPU when it trapped (§5 W3 / §23-D57 per-fiber
+    /// attribution, the interpreter counterpart to the JIT's `last_trap_fiber`): `Some(handle)` for a
+    /// trap inside a fiber, `Some(-1)` for the root computation (no fiber), `None` on a clean finish.
+    /// The handle uses the cross-backend `(generation << FIBER_GEN_SHIFT) | slot` encoding, so it
+    /// compares equal to the JIT's for the same fiber.
+    trap_fiber: Option<i64>,
+}
+
+/// The trapping vCPU's running-fiber handle for [`Outcome::trap_fiber`]: `-1` when the root is running
+/// (no fiber), else the running fiber's guest handle (slot + live generation). Only meaningful at a
+/// trap — call when `result.is_err()`.
+fn trap_fiber_of(v: &VCpu) -> i64 {
+    if v.cur == ROOT_FIBER {
+        -1
+    } else {
+        fiber_handle(v.cur, v.registry.generation(v.cur))
+    }
+}
+
+/// The `IrPc`s of `frames`, innermost frame first — the shape [`Outcome::trap_bt`] captures at a trap.
+fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
+    frames
+        .iter()
+        .rev()
+        .map(|f| IrPc {
+            module: f.module,
+            func: f.func,
+            block: f.block,
+            inst: f.inst,
+        })
+        .collect()
 }
 
 /// Why a vCPU yielded its worker (returned by [`VCpu::run`]).
@@ -1259,6 +3306,10 @@ enum Step {
     /// Ran out its scheduling quantum mid-execution (deterministic-explorer preemption); re-enqueue
     /// and continue later. The real executor uses an unbounded quantum and never yields.
     Yield,
+    /// **Debug pause** (DEBUGGING.md W2/S4): a breakpoint/step hit, before the op at this [`IrPc`].
+    /// Only produced when an [`Inspector`] drives the vCPU; the [`VCpu`] continuation is intact, so
+    /// the next `run` resumes exactly here. Carries the reason + location for the driver to report.
+    Pause(StopReason, IrPc),
 }
 
 /// Internal `?`-friendly driver result; [`VCpu::run`] folds an `Err` into `Step::Done(Err)`.
@@ -1276,6 +3327,9 @@ enum Inner {
     /// been rewound; the parent's `resume` supplies the page and re-runs it (userfaultfd-style lazy
     /// paging). Like `CoYield`, only produced for an inline-driven coroutine.
     CoFault(u64),
+    /// A **debug pause** (DEBUGGING.md W2/S4): the per-op hook stopped before the op at this
+    /// [`IrPc`]. Folded to [`Step::Pause`] by [`VCpu::run`]; never produced unless `debug` is set.
+    Pause(StopReason, IrPc),
 }
 
 /// The **M:N executor** (§12): a bounded pool of worker OS threads runs many vCPUs (green threads)
@@ -1316,6 +3370,13 @@ struct Sched {
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
+    /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
+    /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
+    /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
+    /// outcome would name the join site, not the origin. `drive` reads this instead, so the trap
+    /// diagnostic names *where the guest actually trapped* — the interpreter counterpart to the JIT's
+    /// `Domain` trap-capture handoff. `None` on a clean run.
+    trap_origin: Option<(Vec<IrPc>, Option<i64>)>,
 }
 
 impl Scheduler {
@@ -1448,16 +3509,132 @@ fn worker_loop(sched: &Arc<Scheduler>) {
 /// Run one vCPU until it yields, then route the outcome: publish a result (waking a joiner) and
 /// retire the slot, or park it on a join target / wait address.
 fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
-    match v.run(u64::MAX) {
+    // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
+    // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
+    // shadow-SP ([`SHADOW_SP_OFF`]). The freeze/thaw runs single-worker, so the one shared pair is each
+    // vCPU's own context, swapped per dispatch: the shadow-SP points unwind/rewind at this vCPU's region
+    // (`context = task id`), and the state word is this vCPU's own freeze phase — vital because a
+    // rewinding vCPU flips the word to `NORMAL` after reloading, which must not disturb a sibling still
+    // rewinding. Only at root context — a vCPU parked mid-fiber-resume keeps the fiber swap's own
+    // bookkeeping (a no-op for the no-fiber slice, where `cur` is always `ROOT_FIBER`).
+    if v.durable && v.cur == ROOT_FIBER {
+        // §12.8 4A.5: at root, the active spill context is this vCPU's own; its SP word lives in *its*
+        // region (`shadow_region_base(vcpu_ctx)`), not a shared offset.
+        v.durable_sp_ctx = v.vcpu_ctx;
+        let root_word = shadow_region_base(v.vcpu_ctx);
+        if let Some(m) = v.mem.as_mut() {
+            // §12.8 concurrent-thaw stage 1: route this vCPU's phase across the global freeze word and
+            // its own per-context thaw word, so its rewind can't disturb a sibling's.
+            m.durable_store_dstate(v.vcpu_ctx, v.dstate);
+            m.durable_set_sp(root_word, v.root_shadow_sp);
+        }
+    }
+    let step = v.run(u64::MAX);
+    // Save this vCPU's durable words whenever it parks (it resumes later on this single worker and must
+    // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
+    // from the live words below).
+    if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
+        let root_word = shadow_region_base(v.vcpu_ctx);
+        if let Some(m) = v.mem.as_ref() {
+            // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
+            // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
+            v.dstate = m.durable_load_dstate(v.vcpu_ctx);
+            v.root_shadow_sp = m.durable_get_sp(root_word);
+        }
+    }
+    match step {
         Step::Done(result) => {
+            // `froze` distinguishes a **freeze-unwind** (the run is `UNWINDING`; a spawned child
+            // records `FrozenVCpu` residue and its region is kept for thaw) from a **genuine finish**
+            // (NORMAL completion). Context recycling frees a finished child's shadow context back to
+            // the registry, but a frozen child must keep it (it is re-spawned there on thaw).
+            let froze = v.durable
+                && result.is_ok()
+                && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
+            // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
+            // parked into theirs, while the registry is alive, before the window is snapshotted. **Every**
+            // vCPU drives its own (slice 3.4: a spawned child that owns fibers must flatten them too — the
+            // root's drive runs before the children exist, so it can't see a child's fiber). `freeze_drive`
+            // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
+            // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
+            // drive trap (out-of-scope module) surfaces as the run's result.
+            let result = if froze {
+                // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
+                // repoints the active-SP word to flatten idle fibers and restores it to this extent.
+                let self_sp = v
+                    .mem
+                    .as_ref()
+                    .map(|m| m.durable_get_sp(shadow_region_base(v.vcpu_ctx)))
+                    .unwrap_or_else(|| shadow_frame_base(v.vcpu_ctx));
+                if let Some((func, args)) = v.spawn_residue.clone() {
+                    // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
+                    // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
+                    v.host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .frozen_vcpus
+                        .push(FrozenVCpu {
+                            task: v.id as usize,
+                            parent_task: v.parent_task as usize,
+                            func: func as i32,
+                            args,
+                            shadow_sp: self_sp,
+                            completed_result: None, // interp runs durable single-worker
+                        });
+                } else {
+                    // The root: record its extent (the shared active-SP word will be overwritten by a
+                    // later child, so the root's residue can't ride the window).
+                    v.host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .frozen_root_sp = Some(self_sp);
+                }
+                let r = v.freeze_drive().and(result);
+                // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
+                // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
+                // makes the accumulation order irrelevant to the artifact.
+                if !v.frozen.is_empty() {
+                    let frozen = std::mem::take(&mut v.frozen);
+                    v.host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .frozen_fibers
+                        .extend(frozen);
+                }
+                r
+            } else {
+                result
+            };
+            // Context recycling: a spawned vCPU that genuinely finished frees its shadow context for a
+            // later spawn to reuse (a freeze-unwound child keeps it — it's re-spawned there on thaw).
+            if v.vcpu_ctx > 0 && !froze {
+                v.registry.free_vcpu_context(v.vcpu_ctx);
+            }
             let id = v.id;
+            // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (only on a trap).
+            let trap_bt = if result.is_err() {
+                frames_to_pcs(&v.frames)
+            } else {
+                Vec::new()
+            };
+            let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
             let outcome = Outcome {
                 result,
                 mem: v.mem.take(),
                 fuel: v.fuel,
+                trap_bt,
+                trap_fiber,
             };
             drop(v);
             let mut s = sched.lock();
+            // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
+            // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
+            // true origin. A clean finish leaves it untouched.
+            if outcome.result.is_err() {
+                s.trap_origin
+                    .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
+            }
             if let Some(parent) = s.join_waiters.remove(&id) {
                 s.runnable.push_back(parent);
                 sched.work.notify_one();
@@ -1506,6 +3683,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
+        // Only an `Inspector`-driven vCPU pauses, and those are never on the executor (DEBUGGING.md S4).
+        Step::Pause(..) => unreachable!("debug pause on a pooled vCPU"),
     }
 }
 
@@ -1589,6 +3768,39 @@ struct DetState {
 }
 
 impl DetState {
+    /// Find a **live** vCPU by id wherever the scheduler parks it — runnable, join/wait/spin-parked
+    /// (DEBUGGING.md Milestone B: the debugger inspects any thread while stopped). Finished vCPUs are
+    /// gone (only their [`Outcome`] remains in `results`), so they aren't found here.
+    fn find_vcpu(&self, id: TaskId) -> Option<&VCpu> {
+        if let Some(v) = self.runnable.iter().find(|v| v.id == id) {
+            return Some(v);
+        }
+        if let Some(v) = self.join_waiters.get(&id) {
+            return Some(v);
+        }
+        if let Some(w) = self.wait_waiters.iter().find(|w| w.vcpu.id == id) {
+            return Some(&w.vcpu);
+        }
+        self.spin_waiters
+            .iter()
+            .find(|w| w.vcpu.id == id)
+            .map(|w| &*w.vcpu)
+    }
+
+    /// The ids of every live (not-yet-finished) vCPU the scheduler holds, sorted.
+    fn live_ids(&self) -> Vec<TaskId> {
+        let mut ids: Vec<TaskId> = self
+            .runnable
+            .iter()
+            .map(|v| v.id)
+            .chain(self.join_waiters.keys().copied())
+            .chain(self.wait_waiters.iter().map(|w| w.vcpu.id))
+            .chain(self.spin_waiters.iter().map(|w| w.vcpu.id))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Move every spin-parked vCPU whose read range `[base, base+width)` overlaps the just-written
     /// `[w_base, w_base+w_width)` back to the runnable set — a write there may have changed the value it
     /// spins on, so it must re-check (it re-parks if still stuck). The interpreter is sequentially
@@ -1696,145 +3908,431 @@ fn run_det(det: &Arc<DetSched>) {
 }
 
 fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
-    loop {
-        // Choose the next vCPU + quantum under the lock; release it before running (run_inner may
-        // re-enter via `spawn`/`notify`).
-        let (mut v, quantum) = {
-            let mut s = det.lock();
-            if s.runnable.is_empty() {
-                if s.live == 0 {
-                    return; // all done
-                }
-                // No one runnable: fire the earliest timeout (or deadlock if none).
-                let Some(idx) =
-                    (0..s.wait_waiters.len()).min_by_key(|&i| s.wait_waiters[i].deadline)
-                else {
-                    return; // live > 0 but nothing runnable/waiting: a guest join-deadlock
-                };
-                let mut w = s.wait_waiters.remove(idx);
-                s.clock = s.clock.max(w.deadline);
-                w.vcpu.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
-                s.runnable.push(w.vcpu);
-                continue;
+    match SchedDriver::default().run(det, &mut policy) {
+        DriverStop::Done => {}
+        // The explorer sets neither `debug` nor a turn limit, so only `Done` can occur (S4).
+        DriverStop::Paused { .. } | DriverStop::TurnLimit => {
+            unreachable!("debug pause / turn limit in the deterministic explorer")
+        }
+    }
+}
+
+/// Outcome of one [`SchedDriver::run`] pump.
+enum DriverStop {
+    /// A debugged vCPU paused *before* an op (breakpoint/step/watchpoint/cap.call). The vCPU is held
+    /// inside the driver (`driver.held`) so the next pump resumes its turn without re-deciding the
+    /// schedule; the held vCPU's id is the stopped thread ([`Inspector::stopped_task`]).
+    Paused { reason: StopReason, pc: IrPc },
+    /// The run reached a scheduler quiescence: every vCPU finished, or a join-deadlock, or (under a
+    /// plan) every runnable vCPU is asleep. The caller reads outcomes from `det`.
+    Done,
+    /// Ran the requested number of scheduler turns (`turn_limit`) and stopped at that turn boundary —
+    /// a global snapshot for scheduled-mode time-travel `seek` (DEBUGGING.md W1). No vCPU is held;
+    /// every thread is back in the scheduler, inspectable via `threads`/`select_task`.
+    TurnLimit,
+}
+
+/// A vCPU whose turn a debug stop interrupted (the op has not run). Resumed verbatim on the next
+/// pump — same quantum, same spin-detection baseline — so the schedule decision for the turn stands.
+struct HeldTurn {
+    v: Box<VCpu>,
+    quantum: u64,
+    pre_fp: u64,
+    writes_before: u64,
+    spin_capable: bool,
+}
+
+/// The cooperative single-thread multi-vCPU scheduler loop, made **re-entrant** so a debugger can
+/// pause it at a breakpoint and resume (DEBUGGING.md Milestone B). [`run_with_policy`] is the
+/// non-pausing wrapper used by the model-checker/explorer (whose vCPUs carry no `debug`, so
+/// [`DriverStop::Paused`] never occurs); the [`Inspector`] drives the same loop and stops on it.
+#[derive(Default)]
+struct SchedDriver {
+    held: Option<HeldTurn>,
+    /// Completed scheduler turns (one per visible-op decision) — the global logical-time coordinate
+    /// scheduled-mode `seek` targets (DEBUGGING.md W1).
+    turns: u64,
+    /// When `Some(t)`, stop with [`DriverStop::TurnLimit`] once `turns` reaches `t` (a seek).
+    turn_limit: Option<u64>,
+}
+
+impl SchedDriver {
+    /// Pump turns until a debug stop or scheduler quiescence. On `Paused`, the interrupted vCPU is
+    /// retained in `self.held` and the next `run` resumes exactly there.
+    fn run(&mut self, det: &Arc<DetSched>, policy: &mut Policy) -> DriverStop {
+        loop {
+            // Scheduled-seek stop: at the requested turn boundary (no vCPU held — a global snapshot).
+            if self.turn_limit == Some(self.turns) {
+                return DriverStop::TurnLimit;
             }
-            let n = s.runnable.len();
-            // One visible op per turn (`memop` vCPUs) so every shared-state access is a decision.
-            let (pick, quantum) = match &mut policy {
-                Policy::Seeded => ((s.rng() as usize) % n, 1 + s.rng() % MAX_QUANTUM),
-                Policy::Brute(c) => (c.pick(n), 1),
-                Policy::Dpor(d) => {
-                    // Address by `TaskId` (the runnable order is reshuffled by `swap_remove`), so the
-                    // plan replays identically. `enabled` sorted ⇒ a stable default (smallest id). A
-                    // `None` pick means every runnable vCPU is asleep ⇒ stop this redundant schedule.
-                    let mut enabled: Vec<TaskId> = s.runnable.iter().map(|v| v.id).collect();
-                    enabled.sort_unstable();
-                    match d.pick(&enabled) {
-                        Some(tid) => {
-                            let idx = s
-                                .runnable
-                                .iter()
-                                .position(|v| v.id == tid)
-                                .expect("planned tid is runnable");
-                            (idx, 1)
+            // Resume an interrupted turn verbatim, else pick the next vCPU + quantum under the lock
+            // (release it before running — run_inner may re-enter via `spawn`/`notify`).
+            let (mut v, quantum, pre_fp, writes_before, spin_capable) = match self.held.take() {
+                Some(h) => (h.v, h.quantum, h.pre_fp, h.writes_before, h.spin_capable),
+                None => {
+                    let (v, quantum) = {
+                        let mut s = det.lock();
+                        if s.runnable.is_empty() {
+                            if s.live == 0 {
+                                return DriverStop::Done; // all done
+                            }
+                            // No one runnable: fire the earliest timeout (or deadlock if none).
+                            let Some(idx) = (0..s.wait_waiters.len())
+                                .min_by_key(|&i| s.wait_waiters[i].deadline)
+                            else {
+                                return DriverStop::Done; // live > 0 but quiescent: a join-deadlock
+                            };
+                            let mut w = s.wait_waiters.remove(idx);
+                            s.clock = s.clock.max(w.deadline);
+                            w.vcpu.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
+                            s.runnable.push(w.vcpu);
+                            continue;
                         }
-                        None => return,
-                    }
+                        let n = s.runnable.len();
+                        // One visible op per turn (`memop` vCPUs) so every shared access is a decision.
+                        let (pick, quantum) = match &mut *policy {
+                            Policy::Seeded => ((s.rng() as usize) % n, 1 + s.rng() % MAX_QUANTUM),
+                            Policy::Brute(c) => (c.pick(n), 1),
+                            Policy::Dpor(d) => {
+                                // Address by `TaskId` (runnable order is reshuffled by `swap_remove`),
+                                // so the plan replays identically. `enabled` sorted ⇒ stable default
+                                // (smallest id). `None` ⇒ every runnable vCPU is asleep: stop here.
+                                let mut enabled: Vec<TaskId> =
+                                    s.runnable.iter().map(|v| v.id).collect();
+                                enabled.sort_unstable();
+                                match d.pick(&enabled) {
+                                    Some(tid) => {
+                                        let idx = s
+                                            .runnable
+                                            .iter()
+                                            .position(|v| v.id == tid)
+                                            .expect("planned tid is runnable");
+                                        (idx, 1)
+                                    }
+                                    None => return DriverStop::Done,
+                                }
+                            }
+                        };
+                        let v = s.runnable.swap_remove(pick);
+                        (v, quantum)
+                    };
+                    // Spin-loop detection (memop explorer only): snapshot the vCPU's local
+                    // configuration and write count so a post-turn busy-wait retry (same config, no
+                    // memory changed) is distinguishable from real progress.
+                    let spin_capable = v.memop;
+                    let pre_fp = if spin_capable {
+                        v.local_fingerprint()
+                    } else {
+                        0
+                    };
+                    let writes_before = v.mem.as_ref().map_or(0, |m| m.writes);
+                    (v, quantum, pre_fp, writes_before, spin_capable)
                 }
             };
-            let v = s.runnable.swap_remove(pick);
-            (v, quantum)
-        };
-        // Spin-loop detection (memop explorer only): snapshot the vCPU's local configuration and its
-        // memory-write count so that, after the turn, a pure busy-wait retry (same config, no memory
-        // changed) is distinguishable from real progress.
-        let spin_capable = v.memop;
-        let pre_fp = if spin_capable {
-            v.local_fingerprint()
-        } else {
-            0
-        };
-        let writes_before = v.mem.as_ref().map_or(0, |m| m.writes);
 
-        let step = v.run(quantum);
+            let step = v.run(quantum);
 
-        let acc = v.acc.take();
-        // DPOR: finalize this decision's trace entry now that the step's accessed object is known.
-        if let Policy::Dpor(d) = &mut policy {
-            d.finish(acc.unwrap_or(MemAccess::None));
-        }
-        // A turn that actually changed a byte may unblock spinners parked on that address — wake them
-        // to re-check (they re-park if still stuck). Memory change is the only thing that can, under
-        // sequential consistency, alter a parked spinner's read.
-        let mem_changed = v.mem.as_ref().map_or(0, |m| m.writes) != writes_before;
-        if mem_changed {
-            if let Some(MemAccess::Range { base, width, .. }) = acc {
-                det.lock().wake_spins(base, width);
+            // A debug stop interrupts the turn before the op runs: hold the vCPU (its continuation is
+            // intact) and hand control back. The DPOR decision isn't finalized — `d.finish` waits for
+            // the turn to actually complete on a later pump.
+            if let Step::Pause(reason, pc) = step {
+                self.held = Some(HeldTurn {
+                    v,
+                    quantum,
+                    pre_fp,
+                    writes_before,
+                    spin_capable,
+                });
+                return DriverStop::Paused { reason, pc };
             }
-        }
-        match step {
-            Step::Done(result) => {
-                let id = v.id;
-                let outcome = Outcome {
-                    result,
-                    mem: v.mem.take(),
-                    fuel: v.fuel,
-                };
-                drop(v);
-                let mut s = det.lock();
-                if let Some(parent) = s.join_waiters.remove(&id) {
-                    s.runnable.push(parent);
-                }
-                s.results.insert(id, outcome);
-                s.live -= 1;
+            self.turns += 1; // a visible-op decision completed — advance global logical time
+
+            let acc = v.acc.take();
+            // DPOR: finalize this decision's trace entry now that the step's accessed object is known.
+            if let Policy::Dpor(d) = &mut *policy {
+                d.finish(acc.unwrap_or(MemAccess::None));
             }
-            Step::Park(Blocked::Join { child }) => {
-                let mut s = det.lock();
-                if s.results.contains_key(&child) {
-                    s.runnable.push(v); // already done (pending already set)
-                } else {
-                    s.join_waiters.insert(child, v);
+            // A turn that actually changed a byte may unblock spinners parked on that address — wake
+            // them to re-check (they re-park if still stuck). Memory change is the only thing that
+            // can, under sequential consistency, alter a parked spinner's read.
+            let mem_changed = v.mem.as_ref().map_or(0, |m| m.writes) != writes_before;
+            if mem_changed {
+                if let Some(MemAccess::Range { base, width, .. }) = acc {
+                    det.lock().wake_spins(base, width);
                 }
             }
-            Step::Park(Blocked::Wait {
-                key,
-                expected,
-                width,
-                timeout_ns,
-            }) => {
-                let mut s = det.lock();
-                if v.atomic_value(key, width) != expected {
-                    v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
-                    s.runnable.push(v);
-                } else {
-                    let deadline = s.clock.saturating_add(timeout_ns);
-                    s.wait_waiters.push(DetWaiter {
-                        key,
-                        deadline,
-                        vcpu: v,
-                    });
+            match step {
+                Step::Done(result) => {
+                    let id = v.id;
+                    // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (trap only).
+                    let trap_bt = if result.is_err() {
+                        frames_to_pcs(&v.frames)
+                    } else {
+                        Vec::new()
+                    };
+                    let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
+                    let outcome = Outcome {
+                        result,
+                        mem: v.mem.take(),
+                        fuel: v.fuel,
+                        trap_bt,
+                        trap_fiber,
+                    };
+                    drop(v);
+                    let mut s = det.lock();
+                    if let Some(parent) = s.join_waiters.remove(&id) {
+                        s.runnable.push(parent);
+                    }
+                    s.results.insert(id, outcome);
+                    s.live -= 1;
                 }
-            }
-            Step::Yield => {
-                // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU to
-                // the same local configuration — a busy-wait whose only way forward is another vCPU
-                // writing what it just read. Park it off the runnable set (so the spin doesn't multiply
-                // the interleaving tree, and an unfair "spin forever" schedule can't starve the writer)
-                // until such a write wakes it. Anything else re-enqueues normally.
-                if spin_capable && !mem_changed && v.local_fingerprint() == pre_fp {
-                    if let Some(MemAccess::Range { base, width, .. }) = acc {
-                        let mut s = det.lock();
-                        s.spin_waiters.push(SpinWaiter {
-                            vcpu: v,
-                            base,
-                            width,
-                        });
-                        continue;
+                Step::Park(Blocked::Join { child }) => {
+                    let mut s = det.lock();
+                    if s.results.contains_key(&child) {
+                        s.runnable.push(v); // already done (pending already set)
+                    } else {
+                        s.join_waiters.insert(child, v);
                     }
                 }
-                det.lock().runnable.push(v);
+                Step::Park(Blocked::Wait {
+                    key,
+                    expected,
+                    width,
+                    timeout_ns,
+                }) => {
+                    let mut s = det.lock();
+                    if v.atomic_value(key, width) != expected {
+                        v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
+                        s.runnable.push(v);
+                    } else {
+                        let deadline = s.clock.saturating_add(timeout_ns);
+                        s.wait_waiters.push(DetWaiter {
+                            key,
+                            deadline,
+                            vcpu: v,
+                        });
+                    }
+                }
+                Step::Yield => {
+                    // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU
+                    // to the same local configuration — a busy-wait whose only way forward is another
+                    // vCPU writing what it just read. Park it off the runnable set until such a write
+                    // wakes it. Anything else re-enqueues normally.
+                    if spin_capable && !mem_changed && v.local_fingerprint() == pre_fp {
+                        if let Some(MemAccess::Range { base, width, .. }) = acc {
+                            let mut s = det.lock();
+                            s.spin_waiters.push(SpinWaiter {
+                                vcpu: v,
+                                base,
+                                width,
+                            });
+                            continue;
+                        }
+                    }
+                    det.lock().runnable.push(v);
+                }
+                Step::Pause(..) => unreachable!("handled above"),
             }
         }
     }
+}
+
+// ---- Durable runtime ABI (DURABILITY.md §12.7/§12.8) ----
+//
+// These describe where a **durable** (freeze/thaw-instrumented) module's per-context shadow
+// state lives in the window. They are the runtime half of a contract whose tooling half is
+// `svm-durable`: the transform emits IR that reads/writes the *active* shadow-SP word at
+// [`SHADOW_SP_OFF`]; the runtime (here) keeps that word pointing at the **currently-running
+// context's** shadow region, swapping it on every fiber switch (D-fiber-cont option A — the
+// switch knowledge lives in the runtime's resume chain, not in emitted IR). `svm-interp` is
+// TCB and must not depend on the tooling-tier `svm-durable`, so these constants are duplicated
+// and cross-checked against `svm_durable`'s in that crate's tests.
+//
+// Per-context layout: context `i` owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +
+// SHADOW_STRIDE)`, all within the reserved low slice `[0, DURABLE_RESERVE)`. The root
+// computation is context 0 (so a single-context run is byte-identical to the pre-fiber layout,
+// whose lone shadow stack started at `SHADOW_BASE`); a `cont.new`-created fiber in registry
+// slot `s` is context `s + 1`.
+
+/// Window byte offset of the `i32` durable **state word** (`NORMAL | UNWINDING | REWINDING`).
+/// The freeze driver reads it to tell a freeze (UNWINDING) run from an ordinary one. Must equal
+/// `svm_durable::STATE_OFF`.
+pub const STATE_OFF: u64 = 0;
+/// State-word values (must equal `svm_durable::STATE_*`). Only `UNWINDING` is read by the runtime
+/// today (the freeze-driver trigger); the others are maintained entirely by the instrumented IR.
+pub const STATE_NORMAL: i32 = 0;
+pub const STATE_UNWINDING: i32 = 1;
+pub const STATE_REWINDING: i32 = 2;
+/// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
+/// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
+/// the instrumented IR (which tests only `UNWINDING`/`REWINDING`). Must equal `svm_durable::STATE_ARMED`.
+pub const STATE_ARMED: i32 = 3;
+/// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
+/// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
+/// `svm_durable::ARM_COUNTDOWN_OFF`.
+pub const ARM_COUNTDOWN_OFF: u64 = 16;
+/// Window byte offset of the `i64` **back-edge arm countdown** (loop back-edges left before an
+/// `ARMED` run promotes to `UNWINDING`, so a loop-header poll begins the freeze). Decremented at each
+/// branch terminator; inert unless `ARMED` and the slot is positive. Must equal
+/// `svm_durable::ARM_BACKEDGE_OFF`.
+pub const ARM_BACKEDGE_OFF: u64 = 24;
+/// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
+/// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
+/// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
+pub const SHADOW_SP_OFF: u64 = 8;
+/// Window byte offset where **context 0's** (the root's) shadow stack begins. Must equal
+/// `svm_durable::SHADOW_BASE`.
+pub const SHADOW_BASE: u64 = 64;
+/// Per-context shadow-stack stride: context `i` occupies `[SHADOW_BASE + i*SHADOW_STRIDE, +
+/// SHADOW_STRIDE)`. 4 KiB per context fits ~15 contexts in the 64 KiB reserve — a provisional
+/// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
+///
+/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the global
+/// `DURABLE_RESERVE` ceiling, not at a per-region bound, so a fiber recursed deeper than
+/// `SHADOW_STRIDE` would grow into the next context's region before tripping. Shallow fibers
+/// (every test today) stay confined; making the overflow bound per-region travels with the
+/// sizing decision.
+pub const SHADOW_STRIDE: u64 = 1 << 12;
+/// Ceiling of the reserved durable region `[0, DURABLE_RESERVE)`. Must equal
+/// `svm_durable::DURABLE_RESERVE`.
+pub const DURABLE_RESERVE: u64 = 1 << 16;
+
+/// The shadow-region base (window offset) of context `ctx_idx` (root = 0, fiber slot `s` =
+/// `s + 1`). The per-context partition that keeps two fibers' frozen frames from colliding.
+fn shadow_region_base(ctx_idx: usize) -> u64 {
+    SHADOW_BASE + ctx_idx as u64 * SHADOW_STRIDE
+}
+
+/// Bytes reserved at each region's base for its **per-context shadow-SP word** (§12.8 4A.5): the SP
+/// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
+/// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
+const SHADOW_SP_WORD_LEN: u64 = 8;
+/// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
+/// within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte SP word, addressed via
+/// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) stays at the global
+/// [`STATE_OFF`]. Must equal `svm_durable::STATE_IN_REGION_OFF`.
+const STATE_IN_REGION_OFF: u64 = SHADOW_SP_WORD_LEN;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
+/// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
+/// `svm_durable::REGION_HEADER_LEN`.
+const REGION_HEADER_LEN: u64 = 16;
+
+/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP + thaw words. The
+/// empty (no-frames) extent of a context's shadow stack.
+fn shadow_frame_base(ctx_idx: usize) -> u64 {
+    shadow_region_base(ctx_idx) + REGION_HEADER_LEN
+}
+
+/// Byte offset of context `ctx_idx`'s per-context **thaw** state word (§12.8 concurrent-thaw stage 1).
+fn thaw_state_off(ctx_idx: usize) -> u64 {
+    shadow_region_base(ctx_idx) + STATE_IN_REGION_OFF
+}
+
+/// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
+/// `cont.new` checks before handing out a new fiber's region.
+fn shadow_region_fits(ctx_idx: usize) -> bool {
+    shadow_region_base(ctx_idx) + SHADOW_STRIDE <= DURABLE_RESERVE
+}
+
+/// The highest usable shadow-context index: the reserve holds `DURABLE_RESERVE / SHADOW_STRIDE`
+/// contexts and index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root regions.
+const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
+
+/// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
+/// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
+/// low 16 bits and the generation occupies bits 16.. of the **`i64`** handle. A handle is
+/// `(generation << FIBER_GEN_SHIFT) | slot` — and since a fresh slot's generation is 0, a non-recycled
+/// run's handle is exactly its slot (byte-identical to before, and to the JIT, which likewise hands out
+/// `slot`). The generation lets a later **recycled** slot reject a stale handle to its former occupant
+/// (the ABA guard the JIT's `Ownership` word already carries internally).
+const FIBER_GEN_SHIFT: u32 = 16;
+
+/// The generation bits a fiber guest handle carries (the field above the slot): an `i64` handle leaves
+/// **48 bits** for the generation, so a stale handle is rejected modulo `2^48` — an ABA window so vast
+/// (≈ centuries of recycling even at 10⁶ finishes/s) that wraparound is unreachable in practice.
+/// Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
+const FIBER_GEN_MASK: u64 = (1 << 48) - 1;
+
+/// Encode a fiber guest handle from its registry `slot` and `generation` (low 48 bits).
+fn fiber_handle(slot: usize, generation: u64) -> i64 {
+    (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
+}
+
+/// The generation field a guest fiber handle carries (the high bits above the slot).
+fn fiber_handle_generation(handle: i64) -> u64 {
+    (handle as u64) >> FIBER_GEN_SHIFT
+}
+
+/// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
+/// on a fiber switch (D-fiber-cont option A). A no-op unless the run is `durable` and has a
+/// window. The saved-SP of each *non-running* context lives host-side (the root's in
+/// [`VCpu::root_shadow_sp`], a fiber's in the registry's `shadow` table); the running context's
+/// live SP is the in-window word the instrumented IR maintains. In `NORMAL` execution the
+/// shadow stacks are empty (frames are pushed only under `UNWINDING`), so a saved SP equals its
+/// region base — but saving/restoring the real word keeps this correct for the freeze/thaw
+/// choreography (slices 3.1.3–4), where a drained fiber carries a non-empty shadow stack.
+#[allow(clippy::too_many_arguments)] // an internal swap helper threading the per-context durable state
+fn shadow_switch(
+    mem: &mut Option<Mem>,
+    registry: &FiberRegistry,
+    root_shadow_sp: &mut u64,
+    root_ctx: usize,
+    sp_ctx: &mut usize,
+    durable: bool,
+    out_ctx: usize,
+    in_ctx: usize,
+) {
+    if !durable {
+        return;
+    }
+    // The incoming context becomes the active spill context for `durable.shadow_base`.
+    *sp_ctx = if in_ctx == ROOT_FIBER {
+        root_ctx
+    } else {
+        shadow_context_index(in_ctx)
+    };
+    let Some(m) = mem.as_mut() else { return };
+    // §12.8 4A.5: each context's SP word lives in its **own** region (`shadow_region_base`); the
+    // off-table root uses this vCPU's `root_ctx`, a fiber slot `s` its context `s + 1`. The save/load
+    // mirror the host-side caches — with per-context words the load is a redundant equal-write (the
+    // incoming region already holds its SP), retained for choreography parity with freeze/thaw.
+    let region_of = |ctx: usize| {
+        shadow_region_base(if ctx == ROOT_FIBER {
+            root_ctx
+        } else {
+            shadow_context_index(ctx)
+        })
+    };
+    // Save the outgoing context's live SP to its host-side slot.
+    let sp = m.durable_get_sp(region_of(out_ctx));
+    if out_ctx == ROOT_FIBER {
+        *root_shadow_sp = sp;
+    } else {
+        registry.set_saved_sp(out_ctx, sp);
+    }
+    // Load the incoming context's SP into its (own) region word.
+    let in_sp = if in_ctx == ROOT_FIBER {
+        *root_shadow_sp
+    } else {
+        registry.saved_sp(in_ctx)
+    };
+    m.durable_set_sp(region_of(in_ctx), in_sp);
+    // §12.8 concurrent-thaw stage 1: carry the active **thaw** phase (`REWINDING`/`NORMAL`) from the
+    // outgoing context to the incoming one. Within a vCPU the rewind is sequential (a `cont.resume`
+    // resumer waits on its resumee), so the globally-deepest frame's flip to `NORMAL` must propagate
+    // back up through the switches — exactly as the former single global state word did (a resumer
+    // doesn't flip its own word; this carry does, on the return switch). The **freeze** word is global,
+    // so a non-thaw switch carries `NORMAL` (a no-op). Cross-*vCPU* concurrency uses distinct words and
+    // never routes through `shadow_switch`, so each vCPU's thaw stays independent.
+    let ctx_idx_of = |ctx: usize| {
+        if ctx == ROOT_FIBER {
+            root_ctx
+        } else {
+            shadow_context_index(ctx)
+        }
+    };
+    let phase = m.durable_thaw_state(ctx_idx_of(out_ctx));
+    m.durable_set_thaw_state(ctx_idx_of(in_ctx), phase);
 }
 
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
@@ -1843,6 +4341,63 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
 /// unification of D57 step 3b-i, closing the documented interp↔JIT divergence). The root's parked
 /// frames (while it is resuming a fiber) live in `VCpu::root_parked`.
 const ROOT_FIBER: usize = usize::MAX;
+
+/// A fiber **flattened for freeze** (DURABILITY.md §12.8 slice 3.1.4–5), as the snapshot carries it
+/// (the eventual §12.4 Section-2 per-fiber record). Its continuation is bytes in its in-window
+/// shadow region `[shadow_region_base(slot+1), shadow_sp)`; this is the small host-side residue:
+/// where it sits and how to re-enter it on thaw. Re-entry recreates it as a `Pending` fiber so a
+/// thaw `cont.resume` runs its entry under `REWINDING`, rebuilding then re-parking it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenFiber {
+    /// Registry slot = the guest fiber handle (so re-seeding preserves handle values).
+    pub slot: usize,
+    /// The fiber's entry funcref (== func index; `ref.func`/the identity table), re-entered on thaw.
+    pub func: i32,
+    /// The fiber's data-stack base (the entry's first param). Inert for rewind (the prologue
+    /// dispatches to the resume arm, ignoring params) but recorded for fidelity / forward use.
+    pub sp: i64,
+    /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
+    /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
+    pub shadow_sp: u64,
+    /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
+    /// *recycled* (generation > 0) fiber still resolves (`(generation << 16) | slot`). 0 for a
+    /// non-recycled fiber — then the handle is exactly its slot. 48-bit field (the `i64` handle's
+    /// generation bits); serialized as `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
+    pub generation: u64,
+}
+
+/// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
+/// Like [`FrozenFiber`] but for a whole green thread rather than a fiber: under a multi-vCPU freeze the
+/// child unwinds its own native stack into *its* per-context shadow region (`context = task id`), and
+/// this is the host-side residue needed to reconstruct it on thaw. The **root** vCPU needs no residue —
+/// its entry/args are supplied by the thaw caller (it is re-entered directly, like the single-vCPU
+/// case). On thaw the child is re-attached by the runtime: the root's rewind re-executes `thread.spawn`
+/// (not a transform checkpoint), and under `REWINDING` that op re-spawns the next frozen child from this
+/// residue — in deterministic spawn order — instead of creating a fresh one (a reload-not-reissue done
+/// in the runtime, so `svm-durable` is unchanged).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenVCpu {
+    /// The child's task id at freeze — globally unique + monotonic in spawn order across the whole vCPU
+    /// tree. Preserved on thaw so the §12.6 canonical re-freeze records the same task.
+    pub task: usize,
+    /// The task id of the vCPU that **spawned** this child (slice 3.4: nested spawns). The root's direct
+    /// children carry the root's id (`0`); a grandchild carries its parent child's task. Thaw groups the
+    /// residue by this, re-attaches parents before children, and rebuilds each parent's join table so a
+    /// grandchild's reloaded handle resolves in its *parent's* table, not the root's.
+    pub parent_task: usize,
+    /// The child's entry function (the `thread.spawn` target), re-entered on thaw.
+    pub func: i32,
+    /// The child's spawn args (`[sp, arg]`, the fiber-style thread entry), replayed on re-spawn.
+    pub args: Vec<i64>,
+    /// Window offset of the child's flattened shadow-SP — the extent of its frozen continuation in its
+    /// region; restored as the child's shadow-SP so its thaw re-entry rewinds from the right point.
+    pub shadow_sp: u64,
+    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child (JIT
+    /// only — the interp runs durable single-worker, so it always records `None`). The thaw delivers the
+    /// result into the spawner's join table without re-running the child. `None` for a normal frozen
+    /// child (re-spawned + rewound).
+    pub completed_result: Option<i64>,
+}
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
 /// continuation is exactly its reified call stack. `cont.new` makes one (`Pending`);
@@ -1870,6 +4425,11 @@ enum RegFiber {
     /// historical tables, so handles stay dense and deterministic); recycling + the generation
     /// tag land with the JIT shared registry (3b-ii) so both backends adopt one policy together.
     Done,
+    /// **Flattened for freeze** (DURABILITY.md §12.8 slice 3.1.4): the freeze driver drove this
+    /// (formerly `Parked`) fiber under `UNWINDING`, so its continuation now lives in its in-window
+    /// shadow region (extent recorded in the registry's `shadow` table) instead of as host frames.
+    /// A `claim` of it currently loses (thaw re-entry is slice 3.1.5); never claimable meanwhile.
+    Frozen,
 }
 
 /// What a successful [`FiberRegistry::claim`] hands the winning vCPU.
@@ -1891,31 +4451,153 @@ enum Claimed {
 /// `Ownership`-word table is slice 3b-ii/3c). The lock is a leaf (nothing else is locked while
 /// it is held) and is touched only by fiber ops, never the execution hot path.
 struct FiberRegistry {
-    mx: Mutex<Vec<RegFiber>>,
+    mx: Mutex<RegState>,
+}
+
+/// The registry's locked state: the fiber slots, plus a parallel **durable shadow** table
+/// (`shadow[s]` = the saved shadow-SP window offset of the fiber in slot `s`, for the
+/// freeze/thaw codec — D-fiber-cont option A). The two vecs grow together in [`create`], so a
+/// slot's index is the same in both. `shadow` is meaningful only for durable runs; a
+/// non-durable run never reads it.
+struct RegState {
+    fibers: Vec<RegFiber>,
+    shadow: Vec<u64>,
+    /// Per-slot **generation** (recycling step 1): bumped when a slot is freed for reuse, and carried
+    /// in the guest handle's high bits ([`FIBER_GEN_SHIFT`]) so a stale handle to a slot's former
+    /// occupant is rejected on `claim`. Grows with `fibers`/`shadow` (same index).
+    gens: Vec<u64>,
+    /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
+    /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
+    /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
+    /// lifetime total. A finished slot's generation is already bumped, so reuse is ABA-safe.
+    free: BinaryHeap<Reverse<usize>>,
+    /// **Occupied** durable vCPU shadow contexts (slice 3.2.2 + context recycling): a bitmask over
+    /// contexts `1..=MAX_SHADOW_CTX` (bit `c` set ⇒ context `c` is live). The root spawns children that
+    /// grow **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1; a child's context is
+    /// *freed* (its bit cleared) when it genuinely finishes, so the bound is now *peak concurrent* vCPUs
+    /// rather than the lifetime total. `MAX_SHADOW_CTX` is 15, so a `u16` holds every context bit.
+    vcpu_mask: u16,
 }
 
 impl FiberRegistry {
     fn new() -> FiberRegistry {
         FiberRegistry {
-            mx: Mutex::new(Vec::new()),
+            mx: Mutex::new(RegState {
+                fibers: Vec::new(),
+                shadow: Vec::new(),
+                gens: Vec::new(),
+                free: BinaryHeap::new(),
+                vcpu_mask: 0,
+            }),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RegFiber>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegState> {
         self.mx.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `cont.new`: allocate the next slot — the guest handle — under the §15 quota, which is
-    /// **per run** now that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the
-    /// off-table root computation, so a quota value admits exactly the creations the JIT's
-    /// `fibers.len() + 1 >= max_fibers` check admits for a single-vCPU run.
-    fn create(&self, func: i32, sp: i64, max_fibers: usize) -> Result<i32, Trap> {
+    /// The saved shadow-SP of the fiber in `slot` (its region base if it has never been frozen).
+    /// Out-of-range slots return the root base — they can only arise from a corrupt chain, which
+    /// the surrounding fiber logic already treats as `Malformed`.
+    fn saved_sp(&self, slot: usize) -> u64 {
+        self.lock().shadow.get(slot).copied().unwrap_or(SHADOW_BASE)
+    }
+
+    /// The `slot`'s current generation (recycling step 2) — recorded in its [`FrozenFiber`] residue at
+    /// freeze so a thaw re-seeds it at the same generation. 0 for an out-of-range slot.
+    fn generation(&self, slot: usize) -> u64 {
+        self.lock().gens.get(slot).copied().unwrap_or(0)
+    }
+
+    /// Record the fiber in `slot`'s shadow-SP (called when it stops being the running context).
+    fn set_saved_sp(&self, slot: usize, sp: u64) {
         let mut t = self.lock();
-        if t.len() + 1 >= max_fibers {
+        if let Some(s) = t.shadow.get_mut(slot) {
+            *s = sp;
+        }
+    }
+
+    /// Reserve the next durable vCPU shadow-context (slice 3.2.2): the `thread.spawn` path calls this
+    /// to claim a top-down region (`MAX_SHADOW_CTX`, `−1`, …) for a freshly spawned child. `None` if
+    /// the reserve is full (the vCPU pool growing down would meet the fiber pool growing up) — a clean
+    /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
+    fn reserve_vcpu_context(&self) -> Option<usize> {
+        let mut t = self.lock();
+        // Hand out the **highest free** context above the fiber pool (`fibers.len()` occupies contexts
+        // `1..=fibers.len()`). Top-down keeps the vCPU pool clear of the upward-growing fibers; reusing
+        // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
+        let floor = t.fibers.len();
+        let mut c = MAX_SHADOW_CTX;
+        while c > floor {
+            if t.vcpu_mask & (1 << c) == 0 {
+                t.vcpu_mask |= 1 << c;
+                return Some(c);
+            }
+            c -= 1;
+        }
+        None // the reserve is full (the vCPU pool growing down would meet the fibers growing up)
+    }
+
+    /// Free a spawned vCPU's shadow context for reuse (context recycling): called when the child
+    /// **genuinely finishes** (not a freeze-unwind, which keeps the region for thaw). A no-op for the
+    /// root / a non-durable child (context 0).
+    fn free_vcpu_context(&self, ctx: usize) {
+        if (1..=MAX_SHADOW_CTX).contains(&ctx) {
+            self.lock().vcpu_mask &= !(1 << ctx);
+        }
+    }
+
+    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (context recycling): the
+    /// re-spawned children reclaim *exactly* the contexts they held at freeze (derived from their
+    /// restored shadow-SPs — recycling means these need not be the top `n`), so a post-thaw spawn
+    /// allocates into a genuinely-free context. Set once after re-seeding, before forward execution.
+    fn seed_vcpu_mask(&self, mask: u16) {
+        self.lock().vcpu_mask = mask;
+    }
+
+    /// `cont.new`: allocate a slot — the guest handle — under the §15 quota, which is **per run** now
+    /// that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the off-table root
+    /// computation. **Recycling (step 3):** the lowest freed slot is reused (its already-bumped
+    /// generation kept, so a stale handle to its former occupant fails `claim`); only when none is free
+    /// does the table grow. So the table is bounded by the *peak concurrent* fiber count, not the
+    /// lifetime total — and the quota / durable-reserve checks (on the grow path / the allocated
+    /// context) likewise bound concurrency rather than lifetime.
+    fn create(&self, func: i32, sp: i64, max_fibers: usize, durable: bool) -> Result<i64, Trap> {
+        let mut t = self.lock();
+        let reuse = t.free.peek().map(|&Reverse(s)| s);
+        // Growing (no free slot ⇒ every existing slot is live) must honor the concurrency quota.
+        if reuse.is_none() && t.fibers.len() + 1 >= max_fibers {
             return Err(Trap::FiberFault);
         }
-        t.push(RegFiber::Pending { func, sp });
-        Ok((t.len() - 1) as i32)
+        let slot = reuse.unwrap_or(t.fibers.len());
+        // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
+        // clean `FiberFault`, like exhausting the quota — never an overflow into another
+        // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
+        // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
+        // (slice 3.2.2), so this fiber must stay strictly below the lowest live vCPU context (which,
+        // with recycling, need not be a simple count from the top).
+        let lowest_vcpu = {
+            if t.vcpu_mask == 0 {
+                MAX_SHADOW_CTX + 1
+            } else {
+                t.vcpu_mask.trailing_zeros() as usize
+            }
+        };
+        if durable && (!shadow_region_fits(slot + 1) || slot + 1 >= lowest_vcpu) {
+            return Err(Trap::FiberFault);
+        }
+        let generation = if reuse.is_some() {
+            t.free.pop();
+            t.fibers[slot] = RegFiber::Pending { func, sp };
+            t.shadow[slot] = shadow_frame_base(slot + 1); // reused region: empty stack at its frame base
+            t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
+        } else {
+            t.fibers.push(RegFiber::Pending { func, sp });
+            t.shadow.push(shadow_frame_base(slot + 1));
+            t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
+            0
+        };
+        Ok(fiber_handle(slot, generation))
     }
 
     /// `cont.resume`: resolve the (forgeable) handle — **masked** into the power-of-two-padded
@@ -1925,18 +4607,25 @@ impl FiberRegistry {
     /// ⇒ inert [`Trap::FiberFault`]. On a win the slot is `Running(None)` — if the *caller* then
     /// traps before running it (a bad `Pending` funcref), the slot stays claimed forever, which a
     /// later resume sees as an ordinary lost claim.
-    fn claim(&self, handle: i32) -> Result<(usize, Claimed), Trap> {
+    fn claim(&self, handle: i64) -> Result<(usize, Claimed), Trap> {
         let mut t = self.lock();
-        let mask = t.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
-        let slot = (handle as u32 as usize) & mask;
-        if slot >= t.len() {
+        let mask = t.fibers.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
+        let slot = (handle as u64 as usize) & mask; // the generation bits are above the slot mask
+        if slot >= t.fibers.len() {
             return Err(Trap::FiberFault);
         }
-        match std::mem::replace(&mut t[slot], RegFiber::Running(None)) {
+        // Generation check (recycling step 1/3): reject a handle whose generation doesn't match the
+        // slot's current one — a stale handle to a slot's former occupant after the slot was recycled
+        // (`finish` bumped the generation). Compared modulo `2^48` (the handle's field width); a forged
+        // non-zero generation is rejected, exactly as a forged slot is masked-and-lost.
+        if fiber_handle_generation(handle) != (t.gens[slot] & FIBER_GEN_MASK) {
+            return Err(Trap::FiberFault);
+        }
+        match std::mem::replace(&mut t.fibers[slot], RegFiber::Running(None)) {
             RegFiber::Pending { func, sp } => Ok((slot, Claimed::Start { func, sp })),
             RegFiber::Parked(f) => Ok((slot, Claimed::Live(f))),
             old => {
-                t[slot] = old; // lost: already running (or done) — put it back untouched
+                t.fibers[slot] = old; // lost: already running (or done) — put it back untouched
                 Err(Trap::FiberFault)
             }
         }
@@ -1947,8 +4636,8 @@ impl FiberRegistry {
     /// resume chain is never claimable.
     fn park_resumer(&self, slot: usize, frames: Vec<Frame>) {
         let mut t = self.lock();
-        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
-        t[slot] = RegFiber::Running(Some(frames));
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Running(Some(frames));
     }
 
     /// Pop back into a parked resumer (its resumee suspended or returned): take its frames; the
@@ -1956,7 +4645,7 @@ impl FiberRegistry {
     fn unpark_resumer(&self, slot: usize) -> Result<Vec<Frame>, Trap> {
         let mut t = self.lock();
         match std::mem::replace(
-            t.get_mut(slot).ok_or(Trap::Malformed)?,
+            t.fibers.get_mut(slot).ok_or(Trap::Malformed)?,
             RegFiber::Running(None),
         ) {
             RegFiber::Running(Some(f)) => Ok(f),
@@ -1968,15 +4657,59 @@ impl FiberRegistry {
     /// vCPU again (the migration point).
     fn park_suspended(&self, slot: usize, frames: Vec<Frame>) {
         let mut t = self.lock();
-        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
-        t[slot] = RegFiber::Parked(frames);
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Parked(frames);
     }
 
-    /// The claimant's current fiber returned: the slot is `Done` (resuming it again faults).
+    /// The claimant's current fiber returned: the slot is `Done`. **Recycling (step 3):** bump the
+    /// slot's generation (so any stale guest handle to it now fails `claim` — the ABA guard) and add it
+    /// to the free list, reclaimable for a new `cont.new`. Resuming the *old* handle faults either way
+    /// (a `Done` slot, or — once reused — a generation mismatch).
     fn finish(&self, slot: usize) {
         let mut t = self.lock();
-        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
-        t[slot] = RegFiber::Done;
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Done;
+        t.gens[slot] = t.gens[slot].wrapping_add(1);
+        t.free.push(Reverse(slot));
+    }
+
+    /// Freeze (slice 3.2 active-chain): the running fiber base-returned **while unwinding for a
+    /// freeze** (state == UNWINDING), so it didn't really finish — its continuation now lives in its
+    /// shadow region. Mark the slot `Frozen` (re-enterable on thaw, *not* `Done`) and record its
+    /// flattened shadow-SP, so the residue + a thaw re-seed reconstruct it like an idle-parked fiber.
+    fn freeze_active(&self, slot: usize, shadow_sp: u64) {
+        let mut t = self.lock();
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Frozen;
+        t.shadow[slot] = shadow_sp;
+    }
+
+    /// Freeze driver (slice 3.1.4): take the lowest still-`Parked` fiber's frames and mark its slot
+    /// `Frozen`, so the driver can flatten it into its shadow region and not revisit it. Returns
+    /// `(slot, frames)`, or `None` once every fiber is flattened (no `Parked` slot remains).
+    fn take_parked_for_freeze(&self) -> Option<(usize, Vec<Frame>)> {
+        let mut t = self.lock();
+        let slot = t
+            .fibers
+            .iter()
+            .position(|f| matches!(f, RegFiber::Parked(_)))?;
+        match std::mem::replace(&mut t.fibers[slot], RegFiber::Frozen) {
+            RegFiber::Parked(frames) => Some((slot, frames)),
+            _ => unreachable!("position found a Parked slot"),
+        }
+    }
+
+    /// Thaw seeding (slice 3.1.5): re-create a frozen fiber at the next slot as `Pending` (so a
+    /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
+    /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
+    /// dense handle namespace; returns the slot, which must equal the recorded one.
+    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64, generation: u64) -> usize {
+        let mut t = self.lock();
+        let slot = t.fibers.len();
+        t.fibers.push(RegFiber::Pending { func, sp });
+        t.shadow.push(shadow_sp);
+        t.gens.push(generation); // restore the freeze-time generation so a recycled handle resolves
+        slot
     }
 }
 
@@ -2051,6 +4784,41 @@ struct VCpu {
     /// maintained at fiber switches so the recursion depth bound (`MAX_CALL_DEPTH`) spans all
     /// active fibers without walking the shared registry on every call.
     parked_frames: usize,
+    /// This run executes a **durable** (freeze/thaw-instrumented) module, so the runtime keeps the
+    /// active shadow-SP word ([`SHADOW_SP_OFF`]) pointing at the running context's per-fiber shadow
+    /// region, swapping it on every fiber switch (D-fiber-cont option A, DURABILITY.md §12.8). A
+    /// non-durable run leaves this `false` and never touches the reserve. Set from
+    /// [`Host::is_durable`] by `drive`, inherited by `thread.spawn` children.
+    durable: bool,
+    /// The root computation's saved shadow-SP (window offset) while it is parked resuming a fiber
+    /// — the off-table root's slot in the per-context saved-SP table (a fiber's lives in the
+    /// registry's `shadow`). The root is context 0, so this starts at [`shadow_frame_base`]`(0)` (its
+    /// in-region SP word at `SHADOW_BASE`, frames just past it).
+    root_shadow_sp: u64,
+    /// §12.8 4A.5: the **active spill context** — whose region the running instrumented code addresses
+    /// via `durable.shadow_base`. The root's `vcpu_ctx` while at root, a fiber's `slot + 1` while a
+    /// fiber runs (maintained at the fiber switch), and the driven fiber's during `freeze_drive` (where
+    /// `cur` is the `ROOT_FIBER` sentinel but the spill must land in the fiber's region).
+    durable_sp_ctx: usize,
+    /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
+    /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
+    frozen: Vec<FrozenFiber>,
+    /// `Some` on a **spawned** (`thread.spawn`) vCPU: its `(entry, [sp, arg])`, retained so that when
+    /// it unwinds under a freeze it can emit its [`FrozenVCpu`] residue (its frames are gone by then).
+    /// `None` on the root (whose entry/args the thaw caller supplies) and on every non-durable vCPU.
+    /// (slice 3.2.1)
+    spawn_residue: Option<(FuncIdx, Vec<i64>)>,
+    /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at
+    /// `thread.spawn` and freed back to the registry when the vCPU genuinely finishes (context
+    /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
+    vcpu_ctx: usize,
+    /// This vCPU's **saved durable state word** (`NORMAL | UNWINDING | REWINDING`), swapped into the
+    /// shared window word ([`STATE_OFF`]) by the runtime when this vCPU runs and saved back when it
+    /// parks (slice 3.2.1). Multi-vCPU freeze/thaw run single-worker, so the one shared state word is
+    /// each vCPU's *own* context, swapped per dispatch — essential because a rewinding vCPU flips the
+    /// word to `NORMAL` after reloading, which must not disturb siblings still rewinding. A non-durable
+    /// run leaves it `NORMAL` and never touches the word.
+    dstate: i32,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
     /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
@@ -2076,6 +4844,20 @@ struct VCpu {
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
     id: TaskId,
+    /// The id of the vCPU that spawned this one (slice 3.4: nested spawns) — `0` for the root and every
+    /// non-durable vCPU. Stamped at `thread.spawn` and on a thaw re-attach so a freeze records each
+    /// child's parent in its [`FrozenVCpu`], letting thaw rebuild the per-parent join-table topology.
+    parent_task: TaskId,
+    /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
+    /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
+    /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
+    tls: i64,
+    /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here keyed by the guest
+    /// `jmp_buf` window address; `longjmp` looks it up. Per-vCPU (a checkpoint references *this* frame
+    /// stack; cross-thread `longjmp` is UB in C and simply misses). Keyed by buffer address (not a
+    /// growing token table) so a re-`setjmp` to the same buffer overwrites and a `pcall`-in-a-loop
+    /// stays bounded; the trade-off is that a *copied* `jmp_buf` (rare/UB-adjacent) misses → traps.
+    setjmp_points: BTreeMap<u64, SetJmpPoint>,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
@@ -2105,6 +4887,11 @@ struct VCpu {
     /// resolved as module [`INVOKE_MODULE`] — kept out of the shared `dt.units` so it is never
     /// installed/`call_indirect`-reachable and never collides with a concurrent install.
     invoked: Option<Arc<[Func]>>,
+    /// **Debug seam** (DEBUGGING.md W2/S4): `Some` only when an [`Inspector`] drives this vCPU.
+    /// `None` is the production hot path — the per-op hook in [`run_inner`] is gated on it, so an
+    /// undebugged run pays a single null check per op and is otherwise byte-identical (S7). Not
+    /// inherited across `thread.spawn` (slice 1 debugs single-threaded guests).
+    debug: Option<Box<DebugCtx>>,
 }
 
 impl VCpu {
@@ -2134,10 +4921,17 @@ impl VCpu {
                 module: 0,
                 block: 0,
                 inst: 0,
-                vals: args.to_vec(),
+                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
             }],
             root_parked: None,
             parked_frames: 0,
+            durable: false,
+            root_shadow_sp: shadow_frame_base(0),
+            durable_sp_ctx: 0,
+            frozen: Vec::new(),
+            spawn_residue: None,
+            vcpu_ctx: 0,
+            dstate: STATE_NORMAL,
             mem,
             host,
             fuel,
@@ -2146,6 +4940,9 @@ impl VCpu {
             fault_yields: false,
             depth,
             id,
+            parent_task: 0,
+            tls: id as i64, // §12 seed the per-vCPU TLS register to the dense vCPU id (root = 0)
+            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -2154,6 +4951,7 @@ impl VCpu {
             dt,
             units: Vec::new(),
             invoked: None,
+            debug: None,
         }
     }
 
@@ -2188,10 +4986,17 @@ impl VCpu {
                 module: INVOKE_MODULE,
                 block: 0,
                 inst: 0,
-                vals: args.to_vec(),
+                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
             }],
             root_parked: None,
             parked_frames: 0,
+            durable: false,
+            root_shadow_sp: shadow_frame_base(0),
+            durable_sp_ctx: 0,
+            frozen: Vec::new(),
+            spawn_residue: None,
+            vcpu_ctx: 0,
+            dstate: STATE_NORMAL,
             mem,
             host,
             fuel,
@@ -2200,6 +5005,9 @@ impl VCpu {
             fault_yields: false,
             depth,
             id: 0, // unused: driven inline, never via the executor
+            parent_task: 0,
+            tls: 0, // §12 per-vCPU TLS seed (id 0)
+            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -2208,6 +5016,7 @@ impl VCpu {
             dt,
             units: Vec::new(),
             invoked: Some(unit),
+            debug: None,
         }
     }
 
@@ -2220,16 +5029,12 @@ impl VCpu {
     /// op apart colliding is ~2^-64; the values fully determine the hash (floats by bit pattern).
     fn local_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        fn hash_vals(h: &mut std::collections::hash_map::DefaultHasher, vals: &[Value]) {
+        fn hash_vals(h: &mut std::collections::hash_map::DefaultHasher, vals: &[Reg]) {
             vals.len().hash(h);
             for v in vals {
-                match v {
-                    Value::I32(x) => (0u8, *x as i64).hash(h),
-                    Value::I64(x) => (1u8, *x).hash(h),
-                    Value::F32(x) => (2u8, x.to_bits() as u64).hash(h),
-                    Value::F64(x) => (3u8, x.to_bits()).hash(h),
-                    Value::V128(b) => (4u8, *b).hash(h),
-                }
+                // Untyped raw slots: hash the two words directly (the fingerprint is only compared
+                // pre/post one turn of this vCPU, so any stable encoding is fine).
+                (v.lo, v.hi).hash(h);
             }
         }
         fn hash_frames(h: &mut std::collections::hash_map::DefaultHasher, frames: &[Frame]) {
@@ -2265,6 +5070,60 @@ impl VCpu {
         self.mem.as_ref().map_or(0, |m| m.atomic_value(key, width))
     }
 
+    /// This vCPU's logical-time `clock` (ops executed), or 0 if undebugged. The coordinate a
+    /// single-threaded time-travel `seek`/checkpoint is keyed by.
+    fn debug_clock(&self) -> u64 {
+        self.debug.as_ref().map(|d| d.clock).unwrap_or(0)
+    }
+
+    /// Arm the time-travel replay to fast-forward to logical time `t` (W1): the next `run` advances
+    /// `clock` to `t`, ignoring breakpoints, then pauses. Used by the chunked checkpoint drive.
+    fn dbg_seek_to(&mut self, t: u64) {
+        if let Some(d) = self.debug.as_mut() {
+            d.seek_target = Some(t);
+        }
+    }
+
+    /// Whether this vCPU's state is fully captured by `frames` + the window bytes — the subset a
+    /// single-threaded time-travel **checkpoint** (W1) snapshots: the **root** computation is running
+    /// (no fiber resume-chain or parked root), nothing durable/frozen, no `thread.spawn`/coroutine
+    /// children, and memory has a pristine layout (no `map`/`unmap`/`protect`/grow or §13 region
+    /// aliasing, so `snapshot`/`seed` of the mapped prefix round-trips). Outside this subset the
+    /// `Inspector` stops checkpointing and falls back to replay-from-clock-0.
+    fn checkpointable(&self) -> bool {
+        self.cur == ROOT_FIBER
+            && self.chain.as_slice() == [ROOT_FIBER]
+            && self.root_parked.is_none()
+            && self.frozen.is_empty()
+            && !self.durable
+            && self.threads.is_empty()
+            && self.coroutines.is_empty()
+            && self.invoked.is_none() // no guest-installed §22 units (would need the domain table rebuilt)
+            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+    }
+
+    /// Restore a checkpoint's continuation into this freshly-built root vCPU (from
+    /// [`Inspector::fresh_single_root`]): replace the call stack, fuel, window bytes, and logical clock
+    /// so a subsequent `run` (with a `seek_target`) resumes the replay exactly at the checkpoint's
+    /// logical time. The shared structure (funcs, fresh registry, host, scheduler) already matches a
+    /// root-only run, which is the only kind that is checkpointed.
+    fn restore_continuation(
+        &mut self,
+        frames: Vec<Frame>,
+        fuel: u64,
+        mem_bytes: Option<&[u8]>,
+        clock: u64,
+    ) {
+        self.frames = frames;
+        self.fuel = fuel;
+        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), mem_bytes) {
+            m.seed(bytes);
+        }
+        if let Some(d) = self.debug.as_mut() {
+            d.clock = clock;
+        }
+    }
+
     /// Run for up to `quantum` instructions, then finish / park / yield. The real executor passes
     /// `u64::MAX` (run to completion or park); the deterministic explorer passes a small seeded
     /// quantum to interleave vCPUs finely. Folds a trap into `Step::Done(Err)`.
@@ -2276,9 +5135,92 @@ impl VCpu {
             // A `Yielder` cap.call / fault-driven yield on a vCPU the *executor* runs has no resumer to
             // yield to (a coroutine child is driven inline by `resume`, never enqueued here) — inert.
             Ok(Inner::CoYield(_)) | Ok(Inner::CoFault(_)) => Step::Done(Err(Trap::FiberFault)),
+            Ok(Inner::Pause(r, pc)) => Step::Pause(r, pc),
             Err(t) => Step::Done(Err(t)),
         }
     }
+
+    /// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4). Called once this vCPU's root has run to
+    /// completion under `UNWINDING` (its native stack drained into the root's shadow region): flatten
+    /// every still-**parked** fiber into *its own* shadow region so the window snapshot captures it.
+    ///
+    /// Each parked fiber is resumed under `UNWINDING` like a standalone root run — its frames become
+    /// the active stack with `cur = ROOT_FIBER`, the active shadow-SP is pointed at the fiber's region
+    /// base, and a placeholder resume value is delivered (mimicking `cont.resume`, so the post-suspend
+    /// continuation is well-formed; the suspend's result slot is inert — the `Yield` thaw arm
+    /// redelivers it). Because the transform places the poll **immediately** after the `suspend`, that
+    /// poll fires before any of the fiber's guest code runs, so it unwinds with **zero forward
+    /// progress** and its base-frame return (under `cur == ROOT_FIBER`) ends the sub-run. The fiber's
+    /// flattened shadow-SP extent is recorded in the registry's `shadow` table for the snapshot.
+    ///
+    /// Each flattened fiber is recorded as a [`FrozenFiber`] in `self.frozen` (handed to the embedder
+    /// via the [`Host`] for the snapshot / a thaw re-seed). The active shadow-SP is left pointing at
+    /// the **root's** region on return, so the captured window is thaw-ready (the root rewinds first;
+    /// each fiber's own SP travels in its `FrozenFiber`, re-seeded into the registry on thaw).
+    ///
+    /// Single-vCPU only (slice 3.1); the multi-vCPU stop-the-world choreography is slice 3.2. Handles
+    /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
+    /// is a 3.1.5/3.2 follow-up.
+    fn freeze_drive(&mut self) -> Result<(), Trap> {
+        // §12.8 4A.5: this vCPU's root region word (where the root's SP lives); restored at the end so
+        // the window is thaw-ready (the root rewinds first).
+        let root_word = shadow_region_base(self.vcpu_ctx);
+        let root_sp = self
+            .mem
+            .as_ref()
+            .map(|m| m.durable_get_sp(root_word))
+            .unwrap_or_else(|| shadow_frame_base(self.vcpu_ctx));
+        while let Some((slot, mut frames)) = self.registry.take_parked_for_freeze() {
+            // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
+            let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
+            let sp = match frames.first().and_then(|f| f.vals.first()) {
+                Some(r) => r.i64(),
+                _ => 0,
+            };
+            if let Some(f) = frames.last_mut() {
+                f.vals.push(Reg::from_i64(0)); // placeholder resume value (inert; not spilled by Yield)
+            }
+            // The fiber spills into *its* region: its SP word starts empty (frame base) and
+            // `durable.shadow_base` must resolve to its region during the unwind sub-run (where `cur`
+            // is the `ROOT_FIBER` sentinel), so set the active spill context explicitly.
+            let fctx = shadow_context_index(slot);
+            self.durable_sp_ctx = fctx;
+            if let Some(m) = self.mem.as_mut() {
+                m.durable_set_sp(shadow_region_base(fctx), shadow_frame_base(fctx));
+            }
+            self.frames = frames;
+            self.cur = ROOT_FIBER;
+            self.chain = vec![ROOT_FIBER];
+            self.root_parked = None;
+            self.parked_frames = 0;
+            run_inner(self, u64::MAX)?; // the fiber unwinds; base return (cur == ROOT) ends the sub-run
+            let shadow_sp = self
+                .mem
+                .as_ref()
+                .map(|m| m.durable_get_sp(shadow_region_base(fctx)))
+                .unwrap_or_else(|| shadow_frame_base(fctx));
+            self.registry.set_saved_sp(slot, shadow_sp);
+            self.frozen.push(FrozenFiber {
+                slot,
+                func,
+                sp,
+                shadow_sp,
+                generation: self.registry.generation(slot),
+            });
+        }
+        // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
+        self.durable_sp_ctx = self.vcpu_ctx;
+        if let Some(m) = self.mem.as_mut() {
+            m.durable_set_sp(root_word, root_sp);
+        }
+        Ok(())
+    }
+}
+
+/// The shadow-context index of a fiber registry `slot` (the root is context 0, fiber slot `s` is
+/// context `s + 1`). Mirrors [`shadow_switch`]'s mapping for the off-table root vs. a fiber.
+fn shadow_context_index(slot: usize) -> usize {
+    slot + 1
 }
 
 /// A **visible** instruction — one whose effect another vCPU can observe or that synchronizes with
@@ -2306,12 +5248,45 @@ fn is_visible(inst: &Inst) -> bool {
             | Inst::ContNew { .. }
             | Inst::ContResume { .. }
             | Inst::Suspend { .. }
+            // §GC `gc.roots` reads every fiber's registry frames and writes guest memory, so it is
+            // observable to another vCPU — a scheduling decision point like the fiber ops.
+            | Inst::GcRoots { .. }
     )
 }
 
 /// Drive a vCPU until it finishes (`Inner::Done`) or parks on a blocking op (`Inner::Park`). On
 /// re-entry it first completes the parked op recorded in `pending`. The owned `funcs` is borrowed
 /// locally as `fs` so the loop can mutate the other fields.
+/// Finish a memory-op result in the eval loop. Pushes the loaded value (if any). For a
+/// coroutine child's *recoverable* in-window page fault (`fault_yields`), it rewinds the op and
+/// returns `Some(Inner::CoFault)` so the loop suspends to the parent (which supplies the page)
+/// instead of trapping; any other fault propagates. `Ok(None)` means "handled, keep going". This
+/// is the one home for the §14 fault-driven-yield decision, shared by the fast-pathed memory ops
+/// and the `eval_inst` fallback so the logic isn't repeated per arm.
+#[inline]
+fn handle_mem(
+    r: Result<Option<Reg>, Trap>,
+    frame: &mut Frame,
+    fault_yields: bool,
+    mem: &Option<Mem>,
+) -> Result<Option<Inner>, Trap> {
+    match r {
+        Ok(Some(v)) => {
+            frame.vals.push(v);
+            Ok(None)
+        }
+        Ok(None) => Ok(None),
+        Err(Trap::MemoryFault) if fault_yields => match mem.as_ref().and_then(|m| m.take_fault()) {
+            Some(addr) => {
+                frame.inst -= 1; // re-execute the access on resume
+                Ok(Some(Inner::CoFault(addr)))
+            }
+            None => Err(Trap::MemoryFault),
+        },
+        Err(t) => Err(t),
+    }
+}
+
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
                               // Resuming from a park: finish the op the scheduler woke us for.
@@ -2326,19 +5301,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
             let vals = out.result?; // a child trap propagates as this vCPU's trap
             let top = v.frames.len() - 1;
-            v.frames[top]
-                .vals
-                .push(vals.first().copied().unwrap_or(Value::I64(0)));
+            v.frames[top].vals.push(Reg::from_value(
+                vals.first().copied().unwrap_or(Value::I64(0)),
+            ));
         }
         Some(Pending::Wait(status)) => {
             let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Value::I32(status));
+            v.frames[top].vals.push(Reg::from_i32(status));
         }
         Some(Pending::CoResume(value)) => {
             // The parent's `resume` delivered `value` — push it as the child `Yielder` cap.call's
             // result so the coroutine continues past its `yield`.
             let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Value::I64(value));
+            v.frames[top].vals.push(Reg::from_i64(value));
         }
         None => {}
     }
@@ -2356,6 +5331,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         frames,
         root_parked,
         parked_frames,
+        durable,
+        root_shadow_sp,
+        durable_sp_ctx, // §12.8 4A.5: active spill context, maintained at fiber switches
+        frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
+        spawn_residue: _,
+        vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
+        dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
         fuel,
@@ -2366,17 +5348,46 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         pending,
         sched,
         funcs: _,
-        id: _,
+        id,
+        parent_task: _, // a spawned child stamps *its own* id as the grandchild's parent below
+        tls,
         memop,
         acc,
         quota: _,
+        setjmp_points,
         dt,
         units,
         invoked,
+        debug,
     } = v;
     let depth = *depth;
+    let durable = *durable;
     let memop = *memop;
     let fault_yields = *fault_yields;
+
+    // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
+    // args here and swaps the buffer into the frame's value slot, so steady-state branching —
+    // notably a loop back-edge, run every iteration — allocates nothing (the displaced buffer
+    // becomes the next edge's scratch). Lives across the whole `run_inner` call, so the two
+    // buffers ping-pong for free once warmed.
+    let mut edge_buf: Vec<Reg> = Vec::new();
+    // Reusable scratch for `return` results. The common case (a callee returning to a caller in
+    // the same fiber) gathers results here and copies them straight into the caller's value
+    // file, so a call/return pair no longer allocates a results `Vec` per return. The rarer
+    // root/fiber exits read out of the same buffer.
+    let mut ret_buf: Vec<Reg> = Vec::new();
+
+    // Resolve the running frame against *its* module (module 0 = this vCPU's program;
+    // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit), cloning the module's `Arc`
+    // into a local so the shared `dt` is never borrowed across the loop body. This is **cached
+    // across loop iterations**: re-resolving (an atomic `Arc` refcount bump) on every block entry
+    // showed up on the hot path — a branch / loop back-edge re-enters this loop, and almost always
+    // stays in the same module — so we only re-resolve when `module` actually changes. A module's
+    // code never mutates in place (units are append-only; module 0 is fixed), so a same-id reuse is
+    // sound.
+    let mut cur_module = frames.last().map(|f| f.module).unwrap_or(0);
+    let mut cur_funcs: Arc<[Func]> =
+        resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
 
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
@@ -2384,13 +5395,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
-        // Resolve the running frame against *its* module (module 0 = this vCPU's program;
-        // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit). Clone the module's `Arc`
-        // into a local so the shared `dt` is never borrowed across the loop body. `block` borrows
-        // `cur` (the owned local), *not* `frames`, so the loop body is free to push/pop/mutate
-        // `frames` (and move it on a fiber switch) while holding it.
-        let cur_funcs: Arc<[Func]> = resolve_module(&funcs, units, invoked, dt, frames[top].module)
-            .ok_or(Trap::Malformed)?;
+        if frames[top].module != cur_module {
+            cur_module = frames[top].module;
+            cur_funcs =
+                resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
+        }
         let fs: &[Func] = &cur_funcs;
         let block = fs
             .get(frames[top].func as usize)
@@ -2401,34 +5410,79 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 
         // Execute the remaining instructions of this block.
         while frames[top].inst < block.insts.len() {
+            // An op counts against the scheduling quantum when it is "visible": every op in the real
+            // executor / single-threaded debugger (`!memop`), or only a **shared-state / sync** op in
+            // `memop` mode (so thread-local computation runs to the next memory op before a yield is
+            // possible — the partial-order reduction that keeps exhaustive exploration tractable).
+            let visible = !memop || is_visible(&block.insts[frames[top].inst]);
             // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
-            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`.
-            // In `memop` mode the budget counts only **visible** (shared-state / sync) ops, so
-            // thread-local computation runs to the next memory op before a yield is possible — the
-            // partial-order reduction that keeps exhaustive exploration tractable.
-            if memop {
-                if is_visible(&block.insts[frames[top].inst]) {
-                    if budget == 0 {
-                        return Ok(Inner::Yield);
-                    }
-                    // Record the object this visible op touches (for DPOR's race analysis) before it
-                    // runs — the confined address is a pure function of the live SSA values here.
+            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`, so
+            // it never yields. **This precedes the debug seam below**: a debug stop (breakpoint /
+            // watch / step) at a budget-exhausted visible op must fire at the *start of its own turn*
+            // (budget fresh, on the next pick), not inside the previous turn — otherwise a stop would
+            // run the op in the prior turn, collapsing two one-visible-op turns into one and desyncing
+            // a fixed replay plan (DEBUGGING.md Milestone B). Undebugged runs are unaffected (the
+            // ordering only matters when something stops).
+            if visible && budget == 0 {
+                return Ok(Inner::Yield);
+            }
+            // Debug seam (DEBUGGING.md W2/S4): before each op, consult the inspector's probe. A
+            // breakpoint/step hit returns `Inner::Pause` with the op not yet advanced, so the
+            // continuation is intact and the next `run` resumes exactly here. Gated on `debug`
+            // being `Some`, so an undebugged run is unaffected (S7). The `clock` it maintains is
+            // the S3 logical-time coordinate (ops executed on this vCPU).
+            if let Some(dbg) = debug.as_mut() {
+                let pc = IrPc {
+                    module: frames[top].module,
+                    func: frames[top].func,
+                    block: frames[top].block,
+                    inst: frames[top].inst,
+                };
+                // Watchpoints reuse `access_of` — the same confined-range analysis the DPOR
+                // explorer uses — but only when armed (it confines, so it isn't free). Breakpoints,
+                // stepping, and the cap.call stop need no memory analysis.
+                let inst = &block.insts[frames[top].inst];
+                let access = if dbg.watches_armed() {
+                    access_of(inst, &frames[top].vals, &*mem)
+                } else {
+                    MemAccess::None
+                };
+                if let Some(reason) = dbg.before_op(pc, inst, access, frames.len()) {
+                    return Ok(Inner::Pause(reason, pc));
+                }
+            }
+            // Charge the quantum for the visible op about to run, recording the object it touches (for
+            // DPOR's race analysis) first — the confined address is a pure function of the live SSA
+            // values here.
+            if visible {
+                if memop {
                     *acc = Some(access_of(
                         &block.insts[frames[top].inst],
                         &frames[top].vals,
                         mem,
                     ));
-                    budget -= 1;
-                }
-            } else {
-                if budget == 0 {
-                    return Ok(Inner::Yield);
                 }
                 budget -= 1;
             }
             let inst = &block.insts[frames[top].inst];
             step(fuel)?;
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
+
+            // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
+            // armed via `STATE_ARMED`, count down at each **fiber safepoint** (`cont.resume`/`suspend`)
+            // and promote to `UNWINDING` at 0, so *this* op's trailing poll begins the freeze. Inert
+            // unless armed; gated on `durable` so an ordinary run is untouched. Lets a run freeze after
+            // forward progress (e.g. once a fiber is recycled), which the freeze-before-start harness
+            // cannot reach. Counting only the fiber ops (routed through runtime thunks on both backends)
+            // keeps the trigger point identical interp↔JIT — cap.call is *not* counted (the JIT's
+            // cap.call thunk is host-supplied, so there is no cross-backend choke for it); a cap.call
+            // freeze is already reachable at the first safepoint, and a production async trigger handles
+            // general mid-run freeze.
+            if durable && matches!(inst, Inst::ContResume { .. } | Inst::Suspend { .. }) {
+                if let Some(m) = mem.as_mut() {
+                    m.durable_tick_arm();
+                }
+            }
 
             match inst {
                 // Non-tail calls push a new frame and switch to it; the callee's results
@@ -2458,7 +5512,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         &funcs,
                         units,
                         invoked,
-                        as_i32(get(&frames[top].vals, *idx)?)?,
+                        get_i32(&frames[top].vals, *idx)?,
                         ty,
                     )?;
                     let argv = collect(&frames[top].vals, args)?;
@@ -2493,15 +5547,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *op != 0 {
                         return Err(Trap::CapFault);
                     }
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_yielder(h)?; // authority: a forged/wrong handle is inert
                     }
-                    let value = as_i64(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?)?;
+                    let value = get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                     return Ok(Inner::CoYield(value));
                 }
                 // §13/§14 cross-domain **`grant`** (SharedRegion op 4): install this region — the
@@ -2519,15 +5570,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let backing = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_region(h)?
                     };
-                    let ch = as_i32(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?)?;
+                    let ch = get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                     let coro = coroutines
                         .get_mut(ch as usize)
                         .and_then(|c| c.as_mut())
@@ -2540,7 +5588,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     frames[top]
                         .vals
-                        .push(Value::I64(child_handle.map_or(EMFILE, |h| h as i64)));
+                        .push(Reg::from_i64(child_handle.map_or(EMFILE, |h| h as i64)));
                 }
                 Inst::CapCall {
                     type_id: iface::INSTANTIATOR,
@@ -2549,7 +5597,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let (ibase, isize) = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_instantiator(h)?
@@ -2564,10 +5612,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let (op, child_mod, askip): (u32, Option<ModArc>, usize) = match *op {
                         mop @ 5..=7 => {
                             // The module handle crosses as an i64 arg (the slot ABI); low 32 bits.
-                            let mh = as_i64(get(
-                                &frames[top].vals,
-                                *args.first().ok_or(Trap::Malformed)?,
-                            )?)? as i32;
+                            let mh =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as i32;
                             let g = {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 let g = hg.resolve_module(mh)?;
@@ -2593,10 +5640,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // directly (it sees the superset) before/after, so there is no scalar arg.
                         0 => {
                             let argn = |i: usize| -> Result<i64, Trap> {
-                                as_i64(get(
+                                Ok(get(
                                     &frames[top].vals,
                                     *args.get(i + askip).ok_or(Trap::Malformed)?,
-                                )?)
+                                )?
+                                .i64())
                             };
                             let entry = argn(0)? as u64;
                             let off = argn(1)? as u64;
@@ -2632,7 +5680,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
                             if !ok_entry || !fits || !mod_ok {
-                                frames[top].vals.push(Value::I32(EINVAL as i32));
+                                frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
                                 // `ibase`/`off` are holder-relative; the backing-absolute base
                                 // adds the holder's own window base (0 for a top-level holder), so
@@ -2708,7 +5756,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         threads.push(Some(child_id));
                                         frames[top]
                                             .vals
-                                            .push(Value::I32((threads.len() - 1) as i32));
+                                            .push(Reg::from_i32((threads.len() - 1) as i32));
                                     }
                                     None => return Err(Trap::ThreadFault),
                                 }
@@ -2717,10 +5765,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // join(child) -> result: park only this fiber until the child finishes (its
                         // result/trap is delivered on resume via `Pending::Join`); siblings run on.
                         1 => {
-                            let ch = as_i32(get(
-                                &frames[top].vals,
-                                *args.first().ok_or(Trap::Malformed)?,
-                            )?)?;
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
                             *pending = Some(Pending::Join { slot });
@@ -2736,10 +5782,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         2 | 4 => {
                             let demand = op == 4;
                             let argn = |i: usize| -> Result<i64, Trap> {
-                                as_i64(get(
+                                Ok(get(
                                     &frames[top].vals,
                                     *args.get(i + askip).ok_or(Trap::Malformed)?,
-                                )?)
+                                )?
+                                .i64())
                             };
                             let entry = argn(0)? as u64;
                             let off = argn(1)? as u64;
@@ -2764,7 +5811,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
                             if !ok_entry || !fits || !mod_ok {
-                                frames[top].vals.push(Value::I32(EINVAL as i32));
+                                frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
                                 // `ibase`/`off` are holder-relative; the backing-absolute base
                                 // adds the holder's own window base (0 for a top-level holder), so
@@ -2823,7 +5870,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }));
                                 frames[top]
                                     .vals
-                                    .push(Value::I32((coroutines.len() - 1) as i32));
+                                    .push(Reg::from_i32((coroutines.len() - 1) as i32));
                             }
                         }
                         // resume(child, value) -> (status: i32, value: i64): drive the coroutine
@@ -2834,14 +5881,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // (the parent has placed its bytes in the shared window) and re-runs the access.
                         // A child trap propagates to us.
                         3 => {
-                            let ch = as_i32(get(
-                                &frames[top].vals,
-                                *args.first().ok_or(Trap::Malformed)?,
-                            )?)?;
-                            let value = as_i64(get(
-                                &frames[top].vals,
-                                *args.get(1).ok_or(Trap::Malformed)?,
-                            )?)?;
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
+                            let value =
+                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?;
                             let slot = ch as usize;
                             let mut coro = match coroutines.get_mut(slot).and_then(|c| c.take()) {
                                 Some(c) => c,
@@ -2860,26 +5903,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 Ok(Inner::CoYield(yv)) => {
                                     coro.awaiting_resume = true;
                                     coroutines[slot] = Some(coro);
-                                    frames[top].vals.push(Value::I32(FIBER_SUSPENDED));
-                                    frames[top].vals.push(Value::I64(yv));
+                                    frames[top].vals.push(Reg::from_i32(FIBER_SUSPENDED));
+                                    frames[top].vals.push(Reg::from_i64(yv));
                                 }
                                 Ok(Inner::CoFault(addr)) => {
                                     coro.faulted_page = Some(addr);
                                     coroutines[slot] = Some(coro);
-                                    frames[top].vals.push(Value::I32(CORO_FAULTED));
-                                    frames[top].vals.push(Value::I64(addr as i64));
+                                    frames[top].vals.push(Reg::from_i32(CORO_FAULTED));
+                                    frames[top].vals.push(Reg::from_i64(addr as i64));
                                 }
                                 Ok(Inner::Done(result)) => {
                                     // Finished — `coroutines[slot]` stays `None` (a later resume inert).
-                                    frames[top].vals.push(Value::I32(FIBER_RETURNED));
-                                    frames[top]
-                                        .vals
-                                        .push(result.first().copied().unwrap_or(Value::I64(0)));
+                                    frames[top].vals.push(Reg::from_i32(FIBER_RETURNED));
+                                    frames[top].vals.push(Reg::from_value(
+                                        result.first().copied().unwrap_or(Value::I64(0)),
+                                    ));
                                 }
                                 // A coroutine that parks used a blocking concurrency op (it has no
                                 // executor driving it) — unsupported; surface as a fault.
                                 Ok(Inner::Park(_)) | Ok(Inner::Yield) => {
                                     return Err(Trap::FiberFault)
+                                }
+                                // A co-fiber child never carries `debug`, so it cannot pause (S4).
+                                Ok(Inner::Pause(..)) => {
+                                    unreachable!("debug pause in a coroutine child")
                                 }
                                 Err(t) => return Err(t), // a child trap propagates to the parent
                             }
@@ -2907,11 +5954,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
-                    let ch = val_to_slot(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?) as i32;
+                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let ch =
+                        get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     let unit_funcs = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         let domain = hg.resolve_jit_domain(h)?;
@@ -2929,7 +5974,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(slot) => slot as i64,
                         None => ENOSPC,
                     };
-                    frames[top].vals.push(Value::I64(res));
+                    frames[top].vals.push(Reg::from_i64(res));
                 }
                 // `Jit.uninstall(slot)` (iface 11 op 4, DESIGN.md §22 reclaim): clear a
                 // previously-installed table slot so the index is reusable and a stale
@@ -2943,15 +5988,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_jit_domain(h)?; // authority: a forged handle is inert
                     }
-                    let slot = val_to_slot(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?) as usize;
+                    let slot = get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64()
+                        as usize;
                     // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
                     // function count) — `dt.uninstall` enforces the range + filled checks.
                     let res = if dt.uninstall(slot, funcs.len()) {
@@ -2959,7 +6002,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         EINVAL
                     };
-                    frames[top].vals.push(Value::I64(res));
+                    frames[top].vals.push(Reg::from_i64(res));
                 }
                 Inst::CapCall {
                     type_id: iface::JIT,
@@ -2968,14 +6011,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     sig,
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     // arg0 = the CompiledCode handle; the rest are the invoke args. Args cross in
                     // the i64-slot ABI (the handle rides the low 32 bits of its slot, like every
                     // handle-as-arg — e.g. the Instantiator's module ops), so read it as a slot.
-                    let ch = val_to_slot(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?) as i32;
+                    let ch =
+                        get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     let unit_funcs = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         let domain = hg.resolve_jit_domain(h)?;
@@ -2998,7 +6039,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // exactly the JIT trampoline's decode.
                     let mut child_args = Vec::with_capacity(entry.params.len());
                     for (a, ty) in args[1..].iter().zip(entry.params.clone()) {
-                        let slot = val_to_slot(get(&frames[top].vals, *a)?);
+                        let slot = get(&frames[top].vals, *a)?.i64();
                         child_args.push(slot_to_val(ty, slot));
                     }
                     // Nested run over the SAME window/fuel/powerbox: move them into an
@@ -3032,7 +6073,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Ok(Inner::Done(results)) => {
                             // Results cross back as slots (arity already checked equal).
                             for (v, ty) in results.iter().zip(&sig.results) {
-                                frames[top].vals.push(slot_to_val(*ty, val_to_slot(*v)));
+                                frames[top]
+                                    .vals
+                                    .push(Reg::from_value(slot_to_val(*ty, val_to_slot(*v))));
                             }
                         }
                         // The unit cannot park/yield (concurrency is rejected at compile);
@@ -3054,10 +6097,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (mask + type_id/generation check) and dispatch to the mock host.
                     // Args/results cross as i64 slots (the shared host-dispatch ABI).
                     // Synchronous in the reference (the async/submit-complete ABI is §12).
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
-                        argv.push(val_to_slot(get(&frames[top].vals, *a)?));
+                        argv.push(get(&frames[top].vals, *a)?.i64());
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
@@ -3065,7 +6108,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results = hg.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
-                        frames[top].vals.push(slot_to_val(*ty, *s));
+                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
                 }
                 // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
@@ -3073,26 +6116,77 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapSelfCount => {
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let r = hg.self_dispatch(0, &[])?;
-                    frames[top].vals.push(Value::I32(r[0] as i32));
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
                 }
                 // §7 reflection (`cap.self.get`): the `idx`-th held capability as `(handle, type_id)`
                 // (op 1). An out-of-range index is fail-closed (the guest bounds it by the count).
                 Inst::CapSelfGet { idx } => {
-                    let i = as_i32(get(&frames[top].vals, *idx)?)? as i64;
+                    let i = get_i32(&frames[top].vals, *idx)? as i64;
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let r = hg.self_dispatch(1, &[i])?;
                     drop(hg);
-                    frames[top].vals.push(Value::I32(r[0] as i32));
-                    frames[top].vals.push(Value::I32(r[1] as i32));
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                    frames[top].vals.push(Reg::from_i32(r[1] as i32));
+                }
+                // §7 reflection (`cap.self.resolve`): resolve a name buffer to its handle (op 2).
+                // Routed through the generic capability dispatch (which has the window to read the
+                // name) — the same code the JIT thunk / bytecode engine reach, so all three agree.
+                Inst::CapSelfResolve { name_ptr, name_len } => {
+                    let ptr = get_i64(&frames[top].vals, *name_ptr)?;
+                    let len = get_i64(&frames[top].vals, *name_len)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r =
+                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
+                    drop(hg);
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
+                // §7 reflection (`cap.self.label`): write the handle's label into the window (op 3),
+                // the reverse of resolve. Routed through the generic dispatch (which has the window).
+                Inst::CapSelfLabel {
+                    handle,
+                    buf_ptr,
+                    buf_cap,
+                } => {
+                    let h = get_i32(&frames[top].vals, *handle)? as i64;
+                    let ptr = get_i64(&frames[top].vals, *buf_ptr)?;
+                    let cap = get_i64(&frames[top].vals, *buf_cap)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r =
+                        hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 3, 0, &[h, ptr, cap], gm)?;
+                    drop(hg);
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
+                // §12 per-vCPU TLS register: read/write **this** vCPU's word (`tls`, destructured from
+                // `v` above), so a fiber that migrated here sees the current vCPU's value.
+                Inst::VcpuTlsGet => {
+                    frames[top].vals.push(Reg::from_i64(*tls));
+                }
+                Inst::VcpuTlsSet { val } => {
+                    *tls = get_i64(&frames[top].vals, *val)?;
+                }
+                // §12.8 4A.5 durable-runtime-internal: the active context's shadow-SP **word address** —
+                // the base of *its own* region (the SP word is the region's first 8 bytes), so concurrent
+                // vCPUs never share an SP word. The active context is the running fiber's (`cur + 1`) or,
+                // off-table, this vCPU's root context (`vcpu_ctx`). The transform reads no guest-mutable
+                // state, so a guest cannot redirect its own shadow stack.
+                Inst::DurableShadowBase => {
+                    frames[top]
+                        .vals
+                        .push(Reg::from_i64(shadow_region_base(*durable_sp_ctx) as i64));
                 }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
                 Inst::ContNew { func, sp } => {
-                    let funcref = as_i32(get(&frames[top].vals, *func)?)?;
-                    let stack_base = as_i64(get(&frames[top].vals, *sp)?)?;
-                    let handle = registry.create(funcref, stack_base, spawn_quota.max_fibers)?;
-                    frames[top].vals.push(Value::I32(handle));
+                    let funcref = get_i32(&frames[top].vals, *func)?;
+                    let stack_base = get_i64(&frames[top].vals, *sp)?;
+                    // `durable` runs assign the new fiber a distinct shadow region (and refuse if
+                    // the reserve is full); a non-durable run ignores the region bookkeeping.
+                    let handle =
+                        registry.create(funcref, stack_base, spawn_quota.max_fibers, durable)?;
+                    frames[top].vals.push(Reg::from_i64(handle));
                 }
                 // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
                 // one vCPU migrates to whichever claims it next; exactly one racing claimant wins
@@ -3100,14 +6194,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
                 Inst::ContResume { k, arg } => {
-                    let kh = as_i32(get(&frames[top].vals, *k)?)?;
-                    let av = as_i64(get(&frames[top].vals, *arg)?)?;
+                    let kh = get_i64(&frames[top].vals, *k)?;
+                    let av = get_i64(&frames[top].vals, *arg)?;
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
                     // parked one (delivering `arg` as the result of its `suspend`).
                     let (target, claimed) = registry.claim(kh)?;
                     let new_frames = match claimed {
                         Claimed::Start { func: funcref, sp } => {
-                            let callee = table_lookup(fs, funcref, &fiber_sig())?;
+                            // A forged / wrong-type fiber funcref is a **fiber** fault, not a
+                            // generic `IndirectCallType`: the fault arises from a `cont.*` op, so it
+                            // joins the forged-handle / dead / bomb family and matches the JIT, which
+                            // raises `FiberFault` from its first-resume type-check (`fiber_rt`). The
+                            // claim already took the slot to `Running`, so this fiber stays inert.
+                            let callee = table_lookup(fs, funcref, &fiber_sig())
+                                .map_err(|_| Trap::FiberFault)?;
                             // First entry: call `func(sp, arg)` on the fiber's data stack. Fibers
                             // are module-0 only (a unit cannot use `cont.*`, gated at compile).
                             vec![Frame {
@@ -3115,14 +6215,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 module: 0,
                                 block: 0,
                                 inst: 0,
-                                vals: vec![Value::I64(sp), Value::I64(av)],
+                                vals: vec![Reg::from_i64(sp), Reg::from_i64(av)],
                             }]
                         }
                         Claimed::Live(mut f) => {
                             f.last_mut()
                                 .ok_or(Trap::Malformed)?
                                 .vals
-                                .push(Value::I64(av));
+                                .push(Reg::from_i64(av));
                             f
                         }
                     };
@@ -3135,6 +6235,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         registry.park_resumer(*cur, parked);
                     }
+                    // Re-point the active shadow-SP from the resumer's region to the target's
+                    // (durable runs only) so a freeze that lands while the target runs spills into
+                    // the target's own region — never the resumer's.
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        *cur,
+                        target,
+                    );
                     chain.push(target);
                     *cur = target;
                     *frames = new_frames;
@@ -3147,10 +6260,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *cur == ROOT_FIBER {
                         return Err(Trap::FiberFault); // no resumer (the root cannot suspend)
                     }
-                    let v = as_i64(get(&frames[top].vals, *value)?)?;
+                    let v = get_i64(&frames[top].vals, *value)?;
+                    let leaving = *cur;
                     registry.park_suspended(*cur, std::mem::take(frames));
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
+                    // Hand the active shadow-SP back to the resumer's region (durable runs only):
+                    // the suspended fiber's SP is saved to its slot so a later resume restores it.
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -3158,9 +6284,102 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
-                    frames[rtop].vals.push(Value::I32(FIBER_SUSPENDED));
-                    frames[rtop].vals.push(Value::I64(v));
+                    frames[rtop].vals.push(Reg::from_i32(FIBER_SUSPENDED));
+                    frames[rtop].vals.push(Reg::from_i64(v));
                     continue 'frames;
+                }
+                // `setjmp`: snapshot this frame's resume point (the value state is captured because
+                // `vals` is replaced per block) keyed by the guest `jmp_buf` address, and fall through
+                // returning 0. `frames[top].inst` is already advanced past the `setjmp` (line above), so
+                // it is exactly the re-entry point. A re-`setjmp` to the same buffer overwrites.
+                Inst::SetJmp { buf } => {
+                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let result_idx = frames[top].vals.len();
+                    let mut snap = frames[top].vals.clone();
+                    snap.push(Reg::from_i32(0)); // the result slot (overwritten by longjmp)
+                    setjmp_points.insert(
+                        key,
+                        SetJmpPoint {
+                            depth: frames.len(),
+                            block: frames[top].block,
+                            inst: frames[top].inst,
+                            vals: snap,
+                            result_idx,
+                        },
+                    );
+                    frames[top].vals.push(Reg::from_i32(0)); // the direct call returns 0
+                }
+                // `longjmp`: look up the checkpoint by `jmp_buf` address, unwind the call stack to it
+                // (the intervening frames discarded — C has no cleanups), restore the `setjmp` frame's
+                // (block, inst, vals) with the result slot set to `val` (a `0` `val` becomes `1`, per C),
+                // and resume there. A missing checkpoint, or one whose frame already returned (its
+                // `depth` now exceeds the live stack), traps in-sandbox (§3b totality).
+                Inst::LongJmp { buf, val } => {
+                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let v = get_i32(&frames[top].vals, *val)?;
+                    let resume = if v == 0 { 1 } else { v };
+                    let point = setjmp_points.get(&key).cloned().ok_or(Trap::Malformed)?;
+                    if point.depth == 0 || point.depth > frames.len() {
+                        return Err(Trap::Malformed); // the setjmp frame has already returned
+                    }
+                    frames.truncate(point.depth);
+                    let f = &mut frames[point.depth - 1];
+                    f.block = point.block;
+                    f.inst = point.inst;
+                    f.vals = point.vals;
+                    f.vals[point.result_idx] = Reg::from_i32(resume);
+                    continue 'frames;
+                }
+                // §GC conservative root enumeration (`gc.roots`): collect the deduplicated set of
+                // candidate words in `[heap_lo, heap_hi)` across **every** fiber of the domain —
+                // this computation's own live `frames` (the caller; the op is call-clobbering, so
+                // its roots are already in `frames`), the parked root computation (`root_parked`),
+                // and every registry fiber that holds frames: `Parked` (suspended) and
+                // `Running(Some)` (a resume-chain ancestor). The currently-running fiber's slot is
+                // `Running(None)` (its frames are `frames`, scanned above) so nothing double-counts.
+                // Write the first `cap` candidates (ascending) into guest memory at `buf`, yield the
+                // total found. Ambient + authority-neutral (GC.md §3): every candidate is in-window
+                // guest data the heap already encodes; nothing host-side can appear in a `Value`.
+                Inst::GcRoots {
+                    heap_lo,
+                    heap_hi,
+                    mask,
+                    buf,
+                    cap,
+                } => {
+                    let lo = get_i64(&frames[top].vals, *heap_lo)? as u64;
+                    let hi = get_i64(&frames[top].vals, *heap_hi)? as u64;
+                    let mask = get_i64(&frames[top].vals, *mask)? as u64;
+                    // Security: the payload mask may only clear the top byte (low 56 bits all-ones),
+                    // else a host pointer could be folded into the guest window and leak host-address
+                    // bits past the range filter (GC.md §3, §6). The verifier rejects a constant
+                    // fold-down mask statically; this defends an unverified module / non-constant mask.
+                    if mask | 0xFF00_0000_0000_0000 != u64::MAX {
+                        return Err(Trap::Malformed);
+                    }
+                    let dst = get_i64(&frames[top].vals, *buf)? as u64;
+                    let cap = get_i64(&frames[top].vals, *cap)?.max(0) as usize;
+                    let mut roots = std::collections::BTreeSet::new();
+                    gc_scan_frames(frames, lo, hi, mask, &mut roots);
+                    if let Some(rp) = root_parked.as_ref() {
+                        gc_scan_frames(rp, lo, hi, mask, &mut roots);
+                    }
+                    for fib in registry.lock().fibers.iter() {
+                        if let RegFiber::Parked(f) | RegFiber::Running(Some(f)) = fib {
+                            gc_scan_frames(f, lo, hi, mask, &mut roots);
+                        }
+                    }
+                    let total = roots.len();
+                    let mut bytes = Vec::with_capacity(total.min(cap) * 8);
+                    for w in roots.into_iter().take(cap) {
+                        bytes.extend_from_slice(&w.to_le_bytes());
+                    }
+                    // Reuse the §7 cap-buffer write path: confines `buf` to committed, writable
+                    // window pages (a forged/unmapped buffer ⇒ `MemoryFault`), exactly like a host
+                    // capability writing its result buffer.
+                    let m = mem.as_mut().ok_or(Trap::Malformed)?;
+                    m.write_bytes_impl(dst, &bytes).ok_or(Trap::MemoryFault)?;
+                    frames[top].vals.push(Reg::from_i64(total as i64));
                 }
                 // §12 thread spawn: enqueue a new vCPU (green thread) running `funcs[func](arg)` over
                 // the *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
@@ -3173,8 +6392,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::Malformed);
                     }
                     let entry = *func;
-                    let spv = as_i64(get(&frames[top].vals, *sp)?)?; // the thread's data-stack base
-                    let av = as_i64(get(&frames[top].vals, *arg)?)?;
+                    let spv = get_i64(&frames[top].vals, *sp)?; // the thread's data-stack base
+                    let av = get_i64(&frames[top].vals, *arg)?;
+                    // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): a child inherits the *current*
+                    // state word — under a freeze it spawns into `UNWINDING` so it too unwinds at its next
+                    // safepoint. (A child existing *before* the freeze point is reconstructed by the
+                    // runtime at thaw, not re-spawned here — the root's rewind skips the prologue
+                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.)
+                    let child_state = mem
+                        .as_ref()
+                        .map(|m| m.durable_state())
+                        .unwrap_or(STATE_NORMAL);
+                    // Durable multi-vCPU (slice 3.2.2): reserve this child's shadow context top-down
+                    // (`MAX_SHADOW_CTX`, −1, …) so it can't collide with a fiber's `slot+1` region.
+                    // Fail closed (`ThreadFault`) if the reserve is full — the vCPU pool growing down
+                    // would meet the fiber pool growing up. (Non-durable runs never touch the reserve.)
+                    let child_ctx = if durable {
+                        match registry.reserve_vcpu_context() {
+                            Some(c) => c,
+                            None => return Err(Trap::ThreadFault),
+                        }
+                    } else {
+                        0
+                    };
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_host = Arc::clone(host); // inherit the domain powerbox
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
@@ -3183,7 +6423,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                               // **Share** the fiber registry (D57 3b-i): one handle namespace per domain, so
                                               // the child can resume fibers the parent (or a sibling) created and suspended.
                     let creg = Arc::clone(registry);
+                    let parent_id = *id; // the spawning vCPU's task — the child's `parent_task`
                     let csched = sched.clone();
+                    // A debugged run shares one breakpoint/watchpoint set across all threads
+                    // (DEBUGGING.md Milestone B): the child gets its own per-vCPU `DebugCtx` (fresh
+                    // logical clock) over the same shared state, so a breakpoint fires in it too.
+                    let cdebug = debug.as_ref().map(|d| Arc::clone(&d.shared));
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
                             cfuncs,
@@ -3200,6 +6445,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         );
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
+                        child.durable = durable; // durability is a domain property (shared window/registry)
+                                                 // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
+                                                 // above, so its shadow stack lives in its own region; it carries its own state word
+                                                 // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
+                        child.root_shadow_sp = shadow_frame_base(child_ctx);
+                        child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
+                        child.dstate = child_state;
+                        child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
+                        child.spawn_residue = Some((entry, vec![spv, av]));
+                        child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         Box::new(child)
                     });
                     match made {
@@ -3207,7 +6462,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             threads.push(Some(child_id));
                             frames[top]
                                 .vals
-                                .push(Value::I32((threads.len() - 1) as i32));
+                                .push(Reg::from_i32((threads.len() - 1) as i32));
                         }
                         None => return Err(Trap::ThreadFault), // live cap (a thread-bomb)
                     }
@@ -3216,7 +6471,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // result. A forged / out-of-range / already-joined handle is inert (masked + checked
                 // like a fiber handle); a trap in the joined vCPU propagates here (on resume).
                 Inst::ThreadJoin { handle } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let slot = resolve_thread(threads, h)?;
                     let child = threads[slot].ok_or(Trap::ThreadFault)?;
                     *pending = Some(Pending::Join { slot });
@@ -3232,9 +6487,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     timeout,
                 } => {
                     let width = atomic_width(*ty);
-                    let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
-                    let exp = store_bits(get(&frames[top].vals, *expected)?) & width_mask(width);
-                    let to_ns = as_i64(get(&frames[top].vals, *timeout)?)?;
+                    let a = get_i64(&frames[top].vals, *addr)? as u64;
+                    let exp = get(&frames[top].vals, *expected)?.lo & width_mask(width);
+                    let to_ns = get_i64(&frames[top].vals, *timeout)?;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.prepare_wait(a, *ty)?;
                     let wait = if to_ns < 0 {
@@ -3251,45 +6506,205 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 // §12 futex notify: wake up to `count` vCPUs parked on the confined address.
                 Inst::MemoryNotify { addr, count } => {
-                    let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
+                    let a = get_i64(&frames[top].vals, *addr)? as u64;
                     // The count is **unsigned** "wake up to N" (wasm's `memory.atomic.notify` count is
                     // u32; the wake-all idiom is `-1` = u32::MAX). `notify` caps at the real waiter
                     // count, so reinterpreting the i32 bits as u32 is safe and faithful.
-                    let n = as_i32(get(&frames[top].vals, *count)?)? as u32;
+                    let n = get_i32(&frames[top].vals, *count)? as u32;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.confine_for_notify(a)?;
                     frames[top]
                         .vals
-                        .push(Value::I32(sched.notify(base, n) as i32));
+                        .push(Reg::from_i32(sched.notify(base, n) as i32));
                 }
-                // Everything else: one value, or none for `Store`/`AtomicStore`.
-                other => {
-                    match eval_inst(other, &frames[top].vals, mem) {
-                        Ok(Some(v)) => frames[top].vals.push(v),
-                        Ok(None) => {}
-                        // §14 fault-driven yield: a coroutine child's access to an unmapped page in its
-                        // window suspends to the parent (which supplies the page) instead of trapping.
-                        // `take_fault` is `Some` only for a *recoverable* in-window page fault (not an
-                        // out-of-window fault, which traps). Rewind to re-execute the access on resume.
-                        Err(Trap::MemoryFault) if fault_yields => {
-                            match mem.as_ref().and_then(|m| m.take_fault()) {
-                                Some(addr) => {
-                                    frames[top].inst -= 1;
-                                    return Ok(Inner::CoFault(addr));
-                                }
-                                None => return Err(Trap::MemoryFault),
-                            }
+                // Fast paths for the **pure** value ops (no memory, no SIMD): dispatch here and
+                // push the result directly, instead of through the `eval_inst` call (and its
+                // `Option<Reg>` return). `eval_inst` is a very large function that never inlines,
+                // so the call dominated the per-op cost on scalar/float code — eliminating it for
+                // these ops is the bulk of the eval-loop speedup. The operation *semantics* live in
+                // shared helpers (`bin64`/`fbin64`/`cast`/…) called from both here and `eval_inst`,
+                // so only thin dispatch glue is repeated; `eval_inst` keeps a (now-unreachable, but
+                // exhaustive and identical) copy of these arms and remains the path for memory,
+                // SIMD, and the no-result/control ops.
+                Inst::ConstI32(c) => frames[top].vals.push(Reg::from_i32(*c)),
+                Inst::ConstI64(c) => frames[top].vals.push(Reg::from_i64(*c)),
+                Inst::ConstF32(bits) => frames[top].vals.push(Reg::from_f32(f32::from_bits(*bits))),
+                Inst::ConstF64(bits) => frames[top].vals.push(Reg::from_f64(f64::from_bits(*bits))),
+                Inst::IntBin { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => {
+                            Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?)
                         }
-                        Err(t) => return Err(t),
+                        IntTy::I64 => {
+                            Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?)
+                        }
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::IntCmp { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
+                        IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::IntUn { ty, op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => Reg::from_i32(intun32(*op, get_i32(vals, *a)?)),
+                        IntTy::I64 => Reg::from_i64(intun64(*op, get_i64(vals, *a)?)),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::Eqz { ty, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => get_i32(vals, *a)? == 0,
+                        IntTy::I64 => get_i64(vals, *a)? == 0,
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::Convert { op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match op {
+                        ConvOp::ExtendI32S => Reg::from_i64(get_i32(vals, *a)? as i64),
+                        ConvOp::ExtendI32U => Reg::from_i64(get_i32(vals, *a)? as u32 as i64),
+                        ConvOp::WrapI64 => Reg::from_i32(get_i64(vals, *a)? as i32),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::Select { cond, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = if get_i32(vals, *cond)? != 0 {
+                        get(vals, *a)?
+                    } else {
+                        get(vals, *b)?
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FBin { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => {
+                            Reg::from_f32(fbin32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?))
+                        }
+                        FloatTy::F64 => {
+                            Reg::from_f64(fbin64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?))
+                        }
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FUn { ty, op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
+                        FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FCmp { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => fcmp32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?),
+                        FloatTy::F64 => fcmp64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::FToISat { op, a } => {
+                    let r = fto_i(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::FToITrap { op, a } => {
+                    let r = trunc_trap(*op, get(&frames[top].vals, *a)?)?;
+                    frames[top].vals.push(r);
+                }
+                Inst::IToFConv { op, a } => {
+                    let r = i_to_f(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::PtrAdd { a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?));
+                    frames[top].vals.push(r);
+                }
+                Inst::PtrCast { a, .. } => {
+                    let r = Reg::from_i64(get_i64(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::Cast { op, a } => {
+                    let r = cast(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::RefFunc { func } => frames[top].vals.push(Reg::from_i32(*func as i32)),
+                // Everything else: one value, or none for `Store`/`AtomicStore`.
+                // Fast-path the two common scalar memory ops out of the `eval_inst` call; the
+                // §14 fault-driven-yield handling is shared via `handle_mem`. The expensive part
+                // (confinement + page-protection in `Mem`) is unchanged — only the dispatch call
+                // is removed.
+                Inst::Load {
+                    op, addr, offset, ..
+                } => {
+                    let r = (|| -> Result<Option<Reg>, Trap> {
+                        let a = get_i64(&frames[top].vals, *addr)? as u64;
+                        let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                        Ok(Some(Reg::from_value(m.load(a, *offset, *op)?)))
+                    })();
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
+                    }
+                }
+                Inst::Store {
+                    op,
+                    addr,
+                    value,
+                    offset,
+                    ..
+                } => {
+                    let r = (|| -> Result<Option<Reg>, Trap> {
+                        let a = get_i64(&frames[top].vals, *addr)? as u64;
+                        let v = Value::I64(get(&frames[top].vals, *value)?.i64());
+                        mem.as_mut()
+                            .ok_or(Trap::Malformed)?
+                            .store(a, *offset, *op, v)?;
+                        Ok(None)
+                    })();
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
+                    }
+                }
+                // Everything else (other memory ops, SIMD, no-result/control): one `eval_inst`
+                // call, through the same fault-yield handling.
+                other => {
+                    let r = eval_inst(other, &frames[top].vals, mem);
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
                     }
                 }
             }
         }
 
         step(fuel)?;
+        // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
+        // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
+        // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
+        // compute loop that the fiber-safepoint countdown cannot. Inert unless armed; gated on
+        // `durable` so an ordinary run is untouched (byte-identical).
+        if durable
+            && matches!(
+                &block.term,
+                Terminator::Br { .. } | Terminator::BrIf { .. } | Terminator::BrTable { .. }
+            )
+        {
+            if let Some(m) = mem.as_mut() {
+                m.durable_tick_arm_backedge();
+            }
+        }
         match &block.term {
             Terminator::Br { target, args } => {
-                frames[top].vals = collect(&frames[top].vals, args)?;
+                collect_into(&mut edge_buf, &frames[top].vals, args)?;
+                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = *target as usize;
                 frames[top].inst = 0;
             }
@@ -3300,12 +6715,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 else_blk,
                 else_args,
             } => {
-                let (target, edge_args) = if as_i32(get(&frames[top].vals, *cond)?)? != 0 {
+                let (target, edge_args) = if get_i32(&frames[top].vals, *cond)? != 0 {
                     (*then_blk, then_args)
                 } else {
                     (*else_blk, else_args)
                 };
-                frames[top].vals = collect(&frames[top].vals, edge_args)?;
+                collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
+                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = target as usize;
                 frames[top].inst = 0;
             }
@@ -3314,26 +6730,95 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 targets,
                 default,
             } => {
-                let i = as_i32(get(&frames[top].vals, *idx)?)? as u32 as usize;
+                let i = get_i32(&frames[top].vals, *idx)? as u32 as usize;
                 let (target, edge_args) = targets.get(i).unwrap_or(default);
-                frames[top].vals = collect(&frames[top].vals, edge_args)?;
+                collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
+                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = *target as usize;
                 frames[top].inst = 0;
             }
             Terminator::Return(out) => {
-                let results = collect(&frames[top].vals, out)?;
-                frames.pop();
+                collect_into(&mut ret_buf, &frames[top].vals, out)?;
+                let popped = frames.pop();
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
-                    caller.vals.extend(results);
+                    // Copy results straight in — no per-return results `Vec`.
+                    caller.vals.extend_from_slice(&ret_buf);
                 } else if *cur == ROOT_FIBER {
-                    return Ok(Inner::Done(results)); // the root returned: this vCPU is done
+                    // The root returned: this vCPU is done. Reconstruct typed result `Value`s from
+                    // the returning function's result signature (the public boundary is `Value`).
+                    let results = match popped.as_ref().and_then(|p| fs.get(p.func as usize)) {
+                        Some(f) => ret_buf
+                            .iter()
+                            .zip(&f.results)
+                            .map(|(s, ty)| s.to_value(*ty))
+                            .collect(),
+                        None => ret_buf.iter().map(|s| s.to_value(ValType::I64)).collect(),
+                    };
+                    return Ok(Inner::Done(results));
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
-                    // with status RETURNED; the fiber is now `Done` (resuming again traps).
-                    registry.finish(*cur);
+                    // with status RETURNED; the fiber is now `Done` (resuming again traps) —
+                    // **unless** this is a freeze-unwind (durable + UNWINDING): then the fiber is
+                    // mid-resume-chain and unwound *for freeze*, not a real return, so capture its
+                    // residue and mark it `Frozen` (re-enterable on thaw) instead of `Done`. Its
+                    // continuation is already flattened into its shadow region; on thaw the resumer
+                    // re-issues `cont.resume`, the fiber rewinds at its in-flight (leaf/propagated)
+                    // point and runs *forward* — the active-chain analogue of an idle fiber's re-park.
+                    let leaving = *cur;
+                    // Distinguish a freeze-unwind from a genuine return under UNWINDING: an unwound
+                    // fiber spilled frames into its shadow region (`shadow_sp` past the region base),
+                    // whereas a non-instrumented fiber that truly returned left it empty. Only the
+                    // former is `Frozen` (an instrumented fiber always unwinds at a poll before its
+                    // real return, so this never mis-classifies one that should be `Done`).
+                    let lctx = shadow_context_index(leaving);
+                    let region_base = shadow_region_base(lctx);
+                    let shadow_sp = mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp(region_base))
+                        .unwrap_or_else(|| shadow_frame_base(lctx));
+                    // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word occupies
+                    // the region's first 8 bytes); an empty stack sits exactly at the frame base.
+                    let freezing = durable
+                        && shadow_sp > shadow_frame_base(lctx)
+                        && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                    if freezing {
+                        let (func, sp) = match popped.as_ref() {
+                            Some(f) => (
+                                f.func as i32,
+                                match f.vals.first() {
+                                    Some(r) => r.i64(),
+                                    _ => 0,
+                                },
+                            ),
+                            None => (0, 0),
+                        };
+                        registry.freeze_active(*cur, shadow_sp);
+                        frozen.push(FrozenFiber {
+                            slot: leaving,
+                            func,
+                            sp,
+                            shadow_sp,
+                            generation: registry.generation(leaving),
+                        });
+                    } else {
+                        registry.finish(*cur);
+                    }
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
+                    // Restore the resumer's active shadow-SP (durable runs only). The fiber is
+                    // `Done`, so saving its SP is moot, but `shadow_switch` reads the live word
+                    // before overwriting it — correct whether or not it had unwound frames.
+                    shadow_switch(
+                        mem,
+                        registry,
+                        root_shadow_sp,
+                        *vcpu_ctx,
+                        durable_sp_ctx,
+                        durable,
+                        leaving,
+                        *cur,
+                    );
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -3341,10 +6826,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
-                    frames[rtop].vals.push(Value::I32(FIBER_RETURNED));
+                    frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
                     frames[rtop]
                         .vals
-                        .push(results.into_iter().next().unwrap_or(Value::I64(0)));
+                        .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));
                 }
             }
             Terminator::Unreachable => return Err(Trap::Unreachable),
@@ -3368,7 +6853,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     &funcs,
                     units,
                     invoked,
-                    as_i32(get(&frames[top].vals, *idx)?)?,
+                    get_i32(&frames[top].vals, *idx)?,
                     ty,
                 )?;
                 let argv = collect(&frames[top].vals, args)?;
@@ -3384,152 +6869,151 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     }
 }
 
-fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Option<Value>, Trap> {
-    // `Store` is the only instruction that produces no value.
-    if let Inst::Store {
-        op,
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = get(vals, *value)?;
-        m.store(a, *offset, *op, v)?;
-        return Ok(None);
-    }
-    // §12 atomic store — the other no-result memory op.
-    if let Inst::AtomicStore {
-        ty,
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = get(vals, *value)?;
-        m.atomic_store(a, *offset, *ty, v)?;
-        return Ok(None);
-    }
-    // §17 `v128.store` — the third no-result memory op (a 16-byte masked write, D58).
-    if let Inst::V128Store {
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = as_v128(get(vals, *value)?)?;
-        m.store_v128(a, *offset, v)?;
-        return Ok(None);
-    }
+fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<Reg>, Trap> {
+    // Single dispatch over `inst`: value-producing ops yield the produced [`Reg`]; the
+    // no-result ops (`Store`/`AtomicStore`/`V128Store`, fences, and the control/fiber ops
+    // serviced in the eval loop) take a `return Ok(None)` arm. Operand reads are op-directed
+    // (`get_i32`/`get_f64`/`Reg::v128`, …) — the instruction's static type says how to read the
+    // untyped slot, so there is no per-value tag to match. The `Mem` wrappers stay `Value`-based;
+    // we convert at that boundary (`Value::I64(slot.i64())` covers any scalar store, since the
+    // store keeps only the low `width` bytes; loads come back typed → `Reg::from_value`).
     let v = match inst {
-        Inst::ConstI32(c) => Value::I32(*c),
-        Inst::ConstI64(c) => Value::I64(*c),
+        // ----- §3a/§12/§17 no-result memory writes (the only value-less data ops) -----
+        Inst::Store {
+            op,
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            m.store(a, *offset, *op, Value::I64(get(vals, *value)?.i64()))?;
+            return Ok(None);
+        }
+        Inst::AtomicStore {
+            ty,
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            m.atomic_store(a, *offset, *ty, Value::I64(get(vals, *value)?.i64()))?;
+            return Ok(None);
+        }
+        Inst::V128Store {
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            m.store_v128(a, *offset, get(vals, *value)?.v128())?;
+            return Ok(None);
+        }
+        Inst::ConstI32(c) => Reg::from_i32(*c),
+        Inst::ConstI64(c) => Reg::from_i64(*c),
         // §7 named imports must be lowered to `cap.call` by `resolve_imports` before
         // execution; a stray `CallImport` is fail-closed (it carries no `type_id`/`op`).
         Inst::CallImport { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
-        Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
+        Inst::CapSelfCount
+        | Inst::CapSelfGet { .. }
+        | Inst::CapSelfResolve { .. }
+        | Inst::CapSelfLabel { .. } => return Err(Trap::Malformed),
+        // §12 per-vCPU TLS register needs the running vCPU's state, so it's serviced in the eval
+        // loop (`run_inner`), never here.
+        Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => return Err(Trap::Malformed),
+        // §12.8 4A.5 durable shadow base needs the running vCPU's context, so it's serviced in the
+        // eval loop (`run_inner`), never here.
+        Inst::DurableShadowBase => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
-            IntTy::I32 => Value::I32(bin32(
-                *op,
-                as_i32(get(vals, *a)?)?,
-                as_i32(get(vals, *b)?)?,
-            )?),
-            IntTy::I64 => Value::I64(bin64(
-                *op,
-                as_i64(get(vals, *a)?)?,
-                as_i64(get(vals, *b)?)?,
-            )?),
+            IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?),
+            IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?),
         },
         Inst::IntCmp { ty, op, a, b } => {
             let r = match ty {
-                IntTy::I32 => cmp32(*op, as_i32(get(vals, *a)?)?, as_i32(get(vals, *b)?)?),
-                IntTy::I64 => cmp64(*op, as_i64(get(vals, *a)?)?, as_i64(get(vals, *b)?)?),
+                IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
+                IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
             };
-            Value::I32(r as i32)
+            Reg::from_i32(r as i32)
         }
         Inst::IntUn { ty, op, a } => match ty {
-            IntTy::I32 => Value::I32(intun32(*op, as_i32(get(vals, *a)?)?)),
-            IntTy::I64 => Value::I64(intun64(*op, as_i64(get(vals, *a)?)?)),
+            IntTy::I32 => Reg::from_i32(intun32(*op, get_i32(vals, *a)?)),
+            IntTy::I64 => Reg::from_i64(intun64(*op, get_i64(vals, *a)?)),
         },
         Inst::Eqz { ty, a } => {
             let r = match ty {
-                IntTy::I32 => as_i32(get(vals, *a)?)? == 0,
-                IntTy::I64 => as_i64(get(vals, *a)?)? == 0,
+                IntTy::I32 => get_i32(vals, *a)? == 0,
+                IntTy::I64 => get_i64(vals, *a)? == 0,
             };
-            Value::I32(r as i32)
+            Reg::from_i32(r as i32)
         }
         Inst::Convert { op, a } => match op {
-            ConvOp::ExtendI32S => Value::I64(as_i32(get(vals, *a)?)? as i64),
-            ConvOp::ExtendI32U => Value::I64(as_i32(get(vals, *a)?)? as u32 as i64),
-            ConvOp::WrapI64 => Value::I32(as_i64(get(vals, *a)?)? as i32),
+            ConvOp::ExtendI32S => Reg::from_i64(get_i32(vals, *a)? as i64),
+            ConvOp::ExtendI32U => Reg::from_i64(get_i32(vals, *a)? as u32 as i64),
+            ConvOp::WrapI64 => Reg::from_i32(get_i64(vals, *a)? as i32),
         },
         Inst::Select { cond, a, b } => {
-            if as_i32(get(vals, *cond)?)? != 0 {
+            if get_i32(vals, *cond)? != 0 {
                 get(vals, *a)?
             } else {
                 get(vals, *b)?
             }
         }
-        Inst::ConstF32(bits) => Value::F32(f32::from_bits(*bits)),
-        Inst::ConstF64(bits) => Value::F64(f64::from_bits(*bits)),
+        Inst::ConstF32(bits) => Reg::from_f32(f32::from_bits(*bits)),
+        Inst::ConstF64(bits) => Reg::from_f64(f64::from_bits(*bits)),
         Inst::FBin { ty, op, a, b } => match ty {
-            FloatTy::F32 => Value::F32(fbin32(
-                *op,
-                as_f32(get(vals, *a)?)?,
-                as_f32(get(vals, *b)?)?,
-            )),
-            FloatTy::F64 => Value::F64(fbin64(
-                *op,
-                as_f64(get(vals, *a)?)?,
-                as_f64(get(vals, *b)?)?,
-            )),
+            FloatTy::F32 => Reg::from_f32(fbin32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?)),
+            FloatTy::F64 => Reg::from_f64(fbin64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?)),
         },
         Inst::FUn { ty, op, a } => match ty {
-            FloatTy::F32 => Value::F32(fun32(*op, as_f32(get(vals, *a)?)?)),
-            FloatTy::F64 => Value::F64(fun64(*op, as_f64(get(vals, *a)?)?)),
+            FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
+            FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
+        },
+        Inst::Fma { ty, a, b, c } => match ty {
+            // `mul_add` is the correctly-rounded fused FMA — bit-identical to Cranelift's `fma`.
+            FloatTy::F32 => {
+                Reg::from_f32(get_f32(vals, *a)?.mul_add(get_f32(vals, *b)?, get_f32(vals, *c)?))
+            }
+            FloatTy::F64 => {
+                Reg::from_f64(get_f64(vals, *a)?.mul_add(get_f64(vals, *b)?, get_f64(vals, *c)?))
+            }
         },
         Inst::FCmp { ty, op, a, b } => {
             let r = match ty {
-                FloatTy::F32 => fcmp32(*op, as_f32(get(vals, *a)?)?, as_f32(get(vals, *b)?)?),
-                FloatTy::F64 => fcmp64(*op, as_f64(get(vals, *a)?)?, as_f64(get(vals, *b)?)?),
+                FloatTy::F32 => fcmp32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?),
+                FloatTy::F64 => fcmp64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?),
             };
-            Value::I32(r as i32)
+            Reg::from_i32(r as i32)
         }
-        Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?)?,
+        Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?),
         Inst::FToITrap { op, a } => trunc_trap(*op, get(vals, *a)?)?,
-        Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?)?,
-        Inst::PtrAdd { a, b } => {
-            Value::I64(as_i64(get(vals, *a)?)?.wrapping_add(as_i64(get(vals, *b)?)?))
-        }
+        Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?),
+        Inst::PtrAdd { a, b } => Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?)),
         // `ptr.from_int`/`ptr.to_int` are a no-op off-CHERI: pass the i64 through.
-        Inst::PtrCast { a, .. } => Value::I64(as_i64(get(vals, *a)?)?),
-        Inst::Cast { op, a } => cast(*op, get(vals, *a)?)?,
+        Inst::PtrCast { a, .. } => Reg::from_i64(get_i64(vals, *a)?),
+        Inst::Cast { op, a } => cast(*op, get(vals, *a)?),
         // A funcref is just the function index as plain i32 data (§3c).
-        Inst::RefFunc { func } => Value::I32(*func as i32),
+        Inst::RefFunc { func } => Reg::from_i32(*func as i32),
         Inst::Load {
             op, addr, offset, ..
         } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            m.load(a, *offset, *op)?
+            let a = get_i64(vals, *addr)? as u64;
+            Reg::from_value(m.load(a, *offset, *op)?)
         }
         // The `order` is carried but execution is seq-cst (a sound strengthening; see `svm_ir::Ordering`).
         Inst::AtomicLoad {
             ty, addr, offset, ..
         } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            m.atomic_load(a, *offset, *ty)?
+            let a = get_i64(vals, *addr)? as u64;
+            Reg::from_value(m.atomic_load(a, *offset, *ty)?)
         }
         Inst::AtomicRmw {
             ty,
@@ -3540,9 +7024,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            let v = get(vals, *value)?;
-            m.atomic_rmw(a, *offset, *ty, *op, v)?
+            let a = get_i64(vals, *addr)? as u64;
+            let v = Value::I64(get(vals, *value)?.i64());
+            Reg::from_value(m.atomic_rmw(a, *offset, *ty, *op, v)?)
         }
         Inst::AtomicCmpxchg {
             ty,
@@ -3553,10 +7037,10 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            let exp = get(vals, *expected)?;
-            let rep = get(vals, *replacement)?;
-            m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?
+            let a = get_i64(vals, *addr)? as u64;
+            let exp = Value::I64(get(vals, *expected)?.i64());
+            let rep = Value::I64(get(vals, *replacement)?.i64());
+            Reg::from_value(m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?)
         }
         // §12 standalone fence — issue the real hardware fence (a `Relaxed` fence is a no-op; `std`
         // would panic on it). Both backends are otherwise seq-cst, so this is the one place ordering
@@ -3574,82 +7058,173 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         }
 
         // ----- §17 SIMD reference lane semantics (the differential oracle, D58) -----
-        Inst::ConstV128(b) => Value::V128(*b),
+        Inst::ConstV128(b) => Reg::from_v128(*b),
         Inst::V128Load { addr, offset, .. } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            m.load_v128(a, *offset)?
+            let a = get_i64(vals, *addr)? as u64;
+            Reg::from_value(m.load_v128(a, *offset)?)
         }
-        Inst::Splat { shape, a } => Value::V128(simd_splat(*shape, store_bits(get(vals, *a)?))),
+        Inst::Splat { shape, a } => Reg::from_v128(simd_splat(*shape, get(vals, *a)?.lo)),
         Inst::ExtractLane {
             shape,
             lane,
             signed,
             a,
-        } => simd_extract(*shape, *lane, *signed, as_v128(get(vals, *a)?)?),
-        Inst::ReplaceLane { shape, lane, a, b } => Value::V128(simd_replace(
+        } => simd_extract(*shape, *lane, *signed, get(vals, *a)?.v128()),
+        Inst::ReplaceLane { shape, lane, a, b } => Reg::from_v128(simd_replace(
             *shape,
             *lane,
-            as_v128(get(vals, *a)?)?,
-            store_bits(get(vals, *b)?),
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.lo,
         )),
-        Inst::VIntBin { shape, op, a, b } => Value::V128(simd_vint_bin(
+        Inst::VIntBin { shape, op, a, b } => Reg::from_v128(simd_vint_bin(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
+        Inst::VIntCmp { shape, op, a, b } => Reg::from_v128(simd_vint_cmp(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+        )),
+        Inst::VFloatCmp { shape, op, a, b } => Reg::from_v128(simd_vfloat_cmp(
+            *shape,
+            *op,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+        )),
+        Inst::VShift { shape, op, a, amt } => Reg::from_v128(simd_vshift(
+            *shape,
+            *op,
+            get(vals, *a)?.v128(),
+            get_i32(vals, *amt)? as u32,
+        )),
+        Inst::VIntUn { shape, op, a } => {
+            Reg::from_v128(simd_vint_un(*shape, *op, get(vals, *a)?.v128()))
+        }
+        Inst::VSatBin { shape, op, a, b } => Reg::from_v128(simd_vsat_bin(
+            *shape,
+            *op,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+        )),
+        Inst::VWiden { shape, op, a } => {
+            Reg::from_v128(simd_widen(*shape, *op, get(vals, *a)?.v128()))
+        }
+        Inst::VNarrow { shape, op, a, b } => Reg::from_v128(simd_narrow(
+            *shape,
+            *op,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+        )),
+        Inst::VConvert { op, a } => Reg::from_v128(simd_convert(*op, get(vals, *a)?.v128())),
+        Inst::VPMinMax { shape, op, a, b } => Reg::from_v128(simd_pminmax(
+            *shape,
+            *op,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+        )),
+        Inst::VPopcnt { a } => {
+            let v = get(vals, *a)?.v128();
+            let mut o = [0u8; 16];
+            for i in 0..16 {
+                o[i] = v[i].count_ones() as u8;
+            }
+            Reg::from_v128(o)
+        }
+        Inst::VAvgr { shape, a, b } => Reg::from_v128(simd_avgr(
+            *shape,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+        )),
+        Inst::VDot { a, b } => {
+            Reg::from_v128(simd_dot(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
+        Inst::VDotI8 { a, b } => {
+            Reg::from_v128(simd_dot_i8(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
+        Inst::VExtMul { shape, op, a, b } => Reg::from_v128(simd_extmul(
+            *shape,
+            *op,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+        )),
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            Reg::from_v128(simd_extadd_pairwise(*shape, *signed, get(vals, *a)?.v128()))
+        }
+        Inst::VQ15MulrSat { a, b } => {
+            Reg::from_v128(simd_q15mulr(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => Reg::from_v128(simd_fma(
+            *shape,
+            *neg,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+            get(vals, *c)?.v128(),
+        )),
+        Inst::VAnyTrue { a } => {
+            Reg::from_i32((get(vals, *a)?.v128().iter().any(|&b| b != 0)) as i32)
+        }
+        Inst::VAllTrue { shape, a } => Reg::from_i32(simd_all_true(*shape, get(vals, *a)?.v128())),
+        Inst::VBitmask { shape, a } => Reg::from_i32(simd_bitmask(*shape, get(vals, *a)?.v128())),
+        Inst::VFloatBin { shape, op, a, b } => Reg::from_v128(simd_vfloat_bin(
+            *shape,
+            *op,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
         Inst::VFloatUn { shape, op, a } => {
-            Value::V128(simd_vfloat_un(*shape, *op, as_v128(get(vals, *a)?)?))
+            Reg::from_v128(simd_vfloat_un(*shape, *op, get(vals, *a)?.v128()))
         }
-        Inst::VBitBin { op, a, b } => Value::V128(simd_vbit_bin(
+        Inst::VBitBin { op, a, b } => Reg::from_v128(simd_vbit_bin(
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
         Inst::VNot { a } => {
-            let x = as_v128(get(vals, *a)?)?;
+            let x = get(vals, *a)?.v128();
             let mut o = [0u8; 16];
             for i in 0..16 {
                 o[i] = !x[i];
             }
-            Value::V128(o)
+            Reg::from_v128(o)
         }
-        Inst::Bitselect { a, b, mask } => Value::V128(simd_bitselect(
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
-            as_v128(get(vals, *mask)?)?,
+        Inst::Bitselect { a, b, mask } => Reg::from_v128(simd_bitselect(
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+            get(vals, *mask)?.v128(),
         )),
-        Inst::Shuffle { lanes, a, b } => Value::V128(simd_shuffle(
+        Inst::Shuffle { lanes, a, b } => Reg::from_v128(simd_shuffle(
             lanes,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::Swizzle { a, b } => Value::V128(simd_swizzle(
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
-        )),
+        Inst::Swizzle { a, b } => {
+            Reg::from_v128(simd_swizzle(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
         // The §17/D58 feature-detect hook: a deterministic constant in the fixed-128 MVP, so it
         // stays identical across the interp↔JIT oracle.
-        Inst::SimdWidthBytes => Value::I32(16),
+        Inst::SimdWidthBytes => Reg::from_i32(16),
 
-        // Handled before/around the match (or in `run_func` for the §12 fiber ops, which
-        // switch stacks); listed for exhaustiveness (no panic).
-        Inst::Store { .. }
-        | Inst::AtomicStore { .. }
-        | Inst::V128Store { .. }
-        | Inst::Call { .. }
+        // Handled in `run_func` for the §12 fiber ops (which switch stacks) and in the eval
+        // loop for calls/cap-calls; listed for exhaustiveness (no panic).
+        Inst::Call { .. }
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }
+        | Inst::SetJmp { .. }
+        | Inst::LongJmp { .. }
+        | Inst::GcRoots { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
         | Inst::MemoryWait { .. }
@@ -3690,7 +7265,7 @@ fn simd_splat(shape: VShape, bits: u64) -> [u8; 16] {
 
 /// `<shape>.extract_lane`: read lane `lane` as the shape's scalar [`Value`]. Narrow integer
 /// lanes sign- or zero-extend into the `i32` result per `signed`.
-fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Value {
+fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Reg {
     let bytes = shape.lane_bytes() as usize;
     // Lane index is verifier-bounded; clamp defensively so this stays total on raw input.
     let lane = (lane as usize).min(shape.lanes() as usize - 1);
@@ -3704,12 +7279,12 @@ fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Value {
             } else {
                 raw as i32
             };
-            Value::I32(ext)
+            Reg::from_i32(ext)
         }
-        VShape::I32x4 => Value::I32(raw as i32),
-        VShape::I64x2 => Value::I64(raw as i64),
-        VShape::F32x4 => Value::F32(f32::from_bits(raw as u32)),
-        VShape::F64x2 => Value::F64(f64::from_bits(raw)),
+        VShape::I32x4 => Reg::from_i32(raw as i32),
+        VShape::I64x2 => Reg::from_i64(raw as i64),
+        VShape::F32x4 => Reg::from_f32(f32::from_bits(raw as u32)),
+        VShape::F64x2 => Reg::from_f64(f64::from_bits(raw)),
     }
 }
 
@@ -3733,8 +7308,51 @@ fn simd_vint_bin(shape: VShape, op: VIntBinOp, a: [u8; 16], b: [u8; 16]) -> [u8;
             VIntBinOp::Add => x.wrapping_add(y),
             VIntBinOp::Sub => x.wrapping_sub(y),
             VIntBinOp::Mul => x.wrapping_mul(y),
+            // Unsigned compares use the zero-extended lane values directly; signed sign-extend first.
+            VIntBinOp::MinU => x.min(y),
+            VIntBinOp::MaxU => x.max(y),
+            VIntBinOp::MinS => lane_sext(x, bytes).min(lane_sext(y, bytes)) as u64,
+            VIntBinOp::MaxS => lane_sext(x, bytes).max(lane_sext(y, bytes)) as u64,
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Sign-extend the low `bytes` of a zero-extended lane value to a full `i64`.
+fn lane_sext(x: u64, bytes: usize) -> i64 {
+    let bits = bytes * 8;
+    if bits >= 64 {
+        x as i64
+    } else {
+        let shift = 64 - bits;
+        ((x << shift) as i64) >> shift
+    }
+}
+
+/// `<shape>.<cmp>`: per-lane integer comparison → an all-ones (true) / all-zeros (false) mask of the
+/// lane width. `lane_read` zero-extends, so unsigned compares are direct; signed compares
+/// sign-extend each lane first.
+fn simd_vint_cmp(shape: VShape, op: VICmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let xu = lane_read(&a, i, bytes);
+        let yu = lane_read(&b, i, bytes);
+        let (xs, ys) = (lane_sext(xu, bytes), lane_sext(yu, bytes));
+        let t = match op {
+            VICmpOp::Eq => xu == yu,
+            VICmpOp::Ne => xu != yu,
+            VICmpOp::LtS => xs < ys,
+            VICmpOp::LtU => xu < yu,
+            VICmpOp::GtS => xs > ys,
+            VICmpOp::GtU => xu > yu,
+            VICmpOp::LeS => xs <= ys,
+            VICmpOp::LeU => xu <= yu,
+            VICmpOp::GeS => xs >= ys,
+            VICmpOp::GeU => xu >= yu,
+        };
+        lane_write(&mut o, i, bytes, if t { u64::MAX } else { 0 });
     }
     o
 }
@@ -3755,7 +7373,356 @@ fn vf_un(op: VFloatUnOp) -> FUnOp {
         VFloatUnOp::Abs => FUnOp::Abs,
         VFloatUnOp::Neg => FUnOp::Neg,
         VFloatUnOp::Sqrt => FUnOp::Sqrt,
+        VFloatUnOp::Ceil => FUnOp::Ceil,
+        VFloatUnOp::Floor => FUnOp::Floor,
+        VFloatUnOp::Trunc => FUnOp::Trunc,
+        VFloatUnOp::Nearest => FUnOp::Nearest,
     }
+}
+
+/// `<f-shape>.<cmp>`: per-lane float comparison → an all-ones (true) / all-zeros (false) mask of the
+/// lane width. Rust's `==`/`!=`/`<`/… already match wasm's ordered (`ne` unordered) NaN behaviour.
+fn simd_vfloat_cmp(shape: VShape, op: VFCmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let t = match op {
+                    VFCmpOp::Eq => x == y,
+                    VFCmpOp::Ne => x != y,
+                    VFCmpOp::Lt => x < y,
+                    VFCmpOp::Gt => x > y,
+                    VFCmpOp::Le => x <= y,
+                    VFCmpOp::Ge => x >= y,
+                };
+                lane_write(&mut o, i, 4, if t { u64::MAX } else { 0 });
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let t = match op {
+                    VFCmpOp::Eq => x == y,
+                    VFCmpOp::Ne => x != y,
+                    VFCmpOp::Lt => x < y,
+                    VFCmpOp::Gt => x > y,
+                    VFCmpOp::Le => x <= y,
+                    VFCmpOp::Ge => x >= y,
+                };
+                lane_write(&mut o, i, 8, if t { u64::MAX } else { 0 });
+            }
+        }
+        // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
+}
+
+/// `<i-shape>.{shl,shr_s,shr_u}`: shift every lane by the same scalar amount, taken modulo the lane
+/// bit-width (the wasm rule). `shl`/`shr_u` are logical on the zero-extended lane; `shr_s` is
+/// arithmetic on the sign-extended lane.
+fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let sh = amt & (bytes as u32 * 8 - 1);
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let r = match op {
+            VShiftOp::Shl => x << sh,
+            VShiftOp::ShrU => x >> sh,
+            VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
+        };
+        lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Lane int↔float / float↔float conversions. Rust's `as` casts already match wasm: int→float is
+/// round-to-nearest, float→int is `trunc_sat` (NaN→0, clamp to the int range), and `f64 as f32` is
+/// the IEEE round demote. `demote`/`promote_low` touch the low 2 lanes; demote zeroes lanes 2/3.
+fn simd_convert(op: VCvtOp, a: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match op {
+        VCvtOp::F32x4ConvertI32x4S => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32 as i32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::F32x4ConvertI32x4U => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4S => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as i32) as u32 as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4U => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as u32) as u64);
+            }
+        }
+        VCvtOp::F32x4DemoteF64x2Zero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+        VCvtOp::F64x2PromoteLowF32x4 => {
+            for i in 0..2 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::F64x2ConvertLowI32x4S => {
+            for i in 0..2 {
+                let x = lane_read(&a, i, 4) as u32 as i32;
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::F64x2ConvertLowI32x4U => {
+            for i in 0..2 {
+                let x = lane_read(&a, i, 4) as u32;
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::I32x4TruncSatF64x2SZero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as i32) as u32 as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+        VCvtOp::I32x4TruncSatF64x2UZero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as u32) as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+    }
+    o
+}
+
+/// `<narrow>.narrow_{s,u}`: saturate every lane of two wide sources to the narrow width and
+/// concatenate (`a` then `b`). The source is read as **signed**; `S`/`U` pick the saturation range.
+fn simd_narrow(out: VShape, op: VNarrowOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let out_bytes = out.lane_bytes() as usize;
+    let src = out.wider().expect("verifier ensures a wider source");
+    let src_bytes = src.lane_bytes() as usize;
+    let src_lanes = src.lanes() as usize; // = out.lanes() / 2
+    let bits = out_bytes as u32 * 8;
+    let (min, max) = match op {
+        VNarrowOp::S => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+        VNarrowOp::U => (0i128, (1i128 << bits) - 1),
+    };
+    let mut o = [0u8; 16];
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&a, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, i, out_bytes, s.clamp(min, max) as u64);
+    }
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&b, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, src_lanes + i, out_bytes, s.clamp(min, max) as u64);
+    }
+    o
+}
+
+/// `<wide>.extend_{low,high}_{s,u}`: take the low or high half of the (half-width) source lanes and
+/// sign/zero-extend each to the wide lane width.
+fn simd_widen(out: VShape, op: VWidenOp, a: [u8; 16]) -> [u8; 16] {
+    let (low, signed) = op.parts();
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize; // result lanes = source lanes we consume
+    let base = if low { 0 } else { n }; // the low or high half of the source lanes
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let s = lane_read(&a, base + i, src_bytes);
+        let v = if signed {
+            lane_sext(s, src_bytes) as u64
+        } else {
+            s
+        };
+        lane_write(&mut o, i, out_bytes, v);
+    }
+    o
+}
+
+/// `<wide>.extmul_{low,high}_<src>_{s,u}`: widen the low/high half of both operands (sign/zero per
+/// the op) and multiply lane-wise into the wide result. Products are computed in `i128` so they
+/// can't overflow before the wrapping write at the wide lane width.
+fn simd_extmul(out: VShape, op: VWidenOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let (low, signed) = op.parts();
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize;
+    let base = if low { 0 } else { n };
+    let widen = |raw: u64| -> i128 {
+        if signed {
+            lane_sext(raw, src_bytes) as i128
+        } else {
+            raw as i128
+        }
+    };
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let x = widen(lane_read(&a, base + i, src_bytes));
+        let y = widen(lane_read(&b, base + i, src_bytes));
+        lane_write(&mut o, i, out_bytes, (x * y) as u64);
+    }
+    o
+}
+
+/// `<wide>.extadd_pairwise_<src>_{s,u}`: widen every source lane (sign/zero) and sum adjacent pairs
+/// into the wide result — `out[i] = w(a[2i]) + w(a[2i+1])`.
+fn simd_extadd_pairwise(out: VShape, signed: bool, a: [u8; 16]) -> [u8; 16] {
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize;
+    let widen = |raw: u64| -> i128 {
+        if signed {
+            lane_sext(raw, src_bytes) as i128
+        } else {
+            raw as i128
+        }
+    };
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let lo = widen(lane_read(&a, 2 * i, src_bytes));
+        let hi = widen(lane_read(&a, 2 * i + 1, src_bytes));
+        lane_write(&mut o, i, out_bytes, (lo + hi) as u64);
+    }
+    o
+}
+
+/// `i16x8.q15mulr_sat_s`: signed Q15 fixed-point multiply with rounding and saturation —
+/// `out[i] = sat_i16((a[i]·b[i] + 0x4000) >> 15)`.
+fn simd_q15mulr(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..8 {
+        let x = lane_sext(lane_read(&a, i, 2), 2);
+        let y = lane_sext(lane_read(&b, i, 2), 2);
+        let r = (x * y + 0x4000) >> 15;
+        let sat = r.clamp(i16::MIN as i64, i16::MAX as i64);
+        lane_write(&mut o, i, 2, sat as u16 as u64);
+    }
+    o
+}
+
+/// `<i-shape>.{add,sub}_sat_{s,u}`: per-lane add/sub that **clamps** to the lane's signed/unsigned
+/// range instead of wrapping. Computed in `i128` so the intermediate can't overflow. `i8x16`/`i16x8`.
+fn simd_vsat_bin(shape: VShape, op: VSatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let bits = bytes as u32 * 8;
+    let max_u = (1i128 << bits) - 1;
+    let max_s = (1i128 << (bits - 1)) - 1;
+    let min_s = -(1i128 << (bits - 1));
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let (xu, yu) = (
+            lane_read(&a, i, bytes) as i128,
+            lane_read(&b, i, bytes) as i128,
+        );
+        let (xs, ys) = (
+            lane_sext(lane_read(&a, i, bytes), bytes) as i128,
+            lane_sext(lane_read(&b, i, bytes), bytes) as i128,
+        );
+        let r = match op {
+            VSatBinOp::AddU => (xu + yu).min(max_u),
+            VSatBinOp::SubU => (xu - yu).max(0),
+            VSatBinOp::AddS => (xs + ys).clamp(min_s, max_s),
+            VSatBinOp::SubS => (xs - ys).clamp(min_s, max_s),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
+    }
+    o
+}
+
+/// `<i-shape>.avgr_u`: per-lane unsigned rounding average `(a + b + 1) >> 1`, computed wide so the
+/// `+1` can't overflow. `i8x16`/`i16x8`.
+fn simd_avgr(shape: VShape, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let y = lane_read(&b, i, bytes);
+        lane_write(&mut o, i, bytes, (x + y + 1) >> 1);
+    }
+    o
+}
+
+/// `i32x4.dot_i16x8_s`: signed dot product of adjacent `i16` pairs into `i32` lanes —
+/// `out[i] = a[2i]·b[2i] + a[2i+1]·b[2i+1]`. Products are computed in `i32`; the pair sum can
+/// overflow `i32` only for the `(-32768)·(-32768)` corner doubled, which wraps (matches wasm).
+fn simd_dot(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..4 {
+        let a0 = lane_sext(lane_read(&a, 2 * i, 2), 2) as i32;
+        let a1 = lane_sext(lane_read(&a, 2 * i + 1, 2), 2) as i32;
+        let b0 = lane_sext(lane_read(&b, 2 * i, 2), 2) as i32;
+        let b1 = lane_sext(lane_read(&b, 2 * i + 1, 2), 2) as i32;
+        let r = a0.wrapping_mul(b0).wrapping_add(a1.wrapping_mul(b1));
+        lane_write(&mut o, i, 4, r as u32 as u64);
+    }
+    o
+}
+
+/// `i16x8.dot_i8x16_s`: signed `i8` dot of adjacent pairs into `i16` lanes (wrapping) — the
+/// deterministic `relaxed_dot_i8x16_i7x16_s`. Products of `i8`s fit in `i16`; the pair sum wraps.
+fn simd_dot_i8(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for j in 0..8 {
+        let a0 = lane_sext(lane_read(&a, 2 * j, 1), 1) as i32;
+        let a1 = lane_sext(lane_read(&a, 2 * j + 1, 1), 1) as i32;
+        let b0 = lane_sext(lane_read(&b, 2 * j, 1), 1) as i32;
+        let b1 = lane_sext(lane_read(&b, 2 * j + 1, 1), 1) as i32;
+        let r = a0 * b0 + a1 * b1; // exact in i32; wraps when written at i16 width
+        lane_write(&mut o, j, 2, r as u16 as u64);
+    }
+    o
+}
+
+/// `<shape>.all_true`: `1` iff every lane is non-zero.
+fn simd_all_true(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    (0..shape.lanes() as usize).all(|i| lane_read(&a, i, bytes) != 0) as i32
+}
+
+/// `<shape>.bitmask`: lane `i`'s high (sign) bit → bit `i` of the result.
+fn simd_bitmask(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    let top = bytes as u32 * 8 - 1;
+    let mut m = 0i32;
+    for i in 0..shape.lanes() as usize {
+        m |= (((lane_read(&a, i, bytes) >> top) & 1) as i32) << i;
+    }
+    m
+}
+
+/// `<i-shape>.{abs,neg}`: per-lane two's-complement `|x|` / `0 - x` (both wrapping at the lane
+/// width — `abs(INT_MIN) == INT_MIN`, matching wasm/hardware).
+fn simd_vint_un(shape: VShape, op: VIntUnOp, a: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_sext(lane_read(&a, i, bytes), bytes);
+        let r = match op {
+            VIntUnOp::Abs => x.wrapping_abs(),
+            VIntUnOp::Neg => x.wrapping_neg(),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
+    }
+    o
 }
 
 fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
@@ -3773,6 +7740,95 @@ fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> 
                 let x = f64::from_bits(lane_read(&a, i, 8));
                 let y = f64::from_bits(lane_read(&b, i, 8));
                 lane_write(&mut o, i, 8, fbin64(vf_bin(op), x, y).to_bits());
+            }
+        }
+        // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
+}
+
+/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding.
+/// `f*::mul_add` is the correctly-rounded IEEE-754 FMA — bit-identical to Cranelift's `fma`, so the
+/// interp↔JIT differential holds. `neg` negates the product (the `nmadd` form, `−a·b + c`).
+fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let z = f32::from_bits(lane_read(&c, i, 4) as u32);
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let z = f64::from_bits(lane_read(&c, i, 8));
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+            }
+        }
+        _ => {}
+    }
+    o
+}
+
+fn simd_pminmax(shape: VShape, op: VPMinMaxOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    // wasm pmin/pmax: pseudo-min/max defined as a one-sided compare-and-select.
+    //   pmin(a, b) = b < a ? b : a
+    //   pmax(a, b) = a < b ? b : a
+    // This propagates NaN from the second operand and returns -0/+0 per the
+    // chosen operand (no IEEE min/max canonicalization).
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let r = match op {
+                    VPMinMaxOp::Pmin => {
+                        if y < x {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                    VPMinMaxOp::Pmax => {
+                        if x < y {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                };
+                lane_write(&mut o, i, 4, r.to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let r = match op {
+                    VPMinMaxOp::Pmin => {
+                        if y < x {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                    VPMinMaxOp::Pmax => {
+                        if x < y {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                };
+                lane_write(&mut o, i, 8, r.to_bits());
             }
         }
         // Verifier rejects an integer shape here; total fall-through returns zero.
@@ -3994,17 +8050,17 @@ fn fmax64(a: f64, b: f64) -> f64 {
 }
 
 // Float→int casts are saturating with NaN→0 (Rust `as` matches wasm `trunc_sat`).
-fn fto_i(op: FToI, v: Value) -> Result<Value, Trap> {
-    Ok(match op {
-        FToI::F32I32S => Value::I32(as_f32(v)? as i32),
-        FToI::F32I32U => Value::I32(as_f32(v)? as u32 as i32),
-        FToI::F32I64S => Value::I64(as_f32(v)? as i64),
-        FToI::F32I64U => Value::I64(as_f32(v)? as u64 as i64),
-        FToI::F64I32S => Value::I32(as_f64(v)? as i32),
-        FToI::F64I32U => Value::I32(as_f64(v)? as u32 as i32),
-        FToI::F64I64S => Value::I64(as_f64(v)? as i64),
-        FToI::F64I64U => Value::I64(as_f64(v)? as u64 as i64),
-    })
+fn fto_i(op: FToI, a: Reg) -> Reg {
+    match op {
+        FToI::F32I32S => Reg::from_i32(a.f32() as i32),
+        FToI::F32I32U => Reg::from_i32(a.f32() as u32 as i32),
+        FToI::F32I64S => Reg::from_i64(a.f32() as i64),
+        FToI::F32I64U => Reg::from_i64(a.f32() as u64 as i64),
+        FToI::F64I32S => Reg::from_i32(a.f64() as i32),
+        FToI::F64I32U => Reg::from_i32(a.f64() as u32 as i32),
+        FToI::F64I64S => Reg::from_i64(a.f64() as i64),
+        FToI::F64I64U => Reg::from_i64(a.f64() as u64 as i64),
+    }
 }
 
 /// Trapping float→int conversion (`trunc`, vs the saturating `trunc_sat`): NaN and
@@ -4012,11 +8068,11 @@ fn fto_i(op: FToI, v: Value) -> Result<Value, Trap> {
 /// unless the truncation toward zero fits the target — `f > MIN-1 && f < MAX+1`
 /// (using the exact float boundary constants; the `i64` signed lower bound is
 /// closed because `-2^63 - 1` is not representable and rounds to `-2^63`).
-fn trunc_trap(op: FToI, v: Value) -> Result<Value, Trap> {
+fn trunc_trap(op: FToI, a: Reg) -> Result<Reg, Trap> {
     let (from, to, signed) = op.parts();
     let f: f64 = match from {
-        FloatTy::F32 => as_f32(v)? as f64,
-        FloatTy::F64 => as_f64(v)?,
+        FloatTy::F32 => a.f32() as f64,
+        FloatTy::F64 => a.f64(),
     };
     if f.is_nan() {
         return Err(Trap::BadConversion);
@@ -4036,35 +8092,35 @@ fn trunc_trap(op: FToI, v: Value) -> Result<Value, Trap> {
     }
     // In range, so the cast is exact (truncating toward zero, no saturation).
     Ok(match (to, signed) {
-        (IntTy::I32, true) => Value::I32(f as i32),
-        (IntTy::I32, false) => Value::I32(f as u32 as i32),
-        (IntTy::I64, true) => Value::I64(f as i64),
-        (IntTy::I64, false) => Value::I64(f as u64 as i64),
+        (IntTy::I32, true) => Reg::from_i32(f as i32),
+        (IntTy::I32, false) => Reg::from_i32(f as u32 as i32),
+        (IntTy::I64, true) => Reg::from_i64(f as i64),
+        (IntTy::I64, false) => Reg::from_i64(f as u64 as i64),
     })
 }
 
-fn i_to_f(op: IToF, v: Value) -> Result<Value, Trap> {
-    Ok(match op {
-        IToF::I32F32S => Value::F32(as_i32(v)? as f32),
-        IToF::I32F32U => Value::F32(as_i32(v)? as u32 as f32),
-        IToF::I64F32S => Value::F32(as_i64(v)? as f32),
-        IToF::I64F32U => Value::F32(as_i64(v)? as u64 as f32),
-        IToF::I32F64S => Value::F64(as_i32(v)? as f64),
-        IToF::I32F64U => Value::F64(as_i32(v)? as u32 as f64),
-        IToF::I64F64S => Value::F64(as_i64(v)? as f64),
-        IToF::I64F64U => Value::F64(as_i64(v)? as u64 as f64),
-    })
+fn i_to_f(op: IToF, a: Reg) -> Reg {
+    match op {
+        IToF::I32F32S => Reg::from_f32(a.i32() as f32),
+        IToF::I32F32U => Reg::from_f32(a.i32() as u32 as f32),
+        IToF::I64F32S => Reg::from_f32(a.i64() as f32),
+        IToF::I64F32U => Reg::from_f32(a.i64() as u64 as f32),
+        IToF::I32F64S => Reg::from_f64(a.i32() as f64),
+        IToF::I32F64U => Reg::from_f64(a.i32() as u32 as f64),
+        IToF::I64F64S => Reg::from_f64(a.i64() as f64),
+        IToF::I64F64U => Reg::from_f64(a.i64() as u64 as f64),
+    }
 }
 
-fn cast(op: CastOp, v: Value) -> Result<Value, Trap> {
-    Ok(match op {
-        CastOp::Demote => Value::F32(as_f64(v)? as f32),
-        CastOp::Promote => Value::F64(as_f32(v)? as f64),
-        CastOp::ReinterpI32F32 => Value::F32(f32::from_bits(as_i32(v)? as u32)),
-        CastOp::ReinterpF32I32 => Value::I32(as_f32(v)?.to_bits() as i32),
-        CastOp::ReinterpI64F64 => Value::F64(f64::from_bits(as_i64(v)? as u64)),
-        CastOp::ReinterpF64I64 => Value::I64(as_f64(v)?.to_bits() as i64),
-    })
+fn cast(op: CastOp, a: Reg) -> Reg {
+    match op {
+        CastOp::Demote => Reg::from_f32(a.f64() as f32),
+        CastOp::Promote => Reg::from_f64(a.f32() as f64),
+        CastOp::ReinterpI32F32 => Reg::from_f32(f32::from_bits(a.i32() as u32)),
+        CastOp::ReinterpF32I32 => Reg::from_i32(a.f32().to_bits() as i32),
+        CastOp::ReinterpI64F64 => Reg::from_f64(f64::from_bits(a.i64() as u64)),
+        CastOp::ReinterpF64I64 => Reg::from_i64(a.f64().to_bits() as i64),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -4461,6 +8517,59 @@ enum Binding {
     HostFn(u32),
 }
 
+/// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
+/// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
+/// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
+/// into a fresh `Host` reconstructs the exact authority. The non-value bindings
+/// (`SharedRegion`, `Module`, `IoRing`, `Blocking`, `JitDomain`, `JitCode`, `HostFn`) are
+/// **not** durable: a live one makes the domain non-snapshottable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DurableBinding {
+    Stream(StreamRole),
+    Exit,
+    Clock,
+    Memory,
+    Yielder,
+    AddressSpace { base: u64, size: u64 },
+    Instantiator { base: u64, size: u64 },
+}
+
+/// One live, re-grantable handle-table entry captured for snapshot/restore (DURABILITY.md
+/// §12.5 Section 3). The `(slot, generation)` pin is what keeps a **guest-held handle value**
+/// valid across restore: the guest names `(generation << CAP_LOG2) | slot`, so restore must
+/// reinstate the same pair. `type_id` is the interface the slot was granted under (the
+/// resolve check is `type_id` + `generation`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DurableHandle {
+    pub slot: u32,
+    pub generation: u32,
+    pub type_id: u32,
+    pub binding: DurableBinding,
+}
+
+/// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
+/// out-of-line host state or native pointers, so it isn't re-grantable (DURABILITY.md §12.5).
+/// Freeze refuses with this rather than silently dropping authority, so restore is
+/// all-or-nothing. Such handles must be closed/drained (§5) before a freeze can proceed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NonDurableHandle {
+    pub slot: u32,
+    pub type_id: u32,
+    pub kind: NonDurableKind,
+}
+
+/// Which non-re-grantable binding kind a live slot held (the [`NonDurableHandle`] reason).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NonDurableKind {
+    SharedRegion,
+    Module,
+    IoRing,
+    Blocking,
+    JitDomain,
+    JitCode,
+    HostFn,
+}
+
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
 /// per-slot and only advances on (re)grant, so a closed handle's value can never
 /// alias a later grant of the same slot (ABA-safe use-after-close detection, D37).
@@ -4778,6 +8887,38 @@ pub struct Host {
     /// JIT's `table_reserve_log2` for the backends to agree on slot indices. `0` ⇒ natural size
     /// (no install room).
     jit_table_log2: u8,
+    /// W1 record/replay (DEBUGGING.md): when `Some`, every nondeterministic-input `cap.call`
+    /// ([`is_recorded_input`]) is appended here as it crosses, so a later re-execution can replay it.
+    cap_record: Option<Vec<CapRecord>>,
+    /// W1 replay: when `Some`, serve nondeterministic-input `cap.call`s from this tape (cursor) in
+    /// order instead of the live host, so a fresh-powerbox re-execution reproduces the guest's inputs.
+    cap_replay: Option<(Arc<[CapRecord]>, usize)>,
+    /// This domain runs a **durable** (freeze/thaw-instrumented) module: `drive` propagates it to
+    /// every vCPU so the runtime maintains the per-context shadow-SP swap (D-fiber-cont option A,
+    /// DURABILITY.md §12.8). `false` (the default) ⇒ an ordinary run that never touches the
+    /// durable reserve. Set with [`Host::set_durable`] before [`run_with_host`] / friends.
+    durable: bool,
+    /// The freeze/thaw fiber residue (slice 3.1.5): **out** of a freeze run (the driver flattens
+    /// each parked fiber and records it here for the snapshot) and **in** to a thaw run (`drive`
+    /// re-seeds the registry from it before re-entering under `REWINDING`). Empty for an ordinary run.
+    frozen_fibers: Vec<FrozenFiber>,
+    /// The freeze/thaw **spawned-vCPU** residue (slice 3.2.1): **out** of a multi-vCPU freeze (each
+    /// `thread.spawn` child that unwinds records itself here for the snapshot) and **in** to a thaw
+    /// (the root's re-executed `thread.spawn` re-attaches these, in spawn order, under `REWINDING`).
+    /// Empty for a single-vCPU or ordinary run.
+    frozen_vcpus: Vec<FrozenVCpu>,
+    /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
+    /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
+    /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
+    /// recorded here instead. `None` ⇒ a single-vCPU thaw, which reads the extent from the window's
+    /// active-SP word as before. Set by the freeze driver; consumed by `drive` on thaw.
+    frozen_root_sp: Option<u64>,
+    /// §7 the **capability-name directory** (Followup F7): name → handle for the powerbox grants, so a
+    /// guest can resolve a capability by name at runtime (`cap.self` op 2) — dlopen-style discovery, the
+    /// dynamic counterpart to load-time name binding. Populated by the powerbox layer at grant time
+    /// (`svm_run`); empty for a bare `Host` (resolution then finds nothing — fail-closed). First match
+    /// wins on a duplicate name. A side table only — it never affects handle values or grant order.
+    cap_names: Vec<(String, i32)>,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -4788,7 +8929,13 @@ pub struct Host {
 /// ([`Func::uses_concurrency`]) — and the *same* function must be installed for the
 /// interpreter and JIT runs of a differential pair, so both backends accept/reject
 /// identically (`svm-run` provides the canonical one).
-pub type JitValidator = fn(&[u8], Option<u8>) -> Result<Arc<[Func]>, i64>;
+///
+/// The third argument is the **symbol-table bytes** for host-assisted dynamic linking
+/// (DESIGN.md §22): a guest-provided `name → slot | capability` table the validator resolves the
+/// unit's §7 imports against *before* verify (rewrite-then-verify). It is empty (`&[]`) for the
+/// ordinary closed-blob `compile` op — an empty table resolves nothing, so a unit with imports
+/// fails closed — and carries the guest's table only for the `compile_linked` op.
+pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<Arc<[Func]>, i64>;
 
 /// A successful [`Host::jit_compile`]: the minted `CompiledCode` handle and the `(domain,
 /// unit)` indices the JIT embedder needs to compile the unit natively and register its
@@ -4836,12 +8983,14 @@ struct JitDomainState {
 const JIT_DEFAULT_MAX_UNITS: u32 = 4096;
 const JIT_DEFAULT_MAX_BLOB_BYTES: u64 = 1 << 26; // 64 MiB of cumulative submitted IR
 
-/// One §14 module grant: the verified module's functions, declared window size, and data segments —
-/// what spawning a child domain of it needs.
+/// One §14 module grant: the verified module's functions, declared window size, data segments — what
+/// spawning a child domain of it needs — and its first-class export table, so a parent can resolve a
+/// child entry **by name** (`Module` op 0, F2) instead of hardcoding its funcidx.
 struct ModuleGrant {
     funcs: Arc<[Func]>,
     memory_log2: Option<u8>,
     data: Arc<[Data]>,
+    exports: Arc<[svm_ir::Export]>,
 }
 
 impl Default for Host {
@@ -4872,7 +9021,137 @@ impl Host {
             jit_domains: Vec::new(),
             jit_validator: None,
             jit_table_log2: 0,
+            cap_record: None,
+            cap_replay: None,
+            durable: false,
+            frozen_fibers: Vec::new(),
+            frozen_vcpus: Vec::new(),
+            frozen_root_sp: None,
+            cap_names: Vec::new(),
         }
+    }
+
+    /// Mark this domain **durable**: its module has been freeze/thaw-instrumented, so the runtime
+    /// keeps the per-context shadow-SP word pointing at the running fiber's region (D-fiber-cont
+    /// option A, DURABILITY.md §12.8). Set before handing the host to [`run_with_host`] /
+    /// [`run_capture_reserved_with_host`]. A non-durable run leaves the reserve untouched.
+    pub fn set_durable(&mut self, durable: bool) {
+        self.durable = durable;
+    }
+
+    /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
+    pub fn is_durable(&self) -> bool {
+        self.durable
+    }
+
+    /// The fibers the freeze driver flattened on the last freeze run (slice 3.1.5) — the host-side
+    /// residue a snapshot records (their continuations are in the captured window). Empty otherwise.
+    pub fn frozen_fibers(&self) -> &[FrozenFiber] {
+        &self.frozen_fibers
+    }
+
+    /// Seed the frozen fibers a **thaw** must reconstruct (from a snapshot's Section 2). `drive`
+    /// re-creates each in the registry before re-entering the root under `REWINDING`. Set alongside
+    /// the restored (REWINDING) window and [`Host::set_durable`].
+    pub fn set_frozen_fibers(&mut self, frozen: Vec<FrozenFiber>) {
+        self.frozen_fibers = frozen;
+    }
+
+    /// The spawned vCPUs a multi-vCPU freeze flattened on the last freeze run (slice 3.2.1) — the
+    /// host-side residue a snapshot records (their continuations are in the captured window, each in
+    /// its own per-context region). Empty for a single-vCPU or ordinary run.
+    pub fn frozen_vcpus(&self) -> &[FrozenVCpu] {
+        &self.frozen_vcpus
+    }
+
+    /// Seed the spawned vCPUs a **thaw** must reconstruct (from a snapshot's control section). The
+    /// root's re-executed `thread.spawn` re-attaches these (in spawn order) under `REWINDING`. Set
+    /// alongside the restored (REWINDING) window and [`Host::set_durable`].
+    pub fn set_frozen_vcpus(&mut self, frozen: Vec<FrozenVCpu>) {
+        self.frozen_vcpus = frozen;
+    }
+
+    /// The root vCPU's flattened shadow-SP extent from the last multi-vCPU freeze (slice 3.2.1), or
+    /// `None` for a single-vCPU freeze (its extent is the window's active-SP word). A snapshot records
+    /// it alongside [`Host::frozen_vcpus`].
+    pub fn frozen_root_sp(&self) -> Option<u64> {
+        self.frozen_root_sp
+    }
+
+    /// Seed the root vCPU's flattened shadow-SP extent a **thaw** must restore (slice 3.2.1). Set only
+    /// for a multi-vCPU thaw, alongside [`Host::set_frozen_vcpus`].
+    pub fn set_frozen_root_sp(&mut self, sp: u64) {
+        self.frozen_root_sp = Some(sp);
+    }
+
+    /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a
+    /// re-execution can replay them (DEBUGGING.md W1). Idempotent; keeps any records already logged.
+    pub fn record_caps(&mut self) {
+        if self.cap_record.is_none() {
+            self.cap_record = Some(Vec::new());
+        }
+    }
+
+    /// The capability inputs recorded so far (empty if [`record_caps`](Host::record_caps) was never
+    /// called).
+    pub fn cap_tape(&self) -> CapTape {
+        CapTape {
+            records: self.cap_record.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Serve nondeterministic-input `cap.call`s from `tape` (from the start) instead of the live host
+    /// — used by re-execution / time-travel so it sees identical inputs without a live powerbox.
+    fn replay_caps(&mut self, tape: Arc<[CapRecord]>) {
+        self.cap_replay = Some((tape, 0));
+    }
+
+    /// Whether the only run-mutable state this host has accumulated is the **restorable** replay
+    /// substate (I/O streams, clock, cap cursor) — i.e. no stateful host capability has left residue a
+    /// checkpoint restore would silently drop. A fresh seek-host starts with all of these empty; the
+    /// guest minting a §13 region / §14 module / §12 blocking / async ring / §22 JIT domain, or the
+    /// embedder granting a host-fn, populates one. While they stay empty a checkpoint restored to an
+    /// earlier logical time reproduces the host faithfully (W1); otherwise the `Inspector` stops
+    /// checkpointing and falls back to replay-from-clock-0.
+    fn checkpoint_safe(&self) -> bool {
+        self.regions.is_empty()
+            && self.modules.is_empty()
+            && self.blockings.is_empty()
+            && self.rings.is_empty()
+            && self.host_fns.is_empty()
+            && self.jit_domains.is_empty()
+    }
+
+    /// Snapshot the run-mutable substate a time-travel **checkpoint** (W1) must restore so resuming a
+    /// replay from logical time `c` sees the host exactly as it was then: the I/O streams the run has
+    /// produced/consumed, the deterministic clock, and the cap-replay cursor (which record the next
+    /// `Clock`/stdin input is served from). Everything else on a fresh seek-host is immutable for the
+    /// run (the replay tape, the empty cap table) or absent (no granted powerbox), so this small set is
+    /// the whole mutable frontier. Cheap clones (`stdout`/`stderr` are typically tiny in a debug run).
+    fn replay_substate(&self) -> HostReplaySubstate {
+        HostReplaySubstate {
+            stdin_pos: self.stdin_pos,
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+            clock_ns: self.clock_ns,
+            cap_cursor: self.cap_replay.as_ref().map(|(_, c)| *c).unwrap_or(0),
+            cap_record: self.cap_record.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Restore a [`replay_substate`](Host::replay_substate) snapshot onto a fresh seek-host (one already
+    /// seeded with the replay tape via [`replay_caps`](Host::replay_caps) + recording). Re-points the
+    /// cap-replay cursor and reinstates the I/O streams + clock, so a replay resumed from the
+    /// checkpoint's logical time draws the same subsequent inputs and accumulates onto the same output.
+    fn restore_replay_substate(&mut self, s: &HostReplaySubstate) {
+        self.stdin_pos = s.stdin_pos;
+        self.stdout = s.stdout.clone();
+        self.stderr = s.stderr.clone();
+        self.clock_ns = s.clock_ns;
+        if let Some(slot) = self.cap_replay.as_mut() {
+            slot.1 = s.cap_cursor;
+        }
+        self.cap_record = Some(s.cap_record.clone());
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
@@ -4887,6 +9166,33 @@ impl Host {
         self.quota
     }
 
+    /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
+    /// `cap.self`-resolve `name` to this handle at runtime. The powerbox layer (`svm_run`) calls this
+    /// for each granted handle; an embedder may add its own names. First registration of a name wins.
+    pub fn register_cap_name(&mut self, name: &str, handle: i32) {
+        self.cap_names.push((name.to_string(), handle));
+    }
+
+    /// Resolve a capability `name` to the handle it was registered under ([`Host::register_cap_name`]),
+    /// or `None` if no grant carries that name. The backing for the guest's `cap.self` op-2 resolve.
+    fn resolve_cap_name(&self, name: &str) -> Option<i32> {
+        self.cap_names
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| *h)
+    }
+
+    /// The human-readable **label** registered for `handle` (the reverse of [`Host::resolve_cap_name`]),
+    /// or `None` if the handle carries no label — the cosmetic name an embedder can use in diagnostics,
+    /// and the backing for the guest's `cap.self.label` reflection (Followup F9). Authority-neutral: a
+    /// label is not a nominal type_id and the verifier ignores it. First registration of a handle wins.
+    pub fn cap_label(&self, handle: i32) -> Option<&str> {
+        self.cap_names
+            .iter()
+            .find(|(_, h)| *h == handle)
+            .map(|(n, _)| n.as_str())
+    }
+
     /// §4/§7 the JIT cap-path window page map (see [`Host::cap_pages`]) for window `base`, persistent
     /// across this run's `cap.call`s so a guest-grown heap page stays borrowable. Returns a fresh empty
     /// map when the base changes (a new window / run reusing this `Host`), else the existing one.
@@ -4899,6 +9205,68 @@ impl Host {
                 m
             }
         }
+    }
+
+    /// Capture the window's per-page protections for a durable freeze of a **JIT** run
+    /// (DURABILITY.md §12.3). The JIT keeps protections in the OS page tables, so — unlike the
+    /// interpreter, where [`run_capture_reserved_with_host_prots`] reads its software map — a
+    /// freeze reconstructs them here from the two host-side sources, mirroring the interpreter's
+    /// `snapshot_prots` so the backends agree page-for-page:
+    ///
+    /// * the module's `readonly` data segments → `Ro` (applied to the window at instantiation but
+    ///   not recorded in `cap_pages`), and
+    /// * the runtime page-state map the Memory cap maintained (`cap_pages`: `map`/`unmap`/`protect`)
+    ///   — which **overrides** the segment/default for any page the guest changed.
+    ///
+    /// One [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page over `npages`; `mapped` is the
+    /// backed-prefix byte length (pages beyond it default `Unmapped`). A `Backed` (§13) page can't
+    /// arise here — a domain holding a shared region isn't freezable (its handle is non-durable).
+    pub fn capture_window_prots(
+        &self,
+        data: &[Data],
+        mapped: u64,
+        npages: usize,
+    ) -> Vec<CapturedProt> {
+        // Default: Rw in the backed prefix, Unmapped in the reserved tail.
+        let mut out: Vec<CapturedProt> = (0..npages as u64)
+            .map(|p| {
+                if p * DURABLE_SNAPSHOT_PAGE < mapped {
+                    CapturedProt::Rw
+                } else {
+                    CapturedProt::Unmapped
+                }
+            })
+            .collect();
+        // `readonly` data segments → Ro. Protection is **host-page** granular (the runtime's
+        // `protect_ro` and the interpreter's `init_data` protect the whole host page), so a
+        // segment marks every codec page of the host page(s) it touches — this is what makes the
+        // result match `snapshot_prots` on a host whose page is larger than a codec page.
+        let host = host_page_size();
+        for d in data {
+            if !d.readonly || d.bytes.is_empty() {
+                continue;
+            }
+            let lo = (d.offset / host) * host / DURABLE_SNAPSHOT_PAGE;
+            let hi =
+                (d.offset + d.bytes.len() as u64).div_ceil(host) * host / DURABLE_SNAPSHOT_PAGE;
+            for p in lo..hi.min(npages as u64) {
+                out[p as usize] = CapturedProt::Ro;
+            }
+        }
+        // Runtime map/unmap/protect (host-page-indexed) override the defaults.
+        if let Some((_, map)) = &self.cap_pages {
+            let m = map.lock().unwrap();
+            for (p, slot) in out.iter_mut().enumerate() {
+                let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
+                match m.get(&hp) {
+                    Some(1) => *slot = CapturedProt::Rw,
+                    Some(2) => *slot = CapturedProt::Ro,
+                    Some(3) => *slot = CapturedProt::Unmapped,
+                    _ => {}
+                }
+            }
+        }
+        out
     }
 
     /// Install the §9/§12 async-completion `notify` hook (the executor that owns the wake mechanism
@@ -4983,6 +9351,94 @@ impl Host {
     fn grant(&mut self, type_id: u32, binding: Binding) -> i32 {
         self.try_grant(type_id, binding)
             .expect("handle table full during host powerbox setup (bounded by construction)")
+    }
+
+    /// Classify the **live** handle table for a snapshot (DURABILITY.md §12.5 Section 3). On
+    /// success, the re-grantable handles in ascending slot order. Refuses — `Err` naming the
+    /// **first** offending slot — if any live slot holds a non-durable binding, so freeze is
+    /// all-or-nothing rather than dropping authority on restore.
+    pub fn capture_durable_handles(&self) -> Result<Vec<DurableHandle>, NonDurableHandle> {
+        let mut out = Vec::new();
+        for (slot, s) in self.table.iter().enumerate() {
+            let Some(binding) = s.entry else { continue };
+            let binding = match binding {
+                Binding::Stream(role) => DurableBinding::Stream(role),
+                Binding::Exit => DurableBinding::Exit,
+                Binding::Clock => DurableBinding::Clock,
+                Binding::Memory => DurableBinding::Memory,
+                Binding::Yielder => DurableBinding::Yielder,
+                Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
+                Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
+                Binding::SharedRegion(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
+                }
+                Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                Binding::IoRing(_) => return Err(self.non_durable(slot, NonDurableKind::IoRing)),
+                Binding::Blocking(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::Blocking))
+                }
+                Binding::JitDomain(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::JitDomain))
+                }
+                Binding::JitCode { .. } => {
+                    return Err(self.non_durable(slot, NonDurableKind::JitCode))
+                }
+                Binding::HostFn(_) => return Err(self.non_durable(slot, NonDurableKind::HostFn)),
+            };
+            out.push(DurableHandle {
+                slot: slot as u32,
+                generation: s.generation,
+                type_id: s.type_id,
+                binding,
+            });
+        }
+        Ok(out)
+    }
+
+    fn non_durable(&self, slot: usize, kind: NonDurableKind) -> NonDurableHandle {
+        NonDurableHandle {
+            slot: slot as u32,
+            type_id: self.table[slot].type_id,
+            kind,
+        }
+    }
+
+    /// Reinstate a captured durable set into this table (DURABILITY.md §12.5), pinning each
+    /// `(slot, generation)` so guest-held handle values stay valid across restore. Intended
+    /// for the restore path on a **fresh** table; entries already at those slots are
+    /// overwritten. Slots must be in range (the snapshot codec validates that against
+    /// [`Host::handle_capacity`] before calling).
+    pub fn restore_durable_handles(&mut self, handles: &[DurableHandle]) {
+        for h in handles {
+            let binding = match h.binding {
+                DurableBinding::Stream(role) => Binding::Stream(role),
+                DurableBinding::Exit => Binding::Exit,
+                DurableBinding::Clock => Binding::Clock,
+                DurableBinding::Memory => Binding::Memory,
+                DurableBinding::Yielder => Binding::Yielder,
+                DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
+                DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
+            };
+            self.grant_at(h.slot, h.generation, h.type_id, binding);
+        }
+    }
+
+    /// The handle-table capacity (`CAP`): valid slot indices are `0..handle_capacity()`. The
+    /// snapshot codec validates a captured slot against this before [`Host::restore_durable_handles`].
+    pub fn handle_capacity() -> u32 {
+        CAP as u32
+    }
+
+    /// Pin `binding` at an exact `(slot, generation)` — the restore primitive behind
+    /// [`Host::restore_durable_handles`] (DURABILITY.md §12.5). Unlike [`Host::grant`], it
+    /// neither picks a free slot nor advances the generation: the snapshot already fixed both,
+    /// and the guest holds handle values that encode them. Panics on an out-of-range slot (a
+    /// codec bug, not reachable from guest code — like `grant`'s table-full panic).
+    fn grant_at(&mut self, slot: u32, generation: u32, type_id: u32, binding: Binding) {
+        let s = &mut self.table[slot as usize];
+        s.generation = generation;
+        s.entry = Some(binding);
+        s.type_id = type_id;
     }
 
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
@@ -5091,6 +9547,7 @@ impl Host {
             funcs: m.funcs.clone().into(),
             memory_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone().into(),
+            exports: m.exports.clone().into(),
         });
         self.grant(iface::MODULE, Binding::Module(id))
     }
@@ -5219,6 +9676,21 @@ impl Host {
         handle: i32,
         bytes: &[u8],
     ) -> Result<Result<JitCompiled, i64>, Trap> {
+        // The closed-blob path: no symbol table, so a unit with §7 imports fails closed.
+        self.jit_compile_linked(handle, bytes, &[])
+    }
+
+    /// Like [`Self::jit_compile`], but the unit's §7 imports are resolved against the
+    /// guest-provided **symbol-table bytes** before verify — host-assisted dynamic linking
+    /// (DESIGN.md §22). The `compile_linked` op routes here; `compile` routes here with an empty
+    /// table. The validator does the resolve-then-verify, so the symbol table stays
+    /// guest-controlled yet a mis-link can never escape (it fails re-verification, `-EINVAL`).
+    pub fn jit_compile_linked(
+        &mut self,
+        handle: i32,
+        bytes: &[u8],
+        symtab: &[u8],
+    ) -> Result<Result<JitCompiled, i64>, Trap> {
         let domain = self.resolve_jit_domain(handle)?;
         let Some(validate) = self.jit_validator else {
             return Ok(Err(EINVAL));
@@ -5230,7 +9702,7 @@ impl Host {
             return Ok(Err(ENOMEM));
         }
         d.bytes_left -= bytes.len() as u64;
-        let funcs = match validate(bytes, d.mem_log2) {
+        let funcs = match validate(bytes, d.mem_log2, symtab) {
             Ok(f) if !f.is_empty() => f,
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
@@ -5417,6 +9889,34 @@ impl Host {
         }
     }
 
+    /// **D45 allocation-free fast path for `Clock.now()`** (ISSUES.md I12). The generic
+    /// [`Self::cap_dispatch_slots`] path is dominated, for a cheap cap, by the per-call `Vec` result
+    /// allocation and the W1 record/replay gate — not by the work (a field read). This does the
+    /// authority check ([`Self::resolve`], identical to the generic path: a forged/closed/wrong-type
+    /// handle is an inert `CapFault`) and the read+advance **inline**, returning the `i64` directly.
+    ///
+    /// Returns `None` when a W1 record or replay tape is active — the caller must then use the full
+    /// [`Self::cap_dispatch_slots`] so the crossing is taped/served faithfully (the clock is a recorded
+    /// nondeterministic input, [`is_recorded_input`]). Semantics are otherwise byte-identical to the
+    /// `Binding::Clock` arm, so interp == JIT still holds.
+    #[inline]
+    pub fn fast_clock_now(&mut self, handle: i32) -> Option<Result<i64, Trap>> {
+        if self.cap_record.is_some() || self.cap_replay.is_some() {
+            return None; // a tape is active — fall back so the input is recorded/replayed
+        }
+        Some(match self.resolve(handle, iface::CLOCK) {
+            Ok(Binding::Clock) => {
+                let now = self.clock_ns;
+                self.clock_ns = self.clock_ns.wrapping_add(1);
+                Ok(now)
+            }
+            // `resolve` already enforced `type_id == CLOCK`, so a success is always `Binding::Clock`;
+            // any other binding at a CLOCK-typed slot would be a host bug — fail closed like a fault.
+            Ok(_) => Err(Trap::CapFault),
+            Err(t) => Err(t),
+        })
+    }
+
     /// Dispatch a `cap.call` (§3c): resolve the handle, then run the mock operation.
     /// Returns the op's result values (negative-errno encoded in an `i64` for the
     /// fallible ops, §3e D42), or a `Trap` for escape/exit. `mem` backs buffer args.
@@ -5433,9 +9933,132 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
+        // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
+        if is_recorded_input(type_id, op) {
+            // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
+            // re-execution diverged before this point — fall through to live as a best effort).
+            let served = if let Some((tape, pos)) = &mut self.cap_replay {
+                match tape.get(*pos) {
+                    Some(rec)
+                        if rec.type_id == type_id
+                            && rec.op == op
+                            && rec.handle == handle
+                            && rec.args == args =>
+                    {
+                        *pos += 1;
+                        Some(rec.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(rec) = served {
+                // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
+                // return the recorded result slots — no live host needed.
+                if let Some(m) = mem {
+                    for (ptr, bytes) in &rec.mem_writes {
+                        m.write_bytes(*ptr, bytes);
+                    }
+                }
+                return rec.result;
+            }
+            // Record: run live through a `RecordingMem` so any guest-window writes are captured,
+            // then log the crossing for a future replay.
+            let (result, mem_writes) = match mem {
+                Some(m) => {
+                    let mut rec_mem = RecordingMem {
+                        inner: m,
+                        writes: Vec::new(),
+                    };
+                    let r = self.cap_dispatch_slots_inner(
+                        type_id,
+                        op,
+                        handle,
+                        args,
+                        Some(&mut rec_mem),
+                    );
+                    (r, rec_mem.writes)
+                }
+                None => (
+                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None),
+                    Vec::new(),
+                ),
+            };
+            if let Some(rec) = &mut self.cap_record {
+                rec.push(CapRecord {
+                    type_id,
+                    op,
+                    handle,
+                    args: args.to_vec(),
+                    result: result.clone(),
+                    mem_writes,
+                });
+            }
+            return result;
+        }
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem)
+    }
+
+    /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
+    /// public [`cap_dispatch_slots`](Host::cap_dispatch_slots) wraps this with W1 record/replay.
+    fn cap_dispatch_slots_inner(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
         // §7 reflection: the reserved pseudo-`type_id` has no handle to resolve — service it directly
-        // (read-only over this domain's own table). This is the JIT's entry point for `cap.self.*`.
+        // (read-only over this domain's own powerbox). This is the JIT's entry point for `cap.self.*`.
         if type_id == svm_ir::CAP_SELF_TYPE_ID {
+            // op 2 = `resolve(name_ptr, name_len) -> handle | -errno` (F7): look a capability **name**
+            // up in this domain's name directory (populated at powerbox grant) and return the handle
+            // it's bound to — runtime, in-guest, dlopen-style discovery, the dynamic counterpart to
+            // load-time name binding. Confers no authority: it only re-finds a handle the guest was
+            // already granted (a name with no grant is `-EINVAL`). Serviced here, not in the mem-less
+            // `self_dispatch`, because it must read the name from the window (fail-closed: `-EFAULT`
+            // out of bounds, `-EINVAL` on bad UTF-8 / unknown name).
+            if op == 2 {
+                let Some(mem) = mem else {
+                    return Ok(vec![EFAULT]);
+                };
+                let ptr = *args.first().unwrap_or(&0) as u64;
+                let len = *args.get(1).unwrap_or(&0) as u64;
+                let Some(bytes) = mem.read_bytes(ptr, len) else {
+                    return Ok(vec![EFAULT]);
+                };
+                let Ok(name) = std::str::from_utf8(&bytes) else {
+                    return Ok(vec![EINVAL]);
+                };
+                return Ok(vec![self
+                    .resolve_cap_name(name)
+                    .map_or(EINVAL, |h| h as i64)]);
+            }
+            // op 3 = `label(handle, buf_ptr, buf_cap) -> len | 0 | -EFAULT` (F9): write the handle's
+            // human-readable label into the window (the reverse of op 2). Returns the label's full
+            // length (`0` if unlabeled); writes nothing if it doesn't fit (`buf_cap < len`) so the
+            // guest can retry with a buffer of the returned size. Authority-neutral reflection.
+            if op == 3 {
+                let h = *args.first().unwrap_or(&0) as i32;
+                let ptr = *args.get(1).unwrap_or(&0) as u64;
+                let cap = *args.get(2).unwrap_or(&0) as u64;
+                let Some(label) = self.cap_label(h).map(|s| s.to_string()) else {
+                    return Ok(vec![0]); // no label for this handle
+                };
+                let len = label.len() as u64;
+                if len <= cap {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    if mem.write_bytes(ptr, label.as_bytes()).is_none() {
+                        return Ok(vec![EFAULT]);
+                    }
+                }
+                return Ok(vec![len as i64]);
+            }
             return self.self_dispatch(op, args);
         }
         match self.resolve(handle, type_id)? {
@@ -5601,10 +10224,38 @@ impl Host {
             // a `Yielder` cap.call slipped through (e.g. the JIT, which has no coroutine runtime) —
             // inert `CapFault`.
             Binding::Yielder => Err(Trap::CapFault),
-            // A §14 `Module` handle confers instantiation authority only (through the Instantiator's
-            // module ops); it has no callable ops — and crucially, the generic dispatch never exposes
-            // the grant's host-side data, so no host pointer is guest-reachable.
-            Binding::Module(_) => Err(Trap::CapFault),
+            // A §14 `Module` handle confers instantiation authority (through the Instantiator's module
+            // ops 5/6/7) plus one callable op:
+            //   op 0 `resolve_export(name_ptr, name_len) -> funcidx | -errno` (F2): look a name up in
+            //   the child module's first-class export table so a parent can address a child entry **by
+            //   name** rather than hardcoding its funcidx; the result is passed as the `entry` to the
+            //   Instantiator's module ops. The name is borrowed from the calling domain's window
+            //   (fail-closed: `-EFAULT` out of bounds, `-EINVAL` on bad UTF-8 / unknown name). Only the
+            //   funcidx (a small integer, already implicit in the granted module) crosses back — no
+            //   host pointer or grant-internal data is ever exposed.
+            Binding::Module(id) => match op {
+                0 => {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let ptr = *args.first().unwrap_or(&0) as u64;
+                    let len = *args.get(1).unwrap_or(&0) as u64;
+                    let Some(bytes) = mem.read_bytes(ptr, len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let Some(g) = self.modules.get(id as usize) else {
+                        return Ok(vec![EINVAL]);
+                    };
+                    let Ok(name) = std::str::from_utf8(&bytes) else {
+                        return Ok(vec![EINVAL]);
+                    };
+                    Ok(vec![match g.exports.iter().find(|e| e.name == name) {
+                        Some(e) => e.func as i64,
+                        None => EINVAL,
+                    }])
+                }
+                _ => Err(Trap::CapFault),
+            },
             // Guest-driven `Jit` (iface 11, DESIGN.md §22). This generic arm is the **reference**
             // path (an interpreter run, or a wiring-bug fallback): op 0 `compile` validates +
             // stores the unit and mints its handle; op 2 `release` revokes one. op 1 `invoke` can
@@ -5636,6 +10287,30 @@ impl Host {
                     Ok(vec![match self.jit_release(ch) {
                         Ok(()) => 0,
                         Err(_) => EINVAL,
+                    }])
+                }
+                5 => {
+                    // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle |
+                    // -errno (DESIGN.md §22 host-assisted dynamic linking). Like op 0 `compile`, but
+                    // the unit may carry unresolved §7 imports, bound by name against the guest's
+                    // symbol-table buffer before verify. Both buffers are borrowed from the
+                    // window; with no window there is nothing to read (-EFAULT, like op 0).
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let ir_ptr = *args.first().unwrap_or(&0) as u64;
+                    let ir_len = *args.get(1).unwrap_or(&0) as u64;
+                    let st_ptr = *args.get(2).unwrap_or(&0) as u64;
+                    let st_len = *args.get(3).unwrap_or(&0) as u64;
+                    let Some(ir) = mem.read_bytes(ir_ptr, ir_len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let Some(symtab) = mem.read_bytes(st_ptr, st_len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    Ok(vec![match self.jit_compile_linked(handle, &ir, &symtab)? {
+                        Ok(c) => c.handle as i64,
+                        Err(e) => e,
                     }])
                 }
                 _ => Ok(vec![EINVAL]),
@@ -6063,6 +10738,14 @@ impl Host {
 /// interpreter memory bounded by what a (fuel-limited) run touches, so a huge declared window never
 /// eagerly allocates — safe to fuzz.
 fn host_page_size() -> u64 {
+    // wasm has no host MMU and no `mprotect`: linear-memory pages are a fixed 64 KiB, so report that
+    // (and avoid pulling the `page_size` crate into the wasm dependency graph). On native, query the
+    // real host page so interpreter and JIT agree page-for-page.
+    #[cfg(target_family = "wasm")]
+    {
+        65536
+    }
+    #[cfg(not(target_family = "wasm"))]
     match page_size::get() as u64 {
         0 => 4096,
         p => p,
@@ -6078,6 +10761,13 @@ fn host_page_size() -> u64 {
 /// works on every backend and the §13 differential stays in lockstep. `page_size::get_granularity`
 /// returns `dwAllocationGranularity` on Windows and the page size on unix.
 pub fn host_region_granularity() -> u64 {
+    // wasm: no separate allocation granularity (no `MapViewOfFile3`), so a region aligns to the same
+    // 64 KiB linear-memory page as the protection model.
+    #[cfg(target_family = "wasm")]
+    {
+        host_page_size()
+    }
+    #[cfg(not(target_family = "wasm"))]
     match page_size::get_granularity() as u64 {
         0 => host_page_size(),
         g => g,
@@ -6146,6 +10836,13 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
+    /// Fast-path flag: set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13
+    /// region alias, demand/supply paging) — monotonic, dirtied at the [`Mem::space_write`] choke
+    /// point. While clear — the overwhelmingly common case (no syscalls, no coroutines, no regions)
+    /// — [`Mem::check_prot`] knows every in-prefix page is plain RW and skips the address-space
+    /// `RwLock` read entirely. Shared with the same topology as `space` (cloned for a forked thread,
+    /// fresh for a §14 child, which has its own address space).
+    prot_dirty: Arc<AtomicBool>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
     /// `confine_checked` clears it to [`NO_FAULT`]). A coroutine child with `fault_yields` reads it
@@ -6197,6 +10894,30 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
+            last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
+        }
+    }
+
+    /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
+    /// [`Region::shared`] over the host's shared linear memory) rather than an engine-`mmap`ped one —
+    /// the substrate the parallel-wasm backend runs over (every per-vCPU Worker executes over the same
+    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`; reserved-tail
+    /// accesses beyond it read as zero (a confined guest stays in its prefix). The crate stays
+    /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
+    /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
+    fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
+        let reserved_log2 = reserved_log2.max(mapped_log2);
+        let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
+        let page = host_page_size();
+        Mem {
+            back,
+            window,
+            page,
+            space: Arc::new(RwLock::new(AddrSpace::default())),
+            has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -6219,6 +10940,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -6230,6 +10952,11 @@ impl Mem {
         self.space.read().unwrap_or_else(|e| e.into_inner())
     }
     fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
+        // Any address-space mutation (the only reason to take the write lock) disables the lock-free
+        // `check_prot` fast path, monotonically. Set *before* acquiring the lock so a concurrent
+        // reader never observes a clear flag after a mutation has begun (a false positive just makes
+        // it take the read lock — always safe; a false negative would not be).
+        self.prot_dirty.store(true, Ordering::Release);
         self.space.write().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -6244,6 +10971,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
+            prot_dirty: Arc::clone(&self.prot_dirty),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -6268,6 +10996,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -6296,6 +11025,12 @@ impl Mem {
         // §14 child).
         let rel = base.wrapping_sub(self.window.base());
         let last = rel + width as u64 - 1;
+        // Lock-free fast path: the address space has never been mutated, so every page is in its
+        // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
+        // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
+        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+            return Ok(());
+        }
         let space = self.space_read();
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
@@ -6371,6 +11106,19 @@ impl Mem {
         }
     }
 
+    /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
+    /// it through the same `confine_checked` a guest load uses, so a read past the reserved window
+    /// faults instead of escaping; uncommitted in-window pages read as zero (demand-zeroed backing).
+    fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let abs = self.confine_checked(addr, 0, len as u32)?;
+        let mut out = vec![0u8; len];
+        self.back.read_into(abs, &mut out);
+        Ok(out)
+    }
+
     fn load(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Value, Trap> {
         let (_, rty, width, signed) = op.info();
         let base = self.confine_checked(addr, offset, width)?;
@@ -6387,6 +11135,46 @@ impl Mem {
         self.write_le(base, width, store_bits(v));
         self.writes += 1;
         Ok(())
+    }
+
+    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When no protection has
+    /// ever been mutated (`!prot_dirty` — the common case: no syscalls / coroutines / §13 regions, so
+    /// every prefix page is plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies
+    /// wholly in the backed prefix ([`Window::checked`]), read straight through — skipping the per-op
+    /// `last_fault` atomic store in `confine_checked` and the `check_prot` page scan. **Semantically
+    /// identical** to the cold [`Mem::load`] for this case (the escape-oracle byte-compares it); any
+    /// other case (RO/unmapped/reserved-tail/regions, or a recoverable demand fault) falls to the cold
+    /// path, which keeps the exact trap + `last_fault` semantics. Returns the [`Reg`] slot directly,
+    /// dropping the `Value` round-trip the bytecode engine paid via `Reg::from_value(load(..))`.
+    #[inline]
+    fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
+        let (_, rty, width, signed) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                // `!prot_dirty ⟹ !has_regions`, so the bytes live in `back` (no §13 redirect); the
+                // cooperative bytecode engine is the sole accessor, so a single non-atomic word read
+                // is sound (and one instruction, not `width` atomic byte loads).
+                let raw = self.back.read_word(abs, width);
+                return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
+            }
+        }
+        Ok(Reg::from_value(self.load(addr, offset, op)?))
+    }
+
+    /// Bytecode-engine scalar store (Phase 2): the fast path of [`Mem::store`], taking the value as
+    /// raw slot `lo` bits (no `Value` wrap). Same fast-path gate + cold fallback as
+    /// [`Mem::load_scalar`]; `write_le` truncates to the op width.
+    #[inline]
+    fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
+        let (_, _, width) = op.info();
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            if let Some(abs) = self.window.checked(addr, offset, width) {
+                self.back.write_word(abs, width, lo);
+                self.writes += 1;
+                return Ok(());
+            }
+        }
+        self.store(addr, offset, op, Value::I64(lo as i64))
     }
 
     /// §17 `v128.load`: the **16-byte** masked access — the sole escape-TCB delta SIMD adds
@@ -6686,17 +11474,142 @@ impl Mem {
         Some(())
     }
 
+    /// The durable **active shadow-SP** word at [`SHADOW_SP_OFF`] (the running context's
+    /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
+    /// the current context's region (D-fiber-cont option A). Falls back to [`SHADOW_BASE`] if the
+    /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
+    fn durable_get_sp(&self, sp_word: u64) -> u64 {
+        self.read_bytes_impl(sp_word, 8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(SHADOW_BASE)
+    }
+
+    fn durable_set_sp(&mut self, sp_word: u64, sp: u64) {
+        let _ = self.write_bytes_impl(sp_word, &sp.to_le_bytes());
+    }
+
+    /// The durable state word at [`STATE_OFF`] (the freeze driver's trigger). `STATE_NORMAL` if the
+    /// word's page is somehow uncommitted (a non-durable / malformed window).
+    fn durable_state(&self) -> i32 {
+        self.read_bytes_impl(STATE_OFF, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_le_bytes)
+            .unwrap_or(STATE_NORMAL)
+    }
+
+    /// Set the global durable **freeze** word at [`STATE_OFF`] (`UNWINDING`/`ARMED`/`NORMAL`) — the
+    /// stop-the-world trigger every poll reads.
+    fn durable_set_state(&mut self, state: i32) {
+        let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
+    }
+
+    /// Read context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) at
+    /// [`thaw_state_off`] (§12.8 concurrent-thaw stage 1). `STATE_NORMAL` if its page is uncommitted.
+    fn durable_thaw_state(&self, ctx: usize) -> i32 {
+        self.read_bytes_impl(thaw_state_off(ctx), 4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_le_bytes)
+            .unwrap_or(STATE_NORMAL)
+    }
+
+    /// Set context `ctx`'s per-context **thaw** state word.
+    fn durable_set_thaw_state(&mut self, ctx: usize, state: i32) {
+        let _ = self.write_bytes_impl(thaw_state_off(ctx), &state.to_le_bytes());
+    }
+
+    /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
+    /// stage 1): the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`) takes precedence; else
+    /// context `ctx`'s per-context **thaw** word (`REWINDING`/`NORMAL`). Mirror of [`Self::durable_store_dstate`].
+    fn durable_load_dstate(&self, ctx: usize) -> i32 {
+        let g = self.durable_state();
+        if g != STATE_NORMAL {
+            g
+        } else {
+            self.durable_thaw_state(ctx)
+        }
+    }
+
+    /// Store a vCPU's unified durable phase, routing `REWINDING` to context `ctx`'s own **thaw** word and
+    /// the freeze phases (`UNWINDING`/`ARMED`/`NORMAL`) to the global **freeze** word — so a rewinding
+    /// vCPU flipping its own word to `NORMAL` can't disturb a sibling still `REWINDING` (the relocation
+    /// the JIT needs for concurrent rewinds; the interp swaps it per dispatch, slice 3.2.1).
+    fn durable_store_dstate(&mut self, ctx: usize, dstate: i32) {
+        if dstate == STATE_REWINDING {
+            self.durable_set_state(STATE_NORMAL);
+            self.durable_set_thaw_state(ctx, STATE_REWINDING);
+        } else {
+            self.durable_set_state(dstate);
+            self.durable_set_thaw_state(ctx, STATE_NORMAL);
+        }
+    }
+
+    /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`): if the run
+    /// is `STATE_ARMED`, decrement the arm countdown at [`ARM_COUNTDOWN_OFF`] and, when it reaches 0,
+    /// promote the state word to `UNWINDING` — so the safepoint's trailing poll begins the freeze. A
+    /// no-op unless armed (the common case: one `i32` read per safepoint, no write), so an unarmed run
+    /// is byte-identical. Call once per fiber safepoint — see the `run_inner` dispatch.
+    fn durable_tick_arm(&mut self) {
+        self.durable_tick_countdown(ARM_COUNTDOWN_OFF);
+    }
+
+    /// Back-edge variant (Phase-4 Slice A): on an `ARMED` run, count down [`ARM_BACKEDGE_OFF`] at
+    /// each branch terminator and promote to `UNWINDING` at 0, so the next loop-header poll begins
+    /// the freeze — reaching a poll-free compute loop. Inert unless armed for back-edges (the slot
+    /// is positive), so a fiber-armed or ordinary run is byte-identical. Call at branch terminators.
+    fn durable_tick_arm_backedge(&mut self) {
+        self.durable_tick_countdown(ARM_BACKEDGE_OFF);
+    }
+
+    /// Decrement the countdown at `off` on an `ARMED` run and promote to `UNWINDING` at 0. Guarded
+    /// on the slot being **positive**, so the two countdowns (fiber-safepoint / back-edge) never
+    /// interfere: arming one leaves the other at 0, where this is a no-op. An unarmed run is one
+    /// `i32` state read, no write.
+    fn durable_tick_countdown(&mut self, off: u64) {
+        if self.durable_state() != STATE_ARMED {
+            return;
+        }
+        let cur = self
+            .read_bytes_impl(off, 8)
+            .and_then(|b| b.try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(0);
+        if cur <= 0 {
+            return; // not armed for this countdown
+        }
+        let n = cur - 1;
+        let _ = self.write_bytes_impl(off, &n.to_le_bytes());
+        if n <= 0 {
+            self.durable_set_state(STATE_UNWINDING);
+        }
+    }
+
     fn read_le(&self, base: u64, width: u32) -> u64 {
+        // Hoist the `has_regions` check out of the per-byte loop: when no §13 region is aliased in
+        // (the common case) read straight from `back`, one `has_regions` load instead of `width`.
+        // Still per-byte (each `Region::byte` is a relaxed atomic — defined under §12 races).
         let mut raw = 0u64;
-        for k in 0..width as u64 {
-            raw |= (self.byte(base + k) as u64) << (8 * k);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                raw |= (self.back.byte(base + k) as u64) << (8 * k);
+            }
+        } else {
+            for k in 0..width as u64 {
+                raw |= (self.byte(base + k) as u64) << (8 * k);
+            }
         }
         raw
     }
 
     fn write_le(&mut self, base: u64, width: u32, raw: u64) {
-        for k in 0..width as u64 {
-            self.set_byte(base + k, (raw >> (8 * k)) as u8);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                self.back.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
+        } else {
+            for k in 0..width as u64 {
+                self.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
         }
     }
 
@@ -6763,6 +11676,36 @@ impl Mem {
         (0..n).map(|i| self.byte(i)).collect()
     }
 
+    /// Whether the live memory state is **fully captured** by a [`window_snapshot`](Mem::window_snapshot)
+    /// then [`seed`](Mem::seed) round-trip of the mapped prefix — the precondition for time-travel
+    /// checkpointing the window (W1). True when nothing has changed *how* `[0, mapped)` is read back or
+    /// extended it: no §13 region aliasing, and every explicit page-protection entry is a benign
+    /// in-prefix `Rw` commit (the only kind demand-paging inserts). A `protect`ed (`Ro`), `unmap`ped,
+    /// region-`Backed`, or **grown** (tail `Rw`) page is *not* reproduced by reseeding a fresh window,
+    /// so it makes the run un-checkpointable (it falls back to replay-from-clock-0). Plain in-prefix
+    /// writes are fine — they leave the prefix `Rw` (absent from the map) and snapshot/seed round-trips
+    /// their bytes.
+    fn snapshot_safe(&self) -> bool {
+        if self.has_regions.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            return true; // never mutated ⇒ the prefix is plain Rw throughout
+        }
+        let mapped_pages = self.window.mapped() / self.page;
+        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        space.regions.is_empty()
+            && space
+                .prot
+                .iter()
+                .all(|(&pg, p)| matches!(p, PageProt::Rw) && pg < mapped_pages)
+    }
+
+    /// The full mapped window, for a time-travel checkpoint (restored with [`seed`](Mem::seed)).
+    fn window_snapshot(&self) -> Vec<u8> {
+        self.snapshot(self.window.mapped())
+    }
+
     /// Seed the **whole parent backing** of a §14 sub-window (parent-absolute bytes), so the
     /// escape-oracle starts with non-zero bytes *outside* the child's slice — a child write that
     /// escaped its `[base, base+size)` slice would then perturb a byte the snapshot catches.
@@ -6810,6 +11753,58 @@ impl Mem {
             }
         }
         out
+    }
+
+    /// Per-page protections over the same span as [`snapshot_window`], one [`CapturedProt`] per
+    /// [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). A page absent from the map is
+    /// `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same default the
+    /// access path and the JIT's page tables use.
+    fn snapshot_prots(&self, snap_cap: usize) -> Vec<CapturedProt> {
+        let snap = self
+            .window
+            .reserved()
+            .min(self.window.mapped().max(snap_cap as u64));
+        let mapped = self.window.mapped();
+        let space = self.space_read();
+        (0..snap / DURABLE_SNAPSHOT_PAGE)
+            .map(|i| {
+                let byte_off = i * DURABLE_SNAPSHOT_PAGE;
+                match space.prot.get(&(byte_off / self.page)) {
+                    Some(PageProt::Rw) => CapturedProt::Rw,
+                    Some(PageProt::Ro) => CapturedProt::Ro,
+                    Some(PageProt::Unmapped) => CapturedProt::Unmapped,
+                    Some(PageProt::Backed { .. }) => CapturedProt::Backed,
+                    None if byte_off < mapped => CapturedProt::Rw,
+                    None => CapturedProt::Unmapped,
+                }
+            })
+            .collect()
+    }
+
+    /// Re-establish a captured protection map on this window (the durable-restore step, the
+    /// inverse of [`snapshot_prots`]): mark each `Ro`/`Unmapped` page so a thawed guest faults
+    /// exactly as the frozen one would. `Rw` is the prefix default (left absent) but is set
+    /// explicitly for a reserved-tail page (a grown commit); `Backed` is skipped — a §13
+    /// shared-region alias isn't restorable here (D-region), the embedder re-grants the region.
+    fn apply_prots(&mut self, prots: &[CapturedProt]) {
+        let mapped = self.window.mapped();
+        let mut space = self.space_write();
+        for (i, &p) in prots.iter().enumerate() {
+            let byte_off = i as u64 * DURABLE_SNAPSHOT_PAGE;
+            let host_page = byte_off / self.page;
+            match p {
+                CapturedProt::Ro => {
+                    space.prot.insert(host_page, PageProt::Ro);
+                }
+                CapturedProt::Unmapped => {
+                    space.prot.insert(host_page, PageProt::Unmapped);
+                }
+                CapturedProt::Rw if byte_off >= mapped => {
+                    space.prot.insert(host_page, PageProt::Rw);
+                }
+                CapturedProt::Rw | CapturedProt::Backed => {}
+            }
+        }
     }
 }
 
@@ -6965,7 +11960,7 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
         // `v128` never reaches here — its loads go through the dedicated 16-byte path, not
         // a `LoadOp` (whose widths are ≤8). Total arm for exhaustiveness only.
         ValType::V128 => Value::V128([0; 16]),
-        ValType::I32 | ValType::I64 => {
+        ValType::I32 | ValType::I64 | ValType::Ref => {
             let bits = width * 8;
             let ext = if signed && bits < 64 {
                 let shift = 64 - bits;
@@ -6973,11 +11968,45 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
             } else {
                 raw
             };
-            if rty == ValType::I32 {
-                Value::I32(ext as i32)
-            } else {
-                Value::I64(ext as i64)
+            match rty {
+                ValType::I32 => Value::I32(ext as i32),
+                ValType::Ref => Value::Ref(ext), // opaque, stored/loaded as an i64-width word
+                _ => Value::I64(ext as i64),
             }
+        }
+    }
+}
+
+/// Scan a fiber's frames for candidate root words in `[lo, hi)` and insert them into `out` (§GC
+/// `gc.roots`). Each word is first masked (`m = w & mask`); the **masked** value is what's range-
+/// tested and inserted, so a guest with tagged pointers (tag in the top byte) recovers the bare
+/// offset (`mask = !0` is the untagged case). Conservative: every SSA value whose masked bits land
+/// in range is a candidate — the interpreter scans typed `Value`s (the JIT scans raw control-stack
+/// words; both are sound over-approximations that may differ in false positives, GC.md §3.2).
+/// `v128` contributes both of its 64-bit halves. `mask` is caller-validated to top-byte-strip only,
+/// so a host pointer stays large and is excluded by the range test.
+fn gc_scan_frames(
+    frames: &[Frame],
+    lo: u64,
+    hi: u64,
+    mask: u64,
+    out: &mut std::collections::BTreeSet<u64>,
+) {
+    let mut consider = |w: u64| {
+        let m = w & mask;
+        if m >= lo && m < hi {
+            out.insert(m);
+        }
+    };
+    for f in frames {
+        for v in &f.vals {
+            // Untyped raw slots: scan both 64-bit words, like the JIT scans raw control-stack
+            // words (a `v128` contributes both halves; a scalar's high half is 0, which the GC
+            // heap range never contains, so `consider` filters it out). An `i32` slot is
+            // sign-extended in `lo` — exactly the JIT slot ABI — so the two backends' candidate
+            // words now align (still sound over-approximations, GC.md §3.2).
+            consider(v.lo);
+            consider(v.hi);
         }
     }
 }
@@ -6992,6 +12021,7 @@ fn store_bits(v: Value) -> u64 {
         // `v128` stores go through the dedicated 16-byte path; a scalar store never sees one.
         // Total arm: low 8 bytes (little-endian).
         Value::V128(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x, // opaque reference: its raw 64-bit word
     }
 }
 
@@ -7201,12 +12231,51 @@ fn step(fuel: &mut u64) -> Result<(), Trap> {
 }
 
 #[inline]
-fn get(vals: &[Value], v: ValIdx) -> Result<Value, Trap> {
+fn get(vals: &[Reg], v: ValIdx) -> Result<Reg, Trap> {
     vals.get(v as usize).copied().ok_or(Trap::Malformed)
 }
 
-fn collect(vals: &[Value], idxs: &[ValIdx]) -> Result<Vec<Value>, Trap> {
+// Typed operand reads: pull the needed scalar out of the (untyped) value slot. The executing
+// instruction's static type picks which getter to call, so the bit pattern is interpreted
+// correctly without a per-value tag. `Malformed` on an out-of-range index, as before.
+#[inline]
+fn get_i32(vals: &[Reg], v: ValIdx) -> Result<i32, Trap> {
+    Ok(get(vals, v)?.i32())
+}
+
+#[inline]
+fn get_i64(vals: &[Reg], v: ValIdx) -> Result<i64, Trap> {
+    Ok(get(vals, v)?.i64())
+}
+
+#[inline]
+fn get_f32(vals: &[Reg], v: ValIdx) -> Result<f32, Trap> {
+    Ok(get(vals, v)?.f32())
+}
+
+#[inline]
+fn get_f64(vals: &[Reg], v: ValIdx) -> Result<f64, Trap> {
+    Ok(get(vals, v)?.f64())
+}
+
+fn collect(vals: &[Reg], idxs: &[ValIdx]) -> Result<Vec<Reg>, Trap> {
     idxs.iter().map(|&v| get(vals, v)).collect()
+}
+
+/// Like [`collect`], but gather into a caller-owned buffer instead of a fresh `Vec`. The
+/// hot-loop branch path (`Br`/`BrIf`/`BrTable`) fills a reusable scratch buffer and then
+/// **swaps** it into the frame's value slot, so a taken edge allocates nothing in steady
+/// state — the back-edge of a loop runs every iteration, where the per-branch `collect`
+/// alloc/free dominated. `dst` is cleared first; on a bad index it returns `Malformed`
+/// (leaving `dst` partially filled, which the caller discards as it traps), exactly as
+/// `collect` would have.
+fn collect_into(dst: &mut Vec<Reg>, vals: &[Reg], idxs: &[ValIdx]) -> Result<(), Trap> {
+    dst.clear();
+    dst.reserve(idxs.len());
+    for &v in idxs {
+        dst.push(get(vals, v)?);
+    }
+    Ok(())
 }
 
 #[inline]
@@ -7221,6 +12290,7 @@ fn val_to_slot(v: Value) -> i64 {
         // The cap ABI marshals scalars only; a `v128` arg/result is out of MVP scope (§17). Total
         // arm — its low 8 bytes — keeps the interpreter panic-free if a module declares one.
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x as i64, // opaque reference marshals as its i64-width word
     }
 }
 
@@ -7231,6 +12301,7 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
         ValType::I64 => Value::I64(s),
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+        ValType::Ref => Value::Ref(s as u64), // opaque i64-width reference
         // `v128` cap results are out of MVP scope; zero-extend the slot into the low lanes.
         ValType::V128 => {
             let mut b = [0u8; 16];
@@ -7240,43 +12311,66 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
     }
 }
 
-fn as_i32(v: Value) -> Result<i32, Trap> {
-    match v {
-        Value::I32(x) => Ok(x),
-        _ => Err(Trap::Malformed),
+/// Whether a variable scoped to `var_func` is visible in a frame of function `frame_func`: its own
+/// function, or a [`svm_ir::GLOBAL_SCOPE`] module-scoped global (visible in every frame).
+fn var_in_scope(var_func: u32, frame_func: u32) -> bool {
+    var_func == frame_func || var_func == svm_ir::GLOBAL_SCOPE
+}
+
+/// The source line at pc `(func, block, inst)` — the nearest-preceding `debug.loc` within the block
+/// (the same semantics as [`Inspector::source_loc`]). `None` ⇒ no source mapping at this pc.
+fn source_line_at(di: &DebugInfo, func: u32, block: usize, inst: usize) -> Option<u32> {
+    di.locs
+        .iter()
+        .filter(|l| l.func == func && l.block as usize == block && l.inst as usize <= inst)
+        .max_by_key(|l| l.inst)
+        .map(|l| l.line)
+}
+
+/// Whether a variable's lexical `scope` covers source line `line`. A function-wide var (`None`)
+/// always covers; a `Some((start, end))` covers `line ∈ [start, end]`. When the pc has no source
+/// line (`line == None`), scopes can't be evaluated, so every var is treated as covering (the
+/// function-wide back-compat behavior).
+fn scope_covers(scope: Option<(u32, u32)>, line: Option<u32>) -> bool {
+    match (scope, line) {
+        (None, _) | (_, None) => true,
+        (Some((s, e)), Some(l)) => s <= l && l <= e,
     }
 }
 
-#[inline]
-fn as_v128(v: Value) -> Result<[u8; 16], Trap> {
-    match v {
-        Value::V128(b) => Ok(b),
-        _ => Err(Trap::Malformed),
+/// Pick the source variable named `name` that is **innermost in scope** at the stopped pc, resolving
+/// C shadowing (an inner-block redeclaration, or a local shadowing a global): among same-name
+/// candidates visible in `frame_func`, keep those whose lexical scope covers the stopped source
+/// line, and choose the most deeply nested (largest `start_line`; a function-wide `None` is the
+/// outermost). Ties keep the first (declaration order).
+fn pick_var<'a>(
+    di: &'a DebugInfo,
+    frame_func: u32,
+    name: &str,
+    block: usize,
+    inst: usize,
+) -> Option<&'a VarInfo> {
+    let line = source_line_at(di, frame_func, block, inst);
+    let depth = |x: &VarInfo| x.scope.map_or(0, |(s, _)| s);
+    let mut best: Option<&VarInfo> = None;
+    for x in di.vars.iter().filter(|x| {
+        var_in_scope(x.func, frame_func) && x.name == name && scope_covers(x.scope, line)
+    }) {
+        if best.is_none_or(|b| depth(x) > depth(b)) {
+            best = Some(x);
+        }
     }
+    best
 }
 
-#[inline]
-fn as_i64(v: Value) -> Result<i64, Trap> {
-    match v {
-        Value::I64(x) => Ok(x),
-        _ => Err(Trap::Malformed),
-    }
-}
-
-#[inline]
-fn as_f32(v: Value) -> Result<f32, Trap> {
-    match v {
-        Value::F32(x) => Ok(x),
-        _ => Err(Trap::Malformed),
-    }
-}
-
-#[inline]
-fn as_f64(v: Value) -> Result<f64, Trap> {
-    match v {
-        Value::F64(x) => Ok(x),
-        _ => Err(Trap::Malformed),
-    }
+/// Resolve a debug-info location list (`SsaList` / `WindowVia` base) at pc `(block, inst)`: the
+/// covering entry is the largest `inst` at-or-before within the stopped block (nearest-preceding,
+/// DWARF line-table semantics). `None` ⇒ the var isn't live at this pc.
+fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
+    locs.iter()
+        .filter(|l| l.block as usize == block && l.inst as usize <= inst)
+        .max_by_key(|l| l.inst)
+        .map(|l| l.value)
 }
 
 #[cfg(test)]

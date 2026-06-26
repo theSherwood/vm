@@ -59,7 +59,7 @@ pub fn run_text(src: &str, func: FuncIdx, args: &[Value], fuel: u64) -> Result<V
     // A verified module that traps is a runtime outcome, not a pipeline error; we
     // surface traps to callers that care via the lower-level API. Here we treat a
     // trap as an empty result for ergonomics in examples/tests.
-    Ok(svm_interp::run(&m, func, args, &mut fuel).unwrap_or_default())
+    Ok(svm_interp::run_fast(&m, func, args, &mut fuel).unwrap_or_default())
 }
 
 /// A zeroed value of each parameter type — handy for fuzzing/driving arbitrary funcs.
@@ -72,6 +72,7 @@ pub fn default_args(params: &[ValType]) -> Vec<Value> {
             ValType::F32 => Value::F32(0.0),
             ValType::F64 => Value::F64(0.0),
             ValType::V128 => Value::V128([0; 16]),
+            ValType::Ref => Value::Ref(0),
         })
         .collect()
 }

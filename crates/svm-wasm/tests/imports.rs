@@ -1,9 +1,10 @@
 //! Differential tests for **function imports / the host ABI** (the wasm `call` → SVM `cap.call`
 //! lowering). A wasm import binds to a capability by the convention `module` = decimal `type_id`,
-//! `name` = decimal `op`; the transpiler threads one capability handle as the leading param of every
-//! function, and the embedder grants the matching capability and passes its handle as the entry's
-//! leading argument. These tests run a transpiled import-using module on **both** backends under one
-//! reference `Host`, asserting they agree — and against a hand-computed oracle.
+//! `name` = decimal `op`; the transpiler threads one capability handle **per distinct import
+//! interface (module)** as the leading params of every function, and the embedder grants one
+//! capability per interface and passes their handles as the entry's leading arguments (in
+//! first-appearance order). These tests run a transpiled import-using module on **both** backends
+//! under one reference `Host`, asserting they agree — and against a hand-computed oracle.
 //!
 //! Unlike `transpile.rs`'s capability-free `run`/`eval`, these need a powerbox: the interpreter via
 //! `run_with_host`, the JIT via `compile_and_run_with_host` over the production `svm_run::cap_thunk`.
@@ -194,15 +195,7 @@ fn import_handle_threads_through_call_indirect() {
     assert_eq!(got_b, mix(5).wrapping_add(1));
 }
 
-// ---- the clean-error surface (the convention's guard rails) ----
-
-fn err(wat: &str) -> svm_wasm::Error {
-    let wasm = wat::parse_str(wat).expect("assemble wat");
-    match svm_wasm::transpile(&wasm) {
-        Ok(_) => panic!("expected an Unsupported error, got Ok"),
-        Err(e) => e,
-    }
-}
+// ---- the binding surface (the convention's guard rails) ----
 
 /// A non-numeric import name is now a §7 **named import** (resolved to a capability at load by the
 /// embedder, e.g. an `svm-wasi` shim), not an error: the module declares it in its import table —
@@ -219,17 +212,158 @@ fn import_non_numeric_name_is_a_named_import() {
     assert_eq!(t.module.imports[0].name, "env.host_fn");
 }
 
-/// Imports spanning two distinct capability interfaces (type_ids) is unsupported in v1 (one handle is
-/// threaded) — a clean error, not a wrong binding.
+/// Run a module importing **N** capability interfaces (distinct modules): grant one capability per
+/// interface (in slot/first-appearance order), then pass the N handles as the entry's N leading args,
+/// followed by `extra_args`. Asserts interp == JIT and returns the single result.
+fn run_import_multi(
+    wat: &str,
+    entry: &str,
+    grants: &[&dyn Fn(&mut Host) -> i32],
+    extra_args: &[Value],
+) -> i64 {
+    let wasm = wat::parse_str(wat).expect("assemble wat");
+    let t = svm_wasm::transpile(&wasm).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify transpiled IR");
+    let idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == entry)
+        .unwrap_or_else(|| panic!("no export {entry}"))
+        .1;
+
+    // Interpreter: grant each cap, pass the handles (i32) as the entry's leading args, in slot order.
+    let mut hi = Host::new();
+    let handles: Vec<i32> = grants.iter().map(|g| g(&mut hi)).collect();
+    let mut iargs: Vec<Value> = handles.iter().map(|h| Value::I32(*h)).collect();
+    iargs.extend_from_slice(extra_args);
+    let mut fuel = 100_000_000u64;
+    let interp = run_with_host(&t.module, idx, &iargs, &mut fuel, &mut hi).expect("interp run");
+
+    // JIT: the same grants (so handle values match) through the production cap thunk.
+    let mut hj = Host::new();
+    let jhandles: Vec<i32> = grants.iter().map(|g| g(&mut hj)).collect();
+    assert_eq!(handles, jhandles, "handle encoding must match across hosts");
+    let mut slots: Vec<i64> = jhandles.iter().map(|h| *h as i64).collect();
+    slots.extend(extra_args.iter().map(|v| match v {
+        Value::I32(x) => *x as i64,
+        Value::I64(x) => *x,
+        other => panic!("unsupported arg {other:?}"),
+    }));
+    let jit = match compile_and_run_with_host(
+        &t.module,
+        idx,
+        &slots,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compile")
+    {
+        JitOutcome::Returned(v) => v,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    let iv = match interp[0] {
+        Value::I64(x) => x,
+        Value::I32(x) => x as i64,
+        other => panic!("unexpected interp value {other:?}"),
+    };
+    assert_eq!(iv, jit[0], "interp != jit");
+    iv
+}
+
+/// Imports spanning two distinct capability interfaces now bind to **two** handles — one per interface
+/// (module), threaded as the entry's two leading params in first-appearance order. Here Clock
+/// (type_id 2) gets slot 0 and Blocking (type_id 10) slot 1; the guest calls both in one function.
 #[test]
-fn import_multiple_interfaces_is_clean_error() {
-    let e = err(r#"
+fn import_multiple_interfaces_bind_to_distinct_handles() {
+    let wat = r#"
 (module
   (import "2" "0" (func $now (result i64)))
   (import "10" "0" (func $work (param i64) (result i64)))
-  (func (export "f") (result i64) (call $now)))
-"#);
-    assert!(matches!(e, svm_wasm::Error::Unsupported(_)), "{e:?}");
+  (func (export "f") (result i64)
+    (i64.add (call $now) (call $work (i64.const 5)))))
+"#;
+    // Slot 0 = Clock (first appearance), slot 1 = Blocking. The reference clock's first read is 0.
+    let got = run_import_multi(
+        wat,
+        "f",
+        &[&|h: &mut Host| h.grant_clock(), &|h: &mut Host| {
+            h.grant_blocking(std::time::Duration::ZERO, None)
+        }],
+        &[],
+    );
+    assert_eq!(got, mix(5), "clock.now (=0) + work(5) (=mix(5))");
+}
+
+/// The two handles are distinct interfaces *and distinct call paths*: a defined helper threads both
+/// handles through a normal `call`, proving the N-handle prefix rides cross-function calls (not just
+/// the entry). The helper sums clock + work; the entry calls it twice.
+#[test]
+fn import_two_handles_thread_through_defined_call() {
+    let wat = r#"
+(module
+  (import "2" "0" (func $now (result i64)))
+  (import "10" "0" (func $work (param i64) (result i64)))
+  (func $step (param $x i64) (result i64)
+    (i64.add (call $now) (call $work (local.get $x))))
+  (func (export "f") (result i64)
+    (i64.add (call $step (i64.const 5)) (call $step (i64.const 7)))))
+"#;
+    let got = run_import_multi(
+        wat,
+        "f",
+        &[&|h: &mut Host| h.grant_clock(), &|h: &mut Host| {
+            h.grant_blocking(std::time::Duration::ZERO, None)
+        }],
+        &[],
+    );
+    // step(5): clock=0 + mix(5). step(7): clock=1 + mix(7). Sum = 1 + mix(5) + mix(7).
+    assert_eq!(got, 1i64.wrapping_add(mix(5)).wrapping_add(mix(7)));
+}
+
+/// **`wasi:thread/spawn` *alongside* a capability import** (§12 — the per-thread handle stash). The
+/// spawning thread writes its capability handle into a reserved window slot before each spawn; the
+/// synthesized shim reads it back on the new thread and threads it into `wasi_thread_start`, so a
+/// spawned worker can `cap.call`. Here each of `n` workers computes `work(its start_arg)` (the
+/// `Blocking` capability, a deterministic `mix`) and atomically adds it to a shared sum — which is
+/// `Σ mix(i)` on every interleaving (so interp's M:N executor and the JIT's real OS threads must
+/// agree). This proves capabilities reach spawned threads, the gap this slice closes.
+#[test]
+fn spawn_alongside_capability_import() {
+    let wat = r#"
+(module
+  (import "10" "0" (func $work (param i64) (result i64)))     ;; Blocking cap (handle slot 0)
+  (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
+  (memory 1 1 shared)
+  (func (export "wasi_thread_start") (param $tid i32) (param $start_arg i32)
+    ;; sum (i64 at mem[8]) += work(start_arg)
+    (drop (i64.atomic.rmw.add (i32.const 8)
+            (call $work (i64.extend_i32_u (local.get $start_arg)))))
+    (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))   ;; remaining -= 1
+    (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
+  (func (export "run") (param $n i32) (result i64)
+    (local $i i32) (local $r i32)
+    (i32.atomic.store (i32.const 4) (local.get $n))           ;; remaining = n
+    (block $spawned (loop $sp
+      (br_if $spawned (i32.ge_u (local.get $i) (local.get $n)))
+      (drop (call $spawn (local.get $i)))                     ;; start_arg = i
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $sp)))
+    (block $finished (loop $wait
+      (local.set $r (i32.atomic.load (i32.const 4)))
+      (br_if $finished (i32.eqz (local.get $r)))
+      (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
+      (br $wait)))
+    (i64.atomic.load (i32.const 8))))
+"#;
+    let n = 6i64;
+    let got = run_import(
+        wat,
+        "run",
+        |h| h.grant_blocking(std::time::Duration::ZERO, None),
+        &[Value::I32(n as i32)],
+    );
+    let want: i64 = (0..n).map(mix).fold(0i64, |a, x| a.wrapping_add(x));
+    assert_eq!(got, want, "Σ mix(i) over {n} spawned workers using the cap");
 }
 
 /// An **imported memory** is now supported (the wasi-threads shape — the host owns the one shared

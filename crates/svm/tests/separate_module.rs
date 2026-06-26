@@ -148,6 +148,134 @@ block0(v0: i32, v1: i32):
     );
 }
 
+/// A child ("plugin") with **two** exported entries, to prove name→funcidx resolution selects the
+/// right one (not just func 0): `"alpha"` (func 0) returns `byte + 1000`, `"beta"` (func 1) returns
+/// `byte + 2000`. Both are `(i64) -> (i64)` (the starter-cap convention).
+fn named_child_src() -> &'static str {
+    "memory 16
+data 100 \"VM\"
+export \"alpha\" 0
+export \"beta\" 1
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  v4 = i64.const 2000
+  v5 = i64.add v3 v4
+  return v5
+}
+"
+}
+
+/// Run `parent_src` with `(instantiator over the whole window, module handle for [`named_child_src`])`,
+/// over a 128 KiB window seeded with the test pattern; return the result and final window.
+fn run_with_named_child(parent_src: &str) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let parent = parse_module(parent_src).expect("parse parent");
+    verify_module(&parent).expect("verify parent");
+    let child = parse_module(named_child_src()).expect("parse child");
+    verify_module(&child).expect("verify child");
+
+    let mut host = Host::new();
+    let ih = host.grant_instantiator(0, 128 << 10);
+    let mh = host.grant_module(&child);
+    let init: Vec<u8> = (0..(128u64 << 10))
+        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+        .collect();
+    let mut fuel = 5_000_000u64;
+    run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih), Value::I32(mh)],
+        &mut fuel,
+        &init,
+        0,
+        &mut host,
+    )
+}
+
+#[test]
+fn module_child_addressed_by_export_name() {
+    // The parent resolves the child export "beta" (func 1, the *non-default* entry) via the new Module
+    // op 0, then instantiate_module's that funcidx → join. Proving name → funcidx mapping (the name
+    // bytes live in the parent's own data segment at offset 200).
+    let parent = "memory 17
+data 200 \"beta\"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 200
+  v3 = i64.const 4
+  v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
+  v5 = i64.extend_i32_s v1
+  v6 = i64.const 0
+  v7 = i64.const 65536
+  v8 = i64.const 16
+  v9 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
+  v10 = cap.call 6 1 (i32) -> (i64) v0 (v9)
+  return v10
+}
+";
+    let (res, _mem) = run_with_named_child(parent);
+    // 'V' (86) + 2000 — the *beta* entry ran, so resolve_export returned funcidx 1, not 0.
+    assert_eq!(
+        res.expect("run ok"),
+        vec![Value::I64(86 + 2000)],
+        "name-addressed child must run the resolved (non-0) export"
+    );
+}
+
+#[test]
+fn module_resolve_export_is_fail_closed() {
+    // An unknown name → -EINVAL (-22); the parent returns the resolve result directly. Pins the
+    // fail-closed contract of the new untrusted-name surface (a bad name must never trap or default).
+    let parent = "memory 17
+data 200 \"nope\"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 200
+  v3 = i64.const 4
+  v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
+  return v4
+}
+";
+    let (res, _mem) = run_with_named_child(parent);
+    assert_eq!(
+        res.expect("run ok"),
+        vec![Value::I64(-22)],
+        "an unknown export name must resolve to -EINVAL"
+    );
+}
+
+#[test]
+fn module_resolve_export_out_of_bounds_name_is_efault() {
+    // A name buffer past the window → -EFAULT (-14): the borrow is bounds-checked like every other
+    // guest-buffer cap op (Stream/Jit.compile), never an over-read.
+    let parent = "memory 17
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 4294967296
+  v3 = i64.const 4
+  v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
+  return v4
+}
+";
+    let (res, _mem) = run_with_named_child(parent);
+    assert_eq!(
+        res.expect("run ok"),
+        vec![Value::I64(-14)],
+        "an out-of-window name buffer must resolve to -EFAULT"
+    );
+}
+
 #[test]
 fn demand_module_child_gets_data_segments_lazily() {
     // spawn_demand_coroutine_module: the child's data segments are in the shared backing, but its

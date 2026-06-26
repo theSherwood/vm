@@ -12,8 +12,12 @@
 //! `br`/`br_if`/`br_table`/`return` terminators. Float, memory, calls, and
 //! capabilities come in later batches per §3b.
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 
 /// Block-local value index (parameters first, then instruction results in order).
@@ -41,6 +45,13 @@ pub enum ValType {
     F32,
     F64,
     V128,
+    /// An opaque 64-bit **reference** (§GC.md §6 forward-compat reservation). Reserved now so
+    /// future *precise* GC (stack maps + value-location metadata) can name pointer-typed slots
+    /// without a format break. Today it is a pure reservation: no instruction produces a `ref`
+    /// literal, and wherever a `ref` value does flow (a `ref`-typed param/result/block-arg) it is
+    /// indistinguishable from an `i64` — it lowers as `i64` in the JIT and as the opaque
+    /// `Value::Ref` in the interp. Conservative GC needs none of this; it scans raw words.
+    Ref,
 }
 
 impl ValType {
@@ -52,6 +63,7 @@ impl ValType {
             ValType::F32 => "f32",
             ValType::F64 => "f64",
             ValType::V128 => "v128",
+            ValType::Ref => "ref",
         }
     }
 
@@ -64,6 +76,7 @@ impl ValType {
             "f32" => ValType::F32,
             "f64" => ValType::F64,
             "v128" => ValType::V128,
+            "ref" => ValType::Ref,
             _ => return None,
         })
     }
@@ -143,6 +156,30 @@ impl VShape {
     pub fn from_name(s: &str) -> Option<VShape> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
+
+    /// The integer shape with **half** the lane width (and twice the lanes): `i16x8`→`i8x16`,
+    /// `i32x4`→`i16x8`, `i64x2`→`i32x4`. `None` for `i8x16` and the float shapes. The source of a
+    /// widen / the result of a narrow.
+    pub fn narrower(self) -> Option<VShape> {
+        match self {
+            VShape::I16x8 => Some(VShape::I8x16),
+            VShape::I32x4 => Some(VShape::I16x8),
+            VShape::I64x2 => Some(VShape::I32x4),
+            _ => None,
+        }
+    }
+
+    /// The integer shape with **double** the lane width: `i8x16`→`i16x8`, `i16x8`→`i32x4`,
+    /// `i32x4`→`i64x2`. `None` for `i64x2` and the float shapes. The result of a widen / the source
+    /// of a narrow.
+    pub fn wider(self) -> Option<VShape> {
+        match self {
+            VShape::I8x16 => Some(VShape::I16x8),
+            VShape::I16x8 => Some(VShape::I32x4),
+            VShape::I32x4 => Some(VShape::I64x2),
+            _ => None,
+        }
+    }
 }
 
 /// Lane-wise binary integer ops on a `v128` (§17). Defined for every integer [`VShape`]
@@ -154,15 +191,31 @@ pub enum VIntBinOp {
     Add,
     Sub,
     Mul,
+    MinS,
+    MinU,
+    MaxS,
+    MaxU,
 }
 
 impl VIntBinOp {
-    pub const ALL: [VIntBinOp; 3] = [VIntBinOp::Add, VIntBinOp::Sub, VIntBinOp::Mul];
+    pub const ALL: [VIntBinOp; 7] = [
+        VIntBinOp::Add,
+        VIntBinOp::Sub,
+        VIntBinOp::Mul,
+        VIntBinOp::MinS,
+        VIntBinOp::MinU,
+        VIntBinOp::MaxS,
+        VIntBinOp::MaxU,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             VIntBinOp::Add => "add",
             VIntBinOp::Sub => "sub",
             VIntBinOp::Mul => "mul",
+            VIntBinOp::MinS => "min_s",
+            VIntBinOp::MinU => "min_u",
+            VIntBinOp::MaxS => "max_s",
+            VIntBinOp::MaxU => "max_u",
         }
     }
     pub fn index(self) -> u8 {
@@ -172,6 +225,369 @@ impl VIntBinOp {
         Self::ALL.get(i as usize).copied()
     }
     pub fn from_name(s: &str) -> Option<VIntBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise integer **comparison** ops on a `v128` (§17): each lane yields an all-ones (true) or
+/// all-zeros (false) mask of the lane width, so the result is a `v128`. `s`/`u` select signed vs
+/// unsigned lane ordering (`Eq`/`Ne` are sign-agnostic). Defined for every integer [`VShape`] — the
+/// wasm spec omits unsigned `i64x2` compares, but the op set is total and the transpiler only emits
+/// the shapes wasm defines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VICmpOp {
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
+}
+
+impl VICmpOp {
+    pub const ALL: [VICmpOp; 10] = [
+        VICmpOp::Eq,
+        VICmpOp::Ne,
+        VICmpOp::LtS,
+        VICmpOp::LtU,
+        VICmpOp::GtS,
+        VICmpOp::GtU,
+        VICmpOp::LeS,
+        VICmpOp::LeU,
+        VICmpOp::GeS,
+        VICmpOp::GeU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VICmpOp::Eq => "eq",
+            VICmpOp::Ne => "ne",
+            VICmpOp::LtS => "lt_s",
+            VICmpOp::LtU => "lt_u",
+            VICmpOp::GtS => "gt_s",
+            VICmpOp::GtU => "gt_u",
+            VICmpOp::LeS => "le_s",
+            VICmpOp::LeU => "le_u",
+            VICmpOp::GeS => "ge_s",
+            VICmpOp::GeU => "ge_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VICmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VICmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **float** comparison ops on a `v128` (§17): each lane yields an all-ones (true) or
+/// all-zeros (false) mask of the lane width → result `v128`. Defined for the float [`VShape`]s
+/// (`f32x4`/`f64x2`). `eq`/`lt`/`gt`/`le`/`ge` are **ordered** (a NaN operand ⇒ false); `ne` is the
+/// **unordered** negation (a NaN operand ⇒ true) — exactly the wasm (and Rust `==`/`!=`/`<`/…) rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VFCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+impl VFCmpOp {
+    pub const ALL: [VFCmpOp; 6] = [
+        VFCmpOp::Eq,
+        VFCmpOp::Ne,
+        VFCmpOp::Lt,
+        VFCmpOp::Gt,
+        VFCmpOp::Le,
+        VFCmpOp::Ge,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VFCmpOp::Eq => "eq",
+            VFCmpOp::Ne => "ne",
+            VFCmpOp::Lt => "lt",
+            VFCmpOp::Gt => "gt",
+            VFCmpOp::Le => "le",
+            VFCmpOp::Ge => "ge",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VFCmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VFCmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise integer **shift** ops on a `v128` (§17): every lane is shifted by the **same** scalar
+/// `i32` amount, taken **modulo the lane bit-width** (the wasm rule). `ShrS` is arithmetic
+/// (sign-replicating); `Shl`/`ShrU` are logical. Defined for every integer [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VShiftOp {
+    Shl,
+    ShrS,
+    ShrU,
+}
+
+impl VShiftOp {
+    pub const ALL: [VShiftOp; 3] = [VShiftOp::Shl, VShiftOp::ShrS, VShiftOp::ShrU];
+    pub fn name(self) -> &'static str {
+        match self {
+            VShiftOp::Shl => "shl",
+            VShiftOp::ShrS => "shr_s",
+            VShiftOp::ShrU => "shr_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VShiftOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VShiftOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **unary** integer ops on a `v128` (§17): `Abs` (`|x|`, two's-complement, so
+/// `abs(INT_MIN) == INT_MIN`, the wasm/hardware wrap) and `Neg` (`0 - x`, wrapping). `a`/result are
+/// `v128`. Defined for every integer [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VIntUnOp {
+    Abs,
+    Neg,
+}
+
+impl VIntUnOp {
+    pub const ALL: [VIntUnOp; 2] = [VIntUnOp::Abs, VIntUnOp::Neg];
+    pub fn name(self) -> &'static str {
+        match self {
+            VIntUnOp::Abs => "abs",
+            VIntUnOp::Neg => "neg",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VIntUnOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VIntUnOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **saturating** add/sub on a `v128` (§17): a lane that would overflow clamps to the
+/// lane's signed/unsigned min or max instead of wrapping. Defined **only for `i8x16`/`i16x8`** (the
+/// wasm spec has no wider saturating add/sub) — the verifier rejects any other [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VSatBinOp {
+    AddS,
+    AddU,
+    SubS,
+    SubU,
+}
+
+impl VSatBinOp {
+    pub const ALL: [VSatBinOp; 4] = [
+        VSatBinOp::AddS,
+        VSatBinOp::AddU,
+        VSatBinOp::SubS,
+        VSatBinOp::SubU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VSatBinOp::AddS => "add_sat_s",
+            VSatBinOp::AddU => "add_sat_u",
+            VSatBinOp::SubS => "sub_sat_s",
+            VSatBinOp::SubU => "sub_sat_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VSatBinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VSatBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane **widening** (`extend`): take the low or high half of the source lanes and sign/zero-extend
+/// each to twice the width. The result [`VShape`] is the wider one; the source is its [`VShape::narrower`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VWidenOp {
+    LowS,
+    LowU,
+    HighS,
+    HighU,
+}
+
+impl VWidenOp {
+    pub const ALL: [VWidenOp; 4] = [
+        VWidenOp::LowS,
+        VWidenOp::LowU,
+        VWidenOp::HighS,
+        VWidenOp::HighU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VWidenOp::LowS => "extend_low_s",
+            VWidenOp::LowU => "extend_low_u",
+            VWidenOp::HighS => "extend_high_s",
+            VWidenOp::HighU => "extend_high_u",
+        }
+    }
+    /// `(low_half, signed)`.
+    pub fn parts(self) -> (bool, bool) {
+        match self {
+            VWidenOp::LowS => (true, true),
+            VWidenOp::LowU => (true, false),
+            VWidenOp::HighS => (false, true),
+            VWidenOp::HighU => (false, false),
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VWidenOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VWidenOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane **narrowing**: take two source vectors (each the wider shape), saturate every lane to the
+/// narrow width, and concatenate (`a`'s lanes then `b`'s). `S`/`U` pick the *saturation* range; the
+/// source is always read as **signed** (the wasm rule). `i8x16`/`i16x8` results only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VNarrowOp {
+    S,
+    U,
+}
+
+impl VNarrowOp {
+    pub const ALL: [VNarrowOp; 2] = [VNarrowOp::S, VNarrowOp::U];
+    pub fn name(self) -> &'static str {
+        match self {
+            VNarrowOp::S => "narrow_s",
+            VNarrowOp::U => "narrow_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VNarrowOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VNarrowOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane **int↔float / float↔float conversions** (§17). Each is a whole-instruction mnemonic (the
+/// source and result lane shapes differ, so unlike the lane-op families these don't share a
+/// `shape.suffix` form). `a`/result are `v128`. `trunc_sat` is the non-trapping float→int (NaN→0,
+/// clamp to the integer range); `demote`/`promote` change float width (low 2 lanes, high zeroed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VCvtOp {
+    /// `f32x4.convert_i32x4_s`: each `i32` lane → `f32`.
+    F32x4ConvertI32x4S,
+    /// `f32x4.convert_i32x4_u`: each `u32` lane → `f32`.
+    F32x4ConvertI32x4U,
+    /// `i32x4.trunc_sat_f32x4_s`: each `f32` lane → saturating `i32`.
+    I32x4TruncSatF32x4S,
+    /// `i32x4.trunc_sat_f32x4_u`: each `f32` lane → saturating `u32`.
+    I32x4TruncSatF32x4U,
+    /// `f32x4.demote_f64x2_zero`: the two `f64` lanes → `f32` (lanes 0/1); lanes 2/3 = 0.
+    F32x4DemoteF64x2Zero,
+    /// `f64x2.promote_low_f32x4`: the low two `f32` lanes → `f64`.
+    F64x2PromoteLowF32x4,
+    /// `f64x2.convert_low_i32x4_s`: the low two `i32` lanes → `f64` (lanes 0/1).
+    F64x2ConvertLowI32x4S,
+    /// `f64x2.convert_low_i32x4_u`: the low two `u32` lanes → `f64` (lanes 0/1).
+    F64x2ConvertLowI32x4U,
+    /// `i32x4.trunc_sat_f64x2_s_zero`: the two `f64` lanes → saturating `i32` (lanes 0/1); 2/3 = 0.
+    I32x4TruncSatF64x2SZero,
+    /// `i32x4.trunc_sat_f64x2_u_zero`: the two `f64` lanes → saturating `u32` (lanes 0/1); 2/3 = 0.
+    I32x4TruncSatF64x2UZero,
+}
+
+impl VCvtOp {
+    pub const ALL: [VCvtOp; 10] = [
+        VCvtOp::F32x4ConvertI32x4S,
+        VCvtOp::F32x4ConvertI32x4U,
+        VCvtOp::I32x4TruncSatF32x4S,
+        VCvtOp::I32x4TruncSatF32x4U,
+        VCvtOp::F32x4DemoteF64x2Zero,
+        VCvtOp::F64x2PromoteLowF32x4,
+        VCvtOp::F64x2ConvertLowI32x4S,
+        VCvtOp::F64x2ConvertLowI32x4U,
+        VCvtOp::I32x4TruncSatF64x2SZero,
+        VCvtOp::I32x4TruncSatF64x2UZero,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VCvtOp::F32x4ConvertI32x4S => "f32x4.convert_i32x4_s",
+            VCvtOp::F32x4ConvertI32x4U => "f32x4.convert_i32x4_u",
+            VCvtOp::I32x4TruncSatF32x4S => "i32x4.trunc_sat_f32x4_s",
+            VCvtOp::I32x4TruncSatF32x4U => "i32x4.trunc_sat_f32x4_u",
+            VCvtOp::F32x4DemoteF64x2Zero => "f32x4.demote_f64x2_zero",
+            VCvtOp::F64x2PromoteLowF32x4 => "f64x2.promote_low_f32x4",
+            VCvtOp::F64x2ConvertLowI32x4S => "f64x2.convert_low_i32x4_s",
+            VCvtOp::F64x2ConvertLowI32x4U => "f64x2.convert_low_i32x4_u",
+            VCvtOp::I32x4TruncSatF64x2SZero => "i32x4.trunc_sat_f64x2_s_zero",
+            VCvtOp::I32x4TruncSatF64x2UZero => "i32x4.trunc_sat_f64x2_u_zero",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VCvtOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VCvtOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **pseudo** min/max on a float `v128` (§17). Unlike the IEEE [`VFloatBinOp::Min`]/`Max`,
+/// these are the wasm `pmin`/`pmax`: a plain compare-and-select — `pmin(a,b) = b < a ? b : a`,
+/// `pmax(a,b) = a < b ? b : a` — so a NaN operand (and `±0`) follow the select, not IEEE rules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VPMinMaxOp {
+    Pmin,
+    Pmax,
+}
+
+impl VPMinMaxOp {
+    pub const ALL: [VPMinMaxOp; 2] = [VPMinMaxOp::Pmin, VPMinMaxOp::Pmax];
+    pub fn name(self) -> &'static str {
+        match self {
+            VPMinMaxOp::Pmin => "pmin",
+            VPMinMaxOp::Pmax => "pmax",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VPMinMaxOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VPMinMaxOp> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
 }
@@ -224,15 +640,32 @@ pub enum VFloatUnOp {
     Abs,
     Neg,
     Sqrt,
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
 }
 
 impl VFloatUnOp {
-    pub const ALL: [VFloatUnOp; 3] = [VFloatUnOp::Abs, VFloatUnOp::Neg, VFloatUnOp::Sqrt];
+    // Appended (not reordered) so the binary `index` of Abs/Neg/Sqrt stays stable.
+    pub const ALL: [VFloatUnOp; 7] = [
+        VFloatUnOp::Abs,
+        VFloatUnOp::Neg,
+        VFloatUnOp::Sqrt,
+        VFloatUnOp::Ceil,
+        VFloatUnOp::Floor,
+        VFloatUnOp::Trunc,
+        VFloatUnOp::Nearest,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             VFloatUnOp::Abs => "abs",
             VFloatUnOp::Neg => "neg",
             VFloatUnOp::Sqrt => "sqrt",
+            VFloatUnOp::Ceil => "ceil",
+            VFloatUnOp::Floor => "floor",
+            VFloatUnOp::Trunc => "trunc",
+            VFloatUnOp::Nearest => "nearest",
         }
     }
     pub fn index(self) -> u8 {
@@ -1102,6 +1535,15 @@ pub enum Inst {
         op: FUnOp,
         a: ValIdx,
     },
+    /// Scalar **fused multiply-add** `a·b + c` with a single rounding (IEEE-754 FMA) — the scalar
+    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` / Rust
+    /// `f*::mul_add` are both correctly-rounded, so interp and JIT agree. Operands/result are `ty`.
+    Fma {
+        ty: FloatTy,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
+    },
     /// Float compare; operands are `ty`, result is `i32` 0/1.
     FCmp {
         ty: FloatTy,
@@ -1272,6 +1714,54 @@ pub enum Inst {
     CapSelfGet {
         idx: ValIdx,
     },
+    /// §7 capability **reflection** (`cap.self.resolve`): resolve a capability **name** to the handle
+    /// it was granted under, as `i32` (`-errno` on miss) — the runtime, in-guest counterpart to
+    /// load-time name binding (dlopen-style discovery). `name_ptr`/`name_len` (both `i64`) point at a
+    /// UTF-8 name in the window. Read-only and authority-neutral like the rest of `cap.self`: it only
+    /// re-finds a handle the domain already holds (an unknown / ungranted name is `-EINVAL`; an
+    /// out-of-window buffer is `-EFAULT`). Sugar over the reserved `CAP_SELF_TYPE_ID` op 2, which it
+    /// lowers to on every backend.
+    CapSelfResolve {
+        name_ptr: ValIdx,
+        name_len: ValIdx,
+    },
+    /// §7 capability **reflection** (`cap.self.label`): write the human-readable **label** of the
+    /// capability `handle` into the window at `buf_ptr` (up to `buf_cap` bytes), returning the label's
+    /// full byte length — `0` if the handle has no label. The reverse of [`Inst::CapSelfResolve`]: a
+    /// guest enumerating its handles (`cap.self.count`/`get`) can name each one for diagnostics /
+    /// discovery. Cosmetic and authority-neutral (a label is not a nominal type_id; the verifier
+    /// ignores it). If the label doesn't fit (`buf_cap < len`) nothing is written — the guest retries
+    /// with a buffer of the returned size. An out-of-window buffer is `-EFAULT`.
+    CapSelfLabel {
+        handle: ValIdx,
+        buf_ptr: ValIdx,
+        buf_cap: ValIdx,
+    },
+    /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
+    /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
+    /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
+    /// resumable fiber) `get` returns the *new* vCPU's word — the correct per-CPU value, which the
+    /// guest cannot otherwise name (the `thread.spawn` handle is the parent's view, not "which vCPU am
+    /// I on now"). Seeded at vCPU creation to a **dense id** (root = 0, children sequential in spawn
+    /// order), so before any `set` it doubles as a `vcpu.id`; the guest may overwrite it (e.g. a
+    /// pointer to its per-CPU block) for full thread-local storage. Authority-neutral, ambient (the
+    /// `cap.self`/`gc.roots` family). Result is `i64`. (Determinism: program *output* must not depend
+    /// on *which* vCPU runs you, only on per-CPU state being self-consistent — GC.md §3.2.)
+    VcpuTlsGet,
+    /// §12 per-vCPU **thread-local register** write (`vcpu.tls.set`): set the executing vCPU's `i64`
+    /// TLS word to `val`. No result (like `store`). See [`Inst::VcpuTlsGet`].
+    VcpuTlsSet {
+        val: ValIdx,
+    },
+    /// **Durable-runtime-internal** (DURABILITY.md §12.8, Phase 4 Slice A.5): read the **current
+    /// durable context's shadow region base** — a window byte offset. Emitted only by the durable
+    /// transform (`svm-durable`) to address that context's *own* per-context shadow-SP word, so
+    /// concurrent vCPUs each spill against their own region with no shared word. Like
+    /// [`Inst::VcpuTlsGet`] it is a per-OS-thread runtime register read (no window/trap context, cannot
+    /// fault), but **runtime-private**: the runtime seeds it per dispatch / per child and there is no
+    /// guest write op, so a guest cannot clobber it (unlike the guest-overwritable `vcpu.tls`). Result
+    /// is `i64`.
+    DurableShadowBase,
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
     /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
     /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
@@ -1303,6 +1793,66 @@ pub enum Inst {
     /// [`Inst::ContResume`] this is a call-clobbering control op.
     Suspend {
         value: ValIdx,
+    },
+    /// `setjmp` (the `<setjmp.h>` non-local-jump save). Captures the **current frame's resume point**
+    /// — a checkpoint of (this call-stack depth, the data-stack pointer, this frame's continuation just
+    /// after the `setjmp`) — into a runtime-owned checkpoint table, writing an opaque token into the
+    /// guest `jmp_buf` at byte offset `buf` (`i64`). Evaluates to `i32` **0** on the direct call; a
+    /// later [`Inst::LongJmp`] re-enters the frame *here* (returns "twice") with the long-jump value.
+    /// Like `cont.*` it is a **call-clobbering** control op (the live state is captured), but it does
+    /// not switch stacks and falls through normally on the direct call. The `jmp_buf` token is
+    /// **backend-internal** (the interpreter stores a checkpoint index) and opaque to the guest, so
+    /// observable behavior matches across engines though the bytes differ; it is transient (not
+    /// snapshot-portable). Lowers from the recognized external `setjmp`/`_setjmp`/`sigsetjmp` call.
+    SetJmp {
+        buf: ValIdx,
+    },
+    /// `longjmp` (the `<setjmp.h>` non-local jump). Reads the checkpoint token from the guest `jmp_buf`
+    /// at byte offset `buf` (`i64`), **unwinds** the call stack back to the captured [`Inst::SetJmp`]
+    /// frame (the intervening frames discarded with no per-frame work — C has no cleanups), restores the
+    /// data-stack pointer, and re-enters at the `setjmp` continuation, making *that* `setjmp` evaluate
+    /// to `val` (`i32`; a `0` `val` becomes `1`, per C). **Never returns** to the next instruction (a
+    /// `noreturn` control op; the trailing `unreachable` is dead). A stale/forged token, or a checkpoint
+    /// whose frame has already returned, **traps** (in-sandbox; §3b totality). Lowers from the
+    /// recognized external `longjmp`/`siglongjmp` call.
+    LongJmp {
+        buf: ValIdx,
+        val: ValIdx,
+    },
+    /// §GC (`GC.md`) **conservative root enumeration** (`gc.roots`): scan every fiber of the
+    /// domain — parked fibers, resume-chain ancestors, and the calling computation's own live
+    /// frames (the op is **call-clobbering**, so the caller's roots are already spilled to its
+    /// control stack, exactly like `cont.resume`/`suspend`) — for candidate pointer words that
+    /// — after masking each scanned word `w` with `mask` (`m = w & mask`) — fall in the half-open
+    /// guest-window range `[heap_lo, heap_hi)` (`i64` window offsets). The **masked** value `m` is
+    /// what's tested and emitted, letting a guest with **tagged** pointers (e.g. a tag in the high
+    /// byte, `(tag << 56) | offset`) recover the bare offset; `mask = !0` reproduces the untagged
+    /// behavior. Writes up to `cap` **distinct (deduplicated)** `i64`-width candidate words,
+    /// ascending, into guest memory at byte offset `buf`, and yields the **total** number found
+    /// (`i64`); if that exceeds `cap` the guest retries with a larger buffer (only the first `cap`
+    /// are written). An **ambient introspection op** — authority-neutral like `cap.self` reflection:
+    /// every candidate is an in-window word the guest's own heap already encodes, while
+    /// out-of-window words (host return addresses, frame pointers, host pointers) are filtered
+    /// *inside* the VM and never cross the boundary, so no host layout leaks (GC.md §3, §6).
+    /// **Security — `mask` may only clear the top byte** (the low 56 bits must be all-ones:
+    /// `mask | 0xFF00_0000_0000_0000 == !0`): a mask that cleared lower bits could fold a host
+    /// pointer (canonical, `< 2^56`) down into the guest window and leak host-address bits past the
+    /// range filter (ASLR). The constraint keeps any host word large → excluded; it's enforced
+    /// statically by the verifier (constant masks) and defensively at runtime on both backends.
+    /// Implemented on **both backends**: the interpreter scans its reified `Value` frames; the JIT
+    /// conservatively walks the live native control stacks of its fibers (parked fibers' saved
+    /// extents `[ctx, top)`, the running resume chain, and the root computation's frames). The two
+    /// over-approximate differently (a sound superset of the live roots, not a matching set —
+    /// GC.md §3.2). Where the stack-switch substrate is absent the JIT bails `Unsupported` and the
+    /// interpreter covers it.
+    GcRoots {
+        heap_lo: ValIdx,
+        heap_hi: ValIdx,
+        /// `i64` payload mask AND-ed with each scanned word before the range test (and emitted).
+        /// Constrained to top-byte-strip only (`mask | 0xFF00_0000_0000_0000 == !0`); see above.
+        mask: ValIdx,
+        buf: ValIdx,
+        cap: ValIdx,
     },
     /// §12 thread spawn (`thread.spawn`): start a new vCPU — **one real OS thread** (1:1; the VM
     /// provides the thread + futex as *primitives*, not a scheduler — any M:N model is built by the
@@ -1403,6 +1953,152 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// Lane-wise integer comparison (see [`VICmpOp`]); `a`/`b`/result are `v128` (per-lane all-ones
+    /// or all-zeros mask of the lane width).
+    VIntCmp {
+        shape: VShape,
+        op: VICmpOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise float comparison (see [`VFCmpOp`]); `a`/`b`/result are `v128` (per-lane all-ones or
+    /// all-zeros mask of the lane width).
+    VFloatCmp {
+        shape: VShape,
+        op: VFCmpOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise integer shift by a scalar amount (see [`VShiftOp`]): `a`/result are `v128`, `amt`
+    /// is an `i32` (taken modulo the lane bit-width).
+    VShift {
+        shape: VShape,
+        op: VShiftOp,
+        a: ValIdx,
+        amt: ValIdx,
+    },
+    /// Lane-wise unary integer op (see [`VIntUnOp`]); `a`/result are `v128`.
+    VIntUn {
+        shape: VShape,
+        op: VIntUnOp,
+        a: ValIdx,
+    },
+    /// Lane-wise saturating add/sub (see [`VSatBinOp`]); `a`/`b`/result are `v128`. `i8x16`/`i16x8`
+    /// only (verifier-enforced).
+    VSatBin {
+        shape: VShape,
+        op: VSatBinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane **widen** (`extend`, see [`VWidenOp`]); `shape` is the **result** (wider) shape, the
+    /// source is its [`VShape::narrower`]. `a`/result are `v128`.
+    VWiden {
+        shape: VShape,
+        op: VWidenOp,
+        a: ValIdx,
+    },
+    /// Lane **narrow** (see [`VNarrowOp`]); `shape` is the **result** (narrow) shape, the source is
+    /// its [`VShape::wider`]. `a`/`b`/result are `v128`. `i8x16`/`i16x8` only (verifier-enforced).
+    VNarrow {
+        shape: VShape,
+        op: VNarrowOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane int↔float / float↔float conversion (see [`VCvtOp`]); `a`/result are `v128`.
+    VConvert {
+        op: VCvtOp,
+        a: ValIdx,
+    },
+    /// Lane-wise float pseudo-min/max (see [`VPMinMaxOp`]); `a`/`b`/result are `v128`. Float shapes.
+    VPMinMax {
+        shape: VShape,
+        op: VPMinMaxOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `i8x16.popcnt`: per-byte population count. `a`/result are `v128`. Shape is always `i8x16`
+    /// (the only shape wasm defines), so no shape field — the verifier needs no lane rule.
+    VPopcnt {
+        a: ValIdx,
+    },
+    /// Lane-wise unsigned rounding average `(a + b + 1) >> 1` (computed wide, no overflow).
+    /// `a`/`b`/result are `v128`. `i8x16`/`i16x8` only (verifier-enforced — the only shapes wasm
+    /// defines `avgr_u` for), so like [`Inst::VSatBin`] there is no JIT bail list.
+    VAvgr {
+        shape: VShape,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `i32x4.dot_i16x8_s`: signed dot product of adjacent `i16` pairs into `i32` lanes —
+    /// `result[i] = a[2i]·b[2i] + a[2i+1]·b[2i+1]`. Source `i16x8`, result `i32x4` (the only dot
+    /// wasm defines), so no shape field. `a`/`b`/result are `v128`.
+    VDot {
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Signed `i8` dot product of adjacent pairs into `i16` lanes — `result[j] = a[2j]·b[2j] +
+    /// a[2j+1]·b[2j+1]` (wrapping at `i16`), both operands read as signed `i8`. Source `i8x16`,
+    /// result `i16x8`. The **deterministic** lowering of the relaxed `relaxed_dot_i8x16_i7x16_s`
+    /// (the spec-allowed signed-×-signed behavior, not the x86 `pmaddubsw` unsigned-×-signed one).
+    VDotI8 {
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Extended (widening) multiply: widen the low/high half of both `i8x16`/`i16x8`/`i32x4`
+    /// operands (sign- or zero-, per [`VWidenOp`]) to the next wider shape, then multiply lane-wise.
+    /// `shape` is the **wide result** (`i16x8`/`i32x4`/`i64x2`); `a`/`b`/result are `v128`.
+    VExtMul {
+        shape: VShape,
+        op: VWidenOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Extended pairwise add: widen every lane of an `i8x16`/`i16x8` source (sign- or zero-, per
+    /// `signed`) and sum adjacent pairs into the next wider shape — `out[i] = w(a[2i]) + w(a[2i+1])`.
+    /// `shape` is the **wide result** (`i16x8`/`i32x4`); `a`/result are `v128`.
+    VExtAddPairwise {
+        shape: VShape,
+        signed: bool,
+        a: ValIdx,
+    },
+    /// `i16x8.q15mulr_sat_s`: signed Q15 fixed-point multiply with rounding and saturation —
+    /// `out[i] = sat_i16((a[i]·b[i] + 0x4000) >> 15)`. Fixed `i16x8` (the only shape wasm defines),
+    /// so no shape field. `a`/`b`/result are `v128`.
+    VQ15MulrSat {
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise **fused multiply-add** (the relaxed-SIMD `relaxed_madd`/`relaxed_nmadd`): each lane
+    /// is `a·b + c` (`neg == false`) or `−a·b + c` (`neg == true`), computed with a **single rounding**
+    /// (IEEE-754 FMA). Float shapes (`f32x4`/`f64x2`); `a`/`b`/`c`/result are `v128`. SVM picks the
+    /// fused behavior (one of the two the relaxed proposal permits) consistently in both backends —
+    /// Cranelift `fma` and Rust `f*::mul_add` are both correctly-rounded, so the differential holds.
+    VFma {
+        shape: VShape,
+        neg: bool,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
+    },
+    /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
+    /// (shape-agnostic). `a` is `v128`, result `i32`.
+    VAnyTrue {
+        a: ValIdx,
+    },
+    /// `<shape>.all_true`: `i32` `1` if **every** lane (of `shape`) is non-zero, else `0`. `a` is
+    /// `v128`, result `i32`.
+    VAllTrue {
+        shape: VShape,
+        a: ValIdx,
+    },
+    /// `<shape>.bitmask`: gather the **high (sign) bit** of each lane into the low bits of an `i32`
+    /// (lane `i` → bit `i`). `a` is `v128`, result `i32`.
+    VBitmask {
+        shape: VShape,
+        a: ValIdx,
+    },
     /// Lane-wise binary float op (see [`VFloatBinOp`]); `a`/`b`/result are `v128`.
     VFloatBin {
         shape: VShape,
@@ -1464,12 +2160,17 @@ impl Inst {
             Inst::Store { .. }
             | Inst::AtomicStore { .. }
             | Inst::AtomicFence { .. }
+            | Inst::VcpuTlsSet { .. }
+            | Inst::LongJmp { .. }
             | Inst::V128Store { .. } => 0,
+            // `vcpu.tls.get` appends one `i64`; `durable.shadow_base` likewise (a window byte offset).
+            Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
-            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count` appends one `i32`.
+            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`resolve`/`label` append
+            // one `i32`.
             Inst::CapSelfGet { .. } => 2,
-            Inst::CapSelfCount => 1,
+            Inst::CapSelfCount | Inst::CapSelfResolve { .. } | Inst::CapSelfLabel { .. } => 1,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),
@@ -1567,6 +2268,17 @@ impl Func {
             })
         })
     }
+
+    /// Whether this function contains any `setjmp`/`longjmp` op ([`Inst::SetJmp`]/[`Inst::LongJmp`]).
+    /// Used to reject a §14 JIT child that uses `setjmp` (no per-child `setjmp` runtime yet — like
+    /// `uses_concurrency` for fibers/threads).
+    pub fn uses_setjmp(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
+        })
+    }
 }
 
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —
@@ -1597,6 +2309,290 @@ impl Memory {
 /// costs virtual address space, not committed memory.
 pub const DEFAULT_RESERVED_LOG2: u8 = 40;
 
+/// The §3e powerbox **args-buffer** window offset: where a host seeds the program-arguments blob so
+/// the frontend's `_start` can hand `argc`/`argv` to a C `main(int, char**)`. This is the
+/// "borrowed buffer at a known window offset" of DESIGN §3e / D44, realized as a *fixed* offset (not
+/// an extra entry parameter) so the powerbox entry signature stays the language-neutral handle
+/// vector — the C-specific `argv[]` marshalling lives entirely in the on-ramp's `_start`.
+///
+/// Layout at `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)`:
+/// `{ argc: u32-LE, envc: u32-LE }` then `argc` + `envc` NUL-terminated UTF-8 strings, packed
+/// (the argv strings first, then the envp strings). A guest that never reads it (e.g. `main(void)`)
+/// is unaffected. The region sits below the frontend's globals base, so it never overlaps a data
+/// segment; a host must reject a blob that would reach `POWERBOX_ARGS_END`.
+pub const POWERBOX_ARGS_BASE: u64 = 128;
+/// The end of the powerbox args-buffer region (exclusive) — the frontend's globals/data-stack base
+/// for a powerbox program (`svm-llvm`'s `STACK_PAGE`). The args blob must fit in
+/// `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)` so it never collides with a data segment.
+pub const POWERBOX_ARGS_END: u64 = 16384;
+
+/// The §3e powerbox **handle-stash** base: the synthesized `_start` stashes each granted capability
+/// handle as an `i32` slot at window offset `STASH_BASE + i*4` (handle `i` at `i*4`), for the
+/// contiguous prefix of the eight fixed `VM_CAP_*` capabilities the program was granted. This is the
+/// *public* contract the C on-ramp (`svm-llvm`) bakes into its private `synth_start`;
+/// [`synth_powerbox_start`] reproduces it byte-for-byte so a frontend that emits SVM-IR directly
+/// gets the identical bootstrap without reaching into the on-ramp.
+pub const POWERBOX_STASH_BASE: u64 = 0;
+/// The guest heap's bump-pointer word (`i64`), just above the 8-handle stash region (`[0, 32)`).
+/// Seeded by `_start` (to the window's mapped boundary) when the program allocates (`seed_heap`).
+pub const POWERBOX_HEAP_BRK: u64 = 32;
+/// The guest heap's committed-boundary word (`i64`), just above [`POWERBOX_HEAP_BRK`]. The allocator
+/// `Memory.map`-commits upward from here into the reserved tail (§1a sparse address space).
+pub const POWERBOX_HEAP_TOP: u64 = 40;
+/// The powerbox globals / data-stack base (= [`POWERBOX_ARGS_END`]): page 0 is the writable
+/// stash + heap state + format scratch + args buffer, so a frontend's globals and the data stack
+/// live at/above this page — a read-only global never shares page 0 with the writable stash, and
+/// `_start`'s handle stores never fault on a read-only page (D40 page isolation).
+pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
+/// The data-stack reserve [`synth_powerbox_start`] leaves above the globals when sizing the window
+/// (matches `svm-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
+pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
+/// The number of fixed powerbox capabilities (`VM_CAP_*`, `<svm.h>`): stdout, stdin, exit, memory,
+/// addrspace, ioring, blocking, jit — always granted as a contiguous prefix of this set.
+pub const POWERBOX_MAX_HANDLES: usize = 8;
+
+/// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
+/// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
+/// [`Quota`] can only *tighten* below this, never raise it.
+pub const MAX_FIBERS: usize = 1 << 16;
+
+/// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
+/// `ThreadFault` past it. The interpreter bounds *concurrently-live* vCPUs; the JIT's table is
+/// cumulative, so there it bounds *total* spawns (stricter, but containment holds either way).
+pub const MAX_VCPUS: usize = 1 << 16;
+
+/// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
+/// (`thread.spawn`) a run may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb
+/// ceilings. The **single** quota type shared by both runtimes (re-exported as `svm_interp::Quota` and
+/// `svm_jit::Quota`), so a powerbox embedder sets it once and it binds the tree-walker, bytecode
+/// engine, and JIT identically (no facade conversion). The embedder sets it on the `Host`
+/// (`Host::set_quota`, which [`Quota::clamped`]s it); a guest that exceeds it traps cleanly
+/// (`FiberFault`/`ThreadFault`) — DoS *containment* policy (§15/D48), not just the host-OOM backstop.
+/// [`Default`] is the hard ceilings, so an unconfigured run is unchanged.
+///
+/// `max_vcpus` semantics differ slightly by backend (documented at the ceilings): the interpreter
+/// counts concurrent liveness, the JIT counts cumulative spawns. The *type* is one; the runtimes apply
+/// it per their model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quota {
+    /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
+    /// clamped to [`MAX_FIBERS`]. Per-run, not per-vCPU (the fiber table is the run-shared registry).
+    pub max_fibers: usize,
+    /// Max vCPUs a run may create (`thread.spawn`); clamped to [`MAX_VCPUS`].
+    pub max_vcpus: usize,
+}
+
+impl Default for Quota {
+    fn default() -> Quota {
+        Quota {
+            max_fibers: MAX_FIBERS,
+            max_vcpus: MAX_VCPUS,
+        }
+    }
+}
+
+impl Quota {
+    /// Clamp each limit to its hard anti-bomb ceiling (a quota can only *tighten*, never raise the
+    /// ceiling), and to ≥ 1 (the root vCPU/computation always exists).
+    pub fn clamped(self) -> Quota {
+        Quota {
+            max_fibers: self.max_fibers.clamp(1, MAX_FIBERS),
+            max_vcpus: self.max_vcpus.clamp(1, MAX_VCPUS),
+        }
+    }
+}
+
+/// The powerbox data-stack base for `module`: the page-aligned offset just above its globals/data
+/// segments (and never below [`POWERBOX_STACK_PAGE`]) — the `sp` the synthesized `_start` passes to
+/// the entry. Exposed so an embedder driving exports directly (the reactor / `Session` model) can
+/// synthesize the same `sp` per call that `_start` would. Stable across [`synth_powerbox_start`]
+/// (which adds no data segments), so it returns the same value before and after the prepend.
+pub fn powerbox_entry_sp(module: &Module) -> u64 {
+    let data_end = module
+        .data
+        .iter()
+        .map(|d| d.offset + d.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    data_end
+        .max(POWERBOX_STACK_PAGE)
+        .div_ceil(POWERBOX_STACK_PAGE)
+        * POWERBOX_STACK_PAGE
+}
+
+/// Prepend the powerbox bootstrap `_start` (the new function 0) to an already-linked, possibly
+/// import-bearing `module`, reproducing the exact layout the C on-ramp (`svm-llvm`) bakes into its
+/// own `synth_start` — so a frontend that emits SVM-IR directly (and links it itself, e.g. via
+/// [`link`]) gets the same "just works" powerbox bootstrap the C path enjoys, with no access to the
+/// on-ramp internals.
+///
+/// The synthesized `_start` takes `n_handles` `i32` capability handles (a contiguous prefix of the
+/// eight fixed [`POWERBOX_MAX_HANDLES`] `VM_CAP_*` slots — stdout, stdin, exit, memory, addrspace,
+/// ioring, blocking, jit), **stashes** each at window offset `i*4` (the public
+/// [`POWERBOX_STASH_BASE`] layout), optionally **seeds** the guest heap (`seed_heap`, when the
+/// program allocates — the bump pointer/boundary at [`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`]),
+/// then calls `entry(sp)` with the page-aligned data-stack base and returns the entry's result.
+///
+/// `entry` is the funcidx (in `module`, **before** the prepend) of the program's entry — a
+/// `(i64 sp) -> ()` or `(i64 sp) -> (T)` function (the C `main(void)` shape: it takes the threaded
+/// data-stack pointer). Prepending `_start` shifts every existing funcidx up by one; this is handled
+/// here (including the call to `entry`), so the returned module is internally consistent.
+///
+/// The window is grown (never shrunk) to cover the stash, the module's globals/data segments, and a
+/// [`POWERBOX_STACK_RESERVE`] data-stack reserve; a frontend's globals must already live at/above
+/// [`POWERBOX_STACK_PAGE`] (page 0 is the writable scratch). Returns an error if `n_handles` is
+/// outside `[3, 8]`, `entry` is out of range, or the entry signature isn't `(i64) -> ()`/`(i64) -> (T)`.
+pub fn synth_powerbox_start(
+    mut module: Module,
+    entry: FuncIdx,
+    n_handles: usize,
+    seed_heap: bool,
+) -> Result<Module, String> {
+    // The handle stash occupies `[0, n_handles*4)`. It must not run into the reserved low state that
+    // sits above it: the heap bump/boundary words at [`POWERBOX_HEAP_BRK`] (when the program seeds a
+    // heap), else the format scratch / §3e args buffer at [`POWERBOX_ARGS_BASE`]. So a *fixed*
+    // powerbox is the 8-handle case (`32 == POWERBOX_HEAP_BRK`), and a name-bound frontend may stash
+    // more (up to 32 handles) as long as it doesn't seed a heap. This is the only cap — there is no
+    // lower bound (a capability-free program stashes nothing).
+    let stash_end = n_handles as u64 * 4;
+    let ceiling = if seed_heap {
+        POWERBOX_HEAP_BRK
+    } else {
+        POWERBOX_ARGS_BASE
+    };
+    if stash_end > ceiling {
+        return Err(format!(
+            "powerbox stash for {n_handles} handles ([0, {stash_end})) overflows the reserved low \
+             region (must end by offset {ceiling}{})",
+            if seed_heap {
+                " — with seed_heap the heap state lives just above the 8-handle region"
+            } else {
+                ""
+            }
+        ));
+    }
+    let ef = module.funcs.get(entry as usize).ok_or_else(|| {
+        format!(
+            "entry funcidx {entry} out of range ({} funcs)",
+            module.funcs.len()
+        )
+    })?;
+    if ef.params.as_slice() != [ValType::I64] {
+        return Err(format!(
+            "powerbox entry must take a single i64 (the data-stack pointer), got params {:?}",
+            ef.params
+        ));
+    }
+    if ef.results.len() > 1 {
+        return Err(format!(
+            "powerbox entry must return 0 or 1 value, got {:?}",
+            ef.results
+        ));
+    }
+    let results = ef.results.clone();
+
+    // Globals/data segments live at/above STACK_PAGE; the data stack starts page-aligned above the
+    // highest data segment (and never below STACK_PAGE), so a read-only global never shares a page
+    // with the writable stash, and a stack write never lands on a read-only global's page (D40).
+    let entry_sp = powerbox_entry_sp(&module);
+
+    // The window must cover the stash + globals + a data-stack reserve. Grow the declared memory to
+    // fit (never shrink); beyond the mapped window is the faulting guard region (§5).
+    let top = entry_sp + POWERBOX_STACK_RESERVE;
+    let need_log2 = (64 - (top - 1).leading_zeros()) as u8;
+    let size_log2 = module
+        .memory
+        .map_or(need_log2, |m| m.size_log2.max(need_log2));
+    module.memory = Some(Memory { size_log2 });
+
+    // The guest heap (when the program allocates) begins at the window's mapped boundary and grows up
+    // into the reserved tail via `Memory.map`.
+    let heap_base = seed_heap.then(|| 1u64 << size_log2);
+
+    // Every existing funcidx (in code *and* in the export table) shifts up by one — the prepended
+    // `_start` becomes function 0.
+    offset_func_indices(&mut module, 1);
+    let start = build_powerbox_start(entry + 1, &results, entry_sp, n_handles, heap_base);
+    module.funcs.insert(0, start);
+    // Expose the bootstrap as a named export so an embedder reaches it by name (`call("_start")`),
+    // not by a magic funcidx. A frontend's own entry export (e.g. "main") survives, shifted above.
+    module.exports.push(Export {
+        name: "_start".to_string(),
+        func: 0,
+    });
+    Ok(module)
+}
+
+/// Build the powerbox bootstrap `_start` body (the language-neutral core of `svm-llvm`'s
+/// `synth_start`, minus the C-specific argv/ctor paths): stash the granted handles, optionally seed
+/// the heap, then `call entry(sp)` and return its result. See [`synth_powerbox_start`].
+fn build_powerbox_start(
+    entry_idx: FuncIdx,
+    entry_results: &[ValType],
+    entry_sp: u64,
+    n_handles: usize,
+    heap_base: Option<u64>,
+) -> Func {
+    let params = vec![ValType::I32; n_handles];
+    let mut insts: Vec<Inst> = Vec::new();
+    // params v0..v(n-1) = the granted handles; stash param `i` at byte offset `i*4` (the public
+    // STASH layout). A program is granted a prefix sized to the highest capability index it uses.
+    let mut next: ValIdx = n_handles as ValIdx;
+    for i in 0..n_handles {
+        insts.push(Inst::ConstI64(POWERBOX_STASH_BASE as i64 + (i as i64) * 4));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: i as ValIdx,
+            offset: 0,
+            align: 0,
+        });
+    }
+    // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base`
+    // (the window's mapped boundary); the allocator `vm_map`-commits upward from there.
+    if let Some(hb) = heap_base {
+        for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
+            insts.push(Inst::ConstI64(off as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI64(hb as i64));
+            let val = next;
+            next += 1;
+            insts.push(Inst::Store {
+                op: StoreOp::I64,
+                addr,
+                value: val,
+                offset: 0,
+                align: 0,
+            });
+        }
+    }
+    // sp = entry_sp (constant); the data-SP the entry carries as param 0.
+    insts.push(Inst::ConstI64(entry_sp as i64));
+    let sp = next;
+    next += 1;
+    insts.push(Inst::Call {
+        func: entry_idx,
+        args: vec![sp],
+    });
+    let term = if entry_results.is_empty() {
+        Terminator::Return(vec![])
+    } else {
+        Terminator::Return(vec![next]) // the entry's single result, appended by the call
+    };
+    Func {
+        results: entry_results.to_vec(),
+        blocks: vec![Block {
+            params: params.clone(),
+            insts,
+            term,
+        }],
+        params,
+    }
+}
+
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
@@ -1616,6 +2612,227 @@ pub struct Module {
     /// backend is a fail-closed error (resolution is mandatory first). Empty for modules that
     /// inline their capability calls (the legacy `cap.call`-only form).
     pub imports: Vec<Import>,
+    /// Named function **exports** (name → funcidx): the host-addressable entry points, the
+    /// runtime-`Module` analogue of [`LinkUnit::exports`]. Populated by [`link`] from each unit's
+    /// exports, or declared directly by a frontend (`export "name" <funcidx>` in the text IR). Lets
+    /// an embedder reach a function by name ([`resolve_export`]) instead of tracking funcidxs. The
+    /// verifier checks each `func` is in range and names are unique; both backends ignore the table
+    /// (they execute a funcidx). Empty for a module with no named entry points.
+    pub exports: Vec<Export>,
+    /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
+    /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
+    /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
+    /// lowering* (only it knows which source produced which op); consumed host-side by the
+    /// interpreter debugger and (later) DWARF/DAP. Slice 1 carries the neutral core (source
+    /// locations + variables); the per-producer rich blob is a later field.
+    pub debug_info: Option<DebugInfo>,
+}
+
+impl Module {
+    /// Resolve a named [export](Module::exports) to its function index, or `None` if no export
+    /// carries `name`. The verifier guarantees export names are unique, so the first match is the
+    /// only match.
+    pub fn resolve_export(&self, name: &str) -> Option<FuncIdx> {
+        self.exports.iter().find(|e| e.name == name).map(|e| e.func)
+    }
+}
+
+/// The neutral core of the debug-info waist (`DEBUGGING.md` §6): everything the interpreter
+/// stepper and backtraces need, in a form **every** frontend can populate (chibicc tokens, LLVM
+/// `!DILocation`/`dbg.value`, wasm DWARF). Positions key on `(func, block, inst)` — module 0, the
+/// guest's own program (installed §22 units have no source). Format-specific richness (full DWARF
+/// DIEs / LLVM DI) is a later opaque per-producer blob the middle never parses.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct DebugInfo {
+    /// Source file paths, referenced by index from [`Loc::file`].
+    pub files: Vec<String>,
+    /// Source location of individual ops. An op with no entry inherits nothing (unmapped).
+    pub locs: Vec<Loc>,
+    /// Structured source types, referenced by index ([`TypeId`]) from [`VarInfo::type_id`] and
+    /// [`Field::ty`]. The §6 `TypeRef` enriched with the field offsets / element strides that
+    /// aggregate inspection needs (struct/array expansion, `a.b` / `arr[i]`). Optional: a module
+    /// can carry `vars` with only render-name `ty` strings and no `types` table at all.
+    pub types: Vec<TypeDef>,
+    /// Source variables and where their value lives (the §6 neutral `VarLoc` = S2).
+    pub vars: Vec<VarInfo>,
+    /// Opaque per-producer debug blobs (the §6 / D-DBG-7 "rich blob"): a frontend's native debug
+    /// info (DWARF sections, LLVM DI metadata) carried through the IR verbatim. The middle never
+    /// parses it — only a future DWARF/DI re-emitter (W5) does — and the verifier ignores it (§2a,
+    /// strippable / untrusted-for-escape). Empty for the common case.
+    pub blobs: Vec<ProducerBlob>,
+    /// Source **function names** (the §6 waist's function-name table): a sparse `func → name`, so a
+    /// backtrace / DWARF subprogram / kill message reads `compute` instead of `fn3`. Module 0 only
+    /// (installed §22 units have no source). Empty ⇒ no names — consumers fall back to the
+    /// synthesized `fn{N}`. Frontend-emitted under `-g`; strippable / untrusted-for-escape (§2a).
+    pub func_names: Vec<FuncName>,
+}
+
+/// One source function name (DEBUGGING.md §6): the symbolic `name` of function index `func`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FuncName {
+    pub func: u32,
+    pub name: String,
+}
+
+/// An opaque per-producer debug blob (DEBUGGING.md §6 rich blob). `producer` tags the format so a
+/// consumer can dispatch (e.g. `".debug_info"`, `".debug_str"`, `"llvm-di"`); `bytes` is verbatim.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProducerBlob {
+    pub producer: String,
+    pub bytes: Vec<u8>,
+}
+
+/// An index into [`DebugInfo::types`].
+pub type TypeId = u32;
+
+/// How to interpret the bytes of a [`TypeDef::Base`] scalar (the §6 neutral encoding).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Encoding {
+    Signed,
+    Unsigned,
+    Float,
+    Bool,
+}
+
+/// A structured source type (`DEBUGGING.md` §6 `TypeRef`, enriched for aggregate inspection). The
+/// `name` each variant carries is the neutral render name; aggregates additionally carry the
+/// layout (field offsets, element count) a debugger needs to expand them. The middle never reads
+/// this — it is host-side tooling, strippable and untrusted-for-escape (§2a).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypeDef {
+    /// A scalar primitive: `int`, `char`, `_Bool`, `double`, …
+    Base {
+        name: String,
+        encoding: Encoding,
+        size: u32,
+    },
+    /// `T *` — `pointee` indexes the pointed-to type; `size` is the pointer width.
+    Pointer {
+        name: String,
+        pointee: TypeId,
+        size: u32,
+    },
+    /// `T[count]` — `elem` indexes the element type; the stride is the element's size.
+    Array {
+        name: String,
+        elem: TypeId,
+        count: u32,
+    },
+    /// A `struct` (distinct field offsets) or `union` (overlapping offsets); `size` is `sizeof`.
+    Aggregate {
+        name: String,
+        size: u32,
+        fields: Vec<Field>,
+    },
+    /// A type whose structure isn't carried (function, VLA, …): render name + `sizeof` only.
+    Opaque { name: String, size: u32 },
+}
+
+impl TypeDef {
+    /// The `sizeof` of this type (the array stride for [`TypeDef::Array`] is `elem`'s size, which
+    /// the consumer resolves through the table).
+    pub fn size(&self) -> u32 {
+        match self {
+            TypeDef::Base { size, .. }
+            | TypeDef::Pointer { size, .. }
+            | TypeDef::Opaque { size, .. }
+            | TypeDef::Aggregate { size, .. } => *size,
+            // An array's size isn't stored; it's `count * elem.size`, resolved by the consumer.
+            TypeDef::Array { .. } => 0,
+        }
+    }
+}
+
+/// One member of a [`TypeDef::Aggregate`]: its source name, byte `offset` from the aggregate's
+/// base, and the [`TypeId`] of its type.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Field {
+    pub name: String,
+    pub offset: u32,
+    pub ty: TypeId,
+}
+
+/// A source location for one op (`DEBUGGING.md` §6 neutral core). `col == 0` means "no column"
+/// (wasm DWARF often omits columns).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Loc {
+    pub func: u32,
+    pub block: u32,
+    pub inst: u32,
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// A source variable and its value location (`DEBUGGING.md` §6 / S2). Carries a neutral render
+/// name (`ty`) and, when known, a [`TypeId`] into [`DebugInfo::types`] for its structured layout
+/// (`type_id`). A **module-scoped global** (source-level `static`/global variable) uses `func ==
+/// `[`GLOBAL_SCOPE`] — visible in every frame — and a [`VarLoc::Fixed`] absolute window address.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VarInfo {
+    pub func: u32,
+    pub name: String,
+    /// Neutral render name (e.g. `"int"`, `"struct"`). Kept for the scalar common case and
+    /// as the always-present human label; aggregate *layout* lives in [`VarInfo::type_id`].
+    pub ty: String,
+    pub loc: VarLoc,
+    /// The structured type ([`DebugInfo::types`] index) when this var's layout is carried — set for
+    /// aggregates (and, when emitted, scalars). `None` ⇒ render via `ty` only (no expansion).
+    pub type_id: Option<TypeId>,
+    /// The variable's **lexical scope** as an inclusive source-line range `(start_line, end_line)`,
+    /// for resolving C shadowing (an inner-block redeclaration, or a local shadowing a global):
+    /// among same-name variables, the consumer picks the one whose scope covers the stopped source
+    /// line, innermost (largest `start_line`) winning. `None` ⇒ function-wide (the outermost scope;
+    /// the back-compatible default). Line-based rather than `IrPc`-based because a frontend knows
+    /// source spans at parse time and the consumer already maps a stopped pc to a source line.
+    pub scope: Option<(u32, u32)>,
+}
+
+/// Where a source variable's value lives at runtime (the S2 value-location model, IR form). The
+/// `Machine` (Cranelift register/stack) variant for debugging JIT-optimized code is a later field.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum VarLoc {
+    /// An address-taken / aggregate / narrow local: window data-stack slot at `data-SP + off`.
+    Window { off: i64 },
+    /// A promoted scalar with a single function-wide SSA value index (resolved directly from the
+    /// frame's values by the interpreter — no debug-build mode needed). Valid when the holding value
+    /// never changes (e.g. a parameter, or chibicc `-Og` window-free scalars).
+    Ssa { value: u32 },
+    /// A promoted scalar whose holding SSA value **varies through the function** — the DWARF
+    /// location-list case (S2). Each [`SsaLoc`] says "from this `(block, inst)` onward (within the
+    /// block) the var is held by this block-local value index"; resolution is nearest-preceding
+    /// within the stopped block (a block with no covering entry ⇒ the var is not live there). This
+    /// is what lets promoted scalars — and wasm/LLVM SSA-valued locals, which change per block — be
+    /// inspected without a window slot.
+    SsaList(Vec<SsaLoc>),
+    /// A variable in **window memory at a runtime base address + offset**: the base is an SSA value
+    /// that varies per pc (a location list, `base`), so `read = window[resolve(base) + off ..]`.
+    /// This is the wasm/DWARF case — clang describes a C local as `DW_OP_fbreg <off>` relative to a
+    /// frame base held in a wasm local (an SSA value here), not as a fixed `data-SP + off` window
+    /// slot. ([`Window`] is the special case where the base is always frame value 0, the data-SP.)
+    ///
+    /// [`Window`]: VarLoc::Window
+    WindowVia { base: Vec<SsaLoc>, off: i64 },
+    /// A variable at a **fixed absolute window address** — a module-scoped global (source-level
+    /// `static`/global): `read = window[addr ..]`, frame-independent. Paired with `func ==
+    /// `[`GLOBAL_SCOPE`] so it is visible in every frame. (Unlike [`Window`], which is `data-SP +
+    /// off`, this is an absolute address — globals live low in the window, below the data stack.)
+    Fixed { addr: u64 },
+}
+
+/// The sentinel [`VarInfo::func`] of a **module-scoped global** (no owning function): it resolves in
+/// every frame, not just one function's. Real function indices are `0..funcs.len()`, so `u32::MAX`
+/// never collides.
+pub const GLOBAL_SCOPE: u32 = u32::MAX;
+
+/// One entry of a [`VarLoc::SsaList`] location list: within block `block`, from instruction `inst`
+/// onward (until a later entry in the same block), the variable is held by block-local SSA value
+/// index `value`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SsaLoc {
+    pub block: u32,
+    pub inst: u32,
+    pub value: u32,
 }
 
 /// A named capability import (§7). `name` is the symbolic tag the host resolves at
@@ -1629,6 +2846,17 @@ pub struct Import {
     pub sig: FuncType,
 }
 
+/// A named function **export**: a `name` the host (or a linker) addresses a function by, mapping to
+/// its index in [`Module::funcs`]. The runtime-`Module` analogue of [`LinkUnit::exports`] — wasm-like
+/// name-addressable entry points, so an embedder can `call("main")` without tracking funcidxs. The
+/// verifier checks `func` is in range and names are unique; backends ignore exports (they run a
+/// funcidx). Empty for a module with no named entry points (e.g. a bare kernel run by index).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Export {
+    pub name: String,
+    pub func: FuncIdx,
+}
+
 /// A capability binding resolved from an import name at instantiation (§7): the concrete
 /// interface `type_id` and operation `op` the host bound the name to. Returned by the
 /// resolver passed to [`resolve_imports`].
@@ -1636,6 +2864,31 @@ pub struct Import {
 pub struct ResolvedCap {
     pub type_id: u32,
     pub op: u32,
+}
+
+/// What an import **name** binds to when [`resolve_imports_with`] lowers it. The §7 capability
+/// case (`Cap`) is the host-ABI binding; `Func` is the **compile-time (static) linking** case — the
+/// name resolved to a concrete function index, so the call lowers to a direct [`Inst::Call`]. (A
+/// data-symbol binding — lowering to a constant window offset — is a natural follow-up.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resolved {
+    /// A host capability: lower to a `cap.call` on the import's handle operand (§7).
+    Cap(ResolvedCap),
+    /// Another function in the **same** linked module (by index): lower to a direct `call`. The
+    /// static-linking case — a symbol resolved to a function merged into this module at link time.
+    Func(FuncIdx),
+    /// A function reached through the shared `call_indirect` **table slot** (the *dynamic*-linking
+    /// case): lower to `call_indirect <slot>`, so a separately-compiled unit can call a function it
+    /// doesn't share an index space with (e.g. a plugin calling the host program it was loaded into).
+    /// The import's handle operand must be a `ConstI32` placeholder — it is patched to `slot` and
+    /// reused as the `call_indirect` index (a 1:1 rewrite, no value renumbering).
+    Slot(u32),
+}
+
+impl From<ResolvedCap> for Resolved {
+    fn from(c: ResolvedCap) -> Self {
+        Resolved::Cap(c)
+    }
 }
 
 /// Why [`resolve_imports`] failed (fail-closed: a missing/garbled import never silently
@@ -1646,6 +2899,10 @@ pub enum ImportError {
     Unresolved(String),
     /// A `CallImport` referenced an import index past the module's [`Module::imports`].
     BadImportIndex(u32),
+    /// A [`Resolved::Slot`] binding's import had a handle operand that is **not** a `ConstI32`
+    /// placeholder (the frontend must emit one for a dynamic/slot import, since it is patched to the
+    /// slot and reused as the `call_indirect` index).
+    SlotHandleNotConst,
 }
 
 /// Lower every [`Inst::CallImport`] to a concrete [`Inst::CapCall`] using `resolve` (the
@@ -1660,40 +2917,299 @@ pub fn resolve_imports(
     module: &Module,
     mut resolve: impl FnMut(&str) -> Option<ResolvedCap>,
 ) -> Result<Module, ImportError> {
+    resolve_imports_with(module, |name| resolve(name).map(Resolved::Cap))
+}
+
+/// The general §7 import-lowering pass: like [`resolve_imports`], but a name may bind to **either**
+/// a host capability ([`Resolved::Cap`] → `cap.call`) **or** another function in the linked module
+/// ([`Resolved::Func`] → a direct `call`). The latter is the compile-time (static) linking step the
+/// in-window loader builds on: a symbol resolved to a concrete function index. Each `CallImport`
+/// rewrites **1:1** (no value renumbering) — a `Func` binding drops the unused handle operand.
+/// Fails closed on an unresolved name. The result is import-free (verifier/both backends accept it).
+pub fn resolve_imports_with(
+    module: &Module,
+    mut resolve: impl FnMut(&str) -> Option<Resolved>,
+) -> Result<Module, ImportError> {
     // Resolve each declared import once, up front (so a name binds consistently and a
     // missing one fails before any rewriting).
-    let bound: Vec<ResolvedCap> = module
+    let bound: Vec<Resolved> = module
         .imports
         .iter()
         .map(|imp| resolve(&imp.name).ok_or_else(|| ImportError::Unresolved(imp.name.clone())))
         .collect::<Result<_, _>>()?;
     let mut out = module.clone();
+    let fn_results: Vec<usize> = out.funcs.iter().map(|f| f.results.len()).collect();
     for f in &mut out.funcs {
         for b in &mut f.blocks {
-            for inst in &mut b.insts {
-                if let Inst::CallImport {
-                    import,
-                    sig,
-                    handle,
-                    args,
-                } = inst
-                {
-                    let cap = *bound
-                        .get(*import as usize)
-                        .ok_or(ImportError::BadImportIndex(*import))?;
-                    *inst = Inst::CapCall {
+            // Map each value index to its defining instruction (block params → `None`) — a `Slot`
+            // import patches the `ConstI32` that defines its handle operand, so we may need to reach
+            // a *different* instruction than the `CallImport` we're rewriting.
+            let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
+            for (p, inst) in b.insts.iter().enumerate() {
+                for _ in 0..inst.result_count(&fn_results) {
+                    def_of.push(Some(p));
+                }
+            }
+            for i in 0..b.insts.len() {
+                let (import, handle) = match &b.insts[i] {
+                    Inst::CallImport { import, handle, .. } => (*import, *handle),
+                    _ => continue,
+                };
+                let bind = *bound
+                    .get(import as usize)
+                    .ok_or(ImportError::BadImportIndex(import))?;
+                // Pull the call's pieces out of the placeholder so we can rebuild it.
+                let (sig, args) = match &mut b.insts[i] {
+                    Inst::CallImport { sig, args, .. } => {
+                        (core::mem::take(sig), core::mem::take(args))
+                    }
+                    _ => unreachable!(),
+                };
+                b.insts[i] = match bind {
+                    Resolved::Cap(cap) => Inst::CapCall {
                         type_id: cap.type_id,
                         op: cap.op,
-                        sig: std::mem::take(sig),
-                        handle: *handle,
-                        args: std::mem::take(args),
-                    };
-                }
+                        sig,
+                        handle,
+                        args,
+                    },
+                    // Static-link a function symbol → a direct call (handle unused; sig re-checked).
+                    Resolved::Func(func) => Inst::Call { func, args },
+                    // Dynamic-link a function symbol → a `call_indirect` through the table slot: patch
+                    // the handle's `ConstI32` placeholder to `slot` and reuse it as the index.
+                    Resolved::Slot(slot) => {
+                        let def = def_of
+                            .get(handle as usize)
+                            .copied()
+                            .flatten()
+                            .ok_or(ImportError::SlotHandleNotConst)?;
+                        match &mut b.insts[def] {
+                            Inst::ConstI32(c) => *c = slot as i32,
+                            _ => return Err(ImportError::SlotHandleNotConst),
+                        }
+                        Inst::CallIndirect {
+                            ty: sig,
+                            idx: handle,
+                            args,
+                        }
+                    }
+                };
             }
         }
     }
     out.imports.clear();
     Ok(out)
+}
+
+/// One unit to statically link: a module plus the symbols it **exports** and the **relocations** its
+/// own data references need. Function symbols (`exports`) and its named `Module::imports` are resolved
+/// against the other units by [`link`]; `data_exports` name window offsets within the unit's data; and
+/// `relocations` patch the unit's address constants once its data is placed (see [`DataReloc`]).
+#[derive(Clone, Debug, Default)]
+pub struct LinkUnit {
+    pub module: Module,
+    /// Function symbols this unit provides: `name → local function index`.
+    pub exports: Vec<(String, FuncIdx)>,
+    /// Data symbols this unit provides: `name → byte offset within the unit's (un-relocated) data`.
+    pub data_exports: Vec<(String, u64)>,
+    /// Relocations the unit's data references need after the linker places its data (§ELF-style).
+    pub relocations: Vec<DataReloc>,
+}
+
+/// A relocation: at link time, patch the **constant** at `(func, block, inst)` — which must be a
+/// `ConstI64`/`ConstI32` (an address the frontend left at a unit-local value) — by **adding** a base
+/// resolved from `kind`; the const's current value is the **addend** (so `&g + 4` works). This is how
+/// a unit's data references survive relocation into the one shared window — no IR change, no value
+/// renumbering, just a const edit. `func`/`block`/`inst` are unit-local (applied before concatenation).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataReloc {
+    pub func: u32,
+    pub block: u32,
+    pub inst: u32,
+    pub kind: RelocKind,
+}
+
+/// What base a [`DataReloc`] adds.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RelocKind {
+    /// This unit's own assigned data base — the const holds a unit-local data offset (an own-data ref).
+    SelfData,
+    /// The resolved address of an exported **data** symbol (a cross-unit data import).
+    DataSymbol(String),
+}
+
+/// Why [`link`] failed (fail-closed; the linked module is also re-verified before it runs).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LinkError {
+    /// Two units export the same symbol.
+    DuplicateSymbol(String),
+    /// An export names a function index past its unit's `funcs`.
+    BadExport { symbol: String, index: FuncIdx },
+    /// A unit imports a symbol no unit exports.
+    Unresolved(String),
+    /// A `CallImport` referenced an out-of-range import (a malformed unit).
+    BadImportIndex(u32),
+    /// A relocation pointed at a missing instruction, or one that isn't an address constant.
+    BadReloc(DataReloc),
+}
+
+/// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
+/// 1–2). Concatenate the units' functions into one list, **reindexing** each unit's internal function
+/// references by its base offset; place each unit's **data** in a non-overlapping window region and
+/// apply its **relocations** so its address constants follow; build function + data symbol tables from
+/// all exports; and resolve every unit's named imports — a `call` symbol to a **direct call**, a data
+/// symbol to a **constant address** — against them. The result is one import-free, relocated module —
+/// re-verify it before running, since a unit is untrusted like any frontend output (a cross-unit
+/// signature mismatch is caught there).
+pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
+    // Function and data layout: each unit's functions occupy `[fbase, fbase + n_funcs)` in the merged
+    // list, and its data occupies the window region `[dbase, dbase + data_span)` (16-byte aligned, so
+    // units never overlap). `data_span` is the high-water mark of the unit's own (un-relocated) data.
+    let align16 = |x: u64| (x + 15) & !15;
+    let mut fbases = Vec::with_capacity(units.len());
+    let mut dbases = Vec::with_capacity(units.len());
+    let (mut ftotal, mut dtotal): (u32, u64) = (0, 0);
+    for u in units {
+        fbases.push(ftotal);
+        ftotal += u.module.funcs.len() as u32;
+        let dbase = align16(dtotal);
+        dbases.push(dbase);
+        let span = u
+            .module
+            .data
+            .iter()
+            .map(|d| d.offset + d.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        dtotal = dbase + span;
+    }
+    // Symbol tables: exported name → global function index, and exported data name → window address.
+    let mut funcs_tab: alloc::collections::BTreeMap<String, FuncIdx> =
+        alloc::collections::BTreeMap::new();
+    let mut data_tab: alloc::collections::BTreeMap<String, u64> =
+        alloc::collections::BTreeMap::new();
+    // The merged module's first-class export table — every unit's function exports, in declaration
+    // order (deterministic, unlike a by-name map walk), at their reindexed global funcidxs.
+    let mut exports: Vec<Export> = Vec::new();
+    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
+        for (name, local) in &u.exports {
+            if *local as usize >= u.module.funcs.len() {
+                return Err(LinkError::BadExport {
+                    symbol: name.clone(),
+                    index: *local,
+                });
+            }
+            if funcs_tab.insert(name.clone(), fbase + local).is_some()
+                || data_tab.contains_key(name)
+            {
+                return Err(LinkError::DuplicateSymbol(name.clone()));
+            }
+            exports.push(Export {
+                name: name.clone(),
+                func: fbase + local,
+            });
+        }
+        for (name, local_off) in &u.data_exports {
+            if data_tab.insert(name.clone(), dbase + local_off).is_some()
+                || funcs_tab.contains_key(name)
+            {
+                return Err(LinkError::DuplicateSymbol(name.clone()));
+            }
+        }
+    }
+    // Per unit: place its data, apply its relocations, reindex its functions, resolve its imports.
+    let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
+    let mut data: Vec<Data> = Vec::new();
+    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
+        let mut m = u.module.clone();
+        // Relocate this unit's data segments into its assigned window region…
+        for d in &mut m.data {
+            d.offset += dbase;
+        }
+        // …and patch its address constants so they point at the relocated data (own or imported).
+        for r in &u.relocations {
+            let base = match &r.kind {
+                RelocKind::SelfData => dbase,
+                RelocKind::DataSymbol(name) => *data_tab
+                    .get(name)
+                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?,
+            };
+            apply_reloc(&mut m, r, base)?;
+        }
+        offset_func_indices(&mut m, fbase);
+        let resolved =
+            resolve_imports_with(&m, |name| funcs_tab.get(name).copied().map(Resolved::Func))
+                .map_err(|e| match e {
+                    ImportError::Unresolved(n) => LinkError::Unresolved(n),
+                    ImportError::BadImportIndex(i) => LinkError::BadImportIndex(i),
+                    // `link` only ever resolves to `Func` (static merge), never `Slot`, so a
+                    // slot-handle error cannot arise here.
+                    ImportError::SlotHandleNotConst => {
+                        unreachable!("static link never resolves to a Slot")
+                    }
+                })?;
+        funcs.extend(resolved.funcs);
+        data.extend(resolved.data);
+    }
+    Ok(Module {
+        funcs,
+        // The merged window is the largest any unit declared (they share one linear memory).
+        memory: units
+            .iter()
+            .filter_map(|u| u.module.memory)
+            .max_by_key(|m| m.size_log2),
+        data,
+        imports: Vec::new(),
+        exports,
+        // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
+        debug_info: None,
+    })
+}
+
+/// Apply one [`DataReloc`]: add `base` to the addend held in the constant it points at (a `ConstI64`/
+/// `ConstI32`). A reloc pointing at a missing or non-constant instruction is fail-closed.
+fn apply_reloc(m: &mut Module, r: &DataReloc, base: u64) -> Result<(), LinkError> {
+    let inst = m
+        .funcs
+        .get_mut(r.func as usize)
+        .and_then(|f| f.blocks.get_mut(r.block as usize))
+        .and_then(|b| b.insts.get_mut(r.inst as usize))
+        .ok_or_else(|| LinkError::BadReloc(r.clone()))?;
+    match inst {
+        Inst::ConstI64(c) => *c = c.wrapping_add(base as i64),
+        Inst::ConstI32(c) => *c = (*c as i64).wrapping_add(base as i64) as i32,
+        _ => return Err(LinkError::BadReloc(r.clone())),
+    }
+    Ok(())
+}
+
+/// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,
+/// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call_indirect`/`cont.*` dispatch on
+/// runtime funcref *values*, not static indices, so they are untouched. `call.import` carries an
+/// import index (not a function index) and is likewise untouched — it is resolved separately.
+fn offset_func_indices(m: &mut Module, offset: u32) {
+    if offset == 0 {
+        return;
+    }
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => *func += offset,
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &mut b.term {
+                *func += offset;
+            }
+        }
+    }
+    // Named exports point at funcidxs too, so they shift with the functions.
+    for e in &mut m.exports {
+        e.func += offset;
+    }
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`
@@ -1760,6 +3276,8 @@ mod import_tests {
                     sig: sig_exit,
                 },
             ],
+            exports: vec![],
+            debug_info: None,
         }
     }
 
@@ -1831,5 +3349,177 @@ mod import_tests {
         m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
         let r = resolve_imports(&m, policy).expect("resolve");
         assert_eq!(r, m, "a no-import module round-trips identically");
+    }
+}
+
+#[cfg(test)]
+mod powerbox_start_tests {
+    use super::*;
+
+    /// An entry that takes the threaded data-stack pointer and (statically) calls a sibling — so
+    /// we can pin that prepending `_start` shifts both the entry funcidx and its internal `Call`.
+    fn entry_module() -> Module {
+        // func 0: helper `(i64) -> (i64)` returns its arg.
+        let helper = Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64],
+                insts: vec![],
+                term: Terminator::Return(vec![0]),
+            }],
+        };
+        // func 1: entry `(i64 sp) -> (i32)` calls helper(sp), discards it, returns 0.
+        let entry = Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![ValType::I64],
+                insts: vec![
+                    Inst::Call {
+                        func: 0,
+                        args: vec![0],
+                    }, // v1 = helper(sp)
+                    Inst::ConstI32(0), // v2
+                ],
+                term: Terminator::Return(vec![2]),
+            }],
+        };
+        Module {
+            funcs: vec![helper, entry],
+            memory: Some(Memory { size_log2: 10 }),
+            data: vec![],
+            imports: vec![],
+            exports: vec![],
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn prepends_start_and_reindexes() {
+        let m = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
+        // `_start` is the new function 0 with three i32 handle params.
+        assert_eq!(m.funcs.len(), 3);
+        assert_eq!(m.funcs[0].params, vec![ValType::I32; 3]);
+        assert_eq!(m.funcs[0].results, vec![ValType::I32]); // mirrors the entry's result
+                                                            // It stashes each handle at offset i*4 and ends by calling the (shifted) entry at index 2.
+        let blk = &m.funcs[0].blocks[0];
+        assert!(matches!(
+            blk.term,
+            Terminator::Return(ref v) if v.len() == 1
+        ));
+        assert!(
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { func: 2, .. })),
+            "_start must call the entry at its shifted index (2)"
+        );
+        let stores: Vec<_> = blk
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::Store {
+                        op: StoreOp::I32,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(stores.len(), 3, "three handle stashes");
+        // The entry's internal `Call func: 0` (to the helper) shifted to `func: 1`.
+        assert!(
+            m.funcs[2].blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { func: 1, .. })),
+            "the entry's static call to the helper must be reindexed +1"
+        );
+    }
+
+    #[test]
+    fn registers_start_export_and_shifts_existing_ones() {
+        let mut m = entry_module();
+        // A frontend exports its entry by name; after the prepend it must shift +1 and `_start`
+        // must be registered at funcidx 0.
+        m.exports = vec![Export {
+            name: "main".to_string(),
+            func: 1,
+        }];
+        let m = synth_powerbox_start(m, 1, 3, false).expect("synth");
+        assert_eq!(
+            m.resolve_export("_start"),
+            Some(0),
+            "_start registered at 0"
+        );
+        assert_eq!(
+            m.resolve_export("main"),
+            Some(2),
+            "the entry export shifted +1"
+        );
+        assert_eq!(m.resolve_export("absent"), None);
+    }
+
+    #[test]
+    fn seeds_heap_when_requested() {
+        let m = synth_powerbox_start(entry_module(), 1, 4, true).expect("synth");
+        let blk = &m.funcs[0].blocks[0];
+        // Two i64 stores seed HEAP_BRK / HEAP_TOP (plus heap_base = 1 << size_log2 consts).
+        let i64_stores = blk
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::Store {
+                        op: StoreOp::I64,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            i64_stores, 2,
+            "heap bump pointer + committed boundary seeded"
+        );
+    }
+
+    #[test]
+    fn grows_window_but_never_shrinks() {
+        // A tiny declared window is grown to cover the stash + stack reserve.
+        let grown = synth_powerbox_start(entry_module(), 1, 3, false).expect("synth");
+        let g = grown.memory.unwrap().size_log2;
+        assert!(
+            (1u64 << g) >= POWERBOX_STACK_PAGE + POWERBOX_STACK_RESERVE,
+            "window must cover globals + the data-stack reserve"
+        );
+        // A generously-declared window is left as-is (never shrunk).
+        let mut big = entry_module();
+        big.memory = Some(Memory { size_log2: 40 });
+        let kept = synth_powerbox_start(big, 1, 3, false).expect("synth");
+        assert_eq!(kept.memory.unwrap().size_log2, 40);
+    }
+
+    #[test]
+    fn handle_count_is_bounded_only_by_the_stash_region() {
+        // No lower bound now (a 2-handle name-bound entry is fine), and >8 is allowed without a heap
+        // (the stash may run up to `POWERBOX_ARGS_BASE`).
+        assert!(synth_powerbox_start(entry_module(), 1, 2, false).is_ok());
+        assert!(synth_powerbox_start(entry_module(), 1, 9, false).is_ok());
+        assert!(synth_powerbox_start(entry_module(), 1, 32, false).is_ok()); // 32*4 == 128 == ARGS_BASE
+                                                                             // …but the stash can't run into the format/args region, or (with a heap) the heap words.
+        assert!(synth_powerbox_start(entry_module(), 1, 33, false).is_err()); // 33*4 > 128
+        assert!(synth_powerbox_start(entry_module(), 1, 9, true).is_err()); // 9*4 > HEAP_BRK(32)
+        assert!(synth_powerbox_start(entry_module(), 1, 8, true).is_ok()); // the fixed 8-handle heap case
+    }
+
+    #[test]
+    fn rejects_bad_entry() {
+        assert!(synth_powerbox_start(entry_module(), 99, 3, false).is_err()); // entry out of range
+                                                                              // The entry must take the i64 data-stack pointer; a non-`(i64) -> _` entry is rejected.
+        let mut m = entry_module();
+        m.funcs[1].params = vec![ValType::I32];
+        assert!(synth_powerbox_start(m, 1, 3, false).is_err());
     }
 }

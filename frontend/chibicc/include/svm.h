@@ -81,6 +81,15 @@ long __vm_region_page_size(int region);
 // (-22 invalid, -12 compile quota exhausted). Fail-closed: on any error nothing is installed.
 long __vm_jit_compile(void *blob, long len);
 
+// Like `__vm_jit_compile`, but the unit may carry **unresolved imports** (`call.import "name"`):
+// the host binds each by name against the guest-provided **symbol table** before verify
+// (host-assisted dynamic linking, DESIGN.md §22). `symtab`/`symtab_len` is a buffer the guest builds
+// — `count` (uleb), then per entry `name` (uleb len + bytes), a `kind` byte (`0` = a table slot
+// from `__vm_jit_install`, `1` = a capability), and its payload (`Slot`: uleb slot). A mis-link
+// (unknown name, wrong signature) is caught by re-verification: `-22`, nothing installed. This is
+// the `vm_dlopen` primitive — resolve a separately-compiled `.so`-shaped unit against a registry.
+long __vm_jit_compile_linked(void *ir, long ir_len, void *symtab, long symtab_len);
+
 // Call a compiled unit's entry, which must be exactly the **raw** shape `(i64, i64) -> (i64)`
 // (no C frame — the args go straight to the entry's block params; the strict-arity MVP shape,
 // anything else faults). The unit reads/writes this window directly (zero copy). A trap inside

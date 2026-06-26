@@ -16,8 +16,12 @@
 //! the precondition for the escape-freedom contract (§2a); soundness of *this code*
 //! is the separate hard problem (§18).
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), no_std)]
 
-use svm_ir::{BlockIdx, Func, Inst, Module, Terminator, ValIdx, ValType};
+extern crate alloc;
+use alloc::vec::Vec;
+
+use svm_ir::{Block, BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
 
 /// Why verification rejected a module. Carries enough location to debug, never
 /// enough to be load-bearing for safety (the boolean accept/reject is the contract).
@@ -90,6 +94,16 @@ pub enum VerifyError {
     /// concrete `cap.call`s by `svm_ir::resolve_imports` at instantiation *before*
     /// verification; an unresolved import in a module presented for execution is fail-closed.
     UnresolvedImport { func: u32, block: u32, import: u32 },
+    /// A `gc.roots` carried a **constant** payload mask that clears more than the top byte (its
+    /// low 56 bits are not all-ones). Such a mask could fold a canonical host pointer down into the
+    /// guest window and leak host-address bits past the range filter (GC.md §3, §6). Only
+    /// top-byte-strip masks (`mask | 0xFF00_0000_0000_0000 == !0`) are allowed; the runtime also
+    /// rejects a non-constant mask that violates this at execution.
+    GcRootsMaskUnsafe { func: u32, block: u32, mask: u64 },
+    /// A named [`Module::exports`] entry points at a funcidx past the end of `funcs`.
+    ExportFuncOutOfRange { export: u32, func: u32 },
+    /// Two [`Module::exports`] entries share a name — exports must be uniquely addressable.
+    DuplicateExport { export: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -111,14 +125,35 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         let Some(mem) = &m.memory else {
             return Err(VerifyError::DataWithoutMemory { seg });
         };
+        // Reject if `offset + len` overflows (`None`) or exceeds the window. Written as an explicit
+        // match (not `is_none_or`, stabilized in 1.82) so this crate also compiles on the on-ramp's
+        // pinned `rustc 1.81` (LLVM-18) toolchain — see DESIGN.md §20c.
         let end = d.offset.checked_add(d.bytes.len() as u64);
-        if end.is_none_or(|e| e > mem.size()) {
+        let out_of_window = match end {
+            Some(e) => e > mem.size(),
+            None => true,
+        };
+        if out_of_window {
             return Err(VerifyError::DataOutOfWindow { seg });
         }
     }
     let has_memory = m.memory.is_some();
     for (fi, f) in m.funcs.iter().enumerate() {
         verify_func(fi as u32, f, &m.funcs, has_memory)?;
+    }
+    // Named exports must point at a real function and be uniquely addressable (backends ignore the
+    // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
+    // fail-closed here).
+    for (ei, e) in m.exports.iter().enumerate() {
+        if e.func as usize >= m.funcs.len() {
+            return Err(VerifyError::ExportFuncOutOfRange {
+                export: ei as u32,
+                func: e.func,
+            });
+        }
+        if m.exports[..ei].iter().any(|o| o.name == e.name) {
+            return Err(VerifyError::DuplicateExport { export: ei as u32 });
+        }
     }
     Ok(())
 }
@@ -133,6 +168,9 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
     }
 
     let nblocks = f.blocks.len() as u32;
+    // Per-function result arity, for `Inst::result_count` (used to trace a `gc.roots` constant mask
+    // through the block's value numbering).
+    let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     for (bi, b) in f.blocks.iter().enumerate() {
         let bi = bi as u32;
         // Seed the local type vector with the block's declared parameter types.
@@ -249,7 +287,7 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                     bi,
                     types: &types,
                 };
-                cx.expect(*k, ValType::I32)?; // forgeable fiber handle
+                cx.expect(*k, ValType::I64)?; // forgeable fiber handle (i64: 16-bit slot + 48-bit generation)
                 cx.expect(*arg, ValType::I64)?;
                 types.push(ValType::I32); // status
                 types.push(ValType::I64); // value
@@ -271,6 +309,38 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 cx.expect(*idx, ValType::I32)?;
                 types.push(ValType::I32); // handle
                 types.push(ValType::I32); // type_id
+                continue;
+            }
+            // §7 `cap.self.resolve` reads a name buffer `(ptr: i64, len: i64)` and appends the resolved
+            // handle (or `-errno`) as `i32`. Authority-neutral like the rest of `cap.self`.
+            if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*name_ptr, ValType::I64)?;
+                cx.expect(*name_len, ValType::I64)?;
+                types.push(ValType::I32); // handle | -errno
+                continue;
+            }
+            // §7 `cap.self.label` reads a handle (`i32`) and a buffer `(ptr: i64, cap: i64)`, and
+            // appends the label length (`i32`). Authority-neutral like the rest of `cap.self`.
+            if let Inst::CapSelfLabel {
+                handle,
+                buf_ptr,
+                buf_cap,
+            } = inst
+            {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*handle, ValType::I32)?;
+                cx.expect(*buf_ptr, ValType::I64)?;
+                cx.expect(*buf_cap, ValType::I64)?;
+                types.push(ValType::I32); // label length (0 = none)
                 continue;
             }
             // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
@@ -302,6 +372,20 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.push(ValType::I32); // the thread handle
                 continue;
             }
+            // Security: a `gc.roots` payload mask may only clear the top byte. When the mask is a
+            // constant we can reject a fold-down mask statically (a non-constant mask is enforced at
+            // runtime on both backends). `mask | 0xFF00_..._0000 == !0` ⇔ the low 56 bits are all 1.
+            if let Inst::GcRoots { mask, .. } = inst {
+                if let Some(m) = const_i64_in_block(b, &fn_results, *mask) {
+                    if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
+                        return Err(VerifyError::GcRootsMaskUnsafe {
+                            func: fi,
+                            block: bi,
+                            mask: m as u64,
+                        });
+                    }
+                }
+            }
             // A value-producing instruction appends its result type; `Store` does not.
             if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
                 types.push(result);
@@ -313,9 +397,82 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
     Ok(())
 }
 
+/// Per-block SSA value **types** for a function: each block's declared params followed by every
+/// instruction's result type(s) — exactly the assignment [`verify_func`] performs while checking.
+/// Indexing `func_value_types(..)[block][value_idx]` gives the type of block-local value
+/// `value_idx`, which the interpreter's debugger uses to reconstruct a typed value from its
+/// (untyped) storage slot. Assumes `f` is **verified** (it shares the single-result type rules via
+/// [`check_inst`] and re-lists only the few multi-result appends `verify_func` special-cases — keep
+/// the two in sync); on an unverified function it degrades gracefully (a value whose type can't be
+/// derived is simply absent from the vector) rather than erroring.
+pub fn func_value_types(f: &Func, funcs: &[Func], has_memory: bool) -> Vec<Vec<ValType>> {
+    f.blocks
+        .iter()
+        .map(|b| block_value_types(b, funcs, has_memory))
+        .collect()
+}
+
+fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType> {
+    let mut types: Vec<ValType> = b.params.clone();
+    for inst in &b.insts {
+        // Multi-result / non-`check_inst` ops: mirror the inline appends in `verify_func`.
+        match inst {
+            Inst::Call { func, .. } => {
+                if let Some(callee) = funcs.get(*func as usize) {
+                    types.extend_from_slice(&callee.results);
+                }
+            }
+            Inst::CallIndirect { ty, .. } => types.extend_from_slice(&ty.results),
+            Inst::CapCall { sig, .. } => types.extend_from_slice(&sig.results),
+            Inst::ContResume { .. } => {
+                types.push(ValType::I32); // status
+                types.push(ValType::I64); // value
+            }
+            Inst::CapSelfCount => types.push(ValType::I32),
+            Inst::CapSelfGet { .. } => {
+                types.push(ValType::I32); // handle
+                types.push(ValType::I32); // type_id
+            }
+            Inst::CapSelfResolve { .. } => types.push(ValType::I32), // handle | -errno
+            Inst::CapSelfLabel { .. } => types.push(ValType::I32),   // label length
+            Inst::ThreadSpawn { .. } => types.push(ValType::I32),
+            Inst::RefFunc { .. } => types.push(ValType::I32),
+            Inst::CallImport { .. } => {} // unreachable in a verified module
+            // Everything else (single result, or `Store`/no result) goes through the shared
+            // `check_inst` rules — the single source of truth for those types.
+            _ => {
+                if let Ok(Some(t)) = check_inst(0, 0, inst, &types, has_memory) {
+                    types.push(t);
+                }
+            }
+        }
+    }
+    types
+}
+
 /// Check one instruction's operands against the running type vector and return the
 /// result type to append (`None` for `Store`). Operands must reference
 /// strictly-earlier indices.
+/// The constant `i64` an operand resolves to, if it's defined by an `i64.const` **earlier in this
+/// block** (the only place a value can be defined in this block-param SSA — see `verify_func`).
+/// Returns `None` for a block parameter or any non-constant definition. Mirrors the value
+/// numbering of `verify_func`: params occupy `0..params.len()`, then each instruction owns its
+/// `result_count` consecutive indices.
+fn const_i64_in_block(b: &svm_ir::Block, fn_results: &[usize], v: ValIdx) -> Option<i64> {
+    let mut idx = b.params.len() as u32;
+    for inst in &b.insts {
+        let n = inst.result_count(fn_results) as u32;
+        if v >= idx && v < idx + n {
+            return match inst {
+                Inst::ConstI64(c) => Some(*c),
+                _ => None,
+            };
+        }
+        idx += n;
+    }
+    None
+}
+
 fn check_inst(
     fi: u32,
     bi: u32,
@@ -377,6 +534,31 @@ fn check_inst(
         cx.expect(*value, ValType::V128)?;
         return Ok(None);
     }
+    // `setjmp`/`longjmp` (the non-local jump): both touch the guest `jmp_buf` token in window memory,
+    // so both require a declared window. `setjmp` takes an `i64` buffer address, yields `i32` (0 on the
+    // direct call, the long-jump value on re-entry); `longjmp` takes the `i64` address + an `i32` value
+    // and yields no result (a `noreturn` control op).
+    if let Inst::SetJmp { buf } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*buf, ValType::I64)?;
+        return Ok(Some(ValType::I32));
+    }
+    if let Inst::LongJmp { buf, val } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*buf, ValType::I64)?;
+        cx.expect(*val, ValType::I32)?;
+        return Ok(None);
+    }
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
@@ -385,8 +567,20 @@ fn check_inst(
             unreachable!("CallImport handled before check_inst's value match")
         }
         // §7 reflection appends its results in the multi-result section above; unreachable here.
-        Inst::CapSelfCount | Inst::CapSelfGet { .. } => {
+        Inst::CapSelfCount
+        | Inst::CapSelfGet { .. }
+        | Inst::CapSelfResolve { .. }
+        | Inst::CapSelfLabel { .. } => {
             unreachable!("cap.self.* handled before check_inst's value match")
+        }
+        // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
+        // `set` consumes an i64 and yields nothing (handled like `store`).
+        Inst::VcpuTlsGet => ValType::I64,
+        // Durable-runtime-internal: the current context's shadow region base (a window byte offset).
+        Inst::DurableShadowBase => ValType::I64,
+        Inst::VcpuTlsSet { val } => {
+            cx.expect(*val, ValType::I64)?;
+            return Ok(None);
         }
         Inst::IntBin { ty, a, b, .. } => {
             let t = ty.val();
@@ -431,6 +625,14 @@ fn check_inst(
         Inst::FUn { ty, a, .. } => {
             cx.expect(*a, ty.val())?;
             ty.val()
+        }
+        // Scalar fused multiply-add: all three operands and the result are `ty`.
+        Inst::Fma { ty, a, b, c } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            cx.expect(*c, t)?;
+            t
         }
         Inst::FCmp { ty, a, b, .. } => {
             let t = ty.val();
@@ -521,16 +723,41 @@ fn check_inst(
             cx.expect(*replacement, ty.val())?;
             ty.val()
         }
-        // §12 fibers. `cont.new` takes an i32 funcref, yields an i32 handle; `suspend`
-        // takes an i64, yields the i64 of the next resume. (`cont.resume` is multi-result
-        // and handled in the main loop.)
+        // §12 fibers. `cont.new` takes an i32 funcref, yields an i64 handle (16-bit slot +
+        // 48-bit generation); `suspend` takes an i64, yields the i64 of the next resume.
+        // (`cont.resume` is multi-result and handled in the main loop.)
         Inst::ContNew { func, sp } => {
             cx.expect(*func, ValType::I32)?;
             cx.expect(*sp, ValType::I64)?; // the fiber's data-stack base
-            ValType::I32
+            ValType::I64
         }
         Inst::Suspend { value } => {
             cx.expect(*value, ValType::I64)?;
+            ValType::I64
+        }
+        // §GC conservative root enumeration: i64 heap_lo, heap_hi, buf, cap ⇒ i64 count. Writes the
+        // candidate words into guest memory at `buf`, so it requires a declared window.
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*heap_lo, ValType::I64)?;
+            cx.expect(*heap_hi, ValType::I64)?;
+            cx.expect(*mask, ValType::I64)?;
+            cx.expect(*buf, ValType::I64)?;
+            cx.expect(*cap, ValType::I64)?;
+            // The top-byte-strip constraint on a *constant* `mask` is checked in `verify_func`'s
+            // block loop (which can trace the operand to its defining `i64.const`); a non-constant
+            // mask is enforced defensively at runtime on both backends.
             ValType::I64
         }
         // §12 thread join: an i32 thread handle in, the joined vCPU's i64 result out. (The handle
@@ -623,7 +850,31 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
-        Inst::VFloatBin { shape, a, b, .. } => {
+        Inst::VIntCmp { shape, a, b, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::VShift { shape, a, amt, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*amt, ValType::I32)?;
+            ValType::V128
+        }
+        Inst::VFloatBin { shape, a, b, .. }
+        | Inst::VFloatCmp { shape, a, b, .. }
+        | Inst::VPMinMax { shape, a, b, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {
                     func: fi,
@@ -632,6 +883,19 @@ fn check_inst(
             }
             cx.expect(*a, ValType::V128)?;
             cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Fused multiply-add (`relaxed_madd`/`nmadd`): a ternary float-lane op.
+        Inst::VFma { shape, a, b, c, .. } => {
+            if !shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            cx.expect(*c, ValType::V128)?;
             ValType::V128
         }
         Inst::VFloatUn { shape, a, .. } => {
@@ -643,6 +907,126 @@ fn check_inst(
             }
             cx.expect(*a, ValType::V128)?;
             ValType::V128
+        }
+        Inst::VIntUn { shape, a, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // `i8x16.popcnt`: shape is fixed (i8x16), so there is no lane rule to enforce.
+        Inst::VPopcnt { a } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Saturating add/sub is `i8x16`/`i16x8` only (the wasm spec has no wider sat).
+        Inst::VSatBin { shape, a, b, .. } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Unsigned rounding average: `i8x16`/`i16x8` only (the only shapes wasm defines `avgr_u`).
+        Inst::VAvgr { shape, a, b } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Dot product: fixed shapes (i16x8 → i32x4), so there is no lane rule to enforce.
+        Inst::VDot { a, b } | Inst::VDotI8 { a, b } => {
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Extended multiply: the result `shape` must be a wide integer shape (has a half-width
+        // source to widen from) — same rule as widen.
+        Inst::VExtMul { shape, a, b, .. } => {
+            if shape.narrower().is_none() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Extended pairwise add: wide integer result only. `i16x8`/`i32x4` (i64x2 has no wasm op,
+        // but a half-width source exists, so restrict to the two wasm shapes explicitly).
+        Inst::VExtAddPairwise { shape, a, .. } => {
+            if !matches!(shape, VShape::I16x8 | VShape::I32x4) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Q15 rounding multiply: fixed `i16x8`, so there is no lane rule to enforce.
+        Inst::VQ15MulrSat { a, b } => {
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Widen: the result shape must be an integer shape that has a (half-width) source.
+        Inst::VWiden { shape, a, .. } => {
+            if shape.narrower().is_none() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Narrow: `i8x16`/`i16x8` results only (the wasm spec has no wider narrow).
+        Inst::VNarrow { shape, a, b, .. } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Lane conversions: `v128` → `v128`, fully described by the op.
+        Inst::VConvert { a, .. } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Boolean reductions: a `v128` → an `i32`. `all_true`/`bitmask` carry an integer shape;
+        // `any_true` is shape-agnostic.
+        Inst::VAnyTrue { a } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::I32
+        }
+        Inst::VAllTrue { shape, a } | Inst::VBitmask { shape, a } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::I32
         }
         Inst::VBitBin { a, b, .. } => {
             cx.expect(*a, ValType::V128)?;
@@ -687,6 +1071,8 @@ fn check_inst(
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContResume { .. }
+        | Inst::SetJmp { .. }
+        | Inst::LongJmp { .. }
         | Inst::ThreadSpawn { .. } => return Ok(None),
     };
     Ok(Some(ty))

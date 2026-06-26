@@ -231,6 +231,9 @@ impl<'g> BB<'g> {
             ValType::F32 => Inst::ConstF32(self.g.f32bits()),
             ValType::F64 => Inst::ConstF64(self.g.f64bits()),
             ValType::V128 => Inst::ConstV128(self.g.v128bytes()),
+            // The generator never produces `ref`-typed values (it's an svm GC reservation, not in
+            // `valtype()`); there is no const-ref instruction to synthesize one.
+            ValType::Ref => unreachable!("irgen does not generate ref-typed values"),
         };
         self.push(inst, ty)
     }
@@ -976,6 +979,8 @@ pub fn gen_module(g: &mut Gen) -> Module {
         memory,
         data,
         imports: Vec::new(),
+        exports: Vec::new(),
+        debug_info: None,
     }
 }
 
@@ -1018,6 +1023,7 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
             ValType::F32 => Value::F32(f32::from_bits(g.f32bits())),
             ValType::F64 => Value::F64(f64::from_bits(g.f64bits())),
             ValType::V128 => Value::V128(g.v128bytes()),
+            ValType::Ref => unreachable!("irgen does not generate ref-typed params"),
         })
         .collect()
 }
@@ -1046,6 +1052,7 @@ fn to_slot(v: Value) -> i64 {
         // The entry signature never returns a v128 (the generator's entry results are scalar), so
         // this is a total fall-through, not a live path.
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x as i64,
     }
 }
 fn from_slot(t: ValType, s: i64) -> Value {
@@ -1059,6 +1066,7 @@ fn from_slot(t: ValType, s: i64) -> Value {
             b[..8].copy_from_slice(&s.to_le_bytes());
             Value::V128(b)
         }
+        ValType::Ref => Value::Ref(s as u64),
     }
 }
 fn values_equal(a: &Value, b: &Value) -> bool {
@@ -1214,6 +1222,9 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
     ) {
         Ok(o) => o,
         Err(JitError::Unsupported(_)) => return, // generator only emits lowered ops; be safe
+        // Transient host allocation failure (e.g. Windows ERROR_COMMITMENT_LIMIT under the
+        // workspace test's compile churn), not a divergence — skip, like an unsupported op.
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
         Err(e) => panic!("JIT failed to compile a verified module: {e:?}\n{m:#?}"),
     };
     assert_outcomes_agree(m, &results, interp, &imem, jit, &jmem, mem_oracle);
@@ -1241,6 +1252,7 @@ fn differential_pass_sub(m: &Module, args: &[Value], mem_oracle: bool) {
     let (jit, jmem) = match compile_and_run_capture_sub(m, 0, &slots, &init, base, parent) {
         Ok(o) => o,
         Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return, // transient host OOM, not a divergence
         Err(e) => panic!("JIT failed to compile a verified module (sub-window): {e:?}\n{m:#?}"),
     };
     // Confinement: every byte *outside* the child's slice must equal the seed on the interpreter

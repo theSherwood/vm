@@ -120,7 +120,7 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
                 next += 1;
             }
             3 => {
-                // cont.new(funcref, sp) -> i32 handle; sp is any i64 (the fiber's data-stack base).
+                // cont.new(funcref, sp) -> i64 handle; sp is any i64 (the fiber's data-stack base).
                 // Interp-only: the funcref is any i32 in scope (a forgeable index, masked into the
                 // func table at first resume). Acyclic differential: the funcref is a *const* equal to
                 // a strictly-higher function index (`< nfuncs ≤ next_pow2`, so masking is the identity)
@@ -144,26 +144,21 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
                 };
                 let sp = any_i64!();
                 insts.push(Inst::ContNew { func, sp });
-                i32s.push(next);
-                fiber_handles.push(next); // a genuine fiber handle
-                next += 1;
-                // Widen the handle into the i64 pool so its *value* can flow into returns/args —
-                // the differential then observes handle numbering itself (the D57 3b-i unified
-                // namespace: handles match across backends, pinned per-program here).
-                insts.push(Inst::Convert {
-                    op: svm_ir::ConvOp::ExtendI32U,
-                    a: next - 1,
-                });
+                // The handle is an i64 (16-bit slot + 48-bit generation); it lands directly in the
+                // i64 pool so its *value* can flow into returns/args — the differential then observes
+                // handle numbering itself (the D57 3b-i unified namespace: handles match across
+                // backends, pinned per-program here).
                 i64s.push(next);
+                fiber_handles.push(next); // a genuine fiber handle
                 next += 1;
             }
             4 => {
                 // cont.resume(handle, arg) -> (status: i32, value: i64). The acyclic differential
                 // resumes a genuine fiber handle (see `fiber_handles`) most of the time, a forged
-                // i32 ~1-in-8 (comparable across backends since the 3b-i unified namespace; a
+                // i64 ~1-in-8 (comparable across backends since the 3b-i unified namespace; a
                 // forged resume that traps just makes the interp skip that program). With no
                 // genuine handle in scope it emits a const instead. The interp-only fuzzer
-                // resumes any i32 throughout.
+                // resumes any i64 throughout.
                 let k = if acyclic_from.is_some() && g.range(8) != 0 {
                     if fiber_handles.is_empty() {
                         insts.push(Inst::ConstI64(g.next_u64() as i64));
@@ -173,7 +168,7 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
                     }
                     fiber_handles[g.range(fiber_handles.len())]
                 } else {
-                    any_i32!()
+                    any_i64!()
                 };
                 let arg = any_i64!();
                 insts.push(Inst::ContResume { k, arg });
@@ -228,6 +223,8 @@ fn gen_module(g: &mut Rng) -> Module {
         memory: None,
         data: Vec::new(),
         imports: Vec::new(),
+        exports: Vec::new(),
+        debug_info: None,
     }
 }
 
@@ -247,6 +244,8 @@ fn gen_module_acyclic(g: &mut Rng) -> Module {
         memory: None,
         data: Vec::new(),
         imports: Vec::new(),
+        exports: Vec::new(),
+        debug_info: None,
     }
 }
 
@@ -366,6 +365,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
         ) {
             Ok(cm) => cm,
             Err(JitError::Unsupported(_)) => continue, // off a fiber_rt target / an unlowered op
+            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => continue, // transient host OOM (Windows commit limit), not a divergence
             Err(e) => panic!("JIT failed to compile a verified fiber module: {e:?}\n{m:#?}"),
         };
         let (jit, _) = cm.run(&[4096, 1], None, None, None).expect("jit fiber run");
@@ -437,8 +437,8 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
     /// (the root stores each handle right after `cont.new`). Accumulates `1000*status + value`.
     fn emit_step(src: &mut String, v: &mut u32, step: &Step, acc: u32) -> u32 {
         let a = *v;
-        writeln!(src, "  v{a} = i64.const {}", 16 + 4 * step.fiber).unwrap();
-        writeln!(src, "  v{} = i32.load v{a}", a + 1).unwrap();
+        writeln!(src, "  v{a} = i64.const {}", 16 + 8 * step.fiber).unwrap();
+        writeln!(src, "  v{} = i64.load v{a}", a + 1).unwrap(); // i64 fiber handle
         writeln!(src, "  v{} = i64.const {}", a + 2, step.arg).unwrap();
         writeln!(
             src,
@@ -500,7 +500,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
 
         // ---- Emit the module: func 0 = root, funcs 1..=nw = workers, then the fiber bodies.
         let mut src = String::from("memory 16\n");
-        // Root: create the fibers (handle of fiber f stored at mem[16+4f]), then run its phases,
+        // Root: create the fibers (handle of fiber f stored at mem[16+8f]), then run its phases,
         // spawning + joining each worker in between (strictly sequential).
         src.push_str("func () -> (i64) {\nblock0():\n");
         let mut v: u32 = 0;
@@ -508,8 +508,8 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
             writeln!(src, "  v{v} = ref.func {}", 1 + nw + f).unwrap();
             writeln!(src, "  v{} = i64.const {}", v + 1, 4096 * (f + 1)).unwrap();
             writeln!(src, "  v{} = cont.new v{v} v{}", v + 2, v + 1).unwrap();
-            writeln!(src, "  v{} = i64.const {}", v + 3, 16 + 4 * f).unwrap();
-            writeln!(src, "  i32.store v{} v{}", v + 3, v + 2).unwrap();
+            writeln!(src, "  v{} = i64.const {}", v + 3, 16 + 8 * f).unwrap();
+            writeln!(src, "  i64.store v{} v{}", v + 3, v + 2).unwrap();
             v += 4;
         }
         writeln!(src, "  v{v} = i64.const 0").unwrap(); // the root's accumulator

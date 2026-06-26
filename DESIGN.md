@@ -266,6 +266,36 @@ review, fuzzing infra, audit), tracked as open-ended in §18.
   structured-control-flow straitjacket. This is a direct target for LLVM-style
   producers and feeds register allocation directly in the JIT.
 
+### Three backends, one observable behavior (the parity invariant)  [SETTLED]
+The same verified IR is executed by **three backends**, each with a distinct job:
+
+1. **Tree-walk interpreter** (`svm_interp::run`/`run_with_host`) — walks the SSA IR
+   data structure directly. This is the reference **oracle**: escape-TCB,
+   `#![forbid(unsafe_code)]`, total and panic-free *even on unverified input* (so it
+   is safe to drive from a fuzzer, §18). Correctness is defined *here*.
+2. **Bytecode interpreter** (`svm_interp::bytecode`) — the IR lowered to a flat,
+   operand-resolved bytecode with threaded dispatch and its own single-OS-thread
+   cooperative scheduler; also `#![forbid(unsafe_code)]`. It is faster than the
+   tree-walker and is the portable execution path for **targets where the JIT is
+   unavailable** — notably the wasm64 browser build (§21) — and the JIT-not-viable
+   fallback generally.
+3. **Cranelift JIT** (`svm-jit`) — the production **speed** path (§9).
+
+> **Invariant:** on every verified module, all three backends produce **identical
+> observable behavior** — same results, same trap kind, same final memory window.
+
+The tree-walker is the hub against which the other two are continuously
+differential-tested: the **bytecode engine is held bit-exact** against it (shared
+semantic helpers → results, trap kind, *and* float/NaN bits all identical;
+`crates/svm/tests/bytecode_diff.rs` — "the gate that must stay green before the
+bytecode path is made a default"), and the **JIT is held exact** against it *modulo*
+cross-backend float-NaN bit patterns, which are host-defined and deliberately
+unpinned (§3b; `crates/svm/tests/jit_diff.rs`). Where the bytecode engine does not
+yet implement an op, that module is excluded from its differential corpus; every op
+it *does* support must match exactly. This three-way agreement is what lets the JIT
+(the dominant escape-TCB, §2a) and the bytecode path be trusted: both are checked,
+continuously and generatively, against a small, auditable, `unsafe`-free oracle.
+
 ---
 
 ## 3a. Type system, value model & binary encoding  [SETTLED]
@@ -978,6 +1008,40 @@ i64` (the `__vm_page_size` frontend builtin) — so a guest allocator can align 
 guest-visible page (decoupled from the host page) for reproducible cross-host
 execution is a later refinement.
 
+### Target dependence (the explicit catalog)
+
+svm aims to be **target-uniform**: a module that verifies runs identically on every supported
+backend/target. The few genuinely target-dependent items are enumerated here so they stay few and
+visible; anything not listed is intended to be byte-for-byte uniform (the interp↔JIT escape oracle
+and differential enforce that for the confinement + codegen surface).
+
+- **Supported targets for native stack-switching** (`svm_fiber::supported()`): x86-64 unix,
+  aarch64 unix (incl. Apple Silicon), x86-64 Windows. The reference JIT derives `cfg(fiber_rt)`
+  from this set.
+- **Features gated to that set** — present on **all three** supported targets; on others the **JIT
+  bails `Unsupported`** (uniformly) while the **interpreter still runs them**, so this is a clean
+  supported-set gate, *not* a behavior difference *between* supported targets: §12 fibers
+  (`cont.*`), threads (`thread.spawn`/`join`), futex (`*.atomic.wait`/`atomic.notify`); §GC
+  `gc.roots` (it walks the fiber runtime's native stacks); §14 nesting (`Instantiator`).
+- **Op-level JIT bails, uniform across all targets** (interpreter covers them): `i8x16.mul` (no
+  single-instruction ISA lowering); a `v128` result inside a many-result signature (see below).
+- **Function results are target-uniform via a return-area (sret).** Cranelift's `Tail` calling
+  convention returns values in registers with a *per-ABI budget* (x86-64 admits more than aarch64).
+  To stop a valid module being accepted on one supported target and rejected on another, the JIT
+  spills results beyond `MAX_REG_RESULTS` (= 4) to a **caller-provided memory return-area pointer**
+  — the technique wasm engines use for multi-value — which is identical codegen on every target, so
+  the result *count* is not target-dependent. (The 8-byte return-area slots can't carry a `v128`, so
+  a `v128` in a `>4`-result signature is the one `Unsupported` bail above; frontends that return many
+  values idiomatically use a guest-memory buffer anyway, e.g. `gc.roots`.)
+- **PAL + page size** (see "Platform support" above): VA reserve/commit/protect/release and
+  guard-fault recovery differ per OS (a non-TCB seam); page granularity is the host MMU page,
+  queried at runtime. The *guarantee* is identical across targets.
+- **Arch/OS-specific code, all behind one seam** (`crates/svm-fiber/`): the register/stack switch
+  (`switch_{x86_64_sysv,aarch64,x86_64_windows}.rs`) and guard-paged stack allocation
+  (`stack_{unix,windows}.rs`). They differ in saved-register frame layout and, on Windows, TEB
+  `StackBase`/`StackLimit`/`DeallocationStack` swaps per switch, but expose one uniform
+  `Fiber`/`Yielder` API.
+
 A window may itself be a power-of-two-aligned **sub-region of a parent window**
 (see §14); confinement is then `base + (offset & (size−1))` with `base`/`size`
 as instantiation constants, so a sub-window is indistinguishable from a
@@ -1095,7 +1159,10 @@ something new is a capability**:
   references; a wasm frontend emits named imports; both resolve against the same
   `name → (type_id, op)` table. The grant set is still **statically bounded per instance**
   (fixed once instantiation completes), so the §9 egress closure is unaffected — only the
-  *binding* moved from compile-time to instantiation-time.
+  *binding* moved from compile-time to instantiation-time. The **same named-import mechanism
+  generalizes to cross-unit linking** — a name may bind to another function (a direct `call`) or a
+  table slot (`call_indirect`), not only a capability — which is how in-window dynamic linking
+  (`vm_dlopen`) works; see §22.
 
 - **Reflection = an always-available intrinsic** (`cap.self`), read-only over the domain's
   **own** handle table: it returns the count and, per live entry, the `type_id` + op-schema
@@ -1414,6 +1481,17 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   independent-op reorderings and busy-wait retries, sound vs an unreduced
   enumerator, §18), against which the real-thread JIT is differential-tested; the
   futex glue is loom-checked.
+- **Per-vCPU TLS register (`vcpu.tls.get`/`vcpu.tls.set`).** One ambient i64 of
+  per-vCPU state, **read at the execution point** — so a fiber that migrated to
+  another vCPU reads the *current* vCPU's word, the value only the runtime knows
+  (the `thread.spawn` handle is the parent's view, not "which vCPU am I on now").
+  Seeded at vCPU creation to a **dense id** (root = 0, children sequential), so a
+  bare `get` doubles as a `vcpu.id`; the guest may overwrite it with a pointer to
+  its per-CPU block for full `__thread`-style TLS. The natural primitive for a
+  guest M:N runtime / GC's per-CPU state (mark stacks, allocator magazines). Not a
+  cross-vCPU channel (each vCPU touches only its own word — no new visible op for
+  the DPOR oracle); program *output* must not depend on *which* vCPU runs you,
+  only on per-CPU state being self-consistent (the GC.md §3.2 framing).
 
 ### Host-call ABI: async-first
 - Blocking-capable host calls are **submit/complete** (io_uring-shaped). The
@@ -1676,7 +1754,7 @@ cross-domain, supervisor, capability bookkeeping); the *software-isolation half*
 Frameworks like the seL4 Core Platform / Microkit, CAmkES, or Genode would host
 our components.
 
-### Platform abstraction & portability  [OPEN — Linux/macOS first, Windows next]
+### Platform abstraction & portability  [SETTLED — Linux/macOS/Windows at parity (Phase 3.5 done); seL4 backend still future]
 
 The escape-critical core is **already portable**: confinement masking (§4) is pure
 arithmetic (`svm-mask` is `no_std`, dependency-free), so the security hinge carries no
@@ -1768,6 +1846,20 @@ IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stan
   vectors (SVE/RVV) are rejected** (runtime-variable width makes the one security-critical
   unit — the masked-access bounds proof — runtime-variable too; no Cranelift support;
   fragmented HW benefit).
+- **An opt-in *host-dependent* (non-deterministic) SIMD mode is an accepted future
+  direction.** The default stays **fixed-128, deterministic** (the replay / freeze-thaw /
+  byte-exact-oracle contract). But a guest/embedder that prioritizes raw throughput over
+  those guarantees may opt into legalizing to the **host-native vector width** (256/512),
+  accepting that results and snapshots become **host-dependent** (no cross-host replay, no
+  durable freeze-thaw across machines, excluded from the scalar-128 oracle differential) —
+  the same bargain a native binary already makes. This is a **product-sanctioned tradeoff**,
+  so the determinism objection is *not* the blocker for this mode. The actual blocker is the
+  same backend gap above: until **Cranelift grows an upstream wide-vector register class**,
+  the host-native arm has nothing to lower to (splitting to `v128` buys nothing). So the mode
+  is *designed-in but not buildable yet*; when Cranelift lands wide vectors it slots in as a
+  non-default flag (e.g. a `SimdWidth::HostNative` legalization policy in the on-ramp +
+  `svm-jit`), leaving the deterministic default untouched. Until then, width-hungry work uses
+  the host-provided vectorized capability *(a)* or the GPU broker *(b)* above.
 
 ### GPU = WebGPU via a sandboxed broker  [SETTLED]
 The VM does *not* execute GPU code, and the guest never touches the driver. GPU
@@ -1805,44 +1897,78 @@ browser — good enough here.
 
 ---
 
-## 19. Debugging & observability  [DESIGN — new]
+## 19. Debugging & observability  [PARTIALLY BUILT — interpreter stepping + DAP shipped; DWARF & cap.call record/replay staged]
+
+> **Work-breakdown & detailed designs:** `DEBUGGING.md` (workstreams W1–W8, sequencing,
+> open decisions). This section stays the canonical *rationale*; that doc is the *plan*.
 
 Good debugging is a **first-class ergonomics goal**, not an afterthought. The architecture
 yields three debugging pillars cheaply, plus one that is real work — pursue all three cheap
 ones as pillars and stage the expensive one.
 
-1. **Record/replay & time-travel — nearly free, a genuine differentiator.** With no ambient
-   authority (§7), *all* guest nondeterminism enters through capabilities. Logging
-   `cap.call` inputs/outputs and seeding the deterministic mode (§12) yields a fully
-   **replayable** trace — the capability boundary *is* the recording boundary. Time-travel
-   (step backward) follows from deterministic replay to any prior point.
-2. **Trustworthy backtraces even after corruption — free.** The out-of-band control stack
-   (D5/§5) holds return addresses the guest cannot forge or smash, so unwinding yields a
-   reliable stack trace even when the in-window data stack is corrupted — the inverse of
-   native debugging, where a smashed stack destroys the backtrace.
-3. **Reference interpreter as a debug engine — cheap.** Single-step / breakpoint /
-   watchpoint over a masked, contiguous window is straightforward and deterministic with no
-   JIT plumbing; address watchpoints are trivial (the window is one buffer).
+**Status (2026-06).** The *architectural premises* these pillars rest on are built and
+cross-platform-validated — the out-of-band control stack + per-fiber two-stack split (§5/§3d,
+`svm-fiber`), the deterministic interpreter oracle (§12, `run_scheduled`/`explore_all`),
+capabilities (§3c/§7), and SSA promotion (§3d). **Two of the four debug surfaces have now
+shipped:** the **interpreter stepping engine** (the `svm-interp` `Inspector` — breakpoints,
+single-step, backtrace, watchpoints over the masked window) and an **IR debug-info side-table**
+(W4) that carries source locations + named locals, consumed by an **interpreter-backed Debug
+Adapter Protocol server** (`svm-dap`, W5 slice 1; `DEBUGGING.md`) — so a client (VS Code) sets a
+source-line breakpoint, it binds, and hitting it shows the source frame with inspectable locals,
+with no DWARF and no JIT in the loop. **Still staged:** the `cap.call` record/replay log (pillar 1)
+and source-level **DWARF for JIT-compiled code** (pillar 4's full form). So pillars 2–4 are
+realized in their interpreter-tier form; the DWARF/record-replay work remains.
+
+1. **Record/replay & time-travel — nearly free *in deterministic mode*, a genuine
+   differentiator.** With no ambient authority (§7), guest nondeterminism enters through
+   capabilities; logging `cap.call` inputs/outputs and seeding the deterministic mode (§12)
+   yields a fully **replayable** trace — the capability boundary *is* the recording boundary.
+   Time-travel (step backward) follows from deterministic replay to any prior point.
+   **Caveat (inherited from §12):** "all nondeterminism via capabilities" holds *only in
+   single-vCPU/deterministic mode*. Under the now-built concurrency (threads, relaxed atomics,
+   work-stealing fibers — §12/§23) shared-memory **race outcomes** are a nondeterminism source
+   that bypasses the capability boundary, so faithful replay there must also record schedule +
+   memory-order choices — exactly what the interpreter's DPOR `explore_all` already reifies (a
+   stronger substrate than plain seed-replay). The `cap.call` I/O log itself is not yet built.
+2. **Trustworthy backtraces even after corruption — integrity free, materialization cheap.**
+   The out-of-band control stack (D5/§5, now built) holds return addresses the guest cannot
+   forge or smash, so a corrupted in-window data stack cannot destroy the trace — the inverse
+   of native debugging, where a smashed stack destroys the backtrace. The *integrity* is free;
+   *materializing* a backtrace still needs frame/unwind metadata from Cranelift to walk the
+   machine stack, and with migratable fibers (D57/§23) the walk is **per-fiber**, not
+   per-thread (each fiber owns its control+data pair).
+3. **Reference interpreter as a debug engine — cheap; vehicle mature, surface unbuilt.**
+   Single-step / breakpoint / watchpoint over a masked, contiguous window is straightforward
+   and deterministic with no JIT plumbing; address watchpoints are trivial (the window is one
+   buffer). The interpreter (`svm-interp`) is mature and is already the deterministic oracle,
+   it now also exposes the `Inspector` stepping API (breakpoints/step/backtrace/watchpoints) that `svm-dap` drives.
 4. **Source-level debugging (the real work, staged).** Preserve source-location +
    variable-location info **frontend → an IR debug-info side-table (§3a) → Cranelift →
    DWARF**, so gdb/lldb and VS Code (via **DAP**) set breakpoints and inspect variables in
    the *source* language. Cranelift already emits DWARF for JIT code (Wasmtime precedent);
-   the new piece is threading debug info through *our* IR.
+   the new piece is threading debug info through *our* IR. **The dependency is still step
+   zero:** the IR (`svm-ir`) carries no source-location fields and chibicc's `codegen_ir.c`
+   discards them, so the §3a side-table comes first. A cheap intermediate before full
+   DWARF/DAP: a source↔IR-position side-table consumed by the interpreter (pillar 3), which
+   needs no Cranelift work.
 
 **Debugger = a host-side capability** (an `Inspector`/`Debugger`, shaped like the §15
 `Monitor`): it *observes* a guest from outside, so it never widens the guest's authority and
-fits the ocap model. Debug info is **tooling, untrusted for escape** (§2a) — strippable, and
-the verifier never trusts it.
+fits the ocap model. (§15's metering *properties* — fuel/quota — exist on `Host` today, but
+`Monitor` is still a **pattern**, not a built type — though the `Inspector` half is now real
+(`svm-interp`'s `Inspector`, driven by the `svm-dap` DAP server).) Debug info is **tooling,
+untrusted for escape** (§2a) — strippable, and the verifier never trusts it.
 
-**Tension to record (it entangles the §3d perf pass):** SSA promotion gives a promoted local
-**no memory address**, so it is not inspectable as a variable. A debug build therefore either
-**disables promotion** (locals stay in-window, addressable) or emits **Cranelift
-value-location lists** so the debugger finds the register/stack slot — the classic
-`-O0`-vs-optimized-debug trade, here tangled with our headline optimization.
+**Tension to record (it entangles the §3d perf pass — now concrete, not hypothetical):** SSA
+promotion (the implemented headline perf win, §3d) gives a promoted local **no memory
+address**, so it is not inspectable as a variable. A debug build therefore either **disables
+promotion** (locals stay in-window, addressable) or emits **Cranelift value-location lists**
+so the debugger finds the register/stack slot — the classic `-O0`-vs-optimized-debug trade,
+here tangled with our headline optimization.
 
 ---
 
-## 20. Frontends & language on-ramps  [OPEN — strategy settled, vehicle deferred]
+## 20. Frontends & language on-ramps  [LLVM on-ramp BUILT (D54) + wasm bridge built; breadth ongoing]
 
 chibicc is the **MVP frontend** (§3d); the goal is to be a target for **many** languages.
 The enabling principle should be explicit:
@@ -1871,9 +1997,134 @@ non-negotiable **two-stack constraint** (§3d) — any frontend must place addre
 on the in-window data stack, scalars in SSA, control out-of-band, exactly as `codegen_ir.c`
 does. Generalizing that discipline to LLVM is the work.
 
+### 20a. The LLVM on-ramp, built (`crates/svm-llvm`)  [D54 exit criterion MET]
+
+An AOT **LLVM-bitcode → SVM-IR translator**. Untrusted-for-escape (§2a): its output is
+re-verified, so a translation bug is a clean error, never an escape — adding it cost **zero
+escape-TCB**. It links libLLVM at **build/dev time only** (via `llvm-ir`/`llvm-sys`, LLVM 18
+pinned), so it is **excluded from the workspace** and built as a Linux-dev-only CI lane — the
+cross-OS runtime never links libLLVM (off the runtime path). **Legalization is out-of-process**:
+`clang -O2 -emit-llvm` runs `mem2reg`/SROA, so scalars arrive in SSA registers (the §3d two-stack
+split falls out of LLVM's own promotion — address-taken `alloca`s that survive → data-stack slots;
+the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
+
+- **Core.** The headline is the **SSA → block-argument conversion** (the §1a win over wasm):
+  LLVM dominance-SSA + φ-nodes → SVM's block-local form via backward liveness — φ-results and
+  threaded live-ins become block params, branches supply args; loops/joins/irreducible/critical
+  edges need no edge splitting. Plus: narrow ints collapse to `i32` with re-emitted truncation /
+  sign-extension at the hazards (§3b — incl. signed `icmp` on a narrow operand); pointers are `i64`;
+  the **data-SP is threaded** as block-local index 0 of every block (a call passes `sp+frame_size`).
+- **Scalar+memory+call+aggregate coverage.** Integer/float arithmetic, `icmp`/`fcmp`, casts;
+  `switch`→`br_table`; globals low in the window as `data` segments (read-only ones **page-isolated**
+  from writable, D40); direct/indirect calls; struct GEP + by-value structs (`sret`/`byval` and
+  register coercion) + **multi-value returns** (a small struct → multi-result, §3a); memory
+  intrinsics (constant-length inline, variable-length via **synthesized runtime `memset`/`memcpy`
+  loop helpers** — the first hand-built multi-block CFGs); funnel-shift rotates, `ptr↔int`, `freeze`,
+  constexpr-GEP, `llvm.load.relative`; **2-lane 32-bit vectors** (`<2 x float>`/`<2 x i32>`)
+  scalarized to a packed `i64`.
+- **libc & the powerbox (Lane C).** A program that does I/O gets a synthesized `_start` powerbox
+  entry; libc binds via **§7 named imports** the host resolves at load — `write`/`read`→`Stream`,
+  `exit`→`Exit`, `malloc`/`calloc`→a synthesized bump allocator that grows the heap into the reserved
+  window tail by `vm_map`-committing pages on demand via the `Memory` cap (the §1a sparse-address
+  win); the stdio output family (`puts`/`putc`/`fwrite`…) and constant-string `printf` lower to
+  `Stream.write`. **All libc *logic* runs in the guest** as synthesized/translated IR; only the
+  irreducible boundary primitives (`write`/`read`/`exit`/`vm_map`) are host capabilities.
+- **Proof (the D54 "matches native clang" exit criterion).** All **eight** chibicc corpus
+  libraries — SHA-256, xxHash, stb_perlin, tiny-regex-c, jsmn, heapgrow, miniz/tinfl, clay — run
+  **byte-identical to a native `clang` build**, on **both** the interpreter and the JIT (the §18
+  differential). Every translation test is interp == JIT == native/hand-computed.
+- **Pending (general-C breadth, beyond the corpus; tracked in `LLVM.md`).** Wider/other SIMD
+  (`<2 x double>`, `<8 x i16>`), `llvm.bitreverse`, transcendental libm (a guest `libm`),
+  `envp`/`getenv`, and the deferred-hard items (C++ EH, `setjmp`/`longjmp`, byte-exact float
+  `printf` — needs a bignum formatter). *(Done since: varargs `printf`/`fprintf` with `%s`/flags/
+  precision, `realloc`, overlapping `memmove`, `bswap`, and `argc`/`argv` — the §3e args buffer at
+  the fixed offset `POWERBOX_ARGS_BASE`, D44.)*
+
 ---
 
-## 21. Host/guest boundary: synchrony & nesting cost  [SETTLED — clarification]
+### 20c. The partial-evaluation on-ramp (`crates/svm-peval`)  [BUILT — first Futamura projection, host-side + guest-side (in-sandbox)]
+
+A guest that wants to run JS/Python/Lisp/a DSL ships an **interpreter** (compiled to our IR
+via the C or LLVM on-ramp) and pays interpreter overhead forever, or hand-writes a per-language
+JIT on the §22 `Jit` capability. `svm-peval` adds a third option — the **first Futamura
+projection**: partial-evaluate the interpreter against a fixed program and get the *compiled*
+program out. `spec(interp, program)(input) ≡ interp(program, input)`, with the dispatch loop,
+opcode decode, and program-walking folded away. **Write only the interpreter, get the compiler
+for free** (weval's value proposition for SpiderMonkey, applied here).
+
+- **Posture — untrusted-for-escape, identical to the LLVM on-ramp (§20a).** The engine is a
+  pure host-side `Module → Module` transform (depends only on `svm-ir`). Its output is
+  re-verified (`svm_verify::verify_module`) before it runs, so a specializer bug is a clean
+  verify error, **never an escape**. The correctness spec is the differential oracle: the
+  residual must equal the interpreter on **both** backends (interp and JIT) for every input.
+- **Why SVM is a good substrate.** SSA-on-the-wire (§3, §3a) skips weval's hardest first step
+  (SSA reconstruction from a stack machine); total/deterministic semantics (§3b — div/`INT_MIN`
+  trap, shifts mod width, wrapping) make folding sound with no UB to reason around.
+- **Engine — online polyvariant symbolic execution** (weval's shape). Each SSA value is
+  abstractly a constant or a residual value; pure integer ops with constant operands fold
+  (matching the interpreter's arithmetic exactly), the rest is emitted into the residual. The
+  **context** threaded through the CFG is `(call stack, constant valuation of the live
+  abstract-memory cells)` — each frame `(block, constant valuation of its live SSA values)`, one
+  frame for a single function and deeper when calls are CFG-inlined; one residual block per
+  context, memoized — so a constant PC drives loop unrolling and repeated contexts reconnect
+  (bounded by a block budget).
+  - **Constant memory** is a *caller contract*, not a runtime-enforced invariant: a load from a
+    caller-declared-constant address folds to those bytes (a readonly data segment by default,
+    or an arbitrary region / explicit overlay via `SpecConfig`). A false promise is a miscompile,
+    never an escape (cf. weval's `assume_const_memory`).
+  - **Value-stack renaming (Stage 2):** a caller-designated private window range (the
+    interpreter's operand stack/locals) is modeled as abstract memory — its constant-address
+    full-width stores/loads are lifted into SSA and elided, so the in-memory stack vanishes from
+    the residual. `rename_is_private` additionally lets a pointer-addressed heap coexist with it.
+  - **Cross-function `call` is inlined at the call site.** A static-control-flow callee is traced
+    straight-line into the caller's block (static recursion unrolls); a callee whose control flow
+    stays dynamic has its **CFG inlined as residual blocks** — the context's call stack carries the
+    caller's live values through the callee (dead ones cleaned by the optimizer) and each `return`
+    becomes a branch to the continuation. Loops and `unreachable` in the callee work; one residual
+    function still comes out. A constant-index `call_indirect`/`ref.func` resolves through the
+    identity table and inlines too. (Indirect-dynamic/host calls are not inlined.)
+  - **Outlining (residual-call mode, opt-in).** Instead of inlining, each `(callee, arg pattern)`
+    can be specialized to its own residual function (memoized/shared) and called — a multi-function
+    residual that bounds code growth and specializes **dynamic-depth recursion** (a finite
+    self-recursive residual where inlining would diverge). Requires no rename region (no abstract
+    cells to thread across the call).
+  - **CFG cleanup** (shared with the generic optimizer): constant folding, branch resolution,
+    dead-block / dead-value elimination, block merging, dead block-param elimination — so
+    residuals come out as tight straight-line/looped code, not `br`-chains.
+- **AOT, by construction.** Nothing is runtime-coupled: `specialize → verify → encode_module`
+  produces a shippable artifact; load it with `decode_module` and run or `svm_jit::compile_and_run`
+  it with zero specialization cost at run time (the host-side/offline architecture).
+- **Guest-side, in-sandbox — built.** The engine also runs *inside* the sandbox: `svm-peval`
+  compiles to svm-IR through the Rust→svm-IR on-ramp (`no_std` + `alloc`, `default-features = false`
+  to drop `libm`), so an ordinary guest can `specialize → encode_module → §22 Jit.compile → invoke`
+  a residual without leaving its domain — the first Futamura projection performed in-sandbox by an
+  untrusted program, the residual re-verified before it runs (zero new escape-TCB; the trust hinge is
+  verification, not the producer). Demonstrated end-to-end by `crates/svm-llvm/tests/peval_jit.rs`
+  (a guest specializes + JITs a module) and `peval_futamura.rs` (a guest specializes a `br_table`
+  interpreter against its program — dispatch + decode fold away — and JITs the result); the
+  `specialize` closure's in-sandbox translate+run is regression-pinned by `peval_in_sandbox.rs`. The
+  residual IR and the JIT back half are shared with the host-side path.
+- **Measured ROI** (register-machine bytecode, runtime-controlled loop, release): removing
+  dispatch by specialization is **~5–6×** on either backend (apples-to-apples, same backend); the
+  end-to-end software-interpreted → compiled-native path is **~470×**. Lean-ISA dispatch-overhead
+  fraction, not a universal constant — a heavier decode shows more.
+- **Coverage today:** integer/long, **scalar-float**, **and common v128 (SIMD)** ops — arithmetic,
+  compares, fused multiply-add, float↔int conversions and reinterpret/demote/promote casts; plus the
+  common SIMD lane ops (splat, extract/replace, lane int+float arithmetic/compares/shifts, bitwise,
+  shuffle, swizzle) — all constant-**folded** bit-for-bit the interpreter (NaN payloads + the wasm
+  min/max/nearest rules preserved, float lanes reusing the scalar folds; a trapping `trunc` folds
+  only in range and is otherwise kept so it still traps); static + dynamic branches; any-width
+  constant-memory reads; renamed stack/locals (word **and** narrow `i8`/`i16` cells, with a dynamic
+  heap alongside); cross-function `call` inlining — direct **and** constant-index
+  `call_indirect`/`return_call_indirect`/`ref.func` (resolved through the identity module-0 table) —
+  with static + dynamic control flow, recursion, and loops; and opt-in **outlining** (specialize a
+  callee to a shared residual function, for dynamic-depth recursion / bounded size); **and the
+  guest-side, in-sandbox engine** (above). **Remaining enhancement (not a gap):** the **exotic SIMD
+  ops** (saturating add/sub, widen/narrow, lane convert, dot, pairwise, pmin/pmax, avgr, popcnt,
+  any/all-true, bitmask, q15) still pass through unfolded.
+
+---
+
 
 Consolidates what §9/§12/§14 imply but never state in one place: **how synchronous the
 host/guest (and guest/guest-as-host) boundary is.**
@@ -1918,6 +2169,72 @@ nesting bites.
 
 ---
 
+## 21. Durable domains, snapshots & embedding  [DURABILITY built (single+multi-vCPU); browser built]
+
+> **Detailed designs & status:** `DURABILITY.md` (durable domains — the freeze/thaw transform,
+> the snapshot container, phase tracker) and `BROWSER.md` (the interpreter-as-wasm build). This
+> section is the canonical *rationale*; those docs are the *plans*.
+
+Three capabilities the architecture makes cheap and wasm makes hard: **freeze a running domain to
+bytes, restore it elsewhere, and run the whole VM inside a browser.** Each falls out of decisions
+already settled — total IR (D34), out-of-band control stack (D5), block-local SSA with no phi (D1),
+and the masked-window memory model (D38) — rather than needing new escape-TCB.
+
+### Durable domains (freeze / thaw / restore)  [D60]
+A **durable** domain can be quiesced, serialized to `(window pages + per-page prots, shadow control
+state, handle table)`, and later restored to **bytewise-equivalent** execution — possibly on the
+other backend, possibly on a different host, surviving a recompile, a Cranelift version bump, and
+ASLR (the precise meaning of "survive a recompile" is narrower than it sounds — see `DURABILITY.md`
+§1). Two crates, both **tooling-tier / +0-TCB** (they depend only on `svm-ir` and move bytes; an
+embedder running pre-instrumented modules links neither into the escape-TCB):
+
+- **`svm-durable` — the IR→IR freeze/thaw transform.** It instruments a function so an in-flight
+  may-suspend op (a `cap.call`, or a `Call` into a suspended chain) can be **unwound** into
+  guest-resident shadow state and later **rewound** back into execution, byte-for-byte. The codec is
+  pure IR — *no new instruction*: a state word (`NORMAL | UNWINDING | REWINDING`) + a per-fiber
+  **shadow stack**, both in the window; unwind spills the live set + a resume id and returns out to
+  the host; rewind `br_table`s on the saved resume id in the prologue, reloads the live values, and
+  continues. The IR shape pays off here — a continuation block's `params` *are* the resume-point live
+  set, so liveness is free and the verifier still does one linear pass. Handles arbitrary single-vCPU
+  CFGs (branches, loops, joins), leaf `cap.call`s, and propagated call chains (re-issue vs. continue).
+- **`svm-snapshot` — the snapshot artifact codec.** (De)serializes a quiesced durable domain into a
+  backend-independent, recompile-survivable artifact and back. A frozen domain is described almost
+  entirely by its **window image** (shadow stack, spilled live values, state word are all
+  guest-resident bytes, so they ride along for free); what is captured host-side is the **handle
+  table** (authority, not the resources it names). The artifact binds the **instrumented-module
+  digest** — restore refuses on a mismatch (the durability boundary: the shadow schema is a function
+  of the instrumented module's structure). Container is `b"SVMD"` + versioned ascending-tag TLV,
+  **canonical** encoding (so "re-serialize a freshly-restored domain at the same safepoint is
+  byte-identical" is a plain `==`), with sparse window pages + zero-page elision + per-page
+  protection, and parked **fibers** flattened into the image. **Status:** single- and multi-vCPU
+  freeze + thaw land on **both backends** (nested spawns + child-owned fibers, snapshot v4),
+  validated by the interp↔JIT differential; a `Backed` §13 shared-region page is out of scope (freeze
+  refuses a domain holding shared regions).
+
+### Browser embedding (the interpreter as a wasm guest)  [built]
+The bytecode **interpreter** (`svm-interp`'s `bytecode.rs`, `#![forbid(unsafe_code)]`, with its own
+single-OS-thread cooperative scheduler) compiles **to wasm** so an SVM guest runs **client-side** —
+ship one `.wasm`, no native dependency. The payoff is portability/embeddability, **not** added
+isolation (inside wasm you are double-sandboxing: the host's wasm sandbox over SVM's own masking +
+guard pages). The production target is **wasm64** (memory64), because SVM addresses are `u64`
+end-to-end (`svm-mask` confines into `[0, 1<<reserved_log2)`); `wasm32` is kept only as a flag-free
+Node smoke target for compute-only guests. Don't confuse this *outbound* direction (the VM compiled
+*to* wasm) with the *inbound* `svm-wasm` frontend (wasm bytes → IR, §20) — a guest could even be
+`svm-wasm`-transpiled and then run by this interpreter-in-wasm. See `BROWSER.md`.
+
+### Conservative GC support (`gc.roots`)  [primitive built; collector is guest policy]
+SVM implements **no GC and no object model**. It contributes exactly one thing a guest's own
+collector cannot do itself: enumerate the roots living on the **out-of-band control stack +
+saved-register blocks** (§3d/§5) — the one place the guest cannot reach by masking. `gc.roots` does
+that conservatively (reporting candidate root words, with an optional top-byte-only payload mask for
+guests that tag pointers in the high byte). Everything else — heap, allocator, mark/sweep,
+object/line maps, world-stop coordination, scanning the in-window data stack + heap — is guest policy
+over primitives that already exist (the `Memory` cap, the futex, atomics). World-stop is cooperative
+and guest-coordinated; SVM provides no preemptive any-PC register-capturing stop (it would add
+escape-TCB). See `GC.md` (a draft RFC, converged with the JACL guest side).
+
+---
+
 ## 22. Guest-driven JIT (the `Jit` capability)  [SETTLED — built, differentially tested]
 
 **The problem.** Can *guest* code (an interpreter running inside the sandbox) generate SVM IR at
@@ -1954,11 +2271,13 @@ domain.**
 | 2 `release` | `(code) -> 0 \| -errno` | revoke the handle (generation bump). Code/slots not freed (see reclaim). |
 | 3 `install` | `(code) -> slot \| -errno` | write the unit into the `call_indirect` table's next reserved slot; returns a funcref index (`-ENOSPC` if full). |
 | 4 `uninstall` | `(slot) -> 0 \| -errno` | clear an installed slot (reusable; stale calls trap). |
+| 5 `compile_linked` | `(ir, ir_len, symtab, symtab_len) -> code \| -errno` | like `compile`, but the unit may carry **unresolved §7 imports** bound by name against the guest-provided symbol table before verify — the dynamic-linking entry (below). Fail-closed. |
 
-C surface (`frontend/chibicc`, `<svm.h>`): `__vm_jit_compile/invoke2/install/uninstall/release`, the
-8th of the fixed chibicc powerbox. Demos in `crates/svm-run/demos/jit/` (`jit_demo.c` self-JITs a
+C surface (`frontend/chibicc`, `<svm.h>`): `__vm_jit_compile/compile_linked/invoke2/install/uninstall/release`,
+the 8th of the fixed chibicc powerbox; the in-guest dynamic-linking loader `vm_dlopen`/`vm_dlsym`/`vm_dlclose`
+(`<vm_dl.h>`) sits on top (below). Demos in `crates/svm-run/demos/jit/` (`jit_demo.c` self-JITs a
 bytecode interpreter; `jit_threads.c` concurrently compiles from worker threads; `jit_repl.c` is the
-auto-compacting REPL driven by `JitSession`).
+auto-compacting REPL driven by `JitSession`; `jit_link.c`/`jit_dlopen.c`/`jit_hotreload.c` link by name).
 
 ### The one structural obstacle — the baked function-table mask
 
@@ -2058,13 +2377,84 @@ thunk on every recompaction, so a multi-threaded guest auto-compacts soundly bet
 **Deferred (gated on a measured need):** a coarse-lock→sharded-module optimization if parallel-compile
 *throughput* is ever shown to matter — a pure internal swap, since the guest iface is unchanged.
 
+### In-window dynamic linking (`vm_dlopen`)  [SETTLED — built, differentially tested]
+
+Loading separately-authored/compiled code units and resolving cross-unit references **by name** —
+the foundation for plugins, dynamic class loading in GC'd-language runtimes, a stateful REPL, and
+shared runtime libraries. (Absorbed from the former `DYNLINK.md` when the track completed.)
+
+**The model — linking is a source-to-source rewrite, above the TCB.** A unit carries *named
+placeholders* (`call.import "f"` with a self-describing op signature, the §7 import generalized from
+capabilities to any symbol). The loader resolves each name against a **symbol table** and rewrites the
+placeholder into a concrete instruction; by the time the verifier and both backends see the module it
+is an ordinary **closed** module — indistinguishable from any frontend's output, and **re-verified**
+like it. There is no runtime "linker" and no new IR execution semantics; a mis-link (wrong signature,
+missing symbol) is caught by re-verification, never trusted. Two flavors, both built:
+
+- **Static** (`svm_ir::link`, like `ld`) — merge separate units into **one module** before
+  compilation: function symbols → a **direct `call`**, data symbols → **constant addresses** in one
+  shared, 16-byte-aligned data window. `LinkUnit { module, exports, data_exports, relocations }`;
+  per-unit data is relocated by the unit's data base, `FuncIdx` sites are reindexed by its function
+  base, and a `DataReloc`/`RelocKind` patches an address constant by *adding* a base to its addend (so
+  `&g + 4` works) — no new IR instruction, just a constant edit. Duplicate / cross-namespace symbol
+  collisions, bad exports, and unresolved/non-const relocations all fail closed.
+- **Dynamic** (`Resolved::Slot` + `compile_linked`, like `dlopen`) — a **separately-compiled** unit
+  reaches a function it does not share an index space with through the **shared `call_indirect` table**
+  at a runtime-assigned slot. Both directions work: plugin→host and old/loaded→newly-installed.
+
+**The lowering primitive** is `svm_ir::resolve_imports_with`: each `CallImport` rewrites **1:1** (no
+value renumbering) to `Cap(ResolvedCap)`→`cap.call` (the §7 case), `Func(FuncIdx)`→a direct `call`
+(static), or `Slot(u32)`→`call_indirect <slot>` (dynamic; the import's handle operand must be a
+`ConstI32` placeholder, patched to the slot and reused as the index). Unresolved/ill-typed → fail-closed.
+
+**Serializable imports (codec v2).** So a unit can be shipped as a `.so` with *undefined references*,
+the binary form (`svm-encode`) now round-trips the §7 **import section** (name + op signature) and the
+`call.import` opcode. v1 was always import-free (imports resolved before encoding); decode stays
+untrusted-input TCB and re-verification still gates everything.
+
+**Host-assisted resolve (op 5, both backends).** The design question — does the rewrite run guest-side
+or host-side — is **settled host-assisted**: `compile_linked` takes a guest-provided **symbol-table
+buffer** and resolves *before* verify (`svm_run::jit_resolve_and_validate`: decode → `resolve_imports_with`
+→ verify → the §22 precondition gate). Simpler than a guest-side rewriter (none to load/trust) and
+equally safe. The symbol table is a small LEB128 wire form (`count`, then per entry `name` + `kind` —
+`0`=`Slot(uleb)`, `1`=`Cap(uleb type_id, uleb op)`); its decoder is fail-closed and fuzzed (a new
+untrusted-input surface). The `JitValidator` seam carries the symtab bytes so resolution stays in
+`svm-run`; the closed `compile` op (0) is just the empty-table case.
+
+**Security argument.** Resolution is rewrite-**then**-verify, so a missing name, a wrong import
+signature, or a non-const slot handle fails verification — nothing reaches Cranelift. The symbol
+table's *values* are **guest-chosen by design and confer no authority**: a resolved `Slot` lowers to a
+`call_indirect`, which is masked + `type_id`-checked at the call exactly like any index the guest
+already controls in its own code — binding to a **wrong-typed** slot **traps `IndirectCallType`**, never
+a type-confused dispatch; binding to a forged slot is no worse than a forged index the §3c table check
+already handles. So host-assisted linking adds **no escape-TCB surface** on top of §22 — it is the
+existing intern + dynamic table population, driven by a guest-controlled name map.
+
+**The guest loader (`<vm_dl.h>`).** `vm_dlopen(name, ir, len)` = build the symbol table from a
+`name → {slot, code}` registry → `compile_linked` (host re-verifies) → `install` → record; `vm_dlsym`
+= the registry lookup (a funcref **slot**); `vm_dlclose` = `uninstall` + drop. Re-opening a name is
+**hot reload**: the new version installs at a *new* slot and the registry repoints, so units already
+linked keep their old binding (they baked the old slot) while new resolves see the new one. **Why this
+beats POSIX `dlopen`:** the "shared object" is serialized SVM IR, **re-verified** on load (a malicious
+one can't escape — worst case it corrupts its own window, a §1 non-goal); `dlsym` returns an
+**unforgeable funcref slot** (§3c-checked), not a raw pointer; and loading is **capability-gated** (you
+need the `Jit` handle, and the bytes arrive through the powerbox — no ambient "load any file").
+
+Tests/demos: `dynlink.rs` (IR-level static link, interp==JIT), `dynlink_runtime.rs` (runtime by-name),
+`dynlink_resolve.rs` (host-assisted resolve + the `Cap` kind), `dynlink_repl.rs` (the symbol-table REPL
+spec), `dynlink_cap.rs` (the `compile_linked` op + type-confusion trap, differential), `svm-run`
+`symtab_tests` (decoder fuzz), and the guest-C `jit_link.c`/`jit_dlopen.c`/`jit_hotreload.c`. **Open
+follow-up:** data symbols through `vm_dlsym` (place data via `Memory`+`memory.init` applying a
+`DataReloc`, returning an address) — not yet wired; and a GOT/late-binding variant so *old* code can
+call *not-yet-loaded* code by name without recompiling the caller.
+
 ---
 
 ## 23. Scheduling & migratable fibers (D56/D57)  [SETTLED — built, all slices landed]
 
 How the VM exposes concurrency, why, and how **stackful work-stealing over migratable
 fibers** was designed, staged, and verified. (Absorbed from the former `SCHEDULING.md`
-when the track completed; the build history lives in HANDOFF.md's log.)
+when the track completed; the build history lives in the git log.)
 
 ### The model: two primitives, nothing more
 
@@ -2325,8 +2715,10 @@ review, serious fuzzing/differential-testing infra, eventually an audit. Treat i
 as open-ended, not a byproduct of the build.
 
 **De-risking moves that fit this setup:**
-- **Interpreter-as-oracle:** differential-test the JIT against the interpreter on
-  a large random corpus — catches codegen bugs without expert eyes.
+- **Interpreter-as-oracle:** the tree-walk interpreter is the reference; differential-test
+  **both** the Cranelift JIT (`jit_diff`) **and** the bytecode interpreter (`bytecode_diff`,
+  bit-exact) against it on a large random corpus — catches codegen/compile bugs without
+  expert eyes. This is the §3 parity invariant (three backends, one observable behavior).
 - **Fuzz the verifier from day one** (invariant: verified ⇒ cannot escape) — the
   one security validation that doesn't need a continuous expert in the loop.
 - **Fuzz the confinement-masking lowering as its own unit** (D38) — it is the part
@@ -2415,11 +2807,12 @@ as open-ended, not a byproduct of the build.
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
 | D50 | **Accept the mask cost on unbounded-base accesses; do not pursue 32-bit window addressing.** Mask elision (§4 guard-when-bounded) covers *provably-bounded* addresses; for an unbounded base (the threaded data-SP in C locals) we keep the single AND mask (`locals_c` ~2.26× wasm32, still < wasm64) rather than lower window addresses as 32-bit | Settled | The 64-bit address space is a core goal (D36/§1a); the only sound way to elide an unbounded-base access is the wasm32 trick (32-bit address arithmetic, address `< 2^32` by construction so it matches the interp and elides) — masking the i64 data-SP alone is un-elidable or diverges from the interp (an escape). That trick caps the elided window at 4 GiB and reworks the frontend's pointer model for one benchmark; not worth trading the clean 64-bit model. Revisit only if a real workload makes the data-SP mask a measured bottleneck |
 | D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement masking stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
-| D52 | **Capability-boundary record/replay** as the primary debugging differentiator: all nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + deterministic mode (§12) gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5) | Proposed | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary; the control stack survives heap corruption |
-| D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`) | Proposed | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
-| D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
+| D52 | **Capability-boundary record/replay** as the primary debugging differentiator: in deterministic mode (§12) nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + seeding that mode gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5). **Caveat:** under multicore + relaxed atomics (§12/§23) race outcomes bypass the cap boundary, so faithful replay must also record schedule/memory-order choices (the interp's DPOR `explore_all` already reifies these) | Proposed (premises built; surfaces unbuilt) | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary *in single-vCPU mode*; the control stack survives heap corruption |
+| D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`). **Status:** premises built (control stack, deterministic interp, SSA promotion); no stepping API, cap.call log, or §3a debug side-table yet — the side-table is step zero for DWARF | Proposed (premises built; surfaces unbuilt) | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
+| D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset, `crates/svm-llvm`) and wasm→IR bridge (compat, `svm-wasm`).** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | **Settled + built** (§20a): LLVM on-ramp passes the **exit criterion** — all 8 chibicc corpus libraries run byte-identical to native `clang` on both backends; general-C breadth (varargs `printf`, wider SIMD, libm) ongoing | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
 | D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
 | D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (§23 "verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `svm-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `svm-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full design + verification story + demo evidence in **§23** |
 | D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (cap.call trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |
+| D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`svm-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`svm-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |

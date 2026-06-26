@@ -27,9 +27,16 @@ path = "src/bin/bench.rs"
 # out of the umbrella crate's normal build and the auditable dependency-free core.
 [dev-dependencies]
 svm-jit.workspace = true
+# The hand-rolled DWARF readers (`dwarf_line`/`dwarf_info`), reused to round-trip the JIT's DWARF
+# *emitter* (W5 JIT/DWARF tier) — emit in svm-jit, parse back here, assert they reconstruct.
+svm-wasm = { path = "../svm-wasm" }
 # The embedding runtime — its `cap_thunk` (JIT CapThunk → reference-Host bridge) is shared by
 # the C-frontend differential tests instead of a copy-pasted local one.
 svm-run = { path = "../svm-run" }
+# The freeze/thaw transform, for the cross-backend durable differential (`durable_jit.rs`).
+svm-durable = { path = "../svm-durable" }
+# The §12 snapshot artifact codec, exercised across backends by `durable_jit.rs`.
+svm-snapshot = { path = "../svm-snapshot" }
 # For the JIT-side `mprotect`-backed Memory-capability test harness (real page protection on
 # the guest window, mirroring the interpreter's page-protection model). Unix-only test.
 libc = "0.2"

@@ -213,8 +213,7 @@ func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
   v0 = ref.func 2
   v1 = cont.new v0 varg
-  v2 = i64.extend_i32_u v1
-  return v2
+  return v1
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):

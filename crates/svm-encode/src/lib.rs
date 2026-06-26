@@ -13,11 +13,25 @@
 //! bytes (fuzzed in the `svm` crate). We therefore never pre-allocate from an
 //! untrusted count, and we reject counts that cannot fit in the remaining bytes.
 #![forbid(unsafe_code)]
+// `no_std` + `alloc` so the encoder runs **in-sandbox**: a guest specializes a module with
+// `svm-peval` and serializes the residual here before submitting it to the §22 `Jit` capability
+// (DESIGN.md §20c — guest-side specialization). The test harness still gets `std`; dependents
+// are unaffected (they bring their own `std`). Matches `svm-ir`/`svm-verify`/`svm-peval`.
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
-    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, Export,
+    FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncIdx, FuncName, FuncType, IToF, Import,
+    Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp,
+    Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
+    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -49,6 +63,7 @@ mod op {
     pub const T_F32: u8 = 2;
     pub const T_F64: u8 = 3;
     pub const T_V128: u8 = 4;
+    pub const T_REF: u8 = 5; // opaque 64-bit reference (GC forward-compat reservation)
 
     // Constants.
     pub const CONST_I32: u8 = 0x10;
@@ -89,6 +104,10 @@ mod op {
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
+    pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, sig, handle, arg idx-list
+    pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
+    pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
+    pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -134,6 +153,14 @@ mod op {
     pub const ATOMIC_NOTIFY: u8 = 0xE8; // addr, count -> i32 woken
     pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
 
+    // §GC (GC.md) conservative root enumeration.
+    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
+    pub const VCPU_TLS_GET: u8 = 0xEB; // §12 per-vCPU TLS register: () -> i64
+    pub const VCPU_TLS_SET: u8 = 0xEC; // §12 per-vCPU TLS register: val -> ()
+    pub const DURABLE_SHADOW_BASE: u8 = 0xED; // durable-internal: () -> i64 (current ctx shadow base)
+    pub const SETJMP: u8 = 0xEE; // <setjmp.h>: buf -> i32 (0, or the longjmp value on re-entry)
+    pub const LONGJMP: u8 = 0xEF; // <setjmp.h>: buf, val -> () (noreturn)
+
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
     pub const SIMD: u8 = 0xFE;
@@ -153,6 +180,26 @@ mod op {
         pub const SHUFFLE: u8 = 0x0C; // 16 lane bytes, a, b
         pub const SWIZZLE: u8 = 0x0D; // a, b
         pub const WIDTH_BYTES: u8 = 0x0E; // (no payload) -> i32
+        pub const VINT_CMP: u8 = 0x0F; // shape, op, a, b
+        pub const VFLOAT_CMP: u8 = 0x10; // shape, op, a, b
+        pub const VSHIFT: u8 = 0x11; // shape, op, a (v128), amt (i32)
+        pub const VINT_UN: u8 = 0x12; // shape, op, a
+        pub const VANY_TRUE: u8 = 0x13; // a -> i32
+        pub const VALL_TRUE: u8 = 0x14; // shape, a -> i32
+        pub const VBITMASK: u8 = 0x15; // shape, a -> i32
+        pub const VSAT_BIN: u8 = 0x16; // shape, op, a, b
+        pub const VWIDEN: u8 = 0x17; // shape (result), op, a
+        pub const VNARROW: u8 = 0x18; // shape (result), op, a, b
+        pub const VCONVERT: u8 = 0x19; // op, a
+        pub const VPMINMAX: u8 = 0x1A; // shape, op, a, b
+        pub const VPOPCNT: u8 = 0x1B; // a (i8x16 implicit)
+        pub const VAVGR: u8 = 0x1C; // shape, a, b
+        pub const VDOT: u8 = 0x1D; // a, b (i16x8 -> i32x4 implicit)
+        pub const VDOT_I8: u8 = 0x22; // a, b (i8x16 -> i16x8 implicit)
+        pub const VEXTMUL: u8 = 0x1E; // shape (wide), op (VWidenOp), a, b
+        pub const VEXTADD: u8 = 0x1F; // shape (wide), signed (u8), a
+        pub const VQ15MULR: u8 = 0x20; // a, b (i16x8 implicit)
+        pub const VFMA: u8 = 0x21; // shape, neg (u8), a, b, c
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -166,7 +213,15 @@ mod op {
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
-const VERSION: u8 = 1;
+// v3 adds the first-class **export section** (named function entry points: name + funcidx), the
+// runtime-`Module` analogue of a link unit's exports — so an embedder can `call("main")` by name.
+// The decoder accepts only the exact current `VERSION`, so the bump simply retires v2 readers; there
+// is no in-place v2 blob to stay compatible with.
+// v2 adds the §7 import section (name + op signature per import) and the `call.import` opcode, so a
+// separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
+// for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
+// against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
+const VERSION: u8 = 3;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -186,8 +241,18 @@ pub enum DecodeError {
     BadMemoryFlag(u8),
     /// A data segment's `readonly` flag byte was neither 0 nor 1.
     BadDataFlag(u8),
+    /// An import name's length-prefixed bytes were not valid UTF-8.
+    BadUtf8,
     /// Bytes remained after a complete module was decoded.
     TrailingBytes,
+    /// A debug-info `TypeDef` kind byte was not one of the known variants.
+    BadTypeDefKind(u8),
+    /// A debug-info base-type encoding byte was out of range.
+    BadEncoding(u8),
+    /// A debug-info `VarLoc` discriminant byte was neither 0 (window) nor 1 (ssa).
+    BadVarLoc(u8),
+    /// A debug-info optional-field flag byte was neither 0 (none) nor 1 (some).
+    BadOptionFlag(u8),
 }
 
 // ----------------------------------------------------------------------------
@@ -216,11 +281,169 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
         write_uleb(&mut out, d.bytes.len() as u64);
         out.extend_from_slice(&d.bytes);
     }
+    // §7 import section (v2): count, then each import's `name` and op `sig`. Usually empty — an
+    // import-free module (every prior frontend's output, and any unit whose symbols were already
+    // resolved) writes a single `0` here. A non-empty section is a unit shipped with **unresolved**
+    // symbols, for a loader to bind by name (DESIGN.md §22 host-assisted resolve).
+    write_uleb(&mut out, m.imports.len() as u64);
+    for imp in &m.imports {
+        write_str(&mut out, &imp.name);
+        write_types(&mut out, &imp.sig.params);
+        write_types(&mut out, &imp.sig.results);
+    }
+    // Export section (v3): count, then each export's `name` and target funcidx. Usually a handful
+    // (the named entry points); empty for a bare kernel addressed only by index.
+    write_uleb(&mut out, m.exports.len() as u64);
+    for e in &m.exports {
+        write_str(&mut out, &e.name);
+        write_uleb(&mut out, e.func as u64);
+    }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
         encode_func(&mut out, f);
     }
+    // Optional strippable debug section (DEBUGGING.md §6/§2a). Written only when present, so a
+    // module without debug info encodes byte-identically to before (snapshot digests, round-trip
+    // fixtures): the decoder treats "no bytes after the funcs" as no debug info.
+    if let Some(di) = &m.debug_info {
+        encode_debug_info(&mut out, di);
+    }
     out
+}
+
+/// Encode the §6 debug-info waist: the file table, source locations, the structured type table,
+/// and the variable table. Mirrored by [`decode_debug_info`].
+fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
+    write_uleb(out, di.files.len() as u64);
+    for f in &di.files {
+        write_str(out, f);
+    }
+    write_uleb(out, di.locs.len() as u64);
+    for l in &di.locs {
+        for field in [l.func, l.block, l.inst, l.file, l.line, l.col] {
+            write_uleb(out, field as u64);
+        }
+    }
+    write_uleb(out, di.types.len() as u64);
+    for t in &di.types {
+        match t {
+            TypeDef::Base {
+                name,
+                encoding,
+                size,
+            } => {
+                out.push(0);
+                write_str(out, name);
+                out.push(match encoding {
+                    Encoding::Signed => 0,
+                    Encoding::Unsigned => 1,
+                    Encoding::Float => 2,
+                    Encoding::Bool => 3,
+                });
+                write_uleb(out, *size as u64);
+            }
+            TypeDef::Pointer {
+                name,
+                pointee,
+                size,
+            } => {
+                out.push(1);
+                write_str(out, name);
+                write_uleb(out, *pointee as u64);
+                write_uleb(out, *size as u64);
+            }
+            TypeDef::Array { name, elem, count } => {
+                out.push(2);
+                write_str(out, name);
+                write_uleb(out, *elem as u64);
+                write_uleb(out, *count as u64);
+            }
+            TypeDef::Aggregate { name, size, fields } => {
+                out.push(3);
+                write_str(out, name);
+                write_uleb(out, *size as u64);
+                write_uleb(out, fields.len() as u64);
+                for f in fields {
+                    write_str(out, &f.name);
+                    write_uleb(out, f.offset as u64);
+                    write_uleb(out, f.ty as u64);
+                }
+            }
+            TypeDef::Opaque { name, size } => {
+                out.push(4);
+                write_str(out, name);
+                write_uleb(out, *size as u64);
+            }
+        }
+    }
+    write_uleb(out, di.vars.len() as u64);
+    for v in &di.vars {
+        write_uleb(out, v.func as u64);
+        write_str(out, &v.name);
+        write_str(out, &v.ty);
+        match &v.loc {
+            VarLoc::Window { off } => {
+                out.push(0);
+                write_sleb(out, *off);
+            }
+            VarLoc::Ssa { value } => {
+                out.push(1);
+                write_uleb(out, *value as u64);
+            }
+            VarLoc::SsaList(locs) => {
+                out.push(2);
+                write_uleb(out, locs.len() as u64);
+                for l in locs {
+                    write_uleb(out, l.block as u64);
+                    write_uleb(out, l.inst as u64);
+                    write_uleb(out, l.value as u64);
+                }
+            }
+            VarLoc::WindowVia { base, off } => {
+                out.push(3);
+                write_uleb(out, base.len() as u64);
+                for l in base {
+                    write_uleb(out, l.block as u64);
+                    write_uleb(out, l.inst as u64);
+                    write_uleb(out, l.value as u64);
+                }
+                write_sleb(out, *off);
+            }
+            VarLoc::Fixed { addr } => {
+                out.push(4);
+                write_uleb(out, *addr);
+            }
+        }
+        match v.type_id {
+            None => out.push(0),
+            Some(t) => {
+                out.push(1);
+                write_uleb(out, t as u64);
+            }
+        }
+        // Optional lexical scope `(start_line, end_line)` (§6 shadowing resolution).
+        match v.scope {
+            None => out.push(0),
+            Some((s, e)) => {
+                out.push(1);
+                write_uleb(out, s as u64);
+                write_uleb(out, e as u64);
+            }
+        }
+    }
+    // Opaque per-producer rich blobs (§6): count, then each `(producer, length-prefixed bytes)`.
+    write_uleb(out, di.blobs.len() as u64);
+    for b in &di.blobs {
+        write_str(out, &b.producer);
+        write_uleb(out, b.bytes.len() as u64);
+        out.extend_from_slice(&b.bytes);
+    }
+    // Function names (§6, last so an older decoder stops cleanly at the blobs): `(func, name)`.
+    write_uleb(out, di.func_names.len() as u64);
+    for fname in &di.func_names {
+        write_uleb(out, fname.func as u64);
+        write_str(out, &fname.name);
+    }
 }
 
 fn encode_func(out: &mut Vec<u8>, f: &Func) {
@@ -239,18 +462,48 @@ fn encode_func(out: &mut Vec<u8>, f: &Func) {
 
 fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
     match inst {
-        // §7 named imports have no wire opcode: the binary form is always import-free
-        // (resolution to `cap.call` precedes encoding). Reaching here is a toolchain bug
-        // — encoding an unresolved module — not an untrusted-input path (decode never
-        // produces a `CallImport`).
-        Inst::CallImport { .. } => {
-            unreachable!("encode: resolve_imports must run before binary encoding")
+        // §7 named import (v2 wire form), mirroring `cap.call` but carrying an import *index*
+        // (into the module's import section) instead of a bound `(type_id, op)`: the import stays
+        // unresolved on the wire so a loader can bind it by name (DESIGN.md §22 host-assisted resolve).
+        Inst::CallImport {
+            import,
+            sig,
+            handle,
+            args,
+        } => {
+            out.push(op::CALL_IMPORT);
+            write_uleb(out, *import as u64);
+            write_types(out, &sig.params);
+            write_types(out, &sig.results);
+            write_uleb(out, *handle as u64);
+            write_idxs(out, args);
         }
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
         Inst::CapSelfGet { idx } => {
             out.push(op::CAP_SELF_GET);
             write_uleb(out, *idx as u64);
+        }
+        Inst::CapSelfResolve { name_ptr, name_len } => {
+            out.push(op::CAP_SELF_RESOLVE);
+            write_uleb(out, *name_ptr as u64);
+            write_uleb(out, *name_len as u64);
+        }
+        Inst::CapSelfLabel {
+            handle,
+            buf_ptr,
+            buf_cap,
+        } => {
+            out.push(op::CAP_SELF_LABEL);
+            write_uleb(out, *handle as u64);
+            write_uleb(out, *buf_ptr as u64);
+            write_uleb(out, *buf_cap as u64);
+        }
+        Inst::VcpuTlsGet => out.push(op::VCPU_TLS_GET),
+        Inst::DurableShadowBase => out.push(op::DURABLE_SHADOW_BASE),
+        Inst::VcpuTlsSet { val } => {
+            out.push(op::VCPU_TLS_SET);
+            write_uleb(out, *val as u64);
         }
         Inst::ConstI32(c) => {
             out.push(op::CONST_I32);
@@ -311,6 +564,16 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::FUn { ty, op: o, a } => {
             out.push(fun_base(*ty) + o.index());
             write_uleb(out, *a as u64);
+        }
+        Inst::Fma { ty, a, b, c } => {
+            out.push(op::FMA);
+            out.push(match ty {
+                FloatTy::F32 => 0,
+                FloatTy::F64 => 1,
+            });
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+            write_uleb(out, *c as u64);
         }
         Inst::FCmp { ty, op: o, a, b } => {
             out.push(fcmp_base(*ty) + o.index());
@@ -473,6 +736,29 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::SUSPEND);
             write_uleb(out, *value as u64);
         }
+        Inst::SetJmp { buf } => {
+            out.push(op::SETJMP);
+            write_uleb(out, *buf as u64);
+        }
+        Inst::LongJmp { buf, val } => {
+            out.push(op::LONGJMP);
+            write_uleb(out, *buf as u64);
+            write_uleb(out, *val as u64);
+        }
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } => {
+            out.push(op::GC_ROOTS);
+            write_uleb(out, *heap_lo as u64);
+            write_uleb(out, *heap_hi as u64);
+            write_uleb(out, *mask as u64);
+            write_uleb(out, *buf as u64);
+            write_uleb(out, *cap as u64);
+        }
         Inst::ThreadSpawn { func, sp, arg } => {
             out.push(op::THREAD_SPAWN);
             write_uleb(out, *func as u64);
@@ -570,6 +856,35 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::VIntCmp { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VINT_CMP);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VFloatCmp { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFLOAT_CMP);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VShift {
+            shape,
+            op: o,
+            a,
+            amt,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VSHIFT);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *amt as u64);
+        }
         Inst::VFloatBin { shape, op: o, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::VFLOAT_BIN);
@@ -583,6 +898,127 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::simd::VFLOAT_UN);
             out.push(shape.index());
             out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VIntUn { shape, op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VINT_UN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VSatBin { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VSAT_BIN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VWiden { shape, op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VWIDEN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VNarrow { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VNARROW);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VConvert { op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VCONVERT);
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VPMinMax { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VPMINMAX);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VPopcnt { a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VPOPCNT);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VAvgr { shape, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VAVGR);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VDot { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VDOT);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VDotI8 { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VDOT_I8);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VExtMul { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VEXTMUL);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VEXTADD);
+            out.push(shape.index());
+            out.push(*signed as u8);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VQ15MulrSat { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VQ15MULR);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFMA);
+            out.push(shape.index());
+            out.push(*neg as u8);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+            write_uleb(out, *c as u64);
+        }
+        Inst::VAnyTrue { a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VANY_TRUE);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VAllTrue { shape, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VALL_TRUE);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VBitmask { shape, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VBITMASK);
+            out.push(shape.index());
             write_uleb(out, *a as u64);
         }
         Inst::VBitBin { op: o, a, b } => {
@@ -680,6 +1116,36 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 b: c.idx()?,
             }
         }
+        op::simd::VINT_CMP => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VIntCmp {
+                shape,
+                op: VICmpOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VFLOAT_CMP => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VFloatCmp {
+                shape,
+                op: VFCmpOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VSHIFT => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VShift {
+                shape,
+                op: VShiftOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                amt: c.idx()?,
+            }
+        }
         op::simd::VFLOAT_BIN => {
             let shape = dec_shape(c)?;
             let ob = c.byte()?;
@@ -699,6 +1165,118 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 a: c.idx()?,
             }
         }
+        op::simd::VINT_UN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VIntUn {
+                shape,
+                op: VIntUnOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VSAT_BIN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VSatBin {
+                shape,
+                op: VSatBinOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VWIDEN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VWiden {
+                shape,
+                op: VWidenOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VNARROW => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VNarrow {
+                shape,
+                op: VNarrowOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VCONVERT => {
+            let ob = c.byte()?;
+            Inst::VConvert {
+                op: VCvtOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VPMINMAX => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VPMinMax {
+                shape,
+                op: VPMinMaxOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VPOPCNT => Inst::VPopcnt { a: c.idx()? },
+        op::simd::VAVGR => Inst::VAvgr {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VDOT => Inst::VDot {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VDOT_I8 => Inst::VDotI8 {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VEXTMUL => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VExtMul {
+                shape,
+                op: VWidenOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VEXTADD => {
+            let shape = dec_shape(c)?;
+            let signed = c.byte()? != 0;
+            Inst::VExtAddPairwise {
+                shape,
+                signed,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VQ15MULR => Inst::VQ15MulrSat {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VFMA => {
+            let shape = dec_shape(c)?;
+            let neg = c.byte()? != 0;
+            Inst::VFma {
+                shape,
+                neg,
+                a: c.idx()?,
+                b: c.idx()?,
+                c: c.idx()?,
+            }
+        }
+        op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },
+        op::simd::VALL_TRUE => Inst::VAllTrue {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+        },
+        op::simd::VBITMASK => Inst::VBitmask {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+        },
         op::simd::VBIT_BIN => {
             let ob = c.byte()?;
             Inst::VBitBin {
@@ -828,6 +1406,11 @@ fn write_types(out: &mut Vec<u8>, ts: &[ValType]) {
     }
 }
 
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    write_uleb(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
 fn write_idxs(out: &mut Vec<u8>, idxs: &[u32]) {
     write_uleb(out, idxs.len() as u64);
     for i in idxs {
@@ -842,6 +1425,7 @@ fn type_tag(t: ValType) -> u8 {
         ValType::F32 => op::T_F32,
         ValType::F64 => op::T_F64,
         ValType::V128 => op::T_V128,
+        ValType::Ref => op::T_REF,
     }
 }
 
@@ -913,11 +1497,39 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
             bytes,
         });
     }
+    // §7 import section (v2): mirrors the encoder. Grows on demand (the count is attacker-influenced).
+    let nimports = c.count()?;
+    let mut imports = Vec::new();
+    for _ in 0..nimports {
+        let name = c.str()?;
+        let sig = FuncType {
+            params: decode_types(&mut c)?,
+            results: decode_types(&mut c)?,
+        };
+        imports.push(Import { name, sig });
+    }
+    // Export section (v3): mirrors the encoder. Grows on demand (the count is attacker-influenced).
+    // Funcidx range + name uniqueness are the verifier's job, not the decoder's (it stays a pure,
+    // fail-closed byte reader).
+    let nexports = c.count()?;
+    let mut exports = Vec::new();
+    for _ in 0..nexports {
+        let name = c.str()?;
+        let func = c.uleb()? as FuncIdx;
+        exports.push(Export { name, func });
+    }
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
     for _ in 0..nfuncs {
         funcs.push(decode_func(&mut c)?);
     }
+    // Optional strippable debug section (mirrors the encoder): present iff bytes remain after the
+    // funcs. Strippable and untrusted-for-escape (§2a) — the verifier ignores it.
+    let debug_info = if c.at_end() {
+        None
+    } else {
+        Some(decode_debug_info(&mut c)?)
+    };
     if !c.at_end() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -925,8 +1537,169 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         funcs,
         memory,
         data,
-        // The binary form is always import-free (§7 imports are resolved before encoding).
-        imports: Vec::new(),
+        imports,
+        exports,
+        debug_info,
+    })
+}
+
+/// Decode the §6 debug-info waist (untrusted input: counts are bounded, strings UTF-8-checked,
+/// discriminants validated). Mirrors [`encode_debug_info`].
+fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
+    let nfiles = c.count()?;
+    let mut files = Vec::new();
+    for _ in 0..nfiles {
+        files.push(c.str()?);
+    }
+    let nlocs = c.count()?;
+    let mut locs = Vec::new();
+    for _ in 0..nlocs {
+        locs.push(Loc {
+            func: c.idx()?,
+            block: c.idx()?,
+            inst: c.idx()?,
+            file: c.idx()?,
+            line: c.idx()?,
+            col: c.idx()?,
+        });
+    }
+    let ntypes = c.count()?;
+    let mut types = Vec::new();
+    for _ in 0..ntypes {
+        let t = match c.byte()? {
+            0 => {
+                let name = c.str()?;
+                let encoding = match c.byte()? {
+                    0 => Encoding::Signed,
+                    1 => Encoding::Unsigned,
+                    2 => Encoding::Float,
+                    3 => Encoding::Bool,
+                    b => return Err(DecodeError::BadEncoding(b)),
+                };
+                TypeDef::Base {
+                    name,
+                    encoding,
+                    size: c.idx()?,
+                }
+            }
+            1 => TypeDef::Pointer {
+                name: c.str()?,
+                pointee: c.idx()?,
+                size: c.idx()?,
+            },
+            2 => TypeDef::Array {
+                name: c.str()?,
+                elem: c.idx()?,
+                count: c.idx()?,
+            },
+            3 => {
+                let name = c.str()?;
+                let size = c.idx()?;
+                let nfields = c.count()?;
+                let mut fields = Vec::new();
+                for _ in 0..nfields {
+                    fields.push(Field {
+                        name: c.str()?,
+                        offset: c.idx()?,
+                        ty: c.idx()?,
+                    });
+                }
+                TypeDef::Aggregate { name, size, fields }
+            }
+            4 => TypeDef::Opaque {
+                name: c.str()?,
+                size: c.idx()?,
+            },
+            b => return Err(DecodeError::BadTypeDefKind(b)),
+        };
+        types.push(t);
+    }
+    let nvars = c.count()?;
+    let mut vars = Vec::new();
+    for _ in 0..nvars {
+        let func = c.idx()?;
+        let name = c.str()?;
+        let ty = c.str()?;
+        let loc = match c.byte()? {
+            0 => VarLoc::Window { off: c.sleb()? },
+            1 => VarLoc::Ssa { value: c.idx()? },
+            2 => {
+                let n = c.count()?;
+                let mut locs = Vec::new();
+                for _ in 0..n {
+                    locs.push(SsaLoc {
+                        block: c.idx()?,
+                        inst: c.idx()?,
+                        value: c.idx()?,
+                    });
+                }
+                VarLoc::SsaList(locs)
+            }
+            3 => {
+                let n = c.count()?;
+                let mut base = Vec::new();
+                for _ in 0..n {
+                    base.push(SsaLoc {
+                        block: c.idx()?,
+                        inst: c.idx()?,
+                        value: c.idx()?,
+                    });
+                }
+                VarLoc::WindowVia {
+                    base,
+                    off: c.sleb()?,
+                }
+            }
+            4 => VarLoc::Fixed { addr: c.uleb()? },
+            b => return Err(DecodeError::BadVarLoc(b)),
+        };
+        let type_id = match c.byte()? {
+            0 => None,
+            1 => Some(c.idx()?),
+            b => return Err(DecodeError::BadOptionFlag(b)),
+        };
+        let scope = match c.byte()? {
+            0 => None,
+            1 => Some((c.idx()?, c.idx()?)),
+            b => return Err(DecodeError::BadOptionFlag(b)),
+        };
+        vars.push(VarInfo {
+            func,
+            name,
+            ty,
+            loc,
+            type_id,
+            scope,
+        });
+    }
+    // Opaque per-producer rich blobs (§6): bounded count, then producer + length-prefixed bytes.
+    let nblobs = c.count()?;
+    let mut blobs = Vec::new();
+    for _ in 0..nblobs {
+        let producer = c.str()?;
+        let len = c.count()?;
+        let bytes = c.take(len)?.to_vec();
+        blobs.push(ProducerBlob { producer, bytes });
+    }
+    // Function names (§6) — a trailing section: an artifact from before they existed ends right after
+    // the blobs, so `at_end` ⇒ none (the field was appended last, after `blobs`, for this compat).
+    let mut func_names = Vec::new();
+    if !c.at_end() {
+        let n = c.count()?;
+        for _ in 0..n {
+            func_names.push(FuncName {
+                func: c.idx()?,
+                name: c.str()?,
+            });
+        }
+    }
+    Ok(DebugInfo {
+        files,
+        locs,
+        types,
+        vars,
+        blobs,
+        func_names,
     })
 }
 
@@ -1020,6 +1793,19 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
+        op::FMA => {
+            let ty = match c.byte()? {
+                0 => FloatTy::F32,
+                1 => FloatTy::F64,
+                other => return Err(DecodeError::BadOpcode(other)),
+            };
+            Inst::Fma {
+                ty,
+                a: c.idx()?,
+                b: c.idx()?,
+                c: c.idx()?,
+            }
+        }
         op::FTOI_TRAP..=op::FTOI_TRAP_END => Inst::FToITrap {
             op: FToI::from_index(b - op::FTOI_TRAP).ok_or(DecodeError::BadOpcode(b))?,
             a: c.idx()?,
@@ -1042,8 +1828,29 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             handle: c.idx()?,
             args: decode_idxs(c)?,
         },
+        op::CALL_IMPORT => Inst::CallImport {
+            import: c.idx()?,
+            sig: FuncType {
+                params: decode_types(c)?,
+                results: decode_types(c)?,
+            },
+            handle: c.idx()?,
+            args: decode_idxs(c)?,
+        },
         op::CAP_SELF_COUNT => Inst::CapSelfCount,
         op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
+        op::CAP_SELF_RESOLVE => Inst::CapSelfResolve {
+            name_ptr: c.idx()?,
+            name_len: c.idx()?,
+        },
+        op::CAP_SELF_LABEL => Inst::CapSelfLabel {
+            handle: c.idx()?,
+            buf_ptr: c.idx()?,
+            buf_cap: c.idx()?,
+        },
+        op::VCPU_TLS_GET => Inst::VcpuTlsGet,
+        op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
+        op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,
 
         op::CONST_F32 => Inst::ConstF32(c.u32_le()?),
         op::CONST_F64 => Inst::ConstF64(c.u64_le()?),
@@ -1121,6 +1928,18 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             arg: c.idx()?,
         },
         op::SUSPEND => Inst::Suspend { value: c.idx()? },
+        op::SETJMP => Inst::SetJmp { buf: c.idx()? },
+        op::LONGJMP => Inst::LongJmp {
+            buf: c.idx()?,
+            val: c.idx()?,
+        },
+        op::GC_ROOTS => Inst::GcRoots {
+            heap_lo: c.idx()?,
+            heap_hi: c.idx()?,
+            mask: c.idx()?,
+            buf: c.idx()?,
+            cap: c.idx()?,
+        },
 
         op::THREAD_SPAWN => Inst::ThreadSpawn {
             func: c.idx()?,
@@ -1277,6 +2096,7 @@ fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
         op::T_F32 => ValType::F32,
         op::T_F64 => ValType::F64,
         op::T_V128 => ValType::V128,
+        op::T_REF => ValType::Ref,
         other => return Err(DecodeError::BadType(other)),
     })
 }
@@ -1409,6 +2229,261 @@ impl<'a> Cursor<'a> {
             return Err(DecodeError::CountTooLarge);
         }
         Ok(n)
+    }
+
+    /// Read a length-prefixed UTF-8 string (an import name). The length is `count`-bounded
+    /// (cannot exceed the remaining bytes), then the bytes must be valid UTF-8.
+    fn str(&mut self) -> Result<String, DecodeError> {
+        let n = self.count()?;
+        let bytes = self.take(n)?;
+        core::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| DecodeError::BadUtf8)
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    fn sample_debug() -> DebugInfo {
+        DebugInfo {
+            files: vec!["a.c".into(), "b.c".into()],
+            locs: vec![
+                Loc {
+                    func: 0,
+                    block: 1,
+                    inst: 2,
+                    file: 0,
+                    line: 7,
+                    col: 3,
+                },
+                Loc {
+                    func: 0,
+                    block: 1,
+                    inst: 5,
+                    file: 1,
+                    line: 9,
+                    col: 0,
+                },
+            ],
+            // Every TypeDef variant + encoding.
+            types: vec![
+                TypeDef::Base {
+                    name: "int".into(),
+                    encoding: Encoding::Signed,
+                    size: 4,
+                },
+                TypeDef::Base {
+                    name: "double".into(),
+                    encoding: Encoding::Float,
+                    size: 8,
+                },
+                TypeDef::Pointer {
+                    name: "int *".into(),
+                    pointee: 0,
+                    size: 8,
+                },
+                TypeDef::Array {
+                    name: "int[4]".into(),
+                    elem: 0,
+                    count: 4,
+                },
+                TypeDef::Aggregate {
+                    name: "struct Point".into(),
+                    size: 8,
+                    fields: vec![
+                        Field {
+                            name: "x".into(),
+                            offset: 0,
+                            ty: 0,
+                        },
+                        Field {
+                            name: "y".into(),
+                            offset: 4,
+                            ty: 0,
+                        },
+                    ],
+                },
+                TypeDef::Opaque {
+                    name: "void".into(),
+                    size: 0,
+                },
+            ],
+            // Window (incl. a negative offset → sleb) / Ssa locations, Some/None type ids.
+            vars: vec![
+                VarInfo {
+                    func: 0,
+                    name: "p".into(),
+                    ty: "struct Point".into(),
+                    loc: VarLoc::Window { off: 24 },
+                    type_id: Some(4),
+                    scope: Some((4, 9)),
+                },
+                VarInfo {
+                    func: 0,
+                    name: "i".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::Ssa { value: 3 },
+                    type_id: None,
+                    scope: None,
+                },
+                VarInfo {
+                    func: 0,
+                    name: "neg".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::Window { off: -8 },
+                    type_id: Some(0),
+                    scope: None,
+                },
+                // A location list (S2): the holding SSA value varies by pc.
+                VarInfo {
+                    func: 0,
+                    name: "k".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::SsaList(vec![
+                        SsaLoc {
+                            block: 0,
+                            inst: 0,
+                            value: 1,
+                        },
+                        SsaLoc {
+                            block: 1,
+                            inst: 2,
+                            value: 4,
+                        },
+                    ]),
+                    type_id: Some(0),
+                    scope: None,
+                },
+                // A runtime-base window var (wasm/DWARF fbreg case): base loclist + a negative off.
+                VarInfo {
+                    func: 0,
+                    name: "w".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::WindowVia {
+                        base: vec![
+                            SsaLoc {
+                                block: 0,
+                                inst: 0,
+                                value: 4,
+                            },
+                            SsaLoc {
+                                block: 2,
+                                inst: 1,
+                                value: 4,
+                            },
+                        ],
+                        off: -8,
+                    },
+                    type_id: Some(0),
+                    scope: None,
+                },
+                // A module-scoped global at a fixed absolute window address (the GLOBAL_SCOPE
+                // sentinel func + Fixed loc).
+                VarInfo {
+                    func: svm_ir::GLOBAL_SCOPE,
+                    name: "counter".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::Fixed { addr: 64 },
+                    type_id: Some(0),
+                    scope: None,
+                },
+            ],
+            // An opaque per-producer rich blob (incl. non-UTF-8 / NUL bytes — verbatim DWARF).
+            blobs: vec![ProducerBlob {
+                producer: ".debug_info".into(),
+                bytes: vec![0x00, 0x01, 0xff, 0x7f, 0x80, b'd', b'w'],
+            }],
+            func_names: vec![
+                FuncName {
+                    func: 0,
+                    name: "compute".into(),
+                },
+                FuncName {
+                    func: 2,
+                    name: "main".into(),
+                },
+            ],
+        }
+    }
+
+    fn module(debug_info: Option<DebugInfo>) -> Module {
+        Module {
+            funcs: vec![],
+            memory: None,
+            data: vec![],
+            imports: vec![],
+            exports: vec![],
+            debug_info,
+        }
+    }
+
+    #[test]
+    fn debug_info_round_trips_through_binary() {
+        let m = module(Some(sample_debug()));
+        let back = decode_module(&encode_module(&m)).expect("decode");
+        assert_eq!(
+            back, m,
+            "every files/locs/types/vars detail survives binary round-trip"
+        );
+    }
+
+    #[test]
+    fn no_debug_info_is_back_compatible_and_append_only() {
+        // A module without debug info decodes to `None`, and its encoding is a strict prefix of the
+        // same module *with* debug info — i.e. the section is appended after byte-identical output,
+        // so existing import/debug-free blobs (and snapshot digests) are unchanged.
+        let m_none = module(None);
+        let bytes_none = encode_module(&m_none);
+        assert_eq!(decode_module(&bytes_none).expect("decode"), m_none);
+
+        let bytes_dbg = encode_module(&module(Some(sample_debug())));
+        assert!(
+            bytes_dbg.starts_with(&bytes_none),
+            "debug section is appended after a byte-identical prefix"
+        );
+    }
+
+    #[test]
+    fn exports_round_trip_through_binary() {
+        let mut m = module(None);
+        m.funcs.push(Func {
+            params: vec![],
+            results: vec![],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![],
+                term: Terminator::Return(vec![]),
+            }],
+        });
+        m.exports = vec![
+            Export {
+                name: "main".to_string(),
+                func: 0,
+            },
+            Export {
+                name: "aux".to_string(),
+                func: 0,
+            },
+        ];
+        let decoded = decode_module(&encode_module(&m)).expect("decode");
+        assert_eq!(decoded.exports, m.exports, "export section round-trips");
+        assert_eq!(decoded, m);
+    }
+
+    #[test]
+    fn rejects_a_truncated_debug_section() {
+        // A truncated section must fail to decode, never panic (untrusted-input discipline): a
+        // declared count/length runs past the bytes (a blob's length, a var/type count, …).
+        let bytes = encode_module(&module(Some(sample_debug())));
+        for cut in 1..=8 {
+            let truncated = &bytes[..bytes.len() - cut];
+            assert!(
+                decode_module(truncated).is_err(),
+                "truncating {cut} byte(s) must error, not panic"
+            );
+        }
     }
 }
 

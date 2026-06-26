@@ -905,6 +905,7 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       // For example, `int x[n+2]` is translated to `tmp = n + 2,
       // x = alloca(tmp)`.
       Obj *var = new_lvar(get_ident(ty->name), ty);
+      var->scope_start_line = ty->name->line_no; // §6 lexical scope start
       Token *tok = ty->name;
       Node *expr = new_binary(ND_ASSIGN, new_vla_ptr(var, tok),
                               new_alloca(new_var_node(ty->vla_size, tok)),
@@ -915,6 +916,7 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
     }
 
     Obj *var = new_lvar(get_ident(ty->name), ty);
+    var->scope_start_line = ty->name->line_no; // §6 lexical scope start (declaration line)
     if (attr && attr->align)
       var->align = attr->align;
 
@@ -1814,6 +1816,7 @@ static Node *compound_stmt(Token **rest, Token *tok) {
   Node *cur = &head;
 
   enter_scope();
+  Obj *locals_at_entry = locals; // §6: locals declared in this block prepend above this mark
 
   while (!equal(tok, "}")) {
     if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
@@ -1847,6 +1850,12 @@ static Node *compound_stmt(Token **rest, Token *tok) {
   }
 
   leave_scope();
+
+  // §6 lexical scope end: this block's locals (those prepended since entry) close at the `}` line.
+  // Set only if unset, so a nested block — which runs first — keeps its own (tighter) end line.
+  for (Obj *v = locals; v && v != locals_at_entry; v = v->next)
+    if (v->scope_end_line == 0)
+      v->scope_end_line = tok->line_no;
 
   node->body = head.next;
   *rest = tok->next;
@@ -2692,6 +2701,7 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
     tag = tok;
     tok = tok->next;
   }
+  ty->tag = tag; // carry the tag for debug-info render names (NULL if anonymous)
 
   if (tag && !equal(tok, "{")) {
     *rest = tok;

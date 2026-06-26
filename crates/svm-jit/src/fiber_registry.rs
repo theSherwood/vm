@@ -64,6 +64,14 @@ const FREE: u64 = 3;
 const STATE_BITS: u64 = 2;
 const STATE_MASK: u64 = (1 << STATE_BITS) - 1;
 
+/// Generation bits a fiber **guest handle** carries (recycling step 1): the handle is
+/// `(generation << 16) | slot` and a slot fits in the low 16 bits (`MAX_FIBERS = 1<<16`), so an `i64`
+/// handle conveys the low **48** bits of the slot's full word generation. [`Ownership::claim_gen`]
+/// validates a handle against `gen_of(word) & FIBER_HANDLE_GEN_MASK`, so the cross-backend handle
+/// namespace (shared with `svm_interp`, whose `FIBER_GEN_SHIFT` is likewise 16) matches. 48 bits puts
+/// wraparound at 2^48 recycles — unreachable in practice, so the ABA guard never silently re-matches.
+pub(crate) const FIBER_HANDLE_GEN_MASK: u64 = (1 << 48) - 1;
+
 #[inline]
 fn pack(generation: u64, state: u64) -> u64 {
     (generation << STATE_BITS) | state
@@ -87,9 +95,19 @@ pub(crate) struct Ownership {
 
 impl Ownership {
     /// A freshly created fiber, **owned by its creator** and not yet in the steal pool (generation 0).
+    #[allow(dead_code)] // the live paths use `new_owned_at` (recycling step 2/3); kept for the tests + as the generation-0 spelling
     pub(crate) fn new_owned() -> Ownership {
+        Ownership::new_owned_at(0)
+    }
+
+    /// A freshly created fiber at a **carried generation** — for **recycling a freed slot** (step 3):
+    /// a reused slot keeps its finished occupant's (already-bumped) generation, so a stale guest handle
+    /// to that occupant still fails `claim_gen`. (Replacing the slot's `Ownership` rather than mutating
+    /// it in place keeps the `FiberSlot`'s immutable `func`/`sp` simple; the generation is read off the
+    /// `FREE` slot just before replacement.)
+    pub(crate) fn new_owned_at(generation: u64) -> Ownership {
         Ownership {
-            word: AtomicU64::new(pack(0, OWNED)),
+            word: AtomicU64::new(pack(generation, OWNED)),
         }
     }
 
@@ -133,9 +151,38 @@ impl Ownership {
     /// resume-by-handle path **must** switch to a generation-checked claim ([`Self::try_steal`]-style,
     /// with generation-carrying guest handles), or a stale handle could claim a *recycled* fiber. See
     /// [`Self::recycle_owned`] and the `claim_ignores_a_stale_generation` characterization test.
+    #[allow(dead_code)] // recycling step 1: the live `cont.resume` path now uses the generation-checked
+                        // `claim_gen`; this ungated variant is kept as the primitive + ABA characterization
     pub(crate) fn claim(&self) -> bool {
         let w = self.word.load(Ordering::Relaxed);
         if state_of(w) != OWNED && state_of(w) != RUNNABLE {
+            return false;
+        }
+        self.word
+            .compare_exchange(
+                w,
+                pack(gen_of(w), RUNNING),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// **Generation-checked resume-by-handle (recycling step 1).** Like [`Self::claim`] — claims a
+    /// fresh (`OWNED`) or suspended (`RUNNABLE`) fiber for a `cont.resume`, one acquire CAS, exactly
+    /// one racing claimant wins — but the caller presents the **generation carried in the guest
+    /// handle**, and the claim succeeds only if it matches the slot's current generation (low
+    /// [`FIBER_HANDLE_GEN_MASK`] bits). This is the ABA-safe front end recycling requires: a stale
+    /// handle to a slot's *former* occupant (whose generation has since advanced via [`Self::finish`])
+    /// is rejected, where [`Self::claim`] would wrongly claim the new occupant. The CAS preserves the
+    /// slot's full word generation. While slots are not recycled every generation is 0, so
+    /// `claim_gen(0)` is exactly `claim()` — behavior-preserving (the guest handle is then just `slot`).
+    pub(crate) fn claim_gen(&self, handle_generation: u64) -> bool {
+        let w = self.word.load(Ordering::Relaxed);
+        let st = state_of(w);
+        if (st != OWNED && st != RUNNABLE)
+            || (gen_of(w) & FIBER_HANDLE_GEN_MASK) != (handle_generation & FIBER_HANDLE_GEN_MASK)
+        {
             return false;
         }
         self.word
@@ -223,6 +270,21 @@ impl Ownership {
     #[allow(dead_code)] // observability/assertions (tests)
     pub(crate) fn state(&self) -> u64 {
         state_of(self.word.load(Ordering::Relaxed))
+    }
+
+    /// Whether a worker is currently executing this fiber's native stack (`RUNNING`) — for the
+    /// `gc.roots` walker (`fiber_rt`) to pick a parked vs. running stack-scan extent (relaxed read;
+    /// the scan happens at a safepoint with the chain quiescent / stop-the-world).
+    pub(crate) fn is_running(&self) -> bool {
+        state_of(self.word.load(Ordering::Relaxed)) == RUNNING
+    }
+
+    /// Whether the fiber is **voluntarily suspended** (`RUNNABLE`, in the steal pool) — the durable
+    /// freeze driver (DURABILITY.md §12.8) flattens exactly these (a fresh `OWNED` fiber has no
+    /// continuation to flatten; `RUNNING`/`FREE` are not parked). Relaxed: the freeze runs at a
+    /// quiescent safepoint (the root has unwound, single-vCPU).
+    pub(crate) fn is_runnable(&self) -> bool {
+        state_of(self.word.load(Ordering::Relaxed)) == RUNNABLE
     }
 }
 
@@ -340,6 +402,52 @@ mod tests {
         );
         assert_eq!(o.state(), RUNNING);
     }
+
+    /// Recycling step 1: the live resume path uses [`Ownership::claim_gen`], which **does** carry the
+    /// handle's generation — so a stale handle to a recycled slot is rejected (the ABA guard that lets
+    /// recycling land), while the current-generation handle claims it. The companion to
+    /// `claim_ignores_a_stale_generation` for the generation-checked front end.
+    #[test]
+    fn claim_gen_rejects_a_stale_generation() {
+        let o = Ownership::new_owned(); // fiber A, gen 0
+        assert!(o.begin_owned());
+        o.finish(); // A done → FREE, gen → 1
+        o.recycle_owned(); // slot reused for fiber B, gen 1
+        assert_eq!(o.generation(), 1);
+        assert!(
+            !o.claim_gen(0),
+            "a stale (gen-0) handle must not claim the recycled (gen-1) fiber"
+        );
+        assert_eq!(
+            o.state(),
+            OWNED,
+            "the recycled fiber is untouched by the stale claim"
+        );
+        assert!(
+            o.claim_gen(1),
+            "the current-generation handle claims the recycled fiber"
+        );
+        assert_eq!(o.state(), RUNNING);
+    }
+
+    /// `claim_gen(0)` on a never-recycled slot is exactly `claim()` (every generation is 0 today), so
+    /// the behavior-preserving wiring holds: fresh `OWNED` and suspended `RUNNABLE` are claimable once.
+    #[test]
+    fn claim_gen_matches_claim_at_generation_zero() {
+        let o = Ownership::new_owned();
+        assert!(
+            o.claim_gen(0),
+            "a fresh (OWNED, gen 0) fiber is claimable by its handle"
+        );
+        assert!(!o.claim_gen(0), "a running fiber is not claimable");
+        o.suspend_to_pool();
+        assert!(
+            o.claim_gen(0),
+            "a suspended (RUNNABLE, gen 0) fiber is claimable"
+        );
+        o.finish();
+        assert!(!o.claim_gen(0), "a finished (FREE) slot is not claimable");
+    }
 }
 
 // The load-bearing invariant, model-checked: when several workers race to steal one pooled fiber,
@@ -434,6 +542,49 @@ mod loom_tests {
 
             let winners: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
             assert_eq!(winners, 1, "exactly one thread may claim a resumable fiber");
+            assert_eq!(own.state(), RUNNING);
+        });
+    }
+
+    /// The **generation-checked** front end the live `cont.resume` thunk now calls (recycling step 1):
+    /// several workers race to `claim_gen(g)` one fiber suspended at generation `g` — still exactly one
+    /// wins, and the winner observes the published context. The generation check must not weaken the
+    /// single-owner arbitration (it only *adds* a reject for a mismatched generation).
+    #[test]
+    fn loom_claim_gen_is_exclusive_across_threads() {
+        const CLAIMANTS: usize = 2;
+        loom::model(|| {
+            let own = Arc::new(Ownership::new_owned());
+            let ctx = Arc::new(LoomU64::new(0));
+
+            assert!(own.begin_owned());
+            ctx.store(0xF1BE5, LoomOrdering::Relaxed);
+            let g = own.suspend_to_pool(); // release-publishes (g, RUNNABLE)
+
+            let handles: Vec<_> = (0..CLAIMANTS)
+                .map(|_| {
+                    let own = own.clone();
+                    let ctx = ctx.clone();
+                    loom::thread::spawn(move || {
+                        if own.claim_gen(g) {
+                            assert_eq!(
+                                ctx.load(LoomOrdering::Relaxed),
+                                0xF1BE5,
+                                "the winning claimant must observe the published stack context"
+                            );
+                            1u32
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .collect();
+
+            let winners: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            assert_eq!(
+                winners, 1,
+                "exactly one thread may claim_gen a resumable fiber"
+            );
             assert_eq!(own.state(), RUNNING);
         });
     }

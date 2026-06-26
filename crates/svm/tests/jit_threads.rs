@@ -87,6 +87,7 @@ fn to_slot(v: &Value) -> i64 {
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => *x as i64,
     }
 }
 
@@ -370,9 +371,8 @@ fn fiber_namespace_is_domain_wide() {
         \x20 v8 = i64.const 100\n\
         \x20 v9 = i64.mul v4 v8\n\
         \x20 v10 = i64.add v9 v7\n\
-        \x20 v11 = i64.extend_i32_u v2\n\
-        \x20 v12 = i64.add v10 v11\n\
-        \x20 return v12\n\
+        \x20 v11 = i64.add v10 v2\n\
+        \x20 return v11\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
         block0(vsp: i64, varg: i64):\n\
@@ -380,11 +380,10 @@ fn fiber_namespace_is_domain_wide() {
         \x20 v1 = cont.new v0 vsp\n\
         \x20 v2 = i64.const 1\n\
         \x20 v3, v4 = cont.resume v1 v2\n\
-        \x20 v5 = i64.extend_i32_u v1\n\
-        \x20 v6 = i64.const 42\n\
-        \x20 v7 = i64.sub v4 v6\n\
-        \x20 v8 = i64.add v5 v7\n\
-        \x20 return v8\n\
+        \x20 v5 = i64.const 42\n\
+        \x20 v6 = i64.sub v4 v5\n\
+        \x20 v7 = i64.add v1 v6\n\
+        \x20 return v7\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
         block0(vsp: i64, varg: i64):\n\
@@ -417,17 +416,15 @@ fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 5\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
-        \x20 v6 = i64.extend_i32_u v2\n\
-        \x20 v7 = thread.spawn 1 v6 v6\n\
-        \x20 v8 = thread.join v7\n\
-        \x20 return v8\n\
+        \x20 v6 = thread.spawn 1 v2 v2\n\
+        \x20 v7 = thread.join v6\n\
+        \x20 return v7\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
         block0(vsp: i64, varg: i64):\n\
-        \x20 v0 = i32.wrap_i64 varg\n\
-        \x20 v1 = i64.const 7\n\
-        \x20 v2, v3 = cont.resume v0 v1\n\
-        \x20 return v3\n\
+        \x20 v0 = i64.const 7\n\
+        \x20 v1, v2 = cont.resume varg v0\n\
+        \x20 return v2\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
         block0(vsp: i64, varg: i64):\n\
@@ -456,11 +453,13 @@ fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
 /// 30 reps on the JIT (real cores) + the interp differential.
 #[test]
 fn concurrent_fiber_steal_stress() {
-    // mem[16]: round-1 work index; mem[20]: round-2 work index; mem[24+4i]: fiber i's handle;
-    // mem[128]: the i64 atomic sum. Fiber identity rides its `sp` (= its index i).
+    // mem[16]: round-1 work index; mem[20]: round-2 work index; mem[512+8i]: fiber i's i64 handle;
+    // mem[128]: the i64 atomic sum. Fiber identity rides its `sp` (= its index i). (The handle array
+    // is at 512/stride-8 — not 24/stride-4 — because an i64 handle is 8 bytes and a stride-8 array
+    // from 24 would overlap the sum at 128.)
     // Worker body (funcs 1 and 2, differing only in the work-index address):
     //   loop: i = i32.atomic.rmw.add idx 1; if i >= 16 return 0;
-    //         h = i32.load(24+4i); (st, v) = cont.resume h 0; i64.atomic.rmw.add mem[128] v
+    //         h = i64.load(512+8i); (st, v) = cont.resume h 0; i64.atomic.rmw.add mem[128] v
     let worker = |idx_addr: u64| -> String {
         format!(
             "func (i64, i64) -> (i64) {{\n\
@@ -475,11 +474,11 @@ fn concurrent_fiber_steal_stress() {
              \x20 br_if v6 block2(v4) block3()\n\
              block2(v7: i32):\n\
              \x20 v8 = i64.extend_i32_u v7\n\
-             \x20 v9 = i64.const 4\n\
+             \x20 v9 = i64.const 8\n\
              \x20 v10 = i64.mul v8 v9\n\
-             \x20 v11 = i64.const 24\n\
+             \x20 v11 = i64.const 512\n\
              \x20 v12 = i64.add v11 v10\n\
-             \x20 v13 = i32.load v12\n\
+             \x20 v13 = i64.load v12\n\
              \x20 v14 = i64.const 0\n\
              \x20 v15, v16 = cont.resume v13 v14\n\
              \x20 v17 = i64.const 128\n\
@@ -505,11 +504,11 @@ fn concurrent_fiber_steal_stress() {
          block2(v4: i64):\n\
          \x20 v5 = ref.func 3\n\
          \x20 v6 = cont.new v5 v4\n\
-         \x20 v7 = i64.const 4\n\
+         \x20 v7 = i64.const 8\n\
          \x20 v8 = i64.mul v4 v7\n\
-         \x20 v9 = i64.const 24\n\
+         \x20 v9 = i64.const 512\n\
          \x20 v10 = i64.add v9 v8\n\
-         \x20 i32.store v10 v6\n\
+         \x20 i64.store v10 v6\n\
          \x20 v11 = i64.const 1\n\
          \x20 v12 = i64.add v4 v11\n\
          \x20 br block1(v12)\n\

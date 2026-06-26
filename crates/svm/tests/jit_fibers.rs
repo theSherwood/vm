@@ -25,6 +25,7 @@ fn to_slot(v: &Value) -> i64 {
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => *x as i64,
     }
 }
 
@@ -90,7 +91,7 @@ fn fiber_generator_loop() {
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 0\n\
         \x20 br block1(v2, v3)\n\
-        block1(v4: i32, v5: i64):\n\
+        block1(v4: i64, v5: i64):\n\
         \x20 v6 = i64.const 0\n\
         \x20 v7, v8 = cont.resume v4 v6\n\
         \x20 v9 = i64.add v5 v8\n\
@@ -196,9 +197,7 @@ fn fiber_handle_values_match_across_backends() {
         \x20 v3 = cont.new v0 v1\n\
         \x20 v4 = i64.const 3\n\
         \x20 v5, v6 = cont.resume v3 v4\n\
-        \x20 v7 = i64.extend_i32_u v2\n\
-        \x20 v8 = i64.extend_i32_u v3\n\
-        \x20 return v7 v8 v5 v6\n\
+        \x20 return v2 v3 v5 v6\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
         block0(v0: i64, v1: i64):\n\
@@ -215,6 +214,29 @@ fn fiber_handle_values_match_across_backends() {
         vec![Value::I64(0), Value::I64(1), Value::I32(1), Value::I64(3)],
         "the unified handle namespace must start at 0 and number densely"
     );
+}
+
+/// `cont.new` over a **wrong-type funcref** (the funcref names a function whose signature is not the
+/// fiber entry type `(i64, i64) -> i64`) faults on first resume on *both* backends → `FiberFault`. The
+/// verifier only checks the funcref is an `i32` (§12 — the type is a runtime use-site check), so this
+/// path is reachable; both backends type-check lazily at first resume, and the fault is a *fiber* fault
+/// (the forged-handle / dead / bomb family), not a generic `IndirectCallType`.
+#[test]
+fn fiber_wrong_type_funcref_traps() {
+    let src = "func () -> (i32, i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 1\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 return v4 v5\n\
+        }\n\
+        func (i32) -> (i32) {\n\
+        block0(v0: i32):\n\
+        \x20 return v0\n\
+        }\n";
+    assert_jit_matches_interp(src);
 }
 
 /// A fiber whose body actually uses the **data stack** (its `sp`) and shared memory: it stores `arg`
@@ -243,4 +265,186 @@ fn fiber_uses_data_stack_and_memory() {
         \x20 return v4\n\
         }\n";
     assert_jit_matches_interp(src);
+}
+
+/// W5 JIT/DWARF Stage 4c — the fiber-rooted backtrace. A fiber entry `func 1` calls helper `func 2`,
+/// which `suspend`s; the root resumes the fiber once and **returns without completing it**, leaving it
+/// parked. The host then walks the suspended fiber's control stack and symbolizes its guest frames.
+#[test]
+fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
+    use svm_ir::DEFAULT_RESERVED_LOG2;
+    use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+
+    // `func 1` (entry) calls `func 2` (helper) at fib.c:5; the helper `suspend`s at fib.c:9.
+    let src = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 5
+  v4, v5 = cont.resume v2 v3
+  return v5
+}
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = call 2(v0, v1)
+  return v2
+}
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = suspend v1
+  return v2
+}
+
+debug.file 0 "fib.c"
+debug.loc 1 0 0 0 5 3
+debug.loc 2 0 0 0 9 3
+"#;
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut cm = CompiledModule::compile(
+        &m,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )
+    .expect("compile");
+
+    // Before the run no fiber has been created, so there is nothing to walk.
+    assert!(
+        cm.fiber_backtrace(0).is_empty(),
+        "no parked fiber before the run"
+    );
+
+    // The root resumes the fiber (it suspends) and returns its yielded value, leaving fiber 0 parked.
+    let (outcome, _) = cm.run(&[], None, None, None).expect("run");
+    let JitOutcome::Returned(ref v) = outcome else {
+        panic!("expected the root to return, got {outcome:?}");
+    };
+    assert_eq!(
+        v.as_slice(),
+        &[5i64],
+        "root returned the fiber's suspended value, leaving it parked"
+    );
+
+    // The fiber-rooted walk: the parked fiber's guest call stack, innermost frame first.
+    let bt = cm.fiber_backtrace(0);
+    let frames: Vec<(u32, &str, u32)> = bt
+        .iter()
+        .map(|f| (f.func, f.file.as_str(), f.line))
+        .collect();
+    assert_eq!(
+        frames,
+        vec![(2, "fib.c", 9), (1, "fib.c", 5)],
+        "backtrace is [helper (suspended, innermost), entry (its caller)]"
+    );
+}
+
+// ---- Recycling ABA guard, cross-backend (DURABILITY.md §12.8 steps 1/3) ----
+//
+// A fiber guest handle carries a generation in its high bits (`FIBER_GEN_SHIFT == 16`), and
+// `cont.resume` rejects a handle whose generation doesn't match the slot's current one — the ABA
+// guard that makes slot recycling safe. The interpreter pins this directly
+// (`svm-durable/tests/fiber.rs::{forged_fiber_generation_is_rejected,
+// recycling_reuses_a_freed_slot_with_a_bumped_generation}`) and the JIT registry has a unit test
+// (`fiber_registry::claim_gen_rejects_a_stale_generation`); these pin the **wired** JIT path
+// (`cont.resume` → `fiber_resume` → `resolve` + `claim_gen`) against the interpreter oracle, so the
+// generation guard is enforced identically end-to-end on both backends.
+
+/// A genuine handle (slot 0, generation 0) resumes; a forged generation-1 handle for the same slot
+/// (`(1 << 16) | 0 == 65536`, which the slot mask clamps back to slot 0) faults — on both backends.
+#[test]
+fn fiber_forged_generation_faults_identically() {
+    // Genuine handle: the fiber runs and returns 99.
+    assert_jit_matches_interp(
+        "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v4 = i64.const 0\n\
+        \x20 v5, v6 = cont.resume v2 v4\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 99\n\
+        \x20 return v2\n\
+        }\n",
+    );
+    // Forged handle `(1 << 16) | 0`: same slot 0, generation 1 ≠ 0 ⇒ FiberFault on both backends.
+    assert_jit_matches_interp(
+        "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 65536\n\
+        \x20 v4 = i64.const 0\n\
+        \x20 v5, v6 = cont.resume v3 v4\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 99\n\
+        \x20 return v2\n\
+        }\n",
+    );
+}
+
+/// A finished fiber's slot is recycled at a bumped generation: the next `cont.new` reuses slot 0 at
+/// generation 1 (handle `(1 << 16) | 0 == 65536`), and the *stale* generation-0 handle to the former
+/// occupant then faults even though slot 0 is live. Both backends must agree on each.
+#[test]
+fn recycled_slot_generation_guard_agrees() {
+    // Fiber A (slot 0, gen 0) finishes; the next cont.new reuses slot 0 at gen 1 — returning the i32
+    // handle makes the reuse observable (65536). Both backends must produce the same handle.
+    assert_jit_matches_interp(
+        "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = cont.new v0 v1\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 7\n\
+        \x20 return v2\n\
+        }\n",
+    );
+    // After slot 0 is recycled (now gen 1), resuming A's stale gen-0 handle (i64 0) must fault on
+    // both backends — even though slot 0 is live — because the generation no longer matches.
+    assert_jit_matches_interp(
+        "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = cont.new v0 v1\n\
+        \x20 v9 = i64.const 0\n\
+        \x20 v7, v8 = cont.resume v9 v3\n\
+        \x20 return v8\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 7\n\
+        \x20 return v2\n\
+        }\n",
+    );
 }

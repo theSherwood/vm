@@ -79,17 +79,15 @@ block0():
   v2 = cont.new v0 v1
   v3 = i64.const 5
   v4, v5 = cont.resume v2 v3
-  v6 = i64.extend_i32_u v2
-  v7 = thread.spawn 1 v6 v6
-  v8 = thread.join v7
-  return v8
+  v6 = thread.spawn 1 v2 v2
+  v7 = thread.join v6
+  return v7
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
-  v0 = i32.wrap_i64 varg
-  v1 = i64.const 7
-  v2, v3 = cont.resume v0 v1
-  return v3
+  v0 = i64.const 7
+  v1, v2 = cont.resume varg v0
+  return v2
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
@@ -127,20 +125,18 @@ block0():
   v0 = ref.func 2
   v1 = i64.const 0
   v2 = cont.new v0 v1
-  v3 = i64.extend_i32_u v2
-  v4 = thread.spawn 1 v3 v3
-  v5 = thread.spawn 1 v3 v3
+  v3 = thread.spawn 1 v2 v2
+  v4 = thread.spawn 1 v2 v2
+  v5 = thread.join v3
   v6 = thread.join v4
-  v7 = thread.join v5
-  v8 = i64.add v6 v7
-  return v8
+  v7 = i64.add v5 v6
+  return v7
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
-  v0 = i32.wrap_i64 varg
-  v1 = i64.const 1
-  v2, v3 = cont.resume v0 v1
-  return v3
+  v0 = i64.const 1
+  v1, v2 = cont.resume varg v0
+  return v2
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
@@ -166,17 +162,15 @@ block0():
   v0 = ref.func 2
   v1 = i64.const 0
   v2 = cont.new v0 v1
-  v3 = i64.extend_i32_u v2
-  v4 = thread.spawn 1 v3 v3
-  v5 = thread.join v4
-  return v5
+  v3 = thread.spawn 1 v2 v2
+  v4 = thread.join v3
+  return v4
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
-  v0 = i32.wrap_i64 varg
-  v1 = i64.const 1
-  v2, v3 = cont.resume v0 v1
-  return v3
+  v0 = i64.const 1
+  v1, v2 = cont.resume varg v0
+  return v2
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
@@ -212,8 +206,7 @@ func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
   v0 = ref.func 2
   v1 = cont.new v0 varg
-  v2 = i64.extend_i32_u v1
-  return v2
+  return v1
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):

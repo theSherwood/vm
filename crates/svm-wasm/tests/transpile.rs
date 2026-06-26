@@ -68,6 +68,7 @@ fn eval(wat: &str, entry: &str, args: &[Value]) -> Value {
             Value::F32(x) => x.to_bits() as i64,
             Value::F64(x) => x.to_bits() as i64,
             Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+            Value::Ref(x) => *x as i64,
         })
         .collect();
     let jit = match svm_jit::compile_and_run(&t.module, idx, &jit_args).expect("jit") {
@@ -743,9 +744,10 @@ fn memory64_grow_and_size() {
 
 #[test]
 fn unsupported_is_clean_error() {
-    // A **passive** data segment is out of the current subset → a clean Unsupported error, not a panic.
-    let wat = r#"(module (memory 1) (data "abc")
-      (func (export "f") (result i32) (i32.const 0)))"#;
+    // An **imported global** is out of the current subset → a clean Unsupported error, not a panic.
+    // (Passive data segments + `memory.init`/`data.drop` are now supported — see tests/bulk.rs.)
+    let wat = r#"(module (import "env" "g" (global i32))
+      (func (export "f") (result i32) (global.get 0)))"#;
     let wasm = wat::parse_str(wat).unwrap();
     match svm_wasm::transpile(&wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}

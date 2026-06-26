@@ -12,11 +12,17 @@
  * thread-local, so concurrent JIT runs on different threads are independent: the handler
  * runs on the faulting thread and reads that thread's state.
  */
+/* Feature-test macros must precede every include. `_XOPEN_SOURCE` exposes the (macOS-deprecated)
+ * ucontext routines + `ucontext_t` mcontext on Apple SDKs; `_GNU_SOURCE` gates glibc's REG_RIP/REG_RBP
+ * in <sys/ucontext.h>. Both are harmless where unneeded. */
+#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ucontext.h>
 
 static _Thread_local sigjmp_buf g_buf;
 static _Thread_local volatile int g_armed = 0;
@@ -45,6 +51,40 @@ void svm_clear_demand(void) {
     g_demand_lo = 0;
     g_demand_hi = 0;
     g_demand_ctx = 0;
+}
+
+/* The trap-time backtrace capture *state* and the frame-pointer walk live in `trap_capture.c` (shared
+ * with the windows VEH and the explicit-trap helper). The signal handler below extracts the faulting
+ * `(pc, fp)` from the ucontext and hands them to `svm_store_trap_frame`, which walks the chain and
+ * stashes it in a thread-local for the host to symbolize (DEBUGGING.md §5 W3). The walk must happen
+ * here, while the guest stack is intact: a siglongjmp unwinds back onto the same stack the post-fault
+ * host code then reuses, so the frames would be gone by the time the host could walk them. */
+extern void svm_store_trap_frame(uintptr_t pc, uintptr_t fp);
+
+/* Memory-fault capture: extract the faulting (pc, fp) from the signal ucontext and hand off the walk.
+ * Async-signal-safe: only the ucontext read + the (stack-reading, TLS-writing) store. */
+static void svm_capture_frame(void *uc) {
+    uintptr_t pc = 0, fp = 0;
+#if defined(__linux__) && defined(__x86_64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext.gregs[REG_RIP];
+    fp = (uintptr_t)c->uc_mcontext.gregs[REG_RBP];
+#elif defined(__linux__) && defined(__aarch64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext.pc;
+    fp = (uintptr_t)c->uc_mcontext.regs[29]; /* AAPCS64 frame pointer */
+#elif defined(__APPLE__) && defined(__x86_64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext->__ss.__rip;
+    fp = (uintptr_t)c->uc_mcontext->__ss.__rbp;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext->__ss.__pc;
+    fp = (uintptr_t)c->uc_mcontext->__ss.__fp;
+#else
+    (void)uc; /* an arch we don't decode: pc/fp stay 0 → the host yields an empty backtrace */
+#endif
+    svm_store_trap_frame(pc, fp); /* walk + stash in the shared (trap_capture.c) thread-local */
 }
 
 static struct sigaction g_old_segv;
@@ -77,7 +117,8 @@ static void svm_handler(int sig, siginfo_t *info, void *uc) {
     }
     if (g_armed && addr >= g_lo && addr < g_hi) {
         g_armed = 0;
-        siglongjmp(g_buf, 1); /* back to svm_run_guarded; does not return */
+        svm_capture_frame(uc); /* stash the faulting frame before the stack unwinds (§5 W3) */
+        siglongjmp(g_buf, 1);  /* back to svm_run_guarded; does not return */
     }
     svm_chain(sig == SIGBUS ? &g_old_bus : &g_old_segv, sig, info, uc);
 }

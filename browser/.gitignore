@@ -1,0 +1,9 @@
+/target
+/wt/target
+/threads-spike/target
+# regenerable fixtures/corpus (see `cargo run --bin genfixture` / `gencorpus`)
+*.svmbc
+/corpus
+/corpus.json
+# scratch wasm patches
+patched*.wasm

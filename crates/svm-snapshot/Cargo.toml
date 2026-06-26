@@ -1,0 +1,16 @@
+[package]
+name = "svm-snapshot"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+svm-ir.workspace = true
+svm-encode.workspace = true
+svm-interp.workspace = true
+
+[dev-dependencies]
+svm-durable.workspace = true
+svm-text.workspace = true
+svm-verify.workspace = true

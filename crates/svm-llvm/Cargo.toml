@@ -15,6 +15,10 @@ publish = false
 
 [dependencies]
 svm-ir = { path = "../svm-ir" }
+# The `svm-llvm-translate` CLI emits the translated module as text (`.svm`) or binary (`.svmb`);
+# pure-Rust serializers (no LLVM), shared with the runtime crates.
+svm-text = { path = "../svm-text" }
+svm-encode = { path = "../svm-encode" }
 # Reads legalized bitcode into an owned, pure-Rust AST (LLVM.md §8 Q1). Pinned to the LLVM-18
 # feature to match the container's `clang`/`libLLVM` (LLVM.md §2). Off-version bitcode is rejected.
 llvm-ir = { version = "0.11.3", features = ["llvm-18"] }
@@ -25,6 +29,23 @@ llvm-ir = { version = "0.11.3", features = ["llvm-18"] }
 llvm-sys = { version = "181", features = ["prefer-dynamic"] }
 
 [dev-dependencies]
-svm-text = { path = "../svm-text" }
 svm-verify = { path = "../svm-verify" }
 svm-interp = { path = "../svm-interp" }
+# The JIT, so every translation test is also an interp↔JIT differential (the §18 oracle).
+svm-jit = { path = "../svm-jit" }
+# The partial evaluator (§20c): the end-to-end Futamura demo specializes a real LLVM-translated
+# interpreter against a fixed program and measures the size/speed win (`tests/peval_demo.rs`).
+svm-peval = { path = "../svm-peval" }
+# The reference host/powerbox — drives a capability-using program (`_start`) end-to-end (the Lane C
+# demo: real stdout + exit code vs native), and resolves §7 named imports to concrete capabilities.
+svm-run = { path = "../svm-run" }
+# The W5 DAP server — drives a *real* LLVM-translated module (its §6 debug info, serialized to text)
+# through the Debug Adapter Protocol end-to-end, proving the LLVM producer feeds the DAP consumer.
+svm-dap = { path = "../svm-dap" }
+
+# The library is the lib target; the `svm-llvm-translate` CLI is an explicit bin so the
+# **separate-artifact** path is scriptable: translate a `.bc` once to a `.svm`/`.svmb` module plus a
+# `.syms` export sidecar, then a frontend links many programs against it (`svm_ir::link`).
+[[bin]]
+name = "svm-llvm-translate"
+path = "src/bin/translate.rs"

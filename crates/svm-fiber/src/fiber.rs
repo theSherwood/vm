@@ -143,6 +143,17 @@ impl Yielder {
         c.resumer.set(t.fctx); // the resumer may be a different context next time
         c.value.get()
     }
+
+    /// The resumer's saved stack pointer — the context this fiber will `jump` back to when it
+    /// suspends, i.e. the resumer's live low-water mark at the moment it switched in. Used by the
+    /// `svm-jit` `gc.roots` walker as the conservative low bound for scanning the **root
+    /// computation's** frames (the resume chain's non-fiber parent runs on the OS thread stack, so
+    /// its live region is `[resumer_sp, entry_sp)`).
+    pub fn resumer_sp(&self) -> *const u8 {
+        // SAFETY: `control` outlives the running body (the `Fiber` owns the `Box<Control>` and
+        // cannot be dropped while suspended inside its own body), and only this side is live.
+        unsafe { (*self.control).resumer.get() as *const u8 }
+    }
 }
 
 /// A first-class suspendable computation running on its own native stack.
@@ -218,11 +229,15 @@ where
 impl Fiber {
     /// Create a fiber with a `stack_size`-byte (rounded up) guard-paged control stack. The body
     /// receives a [`Yielder`] and the first resume value, and returns the fiber's final value.
-    pub fn new<F>(stack_size: usize, f: F) -> Fiber
+    ///
+    /// Returns `None` if the OS refuses the stack reservation — a **recoverable** condition the
+    /// caller turns into a `FiberFault` rather than an abort, so a guest spawning many fibers can
+    /// never crash the host (ISSUES.md I1).
+    pub fn new<F>(stack_size: usize, f: F) -> Option<Fiber>
     where
         F: FnOnce(&Yielder, u64) -> u64 + 'static,
     {
-        let stack = Stack::new(stack_size);
+        let stack = Stack::new(stack_size)?;
         #[cfg(feature = "asan")]
         let (asan_bottom, asan_size) = stack.usable();
         let control = Box::new(Control {
@@ -245,17 +260,37 @@ impl Fiber {
         });
         // SAFETY: fresh, live stack; `fiber_entry::<F>` matches the boxed closure's type.
         let ctx = unsafe { make(&stack, fiber_entry::<F>) };
-        Fiber {
+        Some(Fiber {
             _stack: stack,
             ctx,
             done: false,
             control,
-        }
+        })
     }
 
     /// Whether the fiber has finished (returned). A finished fiber must not be resumed.
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Conservative GC stack-scan bounds `[low, high)` for a **parked** (suspended or fresh) fiber:
+    /// `[ctx, top)`. `ctx` is the saved-context pointer — the lowest live address, since the switch
+    /// spilled the fiber's callee-saved registers (its in-register roots) there before suspending —
+    /// so this is the *exact* live extent, and scanning it conservatively (every in-range word is a
+    /// candidate root) cannot miss a root the suspended fiber holds.
+    ///
+    /// Must only be called on a fiber that is **not currently running** (parked): while a fiber
+    /// runs, `ctx` is the stale pre-resume context and does not bound the live frames.
+    pub fn parked_extent(&self) -> (*const u8, *const u8) {
+        (self.ctx as *const u8, self._stack.top() as *const u8)
+    }
+
+    /// Conservative bounds `[usable_low, top)` for a **running** fiber whose exact live SP the
+    /// scanner does not know (a resume-chain ancestor, or the fiber calling `gc.roots` itself):
+    /// scan the *whole* usable stack — a sound superset of its live frames (the unused portion is
+    /// untouched/zeroed reserved pages or stale non-root bytes, harmless to a conservative scan).
+    pub fn full_extent(&self) -> (*const u8, *const u8) {
+        (self._stack.usable_low(), self._stack.top() as *const u8)
     }
 
     /// Resume the fiber, passing `val`; returns whether it yielded or completed.
@@ -333,7 +368,8 @@ mod tests {
             let a = y.suspend(first + 1);
             let b = y.suspend(a + 1);
             b + 100
-        });
+        })
+        .unwrap();
         assert_eq!(f.resume(10), State::Yielded(11));
         assert_eq!(f.resume(20), State::Yielded(21));
         assert_eq!(f.resume(30), State::Complete(130));
@@ -343,7 +379,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "resumed a finished fiber")]
     fn resume_after_complete_panics() {
-        let mut f = Fiber::new(64 * 1024, |_y, _| 0);
+        let mut f = Fiber::new(64 * 1024, |_y, _| 0).unwrap();
         assert_eq!(f.resume(0), State::Complete(0));
         f.resume(0);
     }
@@ -357,7 +393,8 @@ mod tests {
                 acc += y.suspend(acc);
             }
             acc
-        });
+        })
+        .unwrap();
         let mut vals = Vec::new();
         loop {
             match f.resume(2) {
@@ -379,7 +416,8 @@ mod tests {
         let f = Fiber::new(64 * 1024, move |_y, _| {
             let _hold = &captured;
             0
-        });
+        })
+        .unwrap();
         assert_eq!(Rc::strong_count(&marker), 2);
         drop(f);
         assert_eq!(Rc::strong_count(&marker), 1, "closure was not dropped");
@@ -396,6 +434,7 @@ mod tests {
                     let b = y.suspend(0);
                     (k as u64) * 1000 + a * 10 + b
                 })
+                .unwrap()
             })
             .collect();
         // Round 1: start each (Yielded 0).
@@ -445,6 +484,7 @@ mod tests {
                         }
                         a.wrapping_add(99)
                     })
+                    .unwrap()
                 })
                 .collect();
             let mut sum = vec![0u64; n];
