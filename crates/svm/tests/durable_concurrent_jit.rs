@@ -80,10 +80,8 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
     let fc = Arc::clone(&freeze);
     let controller = std::thread::spawn(move || {
         // Wait until the children are spawned (so they run concurrently, not deferred), then freeze.
-        // `yield_now` (not a busy `spin_loop`): on a few-core CI runner the controller must not hog a
-        // core away from the vCPU threads it's waiting on — vital once a test loops this many times.
         while !spawned.load(Ordering::SeqCst) {
-            std::thread::yield_now();
+            std::hint::spin_loop();
         }
         fc.request_freeze();
     });
@@ -780,9 +778,20 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
     };
 
     if read_state(&fsnap) != STATE_UNWINDING {
-        // The root's wait found the changed value and returned before the freeze landed (rare): its
-        // recorded status already rides the snapshot.
-        assert_eq!(le_i64(&fsnap, OFF_ROOT), WAIT_NOT_EQUAL);
+        // No frozen artifact (the freeze didn't engage), so there's nothing to thaw. Two valid races:
+        // the root's wait found the changed value before parking (`NOT_EQUAL`, riding the snapshot), or —
+        // rarer — it had parked and the freeze raced past it, so the child's plain store (no `notify`)
+        // can't wake it and the run deadlock-traps (`ThreadFault`, the interp's join-deadlock). A
+        // `Returned` with any other recorded status would be a real bug.
+        match fout {
+            JitOutcome::Returned(_) => assert_eq!(
+                le_i64(&fsnap, OFF_ROOT),
+                WAIT_NOT_EQUAL,
+                "no-freeze completion: the root's wait resolved NOT_EQUAL",
+            ),
+            JitOutcome::Trapped(TrapKind::ThreadFault) => {}
+            other => panic!("unexpected no-freeze outcome: {other:?}"),
+        }
         return;
     }
     assert!(

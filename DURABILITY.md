@@ -1280,9 +1280,10 @@ per-context word set on all contexts at once — TBD in stage 1.
      ~1/6 hang until that was fixed).
    - *Interleaving stress (landed).* `concurrent_freeze_thaw_is_deterministic_across_interleavings`
      re-runs the multi-vCPU freeze/thaw 10× across different real OS-thread schedules, asserting the
-     uninterrupted oracle each time. The `concurrent_freeze` controller `yield_now`s rather than
-     busy-spins, so looping it doesn't starve few-core CI runners (the original 20×-busy-spin version was
-     reverted after a CI hang).
+     uninterrupted oracle each time. It reuses the unchanged `concurrent_freeze` helper (the CI hangs that
+     first appeared alongside a 20× version were the mutual-block deadlock bug above, not the loop — each
+     iteration's spin-wait `FreezeController` is short-lived, so looping a modest count doesn't starve a
+     runner). The helper's controller is left as-is so the per-shape tests keep their proven timing.
    - *Loom model (landed).* `loom_deadlock_detection_resolves_when_last_peer_exits` model-checks the
      quiescence detection: a consumer waits with a modeled live-peer flag; the peer goes non-live + wakes
      under the futex lock; under every interleaving the consumer returns `WAIT_DEADLOCK`, never blocking
