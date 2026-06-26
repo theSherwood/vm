@@ -12,7 +12,7 @@
 //! across a restore ⇒ every guest-held handle stays valid. (The full freeze→serialize→
 //! restore→thaw run lands with the snapshot-codec slice that wires this to the window image.)
 
-use svm_interp::{DurableBinding, DurableHandle, Host, NonDurableKind, StreamRole};
+use svm_interp::{iface, DurableBinding, DurableHandle, Host, NonDurableKind, StreamRole, Trap};
 
 /// Grant a spread of durable bindings, capture, restore into a fresh table, and confirm the
 /// captured set is byte-for-byte identical — slot, generation, type_id, and binding all pinned.
@@ -95,6 +95,89 @@ fn capture_refuses_a_non_durable_handle() {
         .expect_err("an io_ring handle blocks the snapshot");
     assert_eq!(err.slot, 1);
     assert_eq!(err.kind, NonDurableKind::IoRing);
+}
+
+/// Draining the non-durable handles turns a capture refusal into a successful one: the out-of-line
+/// bindings (an `IoRing` and a `HostFn`) are closed, the durable `Clock` is kept, and
+/// `capture_durable_handles` then succeeds. The drained set comes back in ascending slot order so the
+/// embedder can audit the relinquished authority (DURABILITY.md §12.5 handle hardening).
+#[test]
+fn drain_non_durable_makes_a_domain_snapshottable() {
+    let mut a = Host::new();
+    a.grant_clock(); // slot 0 — durable
+    a.grant_io_ring(); // slot 1 — non-durable
+    a.grant_host_fn(Box::new(|_op, _args, _mem| Ok(vec![0]))); // slot 2 — non-durable
+
+    assert!(
+        a.capture_durable_handles().is_err(),
+        "a live non-durable handle blocks the snapshot"
+    );
+
+    let drained = a.drain_non_durable();
+    assert_eq!(drained.len(), 2, "the io_ring and the host_fn were drained");
+    assert_eq!(
+        (drained[0].slot, drained[0].kind),
+        (1, NonDurableKind::IoRing)
+    );
+    assert_eq!(
+        (drained[1].slot, drained[1].kind),
+        (2, NonDurableKind::HostFn)
+    );
+
+    let captured = a
+        .capture_durable_handles()
+        .expect("a drained domain is snapshottable");
+    assert_eq!(
+        captured.len(),
+        1,
+        "only the durable Clock survives the drain"
+    );
+    assert_eq!(captured[0].slot, 0);
+    assert_eq!(captured[0].binding, DurableBinding::Clock);
+}
+
+/// A drained handle's value is a dead generation: a `cap.call` on it is an inert `CapFault`, never
+/// authority into the freed slot (D37). The durable handles the drain left alone still resolve.
+#[test]
+fn drain_non_durable_kills_stale_handle_values() {
+    let mut a = Host::new();
+    a.grant_clock(); // durable — kept
+    let ring = a.grant_io_ring(); // non-durable — drained
+
+    let drained = a.drain_non_durable();
+    assert_eq!(drained.len(), 1, "only the io_ring drained");
+
+    // The drained handle now faults at the use site (freed slot ⇒ resolve fails before the op runs).
+    let r = a.cap_dispatch_slots(iface::IO_RING, 0, ring, &[], None);
+    assert!(
+        matches!(r, Err(Trap::CapFault)),
+        "a drained handle is a dead generation, got {r:?}"
+    );
+    // The durable Clock is untouched.
+    assert!(a
+        .capture_durable_handles()
+        .unwrap()
+        .iter()
+        .any(|h| h.binding == DurableBinding::Clock));
+}
+
+/// On an all-durable table draining is a no-op: nothing closes and the captured set is unchanged.
+#[test]
+fn drain_non_durable_is_a_noop_when_all_durable() {
+    let mut a = Host::new();
+    a.grant_clock();
+    a.grant_memory();
+    let before = a.capture_durable_handles().unwrap();
+
+    assert!(
+        a.drain_non_durable().is_empty(),
+        "nothing non-durable to drain"
+    );
+    assert_eq!(
+        a.capture_durable_handles().unwrap(),
+        before,
+        "the durable table is unchanged by a no-op drain"
+    );
 }
 
 /// An empty table captures to an empty set; capacity is the table size, so the codec can
