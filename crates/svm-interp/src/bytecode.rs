@@ -4912,8 +4912,142 @@ fn run_vcpu_parallel<'scope, 'env>(
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
             }
-            // Still outside this driver's subset (§14 `instantiate_module` /
-            // `spawn_coroutine_module`): they compile/push a granted module — a later slice.
+            // §14 `Instantiator.instantiate_module` (THREADS.md 4c-domain) — a **separate-module**
+            // confined child: the host (which holds the powerbox) is locked to resolve + clone the
+            // granted `Module`, it is compiled to bytecode and **pushed to the shared source** (so it
+            // resolves by index, like a `Jit.invoke` transient), the child's data segments are
+            // materialized into the carve, and the child runs over its own table mapping into *its*
+            // pushed module index. Everything else (confined window, attenuated powerbox, quota, own
+            // registry, nested scoped thread, join) is exactly as op 0.
+            Ok(VcpuStop::InstantiateModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+            }) => {
+                // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
+                // handle is an inert CapFault → trap).
+                let (cfuncs, cmem_log2, cdata) = {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.resolve_module(mh) {
+                        Ok(grant) => (grant.funcs.clone(), grant.memory_log2, grant.data.clone()),
+                        Err(t) => return (Err(t), mem),
+                    }
+                };
+                // Compile to bytecode — a module using an op the engine can't lower is the one place a
+                // guest-provided program outruns coverage (a `Malformed` trap, as for `Jit.install`).
+                let child_compiled = match compile_module(&cfuncs) {
+                    Some(c) => c,
+                    None => return (Err(Trap::Malformed), mem),
+                };
+                // Validate the entry against the *child module* and the carve; a separate-module
+                // child's carve must equal its declared memory (§14 transparency).
+                let want_as = child_compiled
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                let ok_entry = child_compiled
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, r)| {
+                        r[..] == [ValType::I64]
+                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+                    });
+                let child_size = if (0..64).contains(&size_log2) {
+                    1u64 << size_log2
+                } else {
+                    0
+                };
+                let off_u = off as u64;
+                let fits = child_size != 0
+                    && child_size <= isz
+                    && off_u & (child_size - 1) == 0
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                if !ok_entry || !fits || !mod_ok {
+                    vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
+                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                    > super::MAX_VCPUS
+                {
+                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return (Err(Trap::ThreadFault), mem);
+                }
+                let pbase = mem.as_ref().map_or(0, |m| m.window.base());
+                let abs_base = pbase + ibase + off_u;
+                // Materialize the module's data segments into the carve *before* spawning the child
+                // (the write happens-before the child thread, so it sees them), then the confined view.
+                let child_mem = {
+                    if let Some(m) = mem.as_ref() {
+                        for d in cdata.iter() {
+                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                                for (k, &b) in d.bytes.iter().enumerate() {
+                                    m.set_byte(abs_base + d.offset + k as u64, b);
+                                }
+                            }
+                        }
+                    }
+                    mem.as_ref()
+                        .map(|m| m.nested_view(abs_base, size_log2 as u8))
+                };
+                let mut child_host = Host::new();
+                let cinst = child_host.grant_instantiator(0, child_size);
+                let cas = child_host.grant_address_space(0, child_size);
+                let child_args = if want_as {
+                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                } else {
+                    vec![Value::I64(cinst as i64)]
+                };
+                let child_fuel = if quota <= 0 {
+                    fuel
+                } else {
+                    (quota as u64).min(fuel)
+                };
+                // Push the compiled module to the **shared** source and run the child over its own
+                // table mapping into *its* module index (no parent install slots).
+                let progs_len = child_compiled.progs.len();
+                let cm = dom.source.push(child_compiled);
+                let child_table = build_table_for(progs_len, 0, cm as u32);
+                let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
+                let cunit = match child_dom.source.get(cm) {
+                    Some(u) => u,
+                    None => return (Err(Trap::Malformed), mem),
+                };
+                let mut child_vt = match VTask::new(&cunit, entry as usize, &child_args) {
+                    Ok(v) => v,
+                    Err(t) => return (Err(t), mem),
+                };
+                child_vt.active.module = cm;
+                let id = reg
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                scope.spawn(move || {
+                    let child_reg = ThreadRegistry::new();
+                    let child_host = std::sync::Mutex::new(child_host);
+                    let (r, _m) = std::thread::scope(|cscope| {
+                        run_vcpu_parallel(
+                            cscope,
+                            &child_dom,
+                            &child_reg,
+                            &child_host,
+                            child_vt,
+                            child_mem,
+                            child_fuel,
+                        )
+                    });
+                    reg.publish(id, r);
+                });
+                let handle = threads.len() as i32;
+                threads.push(Some(id));
+                vt.active.set(dst, Reg::from_i32(handle));
+            }
+            // Still outside this driver's subset (§14 `spawn_coroutine_module`): builds an inline
+            // coroutine over a granted module — a later slice.
             Ok(_) => return (Err(Trap::ThreadFault), mem),
         }
     }

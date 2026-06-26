@@ -230,8 +230,14 @@ property, so in practice:
       kernel where each child instantiates a grandchild on a further nested scope, both folded to the
       cooperative oracle's value, 50 runs) and `parallel_instantiate_miri.rs` (the `nested_view`
       cross-thread access is race/UB/provenance-clean under Miri).
-    - [ ] **§14-B — `instantiate_module` (op 5)**: resolve + compile + push the host-granted module,
-      materialize its data segments into the carve, start the child at the pushed module index.
+    - [x] **§14-B — `instantiate_module` (op 5)**: resolve + clone the host-granted module under the
+      shared-host lock, compile it, **push it to the shared source** (resolves by index like a
+      `Jit.invoke` transient), materialize its data segments into the carve before the child thread
+      starts, and run the child over its own table mapping into *its* pushed module index. Proven by
+      the `instantiate_module` fan-out in `bytecode_parallel_instantiate.rs` (8 separate-module
+      children, each compiled+pushed, data materialized, run, joined → oracle's value) and a
+      `instantiate_module` case in `parallel_instantiate_miri.rs` (data-materialization + cross-thread
+      access over the pushed module, race/UB-clean).
     - [ ] **§14-C — `spawn_coroutine_module` (op 6/7)**: build the `Coro` (inline-driven) + demand
       paging.
     - [ ] **§14-D — the resumable `Vcpu` / browser path** (like §22 C1/C2), if wanted.
