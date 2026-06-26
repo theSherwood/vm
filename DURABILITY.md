@@ -837,6 +837,42 @@ the gap-tolerance is exercised only on the dense path today; the cap-lifting is 
 `svm-durable/tests/vcpu_recycle.rs` (20 sequential and 8×2 concurrent spawn/join cycles, both of which
 would `ThreadFault` at the 16th lifetime spawn without recycling).
 
+**[DESIGN] 4A.6 — recycled-context async freeze (sparse-residue payoff).** The recycling note above flagged
+that a *recycled-context child at freeze* "is not reachable yet" — a mid-run multi-vCPU freeze needed a
+true STW that didn't exist. The concurrent STW freeze (4A.5) + async `request_freeze` (4A.3) now provide
+it, so 4A.6 finally **exercises the gap-tolerant thaw the recycling work built**, on the JIT.
+
+*The scenario.* A long-lived JIT durable domain spawns/joins children over its lifetime, so by mid-run
+some vCPU contexts have been **freed and reused** (`free_vcpu_context` on a genuine finish;
+`reserve_vcpu_context` reuses the highest-free bit). An async freeze that lands then catches only the
+**currently-live** vCPUs — the residue is **sparse** (each frozen child pushes its *own* `FrozenVCpu`; a
+finished child freed its context and emits nothing), with **gaps** in the context indices. *Payoff:*
+artifacts proportional to *peak-concurrent* live contexts, not lifetime spawns.
+
+*Already built — no `FORMAT_VERSION` bump.* The residue *shape* is unchanged (recycling just yields
+fewer/sparser `FrozenVCpu` records of the same kind); the gap-tolerant thaw derives each child's context
+from its restored shadow-SP (`shadow_context_of_sp`), so it re-attaches any sparse/gappy set; follow-up
+**A** rides a finished-but-unjoined child's result via `completed_result`. So the *sparse freeze→thaw* arc
+likely already works — it is **built but untested** on the sparse path (only the dense, freeze-from-start
+path has coverage).
+
+*Gap to close — occupancy re-seed.* The concurrent `thaw_reattach_and_run` re-attaches children at their
+frozen contexts but never re-seeds the registry's `vcpu_mask` (`seed_vcpu_mask` is `#[allow(dead_code)]` —
+only the inline single-worker path wired it). Harmless while the thaw just reproduces the frozen tree, but
+a **post-thaw new spawn** (`reserve_vcpu_context` → highest-free) could hand out a context a re-attached
+sibling still occupies — a collision. Fix: mark each re-attached child's context occupied (re-seed the
+mask from the re-attached set) before the root resumes; wire `seed_vcpu_mask` (drop the `dead_code` allow).
+
+*Staging.* **(i)** A JIT test (`durable_concurrent_jit`): a domain spawns + joins children (recycling/
+reusing contexts) and keeps others live, then an async `request_freeze` lands mid-run — assert the residue
+is **sparse** (fewer frozen records than lifetime spawns, with index gaps), the thaw reproduces every
+result, and the **canonical re-freeze is byte-identical** (§12.6). This both proves the payoff and is the
+first coverage of the sparse path. **(ii)** Add a **post-thaw spawn** to the test to exercise — and the
+mask re-seed to fix — the occupancy gap above. **(iii)** Optionally fuzz the spawn/join/freeze interleaving
+(reuse the stage-3 controller harness). *Interp note:* recycling is done interp-side, but the interp has
+no async concurrent STW (single-worker; `arm_freeze_after` flips only the running vCPU's word), so the
+recycled-context-at-freeze stays a **JIT** slice; the interp path is unaffected.
+
 Remaining for 3.2: **nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and
 **JIT multi-vCPU parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze —
 which also unlocks the mid-run multi-vCPU STW that would make recycled-context freeze/thaw reachable.
