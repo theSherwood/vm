@@ -365,8 +365,17 @@ fn translate_impl(
         .global_vars
         .iter()
         .any(|g| name_str(&g.name) == "llvm.global_ctors");
-    let needs_powerbox_entry =
-        !imports.is_empty() || need_malloc || uses_blocking || has_global_ctors || need_getenv;
+    // `snprintf` writes the format scratch (`FMT_BUF`, via `utoa`/`dtoa`) — page 0 of the **writable**
+    // low scratch. It must force the powerbox layout so the globals start one page up (`STACK_PAGE`,
+    // below): otherwise a read-only global (the constant format string) shares page 0 with `FMT_BUF`
+    // and D40 page-granular protection makes `utoa`'s scratch writes fault. (`printf` already forces
+    // this via its `write` import; `snprintf` has no import of its own, hence the explicit term.)
+    let needs_powerbox_entry = !imports.is_empty()
+        || need_malloc
+        || uses_blocking
+        || has_global_ctors
+        || need_getenv
+        || need_snprintf;
     let synth = needs_powerbox_entry && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
@@ -9727,6 +9736,20 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
             b'd' | b'i' => int(10, true),
             b'u' => int(10, false),
             b'x' => int(16, false),
+            // `%p`: a pointer as `0x`-prefixed lowercase hex of the address (glibc form) — i.e. `%#x`
+            // of the `i64` pointer. (glibc prints `(nil)` for a null pointer; that edge prints `0x0`
+            // here — a documented minor divergence. Lua uses `%p` to tag objects in error/debug text.)
+            b'p' => {
+                let mut f = flags;
+                f.alt = true;
+                FmtSeg::Int {
+                    base: 16,
+                    signed: false,
+                    width,
+                    prec,
+                    flags: f,
+                }
+            }
             b'c' => FmtSeg::Char,
             b's' => FmtSeg::Str { width, prec },
             // Fixed-notation float (`%f`). Exact (correctly-rounded) decimal conversion via the
