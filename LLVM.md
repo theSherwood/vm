@@ -1732,32 +1732,48 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
   `llvm-sys`/`di.rs`/`blockaddr.rs`/`wideint.rs` + the rustc-1.81 pin; prove version-tolerance *here*
   by feeding `rustc 1.94`'s LLVM-21 `.ll` (`rustc --emit=llvm-ir`) through the parser. (CI `ci.yml`
   edits need `workflow` scope the bot lacks → manual follow-up.)
-- **Current state (branch `claude/textual-ll-reader`, PR #151).** The `ll` module compiles (fmt+clippy
-  green), wired into `lib.rs` as a **dormant** module (no behavior change — the bitcode reader is still
-  the only live path). Done so far:
-  - `ast.rs` — the type system (`Type`/`TypeRef`/`Types` interner/`Typed`), constants (with the `u128`
-    I14 fix), operands, predicates, module structure, and a **seed** of the `Instruction`/`Terminator`
-    enums (binary ops + `ret`/`br`/`condbr`/`unreachable`).
+- **Current state (branch `claude/ll-translator-swap`, off latest `main`).** The lexer + parser-core-slice
+  landed via PR #151 (merged to `main`); this branch carries the AST expansion on top. The `ll` module
+  compiles (fmt+clippy green), wired into `lib.rs` as a **dormant** module (no behavior change — the
+  bitcode reader is still the only live path). Done so far:
+  - `ast.rs` — **the data model + type system are now complete** (the swap prerequisite, "until the AST
+    enums are complete"). The full **`Instruction`** set (all 48 LLVM-18 variants), the full
+    **`Terminator`** set (all 12), and the **`Constant`** set incl. the const-expr ops the on-ramp folds,
+    each modeling **only the fields the translator reads** (`nuw`/`nsw`/`exact`/calling-conv/attributes
+    omitted — the consumed-subset convention, so we avoid `llvm-ir`'s attribute/CC types). The type
+    system is the **read-only** `Types` (no interning — structural `PartialEq` on `TypeRef` makes equal
+    types compare equal; constructors hand back a fresh `TypeRef`) with `type_of`/`named_struct_def`
+    (`NamedStructDef::{Opaque,Defined}`), and faithful **`Typed`** impls for `TypeRef`/`Operand`/
+    `Constant`/`ConstantRef`/`Float`/`Instruction` (the per-instruction result-type logic mirrored from
+    `llvm-ir`: binop→operand0, conversion→`to_type`, `icmp`/`fcmp`→`i1`/`<N x i1>`, `cmpxchg`→`{ty,i1}`,
+    opaque `alloca`/`gep`→`ptr`, `call`→`function_ty` result, …). Plus `Instruction::try_get_result`,
+    `Operand::as_constant`, `HasDebugLoc`, a dependency-free `Either`, and minimal `InlineAssembly`/
+    `ParameterAttribute`/`Atomicity`/`RMWBinOp`/`LandingPadClause`. The `u128` I14 fix is retained.
   - `lex.rs` — **complete**, fully unit-tested: `%`/`@`/`!` names (numbered/quoted), full-width int +
     decimal/hex float literals (kept as text, so no truncation), strings (escapes left encoded;
     `unescape` decodes), types, punctuation, attribute-group refs, debug-metadata flag-sets.
-  - `parse.rs` — **core slice done**, 4 unit tests: `define` functions over the seed AST (integer types,
-    binary ops, `ret`/`br`/`condbr`/`unreachable`, `%local`/const-int operands), skipping top-level
-    cruft (target/datalayout, attribute groups, module metadata, `declare`) via a balanced-delimiter
-    scan. The I14 fix is proven end-to-end (`full_width_i128_constant_survives` round-trips `i128::MAX`).
-    Out-of-slice constructs fail closed (clean `ParseError`).
-- **Next step (resume here): the translator type-swap (Q1b step c).** Change `lib.rs`'s
-  `use llvm_ir::…` → `use crate::ll::…`. This **will break the build** until the AST enums are complete
-  — and that's the point: the translator's pattern-matches are the exact spec, so the compile errors
-  enumerate every missing `Instruction`/`Constant`/`Terminator` variant + field. Grow `ast.rs` (and
-  `parse.rs` in lockstep) until it compiles. Reference shapes: the `llvm-ir` 0.11.3 source in the cargo
-  registry cache (`…/llvm-ir-0.11.3/src/{instruction,constant,types,terminator}.rs`) — copy the *data
-  definitions*, not the `from_llvm` FFI. It's a focused, build-red-until-done run; do it in one sitting.
+  - `parse.rs` — **core slice only** (not yet grown to the full AST), 4 unit tests: `define` functions
+    (integer types, binary ops, `ret`/`br`/`condbr`/`unreachable`, `%local`/const-int operands),
+    skipping top-level cruft (target/datalayout, attribute groups, module metadata, `declare`) via a
+    balanced-delimiter scan. The I14 fix is proven end-to-end (`full_width_i128_constant_survives`
+    round-trips `i128::MAX`). Out-of-slice constructs fail closed (clean `ParseError`).
+- **Next step (resume here): the translator type-swap (Q1b step c) + the bc→ll conversion shim.** Change
+  `lib.rs`'s `use llvm_ir::…` → `use crate::ll::…` (and the ~10 fully-qualified `llvm_ir::…` sites:
+  `constant::GetElementPtr`, `TypeRef`, `types::NamedStructDef`, `instruction::{Call,GetElementPtr,
+  RMWBinOp}`, `terminator::{Invoke,IndirectBr,Switch}` — see `grep -n llvm_ir:: src/lib.rs`). The AST is
+  now complete (above), so the translator's matches should resolve against `crate::ll`; any remaining
+  errors flag a missed field. **The newly-identified requirement:** `translate_impl` then takes a
+  `crate::ll::Module`, so the **bitcode path decouples** — `translate_bc_path` reads an `llvm_ir::Module`
+  via `from_bc_path`. Add a conversion shim `from_llvm_ir.rs` (`llvm_ir::Module` → `crate::ll::Module`,
+  a mechanical field-by-field map; `llvm-ir` stays a dev-dep) so the existing 215 bitcode tests keep
+  passing through the swapped `translate_impl` and become the parity oracle. (When `llvm-ir` is finally
+  dropped — PR4 — the shim goes with it.)
 - **Then (step c cont.):** add `translate_ll_path` (`lib.rs`: `parse_module` → `translate_impl`) +
   `assert_ll_parity(c_src)` (`tests/translate.rs`, alongside `compile_to_bc`/`check`): compile each test
-  to both `.bc` and `.ll`, translate both, assert identical svm-ir. Keep `llvm-ir` the default + dev-dep;
-  iterate to parity on the core slice, then widen (PR2: SIMD/EH/structs/i128/blockaddress; PR3: debug
-  metadata replacing `di.rs`; PR4: flip + drop `llvm-ir`/`llvm-sys`/the side-readers + the rustc-1.81 pin).
+  to both `.bc` and `.ll`, translate both, assert identical svm-ir. Grow `parse.rs` (lockstep with the
+  parity check) to the full AST. Keep `llvm-ir` the default + dev-dep; iterate to parity on the core
+  slice, then widen (PR2: SIMD/EH/structs/i128/blockaddress; PR3: debug metadata replacing `di.rs`; PR4:
+  flip + drop `llvm-ir`/`llvm-sys`/the side-readers + the rustc-1.81 pin).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
