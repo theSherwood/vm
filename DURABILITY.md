@@ -868,11 +868,17 @@ a **post-thaw spawn** reuses a recycled gap instead of colliding with a re-attac
 context). A full *behavioral* post-thaw-spawn collision test is timing-dependent (the re-attached child must
 still be live when the new spawn lands), so the allocator unit test covers the gap deterministically instead.
 
-*Remaining follow-up.* A byte-identical **canonical re-freeze** check through the snapshot codec (§12.6, an
-`svm-snapshot` roundtrip with a recycled artifact) and optionally fuzzing the spawn/join/freeze interleaving.
-*Interp note:* recycling is done interp-side, but the interp has no async concurrent STW (single-worker;
-`arm_freeze_after` flips only the running vCPU's word), so the recycled-context-at-freeze stays a **JIT**
-slice; the interp path is unaffected.
+*Codec follow-up — landed.* The recycled artifact now round-trips through the **svm-snapshot §12 codec**:
+`recycled_context_artifact_canonical_re_freeze_through_the_codec` (`durable_concurrent_jit`) drives the *same*
+real concurrent-freeze residue (B frozen + A completed, A's context recycled) through serialize → restore →
+re-serialize and asserts the **§12.6 invariant 1 (canonical re-freeze) is byte-identical** — the recycled vCPU
+residue (`completed_result` included) and the sparse window image (recycled regions zero-elided) survive intact.
+Since the codec is `svm_interp::Host`-based and the interp can't *produce* a recycled residue (single-worker, so
+`completed_result` is always `None`), the test bridges the JIT residue (field-identical mirror types) into a
+fresh codec-ready host granting only the durable clock (the harness's signalling host-fn is non-durable, which
+the codec rightly refuses). *Interp note:* recycling is done interp-side, but the interp has no async concurrent
+STW (single-worker; `arm_freeze_after` flips only the running vCPU's word), so the recycled-context-at-freeze
+stays a **JIT** slice; the interp path is unaffected. *Still optional:* fuzzing the spawn/join/freeze interleaving.
 
 Remaining for 3.2: **nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and
 **JIT multi-vCPU parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze —
