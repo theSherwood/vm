@@ -4016,6 +4016,63 @@ int main() {
     check_cpp_eh_vs_native("cpp_eh_catch_by_value_dtor", src, b"");
 }
 
+/// **C++ exceptions — polymorphic catch** — a `catch (Base&)` must catch a thrown `Derived` (the
+/// Itanium `__do_catch` subtype walk), not just an exact-type match. A 3-level hierarchy
+/// `Derived : Mid : Base` is thrown at every level, plus an unrelated class and a primitive. Two
+/// handlers probe the relation: `catch (Base&)` matches all three classes (each *is-a* `Base`) but not
+/// the unrelated/`int` throws; `catch (Mid&)` matches `Derived`/`Mid` but **not** `Base` (a base is
+/// *not* a derived). The on-ramp drives this off the typeinfo base-chains parsed from the bitcode, so
+/// `llvm.eh.typeid.for`'s compare means "thrown is-a clause". Byte-identical to native `clang++`.
+#[test]
+fn cpp_eh_polymorphic_catch() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct Base { int tag; Base(int t) : tag(t) {} };
+struct Mid : Base { Mid(int t) : Base(t) {} };
+struct Derived : Mid { Derived(int t) : Mid(t) {} };
+struct Other { int x; };
+
+__attribute__((noinline)) static void raise(int which) {
+  if (which == 0) throw Derived(10);
+  if (which == 1) throw Mid(20);
+  if (which == 2) throw Base(30);
+  if (which == 3) throw Other{40};
+  if (which == 4) throw 99;
+}
+
+// Base& catches anything is-a Base (Derived, Mid, Base); Other and int fall to the catch-all.
+static int catch_base(int which) {
+  try { raise(which); }
+  catch (Base &b) { return 100 + b.tag; }
+  catch (...)     { return 999; }
+}
+
+// Mid& catches Derived and Mid, but NOT Base (a base is not a derived); others fall to the catch-all.
+static int catch_mid(int which) {
+  try { raise(which); }
+  catch (Mid &m) { return 200 + m.tag; }
+  catch (...)    { return 888; }
+}
+
+int main() {
+  for (int i = 0; i <= 4; i++) puti(catch_base(i));   // 110 120 130 999 999
+  for (int i = 0; i <= 4; i++) puti(catch_mid(i));    // 210 220 888 888 888
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_polymorphic_catch", src, b"");
+}
+
 /// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common
 /// polymorphic base; a loop sums their areas through a base pointer (a virtual call per element →
 /// a vtable load + `call_indirect`), and the total is printed. Exercises vtables (function-pointer
