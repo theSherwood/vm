@@ -11,6 +11,14 @@
 //! is `clang -O2`; the SVM rows compile the same wrapper with `clang -O2 -emit-llvm`, translate, and
 //! run on tree-walk/bytecode/JIT. Every engine's `verify` must equal native's (1 = matched Embench's
 //! expected output) — so this is a benchmark *and* a whole-stack differential on real third-party code.
+//!
+//! **Cross-engine (svm-jit vs V8 vs Wasmtime).** The headline `svm-jit` ratio is reported alongside two
+//! external JITs running the *same* kernel: each wrapper also compiles to a self-contained **wasm32**
+//! module (`run` export, no imports — via the freestanding shim in `bench/embench/wasm/`, `-mbulk-memory`
+//! so memcpy/memset are wasm instructions, `--gc-sections` to drop dead `printf`/libc), timed on **V8**
+//! (Node, `bench/embench/wasm/run.mjs`) and **Wasmtime** (in-process Cranelift — the same backend
+//! svm-jit uses — via `bench/cross-engine/wasmtime-rs`'s `embench_one` bin). Both are optional: a missing
+//! `node`/runner just leaves that column blank. All engines' `verify` is still checked against native.
 
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -138,11 +146,42 @@ fn main() {
     let support = format!("{embench}/support");
     let dir = std::env::temp_dir();
 
+    // Cross-engine setup: each kernel also compiles to a self-contained wasm32 module (`run` export, no
+    // imports — see bench/embench/wasm/) timed on V8 (Node) and on in-process Wasmtime (Cranelift, the
+    // same backend svm-jit uses). Both are optional: a missing tool just leaves that column blank.
+    let wasm_dir = root.join("bench/embench/wasm");
+    let run_mjs = wasm_dir.join("run.mjs");
+    let have_node = Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let wt_manifest = root.join("bench/cross-engine/wasmtime-rs/Cargo.toml");
+    let wt_bin = root.join("bench/cross-engine/wasmtime-rs/target/release/embench_one");
+    if !wt_bin.exists() {
+        // Build the in-process Wasmtime runner once (reuses the cached Wasmtime build under bench/).
+        let _ = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--bin",
+                "embench_one",
+                "--manifest-path",
+            ])
+            .arg(&wt_manifest)
+            .status();
+    }
+    let have_wt = wt_bin.exists();
+
     println!(
-        "{:<16} {:>12} {:>12} {:>8}   correctness",
-        "benchmark", "native(ns)", "svm-jit(ns)", "ratio"
+        "{:<16} {:>11} {:>9} {:>9} {:>9}   correctness   (×native)",
+        "benchmark", "native(ns)", "svm-jit", "v8", "wasmtime"
     );
-    let mut ratios = Vec::new();
+    // Per-engine perf ratios vs native (geomean at the end). svm-jit always present; v8/wasmtime only
+    // for kernels whose wasm built and whose runner is available.
+    let mut jit_ratios = Vec::new();
+    let mut v8_ratios = Vec::new();
+    let mut wt_ratios = Vec::new();
     for bench in BENCHES {
         let &Bench {
             name,
@@ -276,45 +315,131 @@ fn main() {
             svm_jit::JitOutcome::Returned(v) => v[0],
             o => panic!("jit: {o:?}"),
         };
-        let ok = nat_chk == 1 && tw == nat_chk && bcv == nat_chk && jitv == nat_chk;
+        // wasm32 build (shared shim) for the V8 + Wasmtime rows. Same kernel flags as the native/SVM
+        // builds via `common`; adds the freestanding-wasm shim + bulk-memory (memcpy/memset → wasm
+        // instructions) and exports only `run` (so dead `printf`/`main`/libc references get DCE'd).
+        let wasm = dir.join(format!("emb_{name}.wasm"));
+        let mut wc = Command::new("clang");
+        common(&mut wc);
+        wc.args([
+            "--target=wasm32",
+            "-msimd128",
+            "-mbulk-memory",
+            "-DSVM_BUILD",
+            "-fno-builtin-memcmp",
+            "-fno-builtin-bcmp",
+            "-fno-builtin-strlen",
+            "-fno-builtin-strchr",
+            "-fno-builtin-strcmp",
+            "-nostdlib",
+            "-Wl,--no-entry",
+            "-Wl,--export=run",
+            "-Wl,--gc-sections",
+        ])
+        .arg("-include")
+        .arg(wasm_dir.join("defs.h"))
+        .arg("-isystem")
+        .arg(wasm_dir.join("include"))
+        .arg(&wrapper)
+        .arg("-o")
+        .arg(&wasm)
+        .stderr(std::process::Stdio::null());
+        let wasm_ok = wc.status().map(|s| s.success()).unwrap_or(false);
+        let v8 = if wasm_ok && have_node {
+            time_wasm(Command::new("node").arg(&run_mjs), &wasm, large)
+        } else {
+            None
+        };
+        let wt = if wasm_ok && have_wt {
+            time_wasm(&mut Command::new(&wt_bin), &wasm, large)
+        } else {
+            None
+        };
 
-        // Backstop: a runtime miscompile is reported but **excluded from the perf geomean** — a wrong
-        // answer has no meaningful speed. (`edn` now translates *and* verifies correct across all three
-        // engines — the ISSUES.md I13 `<2 x i16>`/`<2 x i32>` lane-arithmetic miscompile is fixed — so it
-        // no longer trips this; the branch remains as a guard against any future translate-but-miscompile
-        // kernel.)
+        // Correctness: every engine that ran must match native's verify=1 (1 = Embench-correct). An
+        // absent wasm engine (no tool / build) doesn't gate; one that ran and disagrees does. (`edn`'s
+        // old I13 lane-arithmetic miscompile is fixed; this stays a guard against any future regression.)
+        let wasm_bad = v8.is_some_and(|(_, c)| c != 1) || wt.is_some_and(|(_, c)| c != 1);
+        let ok = nat_chk == 1 && tw == nat_chk && bcv == nat_chk && jitv == nat_chk && !wasm_bad;
         if !ok {
             println!(
-                "{name:<16} {nat_ns:>12.1} {:>12}   {:>7}   MISCOMPILE (excluded) nat={nat_chk} tw={tw} bc={bcv} jit={jitv} — see ISSUES.md I13",
-                "—", "—"
+                "{name:<16} {nat_ns:>11.1} {:>9} {:>9} {:>9}   MISCOMPILE nat={nat_chk} tw={tw} bc={bcv} jit={jitv} v8={} wt={}",
+                "—",
+                "—",
+                "—",
+                v8.map_or(-1, |(_, c)| c),
+                wt.map_or(-1, |(_, c)| c),
             );
             continue;
         }
 
-        // JIT per-iter timing (native + jit, the comparability headline).
+        // JIT per-iter timing (the comparability headline).
         let jit_ns = per_iter(large, |n| {
             black_box(svm_jit::compile_and_run(&t.module, e, &[sp, n]).unwrap());
         });
+        jit_ratios.push((name, jit_ns / nat_ns));
+        if let Some((ns, _)) = v8 {
+            v8_ratios.push((name, ns / nat_ns));
+        }
+        if let Some((ns, _)) = wt {
+            wt_ratios.push((name, ns / nat_ns));
+        }
+        let ratio = |x: Option<(f64, i64)>| {
+            x.map_or_else(|| "—".to_string(), |(ns, _)| format!("{:.2}x", ns / nat_ns))
+        };
+        println!(
+            "{name:<16} {nat_ns:>11.1} {:>9} {:>9} {:>9}   OK (verify=1)",
+            format!("{:.2}x", jit_ns / nat_ns),
+            ratio(v8),
+            ratio(wt),
+        );
+    }
+    let geomean =
+        |rs: &[(&str, f64)]| (rs.iter().map(|(_, r)| r.ln()).sum::<f64>() / rs.len() as f64).exp();
+    if !jit_ratios.is_empty() {
+        println!("\nvs native `clang -O2`, geomean over the kernels each engine ran:");
+        println!(
+            "  svm-jit   {:.2}x   ({} kernels)",
+            geomean(&jit_ratios),
+            jit_ratios.len()
+        );
+        if !v8_ratios.is_empty() {
+            println!(
+                "  v8        {:.2}x   ({} kernels)",
+                geomean(&v8_ratios),
+                v8_ratios.len()
+            );
+        }
+        if !wt_ratios.is_empty() {
+            println!(
+                "  wasmtime  {:.2}x   ({} kernels)",
+                geomean(&wt_ratios),
+                wt_ratios.len()
+            );
+        }
+    }
+}
 
-        ratios.push((name, jit_ns / nat_ns));
-        println!(
-            "{name:<16} {nat_ns:>12.1} {jit_ns:>12.1} {:>7.2}x   OK (all engines = native, verify=1)",
-            jit_ns / nat_ns,
-        );
+/// Run a wasm timing runner (`<cmd> [prefix args…] <wasm> <small> <large> <verify_n>`) and parse its
+/// two stdout lines into `(per_iter_ns, verify)`. `None` if the tool is missing, errors, or its output
+/// doesn't parse — the caller then leaves that engine's column blank for the kernel.
+fn time_wasm(cmd: &mut Command, wasm: &std::path::Path, large: i64) -> Option<(f64, i64)> {
+    let out = cmd
+        .arg(wasm)
+        .arg(SMALL.to_string())
+        .arg(large.to_string())
+        .arg(VERIFY_N.to_string())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    if !ratios.is_empty() {
-        let geo = (ratios.iter().map(|(_, r)| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
-        let worst = ratios
-            .iter()
-            .cloned()
-            .fold(("", 0f64), |a, b| if b.1 > a.1 { b } else { a });
-        println!(
-            "\nsvm-jit vs native over {} Embench-IoT kernels: geomean {geo:.2}x | worst {} {:.2}x",
-            ratios.len(),
-            worst.0,
-            worst.1
-        );
-    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.lines();
+    let ns = it.next()?.trim().parse::<f64>().ok()?;
+    let chk = it.next()?.trim().parse::<i64>().ok()?;
+    Some((ns, chk))
 }
 
 fn per_iter(large: i64, run_one: impl Fn(i64)) -> f64 {
