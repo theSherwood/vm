@@ -299,6 +299,9 @@ fn translate_impl(
     let need_strcmp = calls_external(m, &defined_names, "strcmp")
         || calls_external(m, &defined_names, "strcoll");
     let need_strchr = calls_external(m, &defined_names, "strchr");
+    let need_strcpy = calls_external(m, &defined_names, "strcpy");
+    let need_strspn = calls_external(m, &defined_names, "strspn");
+    let need_strpbrk = calls_external(m, &defined_names, "strpbrk");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -490,6 +493,9 @@ fn translate_impl(
         // The libc string batch — appended last; the matching `funcs.push` order below mirrors this.
         strcmp: take(need_strcmp),
         strchr: take(need_strchr),
+        strcpy: take(need_strcpy),
+        strspn: take(need_strspn),
+        strpbrk: take(need_strpbrk),
         float_scratch: float_scratch_base,
         ctype_b_loc: ctype.b_loc,
         ctype_tolower_loc: ctype.tolower_loc,
@@ -722,6 +728,15 @@ fn translate_impl(
     }
     if need_strchr {
         funcs.push(synth_strchr());
+    }
+    if need_strcpy {
+        funcs.push(synth_strcpy());
+    }
+    if need_strspn {
+        funcs.push(synth_strspn());
+    }
+    if need_strpbrk {
+        funcs.push(synth_strpbrk());
     }
     Ok(Translated {
         module: Module {
@@ -3418,6 +3433,12 @@ struct Helpers {
     /// `__svm_strchr(s:i64, c:i32) -> i64` — first `(unsigned char)c` in `s`, or NULL (`c==0` → the
     /// terminating NUL). Backs `strchr`.
     strchr: Option<u32>,
+    /// `__svm_strcpy(dst:i64, src:i64) -> i64` — copy `src` (incl. NUL) to `dst`, return `dst`.
+    strcpy: Option<u32>,
+    /// `__svm_strspn(s:i64, set:i64) -> i64` — length of the initial run of `s` within `set`.
+    strspn: Option<u32>,
+    /// `__svm_strpbrk(s:i64, set:i64) -> i64` — first byte of `s` that is in `set`, or NULL.
+    strpbrk: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
@@ -4931,6 +4952,334 @@ fn synth_strchr() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, lp, finish],
+    }
+}
+
+/// Synthesize `__svm_strcpy(dst:i64, src:i64) -> i64` — copy the NUL-terminated string `src` into
+/// `dst` (including the terminator) and return the original `dst`. No overlap handling (C `strcpy`).
+fn synth_strcpy() -> Func {
+    use svm_ir::{LoadOp, StoreOp};
+    let params = vec![ValType::I64, ValType::I64]; // dst, src
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 0], // loop(dst, src, orig=dst)
+        },
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64], // d, s, orig
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 1,
+                offset: 0,
+                align: 0,
+            }, // v3 = c = *s
+            Inst::Store {
+                op: StoreOp::I32_8,
+                addr: 0,
+                value: 3,
+                offset: 0,
+                align: 0,
+            }, // *d = c   (void — no value index)
+            Inst::ConstI32(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 4,
+            }, // v5 = c == 0
+            Inst::ConstI64(1), // v6
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 6,
+            }, // v7 = d + 1
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 6,
+            }, // v8 = s + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 2,
+            then_args: vec![2], // done(orig)
+            else_blk: 1,
+            else_args: vec![7, 8, 2], // loop(d+1, s+1, orig)
+        },
+    };
+    let done = Block {
+        params: vec![ValType::I64], // orig
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_strspn(s:i64, set:i64) -> i64` — the length of the initial segment of `s`
+/// consisting entirely of bytes in the NUL-terminated `set`. An inner loop scans `set` for each
+/// byte of `s`; the first `s` byte not found in `set` ends the span.
+fn synth_strspn() -> Func {
+    use svm_ir::LoadOp;
+    let l8 = |addr: u32| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let params = vec![ValType::I64, ValType::I64]; // s, set
+    // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 0],
+        },
+    };
+    // block1 outer(p=0, set=1, s0=2)
+    let outer = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            l8(0),             // v3 = cp = *p
+            Inst::ConstI32(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 4,
+            }, // v5 = cp == 0
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 4,
+            then_args: vec![0, 2], // done(p, s0)
+            else_blk: 2,
+            else_args: vec![1, 3, 0, 1, 2], // inner(q=set, cp, p, set, s0)
+        },
+    };
+    // block2 inner(q=0, cp=1, p=2, set=3, s0=4)
+    let inner = Block {
+        params: vec![
+            ValType::I64,
+            ValType::I32,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ],
+        insts: vec![
+            l8(0),             // v5 = cq = *q
+            Inst::ConstI32(0), // v6
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 6,
+            }, // v7 = cq == 0
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 1,
+            }, // v8 = cq == cp
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: 7,
+                b: 8,
+            }, // v9 = stop
+            Inst::ConstI64(1), // v10
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 10,
+            }, // v11 = q + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 3,
+            then_args: vec![5, 1, 2, 3, 4], // inner_done(cq, cp, p, set, s0)
+            else_blk: 2,
+            else_args: vec![11, 1, 2, 3, 4], // inner(q+1, cp, p, set, s0)
+        },
+    };
+    // block3 inner_done(cq=0, cp=1, p=2, set=3, s0=4)
+    let inner_done = Block {
+        params: vec![
+            ValType::I32,
+            ValType::I32,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ],
+        insts: vec![
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 1,
+            }, // v5 = match = cq == cp
+            Inst::ConstI64(1), // v6
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 2,
+                b: 6,
+            }, // v7 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 1,
+            then_args: vec![7, 3, 4], // outer(p+1, set, s0)  — cp was in set
+            else_blk: 4,
+            else_args: vec![2, 4], // done(p, s0)  — cp not in set
+        },
+    };
+    // block4 done(p=0, s0=1)
+    let done = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Sub,
+            a: 0,
+            b: 1,
+        }], // v2 = p - s0
+        term: Terminator::Return(vec![2]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, outer, inner, inner_done, done],
+    }
+}
+
+/// Synthesize `__svm_strpbrk(s:i64, set:i64) -> i64` — a pointer to the first byte of `s` that is in
+/// the NUL-terminated `set`, or NULL if none. An inner loop scans `set` for each byte of `s`.
+fn synth_strpbrk() -> Func {
+    use svm_ir::LoadOp;
+    let l8 = |addr: u32| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let params = vec![ValType::I64, ValType::I64]; // s, set
+    // block0 entry(s=0, set=1): outer(p=s, set)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1],
+        },
+    };
+    // block1 outer(p=0, set=1)
+    let outer = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            l8(0),             // v2 = cp = *p
+            Inst::ConstI32(0), // v3
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 3,
+            }, // v4 = cp == 0
+        ],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 5,
+            then_args: vec![], // retnull
+            else_blk: 2,
+            else_args: vec![1, 2, 0, 1], // inner(q=set, cp, p, set)
+        },
+    };
+    // block2 inner(q=0, cp=1, p=2, set=3)
+    let inner = Block {
+        params: vec![ValType::I64, ValType::I32, ValType::I64, ValType::I64],
+        insts: vec![
+            l8(0),             // v4 = cq = *q
+            Inst::ConstI32(0), // v5
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 4,
+                b: 5,
+            }, // v6 = qz = cq == 0
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 4,
+                b: 1,
+            }, // v7 = match = cq == cp
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: 6,
+                b: 7,
+            }, // v8 = stop
+            Inst::ConstI64(1), // v9
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 9,
+            }, // v10 = q + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 3,
+            then_args: vec![7, 2, 3], // inner_done(match, p, set)
+            else_blk: 2,
+            else_args: vec![10, 1, 2, 3], // inner(q+1, cp, p, set)
+        },
+    };
+    // block3 inner_done(match=0, p=1, set=2)
+    let inner_done = Block {
+        params: vec![ValType::I32, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(1), // v3
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 3,
+            }, // v4 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 0,
+            then_blk: 4,
+            then_args: vec![1], // found(p)
+            else_blk: 1,
+            else_args: vec![4, 2], // outer(p+1, set)
+        },
+    };
+    // block4 found(p=0)
+    let found = Block {
+        params: vec![ValType::I64],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    // block5 retnull()
+    let retnull = Block {
+        params: vec![],
+        insts: vec![Inst::ConstI64(0)], // v0
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, outer, inner, inner_done, found, retnull],
     }
 }
 
@@ -9694,6 +10043,47 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `strcpy(dst, src)`: the synthesized `__svm_strcpy` copy loop → `dst`.
+        "strcpy" => {
+            let Some(f) = ctx.helpers.strcpy else {
+                return Ok(false);
+            };
+            let d = ctx.operand(&c.arguments[0].0)?;
+            let s = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![d, s],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strspn(s, set)` / `strpbrk(s, set)`: the synthesized nested-scan helpers.
+        "strspn" => {
+            let Some(f) = ctx.helpers.strspn else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let set = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, set],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "strpbrk" => {
+            let Some(f) = ctx.helpers.strpbrk else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let set = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, set],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // `memchr(s, c, n)`: the synthesized `__svm_memchr` byte scan → pointer or NULL.
         "memchr" => {
             let Some(f) = ctx.helpers.memchr else {
@@ -13664,11 +14054,13 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 return Ok(());
             }
         }
-        // A call to a Rust panic/abort lang item (`-C panic=abort`) lowers to a trap: drop the call —
-        // it is `noreturn` and LLVM always follows it with `unreachable`, which the on-ramp traps on
-        // (§3b/§5). This is what lets real Rust, with its non-elidable panic paths, translate.
+        // A call to a Rust panic/abort lang item (`-C panic=abort`) — or the C library `abort()` —
+        // lowers to a trap: drop the call, since it is `noreturn` and LLVM always follows it with
+        // `unreachable`, which the on-ramp traps on (§3b/§5). This is what lets real Rust (non-elidable
+        // panic paths) and C programs (`abort`/`assert` failure paths, e.g. Lua's `lua_assert`)
+        // translate. Gated external so a guest-defined `abort` shadows it.
         if let Some(name) = callee_name(c) {
-            if !ctx.name2idx.contains_key(&name) && is_rust_abort_call(&name) {
+            if !ctx.name2idx.contains_key(&name) && (is_rust_abort_call(&name) || name == "abort") {
                 return Ok(());
             }
         }

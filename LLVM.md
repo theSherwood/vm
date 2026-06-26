@@ -1195,14 +1195,16 @@ externals + 4 defined-varargs functions** — the true first-light surface.
 3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
    decimal→`f64` (the parse direction of the existing Ryū/Dragon dtoa). Reachable.
 4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
-   `memcmp`/`strlen`). **Started (slice 2):** `strcmp` + `strchr` synthesized as `__svm_strcmp` /
-   `__svm_strchr` byte loops, `strcoll`→`strcmp` (C locale = byte compare) — tests
-   `libc_strcmp_strchr_strcoll`, all three engines == native. **Remaining:** `strcpy` `strpbrk`
-   `strspn` (more byte loops), `fmod` `pow` `frexp` `ldexp` (float math — `frexp`/`ldexp` are exact
-   bit ops; `fmod`/`pow` need careful IEEE-exact synthesis — no `frem` op exists), `localeconv` (a
-   static C-locale struct: `decimal_point="."`), `__errno_location` (a fixed window slot — `strtod`
-   sets `ERANGE`), `abort`→trap, `time`→stub/`Clock` cap (RNG seed in `lstate` `makeseed`). Already
-   covered: `_setjmp`/`longjmp`, `free`(no-op), `realloc`, `bcmp`→`memcmp`, `strlen`.
+   `memcmp`/`strlen`). **Done (slice 2):** `strcmp`/`strchr`/`strcoll`(→`strcmp`),
+   `strcpy`/`strspn`/`strpbrk` — synthesized `__svm_*` byte loops (the nested-scan pair for
+   span/break); `abort`→trap (dropped like the Rust panic lang-items — the following `unreachable`
+   traps). Tests `libc_strcmp_strchr_strcoll`, `libc_strcpy_strspn_strpbrk`, `libc_abort_translates`
+   — all three engines == native, with `volatile`-loaded operands so clang `-O2` keeps the calls.
+   **Remaining:** `fmod` `pow` `frexp` `ldexp` (float math — `frexp`/`ldexp` are exact bit ops;
+   `fmod`/`pow` need careful IEEE-exact synthesis — no `frem` op exists), `localeconv` (a static
+   C-locale struct: `decimal_point="."`), `__errno_location` (a fixed window slot — `strtod` sets
+   `ERANGE`), `time`→stub/`Clock` cap (RNG seed in `lstate` `makeseed`). Already covered:
+   `_setjmp`/`longjmp`, `free`(no-op), `realloc`, `bcmp`→`memcmp`, `strlen`.
 
 **Sequencing:** (slice 1 — **DONE**) varargs ABI + standalone differential tests; (slice 2 — in
 progress) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test

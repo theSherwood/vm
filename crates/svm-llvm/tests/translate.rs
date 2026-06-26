@@ -1888,6 +1888,47 @@ fn libc_strcmp_strchr_strcoll() {
 }
 
 #[test]
+fn libc_strcpy_strspn_strpbrk() {
+    // The synthesized `__svm_strcpy` (copy loop) and the nested-scan `__svm_strspn` / `__svm_strpbrk`.
+    // `volatile`-loaded operands keep the calls past `-O2`. Over "12.5e3xy": strspn vs the digit set
+    // is 2 ("12"), strpbrk vs "ex" lands on the 'e' at index 4, and the strcpy round-trips (checked
+    // via the strcmp helper). Three predicate bits → a byte, matching native cc on all three engines.
+    let src = "#include <string.h>\n\
+        int run(int seed){\n\
+          const char *volatile pv = \"12.5e3xy\";\n\
+          const char *s = pv;\n\
+          const char *volatile setv = \"0123456789\";\n\
+          const char *digits = setv;\n\
+          char buf[16];\n\
+          strcpy(buf, s);\n\
+          unsigned long n = strspn(s, digits);\n\
+          const char *p = strpbrk(s, \"ex\");\n\
+          int acc = 0;\n\
+          acc += (strcmp(buf, s) == 0) ? 1 : 0;\n\
+          acc += (n == 2) ? 2 : 0;\n\
+          acc += (p == s + 4) ? 4 : 0;\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_strcpy_strspn_strpbrk", src, 0);
+}
+
+#[test]
+fn libc_abort_translates() {
+    // C `abort()` on an unexecuted error path: it must *translate* (drop → the following `unreachable`
+    // traps) even though the clean run never reaches it. `seed` is a runtime parameter, so clang keeps
+    // the `abort` call. The taken path returns 7 == native.
+    let src = "#include <stdlib.h>\n\
+        int run(int seed){\n\
+          int x = seed + 7;\n\
+          if (x < 0) abort();\n\
+          return x & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_abort", src, 0);
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
