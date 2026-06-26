@@ -2328,9 +2328,23 @@ impl CompiledModule {
                 srcloc_map.as_ref(),
                 var_labels,
             )?;
+            // Optional codegen dump for performance work: `SVM_JIT_DUMP_CLIF=1` prints each function's
+            // CLIF and (post-compile) the Cranelift VCODE disassembly to stderr. A pure diagnostic — no
+            // effect unless the env var is set; used to compare svm-jit's generated code against other
+            // backends (e.g. the Embench cross-engine bench).
+            let dump_codegen = std::env::var_os("SVM_JIT_DUMP_CLIF").is_some();
+            if dump_codegen {
+                eprintln!("=== SVM-JIT CLIF fn{fi} ===\n{}", ctx.func.display());
+                ctx.set_disasm(true);
+            }
             module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            if dump_codegen {
+                if let Some(d) = ctx.compiled_code().and_then(|c| c.vcode.as_ref()) {
+                    eprintln!("=== SVM-JIT VCODE fn{fi} ===\n{d}");
+                }
+            }
             base_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
             if srcloc_map.is_some() {
                 if let Some(cc) = ctx.compiled_code() {
