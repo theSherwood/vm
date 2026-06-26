@@ -269,3 +269,33 @@ jobs:
           # The fiber scheduler intentionally leaks values on a dropped-suspended fiber's stack, so
           # keep leak detection off and check UB/use-after-return/red-zones only (matches the asan lane).
           ASAN_OPTIONS: "detect_leaks=0"
+
+  browser-real:
+    name: real-browser (Chromium via Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      # Playwright + Chromium aren't preinstalled on the runner (unlike Node); install both.
+      - name: Install Playwright + Chromium
+        working-directory: browser
+        run: |
+          npm install playwright@1.56.1
+          npx playwright install --with-deps chromium
+      # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
+      # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
+      - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)
+        working-directory: browser
+        run: |
+          cargo run --bin gencorpus
+          RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
+            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
+            -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
+            -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
+            -Clink-arg=--export=__wasm_init_tls" \
+            cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+          node browser-test.mjs
+

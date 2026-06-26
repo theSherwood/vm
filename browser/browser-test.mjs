@@ -16,11 +16,28 @@ import { dirname, join } from 'node:path';
 import { startServer } from './serve.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-// Playwright is globally installed in this environment (not in node_modules); import by absolute path.
-const { chromium } = (await import('/opt/node22/lib/node_modules/playwright/index.js')).default;
+
+// Resolve Playwright's `chromium` portably: a normal `playwright` resolution (CI installs it locally /
+// `npm i playwright`), falling back to this environment's global install by absolute path.
+async function loadChromium() {
+  const specs = ['playwright', '/opt/node22/lib/node_modules/playwright/index.js'];
+  for (const spec of specs) {
+    try {
+      const m = await import(spec);
+      const chromium = m.chromium ?? m.default?.chromium;
+      if (chromium) return chromium;
+    } catch {
+      /* try the next resolution */
+    }
+  }
+  throw new Error("playwright not found — run `npm i playwright && npx playwright install chromium`");
+}
+const chromium = await loadChromium();
 
 const { server, port } = await startServer(ROOT);
-const browser = await chromium.launch(); // uses the preinstalled Chromium (PLAYWRIGHT_BROWSERS_PATH)
+// `--no-sandbox` only under CI (GitHub sets `CI`): the OS process sandbox is unrelated to what we test
+// (cross-origin isolation / SharedArrayBuffer), and CI runners often can't enable it. Local stays sandboxed.
+const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] : [] });
 let failed = false;
 try {
   const page = await browser.newPage();
