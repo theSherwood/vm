@@ -1660,9 +1660,43 @@ dependency entirely** (the reason `svm-llvm` is excluded from the workspace).
   ongoing** for version bumps. By horizon: stay on LLVM 18 → forking is cheaper; track current Rust/clang
   long-term → the textual reader wins (and `llvm-ir` may not even support the version you need).
 
-**Not urgent.** The LLVM-18 pins + the I14 fail-closed guard are sufficient today (the on-ramp is a
-dev/frontend tool, off the runtime path). The **trigger** to build the textual reader is the on-ramp
-needing to ingest a toolchain newer than `llvm-ir` supports; this note is the standing rationale.
+**Status: IN PROGRESS** (decided to build it now — `llvm-ir` kept biting, both on constants and the
+version ceiling). See the handoff block below for the plan + current state.
+
+**Q1b — Textual `.ll` reader: migration plan & handoff.** Replacing the `llvm-ir`/libLLVM binding
+with a dependency-free textual-`.ll` reader. Approach, validation, and the staged sequence:
+
+- **Approach.** Keep the ~17k-line translator (`lib.rs`) unchanged; replace *only* the input layer.
+  A new `crates/svm-llvm/src/ll/` module: `ast.rs` mirrors the slice of `llvm-ir`'s data model the
+  translator consumes (same variant/field names, same `get_type`/`try_get_result`/`named_struct_def`
+  methods) but **owned by us** — no FFI, no version lock — with the **I14 fix baked in** (`Constant::Int`
+  is a full `u128`). `lex.rs` tokenizes; `parse.rs` is a recursive-descent reader → `ast::Module`. The
+  translator's `use llvm_ir::…` becomes `use crate::ll::…` (mechanical). One text pass also absorbs
+  what `di.rs`/`blockaddr.rs`/`wideint.rs` re-walk today (4 libLLVM parses → 1, no libLLVM link).
+- **Validation oracle = `llvm-ir` itself.** A differential parity check (`assert_ll_parity`): compile
+  each test to *both* `.bc` and `.ll`, translate both, assert identical svm-ir. Keep `llvm-ir` as a
+  dev-dep until parity holds across the corpus; only then flip the default and drop it. The existing
+  215-test suite + this parity check are the regression gate. The translator's matches are the exact
+  spec — complete the `Instruction`/`Constant`/`Terminator` enums by compiling `lib.rs` against `crate::ll`.
+- **Staging (≈4 PRs).** (1) AST + lexer + core parser + parity harness, no flip. (2) widen to full
+  non-`-g` parity (SIMD/AVX, C++ EH, structs, i128, blockaddress — the last two come free in text).
+  (3) debug-info metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing
+  `di.rs` — the hardest, separable slice (the 6 `-g` tests + the DAP test). (4) flip + drop `llvm-ir`/
+  `llvm-sys`/`di.rs`/`blockaddr.rs`/`wideint.rs` + the rustc-1.81 pin; prove version-tolerance *here*
+  by feeding `rustc 1.94`'s LLVM-21 `.ll` (`rustc --emit=llvm-ir`) through the parser. (CI `ci.yml`
+  edits need `workflow` scope the bot lacks → manual follow-up.)
+- **Current state (this branch, `claude/charming-johnson-pmlsnr`).** PR1 *foundation* committed: the
+  `ll` module compiles (fmt+clippy green), wired into `lib.rs` as a **dormant** module (no behavior
+  change). `ast.rs` has the type system (`Type`/`TypeRef`/`Types` interner/`Typed`), constants (with
+  the `u128` fix), operands, predicates, module structure, and a *seed* of the instruction/terminator
+  enums. `lex.rs`/`parse.rs` are stubbed (token set + entry points only).
+- **Next steps, in order.** (a) implement `lex::lex` (names `%`/`@`/`!`, full-width int/float literals,
+  types, strings, punctuation). (b) implement `parse::parse_module` simplest-first; grow the AST enums
+  by compiling `lib.rs` against `crate::ll`. (c) add `translate_ll_path` (`lib.rs`) + `assert_ll_parity`
+  (`tests/translate.rs`, alongside `compile_to_bc`/`check`); iterate to parity on a representative slice,
+  then widen. Reference shapes: the `llvm-ir` 0.11.3 source in the cargo registry cache
+  (`…/llvm-ir-0.11.3/src/{instruction,constant,types,terminator}.rs`) — copy the *data definitions*, not
+  the `from_llvm` FFI.
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
