@@ -22,6 +22,32 @@ fn load(src: &str) -> Module {
 }
 
 #[test]
+fn entry_points_reject_unverified_modules_fail_closed() {
+    // A module that parses but fails verification: an `i64.load` with no declared `memory`
+    // (`MemoryNotDeclared`). The library run entry points re-verify internally, so an embedder that
+    // skips `verify_module` cannot bypass the §2a escape gate — both must fail closed, not run it.
+    let m = parse_module(
+        "func () -> (i64) {\n\
+         block0():\n\
+         \x20 v0 = i64.const 0\n\
+         \x20 v1 = i64.load v0\n\
+         \x20 return v1\n\
+         }\n",
+    )
+    .expect("parse");
+    assert!(
+        verify_module(&m).is_err(),
+        "module must be genuinely invalid"
+    );
+
+    let err = run_kernel(&m, &[]).expect_err("run_kernel must reject an unverified module");
+    assert!(err.contains("verification failed"), "run_kernel: {err}");
+
+    let err = run_powerbox(&m, b"").expect_err("run_powerbox must reject an unverified module");
+    assert!(err.contains("verification failed"), "run_powerbox: {err}");
+}
+
+#[test]
 fn writes_to_stdout_and_returns() {
     // A powerbox program: write "hi\n" to stdout (Stream cap, type 0 op 1) on the granted
     // stdout handle (v0), then return 7.

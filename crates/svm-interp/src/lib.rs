@@ -8585,6 +8585,18 @@ struct Slot {
 const CAP_LOG2: u32 = 8;
 const CAP: usize = 1 << CAP_LOG2;
 
+/// Bits the packed handle carries for the generation counter: the 32-bit `i32`/`u32` handle minus
+/// the `CAP_LOG2` slot bits. `Slot::generation` is a full `u32`, so it is compared **masked to
+/// these bits** (`GEN_MASK`) — otherwise, once the counter passed `2^GEN_BITS` regrants of one slot
+/// the full-width `generation` could no longer equal the truncated value carried in any handle, and
+/// the slot died permanently (a single-slot, fail-closed DoS — reachable via a `Jit.compile`→`release`
+/// loop). Masking lets the slot recycle cleanly on wrap. ABA resistance is `2^GEN_BITS` (~16M)
+/// regrants of one slot; a stale handle that aliased after a full wrap is still inert — it re-selects
+/// one of *this domain's own* current grants, re-checked by `type_id` at the call (D37) — so this is
+/// not an authority escape, only the documented "a forged index is inert" property.
+const GEN_BITS: u32 = 32 - CAP_LOG2;
+const GEN_MASK: u32 = (1u32 << GEN_BITS) - 1;
+
 /// Worker-thread count of the host **bounded blocking-offload pool** (§12 "Keeping cores busy under
 /// blocking", path 2 — the io_uring increment-2 path). At most this many *blocking* SQEs run
 /// concurrently; the `(K+1)`th queues — so the OS-thread cost of a `submit` batch is bounded by `K`,
@@ -9291,7 +9303,7 @@ impl Host {
         s.generation = s.generation.wrapping_add(1); // advance per (re)grant (ABA-safe)
         s.entry = Some(binding);
         s.type_id = type_id;
-        Some(((s.generation << CAP_LOG2) | slot as u32) as i32)
+        Some((((s.generation & GEN_MASK) << CAP_LOG2) | slot as u32) as i32)
     }
 
     /// §7 capability **reflection** (backs `cap.self.count`/`cap.self.get`): the live handle-table
@@ -9326,7 +9338,7 @@ impl Host {
             .enumerate()
             .filter(|(_, s)| s.entry.is_some())
             .map(|(slot, s)| {
-                let handle = ((s.generation << CAP_LOG2) | slot as u32) as i32;
+                let handle = (((s.generation & GEN_MASK) << CAP_LOG2) | slot as u32) as i32;
                 (handle, s.type_id)
             })
             .collect()
@@ -9870,7 +9882,9 @@ impl Host {
         let gen = h >> CAP_LOG2;
         let s = &self.table[slot];
         match s.entry {
-            Some(b) if s.type_id == type_id && s.generation == gen => Ok(b),
+            // Compare the generation masked to the bits a handle actually carries (`GEN_BITS`), so a
+            // slot recycles cleanly when the full-width counter wraps instead of dying permanently.
+            Some(b) if s.type_id == type_id && (s.generation & GEN_MASK) == gen => Ok(b),
             _ => Err(Trap::CapFault),
         }
     }
@@ -12357,6 +12371,52 @@ fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
         .filter(|l| l.block as usize == block && l.inst as usize <= inst)
         .max_by_key(|l| l.inst)
         .map(|l| l.value)
+}
+
+#[cfg(test)]
+mod gen_recycle_tests {
+    //! The handle-table generation counter is a full `u32`, but a packed handle only carries
+    //! `GEN_BITS` of it. The compare must therefore mask, so a slot **recycles** when the counter
+    //! wraps rather than dying permanently (previously a single-slot, fail-closed DoS reachable by a
+    //! `Jit.compile`→`release` loop). These pin both the recycle and that a stale handle stays inert.
+    use super::*;
+
+    #[test]
+    fn handle_slot_recycles_across_generation_wrap() {
+        let mut h = Host::new();
+        // Grant once (slot 0, generation 1) and confirm it resolves.
+        let handle0 = h.try_grant(iface::EXIT, Binding::Exit).expect("grant");
+        let slot = (handle0 as u32 as usize) & (CAP - 1);
+        assert!(h.resolve(handle0, iface::EXIT).is_ok());
+
+        // Force the counter to the last value before wrap, then close + regrant: the new handle is
+        // issued at generation `2^GEN_BITS`, whose low `GEN_BITS` are 0 — exactly the case the old
+        // `s.generation == gen` compare got wrong (the slot would have died forever).
+        h.table[slot].generation = (1u32 << GEN_BITS) - 1;
+        h.close(handle0);
+        let handle_wrap = h.try_grant(iface::EXIT, Binding::Exit).expect("regrant");
+        assert_eq!(
+            (handle_wrap as u32 as usize) & (CAP - 1),
+            slot,
+            "same slot reused"
+        );
+        assert_eq!(
+            h.table[slot].generation,
+            1u32 << GEN_BITS,
+            "counter wrapped past GEN_BITS"
+        );
+        assert!(
+            h.resolve(handle_wrap, iface::EXIT).is_ok(),
+            "slot must recycle cleanly when the generation counter wraps"
+        );
+
+        // The stale pre-wrap handle is still inert (a forged/stale index re-checks the generation and
+        // faults), so recycling did not reopen a use-after-close hole.
+        assert!(matches!(
+            h.resolve(handle0, iface::EXIT),
+            Err(Trap::CapFault)
+        ));
+    }
 }
 
 #[cfg(test)]

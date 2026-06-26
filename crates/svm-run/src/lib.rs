@@ -2494,11 +2494,19 @@ fn run_powerbox_inner(
     deadline: Option<std::time::Duration>,
     quota: Quota,
 ) -> Result<Run, String> {
+    // Escape gate (fail-closed, §2a): the single chokepoint every public powerbox entry point funnels
+    // through (`run_powerbox*`, `run_powerbox_with_args_and_limits`). Verify here so a library embedder
+    // calling any of them directly cannot bypass the verifier the CLI (`main.rs`) and guest-driven JIT
+    // (`jit_blob_validator`) paths enforce — a verified module is the precondition for escape-freedom.
+    // Verification is a single linear pass, negligible beside the JIT compile, so re-checking
+    // already-validated frontend output (chibicc / svm-llvm) is free insurance, not a hot-path cost.
+    svm_verify::verify_module(module)
+        .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
     // The fixed §3e powerbox preset, expressed over the converged [`Instance`] core (F1): the
     // arity-based grant ([`grant_powerbox_prefix`]) and the JIT compile→run + §5 watchdog
     // ([`run_jit`]) now live in exactly one place, shared with the frontend-independent embedding
     // API. The `Instance` is built directly (not via [`instantiate`]) so this path does **not**
-    // re-resolve or re-verify — preserving its behaviour for already-validated frontend output
+    // re-resolve named imports — preserving its behaviour for already-validated frontend output
     // (chibicc / svm-llvm), which emits inline `cap.call`s and a func-0 `_start` and runs JIT-only.
     let inst = Instance {
         module: module.clone(),
@@ -2524,6 +2532,10 @@ fn run_powerbox_inner(
 /// function rather than a program (e.g. the benchmark kernels). `Err` on compile failure,
 /// a guest trap, or an `Exit` (a kernel should not call one).
 pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
+    // Escape gate (fail-closed, §2a): like the powerbox entry point, verify before running so a
+    // direct library caller can't skip the verifier. Idempotent vs an already-verified module.
+    svm_verify::verify_module(module)
+        .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
     match compile_and_run(module, 0, args).map_err(|e| format!("JIT compile failed: {e:?}"))? {
         JitOutcome::Returned(s) => {
             let results = &module.funcs[0].results;
