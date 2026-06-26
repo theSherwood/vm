@@ -1195,9 +1195,18 @@ for a real implementation, split by whether it needs a *host-libm decision*:
     needs the powerbox page-0 layout (a writable persistent slot), which entangles it with the
     powerbox test harness, and it is only ever *set* by `strtod` (`ERANGE`) — so it lands where it is
     exercised end to end.
-- **Hard but decision-free:** **`strtod`** (string→double) — correctly-rounded decimal→`f64`, the parse
-  direction of the existing bignum dtoa. The single keystone for *float* Lua (every float literal hits
-  it); a sizeable bignum slice of its own.
+- **Hard but decision-free:** **`strtod`** (string→double) — **DONE, as guest code** (the keystone for
+  *float* Lua: every decimal float literal hits it). `crates/svm-run/demos/strtod/strtod.c` is a
+  correctly-rounded decimal→`f64` parser. Correctly-rounded is *unique*, so it matches glibc bit-for-
+  bit — and the method needs **no precomputed power-of-ten table** (nothing to mis-transcribe): parse
+  every significant digit into a big integer, form the exact rational `N/Dn`, and take the nearest
+  double by an **exact big-integer division** with round-to-nearest-even (normal / subnormal incl. the
+  boundary / overflow→±inf). A guest def shadows the on-ramp's `strtod` trap stub (`llvm-link
+  lua_core.bc strtod.bc`). Two gates: `demo_strtod_vs_native` (raw-f64-image + `endptr` differential,
+  all three engines == native) and `strtod_guest_correctly_rounded_vs_system` (native-only, bit + `endptr`
+  vs the system `strtod` over the hard cases — subnormal halfway ties, the `2^53` boundary, max-double,
+  over/underflow, 40-digit strings). *Scope:* decimal only; hex floats (`0x1p4` — Lua's core parses
+  these itself), the `inf`/`nan` spellings, and `errno`/`ERANGE` are follow-ups.
 - **Transcendentals → a guest `libm` (DECIDED — keep math in the sandbox).** `pow`/`exp`/`log`/
   `sin`/… can't be synthesized bit-exact to a *specific* host libm, and a host math capability would
   leak math out of the sandbox — so they ride as **guest code** (the §"transcendentals" preference,
@@ -1256,8 +1265,10 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    routed through the shared `printf` format engine (`lower_snprintf`) with output redirected into the
    caller's buffer; reuses the bignum dtoa float formatter + the varargs-call marshaling from (1).
    Merged (PR #155), incl. the page-0 `FMT_BUF` write-protect fix for `snprintf`-into-stack-buffer + `%p`.
-3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
-   decimal→`f64` (the parse direction of the existing Ryū/Dragon dtoa). Reachable.
+3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. **DONE, as guest code**
+   (`demos/strtod/strtod.c`): correctly-rounded decimal→`f64` via an exact big-integer division (no
+   power-of-ten table); a guest def shadows the trap stub. Bit-identical to glibc; see the "remaining-
+   libm slices" section above. Decimal only (hex floats / `inf`/`nan` / `errno` are follow-ups).
 4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
    `memcmp`/`strlen`). **Done (slice 2):** `strcmp`/`strchr`/`strcoll`(→`strcmp`),
    `strcpy`/`strspn`/`strpbrk` — synthesized `__svm_*` byte loops (the nested-scan pair for

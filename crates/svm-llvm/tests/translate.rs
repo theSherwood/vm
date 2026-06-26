@@ -2250,6 +2250,98 @@ fn libm_guest_exp_log_accurate_vs_system() {
 }
 
 #[test]
+fn demo_strtod_vs_native() {
+    // The guest **`strtod`** (`demos/strtod/strtod.c`): a program that needs decimal→f64 parsing
+    // brings it as ordinary guest C, and the guest definition shadows the on-ramp's `strtod` trap
+    // stub. The driver parses a grid of decimal strings and writes each result's raw f64 image + the
+    // `endptr` offset; since the parser is guest code, native `cc` compiles the same source, so the
+    // bytes are identical across the tree-walker, the bytecode VM, the JIT, and native.
+    //
+    // Built `-fno-vectorize -fno-slp-vectorize` (the bignum limb loops would auto-SIMD to `<… x i32>`,
+    // the v128 lane outside this scalar on-ramp; exact integer arithmetic is identical
+    // scalar-vs-vectorized, the corpus-demo split).
+    check_demo_vs_native_flags(
+        "strtod",
+        "strtod/strtod_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn strtod_guest_correctly_rounded_vs_system() {
+    // Correctness gate (native only): the byte-identical differential proves the on-ramp *executes*
+    // the guest `strtod` faithfully, but — same source on both lanes — cannot catch an algorithm
+    // error. Correctly-rounded decimal→f64 is *unique*, so a correct guest `strtod` matches glibc's
+    // bit-for-bit. Compile `strtod.c` renamed (`-Dstrtod=svm_strtod`) and assert the returned bits
+    // *and* the `endptr` offset match the system `strtod` over a grid spanning the hard cases:
+    // subnormals + the smallest-subnormal halfway tie, the 2^53 boundary, max-double, overflow→inf,
+    // underflow→0, the 1e22/1e23 fast-path boundary, `0.30000000000000004`, and long digit strings.
+    let probe = "#include <stdlib.h>\n\
+        #include <string.h>\n\
+        double svm_strtod(const char*, char**);\n\
+        static int bad;\n\
+        static void chk(const char* s){\n\
+          char *e1,*e2; double a=svm_strtod(s,&e1), b=strtod(s,&e2);\n\
+          unsigned long long ua,ub; memcpy(&ua,&a,8); memcpy(&ub,&b,8);\n\
+          if (ua!=ub || (e1-s)!=(e2-s)) bad=1;\n\
+        }\n\
+        int main(void){\n\
+          const char* t[] = {\n\
+            \"0\",\"0.0\",\"-0.0\",\"1\",\"3.14\",\"0.5\",\"2.5\",\"100.0\",\"-2.5\",\"1e10\",\"1e-10\",\n\
+            \"1e100\",\"1e-100\",\"1.5e3\",\"123456789.123456789\",\"0.1\",\"0.3\",\n\
+            \"9007199254740992\",\"9007199254740993\",\"1.7976931348623157e308\",\n\
+            \"2.2250738585072014e-308\",\"5e-324\",\"4.9e-324\",\"2.4703282292062327e-324\",\n\
+            \"1e309\",\"1e-400\",\"0.0000001\",\"  42.0\",\"  -3.25e2\",\"1000000000000000000000\",\n\
+            \"0.30000000000000004\",\"1e22\",\"1e23\",\"0.000244140625\",\"1.25e-1\",\".5\",\"5.\",\n\
+            \"+1.5\",\"3.141592653589793\",\"1234567890123456789012345678901234567890\",\n\
+            \"9.881312916824931e-324\",\"1.1125369292536007e-308\",\"8.98846567431158e307\",\n\
+            \"abc\",\"\",\"17.0\",\"0.000244140625e3\",\n\
+          };\n\
+          for (unsigned i=0;i<sizeof t/sizeof*t;i++) chk(t[i]);\n\
+          return bad;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_strtod_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("svm_strtod_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("svm_strtod_acc_{}", std::process::id()));
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/strtod/strtod.c");
+    std::fs::write(&c, probe).expect("write probe");
+    let built = Command::new("cc")
+        .args(["-O2", "-fno-builtin", "-Dstrtod=svm_strtod", "-c"])
+        .arg(&src)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping strtod accuracy (cc unavailable)");
+            return;
+        }
+    }
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest strtod != system strtod (bit/endptr mismatch)"
+    );
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
