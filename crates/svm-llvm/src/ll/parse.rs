@@ -5,14 +5,15 @@
 //! bitcode reader (`assert_ll_parity`, `tests/translate.rs`). Covered so far: `define` functions with
 //! integer/float types; the instruction set — integer + float **binops**, **conversions**
 //! (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`), **`icmp`/`fcmp`**, **`select`**, **`fneg`/`freeze`**,
-//! and **`phi`** — over `%local`/constant-int operands; the `ret`/`br`/`condbr`/`unreachable`
-//! terminators; and **multi-block** CFGs with LLVM's implicit slot numbering (so an unlabeled entry and
-//! the phi/branch refs into it resolve to the same `Name`s the bitcode reader assigns). Top-level cruft
-//! the on-ramp ignores (target/datalayout lines, attribute
-//! groups, module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier):
-//! `call`, memory (`getelementptr`/`load`/`store`/`alloca`), globals,
-//! `switch`, aggregates, vectors, and float/non-trivial constants. Anything unhandled is a clean
-//! [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
+//! **`phi`**, and **`call`** (direct `@f`/indirect `%fp`, incl. result-less `void` calls and
+//! intrinsics, reconstructing the callee's function type) — over `%local`/constant-int operands; the
+//! `ret`/`br`/`condbr`/`unreachable` terminators; and **multi-block** CFGs with LLVM's implicit slot
+//! numbering (so an unlabeled entry and the phi/branch refs into it resolve to the same `Name`s the
+//! bitcode reader assigns). Top-level cruft the on-ramp ignores (target/datalayout lines, attribute
+//! groups, module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier): memory
+//! (`getelementptr`/`load`/`store`/`alloca`), globals, `switch`, aggregates, vectors, and
+//! float/non-trivial constants. Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified
+//! downstream — §2a), never a miscompile.
 
 use super::ast::*;
 use super::lex::{lex, Token};
@@ -34,6 +35,10 @@ impl ParseError {
 }
 
 type PResult<T> = Result<T, ParseError>;
+
+/// A call/invoke argument list: each operand paired with its parameter attributes (always dropped —
+/// the translator reads only the operand, matching the bitcode reader's `from_llvm_ir::cvt_args`).
+type CallArgs = Vec<(Operand, Vec<ParameterAttribute>)>;
 
 /// Parse `.ll` source text into a [`Module`].
 pub fn parse_module(src: &str) -> PResult<Module> {
@@ -390,9 +395,15 @@ impl Parser {
 
     // ---- instructions --------------------------------------------------------------------------
 
-    /// Parse one non-terminator instruction. The seed slice handles `%dest = <binop> <ty> <op>, <op>`.
+    /// Parse one non-terminator instruction.
     fn instruction(&mut self, next_unnamed: &mut usize) -> PResult<Instruction> {
-        // `%dest =` prefix (every instruction in the seed slice produces a value).
+        // A `call` is handled first: it may have *no* `%dest =` (a `void` call), and an optional
+        // `tail`/`musttail`/`notail` marker sits where an opcode otherwise would — both break the
+        // "every instruction starts `%dest = <opcode>`" shape the rest of this function assumes.
+        if self.at_call() {
+            return self.call_inst(next_unnamed).map(Instruction::Call);
+        }
+        // `%dest =` prefix (every other instruction modeled here produces a value).
         let dest = self.instr_dest(next_unnamed)?;
         let op = match self.peek() {
             Some(Token::Word(w)) => w.clone(),
@@ -725,6 +736,209 @@ impl Parser {
             dest,
             debugloc: None,
         })
+    }
+
+    // ---- calls ---------------------------------------------------------------------------------
+
+    /// Does the cursor begin a `call`? Looks past an optional `%dest =` to the
+    /// `call`/`tail`/`musttail`/`notail` keyword — the lookahead `instruction()` needs to route a
+    /// (possibly result-less) call before assuming the leading `%dest =`.
+    fn at_call(&self) -> bool {
+        let mut i = self.pos;
+        if matches!(self.toks.get(i), Some(Token::Local(_)))
+            && matches!(self.toks.get(i + 1), Some(Token::Equals))
+        {
+            i += 2;
+        }
+        matches!(self.toks.get(i), Some(Token::Word(w))
+            if matches!(w.as_str(), "call" | "tail" | "musttail" | "notail"))
+    }
+
+    /// `[%dest =] [tail|musttail|notail] call [fmf] [cconv/ret-attrs] <retty>|<fnty> <callee>(<args>)
+    /// [#N] [, !meta]`. The callee `@g` becomes a `GlobalReference` whose `ty` is the reconstructed
+    /// function type (return type + the arg types, or the explicit `<ret> (<params>)` signature for a
+    /// vararg call) — the same shape the bitcode reader carries, so a direct call reaches parity.
+    fn call_inst(&mut self, next_unnamed: &mut usize) -> PResult<Call> {
+        let dest = if matches!(
+            (self.peek(), self.peek2()),
+            (Some(Token::Local(_)), Some(Token::Equals))
+        ) {
+            Some(self.instr_dest(next_unnamed)?)
+        } else {
+            None
+        };
+        let is_tail_call = match self.peek() {
+            Some(Token::Word(w)) if matches!(w.as_str(), "tail" | "musttail") => {
+                self.pos += 1;
+                true
+            }
+            Some(Token::Word(w)) if w == "notail" => {
+                self.pos += 1;
+                false
+            }
+            _ => false,
+        };
+        self.expect_word("call")?;
+        self.skip_fast_math_flags();
+        self.skip_pre_signature_attrs(); // calling convention + return attributes
+        let ret_ty = self.type_()?;
+        // An explicit function-pointer type (`<ret> (<params>[, ...])`) — present for vararg/indirect
+        // calls. Otherwise the function type is reconstructed from the return type + the argument types.
+        let explicit_fnty = if self.peek() == Some(&Token::LParen) {
+            let (param_types, is_var_arg) = self.fn_type_params()?;
+            Some(TypeRef::new(Type::FuncType {
+                result_type: ret_ty.clone(),
+                param_types,
+                is_var_arg,
+            }))
+        } else {
+            None
+        };
+        // The callee name (a global `@f` or an indirect `%fp`); the operand is built once the function
+        // type is known (after the arguments, in the reconstructed case).
+        enum Callee {
+            Global(Name),
+            Reg(Name),
+        }
+        let callee = match self.bump() {
+            Some(Token::Global(s)) => Callee::Global(name_from_local(&s)),
+            Some(Token::Local(s)) => Callee::Reg(name_from_local(&s)),
+            other => return self.err(format!("expected a call callee, found {other:?}")),
+        };
+        let (arguments, arg_types) = self.call_arg_list()?;
+        let function_ty = explicit_fnty.unwrap_or_else(|| {
+            TypeRef::new(Type::FuncType {
+                result_type: ret_ty,
+                param_types: arg_types,
+                is_var_arg: false,
+            })
+        });
+        let function = match callee {
+            Callee::Global(name) => Either::Right(Operand::ConstantOperand(ConstantRef::new(
+                Constant::GlobalReference {
+                    name,
+                    ty: function_ty.clone(),
+                },
+            ))),
+            Callee::Reg(name) => Either::Right(Operand::LocalOperand {
+                name,
+                ty: self.module.types.pointer(0),
+            }),
+        };
+        // Trailing attribute-group refs (`#4`) and `, !dbg`-style metadata.
+        while matches!(self.peek(), Some(Token::Word(w)) if w.starts_with('#')) {
+            self.pos += 1;
+        }
+        self.skip_trailing_metadata();
+        Ok(Call {
+            function,
+            function_ty,
+            arguments,
+            dest,
+            is_tail_call,
+            debugloc: None,
+        })
+    }
+
+    /// A call argument list `( <ty> [attrs] <val>, … )` — returns the operands (attributes dropped, as
+    /// the translator only reads the operand) alongside the parsed types (to reconstruct the fn type).
+    fn call_arg_list(&mut self) -> PResult<(CallArgs, Vec<TypeRef>)> {
+        self.expect(&Token::LParen)?;
+        let mut args = Vec::new();
+        let mut types = Vec::new();
+        if self.eat(&Token::RParen) {
+            return Ok((args, types));
+        }
+        loop {
+            let ty = self.type_()?;
+            self.skip_arg_attrs();
+            let val = self.value_as_operand(&ty)?;
+            types.push(ty);
+            args.push((val, Vec::new()));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok((args, types))
+    }
+
+    /// The `( <ty>, … [, ...] )` of an explicit function-pointer type in a call.
+    fn fn_type_params(&mut self) -> PResult<(Vec<TypeRef>, bool)> {
+        self.expect(&Token::LParen)?;
+        let mut params = Vec::new();
+        let mut is_var_arg = false;
+        if self.eat(&Token::RParen) {
+            return Ok((params, false));
+        }
+        loop {
+            if self.eat(&Token::Ellipsis) {
+                is_var_arg = true;
+                break;
+            }
+            params.push(self.type_()?);
+            self.skip_arg_attrs();
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok((params, is_var_arg))
+    }
+
+    /// Skip the parameter attributes between an argument's type and its value (`noundef`, `nonnull`,
+    /// `align N`, `byval(<ty>)`, `dereferenceable(N)`, …). A value word (`null`/`true`/…) stops it.
+    fn skip_arg_attrs(&mut self) {
+        const ATTRS: &[&str] = &[
+            "noundef",
+            "nonnull",
+            "signext",
+            "zeroext",
+            "inreg",
+            "returned",
+            "nest",
+            "sret",
+            "byval",
+            "byref",
+            "preallocated",
+            "inalloca",
+            "noalias",
+            "nocapture",
+            "readonly",
+            "readnone",
+            "writeonly",
+            "immarg",
+            "nofree",
+            "align",
+            "dereferenceable",
+            "dereferenceable_or_null",
+        ];
+        while let Some(Token::Word(w)) = self.peek() {
+            if !ATTRS.contains(&w.as_str()) {
+                break;
+            }
+            let is_align = w == "align";
+            self.pos += 1; // the attribute word
+            if self.peek() == Some(&Token::LParen) {
+                // A parenthesized payload — `byval(<ty>)`, `dereferenceable(N)`, … — skipped balanced.
+                let mut depth = 0usize;
+                loop {
+                    match self.bump() {
+                        Some(Token::LParen) => depth += 1,
+                        Some(Token::RParen) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+            } else if is_align && matches!(self.peek(), Some(Token::Int(_))) {
+                self.pos += 1; // `align N`
+            }
+        }
     }
 
     /// Skip conversion flags (`nneg` on `zext`, `nuw`/`nsw` on `trunc`).

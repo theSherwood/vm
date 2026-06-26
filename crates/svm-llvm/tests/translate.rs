@@ -7420,3 +7420,44 @@ fn ll_parity_branch_phi() {
         "int pick(int c, int a, int b){ if (c) return a + 1; else return b - 1; }",
     );
 }
+
+#[test]
+fn ll_parity_call_direct() {
+    // A direct `call` to a defined (noinline) function in the same module, whose result feeds an add —
+    // the callee becomes a GlobalReference carrying the reconstructed `i32 (i32)` function type.
+    assert_ll_parity(
+        "ll_parity_call",
+        "static __attribute__((noinline)) int dbl(int x){ return x + x; } \
+         int f(int x){ return dbl(x) + 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_two_args() {
+    // A two-argument direct call (`i32 (i32, i32)`), exercising the arg list + fn-type reconstruction.
+    assert_ll_parity(
+        "ll_parity_call2",
+        "static __attribute__((noinline)) int sub(int a, int b){ return a - b; } \
+         int g(int a, int b){ return sub(a, b); }",
+    );
+}
+
+#[test]
+fn ll_parity_call_intrinsic() {
+    // `a > b ? a : b` lowers to `tail call i32 @llvm.smax.i32(i32 %0, i32 %1)` at -O2 — an intrinsic
+    // call (the shape that first forced calls; the translator lowers `llvm.smax` to `icmp`+`select`).
+    assert_ll_parity(
+        "ll_parity_smax",
+        "int mx(int a, int b){ return a > b ? a : b; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_void() {
+    // A result-less `call void @sink(...)` — the dest-less instruction shape (`tail call void …`).
+    assert_ll_parity(
+        "ll_parity_callvoid",
+        "static int g; static __attribute__((noinline)) void sink(int x){ g = x; } \
+         void v(int x){ sink(x); }",
+    );
+}

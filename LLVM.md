@@ -1793,15 +1793,24 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     chain, shifts, `sext`-widen, `icmp`+`zext`, `fadd`, a `for`-loop sum, an `if/else` diamond). Constant
     operands: int (full width) + `true`/`false`; **float constants are deferred** (LLVM's `0x…` hex-float
     image needs exact bit parsing — a small dedicated slice).
-- **Next step (resume here): `call`, then memory.** The growth frontier, each a `clang -O2` shape + an
-  `assert_ll_parity` test: **`call`** (e.g. `llvm.smax`, the `?:`-max lowering; needs the callee/arg-list
-  grammar + the `Either` callee — start with direct `@func` calls, then intrinsics), then
-  **`getelementptr`/`load`/`store`/`alloca`** (memory — also the first instrs *without* a `%dest`, so
-  `instruction()`'s dest-first assumption needs a void-result branch), **globals + initializers**,
-  **float/hex constants**, **`switch`**, **structs/aggregates**, **SIMD vectors**, **C++ EH**
-  (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
-  full-width constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then
-  PR3:
+  - **Parser — `call` landed.** `parse.rs` now parses `[%d =] [tail] call [fmf] [cconv/ret-attrs]
+    <retty>|<fnty> <callee>(<args>) [#N] [,!meta]`: direct `@f` (a `GlobalReference` whose `ty` is the
+    **reconstructed** `<ret>(<argtys>)` function type — or the explicit `<ret>(<params>,...)` signature
+    for varargs) and indirect `%fp` callees, the **result-less `void` call** (which forced
+    `instruction()` to look ahead via `at_call()` before assuming the leading `%dest =`), and dropped
+    arg/return attribute lists. Four parity tests green: direct 1-arg, direct 2-arg, `void`, and the
+    `llvm.smax` intrinsic (the `a>b?a:b` lowering — the translator turns it back into `icmp`+`select`).
+    **Twelve parity tests total.**
+- **Next step (resume here): memory (`alloca`/`load`/`store`/`getelementptr`), then globals.** The growth
+  frontier, each a `clang -O2` shape + an `assert_ll_parity` test: **memory** — `alloca <ty>[, align N]`,
+  `load <ty>, ptr %p[, align N]`, `store <ty> %v, ptr %p[, align N]` (the second result-less instr, like
+  `void` call — `at_store()` lookahead or generalize the dest handling), `getelementptr [inbounds] <ty>,
+  ptr %p, <idx>…` (note the leading element type + the index operand types). Most `-O2` scalar code keeps
+  values in registers, so to *get* memory ops use `volatile`/`-O0`-ish patterns or address-taken locals
+  (`int a[4]; … a[i]`). Then **globals + initializers**, **float/hex constants**, **`switch`**,
+  **structs/aggregates**, **SIMD vectors**, **C++ EH** (`invoke`/`landingpad`/`resume`), and
+  **`i128`/`blockaddress`** (these two come *free* in text — full-width constants, no `llvm-sys`
+  re-parse). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).
