@@ -525,7 +525,7 @@ fn translate_impl(
         strpbrk: take(need_strpbrk),
         ldexp: take(need_ldexp),
         pow_stub: take(need_pow),
-        fmod_stub: take(need_fmod),
+        fmod: take(need_fmod),
         frexp: take(need_frexp),
         strtod_stub: take(need_strtod),
         localeconv_stub: take(need_localeconv),
@@ -783,11 +783,7 @@ fn translate_impl(
         ));
     }
     if need_fmod {
-        // Exact-synthesizable but a large loop-nest CFG — stubbed pending its own slice (see `Helpers`).
-        funcs.push(synth_trap_stub(
-            vec![ValType::F64, ValType::F64],
-            vec![ValType::F64],
-        ));
+        funcs.push(synth_fmod());
     }
     if need_frexp {
         funcs.push(synth_frexp());
@@ -3530,10 +3526,10 @@ struct Helpers {
     /// Fail-closed trap stub for `pow` (and the other libm transcendentals): bit-exact vs native
     /// requires matching a specific host libm, so it stays a `synth_trap_stub` pending that decision.
     pow_stub: Option<u32>,
-    /// Fail-closed trap stub for `fmod`. Exact-synthesizable (the remainder is always representable, so
-    /// glibc/musl's bit-twiddling algorithm is bit-exact with no libm dependency) — a sizeable
-    /// loop-nest CFG slated as the next exact slice; stubbed until then.
-    fmod_stub: Option<u32>,
+    /// `__svm_fmod(x:f64, y:f64) -> f64` — the IEEE floating remainder via musl's exact 64-bit
+    /// bit-twiddling algorithm. The remainder is always representable, so this is bit-exact to libc
+    /// with no host-libm dependency (there is no `frem` IR op).
+    fmod: Option<u32>,
     /// `__svm_frexp(x:f64, eptr:i64) -> f64` — split `x` into mantissa∈[0.5,1) and exponent; writes the
     /// exponent to `*eptr` (an `int`). Pure bit ops, bit-exact to glibc `frexp` (incl. zero/subnormal/
     /// inf/nan: `*eptr=0`, returns `x+x`).
@@ -5829,6 +5825,504 @@ fn synth_frexp() -> Func {
         params: vec![ValType::F64, ValType::I64],
         results: vec![ValType::F64],
         blocks: vec![entry, finite, special, sub_blk, pack],
+    }
+}
+
+/// Synthesize `__svm_fmod(x:f64, y:f64) -> f64` — the IEEE floating remainder, a faithful translation
+/// of musl's `fmod` (the exact 64-bit bit-twiddling algorithm). The remainder is always exactly
+/// representable, so this is bit-identical to libc with no host-libm dependency (there is no `frem`
+/// IR op). Structure (28 blocks):
+/// ```c
+/// ex = ux>>52 & 0x7ff; ey = uy>>52 & 0x7ff; sx = ux>>63;
+/// if (uy<<1 == 0 || isnan(y) || ex == 0x7ff) return (x*y)/(x*y);   // special → NaN
+/// if (ux<<1 <= uy<<1) return ux<<1 == uy<<1 ? sign(x)*0 : x;       // |x| <= |y|
+/// // normalize x and y (subnormals via a leading-bit shift loop), then:
+/// for (; ex > ey; ex--) { i = ux-uy; if (i>>63==0) { if(!i) return sign(x)*0; ux=i; } ux <<= 1; }
+/// i = ux-uy; if (i>>63==0) { if(!i) return sign(x)*0; ux=i; }
+/// for (; ux>>52==0; ux<<=1) ex--;                                  // normalize result
+/// if (ex>0) { ux -= 1<<52; ux |= ex<<52; } else ux >>= 1-ex;       // scale
+/// ux |= sx<<63; return ux;
+/// ```
+/// `sign(x)*0` is built as `reinterpret(sx<<63)` (±0). All arithmetic is on the raw `i64` bit images.
+fn synth_fmod() -> Func {
+    const MANT: i64 = 0x000f_ffff_ffff_ffff; // -1ULL >> 12 (52-bit mantissa mask)
+    const IMPLICIT: i64 = 0x0010_0000_0000_0000; // 1 << 52 (the hidden mantissa bit)
+    const ABS: i64 = 0x7fff_ffff_ffff_ffff; // sign-clearing mask
+    const INF: i64 = 0x7ff0_0000_0000_0000; // +inf bits (|·| > this ⇒ NaN)
+    let ci = |v: i64| Inst::ConstI64(v);
+    let bin = |op: BinOp, a: u32, b: u32| Inst::IntBin {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+    let shru = |a: u32, b: u32| bin(BinOp::ShrU, a, b);
+    let shl = |a: u32, b: u32| bin(BinOp::Shl, a, b);
+    let sub = |a: u32, b: u32| bin(BinOp::Sub, a, b);
+    let and = |a: u32, b: u32| bin(BinOp::And, a, b);
+    let or = |a: u32, b: u32| bin(BinOp::Or, a, b);
+    let cmp = |op: CmpOp, a: u32, b: u32| Inst::IntCmp {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+    let or_i32 = |a: u32, b: u32| Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Or,
+        a,
+        b,
+    };
+    let to_f = |a: u32| Inst::Cast {
+        op: CastOp::ReinterpI64F64,
+        a,
+    };
+    let to_i = |a: u32| Inst::Cast {
+        op: CastOp::ReinterpF64I64,
+        a,
+    };
+    let fbin = |op: FBinOp, a: u32, b: u32| Inst::FBin {
+        ty: FloatTy::F64,
+        op,
+        a,
+        b,
+    };
+    // Block-param shorthands (each block re-derives its values; only ids cross edges).
+    let p5 = || {
+        vec![
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ]
+    };
+    let p6 = || {
+        vec![
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ]
+    };
+
+    // 0 entry(x=v0:f64, y=v1:f64)
+    let b0 = Block {
+        params: vec![ValType::F64, ValType::F64],
+        insts: vec![
+            to_i(0),                 // v2 = ux
+            to_i(1),                 // v3 = uy
+            ci(52),                  // v4
+            shru(2, 4),              // v5 = ux>>52
+            ci(0x7ff),               // v6
+            and(5, 6),               // v7 = ex
+            shru(3, 4),              // v8 = uy>>52
+            and(8, 6),               // v9 = ey
+            ci(63),                  // v10
+            shru(2, 10),             // v11 = sx
+            ci(1),                   // v12
+            shl(3, 12),              // v13 = uy<<1
+            ci(0),                   // v14
+            cmp(CmpOp::Eq, 13, 14),  // v15 = (uy<<1 == 0)  yzero
+            ci(ABS),                 // v16
+            and(3, 16),              // v17 = |uy bits|
+            ci(INF),                 // v18
+            cmp(CmpOp::GtU, 17, 18), // v19 = ynan (|uy| > inf)
+            cmp(CmpOp::Eq, 7, 6),    // v20 = (ex == 0x7ff)  xinf/xnan
+            or_i32(15, 19),          // v21
+            or_i32(21, 20),          // v22 = special
+        ],
+        term: Terminator::BrIf {
+            cond: 22,
+            then_blk: 1,
+            then_args: vec![0, 1],
+            else_blk: 2,
+            else_args: vec![2, 3, 7, 9, 11],
+        },
+    };
+    // 1 special(x=v0, y=v1): (x*y)/(x*y) → NaN
+    let b1 = Block {
+        params: vec![ValType::F64, ValType::F64],
+        insts: vec![
+            fbin(FBinOp::Mul, 0, 1), // v2 = x*y
+            fbin(FBinOp::Div, 2, 2), // v3
+        ],
+        term: Terminator::Return(vec![3]),
+    };
+    // 2 magcmp(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
+    let b2 = Block {
+        params: p5(),
+        insts: vec![
+            ci(1),                 // v5
+            shl(0, 5),             // v6 = ux<<1
+            shl(1, 5),             // v7 = uy<<1
+            cmp(CmpOp::LeU, 6, 7), // v8 = ux<<1 <= uy<<1
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 3, // lecase(ux,uy,sx,ux1,uy1)
+            then_args: vec![0, 1, 4, 6, 7],
+            else_blk: 6, // normx_check(ux,uy,ex,ey,sx)
+            else_args: vec![0, 1, 2, 3, 4],
+        },
+    };
+    // 3 lecase(ux=v0, uy=v1, sx=v2, ux1=v3, uy1=v4)
+    let b3 = Block {
+        params: p5(),
+        insts: vec![cmp(CmpOp::Eq, 3, 4)], // v5 = (|x| == |y|)
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 5, // retzero(sx)
+            then_args: vec![2],
+            else_blk: 4, // retx(ux)
+            else_args: vec![0],
+        },
+    };
+    // 4 retx(ux=v0): return reinterpret(ux)
+    let b4 = Block {
+        params: vec![ValType::I64],
+        insts: vec![to_f(0)], // v1
+        term: Terminator::Return(vec![1]),
+    };
+    // 5 retzero(sx=v0): return reinterpret(sx<<63)  (±0)
+    let b5 = Block {
+        params: vec![ValType::I64],
+        insts: vec![ci(63), shl(0, 1), to_f(2)], // v1,v2,v3
+        term: Terminator::Return(vec![3]),
+    };
+    // 6 normx_check(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
+    let b6 = Block {
+        params: p5(),
+        insts: vec![
+            ci(0),                // v5
+            cmp(CmpOp::Eq, 2, 5), // v6 = (ex == 0) subnormal x
+            ci(12),               // v7
+            shl(0, 7),            // v8 = ux<<12 (loop seed)
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 8, // normx_loop_head(ux,i,uy,ex,ey,sx)
+            then_args: vec![0, 8, 1, 2, 3, 4],
+            else_blk: 7, // normx_normal(ux,uy,ex,ey,sx)
+            else_args: vec![0, 1, 2, 3, 4],
+        },
+    };
+    // 7 normx_normal(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): set the implicit bit
+    let b7 = Block {
+        params: p5(),
+        insts: vec![
+            ci(MANT),     // v5
+            and(0, 5),    // v6
+            ci(IMPLICIT), // v7
+            or(6, 7),     // v8 = normalized ux
+        ],
+        term: Terminator::Br {
+            target: 11, // normy_check(ux,uy,ex,ey,sx)
+            args: vec![8, 1, 2, 3, 4],
+        },
+    };
+    // 8 normx_loop_head(ux=v0, i=v1, uy=v2, ex=v3, ey=v4, sx=v5)
+    let b8 = Block {
+        params: p6(),
+        insts: vec![
+            ci(63),               // v6
+            shru(1, 6),           // v7 = i>>63
+            ci(0),                // v8
+            cmp(CmpOp::Eq, 7, 8), // v9 = (i>>63 == 0) → keep looping
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 9, // body(ux,i,uy,ex,ey,sx)
+            then_args: vec![0, 1, 2, 3, 4, 5],
+            else_blk: 10, // done(ux,ex,uy,ey,sx)
+            else_args: vec![0, 3, 2, 4, 5],
+        },
+    };
+    // 9 normx_loop_body(ux=v0, i=v1, uy=v2, ex=v3, ey=v4, sx=v5): ex--, i<<=1
+    let b9 = Block {
+        params: p6(),
+        insts: vec![
+            ci(1),     // v6
+            sub(3, 6), // v7 = ex-1
+            shl(1, 6), // v8 = i<<1
+        ],
+        term: Terminator::Br {
+            target: 8,
+            args: vec![0, 8, 2, 7, 4, 5],
+        },
+    };
+    // 10 normx_loop_done(ux=v0, ex=v1, uy=v2, ey=v3, sx=v4): ux <<= 1-ex
+    let b10 = Block {
+        params: p5(),
+        insts: vec![
+            ci(1),     // v5
+            sub(5, 1), // v6 = 1-ex
+            shl(0, 6), // v7 = ux << (1-ex)
+        ],
+        term: Terminator::Br {
+            target: 11, // normy_check(ux,uy,ex,ey,sx)
+            args: vec![7, 2, 1, 3, 4],
+        },
+    };
+    // 11 normy_check(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
+    let b11 = Block {
+        params: p5(),
+        insts: vec![
+            ci(0),                // v5
+            cmp(CmpOp::Eq, 3, 5), // v6 = (ey == 0) subnormal y
+            ci(12),               // v7
+            shl(1, 7),            // v8 = uy<<12 (loop seed)
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 13, // normy_loop_head(ux,uy,i,ex,ey,sx)
+            then_args: vec![0, 1, 8, 2, 3, 4],
+            else_blk: 12, // normy_normal(ux,uy,ex,ey,sx)
+            else_args: vec![0, 1, 2, 3, 4],
+        },
+    };
+    // 12 normy_normal(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
+    let b12 = Block {
+        params: p5(),
+        insts: vec![
+            ci(MANT),     // v5
+            and(1, 5),    // v6
+            ci(IMPLICIT), // v7
+            or(6, 7),     // v8 = normalized uy
+        ],
+        term: Terminator::Br {
+            target: 16, // mainloop_head(ux,uy,ex,ey,sx)
+            args: vec![0, 8, 2, 3, 4],
+        },
+    };
+    // 13 normy_loop_head(ux=v0, uy=v1, i=v2, ex=v3, ey=v4, sx=v5)
+    let b13 = Block {
+        params: p6(),
+        insts: vec![
+            ci(63),               // v6
+            shru(2, 6),           // v7 = i>>63
+            ci(0),                // v8
+            cmp(CmpOp::Eq, 7, 8), // v9
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 14, // body(ux,uy,i,ex,ey,sx)
+            then_args: vec![0, 1, 2, 3, 4, 5],
+            else_blk: 15, // done(ux,uy,ey,ex,sx)
+            else_args: vec![0, 1, 4, 3, 5],
+        },
+    };
+    // 14 normy_loop_body(ux=v0, uy=v1, i=v2, ex=v3, ey=v4, sx=v5): ey--, i<<=1
+    let b14 = Block {
+        params: p6(),
+        insts: vec![
+            ci(1),     // v6
+            sub(4, 6), // v7 = ey-1
+            shl(2, 6), // v8 = i<<1
+        ],
+        term: Terminator::Br {
+            target: 13,
+            args: vec![0, 1, 8, 3, 7, 5],
+        },
+    };
+    // 15 normy_loop_done(ux=v0, uy=v1, ey=v2, ex=v3, sx=v4): uy <<= 1-ey
+    let b15 = Block {
+        params: p5(),
+        insts: vec![
+            ci(1),     // v5
+            sub(5, 2), // v6 = 1-ey
+            shl(1, 6), // v7 = uy << (1-ey)
+        ],
+        term: Terminator::Br {
+            target: 16, // mainloop_head(ux,uy,ex,ey,sx)
+            args: vec![0, 7, 3, 2, 4],
+        },
+    };
+    // 16 mainloop_head(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): while ex > ey
+    let b16 = Block {
+        params: p5(),
+        insts: vec![cmp(CmpOp::GtS, 2, 3)], // v5 = ex > ey
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 17, // body(ux,uy,ex,ey,sx)
+            then_args: vec![0, 1, 2, 3, 4],
+            else_blk: 20, // postsub(ux,uy,ex,ey,sx)
+            else_args: vec![0, 1, 2, 3, 4],
+        },
+    };
+    // 17 mainloop_body(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): i = ux-uy; classify
+    let b17 = Block {
+        params: p5(),
+        insts: vec![
+            sub(0, 1),            // v5 = i
+            ci(63),               // v6
+            shru(5, 6),           // v7 = i>>63
+            ci(0),                // v8
+            cmp(CmpOp::Eq, 7, 8), // v9 = (i >= 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 18, // nonneg(i,uy,ex,ey,sx)
+            then_args: vec![5, 1, 2, 3, 4],
+            else_blk: 19, // shift(ux,uy,ex,ey,sx)  (i<0: ux unchanged)
+            else_args: vec![0, 1, 2, 3, 4],
+        },
+    };
+    // 18 mb_nonneg(i=v0, uy=v1, ex=v2, ey=v3, sx=v4): if i==0 → ±0 else ux=i, shift
+    let b18 = Block {
+        params: p5(),
+        insts: vec![
+            ci(0),                // v5
+            cmp(CmpOp::Eq, 0, 5), // v6 = (i == 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 5, // retzero(sx)
+            then_args: vec![4],
+            else_blk: 19, // shift(ux=i,uy,ex,ey,sx)
+            else_args: vec![0, 1, 2, 3, 4],
+        },
+    };
+    // 19 mb_shift(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): ux<<=1; ex--
+    let b19 = Block {
+        params: p5(),
+        insts: vec![
+            ci(1),     // v5
+            shl(0, 5), // v6 = ux<<1
+            sub(2, 5), // v7 = ex-1
+        ],
+        term: Terminator::Br {
+            target: 16, // mainloop_head
+            args: vec![6, 1, 7, 3, 4],
+        },
+    };
+    // 20 postsub(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): the final subtract after the loop
+    let b20 = Block {
+        params: p5(),
+        insts: vec![
+            sub(0, 1),            // v5 = i
+            ci(63),               // v6
+            shru(5, 6),           // v7 = i>>63
+            ci(0),                // v8
+            cmp(CmpOp::Eq, 7, 8), // v9 = (i >= 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 21, // nonneg(i,ex,sx)
+            then_args: vec![5, 2, 4],
+            else_blk: 22, // finalnorm_head(ux,ex,sx)  (i<0: ux unchanged)
+            else_args: vec![0, 2, 4],
+        },
+    };
+    // 21 postsub_nonneg(i=v0, ex=v1, sx=v2): if i==0 → ±0 else ux=i
+    let b21 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            ci(0),                // v3
+            cmp(CmpOp::Eq, 0, 3), // v4 = (i == 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 5, // retzero(sx)
+            then_args: vec![2],
+            else_blk: 22, // finalnorm_head(ux=i,ex,sx)
+            else_args: vec![0, 1, 2],
+        },
+    };
+    // 22 finalnorm_head(ux=v0, ex=v1, sx=v2): while ux>>52 == 0
+    let b22 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            ci(52),               // v3
+            shru(0, 3),           // v4 = ux>>52
+            ci(0),                // v5
+            cmp(CmpOp::Eq, 4, 5), // v6 = (ux>>52 == 0) → keep normalizing
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 23, // body(ux,ex,sx)
+            then_args: vec![0, 1, 2],
+            else_blk: 24, // done(ux,ex,sx)
+            else_args: vec![0, 1, 2],
+        },
+    };
+    // 23 finalnorm_body(ux=v0, ex=v1, sx=v2): ux<<=1; ex--
+    let b23 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            ci(1),     // v3
+            shl(0, 3), // v4 = ux<<1
+            sub(1, 3), // v5 = ex-1
+        ],
+        term: Terminator::Br {
+            target: 22,
+            args: vec![4, 5, 2],
+        },
+    };
+    // 24 finalnorm_done(ux=v0, ex=v1, sx=v2): scale by ex
+    let b24 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            ci(0),                 // v3
+            cmp(CmpOp::GtS, 1, 3), // v4 = (ex > 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 25, // scale_pos(ux,ex,sx)
+            then_args: vec![0, 1, 2],
+            else_blk: 26, // scale_nonpos(ux,ex,sx)
+            else_args: vec![0, 1, 2],
+        },
+    };
+    // 25 scale_pos(ux=v0, ex=v1, sx=v2): ux = (ux - (1<<52)) | (ex<<52)
+    let b25 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            ci(IMPLICIT), // v3
+            sub(0, 3),    // v4 = ux - 1<<52
+            ci(52),       // v5
+            shl(1, 5),    // v6 = ex<<52
+            or(4, 6),     // v7
+        ],
+        term: Terminator::Br {
+            target: 27, // finish(ux,sx)
+            args: vec![7, 2],
+        },
+    };
+    // 26 scale_nonpos(ux=v0, ex=v1, sx=v2): ux >>= 1-ex (subnormal output)
+    let b26 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            ci(1),      // v3
+            sub(3, 1),  // v4 = 1-ex
+            shru(0, 4), // v5 = ux >> (1-ex)
+        ],
+        term: Terminator::Br {
+            target: 27, // finish(ux,sx)
+            args: vec![5, 2],
+        },
+    };
+    // 27 finish(ux=v0, sx=v1): ux |= sx<<63; return reinterpret(ux)
+    let b27 = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            ci(63),    // v2
+            shl(1, 2), // v3 = sx<<63
+            or(0, 3),  // v4
+            to_f(4),   // v5
+        ],
+        term: Terminator::Return(vec![5]),
+    };
+
+    Func {
+        params: vec![ValType::F64, ValType::F64],
+        results: vec![ValType::F64],
+        blocks: vec![
+            b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18,
+            b19, b20, b21, b22, b23, b24, b25, b26, b27,
+        ],
     }
 }
 
@@ -10676,9 +11170,9 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // `fmod(x, y)`: fail-closed trap stub for now (exact-synthesizable — its own slice, see `Helpers`).
+        // `fmod(x, y)`: the synthesized `__svm_fmod` — IEEE remainder (bit-exact, no libm dependency).
         "fmod" => {
-            let Some(f) = ctx.helpers.fmod_stub else {
+            let Some(f) = ctx.helpers.fmod else {
                 return Ok(false);
             };
             let x = ctx.operand(&c.arguments[0].0)?;

@@ -2090,6 +2090,35 @@ fn libc_frexp_bit_exact() {
 }
 
 #[test]
+fn libc_fmod_bit_exact() {
+    // The synthesized `__svm_fmod` (musl's exact 64-bit remainder) over a 10×8 grid of (x, y) pairs:
+    // normal/normal, |x|<|y| (early return), |x|==|y| (±0), every sign combination, a large quotient
+    // (many loop iterations — `1e300 % 7`), subnormal inputs (`1e-310`, the smallest subnormal
+    // `4.9e-324`, a subnormal divisor `1e-311`), and the special paths (`y==0` and `x==inf` → NaN).
+    // A finite result is folded by its raw f64 bits (so it is pinned bit-identical to libc); a NaN
+    // result is folded as a canonical constant (payload-independent) so the check still verifies that
+    // both sides produce NaN without depending on the exact NaN payload. `volatile` keeps the calls.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {5.5, 7.0, -7.0, 1e300, 3.0, 2.0, -2.0, 1e-310, 4.9e-324, 1.0/0.0};\n\
+          volatile double ys[8]  = {2.0, 3.0, -3.0, 1e300, 7.0, 2.0, 1e-311, 0.0};\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) for (int j=0;j<8;j++) {\n\
+            double r = fmod(xs[i], ys[j]);\n\
+            unsigned long long bits;\n\
+            if (r != r) bits = 0x7ff8000000000000ULL; /* canonicalize any NaN */\n\
+            else { union { double d; unsigned long long u; } cvt; cvt.d = r; bits = cvt.u; }\n\
+            acc = (acc ^ bits) * 1099511628211ULL;\n\
+          }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_fmod", src, 0);
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`

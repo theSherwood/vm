@@ -1178,10 +1178,13 @@ for a real implementation, split by whether it needs a *host-libm decision*:
     writing `*e`; bit-exact to glibc incl. the subnormal (`×2^54` renormalize) and special (zero/
     inf/nan → `*e=0`, return `x+x`) paths. Test `libc_frexp_bit_exact` (a grid incl. a subnormal
     and ±inf), all three engines == native.
-  - **`fmod`** — the remainder is mathematically *exact* (always representable), so glibc/musl's
-    integer bit-twiddling algorithm synthesizes bit-for-bit. **No `frem` op and no libm decision** —
-    the earlier "`pow`/`fmod` need host-libm delegation" framing was imprecise: only the
-    *transcendentals* do.
+  - **`fmod`** — **DONE.** `synth_fmod` (28-block CFG): a faithful translation of musl's exact 64-bit
+    remainder (special→NaN, `|x|≤|y|` early returns, subnormal-normalize loops for x and y, the
+    bit-shift remainder loop, result renormalize + scale). The remainder is mathematically *exact*
+    (always representable), so it is bit-for-bit identical to libc with **no `frem` op and no libm
+    decision** — the earlier "`pow`/`fmod` need host-libm delegation" framing was imprecise: only the
+    *transcendentals* do. Test `libc_fmod_bit_exact` (a 10×8 grid incl. subnormals, a large quotient,
+    and the `y==0`/`x==inf`→NaN paths), all three engines == native.
   - **`localeconv`/`__errno_location`** — a static C-locale `lconv` struct (`decimal_point="."`) +
     a fixed window slot for `errno`.
 - **Hard but decision-free:** **`strtod`** (string→double) — correctly-rounded decimal→`f64`, the parse
