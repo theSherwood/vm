@@ -106,15 +106,18 @@ const BENCHES: &[Bench] = &[
         tail: "",
         large: 5_000,
     },
+    Bench {
+        name: "picojpeg",
+        src: "src/picojpeg/picojpeg_test.c",
+        extra: &["src/picojpeg/libpicojpeg.c"],
+        beebs: false,
+        tail: "",
+        large: 5_000,
+    },
     // Still excluded (need on-ramp work, not just a BENCHES row):
     //  - `statemate`: defines a global `unsigned long time;` that collides with `<time.h>`'s `time()`
     //    in the native-oracle build (the wrapper includes time.h); the SVM side translates fine, but
     //    without a buildable native oracle the differential can't be honest. Needs a per-kernel rename.
-    //  - `picojpeg`: multi-TU plumbing works (it's a unity build like xgboost/qrduino), but its `-O2`
-    //    output uses two ops the on-ramp still fail-closes on: a `sext <8 x i1> to <8 x i8>` (widening a
-    //    compare mask to a byte vector — `vec_lane_shape` models i8/i16/i32/i64/ptr/float lanes but not
-    //    an i1-lane mask, so it falls to the scalar path), and an `llvm.fshl.i16` funnel shift (the
-    //    on-ramp lowers funnel shifts only at i32/i64). Add it back once those two land.
 ];
 
 const SMALL: i64 = 10;

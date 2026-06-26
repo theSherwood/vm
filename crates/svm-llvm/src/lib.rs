@@ -10100,24 +10100,27 @@ fn lower_int_intrinsic(
         }
         // `llvm.fshl(a, b, s)` / `fshr`: funnel shift. The **rotate idiom** (the two value operands
         // identical — what clang emits for `(x<<n)|(x>>(w-n))`, e.g. SHA-256's `ROTRIGHT`) lowers to
-        // `rotl`/`rotr`, which mask the count mod width and so have no shift-by-`w` edge case. A true
-        // funnel shift (distinct operands) with a **constant** amount on a full-width (i32/i64) value
-        // lowers to `(a << s) | (b >>u (w - s))` (`s = amt mod w`; `s == 0` ⇒ the no-shift operand) —
-        // both shift counts are then in `1..w`, so there is no shift-by-`w` edge case. Found via Embench
-        // `aha-mont64`'s `modul64` (a double-word `<< 1` shift-and-subtract → `fshl.i64(hi, lo, 1)`). A
-        // non-constant amount (needs a width-edge-safe `select`) or a sub-32-bit width stays fail-closed.
+        // `rotl`/`rotr`, which mask the count mod width and accept a runtime amount — but only at a
+        // *full* width (`i32`/`i64`), where the svm-ir rotate's width equals the i32/i64 container; a
+        // narrow rotate would wrongly rotate the whole 32-bit container, so it falls through to the
+        // general path. A true funnel shift (distinct operands) **or** a narrow rotate, with a
+        // **constant** amount, lowers to `(a << s) | (b >>u (w - s))` (`s = amt mod w`; `s == 0` ⇒ the
+        // no-shift operand) — both shift counts are then in `1..w`, no shift-by-`w` edge case — and the
+        // result is masked back to `w` (a narrow value lives in a wider container). Found via Embench
+        // `aha-mont64`'s `modul64` (`fshl.i64(hi, lo, 1)`) and `picojpeg` (`fshl.i16`). A non-constant
+        // amount (needs a width-edge-safe `select`) or a `33..63` width stays fail-closed.
         "llvm.fshl" | "llvm.fshr" => {
             let is_fshl = base == "llvm.fshl";
-            if args[0] == args[1] {
+            let w = src_bits(args[0], types)?;
+            if args[0] == args[1] && (w == 32 || w == 64) {
                 let a = ctx.operand(args[0])?;
                 let amt = ctx.operand(args[2])?;
                 let op = if is_fshl { BinOp::Rotl } else { BinOp::Rotr };
                 ctx.push(Inst::IntBin { ty, op, a, b: amt })
             } else {
-                let w = src_bits(args[0], types)?;
-                if w != 32 && w != 64 {
+                if w > 32 && w != 64 {
                     return unsup(format!(
-                        "general funnel shift `{name}` on i{w} (only i32/i64)"
+                        "funnel shift `{name}` on i{w} (only i8..=i32 or i64)"
                     ));
                 }
                 let Some(c) = const_int(args[2]) else {
@@ -10128,7 +10131,7 @@ fn lower_int_intrinsic(
                 let s = (c % w as u64) as i64;
                 let a = ctx.operand(args[0])?;
                 let b = ctx.operand(args[1])?;
-                if s == 0 {
+                let r = if s == 0 {
                     // `fshl(a,b,0) = a`, `fshr(a,b,0) = b` (the concatenation shifted by nothing).
                     if is_fshl {
                         a
@@ -10169,6 +10172,13 @@ fn lower_int_intrinsic(
                         a: hi,
                         b: lo,
                     })
+                };
+                // A narrow funnel/rotate result lives in a wider container; mask off bits ≥ `w` so the
+                // value stays canonical (`mask_to` is a no-op at `w == 32`; `w == 64` fills its i64).
+                if w <= 32 {
+                    mask_to(ctx, r, w)
+                } else {
+                    r
                 }
             }
         }
@@ -13587,7 +13597,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, emit_trunc(ctx, v, from, to))
         }
         I::ZExt(x) => {
-            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+            let st = x.operand.get_type(types);
+            if vec_lane_shape(st.as_ref()).is_some() || i1_vector_lanes(st.as_ref()).is_some() {
                 return lower_vec_int_convert(
                     ctx,
                     &x.dest,
@@ -13604,7 +13615,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             (&x.dest, emit_ext(ctx, v, from, to, false))
         }
         I::SExt(x) => {
-            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+            let st = x.operand.get_type(types);
+            if vec_lane_shape(st.as_ref()).is_some() || i1_vector_lanes(st.as_ref()).is_some() {
                 return lower_vec_int_convert(
                     ctx,
                     &x.dest,
@@ -15571,6 +15583,25 @@ fn lower_vec_int_convert(
     types: &Types,
 ) -> Result<(), Error> {
     let from_ty = operand.get_type(types);
+    // A `<N x i1>` **mask** source is held lane-wise (`mask_lanes`: `0`/`1` scalars), not a packed
+    // vector, so it explodes through `mask_operand` rather than `vec_explode`. `zext` widens each lane
+    // `0`/`1`; `sext` widens to `0`/`-1` (all-ones). Found via Embench `picojpeg`'s
+    // `sext <8 x i1> to <8 x i8>` (a `select` mask materialized to a byte vector).
+    if let Some(n) = i1_vector_lanes(from_ty.as_ref()) {
+        let to_bits = vec_int_lane_bits(to_type).ok_or_else(|| {
+            Error::Unsupported("vector mask conversion to non-integer lanes".into())
+        })?;
+        let lanes_in = mask_operand(ctx, operand, n)?;
+        let mut out = Vec::with_capacity(n);
+        for v in lanes_in {
+            out.push(match kind {
+                VConv::ZExt => emit_ext(ctx, v, 1, to_bits, false),
+                VConv::SExt => emit_ext(ctx, v, 1, to_bits, true),
+                VConv::Trunc => return unsup("vector trunc from an i1 mask"),
+            });
+        }
+        return vec_implode(ctx, dest, &out, to_type, types);
+    }
     let from_bits = vec_int_lane_bits(from_ty.as_ref())
         .ok_or_else(|| Error::Unsupported("vector conversion of non-integer lanes".into()))?;
     let to_bits = vec_int_lane_bits(to_type)
