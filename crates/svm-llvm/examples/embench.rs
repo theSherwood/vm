@@ -185,6 +185,15 @@ fn main() {
     }
     let have_wt = wt_bin.exists();
 
+    // CI gate (the `embench-differential` job sets EMBENCH_STRICT=1). A MISCOMPILE — any engine's
+    // `verify` disagreeing with native — is *always* fatal (soundness is non-negotiable; this is the
+    // net that caught the qrduino bug). Under strict mode the SVM-side build/translate/export skips are
+    // *also* fatal, since on a complete checkout they mean an on-ramp regression rather than a missing
+    // kernel. Environmental skips (a TU not present in $EMBENCH, or native failing to compile/run —
+    // i.e. no oracle to compare against) never gate, so a partial manual checkout stays informational.
+    let strict = std::env::var_os("EMBENCH_STRICT").is_some();
+    let mut failures: Vec<String> = Vec::new();
+
     println!(
         "{:<16} {:>11} {:>8} {:>8} {:>8} {:>8} {:>8}   correctness   (×native)",
         "benchmark", "native(ns)", "svm-jit", "v8/w32", "v8/w64", "wt/w32", "wt/w64"
@@ -291,18 +300,27 @@ fn main() {
         .stderr(std::process::Stdio::null());
         if !sc.status().map(|s| s.success()).unwrap_or(false) {
             println!("{name:<16} (skipped: svm bitcode compile failed)");
+            if strict {
+                failures.push(format!("{name}: svm bitcode compile failed"));
+            }
             continue;
         }
         let t = match svm_llvm::translate_bc_path(&bc) {
             Ok(t) => t,
             Err(e) => {
                 println!("{name:<16} (skipped: translate failed: {e:?})");
+                if strict {
+                    failures.push(format!("{name}: translate failed: {e:?}"));
+                }
                 continue;
             }
         };
         let sp = t.entry_sp as i64;
         let Some(e) = t.exports.iter().find(|(n, _)| n == "run").map(|x| x.1) else {
             println!("{name:<16} (skipped: `run` not exported)");
+            if strict {
+                failures.push(format!("{name}: `run` not exported"));
+            }
             continue;
         };
 
@@ -395,11 +413,15 @@ fn main() {
         let ok = nat_chk == 1 && tw == nat_chk && bcv == nat_chk && jitv == nat_chk && !wasm_bad;
         if !ok {
             let chk = |e: Option<(f64, i64)>| e.map_or(-1, |(_, c)| c);
+            let (c8a, c8b, cwa, cwb) = (chk(v8_32), chk(v8_64), chk(wt_32), chk(wt_64));
             println!(
-                "{name:<16} {nat_ns:>11.1} {:>8} {:>8} {:>8} {:>8} {:>8}   MISCOMPILE nat={nat_chk} tw={tw} bc={bcv} jit={jitv} v8/w32={} v8/w64={} wt/w32={} wt/w64={}",
+                "{name:<16} {nat_ns:>11.1} {:>8} {:>8} {:>8} {:>8} {:>8}   MISCOMPILE nat={nat_chk} tw={tw} bc={bcv} jit={jitv} v8/w32={c8a} v8/w64={c8b} wt/w32={cwa} wt/w64={cwb}",
                 "—", "—", "—", "—", "—",
-                chk(v8_32), chk(v8_64), chk(wt_32), chk(wt_64),
             );
+            // Always fatal (even outside strict mode): a verify mismatch is a soundness bug.
+            failures.push(format!(
+                "{name}: MISCOMPILE (nat={nat_chk} tw={tw} bc={bcv} jit={jitv} v8/w32={c8a} v8/w64={c8b} wt/w32={cwa} wt/w64={cwb})"
+            ));
             continue;
         }
 
@@ -447,6 +469,18 @@ fn main() {
         println!(
             "\n  svm-jit consumes host LP64 bitcode (`long` 64-bit); `wasmtime w64` runs the same\n  widths on the same Cranelift backend — the honest cross-engine comparison. `wasm32` columns\n  show how much the wasm frontend gains from 32-bit `long` auto-vectorization on these kernels."
         );
+    }
+    // Differential gate: any MISCOMPILE (always), plus on-ramp build/translate failures under
+    // EMBENCH_STRICT, fail the process so the `embench-differential` CI job goes red on a regression.
+    if !failures.is_empty() {
+        eprintln!(
+            "\nembench differential FAILED ({} kernel(s)):",
+            failures.len()
+        );
+        for f in &failures {
+            eprintln!("  {f}");
+        }
+        std::process::exit(1);
     }
 }
 
