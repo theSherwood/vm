@@ -1154,6 +1154,20 @@ Picking a target is really picking the *gap* it drives to completion. Current st
 - **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
   synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
 
+### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
+**Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
+runs a *float* script identical on the tree-walker, bytecode, and JIT — and identical to a native build
+of the same sources. The script (`tests/fixtures/lua/lua_floats_harness.c`) computes
+`(3.14 + 2.0^0.5 + (10.5 % 3.0) + 1.5e3 + 0.25) * 1000.0` → `1506304`, reaching **every new piece of
+this work in one run**: the guest **`strtod`** (every numeric literal, in the lexer), the guest
+**`pow`** (the `^` operator), and the synthesized **`fmod`** (the `%` operator) — plus
+`frexp`/`localeconv`/`snprintf`/`setjmp` referenced by the core. The guest `pow`/`strtod` definitions
+**shadow** the on-ramp's would-be trap stubs (the `llvm-link` is all it takes); `fmod`/`frexp`/`localeconv`/
+`sqrt`/`ldexp`/the string ops stay undefined and the on-ramp synthesizes/recognizes them. Test
+`tests/lua_floats.rs` (committed fixture `lua_floats.bc`); regenerate per the fixtures README. This
+closes the loop: the per-function units validate each guest impl bit-exact vs the system, and this
+proves they **compose into a real interpreter's float path** end to end.
+
 ### Lua first light — ACHIEVED ✅ (all three engines)
 **Goal (met).** A pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
 runs through the on-ramp **identical to native Lua on the tree-walker, bytecode, *and* JIT**
@@ -1225,8 +1239,10 @@ for a real implementation, split by whether it needs a *host-libm decision*:
   the on-ramp takes scalar bitcode while the oracle vectorizes, the corpus-demo split) and
   `libm_guest_exp_log_accurate_vs_system` (a native-only `-D`-renamed build vs the system `<math.h>`,
   ≤2 ULP — validates the fdlibm transcription, which a same-source differential cannot).
-  **Remaining:** `tan` + inverses/hyperbolics, the Payne-Hanek table for huge `sin`/`cos` args, then
-  `llvm-link` the guest libm into the Lua build so the Lua-core `pow` is real end to end.
+  **Remaining:** `tan` + inverses/hyperbolics, the Payne-Hanek table for huge `sin`/`cos` args.
+  **End to end — DONE:** the guest libm + guest `strtod` `llvm-link`ed into the real Lua 5.4.7 core run
+  a float script (`x^0.5`, `x%y`, decimal/scientific literals) **identical on all three engines and to
+  a native build** — see *Lua with floats* below.
 
 After the float-number surface lands, `print`/stdlib graduates first-light to a script that does I/O.
 
