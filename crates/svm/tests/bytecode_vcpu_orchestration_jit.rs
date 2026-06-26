@@ -215,7 +215,11 @@ impl Orch {
     }
     /// Authority check for `uninstall`: a forged/wrong-type domain handle traps.
     fn check_authority(&self, handle: i32) -> Result<(), Trap> {
-        self.pb.lock().unwrap().resolve_jit_domain(handle).map(|_| ())
+        self.pb
+            .lock()
+            .unwrap()
+            .resolve_jit_domain(handle)
+            .map(|_| ())
     }
 }
 
@@ -355,7 +359,11 @@ fn orchestrated_jit_invoke_matches_oracle() {
     let want = run_cooperative(INVOKE);
     assert_eq!(want, Ok(vec![Value::I64(56)]), "oracle: 8 × invoke(7) = 56");
     for i in 0..50 {
-        assert_eq!(run_orchestrated(INVOKE), want, "orchestrated invoke run {i}");
+        assert_eq!(
+            run_orchestrated(INVOKE),
+            want,
+            "orchestrated invoke run {i}"
+        );
     }
 }
 
@@ -365,8 +373,16 @@ fn orchestrated_jit_invoke_matches_oracle() {
 #[test]
 fn orchestrated_jit_install_matches_oracle() {
     let want = run_cooperative(INSTALL);
-    assert_eq!(want, Ok(vec![Value::I64(56)]), "oracle: 8 × install+call(7) = 56");
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(56)]),
+        "oracle: 8 × install+call(7) = 56"
+    );
     for i in 0..50 {
-        assert_eq!(run_orchestrated(INSTALL), want, "orchestrated install run {i}");
+        assert_eq!(
+            run_orchestrated(INSTALL),
+            want,
+            "orchestrated install run {i}"
+        );
     }
 }

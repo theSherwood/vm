@@ -539,7 +539,9 @@ impl SharedSlots {
     /// `(module, i)` (module 0 for the primary's natural table; a `k≥1` for a §14 separate-module
     /// child), the rest are trapping padding (fillable by [`Domain::install`]).
     fn new(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
-        let len = (1usize << table_log2).max(n_funcs.next_power_of_two()).max(1);
+        let len = (1usize << table_log2)
+            .max(n_funcs.next_power_of_two())
+            .max(1);
         let slots = (0..len)
             .map(|i| {
                 std::sync::atomic::AtomicU64::new(if i < n_funcs {
@@ -668,7 +670,8 @@ impl Domain {
             && slot < self.table.slots.len()
             && (self.table.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != super::TABLE_EMPTY
         {
-            self.table.slots[slot].store(super::pack_slot(super::TABLE_EMPTY, 0), Ordering::Release);
+            self.table.slots[slot]
+                .store(super::pack_slot(super::TABLE_EMPTY, 0), Ordering::Release);
             true
         } else {
             false
@@ -1433,7 +1436,9 @@ fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
     // caller's `inst` past the call before descending.
     for &(module, prog, _base, resume_pc, _ret) in vm.stack.iter().rev() {
         let call_pc = resume_pc.wrapping_sub(1);
-        let Some(cm) = source.get(module) else { continue };
+        let Some(cm) = source.get(module) else {
+            continue;
+        };
         if let Some((block, inst)) = cm.progs[prog].src.get(call_pc).copied().flatten() {
             bt.push(super::IrPc {
                 module: module as u32,
@@ -2346,14 +2351,7 @@ impl DebugRun {
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
-            match vm.resume(
-                source,
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Excl(&mut *host),
-                1,
-            ) {
+            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
                 Ok(Outcome::Suspended) => {}
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2376,14 +2374,7 @@ impl DebugRun {
                     return Some(pc);
                 }
             }
-            match vm.resume(
-                source,
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Excl(&mut *host),
-                1,
-            ) {
+            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
                 Ok(Outcome::Suspended) => continue,
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2420,14 +2411,7 @@ impl DebugRun {
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
-            match vm.resume(
-                source,
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Excl(&mut *host),
-                1,
-            ) {
+            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
                 Ok(Outcome::Suspended) => {}
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -3059,7 +3043,9 @@ fn scan_vm_roots(vm: &Vm, source: &ModuleSource, consider: &mut impl FnMut(u64))
     let frames = std::iter::once((vm.module, vm.cur, vm.base))
         .chain(vm.stack.iter().map(|&(m, p, b, _, _)| (m, p, b)));
     for (module, prog, base) in frames {
-        let Some(c) = source.get(module) else { continue };
+        let Some(c) = source.get(module) else {
+            continue;
+        };
         let n = c.progs[prog].nslots as usize;
         let end = (base + n).min(vm.regs.len());
         for r in &vm.regs[base..end] {
@@ -4412,7 +4398,14 @@ fn drive(
                     .map(|(ty, s)| slot_to_val(*ty, *s))
                     .collect();
                 let umod = dom.source.push(unit);
-                match run_invoke(&dom, umod, &child_args, fuel, mem, &mut HostCell::Excl(host)) {
+                match run_invoke(
+                    &dom,
+                    umod,
+                    &child_args,
+                    fuel,
+                    mem,
+                    &mut HostCell::Excl(host),
+                ) {
                     Ok(vals) => {
                         for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
                             let re = slot_to_val(*ty, val_to_slot(*v));
@@ -4931,11 +4924,7 @@ impl Vm {
     /// instruction-location sequence the tree-walker's `Inspector` reports.
     fn cur_ir_pc(&self, source: &ModuleSource) -> Option<super::IrPc> {
         let cm = source.get(self.module)?;
-        let (block, inst) = cm.progs[self.cur]
-            .src
-            .get(self.pc)
-            .copied()
-            .flatten()?;
+        let (block, inst) = cm.progs[self.cur].src.get(self.pc).copied().flatten()?;
         if inst & SRC_TERM != 0 {
             return None; // terminator — non-steppable (see `Program::src`)
         }

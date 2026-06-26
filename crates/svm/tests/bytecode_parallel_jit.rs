@@ -242,7 +242,11 @@ fn parallel_invoke_matches_oracle() {
     let want = run_cooperative(INVOKE);
     assert_eq!(want, Ok(vec![Value::I64(56)]), "oracle: 8 × invoke(7) = 56");
     for i in 0..50 {
-        assert_eq!(run_parallel(INVOKE), want, "parallel invoke != oracle (run {i})");
+        assert_eq!(
+            run_parallel(INVOKE),
+            want,
+            "parallel invoke != oracle (run {i})"
+        );
     }
 }
 
@@ -251,7 +255,11 @@ fn parallel_invoke_matches_oracle() {
 #[test]
 fn parallel_install_call_indirect_matches_oracle() {
     let want = run_cooperative(INSTALL);
-    assert_eq!(want, Ok(vec![Value::I64(56)]), "oracle: 8 × install+call(7) = 56");
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(56)]),
+        "oracle: 8 × install+call(7) = 56"
+    );
     for i in 0..50 {
         assert_eq!(
             run_parallel(INSTALL),
