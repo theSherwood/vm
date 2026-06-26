@@ -1173,18 +1173,23 @@ The full `luaL_*` build pulls in ~39 externals (file I/O dominates); the core-on
 externals + 4 defined-varargs functions** — the true first-light surface.
 
 **Gap inventory (core-only `lua_core.bc`), in dependency order:**
-1. **Varargs *definition* ABI — the keystone.** `luaG_runerror` / `luaO_pushfstring` / `lua_pushfstring`
-   / `lua_gc` are defined `(...)` functions; clang `-O2` lowers `va_start`/`va_arg` into the **System V
-   AMD64 `__va_list_tag` dance** (`gp_offset`/`fp_offset`/`reg_save_area`/`overflow_arg_area`). The
-   on-ramp rejects defined varargs functions outright (`translate_func`). These are reached via the
-   error-reporting paths in the *static* call graph (so reachability pruning can't drop them) even when
-   a clean script never executes them. **Tractable model:** give a varargs def a hidden trailing
-   `__vararg_area: i64` param; lower `llvm.va_start` to write the tag with `gp_offset=48`,
-   `fp_offset=176` (≥ thresholds → clang's lowered `va_arg` *always* takes the `overflow_arg_area`
-   branch, so **no `reg_save_area` to synthesize**), `overflow_arg_area = __vararg_area`; at a varargs
-   *call* site marshal the variadic args into a contiguous 8-byte-slot stack buffer and pass its
-   pointer as the hidden param. `va_end`→no-op, `va_copy`→struct copy. (Lua's variadic args are all
-   ≤8 bytes — int/ptr/double/ptrdiff — so 8-byte slots suffice; wider-than-8 by-value is a follow-on.)
+1. **Varargs *definition* ABI — the keystone. DONE (slice 1).** `luaG_runerror` / `luaO_pushfstring` /
+   `lua_pushfstring` / `lua_gc` are defined `(...)` functions; clang `-O2` lowers `va_start`/`va_arg`
+   into the **System V AMD64 `__va_list_tag` dance** (`gp_offset`/`fp_offset`/`reg_save_area`/
+   `overflow_arg_area`). The on-ramp used to reject defined varargs functions outright; it now lowers
+   them via an **overflow-only model** (no `reg_save_area` synthesized): a `(...)` def reserves the
+   first 8 bytes of its frame (offset 0) for an **incoming overflow-area pointer**; `llvm.va_start`
+   writes the tag with `gp_offset=48`/`fp_offset=176` (both ≥ their register thresholds, so clang's
+   lowered `va_arg` *always* takes the memory branch — the register path is dead) and
+   `overflow_arg_area = *(sp+0)`, `reg_save_area = null`. At a direct `(...)` **call** site the caller
+   marshals the variadic args into a contiguous 8-byte-slot frame scratch (`VARARG_SCRATCH`) and
+   deposits a pointer to it at `callee_sp + 0`; only the fixed params are passed as IR args (the
+   callee signature stays `(sp, fixed…)`, no synthetic param). `va_end`→no-op, `va_copy`→24-byte tag
+   copy. Mixed int/SSE args work because the forced memory path lays all args out positionally.
+   Limitation: a variadic arg wider than 8 bytes (a 16-byte `v128`/by-value aggregate) is a clean
+   `Unsupported` (Lua's are all int/ptr/double/ptrdiff ≤8B). **Tests:** `varargs_int_double_mixed`,
+   `varargs_many_and_copy` — all three engines == native cc. **217 translate tests green, fmt+clippy
+   clean.**
 2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). Reuses the
    bignum dtoa float formatter + the varargs-call marshaling from (1). Reachable.
 3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
@@ -1197,9 +1202,11 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    `lstate` `makeseed`). Already covered: `_setjmp`/`longjmp`, `free`(no-op), `realloc`, `bcmp`→`memcmp`,
    `strlen`.
 
-**Sequencing:** (slice 1) varargs ABI + a standalone `my_sum(int n, ...)` differential unit test; (slice
-2) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test (native
-exit vs on-ramp exit, all engines). Each slice is independently testable against native.
+**Sequencing:** (slice 1 — **DONE**) varargs ABI + standalone differential tests; (slice 2 — in
+progress) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test
+(native exit vs on-ramp exit, all engines). Each slice is independently testable against native. After
+slice 1 the Lua-core translation advances past the four varargs defs to the libc surface (first stop:
+`ldexp`).
 
 ### SQLite — the north star (in-memory, then disk via the powerbox)
 SQLite is the gold-standard target (≈600:1 test-to-code ratio, ships as one amalgamation `.c`). Two

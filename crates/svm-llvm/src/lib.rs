@@ -764,6 +764,13 @@ const STACK_RESERVE: u64 = svm_ir::POWERBOX_STACK_RESERVE;
 /// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
 const SP: ValueId = usize::MAX;
 
+/// A sentinel `frame` key (never a real SSA value) holding the `sp`-relative offset of this
+/// function's **outgoing-varargs marshaling scratch** (§varargs). A call to a `(...)` function
+/// stores its variadic arguments into 8-byte slots starting here, then hands the callee a pointer
+/// to it via the callee's reserved frame slot (offset 0). Present in `frame` only when the function
+/// makes at least one direct varargs call. See `frame_layout` / the varargs call-site lowering.
+const VARARG_SCRATCH: ValueId = usize::MAX - 1;
+
 /// Accumulates the §6 debug-info **neutral core** as functions are lowered — the LLVM on-ramp as a
 /// third independent producer feeding the frontend-neutral waist (DEBUGGING.md §6 / D-DBG-7).
 ///
@@ -1785,9 +1792,10 @@ fn translate_func(
     ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
 ) -> Result<(Func, u64), Error> {
-    if f.is_var_arg {
-        return unsup(format!("varargs function `{}`", f.name));
-    }
+    // A `(...)`-defined function (`f.is_var_arg`) lowers like any other: its IR signature is
+    // `(sp, fixed-params…)` — the variadic arguments are not IR parameters but are read by `va_start`
+    // from the caller-deposited overflow area (§varargs). `frame_layout` reserves the incoming-pointer
+    // slot at frame offset 0; the `llvm.va_start` lowering reads it.
     if f.basic_blocks.is_empty() {
         return unsup(format!("declaration-only function `{}`", f.name));
     }
@@ -1927,6 +1935,12 @@ fn frame_layout(
 ) -> Result<(HashMap<ValueId, u64>, u64), Error> {
     let mut frame = HashMap::new();
     let mut off = 0u64;
+    // A `(...)`-defined function reserves the first 8 bytes of its frame (offset 0) for the
+    // **incoming varargs pointer** the caller deposits at `callee_sp + 0` before the call; `va_start`
+    // reads it from `sp + 0`. Shifting allocas past it keeps that slot dedicated (§varargs).
+    if f.is_var_arg {
+        off = 8;
+    }
     for bb in &f.basic_blocks {
         for instr in &bb.instrs {
             if let Instruction::Alloca(a) = instr {
@@ -1951,7 +1965,41 @@ fn frame_layout(
             }
         }
     }
+    // Reserve the **outgoing-varargs marshaling scratch**: the widest variadic-argument list across
+    // all direct `(...)` call sites, one 8-byte slot per variadic argument (§varargs). Recorded under
+    // the `VARARG_SCRATCH` sentinel key so the call-site lowering can find its `sp`-relative base.
+    let mut max_vararg_slots = 0u64;
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            if let Instruction::Call(c) = instr {
+                if let Some(extra) = vararg_call_extra(c) {
+                    max_vararg_slots = max_vararg_slots.max(extra as u64);
+                }
+            }
+        }
+    }
+    if max_vararg_slots > 0 {
+        off = off.div_ceil(8) * 8;
+        frame.insert(VARARG_SCRATCH, off);
+        off += max_vararg_slots * 8;
+    }
     Ok((frame, off.div_ceil(16) * 16))
+}
+
+/// The count of **variadic** (beyond-the-fixed) arguments of a direct call to a `(...)` function,
+/// or `None` if `c` is not a direct varargs call. The fixed-parameter count comes from the call's
+/// declared function type (`param_types`); the variadic arguments are `arguments[fixed..]`.
+fn vararg_call_extra(c: &llvm_ir::instruction::Call) -> Option<usize> {
+    callee_name(c)?; // indirect varargs calls are rejected separately
+    if let Type::FuncType {
+        param_types,
+        is_var_arg: true,
+        ..
+    } = c.function_ty.as_ref()
+    {
+        return Some(c.arguments.len().saturating_sub(param_types.len()));
+    }
+    None
 }
 
 /// Pass 1a: assign a `ValueId` to every SSA value (parameters first, then per block the φ-results
@@ -11131,10 +11179,90 @@ fn is_droppable_call(c: &llvm_ir::instruction::Call) -> bool {
             || s.starts_with("llvm.dbg")
             || s.starts_with("llvm.assume")
             || s.starts_with("llvm.invariant")
+            // `llvm.va_end` only marks the end of a `va_list` traversal — no runtime state to tear
+            // down in our overflow-only varargs ABI (§varargs); `va_start`/`va_copy` are lowered.
+            || s.starts_with("llvm.va_end")
             // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
             || s.starts_with("llvm.experimental.noalias.scope.decl");
     }
     false
+}
+
+/// Lower a varargs `llvm.va_start` / `llvm.va_copy` for the **overflow-only varargs ABI** (§varargs).
+/// Returns `Ok(true)` if `name` named a handled varargs intrinsic (`va_end` is dropped earlier in
+/// `is_droppable_call`).
+///
+/// `va_start(list)` initializes the System V AMD64 `__va_list_tag` at `list` so that clang's already-
+/// lowered `va_arg` *always* takes the memory (`overflow_arg_area`) branch: `gp_offset = 48` and
+/// `fp_offset = 176` both sit at/over their register-save thresholds, so the register path is dead and
+/// no `reg_save_area` need be synthesized. `overflow_arg_area` is the caller-deposited pointer read
+/// from this frame's reserved slot (`sp + 0`); `reg_save_area` is left null. Tag layout (x86-64):
+/// `i32 gp_offset @0`, `i32 fp_offset @4`, `ptr overflow_arg_area @8`, `ptr reg_save_area @16` — the
+/// two `i32` offsets are written as one packed `i64` at `@0`.
+///
+/// `va_copy(dst, src)` byte-copies the 24-byte tag.
+fn lower_va_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    if name.starts_with("llvm.va_start") {
+        let list = ctx.operand(&c.arguments[0].0)?;
+        let sp = ctx.sp()?;
+        // overflow_arg_area = *(sp + 0): the area pointer the caller deposited at our frame base.
+        let area = ctx.push(Inst::Load {
+            op: svm_ir::LoadOp::I64,
+            addr: sp,
+            offset: 0,
+            align: 0,
+        });
+        // gp_offset (48) | fp_offset (176) << 32 — both past their thresholds → memory branch only.
+        let off_word = ctx.const_i64(48 | (176i64 << 32));
+        ctx.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I64,
+            addr: list,
+            value: off_word,
+            offset: 0,
+            align: 0,
+        });
+        ctx.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I64,
+            addr: list,
+            value: area,
+            offset: 8,
+            align: 0,
+        });
+        let zero = ctx.const_i64(0);
+        ctx.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I64,
+            addr: list,
+            value: zero,
+            offset: 16,
+            align: 0,
+        });
+        return Ok(true);
+    }
+    if name.starts_with("llvm.va_copy") {
+        let dst = ctx.operand(&c.arguments[0].0)?;
+        let src = ctx.operand(&c.arguments[1].0)?;
+        for off in [0u64, 8, 16] {
+            let w = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr: src,
+                offset: off,
+                align: 0,
+            });
+            ctx.push_effect(Inst::Store {
+                op: svm_ir::StoreOp::I64,
+                addr: dst,
+                value: w,
+                offset: off,
+                align: 0,
+            });
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
@@ -13203,6 +13331,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         if is_droppable_call(c) {
             return Ok(()); // a no-op intrinsic (lifetime/dbg/assume)
         }
+        // `llvm.va_start`/`llvm.va_copy` set up the `__va_list_tag` for the overflow-only varargs ABI.
+        if let Some(name) = callee_name(c) {
+            if lower_va_intrinsic(ctx, c, &name)? {
+                return Ok(());
+            }
+        }
         // Float math intrinsics lower to inline float ops (not a call).
         if let Some(idx) = lower_float_intrinsic(ctx, c, types)? {
             if let Some(dest) = &c.dest {
@@ -13314,8 +13448,57 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         let fs = ctx.const_i64(ctx.frame_size as i64);
         let callee_sp = ctx.add_i64(sp, fs);
         let mut args = vec![callee_sp];
-        for (a, _attrs) in &c.arguments {
-            args.push(ctx.operand(a)?);
+        // A direct call to a `(...)` function (§varargs): only the fixed parameters are IR arguments;
+        // the variadic arguments are marshaled into this frame's scratch (one 8-byte slot each, the
+        // overflow-area layout clang's lowered `va_arg` reads), and a pointer to that scratch is
+        // deposited at the callee's reserved frame slot (`callee_sp + 0`) for its `va_start`.
+        let fixed = match c.function_ty.as_ref() {
+            Type::FuncType {
+                param_types,
+                is_var_arg: true,
+                ..
+            } if callee_name(c).is_some() => Some(param_types.len()),
+            _ => None,
+        };
+        if let Some(fixed) = fixed {
+            let scratch_off = *ctx.frame.get(&VARARG_SCRATCH).ok_or_else(|| {
+                Error::Unsupported("varargs call without reserved scratch".into())
+            })?;
+            let area = {
+                let k = ctx.const_i64(scratch_off as i64);
+                ctx.add_i64(sp, k)
+            };
+            for (i, (a, _)) in c.arguments.iter().enumerate().skip(fixed) {
+                let aty = a.get_type(types);
+                // Each variadic argument occupies one 8-byte overflow slot; a 16-byte `v128` (or any
+                // aggregate, which `store_op` rejects below) would need a wider slot + stride.
+                if matches!(val_type(aty.as_ref()), Ok(ValType::V128)) {
+                    return unsup("varargs argument wider than 8 bytes");
+                }
+                let op = store_op(aty.as_ref())?;
+                let value = ctx.operand(a)?;
+                ctx.push_effect(Inst::Store {
+                    op,
+                    addr: area,
+                    value,
+                    offset: (i - fixed) as u64 * 8,
+                    align: 0,
+                });
+            }
+            ctx.push_effect(Inst::Store {
+                op: svm_ir::StoreOp::I64,
+                addr: callee_sp,
+                value: area,
+                offset: 0,
+                align: 0,
+            });
+            for (a, _attrs) in c.arguments.iter().take(fixed) {
+                args.push(ctx.operand(a)?);
+            }
+        } else {
+            for (a, _attrs) in &c.arguments {
+                args.push(ctx.operand(a)?);
+            }
         }
         // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through
         // a function-pointer value) lowers to `call_indirect <sig>` (§3c: mask + type-id check).

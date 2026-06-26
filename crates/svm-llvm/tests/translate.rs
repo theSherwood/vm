@@ -1748,6 +1748,113 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
     }
 }
 
+/// Compile a C program whose **first defined function** is `run(int seed)` (returning a result byte),
+/// translate it, and assert the tree-walker, bytecode, and JIT engines all reproduce the native exit
+/// code. The §varargs tests use this: `run` calls one or more `(...)`-defined helpers whose `va_arg`
+/// reads must match native. Unlike setjmp, the JIT must *run* varargs (it lowers to ordinary
+/// loads/stores/calls), so a JIT decline is a failure here.
+fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("svm_llvm_va_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let svm = match interp.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: expected i32 result, got {other:?}"),
+    };
+    assert_eq!(svm, native, "{name}: tree-walker={svm} vs native cc={native}");
+
+    let mut bfuel = 100_000_000u64;
+    let bc_out = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+        .expect("bytecode compile")
+        .expect("bytecode run");
+    let bsvm = match bc_out.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: bytecode expected i32 result, got {other:?}"),
+    };
+    assert_eq!(bsvm, native, "{name}: bytecode={bsvm} vs native cc={native}");
+
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            let jsvm = s[0] as i32 as u8;
+            assert_eq!(jsvm, native, "{name}: JIT={jsvm} vs native cc={native}");
+        }
+        Ok(other) => panic!("{name}: unexpected JIT outcome {other:?} on a valid varargs program"),
+        Err(e) => panic!("{name}: JIT errored on varargs: {e:?}"),
+    }
+}
+
+#[test]
+fn varargs_int_double_mixed() {
+    // The first defined function `run` calls three `(...)`-defined helpers — an all-`int` list, an
+    // all-`double` list, and a mixed `int`/`double` list. Forcing every argument to the
+    // `overflow_arg_area` (gp_offset/fp_offset maxed in `va_start`, §varargs) means the helpers read
+    // their arguments positionally from the marshaled scratch; mixed int/SSE classes must still land
+    // byte-identical to native. The helpers are `noinline` so they survive `-O2` as real varargs
+    // definitions (not inlined + constant-folded away).
+    let src = "#include <stdarg.h>\n\
+        static long long vsum(int n, ...);\n\
+        static double vdsum(int n, ...);\n\
+        static long long vmix(int n, ...);\n\
+        int run(int seed){\n\
+          long long a = vsum(5, 10, 20, 30, 40, 50);\n\
+          double d = vdsum(3, 1.5, 2.5, 3.0);\n\
+          long long m = vmix(4, 100, 2.5, 200, 3.9);\n\
+          return (int)((a + (long long)d + m + seed) & 0xff);\n\
+        }\n\
+        __attribute__((noinline)) static long long vsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int i=0;i<n;i++) s+=va_arg(ap,int); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static double vdsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); double s=0;\n\
+          for(int i=0;i<n;i++) s+=va_arg(ap,double); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static long long vmix(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int i=0;i<n;i++){ if(i&1) s+=(long long)va_arg(ap,double); else s+=va_arg(ap,int); }\n\
+          va_end(ap); return s; }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_mixed", src, 0);
+}
+
+#[test]
+fn varargs_many_and_copy() {
+    // A long integer list (more than the six SysV integer-class registers) stresses the memory-path
+    // traversal; `va_copy` re-walks the same list from the start. `run` returns a byte. Sum 1..10 =
+    // 55, walked twice = 110.
+    let src = "#include <stdarg.h>\n\
+        static int vcount(int n, ...);\n\
+        int run(int seed){ return (vcount(10, 1,2,3,4,5,6,7,8,9,10) + seed) & 0xff; }\n\
+        __attribute__((noinline)) static int vcount(int n, ...){\n\
+          va_list ap, aq; va_start(ap,n); va_copy(aq, ap);\n\
+          long long s=0; for(int i=0;i<n;i++) s+=va_arg(ap,int);\n\
+          long long t=0; for(int i=0;i<n;i++) t+=va_arg(aq,int);\n\
+          va_end(aq); va_end(ap); return (int)(s+t); }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_many_copy", src, 0);
+}
+
 #[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
