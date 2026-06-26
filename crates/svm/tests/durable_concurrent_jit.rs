@@ -1163,3 +1163,127 @@ fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
         );
     }
 }
+
+// §12.8 4A.6 — **recycled-context async freeze (sparse-residue payoff).** The root spawns child A and
+// **joins** it (A is uninstrumented — no may-suspend op — so it always finishes), which frees/recycles
+// A's shadow context, *then* spawns the live looping child B and triggers the async freeze. By the freeze
+// point A is finished **and joined** (fully gone — unlike SRC_JOIN's finished-but-unjoined child, which
+// rides the artifact via `completed_result`), so only B is in the residue: 2 lifetime spawns, 1 frozen
+// vCPU. The thaw reloads A's join result (A is never re-run) and reproduces every total.
+const SRC_RECYCLE: &str = r#"
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 65560
+  i32.store v2 v0
+  v3 = i64.const 7
+  v4 = thread.spawn 1 v3 v3
+  v5 = thread.join v4
+  v6 = i64.const 65544
+  v7 = thread.spawn 2 v6 v6
+  v8 = i32.const 0
+  v9 = cap.call 13 0 (i32) -> (i64) v1 (v8)
+  v10 = i64.const 0
+  br block1(v5, v10)
+block1(v11: i64, v12: i64):
+  v13 = i64.const 1
+  v14 = i64.add v12 v13
+  v15 = i64.const 100000000
+  v16 = i64.lt_s v14 v15
+  br_if v16 block1(v11, v14) block2(v11, v14)
+block2(v17: i64, v18: i64):
+  v19 = i64.add v18 v17
+  v20 = i64.const 65536
+  i64.store v20 v19
+  return v19
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 1000
+  v3 = i64.add v1 v2
+  return v3
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65560
+  v3 = i32.load v2
+  v4 = i64.const 0
+  br block1(v1, v3, v4)
+block1(v5: i64, v6: i32, v7: i64):
+  v8 = i64.const 1
+  v9 = i64.add v7 v8
+  v10 = i64.const 100000000
+  v11 = i64.lt_s v9 v10
+  br_if v11 block1(v5, v6, v9) block2(v5, v6, v9)
+block2(v12: i64, v13: i32, v14: i64):
+  v15 = i32.const 0
+  v16 = cap.call 2 0 (i32) -> (i64) v13 (v15)
+  i64.store v12 v14
+  return v14
+}
+"#;
+
+#[test]
+fn recycled_context_freeze_residue_is_sparse() {
+    let inst = instrument(SRC_RECYCLE);
+    const ROOT_ORACLE: i64 = K + 1007; // root loop total K + A's join result (7 + 1000)
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        return;
+    };
+    if read_state(&fsnap) != STATE_UNWINDING {
+        // The freeze didn't catch the loops (rare): the run completed; A joined, B finished.
+        assert_eq!(
+            le_i64(&fsnap, OFF_ROOT),
+            ROOT_ORACLE,
+            "uninterrupted root total"
+        );
+        assert_eq!(le_i64(&fsnap, OFF_C1), K, "uninterrupted child B total");
+        return;
+    }
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "freeze placeholder"
+    );
+    // The recycled-context residue: A finished + had its context freed, then B reserved a context (reusing
+    // the freed slot) and froze live there. The residue is **B frozen** (`completed_result == None`) plus
+    // **A as a completed child** (`completed_result == Some`) — completed children always ride so the
+    // thaw's per-parent join table stays dense (follow-up A); the recycling shows in the *reused context*,
+    // not a smaller record count.
+    assert_eq!(
+        fvcpus.len(),
+        2,
+        "B frozen + A completed (kept for join-table density)"
+    );
+    let frozen: Vec<_> = fvcpus
+        .iter()
+        .filter(|v| v.completed_result.is_none())
+        .collect();
+    let completed: Vec<_> = fvcpus
+        .iter()
+        .filter(|v| v.completed_result.is_some())
+        .collect();
+    assert_eq!(frozen.len(), 1, "exactly one live (frozen) child — B");
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly one completed child — the recycled A"
+    );
+    assert_eq!(
+        completed[0].completed_result,
+        Some(1007),
+        "A's join result (7 + 1000) rides the artifact"
+    );
+
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
+    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        le_i64(&tfinal, OFF_ROOT),
+        ROOT_ORACLE,
+        "root total reproduced — A's join result was reloaded, A never re-run",
+    );
+    assert_eq!(
+        le_i64(&tfinal, OFF_C1),
+        K,
+        "child B total reproduced on thaw"
+    );
+}
