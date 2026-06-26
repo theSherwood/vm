@@ -217,9 +217,24 @@ property, so in practice:
     asserts the same in **real Chromium** (the `#jit` work item). Validates std `Mutex<Vec<Arc<…>>>`
     (the `Domain`'s `ModuleSource`) working cross-Worker on wasm atomics. (Invoked units still run over
     the vCPU's deny-all powerbox — a `cap.call`ing unit is out of scope, the C1 limitation.)
-  - [ ] **§14 `instantiate` in parallel** — a follow-on after §22 (children get their own confined
-    `Domain`; the cooperative driver's single `extra_envs` vec doesn't map onto per-thread vCPUs —
-    separate slice).
+  - **§14 `instantiate` in parallel** — a confined executor child runs as a **nested confined
+    parallel run**: its own `nested_view` sub-window (own page-prot map over the shared backing), its
+    own attenuated powerbox (`Instantiator` + `AddressSpace`), its own natural dispatch table
+    (`Domain::child` over the shared source `Arc`, no parent install slots), a quota sub-allocated from
+    the parent's fuel, and its **own** thread registry for anything it spawns — on its own scoped
+    thread, joinable through the parent's registry. The cooperative driver's single `extra_envs` vec
+    doesn't map onto per-thread vCPUs, but in the parallel driver each vCPU *already* owns its `mem`/
+    `fuel`, so the child's env is natural (no indirection).
+    - [x] **§14-A — `instantiate` (op 0, same-module)** in `drive_parallel`. Proven by
+      `bytecode_parallel_instantiate.rs` (8 confined children on real threads, and a depth-2 nested
+      kernel where each child instantiates a grandchild on a further nested scope, both folded to the
+      cooperative oracle's value, 50 runs) and `parallel_instantiate_miri.rs` (the `nested_view`
+      cross-thread access is race/UB/provenance-clean under Miri).
+    - [ ] **§14-B — `instantiate_module` (op 5)**: resolve + compile + push the host-granted module,
+      materialize its data segments into the carve, start the child at the pushed module index.
+    - [ ] **§14-C — `spawn_coroutine_module` (op 6/7)**: build the `Coro` (inline-driven) + demand
+      paging.
+    - [ ] **§14-D — the resumable `Vcpu` / browser path** (like §22 C1/C2), if wanted.
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
   `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
@@ -278,8 +293,10 @@ cargo test -p svm --test bytecode_parallel_caps       # 4c-host: shared-powerbox
 cargo test -p svm --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
 cargo test -p svm --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in drive_parallel vs oracle
 cargo test -p svm --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
+cargo test -p svm --test bytecode_parallel_instantiate    # 4c-domain §14-A: instantiate in drive_parallel vs oracle
 cargo +nightly miri test -p svm-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
 cargo +nightly miri test -p svm-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
+cargo +nightly miri test -p svm-interp --test parallel_instantiate_miri  # 4c-domain §14-A: confined child race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (tiny spike)
 cd browser/threads-spike && cargo +nightly build --release && node threads-futex.mjs && cd ..

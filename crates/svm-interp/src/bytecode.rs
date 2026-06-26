@@ -641,6 +641,15 @@ impl Domain {
         }
     }
 
+    /// A §14 confined-child domain over a (cloned `Arc`) **shared** `source` with its own dispatch
+    /// `table`. Sharing the source keeps the parent's module archive reachable by index (so an
+    /// `instantiate_module` child's pushed program resolves); the fresh `table` is the confinement —
+    /// it carries only the child's own natural entries, never the parent's installed §22 unit slots
+    /// (matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
+    fn child(source: std::sync::Arc<ModuleSource>, table: SharedSlots) -> Domain {
+        Domain { source, table }
+    }
+
     /// `Jit.install`: append `unit` to the shared source and fill the first padding slot with
     /// `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit is not
     /// appended). `&self` (interior-mutable) so a shared `&Domain` can install. The whole op serializes
@@ -4799,8 +4808,112 @@ fn run_vcpu_parallel<'scope, 'env>(
                     Err(t) => return (Err(t), mem),
                 }
             }
-            // Outside this driver's subset (§14 instantiate): needs a confined executor child the
-            // parallel driver doesn't thread yet — fail closed rather than run wrong.
+            // §14 `Instantiator.instantiate` (THREADS.md 4c-domain) — a **same-module** confined
+            // executor child: its own power-of-two sub-window (`nested_view` of the shared backing,
+            // own page-prot map), its own attenuated powerbox (`Instantiator` + `AddressSpace` over
+            // `[0, child_size)`), its own natural dispatch table (no parent install slots), and a
+            // quota sub-allocated from the parent's fuel. The child is a **nested confined parallel
+            // run** on its own scoped thread — joinable through the parent's registry exactly like a
+            // `thread.spawn` child. Unlike a `thread.spawn` child (which shares this vCPU's `Mem`
+            // view + the shared powerbox), it owns all of these — the §14 confinement.
+            Ok(VcpuStop::Instantiate {
+                ibase,
+                isize: isz,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+            }) => {
+                // Validate the child entry signature against module 0 and the power-of-two-aligned
+                // carve within `[0, isize)` — identical to the cooperative `drive` arm.
+                let c0 = dom.source.primary();
+                let want_as = c0
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
+                    r[..] == [ValType::I64]
+                        && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+                });
+                let child_size = if (0..64).contains(&size_log2) {
+                    1u64 << size_log2
+                } else {
+                    0
+                };
+                let off_u = off as u64;
+                let fits = child_size != 0
+                    && child_size <= isz
+                    && off_u & (child_size - 1) == 0
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                if !ok_entry || !fits {
+                    vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
+                // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`).
+                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                    > super::MAX_VCPUS
+                {
+                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return (Err(Trap::ThreadFault), mem);
+                }
+                // This vCPU's own `mem`/`fuel` *are* its environment (no `extra_envs` indirection —
+                // a confined parent already runs on its own thread with its own confined view), so
+                // holder-relative `ibase`/`off` compose straight onto the backing-absolute base.
+                let pbase = mem.as_ref().map_or(0, |m| m.window.base());
+                let abs_base = pbase + ibase + off_u;
+                let child_mem = mem
+                    .as_ref()
+                    .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                let mut child_host = Host::new();
+                let cinst = child_host.grant_instantiator(0, child_size);
+                let cas = child_host.grant_address_space(0, child_size);
+                let child_args = if want_as {
+                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                } else {
+                    vec![Value::I64(cinst as i64)]
+                };
+                let child_fuel = if quota <= 0 {
+                    fuel
+                } else {
+                    (quota as u64).min(fuel)
+                };
+                // Own table over the **shared** source (module 0 = the same primary the child runs).
+                let child_table = build_table(c0.progs.len(), 0);
+                let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
+                let child_vt = match VTask::new(&c0, entry as usize, &child_args) {
+                    Ok(v) => v,
+                    Err(t) => return (Err(t), mem),
+                };
+                let id = reg
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                scope.spawn(move || {
+                    // A confined nested run: the child owns its domain (own table, shared source
+                    // `Arc`), its attenuated powerbox (`Excl`), its `nested_view` window, its quota,
+                    // and its **own** thread registry (for threads/instantiates *it* spawns). Its
+                    // result is published to the **parent's** `reg` so the parent's `join` finds it.
+                    let child_reg = ThreadRegistry::new();
+                    let child_host = std::sync::Mutex::new(child_host);
+                    let (r, _m) = std::thread::scope(|cscope| {
+                        run_vcpu_parallel(
+                            cscope,
+                            &child_dom,
+                            &child_reg,
+                            &child_host,
+                            child_vt,
+                            child_mem,
+                            child_fuel,
+                        )
+                    });
+                    reg.publish(id, r);
+                });
+                let handle = threads.len() as i32;
+                threads.push(Some(id));
+                vt.active.set(dst, Reg::from_i32(handle));
+            }
+            // Still outside this driver's subset (§14 `instantiate_module` /
+            // `spawn_coroutine_module`): they compile/push a granted module — a later slice.
             Ok(_) => return (Err(Trap::ThreadFault), mem),
         }
     }
