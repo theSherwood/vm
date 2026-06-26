@@ -4,7 +4,9 @@
 use svm_run::{Backend, Limits, RunConfig};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: run_lua <file.bc> [backend]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: run_lua <file.bc> [backend]");
     let backend = match std::env::args().nth(2).as_deref() {
         Some("jit") => Backend::Jit,
         Some("bytecode") => Backend::Bytecode,

@@ -1790,7 +1790,10 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
         Some(Value::I32(x)) => *x as u8,
         other => panic!("{name}: expected i32 result, got {other:?}"),
     };
-    assert_eq!(svm, native, "{name}: tree-walker={svm} vs native cc={native}");
+    assert_eq!(
+        svm, native,
+        "{name}: tree-walker={svm} vs native cc={native}"
+    );
 
     let mut bfuel = 100_000_000u64;
     let bc_out = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
@@ -1800,7 +1803,10 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
         Some(Value::I32(x)) => *x as u8,
         other => panic!("{name}: bytecode expected i32 result, got {other:?}"),
     };
-    assert_eq!(bsvm, native, "{name}: bytecode={bsvm} vs native cc={native}");
+    assert_eq!(
+        bsvm, native,
+        "{name}: bytecode={bsvm} vs native cc={native}"
+    );
 
     let slots: Vec<i64> = full.iter().map(to_slot).collect();
     match svm_jit::compile_and_run(&module, 0, &slots) {
@@ -1971,7 +1977,12 @@ done:\n\
     let llf = dir.join(format!("svm_mask_{}.ll", std::process::id()));
     let bcf = dir.join(format!("svm_mask_{}.bc", std::process::id()));
     std::fs::write(&llf, ll).unwrap();
-    match Command::new("llvm-as").arg(&llf).arg("-o").arg(&bcf).status() {
+    match Command::new("llvm-as")
+        .arg(&llf)
+        .arg("-o")
+        .arg(&bcf)
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping cross_block_i1_mask (llvm-as unavailable)");
@@ -1985,12 +1996,20 @@ done:\n\
         let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
         let mut fuel = 1_000_000u64;
         let tw = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
-        assert_eq!(tw.first(), Some(&Value::I32(expect)), "tree-walker seed={seed}");
+        assert_eq!(
+            tw.first(),
+            Some(&Value::I32(expect)),
+            "tree-walker seed={seed}"
+        );
         let mut bf = 1_000_000u64;
         let bc = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bf)
             .expect("bytecode compile")
             .expect("bytecode run");
-        assert_eq!(bc.first(), Some(&Value::I32(expect)), "bytecode seed={seed}");
+        assert_eq!(
+            bc.first(),
+            Some(&Value::I32(expect)),
+            "bytecode seed={seed}"
+        );
         let slots: Vec<i64> = full.iter().map(to_slot).collect();
         match svm_jit::compile_and_run(&module, 0, &slots) {
             Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, expect, "JIT seed={seed}"),

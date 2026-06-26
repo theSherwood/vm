@@ -296,14 +296,14 @@ fn translate_impl(
     let need_strlen = need_printf || calls_external(m, &defined_names, "strlen");
     // `strcmp` plus its C-locale alias `strcoll` share one synthesized byte-compare helper; `strchr`
     // its own byte scan (the §varargs/libc batch for real-program targets like Lua).
-    let need_strcmp = calls_external(m, &defined_names, "strcmp")
-        || calls_external(m, &defined_names, "strcoll");
+    let need_strcmp =
+        calls_external(m, &defined_names, "strcmp") || calls_external(m, &defined_names, "strcoll");
     let need_strchr = calls_external(m, &defined_names, "strchr");
     let need_strcpy = calls_external(m, &defined_names, "strcpy");
     let need_strspn = calls_external(m, &defined_names, "strspn");
     let need_strpbrk = calls_external(m, &defined_names, "strpbrk");
-    let need_ldexp = calls_external(m, &defined_names, "ldexp")
-        || calls_external(m, &defined_names, "scalbn");
+    let need_ldexp =
+        calls_external(m, &defined_names, "ldexp") || calls_external(m, &defined_names, "scalbn");
     let need_pow = calls_external(m, &defined_names, "pow");
     let need_fmod = calls_external(m, &defined_names, "fmod");
     let need_frexp = calls_external(m, &defined_names, "frexp");
@@ -761,18 +761,30 @@ fn translate_impl(
         funcs.push(synth_ldexp());
     }
     if need_pow {
-        funcs.push(synth_trap_stub(vec![ValType::F64, ValType::F64], vec![ValType::F64]));
+        funcs.push(synth_trap_stub(
+            vec![ValType::F64, ValType::F64],
+            vec![ValType::F64],
+        ));
     }
     if need_fmod {
-        funcs.push(synth_trap_stub(vec![ValType::F64, ValType::F64], vec![ValType::F64]));
+        funcs.push(synth_trap_stub(
+            vec![ValType::F64, ValType::F64],
+            vec![ValType::F64],
+        ));
     }
     if need_frexp {
         // frexp(double, int*) -> double — the exponent out-param is a pointer (i64).
-        funcs.push(synth_trap_stub(vec![ValType::F64, ValType::I64], vec![ValType::F64]));
+        funcs.push(synth_trap_stub(
+            vec![ValType::F64, ValType::I64],
+            vec![ValType::F64],
+        ));
     }
     if need_strtod {
         // strtod(const char*, char**) -> double.
-        funcs.push(synth_trap_stub(vec![ValType::I64, ValType::I64], vec![ValType::F64]));
+        funcs.push(synth_trap_stub(
+            vec![ValType::I64, ValType::I64],
+            vec![ValType::F64],
+        ));
     }
     if need_snprintf {
         // snprintf is varargs; the trap stub takes no args (the dispatch ignores them) → i32.
@@ -5118,7 +5130,7 @@ fn synth_strspn() -> Func {
         align: 0,
     };
     let params = vec![ValType::I64, ValType::I64]; // s, set
-    // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
+                                                   // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
     let entry = Block {
         params: params.clone(),
         insts: vec![],
@@ -5255,7 +5267,7 @@ fn synth_strpbrk() -> Func {
         align: 0,
     };
     let params = vec![ValType::I64, ValType::I64]; // s, set
-    // block0 entry(s=0, set=1): outer(p=s, set)
+                                                   // block0 entry(s=0, set=1): outer(p=s, set)
     let entry = Block {
         params: params.clone(),
         insts: vec![],
@@ -5417,7 +5429,7 @@ fn synth_ldexp() -> Func {
         b,
     };
     let params = vec![ValType::F64, ValType::I32]; // x, n
-    // block0 entry(x=0, n=1): n>1023 → hi1; else chk_lo
+                                                   // block0 entry(x=0, n=1): n>1023 → hi1; else chk_lo
     let entry = Block {
         params: params.clone(),
         insts: vec![
@@ -5471,7 +5483,7 @@ fn synth_ldexp() -> Func {
                 a: 1,
                 b: 5,
             }, // v6 = m
-            Inst::ConstI32(1023), // v7
+            Inst::ConstI32(1023),      // v7
             Inst::IntCmp {
                 ty: IntTy::I32,
                 op: CmpOp::GtS,
@@ -5501,7 +5513,7 @@ fn synth_ldexp() -> Func {
                 a: 1,
                 b: 5,
             }, // v6 = m-1023
-            Inst::ConstI32(1023), // v7
+            Inst::ConstI32(1023),      // v7
             Inst::IntCmp {
                 ty: IntTy::I32,
                 op: CmpOp::GtS,
@@ -5533,7 +5545,7 @@ fn synth_ldexp() -> Func {
                 a: 1,
                 b: 5,
             }, // v6 = m
-            Inst::ConstI32(-1022), // v7
+            Inst::ConstI32(-1022),    // v7
             Inst::IntCmp {
                 ty: IntTy::I32,
                 op: CmpOp::LtS,
@@ -5563,7 +5575,7 @@ fn synth_ldexp() -> Func {
                 a: 1,
                 b: 5,
             }, // v6 = m+969
-            Inst::ConstI32(-1022), // v7
+            Inst::ConstI32(-1022),    // v7
             Inst::IntCmp {
                 ty: IntTy::I32,
                 op: CmpOp::LtS,
@@ -5596,15 +5608,15 @@ fn synth_ldexp() -> Func {
                 op: ConvOp::ExtendI32U,
                 a: 3,
             }, // v4 = (i64)
-            Inst::ConstI64(52), // v5
+            Inst::ConstI64(52),   // v5
             Inst::IntBin {
                 ty: IntTy::I64,
                 op: BinOp::Shl,
                 a: 4,
                 b: 5,
             }, // v6 = bits
-            reinterp(6), // v7 = 2^m
-            fmul(0, 7),  // v8 = y · 2^m
+            reinterp(6),          // v7 = 2^m
+            fmul(0, 7),           // v8 = y · 2^m
         ],
         term: Terminator::Return(vec![8]),
     };
@@ -10491,7 +10503,10 @@ fn lower_io_call(
             let Some(f) = ctx.helpers.snprintf_stub else {
                 return Ok(false);
             };
-            let r = ctx.push(Inst::Call { func: f, args: vec![] });
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![],
+            });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -10500,7 +10515,10 @@ fn lower_io_call(
             let Some(f) = ctx.helpers.localeconv_stub else {
                 return Ok(false);
             };
-            let r = ctx.push(Inst::Call { func: f, args: vec![] });
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![],
+            });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -10508,7 +10526,10 @@ fn lower_io_call(
             let Some(f) = ctx.helpers.errno_stub else {
                 return Ok(false);
             };
-            let r = ctx.push(Inst::Call { func: f, args: vec![] });
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![],
+            });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
