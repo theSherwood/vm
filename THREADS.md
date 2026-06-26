@@ -160,8 +160,8 @@ property, so in practice:
   oracle across 50 real-race repeats; Miri (`parallel_miri.rs`) confirms the shared-host access is
   race/UB-free. (Scope: caps `cap_dispatch_slots` handles — streams/clock/exit/reflection — over the
   native driver; the wasm-Worker shared-`Host` and order-sensitive-cap demos are follow-ons.)
-- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(in progress — §22 first; a
-  shell-like SVM language wants §14 too)*. These mutate the `Domain` (`&mut`), which the parallel driver
+- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(§22 landed: A/B/C1 done;
+  C2 browser glue + §14 remain)*. These mutate the `Domain` (`&mut`), which the parallel driver
   shares `&`-immutably, so they fail closed today. **Motivation:** web *interpreter playgrounds* — a
   guest that JITs/`eval`s user code (§22) or sandboxes sub-programs (§14) **and** runs in parallel.
   **Design (chosen: full-unify, mirroring the tree-walker's proven `DomainTable`).** The bytecode engine's
@@ -179,23 +179,37 @@ property, so in practice:
   `install(&self, Arc<Compiled>)`/`uninstall(&self,…)` go interior-mutable (so a shared `&Domain` can
   install). Dispatch is lock-free: `table.slot(i)` Acquire-loads, pairing with the install Release.
 
+  The realised shapes (in `bytecode.rs`): `SharedSlots { slots: Box<[AtomicU64]> }` (the dispatch
+  table), `ModuleSource { mods: Mutex<Vec<Arc<Compiled>>> }` (the module store), and
+  `Domain { source: Arc<ModuleSource>, table: SharedSlots }` with interior-mutable `install`/`uninstall`.
+
   **Plan (one big suite-gated commit for A, then B/C):**
-  - **A — convert the engine to the unified `Domain`** (behavior-preserving; the whole `bytecode_*`
-    suite gates it). `resume`'s hot loop: `c: &Compiled` → `c: Arc<Compiled>` (clone on the rare
-    module-crossing), resolved via a per-vCPU `local_units: Vec<Arc<Compiled>>` cache refreshed from
-    `units_snapshot()` on a miss; `mods: &[Compiled]` param → `dom: &Domain`. Update every `resume`
-    caller, `step_vcpu`, `drive`'s `JitInstall`/`JitUninstall` arms (now `dom.table.install(...)`),
-    `run_invoke` (already runs an installed unit over the shared table), child/coro construction (build
-    a `Domain`), and the `vm_trap_bt`/`cur_ir_pc` helpers. `INVOKE_MODULE`/child handled as today.
-    *Cost:* dispatch gains a `Relaxed`/`Acquire` atomic load — ~free on x86/ARM; child/coro pay an
-    uncontended atomic/`Arc` cost. Cooperative order (hence determinism) is unchanged.
-  - **B — un-fail-close `JitInstall`/`JitUninstall`/`JitInvoke` in `drive_parallel`/the resumable
-    `Vcpu`**, dispatching to the shared `Domain`. Differential test: a guest that `thread.spawn`s and
-    JITs a unit → parallel result matches the cooperative oracle; Miri for race-freedom.
-  - **C — un-fail-close the browser path** (`svm_par_*`) so a guest JITs **across Web Workers**; a
-    Node/Chromium test proves it.
-  - **§14 `instantiate` in parallel** is a follow-on after §22 (children get their own confined `Domain`;
-    the cooperative driver's single `extra_envs` vec doesn't map onto per-thread vCPUs — separate slice).
+  - [x] **A — convert the engine to the unified `Domain`** (behavior-preserving; the whole `bytecode_*`
+    suite gated it). `resume`'s hot loop: `c: &Compiled` → `c: Arc<Compiled>` (clone on the rare
+    module-crossing), resolved via a per-vCPU snapshot cache refreshed on a miss; `mods: &[Compiled]`
+    param → `(source: &ModuleSource, table: &SharedSlots)`. Updated every `resume` caller, `step_vcpu`,
+    `drive`'s `JitInstall`/`JitUninstall` arms, `run_invoke`, child/coro construction, and the
+    `vm_trap_bt`/`cur_ir_pc` helpers. Dispatch gains a `Relaxed`/`Acquire` load — ~free on x86/ARM;
+    child/coro pay an uncontended atomic/`Arc` cost. Cooperative order (hence determinism) unchanged.
+  - [x] **B — un-fail-close `JitInstall`/`JitUninstall`/`JitInvoke` in `drive_parallel`**, dispatching
+    to the shared `Domain` (`install`/`uninstall`/`push` interior-mutable; an invoked unit runs over
+    the shared powerbox). Proven by `bytecode_parallel_jit.rs` (8 vCPUs concurrently invoke a pure
+    unit, and concurrently `install` + `call_indirect` their own raced slot → counter byte-identical
+    to the cooperative oracle, 50 runs) and `parallel_jit_miri.rs` (race/UB/provenance-clean under Miri).
+  - [x] **C1 — un-fail-close the resumable `Vcpu`**: `Jit.install`/`uninstall`/`invoke` surface as
+    host-serviced `VcpuEvent`s (the host resolves the unit from the powerbox, `deliver_jit_*` hands it
+    back; the vCPU acts on the shared `Domain`). `VcpuProgram::compile_with_jit_table` reserves the
+    granted dispatch table. Proven by `bytecode_vcpu_orchestration_jit.rs` (a `std::thread` host —
+    the native model of the JS/Worker host — drives 8 vCPUs invoking / installing on the shared domain
+    to the oracle's result). Invoked units run over the vCPU's deny-all powerbox (a `cap.call`ing unit
+    is out of scope, like every host capability on this path).
+  - [ ] **C2 — the browser glue**: wire `svm_par_*` so a guest JITs **across Web Workers**, with a
+    Node/Chromium test. Open design question: where the powerbox lives across Workers (Rust-side in
+    shared linear memory vs JS-side) and how a `JitInstall`/`Invoke` event triggers unit resolution
+    over the wasm boundary. Until then the browser path fail-closes JIT (`svm_par_run` → `PAR_TRAP`).
+  - [ ] **§14 `instantiate` in parallel** — a follow-on after §22 (children get their own confined
+    `Domain`; the cooperative driver's single `extra_envs` vec doesn't map onto per-thread vCPUs —
+    separate slice).
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
   `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
@@ -252,7 +266,10 @@ cargo test -p svm --test bytecode_shared_window       # engine over a caller-own
 cargo test -p svm --test bytecode_parallel            # 4c: native parallel driver vs oracle
 cargo test -p svm --test bytecode_parallel_caps       # 4c-host: shared-powerbox cap.call vs oracle
 cargo test -p svm --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
-cargo +nightly miri test -p svm-interp --test parallel_miri  # 4c: parallel driver + shared host race-free
+cargo test -p svm --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in drive_parallel vs oracle
+cargo test -p svm --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
+cargo +nightly miri test -p svm-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
+cargo +nightly miri test -p svm-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (tiny spike)
 cd browser/threads-spike && cargo +nightly build --release && node threads-futex.mjs && cd ..

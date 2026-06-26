@@ -496,6 +496,13 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             v.b = count as i64;
             PAR_NOTIFY
         }
+        // §22 guest-JIT is serviced through the resumable API (proven natively by
+        // `bytecode_vcpu_orchestration_jit.rs`), but the browser JS/Worker glue for resolving a unit
+        // from the powerbox over the FFI is a separate slice — until then a browser guest's JIT op is
+        // fail-closed (a clean trap), exactly as before this seam existed.
+        bytecode::VcpuEvent::JitInstall { .. }
+        | bytecode::VcpuEvent::JitUninstall { .. }
+        | bytecode::VcpuEvent::JitInvoke { .. } => PAR_TRAP,
     }
 }
 

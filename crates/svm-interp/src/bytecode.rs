@@ -524,61 +524,154 @@ impl Compiled {
     }
 }
 
-/// One slot of a domain's `call_indirect` dispatch table: `(module, func)`, where module 0 is the
-/// primary program and `k ≥ 1` is `mods[k]` (an installed §22 unit). `None` is a trapping padding
-/// slot. The flat analogue of the tree-walker's [`crate::DomainTable`] (`module<<32 | func`).
-type Table = Vec<Option<(u32, u32)>>;
-
-/// Build a dispatch table of `2^table_log2` (at least `next_power_of_two(n_funcs)`) slots: the first
-/// `n_funcs` map to `(module 0, i)`, the rest are trapping padding (fillable by `install`).
-fn build_table(n_funcs: usize, table_log2: u8) -> Table {
-    build_table_for(n_funcs, table_log2, 0)
+/// THREADS.md 4c-domain — a domain's `call_indirect` dispatch table, **shareable + installable across
+/// parallel vCPUs** (mirrors the tree-walker's [`crate::DomainTable`]). Each slot packs `(module, func)`
+/// (`module<<32 | func`, [`super::pack_slot`]); `module == TABLE_EMPTY` is trapping padding. Dispatch is
+/// one `Acquire` load; `install` does a `Release` store, so a vCPU that observes a filled slot also
+/// observes the unit pushed into the [`ModuleSource`] before it (the install serializes under the
+/// source lock). Built once per domain (root / §14 child / coroutine); only the root's is installed into.
+struct SharedSlots {
+    slots: Box<[std::sync::atomic::AtomicU64]>,
 }
 
-/// [`build_table`] but for an arbitrary `module` index — the natural table a §14 separate-**module**
-/// child uses, whose funcs live at `dom.mods[module]` (not module 0).
-fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> Table {
-    let len = (1usize << table_log2)
-        .max(n_funcs.next_power_of_two())
-        .max(1);
-    (0..len)
-        .map(|i| (i < n_funcs).then_some((module, i as u32)))
-        .collect()
+impl SharedSlots {
+    /// `2^table_log2` (at least `next_power_of_two(n_funcs)`) slots: the first `n_funcs` map to
+    /// `(module, i)` (module 0 for the primary's natural table; a `k≥1` for a §14 separate-module
+    /// child), the rest are trapping padding (fillable by [`Domain::install`]).
+    fn new(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
+        let len = (1usize << table_log2)
+            .max(n_funcs.next_power_of_two())
+            .max(1);
+        let slots = (0..len)
+            .map(|i| {
+                std::sync::atomic::AtomicU64::new(if i < n_funcs {
+                    super::pack_slot(module, i as u32)
+                } else {
+                    super::pack_slot(super::TABLE_EMPTY, 0)
+                })
+            })
+            .collect();
+        SharedSlots { slots }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Dispatch-path read: one `Acquire` load, paired with [`Domain::install`]'s `Release` store.
+    #[inline]
+    fn slot(&self, i: usize) -> super::TableSlot {
+        super::unpack_slot(self.slots[i].load(std::sync::atomic::Ordering::Acquire))
+    }
 }
 
-/// A running domain: its compiled modules (`mods[0]` = primary, `mods[k≥1]` = installed §22 units)
-/// plus the shared `call_indirect` dispatch table. `install` appends a unit and fills a padding slot;
-/// `uninstall` clears one. Owned by [`drive`]; vCPUs read it, and `install`/`uninstall` mutate it
-/// between op steps (cooperative single-thread, so no atomics — unlike the tree-walker's `DomainTable`).
+/// THREADS.md 4c-domain — a domain's compiled modules, **shared (`Arc`) and append-only** so installed
+/// §22 units / §14 separate-module children are visible to every parallel vCPU without invalidating
+/// references the way a growing `Vec<Compiled>` would: the modules live behind `Arc<Compiled>` (stable
+/// address) inside a `Mutex<Vec<_>>` touched only on install or a reader's local-cache miss. `mods[0]`
+/// is the primary; `k≥1` is an installed unit. A §14 child / coroutine shares the root's `ModuleSource`
+/// (so its table's module indices resolve) but carries its own [`SharedSlots`].
+struct ModuleSource {
+    mods: std::sync::Mutex<Vec<std::sync::Arc<Compiled>>>,
+}
+
+impl ModuleSource {
+    fn new(primary: Compiled) -> ModuleSource {
+        ModuleSource {
+            mods: std::sync::Mutex::new(vec![std::sync::Arc::new(primary)]),
+        }
+    }
+
+    /// A fresh clone of the module `Arc`s — a vCPU's lock-free local cache (cheap refcount bumps),
+    /// refreshed on a miss. The lock acquire pairs with `install`'s push, so the snapshot sees it.
+    fn snapshot(&self) -> Vec<std::sync::Arc<Compiled>> {
+        self.mods.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The primary program (module 0).
+    fn primary(&self) -> std::sync::Arc<Compiled> {
+        std::sync::Arc::clone(&self.mods.lock().unwrap_or_else(|e| e.into_inner())[0])
+    }
+
+    /// Module `i` (`0` = primary, `k≥1` = an installed unit), or `None` if out of range.
+    fn get(&self, i: usize) -> Option<std::sync::Arc<Compiled>> {
+        self.mods
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(i)
+            .cloned()
+    }
+
+    /// Append a module (a §14 `instantiate_module` child's program) and return its index. (§22
+    /// `Jit.install` instead goes through [`Domain::install`], which also fills a dispatch slot.)
+    fn push(&self, unit: Compiled) -> usize {
+        let mut mods = self.mods.lock().unwrap_or_else(|e| e.into_inner());
+        mods.push(std::sync::Arc::new(unit));
+        mods.len() - 1
+    }
+}
+
+/// Build a §14 child / coroutine's natural dispatch table over its `module` in the shared source.
+fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
+    SharedSlots::new(n_funcs, table_log2, module)
+}
+
+/// Build the primary's natural module-0 dispatch table.
+fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
+    SharedSlots::new(n_funcs, table_log2, 0)
+}
+
+/// A running domain (THREADS.md 4c-domain): its shared [`ModuleSource`] (`mods[0]` = primary, `k≥1` =
+/// installed §22 units / §14 child modules) plus its own [`SharedSlots`] `call_indirect` dispatch table.
+/// Both parts are interior-mutable + thread-safe, so a **parallel** driver can share `&Domain` across
+/// vCPU threads and still `install`; the cooperative path is single-threaded (uncontended atomics/lock,
+/// so dispatch order — hence determinism — is unchanged). A §14 child / coroutine shares the root's
+/// `source` (its table's module indices resolve there) but carries its own `table`.
 struct Domain {
-    mods: Vec<Compiled>,
-    table: Table,
+    source: std::sync::Arc<ModuleSource>,
+    table: SharedSlots,
 }
 
 impl Domain {
     fn new(primary: Compiled, table_log2: u8) -> Domain {
-        let table = build_table(primary.progs.len(), table_log2);
+        let table = SharedSlots::new(primary.progs.len(), table_log2, 0);
         Domain {
-            mods: vec![primary],
+            source: std::sync::Arc::new(ModuleSource::new(primary)),
             table,
         }
     }
 
-    /// `Jit.install`: append `unit` (its module id = `mods.len()`), fill the first padding slot with
-    /// `(module, 0)`, and return that slot — or `None` if the table is full (`-ENOSPC`).
-    fn install(&mut self, unit: Compiled) -> Option<usize> {
-        let slot = self.table.iter().position(|e| e.is_none())?;
-        let module = self.mods.len() as u32;
-        self.mods.push(unit);
-        self.table[slot] = Some((module, 0));
+    /// `Jit.install`: append `unit` to the shared source and fill the first padding slot with
+    /// `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit is not
+    /// appended). `&self` (interior-mutable) so a shared `&Domain` can install. The whole op serializes
+    /// under the source lock, and the slot store is `Release`, so a reader that observes the slot also
+    /// observes the pushed unit.
+    fn install(&self, unit: Compiled) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        let mut mods = self.source.mods.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self
+            .table
+            .slots
+            .iter()
+            .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
+        mods.push(std::sync::Arc::new(unit));
+        let module = (mods.len() - 1) as u32;
+        self.table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
         Some(slot)
     }
 
     /// `Jit.uninstall`: clear a filled padding slot (`≥ n_real`) back to trapping, returning success.
-    /// A real-function slot (`< n_real`), out-of-range, or already-empty slot is rejected.
-    fn uninstall(&mut self, slot: usize, n_real: usize) -> bool {
-        if slot >= n_real && slot < self.table.len() && self.table[slot].is_some() {
-            self.table[slot] = None;
+    /// A real-function slot (`< n_real`), out-of-range, or already-empty slot is rejected. The unit
+    /// stays in `source` (append-only); only the slot is reclaimed. Serialized under the source lock.
+    fn uninstall(&self, slot: usize, n_real: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let _g = self.source.mods.lock().unwrap_or_else(|e| e.into_inner());
+        if slot >= n_real
+            && slot < self.table.slots.len()
+            && (self.table.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != super::TABLE_EMPTY
+        {
+            self.table.slots[slot]
+                .store(super::pack_slot(super::TABLE_EMPTY, 0), Ordering::Release);
             true
         } else {
             false
@@ -1275,13 +1368,13 @@ pub fn compile_and_run_with_host_traced(
     }
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
-    let mut vm = match Vm::new(&dom.mods[0], func as usize, args) {
+    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
     loop {
         match vm.resume(
-            &dom.mods,
+            &dom.source,
             &dom.table,
             fuel,
             &mut mem,
@@ -1292,7 +1385,7 @@ pub fn compile_and_run_with_host_traced(
             Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new(), None)),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
             Err(t) => {
-                let bt = vm_trap_bt(&vm, &dom.mods, &t);
+                let bt = vm_trap_bt(&vm, &dom.source, &t);
                 // This single-step path only ever drives the **root** (a fiber/thread op is a seam →
                 // the `Ok(_)` arm above bails to the tree-walker), so a trap here is always the root —
                 // attributed `-1`, matching the JIT's root-trap convention.
@@ -1316,14 +1409,12 @@ pub fn compile_and_run_with_host_traced(
 /// `call_pc + 1` (the tree-walker likewise advances a caller's `inst` past the call before
 /// descending), so its call op sits at `resume_pc - 1` and we report `inst + 1` for it. `None`-`src`
 /// ops (terminators) are skipped, matching [`Program::src`] / [`Vm::cur_ir_pc`].
-fn vm_trap_bt(vm: &Vm, mods: &[Compiled], trap: &Trap) -> Vec<super::IrPc> {
+fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
     let mut bt = Vec::new();
-    if let Some((block, inst)) = mods[vm.module].progs[vm.cur]
-        .src
-        .get(vm.pc)
-        .copied()
-        .flatten()
-    {
+    let Some(c) = source.get(vm.module) else {
+        return bt;
+    };
+    if let Some((block, inst)) = c.progs[vm.cur].src.get(vm.pc).copied().flatten() {
         // An instruction's recorded `inst` advances past the op exactly when the tree-walker's did
         // (it does `inst += 1` before evaluating, so every trap but `OutOfFuel` lands one past); a
         // terminator (`unreachable`, `return_call_indirect`) is already stored as `insts.len()`, the
@@ -1345,7 +1436,10 @@ fn vm_trap_bt(vm: &Vm, mods: &[Compiled], trap: &Trap) -> Vec<super::IrPc> {
     // caller's `inst` past the call before descending.
     for &(module, prog, _base, resume_pc, _ret) in vm.stack.iter().rev() {
         let call_pc = resume_pc.wrapping_sub(1);
-        if let Some((block, inst)) = mods[module].progs[prog].src.get(call_pc).copied().flatten() {
+        let Some(cm) = source.get(module) else {
+            continue;
+        };
+        if let Some((block, inst)) = cm.progs[prog].src.get(call_pc).copied().flatten() {
             bt.push(super::IrPc {
                 module: module as u32,
                 func: prog as FuncIdx,
@@ -1522,9 +1616,21 @@ pub struct VcpuProgram {
 
 impl VcpuProgram {
     /// Compile `m` for the bytecode engine, or `None` if it uses an op outside the engine's subset.
+    /// The dispatch table is natural-sized (no §22 `install` room); use [`compile_with_jit_table`] to
+    /// reserve padding slots for guest-driven install.
+    ///
+    /// [`compile_with_jit_table`]: VcpuProgram::compile_with_jit_table
     pub fn compile(m: &Module) -> Option<VcpuProgram> {
+        Self::compile_with_jit_table(m, 0)
+    }
+
+    /// Like [`compile`](VcpuProgram::compile), but reserve a `call_indirect` table of `2^table_log2`
+    /// slots for §22 `Jit.install` — pass the **same** value the embedder gave `grant_jit_with_table`
+    /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
+    /// cooperative oracle uses. `0` ⇒ natural size (no install room).
+    pub fn compile_with_jit_table(m: &Module, table_log2: u8) -> Option<VcpuProgram> {
         let c = compile_module(&m.funcs)?;
-        let dom = Domain::new(c, Host::new().jit_table_log2());
+        let dom = Domain::new(c, table_log2);
         Some(VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
@@ -1534,7 +1640,7 @@ impl VcpuProgram {
 
     /// Number of functions (a `thread.spawn` target is bounds-checked against this).
     pub fn func_count(&self) -> usize {
-        self.dom.mods[0].progs.len()
+        self.dom.source.primary().progs.len()
     }
 }
 
@@ -1563,13 +1669,53 @@ pub enum VcpuEvent {
     /// `memory.notify`: wake up to `count` waiters on `addr`, then call [`Vcpu::deliver_code`] with the
     /// number actually woken.
     Notify { addr: u64, count: i32 },
+    /// §22 `Jit.install`: the host (which holds the powerbox) resolves authority for `handle` +
+    /// code-handle `code`, returning the unit's funcs — then calls [`Vcpu::deliver_jit_install`]. The
+    /// vCPU compiles + installs into the **shared** [`Domain`] (visible to every vCPU/Worker via the
+    /// interior-mutable table) and writes the slot (or `-ENOSPC`) to the awaiting dst.
+    JitInstall { handle: i32, code: i32 },
+    /// §22 `Jit.uninstall`: the host checks authority for `handle`, then calls
+    /// [`Vcpu::deliver_jit_uninstall`]; the vCPU clears the shared table `slot` (`0`/`EINVAL` → dst).
+    JitUninstall { handle: i32, slot: i64 },
+    /// §22 `Jit.invoke`: the host resolves the unit's funcs (authority + cross-domain), then calls
+    /// [`Vcpu::deliver_jit_invoke`]; the vCPU compiles, arity-checks, and runs the unit synchronously
+    /// over its window, writing the results to the awaiting dst.
+    JitInvoke {
+        handle: i32,
+        code: i32,
+        argv: Box<[i64]>,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
+    },
+}
+
+/// A §22 JIT op awaiting the host's [`VcpuEvent::JitInstall`]/`JitUninstall`/`JitInvoke` reply — the
+/// vCPU-side residue (dst + the op's parameters) carried across the host round-trip, so the matching
+/// `deliver_jit_*` can finish the op against the shared [`Domain`].
+enum PendingJit {
+    Install {
+        dst: u32,
+    },
+    Uninstall {
+        slot: i64,
+        dst: u32,
+    },
+    Invoke {
+        argv: Box<[i64]>,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
+        dst: u32,
+    },
 }
 
 /// One **resumable** vCPU over a shared window. The host calls [`run`](Vcpu::run) to advance it until a
 /// [`VcpuEvent`], services the event, delivers the result (`deliver_*`), and runs again — so the same
 /// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope (as
-/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute; §14
-/// `instantiate` / §22 JIT install fail closed (they need a `&mut Domain`). Carries a deny-all `Host`.
+/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, plus
+/// §22 guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
+/// [`Domain`] (THREADS.md 4c-domain). §14 `instantiate` still fails closed. Carries a deny-all `Host`,
+/// so an *invoked* unit that itself makes a `cap.call` is out of scope (the invoke runs over this empty
+/// powerbox) — the powerbox-backed unit is the orchestrator's job, like every other host capability.
 pub struct Vcpu<'p> {
     prog: &'p VcpuProgram,
     vt: VTask,
@@ -1581,6 +1727,9 @@ pub struct Vcpu<'p> {
     host: Host,
     /// The dst register awaiting a `deliver_*` after a host-serviced event.
     pending: Option<u32>,
+    /// A §22 JIT op awaiting its `deliver_jit_*` (carries the op's dst + parameters across the
+    /// host round-trip). Distinct from `pending` because the reply payload is richer than one register.
+    pending_jit: Option<PendingJit>,
     /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
     trap: Option<Trap>,
 }
@@ -1624,11 +1773,11 @@ impl<'p> Vcpu<'p> {
         args: &[Value],
         mem: Option<Mem>,
     ) -> Result<Vcpu<'p>, Trap> {
-        if func as usize >= prog.dom.mods[0].progs.len() {
+        if func as usize >= prog.dom.source.primary().progs.len() {
             return Err(Trap::Malformed);
         }
         Ok(Vcpu {
-            vt: VTask::new(&prog.dom.mods[0], func as usize, args)?,
+            vt: VTask::new(&prog.dom.source.primary(), func as usize, args)?,
             fibers: Vec::new(),
             fiber_sp: Vec::new(),
             fiber_meta: Vec::new(),
@@ -1637,6 +1786,7 @@ impl<'p> Vcpu<'p> {
             host: Host::new(),
             prog,
             pending: None,
+            pending_jit: None,
             trap: None,
         })
     }
@@ -1670,7 +1820,7 @@ impl<'p> Vcpu<'p> {
             Err(t) => VcpuEvent::Trapped(t),
             Ok(VcpuStop::Done(vals)) => VcpuEvent::Done(vals),
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                if func as usize >= self.prog.dom.mods[0].progs.len() {
+                if func as usize >= self.prog.dom.source.primary().progs.len() {
                     return VcpuEvent::Trapped(Trap::Malformed);
                 }
                 self.pending = Some(dst);
@@ -1699,7 +1849,40 @@ impl<'p> Vcpu<'p> {
                 self.pending = Some(dst);
                 VcpuEvent::Notify { addr: base, count }
             }
-            // §14 instantiate / §22 JIT need a `&mut Domain` the host-orchestrated driver can't share.
+            // §22 guest-JIT — the host resolves the unit (it holds the powerbox), the vCPU installs /
+            // invokes it against the **shared** [`Domain`]. The op's residue is parked in `pending_jit`
+            // until the matching `deliver_jit_*`.
+            Ok(VcpuStop::JitInstall { h, code, dst }) => {
+                self.pending_jit = Some(PendingJit::Install { dst });
+                VcpuEvent::JitInstall { handle: h, code }
+            }
+            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                self.pending_jit = Some(PendingJit::Uninstall { slot, dst });
+                VcpuEvent::JitUninstall { handle: h, slot }
+            }
+            Ok(VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            }) => {
+                self.pending_jit = Some(PendingJit::Invoke {
+                    argv: argv.clone(),
+                    params: params.clone(),
+                    results: results.clone(),
+                    dst,
+                });
+                VcpuEvent::JitInvoke {
+                    handle: h,
+                    code,
+                    argv,
+                    params,
+                    results,
+                }
+            }
+            // §14 instantiate needs a confined executor child the host-orchestrated driver can't share.
             Ok(_) => VcpuEvent::Trapped(Trap::ThreadFault),
         }
     }
@@ -1723,6 +1906,118 @@ impl<'p> Vcpu<'p> {
             Ok(vals) => {
                 let v = vals.first().copied().unwrap_or(Value::I64(0));
                 self.vt.active.set(dst, Reg::from_value(v));
+            }
+            Err(t) => self.trap = Some(t),
+        }
+    }
+
+    /// Deliver the resolved unit funcs for a `JitInstall` (the host resolved authority + code-handle):
+    /// `Err` (forged / cross-domain / wrong-type handle) propagates as a trap; `Ok(funcs)` is compiled
+    /// and installed into the **shared** [`Domain`] (so every vCPU/Worker can `call_indirect` it), the
+    /// slot — or `-ENOSPC` if the table is full / `Malformed` if the unit is outside engine coverage —
+    /// written to the awaiting dst.
+    pub fn deliver_jit_install(&mut self, funcs: Result<std::sync::Arc<[Func]>, Trap>) {
+        let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
+            panic!("deliver_jit_install with no pending install");
+        };
+        let funcs = match funcs {
+            Ok(f) => f,
+            Err(t) => {
+                self.trap = Some(t);
+                return;
+            }
+        };
+        let res = match compile_module(&funcs) {
+            Some(unit) => match self.prog.dom.install(unit) {
+                Some(slot) => slot as i64,
+                None => super::ENOSPC,
+            },
+            None => {
+                self.trap = Some(Trap::Malformed); // unit op outside coverage
+                return;
+            }
+        };
+        self.vt.active.set(dst, Reg::from_i64(res));
+    }
+
+    /// Deliver the authority check for a `JitUninstall`: `Err` propagates as a trap; `Ok(())` clears the
+    /// shared table `slot` (`0` on success, `EINVAL` for a real-func / out-of-range / already-empty slot).
+    pub fn deliver_jit_uninstall(&mut self, authorized: Result<(), Trap>) {
+        let Some(PendingJit::Uninstall { slot, dst }) = self.pending_jit.take() else {
+            panic!("deliver_jit_uninstall with no pending uninstall");
+        };
+        if let Err(t) = authorized {
+            self.trap = Some(t);
+            return;
+        }
+        let n_real = self.prog.dom.source.primary().progs.len();
+        let res = if self.prog.dom.uninstall(slot as usize, n_real) {
+            0
+        } else {
+            super::EINVAL
+        };
+        self.vt.active.set(dst, Reg::from_i64(res));
+    }
+
+    /// Deliver the resolved unit funcs for a `JitInvoke`: `Err` propagates as a trap; `Ok(funcs)` is
+    /// compiled, arity-checked against the call signature (`CapFault` on mismatch), then run
+    /// synchronously over this vCPU's window — its results marshalled to the awaiting dst. The invoked
+    /// unit runs over this vCPU's (deny-all) powerbox, so a unit that itself makes a `cap.call` faults;
+    /// a powerbox-backed unit is the orchestrator's responsibility (see [`Vcpu`]).
+    pub fn deliver_jit_invoke(&mut self, funcs: Result<std::sync::Arc<[Func]>, Trap>) {
+        let Some(PendingJit::Invoke {
+            argv,
+            params,
+            results,
+            dst,
+        }) = self.pending_jit.take()
+        else {
+            panic!("deliver_jit_invoke with no pending invoke");
+        };
+        let funcs = match funcs {
+            Ok(f) => f,
+            Err(t) => {
+                self.trap = Some(t);
+                return;
+            }
+        };
+        let unit = match compile_module(&funcs) {
+            Some(u) => u,
+            None => {
+                self.trap = Some(Trap::Malformed);
+                return;
+            }
+        };
+        let arity_ok = unit
+            .sigs
+            .first()
+            .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+        if !arity_ok {
+            self.trap = Some(Trap::CapFault);
+            return;
+        }
+        let child_args: Vec<Value> = params
+            .iter()
+            .zip(argv.iter())
+            .map(|(ty, s)| slot_to_val(*ty, *s))
+            .collect();
+        // `self.prog` is a `Copy` shared reference — copy it out so the `&prog.dom` borrow is
+        // independent of the disjoint `&mut self.fuel/mem/host` the invoke needs.
+        let prog = self.prog;
+        let umod = prog.dom.source.push(unit);
+        match run_invoke(
+            &prog.dom,
+            umod,
+            &child_args,
+            &mut self.fuel,
+            &mut self.mem,
+            &mut HostCell::Excl(&mut self.host),
+        ) {
+            Ok(vals) => {
+                for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+                    let re = slot_to_val(*ty, val_to_slot(*v));
+                    self.vt.active.set(dst + i as u32, Reg::from_value(re));
+                }
             }
             Err(t) => self.trap = Some(t),
         }
@@ -1816,22 +2111,21 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
-    let mods = [c];
-    let table = build_table(mods[0].progs.len(), 0);
+    let dom = Domain::new(c, 0);
     let mut mem = build_mem(m);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&mods[0], func as usize, args) {
+    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
     let mut trace = Vec::new();
     loop {
-        if let Some(pc) = vm.cur_ir_pc(&mods) {
+        if let Some(pc) = vm.cur_ir_pc(&dom.source) {
             trace.push(pc);
         }
         match vm.resume(
-            &mods,
-            &table,
+            &dom.source,
+            &dom.table,
             fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
@@ -1866,11 +2160,10 @@ pub fn ir_window_trace(
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
-    let mods = [c];
-    let table = build_table(mods[0].progs.len(), 0);
+    let dom = Domain::new(c, 0);
     let mut mem = build_mem(m);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&mods[0], func as usize, args) {
+    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
@@ -1878,7 +2171,7 @@ pub fn ir_window_trace(
     loop {
         // Snapshot the window var *before* running the op — the same point `Inspector::seek(t)` pauses
         // at (paused before the op at clock `t`), so the two byte sequences align step-for-step.
-        if let Some(pc) = vm.cur_ir_pc(&mods) {
+        if let Some(pc) = vm.cur_ir_pc(&dom.source) {
             let bytes = mem
                 .as_ref()
                 .and_then(|mm| mm.read_window(addr, len).ok())
@@ -1886,8 +2179,8 @@ pub fn ir_window_trace(
             trace.push((pc, bytes));
         }
         match vm.resume(
-            &mods,
-            &table,
+            &dom.source,
+            &dom.table,
             fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
@@ -1930,17 +2223,16 @@ pub fn ir_value_trace(
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
-    let mods = [c];
-    let table = build_table(mods[0].progs.len(), 0);
+    let dom = Domain::new(c, 0);
     let mut mem = build_mem(m);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&mods[0], func as usize, args) {
+    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
     let mut trace = Vec::new();
     loop {
-        if let Some(pc) = vm.cur_ir_pc(&mods) {
+        if let Some(pc) = vm.cur_ir_pc(&dom.source) {
             // The block-0 register window typed per value — the same `(base + i, type)` resolution the
             // tree-walker uses for `read_ir_value`. A not-yet-computed slot reads as its default `Reg`;
             // the caller compares only the defined prefix (where `read_ir_value` returns `Some`).
@@ -1952,8 +2244,8 @@ pub fn ir_value_trace(
             trace.push((pc, vals));
         }
         match vm.resume(
-            &mods,
-            &table,
+            &dom.source,
+            &dom.table,
             fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
@@ -1977,8 +2269,8 @@ pub fn ir_value_trace(
 /// `Inspector::read_ir_value`. Scoped to a single function (the value reader resolves slots for the
 /// entry function's blocks; a call or concurrency seam ends the run). Test surface; not production.
 pub struct DebugRun {
-    mods: [Compiled; 1],
-    table: Table,
+    source: std::sync::Arc<ModuleSource>,
+    table: SharedSlots,
     mem: Option<Mem>,
     host: Host,
     vm: Vm,
@@ -2021,13 +2313,13 @@ impl DebugRun {
             ));
         }
         let c = compile_module(&m.funcs)?;
-        let mods = [c];
-        let table = build_table(mods[0].progs.len(), 0);
+        let dom = Domain::new(c, 0);
         let mem = build_mem(m);
         let host = Host::new();
-        let vm = Vm::new(&mods[0], func as usize, args).ok()?;
+        let vm = Vm::new(&dom.source.primary(), func as usize, args).ok()?;
+        let Domain { source, table } = dom;
         Some(DebugRun {
-            mods,
+            source,
             table,
             mem,
             host,
@@ -2047,7 +2339,7 @@ impl DebugRun {
             return None;
         }
         let Self {
-            mods,
+            source,
             table,
             mem,
             host,
@@ -2059,14 +2351,7 @@ impl DebugRun {
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
-            match vm.resume(
-                &mods[..],
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Excl(&mut *host),
-                1,
-            ) {
+            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
                 Ok(Outcome::Suspended) => {}
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2083,20 +2368,13 @@ impl DebugRun {
             }
         }
         loop {
-            if let Some(pc) = vm.cur_ir_pc(&mods[..]) {
+            if let Some(pc) = vm.cur_ir_pc(source) {
                 if bps.contains(&pc) {
                     *at_bp = true;
                     return Some(pc);
                 }
             }
-            match vm.resume(
-                &mods[..],
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Excl(&mut *host),
-                1,
-            ) {
+            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
                 Ok(Outcome::Suspended) => continue,
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2122,7 +2400,7 @@ impl DebugRun {
             return None;
         }
         let Self {
-            mods,
+            source,
             table,
             mem,
             host,
@@ -2133,14 +2411,7 @@ impl DebugRun {
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
-            match vm.resume(
-                &mods[..],
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Excl(&mut *host),
-                1,
-            ) {
+            match vm.resume(source, table, fuel, mem, &mut HostCell::Excl(&mut *host), 1) {
                 Ok(Outcome::Suspended) => {}
                 Ok(Outcome::Done(vals)) => {
                     *done = Some(Ok(vals));
@@ -2157,7 +2428,7 @@ impl DebugRun {
             }
             let depth = vm.stack.len() + 1;
             if max_depth.is_none_or(|m| depth <= m) {
-                if let Some(pc) = vm.cur_ir_pc(&mods[..]) {
+                if let Some(pc) = vm.cur_ir_pc(source) {
                     return Some(pc);
                 }
             }
@@ -2196,13 +2467,14 @@ impl DebugRun {
     /// stack or when the top is paused on a non-instruction.
     fn frame_at(&self, depth: usize) -> Option<(usize, usize, usize, usize, usize)> {
         if depth == 0 {
-            let pc = self.vm.cur_ir_pc(&self.mods[..])?;
+            let pc = self.vm.cur_ir_pc(&self.source)?;
             return Some((self.vm.module, self.vm.cur, pc.block, pc.inst, self.vm.base));
         }
         // depth 1 = innermost caller = last stack entry; depth n = outermost.
         let n = self.vm.stack.len();
         let &(module, f, base, resume_pc, _) = self.vm.stack.get(n.checked_sub(depth)?)?;
-        let (block, inst) = self.mods[module]
+        let cm = self.source.get(module)?;
+        let (block, inst) = cm
             .progs
             .get(f)?
             .src
@@ -2671,7 +2943,7 @@ struct Coro {
     vm: Vm,
     mem: Option<Mem>,
     host: Host,
-    table: Table,
+    table: SharedSlots,
     awaiting: Option<u32>,
     /// §14 **demand** coroutine (ops 4/7): its window starts fully unmapped, so an in-window access to
     /// an unsupplied page is a *recoverable* fault that suspends to the parent (which supplies the
@@ -2695,7 +2967,7 @@ enum CoStop {
 /// holds no Instantiator, its own `spawn_coroutine`/`resume` resolve to `CapFault` inside
 /// [`Vm::resume`] (never reaching here), and coroutine modules carry no fibers/threads — so the only
 /// outcomes possible are `Done`/`Suspended`/`CoYield`. A child trap propagates to the resumer.
-fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoStop, Trap> {
+fn resume_coro(coro: &mut Coro, source: &ModuleSource, fuel: &mut u64) -> Result<CoStop, Trap> {
     // The coroutine child runs over its **own natural** table (built at spawn): it holds no `Jit`
     // cap, so it cannot reach installed §22 units (matching the tree-walker, where a coroutine child
     // gets a fresh `DomainTable::new(&cfuncs, 0)`). `coro.vm.module` selects its program (module 0 for
@@ -2708,7 +2980,7 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
     let budget = if coro.fault_yields { 1 } else { u64::MAX };
     loop {
         match coro.vm.resume(
-            mods,
+            source,
             &coro.table,
             fuel,
             &mut coro.mem,
@@ -2739,7 +3011,7 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
                             roots.insert(m);
                         }
                     };
-                    scan_vm_roots(&coro.vm, mods, &mut consider);
+                    scan_vm_roots(&coro.vm, source, &mut consider);
                 }
                 let total = gc_write(&mut coro.mem, buf, cap, roots)?;
                 coro.vm.set(dst, Reg::from_i64(total));
@@ -2767,11 +3039,14 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
 /// the JIT's native-stack scan does — the backends legitimately differ, GC.md §3.2). The register
 /// file only ever holds guest words (or default `0`), so `consider`'s mask+range filter keeps any
 /// host data out by construction.
-fn scan_vm_roots(vm: &Vm, mods: &[Compiled], consider: &mut impl FnMut(u64)) {
+fn scan_vm_roots(vm: &Vm, source: &ModuleSource, consider: &mut impl FnMut(u64)) {
     let frames = std::iter::once((vm.module, vm.cur, vm.base))
         .chain(vm.stack.iter().map(|&(m, p, b, _, _)| (m, p, b)));
     for (module, prog, base) in frames {
-        let n = mods[module].progs[prog].nslots as usize;
+        let Some(c) = source.get(module) else {
+            continue;
+        };
+        let n = c.progs[prog].nslots as usize;
         let end = (base + n).min(vm.regs.len());
         for r in &vm.regs[base..end] {
             consider(r.lo);
@@ -2812,19 +3087,13 @@ fn run_invoke(
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
-    host: &mut Host,
+    host: &mut HostCell,
 ) -> Result<Vec<Value>, Trap> {
-    let mut vm = Vm::new(&dom.mods[module], 0, args)?;
+    let unit = dom.source.get(module).ok_or(Trap::Malformed)?;
+    let mut vm = Vm::new(&unit, 0, args)?;
     vm.module = module;
     loop {
-        match vm.resume(
-            &dom.mods,
-            &dom.table,
-            fuel,
-            mem,
-            &mut HostCell::Excl(&mut *host),
-            u64::MAX,
-        )? {
+        match vm.resume(&dom.source, &dom.table, fuel, mem, host, u64::MAX)? {
             Outcome::Done(vals) => return Ok(vals),
             Outcome::Suspended => {}
             _ => return Err(Trap::CapFault),
@@ -2950,7 +3219,7 @@ impl HostCell<'_> {
 /// domain's (env `None`); a §14 `instantiate` child carries its own confined [`ChildEnv`]. Bundled so
 /// [`step_vcpu`] takes one ref instead of four (and so the per-task selection has a single type).
 struct RunCtx<'a> {
-    table: &'a Table,
+    table: &'a SharedSlots,
     fuel: &'a mut u64,
     mem: &'a mut Option<Mem>,
     host: HostCell<'a>,
@@ -2974,7 +3243,7 @@ fn step_vcpu(
 ) -> Result<VcpuStop, Trap> {
     loop {
         match vt.active.resume(
-            &dom.mods,
+            &dom.source,
             ctx.table,
             &mut *ctx.fuel,
             &mut *ctx.mem,
@@ -3020,7 +3289,7 @@ fn step_vcpu(
                                                                                                      // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
                                                                                                      // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
                                                                                                      // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
-                let func_idx = (funcref as u32 as usize & dom.mods[0].table_mask) as i32;
+                let func_idx = (funcref as u32 as usize & dom.source.primary().table_mask) as i32;
                 fiber_meta.push((func_idx, sp));
                 vt.active.set(dst, Reg::from_i32(h));
             }
@@ -3039,7 +3308,7 @@ fn step_vcpu(
                         // Resolve the fiber entry through module 0's natural table + `fiber_sig`,
                         // exactly as `table_lookup` does — a forged/mistyped funcref is a
                         // `FiberFault`. Fibers are module-0 only (a unit cannot use `cont.*`).
-                        let m0 = &dom.mods[0];
+                        let m0 = dom.source.primary();
                         let f = (funcref as u32 as usize) & m0.table_mask;
                         let ok = m0
                             .sigs
@@ -3048,7 +3317,7 @@ fn step_vcpu(
                         if !ok {
                             return Err(Trap::FiberFault);
                         }
-                        let mut fvm = Vm::new(m0, f, &[Value::I64(sp), Value::I64(arg)])?;
+                        let mut fvm = Vm::new(&m0, f, &[Value::I64(sp), Value::I64(arg)])?;
                         // §12.8 4A.5: this fiber spills into its own region (slot `k` = context `k + 1`).
                         fvm.durable_region_base = super::shadow_region_base(k + 1);
                         fvm
@@ -3201,7 +3470,7 @@ fn step_vcpu(
                 let h = spawn_coroutine(
                     &mut vt.coroutines,
                     ctx.mem,
-                    &dom.mods[0],
+                    &dom.source.primary(),
                     entry,
                     (ibase, isz, off, size_log2),
                     demand,
@@ -3248,7 +3517,7 @@ fn step_vcpu(
                 } else if let Some(yd) = coro.awaiting.take() {
                     coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
                 }
-                match resume_coro(&mut coro, &dom.mods, &mut *ctx.fuel)? {
+                match resume_coro(&mut coro, &dom.source, &mut *ctx.fuel)? {
                     CoStop::Yield(yv) => {
                         vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
                         vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
@@ -3293,17 +3562,17 @@ fn step_vcpu(
                             roots.insert(m);
                         }
                     };
-                    scan_vm_roots(&vt.active, &dom.mods, &mut consider);
+                    scan_vm_roots(&vt.active, &dom.source, &mut consider);
                     for (_, vm, _) in &vt.chain {
-                        scan_vm_roots(vm, &dom.mods, &mut consider);
+                        scan_vm_roots(vm, &dom.source, &mut consider);
                     }
                     for fib in fibers.iter() {
                         if let FiberState::Parked { vm, .. } = fib {
-                            scan_vm_roots(vm, &dom.mods, &mut consider);
+                            scan_vm_roots(vm, &dom.source, &mut consider);
                         }
                     }
                     for coro in vt.coroutines.iter().flatten() {
-                        scan_vm_roots(&coro.vm, &dom.mods, &mut consider);
+                        scan_vm_roots(&coro.vm, &dom.source, &mut consider);
                     }
                 }
                 let total = gc_write(ctx.mem, buf, cap, roots)?;
@@ -3385,7 +3654,7 @@ const FIBER_RESULTS: [ValType; 1] = [ValType::I64];
 struct ChildEnv {
     mem: Option<Mem>,
     host: Host,
-    table: Table,
+    table: SharedSlots,
     fuel: u64,
 }
 
@@ -3428,7 +3697,7 @@ enum TaskState {
 /// stuck set advances a logical clock to the next `wait` deadline (or deadlocks → `ThreadFault`,
 /// matching the deterministic explorer). The run ends when the **root** vCPU completes.
 fn drive(
-    mut dom: Domain,
+    dom: Domain,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -3437,7 +3706,7 @@ fn drive(
     budget: u64,
 ) -> Result<Vec<Value>, Trap> {
     let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
-        vt: VTask::new(&dom.mods[0], entry as usize, args)?,
+        vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
         threads: Vec::new(),
         env: None,
         state: TaskState::Runnable,
@@ -3581,7 +3850,7 @@ fn drive(
             Err(trap) => complete(&mut tasks, ti, Err(trap)),
             Ok(VcpuStop::Done(vals)) => complete(&mut tasks, ti, Ok(vals)),
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                if func as usize >= dom.mods[0].progs.len() {
+                if func as usize >= dom.source.primary().progs.len() {
                     complete(&mut tasks, ti, Err(Trap::Malformed));
                     continue;
                 }
@@ -3594,7 +3863,7 @@ fn drive(
                     continue;
                 }
                 let child = VTask::new(
-                    &dom.mods[0],
+                    &dom.source.primary(),
                     func as usize,
                     &[Value::I64(sp), Value::I64(arg)],
                 )?;
@@ -3625,7 +3894,7 @@ fn drive(
                 // Validate the child entry signature against module 0 (a same-module child): it
                 // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
                 // `Instantiator`+`AddressSpace` (two) — its starter caps over its own window.
-                let c0 = &dom.mods[0];
+                let c0 = dom.source.primary();
                 let want_as = c0
                     .sigs
                     .get(entry as usize)
@@ -3699,9 +3968,9 @@ fn drive(
                 };
                 // A nested child is its **own** domain: a fresh natural table over module 0 (no access
                 // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
-                let c0 = &dom.mods[0];
+                let c0 = dom.source.primary();
                 let child_table = build_table(c0.progs.len(), 0);
-                let child_vt = VTask::new(c0, entry as usize, &child_args)?;
+                let child_vt = VTask::new(&c0, entry as usize, &child_args)?;
                 let eidx = extra_envs.len();
                 extra_envs.push(ChildEnv {
                     mem: child_mem,
@@ -3832,10 +4101,10 @@ fn drive(
                 // Push the child's compiled module and run the child over it — its own domain: a
                 // natural table mapping into *its* module index (no installed §22 units).
                 let progs_len = child_compiled.progs.len();
-                let cm = dom.mods.len();
-                dom.mods.push(child_compiled);
+                let cm = dom.source.push(child_compiled);
                 let child_table = build_table_for(progs_len, 0, cm as u32);
-                let mut child_vt = VTask::new(&dom.mods[cm], entry as usize, &child_args)?;
+                let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
+                let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
                 child_vt.active.module = cm;
                 let eidx = extra_envs.len();
                 extra_envs.push(ChildEnv {
@@ -3941,20 +4210,21 @@ fn drive(
                 let mut child_host = Host::new();
                 let cy = child_host.grant_yielder();
                 let progs_len = child_compiled.progs.len();
-                let cm = dom.mods.len();
-                dom.mods.push(child_compiled);
+                let cm = dom.source.push(child_compiled);
                 let child_table = build_table_for(progs_len, 0, cm as u32);
-                let mut child_vm =
-                    match Vm::new(&dom.mods[cm], entry as usize, &[Value::I64(cy as i64)]) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            tasks[ti]
-                                .vt
-                                .active
-                                .set(dst, Reg::from_i32(super::EINVAL as i32));
-                            continue;
-                        }
-                    };
+                let cunit = dom.source.get(cm);
+                let mut child_vm = match cunit
+                    .and_then(|u| Vm::new(&u, entry as usize, &[Value::I64(cy as i64)]).ok())
+                {
+                    Some(v) => v,
+                    None => {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                };
                 child_vm.module = cm;
                 // The coroutine lives in the spawning vCPU's coroutine set, driven inline by `resume`.
                 tasks[ti].vt.coroutines.push(Some(Coro {
@@ -4075,7 +4345,7 @@ fn drive(
                     complete(&mut tasks, ti, Err(t)); // authority check
                     continue;
                 }
-                let n_real = dom.mods[0].progs.len();
+                let n_real = dom.source.primary().progs.len();
                 let res = if dom.uninstall(slot as usize, n_real) {
                     0
                 } else {
@@ -4127,9 +4397,15 @@ fn drive(
                     .zip(argv.iter())
                     .map(|(ty, s)| slot_to_val(*ty, *s))
                     .collect();
-                let umod = dom.mods.len();
-                dom.mods.push(unit);
-                match run_invoke(&dom, umod, &child_args, fuel, mem, host) {
+                let umod = dom.source.push(unit);
+                match run_invoke(
+                    &dom,
+                    umod,
+                    &child_args,
+                    fuel,
+                    mem,
+                    &mut HostCell::Excl(host),
+                ) {
                     Ok(vals) => {
                         for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
                             let re = slot_to_val(*ty, val_to_slot(*v));
@@ -4290,7 +4566,7 @@ fn drive_parallel(
     mem: Option<Mem>,
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    let root_vt = match VTask::new(&dom.mods[0], entry as usize, args) {
+    let root_vt = match VTask::new(&dom.source.primary(), entry as usize, args) {
         Ok(v) => v,
         Err(t) => return (Err(t), mem),
     };
@@ -4349,7 +4625,7 @@ fn run_vcpu_parallel<'scope, 'env>(
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                if func as usize >= dom.mods[0].progs.len() {
+                if func as usize >= dom.source.primary().progs.len() {
                     return (Err(Trap::Malformed), mem);
                 }
                 // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`).
@@ -4363,7 +4639,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     .next_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let child_vt = match VTask::new(
-                    &dom.mods[0],
+                    &dom.source.primary(),
                     func as usize,
                     &[Value::I64(sp), Value::I64(arg)],
                 ) {
@@ -4417,8 +4693,114 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let woken = reg.futex.notify(base, count);
                 vt.active.set(dst, Reg::from_i32(woken));
             }
-            // Outside this driver's subset (§14 instantiate, §22 JIT): they need a `&mut Domain` /
-            // shared powerbox the parallel driver doesn't thread yet — fail closed rather than run wrong.
+            // §22 guest-JIT (THREADS.md 4c-domain): install/uninstall/invoke against the **shared**
+            // [`Domain`] — `install`/`uninstall`/`push` are interior-mutable (Release/Acquire-paired
+            // with the dispatch reads), so a worker vCPU drives them on `&Domain` while compute/atomics
+            // on the other vCPUs stay lock-free. The result (slot / `-ENOSPC` / value) is
+            // schedule-independent for the disciplined guest the oracle is differentially run against.
+            Ok(VcpuStop::JitInstall { h, code, dst }) => {
+                // Resolve authority + the unit's funcs under the host lock (a forged/cross-domain
+                // handle is an inert CapFault → trap), then compile + install. Compiling can fail only
+                // if the unit uses an op the engine doesn't lower yet (the one place a guest unit can
+                // outrun coverage — no tree-walker fallback mid-run).
+                let funcs = {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.resolve_jit_domain(h).and_then(|domain| {
+                        let (cd, cu) = g.resolve_jit_code(code)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                    }) {
+                        Ok(f) => f,
+                        Err(t) => return (Err(t), mem),
+                    }
+                };
+                let res = match compile_module(&funcs) {
+                    Some(unit) => match dom.install(unit) {
+                        Some(slot) => slot as i64,
+                        None => super::ENOSPC,
+                    },
+                    None => return (Err(Trap::Malformed), mem), // unit op outside coverage
+                };
+                vt.active.set(dst, Reg::from_i64(res));
+            }
+            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Err(t) = g.resolve_jit_domain(h) {
+                        return (Err(t), mem); // authority check
+                    }
+                }
+                let n_real = dom.source.primary().progs.len();
+                let res = if dom.uninstall(slot as usize, n_real) {
+                    0
+                } else {
+                    super::EINVAL
+                };
+                vt.active.set(dst, Reg::from_i64(res));
+            }
+            Ok(VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            }) => {
+                // Resolve unit funcs (authority + cross-domain) and compile, as for install.
+                let funcs = {
+                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.resolve_jit_domain(h).and_then(|domain| {
+                        let (cd, cu) = g.resolve_jit_code(code)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                    }) {
+                        Ok(f) => f,
+                        Err(t) => return (Err(t), mem),
+                    }
+                };
+                let unit = match compile_module(&funcs) {
+                    Some(u) => u,
+                    None => return (Err(Trap::Malformed), mem),
+                };
+                // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
+                let arity_ok = unit
+                    .sigs
+                    .first()
+                    .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+                if !arity_ok {
+                    return (Err(Trap::CapFault), mem);
+                }
+                // Marshal args via the slot ABI, push the unit as a transient module, run it over the
+                // **shared** powerbox (its `cap.call`s serialize per-call, like every other vCPU's).
+                let child_args: Vec<Value> = params
+                    .iter()
+                    .zip(argv.iter())
+                    .map(|(ty, s)| slot_to_val(*ty, *s))
+                    .collect();
+                let umod = dom.source.push(unit);
+                match run_invoke(
+                    dom,
+                    umod,
+                    &child_args,
+                    &mut fuel,
+                    &mut mem,
+                    &mut HostCell::Shared(host),
+                ) {
+                    Ok(vals) => {
+                        for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+                            let re = slot_to_val(*ty, val_to_slot(*v));
+                            vt.active.set(dst + i as u32, Reg::from_value(re));
+                        }
+                    }
+                    Err(t) => return (Err(t), mem),
+                }
+            }
+            // Outside this driver's subset (§14 instantiate): needs a confined executor child the
+            // parallel driver doesn't thread yet — fail closed rather than run wrong.
             Ok(_) => return (Err(Trap::ThreadFault), mem),
         }
     }
@@ -4540,12 +4922,9 @@ impl Vm {
     /// The [`crate::IrPc`] of the op the cursor is on, or `None` if that op is a terminator (which the
     /// debug seam never stops at — see [`Program::src`]). Used by [`ir_trace`] to record the same
     /// instruction-location sequence the tree-walker's `Inspector` reports.
-    fn cur_ir_pc(&self, mods: &[Compiled]) -> Option<super::IrPc> {
-        let (block, inst) = mods[self.module].progs[self.cur]
-            .src
-            .get(self.pc)
-            .copied()
-            .flatten()?;
+    fn cur_ir_pc(&self, source: &ModuleSource) -> Option<super::IrPc> {
+        let cm = source.get(self.module)?;
+        let (block, inst) = cm.progs[self.cur].src.get(self.pc).copied().flatten()?;
         if inst & SRC_TERM != 0 {
             return None; // terminator — non-steppable (see `Program::src`)
         }
@@ -4568,8 +4947,8 @@ impl Vm {
     /// is also what a future blocking-op / debug-stop seam will do before yielding.
     fn resume(
         &mut self,
-        mods: &[Compiled],
-        table: &Table,
+        source: &ModuleSource,
+        table: &SharedSlots,
         fuel: &mut u64,
         mem: &mut Option<Mem>,
         host: &mut HostCell,
@@ -4579,9 +4958,25 @@ impl Vm {
         let mut cur = self.cur;
         let mut base = self.base;
         let mut pc = self.pc;
-        // The current module's compiled program, re-bound only when an activation crosses modules
-        // (cross-module `call_indirect` / its return) — so the per-op hot path is unchanged.
-        let mut c: &Compiled = &mods[module];
+        // THREADS.md 4c-domain: the shared module source is read through a per-vCPU **lock-free local
+        // cache** (`Arc` clones), refreshed only on a miss (a unit installed since the last sync). The
+        // active module is held as an owned `Arc<Compiled>` (`c`) — independent of `local`, so a refresh
+        // can't invalidate it — re-resolved only when an activation crosses modules (so the per-op hot
+        // path, `c.*` via `Arc` deref, is unchanged). `resolve!` returns the `Arc` for a module index.
+        let mut local: Vec<std::sync::Arc<Compiled>> = source.snapshot();
+        macro_rules! resolve {
+            ($m:expr) => {{
+                let m = $m as usize;
+                if m >= local.len() {
+                    local = source.snapshot(); // miss: a module installed since last sync
+                }
+                match local.get(m) {
+                    Some(a) => std::sync::Arc::clone(a),
+                    None => return Err(Trap::Malformed), // forged/stale module index (defensive)
+                }
+            }};
+        }
+        let mut c: std::sync::Arc<Compiled> = resolve!(module);
 
         macro_rules! r {
             ($i:expr) => {
@@ -4854,7 +5249,7 @@ impl Vm {
                     cur = point.cur;
                     base = point.base;
                     pc = point.pc;
-                    c = &mods[module];
+                    c = resolve!(module);
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
@@ -4885,16 +5280,18 @@ impl Vm {
                     // padding slot or a signature mismatch is an inert IndirectCallType trap. The
                     // target may be an installed §22 unit (a different module) — a cross-module call.
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
-                    let (tmod, tfunc) = match table[slot] {
-                        Some(e) => (e.0 as usize, e.1 as usize),
-                        None => return Err(Trap::IndirectCallType),
-                    };
-                    let (cp, cr) = &mods[tmod].sigs[tfunc];
+                    let ts = table.slot(slot);
+                    if ts.module == super::TABLE_EMPTY {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                    let tm = resolve!(tmod);
+                    let (cp, cr) = &tm.sigs[tfunc];
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
                     let nb = base + c.progs[cur].nslots as usize;
-                    let need = nb + mods[tmod].progs[tfunc].nslots as usize;
+                    let need = nb + tm.progs[tfunc].nslots as usize;
                     if self.regs.len() < need {
                         self.regs.resize(need, Reg::default());
                     }
@@ -4905,7 +5302,7 @@ impl Vm {
                         .push((module, cur, base, pc + 1, base + *dst as usize));
                     if tmod != module {
                         module = tmod;
-                        c = &mods[tmod];
+                        c = tm;
                     }
                     cur = tfunc;
                     base = nb;
@@ -4927,7 +5324,7 @@ impl Vm {
                         }
                         if cmod != module {
                             module = cmod;
-                            c = &mods[cmod];
+                            c = resolve!(cmod);
                         }
                         cur = cprog;
                         base = cbase;
@@ -4960,15 +5357,17 @@ impl Vm {
                     want_results,
                 } => {
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
-                    let (tmod, tfunc) = match table[slot] {
-                        Some(e) => (e.0 as usize, e.1 as usize),
-                        None => return Err(Trap::IndirectCallType),
-                    };
-                    let (cp, cr) = &mods[tmod].sigs[tfunc];
+                    let ts = table.slot(slot);
+                    if ts.module == super::TABLE_EMPTY {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                    let tm = resolve!(tmod);
+                    let (cp, cr) = &tm.sigs[tfunc];
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
-                    let need = base + mods[tmod].progs[tfunc].nslots as usize;
+                    let need = base + tm.progs[tfunc].nslots as usize;
                     if self.regs.len() < need {
                         self.regs.resize(need, Reg::default());
                     }
@@ -4981,7 +5380,7 @@ impl Vm {
                     }
                     if tmod != module {
                         module = tmod;
-                        c = &mods[tmod];
+                        c = tm;
                     }
                     cur = tfunc;
                     pc = 0;
