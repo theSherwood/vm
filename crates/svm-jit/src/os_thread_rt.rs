@@ -1213,6 +1213,17 @@ impl Domain {
             });
         }
 
+        // §12.8 4A.6: re-seed the registry's vCPU-context occupancy from the re-attached children's
+        // contexts (a recycled freeze leaves a **sparse/gappy** set). The re-attach derives each context
+        // from its restored shadow-SP rather than `reserve_vcpu_context`, so without this the mask would
+        // read empty and a **post-thaw** `thread.spawn` (`reserve_vcpu_context` → highest-free) could hand
+        // out a context a re-attached sibling still occupies. (Completed/recycled children freed theirs, so
+        // those bits stay clear — a post-thaw spawn correctly reuses them.)
+        if let Some(table) = self.fiber_table() {
+            let mask: u16 = runs.iter().fold(0, |m, r| m | (1u16 << r.ctx));
+            table.seed_vcpu_mask(mask);
+        }
+
         // (2) §12.8 concurrent-thaw stage 2: **re-spawn each frozen vCPU on its own OS thread**, rewinding
         // from its restored extent (`thaw_extent`) against its *own* per-context thaw word — concurrent
         // with its siblings and the root, mirroring a fresh concurrent durable run (vs. the former inline

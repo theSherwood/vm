@@ -366,10 +366,11 @@ impl SharedFiberTable {
         }
     }
 
-    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (slice 3.3): the re-attached
+    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (§12.8 4A.6): the re-attached
     /// children reclaim exactly the contexts they held at freeze (derived from their restored
-    /// shadow-SPs), so a post-thaw spawn allocates into a genuinely-free context.
-    #[allow(dead_code)] // wired by the inline single-worker path (slice 3.3 freeze side)
+    /// shadow-SPs, which can be a sparse/gappy set after recycling), so a post-thaw spawn allocates into a
+    /// genuinely-free context instead of colliding with a re-attached sibling. Called by the concurrent
+    /// `thaw_reattach_and_run`.
     pub(crate) fn seed_vcpu_mask(&self, mask: u16) {
         self.lock().vcpu_mask = mask;
     }
@@ -1259,6 +1260,28 @@ mod vcpu_ctx_tests {
         t.seed_vcpu_mask(1 << (MAX_SHADOW_CTX - 1));
         assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX));
         assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX - 2)); // skips the seeded one
+    }
+
+    // §12.8 4A.6: a recycled-context freeze re-attaches a **sparse/gappy** vCPU set — a middle context
+    // was freed when its child finished before the freeze. `thaw_reattach_and_run` seeds that mask, so a
+    // post-thaw spawn reuses the freed gap while still avoiding the re-attached siblings (no collision).
+    #[test]
+    fn thaw_seed_with_gaps_reuses_the_recycled_context() {
+        let t = SharedFiberTable::new(MAX_FIBERS);
+        let (hi, mid, lo) = (MAX_SHADOW_CTX, MAX_SHADOW_CTX - 1, MAX_SHADOW_CTX - 2);
+        // Re-attach two live children at `hi` and `lo`; `mid` is the recycled gap between them.
+        t.seed_vcpu_mask((1 << hi) | (1 << lo));
+        // A post-thaw spawn reserves the highest free context — the recycled gap, not a re-attached one.
+        assert_eq!(
+            t.reserve_vcpu_context(),
+            Some(mid),
+            "post-thaw spawn reuses the recycled gap, not a re-attached sibling's context",
+        );
+        assert_eq!(
+            t.reserve_vcpu_context(),
+            Some(lo - 1),
+            "the next spawn takes the highest free context below the re-attached set",
+        );
     }
 
     #[test]
