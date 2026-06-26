@@ -192,7 +192,9 @@ fn main() {
                     "note: svm-bytecode-wasm {disp} failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ),
-                Err(err) => eprintln!("note: svm-bytecode-wasm {disp} failed to launch node: {err}"),
+                Err(err) => {
+                    eprintln!("note: svm-bytecode-wasm {disp} failed to launch node: {err}")
+                }
             }
         }
     }
