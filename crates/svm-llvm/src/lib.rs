@@ -179,6 +179,9 @@ use svm_ir::{
 
 pub mod blockaddr;
 pub mod di;
+/// The in-house textual-`.ll` reader (LLVM.md §8 Q1a) — replacing the `llvm-ir`/libLLVM binding.
+/// Built behind a differential parity check before it becomes the default; see `tests/translate.rs`.
+pub mod ll;
 pub mod wideint;
 
 /// Why a translation could not be produced.
