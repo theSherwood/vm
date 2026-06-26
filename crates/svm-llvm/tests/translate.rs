@@ -7379,3 +7379,24 @@ fn ll_parity_bitwise_shifts() {
         "unsigned s(unsigned x){ return (x << 3) | (x >> 2); }",
     );
 }
+
+#[test]
+fn ll_parity_sext_widen() {
+    // `sext i32 … to i64` + an `i64` add — the conversion path (a widening cast).
+    assert_ll_parity("ll_parity_widen", "long w(int x){ return (long)x + 1; }");
+}
+
+#[test]
+fn ll_parity_icmp_zext() {
+    // `icmp sgt` + `zext i1 … to i32` — a signed compare materialized to an int (the `a > b` shape).
+    assert_ll_parity("ll_parity_cmp", "int gt(int a, int b){ return a > b; }");
+}
+
+#[test]
+fn ll_parity_float_add() {
+    // `fadd float` — float arithmetic (no float *constant*, which is a later slice: hex-float parsing).
+    assert_ll_parity(
+        "ll_parity_fadd",
+        "float a(float x, float y){ return x + y; }",
+    );
+}

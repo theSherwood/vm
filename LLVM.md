@@ -1782,14 +1782,22 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     handles**: `ll_parity_trivial_add` (header + flagged binop + `ret`), `ll_parity_arith_chain`
     (binop chain with `±` immediates), `ll_parity_bitwise_shifts` (`shl`/`lshr`/`or`). The textual path
     is proven end-to-end through the unified (`ll`-consuming) translator.
-- **Next step (resume here): grow `parse.rs` to the full AST under the parity gate.** Each new shape =
-  a `clang -O2` `.ll` construct the core slice doesn't parse yet + an `assert_ll_parity` test. Near-term
-  gaps (from probing the corpus): **`icmp`/`br i1`/multi-block + labels + `phi`** (a `for`-loop sum),
-  **conversions** (`zext`/`trunc`/… incl. `iN` like `i33`), **`call`** (e.g. `llvm.smax`, the `?:`-max
-  lowering), then **`getelementptr`/`load`/`store`/`alloca`** (memory), **globals + initializers**,
-  **`switch`**, **structs/aggregates**, **SIMD vectors**, **`select`**, **C++ EH** (`invoke`/
-  `landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text — full-width
-  constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
+  - **Parser — single-block instruction set landed.** `parse.rs` now covers (each with an
+    `assert_ll_parity` test on real `clang -O2` output): integer **+ float binops**, **conversions**
+    (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`, with `nneg`/flag skipping), **`icmp`/`fcmp`** (full
+    predicate sets + fast-math-flag skipping), **`select`**, **`fneg`/`freeze`**. Six parity tests green
+    (`add`, arith chain, shifts, `sext`-widen, `icmp`+`zext`, `fadd`). Constant operands: int (full
+    width) + `true`/`false`; **float constants are deferred** (LLVM's `0x…` hex-float image needs exact
+    bit parsing — a small dedicated slice).
+- **Next step (resume here): multi-block + `phi`, then `call`, then memory.** The growth frontier, each
+  a `clang -O2` shape + an `assert_ll_parity` test: **`phi` + multi-block label resolution** (a
+  `for`-loop sum — `icmp`/`br i1`/labels/`phi`; the terminators already parse, `phi` + cross-block value
+  refs are the work), **`call`** (e.g. `llvm.smax`, the `?:`-max lowering; needs the callee/arg-list
+  grammar + the `Either` callee), then **`getelementptr`/`load`/`store`/`alloca`** (memory), **globals +
+  initializers**, **float/hex constants**, **`switch`**, **structs/aggregates**, **SIMD vectors**, **C++
+  EH** (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
+  full-width constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then
+  PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).

@@ -1,12 +1,16 @@
 //! Recursive-descent parser for textual LLVM IR (`.ll`) → [`ast::Module`](super::ast). Consumes the
 //! [`lex`](super::lex) token stream.
 //!
-//! Built simplest-first (LLVM.md §8 Q1b): the **core slice** here covers `define` functions over the
-//! seed AST — integer types, binary-op instructions, and the `ret`/`br`/`unreachable` terminators,
-//! with `%local`/constant-int operands. Top-level cruft the on-ramp ignores (target/datalayout lines,
-//! attribute groups, module-level metadata, `declare`s) is skipped. Coverage grows alongside the AST
-//! under the differential parity check against `llvm-ir` (`tests/translate.rs`). Anything not yet
-//! handled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
+//! Built simplest-first (LLVM.md §8 Q1b), growing under the differential parity check against the
+//! bitcode reader (`assert_ll_parity`, `tests/translate.rs`). Covered so far: `define` functions with
+//! integer/float types, the **single-block** instruction set — integer + float **binops**,
+//! **conversions** (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`), **`icmp`/`fcmp`**, **`select`**,
+//! **`fneg`/`freeze`** — over `%local`/constant-int operands, and the `ret`/`br`/`condbr`/
+//! `unreachable` terminators. Top-level cruft the on-ramp ignores (target/datalayout lines, attribute
+//! groups, module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier): `phi`
+//! + multi-block label resolution, `call`, memory (`getelementptr`/`load`/`store`/`alloca`), globals,
+//! `switch`, aggregates, vectors, and float/non-trivial constants. Anything unhandled is a clean
+//! [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
 
 use super::ast::*;
 use super::lex::{lex, Token};
@@ -418,6 +422,29 @@ impl Parser {
             "shl" => Instruction::Shl(bin(self, dest)?),
             "lshr" => Instruction::LShr(bin(self, dest)?),
             "ashr" => Instruction::AShr(bin(self, dest)?),
+            "fadd" => Instruction::FAdd(bin(self, dest)?),
+            "fsub" => Instruction::FSub(bin(self, dest)?),
+            "fmul" => Instruction::FMul(bin(self, dest)?),
+            "fdiv" => Instruction::FDiv(bin(self, dest)?),
+            "frem" => Instruction::FRem(bin(self, dest)?),
+            "trunc" => Instruction::Trunc(self.conv_inst(dest)?),
+            "zext" => Instruction::ZExt(self.conv_inst(dest)?),
+            "sext" => Instruction::SExt(self.conv_inst(dest)?),
+            "fptrunc" => Instruction::FPTrunc(self.conv_inst(dest)?),
+            "fpext" => Instruction::FPExt(self.conv_inst(dest)?),
+            "fptoui" => Instruction::FPToUI(self.conv_inst(dest)?),
+            "fptosi" => Instruction::FPToSI(self.conv_inst(dest)?),
+            "uitofp" => Instruction::UIToFP(self.conv_inst(dest)?),
+            "sitofp" => Instruction::SIToFP(self.conv_inst(dest)?),
+            "ptrtoint" => Instruction::PtrToInt(self.conv_inst(dest)?),
+            "inttoptr" => Instruction::IntToPtr(self.conv_inst(dest)?),
+            "bitcast" => Instruction::BitCast(self.conv_inst(dest)?),
+            "addrspacecast" => Instruction::AddrSpaceCast(self.conv_inst(dest)?),
+            "icmp" => Instruction::ICmp(self.icmp_inst(dest)?),
+            "fcmp" => Instruction::FCmp(self.fcmp_inst(dest)?),
+            "select" => Instruction::Select(self.select_inst(dest)?),
+            "fneg" => Instruction::FNeg(self.fneg_inst(dest)?),
+            "freeze" => Instruction::Freeze(self.freeze_inst(dest)?),
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
@@ -565,6 +592,173 @@ impl Parser {
             }
             other => self.err(format!("value not yet supported: {other:?}")),
         }
+    }
+
+    // ---- conversions / compares / select -------------------------------------------------------
+
+    /// A conversion (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`): `<op> [flags] <srcty> <val> to <dstty>`.
+    fn conv_inst(&mut self, dest: Name) -> PResult<UnaryOp> {
+        self.pos += 1; // opcode
+        self.skip_conv_flags();
+        let srcty = self.type_()?;
+        let operand = self.value_as_operand(&srcty)?;
+        self.expect_word("to")?;
+        let to_type = self.type_()?;
+        Ok(UnaryOp {
+            operand,
+            to_type,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `icmp <pred> <ty> <op0>, <op1>`.
+    fn icmp_inst(&mut self, dest: Name) -> PResult<ICmp> {
+        self.pos += 1; // `icmp`
+        let predicate = self.int_predicate()?;
+        let ty = self.type_()?;
+        let operand0 = self.value_as_operand(&ty)?;
+        self.expect(&Token::Comma)?;
+        let operand1 = self.value_as_operand(&ty)?;
+        Ok(ICmp {
+            predicate,
+            operand0,
+            operand1,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `fcmp [fast-math flags] <pred> <ty> <op0>, <op1>`.
+    fn fcmp_inst(&mut self, dest: Name) -> PResult<FCmp> {
+        self.pos += 1; // `fcmp`
+        self.skip_fast_math_flags();
+        let predicate = self.fp_predicate()?;
+        let ty = self.type_()?;
+        let operand0 = self.value_as_operand(&ty)?;
+        self.expect(&Token::Comma)?;
+        let operand1 = self.value_as_operand(&ty)?;
+        Ok(FCmp {
+            predicate,
+            operand0,
+            operand1,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `select [fast-math flags] <condty> <cond>, <ty> <a>, <ty> <b>`.
+    fn select_inst(&mut self, dest: Name) -> PResult<Select> {
+        self.pos += 1; // `select`
+        self.skip_fast_math_flags();
+        let cty = self.type_()?;
+        let condition = self.value_as_operand(&cty)?;
+        self.expect(&Token::Comma)?;
+        let tty = self.type_()?;
+        let true_value = self.value_as_operand(&tty)?;
+        self.expect(&Token::Comma)?;
+        let fty = self.type_()?;
+        let false_value = self.value_as_operand(&fty)?;
+        Ok(Select {
+            condition,
+            true_value,
+            false_value,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `fneg [fast-math flags] <ty> <val>` — result type is the operand type.
+    fn fneg_inst(&mut self, dest: Name) -> PResult<UnaryOp> {
+        self.pos += 1; // `fneg`
+        self.skip_fast_math_flags();
+        let ty = self.type_()?;
+        let operand = self.value_as_operand(&ty)?;
+        Ok(UnaryOp {
+            operand,
+            to_type: ty,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `freeze <ty> <val>` — result type is the operand type.
+    fn freeze_inst(&mut self, dest: Name) -> PResult<UnaryOp> {
+        self.pos += 1; // `freeze`
+        let ty = self.type_()?;
+        let operand = self.value_as_operand(&ty)?;
+        Ok(UnaryOp {
+            operand,
+            to_type: ty,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// Skip conversion flags (`nneg` on `zext`, `nuw`/`nsw` on `trunc`).
+    fn skip_conv_flags(&mut self) {
+        while matches!(self.peek(), Some(Token::Word(w))
+            if matches!(w.as_str(), "nneg" | "nuw" | "nsw"))
+        {
+            self.pos += 1;
+        }
+    }
+
+    /// Skip fast-math flags (`nnan`/`ninf`/`nsz`/`arcp`/`contract`/`afn`/`reassoc`/`fast`) on a float op.
+    fn skip_fast_math_flags(&mut self) {
+        while matches!(self.peek(), Some(Token::Word(w)) if matches!(w.as_str(),
+            "nnan" | "ninf" | "nsz" | "arcp" | "contract" | "afn" | "reassoc" | "fast"))
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn int_predicate(&mut self) -> PResult<IntPredicate> {
+        let p = match self.peek() {
+            Some(Token::Word(w)) => match w.as_str() {
+                "eq" => IntPredicate::EQ,
+                "ne" => IntPredicate::NE,
+                "ugt" => IntPredicate::UGT,
+                "uge" => IntPredicate::UGE,
+                "ult" => IntPredicate::ULT,
+                "ule" => IntPredicate::ULE,
+                "sgt" => IntPredicate::SGT,
+                "sge" => IntPredicate::SGE,
+                "slt" => IntPredicate::SLT,
+                "sle" => IntPredicate::SLE,
+                other => return self.err(format!("unknown icmp predicate `{other}`")),
+            },
+            other => return self.err(format!("expected an icmp predicate, found {other:?}")),
+        };
+        self.pos += 1;
+        Ok(p)
+    }
+
+    fn fp_predicate(&mut self) -> PResult<FPPredicate> {
+        let p = match self.peek() {
+            Some(Token::Word(w)) => match w.as_str() {
+                "false" => FPPredicate::False,
+                "oeq" => FPPredicate::OEQ,
+                "ogt" => FPPredicate::OGT,
+                "oge" => FPPredicate::OGE,
+                "olt" => FPPredicate::OLT,
+                "ole" => FPPredicate::OLE,
+                "one" => FPPredicate::ONE,
+                "ord" => FPPredicate::ORD,
+                "uno" => FPPredicate::UNO,
+                "ueq" => FPPredicate::UEQ,
+                "ugt" => FPPredicate::UGT,
+                "uge" => FPPredicate::UGE,
+                "ult" => FPPredicate::ULT,
+                "ule" => FPPredicate::ULE,
+                "une" => FPPredicate::UNE,
+                "true" => FPPredicate::True,
+                other => return self.err(format!("unknown fcmp predicate `{other}`")),
+            },
+            other => return self.err(format!("expected an fcmp predicate, found {other:?}")),
+        };
+        self.pos += 1;
+        Ok(p)
     }
 
     // ---- types ---------------------------------------------------------------------------------
