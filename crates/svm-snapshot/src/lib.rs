@@ -148,6 +148,60 @@ pub enum RestoreError {
     GeometryMismatch,
     /// A handle named a slot outside the table capacity.
     SlotOutOfRange(u32),
+    /// An `AddressSpace`/`Instantiator` binding's `[base, base+size)` is not a power-of-two-aligned
+    /// sub-range of the window `[0, mapped)`. A restored (untrusted, persisted) artifact must satisfy
+    /// the same window-containment invariant the grant path guarantees — otherwise a forged `base`
+    /// drives the §14 JIT instantiator's `unsafe` window copy out of bounds (a host-memory escape).
+    BindingOutOfWindow,
+}
+
+/// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
+/// instantiator's `unsafe` window copy (`from_raw_parts(parent_mem_base + base + off, child_size)`)
+/// *assumes* lies within the window, with `size` a power of two and `base` a multiple of it — the
+/// invariant `Host::grant_address_space`/`grant_instantiator` document and the live grant path
+/// establishes. The window image and the (non-cryptographic) module digest don't cover this field,
+/// so a forged artifact could otherwise smuggle an out-of-window `base` straight into that pointer
+/// arithmetic. Re-check it here at the deserialization boundary; bindings with no address payload
+/// always pass.
+fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
+    let (base, size) = match *binding {
+        DurableBinding::AddressSpace { base, size }
+        | DurableBinding::Instantiator { base, size } => (base, size),
+        _ => return true,
+    };
+    size != 0
+        && size.is_power_of_two()
+        && base & (size - 1) == 0
+        && base.checked_add(size).is_some_and(|end| end <= mapped)
+}
+
+#[cfg(test)]
+mod binding_window_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_only_out_of_window_or_malformed_address_bindings() {
+        let mapped = 1u64 << 18; // 256 KiB window
+        let ok = |base, size| {
+            binding_in_window(&DurableBinding::Instantiator { base, size }, mapped)
+                && binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped)
+        };
+        // Legitimate sub-ranges: the whole window, an aligned interior carve, the top slot.
+        assert!(ok(0, mapped));
+        assert!(ok(1 << 12, 1 << 12));
+        assert!(ok(mapped - (1 << 12), 1 << 12));
+        // Out of window, off the top, and base+size overflow.
+        assert!(!ok(mapped, 1 << 12));
+        assert!(!ok(mapped - (1 << 12), 1 << 13));
+        assert!(!ok(u64::MAX & !((1 << 12) - 1), 1 << 12));
+        // Malformed: zero size, non-power-of-two size, base not a multiple of size.
+        assert!(!ok(0, 0));
+        assert!(!ok(0, 3 << 12));
+        assert!(!ok(1 << 11, 1 << 12));
+        // Address-payload-free bindings always pass (nothing to confine).
+        assert!(binding_in_window(&DurableBinding::Exit, mapped));
+        assert!(binding_in_window(&DurableBinding::Memory, mapped));
+    }
 }
 
 /// Serialize a quiesced durable domain into a §12 artifact: the `window` image (the shadow
@@ -402,6 +456,11 @@ pub fn restore_with_prots(
         let generation = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let type_id = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let binding = read_binding(&mut hr)?;
+        // Re-establish the window-containment invariant the §14 JIT instantiator's `unsafe` relies on:
+        // a forged AddressSpace/Instantiator `base`/`size` must not name memory outside `[0, mapped)`.
+        if !binding_in_window(&binding, mapped as u64) {
+            return Err(RestoreError::BindingOutOfWindow);
+        }
         handles.push(DurableHandle {
             slot,
             generation,
