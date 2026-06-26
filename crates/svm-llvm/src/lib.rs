@@ -295,7 +295,10 @@ fn translate_impl(
     // the `invoke`/`landingpad`/`resume`/`__cxa_*` lowering; the typeinfo-id table assigns each
     // `@_ZTI*` referenced by a throw or `llvm.eh.typeid.for` a distinct nonzero id so the thrown-type
     // selector and the catch-clause `eh.typeid.for` agree. Needs the powerbox window (so `&& has_main`).
-    let (uses_eh, eh_typeids) = scan_eh(m);
+    let (uses_eh, eh_typeids, eh_thrown) = scan_eh(m);
+    // Precompute the subtype match table so `catch (Base&)` matches a thrown `Derived` (§ polymorphic
+    // catch). Empty when EH is unused.
+    let eh_subtype_ids = build_eh_subtypes(m, &eh_typeids, &eh_thrown);
     let need_eh = uses_eh && has_main;
     let need_narrow_atomic = uses_narrow_atomic(m);
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
@@ -474,6 +477,7 @@ fn translate_impl(
         ctype_toupper_loc: ctype.toupper_loc,
         eh_base,
         eh_typeids,
+        eh_subtype_ids,
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
@@ -3403,6 +3407,10 @@ struct Helpers {
     /// order). The throw stores the thrown type's id into the selector slot; `eh.typeid.for` returns
     /// the same id, so clang's emitted catch dispatch compares them and selects the right handler.
     eh_typeids: HashMap<String, u32>,
+    /// Subtype match table for polymorphic catch: typeinfo name → the thrown-type ids a `catch` of
+    /// that type matches (itself + every thrown type derived from it; see [`build_eh_subtypes`]). The
+    /// `llvm.eh.typeid.for` lowering uses it to make `icmp eq sel, typeid.for(C)` mean "thrown is-a C".
+    eh_subtype_ids: HashMap<String, Vec<u32>>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
@@ -3456,9 +3464,13 @@ fn calls_external(m: &LModule, defined: &HashMap<String, u32>, want: &str) -> bo
 /// the `@_ZTI*` operand of `__cxa_throw` (arg 1) or `llvm.eh.typeid.for` (arg 0) — to a distinct
 /// 1-based id in first-seen order, so a thrown type's stored selector matches the catch clause's
 /// `eh.typeid.for` exactly when (and only when) the types are the same.
-fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>) {
+fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>, Vec<String>) {
     let mut uses = false;
     let mut ids: HashMap<String, u32> = HashMap::new();
+    // The typeinfos that are actually *thrown* (`__cxa_throw` arg1) — the set of types that can reach
+    // a landing pad's selector. Drives the subtype table (`build_eh_subtypes`): a `catch (B&)` matches
+    // a thrown `D` exactly when some thrown `D` has `B` in its base chain.
+    let mut thrown: Vec<String> = Vec::new();
     let intern = |op: &Operand, ids: &mut HashMap<String, u32>| {
         if let Some(n) = global_name_of(op) {
             let next = ids.len() as u32 + 1;
@@ -3478,6 +3490,9 @@ fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>) {
                             uses = true;
                             if let Some((op, _)) = c.arguments.get(1) {
                                 intern(op, &mut ids);
+                                if let Some(n) = global_name_of(op) {
+                                    thrown.push(n);
+                                }
                             }
                         }
                         Some("llvm.eh.typeid.for") => {
@@ -3501,7 +3516,78 @@ fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>) {
             }
         }
     }
-    (uses, ids)
+    (uses, ids, thrown)
+}
+
+/// Recursively collect the `@_ZTI*` base-class typeinfos referenced by a typeinfo global's
+/// initializer. A `__class_type_info` (a root, no bases) yields none; a `__si_class_type_info` yields
+/// its one base (initializer field 2); a `__vmi_class_type_info` yields each base (nested in the
+/// base-info array). Every `_ZTI`-prefixed reference inside a typeinfo initializer *is* a direct base
+/// — field 0 is the `_ZTV` abi vtable and field 1 the `_ZTS` type-name string, neither prefixed
+/// `_ZTI` — so a prefix filter over a full walk recovers exactly the bases.
+fn collect_ti_bases(c: &Constant, out: &mut Vec<String>) {
+    match c {
+        Constant::GlobalReference { name, .. } => {
+            let n = name_str(name);
+            if n.starts_with("_ZTI") {
+                out.push(n);
+            }
+        }
+        Constant::Struct { values, .. } => values.iter().for_each(|v| collect_ti_bases(v, out)),
+        Constant::Array { elements, .. } | Constant::Vector(elements) => {
+            elements.iter().for_each(|v| collect_ti_bases(v, out))
+        }
+        Constant::BitCast(bc) => collect_ti_bases(bc.operand.as_ref(), out),
+        _ => {}
+    }
+}
+
+/// Build the C++ exception subtype table: for each typeinfo, the set of *thrown* type ids that a
+/// `catch` of that type matches — its own id plus every thrown type derived from it. `catch (B&)`
+/// matches a thrown `D` when `B` is a base of `D` (the Itanium personality's `__do_catch` walk); we
+/// precompute that walk here over the typeinfo base-chains so `llvm.eh.typeid.for` can decide it at
+/// runtime with a flat id compare. A type whose typeinfo is external (no initializer — e.g. a `std`
+/// type) contributes only its own id: its base chain is invisible to a single TU.
+fn build_eh_subtypes(
+    m: &LModule,
+    ids: &HashMap<String, u32>,
+    thrown: &[String],
+) -> HashMap<String, Vec<u32>> {
+    // Direct bases per typeinfo name (only those defined — with an initializer — in this module).
+    let mut bases: HashMap<String, Vec<String>> = HashMap::new();
+    for g in &m.global_vars {
+        let n = name_str(&g.name);
+        if !n.starts_with("_ZTI") {
+            continue;
+        }
+        if let Some(init) = &g.initializer {
+            let mut b = Vec::new();
+            collect_ti_bases(init.as_ref(), &mut b);
+            bases.insert(n, b);
+        }
+    }
+    // For each thrown type, record its id against every ancestor (transitive closure up the base
+    // chain, including itself) — that ancestor's `catch` clause must match this thrown type.
+    let mut out: HashMap<String, Vec<u32>> = HashMap::new();
+    for t in thrown {
+        let Some(&tid) = ids.get(t) else { continue };
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack = vec![t.clone()];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x.clone()) {
+                continue;
+            }
+            out.entry(x.clone()).or_default().push(tid);
+            if let Some(bs) = bases.get(&x) {
+                stack.extend(bs.iter().cloned());
+            }
+        }
+    }
+    for v in out.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    out
 }
 
 /// Does the module call the heap allocator (`malloc`/`calloc`)? (`free` is a no-op; `realloc` is
@@ -11238,9 +11324,43 @@ fn lower_eh_call(
             Ok(true)
         }
         "llvm.eh.typeid.for" => {
-            let tid = ctx.eh_typeid(&c.arguments[0].0)?;
-            let r = ctx.push(Inst::ConstI32(tid as i32));
-            ctx.bind_dest(&c.dest, r);
+            // Subtype-aware selector match (the Itanium personality's `__do_catch`). clang compares the
+            // landing-pad selector — the *thrown* type's id — against this value with `icmp eq` to pick
+            // a catch clause. Return the live selector when the thrown type *is-a* the clause type (so
+            // the compare is true), else a sentinel (`-1`) that no real id equals. The match set — the
+            // thrown ids the clause catches — is precomputed from the typeinfo base-chains, so this is
+            // what lets `catch (Base&)` catch a thrown `Derived` (and an exact match still works: a
+            // type is in its own match set). A clause type that is never thrown has an empty match set
+            // and folds to the sentinel — it simply never matches.
+            let name = global_name_of(&c.arguments[0].0).ok_or_else(|| {
+                Error::Unsupported("eh.typeid.for operand is not a global".into())
+            })?;
+            let base = ctx.eh_base()?;
+            let sel_addr = ctx.const_i64((base + EH_SEL_O) as i64);
+            let sel = ctx.push(Inst::Load {
+                op: LoadOp::I32,
+                addr: sel_addr,
+                offset: 0,
+                align: 4,
+            });
+            let mut result = ctx.push(Inst::ConstI32(-1)); // sentinel: never equals a (1-based) id
+            if let Some(matchset) = ctx.helpers.eh_subtype_ids.get(&name).cloned() {
+                for t in matchset {
+                    let tc = ctx.push(Inst::ConstI32(t as i32));
+                    let eq = ctx.push(Inst::IntCmp {
+                        ty: IntTy::I32,
+                        op: CmpOp::Eq,
+                        a: sel,
+                        b: tc,
+                    });
+                    result = ctx.push(Inst::Select {
+                        cond: eq,
+                        a: sel,
+                        b: result,
+                    });
+                }
+            }
+            ctx.bind_dest(&c.dest, result);
             Ok(true)
         }
         _ => Ok(false),
