@@ -1748,6 +1748,316 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
     }
 }
 
+/// Compile a C program whose **first defined function** is `run(int seed)` (returning a result byte),
+/// translate it, and assert the tree-walker, bytecode, and JIT engines all reproduce the native exit
+/// code. The §varargs tests use this: `run` calls one or more `(...)`-defined helpers whose `va_arg`
+/// reads must match native. Unlike setjmp, the JIT must *run* varargs (it lowers to ordinary
+/// loads/stores/calls), so a JIT decline is a failure here.
+fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("svm_llvm_va_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    // `-lm` so math-helper tests (`ldexp`, …) link against libc's math on the native side.
+    match Command::new("cc")
+        .arg(&c)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let svm = match interp.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        svm, native,
+        "{name}: tree-walker={svm} vs native cc={native}"
+    );
+
+    let mut bfuel = 100_000_000u64;
+    let bc_out = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+        .expect("bytecode compile")
+        .expect("bytecode run");
+    let bsvm = match bc_out.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: bytecode expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        bsvm, native,
+        "{name}: bytecode={bsvm} vs native cc={native}"
+    );
+
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            let jsvm = s[0] as i32 as u8;
+            assert_eq!(jsvm, native, "{name}: JIT={jsvm} vs native cc={native}");
+        }
+        Ok(other) => panic!("{name}: unexpected JIT outcome {other:?} on a valid varargs program"),
+        Err(e) => panic!("{name}: JIT errored on varargs: {e:?}"),
+    }
+}
+
+#[test]
+fn varargs_int_double_mixed() {
+    // The first defined function `run` calls three `(...)`-defined helpers — an all-`int` list, an
+    // all-`double` list, and a mixed `int`/`double` list. Forcing every argument to the
+    // `overflow_arg_area` (gp_offset/fp_offset maxed in `va_start`, §varargs) means the helpers read
+    // their arguments positionally from the marshaled scratch; mixed int/SSE classes must still land
+    // byte-identical to native. The helpers are `noinline` so they survive `-O2` as real varargs
+    // definitions (not inlined + constant-folded away).
+    let src = "#include <stdarg.h>\n\
+        static long long vsum(int n, ...);\n\
+        static double vdsum(int n, ...);\n\
+        static long long vmix(int n, ...);\n\
+        int run(int seed){\n\
+          long long a = vsum(5, 10, 20, 30, 40, 50);\n\
+          double d = vdsum(3, 1.5, 2.5, 3.0);\n\
+          long long m = vmix(4, 100, 2.5, 200, 3.9);\n\
+          return (int)((a + (long long)d + m + seed) & 0xff);\n\
+        }\n\
+        __attribute__((noinline)) static long long vsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int i=0;i<n;i++) s+=va_arg(ap,int); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static double vdsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); double s=0;\n\
+          for(int i=0;i<n;i++) s+=va_arg(ap,double); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static long long vmix(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int i=0;i<n;i++){ if(i&1) s+=(long long)va_arg(ap,double); else s+=va_arg(ap,int); }\n\
+          va_end(ap); return s; }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_mixed", src, 0);
+}
+
+#[test]
+fn varargs_zero_variadic() {
+    // A `(...)` function invoked with ONLY its fixed parameters (zero variadic args) — e.g. Lua's
+    // `lua_gc(L, what)`. The call site still deposits the overflow-area pointer (marshaling nothing),
+    // and the callee's `va_start` runs even though `va_arg` is never reached. Regression for the
+    // "varargs call without reserved scratch" frame-layout bug. `vz(7)` returns its fixed arg.
+    let src = "#include <stdarg.h>\n\
+        static int vz(int n, ...);\n\
+        int run(int seed){ return (vz(7) + vz(20) + seed) & 0xff; }\n\
+        __attribute__((noinline)) static int vz(int n, ...){\n\
+          va_list ap; va_start(ap, n); va_end(ap); return n; }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_zero", src, 0);
+}
+
+#[test]
+fn varargs_many_and_copy() {
+    // A long integer list (more than the six SysV integer-class registers) stresses the memory-path
+    // traversal; `va_copy` re-walks the same list from the start. `run` returns a byte. Sum 1..10 =
+    // 55, walked twice = 110.
+    let src = "#include <stdarg.h>\n\
+        static int vcount(int n, ...);\n\
+        int run(int seed){ return (vcount(10, 1,2,3,4,5,6,7,8,9,10) + seed) & 0xff; }\n\
+        __attribute__((noinline)) static int vcount(int n, ...){\n\
+          va_list ap, aq; va_start(ap,n); va_copy(aq, ap);\n\
+          long long s=0; for(int i=0;i<n;i++) s+=va_arg(ap,int);\n\
+          long long t=0; for(int i=0;i<n;i++) t+=va_arg(aq,int);\n\
+          va_end(aq); va_end(ap); return (int)(s+t); }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_many_copy", src, 0);
+}
+
+#[test]
+fn libc_strcmp_strchr_strcoll() {
+    // The synthesized `__svm_strcmp`/`__svm_strchr` byte loops (libc batch). The string pointers are
+    // read through `volatile` so clang's `-O2` cannot constant-fold the calls away — the helpers are
+    // genuinely exercised. `strcoll` aliases `strcmp` in the C locale. `run` packs six predicate bits
+    // (sign of three compares, two `strchr` hits + one miss, and the `strcoll` equality) into a byte;
+    // matching native cc on all three engines pins the synthesized loops.
+    let src = "#include <string.h>\n\
+        int run(int seed){\n\
+          const char *volatile pa = \"hello\";\n\
+          const char *volatile pb = \"help\";\n\
+          const char *a = pa; const char *b = pb;\n\
+          int r1 = strcmp(a,b);\n\
+          int r2 = strcmp(a,a);\n\
+          int r3 = strcmp(b,a);\n\
+          const char *f = strchr(a,'l');\n\
+          const char *g = strchr(a,'z');\n\
+          const char *h = strchr(a,0);\n\
+          int acc = 0;\n\
+          acc += (r1 < 0) ? 1 : 0;\n\
+          acc += (r2 == 0) ? 2 : 0;\n\
+          acc += (r3 > 0) ? 4 : 0;\n\
+          acc += (f == a + 2) ? 8 : 0;\n\
+          acc += (g == 0) ? 16 : 0;\n\
+          acc += (h == a + 5) ? 32 : 0;\n\
+          acc += (strcoll(a,a) == 0) ? 64 : 0;\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_strcmp_strchr", src, 0);
+}
+
+#[test]
+fn libc_strcpy_strspn_strpbrk() {
+    // The synthesized `__svm_strcpy` (copy loop) and the nested-scan `__svm_strspn` / `__svm_strpbrk`.
+    // `volatile`-loaded operands keep the calls past `-O2`. Over "12.5e3xy": strspn vs the digit set
+    // is 2 ("12"), strpbrk vs "ex" lands on the 'e' at index 4, and the strcpy round-trips (checked
+    // via the strcmp helper). Three predicate bits → a byte, matching native cc on all three engines.
+    let src = "#include <string.h>\n\
+        int run(int seed){\n\
+          const char *volatile pv = \"12.5e3xy\";\n\
+          const char *s = pv;\n\
+          const char *volatile setv = \"0123456789\";\n\
+          const char *digits = setv;\n\
+          char buf[16];\n\
+          strcpy(buf, s);\n\
+          unsigned long n = strspn(s, digits);\n\
+          const char *p = strpbrk(s, \"ex\");\n\
+          int acc = 0;\n\
+          acc += (strcmp(buf, s) == 0) ? 1 : 0;\n\
+          acc += (n == 2) ? 2 : 0;\n\
+          acc += (p == s + 4) ? 4 : 0;\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_strcpy_strspn_strpbrk", src, 0);
+}
+
+#[test]
+fn cross_block_i1_mask() {
+    // A `<2 x i1>` mask defined in one block and `extractelement`-d in *both* successors — the shape
+    // clang's SLP vectorizer emits for fused byte-tests (Lua's GC `atomic`). Regression for masks
+    // crossing block boundaries: they are now held in the `agg` table with an `[i32; N]` layout, so
+    // the per-lane fan-out in `block_params`/`branch_args` threads them across edges. Hand-written
+    // LLVM so the cross-block shape is guaranteed regardless of the optimizer. Expected per seed:
+    // a=seed&0xff; lane0=(a&1==0), lane1=(a&2==0); l0 ? (lane1?1:2) : (lane1?4:8).
+    let ll = "\
+target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-linux-gnu\"\n\
+define i32 @run(i32 %seed) {\n\
+entry:\n\
+  %a = trunc i32 %seed to i8\n\
+  %v0 = insertelement <2 x i8> undef, i8 %a, i64 0\n\
+  %v = insertelement <2 x i8> %v0, i8 %a, i64 1\n\
+  %m = and <2 x i8> %v, <i8 1, i8 2>\n\
+  %mask = icmp eq <2 x i8> %m, zeroinitializer\n\
+  %l0 = extractelement <2 x i1> %mask, i64 0\n\
+  br i1 %l0, label %then, label %else\n\
+then:\n\
+  %l1t = extractelement <2 x i1> %mask, i64 1\n\
+  %rt = select i1 %l1t, i32 1, i32 2\n\
+  br label %done\n\
+else:\n\
+  %l1e = extractelement <2 x i1> %mask, i64 1\n\
+  %re = select i1 %l1e, i32 4, i32 8\n\
+  br label %done\n\
+done:\n\
+  %r = phi i32 [ %rt, %then ], [ %re, %else ]\n\
+  ret i32 %r\n\
+}\n";
+    let dir = std::env::temp_dir();
+    let llf = dir.join(format!("svm_mask_{}.ll", std::process::id()));
+    let bcf = dir.join(format!("svm_mask_{}.bc", std::process::id()));
+    std::fs::write(&llf, ll).unwrap();
+    match Command::new("llvm-as")
+        .arg(&llf)
+        .arg("-o")
+        .arg(&bcf)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping cross_block_i1_mask (llvm-as unavailable)");
+            return;
+        }
+    }
+    let t = svm_llvm::translate_bc_path(&bcf).expect("translate mask bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    for (seed, expect) in [(0i32, 1i32), (1, 4), (2, 2), (3, 8)] {
+        let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+        let mut fuel = 1_000_000u64;
+        let tw = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+        assert_eq!(
+            tw.first(),
+            Some(&Value::I32(expect)),
+            "tree-walker seed={seed}"
+        );
+        let mut bf = 1_000_000u64;
+        let bc = svm_interp::bytecode::compile_and_run(&module, 0, &full, &mut bf)
+            .expect("bytecode compile")
+            .expect("bytecode run");
+        assert_eq!(
+            bc.first(),
+            Some(&Value::I32(expect)),
+            "bytecode seed={seed}"
+        );
+        let slots: Vec<i64> = full.iter().map(to_slot).collect();
+        match svm_jit::compile_and_run(&module, 0, &slots) {
+            Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, expect, "JIT seed={seed}"),
+            Ok(o) => panic!("unexpected JIT outcome {o:?}"),
+            Err(e) => panic!("JIT error {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn libc_abort_translates() {
+    // C `abort()` on an unexecuted error path: it must *translate* (drop → the following `unreachable`
+    // traps) even though the clean run never reaches it. `seed` is a runtime parameter, so clang keeps
+    // the `abort` call. The taken path returns 7 == native.
+    let src = "#include <stdlib.h>\n\
+        int run(int seed){\n\
+          int x = seed + 7;\n\
+          if (x < 0) abort();\n\
+          return x & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_abort", src, 0);
+}
+
+#[test]
+fn libc_ldexp_bit_exact() {
+    // The synthesized `__svm_ldexp` (scalbn) over a grid of finite `x` × exponents `n` spanning the
+    // extremes (overflow→±inf, gradual underflow→denormal/0, and the two-step scaling for |n| huge).
+    // Each result's raw f64 bits are folded into a checksum returned as a byte; bit-identical to libc
+    // `ldexp` on all three engines pins the algorithm. `volatile` inputs keep the calls past `-O2`.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[7] = {1.0, 3.14159265358979, 1e300, 1e-300, 0.0, -2.5, 7.0};\n\
+          volatile int ns[8] = {0, 1, 5, -7, 60, 1100, -1100, -60};\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<7;i++) for (int j=0;j<8;j++) {\n\
+            double r = ldexp(xs[i], ns[j]);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = r;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+          }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_ldexp", src, 0);
+}
+
 #[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns

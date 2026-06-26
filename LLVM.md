@@ -1153,11 +1153,26 @@ Picking a target is really picking the *gap* it drives to completion. Current st
 - **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
   synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
 
-### Lua first light — recon + sequenced plan (IN PROGRESS)
-**Goal.** Run a pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
-through the on-ramp, exit-identical to native Lua — exercising the **lexer, parser, code generator, GC,
-and the VDBE-style bytecode VM** (computed `goto` + `setjmp` error handling, both already done). No
-stdlib / `print` / float output needed for first light (the result returns as the process exit code).
+### Lua first light — ACHIEVED ✅ (all three engines)
+**Goal (met).** A pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
+runs through the on-ramp **identical to native Lua on the tree-walker, bytecode, *and* JIT**
+(`Returned([I32(55)])` on each). It exercises the real **lexer, parser, code generator, GC, and the
+bytecode VM** (computed `goto` dispatch + `setjmp` error handling). The first whole real-world
+interpreter on the on-ramp. Reproduce: build `lua_core.bc` (recipe below) → `examples/run_lua.rs`
+(`run_lua <bc> [tree-walk|bytecode|jit]`, runs through the powerbox with Memory granted).
+
+**What it took (this branch):** the varargs ABI (keystone), the libc string batch + `abort`, exact
+`ldexp`, the cross-block `<N x i1>` mask fix (a real translator bug Lua surfaced), and **fail-closed
+stubs** for the libc the integer-only path never executes: `pow`/`fmod`/`frexp`/`strtod`/`snprintf`/
+`localeconv`/`__errno_location` trap if called (bit-exact transcendentals need a host-libm decision —
+below), and `time()` returns `0` (the `makeseed` RNG seed is result-irrelevant). These stubs translate
+so the module lowers and the executed path is fully real; replacing them is what graduates first light
+to *general* Lua (float arithmetic, `string.format`, error messages).
+
+**Next (post-first-light):** real `pow`/`fmod` (a **host-libm delegation** decision — bit-exact vs
+native requires the *same* libm; synthesis can't match a specific libm's last-ULP rounding), `strtod`
++ `snprintf` (reuse the bignum dtoa), `localeconv`/`errno` (real C-locale struct + a window slot), then
+`print`/stdlib for a script that does I/O. Each is now a localized swap of a stub for an implementation.
 
 **Build recipe (reproducible).** Lua's core (no standard libraries, no `lauxlib`) + a tiny C-API harness
 that drives `lua_newstate`/`lua_load`/`lua_pcall`/`lua_tointeger` with its own allocator (`realloc`) and
@@ -1173,33 +1188,65 @@ The full `luaL_*` build pulls in ~39 externals (file I/O dominates); the core-on
 externals + 4 defined-varargs functions** — the true first-light surface.
 
 **Gap inventory (core-only `lua_core.bc`), in dependency order:**
-1. **Varargs *definition* ABI — the keystone.** `luaG_runerror` / `luaO_pushfstring` / `lua_pushfstring`
-   / `lua_gc` are defined `(...)` functions; clang `-O2` lowers `va_start`/`va_arg` into the **System V
-   AMD64 `__va_list_tag` dance** (`gp_offset`/`fp_offset`/`reg_save_area`/`overflow_arg_area`). The
-   on-ramp rejects defined varargs functions outright (`translate_func`). These are reached via the
-   error-reporting paths in the *static* call graph (so reachability pruning can't drop them) even when
-   a clean script never executes them. **Tractable model:** give a varargs def a hidden trailing
-   `__vararg_area: i64` param; lower `llvm.va_start` to write the tag with `gp_offset=48`,
-   `fp_offset=176` (≥ thresholds → clang's lowered `va_arg` *always* takes the `overflow_arg_area`
-   branch, so **no `reg_save_area` to synthesize**), `overflow_arg_area = __vararg_area`; at a varargs
-   *call* site marshal the variadic args into a contiguous 8-byte-slot stack buffer and pass its
-   pointer as the hidden param. `va_end`→no-op, `va_copy`→struct copy. (Lua's variadic args are all
-   ≤8 bytes — int/ptr/double/ptrdiff — so 8-byte slots suffice; wider-than-8 by-value is a follow-on.)
+1. **Varargs *definition* ABI — the keystone. DONE (slice 1).** `luaG_runerror` / `luaO_pushfstring` /
+   `lua_pushfstring` / `lua_gc` are defined `(...)` functions; clang `-O2` lowers `va_start`/`va_arg`
+   into the **System V AMD64 `__va_list_tag` dance** (`gp_offset`/`fp_offset`/`reg_save_area`/
+   `overflow_arg_area`). The on-ramp used to reject defined varargs functions outright; it now lowers
+   them via an **overflow-only model** (no `reg_save_area` synthesized): a `(...)` def reserves the
+   first 8 bytes of its frame (offset 0) for an **incoming overflow-area pointer**; `llvm.va_start`
+   writes the tag with `gp_offset=48`/`fp_offset=176` (both ≥ their register thresholds, so clang's
+   lowered `va_arg` *always* takes the memory branch — the register path is dead) and
+   `overflow_arg_area = *(sp+0)`, `reg_save_area = null`. At a direct `(...)` **call** site the caller
+   marshals the variadic args into a contiguous 8-byte-slot frame scratch (`VARARG_SCRATCH`) and
+   deposits a pointer to it at `callee_sp + 0`; only the fixed params are passed as IR args (the
+   callee signature stays `(sp, fixed…)`, no synthetic param). `va_end`→no-op, `va_copy`→24-byte tag
+   copy. Mixed int/SSE args work because the forced memory path lays all args out positionally.
+   Limitation: a variadic arg wider than 8 bytes (a 16-byte `v128`/by-value aggregate) is a clean
+   `Unsupported` (Lua's are all int/ptr/double/ptrdiff ≤8B). **Tests:** `varargs_int_double_mixed`,
+   `varargs_many_and_copy` — all three engines == native cc. **217 translate tests green, fmt+clippy
+   clean.**
 2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). Reuses the
    bignum dtoa float formatter + the varargs-call marshaling from (1). Reachable.
 3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
    decimal→`f64` (the parse direction of the existing Ryū/Dragon dtoa). Reachable.
 4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
-   `memcmp`/`strlen`): `strchr` `strcmp` `strcpy` `strpbrk` `strspn`, `strcoll`→`strcmp` (C locale =
-   byte compare), `fmod` `pow` `frexp` `ldexp` (float math — recognize like `sqrt`/`fmin`, or
-   synthesize), `localeconv` (a static C-locale struct: `decimal_point="."`), `__errno_location` (a
-   fixed window slot — `strtod` sets `ERANGE`), `abort`→trap, `time`→stub/`Clock` cap (RNG seed in
-   `lstate` `makeseed`). Already covered: `_setjmp`/`longjmp`, `free`(no-op), `realloc`, `bcmp`→`memcmp`,
-   `strlen`.
+   `memcmp`/`strlen`). **Done (slice 2):** `strcmp`/`strchr`/`strcoll`(→`strcmp`),
+   `strcpy`/`strspn`/`strpbrk` — synthesized `__svm_*` byte loops (the nested-scan pair for
+   span/break); `abort`→trap (dropped like the Rust panic lang-items — the following `unreachable`
+   traps). Tests `libc_strcmp_strchr_strcoll`, `libc_strcpy_strspn_strpbrk`, `libc_abort_translates`
+   — all three engines == native, with `volatile`-loaded operands so clang `-O2` keeps the calls.
+   `ldexp`/`scalbn` synthesized as `__svm_ldexp` (the musl `scalbn` two-step-scale algorithm,
+   bit-exact to libc incl. overflow→±inf and gradual underflow) — test `libc_ldexp_bit_exact` folds a
+   grid of `x`×`n` (extremes included) into a checksum, identical to native on all three engines.
+   **Remaining:** `fmod` `pow` `frexp` (float math — `frexp` is exact bit ops; `fmod`/`pow` need
+   careful IEEE-exact synthesis — no `frem` op exists), `localeconv` (a static C-locale struct:
+   `decimal_point="."`), `__errno_location` (a fixed window slot — `strtod` sets `ERANGE`),
+   `time`→stub/`Clock` cap (RNG seed in `lstate` `makeseed`). Already covered: `_setjmp`/`longjmp`,
+   `free`(no-op), `realloc`, `bcmp`→`memcmp`, `strlen`.
 
-**Sequencing:** (slice 1) varargs ABI + a standalone `my_sum(int n, ...)` differential unit test; (slice
-2) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test (native
-exit vs on-ramp exit, all engines). Each slice is independently testable against native.
+   *Varargs bug found via Lua (fixed):* a `(...)` call with **zero** variadic args (Lua's
+   `lua_gc(L, what)`) triggered marshaling but `frame_layout` reserved no scratch (0 slots) →
+   `Unsupported("varargs call without reserved scratch")`. Fixed by reserving ≥1 slot whenever a
+   function makes any varargs call; regression test `varargs_zero_variadic`.
+
+**Cross-block `<N x i1>` masks — DONE (translator bug Lua surfaced).** With the libc batch in place the
+Lua-core translation reached the GC `atomic` function and failed with `Unsupported("value N not
+available in block")`. Root cause: clang's SLP vectorizer fuses two adjacent byte-tests (a `GCObject`'s
+`marked`/`tt` fields) into a `<2 x i8>` load+`and`+`icmp`, producing a **`<2 x i1>` mask** in one block
+and `extractelement`-ing its lanes in *successor* blocks. The on-ramp held masks lane-wise in a
+**block-local** `mask_lanes` table ("assumed not to cross block boundaries"). Fixed by unifying masks
+into the **`agg` side-table** with an `[i32; N]` `agg_layout` (exactly like the i128 `(lo,hi)` pair), so
+a mask fans out into per-lane block params and threads across edges via the existing
+`block_params`/`branch_args` machinery; `agg_operand` also learned the constant-`<N x i1>` φ-incoming
+case. `mask_lanes` is gone. Regression test `cross_block_i1_mask` (hand-written LLVM, all three engines
+× 4 seeds). 222 translate tests green. After this, the Lua-core translation advances past `atomic` to
+the next libc gap (`pow`).
+
+**Sequencing:** (slice 1 — **DONE**) varargs ABI + standalone differential tests; (slice 2 — in
+progress) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test
+(native exit vs on-ramp exit, all engines). Each slice is independently testable against native. After
+slice 1 the Lua-core translation advances past the four varargs defs to the libc surface (first stop:
+`ldexp`).
 
 ### SQLite — the north star (in-memory, then disk via the powerbox)
 SQLite is the gold-standard target (≈600:1 test-to-code ratio, ships as one amalgamation `.c`). Two

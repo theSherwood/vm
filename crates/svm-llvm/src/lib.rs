@@ -297,6 +297,24 @@ fn translate_impl(
     // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
     // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
     let need_strlen = need_printf || calls_external(m, &defined_names, "strlen");
+    // `strcmp` plus its C-locale alias `strcoll` share one synthesized byte-compare helper; `strchr`
+    // its own byte scan (the §varargs/libc batch for real-program targets like Lua).
+    let need_strcmp =
+        calls_external(m, &defined_names, "strcmp") || calls_external(m, &defined_names, "strcoll");
+    let need_strchr = calls_external(m, &defined_names, "strchr");
+    let need_strcpy = calls_external(m, &defined_names, "strcpy");
+    let need_strspn = calls_external(m, &defined_names, "strspn");
+    let need_strpbrk = calls_external(m, &defined_names, "strpbrk");
+    let need_ldexp =
+        calls_external(m, &defined_names, "ldexp") || calls_external(m, &defined_names, "scalbn");
+    let need_pow = calls_external(m, &defined_names, "pow");
+    let need_fmod = calls_external(m, &defined_names, "fmod");
+    let need_frexp = calls_external(m, &defined_names, "frexp");
+    let need_strtod = calls_external(m, &defined_names, "strtod");
+    let need_snprintf = calls_external(m, &defined_names, "snprintf");
+    let need_localeconv = calls_external(m, &defined_names, "localeconv");
+    let need_errno = calls_external(m, &defined_names, "__errno_location");
+    let need_time = calls_external(m, &defined_names, "time");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -485,6 +503,21 @@ fn translate_impl(
         eh_destroy: take(need_eh_destroy),
         eh_unwind: take(need_eh_unwind),
         udivmod128: take(need_idiv128),
+        // The libc string batch — appended last; the matching `funcs.push` order below mirrors this.
+        strcmp: take(need_strcmp),
+        strchr: take(need_strchr),
+        strcpy: take(need_strcpy),
+        strspn: take(need_strspn),
+        strpbrk: take(need_strpbrk),
+        ldexp: take(need_ldexp),
+        pow_stub: take(need_pow),
+        fmod_stub: take(need_fmod),
+        frexp_stub: take(need_frexp),
+        strtod_stub: take(need_strtod),
+        snprintf_stub: take(need_snprintf),
+        localeconv_stub: take(need_localeconv),
+        errno_stub: take(need_errno),
+        time_zero: take(need_time),
         float_scratch: float_scratch_base,
         ctype_b_loc: ctype.b_loc,
         ctype_tolower_loc: ctype.tolower_loc,
@@ -711,6 +744,67 @@ fn translate_impl(
     if need_idiv128 {
         funcs.push(synth_udivmod128());
     }
+    // The libc string batch — appended last, mirroring the `take()` order in `Helpers` above.
+    if need_strcmp {
+        funcs.push(synth_strcmp());
+    }
+    if need_strchr {
+        funcs.push(synth_strchr());
+    }
+    if need_strcpy {
+        funcs.push(synth_strcpy());
+    }
+    if need_strspn {
+        funcs.push(synth_strspn());
+    }
+    if need_strpbrk {
+        funcs.push(synth_strpbrk());
+    }
+    if need_ldexp {
+        funcs.push(synth_ldexp());
+    }
+    if need_pow {
+        funcs.push(synth_trap_stub(
+            vec![ValType::F64, ValType::F64],
+            vec![ValType::F64],
+        ));
+    }
+    if need_fmod {
+        funcs.push(synth_trap_stub(
+            vec![ValType::F64, ValType::F64],
+            vec![ValType::F64],
+        ));
+    }
+    if need_frexp {
+        // frexp(double, int*) -> double — the exponent out-param is a pointer (i64).
+        funcs.push(synth_trap_stub(
+            vec![ValType::F64, ValType::I64],
+            vec![ValType::F64],
+        ));
+    }
+    if need_strtod {
+        // strtod(const char*, char**) -> double.
+        funcs.push(synth_trap_stub(
+            vec![ValType::I64, ValType::I64],
+            vec![ValType::F64],
+        ));
+    }
+    if need_snprintf {
+        // snprintf is varargs; the trap stub takes no args (the dispatch ignores them) → i32.
+        funcs.push(synth_trap_stub(vec![], vec![ValType::I32]));
+    }
+    if need_localeconv {
+        // localeconv(void) -> struct lconv*.
+        funcs.push(synth_trap_stub(vec![], vec![ValType::I64]));
+    }
+    if need_errno {
+        // __errno_location(void) -> int*.
+        funcs.push(synth_trap_stub(vec![], vec![ValType::I64]));
+    }
+    if need_time {
+        // time(time_t*) -> time_t — returns 0 (seed value is result-irrelevant; see synth_const_i64).
+        funcs.push(synth_const_i64(vec![ValType::I64], 0));
+    }
     Ok(Translated {
         module: Module {
             funcs,
@@ -766,6 +860,13 @@ const STACK_RESERVE: u64 = svm_ir::POWERBOX_STACK_RESERVE;
 /// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
 /// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
 const SP: ValueId = usize::MAX;
+
+/// A sentinel `frame` key (never a real SSA value) holding the `sp`-relative offset of this
+/// function's **outgoing-varargs marshaling scratch** (§varargs). A call to a `(...)` function
+/// stores its variadic arguments into 8-byte slots starting here, then hands the callee a pointer
+/// to it via the callee's reserved frame slot (offset 0). Present in `frame` only when the function
+/// makes at least one direct varargs call. See `frame_layout` / the varargs call-site lowering.
+const VARARG_SCRATCH: ValueId = usize::MAX - 1;
 
 /// Accumulates the §6 debug-info **neutral core** as functions are lowered — the LLVM on-ramp as a
 /// third independent producer feeding the frontend-neutral waist (DEBUGGING.md §6 / D-DBG-7).
@@ -1788,9 +1889,10 @@ fn translate_func(
     ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
 ) -> Result<(Func, u64), Error> {
-    if f.is_var_arg {
-        return unsup(format!("varargs function `{}`", f.name));
-    }
+    // A `(...)`-defined function (`f.is_var_arg`) lowers like any other: its IR signature is
+    // `(sp, fixed-params…)` — the variadic arguments are not IR parameters but are read by `va_start`
+    // from the caller-deposited overflow area (§varargs). `frame_layout` reserves the incoming-pointer
+    // slot at frame offset 0; the `llvm.va_start` lowering reads it.
     if f.basic_blocks.is_empty() {
         return unsup(format!("declaration-only function `{}`", f.name));
     }
@@ -1930,6 +2032,12 @@ fn frame_layout(
 ) -> Result<(HashMap<ValueId, u64>, u64), Error> {
     let mut frame = HashMap::new();
     let mut off = 0u64;
+    // A `(...)`-defined function reserves the first 8 bytes of its frame (offset 0) for the
+    // **incoming varargs pointer** the caller deposits at `callee_sp + 0` before the call; `va_start`
+    // reads it from `sp + 0`. Shifting allocas past it keeps that slot dedicated (§varargs).
+    if f.is_var_arg {
+        off = 8;
+    }
     for bb in &f.basic_blocks {
         for instr in &bb.instrs {
             if let Instruction::Alloca(a) = instr {
@@ -1954,7 +2062,46 @@ fn frame_layout(
             }
         }
     }
+    // Reserve the **outgoing-varargs marshaling scratch**: the widest variadic-argument list across
+    // all direct `(...)` call sites, one 8-byte slot per variadic argument (§varargs). Recorded under
+    // the `VARARG_SCRATCH` sentinel key so the call-site lowering can find its `sp`-relative base.
+    let mut any_vararg_call = false;
+    let mut max_vararg_slots = 0u64;
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            if let Instruction::Call(c) = instr {
+                if let Some(extra) = vararg_call_extra(c) {
+                    any_vararg_call = true;
+                    max_vararg_slots = max_vararg_slots.max(extra as u64);
+                }
+            }
+        }
+    }
+    if any_vararg_call {
+        // Reserve at least one slot so a varargs call with *zero* variadic arguments (e.g. a `(...)`
+        // function invoked with only its fixed parameters) still has a valid scratch base to hand the
+        // callee — the marshaling stores nothing but still deposits the area pointer.
+        off = off.div_ceil(8) * 8;
+        frame.insert(VARARG_SCRATCH, off);
+        off += max_vararg_slots.max(1) * 8;
+    }
     Ok((frame, off.div_ceil(16) * 16))
+}
+
+/// The count of **variadic** (beyond-the-fixed) arguments of a direct call to a `(...)` function,
+/// or `None` if `c` is not a direct varargs call. The fixed-parameter count comes from the call's
+/// declared function type (`param_types`); the variadic arguments are `arguments[fixed..]`.
+fn vararg_call_extra(c: &llvm_ir::instruction::Call) -> Option<usize> {
+    callee_name(c)?; // indirect varargs calls are rejected separately
+    if let Type::FuncType {
+        param_types,
+        is_var_arg: true,
+        ..
+    } = c.function_ty.as_ref()
+    {
+        return Some(c.arguments.len().saturating_sub(param_types.len()));
+    }
+    None
 }
 
 /// Pass 1a: assign a `ValueId` to every SSA value (parameters first, then per block the φ-results
@@ -2012,9 +2159,17 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                         }
                         ValType::I64
                     }
-                    // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
-                    // `mask_lanes`, never used as a scalar — record a placeholder type.
-                    Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
+                    // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is held lane-wise as `N` `i32`
+                    // `0`/`1` scalars in the `agg` side-table — exactly like a flat `N`-field struct, so
+                    // recording an `[i32; N]` `agg_layout` lets the mask **cross block edges** via the
+                    // per-field fan-out in `block_params`/`branch_args` (clang's auto-vectorizer can
+                    // produce a mask in one block and `extractelement` its lanes in successors — e.g.
+                    // Lua's GC fuses two byte-tests into a `<2 x i8>` compare). Placeholder scalar `i32`.
+                    Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => {
+                        let n = i1_vector_lanes(ty.as_ref()).unwrap();
+                        s.agg_layout.insert(id, vec![ValType::I32; n]);
+                        ValType::I32
+                    }
                     // An `i128` result is held as a 2×`i64` aggregate pair `(lo, hi)` (the unified
                     // `agg`-pair representation, shared with `load i128` / `icmp i128` / the tier-3
                     // `lower_i128` ops). Recording an `[i64, i64]` `agg_layout` — exactly like a flat
@@ -3352,6 +3507,34 @@ struct Helpers {
     utoa: Option<u32>,
     /// `__svm_strlen(p:i64) -> i64` — the NUL-terminated byte length, for `printf` `%s`.
     strlen: Option<u32>,
+    /// `__svm_strcmp(a:i64, b:i64) -> i32` — NUL-terminated lexicographic byte compare (unsigned-char
+    /// difference at the first mismatch). Backs `strcmp` and, in the C locale, `strcoll`.
+    strcmp: Option<u32>,
+    /// `__svm_strchr(s:i64, c:i32) -> i64` — first `(unsigned char)c` in `s`, or NULL (`c==0` → the
+    /// terminating NUL). Backs `strchr`.
+    strchr: Option<u32>,
+    /// `__svm_strcpy(dst:i64, src:i64) -> i64` — copy `src` (incl. NUL) to `dst`, return `dst`.
+    strcpy: Option<u32>,
+    /// `__svm_strspn(s:i64, set:i64) -> i64` — length of the initial run of `s` within `set`.
+    strspn: Option<u32>,
+    /// `__svm_strpbrk(s:i64, set:i64) -> i64` — first byte of `s` that is in `set`, or NULL.
+    strpbrk: Option<u32>,
+    /// `__svm_ldexp(x:f64, n:i32) -> f64` — `x · 2^n` (the `scalbn` algorithm), bit-exact to libc.
+    ldexp: Option<u32>,
+    /// Fail-closed trap stubs for not-yet-implemented libm transcendentals (bit-exact `pow`/`fmod`
+    /// require matching a specific host libm — see `synth_trap_stub`). Translate, trap if called.
+    pow_stub: Option<u32>,
+    fmod_stub: Option<u32>,
+    frexp_stub: Option<u32>,
+    /// More fail-closed stubs: `strtod`/`snprintf` (string⇄double conv + formatting — not exercised by
+    /// an integer-only path), `localeconv`/`__errno_location` (locale + errno). Translate, trap if run.
+    strtod_stub: Option<u32>,
+    snprintf_stub: Option<u32>,
+    localeconv_stub: Option<u32>,
+    errno_stub: Option<u32>,
+    /// `time(t)` — the RNG seed source in `makeseed`; executed during state creation but the seed does
+    /// not affect a deterministic script's result, so a constant `0` suffices (a real `Clock` cap later).
+    time_zero: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
@@ -4685,6 +4868,765 @@ fn synth_strlen() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_strcmp(a:i64, b:i64) -> i32` — the lexicographic NUL-terminated byte compare.
+/// Returns `0` when the strings are equal, else the signed difference of the first mismatching bytes
+/// as **unsigned `char`s** (`(unsigned char)a[i] - (unsigned char)b[i]`, matching glibc). Backs
+/// `strcmp` and (in the C locale) `strcoll`.
+fn synth_strcmp() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64, ValType::I64]; // a, b
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1], // loop(a, b)
+        },
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I64], // pa, pb
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 0,
+                offset: 0,
+                align: 0,
+            }, // v2 = ca = *pa
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 1,
+                offset: 0,
+                align: 0,
+            }, // v3 = cb = *pb
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: 2,
+                b: 3,
+            }, // v4 = ca - cb
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 3,
+            }, // v5 = ca == cb
+            Inst::ConstI32(0), // v6
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Ne,
+                a: 2,
+                b: 6,
+            }, // v7 = ca != 0
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 5,
+                b: 7,
+            }, // v8 = equal-and-not-end → keep going
+            Inst::ConstI64(1), // v9
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 9,
+            }, // v10 = pa + 1
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 9,
+            }, // v11 = pb + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 1,
+            then_args: vec![10, 11], // loop(pa+1, pb+1)
+            else_blk: 2,
+            else_args: vec![4], // done(ca - cb)
+        },
+    };
+    let done = Block {
+        params: vec![ValType::I32], // diff
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I32],
+        blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_strchr(s:i64, c:i32) -> i64` — the first occurrence of `(unsigned char)c` in the
+/// NUL-terminated string `s`, or NULL. When `c == 0` this returns a pointer to the terminating NUL (C
+/// semantics): the byte test fires on the NUL itself.
+fn synth_strchr() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64, ValType::I32]; // s, c
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![
+            Inst::ConstI32(255), // v2
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 1,
+                b: 2,
+            }, // v3 = cc = c & 0xff
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 3], // loop(s, cc)
+        },
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I32], // p, cc
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 0,
+                offset: 0,
+                align: 0,
+            }, // v2 = ch = *p
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 1,
+            }, // v3 = ch == cc
+            Inst::ConstI32(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 4,
+            }, // v5 = ch == 0
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: 3,
+                b: 5,
+            }, // v6 = done = hit || end
+            Inst::ConstI64(1), // v7
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 7,
+            }, // v8 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 2,
+            then_args: vec![0, 1, 2], // finish(p, cc, ch)
+            else_blk: 1,
+            else_args: vec![8, 1], // loop(p+1, cc)
+        },
+    };
+    let finish = Block {
+        params: vec![ValType::I64, ValType::I32, ValType::I32], // p, cc, ch
+        insts: vec![
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 1,
+            }, // v3 = hit = ch == cc
+            Inst::ConstI64(0), // v4 = NULL
+            Inst::Select {
+                cond: 3,
+                a: 0,
+                b: 4,
+            }, // v5 = hit ? p : NULL
+        ],
+        term: Terminator::Return(vec![5]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, lp, finish],
+    }
+}
+
+/// Synthesize `__svm_strcpy(dst:i64, src:i64) -> i64` — copy the NUL-terminated string `src` into
+/// `dst` (including the terminator) and return the original `dst`. No overlap handling (C `strcpy`).
+fn synth_strcpy() -> Func {
+    use svm_ir::{LoadOp, StoreOp};
+    let params = vec![ValType::I64, ValType::I64]; // dst, src
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 0], // loop(dst, src, orig=dst)
+        },
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64], // d, s, orig
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 1,
+                offset: 0,
+                align: 0,
+            }, // v3 = c = *s
+            Inst::Store {
+                op: StoreOp::I32_8,
+                addr: 0,
+                value: 3,
+                offset: 0,
+                align: 0,
+            }, // *d = c   (void — no value index)
+            Inst::ConstI32(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 4,
+            }, // v5 = c == 0
+            Inst::ConstI64(1), // v6
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 6,
+            }, // v7 = d + 1
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 6,
+            }, // v8 = s + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 2,
+            then_args: vec![2], // done(orig)
+            else_blk: 1,
+            else_args: vec![7, 8, 2], // loop(d+1, s+1, orig)
+        },
+    };
+    let done = Block {
+        params: vec![ValType::I64], // orig
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_strspn(s:i64, set:i64) -> i64` — the length of the initial segment of `s`
+/// consisting entirely of bytes in the NUL-terminated `set`. An inner loop scans `set` for each
+/// byte of `s`; the first `s` byte not found in `set` ends the span.
+fn synth_strspn() -> Func {
+    use svm_ir::LoadOp;
+    let l8 = |addr: u32| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let params = vec![ValType::I64, ValType::I64]; // s, set
+                                                   // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 0],
+        },
+    };
+    // block1 outer(p=0, set=1, s0=2)
+    let outer = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            l8(0),             // v3 = cp = *p
+            Inst::ConstI32(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 4,
+            }, // v5 = cp == 0
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 4,
+            then_args: vec![0, 2], // done(p, s0)
+            else_blk: 2,
+            else_args: vec![1, 3, 0, 1, 2], // inner(q=set, cp, p, set, s0)
+        },
+    };
+    // block2 inner(q=0, cp=1, p=2, set=3, s0=4)
+    let inner = Block {
+        params: vec![
+            ValType::I64,
+            ValType::I32,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ],
+        insts: vec![
+            l8(0),             // v5 = cq = *q
+            Inst::ConstI32(0), // v6
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 6,
+            }, // v7 = cq == 0
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 1,
+            }, // v8 = cq == cp
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: 7,
+                b: 8,
+            }, // v9 = stop
+            Inst::ConstI64(1), // v10
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 10,
+            }, // v11 = q + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 3,
+            then_args: vec![5, 1, 2, 3, 4], // inner_done(cq, cp, p, set, s0)
+            else_blk: 2,
+            else_args: vec![11, 1, 2, 3, 4], // inner(q+1, cp, p, set, s0)
+        },
+    };
+    // block3 inner_done(cq=0, cp=1, p=2, set=3, s0=4)
+    let inner_done = Block {
+        params: vec![
+            ValType::I32,
+            ValType::I32,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ],
+        insts: vec![
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 1,
+            }, // v5 = match = cq == cp
+            Inst::ConstI64(1), // v6
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 2,
+                b: 6,
+            }, // v7 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 1,
+            then_args: vec![7, 3, 4], // outer(p+1, set, s0)  — cp was in set
+            else_blk: 4,
+            else_args: vec![2, 4], // done(p, s0)  — cp not in set
+        },
+    };
+    // block4 done(p=0, s0=1)
+    let done = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Sub,
+            a: 0,
+            b: 1,
+        }], // v2 = p - s0
+        term: Terminator::Return(vec![2]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, outer, inner, inner_done, done],
+    }
+}
+
+/// Synthesize `__svm_strpbrk(s:i64, set:i64) -> i64` — a pointer to the first byte of `s` that is in
+/// the NUL-terminated `set`, or NULL if none. An inner loop scans `set` for each byte of `s`.
+fn synth_strpbrk() -> Func {
+    use svm_ir::LoadOp;
+    let l8 = |addr: u32| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let params = vec![ValType::I64, ValType::I64]; // s, set
+                                                   // block0 entry(s=0, set=1): outer(p=s, set)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1],
+        },
+    };
+    // block1 outer(p=0, set=1)
+    let outer = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            l8(0),             // v2 = cp = *p
+            Inst::ConstI32(0), // v3
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 2,
+                b: 3,
+            }, // v4 = cp == 0
+        ],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 5,
+            then_args: vec![], // retnull
+            else_blk: 2,
+            else_args: vec![1, 2, 0, 1], // inner(q=set, cp, p, set)
+        },
+    };
+    // block2 inner(q=0, cp=1, p=2, set=3)
+    let inner = Block {
+        params: vec![ValType::I64, ValType::I32, ValType::I64, ValType::I64],
+        insts: vec![
+            l8(0),             // v4 = cq = *q
+            Inst::ConstI32(0), // v5
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 4,
+                b: 5,
+            }, // v6 = qz = cq == 0
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 4,
+                b: 1,
+            }, // v7 = match = cq == cp
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: 6,
+                b: 7,
+            }, // v8 = stop
+            Inst::ConstI64(1), // v9
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 9,
+            }, // v10 = q + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 3,
+            then_args: vec![7, 2, 3], // inner_done(match, p, set)
+            else_blk: 2,
+            else_args: vec![10, 1, 2, 3], // inner(q+1, cp, p, set)
+        },
+    };
+    // block3 inner_done(match=0, p=1, set=2)
+    let inner_done = Block {
+        params: vec![ValType::I32, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(1), // v3
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 3,
+            }, // v4 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 0,
+            then_blk: 4,
+            then_args: vec![1], // found(p)
+            else_blk: 1,
+            else_args: vec![4, 2], // outer(p+1, set)
+        },
+    };
+    // block4 found(p=0)
+    let found = Block {
+        params: vec![ValType::I64],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    // block5 retnull()
+    let retnull = Block {
+        params: vec![],
+        insts: vec![Inst::ConstI64(0)], // v0
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, outer, inner, inner_done, found, retnull],
+    }
+}
+
+/// Synthesize a **fail-closed trap stub** `(params) -> results` whose body is a single `Unreachable`
+/// block — for a libm/libc function the on-ramp does not yet implement exactly. The stub *translates*
+/// (so a module that merely references the function on an **unexecuted** path still lowers — e.g. Lua's
+/// `^`/`pow` when a script does no float exponentiation) but **traps if ever called**. Bit-exact
+/// transcendentals (`pow`/`fmod`/…) require matching a specific host libm — an architecture decision
+/// (host-libm delegation) tracked separately; until then this keeps the module honest and translating.
+fn synth_trap_stub(params: Vec<ValType>, results: Vec<ValType>) -> Func {
+    Func {
+        params: params.clone(),
+        results,
+        blocks: vec![Block {
+            params,
+            insts: vec![],
+            term: Terminator::Unreachable,
+        }],
+    }
+}
+
+/// Synthesize `(params) -> i64` that ignores its arguments and returns the constant `val` — for a
+/// libc function whose *value* does not affect a deterministic result (e.g. `time()` as the `makeseed`
+/// RNG source: the seed only perturbs hash iteration order, not computed results).
+fn synth_const_i64(params: Vec<ValType>, val: i64) -> Func {
+    let nparams = params.len() as u32;
+    Func {
+        params: params.clone(),
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params,
+            insts: vec![Inst::ConstI64(val)], // value index `nparams`
+            term: Terminator::Return(vec![nparams]),
+        }],
+    }
+}
+
+/// Synthesize `__svm_ldexp(x:f64, n:i32) -> f64` — `x * 2^n`, the musl `scalbn` algorithm: scale by
+/// `2^±1023`/`2^∓969` at most twice to bring an extreme `n` into `[-1022, 1023]`, then multiply by a
+/// `2^n` built directly from the exponent field. Bit-exact to libc (the IEEE multiplies carry the
+/// rounding, incl. overflow→±inf and gradual underflow→denormal/0). `ldexp` ≡ `scalbn` for `double`.
+fn synth_ldexp() -> Func {
+    // 2^1023 and 2^-969 (= 2^-1022 · 2^53) as raw double bit patterns (exponent field only).
+    const TWO_P1023: i64 = 0x7FE0000000000000u64 as i64;
+    const TWO_M969: i64 = 0x0360000000000000;
+    let reinterp = |a: u32| Inst::Cast {
+        op: CastOp::ReinterpI64F64,
+        a,
+    };
+    let fmul = |a: u32, b: u32| Inst::FBin {
+        ty: FloatTy::F64,
+        op: FBinOp::Mul,
+        a,
+        b,
+    };
+    let params = vec![ValType::F64, ValType::I32]; // x, n
+                                                   // block0 entry(x=0, n=1): n>1023 → hi1; else chk_lo
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![
+            Inst::ConstI32(1023), // v2
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GtS,
+                a: 1,
+                b: 2,
+            }, // v3 = n > 1023
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 2,
+            then_args: vec![0, 1],
+            else_blk: 1,
+            else_args: vec![0, 1],
+        },
+    };
+    // block1 chk_lo(x=0, n=1): n < -1022 → lo1; else finish
+    let chk_lo = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI32(-1022), // v2
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::LtS,
+                a: 1,
+                b: 2,
+            }, // v3 = n < -1022
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 4,
+            then_args: vec![0, 1],
+            else_blk: 6,
+            else_args: vec![0, 1],
+        },
+    };
+    // block2 hi1(x=0, n=1): y = x·2^1023; m = n-1023; m>1023 → hi2 else finish
+    let hi1 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_P1023), // v2
+            reinterp(2),               // v3 = 2^1023
+            fmul(0, 3),                // v4 = y
+            Inst::ConstI32(1023),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: 1,
+                b: 5,
+            }, // v6 = m
+            Inst::ConstI32(1023),      // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GtS,
+                a: 6,
+                b: 7,
+            }, // v8 = m > 1023
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 3,
+            then_args: vec![4, 6],
+            else_blk: 6,
+            else_args: vec![4, 6],
+        },
+    };
+    // block3 hi2(y=0, m=1): y·2^1023; clamp m-1023 to 1023; → finish
+    let hi2 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_P1023), // v2
+            reinterp(2),               // v3
+            fmul(0, 3),                // v4 = y2
+            Inst::ConstI32(1023),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: 1,
+                b: 5,
+            }, // v6 = m-1023
+            Inst::ConstI32(1023),      // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GtS,
+                a: 6,
+                b: 7,
+            }, // v8
+            Inst::Select {
+                cond: 8,
+                a: 7,
+                b: 6,
+            }, // v9 = min(m-1023, 1023)
+        ],
+        term: Terminator::Br {
+            target: 6,
+            args: vec![4, 9],
+        },
+    };
+    // block4 lo1(x=0, n=1): y = x·2^-969; m = n+969; m<-1022 → lo2 else finish
+    let lo1 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_M969), // v2
+            reinterp(2),              // v3 = 2^-969
+            fmul(0, 3),               // v4 = y
+            Inst::ConstI32(969),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 1,
+                b: 5,
+            }, // v6 = m
+            Inst::ConstI32(-1022),    // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::LtS,
+                a: 6,
+                b: 7,
+            }, // v8 = m < -1022
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 5,
+            then_args: vec![4, 6],
+            else_blk: 6,
+            else_args: vec![4, 6],
+        },
+    };
+    // block5 lo2(y=0, m=1): y·2^-969; clamp m+969 to -1022; → finish
+    let lo2 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_M969), // v2
+            reinterp(2),              // v3
+            fmul(0, 3),               // v4 = y2
+            Inst::ConstI32(969),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 1,
+                b: 5,
+            }, // v6 = m+969
+            Inst::ConstI32(-1022),    // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::LtS,
+                a: 6,
+                b: 7,
+            }, // v8
+            Inst::Select {
+                cond: 8,
+                a: 7,
+                b: 6,
+            }, // v9 = max(m+969, -1022)
+        ],
+        term: Terminator::Br {
+            target: 6,
+            args: vec![4, 9],
+        },
+    };
+    // block6 finish(y=0, m=1): return y · 2^m, 2^m built from the (0x3ff+m) exponent field
+    let finish = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI32(1023), // v2
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 1,
+                b: 2,
+            }, // v3 = 0x3ff + m
+            Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: 3,
+            }, // v4 = (i64)
+            Inst::ConstI64(52),   // v5
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Shl,
+                a: 4,
+                b: 5,
+            }, // v6 = bits
+            reinterp(6),          // v7 = 2^m
+            fmul(0, 7),           // v8 = y · 2^m
+        ],
+        term: Terminator::Return(vec![8]),
+    };
+    Func {
+        params,
+        results: vec![ValType::F64],
+        blocks: vec![entry, chk_lo, hi1, hi2, lo1, lo2, finish],
     }
 }
 
@@ -9419,6 +10361,194 @@ fn lower_io_call(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `strcmp(a, b)` / `strcoll(a, b)`: the synthesized `__svm_strcmp` byte compare. `strcoll` is
+        // locale-sensitive in general, but the on-ramp runs in the C locale, where it is `strcmp`.
+        "strcmp" | "strcoll" => {
+            let Some(f) = ctx.helpers.strcmp else {
+                return Ok(false); // helper not synthesized → fail-closed
+            };
+            let a = ctx.operand(&c.arguments[0].0)?;
+            let b = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![a, b],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strchr(s, c)`: the synthesized `__svm_strchr` byte scan → pointer or NULL.
+        "strchr" => {
+            let Some(f) = ctx.helpers.strchr else {
+                return Ok(false); // helper not synthesized → fail-closed
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let ch = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, ch],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strcpy(dst, src)`: the synthesized `__svm_strcpy` copy loop → `dst`.
+        "strcpy" => {
+            let Some(f) = ctx.helpers.strcpy else {
+                return Ok(false);
+            };
+            let d = ctx.operand(&c.arguments[0].0)?;
+            let s = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![d, s],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strspn(s, set)` / `strpbrk(s, set)`: the synthesized nested-scan helpers.
+        "strspn" => {
+            let Some(f) = ctx.helpers.strspn else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let set = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, set],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "strpbrk" => {
+            let Some(f) = ctx.helpers.strpbrk else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let set = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, set],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `ldexp(x, n)` / `scalbn(x, n)`: the synthesized `__svm_ldexp` (`x · 2^n`, bit-exact to libc).
+        "ldexp" | "scalbn" => {
+            let Some(f) = ctx.helpers.ldexp else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let n = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, n],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // Not-yet-implemented libm transcendentals: route to their fail-closed trap stubs (translate,
+        // trap if executed — see `synth_trap_stub`). `pow`/`fmod` take `(f64,f64)`, `frexp` `(f64,ptr)`.
+        "pow" => {
+            let Some(f) = ctx.helpers.pow_stub else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let y = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, y],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "fmod" => {
+            let Some(f) = ctx.helpers.fmod_stub else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let y = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, y],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "frexp" => {
+            let Some(f) = ctx.helpers.frexp_stub else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let e = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, e],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strtod(nptr, endptr)`: fail-closed trap stub (string→double — not on an integer path).
+        "strtod" => {
+            let Some(f) = ctx.helpers.strtod_stub else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let e = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, e],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `snprintf(buf, n, fmt, …)`: a varargs call — caught here (before the general varargs
+        // marshaling) and routed to a no-arg fail-closed trap stub (number formatting not exercised).
+        "snprintf" => {
+            let Some(f) = ctx.helpers.snprintf_stub else {
+                return Ok(false);
+            };
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `localeconv()` / `__errno_location()`: fail-closed trap stubs (locale + errno, no-arg → ptr).
+        "localeconv" => {
+            let Some(f) = ctx.helpers.localeconv_stub else {
+                return Ok(false);
+            };
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__errno_location" => {
+            let Some(f) = ctx.helpers.errno_stub else {
+                return Ok(false);
+            };
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `time(t)`: returns 0 (the `makeseed` RNG source — value-irrelevant for a deterministic run).
+        "time" => {
+            let Some(f) = ctx.helpers.time_zero else {
+                return Ok(false);
+            };
+            let t = ctx.operand(&c.arguments[0].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![t],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // `memchr(s, c, n)`: the synthesized `__svm_memchr` byte scan → pointer or NULL.
         "memchr" => {
             let Some(f) = ctx.helpers.memchr else {
@@ -11134,10 +12264,90 @@ fn is_droppable_call(c: &llvm_ir::instruction::Call) -> bool {
             || s.starts_with("llvm.dbg")
             || s.starts_with("llvm.assume")
             || s.starts_with("llvm.invariant")
+            // `llvm.va_end` only marks the end of a `va_list` traversal — no runtime state to tear
+            // down in our overflow-only varargs ABI (§varargs); `va_start`/`va_copy` are lowered.
+            || s.starts_with("llvm.va_end")
             // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
             || s.starts_with("llvm.experimental.noalias.scope.decl");
     }
     false
+}
+
+/// Lower a varargs `llvm.va_start` / `llvm.va_copy` for the **overflow-only varargs ABI** (§varargs).
+/// Returns `Ok(true)` if `name` named a handled varargs intrinsic (`va_end` is dropped earlier in
+/// `is_droppable_call`).
+///
+/// `va_start(list)` initializes the System V AMD64 `__va_list_tag` at `list` so that clang's already-
+/// lowered `va_arg` *always* takes the memory (`overflow_arg_area`) branch: `gp_offset = 48` and
+/// `fp_offset = 176` both sit at/over their register-save thresholds, so the register path is dead and
+/// no `reg_save_area` need be synthesized. `overflow_arg_area` is the caller-deposited pointer read
+/// from this frame's reserved slot (`sp + 0`); `reg_save_area` is left null. Tag layout (x86-64):
+/// `i32 gp_offset @0`, `i32 fp_offset @4`, `ptr overflow_arg_area @8`, `ptr reg_save_area @16` — the
+/// two `i32` offsets are written as one packed `i64` at `@0`.
+///
+/// `va_copy(dst, src)` byte-copies the 24-byte tag.
+fn lower_va_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    if name.starts_with("llvm.va_start") {
+        let list = ctx.operand(&c.arguments[0].0)?;
+        let sp = ctx.sp()?;
+        // overflow_arg_area = *(sp + 0): the area pointer the caller deposited at our frame base.
+        let area = ctx.push(Inst::Load {
+            op: svm_ir::LoadOp::I64,
+            addr: sp,
+            offset: 0,
+            align: 0,
+        });
+        // gp_offset (48) | fp_offset (176) << 32 — both past their thresholds → memory branch only.
+        let off_word = ctx.const_i64(48 | (176i64 << 32));
+        ctx.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I64,
+            addr: list,
+            value: off_word,
+            offset: 0,
+            align: 0,
+        });
+        ctx.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I64,
+            addr: list,
+            value: area,
+            offset: 8,
+            align: 0,
+        });
+        let zero = ctx.const_i64(0);
+        ctx.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I64,
+            addr: list,
+            value: zero,
+            offset: 16,
+            align: 0,
+        });
+        return Ok(true);
+    }
+    if name.starts_with("llvm.va_copy") {
+        let dst = ctx.operand(&c.arguments[0].0)?;
+        let src = ctx.operand(&c.arguments[1].0)?;
+        for off in [0u64, 8, 16] {
+            let w = ctx.push(Inst::Load {
+                op: svm_ir::LoadOp::I64,
+                addr: src,
+                offset: off,
+                align: 0,
+            });
+            ctx.push_effect(Inst::Store {
+                op: svm_ir::StoreOp::I64,
+                addr: dst,
+                value: w,
+                offset: off,
+                align: 0,
+            });
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
@@ -11639,12 +12849,6 @@ struct BlockCtx<'a> {
     /// several IR values — but, unlike `agg`, these *do* cross block boundaries (a vectorized loop's
     /// wide accumulator), fanned out into per-part block params by `block_params`/`branch_args`.
     wide_vals: HashMap<ValueId, Vec<ValIdx>>,
-    /// Scalarized boolean-mask SSA values (`<N x i1>`, from a vector `icmp`/`fcmp`): value-id → its
-    /// `N` per-lane `i1` scalars (each `0`/`1` in an `i32` container). svm-ir has no first-class
-    /// `<N x i1>` type, so a mask is held lane-wise — `select` selects per lane, `extractelement`
-    /// reads a lane, `bitcast … to iN` ORs the lanes into a bitmap. Like `agg`, assumed not to cross
-    /// block boundaries (clang produces and consumes a mask in one block).
-    mask_lanes: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
     /// Set true only while lowering a block's final instruction when it is a tail-position call
     /// (`tail`/`musttail` + the block's `ret` returns exactly its result). The direct/indirect call
@@ -11716,6 +12920,15 @@ impl<'a> BlockCtx<'a> {
                     let hi = self.const_i64(0);
                     Ok(vec![lo, hi])
                 }
+                // A constant `<N x i1>` **mask** φ incoming (the mask analog of the cases above): its
+                // per-lane `i1`s materialize as `i32` `0`/`1` consts, one per `agg` field.
+                Constant::Vector(elems) if elems.len() == ftys.len() => Ok(elems
+                    .iter()
+                    .map(|e| {
+                        let bit = matches!(e.as_ref(), Constant::Int { value: 1, .. }) as i32;
+                        self.push(Inst::ConstI32(bit))
+                    })
+                    .collect()),
                 other => unsup(format!("aggregate φ constant incoming {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata struct operand"),
@@ -12322,7 +13535,6 @@ fn translate_block(
         idx_of: HashMap::new(),
         agg: HashMap::new(),
         wide_vals: HashMap::new(),
-        mask_lanes: HashMap::new(),
         next_val: 0,
         tail_return: false,
         pending_tail: None,
@@ -13206,6 +14418,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         if is_droppable_call(c) {
             return Ok(()); // a no-op intrinsic (lifetime/dbg/assume)
         }
+        // `llvm.va_start`/`llvm.va_copy` set up the `__va_list_tag` for the overflow-only varargs ABI.
+        if let Some(name) = callee_name(c) {
+            if lower_va_intrinsic(ctx, c, &name)? {
+                return Ok(());
+            }
+        }
         // Float math intrinsics lower to inline float ops (not a call).
         if let Some(idx) = lower_float_intrinsic(ctx, c, types)? {
             if let Some(dest) = &c.dest {
@@ -13303,11 +14521,13 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 return Ok(());
             }
         }
-        // A call to a Rust panic/abort lang item (`-C panic=abort`) lowers to a trap: drop the call —
-        // it is `noreturn` and LLVM always follows it with `unreachable`, which the on-ramp traps on
-        // (§3b/§5). This is what lets real Rust, with its non-elidable panic paths, translate.
+        // A call to a Rust panic/abort lang item (`-C panic=abort`) — or the C library `abort()` —
+        // lowers to a trap: drop the call, since it is `noreturn` and LLVM always follows it with
+        // `unreachable`, which the on-ramp traps on (§3b/§5). This is what lets real Rust (non-elidable
+        // panic paths) and C programs (`abort`/`assert` failure paths, e.g. Lua's `lua_assert`)
+        // translate. Gated external so a guest-defined `abort` shadows it.
         if let Some(name) = callee_name(c) {
-            if !ctx.name2idx.contains_key(&name) && is_rust_abort_call(&name) {
+            if !ctx.name2idx.contains_key(&name) && (is_rust_abort_call(&name) || name == "abort") {
                 return Ok(());
             }
         }
@@ -13317,8 +14537,57 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         let fs = ctx.const_i64(ctx.frame_size as i64);
         let callee_sp = ctx.add_i64(sp, fs);
         let mut args = vec![callee_sp];
-        for (a, _attrs) in &c.arguments {
-            args.push(ctx.operand(a)?);
+        // A direct call to a `(...)` function (§varargs): only the fixed parameters are IR arguments;
+        // the variadic arguments are marshaled into this frame's scratch (one 8-byte slot each, the
+        // overflow-area layout clang's lowered `va_arg` reads), and a pointer to that scratch is
+        // deposited at the callee's reserved frame slot (`callee_sp + 0`) for its `va_start`.
+        let fixed = match c.function_ty.as_ref() {
+            Type::FuncType {
+                param_types,
+                is_var_arg: true,
+                ..
+            } if callee_name(c).is_some() => Some(param_types.len()),
+            _ => None,
+        };
+        if let Some(fixed) = fixed {
+            let scratch_off = *ctx.frame.get(&VARARG_SCRATCH).ok_or_else(|| {
+                Error::Unsupported("varargs call without reserved scratch".into())
+            })?;
+            let area = {
+                let k = ctx.const_i64(scratch_off as i64);
+                ctx.add_i64(sp, k)
+            };
+            for (i, (a, _)) in c.arguments.iter().enumerate().skip(fixed) {
+                let aty = a.get_type(types);
+                // Each variadic argument occupies one 8-byte overflow slot; a 16-byte `v128` (or any
+                // aggregate, which `store_op` rejects below) would need a wider slot + stride.
+                if matches!(val_type(aty.as_ref()), Ok(ValType::V128)) {
+                    return unsup("varargs argument wider than 8 bytes");
+                }
+                let op = store_op(aty.as_ref())?;
+                let value = ctx.operand(a)?;
+                ctx.push_effect(Inst::Store {
+                    op,
+                    addr: area,
+                    value,
+                    offset: (i - fixed) as u64 * 8,
+                    align: 0,
+                });
+            }
+            ctx.push_effect(Inst::Store {
+                op: svm_ir::StoreOp::I64,
+                addr: callee_sp,
+                value: area,
+                offset: 0,
+                align: 0,
+            });
+            for (a, _attrs) in c.arguments.iter().take(fixed) {
+                args.push(ctx.operand(a)?);
+            }
+        } else {
+            for (a, _attrs) in &c.arguments {
+                args.push(ctx.operand(a)?);
+            }
         }
         // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through
         // a function-pointer value) lowers to `call_indirect <sig>` (§3c: mask + type-id check).
@@ -14642,7 +15911,7 @@ fn mask_operand(ctx: &mut BlockCtx, op: &Operand, n: usize) -> Result<Vec<ValIdx
                 .name2id
                 .get(name)
                 .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
-            ctx.mask_lanes.get(&vid).cloned().ok_or_else(|| {
+            ctx.agg.get(&vid).cloned().ok_or_else(|| {
                 Error::Unsupported(format!("mask value {vid} not available in block"))
             })
         }
@@ -14854,10 +16123,12 @@ fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
     }
 }
 
-/// Record `dest`'s scalarized mask lanes (the `<N x i1>` analog of [`BlockCtx::bind_wide`]).
+/// Record `dest`'s scalarized mask lanes. A mask's `N` lanes live in the `agg` table (an `[i32; N]`
+/// `agg_layout` is recorded in `scan_func`), so the value crosses block edges via the per-field
+/// fan-out in `block_params`/`branch_args` — the `<N x i1>` analog of [`BlockCtx::bind_wide`].
 fn bind_mask(ctx: &mut BlockCtx, dest: &Name, lanes: Vec<ValIdx>) {
     if let Some(&vid) = ctx.s.name2id.get(dest) {
-        ctx.mask_lanes.insert(vid, lanes);
+        ctx.agg.insert(vid, lanes);
     }
 }
 
