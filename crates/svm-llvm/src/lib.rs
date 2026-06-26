@@ -302,6 +302,8 @@ fn translate_impl(
     let need_strcpy = calls_external(m, &defined_names, "strcpy");
     let need_strspn = calls_external(m, &defined_names, "strspn");
     let need_strpbrk = calls_external(m, &defined_names, "strpbrk");
+    let need_ldexp = calls_external(m, &defined_names, "ldexp")
+        || calls_external(m, &defined_names, "scalbn");
     // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
@@ -496,6 +498,7 @@ fn translate_impl(
         strcpy: take(need_strcpy),
         strspn: take(need_strspn),
         strpbrk: take(need_strpbrk),
+        ldexp: take(need_ldexp),
         float_scratch: float_scratch_base,
         ctype_b_loc: ctype.b_loc,
         ctype_tolower_loc: ctype.tolower_loc,
@@ -737,6 +740,9 @@ fn translate_impl(
     }
     if need_strpbrk {
         funcs.push(synth_strpbrk());
+    }
+    if need_ldexp {
+        funcs.push(synth_ldexp());
     }
     Ok(Translated {
         module: Module {
@@ -1998,20 +2004,25 @@ fn frame_layout(
     // Reserve the **outgoing-varargs marshaling scratch**: the widest variadic-argument list across
     // all direct `(...)` call sites, one 8-byte slot per variadic argument (§varargs). Recorded under
     // the `VARARG_SCRATCH` sentinel key so the call-site lowering can find its `sp`-relative base.
+    let mut any_vararg_call = false;
     let mut max_vararg_slots = 0u64;
     for bb in &f.basic_blocks {
         for instr in &bb.instrs {
             if let Instruction::Call(c) = instr {
                 if let Some(extra) = vararg_call_extra(c) {
+                    any_vararg_call = true;
                     max_vararg_slots = max_vararg_slots.max(extra as u64);
                 }
             }
         }
     }
-    if max_vararg_slots > 0 {
+    if any_vararg_call {
+        // Reserve at least one slot so a varargs call with *zero* variadic arguments (e.g. a `(...)`
+        // function invoked with only its fixed parameters) still has a valid scratch base to hand the
+        // callee — the marshaling stores nothing but still deposits the area pointer.
         off = off.div_ceil(8) * 8;
         frame.insert(VARARG_SCRATCH, off);
-        off += max_vararg_slots * 8;
+        off += max_vararg_slots.max(1) * 8;
     }
     Ok((frame, off.div_ceil(16) * 16))
 }
@@ -3439,6 +3450,8 @@ struct Helpers {
     strspn: Option<u32>,
     /// `__svm_strpbrk(s:i64, set:i64) -> i64` — first byte of `s` that is in `set`, or NULL.
     strpbrk: Option<u32>,
+    /// `__svm_ldexp(x:f64, n:i32) -> f64` — `x · 2^n` (the `scalbn` algorithm), bit-exact to libc.
+    ldexp: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
@@ -5280,6 +5293,223 @@ fn synth_strpbrk() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, outer, inner, inner_done, found, retnull],
+    }
+}
+
+/// Synthesize `__svm_ldexp(x:f64, n:i32) -> f64` — `x * 2^n`, the musl `scalbn` algorithm: scale by
+/// `2^±1023`/`2^∓969` at most twice to bring an extreme `n` into `[-1022, 1023]`, then multiply by a
+/// `2^n` built directly from the exponent field. Bit-exact to libc (the IEEE multiplies carry the
+/// rounding, incl. overflow→±inf and gradual underflow→denormal/0). `ldexp` ≡ `scalbn` for `double`.
+fn synth_ldexp() -> Func {
+    // 2^1023 and 2^-969 (= 2^-1022 · 2^53) as raw double bit patterns (exponent field only).
+    const TWO_P1023: i64 = 0x7FE0000000000000u64 as i64;
+    const TWO_M969: i64 = 0x0360000000000000;
+    let reinterp = |a: u32| Inst::Cast {
+        op: CastOp::ReinterpI64F64,
+        a,
+    };
+    let fmul = |a: u32, b: u32| Inst::FBin {
+        ty: FloatTy::F64,
+        op: FBinOp::Mul,
+        a,
+        b,
+    };
+    let params = vec![ValType::F64, ValType::I32]; // x, n
+    // block0 entry(x=0, n=1): n>1023 → hi1; else chk_lo
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![
+            Inst::ConstI32(1023), // v2
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GtS,
+                a: 1,
+                b: 2,
+            }, // v3 = n > 1023
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 2,
+            then_args: vec![0, 1],
+            else_blk: 1,
+            else_args: vec![0, 1],
+        },
+    };
+    // block1 chk_lo(x=0, n=1): n < -1022 → lo1; else finish
+    let chk_lo = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI32(-1022), // v2
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::LtS,
+                a: 1,
+                b: 2,
+            }, // v3 = n < -1022
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 4,
+            then_args: vec![0, 1],
+            else_blk: 6,
+            else_args: vec![0, 1],
+        },
+    };
+    // block2 hi1(x=0, n=1): y = x·2^1023; m = n-1023; m>1023 → hi2 else finish
+    let hi1 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_P1023), // v2
+            reinterp(2),               // v3 = 2^1023
+            fmul(0, 3),                // v4 = y
+            Inst::ConstI32(1023),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: 1,
+                b: 5,
+            }, // v6 = m
+            Inst::ConstI32(1023), // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GtS,
+                a: 6,
+                b: 7,
+            }, // v8 = m > 1023
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 3,
+            then_args: vec![4, 6],
+            else_blk: 6,
+            else_args: vec![4, 6],
+        },
+    };
+    // block3 hi2(y=0, m=1): y·2^1023; clamp m-1023 to 1023; → finish
+    let hi2 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_P1023), // v2
+            reinterp(2),               // v3
+            fmul(0, 3),                // v4 = y2
+            Inst::ConstI32(1023),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: 1,
+                b: 5,
+            }, // v6 = m-1023
+            Inst::ConstI32(1023), // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GtS,
+                a: 6,
+                b: 7,
+            }, // v8
+            Inst::Select {
+                cond: 8,
+                a: 7,
+                b: 6,
+            }, // v9 = min(m-1023, 1023)
+        ],
+        term: Terminator::Br {
+            target: 6,
+            args: vec![4, 9],
+        },
+    };
+    // block4 lo1(x=0, n=1): y = x·2^-969; m = n+969; m<-1022 → lo2 else finish
+    let lo1 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_M969), // v2
+            reinterp(2),              // v3 = 2^-969
+            fmul(0, 3),               // v4 = y
+            Inst::ConstI32(969),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 1,
+                b: 5,
+            }, // v6 = m
+            Inst::ConstI32(-1022), // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::LtS,
+                a: 6,
+                b: 7,
+            }, // v8 = m < -1022
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 5,
+            then_args: vec![4, 6],
+            else_blk: 6,
+            else_args: vec![4, 6],
+        },
+    };
+    // block5 lo2(y=0, m=1): y·2^-969; clamp m+969 to -1022; → finish
+    let lo2 = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI64(TWO_M969), // v2
+            reinterp(2),              // v3
+            fmul(0, 3),               // v4 = y2
+            Inst::ConstI32(969),      // v5
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 1,
+                b: 5,
+            }, // v6 = m+969
+            Inst::ConstI32(-1022), // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::LtS,
+                a: 6,
+                b: 7,
+            }, // v8
+            Inst::Select {
+                cond: 8,
+                a: 7,
+                b: 6,
+            }, // v9 = max(m+969, -1022)
+        ],
+        term: Terminator::Br {
+            target: 6,
+            args: vec![4, 9],
+        },
+    };
+    // block6 finish(y=0, m=1): return y · 2^m, 2^m built from the (0x3ff+m) exponent field
+    let finish = Block {
+        params: vec![ValType::F64, ValType::I32],
+        insts: vec![
+            Inst::ConstI32(1023), // v2
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 1,
+                b: 2,
+            }, // v3 = 0x3ff + m
+            Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: 3,
+            }, // v4 = (i64)
+            Inst::ConstI64(52), // v5
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Shl,
+                a: 4,
+                b: 5,
+            }, // v6 = bits
+            reinterp(6), // v7 = 2^m
+            fmul(0, 7),  // v8 = y · 2^m
+        ],
+        term: Terminator::Return(vec![8]),
+    };
+    Func {
+        params,
+        results: vec![ValType::F64],
+        blocks: vec![entry, chk_lo, hi1, hi2, lo1, lo2, finish],
     }
 }
 
@@ -10080,6 +10310,20 @@ fn lower_io_call(
             let r = ctx.push(Inst::Call {
                 func: f,
                 args: vec![s, set],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `ldexp(x, n)` / `scalbn(x, n)`: the synthesized `__svm_ldexp` (`x · 2^n`, bit-exact to libc).
+        "ldexp" | "scalbn" => {
+            let Some(f) = ctx.helpers.ldexp else {
+                return Ok(false);
+            };
+            let x = ctx.operand(&c.arguments[0].0)?;
+            let n = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![x, n],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)

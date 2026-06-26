@@ -1200,11 +1200,25 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    span/break); `abort`→trap (dropped like the Rust panic lang-items — the following `unreachable`
    traps). Tests `libc_strcmp_strchr_strcoll`, `libc_strcpy_strspn_strpbrk`, `libc_abort_translates`
    — all three engines == native, with `volatile`-loaded operands so clang `-O2` keeps the calls.
-   **Remaining:** `fmod` `pow` `frexp` `ldexp` (float math — `frexp`/`ldexp` are exact bit ops;
-   `fmod`/`pow` need careful IEEE-exact synthesis — no `frem` op exists), `localeconv` (a static
-   C-locale struct: `decimal_point="."`), `__errno_location` (a fixed window slot — `strtod` sets
-   `ERANGE`), `time`→stub/`Clock` cap (RNG seed in `lstate` `makeseed`). Already covered:
-   `_setjmp`/`longjmp`, `free`(no-op), `realloc`, `bcmp`→`memcmp`, `strlen`.
+   `ldexp`/`scalbn` synthesized as `__svm_ldexp` (the musl `scalbn` two-step-scale algorithm,
+   bit-exact to libc incl. overflow→±inf and gradual underflow) — test `libc_ldexp_bit_exact` folds a
+   grid of `x`×`n` (extremes included) into a checksum, identical to native on all three engines.
+   **Remaining:** `fmod` `pow` `frexp` (float math — `frexp` is exact bit ops; `fmod`/`pow` need
+   careful IEEE-exact synthesis — no `frem` op exists), `localeconv` (a static C-locale struct:
+   `decimal_point="."`), `__errno_location` (a fixed window slot — `strtod` sets `ERANGE`),
+   `time`→stub/`Clock` cap (RNG seed in `lstate` `makeseed`). Already covered: `_setjmp`/`longjmp`,
+   `free`(no-op), `realloc`, `bcmp`→`memcmp`, `strlen`.
+
+   *Varargs bug found via Lua (fixed):* a `(...)` call with **zero** variadic args (Lua's
+   `lua_gc(L, what)`) triggered marshaling but `frame_layout` reserved no scratch (0 slots) →
+   `Unsupported("varargs call without reserved scratch")`. Fixed by reserving ≥1 slot whenever a
+   function makes any varargs call; regression test `varargs_zero_variadic`.
+
+**Next Lua blocker (past the libc layer):** with the libc batch above in place, the Lua-core
+translation advances into the VM/runtime functions and hits `Unsupported("value N not available in
+block")` — a **liveness / block-param threading** miss in a large Lua function (the generic `id()`
+value resolution), *not* a libc gap. This is the next investigation: a translator-internals
+threading issue surfaced by Lua's real control flow, independent of the varargs/libc work.
 
 **Sequencing:** (slice 1 — **DONE**) varargs ABI + standalone differential tests; (slice 2 — in
 progress) the small-libc batch; (slice 3) `strtod` + `snprintf`; then the Lua-core differential test

@@ -1759,7 +1759,14 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
     };
     let exe = std::env::temp_dir().join(format!("svm_llvm_va_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
-    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+    // `-lm` so math-helper tests (`ldexp`, …) link against libc's math on the native side.
+    match Command::new("cc")
+        .arg(&c)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping {name} (cc unavailable)");
@@ -1836,6 +1843,21 @@ fn varargs_int_double_mixed() {
           va_end(ap); return s; }\n\
         int main(void){ return run(0); }";
     check_run_byte_vs_native("varargs_mixed", src, 0);
+}
+
+#[test]
+fn varargs_zero_variadic() {
+    // A `(...)` function invoked with ONLY its fixed parameters (zero variadic args) — e.g. Lua's
+    // `lua_gc(L, what)`. The call site still deposits the overflow-area pointer (marshaling nothing),
+    // and the callee's `va_start` runs even though `va_arg` is never reached. Regression for the
+    // "varargs call without reserved scratch" frame-layout bug. `vz(7)` returns its fixed arg.
+    let src = "#include <stdarg.h>\n\
+        static int vz(int n, ...);\n\
+        int run(int seed){ return (vz(7) + vz(20) + seed) & 0xff; }\n\
+        __attribute__((noinline)) static int vz(int n, ...){\n\
+          va_list ap; va_start(ap, n); va_end(ap); return n; }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_zero", src, 0);
 }
 
 #[test]
@@ -1926,6 +1948,30 @@ fn libc_abort_translates() {
         }\n\
         int main(void){ return run(0); }";
     check_run_byte_vs_native("libc_abort", src, 0);
+}
+
+#[test]
+fn libc_ldexp_bit_exact() {
+    // The synthesized `__svm_ldexp` (scalbn) over a grid of finite `x` × exponents `n` spanning the
+    // extremes (overflow→±inf, gradual underflow→denormal/0, and the two-step scaling for |n| huge).
+    // Each result's raw f64 bits are folded into a checksum returned as a byte; bit-identical to libc
+    // `ldexp` on all three engines pins the algorithm. `volatile` inputs keep the calls past `-O2`.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[7] = {1.0, 3.14159265358979, 1e300, 1e-300, 0.0, -2.5, 7.0};\n\
+          volatile int ns[8] = {0, 1, 5, -7, 60, 1100, -1100, -60};\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<7;i++) for (int j=0;j<8;j++) {\n\
+            double r = ldexp(xs[i], ns[j]);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = r;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+          }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_ldexp", src, 0);
 }
 
 #[test]
