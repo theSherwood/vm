@@ -247,6 +247,21 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     translate_impl(&m, di.as_ref(), ba.as_ref())
 }
 
+/// Translate a **textual** LLVM IR file (`*.ll`) via the in-house reader (LLVM.md §8 Q1b) — the
+/// migration target (no libLLVM link, full-width constants, version-tolerant). The structured debug
+/// graph (`di`/`blockaddr`, recovered via `llvm-sys` on the bitcode path) is not yet read from text,
+/// so it passes `None`; the source-line half still rides each instruction's `!DILocation`.
+pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
+    let src = std::fs::read_to_string(path).map_err(|e| Error::Parse(e.to_string()))?;
+    translate_ll_str(&src)
+}
+
+/// Translate textual LLVM IR from a string (the textual-reader entry; see [`translate_ll_path`]).
+pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
+    let m = ll::parse::parse_module(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
+    translate_impl(&m, None, None)
+}
+
 /// Translate an already-parsed [`ll`] module (the shape the textual-`.ll` reader produces, or the
 /// bitcode path's [`from_llvm_ir`] conversion). The neutral core's source-line half is populated from
 /// each instruction's `!DILocation`; the structured variable/type half requires the bitcode path's

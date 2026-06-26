@@ -7306,3 +7306,76 @@ fn i128_small_constant_still_runs() {
         );
     }
 }
+
+// ---- Textual `.ll` reader: differential parity vs the bitcode reader (LLVM.md §8 Q1b) -----------
+//
+// The migration's gate: the *same* C, compiled to **both** `.bc` and `.ll`, must translate to
+// **identical svm-ir** through the two readers — the bitcode→`ll` conversion shim
+// (`from_llvm_ir`) vs the in-house textual reader (`ll::parse`). Both now feed the same translator
+// (it consumes the owned `ll` AST), so a match proves the textual reader produced an equivalent AST.
+// This lets `parse.rs` grow incrementally with confidence; today it covers the core slice, so the
+// parity tests track real `clang -O2` output one shape at a time.
+
+/// Compile C to a textual `.ll` (the in-house reader's input), mirroring [`compile_to_bc`].
+fn compile_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}_ll.c", std::process::id(), name));
+    let ll = dir.join(format!("svm_llvm_{}_{}.ll", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&ll)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(ll),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Assert the bitcode and textual readers translate `src` to byte-identical svm-ir (their
+/// `print_module` text) and the same `entry_sp`. Skips cleanly if `clang` is unavailable.
+fn assert_ll_parity(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (compile_to_bc(name, src), compile_to_ll(name, src)) else {
+        return;
+    };
+    let from_bc = svm_llvm::translate_bc_path(&bc).expect("translate via bitcode");
+    let from_ll = svm_llvm::translate_ll_path(&ll).expect("translate via textual .ll");
+    assert_eq!(
+        svm_text::print_module(&from_bc.module),
+        svm_text::print_module(&from_ll.module),
+        "svm-ir mismatch between the bitcode and textual readers for `{name}`",
+    );
+    assert_eq!(
+        from_bc.entry_sp, from_ll.entry_sp,
+        "entry_sp mismatch for `{name}`",
+    );
+}
+
+#[test]
+fn ll_parity_trivial_add() {
+    // The simplest real `clang -O2` function: `define dso_local i32 @add(i32 %0, i32 %1) … { %3 =
+    // add nsw i32 %1, %0; ret i32 %3 }` — exercising the function header (linkage/param attrs/
+    // attribute-group ref), a flagged binop, and `ret`.
+    assert_ll_parity("ll_parity_add", "int add(int a, int b){ return a + b; }");
+}
+
+#[test]
+fn ll_parity_arith_chain() {
+    // A chain of binops with immediate operands, incl. a negative constant (`add … -7`) — exercises
+    // constant-int operands and operand ordering across `add`/`mul`.
+    assert_ll_parity("ll_parity_poly", "int poly(int x){ return x*x + 3*x - 7; }");
+}
+
+#[test]
+fn ll_parity_bitwise_shifts() {
+    // `shl`/`lshr`/`or` over an unsigned — the bitwise/shift core-slice ops.
+    assert_ll_parity(
+        "ll_parity_shifts",
+        "unsigned s(unsigned x){ return (x << 3) | (x >> 2); }",
+    );
+}

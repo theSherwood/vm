@@ -1774,16 +1774,25 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     `ll::ast` additions the translator relies on: `Deref` for `TypeRef`/`ConstantRef` (deref coercion),
     `Display` for `Type`/`TypeRef` (error messages), `HasDebugLoc` for `Instruction`; and `Constant::Int`
     being `u128` (I14) forced `as u64` casts at the ~7 size/priority/switch read sites (all ≤64-bit).
-- **Next step (resume here): `translate_ll_path` + the `assert_ll_parity` harness + grow `parse.rs`.**
-  Add `pub fn translate_ll_path(path)` / a `translate_ll_str(src)` (`lib.rs`: `ll::parse_module` →
-  `translate`) and `assert_ll_parity(c_src)` (`tests/translate.rs`, alongside `compile_to_bc`/`check`):
-  compile each test C to **both** `.bc` and `.ll` (`clang -S -emit-llvm`), translate both, assert
-  identical svm-ir (`==` on the `Module`, or on `svm_text::print_module`). Then grow `parse.rs` (lockstep
-  with the parity check, which now has a real consumer since the translator is on `ll`) from the core
-  slice to the full AST. Keep `llvm-ir` the default; iterate to parity on the core slice, then widen
-  (PR2: SIMD/EH/structs/i128/blockaddress — the last two come free in text; PR3: debug metadata replacing
-  `di.rs`; PR4: flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the
-  rustc-1.81 pin, proving version-tolerance by feeding an LLVM-21 `.ll`).
+  - **`translate_ll_path`/`translate_ll_str` + the `assert_ll_parity` harness — DONE.** `lib.rs` now
+    exposes the textual entry (`ll::parse::parse_module` → `translate`), and `tests/translate.rs` has
+    `compile_to_ll` (`clang -O2 -emit-llvm -S`) + `assert_ll_parity(name, c_src)`: compile each test C
+    to **both** `.bc` and `.ll`, translate both, assert byte-identical svm-ir (`svm_text::print_module`)
+    and `entry_sp`. Three parity tests pass on real `clang -O2` output the **core-slice parser already
+    handles**: `ll_parity_trivial_add` (header + flagged binop + `ret`), `ll_parity_arith_chain`
+    (binop chain with `±` immediates), `ll_parity_bitwise_shifts` (`shl`/`lshr`/`or`). The textual path
+    is proven end-to-end through the unified (`ll`-consuming) translator.
+- **Next step (resume here): grow `parse.rs` to the full AST under the parity gate.** Each new shape =
+  a `clang -O2` `.ll` construct the core slice doesn't parse yet + an `assert_ll_parity` test. Near-term
+  gaps (from probing the corpus): **`icmp`/`br i1`/multi-block + labels + `phi`** (a `for`-loop sum),
+  **conversions** (`zext`/`trunc`/… incl. `iN` like `i33`), **`call`** (e.g. `llvm.smax`, the `?:`-max
+  lowering), then **`getelementptr`/`load`/`store`/`alloca`** (memory), **globals + initializers**,
+  **`switch`**, **structs/aggregates**, **SIMD vectors**, **`select`**, **C++ EH** (`invoke`/
+  `landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text — full-width
+  constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
+  debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
+  flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
+  (prove version-tolerance by feeding an LLVM-21 `.ll`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
