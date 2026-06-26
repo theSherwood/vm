@@ -1169,10 +1169,27 @@ below), and `time()` returns `0` (the `makeseed` RNG seed is result-irrelevant).
 so the module lowers and the executed path is fully real; replacing them is what graduates first light
 to *general* Lua (float arithmetic, `string.format`, error messages).
 
-**Next (post-first-light):** real `pow`/`fmod` (a **host-libm delegation** decision — bit-exact vs
-native requires the *same* libm; synthesis can't match a specific libm's last-ULP rounding), `strtod`
-+ `snprintf` (reuse the bignum dtoa), `localeconv`/`errno` (real C-locale struct + a window slot), then
-`print`/stdlib for a script that does I/O. Each is now a localized swap of a stub for an implementation.
+**Next (post-first-light) — the remaining-libm slices.** `snprintf` is **DONE** (the number→string
+direction, via the printf engine — merged). What's left, each a localized swap of a fail-closed stub
+for a real implementation, split by whether it needs a *host-libm decision*:
+
+- **Exact, decision-free (synthesizable bit-for-bit, no libm dependency):**
+  - **`frexp`** — pure bit ops (extract exponent + mantissa, write `*e`); exact.
+  - **`fmod`** — the remainder is mathematically *exact* (always representable), so glibc/musl's
+    integer bit-twiddling algorithm synthesizes bit-for-bit. **No `frem` op and no libm decision** —
+    the earlier "`pow`/`fmod` need host-libm delegation" framing was imprecise: only the
+    *transcendentals* do.
+  - **`localeconv`/`__errno_location`** — a static C-locale `lconv` struct (`decimal_point="."`) +
+    a fixed window slot for `errno`.
+- **Hard but decision-free:** **`strtod`** (string→double) — correctly-rounded decimal→`f64`, the parse
+  direction of the existing bignum dtoa. The single keystone for *float* Lua (every float literal hits
+  it); a sizeable bignum slice of its own.
+- **Needs a host-libm decision:** **`pow`** and the other transcendentals (`sin`/`cos`/`exp`/`log`) —
+  bit-exact vs native requires the *same* libm (synthesis can't match a specific libm's last-ULP
+  rounding). Either delegate to a host math capability or bundle a guest `libm` (the §"transcendentals"
+  note prefers guest code to keep math in the sandbox).
+
+After the float-number surface lands, `print`/stdlib graduates first-light to a script that does I/O.
 
 **Build recipe (reproducible).** Lua's core (no standard libraries, no `lauxlib`) + a tiny C-API harness
 that drives `lua_newstate`/`lua_load`/`lua_pcall`/`lua_tointeger` with its own allocator (`realloc`) and
@@ -1205,8 +1222,10 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    `Unsupported` (Lua's are all int/ptr/double/ptrdiff ≤8B). **Tests:** `varargs_int_double_mixed`,
    `varargs_many_and_copy` — all three engines == native cc. **217 translate tests green, fmt+clippy
    clean.**
-2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). Reuses the
-   bignum dtoa float formatter + the varargs-call marshaling from (1). Reachable.
+2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). **DONE:**
+   routed through the shared `printf` format engine (`lower_snprintf`) with output redirected into the
+   caller's buffer; reuses the bignum dtoa float formatter + the varargs-call marshaling from (1).
+   Merged (PR #155), incl. the page-0 `FMT_BUF` write-protect fix for `snprintf`-into-stack-buffer + `%p`.
 3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
    decimal→`f64` (the parse direction of the existing Ryū/Dragon dtoa). Reachable.
 4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
