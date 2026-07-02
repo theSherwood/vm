@@ -72,3 +72,38 @@ The guest `pow`/`exp`/`log`/`sin`/`cos`/`strtod` definitions **shadow** the on-r
 stubs; `fmod`/`frexp`/`localeconv`/`snprintf`/`sqrt`/`ldexp`/the string ops stay undefined and are
 synthesized/recognized by the on-ramp. Pin `EXPECT` in `tests/lua_floats.rs` against a native build of
 the identical sources (`cc … -lm`, our strong defs shadowing libm).
+
+# Lua stdlib fixture
+
+`lua_stdlib.bc` is the Lua 5.4.7 core **plus the base/`string`/`table`/`math` libraries**
+(`lbaselib`/`lstrlib`/`ltablib`/`lmathlib` + `lauxlib`), linked with the guest libm and a small guest
+libc shim (`lua_stdlib_shim.c`: the transcendentals the guest libm lacks, `strstr`, and a
+no-filesystem `stdio` surface). The harness (`lua_stdlib_harness.c`) opens the four libraries via
+`luaL_requiref` and runs a script that `print`s. It is the fixture for the `lua_stdlib` test, which
+asserts the exact **stdout bytes** (through the `Stream.write` capability) on all three engines,
+identical to native.
+
+The script exercises `print`, `string.upper`/`rep`/`sub`/`#`, `table.sort`/`concat`/`insert`/`remove`,
+`math.sqrt`/`pi`/`floor`/`max`/`abs`, `ipairs`, `pairs`, `type`, `tostring`. It deliberately avoids
+`string.format`: that builds the per-directive format spec **at runtime** and calls `snprintf` with it,
+which the on-ramp cannot lower at translate time (the format engine parses constant formats only) — so
+a non-constant / unsupported-conversion (`%a`) format fail-closes to a trap (present but traps if
+called). `print` of numbers uses Lua's *constant* `%lld`/`%.14g` formats, which the on-ramp handles.
+A runtime format engine (to make `string.format` work) is the next Lua slice.
+
+## Regenerating (stdlib)
+
+With Lua 5.4.7 in `lua-5.4.7/`, clang 18, and this repo's guest sources, `-fno-vectorize
+-fno-slp-vectorize` on all, `-fno-builtin` on the guest libm/shim:
+
+```sh
+NV="-fno-vectorize -fno-slp-vectorize"
+CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
+      lstate lstring ltable ltm lundump lvm lzio"
+LIBS="lbaselib lstrlib ltablib lmathlib lauxlib"
+for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
+clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_stdlib_harness.c -o harness.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_stdlib_shim.c   -o guest_shim.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c               -o guest_libm.bc
+llvm-link $CORE.bc $LIBS.bc harness.bc guest_shim.bc guest_libm.bc -o lua_stdlib.bc  # (expand globs)
+```
