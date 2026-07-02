@@ -1801,16 +1801,24 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     arg/return attribute lists. Four parity tests green: direct 1-arg, direct 2-arg, `void`, and the
     `llvm.smax` intrinsic (the `a>b?a:b` lowering — the translator turns it back into `icmp`+`select`).
     **Twelve parity tests total.**
-- **Next step (resume here): memory (`alloca`/`load`/`store`/`getelementptr`), then globals.** The growth
-  frontier, each a `clang -O2` shape + an `assert_ll_parity` test: **memory** — `alloca <ty>[, align N]`,
-  `load <ty>, ptr %p[, align N]`, `store <ty> %v, ptr %p[, align N]` (the second result-less instr, like
-  `void` call — `at_store()` lookahead or generalize the dest handling), `getelementptr [inbounds] <ty>,
-  ptr %p, <idx>…` (note the leading element type + the index operand types). Most `-O2` scalar code keeps
-  values in registers, so to *get* memory ops use `volatile`/`-O0`-ish patterns or address-taken locals
-  (`int a[4]; … a[i]`). Then **globals + initializers**, **float/hex constants**, **`switch`**,
-  **structs/aggregates**, **SIMD vectors**, **C++ EH** (`invoke`/`landingpad`/`resume`), and
-  **`i128`/`blockaddress`** (these two come *free* in text — full-width constants, no `llvm-sys`
-  re-parse). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
+  - **Parser — memory landed.** `parse.rs` now parses `alloca [inalloca] <ty> [, <cty> <count>] [, align
+    N] [, addrspace(N)]` (implicit count → the `i32 1` operand the bitcode reader materializes), `load
+    [volatile] <ty>, ptr <addr> [, align N]`, `store [volatile] <ty> <val>, ptr <addr> [, align N]` (the
+    **second result-less** instruction — the `at_call`/`store` lookahead in `instruction()` routes both),
+    and `getelementptr [inbounds] [nuw|nusw] <srcty>, ptr <addr> [, <ity> <idx>]…`. Three parity tests:
+    `p[i]` (gep+load), `p[i]=v` (gep+store), and a `volatile` local (alloca + volatile load/store + the
+    `llvm.lifetime` intrinsics, which the call path already handles). **Fifteen parity tests total.**
+- **Next step (resume here): globals, then named struct types.** The growth frontier, each a `clang -O2`
+  shape + an `assert_ll_parity` test: **module-level globals** — `@g = [linkage] [unnamed_addr] global
+  <ty> <init>[, align N]` and `constant` (string literals `c"…\00"`, zeroinit, aggregate inits); the
+  parser currently *skips* every non-`define` top-level item (`skip_toplevel_item`), so this means
+  actually parsing `@g = …` into `module.global_vars` (a `GlobalVariable` with its initializer constant)
+  — needed before any test that reads a global (string constants, lookup tables). Then **named struct
+  types** (`%struct.P = type { i32, i32 }` + `type_()` resolving `%struct.P`, unlocking struct GEP/field
+  access), **float/hex constants**, **`switch`**, **aggregates**, **SIMD vectors**, **C++ EH**
+  (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
+  full-width constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then
+  PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).

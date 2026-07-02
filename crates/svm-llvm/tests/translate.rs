@@ -7453,6 +7453,33 @@ fn ll_parity_call_intrinsic() {
 }
 
 #[test]
+fn ll_parity_gep_load() {
+    // `getelementptr inbounds i32, ptr %p, i64 %i` + `load i32, ptr …` — pointer indexing + a load.
+    assert_ll_parity(
+        "ll_parity_gepload",
+        "int idx(const int *p, long i){ return p[i]; }",
+    );
+}
+
+#[test]
+fn ll_parity_gep_store() {
+    // `getelementptr` + a result-less `store i32 %v, ptr …` (the second dest-less instruction shape).
+    assert_ll_parity(
+        "ll_parity_gepstore",
+        "void wr(int *p, long i, int v){ p[i] = v; }",
+    );
+}
+
+#[test]
+fn ll_parity_alloca_volatile() {
+    // A `volatile` local forces `alloca i32` + `store volatile`/`load volatile` (defeating mem2reg).
+    assert_ll_parity(
+        "ll_parity_alloca",
+        "int viadd(int x){ volatile int t = x; return t + 1; }",
+    );
+}
+
+#[test]
 fn ll_parity_call_void() {
     // A result-less `call void @sink(...)` — the dest-less instruction shape (`tail call void …`).
     assert_ll_parity(

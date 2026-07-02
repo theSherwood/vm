@@ -7,11 +7,12 @@
 //! (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`), **`icmp`/`fcmp`**, **`select`**, **`fneg`/`freeze`**,
 //! **`phi`**, and **`call`** (direct `@f`/indirect `%fp`, incl. result-less `void` calls and
 //! intrinsics, reconstructing the callee's function type) — over `%local`/constant-int operands; the
-//! `ret`/`br`/`condbr`/`unreachable` terminators; and **multi-block** CFGs with LLVM's implicit slot
-//! numbering (so an unlabeled entry and the phi/branch refs into it resolve to the same `Name`s the
-//! bitcode reader assigns). Top-level cruft the on-ramp ignores (target/datalayout lines, attribute
-//! groups, module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier): memory
-//! (`getelementptr`/`load`/`store`/`alloca`), globals, `switch`, aggregates, vectors, and
+//! `ret`/`br`/`condbr`/`unreachable` terminators; **memory** (`alloca`/`load`/`store`/`getelementptr`,
+//! incl. the second result-less shape `store` and opaque-pointer element types); and **multi-block**
+//! CFGs with LLVM's implicit slot numbering (so an unlabeled entry and the phi/branch refs into it
+//! resolve to the same `Name`s the bitcode reader assigns). Top-level cruft the on-ramp ignores
+//! (target/datalayout lines, attribute groups, module-level metadata, `declare`s) is skipped. Not yet
+//! handled (the growth frontier): globals, `switch`, aggregates, vectors, named struct types, and
 //! float/non-trivial constants. Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified
 //! downstream — §2a), never a miscompile.
 
@@ -403,6 +404,10 @@ impl Parser {
         if self.at_call() {
             return self.call_inst(next_unnamed).map(Instruction::Call);
         }
+        // `store` is the other result-less instruction (no `%dest =`).
+        if matches!(self.peek(), Some(Token::Word(w)) if w == "store") {
+            return self.store_inst().map(Instruction::Store);
+        }
         // `%dest =` prefix (every other instruction modeled here produces a value).
         let dest = self.instr_dest(next_unnamed)?;
         let op = match self.peek() {
@@ -461,6 +466,9 @@ impl Parser {
             "fneg" => Instruction::FNeg(self.fneg_inst(dest)?),
             "freeze" => Instruction::Freeze(self.freeze_inst(dest)?),
             "phi" => Instruction::Phi(self.phi_inst(dest)?),
+            "alloca" => Instruction::Alloca(self.alloca_inst(dest)?),
+            "load" => Instruction::Load(self.load_inst(dest)?),
+            "getelementptr" => Instruction::GetElementPtr(self.gep_inst(dest)?),
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
@@ -736,6 +744,158 @@ impl Parser {
             dest,
             debugloc: None,
         })
+    }
+
+    // ---- memory --------------------------------------------------------------------------------
+
+    /// `alloca [inalloca] <ty> [, <cty> <count>] [, align N] [, addrspace(N)]`. The array size defaults
+    /// to `i32 1` — the operand the bitcode reader materializes when the count is implicit.
+    fn alloca_inst(&mut self, dest: Name) -> PResult<Alloca> {
+        self.pos += 1; // `alloca`
+        self.eat_word("inalloca");
+        let allocated_type = self.type_()?;
+        let mut num_elements =
+            Operand::ConstantOperand(ConstantRef::new(Constant::Int { bits: 32, value: 1 }));
+        let mut alignment = 0u32;
+        loop {
+            if self.peek() != Some(&Token::Comma) || matches!(self.peek2(), Some(Token::Meta(_))) {
+                break;
+            }
+            self.pos += 1; // `,`
+            if self.eat_word("align") {
+                alignment = self.int_lit_u32()?;
+            } else if self.eat_word("addrspace") {
+                self.skip_balanced_parens();
+            } else {
+                let cty = self.type_()?;
+                num_elements = self.value_as_operand(&cty)?;
+            }
+        }
+        self.skip_trailing_metadata();
+        Ok(Alloca {
+            allocated_type,
+            num_elements,
+            dest,
+            alignment,
+            debugloc: None,
+        })
+    }
+
+    /// `load [volatile] <ty>, ptr <addr> [, align N] [, !meta]` (atomic loads deferred).
+    fn load_inst(&mut self, dest: Name) -> PResult<Load> {
+        self.pos += 1; // `load`
+        let volatile = self.eat_word("volatile");
+        let loaded_ty = self.type_()?;
+        self.expect(&Token::Comma)?;
+        let addr_ty = self.type_()?; // `ptr`
+        let address = self.value_as_operand(&addr_ty)?;
+        let alignment = self.opt_align()?;
+        self.skip_trailing_metadata();
+        Ok(Load {
+            address,
+            dest,
+            loaded_ty,
+            volatile,
+            atomicity: None,
+            alignment,
+            debugloc: None,
+        })
+    }
+
+    /// `store [volatile] <ty> <val>, ptr <addr> [, align N] [, !meta]` — result-less.
+    fn store_inst(&mut self) -> PResult<Store> {
+        self.pos += 1; // `store`
+        let volatile = self.eat_word("volatile");
+        let vty = self.type_()?;
+        let value = self.value_as_operand(&vty)?;
+        self.expect(&Token::Comma)?;
+        let addr_ty = self.type_()?; // `ptr`
+        let address = self.value_as_operand(&addr_ty)?;
+        let alignment = self.opt_align()?;
+        self.skip_trailing_metadata();
+        Ok(Store {
+            address,
+            value,
+            volatile,
+            atomicity: None,
+            alignment,
+            debugloc: None,
+        })
+    }
+
+    /// `getelementptr [inbounds] [nuw|nusw] <srcty>, ptr <addr> [, <ity> <idx>]… [, !meta]`.
+    fn gep_inst(&mut self, dest: Name) -> PResult<GetElementPtr> {
+        self.pos += 1; // `getelementptr`
+        let in_bounds = self.eat_word("inbounds");
+        while matches!(self.peek(), Some(Token::Word(w)) if matches!(w.as_str(), "nuw" | "nusw")) {
+            self.pos += 1;
+        }
+        let source_element_type = self.type_()?;
+        self.expect(&Token::Comma)?;
+        let addr_ty = self.type_()?; // `ptr`
+        let address = self.value_as_operand(&addr_ty)?;
+        let mut indices = Vec::new();
+        loop {
+            if self.peek() != Some(&Token::Comma) || matches!(self.peek2(), Some(Token::Meta(_))) {
+                break;
+            }
+            self.pos += 1; // `,`
+            let ity = self.type_()?;
+            indices.push(self.value_as_operand(&ity)?);
+        }
+        self.skip_trailing_metadata();
+        Ok(GetElementPtr {
+            address,
+            indices,
+            dest,
+            in_bounds,
+            source_element_type,
+            debugloc: None,
+        })
+    }
+
+    /// `, align N` after a load/store — the alignment, or `0` if absent (a trailing `, !meta` is left
+    /// for [`Self::skip_trailing_metadata`]).
+    fn opt_align(&mut self) -> PResult<u32> {
+        if self.peek() == Some(&Token::Comma)
+            && matches!(self.peek2(), Some(Token::Word(w)) if w == "align")
+        {
+            self.pos += 2; // `,` `align`
+            self.int_lit_u32()
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Consume an integer literal as a `u32` (alignments, small counts).
+    fn int_lit_u32(&mut self) -> PResult<u32> {
+        match self.bump() {
+            Some(Token::Int(s)) => s
+                .parse::<u32>()
+                .map_err(|_| ParseError::new(self.pos, format!("bad integer `{s}`"))),
+            other => self.err(format!("expected an integer, found {other:?}")),
+        }
+    }
+
+    /// Skip a balanced `( … )` group starting at the current `(`.
+    fn skip_balanced_parens(&mut self) {
+        if self.peek() != Some(&Token::LParen) {
+            return;
+        }
+        let mut depth = 0usize;
+        loop {
+            match self.bump() {
+                Some(Token::LParen) => depth += 1,
+                Some(Token::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                None => break,
+                _ => {}
+            }
+        }
     }
 
     // ---- calls ---------------------------------------------------------------------------------
