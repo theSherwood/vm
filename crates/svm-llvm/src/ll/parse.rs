@@ -13,10 +13,11 @@
 //! resolve to the same `Name`s the bitcode reader assigns); and **module-level global variables**
 //! (`@g = … global|constant <ty> <init>`, incl. `[N x T]` array types, array/byte-string/`zeroinitializer`
 //! initializers, and `@g` operand references resolved to `GlobalReference`s via a `@name → pointee-type`
-//! symbol table). Top-level cruft the on-ramp ignores (target/datalayout lines, attribute groups,
-//! module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier): named struct
-//! types, `switch`, aggregates, SIMD vectors, and float/non-trivial constants. Anything unhandled is a
-//! clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
+//! symbol table); and **named struct types** (`%s = type { … }` definitions + `%s`/`{…}` references in
+//! `type_()`, so struct GEP/field access resolves). Top-level cruft the on-ramp ignores
+//! (target/datalayout lines, attribute groups, module-level metadata, `declare`s) is skipped. Not yet
+//! handled (the growth frontier): `switch`, SIMD vectors, and float/non-trivial constants. Anything
+//! unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
 
 use super::ast::*;
 use super::lex::{lex, Token};
@@ -158,6 +159,8 @@ impl Parser {
                 }
                 // `@name = [linkage/attrs] global|constant <ty> [<init>] [, align N]`
                 Some(Token::Global(_)) if self.at_global_var() => self.global_def()?,
+                // `%name = type { … }` — a named struct type definition.
+                Some(Token::Local(_)) if self.at_type_def() => self.type_def()?,
                 // Top-level lines/items the on-ramp ignores at this slice: target/datalayout/source,
                 // attribute groups (`attributes #N = { … }`), module flags / named metadata (`!… = …`,
                 // `!name = !{…}`), and `declare`s. Skip to the next top-level item.
@@ -233,14 +236,59 @@ impl Parser {
                     {
                         return
                     }
-                    // A depth-0 `@name` begins the next top-level item (a global/alias/function). Stop
-                    // before it so an unbraced line (`target … = "…"`) doesn't swallow the globals that
-                    // follow it. (We've already advanced ≥1 token this iteration, so this can't spin.)
-                    Some(Token::Global(_)) => return,
+                    // A depth-0 `@name`/`%name` begins the next top-level item (a global/alias/function,
+                    // or a `%name = type …` definition). Stop before it so an unbraced line
+                    // (`target … = "…"`) doesn't swallow the items that follow it. (We've already
+                    // advanced ≥1 token this iteration, so this can't spin.)
+                    Some(Token::Global(_)) | Some(Token::Local(_)) => return,
                     _ => {}
                 }
             }
         }
+    }
+
+    // ---- named struct types --------------------------------------------------------------------
+
+    /// Is the cursor at a named type definition (`%name = type …`)?
+    fn at_type_def(&self) -> bool {
+        matches!(self.toks.get(self.pos), Some(Token::Local(_)))
+            && self.toks.get(self.pos + 1) == Some(&Token::Equals)
+            && matches!(self.toks.get(self.pos + 2), Some(Token::Word(w)) if w == "type")
+    }
+
+    /// `%name = type { … }` | `%name = type opaque` — register the definition so `type_()` references
+    /// (`%name`) and the translator's `named_struct_def` lookups resolve, matching the bitcode reader's
+    /// `all_struct_names` registration.
+    fn type_def(&mut self) -> PResult<()> {
+        let name = match self.bump() {
+            Some(Token::Local(s)) => s,
+            other => return self.err(format!("expected a named type %name, found {other:?}")),
+        };
+        self.expect(&Token::Equals)?;
+        self.expect_word("type")?;
+        let def = if self.eat_word("opaque") {
+            NamedStructDef::Opaque
+        } else {
+            NamedStructDef::Defined(self.type_()?)
+        };
+        self.module.types.add_named_struct_def(name, def);
+        Ok(())
+    }
+
+    /// `[ < ] { <ty>, … } [ > ]` — a literal struct type body (`is_packed` set for the `<{…}>` form).
+    fn struct_type(&mut self, is_packed: bool) -> PResult<TypeRef> {
+        self.expect(&Token::LBrace)?;
+        let mut element_types = Vec::new();
+        if self.peek() != Some(&Token::RBrace) {
+            loop {
+                element_types.push(self.type_()?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(self.module.types.struct_of(element_types, is_packed))
     }
 
     // ---- global variables ----------------------------------------------------------------------
@@ -1461,6 +1509,16 @@ impl Parser {
             let element_type = self.type_()?;
             self.expect(&Token::RBracket)?;
             return Ok(self.module.types.array_of(element_type, num_elements));
+        }
+        // `%name` — a reference to a named struct type (its definition is registered separately).
+        if let Some(Token::Local(s)) = self.peek() {
+            let name = s.clone();
+            self.pos += 1;
+            return Ok(self.module.types.named_struct(name));
+        }
+        // `{ <ty>, … }` — a literal struct type.
+        if self.peek() == Some(&Token::LBrace) {
+            return self.struct_type(false);
         }
         let w = match self.peek() {
             Some(Token::Word(w)) => w.clone(),

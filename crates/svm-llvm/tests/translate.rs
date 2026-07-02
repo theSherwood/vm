@@ -7510,6 +7510,16 @@ fn ll_parity_global_string() {
 }
 
 #[test]
+fn ll_parity_struct_field() {
+    // A named struct type (`%struct.P = type { i32, i32 }`) + struct GEP
+    // (`getelementptr %struct.P, ptr %p, i64 0, i32 1`) for field access.
+    assert_ll_parity(
+        "ll_parity_struct",
+        "struct P { int a; int b; }; int field(const struct P *s){ return s->a + s->b; }",
+    );
+}
+
+#[test]
 fn ll_parity_call_void() {
     // A result-less `call void @sink(...)` — the dest-less instruction shape (`tail call void …`).
     assert_ll_parity(

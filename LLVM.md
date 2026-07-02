@@ -1820,15 +1820,24 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     `nonnull`/`noalias` to the return/pre-signature attribute skip. Three parity tests: a mutable scalar
     (`@counter`, load/add/store), a `constant [4 x i32]` lookup table (array type + array init + gep), and
     a `c"hi\00"` string returned as `ptr @.str`. **Eighteen parity tests total.**
-- **Next step (resume here): named struct types, then float/hex constants.** The growth frontier, each a
-  `clang -O2` shape + an `assert_ll_parity` test: **named struct types** (`%struct.P = type { i32, i32 }`
-  as a top-level def → `module.types.add_named_struct_def`, plus `type_()` resolving a `%struct.P`
-  *reference* — a `Local` token in type position; unlocks struct GEP `getelementptr %struct.P, ptr %p,
-  i64 0, i32 1` + field access), then **float/hex constants** (LLVM's `0x…` hex-float image → exact
-  `f64`/`f32` bits; unblocks any float literal, currently deferred), **`switch`**, **literal struct
-  types/aggregates** `{ i32, i8 }`, **SIMD vectors** `<4 x i32>`, **C++ EH** (`invoke`/`landingpad`/
-  `resume`), and **`i128`/`blockaddress`** (these two come *free* in text — full-width constants, no
-  `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
+  - **Parser — named struct types landed.** `parse.rs` now parses `%s = type { … }` / `%s = type opaque`
+    top-level defs (→ `module.types.add_named_struct_def`, matching the bitcode reader's
+    `all_struct_names` registration), and `type_()` resolves a `%s` **reference** (a `Local` in type
+    position) + a literal `{ i32, i32 }` struct type. `skip_to_toplevel_boundary` also now stops before a
+    depth-0 `%local` (same fix as `@global` — an unbraced `target … = "…"` line was swallowing the
+    `%s = type …` defs after it). One parity test: struct field access (`%struct.P` + `getelementptr
+    %struct.P, ptr %p, i64 0, i32 1`). **Nineteen parity tests total.**
+- **Next step (resume here): float/hex constants, then `switch` + SIMD vectors.** The growth frontier,
+  each a `clang -O2` shape + an `assert_ll_parity` test: **float/hex constants** — LLVM prints float
+  literals as either decimal (`5.000000e-01`) or, more often, its `0x…` hex bit-pattern image (a `double`
+  image even for `float`: `0xKHHHH…` for the wide FP types, plain `0x` + 16 hex digits for double);
+  `value_as_operand`/`constant` must decode both to the exact `Float::{Single,Double,…}` bits (the lexer
+  already keeps the text). This is the last **deferred** primitive — it unblocks any float literal
+  (`x*0.5`, float initializers). Then **`switch`** (`switch <ty> <v>, label %d [ <ty> <c>, label %l … ]`),
+  **SIMD vectors** (`<4 x i32>` types + `<i32 a, …>` vector constants + `shufflevector`/`extractelement`),
+  literal aggregates in constants, **C++ EH** (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`**
+  (these two come *free* in text — full-width constants, no `llvm-sys` re-parse). Grow it incrementally;
+  `llvm-ir` stays the default. Then PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).
