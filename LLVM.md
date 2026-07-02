@@ -1166,15 +1166,32 @@ The first end-to-end Lua producing *real output* (prior Lua tests checked a retu
 shim brings `log10`/`log2`/`tan` (+ fail-closed `acos`/`asin`/`atan2`), `strstr`, and a no-filesystem
 `stdio`.
 
-**Blocker → next slice: `string.format`.** It builds its per-directive format spec **at runtime** and
-calls `snprintf` with it; the on-ramp's format engine parses **constant** formats only (at translate
-time). A non-constant (or unsupported-conversion, `%a`) format now **fail-closes to a trap**
-(`snprintf_rt`) so the enclosing function still lowers — but `string.format` traps if called (the
-stdlib script avoids it; `print` of numbers uses the core's *constant* `%lld`/`%.14g`, which the real
-engine handles). Making `string.format` work needs a **runtime format engine** — a synthesized
-`snprintf` that parses the format at runtime and reuses the on-ramp's bignum dtoa for correctly-rounded
-floats. That's the direct precursor to running **Lua's own test suite** (self-validating, the roadmap's
-gold standard).
+### Lua `string.format` (runtime format engine) — ACHIEVED ✅ (all three engines)
+**Goal (met).** `string.format` now works end to end, byte-identical to native on all three engines.
+Lua's `str_format` builds its per-directive spec **at runtime** and calls `snprintf` once per directive
+— the path the on-ramp's translate-time *constant*-format engine cannot lower (a non-constant or
+unsupported-conversion `%a` format fail-closes to the `snprintf_rt` trap so the enclosing function still
+lowers). The runtime format engine fills that gap with the **guest-brings-its-own-libc** model rather
+than a new translate-time synthesis:
+
+- **Guest runtime `snprintf`** (`tests/fixtures/lua/lua_fmt_snprintf.c`) `llvm-link`ed alongside Lua
+  **shadows** the `snprintf_rt` trap. It parses flags/width/precision/length/conversion at runtime and
+  formats `d`/`i`/`u`/`o`/`x`/`X`/`c`/`s`/`p` in C (matching glibc). One definition covers both the
+  core's *constant* `%lld`/`%.14g` and `string.format`'s runtime directives.
+- **Float bridges** `__vm_fmt_{fix,sci,gen}` — three new vm-builtins recognized in `lower_vm_builtin`.
+  The guest `snprintf` delegates `f`/`F`/`e`/`E`/`g`/`G` to `extern int __vm_fmt_*(char *out, double,
+  int prec, int width, int flags)`; the on-ramp lowers each to the existing correctly-rounded bignum
+  **dtoa** helper (`dtoa_fix`/`dtoa_sci`/`dtoa_gen`) writing to float scratch, then `memcpy`s the result
+  to the guest `out`. Gated by `uses_fmt_float`, which also forces a powerbox entry (so the float
+  scratch is set up) and pulls in `dtoa`/`memcpy`.
+
+Fixture `tests/fixtures/lua/lua_fmt.bc` (core + base/`string`/`table`/`math` + guest shim/libm/strtod +
+guest `snprintf`), test `tests/lua_fmt.rs`, asserts the exact **stdout bytes** across
+`%d`/`%x`/`%#x`/`%o`, width/precision/flags (`%5d`/`%-5d`/`%05d`/`%+d`/`%10s`/`%.3s`), `%c`, `%.2f`/
+`%8.3f`/`%+.1f`, `%.3e`/`%g`/`%.10g`, `%q`, and `%%`. Known edge: `%f` of an extreme magnitude (`1e300`)
+can differ from native by one digit — a pre-existing `dtoa_fix` limit, not the bridge; the script avoids
+it. This unblocks running **Lua's own test suite** (self-validating, the roadmap's gold standard) — the
+next Lua slice.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**

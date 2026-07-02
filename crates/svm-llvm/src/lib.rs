@@ -299,6 +299,13 @@ fn translate_impl(
     // and `memcpy` (the per-segment buffer copy). Unlike `printf` it writes no stdout, so it needs no
     // `write` import / powerbox `main`.
     let need_snprintf = calls_external(m, &defined_names, "snprintf");
+    // `__vm_fmt_{fix,sci,gen}(out, x, prec, width, flags)` — the correctly-rounded float→string bridge
+    // a **guest** printf/`snprintf` calls (so `string.format`'s runtime formats reuse the on-ramp's
+    // bignum dtoa). Each lowers to the matching `dtoa` helper + a `memcpy` into the guest buffer, so it
+    // pulls in the dtoa family (`need_dtoa`) and the memcpy helper even when nothing else does.
+    let uses_fmt_float = calls_external(m, &defined_names, "__vm_fmt_fix")
+        || calls_external(m, &defined_names, "__vm_fmt_sci")
+        || calls_external(m, &defined_names, "__vm_fmt_gen");
     // A direct `strlen` call routes to the same synthesized `__svm_strlen` byte loop that `printf %s`
     // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
     // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
@@ -333,7 +340,7 @@ fn translate_impl(
     // `%f` formatting (`__svm_dtoa_fixed`) rides on `printf`: it writes via the same `write` import and
     // stashed stdout handle. Synthesized for any `printf` program (dead if no `%f` appears — scanning
     // the formats to tighten this is a later refinement).
-    let need_dtoa = need_printf || need_snprintf;
+    let need_dtoa = need_printf || need_snprintf || uses_fmt_float;
     // C++ exception handling (Itanium ABI on-ramp). `need_eh` reserves the EH state region + drives
     // the `invoke`/`landingpad`/`resume`/`__cxa_*` lowering; the typeinfo-id table assigns each
     // `@_ZTI*` referenced by a throw or `llvm.eh.typeid.for` a distinct nonzero id so the thrown-type
@@ -381,7 +388,8 @@ fn translate_impl(
         || uses_blocking
         || has_global_ctors
         || need_getenv
-        || need_snprintf;
+        || need_snprintf
+        || uses_fmt_float; // `__vm_fmt_*` writes the float scratch, reserved by the powerbox layout
     let synth = needs_powerbox_entry && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
@@ -456,9 +464,9 @@ fn translate_impl(
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
     let (need_memset, need_memcpy0, need_memmove) = needs_mem_helpers(m);
-    let need_memcpy = need_memcpy0 || need_realloc || need_snprintf; // `realloc`/`snprintf` copy via `__svm_memcpy`
-                                                                     // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
-                                                                     // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
+    let need_memcpy = need_memcpy0 || need_realloc || need_snprintf || uses_fmt_float; // realloc/snprintf/__vm_fmt copy via `__svm_memcpy`
+                                                                                       // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
+                                                                                       // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
         calls_external(m, &defined_names, "memcmp") || calls_external(m, &defined_names, "bcmp");
     // `memchr(s, c, n)` (string/buffer scans — e.g. Embench `slre`) → the synthesized `__svm_memchr`
@@ -10767,6 +10775,55 @@ fn lower_vm_builtin(
     // All §12 atomics are sequentially consistent (the op makes the JIT emit a hardware atomic).
     let sc = Ordering::SeqCst;
     match name {
+        // ---- correctly-rounded float→string bridge for a **guest** printf/snprintf ----
+        // `int __vm_fmt_{fix,sci,gen}(char *out, double x, int prec, int width, int flags)` formats `x`
+        // via the on-ramp's bignum dtoa (the same `%f`/`%e`/`%g` engine the constant-format path uses),
+        // copies the padded field into the guest `out` buffer, and returns its length. This lets a guest
+        // `snprintf` (which parses a *runtime* format string, e.g. Lua's `string.format`) reuse the exact
+        // correctly-rounded formatter — matching native to the last ULP. `flags`: bit0 left-justify,
+        // bit1 `+`, bit2 space, bit3 uppercase (the encoding the dtoa helpers expect).
+        "__vm_fmt_fix" | "__vm_fmt_sci" | "__vm_fmt_gen" => {
+            let out = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let dval = ctx.operand(vm_arg(c, 1)?)?;
+            let precv = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let widthv = ctx.operand_i64(vm_arg(c, 3)?)?;
+            let flagsv = ctx.operand_i64(vm_arg(c, 4)?)?;
+            let bits = ctx.push(Inst::Cast {
+                op: CastOp::ReinterpF64I64,
+                a: dval,
+            });
+            let formatter = match name {
+                "__vm_fmt_fix" => ctx.helpers.dtoa_fix,
+                "__vm_fmt_sci" => ctx.helpers.dtoa_sci,
+                _ => ctx.helpers.dtoa_gen,
+            }
+            .ok_or_else(|| Error::Unsupported(format!("{name}: bignum float helper missing")))?;
+            let scratch = ctx
+                .helpers
+                .float_scratch
+                .ok_or_else(|| Error::Unsupported(format!("{name}: float scratch missing")))?;
+            let scratchv = ctx.const_i64(scratch as i64);
+            let len = ctx.push(Inst::Call {
+                func: formatter,
+                args: vec![bits, precv, widthv, flagsv, scratchv],
+            });
+            // Copy the formatted field (`scratch + FMT_OUT_O .. +len`) into the guest buffer.
+            let memcpy = ctx
+                .helpers
+                .memcpy
+                .ok_or_else(|| Error::Unsupported(format!("{name}: memcpy helper missing")))?;
+            let src = ctx.const_i64((scratch + FMT_OUT_O as u64) as i64);
+            ctx.push_effect(Inst::Call {
+                func: memcpy,
+                args: vec![out, src, len],
+            });
+            let len32 = ctx.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: len,
+            });
+            ctx.bind_dest(&c.dest, len32);
+            Ok(true)
+        }
         // ---- §3e/§4 Memory capability: `cap.call` on the stashed Memory handle (slot 12) ----
         "__vm_map" | "__vm_unmap" | "__vm_protect" => {
             let import = vm_memory_builtin_import(name).expect("memory builtin");
