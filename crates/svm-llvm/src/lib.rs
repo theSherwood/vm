@@ -299,14 +299,27 @@ fn translate_impl(
     // and `memcpy` (the per-segment buffer copy). Unlike `printf` it writes no stdout, so it needs no
     // `write` import / powerbox `main`.
     let need_snprintf = calls_external(m, &defined_names, "snprintf");
+    // `__vm_fmt_{fix,sci,gen}(out, x, prec, width, flags)` — the correctly-rounded float→string bridge
+    // a **guest** printf/`snprintf` calls (so `string.format`'s runtime formats reuse the on-ramp's
+    // bignum dtoa). Each lowers to the matching `dtoa` helper + a `memcpy` into the guest buffer, so it
+    // pulls in the dtoa family (`need_dtoa`) and the memcpy helper even when nothing else does.
+    let uses_fmt_float = calls_external(m, &defined_names, "__vm_fmt_fix")
+        || calls_external(m, &defined_names, "__vm_fmt_sci")
+        || calls_external(m, &defined_names, "__vm_fmt_gen");
     // A direct `strlen` call routes to the same synthesized `__svm_strlen` byte loop that `printf %s`
     // uses. Unlike `printf` it needs no powerbox/`main` (it only reads guest memory), so a `run`-only
     // module — e.g. an Embench kernel compiled without `main` — can call it; hence *not* `&& has_main`.
-    let need_strlen = need_printf || need_snprintf || calls_external(m, &defined_names, "strlen");
+    // `puts`/`fputs` of a **non-literal** string emit a runtime `__svm_strlen` for the write length.
+    let need_strlen = need_printf
+        || need_snprintf
+        || calls_external(m, &defined_names, "strlen")
+        || calls_external(m, &defined_names, "puts")
+        || calls_external(m, &defined_names, "fputs");
     // `strcmp` plus its C-locale alias `strcoll` share one synthesized byte-compare helper; `strchr`
     // its own byte scan (the §varargs/libc batch for real-program targets like Lua).
     let need_strcmp =
         calls_external(m, &defined_names, "strcmp") || calls_external(m, &defined_names, "strcoll");
+    let need_strncmp = calls_external(m, &defined_names, "strncmp");
     let need_strchr = calls_external(m, &defined_names, "strchr");
     let need_strcpy = calls_external(m, &defined_names, "strcpy");
     let need_strspn = calls_external(m, &defined_names, "strspn");
@@ -327,7 +340,7 @@ fn translate_impl(
     // `%f` formatting (`__svm_dtoa_fixed`) rides on `printf`: it writes via the same `write` import and
     // stashed stdout handle. Synthesized for any `printf` program (dead if no `%f` appears — scanning
     // the formats to tighten this is a later refinement).
-    let need_dtoa = need_printf || need_snprintf;
+    let need_dtoa = need_printf || need_snprintf || uses_fmt_float;
     // C++ exception handling (Itanium ABI on-ramp). `need_eh` reserves the EH state region + drives
     // the `invoke`/`landingpad`/`resume`/`__cxa_*` lowering; the typeinfo-id table assigns each
     // `@_ZTI*` referenced by a throw or `llvm.eh.typeid.for` a distinct nonzero id so the thrown-type
@@ -375,7 +388,8 @@ fn translate_impl(
         || uses_blocking
         || has_global_ctors
         || need_getenv
-        || need_snprintf;
+        || need_snprintf
+        || uses_fmt_float; // `__vm_fmt_*` writes the float scratch, reserved by the powerbox layout
     let synth = needs_powerbox_entry && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
@@ -450,9 +464,9 @@ fn translate_impl(
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
     let (need_memset, need_memcpy0, need_memmove) = needs_mem_helpers(m);
-    let need_memcpy = need_memcpy0 || need_realloc || need_snprintf; // `realloc`/`snprintf` copy via `__svm_memcpy`
-                                                                     // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
-                                                                     // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
+    let need_memcpy = need_memcpy0 || need_realloc || need_snprintf || uses_fmt_float; // realloc/snprintf/__vm_fmt copy via `__svm_memcpy`
+                                                                                       // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
+                                                                                       // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
         calls_external(m, &defined_names, "memcmp") || calls_external(m, &defined_names, "bcmp");
     // `memchr(s, c, n)` (string/buffer scans — e.g. Embench `slre`) → the synthesized `__svm_memchr`
@@ -523,6 +537,7 @@ fn translate_impl(
         udivmod128: take(need_idiv128),
         // The libc string batch — appended last; the matching `funcs.push` order below mirrors this.
         strcmp: take(need_strcmp),
+        strncmp: take(need_strncmp),
         strchr: take(need_strchr),
         strcpy: take(need_strcpy),
         strspn: take(need_strspn),
@@ -535,6 +550,7 @@ fn translate_impl(
         errno_stub: take(need_errno),
         localeconv: take(need_localeconv),
         time_zero: take(need_time),
+        snprintf_rt: take(need_snprintf),
         float_scratch: float_scratch_base,
         ctype_b_loc: ctype.b_loc,
         ctype_tolower_loc: ctype.tolower_loc,
@@ -770,6 +786,9 @@ fn translate_impl(
     if need_strcmp {
         funcs.push(synth_strcmp());
     }
+    if need_strncmp {
+        funcs.push(synth_strncmp());
+    }
     if need_strchr {
         funcs.push(synth_strchr());
     }
@@ -816,6 +835,10 @@ fn translate_impl(
     if need_time {
         // time(time_t*) -> time_t — returns 0 (seed value is result-irrelevant; see synth_const_i64).
         funcs.push(synth_const_i64(vec![ValType::I64], 0));
+    }
+    if need_snprintf {
+        // Fail-closed trap for a non-constant-format snprintf (string.format) — takes no args → i32.
+        funcs.push(synth_trap_stub(vec![], vec![ValType::I32]));
     }
     Ok(Translated {
         module: Module {
@@ -3580,6 +3603,8 @@ struct Helpers {
     /// `__svm_strcmp(a:i64, b:i64) -> i32` — NUL-terminated lexicographic byte compare (unsigned-char
     /// difference at the first mismatch). Backs `strcmp` and, in the C locale, `strcoll`.
     strcmp: Option<u32>,
+    /// `__svm_strncmp(a:i64, b:i64, n:i64) -> i32` — `strcmp` bounded to `n` bytes. Backs `strncmp`.
+    strncmp: Option<u32>,
     /// `__svm_strchr(s:i64, c:i32) -> i64` — first `(unsigned char)c` in `s`, or NULL (`c==0` → the
     /// terminating NUL). Backs `strchr`.
     strchr: Option<u32>,
@@ -3615,6 +3640,11 @@ struct Helpers {
     /// `time(t)` — the RNG seed source in `makeseed`; executed during state creation but the seed does
     /// not affect a deterministic script's result, so a constant `0` suffices (a real `Clock` cap later).
     time_zero: Option<u32>,
+    /// Fail-closed trap for a `snprintf` with a **non-constant** format string (Lua's `string.format`
+    /// builds the per-directive spec at runtime). Translates so `string.format` is present; traps if
+    /// executed. A runtime format engine is a follow-on; the Lua core's own `snprintf` calls all use
+    /// constant formats (`%lld`/`%.14g`).
+    snprintf_rt: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
@@ -5037,6 +5067,124 @@ fn synth_strcmp() -> Func {
         params,
         results: vec![ValType::I32],
         blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_strncmp(a:i64, b:i64, n:i64) -> i32` — compare at most `n` bytes of the two
+/// NUL-terminated strings as unsigned chars (glibc semantics: `0` if equal within `n` or both ended,
+/// else the first-mismatch difference). The `strcmp` analog with an index bound. Used by the stdlib
+/// (option/keyword matching in `lstrlib`/`lbaselib`).
+fn synth_strncmp() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64, ValType::I64, ValType::I64]; // a, b, n
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![Inst::ConstI64(0)], // v3 = i = 0
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2, 3],
+        },
+    };
+    // loop(a=0, b=1, n=2, i=3): while i < n
+    let loop_params = vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64];
+    let test = Block {
+        params: loop_params.clone(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 3,
+            b: 2,
+        }], // v4 = i < n
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 2,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 3,
+            else_args: vec![], // ran out of bytes with no mismatch → equal
+        },
+    };
+    let body = Block {
+        params: loop_params,
+        insts: vec![
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 3,
+            }, // v4 = a + i
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 4,
+                offset: 0,
+                align: 0,
+            }, // v5 = ca
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 3,
+            }, // v6 = b + i
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 6,
+                offset: 0,
+                align: 0,
+            }, // v7 = cb
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: 5,
+                b: 7,
+            }, // v8 = ca - cb
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 7,
+            }, // v9 = ca == cb
+            Inst::ConstI32(0), // v10
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Ne,
+                a: 5,
+                b: 10,
+            }, // v11 = ca != 0
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 9,
+                b: 11,
+            }, // v12 = equal-and-not-end
+            Inst::ConstI64(1), // v13
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 3,
+                b: 13,
+            }, // v14 = i + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 12,
+            then_blk: 1,
+            then_args: vec![0, 1, 2, 14], // loop(a, b, n, i+1)
+            else_blk: 4,
+            else_args: vec![8], // done(ca - cb)
+        },
+    };
+    let retz = Block {
+        params: vec![],
+        insts: vec![Inst::ConstI32(0)],
+        term: Terminator::Return(vec![0]),
+    };
+    let done = Block {
+        params: vec![ValType::I32],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I32],
+        blocks: vec![entry, test, body, retz, done],
     }
 }
 
@@ -10627,6 +10775,55 @@ fn lower_vm_builtin(
     // All §12 atomics are sequentially consistent (the op makes the JIT emit a hardware atomic).
     let sc = Ordering::SeqCst;
     match name {
+        // ---- correctly-rounded float→string bridge for a **guest** printf/snprintf ----
+        // `int __vm_fmt_{fix,sci,gen}(char *out, double x, int prec, int width, int flags)` formats `x`
+        // via the on-ramp's bignum dtoa (the same `%f`/`%e`/`%g` engine the constant-format path uses),
+        // copies the padded field into the guest `out` buffer, and returns its length. This lets a guest
+        // `snprintf` (which parses a *runtime* format string, e.g. Lua's `string.format`) reuse the exact
+        // correctly-rounded formatter — matching native to the last ULP. `flags`: bit0 left-justify,
+        // bit1 `+`, bit2 space, bit3 uppercase (the encoding the dtoa helpers expect).
+        "__vm_fmt_fix" | "__vm_fmt_sci" | "__vm_fmt_gen" => {
+            let out = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let dval = ctx.operand(vm_arg(c, 1)?)?;
+            let precv = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let widthv = ctx.operand_i64(vm_arg(c, 3)?)?;
+            let flagsv = ctx.operand_i64(vm_arg(c, 4)?)?;
+            let bits = ctx.push(Inst::Cast {
+                op: CastOp::ReinterpF64I64,
+                a: dval,
+            });
+            let formatter = match name {
+                "__vm_fmt_fix" => ctx.helpers.dtoa_fix,
+                "__vm_fmt_sci" => ctx.helpers.dtoa_sci,
+                _ => ctx.helpers.dtoa_gen,
+            }
+            .ok_or_else(|| Error::Unsupported(format!("{name}: bignum float helper missing")))?;
+            let scratch = ctx
+                .helpers
+                .float_scratch
+                .ok_or_else(|| Error::Unsupported(format!("{name}: float scratch missing")))?;
+            let scratchv = ctx.const_i64(scratch as i64);
+            let len = ctx.push(Inst::Call {
+                func: formatter,
+                args: vec![bits, precv, widthv, flagsv, scratchv],
+            });
+            // Copy the formatted field (`scratch + FMT_OUT_O .. +len`) into the guest buffer.
+            let memcpy = ctx
+                .helpers
+                .memcpy
+                .ok_or_else(|| Error::Unsupported(format!("{name}: memcpy helper missing")))?;
+            let src = ctx.const_i64((scratch + FMT_OUT_O as u64) as i64);
+            ctx.push_effect(Inst::Call {
+                func: memcpy,
+                args: vec![out, src, len],
+            });
+            let len32 = ctx.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: len,
+            });
+            ctx.bind_dest(&c.dest, len32);
+            Ok(true)
+        }
         // ---- §3e/§4 Memory capability: `cap.call` on the stashed Memory handle (slot 12) ----
         "__vm_map" | "__vm_unmap" | "__vm_protect" => {
             let import = vm_memory_builtin_import(name).expect("memory builtin");
@@ -11015,16 +11212,29 @@ fn lower_io_call(
         // The length comes from the string-literal global (no runtime strlen); a non-literal pointer
         // is a clean `Unsupported` (a runtime strlen loop is a later slice).
         "puts" | "fputs" => {
-            let gname = global_name_of(&c.arguments[0].0)
-                .ok_or_else(|| Error::Unsupported(format!("`{name}` of a non-literal string")))?;
-            let &addr = ctx.globals.get(&gname).ok_or_else(|| {
-                Error::Unsupported(format!("`{name}` of unknown global `@{gname}`"))
-            })?;
-            let &len = ctx.cstrs.get(&gname).ok_or_else(|| {
-                Error::Unsupported(format!("`{name}` of non-string global `@{gname}`"))
-            })?;
-            let buf = ctx.const_i64(addr as i64);
-            let n = ctx.const_i64(len as i64);
+            // A string literal's length is known at translate time; a **non-literal** (runtime) string
+            // pointer needs a runtime `strlen` (`__svm_strlen`) — e.g. the Lua stdlib's `fputs` of a
+            // dynamically-built buffer.
+            let literal = global_name_of(&c.arguments[0].0).and_then(|g| {
+                match (ctx.globals.get(&g).copied(), ctx.cstrs.get(&g).copied()) {
+                    (Some(addr), Some(len)) => Some((addr, len)),
+                    _ => None,
+                }
+            });
+            let (buf, n) = match literal {
+                Some((addr, len)) => (ctx.const_i64(addr as i64), ctx.const_i64(len as i64)),
+                None => {
+                    let p = ctx.operand(&c.arguments[0].0)?;
+                    let strlen = ctx.helpers.strlen.ok_or_else(|| {
+                        Error::Unsupported(format!("`{name}` of a non-literal string (no strlen)"))
+                    })?;
+                    let n = ctx.push(Inst::Call {
+                        func: strlen,
+                        args: vec![p],
+                    });
+                    (p, n)
+                }
+            };
             ctx.emit_write(buf, n)?;
             if name == "puts" {
                 // puts appends a newline (this is why `printf("…\n")` lowers to `puts`).
@@ -11154,6 +11364,21 @@ fn lower_io_call(
             let r = ctx.push(Inst::Call {
                 func: f,
                 args: vec![a, b],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strncmp(a, b, n)`: the synthesized `__svm_strncmp` bounded byte compare.
+        "strncmp" => {
+            let Some(f) = ctx.helpers.strncmp else {
+                return Ok(false);
+            };
+            let a = ctx.operand(&c.arguments[0].0)?;
+            let b = ctx.operand(&c.arguments[1].0)?;
+            let n = ctx.operand(&c.arguments[2].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![a, b, n],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -11629,6 +11854,28 @@ fn lower_format(
 /// A `size` of 0 is not faithfully supported (Lua always passes an adequate buffer); every other size
 /// is bounded so `buf[..size]` is never overrun.
 fn lower_snprintf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<(), Error> {
+    // Route to the fail-closed trap when the format cannot be lowered: a **non-constant** format
+    // (Lua's `string.format` builds the spec at runtime) or one using an **unsupported conversion**
+    // (e.g. `%a` hex-float in the core's `lua_number2strx`). Both translate (so the enclosing function
+    // lowers) but trap only if executed; the Lua core's reachable `snprintf` calls use `%lld`/`%.14g`.
+    let lowerable = global_name_of(&c.arguments[2].0)
+        .and_then(|g| ctx.gbytes.get(&g).cloned())
+        .map(|bytes| {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            parse_format(&bytes[..end]).is_ok()
+        })
+        .unwrap_or(false);
+    if !lowerable {
+        let f = ctx.helpers.snprintf_rt.ok_or_else(|| {
+            Error::Unsupported("snprintf: unlowerable format (no runtime stub)".into())
+        })?;
+        let r = ctx.push(Inst::Call {
+            func: f,
+            args: vec![],
+        });
+        ctx.bind_dest(&c.dest, r);
+        return Ok(());
+    }
     let dest = ctx.operand_i64(&c.arguments[0].0)?;
     let size = ctx.operand_i64(&c.arguments[1].0)?;
     let zero = ctx.const_i64(0);
