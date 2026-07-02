@@ -1154,6 +1154,28 @@ Picking a target is really picking the *gap* it drives to completion. Current st
 - **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
   synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
 
+### Lua standard library + real stdout — ACHIEVED ✅ (all three engines)
+**Goal (met).** Lua 5.4.7 with the **base/`string`/`table`/`math`** libraries open runs a script that
+`print`s, and the on-ramp captures the exact **stdout bytes** the guest writes through the
+`Stream.write` capability — byte-identical on the tree-walker, bytecode, and JIT, and to a native build.
+The first end-to-end Lua producing *real output* (prior Lua tests checked a return value). Exercised:
+`print`, `string.upper`/`rep`/`sub`/`#`, `table.sort`/`concat`/`insert`/`remove`, `math.sqrt`/`pi`/
+`floor`/`max`/`abs`, `ipairs`, `pairs`, `type`, `tostring`. Fixture `tests/fixtures/lua/lua_stdlib.bc`
+(harness + guest-libc shim), test `tests/lua_stdlib.rs`. Translator work it forced: synthesized
+`__svm_strncmp`; `fputs`/`puts` of a **non-literal** string now emit a runtime `__svm_strlen`; the guest
+shim brings `log10`/`log2`/`tan` (+ fail-closed `acos`/`asin`/`atan2`), `strstr`, and a no-filesystem
+`stdio`.
+
+**Blocker → next slice: `string.format`.** It builds its per-directive format spec **at runtime** and
+calls `snprintf` with it; the on-ramp's format engine parses **constant** formats only (at translate
+time). A non-constant (or unsupported-conversion, `%a`) format now **fail-closes to a trap**
+(`snprintf_rt`) so the enclosing function still lowers — but `string.format` traps if called (the
+stdlib script avoids it; `print` of numbers uses the core's *constant* `%lld`/`%.14g`, which the real
+engine handles). Making `string.format` work needs a **runtime format engine** — a synthesized
+`snprintf` that parses the format at runtime and reuses the on-ramp's bignum dtoa for correctly-rounded
+floats. That's the direct precursor to running **Lua's own test suite** (self-validating, the roadmap's
+gold standard).
+
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
 runs a *float* script identical on the tree-walker, bytecode, and JIT — and identical to a native build
