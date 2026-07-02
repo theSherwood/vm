@@ -937,6 +937,49 @@ fn fcmp_unordered_ordered() {
 }
 
 #[test]
+fn fcmp_ordered_unordered_predicates() {
+    // Every LLVM float compare predicate must be **NaN-correct**: the ordered forms (`olt`/`ole`/
+    // `ogt`/`oge`/`oeq`, and `one` via `islessgreater`) are false when an operand is NaN; the
+    // unordered forms (`une` from C `!=`, and `uge`/`ugt`/`ule`/`ult` from negating an ordered
+    // compare) are true. Earlier the on-ramp collapsed ordered/unordered to one op, so e.g. Lua's
+    // `luaV_flttointeger` (`n >= -2^63 && n < 2^63` after clang emits *unordered* forms) accepted a
+    // NaN and `NaN <= math.maxinteger` returned true. Differential interp+JIT with a runtime NaN.
+    let src = "int f(int which, double a, double b){ switch(which){ \
+               case 0: return a <  b;    /* olt */ \
+               case 1: return a <= b;    /* ole */ \
+               case 2: return a >  b;    /* ogt */ \
+               case 3: return a >= b;    /* oge */ \
+               case 4: return a == b;    /* oeq */ \
+               case 5: return a != b;    /* une */ \
+               case 6: return !(a <  b); /* uge */ \
+               case 7: return !(a <= b); /* ugt */ \
+               case 8: return !(a >  b); /* ule */ \
+               case 9: return !(a >= b); /* ult */ \
+               case 10: return __builtin_islessgreater(a, b); /* one */ \
+               default: return 0; } }";
+    // Expected truth of each predicate for (NaN, 1.0) and for the ordinary (1.0, 2.0).
+    let nan_expected = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0];
+    let norm_expected = [1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1];
+    let nan = f64::NAN;
+    for (which, &e) in nan_expected.iter().enumerate() {
+        check(
+            &format!("fcmp_nan_{which}"),
+            src,
+            &[Value::I32(which as i32), Value::F64(nan), Value::F64(1.0)],
+            &[Value::I32(e)],
+        );
+    }
+    for (which, &e) in norm_expected.iter().enumerate() {
+        check(
+            &format!("fcmp_norm_{which}"),
+            src,
+            &[Value::I32(which as i32), Value::F64(1.0), Value::F64(2.0)],
+            &[Value::I32(e)],
+        );
+    }
+}
+
+#[test]
 fn bitreverse_intrinsic() {
     // A bit-reversal loop `-O2` folds into `llvm.bitreverse.i32`; lowered inline via the log-N
     // swap network. Checked against native `cc`.
@@ -2276,7 +2319,10 @@ fn strtod_guest_correctly_rounded_vs_system() {
     // bit-for-bit. Compile `strtod.c` renamed (`-Dstrtod=svm_strtod`) and assert the returned bits
     // *and* the `endptr` offset match the system `strtod` over a grid spanning the hard cases:
     // subnormals + the smallest-subnormal halfway tie, the 2^53 boundary, max-double, overflow→inf,
-    // underflow→0, the 1e22/1e23 fast-path boundary, `0.30000000000000004`, and long digit strings.
+    // underflow→0, the 1e22/1e23 fast-path boundary, `0.30000000000000004`, and long digit strings —
+    // plus **hex floats** (`0x7.4`, `0x.ABCDEFp+24`, a 64-bit hex mantissa needing rounding, sub/
+    // overflow via `p`-exponents, and the malformed `0x`/`0x.`/`0x3.3.3` that must stop at the right
+    // `endptr`), the form Lua's own hex-float literals need.
     let probe = "#include <stdlib.h>\n\
         #include <string.h>\n\
         double svm_strtod(const char*, char**);\n\
@@ -2297,6 +2343,10 @@ fn strtod_guest_correctly_rounded_vs_system() {
             \"+1.5\",\"3.141592653589793\",\"1234567890123456789012345678901234567890\",\n\
             \"9.881312916824931e-324\",\"1.1125369292536007e-308\",\"8.98846567431158e307\",\n\
             \"abc\",\"\",\"17.0\",\"0.000244140625e3\",\n\
+            \"0x7.4\",\"0x.ABCDEFp+24\",\"0x0.51p+8\",\"0x.0p-3\",\"0xa.aP4\",\"0x4P-2\",\n\
+            \"0x0.7a7040a5a323c9d6\",\"0x.00000001\",\"0x1.8p1\",\"-0x1.8p1\",\"0x1.8\",\n\
+            \"0x1.fffffffffffffp1023\",\"0x1p1024\",\"0x1p-1074\",\"0x1p-1075\",\"0Xabcdef.0\",\n\
+            \"0x\",\"0x.\",\"0x3.3.3\",\"0xGG\",\n\
           };\n\
           for (unsigned i=0;i<sizeof t/sizeof*t;i++) chk(t[i]);\n\
           return bad;\n\

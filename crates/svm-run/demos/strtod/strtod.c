@@ -12,10 +12,14 @@
  * `N / Dn`, and take the nearest double by an **exact big-integer division** with round-to-nearest-
  * even. Handles normal, subnormal (incl. the boundary), and overflow→±inf.
  *
- * Scope: decimal floats with optional sign and `e`/`E` exponent. `endptr` is set to the first
- * unconsumed character (NULL `endptr` is allowed). Not yet handled (callers that need them define
- * their own, or a follow-up extends this): hex floats (`0x1p4`), the `inf`/`nan` spellings, and
- * `errno`/`ERANGE`. Significant digits past 800 are ignored (>767 already determines any double).
+ * Scope: decimal floats with optional sign and `e`/`E` exponent, plus **hex floats**
+ * (`0x1.8p3`, `0x.ABCDEFp+24`, …): the hex mantissa is exact in base 2, so it accumulates into the
+ * same big integer with a binary exponent and rounds via `strtod_assemble2` (round-to-nearest-even) —
+ * matching glibc bit-for-bit, incl. Lua's own hex-float literals. `endptr` is set to the first
+ * unconsumed character (NULL `endptr` is allowed); an empty hex mantissa (`0x`, `0x.`) recognizes only
+ * the leading "0" (glibc semantics), so a caller sees the leftover 'x'. Not handled (callers that need
+ * them define their own): the `inf`/`nan` spellings and `errno`/`ERANGE`. Significant digits past 800
+ * (decimal) / 200 (hex) are ignored — far more than the ~17/13 that determine any double.
  */
 
 /* ── a minimal base-2^32 big integer ─────────────────────────────────────────────────────────── */
@@ -275,6 +279,64 @@ static double strtod_assemble(const bn *num, int e10, int neg) {
   }
 }
 
+/* Assemble the nearest double to (num · 2^e2), num != 0 — the hex-float path. A pure power-of-two
+   scale, so (unlike the decimal case) no factor of five: normalize `num` to a 53-bit q with
+   round-to-nearest-even, then place it at binary exponent `be`. */
+static double strtod_assemble2(const bn *num, int e2, int neg) {
+  bn N = *num;
+  int bl = bn_bitlen(&N);  /* >= 1 since num != 0 */
+  int be = bl + e2 - 1;    /* unbiased exponent of the MSB (bit bl-1) */
+  unsigned long long q = 0;
+  int s = bl - 53; /* bits to drop from the bottom of N (may be <= 0) */
+  if (s <= 0) {
+    for (int i = bl - 1; i >= 0; i--) q = (q << 1) | (unsigned long long)(bn_getbit(&N, i) ? 1 : 0);
+    q <<= (unsigned)(-s); /* left-align the MSB to bit 52 (exact) */
+  } else {
+    for (int i = bl - 1; i >= s; i--) q = (q << 1) | (unsigned long long)(bn_getbit(&N, i) ? 1 : 0);
+    int guard = bn_getbit(&N, s - 1);
+    int sticky = 0;
+    for (int i = s - 2; i >= 0; i--) {
+      if (bn_getbit(&N, i)) { sticky = 1; break; }
+    }
+    if (guard && (sticky || (q & 1))) {
+      q += 1;
+      if (q >> 53) { q >>= 1; be += 1; } /* rounding carried out of the 53-bit window */
+    }
+  }
+  /* value = q · 2^(be - 52), q in [2^52, 2^53) */
+  if (be > 1023)
+    return neg ? strtod_bits(0xFFF0000000000000ULL) : strtod_bits(0x7FF0000000000000ULL);
+  if (be >= -1022) { /* normal */
+    unsigned long long mant = q & ((1ULL << 52) - 1);
+    unsigned long long bits = ((unsigned long long)(be + 1023) << 52) | mant;
+    if (neg) bits |= 0x8000000000000000ULL;
+    return strtod_bits(bits);
+  }
+  /* subnormal: q' = round(q / 2^d) at the fixed scale 2^-1074, d = -1022 - be > 0 */
+  int d = -1022 - be;
+  unsigned long long qd, guard, sticky;
+  if (d >= 64) {
+    qd = 0;
+    guard = 0;
+    sticky = (q != 0);
+  } else {
+    qd = q >> d;
+    guard = (q >> (d - 1)) & 1ULL;
+    sticky = (q & ((1ULL << (d - 1)) - 1)) ? 1 : 0;
+  }
+  if (guard && (sticky || (qd & 1))) qd += 1;
+  unsigned long long bits = qd & ((1ULL << 53) - 1); /* qd==2^52 assembles as the smallest normal */
+  if (neg) bits |= 0x8000000000000000ULL;
+  return strtod_bits(bits);
+}
+
+static int strtod_hexval(int c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
 static int strtod_isspace(int c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
 }
@@ -287,6 +349,59 @@ double strtod(const char *nptr, char **endptr) {
   if (*p == '+' || *p == '-') {
     neg = (*p == '-');
     p++;
+  }
+
+  /* hex float: 0x<hexdigits>[.<hexdigits>][p±<dec>]. The mantissa is exact in base 2, so accumulate
+     the hex digits into a big integer and track a binary exponent (each fraction digit is 2^-4, the
+     'p' exponent adds directly); `strtod_assemble2` rounds to nearest. An empty mantissa (`0x`, `0x.`)
+     is not a hex number — consume just the leading "0" so the caller sees the leftover 'x' and
+     reports a malformed number, matching glibc. */
+  if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+    const char *hp = p + 2;
+    bn hm;
+    bn_zero(&hm);
+    int e2 = 0, anyhex = 0, hseen_dot = 0, hsig = 0;
+    for (;; hp++) {
+      if (*hp == '.') {
+        if (hseen_dot) break;
+        hseen_dot = 1;
+        continue;
+      }
+      int d = strtod_hexval((unsigned char)*hp);
+      if (d < 0) break;
+      anyhex = 1;
+      if (hsig < 200) {
+        bn_mul_add_small(&hm, 16, (unsigned)d);
+        hsig++;
+        if (hseen_dot) e2 -= 4;
+      } else if (!hseen_dot) {
+        e2 += 4; /* integer digits past precision keep the magnitude */
+      }
+    }
+    if (!anyhex) { /* "0x" with no mantissa: recognize just the "0" */
+      if (endptr) *endptr = (char *)(p + 1);
+      return neg ? strtod_bits(0x8000000000000000ULL) : 0.0;
+    }
+    if (*hp == 'p' || *hp == 'P') {
+      const char *e = hp + 1;
+      int esign = 0, eval = 0, edig = 0;
+      if (*e == '+' || *e == '-') {
+        esign = (*e == '-');
+        e++;
+      }
+      while (*e >= '0' && *e <= '9') {
+        if (eval < 100000) eval = eval * 10 + (*e - '0');
+        e++;
+        edig = 1;
+      }
+      if (edig) {
+        e2 += esign ? -eval : eval;
+        hp = e;
+      }
+    }
+    if (endptr) *endptr = (char *)hp;
+    if (bn_is_zero(&hm)) return neg ? strtod_bits(0x8000000000000000ULL) : 0.0;
+    return strtod_assemble2(&hm, e2, neg);
   }
 
   bn num;

@@ -1762,27 +1762,42 @@ fn itof_op(src: IntTy, dst: FloatTy, signed: bool) -> IToF {
     }
 }
 
-/// Map an LLVM float compare predicate to the SVM op. Ordered and unordered forms collapse to the
-/// same op (the NaN-distinguishing `o`/`u` corner is a documented fidelity gap until needed);
-/// `ord`/`uno`/`true`/`false` are `Unsupported`.
-fn fcmp_op(p: FPPredicate) -> Result<FCmpOp, Error> {
-    use FPPredicate as P;
-    Ok(match p {
-        P::OEQ | P::UEQ => FCmpOp::Eq,
-        P::ONE | P::UNE => FCmpOp::Ne,
-        P::OLT | P::ULT => FCmpOp::Lt,
-        P::OLE | P::ULE => FCmpOp::Le,
-        P::OGT | P::UGT => FCmpOp::Gt,
-        P::OGE | P::UGE => FCmpOp::Ge,
-        other => return unsup(format!("float compare predicate {other:?}")),
+/// `uno(a, b)` — either operand is NaN — as `(a != a) | (b != b)` (`x != x` is true iff `x` is NaN,
+/// because [`FCmpOp::Ne`] is the *unordered* not-equal). Returns the `i32` (0/1) result.
+fn emit_uno(ctx: &mut BlockCtx, ty: FloatTy, a: ValIdx, b: ValIdx) -> ValIdx {
+    let na = ctx.push(Inst::FCmp {
+        ty,
+        op: FCmpOp::Ne,
+        a,
+        b: a,
+    });
+    let nb = ctx.push(Inst::FCmp {
+        ty,
+        op: FCmpOp::Ne,
+        a: b,
+        b,
+    });
+    ctx.push(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Or,
+        a: na,
+        b: nb,
     })
 }
 
-/// Emit a float compare, returning its `i32` (0/1) result. The ordered/unordered NaN predicates have
-/// no single svm-ir op, so they expand: `uno` (either operand NaN) = `(a != a) | (b != b)` and `ord`
-/// (neither NaN) = `(a == a) & (b == b)` — `x != x` is true iff `x` is NaN. `true`/`false` fold to a
-/// constant. Everything else is the direct [`fcmp_op`] mapping. Rust's float code (`is_nan`, `min`/
-/// `max`, partial compares) emits these.
+/// Emit a float compare, returning its `i32` (0/1) result — **NaN-correct** for every LLVM predicate.
+///
+/// The svm-ir [`FCmpOp`] primitives carry Rust's semantics: `Eq`/`Lt`/`Le`/`Gt`/`Ge` are *ordered*
+/// (false if either operand is NaN) and `Ne` is *unordered* (true if either is NaN) — identically on
+/// the interpreters (native Rust compares) and the JIT (Cranelift `FloatCC::Equal`/`NotEqual`/… ).
+/// The five ordered inequalities (`OLT`/`OLE`/`OGT`/`OGE`/`OEQ`) and `UNE` map straight to a
+/// primitive. The rest have no single primitive and expand so NaN behaves exactly as LLVM specifies:
+/// - unordered `UEQ`/`ULT`/`ULE`/`UGT`/`UGE` = `uno(a,b) | <ordered primitive>` (true on NaN);
+/// - ordered `ONE` (not-equal, **false** on NaN) = `(a < b) | (a > b)`;
+/// - `UNO`/`ORD` = either/neither operand NaN; `true`/`false` fold to a constant.
+///
+/// This closes the ordered/unordered fidelity gap that made e.g. Lua's `luaV_flttointeger`
+/// (`n >= -2^63 && n < 2^63` after clang emits *unordered* forms) accept a NaN.
 fn emit_fcmp(
     ctx: &mut BlockCtx,
     ty: FloatTy,
@@ -1791,27 +1806,56 @@ fn emit_fcmp(
     b: ValIdx,
 ) -> Result<ValIdx, Error> {
     use FPPredicate as P;
+    // an ordered primitive compare (NaN → false)
+    let prim = |ctx: &mut BlockCtx, op| ctx.push(Inst::FCmp { ty, op, a, b });
+    // `uno(a,b) | <ordered primitive>` — the unordered form (NaN → true)
+    fn unordered(ctx: &mut BlockCtx, ty: FloatTy, op: FCmpOp, a: ValIdx, b: ValIdx) -> ValIdx {
+        let ord = ctx.push(Inst::FCmp { ty, op, a, b });
+        let uno = emit_uno(ctx, ty, a, b);
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Or,
+            a: ord,
+            b: uno,
+        })
+    }
     Ok(match p {
-        P::UNO => {
-            let na = ctx.push(Inst::FCmp {
+        // ordered inequalities/equality — the primitive is already NaN → false
+        P::OEQ => prim(ctx, FCmpOp::Eq),
+        P::OLT => prim(ctx, FCmpOp::Lt),
+        P::OLE => prim(ctx, FCmpOp::Le),
+        P::OGT => prim(ctx, FCmpOp::Gt),
+        P::OGE => prim(ctx, FCmpOp::Ge),
+        // ordered not-equal (NaN → false): a < b or a > b
+        P::ONE => {
+            let lt = ctx.push(Inst::FCmp {
                 ty,
-                op: FCmpOp::Ne,
+                op: FCmpOp::Lt,
                 a,
-                b: a,
+                b,
             });
-            let nb = ctx.push(Inst::FCmp {
+            let gt = ctx.push(Inst::FCmp {
                 ty,
-                op: FCmpOp::Ne,
-                a: b,
+                op: FCmpOp::Gt,
+                a,
                 b,
             });
             ctx.push(Inst::IntBin {
                 ty: IntTy::I32,
                 op: BinOp::Or,
-                a: na,
-                b: nb,
+                a: lt,
+                b: gt,
             })
         }
+        // unordered not-equal — the `Ne` primitive is already NaN → true
+        P::UNE => prim(ctx, FCmpOp::Ne),
+        // unordered comparisons — NaN → true, so OR in `uno`
+        P::UEQ => unordered(ctx, ty, FCmpOp::Eq, a, b),
+        P::ULT => unordered(ctx, ty, FCmpOp::Lt, a, b),
+        P::ULE => unordered(ctx, ty, FCmpOp::Le, a, b),
+        P::UGT => unordered(ctx, ty, FCmpOp::Gt, a, b),
+        P::UGE => unordered(ctx, ty, FCmpOp::Ge, a, b),
+        P::UNO => emit_uno(ctx, ty, a, b),
         P::ORD => {
             let aa = ctx.push(Inst::FCmp {
                 ty,
@@ -1834,10 +1878,6 @@ fn emit_fcmp(
         }
         P::True => ctx.push(Inst::ConstI32(1)),
         P::False => ctx.push(Inst::ConstI32(0)),
-        _ => {
-            let op = fcmp_op(p)?;
-            ctx.push(Inst::FCmp { ty, op, a, b })
-        }
     })
 }
 

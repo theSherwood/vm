@@ -152,3 +152,57 @@ gen}` floats stay undefined and are recognized by the on-ramp. Pin `EXPECT` in `
 against a native build of the identical sources (guest `snprintf`/shim/strtod shadowing libc, `-lm`).
 ```
 
+# Lua test-suite fixture
+
+`lua_testsuite.bc` runs **three unmodified files from the official Lua 5.4.7 distribution's own test
+suite** (`testes/vararg.lua`, `testes/bwcoercion.lua`, `testes/pm.lua`, embedded verbatim in
+`lua_testsuite_tests.c`) through the whole VM with the base/`string`/`table`/`math`/`utf8` libraries
+open. The harness (`lua_testsuite_harness.c`) loads each file as its own chunk under `pcall`, one fresh
+`lua_State` per file; a Lua test signals failure by raising (an `assert`), so a clean **exit 0** means
+every `assert` in all three files held — identical to native Lua. Test `tests/lua_testsuite.rs` asserts
+`Returned([I32(0)])` on the tree-walker, bytecode, and JIT.
+
+The three files were chosen because they are **self-contained** (no `require`/`os`/`io`/`debug`/
+`coroutine`, no internal `T` test library): `vararg` covers `...`/`select`/`table.unpack`; `bwcoercion`
+the string↔number bitwise coercions with `_ENV = nil`; `pm` the full pattern-matching engine
+(`find`/`match`/`gmatch`/`gsub`, captures, anchors, `%b`, `%f`). Two translator/library fixes this
+forced: the guest `strtod` now parses **hex floats** (`0x1.8p3`, Lua's hex-float literals — see
+`demos/strtod`), and the on-ramp's `fcmp` lowering is now **NaN-correct** for ordered vs unordered
+predicates (`emit_fcmp`), which Lua's `luaV_flttointeger` relies on. The guest shim adds real fdlibm
+`asin`/`acos`/`atan`/`atan2`/`modf` (`lua_testsuite_trig.c`) that the base libm lacks.
+
+Other files from the suite need capabilities the on-ramp doesn't offer yet: `math.lua` reaches deep
+(numbers, order, NaN, hex floats, `random`) but trips on a debug-info detail — Lua's `getobjname`
+reconstructs an operand name for an error message (`number (field 'huge') has no integer
+representation`) and the on-ramp omits the `(field 'huge')` part; `utf8.lua` needs `require`; `os`/`io`
+files need a filesystem. Those are follow-ups.
+
+## Regenerating (test suite)
+
+Download the official tests (`curl -O https://www.lua.org/tests/lua-5.4.7-tests.tar.gz`), then embed the
+chosen files as a C byte-array (`lua_testsuite_tests.c` exports `lua_tests`/`lua_test_lens`/
+`lua_test_names`/`lua_test_count`) and build like the `string.format` fixture, adding `lutf8lib` and the
+fdlibm trig:
+
+```sh
+NV="-fno-vectorize -fno-slp-vectorize"
+CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
+      lstate lstring ltable ltm lundump lvm lzio"
+LIBS="lbaselib lstrlib ltablib lmathlib lauxlib lutf8lib"
+for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
+clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_testsuite_harness.c -o harness.bc
+clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_testsuite_tests.c   -o tests.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_testsuite_shim.c    -o guest_shim.bc
+clang -O2 $NV -fno-builtin -fno-strict-aliasing -emit-llvm -c lua_testsuite_trig.c -o guest_trig.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c                 lua_fmt_snprintf.c      -o guest_snprintf.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c                   -o guest_libm.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/strtod/strtod.c              -o guest_strtod.bc
+llvm-link $CORE.bc $LIBS.bc harness.bc tests.bc guest_shim.bc guest_trig.bc guest_snprintf.bc \
+          guest_libm.bc guest_strtod.bc -o lua_testsuite.bc   # (expand globs)
+```
+
+`lua_testsuite_shim.c` keeps a 48 MiB arena (the JIT window bound) and resets it between files. The
+`lua_testsuite_trig.c` word-access macros type-pun through `int` pointers, so it needs
+`-fno-strict-aliasing` (exactly as fdlibm does natively).
+```
+
