@@ -1023,6 +1023,35 @@ fn narrow_minmax_noncanonical() {
 }
 
 #[test]
+fn narrow_signed_shift_div_rem() {
+    // A **signed** narrow op reads its whole i32 container as signed, but a narrow `iN` value loaded
+    // from memory is *zero-extended* (canonical) — its sign bit is buried at bit N-1, not the
+    // container's bit 31. So `ashr`/`sdiv`/`srem` on an `i8`/`i16` must sign-extend the operand first.
+    // Before the fix `ashr i8 0x80,7` gave `+1` (should be `-1`), which dropped Lua's `getobjname`
+    // operand name (`testMMMode` compiles to exactly `ashr i8 luaP_opmodes[op],7`); `(i8)-6/3` gave the
+    // unsigned `83`, not `-2`. `volatile` forces the values through memory (a real `load i8`), and the
+    // negatives exercise the sign path. Differential interp+JIT+native `cc`.
+    let src = "int run(int s);\n\
+               int run(int s){\n\
+                 volatile unsigned char ub = (unsigned char)(0x80 ^ (s & 0x20));\n\
+                 signed char sb = ub;                 /* negative i8 */\n\
+                 volatile unsigned short uh = (unsigned short)(0x8000 ^ (s << 4));\n\
+                 short sh = uh;                        /* negative i16 */\n\
+                 int r = 0;\n\
+                 r = r * 37 + (int)(sb >> 2);          /* ashr i8  */\n\
+                 r = r * 37 + (int)(sh >> 4);          /* ashr i16 */\n\
+                 r = r * 37 + (int)(sb / 3);           /* sdiv i8  */\n\
+                 r = r * 37 + (int)(sb % 3);           /* srem i8  */\n\
+                 r = r * 37 + (int)(sh / 7);           /* sdiv i16 */\n\
+                 r = r * 37 + (int)(sh % 7);           /* srem i16 */\n\
+                 r = r * 37 + (int)((unsigned char)ub >> 2);  /* lshr i8 stays unsigned */\n\
+                 return r & 0xff;\n\
+               }\n\
+               int main(void){ return run(5); }";
+    check_vs_native("narrow_signed_shift_div_rem", src, 5);
+}
+
+#[test]
 fn signed_narrow_minmax() {
     // Companion to `narrow_minmax_noncanonical`: a `signed char` min reduction that `-O2` lowers to a
     // scalar `llvm.smin.i8` whose operand is a *negative* i8 (here -100). Narrow values are held
@@ -2346,6 +2375,7 @@ fn strtod_guest_correctly_rounded_vs_system() {
             \"0x7.4\",\"0x.ABCDEFp+24\",\"0x0.51p+8\",\"0x.0p-3\",\"0xa.aP4\",\"0x4P-2\",\n\
             \"0x0.7a7040a5a323c9d6\",\"0x.00000001\",\"0x1.8p1\",\"-0x1.8p1\",\"0x1.8\",\n\
             \"0x1.fffffffffffffp1023\",\"0x1p1024\",\"0x1p-1074\",\"0x1p-1075\",\"0Xabcdef.0\",\n\
+            \"0x0.00000000000001\",\"0x.0000000000000000000000000000000000000000000074p4004\",\n\
             \"0x\",\"0x.\",\"0x3.3.3\",\"0xGG\",\n\
           };\n\
           for (unsigned i=0;i<sizeof t/sizeof*t;i++) chk(t[i]);\n\
