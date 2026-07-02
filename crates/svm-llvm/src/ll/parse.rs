@@ -17,8 +17,9 @@
 //! `type_()`, so struct GEP/field access resolves); and **float constants** (`float`/`double` literals
 //! in decimal or `0x` hex-image form, decoded to the exact bits the bitcode reader carries). Top-level
 //! cruft the on-ramp ignores (target/datalayout lines, attribute groups, module-level metadata,
-//! `declare`s) is skipped. Not yet handled (the growth frontier): `switch`, SIMD vectors, and
-//! constant-expressions (`getelementptr`/`bitcast`/… inside a constant). Anything
+//! `declare`s) is skipped; the `switch` terminator's constant→label jump table is parsed too. Not yet
+//! handled (the growth frontier): SIMD vectors and constant-expressions (`getelementptr`/`bitcast`/…
+//! inside a constant). Anything
 //! unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
 
 use super::ast::*;
@@ -733,6 +734,32 @@ impl Parser {
             "unreachable" => {
                 self.pos += 1;
                 Terminator::Unreachable(Unreachable { debugloc: None })
+            }
+            // `switch <ty> <v>, label %default [ <cty> <c>, label %l … ]` — the case entries inside the
+            // brackets are whitespace-separated (no commas between them).
+            "switch" => {
+                self.pos += 1; // `switch`
+                let ty = self.type_()?;
+                let operand = self.value_as_operand(&ty)?;
+                self.expect(&Token::Comma)?;
+                self.expect_word("label")?;
+                let default_dest = self.label_name()?;
+                self.expect(&Token::LBracket)?;
+                let mut dests = Vec::new();
+                while self.peek() != Some(&Token::RBracket) && self.peek().is_some() {
+                    let cty = self.type_()?;
+                    let case = self.constant(&cty)?;
+                    self.expect(&Token::Comma)?;
+                    self.expect_word("label")?;
+                    dests.push((case, self.label_name()?));
+                }
+                self.expect(&Token::RBracket)?;
+                Terminator::Switch(Switch {
+                    operand,
+                    dests,
+                    default_dest,
+                    debugloc: None,
+                })
             }
             "ret" => {
                 self.pos += 1;

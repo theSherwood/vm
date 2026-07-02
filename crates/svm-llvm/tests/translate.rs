@@ -7538,6 +7538,16 @@ fn ll_parity_global_float_array() {
 }
 
 #[test]
+fn ll_parity_switch() {
+    // A `switch` terminator with a constant→label jump table (sparse cases + default).
+    assert_ll_parity(
+        "ll_parity_switch",
+        "int sw(int x){ switch(x){ case 0: return 10; case 1: return 20; case 7: return 30; \
+         default: return -1; } }",
+    );
+}
+
+#[test]
 fn ll_parity_struct_field() {
     // A named struct type (`%struct.P = type { i32, i32 }`) + struct GEP
     // (`getelementptr %struct.P, ptr %p, i64 0, i32 1`) for field access.
