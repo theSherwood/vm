@@ -428,6 +428,12 @@ pub enum TrapKind {
     /// host `setjmp` table's lookup before the (skipped) `_longjmp` (§3b totality). Matches the
     /// interpreters' `Trap::Malformed` for the same condition (LLVM.md §"JIT `longjmp`").
     SetjmpFault = 12,
+    /// A guest **control-stack overflow** caught by the software stack-limit check the JIT emits in
+    /// each prologue when `feature = "stack-check"` (the arena/software-guard fiber model, which drops
+    /// the per-fiber hardware guard page). A function whose frame would grow the native stack past the
+    /// running fiber's low bound traps here rather than corrupting an adjacent fiber's stack —
+    /// detect-and-kill (§5). With the hardware guard page (the default), overflow is a `MemoryFault`.
+    StackOverflow = 13,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -448,6 +454,7 @@ impl TrapKind {
             10 => TrapKind::ThreadFault,
             11 => TrapKind::OutOfFuel,
             12 => TrapKind::SetjmpFault,
+            13 => TrapKind::StackOverflow,
             _ => return None,
         })
     }
