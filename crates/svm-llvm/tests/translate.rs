@@ -7510,6 +7510,34 @@ fn ll_parity_global_string() {
 }
 
 #[test]
+fn ll_parity_float_const_single() {
+    // `x * 0.5f` → `fmul float %…, 5.000000e-01` — a float constant in decimal form.
+    assert_ll_parity(
+        "ll_parity_fconst",
+        "float half(float x){ return x * 0.5f; }",
+    );
+}
+
+#[test]
+fn ll_parity_float_const_hex_double() {
+    // `x * 3.14` → `fmul double %…, 0x40091EB8…` — a double constant clang emits in `0x` hex form
+    // (3.14 isn't exactly representable), exercising the hex-image decode.
+    assert_ll_parity(
+        "ll_parity_dconst",
+        "double scale(double x){ return x * 3.14; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_float_array() {
+    // A `constant [3 x double]` initializer — float constants in a global aggregate (decimal + hex).
+    assert_ll_parity(
+        "ll_parity_gfloat",
+        "static const double K[3] = {0.5, 3.14, 2.0}; double kth(int i){ return K[i]; }",
+    );
+}
+
+#[test]
 fn ll_parity_struct_field() {
     // A named struct type (`%struct.P = type { i32, i32 }`) + struct GEP
     // (`getelementptr %struct.P, ptr %p, i64 0, i32 1`) for field access.

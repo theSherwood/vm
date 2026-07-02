@@ -14,9 +14,11 @@
 //! (`@g = … global|constant <ty> <init>`, incl. `[N x T]` array types, array/byte-string/`zeroinitializer`
 //! initializers, and `@g` operand references resolved to `GlobalReference`s via a `@name → pointee-type`
 //! symbol table); and **named struct types** (`%s = type { … }` definitions + `%s`/`{…}` references in
-//! `type_()`, so struct GEP/field access resolves). Top-level cruft the on-ramp ignores
-//! (target/datalayout lines, attribute groups, module-level metadata, `declare`s) is skipped. Not yet
-//! handled (the growth frontier): `switch`, SIMD vectors, and float/non-trivial constants. Anything
+//! `type_()`, so struct GEP/field access resolves); and **float constants** (`float`/`double` literals
+//! in decimal or `0x` hex-image form, decoded to the exact bits the bitcode reader carries). Top-level
+//! cruft the on-ramp ignores (target/datalayout lines, attribute groups, module-level metadata,
+//! `declare`s) is skipped. Not yet handled (the growth frontier): `switch`, SIMD vectors, and
+//! constant-expressions (`getelementptr`/`bitcast`/… inside a constant). Anything
 //! unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
 
 use super::ast::*;
@@ -824,12 +826,47 @@ impl Parser {
                     value,
                 })))
             }
+            Some(Token::Float(s)) => {
+                let s = s.clone();
+                let f = self.float_lit(ty, &s)?;
+                self.pos += 1;
+                Ok(Operand::ConstantOperand(ConstantRef::new(Constant::Float(
+                    f,
+                ))))
+            }
             // A reference to a global variable / function (`@g`) — a `GlobalReference` constant. Its
             // `ty` is the referent's pointee type from `symbols`, matching what the bitcode reader
             // carries; the operand's own written type (`ptr`) is discarded.
             Some(Token::Global(_)) => Ok(Operand::ConstantOperand(self.global_ref()?)),
             other => self.err(format!("value not yet supported: {other:?}")),
         }
+    }
+
+    /// Decode a float literal `s` of floating type `ty` into a [`Float`]. LLVM prints these as decimal
+    /// (`5.000000e-01`) or a `0x…` hex bit image; matching the bitcode reader (which reads the value as a
+    /// `double` via `LLVMConstRealGetDouble`, casting to `f32` for `float`), we decode to an `f64` and
+    /// cast. `half`/`bfloat`/`fp128`/`x86_fp80`/`ppc_fp128` are payload-free variants in the AST.
+    fn float_lit(&self, ty: &TypeRef, s: &str) -> PResult<Float> {
+        let fpt = match ty.as_ref() {
+            Type::FPType(fpt) => *fpt,
+            _ => return self.err("float literal with non-floating type"),
+        };
+        Ok(match fpt {
+            FPType::Half => Float::Half,
+            FPType::BFloat => Float::BFloat,
+            FPType::Single => Float::Single(
+                parse_fp_double(s)
+                    .ok_or_else(|| ParseError::new(self.pos, format!("bad float literal `{s}`")))?
+                    as f32,
+            ),
+            FPType::Double => Float::Double(
+                parse_fp_double(s)
+                    .ok_or_else(|| ParseError::new(self.pos, format!("bad float literal `{s}`")))?,
+            ),
+            FPType::FP128 => Float::Quadruple,
+            FPType::X86_FP80 => Float::X86_FP80,
+            FPType::PPC_FP128 => Float::PPC_FP128,
+        })
     }
 
     /// A `@name` global/function reference → a `GlobalReference` constant (pointee type from `symbols`).
@@ -868,6 +905,12 @@ impl Parser {
                 let value = (w == "true") as u128;
                 self.pos += 1;
                 Constant::Int { bits: 1, value }
+            }
+            Some(Token::Float(s)) => {
+                let s = s.clone();
+                let f = self.float_lit(ty, &s)?;
+                self.pos += 1;
+                Constant::Float(f)
             }
             Some(Token::Word(w)) if w == "zeroinitializer" => {
                 self.pos += 1;
@@ -1570,6 +1613,19 @@ fn parse_int_type(w: &str) -> Option<u32> {
         return None;
     }
     rest.parse().ok()
+}
+
+/// A `float`/`double` literal token → its value as an `f64`. LLVM emits either decimal notation
+/// (`5.000000e-01`, `-1.5e10`) or a `0x` + 16-hex-digit image of the **`double`** bit pattern (used even
+/// for `float`, where the value must be exactly representable — the caller casts to `f32`). The wide-FP
+/// hex prefixes (`0xK`/`0xL`/`0xM`/`0xH`/`0xR`) never reach here: those types are payload-free AST
+/// variants. `None` if the text is neither form.
+fn parse_fp_double(s: &str) -> Option<f64> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        // Only the plain 16-hex-digit (double-image) form has an all-hex body.
+        return u64::from_str_radix(hex, 16).ok().map(f64::from_bits);
+    }
+    s.parse::<f64>().ok()
 }
 
 /// An integer-literal token (decimal, optional leading `-`) → its `bits`-wide two's-complement value as

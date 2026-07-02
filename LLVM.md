@@ -1827,17 +1827,25 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     depth-0 `%local` (same fix as `@global` — an unbraced `target … = "…"` line was swallowing the
     `%s = type …` defs after it). One parity test: struct field access (`%struct.P` + `getelementptr
     %struct.P, ptr %p, i64 0, i32 1`). **Nineteen parity tests total.**
-- **Next step (resume here): float/hex constants, then `switch` + SIMD vectors.** The growth frontier,
-  each a `clang -O2` shape + an `assert_ll_parity` test: **float/hex constants** — LLVM prints float
-  literals as either decimal (`5.000000e-01`) or, more often, its `0x…` hex bit-pattern image (a `double`
-  image even for `float`: `0xKHHHH…` for the wide FP types, plain `0x` + 16 hex digits for double);
-  `value_as_operand`/`constant` must decode both to the exact `Float::{Single,Double,…}` bits (the lexer
-  already keeps the text). This is the last **deferred** primitive — it unblocks any float literal
-  (`x*0.5`, float initializers). Then **`switch`** (`switch <ty> <v>, label %d [ <ty> <c>, label %l … ]`),
-  **SIMD vectors** (`<4 x i32>` types + `<i32 a, …>` vector constants + `shufflevector`/`extractelement`),
-  literal aggregates in constants, **C++ EH** (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`**
-  (these two come *free* in text — full-width constants, no `llvm-sys` re-parse). Grow it incrementally;
-  `llvm-ir` stays the default. Then PR3:
+  - **Parser — float constants landed.** `value_as_operand`/`constant` now decode `float`/`double`
+    literals — decimal (`5.000000e-01`) or the `0x` + 16-hex-digit `double`-image form (used even for
+    `float`) — into `Float::Single(f64 as f32)`/`Float::Double(f64)`, exactly matching the bitcode reader
+    (`LLVMConstRealGetDouble`, cast to `f32` for single). `half`/`bfloat`/`fp128`/`x86_fp80`/`ppc_fp128`
+    stay payload-free AST variants. Three parity tests: `x*0.5f` (decimal single), `x*3.14` (hex-image
+    double), and a `constant [3 x double]` global (float aggregate init). **Twenty-two parity tests
+    total.** This was the last deferred *primitive* — the parser now covers scalar/pointer/struct/array
+    computation + memory + calls + globals end-to-end.
+- **Next step (resume here): `switch`, then SIMD vectors.** The growth frontier, each a `clang -O2`
+  shape + an `assert_ll_parity` test: **`switch`** (`switch <ty> <v>, label %default [ <ty> <c>, label
+  %l … ]` — a terminator with a constant→label jump table; add to `terminator()` alongside `br`), then
+  **SIMD vectors** (`<N x T>` types in `type_()`, `<T a, T b, …>` vector constants, and the vector ops
+  `shufflevector`/`extractelement`/`insertelement` + `llvm.vector.reduce.*` intrinsics — the auto-
+  vectorizer emits these for loops like the earlier `arrsum`), literal-struct/array **constant
+  aggregates** as operands, **constant-expressions** (`getelementptr`/`bitcast`/`ptrtoint` inside a
+  constant — `Constant::GetElementPtr` et al. are already in the AST + shim), **C++ EH**
+  (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
+  full-width constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then
+  PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).
