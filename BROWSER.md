@@ -326,6 +326,17 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `Atomics.wait`/`notify`. Verified: **crossOriginIsolated**, powerbox PASS, and the 8-vCPU counter
   kernel → **4000 across 9 Workers** (1 root + 8 spawned), stable across repeats. So the genuinely
   multithreaded SVM-in-wasm runs end-to-end in a real browser, not just Node.
+- [x] **Performance — the sandbox tax (cross-engine `svm-bytecode-wasm` row).** Everything above
+  proves *correctness*; this measures *cost*. The cross-engine benchmark
+  (`crates/svm-llvm/examples/cross_engine.rs`) now times the bytecode engine **compiled to wasm** (the
+  `svm_run_bench` export, driven by `browser/bench.mjs` on V8) running the same LLVM-frontend IR as its
+  native `svm-bytecode` row — so the ratio *is* the double-sandboxing overhead, and every result is
+  cross-checked against native bytecode (a mismatch is a loud `MISCOMPILE`). Indicative: **~1.2–1.4× on
+  pure-compute kernels** (V8 JITs the dispatch loop, so the engine's own work is barely taxed) but
+  **~1.9× / ~3.4× on the `chase` / `chase_rand` dependent-load kernels** — each guest load pays *both*
+  SVM's mask/guard confinement and wasm's linear-memory bounds, and the serial chain can't hide that
+  latency. The honest browser-path cost: cheap for compute, real for pointer-chasing. (See
+  `bench/cross-engine/README.md` § "SVM-in-wasm".)
 
 ## Verification
 

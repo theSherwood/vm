@@ -134,10 +134,10 @@ const BENCHES: &[Bench] = &[
         tail: "",
         large: 5_000,
     },
-    // Still excluded (need on-ramp work, not just a BENCHES row):
-    //  - `statemate`: defines a global `unsigned long time;` that collides with `<time.h>`'s `time()`
-    //    in the native-oracle build (the wrapper includes time.h); the SVM side translates fine, but
-    //    without a buildable native oracle the differential can't be honest. Needs a per-kernel rename.
+    // statemate: defines a file-scope `unsigned long time;` that collides with `<time.h>`'s `time()`
+    // in the native-oracle build. The wrapper (`-DBENCH_TIME_RENAME=statemate_time`, set in `common`
+    // below) renames the kernel's global out of the way, so all 19 Embench-IoT kernels now build.
+    b("statemate", "src/statemate/libstatemate.c", false, 50_000),
 ];
 
 const SMALL: i64 = 10;
@@ -253,6 +253,12 @@ fn main() {
             // the macro — applied to *both* native and SVM builds so the differential stays honest.
             if name == "aha-mont64" {
                 c.arg("-U__SIZEOF_INT128__");
+            }
+            // `statemate`'s global `unsigned long time;` clashes with <time.h>'s `time()` in the native
+            // build; the wrapper renames the kernel's global (see wrapper.c's BENCH_TIME_RENAME block).
+            // A plain `-Dtime=…` can't: it's TU-wide, so it renames libc's `time()` too. Both builds.
+            if name == "statemate" {
+                c.arg("-DBENCH_TIME_RENAME=statemate_time");
             }
         };
 
