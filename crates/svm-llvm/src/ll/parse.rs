@@ -20,9 +20,11 @@
 //! `declare`s) is skipped; the `switch` terminator's constant→label jump table is parsed too. **SIMD
 //! vectors** are covered: `<N x T>` types, `<T …>` vector constants, `extractelement`/`insertelement`/
 //! `shufflevector` (the mask canonicalized to a `Constant::Vector` of `i32` indices, as the bitcode
-//! reader does), and vector binops/reductions. Not yet handled (the growth frontier):
-//! constant-expressions (`getelementptr`/`bitcast`/… inside a constant), C++ EH, and scalable vectors.
-//! Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a
+//! reader does), and vector binops/reductions; and **constant-expressions** (`getelementptr`/
+//! `ptrtoint`/`bitcast`/`add`/… folded inside a constant, e.g. a global initialized to an offset into
+//! another global). Not yet handled (the growth frontier): C++ EH (`invoke`/`landingpad`) and scalable
+//! vectors. Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a),
+//! never a
 //! miscompile.
 
 use super::ast::*;
@@ -421,7 +423,24 @@ impl Parser {
             Some(Token::Word(w)) => {
                 matches!(
                     w.as_str(),
-                    "true" | "false" | "zeroinitializer" | "null" | "undef" | "poison"
+                    "true"
+                        | "false"
+                        | "zeroinitializer"
+                        | "null"
+                        | "undef"
+                        | "poison"
+                        // constant-expression openers
+                        | "getelementptr"
+                        | "trunc"
+                        | "zext"
+                        | "sext"
+                        | "ptrtoint"
+                        | "inttoptr"
+                        | "bitcast"
+                        | "addrspacecast"
+                        | "add"
+                        | "sub"
+                        | "mul"
                 ) || (w == "c" && matches!(self.peek2(), Some(Token::Str(_))))
             }
             _ => false,
@@ -882,6 +901,61 @@ impl Parser {
         }))
     }
 
+    /// A constant-expression `getelementptr [inbounds] ( <srcty>, ptr <addr>, <ity> <idx>, … )`. The
+    /// source element type is parsed but dropped (`ConstGetElementPtr` doesn't carry it, matching the
+    /// bitcode reader's shim).
+    fn const_gep(&mut self) -> PResult<Constant> {
+        self.pos += 1; // `getelementptr`
+        let in_bounds = self.eat_word("inbounds");
+        while matches!(self.peek(), Some(Token::Word(w)) if matches!(w.as_str(), "nuw" | "nusw")) {
+            self.pos += 1;
+        }
+        self.expect(&Token::LParen)?;
+        let _src = self.type_()?;
+        self.expect(&Token::Comma)?;
+        let addr_ty = self.type_()?;
+        let address = self.constant(&addr_ty)?;
+        let mut indices = Vec::new();
+        while self.eat(&Token::Comma) {
+            let ity = self.type_()?;
+            indices.push(self.constant(&ity)?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Constant::GetElementPtr(ConstGetElementPtr {
+            address,
+            indices,
+            in_bounds,
+        }))
+    }
+
+    /// A constant-expression conversion `<op> ( <srcty> <const> to <dstty> )`.
+    fn const_conv(&mut self) -> PResult<ConstUnaryOp> {
+        self.pos += 1; // opcode
+        self.expect(&Token::LParen)?;
+        let srcty = self.type_()?;
+        let operand = self.constant(&srcty)?;
+        self.expect_word("to")?;
+        let to_type = self.type_()?;
+        self.expect(&Token::RParen)?;
+        Ok(ConstUnaryOp { operand, to_type })
+    }
+
+    /// A constant-expression binary op `<op> ( <ty> <c0>, <ty> <c1> )`.
+    fn const_binop(&mut self) -> PResult<ConstBinaryOp> {
+        self.pos += 1; // opcode
+        while matches!(self.peek(), Some(Token::Word(w)) if matches!(w.as_str(), "nuw" | "nsw")) {
+            self.pos += 1;
+        }
+        self.expect(&Token::LParen)?;
+        let t0 = self.type_()?;
+        let operand0 = self.constant(&t0)?;
+        self.expect(&Token::Comma)?;
+        let t1 = self.type_()?;
+        let operand1 = self.constant(&t1)?;
+        self.expect(&Token::RParen)?;
+        Ok(ConstBinaryOp { operand0, operand1 })
+    }
+
     /// Parse a constant of (already-parsed) type `ty` — global initializers and other constant
     /// positions. Covers int/`true`/`false`, `zeroinitializer`/`null`/`undef`/`poison`, `@g` references,
     /// `c"…"` byte strings, and `[ <ty> <c>, … ]` arrays. (Float constants are a later slice.)
@@ -925,6 +999,42 @@ impl Parser {
             Some(Token::Word(w)) if w == "poison" => {
                 self.pos += 1;
                 Constant::Poison(ty.clone())
+            }
+            // Constant-expressions: `<op> ( … )` folded at link time (a global initialized to an offset
+            // into another global, a function-pointer table entry cast, etc.).
+            Some(Token::Word(w)) if w == "getelementptr" => self.const_gep()?,
+            Some(Token::Word(w))
+                if matches!(
+                    w.as_str(),
+                    "trunc"
+                        | "zext"
+                        | "sext"
+                        | "ptrtoint"
+                        | "inttoptr"
+                        | "bitcast"
+                        | "addrspacecast"
+                ) =>
+            {
+                let op = w.clone();
+                let u = self.const_conv()?;
+                match op.as_str() {
+                    "trunc" => Constant::Trunc(u),
+                    "zext" => Constant::ZExt(u),
+                    "sext" => Constant::SExt(u),
+                    "ptrtoint" => Constant::PtrToInt(u),
+                    "inttoptr" => Constant::IntToPtr(u),
+                    "bitcast" => Constant::BitCast(u),
+                    _ => Constant::AddrSpaceCast(u),
+                }
+            }
+            Some(Token::Word(w)) if matches!(w.as_str(), "add" | "sub" | "mul") => {
+                let op = w.clone();
+                let b = self.const_binop()?;
+                match op.as_str() {
+                    "add" => Constant::Add(b),
+                    "sub" => Constant::Sub(b),
+                    _ => Constant::Mul(b),
+                }
             }
             Some(Token::Global(_)) => return self.global_ref(),
             // `c"…"` — a byte string, i.e. an array of `i8` constants (escapes decoded to raw bytes).

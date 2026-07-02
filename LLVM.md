@@ -1845,16 +1845,26 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     `poison`/`undef`/`zeroinitializer`/`null`/vector constants all reach operand position. Four parity
     tests: sparse `switch`, `<4 x i32>` add, a splat (insertelement + shuffle), and a
     `llvm.vector.reduce.add` reduction. **Twenty-six parity tests total.**
-- **Next step (resume here): constant-expressions, then C++ EH.** The growth frontier, each a `clang -O2`
-  shape + an `assert_ll_parity` test: **constant-expressions** — `getelementptr`/`bitcast`/`ptrtoint`/
-  `add`/… *inside* a constant (e.g. a global initialized to `getelementptr(@other, …)` or a vtable of
-  function pointers); `Constant::{GetElementPtr,Trunc,BitCast,…}` + `ConstGetElementPtr`/`ConstUnaryOp`/
-  `ConstBinaryOp` are already in the AST + shim, so `constant()` needs arms that parse the `op (…)` /
-  `getelementptr (…)` constant-expr grammar. Then **C++ EH** (`invoke <ret> @f(...) to label %ok unwind
-  label %lpad` terminator + `landingpad`/`resume` — the corpus's `personality`/cleanup tests), **literal
-  aggregate constants** `{ i32 1, i8 2 }`, **scalable vectors**, and **`i128`/`blockaddress`** (these two
-  come *free* in text — full-width constants, no `llvm-sys` re-parse; `blockaddress` needs the
-  parser-recovered payload). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
+  - **Parser — constant-expressions landed.** `constant()` now parses folded const-exprs: `getelementptr
+    [inbounds] ( <srcty>, ptr <addr>, <idx>… )` → `ConstGetElementPtr`, the conversions
+    `trunc`/`zext`/`sext`/`ptrtoint`/`inttoptr`/`bitcast`/`addrspacecast` `( <c> to <ty> )` →
+    `Const{…}(ConstUnaryOp)`, and `add`/`sub`/`mul` `( <c0>, <c1> )` → `Const{…}(ConstBinaryOp)`
+    (recursive, so nested `ptrtoint(getelementptr(…))` works). `at_constant_start` recognizes these op
+    words so a global initializer that *is* a const-expr isn't skipped. Two parity tests: `&arr[3]` (a
+    `getelementptr` global init) and `(long)&arr[1]` (`ptrtoint` of a `getelementptr`). **NB:** a
+    function-pointer table (`[N x ptr] [ptr @fa, …]`) is rejected by the *translator itself*
+    (`Unsupported("constexpr reference to @fa")`) on **both** paths — a translator gap, not a parser one,
+    so no parity test covers it. **Twenty-eight parity tests total.**
+- **Next step (resume here): C++ EH (`invoke`/`landingpad`/`resume`), then loose ends.** The growth
+  frontier, each a `clang -O2` shape + an `assert_ll_parity` test: **C++ exceptions** — `invoke <ret>
+  @f(args) to label %ok unwind label %lpad` (a *terminator* that both calls and branches — reuses the
+  call-operand/arg grammar + two labels), the `landingpad <ty> { cleanup | catch <ty> <c> }…` instruction,
+  and the `resume <ty> <v>` terminator; the function also carries a `personality` clause in its signature
+  (currently skipped — verify that's still fine). Then **literal aggregate constants** `{ i32 1, i8 2 }`
+  as operands/inits, **scalable vectors** (`<vscale x N x T>` — the type already parses; needs a stepvector/
+  intrinsic test), and **`i128`/`blockaddress`** (these come *free* in text — full-width constants, no
+  `llvm-sys` re-parse; `blockaddress` needs the parser-recovered payload). After the instruction set is
+  saturated, **PR3**:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).

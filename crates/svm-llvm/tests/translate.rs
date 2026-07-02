@@ -7567,6 +7567,19 @@ fn ll_parity_vector_reduce() {
 }
 
 #[test]
+fn ll_parity_const_gep() {
+    // A global initialized to a constant-expression GEP into another global
+    // (`@p = global ptr getelementptr inbounds ([10 x i32], ptr @arr, i64 0, i64 3)`).
+    assert_ll_parity("ll_parity_cgep", "int arr[10]; int *p = &arr[3];");
+}
+
+#[test]
+fn ll_parity_const_ptrtoint() {
+    // A nested constant-expression: `ptrtoint (ptr getelementptr(…) to i64)` as a global initializer.
+    assert_ll_parity("ll_parity_cptr", "int arr[10]; long addr = (long)&arr[1];");
+}
+
+#[test]
 fn ll_parity_switch() {
     // A `switch` terminator with a constant→label jump table (sparse cases + default).
     assert_ll_parity(
