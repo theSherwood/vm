@@ -160,9 +160,9 @@ property, so in practice:
   oracle across 50 real-race repeats; Miri (`parallel_miri.rs`) confirms the shared-host access is
   race/UB-free. (Scope: caps `cap_dispatch_slots` handles — streams/clock/exit/reflection — over the
   native driver; the wasm-Worker shared-`Host` and order-sensitive-cap demos are follow-ons.)
-- [ ] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(§22 fully landed: A/B/C1/C2 —
-  incl. JIT across real Web Workers. §14 in `drive_parallel`: A/B/C done — instantiate, instantiate_module,
-  spawn_coroutine_module; only the resumable-`Vcpu`/browser path §14-D remains)*. These mutate the `Domain` (`&mut`), which the parallel driver
+- [x] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(fully landed: §22 A/B/C1/C2
+  and §14 A/B/C/D — every domain-mutating op now runs on every driver: cooperative, native parallel,
+  resumable/orchestrated, and across real Web Workers in the browser)*. These mutate the `Domain` (`&mut`), which the parallel driver
   shares `&`-immutably, so they fail closed today. **Motivation:** web *interpreter playgrounds* — a
   guest that JITs/`eval`s user code (§22) or sandboxes sub-programs (§14) **and** runs in parallel.
   **Design (chosen: full-unify, mirroring the tree-walker's proven `DomainTable`).** The bytecode engine's
@@ -258,10 +258,32 @@ property, so in practice:
         sees no §14 event; the coroutine then runs inline via `resume`. Proven by
         `bytecode_vcpu_coroutine_module.rs` (a powerbox-carrying root vCPU builds + resumes 8
         module coroutines internally → the cooperative oracle's value).
-      - [ ] **§14-D2 — `instantiate` / `instantiate_module` via the resumable `Vcpu`**: needs
-        scheduler-driven **confined child vCPUs** (each its own `Domain` + attenuated powerbox +
-        sub-window `Mem` — a new `svm-mem` constructor), and across Web Workers the browser glue. The
-        large remaining piece; still fail-closed on the resumable path.
+      - [x] **§14-D2 — `instantiate` / `instantiate_module` via the resumable `Vcpu` — incl. the
+        browser: confined executor children on their own Web Workers.** The parent vCPU does all the
+        authority-bearing work in-Vm (carve validation with `-EINVAL` in place; for op 5 the granted
+        module resolved from its own powerbox + compiled + pushed to the shared source + data segments
+        materialized into the carve), then surfaces one mechanical event —
+        `VcpuEvent::Instantiate { module, entry, carve, size_log2, fuel }` — serviced exactly like
+        `Spawn`: start a Worker/thread running `Vcpu::new_confined_child(prog, module, entry,
+        carve_region, size_log2, fuel)` and wire its completion slot into `join`. Per DESIGN.md §14
+        ("a sub-window is indistinguishable from a top-level window") the carve region — a fresh
+        `Region::shared` at `parent_win + carve` — simply *is* the child's window: **no new `svm-mem`
+        machinery** (the earlier estimate was wrong). The attenuated powerbox (`Instantiator` +
+        `AddressSpace` over the child's own range, its entry args) and the child's own domain
+        (`own_dom`: a natural table over its module in the shared source — the fresh table is the
+        confinement) are built in-engine, so **no authority ever crosses JS** (event operands are
+        inert integers). `carve` is window-relative, so nesting composes with no special casing.
+        Proven natively by `bytecode_vcpu_orchestration_instantiate.rs` (fan-out 40, **depth-2
+        nesting** 72, module fan-out 600 — each vs the cooperative oracle) +
+        `vcpu_instantiate_miri.rs` (aliasing carve-region views race/UB/provenance-clean under Miri);
+        in Node by `threads-spawn.mjs` `SVM_INST=1` (nested = **17 Workers across three
+        generations**); and in **real Chromium** by the `#inst` work item (40 / 72×17 Workers / 600).
+        Browser glue: `svm_par_powerbox_inst` (the §14 recipe: root `Instantiator` span + optional
+        granted module — the root builds its powerbox in `svm_par_root`), `svm_par_child_confined`,
+        `PAR_INSTANTIATE = 6`, and an `INSTANTIATE` arm in the JS hosts that relays the operands into
+        a new Worker whose `win`/`winSize` are the carve. Also fixed a latent JS-host bug D2 exposed:
+        cached `Int32Array`/`BigInt64Array` views go stale when the shared `WebAssembly.Memory` grows
+        mid-run (e.g. a module compile+push) — the hosts now refresh views before Atomics access.
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
   `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
@@ -321,9 +343,11 @@ cargo test -p svm --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu 
 cargo test -p svm --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in drive_parallel vs oracle
 cargo test -p svm --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
 cargo test -p svm --test bytecode_parallel_instantiate    # 4c-domain §14-A: instantiate in drive_parallel vs oracle
+cargo test -p svm --test bytecode_vcpu_orchestration_instantiate  # 4c-domain §14-D2: confined children via resumable Vcpu
 cargo +nightly miri test -p svm-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
 cargo +nightly miri test -p svm-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
 cargo +nightly miri test -p svm-interp --test parallel_instantiate_miri  # 4c-domain §14-A: confined child race-free
+cargo +nightly miri test -p svm-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: carve-region views race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (tiny spike)
 cd browser/threads-spike && cargo +nightly build --release && node threads-futex.mjs && cd ..

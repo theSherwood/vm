@@ -57,18 +57,33 @@ async function main() {
     set('powerbox', 'fail', `powerbox: error ${e}`);
   }
 
-  // Run one guest's `thread.spawn`ed vCPUs across real Web Workers over the one shared window; returns
-  // `{ value, started }`. `jit` ⇒ build the Rust-side shared powerbox + reserve the JIT dispatch table
-  // (the worker loop is identical — §22 JIT is serviced in-Rust, so the page services no new events).
-  async function runAcrossWorkers(guestPath, jit) {
+  // Run one guest's `thread.spawn`ed / `instantiate`d vCPUs across real Web Workers over the one
+  // shared window; returns `{ value, started }`. Options: `jit` ⇒ build the Rust-side §22 powerbox +
+  // reserve the JIT dispatch table; `inst` ⇒ publish the §14 recipe (root `Instantiator` over the
+  // window + the optional granted `unitPath` module) — the root vCPU builds its powerbox from it;
+  // `winSize` sizes the window (the §14 kernels declare 1 MiB so their 64 KiB carves stay
+  // wasm-page-aligned). Either way the page services no authority: JIT is in-Rust, and a §14
+  // `instantiate` event's operands are inert integers relayed into a new Worker.
+  async function runAcrossWorkers(guestPath, { jit = false, inst = false, unitPath = null, winSize = 1 << 16 } = {}) {
     const guest = await fetchBytes(guestPath);
     const gptr = ex.svm_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
     const prog = jit ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
     if (prog === 0) throw new Error('svm_par_compile null');
-    const winSize = 1 << 16;
     const win = ex.svm_par_alloc(winSize);
+    if (inst) {
+      let uptr = 0, ulen = 0;
+      if (unitPath) {
+        const unit = await fetchBytes(unitPath);
+        uptr = ex.svm_par_alloc(unit.length);
+        u8().set(unit, uptr);
+        ulen = unit.length;
+      }
+      if (ex.svm_par_powerbox_inst(BigInt(winSize), uptr, ulen) !== 1) {
+        throw new Error('svm_par_powerbox_inst failed');
+      }
+    }
 
     const workers = new Set();
     let started = 0;
@@ -80,7 +95,10 @@ async function main() {
         w.onmessage = (e) => {
           const m = e.data;
           if (m.kind === 'spawn') {
-            startVcpu({ role: 'child', func: m.func, sp: m.sp, arg: m.arg, slot: m.slot, stackTop: m.stackTop, tlsBase: m.tlsBase });
+            // Plain or §14-confined child: relay the message's cfg verbatim (a confined child's
+            // message carries its own win/winSize — the carve — overriding the run defaults).
+            const { kind, ...cfg2 } = m;
+            startVcpu({ role: 'child', ...cfg2 });
           } else if (m.kind === 'done') {
             resolve(BigInt(m.value));
           } else if (m.kind === 'trap' || m.kind === 'fail') {
@@ -104,7 +122,7 @@ async function main() {
   // --- 2) one guest's vCPUs across real Web Workers ----------------------------------------------
   try {
     const t0 = performance.now();
-    const { value, started } = await runAcrossWorkers('/corpus/threads.svmbc', false);
+    const { value, started } = await runAcrossWorkers('/corpus/threads.svmbc');
     const ms = (performance.now() - t0).toFixed(0);
     const ok = value === 4000n;
     set('threads', ok ? 'pass' : 'fail',
@@ -120,7 +138,7 @@ async function main() {
   // (a leaked `Host` in shared memory); JIT is serviced inside `svm_par_run`, so no new page glue.
   try {
     const t0 = performance.now();
-    const { value, started } = await runAcrossWorkers('/corpus/threads_jit_install.svmbc', true);
+    const { value, started } = await runAcrossWorkers('/corpus/threads_jit_install.svmbc', { jit: true });
     const ms = (performance.now() - t0).toFixed(0);
     const ok = value === 1136n;
     set('jit', ok ? 'pass' : 'fail',
@@ -128,6 +146,30 @@ async function main() {
     log(`jit → ${value} across ${started} Workers in ${ms}ms`);
   } catch (e) {
     set('jit', 'fail', `jit: error ${e}`);
+  }
+
+  // --- 4) §14 confined executor children across real Web Workers (4c-domain §14-D2) ---------------
+  // Three sub-proofs, each a fresh run over a 1 MiB window with 64 KiB carves:
+  //   a. instantiate:  8 confined children (each its own Worker + attenuated powerbox) → 8 × 5 = 40;
+  //   b. nested:       each child instantiates a grandchild over its whole carve — VM-in-VM-in-VM
+  //                    across THREE Worker generations → 8 × 9 = 72;
+  //   c. module:       `instantiate_module` a granted module 8× (compile + push to the shared source
+  //                    + data segments materialized, all crossing Workers) → 8 × 75 = 600.
+  try {
+    const opt = { inst: true, winSize: 1 << 20 };
+    const t0 = performance.now();
+    const a = await runAcrossWorkers('/corpus/threads_inst.svmbc', opt);
+    const b = await runAcrossWorkers('/corpus/threads_inst_nested.svmbc', opt);
+    const c = await runAcrossWorkers('/corpus/threads_inst_mod.svmbc',
+      { ...opt, unitPath: '/corpus/threads_inst_unit.svmbc' });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = a.value === 40n && b.value === 72n && c.value === 600n;
+    set('inst', ok ? 'pass' : 'fail',
+      `inst: confined children → ${a.value} (want 40) · nested ×${b.started} Workers → ${b.value} ` +
+      `(want 72) · module → ${c.value} (want 600) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`inst → ${a.value}/${b.value}/${c.value} (nested spanned ${b.started} Workers) in ${ms}ms`);
+  } catch (e) {
+    set('inst', 'fail', `inst: error ${e}`);
   }
 }
 

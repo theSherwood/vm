@@ -1696,6 +1696,32 @@ pub enum VcpuEvent {
         params: Box<[ValType]>,
         results: Box<[ValType]>,
     },
+    /// §14 `Instantiator.instantiate` / `instantiate_module` (THREADS.md 4c-domain §14-D2): start a
+    /// **confined executor child** vCPU over the carve, then call [`Vcpu::deliver_handle`] with the
+    /// handle the guest will `join` it by — exactly the [`VcpuEvent::Spawn`] protocol. All the
+    /// authority-bearing work already happened in this vCPU before the event surfaced (the
+    /// `Instantiator` grant resolved in-Vm; the carve validated, `-EINVAL` never surfacing; for a
+    /// module child the granted `Module` resolved from this vCPU's powerbox, compiled, **pushed to the
+    /// shared source**, and its data segments materialized into the carve). The host's only job is
+    /// mechanical: start a Worker/thread running
+    /// [`Vcpu::new_confined_child`]`(prog, module, entry, carve_region, size_log2, fuel)` over
+    /// `[win + carve, win + carve + 2^size_log2)` and wire its completion slot into `join` — a
+    /// confined child is just a child Worker with a shifted, smaller window (DESIGN.md §14: a
+    /// sub-window is indistinguishable from a top-level window).
+    Instantiate {
+        /// The child's module: `0` (the primary) for `instantiate`; the pushed shared-source index
+        /// for `instantiate_module`.
+        module: u32,
+        entry: u32,
+        /// Byte offset of the carve within **this vCPU's window** (the host adds its own window
+        /// base/pointer — nesting then composes with no special casing: a confined child's own
+        /// `Instantiate` events are relative to *its* window).
+        carve: u64,
+        size_log2: u8,
+        /// The child's fuel, already sub-allocated (`min(quota, parent fuel)`, or the parent's fuel
+        /// when the guest passed no quota).
+        fuel: u64,
+    },
 }
 
 /// A §22 JIT op awaiting the host's [`VcpuEvent::JitInstall`]/`JitUninstall`/`JitInvoke` reply — the
@@ -1720,11 +1746,13 @@ enum PendingJit {
 /// One **resumable** vCPU over a shared window. The host calls [`run`](Vcpu::run) to advance it until a
 /// [`VcpuEvent`], services the event, delivers the result (`deliver_*`), and runs again — so the same
 /// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope (as
-/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, plus
-/// §22 guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
-/// [`Domain`] (THREADS.md 4c-domain). §14 `instantiate` still fails closed. Carries a deny-all `Host`,
-/// so an *invoked* unit that itself makes a `cap.call` is out of scope (the invoke runs over this empty
-/// powerbox) — the powerbox-backed unit is the orchestrator's job, like every other host capability.
+/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, §22
+/// guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
+/// [`Domain`], and — for a vCPU carrying a powerbox — the §14 domain ops (`spawn_coroutine_module`
+/// serviced internally; `instantiate`/`instantiate_module` surfacing [`VcpuEvent::Instantiate`], the
+/// child a [`Vcpu::new_confined_child`] on its own Worker). By default carries a deny-all `Host`, so
+/// an *invoked* unit that itself makes a `cap.call` is out of scope — host I/O stays the
+/// orchestrator's job.
 pub struct Vcpu<'p> {
     prog: &'p VcpuProgram,
     vt: VTask,
@@ -1734,6 +1762,10 @@ pub struct Vcpu<'p> {
     mem: Option<Mem>,
     fuel: u64,
     host: Host,
+    /// A §14 **confined child**'s own domain (its natural table over the shared source — no parent
+    /// §22 install slots); `None` for a root / `thread.spawn` child, which dispatch through
+    /// [`VcpuProgram::dom`]'s table (`prog.dom`). The `source` `Arc` is the same either way.
+    own_dom: Option<Domain>,
     /// The dst register awaiting a `deliver_*` after a host-serviced event.
     pending: Option<u32>,
     /// A §22 JIT op awaiting its `deliver_jit_*` (carries the op's dst + parameters across the
@@ -1818,6 +1850,77 @@ impl<'p> Vcpu<'p> {
             mem,
             fuel: u64::MAX,
             host,
+            own_dom: None,
+            prog,
+            pending: None,
+            pending_jit: None,
+            trap: None,
+        })
+    }
+
+    /// A §14 **confined executor child** vCPU (THREADS.md 4c-domain §14-D2) — what the host starts on
+    /// its own Worker/thread in response to [`VcpuEvent::Instantiate`]. `back` must be a region over
+    /// exactly the parent's carve (`len == 1 << size_log2`): per DESIGN.md §14, a sub-window is
+    /// indistinguishable from a top-level window, so the carve region simply *is* the child's window
+    /// (its bytes — anything the parent wrote there, an op-5 child's materialized data segments — are
+    /// already in the shared memory; nothing is re-seeded). Builds internally:
+    ///   * the **attenuated powerbox** — an `Instantiator` and an `AddressSpace`, each over the
+    ///     child's own `[0, 2^size_log2)`, passed as the entry args (one or both, per the entry's
+    ///     signature) — so the child can itself nest, and no authority ever crosses the host;
+    ///   * the child's **own domain** — a natural table over `module` in the shared source (no parent
+    ///     §22 install slots — the fresh table is the confinement).
+    ///
+    /// `module`/`entry`/`size_log2`/`fuel` come verbatim from the event.
+    pub fn new_confined_child(
+        prog: &'p VcpuProgram,
+        module: u32,
+        entry: u32,
+        back: std::sync::Arc<super::Region>,
+        size_log2: u8,
+        fuel: u64,
+    ) -> Result<Vcpu<'p>, Trap> {
+        if size_log2 >= 64 {
+            return Err(Trap::Malformed);
+        }
+        let cunit = prog
+            .dom
+            .source
+            .get(module as usize)
+            .ok_or(Trap::Malformed)?;
+        // One or two entry args, per the signature the parent already validated (its starter caps).
+        let want_as = cunit
+            .sigs
+            .get(entry as usize)
+            .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+        let child_size = 1u64 << size_log2;
+        let mut host = Host::new();
+        let cinst = host.grant_instantiator(0, child_size);
+        let cas = host.grant_address_space(0, child_size);
+        let args = if want_as {
+            vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+        } else {
+            vec![Value::I64(cinst as i64)]
+        };
+        let mem = Some(Mem::with_reservation_over(
+            DEFAULT_RESERVED_LOG2,
+            size_log2,
+            back,
+        ));
+        let mut vt = VTask::new(&cunit, entry as usize, &args)?;
+        vt.active.module = module as usize;
+        let own_dom = Domain::child(
+            std::sync::Arc::clone(&prog.dom.source),
+            build_table_for(cunit.progs.len(), 0, module),
+        );
+        Ok(Vcpu {
+            vt,
+            fibers: Vec::new(),
+            fiber_sp: Vec::new(),
+            fiber_meta: Vec::new(),
+            mem,
+            fuel,
+            host,
+            own_dom: Some(own_dom),
             prog,
             pending: None,
             pending_jit: None,
@@ -1837,10 +1940,13 @@ impl<'p> Vcpu<'p> {
         );
         // Loop so §14 `spawn_coroutine_module` (serviced in-Rust against this vCPU's own powerbox)
         // never surfaces to the orchestrating host — it only ever sees the multi-vCPU events
-        // `spawn`/`join`/`wait`/`notify` and the §22 JIT events (+ `done`/`trap`).
+        // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `Instantiate` (+ `done`/`trap`).
         loop {
+            // A §14 confined child dispatches through its OWN domain (own natural table, no parent
+            // install slots); everything else through the program's shared one.
+            let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
             let mut ctx = RunCtx {
-                table: &self.prog.dom.table,
+                table: &dom.table,
                 fuel: &mut self.fuel,
                 mem: &mut self.mem,
                 durable: false,
@@ -1851,7 +1957,7 @@ impl<'p> Vcpu<'p> {
                 &mut self.fibers,
                 &mut self.fiber_sp,
                 &mut self.fiber_meta,
-                &self.prog.dom,
+                dom,
                 &mut ctx,
                 u64::MAX,
             );
@@ -1859,7 +1965,7 @@ impl<'p> Vcpu<'p> {
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
                 Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                    if func as usize >= self.prog.dom.source.primary().progs.len() {
+                    if func as usize >= dom.source.primary().progs.len() {
                         return VcpuEvent::Trapped(Trap::Malformed);
                     }
                     self.pending = Some(dst);
@@ -1942,11 +2048,169 @@ impl<'p> Vcpu<'p> {
                         return VcpuEvent::Trapped(t);
                     }
                 }
-                // §14 instantiate / instantiate_module need scheduler-driven confined child vCPUs the
-                // host-orchestrated driver doesn't thread yet — fail closed (a later slice).
-                Ok(_) => return VcpuEvent::Trapped(Trap::ThreadFault),
+                // §14 executor children (THREADS.md 4c-domain §14-D2): this vCPU does all the
+                // authority-bearing validation/preparation, then surfaces a mechanical
+                // [`VcpuEvent::Instantiate`] for the host (a bad carve/entry lands `-EINVAL` in place
+                // and the run continues; a bad module handle traps).
+                Ok(VcpuStop::Instantiate {
+                    ibase,
+                    isize: isz,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                }) => {
+                    if let Some(ev) =
+                        self.event_instantiate(ibase, isz, entry, off, size_log2, quota, dst)
+                    {
+                        return ev;
+                    }
+                }
+                Ok(VcpuStop::InstantiateModule {
+                    ibase,
+                    isize: isz,
+                    mh,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                }) => {
+                    match self
+                        .event_instantiate_module(ibase, isz, mh, entry, off, size_log2, quota, dst)
+                    {
+                        Ok(Some(ev)) => return ev,
+                        Ok(None) => {} // -EINVAL landed in place — keep running
+                        Err(t) => return VcpuEvent::Trapped(t),
+                    }
+                }
             }
         }
+    }
+
+    /// Validate + prepare a §14 `instantiate` (op 0, same-module child) and produce its
+    /// [`VcpuEvent::Instantiate`], or land `-EINVAL` in place (`None`) on a bad entry/carve —
+    /// identical checks to the cooperative and parallel drivers' arms.
+    #[allow(clippy::too_many_arguments)]
+    fn event_instantiate(
+        &mut self,
+        ibase: u64,
+        isize: u64,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+    ) -> Option<VcpuEvent> {
+        let c0 = self.prog.dom.source.primary();
+        let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
+            r[..] == [ValType::I64]
+                && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+        });
+        let child_size = if (0..64).contains(&size_log2) {
+            1u64 << size_log2
+        } else {
+            0
+        };
+        let off_u = off as u64;
+        let fits = child_size != 0
+            && child_size <= isize
+            && off_u & (child_size - 1) == 0
+            && off_u.checked_add(child_size).is_some_and(|e| e <= isize);
+        if !ok_entry || !fits {
+            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            return None;
+        }
+        // Window-relative carve (`window.base()` is 0 for this path's top-level region windows; the
+        // term keeps exact parity with the drive/parallel arms' backing-absolute math).
+        let pbase = self.mem.as_ref().map_or(0, |m| m.window.base());
+        let carve = pbase + ibase + off_u;
+        let fuel = if quota <= 0 {
+            self.fuel
+        } else {
+            (quota as u64).min(self.fuel)
+        };
+        self.pending = Some(dst);
+        Some(VcpuEvent::Instantiate {
+            module: 0,
+            entry: entry as u32,
+            carve,
+            size_log2: size_log2 as u8,
+            fuel,
+        })
+    }
+
+    /// Validate + prepare a §14 `instantiate_module` (op 5, separate-module child) and produce its
+    /// [`VcpuEvent::Instantiate`]: resolve the granted `Module` from this vCPU's own powerbox
+    /// (`Err` — a forged/closed handle — traps), compile it, **push it to the shared source**, and
+    /// materialize its data segments into the carve *before* the event surfaces (the spawn hand-off
+    /// is the happens-before, so the child Worker observes them). `Ok(None)` lands `-EINVAL` in place
+    /// on a bad entry/carve/memory mismatch.
+    #[allow(clippy::too_many_arguments)]
+    fn event_instantiate_module(
+        &mut self,
+        ibase: u64,
+        isize: u64,
+        mh: i32,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+    ) -> Result<Option<VcpuEvent>, Trap> {
+        let (cfuncs, cmem_log2, cdata) = {
+            let g = self.host.resolve_module(mh)?;
+            (g.funcs.clone(), g.memory_log2, g.data.clone())
+        };
+        let child_compiled = compile_module(&cfuncs).ok_or(Trap::Malformed)?;
+        let ok_entry = child_compiled
+            .sigs
+            .get(entry as usize)
+            .is_some_and(|(p, r)| {
+                r[..] == [ValType::I64]
+                    && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+            });
+        let child_size = if (0..64).contains(&size_log2) {
+            1u64 << size_log2
+        } else {
+            0
+        };
+        let off_u = off as u64;
+        let fits = child_size != 0
+            && child_size <= isize
+            && off_u & (child_size - 1) == 0
+            && off_u.checked_add(child_size).is_some_and(|e| e <= isize);
+        let mod_ok = cmem_log2 == Some(size_log2 as u8);
+        if !ok_entry || !fits || !mod_ok {
+            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            return Ok(None);
+        }
+        let pbase = self.mem.as_ref().map_or(0, |m| m.window.base());
+        let carve = pbase + ibase + off_u;
+        if let Some(m) = self.mem.as_ref() {
+            for d in cdata.iter() {
+                if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                    for (k, &b) in d.bytes.iter().enumerate() {
+                        m.set_byte(carve + d.offset + k as u64, b);
+                    }
+                }
+            }
+        }
+        let cm = self.prog.dom.source.push(child_compiled);
+        let fuel = if quota <= 0 {
+            self.fuel
+        } else {
+            (quota as u64).min(self.fuel)
+        };
+        self.pending = Some(dst);
+        Ok(Some(VcpuEvent::Instantiate {
+            module: cm as u32,
+            entry: entry as u32,
+            carve,
+            size_log2: size_log2 as u8,
+            fuel,
+        }))
     }
 
     /// Build a §14 `spawn_coroutine_module` coroutine **inline** in this vCPU's coroutine set (the
@@ -2093,7 +2357,14 @@ impl<'p> Vcpu<'p> {
             }
         };
         let res = match compile_module(&funcs) {
-            Some(unit) => match self.prog.dom.install(unit) {
+            // Install into THIS vCPU's domain (== the shared one for a root; a §14 confined child —
+            // which can't hold a Jit cap anyway — would only ever fill its own table).
+            Some(unit) => match self
+                .own_dom
+                .as_ref()
+                .unwrap_or(&self.prog.dom)
+                .install(unit)
+            {
                 Some(slot) => slot as i64,
                 None => super::ENOSPC,
             },
@@ -2115,8 +2386,9 @@ impl<'p> Vcpu<'p> {
             self.trap = Some(t);
             return;
         }
-        let n_real = self.prog.dom.source.primary().progs.len();
-        let res = if self.prog.dom.uninstall(slot as usize, n_real) {
+        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
+        let n_real = dom.source.primary().progs.len();
+        let res = if dom.uninstall(slot as usize, n_real) {
             0
         } else {
             super::EINVAL
@@ -2166,12 +2438,12 @@ impl<'p> Vcpu<'p> {
             .zip(argv.iter())
             .map(|(ty, s)| slot_to_val(*ty, *s))
             .collect();
-        // `self.prog` is a `Copy` shared reference — copy it out so the `&prog.dom` borrow is
-        // independent of the disjoint `&mut self.fuel/mem/host` the invoke needs.
-        let prog = self.prog;
-        let umod = prog.dom.source.push(unit);
+        // The effective domain borrows only `self.own_dom`/`self.prog` (shared) — disjoint from the
+        // `&mut self.fuel/mem/host` fields the invoke needs, so the borrows split.
+        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
+        let umod = dom.source.push(unit);
         match run_invoke(
-            &prog.dom,
+            dom,
             umod,
             &child_args,
             &mut self.fuel,
