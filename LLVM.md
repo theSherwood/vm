@@ -584,9 +584,10 @@ Notes:
   (constant) format string at translate time and lowers each conversion to int→string / float→string
   helpers → `Stream.write`; only the bytes cross the boundary. `%f` pulls in float formatting (defer
   to demo 3/6 if demo 1 stays integer/hex). Non-constant format strings stay `Unsupported`.
-- **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
-  `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
-  already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
+- **transcendentals/libm**: a **guest** `libm` (guest code, not a host math capability) — keeps math
+  in the sandbox. `sqrt` lowers to the SVM op (slice F); `exp`/`log`/`pow` now have fdlibm
+  implementations in `crates/svm-run/demos/libm/libm.c` (a guest def shadows the on-ramp's trap stub);
+  `sin`/`cos`/… are the remaining additions. See the "Transcendentals → a guest `libm`" bullet above.
 - **`argc`/`argv`**: **DONE** — see *Slice BE* below. `envp`/`getenv`: **DONE** — see *Slice BF*.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
@@ -1153,6 +1154,20 @@ Picking a target is really picking the *gap* it drives to completion. Current st
 - **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
   synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
 
+### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
+**Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
+runs a *float* script identical on the tree-walker, bytecode, and JIT — and identical to a native build
+of the same sources. The script (`tests/fixtures/lua/lua_floats_harness.c`) computes
+`(3.14 + 2.0^0.5 + (10.5 % 3.0) + 1.5e3 + 0.25) * 1000.0` → `1506304`, reaching **every new piece of
+this work in one run**: the guest **`strtod`** (every numeric literal, in the lexer), the guest
+**`pow`** (the `^` operator), and the synthesized **`fmod`** (the `%` operator) — plus
+`frexp`/`localeconv`/`snprintf`/`setjmp` referenced by the core. The guest `pow`/`strtod` definitions
+**shadow** the on-ramp's would-be trap stubs (the `llvm-link` is all it takes); `fmod`/`frexp`/`localeconv`/
+`sqrt`/`ldexp`/the string ops stay undefined and the on-ramp synthesizes/recognizes them. Test
+`tests/lua_floats.rs` (committed fixture `lua_floats.bc`); regenerate per the fixtures README. This
+closes the loop: the per-function units validate each guest impl bit-exact vs the system, and this
+proves they **compose into a real interpreter's float path** end to end.
+
 ### Lua first light — ACHIEVED ✅ (all three engines)
 **Goal (met).** A pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
 runs through the on-ramp **identical to native Lua on the tree-walker, bytecode, *and* JIT**
@@ -1169,10 +1184,67 @@ below), and `time()` returns `0` (the `makeseed` RNG seed is result-irrelevant).
 so the module lowers and the executed path is fully real; replacing them is what graduates first light
 to *general* Lua (float arithmetic, `string.format`, error messages).
 
-**Next (post-first-light):** real `pow`/`fmod` (a **host-libm delegation** decision — bit-exact vs
-native requires the *same* libm; synthesis can't match a specific libm's last-ULP rounding), `strtod`
-+ `snprintf` (reuse the bignum dtoa), `localeconv`/`errno` (real C-locale struct + a window slot), then
-`print`/stdlib for a script that does I/O. Each is now a localized swap of a stub for an implementation.
+**Next (post-first-light) — the remaining-libm slices.** `snprintf` is **DONE** (the number→string
+direction, via the printf engine — merged). What's left, each a localized swap of a fail-closed stub
+for a real implementation, split by whether it needs a *host-libm decision*:
+
+- **Exact, decision-free (synthesizable bit-for-bit, no libm dependency):**
+  - **`frexp`** — **DONE.** `synth_frexp` (5 blocks): pure bit ops extracting exponent + mantissa,
+    writing `*e`; bit-exact to glibc incl. the subnormal (`×2^54` renormalize) and special (zero/
+    inf/nan → `*e=0`, return `x+x`) paths. Test `libc_frexp_bit_exact` (a grid incl. a subnormal
+    and ±inf), all three engines == native.
+  - **`fmod`** — **DONE.** `synth_fmod` (28-block CFG): a faithful translation of musl's exact 64-bit
+    remainder (special→NaN, `|x|≤|y|` early returns, subnormal-normalize loops for x and y, the
+    bit-shift remainder loop, result renormalize + scale). The remainder is mathematically *exact*
+    (always representable), so it is bit-for-bit identical to libc with **no `frem` op and no libm
+    decision** — the earlier "`pow`/`fmod` need host-libm delegation" framing was imprecise: only the
+    *transcendentals* do. Test `libc_fmod_bit_exact` (a 10×8 grid incl. subnormals, a large quotient,
+    and the `y==0`/`x==inf`→NaN paths), all three engines == native.
+  - **`localeconv`** — **DONE.** `build_locale_data` lays a read-only C-locale `lconv` struct as
+    module data (`decimal_point="."`, the other strings `""`, the numeric/monetary `char` fields
+    `CHAR_MAX`), and `localeconv()` returns its address (a `synth_const_i64`). No powerbox needed
+    (the struct rides in the globals region like the ctype tables). Test `libc_localeconv_c_locale`,
+    all three engines == native's C locale.
+  - **`__errno_location`** — a writable `errno` int slot. Deferred and **bundled with `strtod`**: it
+    needs the powerbox page-0 layout (a writable persistent slot), which entangles it with the
+    powerbox test harness, and it is only ever *set* by `strtod` (`ERANGE`) — so it lands where it is
+    exercised end to end.
+- **Hard but decision-free:** **`strtod`** (string→double) — **DONE, as guest code** (the keystone for
+  *float* Lua: every decimal float literal hits it). `crates/svm-run/demos/strtod/strtod.c` is a
+  correctly-rounded decimal→`f64` parser. Correctly-rounded is *unique*, so it matches glibc bit-for-
+  bit — and the method needs **no precomputed power-of-ten table** (nothing to mis-transcribe): parse
+  every significant digit into a big integer, form the exact rational `N/Dn`, and take the nearest
+  double by an **exact big-integer division** with round-to-nearest-even (normal / subnormal incl. the
+  boundary / overflow→±inf). A guest def shadows the on-ramp's `strtod` trap stub (`llvm-link
+  lua_core.bc strtod.bc`). Two gates: `demo_strtod_vs_native` (raw-f64-image + `endptr` differential,
+  all three engines == native) and `strtod_guest_correctly_rounded_vs_system` (native-only, bit + `endptr`
+  vs the system `strtod` over the hard cases — subnormal halfway ties, the `2^53` boundary, max-double,
+  over/underflow, 40-digit strings). *Scope:* decimal only; hex floats (`0x1p4` — Lua's core parses
+  these itself), the `inf`/`nan` spellings, and `errno`/`ERANGE` are follow-ups.
+- **Transcendentals → a guest `libm` (DECIDED — keep math in the sandbox).** `pow`/`exp`/`log`/
+  `sin`/… can't be synthesized bit-exact to a *specific* host libm, and a host math capability would
+  leak math out of the sandbox — so they ride as **guest code** (the §"transcendentals" preference,
+  the way the raytrace demo bundled `sin`/`exp`). **Started:** `crates/svm-run/demos/libm/libm.c` is a
+  small self-contained guest libm — faithful **fdlibm** transcriptions of `exp`, `log`, and **`pow`**
+  (genuinely accurate, not poly approximations), using only IEEE `+−*/`, compares, and union word
+  access. A guest definition **shadows** the on-ramp's would-be `pow`/`exp`/`log` trap stubs, so
+  `llvm-link lua_core.bc libm.bc` makes them real. `pow` reuses `sqrt` (→ the SVM `f64.sqrt` op) and
+  `scalbn` (→ `__svm_ldexp`); **`sin`/`cos`** add fdlibm's `__kernel_sin`/`__kernel_cos` + the
+  **medium-path** argument reduction (accurate for `|x| ≤ 2²⁰·π/2 ≈ 1.65e6`, the bound where `n·pio2_1`
+  stays an exact product — covering all realistic use; the `npio2_hw` fast-path table is dropped since
+  always running the cancellation-correction is equally correct, and the full Payne-Hanek
+  `__kernel_rem_pio2` table for astronomically large args is the documented future addition).
+  Two gates: `demo_libm_vs_native` (raw-f64-image differential, all three engines == native —
+  byte-identical *because* the math is guest code, unfused on both lanes; built `-fno-*-vectorize` so
+  the on-ramp takes scalar bitcode while the oracle vectorizes, the corpus-demo split) and
+  `libm_guest_exp_log_accurate_vs_system` (a native-only `-D`-renamed build vs the system `<math.h>`,
+  ≤2 ULP — validates the fdlibm transcription, which a same-source differential cannot).
+  **Remaining:** `tan` + inverses/hyperbolics, the Payne-Hanek table for huge `sin`/`cos` args.
+  **End to end — DONE:** the guest libm + guest `strtod` `llvm-link`ed into the real Lua 5.4.7 core run
+  a float script (`x^0.5`, `x%y`, decimal/scientific literals) **identical on all three engines and to
+  a native build** — see *Lua with floats* below.
+
+After the float-number surface lands, `print`/stdlib graduates first-light to a script that does I/O.
 
 **Build recipe (reproducible).** Lua's core (no standard libraries, no `lauxlib`) + a tiny C-API harness
 that drives `lua_newstate`/`lua_load`/`lua_pcall`/`lua_tointeger` with its own allocator (`realloc`) and
@@ -1205,10 +1277,14 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    `Unsupported` (Lua's are all int/ptr/double/ptrdiff ≤8B). **Tests:** `varargs_int_double_mixed`,
    `varargs_many_and_copy` — all three engines == native cc. **217 translate tests green, fmt+clippy
    clean.**
-2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). Reuses the
-   bignum dtoa float formatter + the varargs-call marshaling from (1). Reachable.
-3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
-   decimal→`f64` (the parse direction of the existing Ryū/Dragon dtoa). Reachable.
+2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). **DONE:**
+   routed through the shared `printf` format engine (`lower_snprintf`) with output redirected into the
+   caller's buffer; reuses the bignum dtoa float formatter + the varargs-call marshaling from (1).
+   Merged (PR #155), incl. the page-0 `FMT_BUF` write-protect fix for `snprintf`-into-stack-buffer + `%p`.
+3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. **DONE, as guest code**
+   (`demos/strtod/strtod.c`): correctly-rounded decimal→`f64` via an exact big-integer division (no
+   power-of-ten table); a guest def shadows the trap stub. Bit-identical to glibc; see the "remaining-
+   libm slices" section above. Decimal only (hex floats / `inf`/`nan` / `errno` are follow-ups).
 4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
    `memcmp`/`strlen`). **Done (slice 2):** `strcmp`/`strchr`/`strcoll`(→`strcmp`),
    `strcpy`/`strspn`/`strpbrk` — synthesized `__svm_*` byte loops (the nested-scan pair for

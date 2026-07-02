@@ -195,7 +195,7 @@ jobs:
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo test -p svm-mem (TSan)
-        run: cargo test -p svm-mem -Z build-std --target x86_64-unknown-linux-gnu
+        run: cargo test -p svm-mem --tests -Z build-std --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
 
@@ -255,13 +255,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: crates/svm-llvm }
       - name: install LLVM 18 (dev headers + dynamic lib)
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - name: cargo test -p svm-llvm setjmp (ASan, JIT path live)
-        run: cargo test -p svm-llvm -Z build-std --target x86_64-unknown-linux-gnu setjmp
+        run: cargo test --manifest-path crates/svm-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
         env:
           # -Zsanitizer=address replaces the workflow-global `-D warnings`: -Z build-std recompiles
           # std from source, which would trip warnings-as-errors (same reason the wasm64 lane clears it).
