@@ -46,8 +46,21 @@ mod switch;
 mod switch;
 
 // OS-specific guard-paged control stack (the unix mmap one backs both unix arches).
-#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    not(feature = "arena-stacks"),
+    unix,
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[path = "stack_unix.rs"]
+mod stack;
+// PROTOTYPE arena allocator (feature `arena-stacks`, unix only) — replaces the per-fiber mmap+guard
+// to benchmark allocation cost; see `stack_arena.rs`.
+#[cfg(all(
+    feature = "arena-stacks",
+    unix,
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "stack_arena.rs"]
 mod stack;
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[path = "stack_windows.rs"]
