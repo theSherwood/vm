@@ -2347,6 +2347,11 @@ impl CompiledModule {
             module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            // NOTE (feature `stack-check`, STACK_GUARD.md §2): soundness wants a post-compile bound
+            // rejecting any function whose frame exceeds `RED_ZONE` (so a function can't grow the stack
+            // past the limit before its callee re-checks). Cranelift 0.132 doesn't expose the final
+            // frame size on `CompiledCode` (`FrameLayout`/`total_stacksize` are ABI-internal), so this
+            // bound is DEFERRED — see the increment plan. Until then the check assumes frames ≤ RED_ZONE.
             if dump_codegen {
                 if let Some(d) = ctx.compiled_code().and_then(|c| c.vcode.as_ref()) {
                     eprintln!("=== SVM-JIT VCODE fn{fi} ===\n{d}");
@@ -5901,34 +5906,62 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
     // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
 }
 
-/// PROTOTYPE (feature `stack-check`): a per-prologue software stack-limit check — the recurring cost
-/// of replacing the hardware guard page with a software guard (the arena/software-guard fiber model).
-/// Modeled exactly on [`emit_epoch_check`]: load a per-fiber stack limit from a host-owned cell, get
-/// the current SP, and `brif` to a cold trap when `SP < limit` (the stack grew past its low bound).
-///
-/// To measure the *cost* (not enforce), the prototype reads a process-global `AtomicU64` kept at 0, so
-/// `SP < 0` is never true and the check never traps — but the **atomic** load is opaque to the
-/// optimizer (like the epoch poll), so the load + compare + branch are really emitted in every
-/// prologue and the cost is faithful. A real deployment would source the limit per-fiber (written on
-/// switch-in) and keep enforcement escape-grade; this emitted check alone is NOT a security boundary.
+/// The software stack-overflow guard's per-thread limit cell + tunables (feature `stack-check`). See
+/// `crates/svm-jit/STACK_GUARD.md`. The prologue check ([`emit_stack_check`]) reads [`STACK_LIMIT`];
+/// the fiber runtime writes each resumed fiber's `usable_low` across the resume seam
+/// ([`stack_check::set_limit`]/[`stack_check::restore_limit`]).
+#[cfg(feature = "stack-check")]
+pub(crate) mod stack_check {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Headroom (bytes) the prologue check reserves below the limit for *this* function's frame, whose
+    /// size isn't known at IR-build time. Also the intended **max frame size** for any single guest
+    /// function, so one whose entry passed the check can't allocate past the limit before its callee
+    /// re-checks. NB: the post-compile bound that would *enforce* frame ≤ `RED_ZONE` is deferred
+    /// (Cranelift 0.132 doesn't expose the final frame size) — STACK_GUARD.md §2; until then this is an
+    /// assumption, not a guarantee, for a function with an unusually large spill frame.
+    pub(crate) const RED_ZONE: u64 = 1 << 14; // 16 KiB
+
+    /// The running fiber's stack low bound (`usable_low`), or 0 for the root (⇒ check inert). A `static`
+    /// so its address is stable to bake as an `iconst`. **Process-global: correct for one vCPU's
+    /// cooperative fibers** (set/restored across each resume seam, nesting-safe). Multi-vCPU correctness
+    /// needs a per-thread source (the trap-cell-adjacent word, STACK_GUARD.md §3) — the next increment.
+    pub(crate) static STACK_LIMIT: AtomicU64 = AtomicU64::new(0);
+
+    /// Set the limit for a fiber about to be resumed; returns the previous value to restore on return.
+    pub(crate) fn set_limit(usable_low: u64) -> u64 {
+        STACK_LIMIT.swap(usable_low, Ordering::Relaxed)
+    }
+    /// Restore the resumer's limit (root or an outer fiber) after a resume returns.
+    pub(crate) fn restore_limit(prev: u64) {
+        STACK_LIMIT.store(prev, Ordering::Relaxed);
+    }
+    /// The bakeable address of [`STACK_LIMIT`] for the prologue load.
+    pub(crate) fn limit_addr() -> i64 {
+        &STACK_LIMIT as *const AtomicU64 as i64
+    }
+}
+
+/// PROTOTYPE (feature `stack-check`): the per-prologue software stack-limit check — overflow protection
+/// for the arena/software-guard fiber model, which drops the per-fiber hardware guard page. Modelled on
+/// [`emit_epoch_check`]: load the running fiber's low bound from [`stack_check::STACK_LIMIT`], get the
+/// current SP, and trap [`TrapKind::StackOverflow`] if `SP - RED_ZONE < limit` — this function's frame
+/// (bounded to `RED_ZONE` post-compile) would grow the native stack past the fiber's low bound.
+/// `limit == 0` (the root, on the OS stack) ⇒ `SP - RED_ZONE` is a huge address, never `< 0`, so the
+/// check is inert there. The **atomic** load is opaque to the optimizer (like the epoch poll), so it
+/// isn't hoisted/folded. Emitted once per function entry; the callee re-checks before its own frame.
 #[cfg(feature = "stack-check")]
 fn emit_stack_check(b: &mut FunctionBuilder, lower: &Lower) {
-    use std::sync::atomic::AtomicU64;
-    // Host-owned limit cell. 0 here ⇒ benign (never traps); a real build writes each fiber's
-    // `usable_low` on switch-in. `static` so its address is stable to bake as an `iconst`.
-    static STACK_LIMIT_CELL: AtomicU64 = AtomicU64::new(0);
     let cont = b.create_block();
     let trap_blk = b.create_block();
-    let addr = b
-        .ins()
-        .iconst(I64, &STACK_LIMIT_CELL as *const AtomicU64 as i64);
-    // Atomic load: a host cell the optimizer must not hoist/fold (same reasoning as the epoch poll).
+    let addr = b.ins().iconst(I64, stack_check::limit_addr());
     let limit = b.ins().atomic_load(I64, atomic_flags(), addr);
     let sp = b.ins().get_stack_pointer(I64);
-    let lt = b.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
+    let guard = b.ins().iadd_imm(sp, -(stack_check::RED_ZONE as i64)); // SP - RED_ZONE
+    let lt = b.ins().icmp(IntCC::UnsignedLessThan, guard, limit);
     b.ins().brif(lt, trap_blk, &[], cont, &[]);
     b.switch_to_block(trap_blk);
-    emit_trap(b, lower, TrapKind::OutOfFuel); // never taken in the prototype; reuse a cold kind
+    emit_trap(b, lower, TrapKind::StackOverflow);
     b.switch_to_block(cont);
 }
 #[cfg(not(feature = "stack-check"))]

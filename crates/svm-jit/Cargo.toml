@@ -16,6 +16,10 @@ arena-stacks = ["svm-fiber/arena-stacks"]
 # `emit_stack_check`); a real deployment must keep enforcement in the escape-TCB.
 stack-check = []
 
+[dev-dependencies]
+# Parse hand-written text IR in the `stack-check` guard test (svm-text → svm-ir; no dep cycle).
+svm-text = { path = "../svm-text" }
+
 [dependencies]
 cranelift-codegen = "0.132.0"
 cranelift-frontend = "0.132.0"

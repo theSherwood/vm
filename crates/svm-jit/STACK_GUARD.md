@@ -76,12 +76,23 @@ This keeps the check per-thread-correct with no ABI param and no TLS access-mode
 
 1. **[done]** `TrapKind::StackOverflow` + `from_code`; `arena-stacks` allocator; cost-only
    `emit_stack_check` prototype; feature flags; measurements.
-2. **[next]** Widen the trap cell to `[i64; 2]` at the run-harness allocation sites; write
-   `usable_low` across the resume seam (and 0 for the root); make `emit_stack_check` load
-   `[trap_out+8]`, do the frame-aware `SP − RED_ZONE < limit` compare, and trap `StackOverflow`;
-   add the post-compile frame-size bound. Test: a deeply-recursing fiber traps `StackOverflow`
-   (arena mode) instead of corrupting a neighbour; normal fibers still run; differential vs the
-   interpreter.
+2. **[done — this increment]** Functional escape-grade check: `emit_stack_check` now does the
+   frame-aware `SP − RED_ZONE < limit` compare and traps `StackOverflow`; the fiber runtime writes each
+   resumed fiber's `usable_low` across the resume seam (`fiber_rt.rs`, bracketed with
+   `svm_set_current_fiber`) and the root stays `limit = 0` (inert). Test `tests/stack_check.rs`: an
+   unbounded-recursion fiber traps `StackOverflow`; a shallow fiber still runs. **Two deviations from
+   the plan, deferred to 2b:**
+   - *Limit source* is a **process-global** `STACK_LIMIT` cell, not the trap-cell-adjacent word. It is
+     set/restored across the resume seam, so it is **correct for one vCPU's cooperative fibers**
+     (including nested resumes) but **not** for concurrent multi-vCPU (`thread.spawn`) runs. The
+     feature is off by default, so this affects nothing shipped.
+   - *Frame-size bound* is **not** enforced: Cranelift 0.132 doesn't expose the final frame size on
+     `CompiledCode`, so a function with an unusually large spill frame (> `RED_ZONE`) is an assumption,
+     not a guarantee.
+2b. **[next]** Make it multi-vCPU-correct + fully sound: move the limit to the trap-cell-adjacent word
+   (widen the trap cell to `[trap_code, stack_limit]` at the run-harness sites; prologue loads
+   `[trap_out+8]`), and add the frame-size bound (prologue-parse the `sub rsp, N`, or an upstream
+   Cranelift API, or the native frame-aware mechanism + a SIGILL handler). Differential vs the interp.
 3. **Windows** arena + TEB-field `Stack` surface; **GC** interaction (a reused, un-zeroed slot makes
    the conservative `gc.roots` scan over-approximate — sound but imprecise; decide zero-on-reclaim of
    only the touched high-water region vs accept the over-approximation).

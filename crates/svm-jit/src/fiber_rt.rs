@@ -851,10 +851,18 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // an outer fiber) when the resume returns. Stack-disciplined across nested resumes, mirroring the
     // durable shadow-SP bracket above — so a migrated fiber is named by identity, not by thread.
     let prev_fiber = svm_set_current_fiber(fiber_handle(slot_idx, slot.own.generation()));
+    // Software stack-overflow guard (feature `stack-check`, STACK_GUARD.md §3): publish this fiber's
+    // stack low bound so its prologue checks trap before growing the native stack past it, and restore
+    // the resumer's bound (root or an outer fiber) after — same stack-disciplined bracket as
+    // `svm_set_current_fiber`, so nested resumes compose. `usable_low` is `full_extent().0`.
+    #[cfg(feature = "stack-check")]
+    let prev_limit = crate::stack_check::set_limit((*fib).full_extent().0 as u64);
     // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
     // `*fib` exclusive to this vCPU. The same `svm-fiber` instruction sequence regardless of which
     // thread the fiber last ran on (see the module header's 3c soundness argument).
     let st = (*fib).resume(arg as u64);
+    #[cfg(feature = "stack-check")]
+    crate::stack_check::restore_limit(prev_limit);
     svm_set_current_fiber(prev_fiber);
     // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
     // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region (+ register).
