@@ -23,9 +23,11 @@
 //! reader does), and vector binops/reductions; and **constant-expressions** (`getelementptr`/
 //! `ptrtoint`/`bitcast`/`add`/… folded inside a constant, e.g. a global initialized to an offset into
 //! another global); and **C++ exception handling** (`invoke`/`resume` terminators, `landingpad`,
-//! `extractvalue`/`insertvalue` — the `personality` clause is skipped). Not yet handled (the growth
-//! frontier): scalable-vector-specific ops and `blockaddress`/`indirectbr`. Anything unhandled is a
-//! clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a
+//! `extractvalue`/`insertvalue` — the `personality` clause is skipped); and **atomics**
+//! (`atomicrmw`/`cmpxchg`/`fence` + the `load atomic`/`store atomic` variants — syncscope + memory
+//! ordering). Not yet handled (the growth frontier): scalable-vector-specific ops, `blockaddress`/
+//! `indirectbr`, and literal-aggregate constants. Anything unhandled is a clean [`ParseError`]
+//! (fail-closed, re-verified downstream — §2a), never a
 //! miscompile.
 
 use super::ast::*;
@@ -647,9 +649,12 @@ impl Parser {
         if self.at_call() {
             return self.call_inst(next_unnamed).map(Instruction::Call);
         }
-        // `store` is the other result-less instruction (no `%dest =`).
+        // `store`/`fence` are the other result-less instructions (no `%dest =`).
         if matches!(self.peek(), Some(Token::Word(w)) if w == "store") {
             return self.store_inst().map(Instruction::Store);
+        }
+        if matches!(self.peek(), Some(Token::Word(w)) if w == "fence") {
+            return self.fence_inst().map(Instruction::Fence);
         }
         // `%dest =` prefix (every other instruction modeled here produces a value).
         let dest = self.instr_dest(next_unnamed)?;
@@ -718,6 +723,8 @@ impl Parser {
             "extractvalue" => Instruction::ExtractValue(self.extractvalue_inst(dest)?),
             "insertvalue" => Instruction::InsertValue(self.insertvalue_inst(dest)?),
             "landingpad" => Instruction::LandingPad(self.landingpad_inst(dest)?),
+            "atomicrmw" => Instruction::AtomicRMW(self.atomicrmw_inst(dest)?),
+            "cmpxchg" => Instruction::CmpXchg(self.cmpxchg_inst(dest)?),
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
@@ -1483,6 +1490,142 @@ impl Parser {
         })
     }
 
+    // ---- atomics -------------------------------------------------------------------------------
+
+    /// `atomicrmw [volatile] <op> ptr <addr>, <ty> <val> [syncscope("…")] <ordering> [, align N]`.
+    fn atomicrmw_inst(&mut self, dest: Name) -> PResult<AtomicRMW> {
+        self.pos += 1; // `atomicrmw`
+        let volatile = self.eat_word("volatile");
+        let operation = self.rmw_op()?;
+        let addr_ty = self.type_()?;
+        let address = self.value_as_operand(&addr_ty)?;
+        self.expect(&Token::Comma)?;
+        let vty = self.type_()?;
+        let value = self.value_as_operand(&vty)?;
+        let atomicity = self.atomicity()?;
+        let _align = self.opt_align()?; // AtomicRMW carries no alignment field
+        self.skip_trailing_metadata();
+        Ok(AtomicRMW {
+            operation,
+            address,
+            value,
+            dest,
+            volatile,
+            atomicity,
+            debugloc: None,
+        })
+    }
+
+    /// `cmpxchg [weak] [volatile] ptr <addr>, <ty> <expected>, <ty> <replacement> [syncscope("…")]
+    /// <success-ordering> <failure-ordering> [, align N]`.
+    fn cmpxchg_inst(&mut self, dest: Name) -> PResult<CmpXchg> {
+        self.pos += 1; // `cmpxchg`
+        let weak = self.eat_word("weak");
+        let volatile = self.eat_word("volatile");
+        let addr_ty = self.type_()?;
+        let address = self.value_as_operand(&addr_ty)?;
+        self.expect(&Token::Comma)?;
+        let ety = self.type_()?;
+        let expected = self.value_as_operand(&ety)?;
+        self.expect(&Token::Comma)?;
+        let rty = self.type_()?;
+        let replacement = self.value_as_operand(&rty)?;
+        let atomicity = self.atomicity()?; // syncscope + success ordering
+        let failure_memory_ordering = self.mem_ordering()?;
+        let _align = self.opt_align()?;
+        self.skip_trailing_metadata();
+        Ok(CmpXchg {
+            address,
+            expected,
+            replacement,
+            dest,
+            volatile,
+            atomicity,
+            failure_memory_ordering,
+            weak,
+            debugloc: None,
+        })
+    }
+
+    /// `fence [syncscope("…")] <ordering>` — result-less.
+    fn fence_inst(&mut self) -> PResult<Fence> {
+        self.pos += 1; // `fence`
+        let atomicity = self.atomicity()?;
+        self.skip_trailing_metadata();
+        Ok(Fence {
+            atomicity,
+            debugloc: None,
+        })
+    }
+
+    /// An optional `syncscope("…")` followed by a memory ordering — the atomic annotation on
+    /// `atomicrmw`/`cmpxchg`/`fence`/`load atomic`/`store atomic`. No `syncscope` ⇒ system scope.
+    fn atomicity(&mut self) -> PResult<Atomicity> {
+        let synch_scope = if self.eat_word("syncscope") {
+            self.expect(&Token::LParen)?;
+            let s = match self.bump() {
+                Some(Token::Str(s)) => s,
+                other => return self.err(format!("expected a syncscope string, found {other:?}")),
+            };
+            self.expect(&Token::RParen)?;
+            if s == "singlethread" {
+                SynchronizationScope::SingleThread
+            } else {
+                SynchronizationScope::System
+            }
+        } else {
+            SynchronizationScope::System
+        };
+        let mem_ordering = self.mem_ordering()?;
+        Ok(Atomicity {
+            synch_scope,
+            mem_ordering,
+        })
+    }
+
+    fn mem_ordering(&mut self) -> PResult<MemoryOrdering> {
+        let o = match self.peek() {
+            Some(Token::Word(w)) => match w.as_str() {
+                "unordered" => MemoryOrdering::Unordered,
+                "monotonic" => MemoryOrdering::Monotonic,
+                "acquire" => MemoryOrdering::Acquire,
+                "release" => MemoryOrdering::Release,
+                "acq_rel" => MemoryOrdering::AcquireRelease,
+                "seq_cst" => MemoryOrdering::SequentiallyConsistent,
+                other => return self.err(format!("unknown memory ordering `{other}`")),
+            },
+            other => return self.err(format!("expected a memory ordering, found {other:?}")),
+        };
+        self.pos += 1;
+        Ok(o)
+    }
+
+    fn rmw_op(&mut self) -> PResult<RMWBinOp> {
+        let op = match self.peek() {
+            Some(Token::Word(w)) => match w.as_str() {
+                "xchg" => RMWBinOp::Xchg,
+                "add" => RMWBinOp::Add,
+                "sub" => RMWBinOp::Sub,
+                "and" => RMWBinOp::And,
+                "nand" => RMWBinOp::Nand,
+                "or" => RMWBinOp::Or,
+                "xor" => RMWBinOp::Xor,
+                "max" => RMWBinOp::Max,
+                "min" => RMWBinOp::Min,
+                "umax" => RMWBinOp::UMax,
+                "umin" => RMWBinOp::UMin,
+                "fadd" => RMWBinOp::FAdd,
+                "fsub" => RMWBinOp::FSub,
+                "fmax" => RMWBinOp::FMax,
+                "fmin" => RMWBinOp::FMin,
+                other => return self.err(format!("unknown atomicrmw operation `{other}`")),
+            },
+            other => return self.err(format!("expected an atomicrmw operation, found {other:?}")),
+        };
+        self.pos += 1;
+        Ok(op)
+    }
+
     // ---- memory --------------------------------------------------------------------------------
 
     /// `alloca [inalloca] <ty> [, <cty> <count>] [, align N] [, addrspace(N)]`. The array size defaults
@@ -1518,14 +1661,21 @@ impl Parser {
         })
     }
 
-    /// `load [volatile] <ty>, ptr <addr> [, align N] [, !meta]` (atomic loads deferred).
+    /// `load [atomic] [volatile] <ty>, ptr <addr> [syncscope("…")] <ordering>? [, align N] [, !meta]`.
     fn load_inst(&mut self, dest: Name) -> PResult<Load> {
         self.pos += 1; // `load`
+        let atomic = self.eat_word("atomic");
         let volatile = self.eat_word("volatile");
         let loaded_ty = self.type_()?;
         self.expect(&Token::Comma)?;
         let addr_ty = self.type_()?; // `ptr`
         let address = self.value_as_operand(&addr_ty)?;
+        // An atomic load carries `[syncscope] <ordering>` (before `, align`).
+        let atomicity = if atomic {
+            Some(self.atomicity()?)
+        } else {
+            None
+        };
         let alignment = self.opt_align()?;
         self.skip_trailing_metadata();
         Ok(Load {
@@ -1533,28 +1683,35 @@ impl Parser {
             dest,
             loaded_ty,
             volatile,
-            atomicity: None,
+            atomicity,
             alignment,
             debugloc: None,
         })
     }
 
-    /// `store [volatile] <ty> <val>, ptr <addr> [, align N] [, !meta]` — result-less.
+    /// `store [atomic] [volatile] <ty> <val>, ptr <addr> [syncscope("…")] <ordering>? [, align N]` —
+    /// result-less.
     fn store_inst(&mut self) -> PResult<Store> {
         self.pos += 1; // `store`
+        let atomic = self.eat_word("atomic");
         let volatile = self.eat_word("volatile");
         let vty = self.type_()?;
         let value = self.value_as_operand(&vty)?;
         self.expect(&Token::Comma)?;
         let addr_ty = self.type_()?; // `ptr`
         let address = self.value_as_operand(&addr_ty)?;
+        let atomicity = if atomic {
+            Some(self.atomicity()?)
+        } else {
+            None
+        };
         let alignment = self.opt_align()?;
         self.skip_trailing_metadata();
         Ok(Store {
             address,
             value,
             volatile,
-            atomicity: None,
+            atomicity,
             alignment,
             debugloc: None,
         })

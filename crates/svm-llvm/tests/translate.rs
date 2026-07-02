@@ -7634,6 +7634,17 @@ fn ll_parity_invoke_landingpad() {
 }
 
 #[test]
+fn ll_parity_atomics() {
+    // `atomicrmw`, `cmpxchg`, and `load atomic` — the atomic memory ops (orderings + syncscope), via
+    // `<stdatomic.h>`. (`fence` is omitted: the translator itself doesn't lower it.)
+    let src = "#include <stdatomic.h>\n\
+               int rmw(_Atomic int *p, int v){ return atomic_fetch_add(p, v); }\n\
+               int cx(_Atomic int *p, int a, int b){ atomic_compare_exchange_strong(p, &a, b); return a; }\n\
+               int ld(_Atomic int *p){ return atomic_load(p); }\n";
+    assert_ll_parity("ll_parity_atomic", src);
+}
+
+#[test]
 fn ll_parity_switch() {
     // A `switch` terminator with a constant→label jump table (sparse cases + default).
     assert_ll_parity(

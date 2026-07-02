@@ -1866,12 +1866,20 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     `__cxa_*`) — **NB** the translator only reserves the EH region when the module has a `main`
     (`need_eh = uses_eh && has_main`), so the test source includes one. **Twenty-nine parity tests total.**
     The instruction set is now broadly saturated for `clang`-emitted C/C++.
-- **Next step (resume here): loose ends, then PR3.** Remaining `clang`-emitted shapes, each a small
+  - **Parser — atomics landed.** `atomicrmw [volatile] <op> ptr <a>, <ty> <v> [syncscope("…")]
+    <ordering>` (all 15 `RMWBinOp`s), `cmpxchg [weak] [volatile] ptr <a>, <ty> <exp>, <ty> <new>
+    <success> <failure>`, `fence <ordering>` (result-less, routed like `store`), and the `load atomic`/
+    `store atomic` variants (an `atomic` keyword + trailing `[syncscope] <ordering>` before `, align`).
+    Shared `atomicity()`/`mem_ordering()`/`rmw_op()` helpers; no-`syncscope` ⇒ system scope. One parity
+    test: `atomic_fetch_add` + `atomic_compare_exchange_strong` + `atomic_load` — **NB** `fence` parses
+    but the *translator* doesn't lower it (`Unsupported`), so it's excluded from the test. **Thirty parity
+    tests total.**
+- **Next step (resume here): last loose ends, then PR3.** Remaining `clang`-emitted shapes, each a small
   `clang -O2`-shape + `assert_ll_parity` addition: **literal aggregate constants** `{ i32 1, i8 2 }` as
   operands/inits, **`indirectbr` + `blockaddress`** (the `blockaddress(@f, %bb)` payload the parser
-  recovers structurally — the AST already has `Constant::BlockAddress`), **atomics**
-  (`atomicrmw`/`cmpxchg`/`fence` + the `load atomic`/`store atomic` variants — `Atomicity` is in the AST),
-  and **scalable-vector** ops. Then **PR3**:
+  recovers structurally — the AST already has `Constant::BlockAddress`), and **scalable-vector** ops.
+  These are increasingly rare in `clang -O2` output; the instruction set is otherwise saturated. Then
+  **PR3**:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).
