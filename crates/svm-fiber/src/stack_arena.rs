@@ -44,25 +44,31 @@ fn alloc_slot() -> Option<*mut u8> {
     if let Some(p) = st.free.pop() {
         return Some(p);
     }
-    // SAFETY: a fresh anonymous lazy reservation; checked for MAP_FAILED, owned by `STATE.arenas`.
-    let base = unsafe {
+    // Over-allocate by one SLOT so the usable region can be rounded up to a **SLOT boundary**: with
+    // SLOT-aligned slots, a slot's low bound is `sp & !(SLOT-1)` for any sp in it — which is how the
+    // per-vCPU software stack-limit check derives the limit from SP alone (STACK_GUARD.md §2b path A),
+    // with no per-thread cell. SAFETY: a fresh anonymous lazy reservation; checked for MAP_FAILED.
+    let raw = unsafe {
         libc::mmap(
             core::ptr::null_mut(),
-            ARENA,
+            ARENA + SLOT,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
             -1,
             0,
         )
     };
-    if base == libc::MAP_FAILED {
+    if raw == libc::MAP_FAILED {
         return None;
     }
-    let base = base as *mut u8;
-    st.arenas.push(base);
-    // Hand out slot 0 now; push the rest onto the free-list.
+    let raw = raw as *mut u8;
+    // Record the raw reservation (never unmapped — a prototype).
+    st.arenas.push(raw);
+    // Round up to the next SLOT boundary; the extra SLOT guarantees `[base, base + ARENA)` fits.
+    let base = ((raw as usize + SLOT - 1) & !(SLOT - 1)) as *mut u8;
+    // Hand out slot 0 now; push the rest onto the free-list. Every slot is SLOT-aligned.
     for i in 1..SLOTS_PER_ARENA {
-        // SAFETY: `i * SLOT < ARENA`, within the reservation.
+        // SAFETY: `i * SLOT < ARENA`, within the (over-)reservation from the aligned base.
         st.free.push(unsafe { base.add(i * SLOT) });
     }
     Some(base)

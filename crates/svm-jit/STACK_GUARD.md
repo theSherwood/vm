@@ -89,10 +89,42 @@ This keeps the check per-thread-correct with no ABI param and no TLS access-mode
    - *Frame-size bound* is **not** enforced: Cranelift 0.132 doesn't expose the final frame size on
      `CompiledCode`, so a function with an unusually large spill frame (> `RED_ZONE`) is an assumption,
      not a guarantee.
-2b. **[next]** Make it multi-vCPU-correct + fully sound: move the limit to the trap-cell-adjacent word
-   (widen the trap cell to `[trap_code, stack_limit]` at the run-harness sites; prologue loads
-   `[trap_out+8]`), and add the frame-size bound (prologue-parse the `sub rsp, N`, or an upstream
-   Cranelift API, or the native frame-aware mechanism + a SIGILL handler). Differential vs the interp.
+2b. **[investigated — plan revised, see below]** Make it multi-vCPU-correct + fully sound.
+
+### 2b findings (reading the code changed the plan)
+
+- **The trap cell is shared across vCPUs, not per-vCPU** (`lib.rs:2862` "shared across vCPU threads —
+  every spawned vCPU gets its address via `set_env`"). So the design's §3 "ride alongside `trap_out`"
+  approach **does not give per-vCPU correctness** — a widened trap cell would be shared too, clobbered
+  between concurrent vCPUs. Retracted.
+- **`cranelift-jit` does not support TLS** (`cranelift-jit-0.132/src/backend.rs:448`
+  `assert!(!tls, "JIT doesn't yet support TLS")`). So a Cranelift TLS-data global (the usual per-thread
+  source) is out. A helper-*call* per prologue would work but costs ~10–20× the ~1-cycle check.
+- **The check runs *after* the machine prologue's `sub rsp, frame`** (it's in the entry block, which
+  Cranelift emits after the prologue), so `get_stack_pointer` already reflects this function's frame —
+  the check **validates each frame directly**. Therefore `RED_ZONE` only needs to cover the prologue's
+  pre-check register *pushes* (~tens of bytes), and the post-compile frame-size bound is **not** a
+  per-frame necessity — only a backstop against an absurd (> stack-size) single frame. Good news: the
+  current check is more sound than §2 claimed, and the frame-size-API blocker is far less important.
+
+### 2b revised path (needs a direction decision — two real options)
+
+Per-vCPU state with no vmctx, no TLS, and a shared trap cell leaves two viable routes:
+
+- **A. SP-mask + uniform arena stacks.** Derive the limit from SP itself: `limit = SP & ~(SLOT-1)` is
+  the running arena slot's low bound (requires SLOT-aligned slots) — inherently per-thread (each vCPU
+  has its own SP), no cell, cheapest possible check (pure arithmetic, no load). Catch: the **root**
+  runs on the unaligned OS thread stack, where the mask misfires — so the root must **also** run on an
+  aligned arena slot (switch onto a managed stack at guest entry). Elegant and uniform, but changes the
+  root run path.
+- **B. Per-vCPU ABI channel.** Thread a per-vCPU stack-limit pointer alongside `mem_base`/`trap_out`
+  (a real "vmctx-lite" param), sourced per spawned vCPU. Correct and mechanism-agnostic, but an ABI
+  change touching `sig_from`, every call site, and the trampolines.
+
+Recommendation: **A** (SP-mask + uniform stacks) — it removes per-thread plumbing entirely and is the
+cheapest check, and running everything on managed stacks is the natural end-state for the arena model.
+The frame-size bound stays a backstop (absurd frames only), addressable later via prologue-parse or an
+upstream API.
 3. **Windows** arena + TEB-field `Stack` surface; **GC** interaction (a reused, un-zeroed slot makes
    the conservative `gc.roots` scan over-approximate — sound but imprecise; decide zero-on-reclaim of
    only the touched high-water region vs accept the over-approximation).
