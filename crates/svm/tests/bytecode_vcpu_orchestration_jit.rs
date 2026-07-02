@@ -275,9 +275,11 @@ fn drive<'s, 'e>(
             } => {
                 vcpu.deliver_jit_invoke(orch.resolve_unit(handle, code));
             }
-            // These kernels use only spawn/join + JIT; wait/notify never arise here.
-            bytecode::VcpuEvent::Wait { .. } | bytecode::VcpuEvent::Notify { .. } => {
-                panic!("unexpected wait/notify event in JIT orchestration kernel")
+            // These kernels use only spawn/join + JIT; wait/notify/§14 never arise here.
+            bytecode::VcpuEvent::Wait { .. }
+            | bytecode::VcpuEvent::Notify { .. }
+            | bytecode::VcpuEvent::Instantiate { .. } => {
+                panic!("unexpected event in JIT orchestration kernel")
             }
         }
     }
