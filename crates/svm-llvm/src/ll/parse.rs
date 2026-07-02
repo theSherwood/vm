@@ -22,9 +22,10 @@
 //! `shufflevector` (the mask canonicalized to a `Constant::Vector` of `i32` indices, as the bitcode
 //! reader does), and vector binops/reductions; and **constant-expressions** (`getelementptr`/
 //! `ptrtoint`/`bitcast`/`add`/… folded inside a constant, e.g. a global initialized to an offset into
-//! another global). Not yet handled (the growth frontier): C++ EH (`invoke`/`landingpad`) and scalable
-//! vectors. Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a),
-//! never a
+//! another global); and **C++ exception handling** (`invoke`/`resume` terminators, `landingpad`,
+//! `extractvalue`/`insertvalue` — the `personality` clause is skipped). Not yet handled (the growth
+//! frontier): scalable-vector-specific ops and `blockaddress`/`indirectbr`. Anything unhandled is a
+//! clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a
 //! miscompile.
 
 use super::ast::*;
@@ -595,7 +596,7 @@ impl Parser {
                 let instr = self.instruction(&mut next_unnamed)?;
                 instrs.push(instr);
             }
-            let term = self.terminator()?;
+            let term = self.terminator(&mut next_unnamed)?;
             blocks.push(BasicBlock { name, instrs, term });
         }
         Ok(blocks)
@@ -623,10 +624,17 @@ impl Parser {
         }
     }
 
-    /// Is the cursor at a terminator keyword?
+    /// Is the cursor at a terminator? Looks past an optional `%result =` (an `invoke`/`callbr` produces a
+    /// value yet ends the block), so `basic_blocks` routes it to `terminator()` rather than `instruction()`.
     fn at_terminator(&self) -> bool {
-        matches!(self.peek(), Some(Token::Word(w))
-            if matches!(w.as_str(), "ret" | "br" | "switch" | "indirectbr" | "unreachable" | "invoke" | "resume"))
+        let mut i = self.pos;
+        if matches!(self.toks.get(i), Some(Token::Local(_)))
+            && self.toks.get(i + 1) == Some(&Token::Equals)
+        {
+            i += 2;
+        }
+        matches!(self.toks.get(i), Some(Token::Word(w))
+            if matches!(w.as_str(), "ret" | "br" | "switch" | "indirectbr" | "unreachable" | "invoke" | "resume" | "callbr"))
     }
 
     // ---- instructions --------------------------------------------------------------------------
@@ -707,6 +715,9 @@ impl Parser {
             "extractelement" => Instruction::ExtractElement(self.extractelement_inst(dest)?),
             "insertelement" => Instruction::InsertElement(self.insertelement_inst(dest)?),
             "shufflevector" => Instruction::ShuffleVector(self.shufflevector_inst(dest)?),
+            "extractvalue" => Instruction::ExtractValue(self.extractvalue_inst(dest)?),
+            "insertvalue" => Instruction::InsertValue(self.insertvalue_inst(dest)?),
+            "landingpad" => Instruction::LandingPad(self.landingpad_inst(dest)?),
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
@@ -750,7 +761,16 @@ impl Parser {
 
     // ---- terminators ---------------------------------------------------------------------------
 
-    fn terminator(&mut self) -> PResult<Terminator> {
+    fn terminator(&mut self, next_unnamed: &mut usize) -> PResult<Terminator> {
+        // An `invoke` (value-producing terminator) carries a `%result =` prefix.
+        let result = if matches!(
+            (self.peek(), self.peek2()),
+            (Some(Token::Local(_)), Some(Token::Equals))
+        ) {
+            Some(self.instr_dest(next_unnamed)?)
+        } else {
+            None
+        };
         let op = match self.peek() {
             Some(Token::Word(w)) => w.clone(),
             other => return self.err(format!("expected a terminator, found {other:?}")),
@@ -759,6 +779,42 @@ impl Parser {
             "unreachable" => {
                 self.pos += 1;
                 Terminator::Unreachable(Unreachable { debugloc: None })
+            }
+            // `[%r =] invoke [attrs] <retty>|<fnty> <callee>(<args>) to label %ok unwind label %lpad`.
+            "invoke" => {
+                self.pos += 1; // `invoke`
+                let (function, function_ty, arguments) = self.call_signature()?;
+                self.expect_word("to")?;
+                self.expect_word("label")?;
+                let return_label = self.label_name()?;
+                self.expect_word("unwind")?;
+                self.expect_word("label")?;
+                let exception_label = self.label_name()?;
+                // A `void` invoke has no `%r =`; it still occupies a value slot.
+                let result = result.unwrap_or_else(|| {
+                    let n = *next_unnamed;
+                    *next_unnamed += 1;
+                    Name::Number(n)
+                });
+                Terminator::Invoke(Invoke {
+                    function,
+                    function_ty,
+                    arguments,
+                    result,
+                    return_label,
+                    exception_label,
+                    debugloc: None,
+                })
+            }
+            // `resume <ty> <val>` — re-raise the in-flight exception.
+            "resume" => {
+                self.pos += 1;
+                let ty = self.type_()?;
+                let operand = self.value_as_operand(&ty)?;
+                Terminator::Resume(Resume {
+                    operand,
+                    debugloc: None,
+                })
             }
             // `switch <ty> <v>, label %default [ <cty> <c>, label %l … ]` — the case entries inside the
             // brackets are whitespace-separated (no commas between them).
@@ -1349,6 +1405,84 @@ impl Parser {
         Ok(ConstantRef::new(Constant::Vector(elements)))
     }
 
+    // ---- aggregate value ops + landing pad -----------------------------------------------------
+
+    /// `extractvalue <ty> <agg>, <idx>[, <idx>]…` — the indices are plain integer literals.
+    fn extractvalue_inst(&mut self, dest: Name) -> PResult<ExtractValue> {
+        self.pos += 1; // `extractvalue`
+        let aty = self.type_()?;
+        let aggregate = self.value_as_operand(&aty)?;
+        let indices = self.value_index_list()?;
+        Ok(ExtractValue {
+            aggregate,
+            indices,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `insertvalue <ty> <agg>, <ety> <elt>, <idx>[, <idx>]…`.
+    fn insertvalue_inst(&mut self, dest: Name) -> PResult<InsertValue> {
+        self.pos += 1; // `insertvalue`
+        let aty = self.type_()?;
+        let aggregate = self.value_as_operand(&aty)?;
+        self.expect(&Token::Comma)?;
+        let ety = self.type_()?;
+        let element = self.value_as_operand(&ety)?;
+        let indices = self.value_index_list()?;
+        Ok(InsertValue {
+            aggregate,
+            element,
+            indices,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// The trailing `, <idx>, <idx>, …` integer index list of `extractvalue`/`insertvalue` (a `, !meta`
+    /// tail is left for [`Self::skip_trailing_metadata`]).
+    fn value_index_list(&mut self) -> PResult<Vec<u32>> {
+        let mut indices = Vec::new();
+        while self.peek() == Some(&Token::Comma) && !matches!(self.peek2(), Some(Token::Meta(_))) {
+            self.pos += 1; // `,`
+            indices.push(self.int_lit_u32()?);
+        }
+        self.skip_trailing_metadata();
+        Ok(indices)
+    }
+
+    /// `landingpad <ty> [cleanup] [catch <ty> <c>]… [filter <ty> <c>]…`. Each `catch`/`filter` becomes an
+    /// (opaque) clause marker — the translator reads only the clause count + the `cleanup` flag, matching
+    /// the bitcode reader's `LandingPadClause {}` mapping.
+    fn landingpad_inst(&mut self, dest: Name) -> PResult<LandingPad> {
+        self.pos += 1; // `landingpad`
+        let result_type = self.type_()?;
+        let mut cleanup = false;
+        let mut clauses = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Token::Word(w)) if w == "cleanup" => {
+                    self.pos += 1;
+                    cleanup = true;
+                }
+                Some(Token::Word(w)) if w == "catch" || w == "filter" => {
+                    self.pos += 1;
+                    let cty = self.type_()?;
+                    let _clause = self.constant(&cty)?;
+                    clauses.push(LandingPadClause {});
+                }
+                _ => break,
+            }
+        }
+        Ok(LandingPad {
+            result_type,
+            clauses,
+            dest,
+            cleanup,
+            debugloc: None,
+        })
+    }
+
     // ---- memory --------------------------------------------------------------------------------
 
     /// `alloca [inalloca] <ty> [, <cty> <count>] [, align N] [, addrspace(N)]`. The array size defaults
@@ -1552,6 +1686,22 @@ impl Parser {
             _ => false,
         };
         self.expect_word("call")?;
+        let (function, function_ty, arguments) = self.call_signature()?;
+        self.skip_trailing_metadata();
+        Ok(Call {
+            function,
+            function_ty,
+            arguments,
+            dest,
+            is_tail_call,
+            debugloc: None,
+        })
+    }
+
+    /// The shared `call`/`invoke` body *after* the opcode keyword: `[fmf] [cconv/ret-attrs]
+    /// <retty>|<fnty> <callee>(<args>) [#N]` → the callee operand (a `GlobalReference` for `@f`, an
+    /// opaque-ptr local for an indirect `%fp`), the reconstructed function type, and the arguments.
+    fn call_signature(&mut self) -> PResult<(Either<InlineAssembly, Operand>, TypeRef, CallArgs)> {
         self.skip_fast_math_flags();
         self.skip_pre_signature_attrs(); // calling convention + return attributes
         let ret_ty = self.type_()?;
@@ -1567,8 +1717,6 @@ impl Parser {
         } else {
             None
         };
-        // The callee name (a global `@f` or an indirect `%fp`); the operand is built once the function
-        // type is known (after the arguments, in the reconstructed case).
         enum Callee {
             Global(Name),
             Reg(Name),
@@ -1598,19 +1746,11 @@ impl Parser {
                 ty: self.module.types.pointer(0),
             }),
         };
-        // Trailing attribute-group refs (`#4`) and `, !dbg`-style metadata.
+        // Trailing attribute-group refs (`#4`).
         while matches!(self.peek(), Some(Token::Word(w)) if w.starts_with('#')) {
             self.pos += 1;
         }
-        self.skip_trailing_metadata();
-        Ok(Call {
-            function,
-            function_ty,
-            arguments,
-            dest,
-            is_tail_call,
-            debugloc: None,
-        })
+        Ok((function, function_ty, arguments))
     }
 
     /// A call argument list `( <ty> [attrs] <val>, … )` — returns the operands (attributes dropped, as

@@ -1855,16 +1855,23 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     function-pointer table (`[N x ptr] [ptr @fa, …]`) is rejected by the *translator itself*
     (`Unsupported("constexpr reference to @fa")`) on **both** paths — a translator gap, not a parser one,
     so no parity test covers it. **Twenty-eight parity tests total.**
-- **Next step (resume here): C++ EH (`invoke`/`landingpad`/`resume`), then loose ends.** The growth
-  frontier, each a `clang -O2` shape + an `assert_ll_parity` test: **C++ exceptions** — `invoke <ret>
-  @f(args) to label %ok unwind label %lpad` (a *terminator* that both calls and branches — reuses the
-  call-operand/arg grammar + two labels), the `landingpad <ty> { cleanup | catch <ty> <c> }…` instruction,
-  and the `resume <ty> <v>` terminator; the function also carries a `personality` clause in its signature
-  (currently skipped — verify that's still fine). Then **literal aggregate constants** `{ i32 1, i8 2 }`
-  as operands/inits, **scalable vectors** (`<vscale x N x T>` — the type already parses; needs a stepvector/
-  intrinsic test), and **`i128`/`blockaddress`** (these come *free* in text — full-width constants, no
-  `llvm-sys` re-parse; `blockaddress` needs the parser-recovered payload). After the instruction set is
-  saturated, **PR3**:
+  - **Parser — C++ exception handling landed.** `invoke [%r =] … to label %ok unwind label %lpad` is
+    parsed in `terminator()` (which now takes `next_unnamed` and handles the value-producing terminator's
+    `%r =` prefix; `at_terminator` looks past it). The `call`/`invoke` callee+arg grammar is factored into
+    a shared `call_signature`. Added the `resume <ty> <v>` terminator, `landingpad <ty> [cleanup]
+    [catch|filter <ty> <c>]…` (clauses → opaque `LandingPadClause {}` markers + the `cleanup` flag, as the
+    shim maps them), and `extractvalue`/`insertvalue <ty> <agg>, … , <idx>…`. The function `personality`
+    clause is skipped (already handled by the pre-`{` attr skip). The harness gained `assert_ll_parity_cpp`
+    (`clang++ -O1 -fexceptions`). One parity test: a `try/catch` (invoke + landingpad + extractvalue +
+    `__cxa_*`) — **NB** the translator only reserves the EH region when the module has a `main`
+    (`need_eh = uses_eh && has_main`), so the test source includes one. **Twenty-nine parity tests total.**
+    The instruction set is now broadly saturated for `clang`-emitted C/C++.
+- **Next step (resume here): loose ends, then PR3.** Remaining `clang`-emitted shapes, each a small
+  `clang -O2`-shape + `assert_ll_parity` addition: **literal aggregate constants** `{ i32 1, i8 2 }` as
+  operands/inits, **`indirectbr` + `blockaddress`** (the `blockaddress(@f, %bb)` payload the parser
+  recovers structurally — the AST already has `Constant::BlockAddress`), **atomics**
+  (`atomicrmw`/`cmpxchg`/`fence` + the `load atomic`/`store atomic` variants — `Atomicity` is in the AST),
+  and **scalable-vector** ops. Then **PR3**:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).

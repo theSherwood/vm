@@ -7337,14 +7337,37 @@ fn compile_to_ll(name: &str, src: &str) -> Option<PathBuf> {
     }
 }
 
-/// Assert the bitcode and textual readers translate `src` to byte-identical svm-ir (their
-/// `print_module` text) and the same `entry_sp`. Skips cleanly if `clang` is unavailable.
-fn assert_ll_parity(name: &str, src: &str) {
-    let (Some(bc), Some(ll)) = (compile_to_bc(name, src), compile_to_ll(name, src)) else {
-        return;
-    };
-    let from_bc = svm_llvm::translate_bc_path(&bc).expect("translate via bitcode");
-    let from_ll = svm_llvm::translate_ll_path(&ll).expect("translate via textual .ll");
+/// Compile C++ (with exceptions) to a `.bc`/`.ll` — the EH constructs (`invoke`/`landingpad`/`resume`,
+/// `personality`) only appear from a C++ front end. `emit` is `-c` (bitcode) or `-S` (textual).
+fn compile_cpp(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let cpp = dir.join(format!(
+        "svm_llvm_{}_{}_{}.cpp",
+        std::process::id(),
+        name,
+        ext
+    ));
+    let out = dir.join(format!("svm_llvm_{}_{}.{}", std::process::id(), name, ext));
+    std::fs::write(&cpp, src).expect("write C++ source");
+    let status = Command::new("clang++")
+        .args(["-O1", "-fexceptions", "-emit-llvm", emit])
+        .arg(&cpp)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang++ unavailable)");
+            None
+        }
+    }
+}
+
+/// The parity assertion core: both readers must translate to byte-identical svm-ir + `entry_sp`.
+fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) {
+    let from_bc = svm_llvm::translate_bc_path(bc).expect("translate via bitcode");
+    let from_ll = svm_llvm::translate_ll_path(ll).expect("translate via textual .ll");
     assert_eq!(
         svm_text::print_module(&from_bc.module),
         svm_text::print_module(&from_ll.module),
@@ -7354,6 +7377,26 @@ fn assert_ll_parity(name: &str, src: &str) {
         from_bc.entry_sp, from_ll.entry_sp,
         "entry_sp mismatch for `{name}`",
     );
+}
+
+/// Assert the bitcode and textual readers translate `src` to byte-identical svm-ir (their
+/// `print_module` text) and the same `entry_sp`. Skips cleanly if `clang` is unavailable.
+fn assert_ll_parity(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (compile_to_bc(name, src), compile_to_ll(name, src)) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+/// Like [`assert_ll_parity`], but the source is C++ compiled with exceptions (for EH constructs).
+fn assert_ll_parity_cpp(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_cpp(name, src, "-c", "bc"),
+        compile_cpp(name, src, "-S", "ll"),
+    ) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
 }
 
 #[test]
@@ -7577,6 +7620,17 @@ fn ll_parity_const_gep() {
 fn ll_parity_const_ptrtoint() {
     // A nested constant-expression: `ptrtoint (ptr getelementptr(…) to i64)` as a global initializer.
     assert_ll_parity("ll_parity_cptr", "int arr[10]; long addr = (long)&arr[1];");
+}
+
+#[test]
+fn ll_parity_invoke_landingpad() {
+    // C++ try/catch → `invoke … to label %ok unwind label %lpad` (a value-producing terminator),
+    // `landingpad { ptr, i32 } catch ptr null`, `extractvalue`, and the `__cxa_*` runtime calls. The
+    // translator only reserves the EH region when the module has a `main`, so include one.
+    let src = "int may_throw(int x){ if (x < 0) throw x; return x * 2; } \
+               int f(int x){ try { return may_throw(x); } catch (...) { return -1; } } \
+               int main(){ return f(-1) + f(3); }";
+    assert_ll_parity_cpp("ll_parity_eh", src);
 }
 
 #[test]
