@@ -34,6 +34,19 @@
 #define WARMUP_HEAT 0
 #endif
 
+/* One kernel (statemate) declares a file-scope `unsigned long time;` that clashes with <time.h>'s
+ * `time()` in the native oracle build (the SVM build defines SVM_BUILD and never pulls <time.h>, so it
+ * translates fine either way). Pull <time.h> in first — for the native build — so libc keeps its own
+ * `time`, *then* rename just the kernel's global out of the way. A command-line `-Dtime=...` can't do
+ * this: it's translation-unit-wide, so it renames libc's `time()` too and the clash just recurs under
+ * the new name. Gated per-kernel via -DBENCH_TIME_RENAME=<newname>; applied to native and SVM alike so
+ * both compile the identical program (an honest differential). No-op for every other kernel. */
+#ifdef BENCH_TIME_RENAME
+#ifndef SVM_BUILD
+#include <time.h>
+#endif
+#define time BENCH_TIME_RENAME
+#endif
 #include BENCH_SRC
 #ifdef BENCH_EXTRA1
 #include BENCH_EXTRA1
