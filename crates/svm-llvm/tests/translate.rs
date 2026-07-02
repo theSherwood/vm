@@ -7538,6 +7538,35 @@ fn ll_parity_global_float_array() {
 }
 
 #[test]
+fn ll_parity_vector_add() {
+    // A `<4 x i32>` vector binop — vector types in operands/results.
+    assert_ll_parity(
+        "ll_parity_vadd",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vadd(v4i a, v4i b){ return a + b; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_splat() {
+    // A splat: `insertelement <4 x i32> poison, i32 %x, i64 0` + `shufflevector … zeroinitializer` —
+    // insertelement/shufflevector + `poison`/`zeroinitializer` vector constants.
+    assert_ll_parity(
+        "ll_parity_vsplat",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vsplat(int x){ return (v4i){x,x,x,x}; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_reduce() {
+    // `llvm.vector.reduce.add.v4i32` — a vector-reduction intrinsic call over a `<4 x i32>`.
+    assert_ll_parity(
+        "ll_parity_vreduce",
+        "typedef int v4i __attribute__((vector_size(16))); \
+         int vsum(v4i a){ return a[0]+a[1]+a[2]+a[3]; }",
+    );
+}
+
+#[test]
 fn ll_parity_switch() {
     // A `switch` terminator with a constant→label jump table (sparse cases + default).
     assert_ll_parity(

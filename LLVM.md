@@ -1835,17 +1835,26 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     double), and a `constant [3 x double]` global (float aggregate init). **Twenty-two parity tests
     total.** This was the last deferred *primitive* — the parser now covers scalar/pointer/struct/array
     computation + memory + calls + globals end-to-end.
-- **Next step (resume here): `switch`, then SIMD vectors.** The growth frontier, each a `clang -O2`
-  shape + an `assert_ll_parity` test: **`switch`** (`switch <ty> <v>, label %default [ <ty> <c>, label
-  %l … ]` — a terminator with a constant→label jump table; add to `terminator()` alongside `br`), then
-  **SIMD vectors** (`<N x T>` types in `type_()`, `<T a, T b, …>` vector constants, and the vector ops
-  `shufflevector`/`extractelement`/`insertelement` + `llvm.vector.reduce.*` intrinsics — the auto-
-  vectorizer emits these for loops like the earlier `arrsum`), literal-struct/array **constant
-  aggregates** as operands, **constant-expressions** (`getelementptr`/`bitcast`/`ptrtoint` inside a
-  constant — `Constant::GetElementPtr` et al. are already in the AST + shim), **C++ EH**
-  (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
-  full-width constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then
-  PR3:
+  - **Parser — `switch` + SIMD vectors landed.** `switch <ty> <v>, label %default [ <cty> <c>, label
+    %l … ]` (whitespace-separated case entries) is parsed in `terminator()`. Vectors: `<N x T>` (+ packed
+    `<{…}>` struct, `<vscale x …>`) types in `type_()`, `<T …>` vector constants, and
+    `extractelement`/`insertelement`/`shufflevector` — the shuffle **mask canonicalized to a
+    `Constant::Vector` of `i32` indices** (`zeroinitializer`/`poison`/explicit all normalized), exactly
+    as the bitcode reader does via `LLVMGetMaskValue` (the translator's `<4×>` path *requires* `Vector`).
+    `value_as_operand` was refactored to delegate every non-`%local` value to `constant()`, so
+    `poison`/`undef`/`zeroinitializer`/`null`/vector constants all reach operand position. Four parity
+    tests: sparse `switch`, `<4 x i32>` add, a splat (insertelement + shuffle), and a
+    `llvm.vector.reduce.add` reduction. **Twenty-six parity tests total.**
+- **Next step (resume here): constant-expressions, then C++ EH.** The growth frontier, each a `clang -O2`
+  shape + an `assert_ll_parity` test: **constant-expressions** — `getelementptr`/`bitcast`/`ptrtoint`/
+  `add`/… *inside* a constant (e.g. a global initialized to `getelementptr(@other, …)` or a vtable of
+  function pointers); `Constant::{GetElementPtr,Trunc,BitCast,…}` + `ConstGetElementPtr`/`ConstUnaryOp`/
+  `ConstBinaryOp` are already in the AST + shim, so `constant()` needs arms that parse the `op (…)` /
+  `getelementptr (…)` constant-expr grammar. Then **C++ EH** (`invoke <ret> @f(...) to label %ok unwind
+  label %lpad` terminator + `landingpad`/`resume` — the corpus's `personality`/cleanup tests), **literal
+  aggregate constants** `{ i32 1, i8 2 }`, **scalable vectors**, and **`i128`/`blockaddress`** (these two
+  come *free* in text — full-width constants, no `llvm-sys` re-parse; `blockaddress` needs the
+  parser-recovered payload). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).

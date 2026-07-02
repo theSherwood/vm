@@ -17,10 +17,13 @@
 //! `type_()`, so struct GEP/field access resolves); and **float constants** (`float`/`double` literals
 //! in decimal or `0x` hex-image form, decoded to the exact bits the bitcode reader carries). Top-level
 //! cruft the on-ramp ignores (target/datalayout lines, attribute groups, module-level metadata,
-//! `declare`s) is skipped; the `switch` terminator's constant→label jump table is parsed too. Not yet
-//! handled (the growth frontier): SIMD vectors and constant-expressions (`getelementptr`/`bitcast`/…
-//! inside a constant). Anything
-//! unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
+//! `declare`s) is skipped; the `switch` terminator's constant→label jump table is parsed too. **SIMD
+//! vectors** are covered: `<N x T>` types, `<T …>` vector constants, `extractelement`/`insertelement`/
+//! `shufflevector` (the mask canonicalized to a `Constant::Vector` of `i32` indices, as the bitcode
+//! reader does), and vector binops/reductions. Not yet handled (the growth frontier):
+//! constant-expressions (`getelementptr`/`bitcast`/… inside a constant), C++ EH, and scalable vectors.
+//! Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a
+//! miscompile.
 
 use super::ast::*;
 use super::lex::{lex, Token};
@@ -682,6 +685,9 @@ impl Parser {
             "alloca" => Instruction::Alloca(self.alloca_inst(dest)?),
             "load" => Instruction::Load(self.load_inst(dest)?),
             "getelementptr" => Instruction::GetElementPtr(self.gep_inst(dest)?),
+            "extractelement" => Instruction::ExtractElement(self.extractelement_inst(dest)?),
+            "insertelement" => Instruction::InsertElement(self.insertelement_inst(dest)?),
+            "shufflevector" => Instruction::ShuffleVector(self.shufflevector_inst(dest)?),
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
@@ -819,54 +825,19 @@ impl Parser {
 
     // ---- operands & values ---------------------------------------------------------------------
 
-    /// Parse a value of (already-parsed) type `ty` into an [`Operand`]: a `%local`, or a constant
-    /// (integer literal for the seed slice). The type prefix is supplied by the caller.
+    /// Parse a value of (already-parsed) type `ty` into an [`Operand`]: a `%local`, or (everything else)
+    /// a constant — delegated to [`Self::constant`], so int/float/bool/`poison`/`undef`/`zeroinitializer`/
+    /// `null`/`@g`-ref/aggregate/vector all reach operand position uniformly.
     fn value_as_operand(&mut self, ty: &TypeRef) -> PResult<Operand> {
-        match self.peek() {
-            Some(Token::Local(s)) => {
-                let name = name_from_local(s);
-                self.pos += 1;
-                Ok(Operand::LocalOperand {
-                    name,
-                    ty: ty.clone(),
-                })
-            }
-            Some(Token::Int(s)) => {
-                let bits = match ty.as_ref() {
-                    Type::IntegerType { bits } => *bits,
-                    _ => return self.err("integer literal with non-integer type"),
-                };
-                let value = parse_int_literal(s, bits).ok_or_else(|| {
-                    ParseError::new(self.pos, format!("bad integer literal `{s}`"))
-                })?;
-                self.pos += 1;
-                Ok(Operand::ConstantOperand(ConstantRef::new(Constant::Int {
-                    bits,
-                    value,
-                })))
-            }
-            Some(Token::Word(w)) if w == "true" || w == "false" => {
-                let value = (w == "true") as u128;
-                self.pos += 1;
-                Ok(Operand::ConstantOperand(ConstantRef::new(Constant::Int {
-                    bits: 1,
-                    value,
-                })))
-            }
-            Some(Token::Float(s)) => {
-                let s = s.clone();
-                let f = self.float_lit(ty, &s)?;
-                self.pos += 1;
-                Ok(Operand::ConstantOperand(ConstantRef::new(Constant::Float(
-                    f,
-                ))))
-            }
-            // A reference to a global variable / function (`@g`) — a `GlobalReference` constant. Its
-            // `ty` is the referent's pointee type from `symbols`, matching what the bitcode reader
-            // carries; the operand's own written type (`ptr`) is discarded.
-            Some(Token::Global(_)) => Ok(Operand::ConstantOperand(self.global_ref()?)),
-            other => self.err(format!("value not yet supported: {other:?}")),
+        if let Some(Token::Local(s)) = self.peek() {
+            let name = name_from_local(s);
+            self.pos += 1;
+            return Ok(Operand::LocalOperand {
+                name,
+                ty: ty.clone(),
+            });
         }
+        Ok(Operand::ConstantOperand(self.constant(ty)?))
     }
 
     /// Decode a float literal `s` of floating type `ty` into a [`Float`]. LLVM prints these as decimal
@@ -1003,6 +974,22 @@ impl Parser {
                     elements,
                 }
             }
+            // `< <ty> <c>, … >` — a vector constant.
+            Some(Token::Lt) => {
+                self.pos += 1; // `<`
+                let mut elements = Vec::new();
+                if self.peek() != Some(&Token::Gt) {
+                    loop {
+                        let ety = self.type_()?;
+                        elements.push(self.constant(&ety)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Token::Gt)?;
+                Constant::Vector(elements)
+            }
             other => return self.err(format!("constant not yet supported: {other:?}")),
         };
         Ok(ConstantRef::new(c))
@@ -1134,6 +1121,122 @@ impl Parser {
             dest,
             debugloc: None,
         })
+    }
+
+    // ---- vector element ops --------------------------------------------------------------------
+
+    /// `extractelement <vty> <vec>, <ity> <idx>`.
+    fn extractelement_inst(&mut self, dest: Name) -> PResult<ExtractElement> {
+        self.pos += 1; // `extractelement`
+        let vty = self.type_()?;
+        let vector = self.value_as_operand(&vty)?;
+        self.expect(&Token::Comma)?;
+        let ity = self.type_()?;
+        let index = self.value_as_operand(&ity)?;
+        Ok(ExtractElement {
+            vector,
+            index,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `insertelement <vty> <vec>, <ety> <elt>, <ity> <idx>`.
+    fn insertelement_inst(&mut self, dest: Name) -> PResult<InsertElement> {
+        self.pos += 1; // `insertelement`
+        let vty = self.type_()?;
+        let vector = self.value_as_operand(&vty)?;
+        self.expect(&Token::Comma)?;
+        let ety = self.type_()?;
+        let element = self.value_as_operand(&ety)?;
+        self.expect(&Token::Comma)?;
+        let ity = self.type_()?;
+        let index = self.value_as_operand(&ity)?;
+        Ok(InsertElement {
+            vector,
+            element,
+            index,
+            dest,
+            debugloc: None,
+        })
+    }
+
+    /// `shufflevector <ty> <v0>, <ty> <v1>, <mty> <mask>` — the mask is a constant (index vector or
+    /// `zeroinitializer`).
+    fn shufflevector_inst(&mut self, dest: Name) -> PResult<ShuffleVector> {
+        self.pos += 1; // `shufflevector`
+        let t0 = self.type_()?;
+        let operand0 = self.value_as_operand(&t0)?;
+        self.expect(&Token::Comma)?;
+        let t1 = self.type_()?;
+        let operand1 = self.value_as_operand(&t1)?;
+        self.expect(&Token::Comma)?;
+        let mty = self.type_()?;
+        let mask = self.shuffle_mask(&mty)?;
+        Ok(ShuffleVector {
+            operand0,
+            operand1,
+            dest,
+            mask,
+            debugloc: None,
+        })
+    }
+
+    /// The `shufflevector` mask. The bitcode reader canonicalizes it (via `LLVMGetMaskValue`) to a
+    /// `Constant::Vector` of `i32` indices — an `undef`/`poison` lane becoming `Constant::Undef(i32)` —
+    /// regardless of whether the text writes `zeroinitializer`, `poison`, or an explicit `<i32 …>`
+    /// vector. We reproduce that exact form so a splat's mask reaches parity.
+    fn shuffle_mask(&mut self, mty: &TypeRef) -> PResult<ConstantRef> {
+        let num = match mty.as_ref() {
+            Type::VectorType { num_elements, .. } => *num_elements,
+            _ => return self.err("shufflevector mask is not a vector type"),
+        };
+        let i32ty = self.module.types.int(32);
+        let zero = || ConstantRef::new(Constant::Int { bits: 32, value: 0 });
+        let undef = || ConstantRef::new(Constant::Undef(i32ty.clone()));
+        let elements: Vec<ConstantRef> = match self.peek() {
+            Some(Token::Word(w)) if w == "zeroinitializer" => {
+                self.pos += 1;
+                (0..num).map(|_| zero()).collect()
+            }
+            Some(Token::Word(w)) if w == "undef" || w == "poison" => {
+                self.pos += 1;
+                (0..num).map(|_| undef()).collect()
+            }
+            Some(Token::Lt) => {
+                self.pos += 1; // `<`
+                let mut v = Vec::new();
+                if self.peek() != Some(&Token::Gt) {
+                    loop {
+                        let _ety = self.type_()?; // `i32`
+                        match self.peek() {
+                            Some(Token::Word(w)) if w == "undef" || w == "poison" => {
+                                self.pos += 1;
+                                v.push(undef());
+                            }
+                            Some(Token::Int(s)) => {
+                                let s = s.clone();
+                                self.pos += 1;
+                                let value = parse_int_literal(&s, 32).ok_or_else(|| {
+                                    ParseError::new(self.pos, format!("bad mask index `{s}`"))
+                                })?;
+                                v.push(ConstantRef::new(Constant::Int { bits: 32, value }));
+                            }
+                            other => {
+                                return self.err(format!("bad shuffle-mask element {other:?}"))
+                            }
+                        }
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Token::Gt)?;
+                v
+            }
+            other => return self.err(format!("unsupported shuffle mask {other:?}")),
+        };
+        Ok(ConstantRef::new(Constant::Vector(elements)))
     }
 
     // ---- memory --------------------------------------------------------------------------------
@@ -1589,6 +1692,27 @@ impl Parser {
         // `{ <ty>, … }` — a literal struct type.
         if self.peek() == Some(&Token::LBrace) {
             return self.struct_type(false);
+        }
+        // `<[vscale x] N x T>` vector, or `<{ … }>` packed struct.
+        if self.peek() == Some(&Token::Lt) {
+            self.pos += 1;
+            if self.peek() == Some(&Token::LBrace) {
+                let t = self.struct_type(true)?;
+                self.expect(&Token::Gt)?;
+                return Ok(t);
+            }
+            let scalable = self.eat_word("vscale");
+            if scalable {
+                self.expect_word("x")?;
+            }
+            let num_elements = self.int_lit_usize()?;
+            self.expect_word("x")?;
+            let element_type = self.type_()?;
+            self.expect(&Token::Gt)?;
+            return Ok(self
+                .module
+                .types
+                .vector_of(element_type, num_elements, scalable));
         }
         let w = match self.peek() {
             Some(Token::Word(w)) => w.clone(),
