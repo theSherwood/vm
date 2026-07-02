@@ -819,6 +819,199 @@ block0(vsp: i64, vp: i64):
 }
 "#;
 
+// ---- §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) ----------------------------
+// Browser-sized: carves are 64 KiB (`slog 16` — the wasm page granularity) inside a 1 MiB window
+// (`memory 20`), children at `64 KiB × (i+1)`; handles at `mem[16 + i*4]`. Ground truths (40 / 72 /
+// 600) are asserted in the JS host, like the threads kernel's 4000.
+
+// Root `(instantiator) -> sum`: instantiate 8 same-module children (func 1), join, sum. 8 × 5 = 40.
+const THREADS_INST: &str = r#"memory 20
+func (i32) -> (i64) {
+block0(v0: i32):
+  vi0 = i64.const 0
+  br block1(vi0, v0)
+block1(vi: i64, vinst: i32):
+  vn = i64.const 8
+  vlt = i64.lt_u vi vn
+  br_if vlt block2(vi, vinst) block3(vinst)
+block2(vi2: i64, vinst2: i32):
+  vone = i64.const 1
+  viplus = i64.add vi2 vone
+  v64k = i64.const 65536
+  voff = i64.mul viplus v64k
+  ventry = i64.const 1
+  vslog = i64.const 16
+  vquota = i64.const 0
+  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  v4 = i64.const 4
+  vholo = i64.mul vi2 v4
+  v16 = i64.const 16
+  vhoff = i64.add v16 vholo
+  i32.store vhoff vh
+  vinext = i64.add vi2 vone
+  br block1(vinext, vinst2)
+block3(vinst3: i32):
+  vj0 = i64.const 0
+  vs0 = i64.const 0
+  br block4(vj0, vs0, vinst3)
+block4(vj: i64, vs: i64, vinst4: i32):
+  vn2 = i64.const 8
+  vlt2 = i64.lt_u vj vn2
+  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
+block5(vj2: i64, vs2: i64, vinst5: i32):
+  v4b = i64.const 4
+  vjlo = i64.mul vj2 v4b
+  v16b = i64.const 16
+  vjoff = i64.add v16b vjlo
+  vhh = i32.load vjoff
+  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vsn = i64.add vs2 vr
+  v1b = i64.const 1
+  vjn = i64.add vj2 v1b
+  br block4(vjn, vsn, vinst5)
+block6(vs3: i64):
+  return vs3
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 5
+  return v1
+}
+"#;
+
+// Same fan-out, but each child (handed its own Instantiator) instantiates a grandchild (func 2) over
+// its **whole** 64 KiB window (slog 16 at off 0 — a carve may equal the authorized range), joins it,
+// and returns its value — VM-in-VM-in-VM across three Worker generations. 8 × 9 = 72.
+const THREADS_INST_NESTED: &str = r#"memory 20
+func (i32) -> (i64) {
+block0(v0: i32):
+  vi0 = i64.const 0
+  br block1(vi0, v0)
+block1(vi: i64, vinst: i32):
+  vn = i64.const 8
+  vlt = i64.lt_u vi vn
+  br_if vlt block2(vi, vinst) block3(vinst)
+block2(vi2: i64, vinst2: i32):
+  vone = i64.const 1
+  viplus = i64.add vi2 vone
+  v64k = i64.const 65536
+  voff = i64.mul viplus v64k
+  ventry = i64.const 1
+  vslog = i64.const 16
+  vquota = i64.const 0
+  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  v4 = i64.const 4
+  vholo = i64.mul vi2 v4
+  v16 = i64.const 16
+  vhoff = i64.add v16 vholo
+  i32.store vhoff vh
+  vinext = i64.add vi2 vone
+  br block1(vinext, vinst2)
+block3(vinst3: i32):
+  vj0 = i64.const 0
+  vs0 = i64.const 0
+  br block4(vj0, vs0, vinst3)
+block4(vj: i64, vs: i64, vinst4: i32):
+  vn2 = i64.const 8
+  vlt2 = i64.lt_u vj vn2
+  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
+block5(vj2: i64, vs2: i64, vinst5: i32):
+  v4b = i64.const 4
+  vjlo = i64.mul vj2 v4b
+  v16b = i64.const 16
+  vjoff = i64.add v16b vjlo
+  vhh = i32.load vjoff
+  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vsn = i64.add vs2 vr
+  v1b = i64.const 1
+  vjn = i64.add vj2 v1b
+  br block4(vjn, vsn, vinst5)
+block6(vs3: i64):
+  return vs3
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  vinst = i32.wrap_i64 v0
+  ventry = i64.const 2
+  voff = i64.const 0
+  vslog = i64.const 16
+  vquota = i64.const 0
+  vgh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vgr = cap.call 6 1 (i32) -> (i64) vinst (vgh)
+  return vgr
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 9
+  return v1
+}
+"#;
+
+// The granted "plugin" module for op 5: a 64 KiB window (== the carve, §14 transparency) with a data
+// segment `"K"` (75) at offset 0; its entry reads that own data byte and returns it.
+const THREADS_INST_UNIT: &str = r#"memory 16
+data 0 "K"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  return v3
+}
+"#;
+
+// Root `(instantiator, module) -> sum`: `instantiate_module` the granted module 8 times, join, sum —
+// compile + push-to-shared-source + data materialization crossing Workers. 8 × 75 = 600.
+const THREADS_INST_MOD: &str = r#"memory 20
+func (i32, i32) -> (i64) {
+block0(vinst0: i32, vmod0: i32):
+  vmod64 = i64.extend_i32_s vmod0
+  vi0 = i64.const 0
+  br block1(vi0, vinst0, vmod64)
+block1(vi: i64, vinst: i32, vmod: i64):
+  vn = i64.const 8
+  vlt = i64.lt_u vi vn
+  br_if vlt block2(vi, vinst, vmod) block3(vinst)
+block2(vi2: i64, vinst2: i32, vmod2: i64):
+  vone = i64.const 1
+  viplus = i64.add vi2 vone
+  v64k = i64.const 65536
+  voff = i64.mul viplus v64k
+  ventry = i64.const 0
+  vslog = i64.const 16
+  vquota = i64.const 0
+  vh = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
+  v4 = i64.const 4
+  vholo = i64.mul vi2 v4
+  v16 = i64.const 16
+  vhoff = i64.add v16 vholo
+  i32.store vhoff vh
+  vinext = i64.add vi2 vone
+  br block1(vinext, vinst2, vmod2)
+block3(vinst3: i32):
+  vj0 = i64.const 0
+  vs0 = i64.const 0
+  br block4(vj0, vs0, vinst3)
+block4(vj: i64, vs: i64, vinst4: i32):
+  vn2 = i64.const 8
+  vlt2 = i64.lt_u vj vn2
+  br_if vlt2 block5(vj, vs, vinst4) block6(vs)
+block5(vj2: i64, vs2: i64, vinst5: i32):
+  v4b = i64.const 4
+  vjlo = i64.mul vj2 v4b
+  v16b = i64.const 16
+  vjoff = i64.add v16b vjlo
+  vhh = i32.load vjoff
+  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vsn = i64.add vs2 vr
+  v1b = i64.const 1
+  vjn = i64.add vj2 v1b
+  br block4(vjn, vsn, vinst5)
+block6(vs3: i64):
+  return vs3
+}
+"#;
+
 // ---- durability (freeze / thaw, single-fiber, IR-driven) ---------------------------------------
 // From `crates/svm/tests/bytecode_durable.rs`. A program with two clock reads (each an unwind point);
 // the first value is live across the second, so a freeze after the first spills it to the shadow
@@ -1418,6 +1611,12 @@ fn main() {
     // multi-Worker shared powerbox the single-vCPU corpus differential doesn't set up.
     emit("threads_jit_invoke", THREADS_JIT_INVOKE);
     emit("threads_jit_install", THREADS_JIT_INSTALL);
+    // §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) — the confined-executor-child
+    // kernels + the granted module for op 5. Ground truths (40 / 72 / 600) asserted in the JS host.
+    emit("threads_inst", THREADS_INST);
+    emit("threads_inst_nested", THREADS_INST_NESTED);
+    emit("threads_inst_mod", THREADS_INST_MOD);
+    emit("threads_inst_unit", THREADS_INST_UNIT);
     // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
     // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
     {

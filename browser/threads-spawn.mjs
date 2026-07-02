@@ -24,21 +24,32 @@ const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 // Event codes (must match browser/src/lib.rs PAR_*).
-const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5;
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6;
 
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
-  const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase } = workerData;
+  const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
+    smod, entry, slog, fuel } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
-  const i32 = new Int32Array(memory.buffer);
-  const i64 = new BigInt64Array(memory.buffer);
+  // Views over the shared memory, refreshed when stale: a shared `WebAssembly.Memory` can GROW
+  // mid-run (any Worker's in-wasm allocation — e.g. a §14 module compile+push), and views created
+  // before a growth don't cover the new region (an Atomics access past the old length throws).
+  let i32v = new Int32Array(memory.buffer), i64v = new BigInt64Array(memory.buffer);
+  const i32 = () =>
+    i32v.byteLength === memory.buffer.byteLength ? i32v : (i32v = new Int32Array(memory.buffer));
+  const i64 = () =>
+    i64v.byteLength === memory.buffer.byteLength ? i64v : (i64v = new BigInt64Array(memory.buffer));
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
+  // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
+  // offset) — a confined child is just a child with a shifted, smaller window (DESIGN.md §14).
   const v = role === 'root'
     ? ex.svm_par_root(prog, win, winSize, func)
-    : ex.svm_par_child(prog, win, winSize, func, BigInt(sp), BigInt(arg));
+    : role === 'confined'
+      ? ex.svm_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
+      : ex.svm_par_child(prog, win, winSize, func, BigInt(sp), BigInt(arg));
   if (v === 0) { parentPort.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   const handles = []; // local spawn handle (index) → child completion slot ptr
@@ -47,16 +58,16 @@ async function worker() {
     const ev = ex.svm_par_run(v);
     if (ev === DONE) {
       const value = ex.svm_par_ev_a(v); // i64 → BigInt
-      i64[(slot + 8) >> 3] = value; // publish result...
-      Atomics.store(i32, slot >> 2, 1); // ...set done flag...
-      Atomics.notify(i32, slot >> 2); // ...and wake a joiner
+      i64()[(slot + 8) >> 3] = value; // publish result...
+      Atomics.store(i32(), slot >> 2, 1); // ...set done flag...
+      Atomics.notify(i32(), slot >> 2); // ...and wake a joiner
       if (role === 'root') parentPort.postMessage({ kind: 'done', value: value.toString() });
       ex.svm_par_free(v);
       return;
     }
     if (ev === TRAP) {
-      Atomics.store(i32, slot >> 2, 2); // 2 = trapped
-      Atomics.notify(i32, slot >> 2);
+      Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
+      Atomics.notify(i32(), slot >> 2);
       if (role === 'root') parentPort.postMessage({ kind: 'trap' });
       ex.svm_par_free(v);
       return;
@@ -80,10 +91,31 @@ async function worker() {
     if (ev === JOIN) {
       const handle = Number(ex.svm_par_ev_a(v));
       const cslot = handles[handle];
-      Atomics.wait(i32, cslot >> 2, 0); // block until the child sets its done flag
-      const trapped = Atomics.load(i32, cslot >> 2) === 2;
-      const result = i64[(cslot + 8) >> 3];
+      Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
+      const trapped = Atomics.load(i32(), cslot >> 2) === 2;
+      const result = i64()[(cslot + 8) >> 3];
       ex.svm_par_deliver_join(v, result, trapped ? 1 : 0);
+      continue;
+    }
+    if (ev === INSTANTIATE) {
+      // §14 confined executor child: the engine already validated the carve + built everything
+      // authority-bearing; the operands are inert integers we shuttle into a new Worker (whose
+      // window IS the carve), joined via the same completion-slot protocol as SPAWN.
+      const am = ex.svm_par_ev_a(v); // (module << 32) | entry
+      const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
+      const carve = Number(ex.svm_par_ev_b(v)), cslog = Number(ex.svm_par_ev_c(v));
+      const cfuel = ex.svm_par_ev_d(v); // i64 → BigInt, shuttled verbatim
+      const cslot = ex.svm_par_alloc(SLOT);
+      const cstackTop = ex.svm_par_alloc(STACK) + STACK;
+      const ctlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+      parentPort.postMessage({
+        kind: 'spawn', role: 'confined', smod: csmod, entry: centry, slog: cslog,
+        fuel: cfuel.toString(), win: win + carve, winSize: 1 << cslog,
+        slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
+      });
+      const handle = handles.length;
+      handles.push(cslot);
+      ex.svm_par_deliver_handle(v, handle);
       continue;
     }
     if (ev === WAIT) {
@@ -91,13 +123,13 @@ async function worker() {
       const timeoutNs = ex.svm_par_ev_d(v);
       const idx = (win + addr) >> 2;
       const ms = timeoutNs <= 0n ? Infinity : Number(timeoutNs) / 1e6;
-      const r = Atomics.wait(i32, idx, expected, ms); // 'ok' | 'not-equal' | 'timed-out'
+      const r = Atomics.wait(i32(), idx, expected, ms); // 'ok' | 'not-equal' | 'timed-out'
       ex.svm_par_deliver_code(v, r === 'ok' ? 0 : r === 'not-equal' ? 1 : 2);
       continue;
     }
     if (ev === NOTIFY) {
       const addr = Number(ex.svm_par_ev_a(v)), count = Number(ex.svm_par_ev_b(v));
-      const woke = Atomics.notify(i32, (win + addr) >> 2, count);
+      const woke = Atomics.notify(i32(), (win + addr) >> 2, count);
       ex.svm_par_deliver_code(v, woke);
       continue;
     }
@@ -130,9 +162,26 @@ async function main() {
   const prog = jitMode ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
   if (prog === 0) { console.log('FAIL: svm_par_compile returned null (decode/unsupported)'); process.exit(1); }
 
-  // The one shared guest window every vCPU runs over.
-  const winSize = 1 << 16;
+  // The one shared guest window every vCPU runs over (SVM_WIN sizes it — the §14 kernels declare a
+  // 1 MiB window so their 64 KiB carves stay wasm-page-aligned).
+  const winSize = Number(process.env.SVM_WIN ?? 1 << 16);
   const win = ex.svm_par_alloc(winSize);
+
+  // §14 mode (SVM_INST=1): publish the run recipe — the root's `Instantiator` spans the window, plus
+  // the optional granted module (SVM_INST_UNIT) for `instantiate_module`. The root vCPU builds its own
+  // powerbox from it (svm_par_root); confined children build theirs in-engine.
+  if (process.env.SVM_INST === '1') {
+    let uptr = 0, ulen = 0;
+    if (process.env.SVM_INST_UNIT) {
+      const unit = readFileSync(process.env.SVM_INST_UNIT);
+      uptr = ex.svm_par_alloc(unit.length);
+      u8().set(unit, uptr);
+      ulen = unit.length;
+    }
+    if (ex.svm_par_powerbox_inst(BigInt(winSize), uptr, ulen) !== 1) {
+      console.log('FAIL: svm_par_powerbox_inst returned 0'); process.exit(1);
+    }
+  }
 
   console.log(`module: ${WASM}  shared=${memory.buffer instanceof SharedArrayBuffer}`);
   console.log(`  prog@0x${prog.toString(16)}  window@0x${win.toString(16)} (${winSize >> 10}KiB)  TLS ${tlsSize}B`);
@@ -149,8 +198,11 @@ async function main() {
     workers.add(w);
     w.on('message', (m) => {
       if (m.kind === 'spawn') {
-        // A vCPU asked to spawn a child: start its Worker (slot/stack/TLS already allocated by the parent).
-        startVcpu({ role: 'child', func: m.func, sp: m.sp, arg: m.arg, slot: m.slot, stackTop: m.stackTop, tlsBase: m.tlsBase });
+        // A vCPU asked to spawn a (plain or §14-confined) child: start its Worker with the message's
+        // cfg verbatim (slot/stack/TLS already allocated by the parent; a confined child's message
+        // carries its own win/winSize — the carve — overriding the run defaults).
+        const { kind, ...cfg } = m;
+        startVcpu({ role: 'child', ...cfg });
       } else if (m.kind === 'done') {
         finish(BigInt(m.value));
       } else if (m.kind === 'trap' || m.kind === 'fail') {

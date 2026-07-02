@@ -443,6 +443,7 @@ pub const PAR_SPAWN: i32 = 2;
 pub const PAR_JOIN: i32 = 3;
 pub const PAR_WAIT: i32 = 4;
 pub const PAR_NOTIFY: i32 = 5;
+pub const PAR_INSTANTIATE: i32 = 6;
 
 /// A boxed resumable vCPU plus the operands of its last [`svm_par_run`] event (flattened to four
 /// `i64`s the host reads via [`svm_par_ev_a`]–[`svm_par_ev_d`]).
@@ -561,6 +562,52 @@ fn par_resolve_unit(
     pb.host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
 }
 
+// ---- §14 instantiate across Workers (THREADS.md 4c-domain §14-D2) -------------------------------
+// The §14 root powerbox lives **in the root vCPU** (unlike the §22 JIT powerbox, which the vCPU asks
+// the host to resolve against): §14 resolves its `Instantiator` authority in-Vm during `resume`, so
+// the grant must be in the vCPU's own `Host`. This static only carries the *recipe* — the authority
+// range and the optional granted module — published once by the main thread so the root Worker can
+// build its powerbox deterministically. Confined children never touch it: their attenuated powerbox
+// is built inside `Vcpu::new_confined_child`, so no authority ever crosses JS (the `PAR_INSTANTIATE`
+// event operands are inert integers).
+
+/// The §14 run recipe: `Instantiator` authority over `[0, win_size)` + an optional `Module` grant.
+struct ParInstCfg {
+    win_size: u64,
+    module: Option<svm_ir::Module>,
+}
+
+/// The leaked [`ParInstCfg`] pointer (or `0`), shared across Workers via shared linear memory.
+static PAR_INST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Publish the §14 run recipe: the root's `Instantiator` will span `[0, win_size)`; a non-empty
+/// `[mod_ptr, mod_len)` is decoded as the **granted module** for `instantiate_module` (`0` len ⇒ no
+/// grant). Returns `1`, or `0` on a bad module. Call once (on the main thread) before the run.
+#[no_mangle]
+pub extern "C" fn svm_par_powerbox_inst(win_size: u64, mod_ptr: *const u8, mod_len: usize) -> i32 {
+    let module = if mod_len == 0 {
+        None
+    } else {
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live allocation it just filled.
+        let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+        match svm_encode::decode_module(bytes) {
+            Ok(m) => Some(m),
+            Err(_) => return 0,
+        }
+    };
+    let cfg = Box::into_raw(Box::new(ParInstCfg { win_size, module }));
+    PAR_INST.store(cfg as usize, std::sync::atomic::Ordering::Release);
+    1
+}
+
+/// Borrow the published §14 recipe (`None` until [`svm_par_powerbox_inst`] ran). Leaked + read-only,
+/// as [`par_pb`].
+fn par_inst() -> Option<&'static ParInstCfg> {
+    let p = PAR_INST.load(std::sync::atomic::Ordering::Acquire) as *const ParInstCfg;
+    // SAFETY: once published the recipe is leaked (never freed) and read-only for the run.
+    unsafe { p.as_ref() }
+}
+
 /// Like [`svm_par_compile`], but reserve the `Jit` dispatch table (matching the powerbox grant) so a
 /// guest `install` lands in range. Use this (not [`svm_par_compile`]) for a §22-JIT run.
 #[no_mangle]
@@ -590,9 +637,37 @@ pub extern "C" fn svm_par_root(
 ) -> *mut ParVcpu {
     // SAFETY: the host guarantees `[win_ptr, win_size)` is a live shared window for the run.
     let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
-    // A §22-JIT run seeds the root with `(jit, code)` handles from the shared powerbox (so the guest
-    // can thread them to its workers); a plain run gets no args. (The signature is unchanged, so the
-    // existing JS host needs no edit — it just calls `svm_par_powerbox` first for a JIT run.)
+    // A §14 run builds the root's **own** powerbox from the published recipe (`Instantiator` +
+    // optional `Module` grant; §14 resolves authority in-Vm, so the grants must live in the vCPU's
+    // host) and seeds the root with the handles. A §22-JIT run seeds `(jit, code)` from the shared
+    // powerbox; a plain run gets no args. Signatures unchanged either way — the JS host just calls
+    // the matching `svm_par_powerbox*` first.
+    if let Some(cfg) = par_inst() {
+        let mut host = Host::new();
+        let inst = host.grant_instantiator(0, cfg.win_size);
+        let mut args = vec![Value::I32(inst)];
+        if let Some(m) = &cfg.module {
+            args.push(Value::I32(host.grant_module(m)));
+        }
+        // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+        return match bytecode::Vcpu::new_root_with_powerbox(
+            unsafe { prog_ref(prog) },
+            func,
+            &args,
+            back,
+            &[],
+            host,
+        ) {
+            Ok(inner) => Box::into_raw(Box::new(ParVcpu {
+                inner,
+                a: 0,
+                b: 0,
+                c: 0,
+                d: 0,
+            })),
+            Err(_) => core::ptr::null_mut(),
+        };
+    }
     let args: Vec<Value> = match par_pb() {
         Some(pb) => vec![Value::I32(pb.jit), Value::I32(pb.code)],
         None => Vec::new(),
@@ -626,6 +701,50 @@ pub extern "C" fn svm_par_child(
     let args = [Value::I64(sp), Value::I64(arg)];
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     match bytecode::Vcpu::new_child(unsafe { prog_ref(prog) }, func, &args, back) {
+        Ok(inner) => Box::into_raw(Box::new(ParVcpu {
+            inner,
+            a: 0,
+            b: 0,
+            c: 0,
+            d: 0,
+        })),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Build a §14 **confined executor child** vCPU (THREADS.md 4c-domain §14-D2) over the parent's carve
+/// `[carve_ptr, carve_ptr + 2^size_log2)` — the operands of a [`PAR_INSTANTIATE`] event, shuttled
+/// verbatim by the JS host (`carve_ptr` = the parent Worker's window pointer + the event's `carve`).
+/// Per DESIGN.md §14 a sub-window is indistinguishable from a top-level window, so the carve region
+/// simply *is* the child's window; the attenuated powerbox and the child's own dispatch table are
+/// built in-engine ([`bytecode::Vcpu::new_confined_child`]) — no authority crosses JS. Called on the
+/// child's Worker. Null on a bad module/entry.
+#[no_mangle]
+pub extern "C" fn svm_par_child_confined(
+    prog: *mut bytecode::VcpuProgram,
+    carve_ptr: *mut u8,
+    size_log2: u32,
+    module: u32,
+    entry: u32,
+    fuel: i64,
+) -> *mut ParVcpu {
+    if size_log2 >= 64 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the host guarantees the carve is inside the parent's live window (the engine validated
+    // it before surfacing the event); aliasing views of the shared memory are the §13 data plane.
+    let back = std::sync::Arc::new(unsafe {
+        svm_interp::Region::shared(carve_ptr, 1u64 << size_log2)
+    });
+    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    match bytecode::Vcpu::new_confined_child(
+        unsafe { prog_ref(prog) },
+        module,
+        entry,
+        back,
+        size_log2 as u8,
+        fuel as u64,
+    ) {
         Ok(inner) => Box::into_raw(Box::new(ParVcpu {
             inner,
             a: 0,
@@ -700,6 +819,23 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 Some(pb) => v.inner.deliver_jit_invoke(par_resolve_unit(pb, handle, code)),
                 None => return PAR_TRAP,
             },
+            // §14 confined executor child (THREADS.md 4c-domain §14-D2): all authority-bearing work
+            // already happened in-Vm — the operands are inert integers the JS host shuttles into a
+            // new Worker running `svm_par_child_confined` over `[win + carve, +2^size_log2)`, joined
+            // through the same completion-slot protocol as `PAR_SPAWN`.
+            bytecode::VcpuEvent::Instantiate {
+                module,
+                entry,
+                carve,
+                size_log2,
+                fuel,
+            } => {
+                v.a = ((module as i64) << 32) | entry as i64;
+                v.b = carve as i64;
+                v.c = size_log2 as i64;
+                v.d = fuel as i64;
+                return PAR_INSTANTIATE;
+            }
         }
     }
 }
