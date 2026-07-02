@@ -7682,6 +7682,60 @@ fn assert_ll_parity_cpp(name: &str, src: &str) {
     assert_paths_parity(name, &bc, &ll);
 }
 
+/// Compile C with `-O2 -gline-tables-only` — source-line debug info (`!DILocation`/`!DISubprogram`/
+/// `!DIFile`) but no variable/type graph, so both readers exercise the §6 **source-line + function-name**
+/// halves without the (not-yet-textual) `DILocalVariable`/`DIType` graph.
+fn compile_debug(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    // The source filename is embedded in `!DIFile`, so *both* compiles must use the same `.c` path for
+    // the recovered debug paths to match (the output paths still differ by `ext`).
+    let c = dir.join(format!("svm_llvm_{}_{}_g.c", std::process::id(), name));
+    let out = dir.join(format!(
+        "svm_llvm_{}_{}_g.{}",
+        std::process::id(),
+        name,
+        ext
+    ));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-gline-tables-only", "-emit-llvm", emit])
+        .arg(&c)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Like [`assert_ll_parity`], but with `-gline-tables-only` debug info — verifies the textual reader
+/// recovers the same `!DILocation` source positions + `!DISubprogram` function names as the bitcode
+/// reader's `di` walk.
+fn assert_ll_parity_debug(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_debug(name, src, "-c", "bc"),
+        compile_debug(name, src, "-S", "ll"),
+    ) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+#[test]
+fn ll_parity_debug_source_lines() {
+    // `-gline-tables-only`: each instruction's `!dbg !DILocation` (source line/column, file via the
+    // scope's `!DIFile`) + the `!DISubprogram` function name must match the bitcode reader.
+    assert_ll_parity_debug(
+        "ll_parity_dbg",
+        "int add(int a, int b){ int s = a + b; return s * 2; }\n\
+         int use(int x){ return add(x, x + 1); }\n",
+    );
+}
+
 #[test]
 fn ll_parity_trivial_add() {
     // The simplest real `clang -O2` function: `define dso_local i32 @add(i32 %0, i32 %1) … { %3 =

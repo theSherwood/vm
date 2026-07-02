@@ -25,10 +25,13 @@
 //! another global); and **C++ exception handling** (`invoke`/`resume` terminators, `landingpad`,
 //! `extractvalue`/`insertvalue` — the `personality` clause is skipped); and **atomics**
 //! (`atomicrmw`/`cmpxchg`/`fence` + the `load atomic`/`store atomic` variants — syncscope + memory
-//! ordering). Not yet handled (the growth frontier): scalable-vector-specific ops, `blockaddress`/
-//! `indirectbr`, and literal-aggregate constants. Anything unhandled is a clean [`ParseError`]
-//! (fail-closed, re-verified downstream — §2a), never a
-//! miscompile.
+//! ordering). **Debug info (source-line half):** a metadata pre-pass ([`Parser::collect_di_metadata`])
+//! builds the `!DILocation`/`!DIFile`/scope-node table, and each instruction's `!dbg !N` resolves onto
+//! its `debugloc`; the `!DISubprogram` names feed [`parse_module_with_debug`]'s function-name table.
+//! Not yet handled (the growth frontier): the debug variable/type graph
+//! (`DILocalVariable`/`DIType`), scalable-vector-specific ops, `blockaddress`/`indirectbr`, and
+//! literal-aggregate constants. Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified
+//! downstream — §2a), never a miscompile.
 
 use super::ast::*;
 use super::lex::{lex, Token};
@@ -57,10 +60,21 @@ type CallArgs = Vec<(Operand, Vec<ParameterAttribute>)>;
 
 /// Parse `.ll` source text into a [`Module`].
 pub fn parse_module(src: &str) -> PResult<Module> {
+    parse_module_with_debug(src).map(|(m, _)| m)
+}
+
+/// Parse `.ll` source text into a [`Module`] plus the recovered `@linkage-name → source-name` table
+/// (the §6 function-name half of the structured debug info; empty for a non-`-g` module). The
+/// source-line half rides each instruction's `debugloc` on the returned module.
+pub fn parse_module_with_debug(
+    src: &str,
+) -> PResult<(Module, std::collections::BTreeMap<String, String>)> {
     let toks = lex(src)
         .map_err(|e| ParseError::new(0, format!("lex error at byte {}: {}", e.offset, e.msg)))?;
     let mut p = Parser::new(toks);
-    p.module()
+    p.collect_di_metadata();
+    let m = p.module()?;
+    Ok((m, p.func_names))
 }
 
 /// The token cursor + the module-under-construction (the type interner lives in `module.types`).
@@ -74,6 +88,35 @@ struct Parser {
     /// base pointee). clang emits globals + functions before their uses, so populating this as we parse
     /// resolves every reference; a forward/unknown reference is a clean error (fail-closed).
     symbols: std::collections::BTreeMap<String, TypeRef>,
+    /// The `!N` debug-metadata table (`!DILocation`/`!DIFile`/scope nodes), collected in a pre-pass so
+    /// an instruction's `!dbg !N` — which forward-references the module-level nodes emitted *after* the
+    /// functions — resolves to a [`DebugLoc`] (the §6 source-line half).
+    di_meta: std::collections::BTreeMap<u64, DiNode>,
+    /// The `!dbg !N` id captured while parsing the current instruction's trailing metadata; consumed by
+    /// [`Self::instruction`] to attach the resolved [`DebugLoc`].
+    pending_dbg: Option<u64>,
+    /// `@linkage-name` → source name, from each defined function's `!dbg !DISubprogram(name:…)` — the
+    /// §6 function-name table (the structured-debug half the translator reads via the `di` argument).
+    func_names: std::collections::BTreeMap<String, String>,
+}
+
+/// A debug-metadata node, reduced to what the source-line reader needs. Other kinds (`!DIBasicType`,
+/// `!{…}` tuples, module flags) are collected as nothing.
+enum DiNode {
+    /// `!DILocation(line, column, scope)` — a source position pointing at its lexical `scope`.
+    Location { line: u32, col: u32, scope: u64 },
+    /// `!DIFile(filename, directory)`.
+    File {
+        filename: String,
+        directory: Option<String>,
+    },
+    /// A scope node carrying a `file:` edge (`!DISubprogram`/`!DILexicalBlock`/`!DICompileUnit`/…) — the
+    /// hop from a `!DILocation` to its `!DIFile`. `name` is the `!DISubprogram` source name (the §6
+    /// function-name-table value), `None` for the other scope kinds.
+    Scope {
+        file: Option<u64>,
+        name: Option<String>,
+    },
 }
 
 impl Parser {
@@ -92,6 +135,9 @@ impl Parser {
                 types: Types::new(),
             },
             symbols: std::collections::BTreeMap::new(),
+            di_meta: std::collections::BTreeMap::new(),
+            pending_dbg: None,
+            func_names: std::collections::BTreeMap::new(),
         }
     }
 
@@ -156,6 +202,61 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    // ---- debug metadata (source-line half) -----------------------------------------------------
+
+    /// Pre-pass: scan the whole token stream for module-level `!N = <node>` definitions and record the
+    /// `!DILocation`/`!DIFile`/scope nodes into [`Self::di_meta`]. Runs before [`Self::module`] so an
+    /// instruction's `!dbg !N` — the nodes are emitted *after* the functions — resolves. The pattern
+    /// `!N =` only occurs for these top-level definitions (an in-function `!dbg !N` is a `Meta` *not*
+    /// followed by `=`), so the scan is unambiguous.
+    fn collect_di_metadata(&mut self) {
+        let mut i = 0;
+        while i + 1 < self.toks.len() {
+            let is_def = matches!(self.toks.get(i), Some(Token::Meta(_)))
+                && self.toks.get(i + 1) == Some(&Token::Equals);
+            if !is_def {
+                i += 1;
+                continue;
+            }
+            let id = match self.toks.get(i) {
+                Some(Token::Meta(s)) => s.parse::<u64>().ok(),
+                _ => None,
+            };
+            let (node, next) = parse_di_node(&self.toks, i + 2);
+            if let (Some(id), Some(node)) = (id, node) {
+                self.di_meta.insert(id, node);
+            }
+            i = next.max(i + 2);
+        }
+    }
+
+    /// Resolve a `!dbg` metadata id to a [`DebugLoc`]: the `!DILocation` gives line/column, and its
+    /// `scope` node's `file:` edge reaches the `!DIFile` for filename/directory (the same fields the
+    /// bitcode reader's `DebugLoc` carries).
+    fn resolve_debug_loc(&self, id: u64) -> Option<DebugLoc> {
+        let (line, col, scope) = match self.di_meta.get(&id)? {
+            DiNode::Location { line, col, scope } => (*line, *col, *scope),
+            _ => return None,
+        };
+        let file_id = match self.di_meta.get(&scope)? {
+            DiNode::Scope { file, .. } => (*file)?,
+            _ => return None,
+        };
+        let (filename, directory) = match self.di_meta.get(&file_id)? {
+            DiNode::File {
+                filename,
+                directory,
+            } => (filename.clone(), directory.clone()),
+            _ => return None,
+        };
+        Some(DebugLoc {
+            line,
+            col: Some(col),
+            filename,
+            directory,
+        })
     }
 
     // ---- module --------------------------------------------------------------------------------
@@ -474,8 +575,19 @@ impl Parser {
                 is_var_arg,
             }),
         );
-        // Skip post-signature attributes/personality/etc. up to the opening `{`.
+        // Skip post-signature attributes/personality/etc. up to the opening `{`, capturing the
+        // `!dbg !N` subprogram attachment (→ the §6 source function name).
         while !matches!(self.peek(), Some(Token::LBrace) | None) {
+            if matches!(self.peek(), Some(Token::Meta(k)) if k == "dbg") {
+                if let Some(Token::Meta(v)) = self.peek2() {
+                    if let Some(DiNode::Scope {
+                        name: Some(src), ..
+                    }) = v.parse::<u64>().ok().and_then(|id| self.di_meta.get(&id))
+                    {
+                        self.func_names.insert(name.clone(), src.clone());
+                    }
+                }
+            }
             self.pos += 1;
         }
         self.expect(&Token::LBrace)?;
@@ -646,15 +758,23 @@ impl Parser {
         // A `call` is handled first: it may have *no* `%dest =` (a `void` call), and an optional
         // `tail`/`musttail`/`notail` marker sits where an opcode otherwise would — both break the
         // "every instruction starts `%dest = <opcode>`" shape the rest of this function assumes.
+        // Reset the per-instruction `!dbg` capture; the trailing-metadata parse sets it if present.
+        self.pending_dbg = None;
         if self.at_call() {
-            return self.call_inst(next_unnamed).map(Instruction::Call);
+            let mut inst = Instruction::Call(self.call_inst(next_unnamed)?);
+            self.attach_pending_dbg(&mut inst);
+            return Ok(inst);
         }
         // `store`/`fence` are the other result-less instructions (no `%dest =`).
         if matches!(self.peek(), Some(Token::Word(w)) if w == "store") {
-            return self.store_inst().map(Instruction::Store);
+            let mut inst = Instruction::Store(self.store_inst()?);
+            self.attach_pending_dbg(&mut inst);
+            return Ok(inst);
         }
         if matches!(self.peek(), Some(Token::Word(w)) if w == "fence") {
-            return self.fence_inst().map(Instruction::Fence);
+            let mut inst = Instruction::Fence(self.fence_inst()?);
+            self.attach_pending_dbg(&mut inst);
+            return Ok(inst);
         }
         // `%dest =` prefix (every other instruction modeled here produces a value).
         let dest = self.instr_dest(next_unnamed)?;
@@ -728,7 +848,17 @@ impl Parser {
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
+        let mut i = i;
+        self.attach_pending_dbg(&mut i);
         Ok(i)
+    }
+
+    /// Attach the source location captured from this instruction's `!dbg !N` (via
+    /// [`Self::pending_dbg`]), resolved through the `!DILocation` metadata graph.
+    fn attach_pending_dbg(&mut self, inst: &mut Instruction) {
+        if let Some(id) = self.pending_dbg.take() {
+            inst.set_debug_loc(self.resolve_debug_loc(id));
+        }
     }
 
     /// The `%dest =` of a value-producing instruction; advances the unnamed counter for an unnamed dest.
@@ -758,9 +888,14 @@ impl Parser {
     /// Skip a trailing `, !dbg !N` / `, !tbaa !M` … metadata list attached to an instruction.
     fn skip_trailing_metadata(&mut self) {
         while self.peek() == Some(&Token::Comma) && matches!(self.peek2(), Some(Token::Meta(_))) {
+            let is_dbg = matches!(self.peek2(), Some(Token::Meta(k)) if k == "dbg");
             self.pos += 2; // `,` `!kind`
                            // the metadata value (`!N` or an inline `!{…}`); for `!N` it's a single Meta token.
-            if matches!(self.peek(), Some(Token::Meta(_))) {
+            if let Some(Token::Meta(v)) = self.peek() {
+                // Capture the `!dbg !N` id so `instruction()` can attach the resolved source location.
+                if is_dbg {
+                    self.pending_dbg = v.parse::<u64>().ok();
+                }
                 self.pos += 1;
             }
         }
@@ -2154,6 +2289,124 @@ impl Parser {
 }
 
 // ---- small parsing helpers ---------------------------------------------------------------------
+
+/// Parse a metadata definition body starting just after `!N =` (at `toks[start]`) into a [`DiNode`],
+/// returning it plus the index just past the node. A `distinct` prefix, then a specialized
+/// `!Kind(fields)` node, are handled; a `!{…}` tuple / anything else is skipped (`None`).
+fn parse_di_node(toks: &[Token], start: usize) -> (Option<DiNode>, usize) {
+    let mut j = start;
+    if matches!(toks.get(j), Some(Token::Word(w)) if w == "distinct") {
+        j += 1;
+    }
+    match (toks.get(j), toks.get(j + 1)) {
+        // `!Kind( … )` — a specialized DI node.
+        (Some(Token::Meta(kind)), Some(Token::LParen)) => {
+            let kind = kind.clone();
+            let (fields, next) = scan_node_fields(toks, j + 1);
+            (build_di_node(&kind, &fields), next)
+        }
+        // `!{ … }` — a tuple; skip the balanced braces.
+        (Some(Token::Meta(_)), Some(Token::LBrace)) => (None, skip_braced(toks, j + 1)),
+        // Any other RHS (a bare `!ref`, an `i32 7` module-flag operand, …): advance one token.
+        _ => (None, j + 1),
+    }
+}
+
+/// Scan a specialized node's `( key: value, … )`, returning a map of each depth-1 `key` → its first
+/// value token, plus the index just past the matching `)`. (Only the first token of a value is kept;
+/// flag-sets / trailing tokens are skipped by the depth walk.)
+fn scan_node_fields(
+    toks: &[Token],
+    lparen: usize,
+) -> (std::collections::HashMap<String, Token>, usize) {
+    let mut fields = std::collections::HashMap::new();
+    let mut j = lparen + 1;
+    let mut depth = 1usize;
+    while depth > 0 {
+        match toks.get(j) {
+            None => break,
+            Some(Token::LParen) => {
+                depth += 1;
+                j += 1;
+            }
+            Some(Token::RParen) => {
+                depth -= 1;
+                j += 1;
+            }
+            Some(Token::Word(key)) if depth == 1 && toks.get(j + 1) == Some(&Token::Colon) => {
+                if let Some(v) = toks.get(j + 2) {
+                    fields.insert(key.clone(), v.clone());
+                }
+                j += 3;
+            }
+            _ => j += 1,
+        }
+    }
+    (fields, j)
+}
+
+/// Build the [`DiNode`] for a specialized node `kind` from its scanned fields (only the node kinds
+/// the source-line reader needs; everything else is `None`).
+fn build_di_node(kind: &str, fields: &std::collections::HashMap<String, Token>) -> Option<DiNode> {
+    let meta_id = |k: &str| match fields.get(k) {
+        Some(Token::Meta(s)) => s.parse::<u64>().ok(),
+        _ => None,
+    };
+    let int_u32 = |k: &str| match fields.get(k) {
+        Some(Token::Int(s)) => s.parse::<u32>().ok(),
+        _ => None,
+    };
+    let string = |k: &str| match fields.get(k) {
+        Some(Token::Str(s)) => Some(String::from_utf8_lossy(&super::lex::unescape(s)).into_owned()),
+        _ => None,
+    };
+    match kind {
+        "DILocation" => Some(DiNode::Location {
+            line: int_u32("line")?,
+            col: int_u32("column").unwrap_or(0),
+            scope: meta_id("scope")?,
+        }),
+        "DIFile" => Some(DiNode::File {
+            filename: string("filename")?,
+            directory: string("directory"),
+        }),
+        // Scope nodes: the `file:` edge is the hop to the `!DIFile`; a `!DISubprogram` also names the
+        // source function.
+        "DISubprogram" => Some(DiNode::Scope {
+            file: meta_id("file"),
+            name: string("name"),
+        }),
+        "DILexicalBlock" | "DILexicalBlockFile" | "DICompileUnit" | "DINamespace" | "DIModule" => {
+            Some(DiNode::Scope {
+                file: meta_id("file"),
+                name: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Index just past the balanced `{ … }` starting at `toks[lbrace]`.
+fn skip_braced(toks: &[Token], lbrace: usize) -> usize {
+    let mut j = lbrace;
+    let mut depth = 0usize;
+    while let Some(t) = toks.get(j) {
+        match t {
+            Token::LBrace => depth += 1,
+            Token::RBrace => {
+                depth -= 1;
+                j += 1;
+                if depth == 0 {
+                    break;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    j
+}
 
 /// A `%local`/`@global` name string → [`Name`]: all-digits ⇒ `Number`, else a textual `Name`.
 fn name_from_local(s: &str) -> Name {

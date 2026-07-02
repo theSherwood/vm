@@ -1989,15 +1989,32 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     test: `atomic_fetch_add` + `atomic_compare_exchange_strong` + `atomic_load` — **NB** `fence` parses
     but the *translator* doesn't lower it (`Unsupported`), so it's excluded from the test. **Thirty parity
     tests total.**
-- **Next step (resume here): last loose ends, then PR3.** Remaining `clang`-emitted shapes, each a small
-  `clang -O2`-shape + `assert_ll_parity` addition: **literal aggregate constants** `{ i32 1, i8 2 }` as
-  operands/inits, **`indirectbr` + `blockaddress`** (the `blockaddress(@f, %bb)` payload the parser
-  recovers structurally — the AST already has `Constant::BlockAddress`), and **scalable-vector** ops.
-  These are increasingly rare in `clang -O2` output; the instruction set is otherwise saturated. Then
-  **PR3**:
-  debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
-  flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
-  (prove version-tolerance by feeding an LLVM-21 `.ll`).
+- **PR2 landed + merged (PR #158).** The instruction set is saturated for `clang -O2`/`clang++` (30
+  parity tests). Loose ends remaining, each a small `clang -O2`-shape + `assert_ll_parity` addition:
+  **literal aggregate constants** `{ i32 1, i8 2 }`, **`indirectbr` + `blockaddress`** (AST already has
+  `Constant::BlockAddress`), **scalable-vector** ops — all rare in `-O2` output.
+- **PR3 (in progress, branch `claude/ll-debug-metadata`): debug metadata from `.ll` text, replacing the
+  `di.rs` `llvm-sys` walk.**
+  - **Slice 3a — source-line half + function names — DONE.** A metadata pre-pass
+    (`Parser::collect_di_metadata`, run before `module()` since the `!N` table is emitted *after* the
+    functions that `!dbg`-reference it) parses the reduced `DiNode` table (`!DILocation`/`!DIFile`/scope
+    nodes via a generic `parse_di_node`/`scan_node_fields` field-scanner). `skip_trailing_metadata`
+    captures each instruction's `!dbg !N` into `pending_dbg`; `instruction()` resolves it
+    (`DILocation` → `scope.file` → `DIFile`) and attaches a `DebugLoc` via the new
+    `Instruction::set_debug_loc`. `!DISubprogram(name:)` feeds a `@linkage → source` **func-names** table,
+    exposed by `parse_module_with_debug`; `translate_ll_str` packages it as a `di::LlvmDebug` (the same
+    `di` arg the bitcode path uses). Parity gate: **`assert_ll_parity_debug`** (`clang -O2
+    -gline-tables-only` — source lines + subprogram names but *no* `DILocalVariable`/`DIType`, so the
+    variable/type graph stays out of scope) — **31 parity tests total.** Key gotcha found: the DIFile
+    filename is embedded, so both compiles must use the *same* `.c` source path.
+  - **Next: slice 3b — the variable/type graph.** Replace di.rs's `llvm-sys` walk of
+    `DILocalVariable`/`DIType`(`DIBasicType`/`DIDerivedType`/`DICompositeType`) + the
+    `llvm.dbg.declare`/`dbg.value` correlation, building the `di::LlvmDebug` `types`/`vars`/`globals` from
+    text (`-O0 -g` for `dbg.declare`/`Window` locals; `-Og`/`-O2 -g` for `dbg.value`/`SsaList`). Gate
+    with `-O0 -g` and `-Og` `assert_ll_parity_debug` variants. This is the bigger half; once it reaches
+    parity, di.rs is fully replaced.
+- **PR4:** flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/`di.rs`/the side-readers + the
+  rustc-1.81 pin (prove version-tolerance by feeding an LLVM-21 `.ll`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`

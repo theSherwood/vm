@@ -1160,6 +1160,45 @@ impl HasDebugLoc for Instruction {
     }
 }
 
+impl Instruction {
+    /// Parser-side setter for the source location, resolved from an instruction's `!dbg` attachment
+    /// (the textual reader's analog of the bitcode reader's per-instruction `DebugLoc`). Mirrors the
+    /// variant grouping of [`Instruction::get_debug_loc`].
+    pub fn set_debug_loc(&mut self, dl: Option<DebugLoc>) {
+        use Instruction::*;
+        let slot = match self {
+            Add(i) | Sub(i) | Mul(i) | UDiv(i) | SDiv(i) | URem(i) | SRem(i) | And(i) | Or(i)
+            | Xor(i) | Shl(i) | LShr(i) | AShr(i) | FAdd(i) | FSub(i) | FMul(i) | FDiv(i)
+            | FRem(i) => &mut i.debugloc,
+            FNeg(i) | Trunc(i) | ZExt(i) | SExt(i) | FPTrunc(i) | FPExt(i) | FPToUI(i)
+            | FPToSI(i) | UIToFP(i) | SIToFP(i) | PtrToInt(i) | IntToPtr(i) | BitCast(i)
+            | AddrSpaceCast(i) | Freeze(i) => &mut i.debugloc,
+            ExtractElement(i) => &mut i.debugloc,
+            InsertElement(i) => &mut i.debugloc,
+            ShuffleVector(i) => &mut i.debugloc,
+            ExtractValue(i) => &mut i.debugloc,
+            InsertValue(i) => &mut i.debugloc,
+            Alloca(i) => &mut i.debugloc,
+            Load(i) => &mut i.debugloc,
+            Store(i) => &mut i.debugloc,
+            Fence(i) => &mut i.debugloc,
+            CmpXchg(i) => &mut i.debugloc,
+            AtomicRMW(i) => &mut i.debugloc,
+            GetElementPtr(i) => &mut i.debugloc,
+            ICmp(i) => &mut i.debugloc,
+            FCmp(i) => &mut i.debugloc,
+            Phi(i) => &mut i.debugloc,
+            Select(i) => &mut i.debugloc,
+            Call(i) => &mut i.debugloc,
+            VAArg(i) => &mut i.debugloc,
+            LandingPad(i) => &mut i.debugloc,
+            CatchPad(i) => &mut i.debugloc,
+            CleanupPad(i) => &mut i.debugloc,
+        };
+        *slot = dl;
+    }
+}
+
 /// The element type of a vector `TypeRef`, or a panic (the operand of a vector op must be a vector —
 /// mirrors `llvm-ir`'s behavior; the on-ramp only calls this on verified-valid IR).
 fn vec_element_type(ty: &TypeRef) -> TypeRef {

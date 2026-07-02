@@ -257,9 +257,19 @@ pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 }
 
 /// Translate textual LLVM IR from a string (the textual-reader entry; see [`translate_ll_path`]).
+///
+/// The §6 source-line half rides each instruction's `!DILocation` (parsed onto its `debugloc`); the
+/// structured half is, for now, just the `!DISubprogram` **function-name** table (`-gline-tables-only`
+/// coverage), packaged as a [`di::LlvmDebug`] and threaded through the same `di` argument the bitcode
+/// path uses. The variable/type graph (`DILocalVariable`/`DIType`) is a later slice.
 pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
-    let m = ll::parse::parse_module(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
-    translate_impl(&m, None, None)
+    let (m, func_names) =
+        ll::parse::parse_module_with_debug(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
+    let di = (!func_names.is_empty()).then(|| di::LlvmDebug {
+        func_names: func_names.into_iter().collect(),
+        ..Default::default()
+    });
+    translate_impl(&m, di.as_ref(), None)
 }
 
 /// Translate an already-parsed [`ll`] module (the shape the textual-`.ll` reader produces, or the
