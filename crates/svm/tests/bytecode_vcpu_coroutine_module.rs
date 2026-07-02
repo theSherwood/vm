@@ -111,14 +111,12 @@ fn run_resumable() -> Result<Vec<Value>, Trap> {
         host,
     )
     .expect("root vcpu");
-    let r = loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => break Ok(vals),
-            bytecode::VcpuEvent::Trapped(t) => break Err(t),
-            // The coroutine-module kernel has no thread.spawn / futex, and §14 is serviced internally,
-            // so no host event should ever surface.
-            _ => panic!("unexpected host event: coroutine-module needs none"),
-        }
+    // One `run()` suffices: the coroutine-module kernel has no thread.spawn / futex, and every §14
+    // op is serviced internally, so the vCPU runs to `Done` without the host servicing any event.
+    let r = match vcpu.run() {
+        bytecode::VcpuEvent::Done(vals) => Ok(vals),
+        bytecode::VcpuEvent::Trapped(t) => Err(t),
+        _ => panic!("unexpected host event: coroutine-module needs none"),
     };
     drop(back);
     // SAFETY: same layout; the region (and all borrows) are gone.
