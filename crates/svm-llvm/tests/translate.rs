@@ -2059,6 +2059,289 @@ fn libc_ldexp_bit_exact() {
 }
 
 #[test]
+fn libc_frexp_bit_exact() {
+    // The synthesized `__svm_frexp` over a grid spanning the normal range, a power-of-two boundary,
+    // ±0, a negative value, a subnormal (`1e-310`), and the special path (±inf). For each input both
+    // the returned mantissa's raw f64 bits and the written exponent are folded into the checksum, so
+    // the result *and* the `*e` out-param are pinned bit-identical to libc `frexp` on all three
+    // engines. `volatile` inputs keep the calls past `-O2`.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {1.0, 0.5, 3.14159265358979, 1e300, 1e-300,\n\
+                                    0.0, -2.5, 1024.0, 1e-310, 1.0/0.0};\n\
+          volatile double neg = -1.0/0.0;\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) {\n\
+            int e; double m = frexp(xs[i], &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL;\n\
+          }\n\
+          { int e; double m = frexp(neg, &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL; }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_frexp", src, 0);
+}
+
+#[test]
+fn libc_fmod_bit_exact() {
+    // The synthesized `__svm_fmod` (musl's exact 64-bit remainder) over a 10×8 grid of (x, y) pairs:
+    // normal/normal, |x|<|y| (early return), |x|==|y| (±0), every sign combination, a large quotient
+    // (many loop iterations — `1e300 % 7`), subnormal inputs (`1e-310`, the smallest subnormal
+    // `4.9e-324`, a subnormal divisor `1e-311`), and the special paths (`y==0` and `x==inf` → NaN).
+    // A finite result is folded by its raw f64 bits (so it is pinned bit-identical to libc); a NaN
+    // result is folded as a canonical constant (payload-independent) so the check still verifies that
+    // both sides produce NaN without depending on the exact NaN payload. `volatile` keeps the calls.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {5.5, 7.0, -7.0, 1e300, 3.0, 2.0, -2.0, 1e-310, 4.9e-324, 1.0/0.0};\n\
+          volatile double ys[8]  = {2.0, 3.0, -3.0, 1e300, 7.0, 2.0, 1e-311, 0.0};\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) for (int j=0;j<8;j++) {\n\
+            double r = fmod(xs[i], ys[j]);\n\
+            unsigned long long bits;\n\
+            if (r != r) bits = 0x7ff8000000000000ULL; /* canonicalize any NaN */\n\
+            else { union { double d; unsigned long long u; } cvt; cvt.d = r; bits = cvt.u; }\n\
+            acc = (acc ^ bits) * 1099511628211ULL;\n\
+          }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_fmod", src, 0);
+}
+
+#[test]
+fn libc_localeconv_c_locale() {
+    // `localeconv()` returns the synthesized read-only C-locale `lconv` struct. Read `decimal_point`
+    // (".", plus its NUL), an empty string field (`thousands_sep`/`grouping` → ""), and two of the
+    // `char` fields (`frac_digits`/`p_sign_posn` → CHAR_MAX). With no `setlocale`, native runs in the
+    // "C" locale, so every field matches the synthesized struct — same byte on all three engines.
+    let src = "#include <locale.h>\n\
+        int run(int seed){\n\
+          struct lconv *lc = localeconv();\n\
+          int acc = 0;\n\
+          acc += (unsigned char)lc->decimal_point[0];\n\
+          acc += (unsigned char)lc->decimal_point[1];\n\
+          acc += (unsigned char)lc->thousands_sep[0];\n\
+          acc += (unsigned char)lc->grouping[0];\n\
+          acc += (lc->frac_digits & 0xff);\n\
+          acc += (lc->p_sign_posn & 0xff);\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_localeconv", src, 0);
+}
+
+#[test]
+fn demo_libm_vs_native() {
+    // The bundled **guest `libm`** (`demos/libm/libm.c`, fdlibm `exp`/`log`/`pow`/`sin`/`cos`): a
+    // program that needs the transcendentals brings them as ordinary guest C — no host math
+    // capability, no translator intrinsic — and a guest definition shadows the libc-name binding the
+    // on-ramp would otherwise synthesize. The driver evaluates each over runtime grids and writes the
+    // raw f64 image; since the math is guest code, native `cc` compiles the same source, so the bytes
+    // are identical across the tree-walker, the bytecode VM, the JIT, and native. `pow` also exercises
+    // `sqrt` (→ the SVM `f64.sqrt` op, `y=0.5`) and `scalbn` (→ `__svm_ldexp`).
+    //
+    // Built with `-fno-vectorize -fno-slp-vectorize`: clang would auto-SIMD some of the polynomial
+    // evaluation into `<2 x double>` (the §17 vector lane, outside this scalar on-ramp's scope), and
+    // exact IEEE arithmetic gives the identical bytes scalar-vs-vectorized — so the on-ramp consumes
+    // scalar bitcode while the native oracle keeps vectorizing (the split the corpus demos use).
+    check_demo_vs_native_flags(
+        "libm",
+        "libm/libm_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn libm_guest_exp_log_accurate_vs_system() {
+    // Accuracy gate (native only): the byte-identical differential above proves the on-ramp *executes*
+    // the guest libm faithfully, but — same source on both lanes — it cannot catch a transcription
+    // error (both lanes would be equally wrong). So compile `libm.c` with its symbols renamed
+    // (`-Dexp=svm_exp -Dlog=svm_log`) and compare against the system `<math.h>` over a grid, asserting
+    // each result is within 2 ULP. This validates the fdlibm transcription against a real libm.
+    let probe = "#include <math.h>\n\
+        #include <stdint.h>\n\
+        double svm_exp(double); double svm_log(double); double svm_pow(double,double);\n\
+        double svm_sin(double); double svm_cos(double);\n\
+        static int ulp_ok(double a, double b){\n\
+          if (a==b) return 1;\n\
+          if (a!=a && b!=b) return 1; /* both NaN */\n\
+          int64_t ia, ib; __builtin_memcpy(&ia,&a,8); __builtin_memcpy(&ib,&b,8);\n\
+          if (ia<0) ia = (int64_t)0x8000000000000000ULL - ia;\n\
+          if (ib<0) ib = (int64_t)0x8000000000000000ULL - ib;\n\
+          int64_t d = ia>ib ? ia-ib : ib-ia; return d <= 2;\n\
+        }\n\
+        int main(void){\n\
+          double xs[] = {0.0,0.5,1.0,2.0,3.14159265,10.0,-1.0,-5.0,100.0,0.001,709.0,-700.0};\n\
+          double ls[] = {1.0,2.0,0.5,2.718281828459045,10.0,1e10,1e-10,0.001,1e300,123456.789};\n\
+          double pb[] = {2.0,3.0,-2.0,-2.0,10.0,0.5,9.0,-1.0,1.5,2.0,-3.0,0.5,7.0};\n\
+          double pe[] = {10.0,3.0,3.0,4.0,-2.0,0.5,0.5,2.0,2.5,0.5,3.0,-1.0,2.0};\n\
+          /* sin/cos: generic O(1)-result args (avoid exact multiples of pi where the residual is\n\
+             pathologically tiny), spanning every quadrant up to the medium-path bound (~1.6e6). */\n\
+          double ts[] = {0.3,0.5,0.7853981633974483,1.0,1.5,2.0,2.5,3.0,5.0,10.0,100.0,\n\
+                         1000.0,12345.678,1e5,1e6,-0.5,-3.0,-100.0};\n\
+          for (unsigned i=0;i<sizeof xs/sizeof*xs;i++) if(!ulp_ok(svm_exp(xs[i]), exp(xs[i]))) return 1;\n\
+          for (unsigned i=0;i<sizeof ls/sizeof*ls;i++) if(!ulp_ok(svm_log(ls[i]), log(ls[i]))) return 2;\n\
+          for (unsigned i=0;i<sizeof pb/sizeof*pb;i++) if(!ulp_ok(svm_pow(pb[i],pe[i]), pow(pb[i],pe[i]))) return 3;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(svm_sin(ts[i]), sin(ts[i]))) return 4;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(svm_cos(ts[i]), cos(ts[i]))) return 5;\n\
+          return 0;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_libm_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("svm_libm_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("svm_libm_acc_{}", std::process::id()));
+    let libm =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/libm/libm.c");
+    std::fs::write(&c, probe).expect("write probe");
+    // Compile the guest libm with its symbols renamed (`exp`→`svm_exp`, `log`→`svm_log`) so the probe
+    // can hold both it *and* the system `exp`/`log` for comparison.
+    let built = Command::new("cc")
+        .args([
+            "-O2",
+            "-fno-builtin",
+            "-Dexp=svm_exp",
+            "-Dlog=svm_log",
+            "-Dpow=svm_pow",
+            "-Dsin=svm_sin",
+            "-Dcos=svm_cos",
+            "-c",
+        ])
+        .arg(&libm)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping libm accuracy (cc unavailable)");
+            return;
+        }
+    }
+    // Link the probe (its own `exp`/`log` are the system libm) against the renamed guest object.
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest libm vs system: failing stage {code} (1=exp, 2=log, 3=pow, 4=sin, 5=cos)"
+    );
+}
+
+#[test]
+fn demo_strtod_vs_native() {
+    // The guest **`strtod`** (`demos/strtod/strtod.c`): a program that needs decimal→f64 parsing
+    // brings it as ordinary guest C, and the guest definition shadows the on-ramp's `strtod` trap
+    // stub. The driver parses a grid of decimal strings and writes each result's raw f64 image + the
+    // `endptr` offset; since the parser is guest code, native `cc` compiles the same source, so the
+    // bytes are identical across the tree-walker, the bytecode VM, the JIT, and native.
+    //
+    // Built `-fno-vectorize -fno-slp-vectorize` (the bignum limb loops would auto-SIMD to `<… x i32>`,
+    // the v128 lane outside this scalar on-ramp; exact integer arithmetic is identical
+    // scalar-vs-vectorized, the corpus-demo split).
+    check_demo_vs_native_flags(
+        "strtod",
+        "strtod/strtod_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn strtod_guest_correctly_rounded_vs_system() {
+    // Correctness gate (native only): the byte-identical differential proves the on-ramp *executes*
+    // the guest `strtod` faithfully, but — same source on both lanes — cannot catch an algorithm
+    // error. Correctly-rounded decimal→f64 is *unique*, so a correct guest `strtod` matches glibc's
+    // bit-for-bit. Compile `strtod.c` renamed (`-Dstrtod=svm_strtod`) and assert the returned bits
+    // *and* the `endptr` offset match the system `strtod` over a grid spanning the hard cases:
+    // subnormals + the smallest-subnormal halfway tie, the 2^53 boundary, max-double, overflow→inf,
+    // underflow→0, the 1e22/1e23 fast-path boundary, `0.30000000000000004`, and long digit strings.
+    let probe = "#include <stdlib.h>\n\
+        #include <string.h>\n\
+        double svm_strtod(const char*, char**);\n\
+        static int bad;\n\
+        static void chk(const char* s){\n\
+          char *e1,*e2; double a=svm_strtod(s,&e1), b=strtod(s,&e2);\n\
+          unsigned long long ua,ub; memcpy(&ua,&a,8); memcpy(&ub,&b,8);\n\
+          if (ua!=ub || (e1-s)!=(e2-s)) bad=1;\n\
+        }\n\
+        int main(void){\n\
+          const char* t[] = {\n\
+            \"0\",\"0.0\",\"-0.0\",\"1\",\"3.14\",\"0.5\",\"2.5\",\"100.0\",\"-2.5\",\"1e10\",\"1e-10\",\n\
+            \"1e100\",\"1e-100\",\"1.5e3\",\"123456789.123456789\",\"0.1\",\"0.3\",\n\
+            \"9007199254740992\",\"9007199254740993\",\"1.7976931348623157e308\",\n\
+            \"2.2250738585072014e-308\",\"5e-324\",\"4.9e-324\",\"2.4703282292062327e-324\",\n\
+            \"1e309\",\"1e-400\",\"0.0000001\",\"  42.0\",\"  -3.25e2\",\"1000000000000000000000\",\n\
+            \"0.30000000000000004\",\"1e22\",\"1e23\",\"0.000244140625\",\"1.25e-1\",\".5\",\"5.\",\n\
+            \"+1.5\",\"3.141592653589793\",\"1234567890123456789012345678901234567890\",\n\
+            \"9.881312916824931e-324\",\"1.1125369292536007e-308\",\"8.98846567431158e307\",\n\
+            \"abc\",\"\",\"17.0\",\"0.000244140625e3\",\n\
+          };\n\
+          for (unsigned i=0;i<sizeof t/sizeof*t;i++) chk(t[i]);\n\
+          return bad;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_strtod_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("svm_strtod_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("svm_strtod_acc_{}", std::process::id()));
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/strtod/strtod.c");
+    std::fs::write(&c, probe).expect("write probe");
+    let built = Command::new("cc")
+        .args(["-O2", "-fno-builtin", "-Dstrtod=svm_strtod", "-c"])
+        .arg(&src)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping strtod accuracy (cc unavailable)");
+            return;
+        }
+    }
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest strtod != system strtod (bit/endptr mismatch)"
+    );
+}
+
+#[test]
 fn setjmp_longjmp_round_trip() {
     // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
     // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
