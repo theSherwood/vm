@@ -10,11 +10,13 @@
 //! `ret`/`br`/`condbr`/`unreachable` terminators; **memory** (`alloca`/`load`/`store`/`getelementptr`,
 //! incl. the second result-less shape `store` and opaque-pointer element types); and **multi-block**
 //! CFGs with LLVM's implicit slot numbering (so an unlabeled entry and the phi/branch refs into it
-//! resolve to the same `Name`s the bitcode reader assigns). Top-level cruft the on-ramp ignores
-//! (target/datalayout lines, attribute groups, module-level metadata, `declare`s) is skipped. Not yet
-//! handled (the growth frontier): globals, `switch`, aggregates, vectors, named struct types, and
-//! float/non-trivial constants. Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified
-//! downstream — §2a), never a miscompile.
+//! resolve to the same `Name`s the bitcode reader assigns); and **module-level global variables**
+//! (`@g = … global|constant <ty> <init>`, incl. `[N x T]` array types, array/byte-string/`zeroinitializer`
+//! initializers, and `@g` operand references resolved to `GlobalReference`s via a `@name → pointee-type`
+//! symbol table). Top-level cruft the on-ramp ignores (target/datalayout lines, attribute groups,
+//! module-level metadata, `declare`s) is skipped. Not yet handled (the growth frontier): named struct
+//! types, `switch`, aggregates, SIMD vectors, and float/non-trivial constants. Anything unhandled is a
+//! clean [`ParseError`] (fail-closed, re-verified downstream — §2a), never a miscompile.
 
 use super::ast::*;
 use super::lex::{lex, Token};
@@ -54,6 +56,12 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     module: Module,
+    /// `@name` → its *pointee* type: a global variable's content type, or a function's type. A
+    /// `@g`/`@f` operand tokenizes without its type (opaque pointers), but the `GlobalReference` the
+    /// bitcode reader builds carries this pointee type, and the translator reads it (e.g. as a GEP's
+    /// base pointee). clang emits globals + functions before their uses, so populating this as we parse
+    /// resolves every reference; a forward/unknown reference is a clean error (fail-closed).
+    symbols: std::collections::BTreeMap<String, TypeRef>,
 }
 
 impl Parser {
@@ -71,6 +79,7 @@ impl Parser {
                 global_aliases: Vec::new(),
                 types: Types::new(),
             },
+            symbols: std::collections::BTreeMap::new(),
         }
     }
 
@@ -147,6 +156,8 @@ impl Parser {
                     let f = self.function_def()?;
                     self.module.functions.push(f);
                 }
+                // `@name = [linkage/attrs] global|constant <ty> [<init>] [, align N]`
+                Some(Token::Global(_)) if self.at_global_var() => self.global_def()?,
                 // Top-level lines/items the on-ramp ignores at this slice: target/datalayout/source,
                 // attribute groups (`attributes #N = { … }`), module flags / named metadata (`!… = …`,
                 // `!name = !{…}`), and `declare`s. Skip to the next top-level item.
@@ -214,13 +225,152 @@ impl Parser {
             if depth == 0 {
                 match self.peek() {
                     Some(Token::Word(w))
-                        if w == "define" || w == "declare" || w == "attributes" =>
+                        if w == "define"
+                            || w == "declare"
+                            || w == "attributes"
+                            || w == "target"
+                            || w == "source_filename" =>
                     {
                         return
                     }
+                    // A depth-0 `@name` begins the next top-level item (a global/alias/function). Stop
+                    // before it so an unbraced line (`target … = "…"`) doesn't swallow the globals that
+                    // follow it. (We've already advanced ≥1 token this iteration, so this can't spin.)
+                    Some(Token::Global(_)) => return,
                     _ => {}
                 }
             }
+        }
+    }
+
+    // ---- global variables ----------------------------------------------------------------------
+
+    /// Is the cursor at a global *variable* definition (`@g = … global|constant …`)? Distinguishes it
+    /// from an alias/ifunc (also `@g = …`) by scanning the linkage/attribute barewords for the
+    /// `global`/`constant` keyword, skipping an `addrspace(N)` group.
+    fn at_global_var(&self) -> bool {
+        let mut i = self.pos;
+        if !matches!(self.toks.get(i), Some(Token::Global(_))) {
+            return false;
+        }
+        i += 1;
+        if self.toks.get(i) != Some(&Token::Equals) {
+            return false;
+        }
+        i += 1;
+        let mut guard = 0;
+        while guard < 32 {
+            guard += 1;
+            match self.toks.get(i) {
+                Some(Token::Word(w)) if w == "global" || w == "constant" => return true,
+                Some(Token::Word(w)) if w == "alias" || w == "ifunc" => return false,
+                Some(Token::Word(_)) => i += 1,
+                Some(Token::LParen) => {
+                    // `addrspace(N)` — skip the balanced group.
+                    let mut depth = 0usize;
+                    loop {
+                        match self.toks.get(i) {
+                            Some(Token::LParen) => {
+                                depth += 1;
+                                i += 1;
+                            }
+                            Some(Token::RParen) => {
+                                depth -= 1;
+                                i += 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            None => return false,
+                            _ => i += 1,
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `@name = [linkage/visibility/attrs] [addrspace(N)] global|constant <ty> [<init>] [, align N]
+    /// [, …]`. The `GlobalVariable.ty` is the *pointer* type (as the bitcode reader records
+    /// `LLVMTypeOf`); the written `<ty>` is the content type — kept in `symbols` (for `@name` operands)
+    /// and used to parse the initializer. Pushes into `module.global_vars`.
+    fn global_def(&mut self) -> PResult<()> {
+        let name = match self.bump() {
+            Some(Token::Global(s)) => s,
+            other => return self.err(format!("expected a global @name, found {other:?}")),
+        };
+        self.expect(&Token::Equals)?;
+        let mut addr_space: AddrSpace = 0;
+        let is_constant = loop {
+            match self.peek() {
+                Some(Token::Word(w)) if w == "global" => {
+                    self.pos += 1;
+                    break false;
+                }
+                Some(Token::Word(w)) if w == "constant" => {
+                    self.pos += 1;
+                    break true;
+                }
+                Some(Token::Word(w)) if w == "addrspace" => {
+                    self.pos += 1;
+                    if self.peek() == Some(&Token::LParen) {
+                        self.pos += 1;
+                        addr_space = self.int_lit_u32()?;
+                        self.expect(&Token::RParen)?;
+                    }
+                }
+                Some(Token::Word(_)) => self.pos += 1, // linkage / visibility / unnamed_addr / …
+                other => return self.err(format!("expected `global`/`constant`, found {other:?}")),
+            }
+        };
+        let content_ty = self.type_()?;
+        self.symbols.insert(name.clone(), content_ty.clone());
+        // The initializer (absent for an `external` declaration — then the next token is `,`/a new item).
+        let initializer = if self.at_constant_start() {
+            Some(self.constant(&content_ty)?)
+        } else {
+            None
+        };
+        let mut alignment = 0u32;
+        while self.peek() == Some(&Token::Comma) {
+            self.pos += 1; // `,`
+            if self.eat_word("align") {
+                alignment = self.int_lit_u32()?;
+            } else {
+                // section/comdat/metadata — skip this trailing clause to the next top-level item.
+                self.skip_to_toplevel_boundary();
+                break;
+            }
+        }
+        self.module.global_vars.push(GlobalVariable {
+            name: name_from_local(&name),
+            ty: self.module.types.pointer(addr_space),
+            initializer,
+            is_constant,
+            alignment,
+        });
+        Ok(())
+    }
+
+    /// Does the cursor begin a constant (an initializer value), as opposed to a `,`/end-of-item?
+    fn at_constant_start(&self) -> bool {
+        match self.peek() {
+            Some(Token::Int(_))
+            | Some(Token::Float(_))
+            | Some(Token::Str(_))
+            | Some(Token::LBracket)
+            | Some(Token::LBrace)
+            | Some(Token::Lt)
+            | Some(Token::Global(_)) => true,
+            Some(Token::Word(w)) => {
+                matches!(
+                    w.as_str(),
+                    "true" | "false" | "zeroinitializer" | "null" | "undef" | "poison"
+                ) || (w == "c" && matches!(self.peek2(), Some(Token::Str(_))))
+            }
+            _ => false,
         }
     }
 
@@ -238,6 +388,16 @@ impl Parser {
             other => return self.err(format!("expected function @name, found {other:?}")),
         };
         let (parameters, is_var_arg) = self.param_list()?;
+        // Record `@name` → its function type, so a later `@name` operand (an address-of, not a direct
+        // call) resolves to a `GlobalReference` carrying that pointee type.
+        self.symbols.insert(
+            name.clone(),
+            TypeRef::new(Type::FuncType {
+                result_type: return_type.clone(),
+                param_types: parameters.iter().map(|p| p.ty.clone()).collect(),
+                is_var_arg,
+            }),
+        );
         // Skip post-signature attributes/personality/etc. up to the opening `{`.
         while !matches!(self.peek(), Some(Token::LBrace) | None) {
             self.pos += 1;
@@ -283,6 +443,8 @@ impl Parser {
             "zeroext",
             "signext",
             "noundef",
+            "nonnull",
+            "noalias",
             "ccc",
             "fastcc",
             "coldcc",
@@ -614,8 +776,118 @@ impl Parser {
                     value,
                 })))
             }
+            // A reference to a global variable / function (`@g`) — a `GlobalReference` constant. Its
+            // `ty` is the referent's pointee type from `symbols`, matching what the bitcode reader
+            // carries; the operand's own written type (`ptr`) is discarded.
+            Some(Token::Global(_)) => Ok(Operand::ConstantOperand(self.global_ref()?)),
             other => self.err(format!("value not yet supported: {other:?}")),
         }
+    }
+
+    /// A `@name` global/function reference → a `GlobalReference` constant (pointee type from `symbols`).
+    fn global_ref(&mut self) -> PResult<ConstantRef> {
+        let s = match self.bump() {
+            Some(Token::Global(s)) => s,
+            other => return self.err(format!("expected @global, found {other:?}")),
+        };
+        let ty = self.symbols.get(&s).cloned().ok_or_else(|| {
+            ParseError::new(self.pos, format!("reference to undeclared global `@{s}`"))
+        })?;
+        Ok(ConstantRef::new(Constant::GlobalReference {
+            name: name_from_local(&s),
+            ty,
+        }))
+    }
+
+    /// Parse a constant of (already-parsed) type `ty` — global initializers and other constant
+    /// positions. Covers int/`true`/`false`, `zeroinitializer`/`null`/`undef`/`poison`, `@g` references,
+    /// `c"…"` byte strings, and `[ <ty> <c>, … ]` arrays. (Float constants are a later slice.)
+    fn constant(&mut self, ty: &TypeRef) -> PResult<ConstantRef> {
+        let c = match self.peek() {
+            Some(Token::Int(s)) => {
+                let s = s.clone();
+                let bits = match ty.as_ref() {
+                    Type::IntegerType { bits } => *bits,
+                    _ => return self.err("integer constant with non-integer type"),
+                };
+                self.pos += 1;
+                let value = parse_int_literal(&s, bits).ok_or_else(|| {
+                    ParseError::new(self.pos, format!("bad integer literal `{s}`"))
+                })?;
+                Constant::Int { bits, value }
+            }
+            Some(Token::Word(w)) if w == "true" || w == "false" => {
+                let value = (w == "true") as u128;
+                self.pos += 1;
+                Constant::Int { bits: 1, value }
+            }
+            Some(Token::Word(w)) if w == "zeroinitializer" => {
+                self.pos += 1;
+                Constant::AggregateZero(ty.clone())
+            }
+            Some(Token::Word(w)) if w == "null" => {
+                self.pos += 1;
+                Constant::Null(ty.clone())
+            }
+            Some(Token::Word(w)) if w == "undef" => {
+                self.pos += 1;
+                Constant::Undef(ty.clone())
+            }
+            Some(Token::Word(w)) if w == "poison" => {
+                self.pos += 1;
+                Constant::Poison(ty.clone())
+            }
+            Some(Token::Global(_)) => return self.global_ref(),
+            // `c"…"` — a byte string, i.e. an array of `i8` constants (escapes decoded to raw bytes).
+            // The `c` prefix lexes as its own `Word` before the `Str` body.
+            Some(Token::Word(w)) if w == "c" && matches!(self.peek2(), Some(Token::Str(_))) => {
+                self.pos += 1; // `c`
+                let s = match self.bump() {
+                    Some(Token::Str(s)) => s,
+                    _ => unreachable!("peek2 checked Str"),
+                };
+                let bytes = super::lex::unescape(&s);
+                let element_type = self.module.types.int(8);
+                let elements = bytes
+                    .into_iter()
+                    .map(|b| {
+                        ConstantRef::new(Constant::Int {
+                            bits: 8,
+                            value: b as u128,
+                        })
+                    })
+                    .collect();
+                Constant::Array {
+                    element_type,
+                    elements,
+                }
+            }
+            // `[ <ty> <c>, … ]` — an array constant; the element type comes from the array type.
+            Some(Token::LBracket) => {
+                let element_type = match ty.as_ref() {
+                    Type::ArrayType { element_type, .. } => element_type.clone(),
+                    _ => return self.err("array constant with non-array type"),
+                };
+                self.pos += 1; // `[`
+                let mut elements = Vec::new();
+                if self.peek() != Some(&Token::RBracket) {
+                    loop {
+                        let ety = self.type_()?;
+                        elements.push(self.constant(&ety)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Token::RBracket)?;
+                Constant::Array {
+                    element_type,
+                    elements,
+                }
+            }
+            other => return self.err(format!("constant not yet supported: {other:?}")),
+        };
+        Ok(ConstantRef::new(c))
     }
 
     // ---- conversions / compares / select -------------------------------------------------------
@@ -872,6 +1144,16 @@ impl Parser {
         match self.bump() {
             Some(Token::Int(s)) => s
                 .parse::<u32>()
+                .map_err(|_| ParseError::new(self.pos, format!("bad integer `{s}`"))),
+            other => self.err(format!("expected an integer, found {other:?}")),
+        }
+    }
+
+    /// Consume an integer literal as a `usize` (array/vector element counts).
+    fn int_lit_usize(&mut self) -> PResult<usize> {
+        match self.bump() {
+            Some(Token::Int(s)) => s
+                .parse::<usize>()
                 .map_err(|_| ParseError::new(self.pos, format!("bad integer `{s}`"))),
             other => self.err(format!("expected an integer, found {other:?}")),
         }
@@ -1171,6 +1453,15 @@ impl Parser {
 
     /// Parse a type, interning it in `module.types`. Seed slice: `void`, `iN`, `ptr`, `float`/`double`.
     fn type_(&mut self) -> PResult<TypeRef> {
+        // `[N x T]` array type.
+        if self.peek() == Some(&Token::LBracket) {
+            self.pos += 1;
+            let num_elements = self.int_lit_usize()?;
+            self.expect_word("x")?;
+            let element_type = self.type_()?;
+            self.expect(&Token::RBracket)?;
+            return Ok(self.module.types.array_of(element_type, num_elements));
+        }
         let w = match self.peek() {
             Some(Token::Word(w)) => w.clone(),
             other => return self.err(format!("expected a type, found {other:?}")),

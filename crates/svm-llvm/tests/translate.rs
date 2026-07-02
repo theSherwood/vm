@@ -7480,6 +7480,36 @@ fn ll_parity_alloca_volatile() {
 }
 
 #[test]
+fn ll_parity_global_scalar() {
+    // A mutable scalar global (`@counter = global i32 0`) read + written by a function
+    // (`load`/`add`/`store` through `ptr @counter`).
+    assert_ll_parity(
+        "ll_parity_gscalar",
+        "int counter = 0; int bump(void){ return ++counter; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_array() {
+    // A `constant [4 x i32]` lookup table indexed by a function — array type + array constant
+    // initializer + a `getelementptr [4 x i32], ptr @TBL, …`.
+    assert_ll_parity(
+        "ll_parity_garray",
+        "static const int TBL[4] = {10, 20, 30, 40}; int lookup(int i){ return TBL[i & 3]; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_string() {
+    // A `private constant [N x i8] c\"…\\00\"` string returned by a function (`ret ptr @.str`) —
+    // byte-string constant + a `@.str` operand reference.
+    assert_ll_parity(
+        "ll_parity_gstring",
+        "const char *greeting(void){ return \"hi\"; }",
+    );
+}
+
+#[test]
 fn ll_parity_call_void() {
     // A result-less `call void @sink(...)` — the dest-less instruction shape (`tail call void …`).
     assert_ll_parity(

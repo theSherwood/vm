@@ -1808,17 +1808,27 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     and `getelementptr [inbounds] [nuw|nusw] <srcty>, ptr <addr> [, <ity> <idx>]…`. Three parity tests:
     `p[i]` (gep+load), `p[i]=v` (gep+store), and a `volatile` local (alloca + volatile load/store + the
     `llvm.lifetime` intrinsics, which the call path already handles). **Fifteen parity tests total.**
-- **Next step (resume here): globals, then named struct types.** The growth frontier, each a `clang -O2`
-  shape + an `assert_ll_parity` test: **module-level globals** — `@g = [linkage] [unnamed_addr] global
-  <ty> <init>[, align N]` and `constant` (string literals `c"…\00"`, zeroinit, aggregate inits); the
-  parser currently *skips* every non-`define` top-level item (`skip_toplevel_item`), so this means
-  actually parsing `@g = …` into `module.global_vars` (a `GlobalVariable` with its initializer constant)
-  — needed before any test that reads a global (string constants, lookup tables). Then **named struct
-  types** (`%struct.P = type { i32, i32 }` + `type_()` resolving `%struct.P`, unlocking struct GEP/field
-  access), **float/hex constants**, **`switch`**, **aggregates**, **SIMD vectors**, **C++ EH**
-  (`invoke`/`landingpad`/`resume`), and **`i128`/`blockaddress`** (these two come *free* in text —
-  full-width constants, no `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then
-  PR3:
+  - **Parser — module-level globals landed.** `parse.rs` now parses `@g = [linkage/attrs] [addrspace(N)]
+    global|constant <ty> [<init>] [, align N]` into `module.global_vars` (`ty` = the *pointer* type, as
+    the bitcode reader records `LLVMTypeOf`; the written content type parses the initializer). New AST
+    coverage: `[N x T]` **array types** in `type_()`, a `constant(&ty)` parser (int/`true`/`false`/
+    `zeroinitializer`/`null`/`undef`/`poison`/`@g`-refs/`[…]` arrays/`c"…"` byte strings — the `c` prefix
+    lexes as its own `Word`), and a `@name → pointee-type` **symbol table** (populated from each global +
+    function as parsed) so a `@g` *operand* resolves to a `GlobalReference` carrying the pointee type the
+    translator reads (e.g. GEP base). Also fixed `skip_to_toplevel_boundary` to stop before a depth-0
+    `@global` (an unbraced `target … = "…"` line was swallowing the globals after it) and added
+    `nonnull`/`noalias` to the return/pre-signature attribute skip. Three parity tests: a mutable scalar
+    (`@counter`, load/add/store), a `constant [4 x i32]` lookup table (array type + array init + gep), and
+    a `c"hi\00"` string returned as `ptr @.str`. **Eighteen parity tests total.**
+- **Next step (resume here): named struct types, then float/hex constants.** The growth frontier, each a
+  `clang -O2` shape + an `assert_ll_parity` test: **named struct types** (`%struct.P = type { i32, i32 }`
+  as a top-level def → `module.types.add_named_struct_def`, plus `type_()` resolving a `%struct.P`
+  *reference* — a `Local` token in type position; unlocks struct GEP `getelementptr %struct.P, ptr %p,
+  i64 0, i32 1` + field access), then **float/hex constants** (LLVM's `0x…` hex-float image → exact
+  `f64`/`f32` bits; unblocks any float literal, currently deferred), **`switch`**, **literal struct
+  types/aggregates** `{ i32, i8 }`, **SIMD vectors** `<4 x i32>`, **C++ EH** (`invoke`/`landingpad`/
+  `resume`), and **`i128`/`blockaddress`** (these two come *free* in text — full-width constants, no
+  `llvm-sys` re-parse). Grow it incrementally; `llvm-ir` stays the default. Then PR3:
   debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
   flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
   (prove version-tolerance by feeding an LLVM-21 `.ll`).
