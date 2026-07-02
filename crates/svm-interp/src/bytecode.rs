@@ -1759,7 +1759,31 @@ impl<'p> Vcpu<'p> {
             mm.init_data(&prog.data);
             mm
         });
-        Vcpu::with_mem(prog, func, args, mem)
+        Vcpu::with_mem(prog, func, args, mem, Host::new())
+    }
+
+    /// Like [`new_root`](Vcpu::new_root), but the vCPU carries a **powerbox** (its own `Host`) instead
+    /// of the deny-all default — the seam §14 needs (THREADS.md 4c-domain §14-D). Unlike §22 JIT
+    /// (whose ops hand the raw cap handle to the host to resolve), §14 resolves its `Instantiator`
+    /// authority **in-Vm** during `resume`, so the grant must live in this vCPU's own host; with it,
+    /// `spawn_coroutine_module` is then serviced entirely inside [`run`](Vcpu::run) (no host event).
+    /// Grant only the non-I/O caps (`Instantiator`/`Module`) — the resumable path still has no host
+    /// I/O, so an I/O `cap.call` remains an inert `CapFault`.
+    pub fn new_root_with_powerbox(
+        prog: &'p VcpuProgram,
+        func: u32,
+        args: &[Value],
+        back: std::sync::Arc<super::Region>,
+        init_mem: &[u8],
+        host: Host,
+    ) -> Result<Vcpu<'p>, Trap> {
+        let mem = prog.mem_size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            mm.seed(init_mem);
+            mm.init_data(&prog.data);
+            mm
+        });
+        Vcpu::with_mem(prog, func, args, mem, host)
     }
 
     /// A `thread.spawn`ed **child** vCPU: shares `back` but does **not** re-seed (the window is already
@@ -1773,7 +1797,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog
             .mem_size_log2
             .map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
-        Vcpu::with_mem(prog, func, args, mem)
+        Vcpu::with_mem(prog, func, args, mem, Host::new())
     }
 
     fn with_mem(
@@ -1781,6 +1805,7 @@ impl<'p> Vcpu<'p> {
         func: u32,
         args: &[Value],
         mem: Option<Mem>,
+        host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
         if func as usize >= prog.dom.source.primary().progs.len() {
             return Err(Trap::Malformed);
@@ -1792,7 +1817,7 @@ impl<'p> Vcpu<'p> {
             fiber_meta: Vec::new(),
             mem,
             fuel: u64::MAX,
-            host: Host::new(),
+            host,
             prog,
             pending: None,
             pending_jit: None,
@@ -1810,90 +1835,221 @@ impl<'p> Vcpu<'p> {
             self.pending.is_none(),
             "deliver the last event before resuming"
         );
-        let mut ctx = RunCtx {
-            table: &self.prog.dom.table,
-            fuel: &mut self.fuel,
-            mem: &mut self.mem,
-            durable: false,
-            host: HostCell::Excl(&mut self.host),
-        };
-        match step_vcpu(
-            &mut self.vt,
-            &mut self.fibers,
-            &mut self.fiber_sp,
-            &mut self.fiber_meta,
-            &self.prog.dom,
-            &mut ctx,
-            u64::MAX,
-        ) {
-            Err(t) => VcpuEvent::Trapped(t),
-            Ok(VcpuStop::Done(vals)) => VcpuEvent::Done(vals),
-            Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                if func as usize >= self.prog.dom.source.primary().progs.len() {
-                    return VcpuEvent::Trapped(Trap::Malformed);
+        // Loop so §14 `spawn_coroutine_module` (serviced in-Rust against this vCPU's own powerbox)
+        // never surfaces to the orchestrating host — it only ever sees the multi-vCPU events
+        // `spawn`/`join`/`wait`/`notify` and the §22 JIT events (+ `done`/`trap`).
+        loop {
+            let mut ctx = RunCtx {
+                table: &self.prog.dom.table,
+                fuel: &mut self.fuel,
+                mem: &mut self.mem,
+                durable: false,
+                host: HostCell::Excl(&mut self.host),
+            };
+            let stop = step_vcpu(
+                &mut self.vt,
+                &mut self.fibers,
+                &mut self.fiber_sp,
+                &mut self.fiber_meta,
+                &self.prog.dom,
+                &mut ctx,
+                u64::MAX,
+            );
+            match stop {
+                Err(t) => return VcpuEvent::Trapped(t),
+                Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
+                Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
+                    if func as usize >= self.prog.dom.source.primary().progs.len() {
+                        return VcpuEvent::Trapped(Trap::Malformed);
+                    }
+                    self.pending = Some(dst);
+                    return VcpuEvent::Spawn { func, sp, arg };
                 }
-                self.pending = Some(dst);
-                VcpuEvent::Spawn { func, sp, arg }
-            }
-            Ok(VcpuStop::Join { handle, dst }) => {
-                self.pending = Some(dst);
-                VcpuEvent::Join { handle }
-            }
-            Ok(VcpuStop::Wait {
-                base,
-                expected,
-                width,
-                timeout,
-                dst,
-            }) => {
-                self.pending = Some(dst);
-                VcpuEvent::Wait {
-                    addr: base,
+                Ok(VcpuStop::Join { handle, dst }) => {
+                    self.pending = Some(dst);
+                    return VcpuEvent::Join { handle };
+                }
+                Ok(VcpuStop::Wait {
+                    base,
                     expected,
                     width,
                     timeout,
-                }
-            }
-            Ok(VcpuStop::Notify { base, count, dst }) => {
-                self.pending = Some(dst);
-                VcpuEvent::Notify { addr: base, count }
-            }
-            // §22 guest-JIT — the host resolves the unit (it holds the powerbox), the vCPU installs /
-            // invokes it against the **shared** [`Domain`]. The op's residue is parked in `pending_jit`
-            // until the matching `deliver_jit_*`.
-            Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                self.pending_jit = Some(PendingJit::Install { dst });
-                VcpuEvent::JitInstall { handle: h, code }
-            }
-            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
-                self.pending_jit = Some(PendingJit::Uninstall { slot, dst });
-                VcpuEvent::JitUninstall { handle: h, slot }
-            }
-            Ok(VcpuStop::JitInvoke {
-                h,
-                code,
-                argv,
-                dst,
-                params,
-                results,
-            }) => {
-                self.pending_jit = Some(PendingJit::Invoke {
-                    argv: argv.clone(),
-                    params: params.clone(),
-                    results: results.clone(),
                     dst,
-                });
-                VcpuEvent::JitInvoke {
-                    handle: h,
+                }) => {
+                    self.pending = Some(dst);
+                    return VcpuEvent::Wait {
+                        addr: base,
+                        expected,
+                        width,
+                        timeout,
+                    };
+                }
+                Ok(VcpuStop::Notify { base, count, dst }) => {
+                    self.pending = Some(dst);
+                    return VcpuEvent::Notify { addr: base, count };
+                }
+                // §22 guest-JIT — the host resolves the unit (it holds the powerbox), the vCPU
+                // installs / invokes it against the **shared** [`Domain`]. The op's residue is parked
+                // in `pending_jit` until the matching `deliver_jit_*`.
+                Ok(VcpuStop::JitInstall { h, code, dst }) => {
+                    self.pending_jit = Some(PendingJit::Install { dst });
+                    return VcpuEvent::JitInstall { handle: h, code };
+                }
+                Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                    self.pending_jit = Some(PendingJit::Uninstall { slot, dst });
+                    return VcpuEvent::JitUninstall { handle: h, slot };
+                }
+                Ok(VcpuStop::JitInvoke {
+                    h,
                     code,
                     argv,
+                    dst,
                     params,
                     results,
+                }) => {
+                    self.pending_jit = Some(PendingJit::Invoke {
+                        argv: argv.clone(),
+                        params: params.clone(),
+                        results: results.clone(),
+                        dst,
+                    });
+                    return VcpuEvent::JitInvoke {
+                        handle: h,
+                        code,
+                        argv,
+                        params,
+                        results,
+                    };
+                }
+                // §14 `spawn_coroutine_module` — serviced **internally** against this vCPU's own
+                // powerbox (which resolved the `Instantiator` authority in-Vm to reach here): resolve
+                // the granted module, build the inline `Coro`, then loop (the coroutine runs inline via
+                // `resume`, no host round-trip). A bad carve/entry/module sets `EINVAL`/traps in place.
+                Ok(VcpuStop::SpawnCoroutineModule {
+                    ibase,
+                    isize: isz,
+                    mh,
+                    entry,
+                    off,
+                    size_log2,
+                    dst,
+                    demand,
+                }) => {
+                    self.service_coroutine_module(
+                        ibase, isz, mh, entry, off, size_log2, demand, dst,
+                    );
+                    if let Some(t) = self.trap.take() {
+                        return VcpuEvent::Trapped(t);
+                    }
+                }
+                // §14 instantiate / instantiate_module need scheduler-driven confined child vCPUs the
+                // host-orchestrated driver doesn't thread yet — fail closed (a later slice).
+                Ok(_) => return VcpuEvent::Trapped(Trap::ThreadFault),
+            }
+        }
+    }
+
+    /// Build a §14 `spawn_coroutine_module` coroutine **inline** in this vCPU's coroutine set (the
+    /// resumable-path counterpart of the parallel driver's arm): resolve the granted module from this
+    /// vCPU's own powerbox, compile + push it to the shared source, materialize its data segments into
+    /// the carve (demand-page for op 7), and register the `Coro` (Yielder-only powerbox) — its handle
+    /// written to `dst`. `EINVAL` on a bad entry/carve/memory mismatch; a resolve failure sets `trap`.
+    #[allow(clippy::too_many_arguments)]
+    fn service_coroutine_module(
+        &mut self,
+        ibase: u64,
+        isize: u64,
+        mh: i32,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        demand: bool,
+        dst: u32,
+    ) {
+        let isz = isize;
+        // Resolve the granted module from this vCPU's own powerbox (forged/closed handle → trap).
+        let (cfuncs, cmem_log2, cdata) = match self.host.resolve_module(mh) {
+            Ok(g) => (g.funcs.clone(), g.memory_log2, g.data.clone()),
+            Err(t) => {
+                self.trap = Some(t);
+                return;
+            }
+        };
+        let child_compiled = match compile_module(&cfuncs) {
+            Some(c) => c,
+            None => {
+                self.trap = Some(Trap::Malformed);
+                return;
+            }
+        };
+        let ok_entry = child_compiled
+            .sigs
+            .get(entry as usize)
+            .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
+        let child_size = if (0..64).contains(&size_log2) {
+            1u64 << size_log2
+        } else {
+            0
+        };
+        let off_u = off as u64;
+        let fits = child_size != 0
+            && child_size <= isz
+            && off_u & (child_size - 1) == 0
+            && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+        let mod_ok = cmem_log2 == Some(size_log2 as u8);
+        if !ok_entry || !fits || !mod_ok {
+            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            return;
+        }
+        let pbase = self.mem.as_ref().map_or(0, |m| m.window.base());
+        let abs_base = pbase + ibase + off_u;
+        let child_mem = {
+            if let Some(m) = self.mem.as_ref() {
+                for d in cdata.iter() {
+                    if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                        for (k, &b) in d.bytes.iter().enumerate() {
+                            m.set_byte(abs_base + d.offset + k as u64, b);
+                        }
+                    }
                 }
             }
-            // §14 instantiate needs a confined executor child the host-orchestrated driver can't share.
-            Ok(_) => VcpuEvent::Trapped(Trap::ThreadFault),
-        }
+            self.mem.as_ref().map(|m| {
+                let cm = m.nested_view(abs_base, size_log2 as u8);
+                if demand {
+                    cm.demand_page();
+                }
+                cm
+            })
+        };
+        let mut child_host = Host::new();
+        let cy = child_host.grant_yielder();
+        // `self.prog` is a `Copy` shared reference — copy it out so the `&prog.dom` borrow is
+        // independent of the `&mut self.vt` push below.
+        let prog = self.prog;
+        let progs_len = child_compiled.progs.len();
+        let cm = prog.dom.source.push(child_compiled);
+        let child_table = build_table_for(progs_len, 0, cm as u32);
+        let cunit = prog.dom.source.get(cm);
+        let mut child_vm =
+            match cunit.and_then(|u| Vm::new(&u, entry as usize, &[Value::I64(cy as i64)]).ok()) {
+                Some(v) => v,
+                None => {
+                    self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                    return;
+                }
+            };
+        child_vm.module = cm;
+        self.vt.coroutines.push(Some(Coro {
+            vm: child_vm,
+            mem: child_mem,
+            host: child_host,
+            table: child_table,
+            awaiting: None,
+            fault_yields: demand,
+            faulted_page: None,
+        }));
+        let h = (self.vt.coroutines.len() - 1) as i32;
+        self.vt.active.set(dst, Reg::from_i32(h));
     }
 
     /// Deliver a `thread.spawn` handle (after `Spawn`).

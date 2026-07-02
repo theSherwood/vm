@@ -248,7 +248,20 @@ property, so in practice:
       + resumed by the root vCPU under the parallel driver → the cooperative oracle's value). (A
       coroutine is single-vCPU by construction — `compile_module` rejects coroutine + `thread.spawn` in
       one module — so there is no cross-thread case to Miri-check here.)
-    - [ ] **§14-D — the resumable `Vcpu` / browser path** (like §22 C1/C2), if wanted.
+    - **§14-D — the resumable `Vcpu` / browser path.** Unlike §22 JIT (whose ops hand the *raw* cap
+      handle to the orchestrating host to resolve), §14 resolves its `Instantiator` authority **in-Vm**
+      during `resume`, so the resumable vCPU must carry a **real powerbox** (not the deny-all default)
+      — [`Vcpu::new_root_with_powerbox`]. With the grant in its own host, a §14 op is then serviced
+      *internally* (no host-serviced event, unlike JIT C1).
+      - [x] **§14-D1 — `spawn_coroutine_module` via the resumable `Vcpu`**: serviced inside `Vcpu::run`
+        (resolve the granted module from the vCPU's own powerbox, build the inline `Coro`), so the host
+        sees no §14 event; the coroutine then runs inline via `resume`. Proven by
+        `bytecode_vcpu_coroutine_module.rs` (a powerbox-carrying root vCPU builds + resumes 8
+        module coroutines internally → the cooperative oracle's value).
+      - [ ] **§14-D2 — `instantiate` / `instantiate_module` via the resumable `Vcpu`**: needs
+        scheduler-driven **confined child vCPUs** (each its own `Domain` + attenuated powerbox +
+        sub-window `Mem` — a new `svm-mem` constructor), and across Web Workers the browser glue. The
+        large remaining piece; still fail-closed on the resumable path.
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
   `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
