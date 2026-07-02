@@ -535,6 +535,9 @@ pub extern "C" fn svm_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i3
     };
     let pb = Box::into_raw(Box::new(ParPowerbox { host, jit, code }));
     PAR_PB.store(pb as usize, std::sync::atomic::Ordering::Release);
+    // Last-published run recipe wins (a page runs several kinds back to back).
+    PAR_INST.store(0, std::sync::atomic::Ordering::Release);
+    PAR_IO.store(0, std::sync::atomic::Ordering::Release);
     1
 }
 
@@ -597,6 +600,9 @@ pub extern "C" fn svm_par_powerbox_inst(win_size: u64, mod_ptr: *const u8, mod_l
     };
     let cfg = Box::into_raw(Box::new(ParInstCfg { win_size, module }));
     PAR_INST.store(cfg as usize, std::sync::atomic::Ordering::Release);
+    // Last-published run recipe wins (a page runs several kinds back to back).
+    PAR_PB.store(0, std::sync::atomic::Ordering::Release);
+    PAR_IO.store(0, std::sync::atomic::Ordering::Release);
     1
 }
 
@@ -606,6 +612,75 @@ fn par_inst() -> Option<&'static ParInstCfg> {
     let p = PAR_INST.load(std::sync::atomic::Ordering::Acquire) as *const ParInstCfg;
     // SAFETY: once published the recipe is leaked (never freed) and read-only for the run.
     unsafe { p.as_ref() }
+}
+
+// ---- 4d: host I/O across Workers — the run's shared powerbox ------------------------------------
+// THREADS.md 4d: one `Mutex<Host>`, leaked into the shared linear memory (the same cross-Worker
+// sharing as `PAR_PB`/`PAR_INST`), attached to **every** vCPU of the run
+// ([`bytecode::Vcpu::with_shared_host`]) — so a worker vCPU's `cap.call` (host I/O) dispatches
+// in-engine under the lock, `drive_parallel`'s 4c-host model, with no JS in the loop at all: the
+// `Host` is fully virtual (stdout is an in-memory buffer the page reads back after the run).
+
+/// The shared I/O powerbox: the `Mutex<Host>` every vCPU dispatches through, plus the handles the
+/// root guest receives as its args.
+struct ParIoCfg {
+    host: std::sync::Mutex<Host>,
+    /// The `Stream(Out)` handle (the root's single entry arg).
+    out: i32,
+}
+
+/// The leaked [`ParIoCfg`] pointer (or `0`), shared across Workers via shared linear memory.
+static PAR_IO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Publish the run's **shared I/O powerbox**: a fresh `Host` granted a `Stream(Out)`, wrapped in the
+/// `Mutex` every vCPU will dispatch `cap.call` through. The root is seeded with `[out_handle]`
+/// (`svm_par_root`); read the accumulated stdout back after the run via [`svm_par_stdout_len`] +
+/// [`svm_par_stdout_ptr`]. Call once (on the main thread) before the run; last-published run recipe
+/// wins (the §22/§14 recipes are cleared, and vice versa).
+#[no_mangle]
+pub extern "C" fn svm_par_powerbox_io() -> i32 {
+    let mut host = Host::new();
+    let out = host.grant_stream(StreamRole::Out);
+    let cfg = Box::into_raw(Box::new(ParIoCfg {
+        host: std::sync::Mutex::new(host),
+        out,
+    }));
+    PAR_IO.store(cfg as usize, std::sync::atomic::Ordering::Release);
+    PAR_INST.store(0, std::sync::atomic::Ordering::Release);
+    PAR_PB.store(0, std::sync::atomic::Ordering::Release);
+    1
+}
+
+/// Borrow the published I/O powerbox (`None` until [`svm_par_powerbox_io`] ran). Leaked; interior
+/// mutability is the `Mutex` (cross-Worker-safe on wasm atomics, like the `Domain`'s `ModuleSource`).
+fn par_io() -> Option<&'static ParIoCfg> {
+    let p = PAR_IO.load(std::sync::atomic::Ordering::Acquire) as *const ParIoCfg;
+    // SAFETY: once published the powerbox is leaked (never freed); all access is via the `Mutex`.
+    unsafe { p.as_ref() }
+}
+
+/// Live-vCPU counter across Workers — the browser path's anti-bomb **backstop** (the native drivers
+/// give the spawner a clean `ThreadFault`; here a construction past the cap returns null and the JS
+/// host fails the run — cruder, but it bounds Worker creation). Incremented by the `svm_par_*` vCPU
+/// constructors, decremented by [`svm_par_free`].
+static PAR_LIVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Far above any legitimate fan-out (a tab with 256 live Workers is already pathological), far below
+/// a Worker bomb's ambition.
+const PAR_MAX_VCPUS: u32 = 256;
+
+/// Admit one vCPU under the live cap (decrementing back out on refusal).
+fn par_vcpu_admit() -> bool {
+    use std::sync::atomic::Ordering;
+    if PAR_LIVE.fetch_add(1, Ordering::AcqRel) >= PAR_MAX_VCPUS {
+        PAR_LIVE.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+/// Un-admit a vCPU that failed to construct (the success path decrements via [`svm_par_free`]).
+fn par_vcpu_retire() {
+    PAR_LIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// Like [`svm_par_compile`], but reserve the `Jit` dispatch table (matching the powerbox grant) so a
@@ -635,13 +710,17 @@ pub extern "C" fn svm_par_root(
     win_size: usize,
     func: u32,
 ) -> *mut ParVcpu {
+    if !par_vcpu_admit() {
+        return core::ptr::null_mut();
+    }
     // SAFETY: the host guarantees `[win_ptr, win_size)` is a live shared window for the run.
     let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
     // A §14 run builds the root's **own** powerbox from the published recipe (`Instantiator` +
     // optional `Module` grant; §14 resolves authority in-Vm, so the grants must live in the vCPU's
     // host) and seeds the root with the handles. A §22-JIT run seeds `(jit, code)` from the shared
-    // powerbox; a plain run gets no args. Signatures unchanged either way — the JS host just calls
-    // the matching `svm_par_powerbox*` first.
+    // powerbox; a 4d I/O run attaches the shared `Mutex<Host>` and seeds `[out]`; a plain run gets
+    // no args. Signatures unchanged either way — the JS host just calls the matching
+    // `svm_par_powerbox*` first.
     if let Some(cfg) = par_inst() {
         let mut host = Host::new();
         let inst = host.grant_instantiator(0, cfg.win_size);
@@ -665,23 +744,36 @@ pub extern "C" fn svm_par_root(
                 c: 0,
                 d: 0,
             })),
-            Err(_) => core::ptr::null_mut(),
+            Err(_) => {
+                par_vcpu_retire();
+                core::ptr::null_mut()
+            }
         };
     }
-    let args: Vec<Value> = match par_pb() {
-        Some(pb) => vec![Value::I32(pb.jit), Value::I32(pb.code)],
-        None => Vec::new(),
+    let (args, io): (Vec<Value>, Option<&'static ParIoCfg>) = match (par_io(), par_pb()) {
+        (Some(io), _) => (vec![Value::I32(io.out)], Some(io)),
+        (None, Some(pb)) => (vec![Value::I32(pb.jit), Value::I32(pb.code)], None),
+        (None, None) => (Vec::new(), None),
     };
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     match bytecode::Vcpu::new_root(unsafe { prog_ref(prog) }, func, &args, back, &[]) {
-        Ok(inner) => Box::into_raw(Box::new(ParVcpu {
-            inner,
-            a: 0,
-            b: 0,
-            c: 0,
-            d: 0,
-        })),
-        Err(_) => core::ptr::null_mut(),
+        Ok(inner) => {
+            let inner = match io {
+                Some(io) => inner.with_shared_host(&io.host),
+                None => inner,
+            };
+            Box::into_raw(Box::new(ParVcpu {
+                inner,
+                a: 0,
+                b: 0,
+                c: 0,
+                d: 0,
+            }))
+        }
+        Err(_) => {
+            par_vcpu_retire();
+            core::ptr::null_mut()
+        }
     }
 }
 
@@ -696,19 +788,32 @@ pub extern "C" fn svm_par_child(
     sp: i64,
     arg: i64,
 ) -> *mut ParVcpu {
+    if !par_vcpu_admit() {
+        return core::ptr::null_mut();
+    }
     // SAFETY: the host guarantees `[win_ptr, win_size)` is the same live shared window.
     let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
     let args = [Value::I64(sp), Value::I64(arg)];
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     match bytecode::Vcpu::new_child(unsafe { prog_ref(prog) }, func, &args, back) {
-        Ok(inner) => Box::into_raw(Box::new(ParVcpu {
-            inner,
-            a: 0,
-            b: 0,
-            c: 0,
-            d: 0,
-        })),
-        Err(_) => core::ptr::null_mut(),
+        Ok(inner) => {
+            // A 4d I/O run shares one powerbox across every vCPU (worker `cap.call` = host I/O).
+            let inner = match par_io() {
+                Some(io) => inner.with_shared_host(&io.host),
+                None => inner,
+            };
+            Box::into_raw(Box::new(ParVcpu {
+                inner,
+                a: 0,
+                b: 0,
+                c: 0,
+                d: 0,
+            }))
+        }
+        Err(_) => {
+            par_vcpu_retire();
+            core::ptr::null_mut()
+        }
     }
 }
 
@@ -728,7 +833,7 @@ pub extern "C" fn svm_par_child_confined(
     entry: u32,
     fuel: i64,
 ) -> *mut ParVcpu {
-    if size_log2 >= 64 {
+    if size_log2 >= 64 || !par_vcpu_admit() {
         return core::ptr::null_mut();
     }
     // SAFETY: the host guarantees the carve is inside the parent's live window (the engine validated
@@ -737,6 +842,8 @@ pub extern "C" fn svm_par_child_confined(
         svm_interp::Region::shared(carve_ptr, 1u64 << size_log2)
     });
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    // (No shared-host attach: a §14 confined child's powerbox is its own attenuated one, built
+    // in-engine — its capability set never includes the run's I/O grants.)
     match bytecode::Vcpu::new_confined_child(
         unsafe { prog_ref(prog) },
         module,
@@ -752,9 +859,36 @@ pub extern "C" fn svm_par_child_confined(
             c: 0,
             d: 0,
         })),
-        Err(_) => core::ptr::null_mut(),
+        Err(_) => {
+            par_vcpu_retire();
+            core::ptr::null_mut()
+        }
     }
 }
+
+/// Pointer / length of the accumulated stdout in the run's shared I/O powerbox (4d). Call `len`
+/// **first** — it snapshots the buffer under the powerbox lock into a stable stash `ptr` then reads —
+/// after the run completes (the root's `done`; a mid-run call sees a prefix). `0` when no
+/// [`svm_par_powerbox_io`] was published.
+#[no_mangle]
+pub extern "C" fn svm_par_stdout_len() -> usize {
+    let Some(io) = par_io() else { return 0 };
+    let bytes = {
+        let g = io.host.lock().unwrap_or_else(|e| e.into_inner());
+        g.stdout.clone()
+    };
+    // SAFETY: the stash slot is only touched from the main thread (the JS host reads results after
+    // the run), matching the `svm_run_pb` accessors' single-reader contract.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(PAR_OUT), bytes) };
+    unsafe { (*core::ptr::addr_of!(PAR_OUT)).1 }
+}
+#[no_mangle]
+pub extern "C" fn svm_par_stdout_ptr() -> *const u8 {
+    // SAFETY: as above — main-thread single-reader stash.
+    unsafe { (*core::ptr::addr_of!(PAR_OUT)).0 }
+}
+/// The stashed 4d stdout snapshot (`svm_par_stdout_len` fills it; `_ptr` reads it).
+static mut PAR_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 /// Advance the vCPU until it finishes, traps, or hits a host-serviced event; returns a `PAR_*` code.
 /// The host reads operands via `svm_par_ev_a`–`d`, services the event, calls the matching `deliver`,
@@ -888,6 +1022,7 @@ pub extern "C" fn svm_par_free(v: *mut ParVcpu) {
     if !v.is_null() {
         // SAFETY: `v` came from `Box::into_raw` in `svm_par_root`/`svm_par_child` and is freed once.
         drop(unsafe { Box::from_raw(v) });
+        par_vcpu_retire(); // the live-cap admit from this vCPU's constructor
     }
 }
 

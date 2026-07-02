@@ -284,6 +284,24 @@ property, so in practice:
         a new Worker whose `win`/`winSize` are the carve. Also fixed a latent JS-host bug D2 exposed:
         cached `Int32Array`/`BigInt64Array` views go stale when the shared `WebAssembly.Memory` grows
         mid-run (e.g. a module compile+push) — the hosts now refresh views before Atomics access.
+- [x] **4d — host I/O (`cap.call`) from every vCPU, resumable + browser.** The last driver-capability
+  cell: natively `drive_parallel` had the 4c-host shared `Mutex<Host>`, but a resumable/browser vCPU
+  carried a deny-all host, so a worker vCPU's I/O `cap.call` was an inert `CapFault` — a parallel
+  browser guest couldn't even print. Now [`Vcpu::with_shared_host`]`(&Mutex<Host>)` attaches the run's
+  shared powerbox to any vCPU: every host access (`cap.call` dispatch, §14 module/authority
+  resolution, an invoked §22 unit's calls) goes through the lock — per-call serialization, lock-free
+  compute/atomics between calls, the exact 4c-host model. **No JS in the loop**: the `Host` is fully
+  virtual (stdout is an in-memory buffer), so dispatch is in-engine; the browser publishes one leaked
+  `Mutex<Host>` (`svm_par_powerbox_io`, the same shared-linear-memory sharing as the §22/§14 recipes;
+  last-published recipe wins), roots get `[out_handle]` seeded, and the page reads stdout back after
+  the run (`svm_par_stdout_len`/`_ptr`). Proven: `bytecode_vcpu_orchestration_caps.rs` (the proven
+  schedule-independent 4c-host kernel — 8 workers each `cap.call`-write "tick\n" + atomic add —
+  result AND stdout byte-identical to the cooperative oracle), `vcpu_shared_host_miri.rs` (concurrent
+  `cap.call` on one `Mutex<Host>` race/UB-clean under Miri), Node `threads-spawn.mjs` `SVM_IO=1`, and
+  **real Chromium** (the `#capio` work item: 9 Workers → counter 8, stdout `"tick\n"×8`). Also adds
+  the browser vCPU-bomb **backstop**: a shared live-vCPU counter in the `svm_par_*` constructors
+  (admit/retire around `svm_par_free`), capped at 256 — cruder than the native drivers' spawner
+  `ThreadFault` (a refused construction fails the run via the JS host), but it bounds Worker creation.
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
   `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
@@ -348,6 +366,8 @@ cargo +nightly miri test -p svm-interp --test parallel_miri       # 4c: parallel
 cargo +nightly miri test -p svm-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
 cargo +nightly miri test -p svm-interp --test parallel_instantiate_miri  # 4c-domain §14-A: confined child race-free
 cargo +nightly miri test -p svm-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: carve-region views race-free
+cargo test -p svm --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox cap.call via resumable Vcpu vs oracle
+cargo +nightly miri test -p svm-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> cap.call race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (tiny spike)
 cd browser/threads-spike && cargo +nightly build --release && node threads-futex.mjs && cd ..

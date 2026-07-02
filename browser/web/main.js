@@ -64,11 +64,14 @@ async function main() {
   // `winSize` sizes the window (the §14 kernels declare 1 MiB so their 64 KiB carves stay
   // wasm-page-aligned). Either way the page services no authority: JIT is in-Rust, and a §14
   // `instantiate` event's operands are inert integers relayed into a new Worker.
-  async function runAcrossWorkers(guestPath, { jit = false, inst = false, unitPath = null, winSize = 1 << 16 } = {}) {
+  async function runAcrossWorkers(guestPath, { jit = false, inst = false, io = false, unitPath = null, winSize = 1 << 16 } = {}) {
     const guest = await fetchBytes(guestPath);
     const gptr = ex.svm_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
+    // 4d: the run's shared I/O powerbox — a Mutex<Host> in shared memory every vCPU dispatches
+    // cap.call through; worker host I/O happens in-Rust, the page just reads stdout back after.
+    if (io && ex.svm_par_powerbox_io() !== 1) throw new Error('svm_par_powerbox_io failed');
     const prog = jit ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
     if (prog === 0) throw new Error('svm_par_compile null');
     const win = ex.svm_par_alloc(winSize);
@@ -170,6 +173,26 @@ async function main() {
     log(`inst → ${a.value}/${b.value}/${c.value} (nested spanned ${b.started} Workers) in ${ms}ms`);
   } catch (e) {
     set('inst', 'fail', `inst: error ${e}`);
+  }
+
+  // --- 5) host I/O from worker vCPUs across real Web Workers (THREADS.md 4d) ----------------------
+  // 8 worker vCPUs each `cap.call`-write "tick\n" to the run's ONE shared powerbox (a Mutex<Host> in
+  // shared memory — dispatch is in-Rust under the lock, no JS in the loop) and bump a shared counter.
+  // Result 8 and stdout "tick\n"×8 are schedule-independent; the page reads stdout back afterward.
+  try {
+    const t0 = performance.now();
+    const { value, started } = await runAcrossWorkers('/corpus/threads_io.svmbc', { io: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const len = ex.svm_par_stdout_len();
+    // `slice` (not `subarray`) copies out of the SharedArrayBuffer — TextDecoder rejects shared views.
+    const out = new TextDecoder().decode(u8().slice(ex.svm_par_stdout_ptr(), ex.svm_par_stdout_ptr() + len));
+    const ok = value === 8n && out === 'tick\n'.repeat(8);
+    set('capio', ok ? 'pass' : 'fail',
+      `capio: ${started} Workers → counter ${value} (want 8), stdout ${JSON.stringify(out)} ` +
+      `(want 8 × "tick\\n") ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`capio → ${value}, stdout ${len}B across ${started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('capio', 'fail', `capio: error ${e}`);
   }
 }
 

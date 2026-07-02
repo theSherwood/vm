@@ -167,6 +167,12 @@ async function main() {
   const winSize = Number(process.env.SVM_WIN ?? 1 << 16);
   const win = ex.svm_par_alloc(winSize);
 
+  // 4d I/O mode (SVM_IO=1): publish the run's shared powerbox — a `Mutex<Host>` in shared linear
+  // memory every vCPU dispatches `cap.call` through, so worker vCPUs do host I/O with no JS in the
+  // loop. Stdout accumulates in the powerbox; main reads it back after the run.
+  if (process.env.SVM_IO === '1' && ex.svm_par_powerbox_io() !== 1) {
+    console.log('FAIL: svm_par_powerbox_io returned 0'); process.exit(1);
+  }
   // §14 mode (SVM_INST=1): publish the run recipe — the root's `Instantiator` spans the window, plus
   // the optional granted module (SVM_INST_UNIT) for `instantiate_module`. The root vCPU builds its own
   // powerbox from it (svm_par_root); confined children build theirs in-engine.
@@ -218,10 +224,20 @@ async function main() {
     finished = true;
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     for (const w of workers) w.terminate();
-    const ok = err == null && value === EXPECT;
+    let ok = err == null && value === EXPECT;
     console.log(`  vCPUs started: ${started} (1 root + ${started - 1} spawned), ${ms.toFixed(0)} ms`);
     if (err) console.log(`  error: ${err}`);
     else console.log(`  root returned ${value}  expect ${EXPECT}  ${ok ? '✓' : '✗'}`);
+    // 4d I/O mode: read the shared powerbox's accumulated stdout back and check the expected
+    // schedule-independent bytes ("tick\n" × SVM_IO_LINES, default 8).
+    if (process.env.SVM_IO === '1') {
+      const len = ex.svm_par_stdout_len();
+      const out = Buffer.from(u8().slice(ex.svm_par_stdout_ptr(), ex.svm_par_stdout_ptr() + len)).toString();
+      const want = 'tick\n'.repeat(Number(process.env.SVM_IO_LINES ?? 8));
+      const outOk = out === want;
+      console.log(`  stdout: ${JSON.stringify(out)}  ${outOk ? '✓' : `✗ (want ${JSON.stringify(want)})`}`);
+      ok = ok && outOk;
+    }
     console.log(`\n${ok ? 'PASS' : 'FAIL'}: one guest's vCPUs ran on ${started} separate Workers over ` +
       `one shared memory, synchronising via Atomics (join) ${ok ? '— genuine wasm parallelism' : ''}`);
     process.exit(ok ? 0 : 1);

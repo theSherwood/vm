@@ -1012,6 +1012,68 @@ block6(vs3: i64):
 }
 "#;
 
+// ---- 4d: host I/O across Workers (the shared powerbox) ------------------------------------------
+// The proven schedule-independent 4c-host kernel: root (param = stdout handle) spawns 8 workers, each
+// `cap.call`-writes the SAME 5-byte line and bumps a shared counter — so result (8) AND stdout
+// ("tick\n" × 8) are schedule-independent. Ground truth asserted in the JS host.
+const THREADS_IO: &str = r#"memory 16
+data 0 "tick\n"
+func (i32) -> (i64) {
+block0(v0: i32):
+  vh0 = i64.extend_i32_u v0
+  v1 = i64.const 0
+  br block1(v1, vh0)
+block1(vi: i64, vhh: i64):
+  v2 = i64.const 8
+  v3 = i64.lt_u vi v2
+  br_if v3 block2(vi, vhh) block3()
+block2(vi2: i64, vhh2: i64):
+  vsp = i64.const 0
+  vt = thread.spawn 1 vsp vhh2
+  v4 = i64.const 4
+  v5 = i64.mul vi2 v4
+  v6 = i64.const 16
+  v7 = i64.add v6 v5
+  i32.store v7 vt
+  v8 = i64.const 1
+  v9 = i64.add vi2 v8
+  br block1(v9, vhh2)
+block3():
+  v10 = i64.const 0
+  br block4(v10)
+block4(vj: i64):
+  v11 = i64.const 8
+  v12 = i64.lt_u vj v11
+  br_if v12 block5(vj) block6()
+block5(vj2: i64):
+  v13 = i64.const 4
+  v14 = i64.mul vj2 v13
+  v15 = i64.const 16
+  v16 = i64.add v15 v14
+  v17 = i32.load v16
+  v18 = thread.join v17
+  v19 = i64.const 1
+  v20 = i64.add vj2 v19
+  br block4(v20)
+block6():
+  v21 = i64.const 8
+  v22 = i64.atomic.load v21
+  return v22
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, vh: i64):
+  vhandle = i32.wrap_i64 vh
+  vptr = i64.const 0
+  vlen = i64.const 5
+  vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
+  v1 = i64.const 8
+  v2 = i64.const 1
+  v3 = i64.atomic.rmw.add v1 v2
+  v4 = i64.const 0
+  return v4
+}
+"#;
+
 // ---- durability (freeze / thaw, single-fiber, IR-driven) ---------------------------------------
 // From `crates/svm/tests/bytecode_durable.rs`. A program with two clock reads (each an unwind point);
 // the first value is live across the second, so a freeze after the first spills it to the shadow
@@ -1617,6 +1679,8 @@ fn main() {
     emit("threads_inst_nested", THREADS_INST_NESTED);
     emit("threads_inst_mod", THREADS_INST_MOD);
     emit("threads_inst_unit", THREADS_INST_UNIT);
+    // 4d host I/O across Workers — ground truth (result 8, stdout "tick\n"×8) asserted in JS.
+    emit("threads_io", THREADS_IO);
     // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
     // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
     {
