@@ -164,12 +164,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use llvm_ir::debugloc::{DebugLoc, HasDebugLoc};
-use llvm_ir::instruction::Instruction;
-use llvm_ir::terminator::Terminator as LTerm;
-use llvm_ir::types::{FPType, Type, Typed, Types};
-use llvm_ir::{constant::Constant, constant::Float, BasicBlock, Function, Module as LModule};
-use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
+// The translator consumes our **owned** `ll` AST (LLVM.md §8 Q1b): the bitcode path feeds it via the
+// `from_llvm_ir` conversion shim, and the textual-`.ll` reader produces it directly. The `as
+// LTerm`/`LModule` aliases keep the rest of this file unchanged across the swap.
+use crate::ll::ast::{
+    BasicBlock, Constant, DebugLoc, FPPredicate, FPType, Float, Function, HasDebugLoc, Instruction,
+    IntPredicate, Module as LModule, Name, Operand, Terminator as LTerm, Type, Typed, Types,
+};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
@@ -179,6 +180,9 @@ use svm_ir::{
 
 pub mod blockaddr;
 pub mod di;
+/// Conversion shim from the `llvm-ir` bitcode AST to our owned [`ll`] AST (LLVM.md §8 Q1b). Transient:
+/// the bridge that keeps the bitcode path feeding the swapped translator until `llvm-ir` is dropped.
+mod from_llvm_ir;
 /// The in-house textual-`.ll` reader (LLVM.md §8 Q1a) — replacing the `llvm-ir`/libLLVM binding.
 /// Built behind a differential parity check before it becomes the default; see `tests/translate.rs`.
 pub mod ll;
@@ -234,15 +238,34 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
              (`llvm-ir` truncates it; fail-closed to avoid a miscompile — ISSUES.md I14)"
         ));
     }
-    let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
+    let bc = llvm_ir::Module::from_bc_path(path).map_err(Error::Parse)?;
+    // Bridge the bitcode AST into our owned `ll` AST the translator now consumes (LLVM.md §8 Q1b).
+    let m = from_llvm_ir::convert_module(&bc)?;
     let di = path.to_str().and_then(di::read_debug);
     // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).
     let ba = path.to_str().and_then(blockaddr::read_block_addrs);
     translate_impl(&m, di.as_ref(), ba.as_ref())
 }
 
-/// Translate an already-parsed `llvm-ir` module. The neutral core's source-line half is populated
-/// from `!DILocation`; the variable/type half requires the bitcode path (see [`translate_bc_path`]).
+/// Translate a **textual** LLVM IR file (`*.ll`) via the in-house reader (LLVM.md §8 Q1b) — the
+/// migration target (no libLLVM link, full-width constants, version-tolerant). The structured debug
+/// graph (`di`/`blockaddr`, recovered via `llvm-sys` on the bitcode path) is not yet read from text,
+/// so it passes `None`; the source-line half still rides each instruction's `!DILocation`.
+pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
+    let src = std::fs::read_to_string(path).map_err(|e| Error::Parse(e.to_string()))?;
+    translate_ll_str(&src)
+}
+
+/// Translate textual LLVM IR from a string (the textual-reader entry; see [`translate_ll_path`]).
+pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
+    let m = ll::parse::parse_module(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
+    translate_impl(&m, None, None)
+}
+
+/// Translate an already-parsed [`ll`] module (the shape the textual-`.ll` reader produces, or the
+/// bitcode path's [`from_llvm_ir`] conversion). The neutral core's source-line half is populated from
+/// each instruction's `!DILocation`; the structured variable/type half requires the bitcode path's
+/// `llvm-sys` debug walk (see [`translate_bc_path`]).
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
     translate_impl(m, None, None)
 }
@@ -1044,7 +1067,7 @@ fn const_eval(
 /// pointee type (carried by the base `GlobalReference`) exactly as [`translate_gep`] does for the
 /// instruction form: index 0 strides by the whole pointee, later indices descend array elements /
 /// struct fields.
-fn const_gep_offset(g: &llvm_ir::constant::GetElementPtr, types: &Types) -> Result<i64, Error> {
+fn const_gep_offset(g: &crate::ll::ast::ConstGetElementPtr, types: &Types) -> Result<i64, Error> {
     // The pointee type the GEP indexes from — a `GlobalReference` carries it directly.
     let mut cur = match g.address.as_ref() {
         Constant::GlobalReference { ty, .. } => ty.clone(),
@@ -1112,7 +1135,8 @@ fn const_size(c: &Constant, types: &Types) -> Result<u64, Error> {
         Constant::Struct {
             values, is_packed, ..
         } => {
-            let fields: Vec<llvm_ir::TypeRef> = values.iter().map(|v| v.get_type(types)).collect();
+            let fields: Vec<crate::ll::ast::TypeRef> =
+                values.iter().map(|v| v.get_type(types)).collect();
             Ok(struct_layout(&fields, *is_packed, types)?.1)
         }
         Constant::AggregateZero(t) | Constant::Undef(t) | Constant::Poison(t) => {
@@ -1163,7 +1187,8 @@ fn const_bytes(
         Constant::Struct {
             values, is_packed, ..
         } => {
-            let fields: Vec<llvm_ir::TypeRef> = values.iter().map(|v| v.get_type(types)).collect();
+            let fields: Vec<crate::ll::ast::TypeRef> =
+                values.iter().map(|v| v.get_type(types)).collect();
             let (offsets, size, _) = struct_layout(&fields, *is_packed, types)?;
             let mut out = vec![0u8; size as usize];
             for (v, &off) in values.iter().zip(&offsets) {
@@ -1667,7 +1692,7 @@ fn struct_field_vtypes(ty: &Type, types: &Types) -> Option<Result<Vec<ValType>, 
             Some(element_types.iter().map(|t| val_type(t.as_ref())).collect())
         }
         Type::NamedStructType { name } => match types.named_struct_def(name) {
-            Some(llvm_ir::types::NamedStructDef::Defined(t)) => {
+            Some(crate::ll::ast::NamedStructDef::Defined(t)) => {
                 struct_field_vtypes(t.as_ref(), types)
             }
             _ => None,
@@ -1869,14 +1894,14 @@ fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
 }
 
 /// Resolve a struct type (literal or named) to its field types + packed flag.
-fn resolve_struct(ty: &Type, types: &Types) -> Result<(Vec<llvm_ir::TypeRef>, bool), Error> {
+fn resolve_struct(ty: &Type, types: &Types) -> Result<(Vec<crate::ll::ast::TypeRef>, bool), Error> {
     match ty {
         Type::StructType {
             element_types,
             is_packed,
         } => Ok((element_types.clone(), *is_packed)),
         Type::NamedStructType { name } => match types.named_struct_def(name) {
-            Some(llvm_ir::types::NamedStructDef::Defined(t)) => resolve_struct(t.as_ref(), types),
+            Some(crate::ll::ast::NamedStructDef::Defined(t)) => resolve_struct(t.as_ref(), types),
             _ => unsup(format!("opaque/undefined struct `{name}`")),
         },
         other => unsup(format!("not a struct: {other}")),
@@ -1887,7 +1912,7 @@ fn resolve_struct(ty: &Type, types: &Types) -> Result<(Vec<llvm_ir::TypeRef>, bo
 /// Fields align naturally (offset rounded up to the field's alignment); the struct's size is padded
 /// to its own alignment. A packed struct skips all padding.
 fn struct_layout(
-    fields: &[llvm_ir::TypeRef],
+    fields: &[crate::ll::ast::TypeRef],
     packed: bool,
     types: &Types,
 ) -> Result<(Vec<u64>, u64, u64), Error> {
@@ -2136,7 +2161,7 @@ fn frame_layout(
             if let Instruction::Alloca(a) = instr {
                 let n = match &a.num_elements {
                     Operand::ConstantOperand(c) => match c.as_ref() {
-                        Constant::Int { value, .. } => *value,
+                        Constant::Int { value, .. } => *value as u64,
                         _ => return unsup("dynamic alloca (non-constant element count)"),
                     },
                     _ => return unsup("dynamic alloca (non-constant element count)"),
@@ -2184,7 +2209,7 @@ fn frame_layout(
 /// The count of **variadic** (beyond-the-fixed) arguments of a direct call to a `(...)` function,
 /// or `None` if `c` is not a direct varargs call. The fixed-parameter count comes from the call's
 /// declared function type (`param_types`); the variadic arguments are `arguments[fixed..]`.
-fn vararg_call_extra(c: &llvm_ir::instruction::Call) -> Option<usize> {
+fn vararg_call_extra(c: &crate::ll::ast::Call) -> Option<usize> {
     callee_name(c)?; // indirect varargs calls are rejected separately
     if let Type::FuncType {
         param_types,
@@ -2401,7 +2426,7 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
 /// callee is a computed value) or inline asm is a clean `Unsupported` for now.
 /// The SVM signature of an indirect call's callee — the function type plus the prepended data-SP
 /// param (§3d), so the runtime type-id check matches the callee's IR signature (§3c).
-fn indirect_sig(c: &llvm_ir::instruction::Call, types: &Types) -> Result<svm_ir::FuncType, Error> {
+fn indirect_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<svm_ir::FuncType, Error> {
     match c.function_ty.as_ref() {
         Type::FuncType {
             result_type,
@@ -2437,7 +2462,7 @@ fn alias_target_name(c: &Constant) -> Option<String> {
     }
 }
 
-fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
+fn callee_name(c: &crate::ll::ast::Call) -> Option<String> {
     match c.function.as_ref().right()? {
         Operand::ConstantOperand(cr) => match cr.as_ref() {
             Constant::GlobalReference {
@@ -2925,7 +2950,7 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
             return unsup("llvm.global_ctors element is not a struct");
         };
         let priority = match values.first().map(|v| v.as_ref()) {
-            Some(Constant::Int { value, .. }) => *value,
+            Some(Constant::Int { value, .. }) => *value as u64,
             _ => 0,
         };
         match values.get(1).map(|v| v.as_ref()) {
@@ -3914,7 +3939,7 @@ fn needs_mem_helpers(m: &LModule) -> (bool, bool, bool) {
                     continue;
                 };
                 let Some(name) = callee_name(c) else { continue };
-                let big = |c: &llvm_ir::instruction::Call| {
+                let big = |c: &crate::ll::ast::Call| {
                     c.arguments
                         .get(2)
                         .is_some_and(|(a, _)| const_int(a).is_none_or(|n| n > MAX_MEM_UNROLL))
@@ -10745,7 +10770,7 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
 
 /// The `i`-th call argument operand, bounds-checked (a fail-closed error rather than a panic when a
 /// declaration has fewer args than the builtin expects).
-fn vm_arg(c: &llvm_ir::instruction::Call, i: usize) -> Result<&Operand, Error> {
+fn vm_arg(c: &crate::ll::ast::Call, i: usize) -> Result<&Operand, Error> {
     c.arguments
         .get(i)
         .map(|(o, _)| o)
@@ -10768,7 +10793,7 @@ fn vm_arg(c: &llvm_ir::instruction::Call, i: usize) -> Result<&Operand, Error> {
 /// chibicc lowering exactly, so a program built through either frontend produces equivalent IR.
 fn lower_vm_builtin(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     name: &str,
 ) -> Result<bool, Error> {
     use svm_ir::{AtomicRmwOp, LoadOp, Ordering, StoreOp};
@@ -11172,11 +11197,7 @@ fn lower_vm_builtin(
     }
 }
 
-fn lower_io_call(
-    ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
-    name: &str,
-) -> Result<bool, Error> {
+fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Result<bool, Error> {
     // The primitive capability mapping (write/read/exit): drop the dropped args, map the rest.
     if let Some(spec) = cap_spec(name) {
         let import = ctx.import_of(spec.name)?;
@@ -11603,7 +11624,7 @@ fn lower_io_call(
 
 /// Lower a `printf(fmt, …)` call (the constant format engine — see the `"printf"` arm). Emits the
 /// `Stream.write`s for the literals and conversions in order, consuming the variadic args.
-fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<(), Error> {
+fn lower_printf(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<(), Error> {
     // `printf(fmt, …)`: format to stdout. `fmt` is arg 0; the conversion arguments start at arg 1.
     lower_format(ctx, c, 0, 1)
 }
@@ -11614,7 +11635,7 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
 /// [`BlockCtx::emit_write`]). Used by both `printf` (no sink) and `snprintf` (sink set by the caller).
 fn lower_format(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     fmt_idx: usize,
     arg_base: usize,
 ) -> Result<(), Error> {
@@ -11853,7 +11874,7 @@ fn lower_format(
 /// argument 2 (e.g. Lua's number formats `%lld`/`%.14g` and the `%d`/`%s` error-message conversions).
 /// A `size` of 0 is not faithfully supported (Lua always passes an adequate buffer); every other size
 /// is bounded so `buf[..size]` is never overrun.
-fn lower_snprintf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<(), Error> {
+fn lower_snprintf(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<(), Error> {
     // Route to the fail-closed trap when the format cannot be lowered: a **non-constant** format
     // (Lua's `string.format` builds the spec at runtime) or one using an **unsupported conversion**
     // (e.g. `%a` hex-float in the core's `lua_number2strx`). Both translate (so the enclosing function
@@ -12223,7 +12244,7 @@ fn store_w(w: u8) -> svm_ir::StoreOp {
 fn const_int(op: &Operand) -> Option<u64> {
     match op {
         Operand::ConstantOperand(c) => match c.as_ref() {
-            Constant::Int { value, .. } => Some(*value),
+            Constant::Int { value, .. } => Some(*value as u64),
             _ => None,
         },
         _ => None,
@@ -12242,7 +12263,7 @@ fn const_splat_int(op: &Operand) -> Option<u64> {
         return None;
     };
     let mut lanes = elems.iter().map(|e| match e.as_ref() {
-        Constant::Int { value, .. } => Some(*value),
+        Constant::Int { value, .. } => Some(*value as u64),
         _ => None,
     });
     let first = lanes.next()??;
@@ -12261,7 +12282,7 @@ fn const_splat_int(op: &Operand) -> Option<u64> {
 /// `Unsupported` for a vector form (`v4i32`/…), a later slice.
 fn lower_fp_sat_intrinsic(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
 ) -> Result<Option<ValIdx>, Error> {
     let Some(name) = callee_name(c) else {
         return Ok(None);
@@ -12300,7 +12321,7 @@ fn lower_fp_sat_intrinsic(
 /// Returns `Ok(None)` for any other call.
 fn lower_int_intrinsic(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     types: &Types,
 ) -> Result<Option<ValIdx>, Error> {
     let Some(name) = callee_name(c) else {
@@ -12641,7 +12662,7 @@ fn lower_int_intrinsic(
 /// correct in the no-overflow case (it is — the formulas are exact). Returns `true` if handled.
 fn lower_overflow_intrinsic(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     types: &Types,
 ) -> Result<bool, Error> {
     let Some(name) = callee_name(c) else {
@@ -12740,7 +12761,7 @@ fn lower_overflow_intrinsic(
 /// if not a (supported) reduce. (Only `i32x4` for now; wider/float reductions are a later slice.)
 fn lower_vector_reduce(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     types: &Types,
 ) -> Result<Option<ValIdx>, Error> {
     let Some(name) = callee_name(c) else {
@@ -12943,7 +12964,7 @@ fn emit_bitreverse(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, bits: u32) -> Resul
 /// have no SVM op, so they fall through to the call path (currently `Unsupported`).
 fn lower_libm_call(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     types: &Types,
 ) -> Result<Option<ValIdx>, Error> {
     let Some(name) = callee_name(c) else {
@@ -12996,7 +13017,7 @@ fn lower_libm_call(
 /// (`trunc(sub(ptrtoint …))` initializers) is serialized by [`const_eval`]. Returns the result index.
 fn lower_load_relative(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
 ) -> Result<Option<ValIdx>, Error> {
     let Some(name) = callee_name(c) else {
         return Ok(None);
@@ -13020,7 +13041,7 @@ fn lower_load_relative(
     Ok(Some(ctx.add_i64(p, delta)))
 }
 
-fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<bool, Error> {
+fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<bool, Error> {
     let Some(name) = callee_name(c) else {
         return Ok(false);
     };
@@ -13141,7 +13162,7 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Re
 /// Returns `Ok(None)` if the call is not a recognized float intrinsic.
 fn lower_float_intrinsic(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     types: &Types,
 ) -> Result<Option<ValIdx>, Error> {
     let Some(name) = callee_name(c) else {
@@ -13359,7 +13380,7 @@ fn lower_float_intrinsic(
 /// Whether a `call` is a droppable intrinsic with no guest-visible effect for our subset —
 /// `llvm.lifetime.*` (stack-slot liveness markers), `llvm.dbg.*` (debug info), `llvm.assume`.
 /// These are lowered to nothing.
-fn is_droppable_call(c: &llvm_ir::instruction::Call) -> bool {
+fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
     let Some(Operand::ConstantOperand(cr)) = c.function.as_ref().right() else {
         return false;
     };
@@ -13396,7 +13417,7 @@ fn is_droppable_call(c: &llvm_ir::instruction::Call) -> bool {
 /// `va_copy(dst, src)` byte-copies the 24-byte tag.
 fn lower_va_intrinsic(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     name: &str,
 ) -> Result<bool, Error> {
     if name.starts_with("llvm.va_start") {
@@ -13493,7 +13514,7 @@ fn is_rust_abort_call(name: &str) -> bool {
 /// external by the caller, so a guest definition of the same name shadows it.
 fn lower_setjmp_call(
     ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
+    c: &crate::ll::ast::Call,
     name: &str,
 ) -> Result<bool, Error> {
     let arg = |ctx: &mut BlockCtx, i: usize| -> Result<ValIdx, Error> {
@@ -13597,11 +13618,7 @@ fn lower_eh_unwinder<A>(
 /// - `__cxa_begin_catch(p)` → the caught object pointer (identity for a primitive/pointer catch).
 /// - `__cxa_end_catch()` → a no-op (no object destruction in the supported scope).
 /// - `llvm.eh.typeid.for(ti)` → the operand type's compile-time id (the selector the catch compares).
-fn lower_eh_call(
-    ctx: &mut BlockCtx,
-    c: &llvm_ir::instruction::Call,
-    name: &str,
-) -> Result<bool, Error> {
+fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Result<bool, Error> {
     // The noreturn unwinders (`__cxa_throw` / `__cxa_rethrow` / `_Unwind_Resume`) are shared with the
     // `invoke` form; the IR's trailing `unreachable` is the dead terminator after the long-jump.
     if lower_eh_unwinder(ctx, name, &c.arguments)? {
@@ -14290,7 +14307,7 @@ impl<'a> BlockCtx<'a> {
                 .map(|k| match elems.get(k).map(|e| e.as_ref()) {
                     Some(Constant::Float(Float::Single(f))) => f.to_bits() as u64,
                     Some(Constant::Float(Float::Double(f))) => f.to_bits(),
-                    Some(Constant::Int { value, .. }) => *value,
+                    Some(Constant::Int { value, .. }) => *value as u64,
                     _ => 0, // undef/poison lane → 0
                 })
                 .collect(),
@@ -14532,10 +14549,10 @@ impl<'a> BlockCtx<'a> {
                 // `i64` and the `iN` (33..63) widths share the `i64` container; an `iN` constant is
                 // canonicalized to its low `N` bits (its in-container representation, see `val_type`).
                 Constant::Int { bits, value } if *bits <= 64 => {
-                    let v = if *bits == 64 {
-                        *value
+                    let v: u64 = if *bits == 64 {
+                        *value as u64
                     } else {
-                        *value & ((1u64 << *bits) - 1)
+                        (*value as u64) & ((1u64 << *bits) - 1)
                     };
                     Ok(self.push(Inst::ConstI64(v as i64)))
                 }
@@ -14588,7 +14605,7 @@ impl<'a> BlockCtx<'a> {
                         let w: u64 = match e.as_ref() {
                             Constant::Float(Float::Single(f)) => f.to_bits() as u64,
                             Constant::Float(Float::Double(f)) => f.to_bits(),
-                            Constant::Int { value, .. } => *value,
+                            Constant::Int { value, .. } => *value as u64,
                             _ => 0,
                         };
                         bytes[k * lb..k * lb + lb].copy_from_slice(&w.to_le_bytes()[..lb]);
@@ -14789,8 +14806,8 @@ fn atom_width(ty: &Type) -> Result<AtomWidth, Error> {
 /// Map an LLVM `atomicrmw` binop to the svm-ir [`AtomicRmwOp`], if svm-ir has it natively. `nand`,
 /// the min/max family, and the float ops have no native op — `None` ⇒ fail-closed for now (a later
 /// slice can CAS-loop-emulate them, like the narrow path).
-fn rmw_op(op: llvm_ir::instruction::RMWBinOp) -> Option<AtomicRmwOp> {
-    use llvm_ir::instruction::RMWBinOp as L;
+fn rmw_op(op: crate::ll::ast::RMWBinOp) -> Option<AtomicRmwOp> {
+    use crate::ll::ast::RMWBinOp as L;
     Some(match op {
         L::Xchg => AtomicRmwOp::Xchg,
         L::Add => AtomicRmwOp::Add,
@@ -14811,8 +14828,8 @@ const NARROW_RMW_OR: i64 = 4;
 const NARROW_RMW_XOR: i64 = 5;
 
 /// LLVM `atomicrmw` binop → narrow-helper opcode (the subset svm-ir/the helper supports).
-fn narrow_rmw_opcode(op: llvm_ir::instruction::RMWBinOp) -> Option<i64> {
-    use llvm_ir::instruction::RMWBinOp as L;
+fn narrow_rmw_opcode(op: crate::ll::ast::RMWBinOp) -> Option<i64> {
+    use crate::ll::ast::RMWBinOp as L;
     Some(match op {
         L::Xchg => NARROW_RMW_XCHG,
         L::Add => NARROW_RMW_ADD,
@@ -16432,7 +16449,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 Constant::Vector(m) => m
                     .iter()
                     .map(|e| match e.as_ref() {
-                        Constant::Int { value, .. } => *value,
+                        Constant::Int { value, .. } => *value as u64,
                         _ => 0, // undef mask lane
                     })
                     .collect(),
@@ -17537,7 +17554,7 @@ fn fp_binop<'d>(
 fn ftoi(
     ctx: &mut BlockCtx,
     operand: &Operand,
-    to_type: &llvm_ir::TypeRef,
+    to_type: &crate::ll::ast::TypeRef,
     types: &Types,
     signed: bool,
 ) -> Result<ValIdx, Error> {
@@ -17554,7 +17571,7 @@ fn ftoi(
 fn itof(
     ctx: &mut BlockCtx,
     operand: &Operand,
-    to_type: &llvm_ir::TypeRef,
+    to_type: &crate::ll::ast::TypeRef,
     types: &Types,
     signed: bool,
 ) -> Result<ValIdx, Error> {
@@ -17706,7 +17723,7 @@ fn store_op(ty: &Type) -> Result<svm_ir::StoreOp, Error> {
 /// indices fold into one offset add; variable indices emit a `mul`+`add` (sign-extended to `i64`).
 fn translate_gep(
     ctx: &mut BlockCtx,
-    g: &llvm_ir::instruction::GetElementPtr,
+    g: &crate::ll::ast::GetElementPtr,
     types: &Types,
 ) -> Result<ValIdx, Error> {
     let mut addr = ctx.operand(&g.address)?;
@@ -18362,7 +18379,7 @@ fn translate_term(
 /// clean `Unsupported`).
 fn lower_invoke(
     ctx: &mut BlockCtx,
-    inv: &llvm_ir::terminator::Invoke,
+    inv: &crate::ll::ast::Invoke,
     bi: usize,
     f: &Function,
     s: &Scan,
@@ -18603,7 +18620,7 @@ fn lower_invoke(
 /// §3b totality — no escape, no stuck state).
 fn translate_indirectbr(
     ctx: &mut BlockCtx,
-    ib: &llvm_ir::terminator::IndirectBr,
+    ib: &crate::ll::ast::IndirectBr,
     bi: usize,
     f: &Function,
     s: &Scan,
@@ -18662,7 +18679,7 @@ const MAX_SWITCH_SPAN: i64 = 4096;
 /// too-sparse switches are `Unsupported`.
 fn translate_switch(
     ctx: &mut BlockCtx,
-    sw: &llvm_ir::terminator::Switch,
+    sw: &crate::ll::ast::Switch,
     bi: usize,
     f: &Function,
     s: &Scan,
@@ -18851,7 +18868,7 @@ fn block_param_types(param_ids: &[ValueId], s: &Scan) -> Vec<ValType> {
 #[allow(clippy::too_many_arguments)]
 fn lower_sparse_switch(
     ctx: &mut BlockCtx,
-    sw: &llvm_ir::terminator::Switch,
+    sw: &crate::ll::ast::Switch,
     bi: usize,
     f: &Function,
     s: &Scan,

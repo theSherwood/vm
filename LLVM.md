@@ -1847,32 +1847,157 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
   `llvm-sys`/`di.rs`/`blockaddr.rs`/`wideint.rs` + the rustc-1.81 pin; prove version-tolerance *here*
   by feeding `rustc 1.94`'s LLVM-21 `.ll` (`rustc --emit=llvm-ir`) through the parser. (CI `ci.yml`
   edits need `workflow` scope the bot lacks → manual follow-up.)
-- **Current state (branch `claude/textual-ll-reader`, PR #151).** The `ll` module compiles (fmt+clippy
-  green), wired into `lib.rs` as a **dormant** module (no behavior change — the bitcode reader is still
-  the only live path). Done so far:
-  - `ast.rs` — the type system (`Type`/`TypeRef`/`Types` interner/`Typed`), constants (with the `u128`
-    I14 fix), operands, predicates, module structure, and a **seed** of the `Instruction`/`Terminator`
-    enums (binary ops + `ret`/`br`/`condbr`/`unreachable`).
+- **Current state (branch `claude/ll-translator-swap`, off latest `main`; PR #158).** The lexer +
+  parser-core-slice landed via PR #151 (merged to `main`); this branch carries the AST expansion **and
+  the translator type-swap + conversion shim** on top. **The translator now consumes the owned `ll`
+  AST** — `lib.rs`'s `Instruction`/`Constant`/`Terminator`/`Type`/`Operand`/`Types` are
+  `crate::ll::ast::*`, fed on the bitcode path by [`from_llvm_ir`]; the textual reader will feed it
+  directly. **All 223 tests pass** (the whole bitcode corpus translates byte-identically through the
+  `ll` AST), fmt + clippy (`-D warnings`) green. Done so far:
+  - `ast.rs` — **the data model + type system are now complete** (the swap prerequisite, "until the AST
+    enums are complete"). The full **`Instruction`** set (all 48 LLVM-18 variants), the full
+    **`Terminator`** set (all 12), and the **`Constant`** set incl. the const-expr ops the on-ramp folds,
+    each modeling **only the fields the translator reads** (`nuw`/`nsw`/`exact`/calling-conv/attributes
+    omitted — the consumed-subset convention, so we avoid `llvm-ir`'s attribute/CC types). The type
+    system is the **read-only** `Types` (no interning — structural `PartialEq` on `TypeRef` makes equal
+    types compare equal; constructors hand back a fresh `TypeRef`) with `type_of`/`named_struct_def`
+    (`NamedStructDef::{Opaque,Defined}`), and faithful **`Typed`** impls for `TypeRef`/`Operand`/
+    `Constant`/`ConstantRef`/`Float`/`Instruction` (the per-instruction result-type logic mirrored from
+    `llvm-ir`: binop→operand0, conversion→`to_type`, `icmp`/`fcmp`→`i1`/`<N x i1>`, `cmpxchg`→`{ty,i1}`,
+    opaque `alloca`/`gep`→`ptr`, `call`→`function_ty` result, …). Plus `Instruction::try_get_result`,
+    `Operand::as_constant`, `HasDebugLoc`, a dependency-free `Either`, and minimal `InlineAssembly`/
+    `ParameterAttribute`/`Atomicity`/`RMWBinOp`/`LandingPadClause`. The `u128` I14 fix is retained.
   - `lex.rs` — **complete**, fully unit-tested: `%`/`@`/`!` names (numbered/quoted), full-width int +
     decimal/hex float literals (kept as text, so no truncation), strings (escapes left encoded;
     `unescape` decodes), types, punctuation, attribute-group refs, debug-metadata flag-sets.
-  - `parse.rs` — **core slice done**, 4 unit tests: `define` functions over the seed AST (integer types,
-    binary ops, `ret`/`br`/`condbr`/`unreachable`, `%local`/const-int operands), skipping top-level
-    cruft (target/datalayout, attribute groups, module metadata, `declare`) via a balanced-delimiter
-    scan. The I14 fix is proven end-to-end (`full_width_i128_constant_survives` round-trips `i128::MAX`).
-    Out-of-slice constructs fail closed (clean `ParseError`).
-- **Next step (resume here): the translator type-swap (Q1b step c).** Change `lib.rs`'s
-  `use llvm_ir::…` → `use crate::ll::…`. This **will break the build** until the AST enums are complete
-  — and that's the point: the translator's pattern-matches are the exact spec, so the compile errors
-  enumerate every missing `Instruction`/`Constant`/`Terminator` variant + field. Grow `ast.rs` (and
-  `parse.rs` in lockstep) until it compiles. Reference shapes: the `llvm-ir` 0.11.3 source in the cargo
-  registry cache (`…/llvm-ir-0.11.3/src/{instruction,constant,types,terminator}.rs`) — copy the *data
-  definitions*, not the `from_llvm` FFI. It's a focused, build-red-until-done run; do it in one sitting.
-- **Then (step c cont.):** add `translate_ll_path` (`lib.rs`: `parse_module` → `translate_impl`) +
-  `assert_ll_parity(c_src)` (`tests/translate.rs`, alongside `compile_to_bc`/`check`): compile each test
-  to both `.bc` and `.ll`, translate both, assert identical svm-ir. Keep `llvm-ir` the default + dev-dep;
-  iterate to parity on the core slice, then widen (PR2: SIMD/EH/structs/i128/blockaddress; PR3: debug
-  metadata replacing `di.rs`; PR4: flip + drop `llvm-ir`/`llvm-sys`/the side-readers + the rustc-1.81 pin).
+  - `parse.rs` — **core slice only** (not yet grown to the full AST), 4 unit tests: `define` functions
+    (integer types, binary ops, `ret`/`br`/`condbr`/`unreachable`, `%local`/const-int operands),
+    skipping top-level cruft (target/datalayout, attribute groups, module metadata, `declare`) via a
+    balanced-delimiter scan. The I14 fix is proven end-to-end (`full_width_i128_constant_survives`
+    round-trips `i128::MAX`). Out-of-slice constructs fail closed (clean `ParseError`).
+  - **`from_llvm_ir.rs` (the bc→ll conversion shim) — DONE.** `translate_impl` now takes a
+    `crate::ll::Module`, so the bitcode path decouples: `translate_bc_path` reads an `llvm_ir::Module`
+    via `from_bc_path`, then `from_llvm_ir::convert_module` maps it field-for-field to the `ll` AST.
+    **Faithful + fail-closed**: it drops the `nuw`/`nsw`/attribute/calling-conv fields the translator
+    ignores, and rejects (clean `Unsupported`) anything outside the modeled subset — a non-folded const
+    expression (`Xor`/`Shl`/`ICmp`/… as a constant), funclet EH (`catchpad`/`cleanupret`/`callbr`), a
+    target-ext type. That is **zero-regression** because `translate_impl` already lowers *every* defined
+    function + global initializer eagerly and rejects those same forms via its `const_eval`/`const_bytes`
+    `other => unsup` arms, so a program that translates today converts losslessly and one that doesn't
+    fails the same way. `llvm-ir`/`llvm-sys` stay normal deps (+ `either`, named directly for the callee
+    `Either`); the shim is **transient** — it goes when they're dropped (PR4). The swap also needed a few
+    `ll::ast` additions the translator relies on: `Deref` for `TypeRef`/`ConstantRef` (deref coercion),
+    `Display` for `Type`/`TypeRef` (error messages), `HasDebugLoc` for `Instruction`; and `Constant::Int`
+    being `u128` (I14) forced `as u64` casts at the ~7 size/priority/switch read sites (all ≤64-bit).
+  - **`translate_ll_path`/`translate_ll_str` + the `assert_ll_parity` harness — DONE.** `lib.rs` now
+    exposes the textual entry (`ll::parse::parse_module` → `translate`), and `tests/translate.rs` has
+    `compile_to_ll` (`clang -O2 -emit-llvm -S`) + `assert_ll_parity(name, c_src)`: compile each test C
+    to **both** `.bc` and `.ll`, translate both, assert byte-identical svm-ir (`svm_text::print_module`)
+    and `entry_sp`. Three parity tests pass on real `clang -O2` output the **core-slice parser already
+    handles**: `ll_parity_trivial_add` (header + flagged binop + `ret`), `ll_parity_arith_chain`
+    (binop chain with `±` immediates), `ll_parity_bitwise_shifts` (`shl`/`lshr`/`or`). The textual path
+    is proven end-to-end through the unified (`ll`-consuming) translator.
+  - **Parser — single-block instruction set + multi-block/`phi` landed.** `parse.rs` now covers (each
+    with an `assert_ll_parity` test on real `clang -O2` output): integer **+ float binops**,
+    **conversions** (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`, with `nneg`/flag skipping),
+    **`icmp`/`fcmp`** (full predicate sets + fast-math-flag skipping), **`select`**, **`fneg`/`freeze`**,
+    **`phi`**, and **multi-block CFGs**. The multi-block enabler was **LLVM implicit slot numbering**:
+    the unnamed counter is shared across (unnamed) params + blocks + value instructions, so `basic_blocks`
+    seeds `next_unnamed` at the parameter count — an unlabeled entry then takes `%{nparams}` and the
+    phi/branch refs into it match the bitcode reader's `Name`s. Eight parity tests green (`add`, arith
+    chain, shifts, `sext`-widen, `icmp`+`zext`, `fadd`, a `for`-loop sum, an `if/else` diamond). Constant
+    operands: int (full width) + `true`/`false`; **float constants are deferred** (LLVM's `0x…` hex-float
+    image needs exact bit parsing — a small dedicated slice).
+  - **Parser — `call` landed.** `parse.rs` now parses `[%d =] [tail] call [fmf] [cconv/ret-attrs]
+    <retty>|<fnty> <callee>(<args>) [#N] [,!meta]`: direct `@f` (a `GlobalReference` whose `ty` is the
+    **reconstructed** `<ret>(<argtys>)` function type — or the explicit `<ret>(<params>,...)` signature
+    for varargs) and indirect `%fp` callees, the **result-less `void` call** (which forced
+    `instruction()` to look ahead via `at_call()` before assuming the leading `%dest =`), and dropped
+    arg/return attribute lists. Four parity tests green: direct 1-arg, direct 2-arg, `void`, and the
+    `llvm.smax` intrinsic (the `a>b?a:b` lowering — the translator turns it back into `icmp`+`select`).
+    **Twelve parity tests total.**
+  - **Parser — memory landed.** `parse.rs` now parses `alloca [inalloca] <ty> [, <cty> <count>] [, align
+    N] [, addrspace(N)]` (implicit count → the `i32 1` operand the bitcode reader materializes), `load
+    [volatile] <ty>, ptr <addr> [, align N]`, `store [volatile] <ty> <val>, ptr <addr> [, align N]` (the
+    **second result-less** instruction — the `at_call`/`store` lookahead in `instruction()` routes both),
+    and `getelementptr [inbounds] [nuw|nusw] <srcty>, ptr <addr> [, <ity> <idx>]…`. Three parity tests:
+    `p[i]` (gep+load), `p[i]=v` (gep+store), and a `volatile` local (alloca + volatile load/store + the
+    `llvm.lifetime` intrinsics, which the call path already handles). **Fifteen parity tests total.**
+  - **Parser — module-level globals landed.** `parse.rs` now parses `@g = [linkage/attrs] [addrspace(N)]
+    global|constant <ty> [<init>] [, align N]` into `module.global_vars` (`ty` = the *pointer* type, as
+    the bitcode reader records `LLVMTypeOf`; the written content type parses the initializer). New AST
+    coverage: `[N x T]` **array types** in `type_()`, a `constant(&ty)` parser (int/`true`/`false`/
+    `zeroinitializer`/`null`/`undef`/`poison`/`@g`-refs/`[…]` arrays/`c"…"` byte strings — the `c` prefix
+    lexes as its own `Word`), and a `@name → pointee-type` **symbol table** (populated from each global +
+    function as parsed) so a `@g` *operand* resolves to a `GlobalReference` carrying the pointee type the
+    translator reads (e.g. GEP base). Also fixed `skip_to_toplevel_boundary` to stop before a depth-0
+    `@global` (an unbraced `target … = "…"` line was swallowing the globals after it) and added
+    `nonnull`/`noalias` to the return/pre-signature attribute skip. Three parity tests: a mutable scalar
+    (`@counter`, load/add/store), a `constant [4 x i32]` lookup table (array type + array init + gep), and
+    a `c"hi\00"` string returned as `ptr @.str`. **Eighteen parity tests total.**
+  - **Parser — named struct types landed.** `parse.rs` now parses `%s = type { … }` / `%s = type opaque`
+    top-level defs (→ `module.types.add_named_struct_def`, matching the bitcode reader's
+    `all_struct_names` registration), and `type_()` resolves a `%s` **reference** (a `Local` in type
+    position) + a literal `{ i32, i32 }` struct type. `skip_to_toplevel_boundary` also now stops before a
+    depth-0 `%local` (same fix as `@global` — an unbraced `target … = "…"` line was swallowing the
+    `%s = type …` defs after it). One parity test: struct field access (`%struct.P` + `getelementptr
+    %struct.P, ptr %p, i64 0, i32 1`). **Nineteen parity tests total.**
+  - **Parser — float constants landed.** `value_as_operand`/`constant` now decode `float`/`double`
+    literals — decimal (`5.000000e-01`) or the `0x` + 16-hex-digit `double`-image form (used even for
+    `float`) — into `Float::Single(f64 as f32)`/`Float::Double(f64)`, exactly matching the bitcode reader
+    (`LLVMConstRealGetDouble`, cast to `f32` for single). `half`/`bfloat`/`fp128`/`x86_fp80`/`ppc_fp128`
+    stay payload-free AST variants. Three parity tests: `x*0.5f` (decimal single), `x*3.14` (hex-image
+    double), and a `constant [3 x double]` global (float aggregate init). **Twenty-two parity tests
+    total.** This was the last deferred *primitive* — the parser now covers scalar/pointer/struct/array
+    computation + memory + calls + globals end-to-end.
+  - **Parser — `switch` + SIMD vectors landed.** `switch <ty> <v>, label %default [ <cty> <c>, label
+    %l … ]` (whitespace-separated case entries) is parsed in `terminator()`. Vectors: `<N x T>` (+ packed
+    `<{…}>` struct, `<vscale x …>`) types in `type_()`, `<T …>` vector constants, and
+    `extractelement`/`insertelement`/`shufflevector` — the shuffle **mask canonicalized to a
+    `Constant::Vector` of `i32` indices** (`zeroinitializer`/`poison`/explicit all normalized), exactly
+    as the bitcode reader does via `LLVMGetMaskValue` (the translator's `<4×>` path *requires* `Vector`).
+    `value_as_operand` was refactored to delegate every non-`%local` value to `constant()`, so
+    `poison`/`undef`/`zeroinitializer`/`null`/vector constants all reach operand position. Four parity
+    tests: sparse `switch`, `<4 x i32>` add, a splat (insertelement + shuffle), and a
+    `llvm.vector.reduce.add` reduction. **Twenty-six parity tests total.**
+  - **Parser — constant-expressions landed.** `constant()` now parses folded const-exprs: `getelementptr
+    [inbounds] ( <srcty>, ptr <addr>, <idx>… )` → `ConstGetElementPtr`, the conversions
+    `trunc`/`zext`/`sext`/`ptrtoint`/`inttoptr`/`bitcast`/`addrspacecast` `( <c> to <ty> )` →
+    `Const{…}(ConstUnaryOp)`, and `add`/`sub`/`mul` `( <c0>, <c1> )` → `Const{…}(ConstBinaryOp)`
+    (recursive, so nested `ptrtoint(getelementptr(…))` works). `at_constant_start` recognizes these op
+    words so a global initializer that *is* a const-expr isn't skipped. Two parity tests: `&arr[3]` (a
+    `getelementptr` global init) and `(long)&arr[1]` (`ptrtoint` of a `getelementptr`). **NB:** a
+    function-pointer table (`[N x ptr] [ptr @fa, …]`) is rejected by the *translator itself*
+    (`Unsupported("constexpr reference to @fa")`) on **both** paths — a translator gap, not a parser one,
+    so no parity test covers it. **Twenty-eight parity tests total.**
+  - **Parser — C++ exception handling landed.** `invoke [%r =] … to label %ok unwind label %lpad` is
+    parsed in `terminator()` (which now takes `next_unnamed` and handles the value-producing terminator's
+    `%r =` prefix; `at_terminator` looks past it). The `call`/`invoke` callee+arg grammar is factored into
+    a shared `call_signature`. Added the `resume <ty> <v>` terminator, `landingpad <ty> [cleanup]
+    [catch|filter <ty> <c>]…` (clauses → opaque `LandingPadClause {}` markers + the `cleanup` flag, as the
+    shim maps them), and `extractvalue`/`insertvalue <ty> <agg>, … , <idx>…`. The function `personality`
+    clause is skipped (already handled by the pre-`{` attr skip). The harness gained `assert_ll_parity_cpp`
+    (`clang++ -O1 -fexceptions`). One parity test: a `try/catch` (invoke + landingpad + extractvalue +
+    `__cxa_*`) — **NB** the translator only reserves the EH region when the module has a `main`
+    (`need_eh = uses_eh && has_main`), so the test source includes one. **Twenty-nine parity tests total.**
+    The instruction set is now broadly saturated for `clang`-emitted C/C++.
+  - **Parser — atomics landed.** `atomicrmw [volatile] <op> ptr <a>, <ty> <v> [syncscope("…")]
+    <ordering>` (all 15 `RMWBinOp`s), `cmpxchg [weak] [volatile] ptr <a>, <ty> <exp>, <ty> <new>
+    <success> <failure>`, `fence <ordering>` (result-less, routed like `store`), and the `load atomic`/
+    `store atomic` variants (an `atomic` keyword + trailing `[syncscope] <ordering>` before `, align`).
+    Shared `atomicity()`/`mem_ordering()`/`rmw_op()` helpers; no-`syncscope` ⇒ system scope. One parity
+    test: `atomic_fetch_add` + `atomic_compare_exchange_strong` + `atomic_load` — **NB** `fence` parses
+    but the *translator* doesn't lower it (`Unsupported`), so it's excluded from the test. **Thirty parity
+    tests total.**
+- **Next step (resume here): last loose ends, then PR3.** Remaining `clang`-emitted shapes, each a small
+  `clang -O2`-shape + `assert_ll_parity` addition: **literal aggregate constants** `{ i32 1, i8 2 }` as
+  operands/inits, **`indirectbr` + `blockaddress`** (the `blockaddress(@f, %bb)` payload the parser
+  recovers structurally — the AST already has `Constant::BlockAddress`), and **scalable-vector** ops.
+  These are increasingly rare in `clang -O2` output; the instruction set is otherwise saturated. Then
+  **PR3**:
+  debug metadata (`!DILocation`/`!DISubprogram`/`!DILocalVariable`/`!DIType`) replacing `di.rs`; PR4:
+  flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/the side-readers + the rustc-1.81 pin
+  (prove version-tolerance by feeding an LLVM-21 `.ll`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`

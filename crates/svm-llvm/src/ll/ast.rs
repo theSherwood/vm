@@ -7,9 +7,49 @@
 //! This file is data definitions + the few pure-Rust accessors the translator calls (`get_type`,
 //! `try_get_result`, `named_struct_def`, …). It has no FFI and no parsing — parsing lives in
 //! [`parse`](super::parse).
+//!
+//! Scope note: we mirror only the **subset the on-ramp consumes**. Where `llvm-ir` carries extra
+//! fields the translator never reads (instruction `nuw`/`nsw`/`exact` flags, calling conventions,
+//! call/parameter attributes), we omit them — the translator's `..`/named-field matches don't need
+//! them and dropping them keeps us free of `llvm-ir`'s attribute/CC types. The pin is **LLVM 18**, so
+//! the LLVM-18 shape is what we model (opaque pointers; explicit `loaded_ty`/`function_ty`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// ---- either ------------------------------------------------------------------------------------
+
+/// A two-variant sum, mirroring the `either::Either` surface the translator uses (`as_ref`/`right`)
+/// without taking the dependency. `Call`/`Invoke`'s callee is `Either<InlineAssembly, Operand>`.
+#[derive(PartialEq, Clone, Debug)]
+pub enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<L, R> Either<L, R> {
+    /// Borrow both sides — `Either<&L, &R>`. Mirrors `either::Either::as_ref`.
+    pub fn as_ref(&self) -> Either<&L, &R> {
+        match self {
+            Either::Left(l) => Either::Left(l),
+            Either::Right(r) => Either::Right(r),
+        }
+    }
+    /// The `Right` value, or `None`. Mirrors `either::Either::right`.
+    pub fn right(self) -> Option<R> {
+        match self {
+            Either::Right(r) => Some(r),
+            Either::Left(_) => None,
+        }
+    }
+    /// The `Left` value, or `None`. Mirrors `either::Either::left`.
+    pub fn left(self) -> Option<L> {
+        match self {
+            Either::Left(l) => Some(l),
+            Either::Right(_) => None,
+        }
+    }
+}
 
 // ---- names -------------------------------------------------------------------------------------
 
@@ -76,6 +116,22 @@ impl AsRef<Type> for TypeRef {
     }
 }
 
+/// Deref to the pointed-to [`Type`], mirroring `llvm_ir::types::TypeRef`: the translator passes
+/// `&TypeRef` where `&Type` is expected (deref coercion) all over.
+impl std::ops::Deref for TypeRef {
+    type Target = Type;
+    fn deref(&self) -> &Type {
+        &self.0
+    }
+}
+
+/// Display delegates to the pointed-to [`Type`] (mirrors `llvm_ir::types::TypeRef: Display`).
+impl std::fmt::Display for TypeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
 /// An LLVM type. The pointer form is the **opaque** LLVM-15+ shape (just an address space) — our pin
 /// is LLVM 18. Mirrors `llvm_ir::types::Type` (the `llvm-18` feature subset; names kept verbatim).
 #[allow(non_camel_case_types)]
@@ -120,15 +176,84 @@ pub enum Type {
     TokenType,
 }
 
-/// The module type table: the interner that hands out cached [`TypeRef`]s and resolves named structs.
-/// Mirrors the subset of `llvm_ir::types::Types` the translator uses (`named_struct_def`, plus the
-/// constructors the parser needs). Named-struct *bodies* are registered as they are parsed.
+/// A concise textual form, used by the translator only in fail-closed error messages (`unsup("type
+/// {ty}")`). Not the canonical LLVM syntax — just legible. Mirrors that `llvm_ir::Type: Display`.
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Type::VoidType => write!(f, "void"),
+            Type::IntegerType { bits } => write!(f, "i{bits}"),
+            Type::PointerType { addr_space } if *addr_space == 0 => write!(f, "ptr"),
+            Type::PointerType { addr_space } => write!(f, "ptr addrspace({addr_space})"),
+            Type::FPType(fp) => write!(f, "{}", fp.name()),
+            Type::FuncType {
+                result_type,
+                is_var_arg,
+                ..
+            } => write!(
+                f,
+                "{result_type} (…{})",
+                if *is_var_arg { ", ..." } else { "" }
+            ),
+            Type::VectorType {
+                element_type,
+                num_elements,
+                scalable,
+            } if *scalable => write!(f, "<vscale x {num_elements} x {}>", element_type.as_ref()),
+            Type::VectorType {
+                element_type,
+                num_elements,
+                ..
+            } => write!(f, "<{num_elements} x {}>", element_type.as_ref()),
+            Type::ArrayType {
+                element_type,
+                num_elements,
+            } => write!(f, "[{num_elements} x {}]", element_type.as_ref()),
+            Type::StructType { element_types, .. } => {
+                write!(f, "{{ {} fields }}", element_types.len())
+            }
+            Type::NamedStructType { name } => write!(f, "%{name}"),
+            Type::X86_MMXType => write!(f, "x86_mmx"),
+            Type::X86_AMXType => write!(f, "x86_amx"),
+            Type::MetadataType => write!(f, "metadata"),
+            Type::LabelType => write!(f, "label"),
+            Type::TokenType => write!(f, "token"),
+        }
+    }
+}
+
+impl FPType {
+    /// The LLVM keyword for this float type (for diagnostics).
+    pub fn name(self) -> &'static str {
+        match self {
+            FPType::Half => "half",
+            FPType::BFloat => "bfloat",
+            FPType::Single => "float",
+            FPType::Double => "double",
+            FPType::FP128 => "fp128",
+            FPType::X86_FP80 => "x86_fp80",
+            FPType::PPC_FP128 => "ppc_fp128",
+        }
+    }
+}
+
+/// The definition of a named struct. Mirrors `llvm_ir::types::NamedStructDef`: `Defined` carries a
+/// `TypeRef` to the body's `StructType`; `Opaque` is a forward declaration with no body.
+#[derive(Clone, Debug)]
+pub enum NamedStructDef {
+    Opaque,
+    Defined(TypeRef),
+}
+
+/// The module type table. Mirrors the read-only `llvm_ir::types::Types` (`type_of`/`named_struct_def`
+/// plus the `&self` constructors the translator's [`Typed`] impls call). Unlike `llvm-ir` we do *not*
+/// intern, since structural [`PartialEq`] on [`TypeRef`] makes equal types compare equal regardless —
+/// a constructor just hands back a fresh [`TypeRef`] (an AOT translate builds a bounded set). Named
+/// struct *definitions* are registered as the parser reads `%struct.Foo = type { … }`.
 #[derive(Clone, Debug, Default)]
 pub struct Types {
-    /// Named-struct definitions (`%struct.Foo = type { … }`), by name. `None` body ⇒ opaque.
-    named_structs: HashMap<String, Option<Vec<TypeRef>>>,
-    /// Cache for the common nullary/parameterized types so equal types share a `TypeRef`.
-    cache: HashMap<Type, TypeRef>,
+    /// Named-struct definitions (`%struct.Foo = type { … }`), by name.
+    named_struct_defs: HashMap<String, NamedStructDef>,
 }
 
 impl Types {
@@ -136,39 +261,80 @@ impl Types {
         Types::default()
     }
 
-    /// Intern a [`Type`], returning a cached [`TypeRef`] (so structurally-equal types are pointer-equal
-    /// and cheap to clone/compare).
-    pub fn get(&mut self, ty: Type) -> TypeRef {
-        if let Some(r) = self.cache.get(&ty) {
-            return r.clone();
-        }
-        let r = TypeRef::new(ty.clone());
-        self.cache.insert(ty, r.clone());
-        r
+    /// The type of anything that is [`Typed`] (`module.types.type_of(x)`). Mirrors `Types::type_of`.
+    pub fn type_of<T: Typed + ?Sized>(&self, t: &T) -> TypeRef {
+        t.get_type(self)
     }
 
-    pub fn int(&mut self, bits: u32) -> TypeRef {
-        self.get(Type::IntegerType { bits })
+    pub fn void(&self) -> TypeRef {
+        TypeRef::new(Type::VoidType)
     }
-    pub fn void(&mut self) -> TypeRef {
-        self.get(Type::VoidType)
+    pub fn int(&self, bits: u32) -> TypeRef {
+        TypeRef::new(Type::IntegerType { bits })
     }
-    pub fn pointer(&mut self, addr_space: AddrSpace) -> TypeRef {
-        self.get(Type::PointerType { addr_space })
+    pub fn bool(&self) -> TypeRef {
+        self.int(1)
     }
-    pub fn fp(&mut self, t: FPType) -> TypeRef {
-        self.get(Type::FPType(t))
+    pub fn pointer(&self, addr_space: AddrSpace) -> TypeRef {
+        TypeRef::new(Type::PointerType { addr_space })
+    }
+    pub fn fp(&self, t: FPType) -> TypeRef {
+        TypeRef::new(Type::FPType(t))
+    }
+    pub fn vector_of(&self, element_type: TypeRef, num_elements: usize, scalable: bool) -> TypeRef {
+        TypeRef::new(Type::VectorType {
+            element_type,
+            num_elements,
+            scalable,
+        })
+    }
+    pub fn array_of(&self, element_type: TypeRef, num_elements: usize) -> TypeRef {
+        TypeRef::new(Type::ArrayType {
+            element_type,
+            num_elements,
+        })
+    }
+    pub fn struct_of(&self, element_types: Vec<TypeRef>, is_packed: bool) -> TypeRef {
+        TypeRef::new(Type::StructType {
+            element_types,
+            is_packed,
+        })
+    }
+    pub fn func_type(
+        &self,
+        result_type: TypeRef,
+        param_types: Vec<TypeRef>,
+        is_var_arg: bool,
+    ) -> TypeRef {
+        TypeRef::new(Type::FuncType {
+            result_type,
+            param_types,
+            is_var_arg,
+        })
+    }
+    pub fn named_struct(&self, name: String) -> TypeRef {
+        TypeRef::new(Type::NamedStructType { name })
+    }
+    pub fn metadata_type(&self) -> TypeRef {
+        TypeRef::new(Type::MetadataType)
+    }
+    pub fn label_type(&self) -> TypeRef {
+        TypeRef::new(Type::LabelType)
+    }
+    pub fn token_type(&self) -> TypeRef {
+        TypeRef::new(Type::TokenType)
     }
 
-    /// Declare (or redeclare) a named struct. `body == None` ⇒ opaque/forward declaration.
-    pub fn register_named_struct(&mut self, name: String, body: Option<Vec<TypeRef>>) {
-        self.named_structs.insert(name, body);
+    /// Register (or replace) a named struct's definition. The parser calls this as it reads a
+    /// `%struct.Foo = type { … }` line (`Opaque` for an opaque/forward declaration).
+    pub fn add_named_struct_def(&mut self, name: String, def: NamedStructDef) {
+        self.named_struct_defs.insert(name, def);
     }
 
-    /// The field types of a named struct (`module.types.named_struct_def(name)`), or `None` if the
-    /// name is unknown or opaque. Mirrors `llvm_ir::types::Types::named_struct_def`.
-    pub fn named_struct_def(&self, name: &str) -> Option<&Vec<TypeRef>> {
-        self.named_structs.get(name).and_then(|b| b.as_ref())
+    /// The definition of a named struct (`module.types.named_struct_def(name)`), or `None` if the
+    /// name is unknown. Mirrors `llvm_ir::types::Types::named_struct_def`.
+    pub fn named_struct_def(&self, name: &str) -> Option<&NamedStructDef> {
+        self.named_struct_defs.get(name)
     }
 }
 
@@ -197,6 +363,21 @@ impl ConstantRef {
 impl AsRef<Constant> for ConstantRef {
     fn as_ref(&self) -> &Constant {
         &self.0
+    }
+}
+
+/// Deref to the pointed-to [`Constant`], mirroring `llvm_ir::constant::ConstantRef` (the translator
+/// passes `&ConstantRef` where `&Constant` is expected).
+impl std::ops::Deref for ConstantRef {
+    type Target = Constant;
+    fn deref(&self) -> &Constant {
+        &self.0
+    }
+}
+
+impl Typed for ConstantRef {
+    fn get_type(&self, types: &Types) -> TypeRef {
+        self.0.get_type(types)
     }
 }
 
@@ -229,8 +410,23 @@ impl std::hash::Hash for Float {
     }
 }
 
+impl Typed for Float {
+    fn get_type(&self, types: &Types) -> TypeRef {
+        types.fp(match self {
+            Float::Half => FPType::Half,
+            Float::BFloat => FPType::BFloat,
+            Float::Single(_) => FPType::Single,
+            Float::Double(_) => FPType::Double,
+            Float::Quadruple => FPType::FP128,
+            Float::X86_FP80 => FPType::X86_FP80,
+            Float::PPC_FP128 => FPType::PPC_FP128,
+        })
+    }
+}
+
 /// An LLVM constant. Mirrors `llvm_ir::constant::Constant`, **with the I14 fix**: `Int.value` is a
-/// full `u128` (the two's-complement bit pattern), never a truncating `u64`.
+/// full `u128` (the two's-complement bit pattern), never a truncating `u64`. We model the constant
+/// expressions the on-ramp folds (`const_eval`); the others fail closed at the parser.
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub enum Constant {
     Int {
@@ -291,6 +487,43 @@ pub struct ConstGetElementPtr {
     pub in_bounds: bool,
 }
 
+impl Typed for Constant {
+    fn get_type(&self, types: &Types) -> TypeRef {
+        match self {
+            Constant::Int { bits, .. } => types.int(*bits),
+            Constant::Float(f) => types.type_of(f),
+            Constant::Null(t) => t.clone(),
+            Constant::AggregateZero(t) => t.clone(),
+            Constant::Struct {
+                values, is_packed, ..
+            } => types.struct_of(
+                values.iter().map(|v| types.type_of(v)).collect(),
+                *is_packed,
+            ),
+            Constant::Array {
+                element_type,
+                elements,
+            } => types.array_of(element_type.clone(), elements.len()),
+            Constant::Vector(v) => types.vector_of(types.type_of(&v[0]), v.len(), false),
+            Constant::Undef(t) => t.clone(),
+            Constant::Poison(t) => t.clone(),
+            Constant::BlockAddress => types.label_type(),
+            // LLVM 15+: a global reference is an opaque pointer (address space 0).
+            Constant::GlobalReference { .. } => types.pointer(0),
+            Constant::TokenNone => types.token_type(),
+            Constant::GetElementPtr(_) => types.pointer(0),
+            Constant::Trunc(u)
+            | Constant::ZExt(u)
+            | Constant::SExt(u)
+            | Constant::PtrToInt(u)
+            | Constant::IntToPtr(u)
+            | Constant::BitCast(u)
+            | Constant::AddrSpaceCast(u) => u.to_type.clone(),
+            Constant::Add(b) | Constant::Sub(b) | Constant::Mul(b) => types.type_of(&b.operand0),
+        }
+    }
+}
+
 // ---- operands ----------------------------------------------------------------------------------
 
 /// An instruction operand. Mirrors `llvm_ir::Operand`.
@@ -299,6 +532,26 @@ pub enum Operand {
     LocalOperand { name: Name, ty: TypeRef },
     ConstantOperand(ConstantRef),
     MetadataOperand,
+}
+
+impl Operand {
+    /// The inner [`Constant`] if this operand is a constant, else `None`. Mirrors `Operand::as_constant`.
+    pub fn as_constant(&self) -> Option<&Constant> {
+        match self {
+            Operand::ConstantOperand(cref) => Some(cref.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl Typed for Operand {
+    fn get_type(&self, types: &Types) -> TypeRef {
+        match self {
+            Operand::LocalOperand { ty, .. } => ty.clone(),
+            Operand::ConstantOperand(c) => types.type_of(c),
+            Operand::MetadataOperand => types.metadata_type(),
+        }
+    }
 }
 
 // ---- predicates --------------------------------------------------------------------------------
@@ -338,6 +591,78 @@ pub enum FPPredicate {
     UNE,
     True,
 }
+
+// ---- atomics -----------------------------------------------------------------------------------
+
+/// Memory ordering on an atomic operation. Mirrors `llvm_ir::instruction::MemoryOrdering`.
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
+pub enum MemoryOrdering {
+    Unordered,
+    Monotonic,
+    Acquire,
+    Release,
+    AcquireRelease,
+    SequentiallyConsistent,
+    NotAtomic,
+}
+
+/// The synchronization scope of an atomic operation. Mirrors `llvm_ir::instruction::SynchronizationScope`.
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
+pub enum SynchronizationScope {
+    SingleThread,
+    System,
+}
+
+/// The atomicity of a memory operation (`load atomic`/`store atomic`/`cmpxchg`/`atomicrmw`).
+/// Mirrors `llvm_ir::instruction::Atomicity`. The translator only checks presence (`Option::is_some`),
+/// but the fields are kept faithful.
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
+pub struct Atomicity {
+    pub synch_scope: SynchronizationScope,
+    pub mem_ordering: MemoryOrdering,
+}
+
+/// The binary operation of an `atomicrmw`. Mirrors `llvm_ir::instruction::RMWBinOp` (the LLVM-18
+/// subset; the LLVM-19 `UIncWrap`/`UDecWrap` are excluded by the pin).
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
+pub enum RMWBinOp {
+    Xchg,
+    Add,
+    Sub,
+    And,
+    Nand,
+    Or,
+    Xor,
+    Max,
+    Min,
+    UMax,
+    UMin,
+    FAdd,
+    FSub,
+    FMax,
+    FMin,
+}
+
+// ---- inline asm / attributes / EH (modeled minimally) ------------------------------------------
+
+/// An inline-assembly callee. The on-ramp fails closed on inline asm, so it only needs to *exist* as
+/// the `Left` of a call's `Either` callee — its contents are never inspected. Mirrors the consumed
+/// shape of `llvm_ir::instruction::InlineAssembly` (the LLVM-18 C-API form is just its type).
+#[derive(PartialEq, Clone, Debug)]
+pub struct InlineAssembly {
+    pub ty: TypeRef,
+}
+
+/// A call/parameter attribute. The on-ramp ignores these (it reads only the operand of each
+/// argument), so the type is an uninhabited placeholder: argument attribute lists are always empty.
+/// Mirrors the *position* of `llvm_ir::function::ParameterAttribute` without modeling its variants.
+#[derive(PartialEq, Clone, Debug)]
+pub enum ParameterAttribute {}
+
+/// A `landingpad` clause. Like `llvm-ir`, the LLVM C API does not expose the fields, so this is empty;
+/// the on-ramp reads exceptions through its own EH slots, not the clause list.
+#[derive(PartialEq, Clone, Debug)]
+pub struct LandingPadClause {}
 
 // ---- debug locations ---------------------------------------------------------------------------
 
@@ -425,17 +750,13 @@ pub struct Module {
     pub types: Types,
 }
 
-// ---- instructions & terminators ----------------------------------------------------------------
-//
-// NOTE (PR1, in progress): the `Instruction` and `Terminator` enums are populated incrementally,
-// driven by compiling `lib.rs` against this module (the translator's matches are the exact spec).
-// The trivial vertical slice below (binary ops + ret/br) is the seed; the full ~48-variant set lands
-// as coverage grows under the parity harness. See super::mod docs.
+// ---- instructions ------------------------------------------------------------------------------
 
-/// An instruction (non-terminator). Mirrors `llvm_ir::instruction::Instruction`. Each variant is a
-/// struct with the operand/dest fields the translator reads.
+/// A non-terminator instruction. Mirrors `llvm_ir::instruction::Instruction` (LLVM-18 subset). Each
+/// variant is a struct holding the operand/dest fields the translator reads.
 #[derive(PartialEq, Clone, Debug)]
 pub enum Instruction {
+    // Integer binary ops
     Add(BinaryOp),
     Sub(BinaryOp),
     Mul(BinaryOp),
@@ -443,20 +764,274 @@ pub enum Instruction {
     SDiv(BinaryOp),
     URem(BinaryOp),
     SRem(BinaryOp),
+    // Bitwise binary ops
     And(BinaryOp),
     Or(BinaryOp),
     Xor(BinaryOp),
     Shl(BinaryOp),
     LShr(BinaryOp),
     AShr(BinaryOp),
+    // Floating-point binary ops
+    FAdd(BinaryOp),
+    FSub(BinaryOp),
+    FMul(BinaryOp),
+    FDiv(BinaryOp),
+    FRem(BinaryOp),
+    FNeg(UnaryOp),
+    // Vector ops
+    ExtractElement(ExtractElement),
+    InsertElement(InsertElement),
+    ShuffleVector(ShuffleVector),
+    // Aggregate ops
+    ExtractValue(ExtractValue),
+    InsertValue(InsertValue),
+    // Memory ops
+    Alloca(Alloca),
+    Load(Load),
+    Store(Store),
+    Fence(Fence),
+    CmpXchg(CmpXchg),
+    AtomicRMW(AtomicRMW),
+    GetElementPtr(GetElementPtr),
+    // Conversion ops
+    Trunc(UnaryOp),
+    ZExt(UnaryOp),
+    SExt(UnaryOp),
+    FPTrunc(UnaryOp),
+    FPExt(UnaryOp),
+    FPToUI(UnaryOp),
+    FPToSI(UnaryOp),
+    UIToFP(UnaryOp),
+    SIToFP(UnaryOp),
+    PtrToInt(UnaryOp),
+    IntToPtr(UnaryOp),
+    BitCast(UnaryOp),
+    AddrSpaceCast(UnaryOp),
+    // Other ops
+    ICmp(ICmp),
+    FCmp(FCmp),
+    Phi(Phi),
+    Select(Select),
+    Freeze(UnaryOp),
+    Call(Call),
+    VAArg(VAArg),
+    LandingPad(LandingPad),
+    CatchPad(CatchPad),
+    CleanupPad(CleanupPad),
 }
 
-/// A binary-operation instruction body (`<dest> = <op> <ty> <operand0>, <operand1>`). Mirrors the
-/// field names of `llvm_ir`'s binop instruction structs (`Add`, `Sub`, …).
+/// A binary-operation body (`<dest> = <op> <ty> <operand0>, <operand1>`). The `nuw`/`nsw`/`exact`
+/// flags `llvm-ir` carries are dropped — the on-ramp defines wrap semantics and never reads them.
 #[derive(PartialEq, Clone, Debug)]
 pub struct BinaryOp {
     pub operand0: Operand,
     pub operand1: Operand,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+/// A unary op with the result type the same as the operand (`fneg`/`freeze`) **or** an
+/// explicitly-typed conversion (`trunc`/`zext`/…/`bitcast`). `to_type` is meaningful for the
+/// conversions; for `fneg`/`freeze` it equals the operand type (the parser fills it in).
+#[derive(PartialEq, Clone, Debug)]
+pub struct UnaryOp {
+    pub operand: Operand,
+    pub to_type: TypeRef,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct ExtractElement {
+    pub vector: Operand,
+    pub index: Operand,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct InsertElement {
+    pub vector: Operand,
+    pub element: Operand,
+    pub index: Operand,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct ShuffleVector {
+    pub operand0: Operand,
+    pub operand1: Operand,
+    pub dest: Name,
+    pub mask: ConstantRef,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct ExtractValue {
+    pub aggregate: Operand,
+    pub indices: Vec<u32>,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct InsertValue {
+    pub aggregate: Operand,
+    pub element: Operand,
+    pub indices: Vec<u32>,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Alloca {
+    pub allocated_type: TypeRef,
+    pub num_elements: Operand,
+    pub dest: Name,
+    pub alignment: u32,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Load {
+    pub address: Operand,
+    pub dest: Name,
+    /// LLVM 15+: the loaded type is explicit (opaque pointers carry no pointee).
+    pub loaded_ty: TypeRef,
+    pub volatile: bool,
+    pub atomicity: Option<Atomicity>,
+    pub alignment: u32,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Store {
+    pub address: Operand,
+    pub value: Operand,
+    pub volatile: bool,
+    pub atomicity: Option<Atomicity>,
+    pub alignment: u32,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Fence {
+    pub atomicity: Atomicity,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct CmpXchg {
+    pub address: Operand,
+    pub expected: Operand,
+    pub replacement: Operand,
+    pub dest: Name,
+    pub volatile: bool,
+    pub atomicity: Atomicity,
+    pub failure_memory_ordering: MemoryOrdering,
+    pub weak: bool,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct AtomicRMW {
+    pub operation: RMWBinOp,
+    pub address: Operand,
+    pub value: Operand,
+    pub dest: Name,
+    pub volatile: bool,
+    pub atomicity: Atomicity,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct GetElementPtr {
+    pub address: Operand,
+    pub indices: Vec<Operand>,
+    pub dest: Name,
+    pub in_bounds: bool,
+    /// LLVM 14+: the source element type the indices walk (opaque pointers carry no pointee).
+    pub source_element_type: TypeRef,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct ICmp {
+    pub predicate: IntPredicate,
+    pub operand0: Operand,
+    pub operand1: Operand,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct FCmp {
+    pub predicate: FPPredicate,
+    pub operand0: Operand,
+    pub operand1: Operand,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Phi {
+    pub incoming_values: Vec<(Operand, Name)>,
+    pub dest: Name,
+    pub to_type: TypeRef,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Select {
+    pub condition: Operand,
+    pub true_value: Operand,
+    pub false_value: Operand,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Call {
+    pub function: Either<InlineAssembly, Operand>,
+    /// LLVM 15+: the callee's function type (the indices/return type the on-ramp reads for an
+    /// indirect call), since an opaque pointer callee carries no signature.
+    pub function_ty: TypeRef,
+    pub arguments: Vec<(Operand, Vec<ParameterAttribute>)>,
+    pub dest: Option<Name>,
+    pub is_tail_call: bool,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct VAArg {
+    pub arg_list: Operand,
+    pub cur_type: TypeRef,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct LandingPad {
+    pub result_type: TypeRef,
+    pub clauses: Vec<LandingPadClause>,
+    pub dest: Name,
+    pub cleanup: bool,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct CatchPad {
+    pub catch_switch: Operand,
+    pub args: Vec<Operand>,
+    pub dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct CleanupPad {
+    pub parent_pad: Operand,
+    pub args: Vec<Operand>,
     pub dest: Name,
     pub debugloc: Option<DebugLoc>,
 }
@@ -466,30 +1041,297 @@ impl Instruction {
     /// none). Mirrors `llvm_ir::instruction::Instruction::try_get_result`.
     pub fn try_get_result(&self) -> Option<&Name> {
         match self {
-            Instruction::Add(b)
-            | Instruction::Sub(b)
-            | Instruction::Mul(b)
-            | Instruction::UDiv(b)
-            | Instruction::SDiv(b)
-            | Instruction::URem(b)
-            | Instruction::SRem(b)
-            | Instruction::And(b)
-            | Instruction::Or(b)
-            | Instruction::Xor(b)
-            | Instruction::Shl(b)
-            | Instruction::LShr(b)
-            | Instruction::AShr(b) => Some(&b.dest),
+            Instruction::Add(i)
+            | Instruction::Sub(i)
+            | Instruction::Mul(i)
+            | Instruction::UDiv(i)
+            | Instruction::SDiv(i)
+            | Instruction::URem(i)
+            | Instruction::SRem(i)
+            | Instruction::And(i)
+            | Instruction::Or(i)
+            | Instruction::Xor(i)
+            | Instruction::Shl(i)
+            | Instruction::LShr(i)
+            | Instruction::AShr(i)
+            | Instruction::FAdd(i)
+            | Instruction::FSub(i)
+            | Instruction::FMul(i)
+            | Instruction::FDiv(i)
+            | Instruction::FRem(i) => Some(&i.dest),
+            Instruction::FNeg(i)
+            | Instruction::Trunc(i)
+            | Instruction::ZExt(i)
+            | Instruction::SExt(i)
+            | Instruction::FPTrunc(i)
+            | Instruction::FPExt(i)
+            | Instruction::FPToUI(i)
+            | Instruction::FPToSI(i)
+            | Instruction::UIToFP(i)
+            | Instruction::SIToFP(i)
+            | Instruction::PtrToInt(i)
+            | Instruction::IntToPtr(i)
+            | Instruction::BitCast(i)
+            | Instruction::AddrSpaceCast(i)
+            | Instruction::Freeze(i) => Some(&i.dest),
+            Instruction::ExtractElement(i) => Some(&i.dest),
+            Instruction::InsertElement(i) => Some(&i.dest),
+            Instruction::ShuffleVector(i) => Some(&i.dest),
+            Instruction::ExtractValue(i) => Some(&i.dest),
+            Instruction::InsertValue(i) => Some(&i.dest),
+            Instruction::Alloca(i) => Some(&i.dest),
+            Instruction::Load(i) => Some(&i.dest),
+            Instruction::Store(_) => None,
+            Instruction::Fence(_) => None,
+            Instruction::CmpXchg(i) => Some(&i.dest),
+            Instruction::AtomicRMW(i) => Some(&i.dest),
+            Instruction::GetElementPtr(i) => Some(&i.dest),
+            Instruction::ICmp(i) => Some(&i.dest),
+            Instruction::FCmp(i) => Some(&i.dest),
+            Instruction::Phi(i) => Some(&i.dest),
+            Instruction::Select(i) => Some(&i.dest),
+            Instruction::Call(i) => i.dest.as_ref(),
+            Instruction::VAArg(i) => Some(&i.dest),
+            Instruction::LandingPad(i) => Some(&i.dest),
+            Instruction::CatchPad(i) => Some(&i.dest),
+            Instruction::CleanupPad(i) => Some(&i.dest),
         }
     }
 }
 
-/// A block terminator. Mirrors `llvm_ir::terminator::Terminator` (seed subset; grows under parity).
+impl HasDebugLoc for Instruction {
+    fn get_debug_loc(&self) -> &Option<DebugLoc> {
+        match self {
+            Instruction::Add(i)
+            | Instruction::Sub(i)
+            | Instruction::Mul(i)
+            | Instruction::UDiv(i)
+            | Instruction::SDiv(i)
+            | Instruction::URem(i)
+            | Instruction::SRem(i)
+            | Instruction::And(i)
+            | Instruction::Or(i)
+            | Instruction::Xor(i)
+            | Instruction::Shl(i)
+            | Instruction::LShr(i)
+            | Instruction::AShr(i)
+            | Instruction::FAdd(i)
+            | Instruction::FSub(i)
+            | Instruction::FMul(i)
+            | Instruction::FDiv(i)
+            | Instruction::FRem(i) => i.get_debug_loc(),
+            Instruction::FNeg(i)
+            | Instruction::Trunc(i)
+            | Instruction::ZExt(i)
+            | Instruction::SExt(i)
+            | Instruction::FPTrunc(i)
+            | Instruction::FPExt(i)
+            | Instruction::FPToUI(i)
+            | Instruction::FPToSI(i)
+            | Instruction::UIToFP(i)
+            | Instruction::SIToFP(i)
+            | Instruction::PtrToInt(i)
+            | Instruction::IntToPtr(i)
+            | Instruction::BitCast(i)
+            | Instruction::AddrSpaceCast(i)
+            | Instruction::Freeze(i) => i.get_debug_loc(),
+            Instruction::ExtractElement(i) => i.get_debug_loc(),
+            Instruction::InsertElement(i) => i.get_debug_loc(),
+            Instruction::ShuffleVector(i) => i.get_debug_loc(),
+            Instruction::ExtractValue(i) => i.get_debug_loc(),
+            Instruction::InsertValue(i) => i.get_debug_loc(),
+            Instruction::Alloca(i) => i.get_debug_loc(),
+            Instruction::Load(i) => i.get_debug_loc(),
+            Instruction::Store(i) => i.get_debug_loc(),
+            Instruction::Fence(i) => i.get_debug_loc(),
+            Instruction::CmpXchg(i) => i.get_debug_loc(),
+            Instruction::AtomicRMW(i) => i.get_debug_loc(),
+            Instruction::GetElementPtr(i) => i.get_debug_loc(),
+            Instruction::ICmp(i) => i.get_debug_loc(),
+            Instruction::FCmp(i) => i.get_debug_loc(),
+            Instruction::Phi(i) => i.get_debug_loc(),
+            Instruction::Select(i) => i.get_debug_loc(),
+            Instruction::Call(i) => i.get_debug_loc(),
+            Instruction::VAArg(i) => i.get_debug_loc(),
+            Instruction::LandingPad(i) => i.get_debug_loc(),
+            Instruction::CatchPad(i) => i.get_debug_loc(),
+            Instruction::CleanupPad(i) => i.get_debug_loc(),
+        }
+    }
+}
+
+/// The element type of a vector `TypeRef`, or a panic (the operand of a vector op must be a vector —
+/// mirrors `llvm-ir`'s behavior; the on-ramp only calls this on verified-valid IR).
+fn vec_element_type(ty: &TypeRef) -> TypeRef {
+    match ty.as_ref() {
+        Type::VectorType { element_type, .. } => element_type.clone(),
+        ty => panic!("Expected a vector type, got {ty:?}"),
+    }
+}
+
+/// Walk an aggregate type by `extractvalue`/`insertvalue` indices to the leaf field type. Mirrors
+/// `llvm-ir`'s `ev_type` (literal array/struct only; named-struct resolution is not needed for the
+/// register-coerced aggregates clang emits).
+fn ev_type(cur_type: TypeRef, indices: &[u32]) -> TypeRef {
+    match indices.split_first() {
+        None => cur_type,
+        Some((&index, rest)) => match cur_type.as_ref() {
+            Type::ArrayType { element_type, .. } => ev_type(element_type.clone(), rest),
+            Type::StructType { element_types, .. } => ev_type(
+                element_types
+                    .get(index as usize)
+                    .expect("ExtractValue index out of range")
+                    .clone(),
+                rest,
+            ),
+            _ => panic!("ExtractValue from a non-aggregate type {cur_type:?}"),
+        },
+    }
+}
+
+/// `icmp`/`fcmp` result type: `i1`, or `<N x i1>` for a vector compare. Mirrors `llvm-ir`.
+fn cmp_result_type(operand_ty: TypeRef, types: &Types) -> TypeRef {
+    match operand_ty.as_ref() {
+        Type::VectorType {
+            num_elements,
+            scalable,
+            ..
+        } => types.vector_of(types.bool(), *num_elements, *scalable),
+        _ => types.bool(),
+    }
+}
+
+impl Typed for Instruction {
+    fn get_type(&self, types: &Types) -> TypeRef {
+        match self {
+            // result type == operand0 type
+            Instruction::Add(i)
+            | Instruction::Sub(i)
+            | Instruction::Mul(i)
+            | Instruction::UDiv(i)
+            | Instruction::SDiv(i)
+            | Instruction::URem(i)
+            | Instruction::SRem(i)
+            | Instruction::And(i)
+            | Instruction::Or(i)
+            | Instruction::Xor(i)
+            | Instruction::Shl(i)
+            | Instruction::LShr(i)
+            | Instruction::AShr(i)
+            | Instruction::FAdd(i)
+            | Instruction::FSub(i)
+            | Instruction::FMul(i)
+            | Instruction::FDiv(i)
+            | Instruction::FRem(i) => types.type_of(&i.operand0),
+            // result type == operand type / the explicit `to_type`
+            Instruction::FNeg(i) | Instruction::Freeze(i) => types.type_of(&i.operand),
+            Instruction::Trunc(i)
+            | Instruction::ZExt(i)
+            | Instruction::SExt(i)
+            | Instruction::FPTrunc(i)
+            | Instruction::FPExt(i)
+            | Instruction::FPToUI(i)
+            | Instruction::FPToSI(i)
+            | Instruction::UIToFP(i)
+            | Instruction::SIToFP(i)
+            | Instruction::PtrToInt(i)
+            | Instruction::IntToPtr(i)
+            | Instruction::BitCast(i)
+            | Instruction::AddrSpaceCast(i) => i.to_type.clone(),
+            Instruction::ExtractElement(i) => vec_element_type(&types.type_of(&i.vector)),
+            Instruction::InsertElement(i) => types.type_of(&i.vector),
+            Instruction::ShuffleVector(i) => {
+                let elem = vec_element_type(&types.type_of(&i.operand0));
+                match types.type_of(&i.mask).as_ref() {
+                    Type::VectorType {
+                        num_elements,
+                        scalable,
+                        ..
+                    } => types.vector_of(elem, *num_elements, *scalable),
+                    ty => panic!("Expected a ShuffleVector mask to be a vector, got {ty:?}"),
+                }
+            }
+            Instruction::ExtractValue(i) => ev_type(types.type_of(&i.aggregate), &i.indices),
+            Instruction::InsertValue(i) => types.type_of(&i.aggregate),
+            // LLVM 15+: alloca/gep produce an opaque pointer.
+            Instruction::Alloca(_) | Instruction::GetElementPtr(_) => types.pointer(0),
+            Instruction::Load(i) => i.loaded_ty.clone(),
+            Instruction::Store(_) | Instruction::Fence(_) => types.void(),
+            Instruction::CmpXchg(i) => {
+                let ty = types.type_of(&i.expected);
+                types.struct_of(vec![ty, types.bool()], false)
+            }
+            Instruction::AtomicRMW(i) => types.type_of(&i.value),
+            Instruction::ICmp(i) => cmp_result_type(types.type_of(&i.operand0), types),
+            Instruction::FCmp(i) => cmp_result_type(types.type_of(&i.operand0), types),
+            Instruction::Phi(i) => i.to_type.clone(),
+            Instruction::Select(i) => types.type_of(&i.true_value),
+            // LLVM 15+: the result type is read off the explicit `function_ty`.
+            Instruction::Call(i) => match i.function_ty.as_ref() {
+                Type::FuncType { result_type, .. } => result_type.clone(),
+                ty => panic!("Expected Call.function_ty to be a FuncType, got {ty:?}"),
+            },
+            Instruction::VAArg(i) => i.cur_type.clone(),
+            Instruction::LandingPad(i) => i.result_type.clone(),
+            Instruction::CatchPad(_) | Instruction::CleanupPad(_) => types.token_type(),
+        }
+    }
+}
+
+macro_rules! impl_has_debug_loc {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl HasDebugLoc for $ty {
+            fn get_debug_loc(&self) -> &Option<DebugLoc> {
+                &self.debugloc
+            }
+        })+
+    };
+}
+impl_has_debug_loc!(
+    BinaryOp,
+    UnaryOp,
+    ExtractElement,
+    InsertElement,
+    ShuffleVector,
+    ExtractValue,
+    InsertValue,
+    Alloca,
+    Load,
+    Store,
+    Fence,
+    CmpXchg,
+    AtomicRMW,
+    GetElementPtr,
+    ICmp,
+    FCmp,
+    Phi,
+    Select,
+    Call,
+    VAArg,
+    LandingPad,
+    CatchPad,
+    CleanupPad,
+);
+
+// ---- terminators -------------------------------------------------------------------------------
+
+/// A block terminator. Mirrors `llvm_ir::terminator::Terminator` (the full LLVM-18 set; the on-ramp
+/// translates `Ret`/`Br`/`CondBr`/`Switch`/`IndirectBr`/`Invoke`/`Resume`/`Unreachable` and fails
+/// closed on the funclet-EH ones via its `other => unsup(..)` arm).
 #[derive(PartialEq, Clone, Debug)]
 pub enum Terminator {
     Ret(Ret),
     Br(Br),
     CondBr(CondBr),
+    Switch(Switch),
+    IndirectBr(IndirectBr),
+    Invoke(Invoke),
+    Resume(Resume),
     Unreachable(Unreachable),
+    CleanupRet(CleanupRet),
+    CatchRet(CatchRet),
+    CatchSwitch(CatchSwitch),
+    CallBr(CallBr),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -513,6 +1355,86 @@ pub struct CondBr {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+pub struct Switch {
+    pub operand: Operand,
+    pub dests: Vec<(ConstantRef, Name)>,
+    pub default_dest: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct IndirectBr {
+    pub operand: Operand,
+    pub possible_dests: Vec<Name>,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Invoke {
+    pub function: Either<InlineAssembly, Operand>,
+    pub function_ty: TypeRef,
+    pub arguments: Vec<(Operand, Vec<ParameterAttribute>)>,
+    pub result: Name,
+    pub return_label: Name,
+    pub exception_label: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Resume {
+    pub operand: Operand,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
 pub struct Unreachable {
     pub debugloc: Option<DebugLoc>,
 }
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct CleanupRet {
+    pub cleanup_pad: Operand,
+    pub unwind_dest: Option<Name>,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct CatchRet {
+    pub catch_pad: Operand,
+    pub successor: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct CatchSwitch {
+    pub parent_pad: Operand,
+    pub catch_handlers: Vec<Name>,
+    pub default_unwind_dest: Option<Name>,
+    pub result: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct CallBr {
+    pub function: Either<InlineAssembly, Operand>,
+    pub function_ty: TypeRef,
+    pub arguments: Vec<(Operand, Vec<ParameterAttribute>)>,
+    pub result: Name,
+    pub return_label: Name,
+    pub debugloc: Option<DebugLoc>,
+}
+
+impl_has_debug_loc!(
+    Ret,
+    Br,
+    CondBr,
+    Switch,
+    IndirectBr,
+    Invoke,
+    Resume,
+    Unreachable,
+    CleanupRet,
+    CatchRet,
+    CatchSwitch,
+    CallBr,
+);

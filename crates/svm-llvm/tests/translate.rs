@@ -7589,3 +7589,370 @@ fn i128_small_constant_still_runs() {
         );
     }
 }
+
+// ---- Textual `.ll` reader: differential parity vs the bitcode reader (LLVM.md §8 Q1b) -----------
+//
+// The migration's gate: the *same* C, compiled to **both** `.bc` and `.ll`, must translate to
+// **identical svm-ir** through the two readers — the bitcode→`ll` conversion shim
+// (`from_llvm_ir`) vs the in-house textual reader (`ll::parse`). Both now feed the same translator
+// (it consumes the owned `ll` AST), so a match proves the textual reader produced an equivalent AST.
+// This lets `parse.rs` grow incrementally with confidence; today it covers the core slice, so the
+// parity tests track real `clang -O2` output one shape at a time.
+
+/// Compile C to a textual `.ll` (the in-house reader's input), mirroring [`compile_to_bc`].
+fn compile_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}_ll.c", std::process::id(), name));
+    let ll = dir.join(format!("svm_llvm_{}_{}.ll", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&ll)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(ll),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Compile C++ (with exceptions) to a `.bc`/`.ll` — the EH constructs (`invoke`/`landingpad`/`resume`,
+/// `personality`) only appear from a C++ front end. `emit` is `-c` (bitcode) or `-S` (textual).
+fn compile_cpp(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let cpp = dir.join(format!(
+        "svm_llvm_{}_{}_{}.cpp",
+        std::process::id(),
+        name,
+        ext
+    ));
+    let out = dir.join(format!("svm_llvm_{}_{}.{}", std::process::id(), name, ext));
+    std::fs::write(&cpp, src).expect("write C++ source");
+    let status = Command::new("clang++")
+        .args(["-O1", "-fexceptions", "-emit-llvm", emit])
+        .arg(&cpp)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang++ unavailable)");
+            None
+        }
+    }
+}
+
+/// The parity assertion core: both readers must translate to byte-identical svm-ir + `entry_sp`.
+fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) {
+    let from_bc = svm_llvm::translate_bc_path(bc).expect("translate via bitcode");
+    let from_ll = svm_llvm::translate_ll_path(ll).expect("translate via textual .ll");
+    assert_eq!(
+        svm_text::print_module(&from_bc.module),
+        svm_text::print_module(&from_ll.module),
+        "svm-ir mismatch between the bitcode and textual readers for `{name}`",
+    );
+    assert_eq!(
+        from_bc.entry_sp, from_ll.entry_sp,
+        "entry_sp mismatch for `{name}`",
+    );
+}
+
+/// Assert the bitcode and textual readers translate `src` to byte-identical svm-ir (their
+/// `print_module` text) and the same `entry_sp`. Skips cleanly if `clang` is unavailable.
+fn assert_ll_parity(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (compile_to_bc(name, src), compile_to_ll(name, src)) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+/// Like [`assert_ll_parity`], but the source is C++ compiled with exceptions (for EH constructs).
+fn assert_ll_parity_cpp(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_cpp(name, src, "-c", "bc"),
+        compile_cpp(name, src, "-S", "ll"),
+    ) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+#[test]
+fn ll_parity_trivial_add() {
+    // The simplest real `clang -O2` function: `define dso_local i32 @add(i32 %0, i32 %1) … { %3 =
+    // add nsw i32 %1, %0; ret i32 %3 }` — exercising the function header (linkage/param attrs/
+    // attribute-group ref), a flagged binop, and `ret`.
+    assert_ll_parity("ll_parity_add", "int add(int a, int b){ return a + b; }");
+}
+
+#[test]
+fn ll_parity_arith_chain() {
+    // A chain of binops with immediate operands, incl. a negative constant (`add … -7`) — exercises
+    // constant-int operands and operand ordering across `add`/`mul`.
+    assert_ll_parity("ll_parity_poly", "int poly(int x){ return x*x + 3*x - 7; }");
+}
+
+#[test]
+fn ll_parity_bitwise_shifts() {
+    // `shl`/`lshr`/`or` over an unsigned — the bitwise/shift core-slice ops.
+    assert_ll_parity(
+        "ll_parity_shifts",
+        "unsigned s(unsigned x){ return (x << 3) | (x >> 2); }",
+    );
+}
+
+#[test]
+fn ll_parity_sext_widen() {
+    // `sext i32 … to i64` + an `i64` add — the conversion path (a widening cast).
+    assert_ll_parity("ll_parity_widen", "long w(int x){ return (long)x + 1; }");
+}
+
+#[test]
+fn ll_parity_icmp_zext() {
+    // `icmp sgt` + `zext i1 … to i32` — a signed compare materialized to an int (the `a > b` shape).
+    assert_ll_parity("ll_parity_cmp", "int gt(int a, int b){ return a > b; }");
+}
+
+#[test]
+fn ll_parity_float_add() {
+    // `fadd float` — float arithmetic (no float *constant*, which is a later slice: hex-float parsing).
+    assert_ll_parity(
+        "ll_parity_fadd",
+        "float a(float x, float y){ return x + y; }",
+    );
+}
+
+#[test]
+fn ll_parity_phi_loop() {
+    // A `for`-loop sum: multi-block CFG with an unlabeled entry, `icmp`/`br i1`/labels, and a `phi`
+    // merging the two predecessors. Exercises implicit block numbering (the phi's `%entry`/`%body`
+    // refs must resolve to the same names the bitcode reader assigns).
+    assert_ll_parity(
+        "ll_parity_loop",
+        "int sum(int n){ int s = 0; for (int i = 0; i < n; i++) s += i; return s; }",
+    );
+}
+
+#[test]
+fn ll_parity_branch_phi() {
+    // An explicit `if`/`else` returning different values — a diamond CFG whose join is a `phi`.
+    assert_ll_parity(
+        "ll_parity_diamond",
+        "int pick(int c, int a, int b){ if (c) return a + 1; else return b - 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_direct() {
+    // A direct `call` to a defined (noinline) function in the same module, whose result feeds an add —
+    // the callee becomes a GlobalReference carrying the reconstructed `i32 (i32)` function type.
+    assert_ll_parity(
+        "ll_parity_call",
+        "static __attribute__((noinline)) int dbl(int x){ return x + x; } \
+         int f(int x){ return dbl(x) + 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_two_args() {
+    // A two-argument direct call (`i32 (i32, i32)`), exercising the arg list + fn-type reconstruction.
+    assert_ll_parity(
+        "ll_parity_call2",
+        "static __attribute__((noinline)) int sub(int a, int b){ return a - b; } \
+         int g(int a, int b){ return sub(a, b); }",
+    );
+}
+
+#[test]
+fn ll_parity_call_intrinsic() {
+    // `a > b ? a : b` lowers to `tail call i32 @llvm.smax.i32(i32 %0, i32 %1)` at -O2 — an intrinsic
+    // call (the shape that first forced calls; the translator lowers `llvm.smax` to `icmp`+`select`).
+    assert_ll_parity(
+        "ll_parity_smax",
+        "int mx(int a, int b){ return a > b ? a : b; }",
+    );
+}
+
+#[test]
+fn ll_parity_gep_load() {
+    // `getelementptr inbounds i32, ptr %p, i64 %i` + `load i32, ptr …` — pointer indexing + a load.
+    assert_ll_parity(
+        "ll_parity_gepload",
+        "int idx(const int *p, long i){ return p[i]; }",
+    );
+}
+
+#[test]
+fn ll_parity_gep_store() {
+    // `getelementptr` + a result-less `store i32 %v, ptr …` (the second dest-less instruction shape).
+    assert_ll_parity(
+        "ll_parity_gepstore",
+        "void wr(int *p, long i, int v){ p[i] = v; }",
+    );
+}
+
+#[test]
+fn ll_parity_alloca_volatile() {
+    // A `volatile` local forces `alloca i32` + `store volatile`/`load volatile` (defeating mem2reg).
+    assert_ll_parity(
+        "ll_parity_alloca",
+        "int viadd(int x){ volatile int t = x; return t + 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_scalar() {
+    // A mutable scalar global (`@counter = global i32 0`) read + written by a function
+    // (`load`/`add`/`store` through `ptr @counter`).
+    assert_ll_parity(
+        "ll_parity_gscalar",
+        "int counter = 0; int bump(void){ return ++counter; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_array() {
+    // A `constant [4 x i32]` lookup table indexed by a function — array type + array constant
+    // initializer + a `getelementptr [4 x i32], ptr @TBL, …`.
+    assert_ll_parity(
+        "ll_parity_garray",
+        "static const int TBL[4] = {10, 20, 30, 40}; int lookup(int i){ return TBL[i & 3]; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_string() {
+    // A `private constant [N x i8] c\"…\\00\"` string returned by a function (`ret ptr @.str`) —
+    // byte-string constant + a `@.str` operand reference.
+    assert_ll_parity(
+        "ll_parity_gstring",
+        "const char *greeting(void){ return \"hi\"; }",
+    );
+}
+
+#[test]
+fn ll_parity_float_const_single() {
+    // `x * 0.5f` → `fmul float %…, 5.000000e-01` — a float constant in decimal form.
+    assert_ll_parity(
+        "ll_parity_fconst",
+        "float half(float x){ return x * 0.5f; }",
+    );
+}
+
+#[test]
+fn ll_parity_float_const_hex_double() {
+    // `x * 3.14` → `fmul double %…, 0x40091EB8…` — a double constant clang emits in `0x` hex form
+    // (3.14 isn't exactly representable), exercising the hex-image decode.
+    assert_ll_parity(
+        "ll_parity_dconst",
+        "double scale(double x){ return x * 3.14; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_float_array() {
+    // A `constant [3 x double]` initializer — float constants in a global aggregate (decimal + hex).
+    assert_ll_parity(
+        "ll_parity_gfloat",
+        "static const double K[3] = {0.5, 3.14, 2.0}; double kth(int i){ return K[i]; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_add() {
+    // A `<4 x i32>` vector binop — vector types in operands/results.
+    assert_ll_parity(
+        "ll_parity_vadd",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vadd(v4i a, v4i b){ return a + b; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_splat() {
+    // A splat: `insertelement <4 x i32> poison, i32 %x, i64 0` + `shufflevector … zeroinitializer` —
+    // insertelement/shufflevector + `poison`/`zeroinitializer` vector constants.
+    assert_ll_parity(
+        "ll_parity_vsplat",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vsplat(int x){ return (v4i){x,x,x,x}; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_reduce() {
+    // `llvm.vector.reduce.add.v4i32` — a vector-reduction intrinsic call over a `<4 x i32>`.
+    assert_ll_parity(
+        "ll_parity_vreduce",
+        "typedef int v4i __attribute__((vector_size(16))); \
+         int vsum(v4i a){ return a[0]+a[1]+a[2]+a[3]; }",
+    );
+}
+
+#[test]
+fn ll_parity_const_gep() {
+    // A global initialized to a constant-expression GEP into another global
+    // (`@p = global ptr getelementptr inbounds ([10 x i32], ptr @arr, i64 0, i64 3)`).
+    assert_ll_parity("ll_parity_cgep", "int arr[10]; int *p = &arr[3];");
+}
+
+#[test]
+fn ll_parity_const_ptrtoint() {
+    // A nested constant-expression: `ptrtoint (ptr getelementptr(…) to i64)` as a global initializer.
+    assert_ll_parity("ll_parity_cptr", "int arr[10]; long addr = (long)&arr[1];");
+}
+
+#[test]
+fn ll_parity_invoke_landingpad() {
+    // C++ try/catch → `invoke … to label %ok unwind label %lpad` (a value-producing terminator),
+    // `landingpad { ptr, i32 } catch ptr null`, `extractvalue`, and the `__cxa_*` runtime calls. The
+    // translator only reserves the EH region when the module has a `main`, so include one.
+    let src = "int may_throw(int x){ if (x < 0) throw x; return x * 2; } \
+               int f(int x){ try { return may_throw(x); } catch (...) { return -1; } } \
+               int main(){ return f(-1) + f(3); }";
+    assert_ll_parity_cpp("ll_parity_eh", src);
+}
+
+#[test]
+fn ll_parity_atomics() {
+    // `atomicrmw`, `cmpxchg`, and `load atomic` — the atomic memory ops (orderings + syncscope), via
+    // `<stdatomic.h>`. (`fence` is omitted: the translator itself doesn't lower it.)
+    let src = "#include <stdatomic.h>\n\
+               int rmw(_Atomic int *p, int v){ return atomic_fetch_add(p, v); }\n\
+               int cx(_Atomic int *p, int a, int b){ atomic_compare_exchange_strong(p, &a, b); return a; }\n\
+               int ld(_Atomic int *p){ return atomic_load(p); }\n";
+    assert_ll_parity("ll_parity_atomic", src);
+}
+
+#[test]
+fn ll_parity_switch() {
+    // A `switch` terminator with a constant→label jump table (sparse cases + default).
+    assert_ll_parity(
+        "ll_parity_switch",
+        "int sw(int x){ switch(x){ case 0: return 10; case 1: return 20; case 7: return 30; \
+         default: return -1; } }",
+    );
+}
+
+#[test]
+fn ll_parity_struct_field() {
+    // A named struct type (`%struct.P = type { i32, i32 }`) + struct GEP
+    // (`getelementptr %struct.P, ptr %p, i64 0, i32 1`) for field access.
+    assert_ll_parity(
+        "ll_parity_struct",
+        "struct P { int a; int b; }; int field(const struct P *s){ return s->a + s->b; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_void() {
+    // A result-less `call void @sink(...)` — the dest-less instruction shape (`tail call void …`).
+    assert_ll_parity(
+        "ll_parity_callvoid",
+        "static int g; static __attribute__((noinline)) void sink(int x){ g = x; } \
+         void v(int x){ sink(x); }",
+    );
+}
