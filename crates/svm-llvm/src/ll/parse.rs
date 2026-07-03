@@ -738,6 +738,11 @@ impl Parser {
             "noundef",
             "nonnull",
             "noalias",
+            "range",
+            "nofpclass",
+            "dereferenceable",
+            "dereferenceable_or_null",
+            "align",
             "ccc",
             "fastcc",
             "coldcc",
@@ -745,10 +750,17 @@ impl Parser {
             "cc",
         ];
         while let Some(Token::Word(w)) = self.peek() {
-            if PRE.contains(&w.as_str()) {
-                self.pos += 1;
-            } else {
+            if !PRE.contains(&w.as_str()) {
                 break;
+            }
+            let is_align = w == "align";
+            self.pos += 1;
+            // Attributes with a payload: `dereferenceable(N)`/`range(…)`/`nofpclass(…)` → a balanced
+            // parenthesized group; `align N` → a bare integer.
+            if self.peek() == Some(&Token::LParen) {
+                self.skip_balanced_parens();
+            } else if is_align && matches!(self.peek(), Some(Token::Int(_))) {
+                self.pos += 1;
             }
         }
     }
@@ -768,13 +780,28 @@ impl Parser {
                 break;
             }
             let ty = self.type_()?;
-            // Skip parameter attributes (barewords / `align N` / attribute-group `#N`) until the name,
-            // the comma, or the closing paren.
-            while !matches!(
-                self.peek(),
-                Some(Token::Local(_)) | Some(Token::Comma) | Some(Token::RParen) | None
-            ) {
-                self.pos += 1;
+            // Skip parameter attributes (barewords / `align N` / `byval(<ty>)` / `dereferenceable(N)` /
+            // attribute-group `#N`) until the name, the comma, or the closing paren — tracking nesting
+            // so a paren/bracket-payload attr's own delimiters aren't mistaken for the list's end.
+            let mut depth = 0i32;
+            loop {
+                match self.peek() {
+                    Some(Token::LParen) | Some(Token::LBracket) | Some(Token::Lt) => {
+                        depth += 1;
+                        self.pos += 1;
+                    }
+                    Some(Token::RParen) | Some(Token::RBracket) | Some(Token::Gt) if depth > 0 => {
+                        depth -= 1;
+                        self.pos += 1;
+                    }
+                    Some(Token::Local(_)) | Some(Token::Comma) | Some(Token::RParen) | None
+                        if depth == 0 =>
+                    {
+                        break
+                    }
+                    None => break,
+                    _ => self.pos += 1,
+                }
             }
             let name = match self.peek() {
                 Some(Token::Local(s)) => {
@@ -824,8 +851,14 @@ impl Parser {
     /// A leading `name:` / `N:` block label, or — if absent — the next implicit block number.
     fn block_label(&mut self, next_unnamed: &mut usize) -> Name {
         match (self.peek(), self.peek2()) {
+            // `name:` / `"quoted name":` — a textual block label.
             (Some(Token::Word(w)), Some(Token::Colon)) => {
                 let nm = Name::from_string(w.clone());
+                self.pos += 2;
+                nm
+            }
+            (Some(Token::Str(s)), Some(Token::Colon)) => {
+                let nm = Name::from_string(s.clone());
                 self.pos += 2;
                 nm
             }
@@ -1387,7 +1420,15 @@ impl Parser {
                     elements,
                 }
             }
-            // `< <ty> <c>, … >` — a vector constant.
+            // `{ <ty> <c>, … }` — a literal struct constant.
+            Some(Token::LBrace) => self.struct_constant(false)?,
+            // `< <ty> <c>, … >` — a vector constant, or `<{ … }>` a packed struct constant.
+            Some(Token::Lt) if matches!(self.peek2(), Some(Token::LBrace)) => {
+                self.pos += 1; // `<`
+                let c = self.struct_constant(true)?;
+                self.expect(&Token::Gt)?;
+                c
+            }
             Some(Token::Lt) => {
                 self.pos += 1; // `<`
                 let mut elements = Vec::new();
@@ -1406,6 +1447,28 @@ impl Parser {
             other => return self.err(format!("constant not yet supported: {other:?}")),
         };
         Ok(ConstantRef::new(c))
+    }
+
+    /// A literal struct constant `{ <ty> <c>, … }` (`is_packed` for the `<{ … }>` form). The caller
+    /// has consumed a leading `<` for the packed form; this consumes `{ … }`.
+    fn struct_constant(&mut self, is_packed: bool) -> PResult<Constant> {
+        self.expect(&Token::LBrace)?;
+        let mut values = Vec::new();
+        if self.peek() != Some(&Token::RBrace) {
+            loop {
+                let ety = self.type_()?;
+                values.push(self.constant(&ety)?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Constant::Struct {
+            name: None,
+            values,
+            is_packed,
+        })
     }
 
     // ---- conversions / compares / select -------------------------------------------------------
@@ -2290,6 +2353,13 @@ impl Parser {
             "writeonly",
             "immarg",
             "nofree",
+            "dead_on_unwind",
+            "dead_on_return",
+            "writable",
+            "captures",
+            "range",
+            "nofpclass",
+            "initializes",
             "align",
             "dereferenceable",
             "dereferenceable_or_null",
@@ -2457,6 +2527,26 @@ impl Parser {
             "double" => {
                 self.pos += 1;
                 self.module.types.fp(FPType::Double)
+            }
+            "half" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::Half)
+            }
+            "bfloat" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::BFloat)
+            }
+            "fp128" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::FP128)
+            }
+            "x86_fp80" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::X86_FP80)
+            }
+            "ppc_fp128" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::PPC_FP128)
             }
             "metadata" => {
                 self.pos += 1;

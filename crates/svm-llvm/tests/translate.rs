@@ -8145,6 +8145,17 @@ fn ll_parity_switch() {
 }
 
 #[test]
+fn ll_parity_struct_constant_global() {
+    // A global initialized to a **literal struct constant** (`@gp = global %struct.P { i32 7, i64 42 }`)
+    // — the `{ <ty> <c>, … }` aggregate-constant form real-world (Rust/C++) IR leans on heavily.
+    assert_ll_parity(
+        "ll_parity_structconst",
+        "struct P { int a; long b; }; struct P gp = { 7, 42 }; \
+         long gets(void){ return gp.a + gp.b; }",
+    );
+}
+
+#[test]
 fn ll_parity_struct_field() {
     // A named struct type (`%struct.P = type { i32, i32 }`) + struct GEP
     // (`getelementptr %struct.P, ptr %p, i64 0, i32 1`) for field access.

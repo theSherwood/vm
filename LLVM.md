@@ -2065,14 +2065,36 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     fully replaceable.** (Corrected a real bug mid-slice: the debug harness had used
     `-gline-tables-only`, which emits no type/var graph, so the type/global/local tests were passing
     trivially — switched to `-O0 -g`.)
-- **PR4 (next): flip the default + drop the libLLVM binding.** Make the textual `.ll` reader the
-  default ingest and delete `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/`di.rs`/`blockaddr`/the side-readers
-  + the rustc-1.81 pin. Sequence: (1) route `translate_bc_path`'s callers through a `clang -emit-llvm
-  -S` step (or add a `.bc`→`.ll` disassembly via `llvm-dis`) so nothing needs the bitcode reader; (2)
-  drop the `di` argument plumbing now that `ll::debug` supplies it; (3) remove the deps + the parity
-  harness's bitcode side (it becomes self-tests on the textual reader); (4) prove version-tolerance by
-  feeding an LLVM-21-emitted `.ll` through the reader. The differential parity corpus (now 35 tests:
-  30 instruction + 5 debug) is the safety net for the flip.
+- **PR4 (in progress, branch `claude/ll-drop-libllvm`): flip the default + drop the libLLVM binding.**
+  - **Experiment (done, then reverted): route `translate_bc_path` through `llvm-dis` + the textual
+    reader and run the *whole corpus* (267 tests, not just the 35 parity shapes).** Result: the `.ll`
+    reader handled **252/267** after the parser-widening below; the mechanism works (out-of-process
+    `llvm-dis foo.bc -o -` → `translate_ll_str`, no libLLVM linked). The reverted experiment is the
+    template for the real flip. **Remaining 15 gaps** (the flip's to-do list): **10** a top-level
+    construct with `=` near the module head (`at: 17`; hits `cpp_eh_*` + `rust_*` — a comdat/alias/ifunc
+    or similar `skip_toplevel_item` doesn't handle; pin it down by dumping tokens near the failure);
+    **4** `blockaddress(@f, %bb)` + `indirectbr` (the `computed_goto_*` tests — needs the `blockaddr`
+    side-reader's payload recovered from text: parse the `blockaddress` constant + thread the
+    `BlockAddrs` the translator reads); **1** `i128_wide_constant_fails_closed` (now *obsolete* — the
+    textual reader carries full-width `i128`, so this fail-closed test's premise is gone; update it to
+    expect success, the whole point of I14). The **forward-reference** globals/functions gap (a `@f`
+    used before its def / an external `declare`) was papered over with an opaque-ptr fallback in the
+    experiment; the correct fix is a **two-pass symbol collection** (pre-scan `define`/`declare`/`@g =`
+    signatures into `symbols` before parsing bodies) — do that in the flip.
+  - **DONE this checkpoint — parser widened for real-world (Rust/C++/`llvm-dis`) IR** (all clean, green,
+    landable without the flip): the lexer drops `^N = …` ThinLTO **module-summary** lines; `type_()`
+    handles `half`/`bfloat`/`fp128`/`x86_fp80`/`ppc_fp128`; `constant()` parses **literal aggregate
+    constants** `{ <ty> <c>, … }` / packed `<{…}>` (`ll_parity_struct_constant_global`);
+    `skip_pre_signature_attrs` + `param_list` handle **paren-payload attributes**
+    (`dereferenceable(N)`/`range(…)`/`byval(<ty>)`, depth-tracked) + the newer attrs
+    (`dead_on_unwind`/`writable`/`captures`/`nofpclass`/…); and `block_label` accepts a **quoted**
+    `"name":` label. (These knocked the corpus from 215→252 in the experiment.)
+  - **Then finish the flip:** (1) re-apply the `llvm-dis` route to `translate_bc_path` (or convert the
+    test helpers to `clang -emit-llvm -S`); (2) close the 15 gaps above; (3) two-pass symbol collection;
+    (4) drop the `di` argument plumbing (`ll::debug` supplies it) + delete `llvm-ir`/`llvm-sys`/
+    `from_llvm_ir.rs`/`di.rs`/`blockaddr`/`wideint` + the rustc-1.81 pin; (5) prove version-tolerance
+    with an LLVM-21-emitted `.ll`. The differential parity corpus (now 36 tests: 31 instruction + 5
+    debug) + the 267-test behavioral corpus are the safety net.
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
