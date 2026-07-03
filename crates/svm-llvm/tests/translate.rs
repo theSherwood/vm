@@ -7755,6 +7755,20 @@ fn ll_parity_debug_locals() {
 }
 
 #[test]
+fn ll_parity_debug_args_ssa() {
+    // `-Og -g`: with locals promoted to SSA, source args are tracked by `llvm.dbg.value(metadata i32
+    // %k, …)` instead of `dbg.declare`. The reader must correlate the value to argument `k` (→ `Arg`,
+    // which the translator resolves to an `SsaList` over the arg's live range) rather than an alloca.
+    assert_ll_parity_debug_at(
+        "ll_parity_dbg_arg",
+        "int square(int x){ return x * x; }\n\
+         int lin(int a, int b){ return a * 3 + b; }\n",
+        "-Og",
+        "-g",
+    );
+}
+
+#[test]
 fn ll_parity_debug_types_globals() {
     // `-gline-tables-only` carries no type graph, so use full `-O0 -g` but keep the only function
     // *local-free* (no `dbg.declare`, so `di.vars` stays empty — the local-var half is a later slice).
