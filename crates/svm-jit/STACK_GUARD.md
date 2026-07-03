@@ -143,7 +143,20 @@ under `-D warnings`; no fiber/thread-suite regression.
 check position means normal frames are validated directly, so this is a low-priority backstop only.
 Note: the SLOT-aligned arena slots (from the prior 2b commit, for path A's SP-mask) are now vestigial
 under B — harmless, removable later.
-3. **Windows** arena + TEB-field `Stack` surface; **GC** interaction (a reused, un-zeroed slot makes
-   the conservative `gc.roots` scan over-approximate — sound but imprecise; decide zero-on-reclaim of
-   only the touched high-water region vs accept the over-approximation).
-4. Fuzz target for the guard; audit; then consider flipping arena+check on by default per platform.
+3. **[Windows arena done — cross-check only]** `stack_arena.rs` is now cross-platform: `mmap`+
+   `MAP_NORESERVE` on unix, `VirtualAlloc(MEM_RESERVE|MEM_COMMIT)` on x86-64 Windows (no
+   `MAP_NORESERVE` analogue ⇒ the arena is committed up front — a pagefile charge, physical stays
+   demand-zero; per-slot commit-on-demand is a follow-up). Provides the Windows `Stack` surface
+   (`base_ptr`/`limit_ptr`/`top` for the TEB seed). Verified with `cargo check --target
+   x86_64-pc-windows-gnu --features arena-stacks` under `-D warnings`; **runtime-untested** (no Windows
+   host / CI — needs the CI job below). **`#3` exit-code parity done:** the interp's `trap_status` now
+   maps `Trap::StackOverflow` to the JIT's `TrapKind::StackOverflow` (13).
+   Still open: **GC** interaction (a reused, un-zeroed slot makes the conservative `gc.roots` scan
+   over-approximate — sound but imprecise; decide zero-on-reclaim of the touched high-water region vs
+   accepting it).
+4. **CI (`#1`, deferred):** a job that builds/tests `--features stack-check,arena-stacks` on Linux
+   (and macOS-aarch64), so the guard tests + arena run somewhere and the Windows arena gets runtime
+   coverage. Then a **fuzz** target for the guard; **audit**; then consider flipping arena+check on by
+   default per platform.
+5. **Frame-size backstop** (low priority): reject an absurd (> stack-size) single frame — needs the
+   Cranelift frame size (not exposed in 0.132) or a prologue parse.

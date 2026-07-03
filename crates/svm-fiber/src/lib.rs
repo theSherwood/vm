@@ -45,7 +45,8 @@ mod switch;
 #[path = "switch_x86_64_windows.rs"]
 mod switch;
 
-// OS-specific guard-paged control stack (the unix mmap one backs both unix arches).
+// OS-specific guard-paged control stack (the unix mmap one backs both unix arches). Selected when the
+// PROTOTYPE `arena-stacks` allocator is OFF.
 #[cfg(all(
     not(feature = "arena-stacks"),
     unix,
@@ -53,17 +54,20 @@ mod switch;
 ))]
 #[path = "stack_unix.rs"]
 mod stack;
-// PROTOTYPE arena allocator (feature `arena-stacks`, unix only) — replaces the per-fiber mmap+guard
-// to benchmark allocation cost; see `stack_arena.rs`.
+#[cfg(all(not(feature = "arena-stacks"), windows, target_arch = "x86_64"))]
+#[path = "stack_windows.rs"]
+mod stack;
+// PROTOTYPE arena allocator (feature `arena-stacks`) — replaces the per-fiber guarded reservation on
+// every supported target (overflow protection moves to the svm-jit software `stack-check`); see
+// `stack_arena.rs`.
 #[cfg(all(
     feature = "arena-stacks",
-    unix,
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        all(unix, any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(windows, target_arch = "x86_64")
+    )
 ))]
 #[path = "stack_arena.rs"]
-mod stack;
-#[cfg(all(windows, target_arch = "x86_64"))]
-#[path = "stack_windows.rs"]
 mod stack;
 
 // Safe RAII asymmetric-coroutine wrapper (ABI-agnostic; built on `switch` + `stack`).

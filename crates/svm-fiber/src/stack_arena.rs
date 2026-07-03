@@ -1,17 +1,17 @@
-//! Arena-allocated control stacks — PROTOTYPE, feature `arena-stacks`, unix only.
+//! Arena-allocated control stacks — PROTOTYPE, feature `arena-stacks` (unix + x86-64 Windows).
 //!
-//! Instead of one `mmap` + `mprotect` guard page per fiber (`stack_unix.rs`, 2 VMAs/fiber, which caps
-//! concurrency at the `vm.max_map_count` wall — see the measurement in the design discussion), this
-//! sub-allocates fixed-size 256 KiB stack slots from a few large `mmap`'d arenas with a free-list. A
-//! fiber then costs ~0 extra VMAs (arenas are contiguous same-prot mappings, so the kernel coalesces
-//! them), and `cont.new`/finish become a free-list pop/push instead of two syscalls.
+//! Instead of one guarded reservation per fiber (`stack_unix.rs` = `mmap`+`mprotect`, 2 VMAs/fiber;
+//! `stack_windows.rs` = `VirtualAlloc`+`VirtualProtect`), this sub-allocates fixed-size 256 KiB stack
+//! slots from a few large reservations with a free-list, so `cont.new`/finish become a free-list
+//! pop/push instead of syscalls and a fiber costs ~0 extra VMAs (unix). Overflow protection moves to
+//! the JIT's software stack-limit check (`svm-jit` feature `stack-check`), so this **drops the
+//! hardware guard page** and must not ship without that check. A reclaimed slot is not zeroed
+//! (zeroing would defeat the alloc win); a conservative GC scan over a reused slot over-approximates
+//! roots (sound superset — noted).
 //!
-//! **This drops the hardware overflow guard.** In a real deployment, overflow protection moves to a
-//! software stack-limit check the JIT emits in each prologue (`svm-jit` feature `stack-check`); this
-//! file exists to *benchmark the allocation cost* of the arena scheme in isolation, and must not ship
-//! on its own. A reclaimed slot is NOT zeroed (zeroing 256 KiB/alloc would defeat the very cost we are
-//! measuring); a conservative GC stack scan over a reused slot therefore over-approximates roots
-//! (sound — a superset — but noted).
+//! Windows note: there is no `MAP_NORESERVE` analogue, so each arena is `MEM_COMMIT`ted up front (a
+//! pagefile *commit* charge; physical pages stay demand-zero, like unix). Per-slot commit-on-demand
+//! is a follow-up; for the prototype benchmark this is the simplest correct shape.
 
 use std::sync::Mutex;
 
@@ -22,10 +22,46 @@ const SLOT: usize = 1 << 18; // 256 KiB
 const ARENA: usize = 1 << 30;
 const SLOTS_PER_ARENA: usize = ARENA / SLOT;
 
+/// Reserve one arena (`ARENA + SLOT` bytes so the usable base can be rounded up to a SLOT boundary)
+/// and return its raw base, or null on failure. Never aborts — the caller turns null into a
+/// recoverable `FiberFault`.
+#[cfg(unix)]
+unsafe fn reserve_arena() -> *mut u8 {
+    // Lazy anonymous reservation (`MAP_NORESERVE`): committed physical pages cost nothing until touched.
+    let p = libc::mmap(
+        core::ptr::null_mut(),
+        ARENA + SLOT,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+        -1,
+        0,
+    );
+    if p == libc::MAP_FAILED {
+        core::ptr::null_mut()
+    } else {
+        p as *mut u8
+    }
+}
+
+#[cfg(windows)]
+unsafe fn reserve_arena() -> *mut u8 {
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+    };
+    // Reserve **and** commit (no `MAP_NORESERVE` equivalent): the commit is a pagefile charge, but
+    // physical pages remain demand-zero until touched. `PAGE_READWRITE`, no per-slot guard page.
+    VirtualAlloc(
+        core::ptr::null(),
+        ARENA + SLOT,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    ) as *mut u8
+}
+
 struct ArenaState {
     /// Free slot base pointers, ready to hand out.
     free: Vec<*mut u8>,
-    /// Arena base pointers, kept mapped for the life of the process (never unmapped — a prototype).
+    /// Arena base pointers, kept reserved for the life of the process (never released — a prototype).
     arenas: Vec<*mut u8>,
 }
 // SAFETY: the pointers are arena/slot bases owned by this global allocator; only ever produced and
@@ -44,27 +80,14 @@ fn alloc_slot() -> Option<*mut u8> {
     if let Some(p) = st.free.pop() {
         return Some(p);
     }
-    // Over-allocate by one SLOT so the usable region can be rounded up to a **SLOT boundary**: with
-    // SLOT-aligned slots, a slot's low bound is `sp & !(SLOT-1)` for any sp in it — which is how the
-    // per-vCPU software stack-limit check derives the limit from SP alone (STACK_GUARD.md §2b path A),
-    // with no per-thread cell. SAFETY: a fresh anonymous lazy reservation; checked for MAP_FAILED.
-    let raw = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
-            ARENA + SLOT,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    if raw == libc::MAP_FAILED {
+    // SAFETY: a fresh reservation; null-checked, owned by `STATE.arenas`.
+    let raw = unsafe { reserve_arena() };
+    if raw.is_null() {
         return None;
     }
-    let raw = raw as *mut u8;
-    // Record the raw reservation (never unmapped — a prototype).
+    // Record the raw reservation (never released — a prototype).
     st.arenas.push(raw);
-    // Round up to the next SLOT boundary; the extra SLOT guarantees `[base, base + ARENA)` fits.
+    // Round the usable base up to a SLOT boundary; the extra SLOT guarantees `[base, base+ARENA)` fits.
     let base = ((raw as usize + SLOT - 1) & !(SLOT - 1)) as *mut u8;
     // Hand out slot 0 now; push the rest onto the free-list. Every slot is SLOT-aligned.
     for i in 1..SLOTS_PER_ARENA {
@@ -74,18 +97,19 @@ fn alloc_slot() -> Option<*mut u8> {
     Some(base)
 }
 
-/// Return a slot to the free-list (not unmapped — slots are recycled).
+/// Return a slot to the free-list (not released — slots are recycled).
 fn free_slot(p: *mut u8) {
     STATE.lock().unwrap_or_else(|e| e.into_inner()).free.push(p);
 }
 
-/// An arena-allocated control stack slot — same surface as `stack_unix::Stack`, minus the guard page.
+/// An arena-allocated control stack slot — same surface as `stack_unix`/`stack_windows`, minus the
+/// guard page.
 pub struct Stack {
     base: *mut u8,
 }
 
-// SAFETY: as in `stack_unix` — an owned slot (a pointer); the bytes are only touched by whichever
-// thread is currently running on it, and the slot returns to the free-list on drop.
+// SAFETY: as in the guarded backends — an owned slot (a pointer); the bytes are only touched by
+// whichever thread is currently running on it, and the slot returns to the free-list on drop.
 unsafe impl Send for Stack {}
 
 impl Stack {
@@ -98,7 +122,7 @@ impl Stack {
         })
     }
 
-    /// The top of the stack (highest address, exclusive) — passed to `make`.
+    /// The top of the stack (highest address, exclusive) — passed to `make`; also TEB `StackBase`.
     pub fn top(&self) -> *mut u8 {
         // SAFETY: one-past-the-end of our own slot.
         unsafe { self.base.add(SLOT) }
@@ -113,6 +137,18 @@ impl Stack {
     #[cfg(feature = "asan")]
     pub fn usable(&self) -> (*const u8, usize) {
         (self.base as *const u8, SLOT)
+    }
+
+    /// TEB `StackLimit` — the lowest usable address (no guard page, so the slot base).
+    #[cfg(windows)]
+    pub fn limit_ptr(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// TEB `DeallocationStack` — the slot base (there is no separate reservation base per slot).
+    #[cfg(windows)]
+    pub fn base_ptr(&self) -> *mut u8 {
+        self.base
     }
 
     /// The usable address range, for tests asserting a fiber runs on this stack.
