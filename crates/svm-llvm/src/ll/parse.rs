@@ -25,10 +25,13 @@
 //! another global); and **C++ exception handling** (`invoke`/`resume` terminators, `landingpad`,
 //! `extractvalue`/`insertvalue` — the `personality` clause is skipped); and **atomics**
 //! (`atomicrmw`/`cmpxchg`/`fence` + the `load atomic`/`store atomic` variants — syncscope + memory
-//! ordering). Not yet handled (the growth frontier): scalable-vector-specific ops, `blockaddress`/
-//! `indirectbr`, and literal-aggregate constants. Anything unhandled is a clean [`ParseError`]
-//! (fail-closed, re-verified downstream — §2a), never a
-//! miscompile.
+//! ordering). **Debug info (source-line half):** a metadata pre-pass ([`Parser::collect_di_metadata`])
+//! builds the `!DILocation`/`!DIFile`/scope-node table, and each instruction's `!dbg !N` resolves onto
+//! its `debugloc`; the `!DISubprogram` names feed [`parse_module_with_debug`]'s function-name table.
+//! Not yet handled (the growth frontier): the debug variable/type graph
+//! (`DILocalVariable`/`DIType`), scalable-vector-specific ops, `blockaddress`/`indirectbr`, and
+//! literal-aggregate constants. Anything unhandled is a clean [`ParseError`] (fail-closed, re-verified
+//! downstream — §2a), never a miscompile.
 
 use super::ast::*;
 use super::lex::{lex, Token};
@@ -57,10 +60,27 @@ type CallArgs = Vec<(Operand, Vec<ParameterAttribute>)>;
 
 /// Parse `.ll` source text into a [`Module`].
 pub fn parse_module(src: &str) -> PResult<Module> {
+    parse_module_with_debug(src).map(|(m, _)| m)
+}
+
+/// Parse `.ll` source text into a [`Module`] plus the recovered structured debug info (the §6
+/// function-name table + the type graph + module globals — the same [`crate::di::LlvmDebug`] the
+/// bitcode path threads; `None` for a non-`-g` module). The source-line half rides each instruction's
+/// `debugloc` on the returned module.
+pub fn parse_module_with_debug(src: &str) -> PResult<(Module, Option<crate::di::LlvmDebug>)> {
     let toks = lex(src)
         .map_err(|e| ParseError::new(0, format!("lex error at byte {}: {}", e.offset, e.msg)))?;
     let mut p = Parser::new(toks);
-    p.module()
+    p.collect_di_metadata();
+    let m = p.module()?;
+    let debug = super::debug::build(
+        &p.di_meta,
+        &p.global_dbg,
+        &p.dbg_intrinsics,
+        &m,
+        p.func_names,
+    );
+    Ok((m, debug))
 }
 
 /// The token cursor + the module-under-construction (the type interner lives in `module.types`).
@@ -74,6 +94,116 @@ struct Parser {
     /// base pointee). clang emits globals + functions before their uses, so populating this as we parse
     /// resolves every reference; a forward/unknown reference is a clean error (fail-closed).
     symbols: std::collections::BTreeMap<String, TypeRef>,
+    /// The `!N` debug-metadata table (`!DILocation`/`!DIFile`/scope nodes), collected in a pre-pass so
+    /// an instruction's `!dbg !N` — which forward-references the module-level nodes emitted *after* the
+    /// functions — resolves to a [`DebugLoc`] (the §6 source-line half).
+    di_meta: std::collections::BTreeMap<u64, DiNode>,
+    /// The `!dbg !N` id captured while parsing the current instruction's trailing metadata; consumed by
+    /// [`Self::instruction`] to attach the resolved [`DebugLoc`].
+    pending_dbg: Option<u64>,
+    /// `@linkage-name` → source name, from each defined function's `!dbg !DISubprogram(name:…)` — the
+    /// §6 function-name table (the structured-debug half the translator reads via the `di` argument).
+    func_names: std::collections::BTreeMap<String, String>,
+    /// `(global symbol, !dbg DIGlobalVariableExpression id)` in module order — the source globals the
+    /// type/variable-graph reader ([`super::debug`]) walks (matching the bitcode `di` walk's order).
+    global_dbg: Vec<(String, u64)>,
+    /// The current function's linkage name (for keying captured `dbg.*` intrinsics).
+    current_func: String,
+    /// `metadata` call operands captured while parsing the current call's argument list.
+    pending_meta_args: Vec<MetaArg>,
+    /// Captured `llvm.dbg.declare`/`dbg.value` intrinsics, in encounter order (the source-variable
+    /// order the bitcode `di` walk records).
+    dbg_intrinsics: Vec<DbgIntrinsic>,
+}
+
+/// One field value of a specialized debug-metadata node (only the first token of the value is kept;
+/// flag-sets like `spFlags: A | B` degrade to their first `Word`).
+#[derive(Clone)]
+pub(crate) enum MetaVal {
+    Int(u64),
+    Str(String),
+    /// A `!N` metadata reference.
+    Ref(u64),
+    /// A bareword (`tag: DW_TAG_…`, `encoding: DW_ATE_…`, `true`/`false`, …).
+    Word(String),
+}
+
+/// A debug-metadata node from the `!N =` table: either a specialized `!DIKind(field: value, …)` node
+/// (kept generically as its kind + field map, serving the source-line reader *and* the type/variable
+/// graph reader) or a `!{…}` tuple of `!N` references (a struct's members, a subroutine's types, …).
+pub(crate) enum DiNode {
+    Node {
+        kind: String,
+        fields: std::collections::HashMap<String, MetaVal>,
+    },
+    Tuple(Vec<u64>),
+}
+
+impl DiNode {
+    /// A field of a specialized node, or `None` if absent / this is a tuple.
+    pub(crate) fn field(&self, key: &str) -> Option<&MetaVal> {
+        match self {
+            DiNode::Node { fields, .. } => fields.get(key),
+            DiNode::Tuple(_) => None,
+        }
+    }
+    pub(crate) fn kind(&self) -> Option<&str> {
+        match self {
+            DiNode::Node { kind, .. } => Some(kind),
+            DiNode::Tuple(_) => None,
+        }
+    }
+}
+
+/// A captured `metadata` call operand's payload (the AST drops it to a payloadless `MetadataOperand`,
+/// so `dbg.declare`/`dbg.value` correlation is recovered from these instead).
+pub(crate) enum MetaArg {
+    /// A wrapped SSA value (`metadata ptr %2` / `metadata i32 %5`) — the alloca (declare) or value.
+    Value(Name),
+    /// A `!N` metadata reference (`metadata !25`) — the `!DILocalVariable`.
+    Ref(u64),
+    /// A constant / `poison` / inline node (`metadata !DIExpression()`) — no tracked correlation.
+    Other,
+}
+
+/// A captured `llvm.dbg.declare`/`llvm.dbg.value` call: the located value paired with its
+/// `!DILocalVariable` id, keyed by the enclosing function's linkage name. The variable/type-graph
+/// reader ([`super::debug`]) correlates `value` to an alloca ordinal (declare) or argument (value).
+pub(crate) struct DbgIntrinsic {
+    pub func: String,
+    /// `true` for `dbg.declare` (an address/alloca), `false` for `dbg.value` (an SSA value).
+    pub declare: bool,
+    /// The wrapped SSA value (`None` for a constant/`poison`/inline located value).
+    pub value: Option<Name>,
+    /// The `!DILocalVariable` metadata id.
+    pub var: u64,
+}
+
+impl MetaVal {
+    pub(crate) fn as_ref_id(&self) -> Option<u64> {
+        match self {
+            MetaVal::Ref(n) => Some(*n),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_int(&self) -> Option<u64> {
+        match self {
+            MetaVal::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        match self {
+            MetaVal::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_word(&self) -> Option<&str> {
+        match self {
+            MetaVal::Word(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 impl Parser {
@@ -92,6 +222,13 @@ impl Parser {
                 types: Types::new(),
             },
             symbols: std::collections::BTreeMap::new(),
+            di_meta: std::collections::BTreeMap::new(),
+            pending_dbg: None,
+            func_names: std::collections::BTreeMap::new(),
+            global_dbg: Vec::new(),
+            current_func: String::new(),
+            pending_meta_args: Vec::new(),
+            dbg_intrinsics: Vec::new(),
         }
     }
 
@@ -156,6 +293,58 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    // ---- debug metadata (source-line half) -----------------------------------------------------
+
+    /// Pre-pass: scan the whole token stream for module-level `!N = <node>` definitions and record the
+    /// `!DILocation`/`!DIFile`/scope nodes into [`Self::di_meta`]. Runs before [`Self::module`] so an
+    /// instruction's `!dbg !N` — the nodes are emitted *after* the functions — resolves. The pattern
+    /// `!N =` only occurs for these top-level definitions (an in-function `!dbg !N` is a `Meta` *not*
+    /// followed by `=`), so the scan is unambiguous.
+    fn collect_di_metadata(&mut self) {
+        let mut i = 0;
+        while i + 1 < self.toks.len() {
+            let is_def = matches!(self.toks.get(i), Some(Token::Meta(_)))
+                && self.toks.get(i + 1) == Some(&Token::Equals);
+            if !is_def {
+                i += 1;
+                continue;
+            }
+            let id = match self.toks.get(i) {
+                Some(Token::Meta(s)) => s.parse::<u64>().ok(),
+                _ => None,
+            };
+            let (node, next) = parse_di_node(&self.toks, i + 2);
+            if let (Some(id), Some(node)) = (id, node) {
+                self.di_meta.insert(id, node);
+            }
+            i = next.max(i + 2);
+        }
+    }
+
+    /// Resolve a `!dbg` metadata id to a [`DebugLoc`]: the `!DILocation` gives line/column, and its
+    /// `scope` node's `file:` edge reaches the `!DIFile` for filename/directory (the same fields the
+    /// bitcode reader's `DebugLoc` carries).
+    fn resolve_debug_loc(&self, id: u64) -> Option<DebugLoc> {
+        let loc = self.di_meta.get(&id)?;
+        if loc.kind() != Some("DILocation") {
+            return None;
+        }
+        let line = loc.field("line")?.as_int()? as u32;
+        let col = loc.field("column").and_then(MetaVal::as_int).unwrap_or(0) as u32;
+        // The lexical scope's `file:` edge reaches the `!DIFile`.
+        let scope = self.di_meta.get(&loc.field("scope")?.as_ref_id()?)?;
+        let file = self.di_meta.get(&scope.field("file")?.as_ref_id()?)?;
+        Some(DebugLoc {
+            line,
+            col: Some(col),
+            filename: file.field("filename")?.as_str()?.to_string(),
+            directory: file
+                .field("directory")
+                .and_then(MetaVal::as_str)
+                .map(String::from),
+        })
     }
 
     // ---- module --------------------------------------------------------------------------------
@@ -397,8 +586,20 @@ impl Parser {
             self.pos += 1; // `,`
             if self.eat_word("align") {
                 alignment = self.int_lit_u32()?;
+            } else if matches!(self.peek(), Some(Token::Meta(_))) {
+                // `!kind !N` metadata — capture the `!dbg` `DIGlobalVariableExpression` id (§6 globals).
+                let is_dbg = matches!(self.peek(), Some(Token::Meta(k)) if k == "dbg");
+                self.pos += 1; // `!kind`
+                if let Some(Token::Meta(v)) = self.peek() {
+                    if is_dbg {
+                        if let Ok(id) = v.parse::<u64>() {
+                            self.global_dbg.push((name.clone(), id));
+                        }
+                    }
+                    self.pos += 1;
+                }
             } else {
-                // section/comdat/metadata — skip this trailing clause to the next top-level item.
+                // section/comdat/… — skip this trailing clause to the next top-level item.
                 self.skip_to_toplevel_boundary();
                 break;
             }
@@ -464,6 +665,7 @@ impl Parser {
             other => return self.err(format!("expected function @name, found {other:?}")),
         };
         let (parameters, is_var_arg) = self.param_list()?;
+        self.current_func = name.clone();
         // Record `@name` → its function type, so a later `@name` operand (an address-of, not a direct
         // call) resolves to a `GlobalReference` carrying that pointee type.
         self.symbols.insert(
@@ -474,8 +676,23 @@ impl Parser {
                 is_var_arg,
             }),
         );
-        // Skip post-signature attributes/personality/etc. up to the opening `{`.
+        // Skip post-signature attributes/personality/etc. up to the opening `{`, capturing the
+        // `!dbg !N` subprogram attachment (→ the §6 source function name).
         while !matches!(self.peek(), Some(Token::LBrace) | None) {
+            if matches!(self.peek(), Some(Token::Meta(k)) if k == "dbg") {
+                if let Some(Token::Meta(v)) = self.peek2() {
+                    if let Some(src) = v
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|id| self.di_meta.get(&id))
+                        .filter(|n| n.kind() == Some("DISubprogram"))
+                        .and_then(|n| n.field("name"))
+                        .and_then(MetaVal::as_str)
+                    {
+                        self.func_names.insert(name.clone(), src.to_string());
+                    }
+                }
+            }
             self.pos += 1;
         }
         self.expect(&Token::LBrace)?;
@@ -646,15 +863,23 @@ impl Parser {
         // A `call` is handled first: it may have *no* `%dest =` (a `void` call), and an optional
         // `tail`/`musttail`/`notail` marker sits where an opcode otherwise would — both break the
         // "every instruction starts `%dest = <opcode>`" shape the rest of this function assumes.
+        // Reset the per-instruction `!dbg` capture; the trailing-metadata parse sets it if present.
+        self.pending_dbg = None;
         if self.at_call() {
-            return self.call_inst(next_unnamed).map(Instruction::Call);
+            let mut inst = Instruction::Call(self.call_inst(next_unnamed)?);
+            self.attach_pending_dbg(&mut inst);
+            return Ok(inst);
         }
         // `store`/`fence` are the other result-less instructions (no `%dest =`).
         if matches!(self.peek(), Some(Token::Word(w)) if w == "store") {
-            return self.store_inst().map(Instruction::Store);
+            let mut inst = Instruction::Store(self.store_inst()?);
+            self.attach_pending_dbg(&mut inst);
+            return Ok(inst);
         }
         if matches!(self.peek(), Some(Token::Word(w)) if w == "fence") {
-            return self.fence_inst().map(Instruction::Fence);
+            let mut inst = Instruction::Fence(self.fence_inst()?);
+            self.attach_pending_dbg(&mut inst);
+            return Ok(inst);
         }
         // `%dest =` prefix (every other instruction modeled here produces a value).
         let dest = self.instr_dest(next_unnamed)?;
@@ -728,7 +953,17 @@ impl Parser {
             other => return self.err(format!("instruction `{other}` not yet supported")),
         };
         self.skip_trailing_metadata();
+        let mut i = i;
+        self.attach_pending_dbg(&mut i);
         Ok(i)
+    }
+
+    /// Attach the source location captured from this instruction's `!dbg !N` (via
+    /// [`Self::pending_dbg`]), resolved through the `!DILocation` metadata graph.
+    fn attach_pending_dbg(&mut self, inst: &mut Instruction) {
+        if let Some(id) = self.pending_dbg.take() {
+            inst.set_debug_loc(self.resolve_debug_loc(id));
+        }
     }
 
     /// The `%dest =` of a value-producing instruction; advances the unnamed counter for an unnamed dest.
@@ -758,9 +993,14 @@ impl Parser {
     /// Skip a trailing `, !dbg !N` / `, !tbaa !M` … metadata list attached to an instruction.
     fn skip_trailing_metadata(&mut self) {
         while self.peek() == Some(&Token::Comma) && matches!(self.peek2(), Some(Token::Meta(_))) {
+            let is_dbg = matches!(self.peek2(), Some(Token::Meta(k)) if k == "dbg");
             self.pos += 2; // `,` `!kind`
                            // the metadata value (`!N` or an inline `!{…}`); for `!N` it's a single Meta token.
-            if matches!(self.peek(), Some(Token::Meta(_))) {
+            if let Some(Token::Meta(v)) = self.peek() {
+                // Capture the `!dbg !N` id so `instruction()` can attach the resolved source location.
+                if is_dbg {
+                    self.pending_dbg = v.parse::<u64>().ok();
+                }
                 self.pos += 1;
             }
         }
@@ -1844,6 +2084,7 @@ impl Parser {
         };
         self.expect_word("call")?;
         let (function, function_ty, arguments) = self.call_signature()?;
+        self.capture_dbg_intrinsic(&function);
         self.skip_trailing_metadata();
         Ok(Call {
             function,
@@ -1853,6 +2094,38 @@ impl Parser {
             is_tail_call,
             debugloc: None,
         })
+    }
+
+    /// If the just-parsed call is `@llvm.dbg.declare`/`@llvm.dbg.value`, record its captured operands
+    /// (`pending_meta_args[0]` = the located value, `[1]` = the `!DILocalVariable`) for the §6
+    /// variable reader — the payload the AST otherwise drops as a `MetadataOperand`.
+    fn capture_dbg_intrinsic(&mut self, function: &Either<InlineAssembly, Operand>) {
+        let Either::Right(Operand::ConstantOperand(cr)) = function else {
+            return;
+        };
+        let Constant::GlobalReference {
+            name: Name::Name(s),
+            ..
+        } = cr.as_ref()
+        else {
+            return;
+        };
+        let declare = s.as_str() == "llvm.dbg.declare";
+        if (!declare && s.as_str() != "llvm.dbg.value") || self.pending_meta_args.len() < 2 {
+            return;
+        }
+        if let MetaArg::Ref(var) = self.pending_meta_args[1] {
+            let value = match &self.pending_meta_args[0] {
+                MetaArg::Value(n) => Some(n.clone()),
+                _ => None,
+            };
+            self.dbg_intrinsics.push(DbgIntrinsic {
+                func: self.current_func.clone(),
+                declare,
+                value,
+                var,
+            });
+        }
     }
 
     /// The shared `call`/`invoke` body *after* the opcode keyword: `[fmf] [cconv/ret-attrs]
@@ -1914,6 +2187,7 @@ impl Parser {
     /// the translator only reads the operand) alongside the parsed types (to reconstruct the fn type).
     fn call_arg_list(&mut self) -> PResult<(CallArgs, Vec<TypeRef>)> {
         self.expect(&Token::LParen)?;
+        self.pending_meta_args.clear();
         let mut args = Vec::new();
         let mut types = Vec::new();
         if self.eat(&Token::RParen) {
@@ -1921,16 +2195,53 @@ impl Parser {
         }
         loop {
             let ty = self.type_()?;
-            self.skip_arg_attrs();
-            let val = self.value_as_operand(&ty)?;
+            if matches!(ty.as_ref(), Type::MetadataType) {
+                // A `metadata` operand (`metadata ptr %2` / `metadata !25` / `metadata !DIExpr()`) —
+                // the AST carries it payloadless; the payload is captured for `dbg.*` correlation.
+                let ma = self.metadata_operand_value()?;
+                self.pending_meta_args.push(ma);
+                args.push((Operand::MetadataOperand, Vec::new()));
+            } else {
+                self.skip_arg_attrs();
+                let val = self.value_as_operand(&ty)?;
+                args.push((val, Vec::new()));
+            }
             types.push(ty);
-            args.push((val, Vec::new()));
             if !self.eat(&Token::Comma) {
                 break;
             }
         }
         self.expect(&Token::RParen)?;
         Ok((args, types))
+    }
+
+    /// The value wrapped by a `metadata` call operand (after the `metadata` keyword): a typed SSA value
+    /// `<ty> <val>`, a `!N` reference, or an inline `!Kind(…)` node.
+    fn metadata_operand_value(&mut self) -> PResult<MetaArg> {
+        match self.peek() {
+            Some(Token::Meta(_)) => {
+                if matches!(self.peek2(), Some(Token::LParen)) {
+                    // Inline `!Kind(…)` — skip its balanced parens.
+                    self.pos += 1; // `!kind`
+                    self.skip_balanced_parens();
+                    Ok(MetaArg::Other)
+                } else {
+                    let id = match self.bump() {
+                        Some(Token::Meta(s)) => s.parse::<u64>().ok(),
+                        _ => None,
+                    };
+                    Ok(id.map(MetaArg::Ref).unwrap_or(MetaArg::Other))
+                }
+            }
+            _ => {
+                let ty = self.type_()?;
+                let val = self.value_as_operand(&ty)?;
+                Ok(match val {
+                    Operand::LocalOperand { name, .. } => MetaArg::Value(name),
+                    _ => MetaArg::Other,
+                })
+            }
+        }
     }
 
     /// The `( <ty>, … [, ...] )` of an explicit function-pointer type in a call.
@@ -2147,6 +2458,10 @@ impl Parser {
                 self.pos += 1;
                 self.module.types.fp(FPType::Double)
             }
+            "metadata" => {
+                self.pos += 1;
+                TypeRef::new(Type::MetadataType)
+            }
             other => return self.err(format!("type `{other}` not yet supported")),
         };
         Ok(ty)
@@ -2154,6 +2469,99 @@ impl Parser {
 }
 
 // ---- small parsing helpers ---------------------------------------------------------------------
+
+/// Parse a metadata definition body starting just after `!N =` (at `toks[start]`) into a [`DiNode`],
+/// returning it plus the index just past the node. A `distinct` prefix, then a specialized
+/// `!Kind(fields)` node, are handled; a `!{…}` tuple / anything else is skipped (`None`).
+fn parse_di_node(toks: &[Token], start: usize) -> (Option<DiNode>, usize) {
+    let mut j = start;
+    if matches!(toks.get(j), Some(Token::Word(w)) if w == "distinct") {
+        j += 1;
+    }
+    match (toks.get(j), toks.get(j + 1)) {
+        // `!Kind( … )` — a specialized DI node.
+        (Some(Token::Meta(kind)), Some(Token::LParen)) => {
+            let kind = kind.clone();
+            let (fields, next) = scan_node_fields(toks, j + 1);
+            (Some(DiNode::Node { kind, fields }), next)
+        }
+        // `!{ !a, !b, … }` — a tuple of metadata references (a struct's members, a fn's types, …).
+        (Some(Token::Meta(_)), Some(Token::LBrace)) => {
+            let (refs, next) = scan_tuple_refs(toks, j + 1);
+            (Some(DiNode::Tuple(refs)), next)
+        }
+        // Any other RHS (a bare `!ref`, an `i32 7` module-flag operand, …): advance one token.
+        _ => (None, j + 1),
+    }
+}
+
+/// Scan a specialized node's `( key: value, … )`, returning each depth-1 `key` → its first value
+/// token (as a [`MetaVal`]) plus the index just past the matching `)`.
+fn scan_node_fields(
+    toks: &[Token],
+    lparen: usize,
+) -> (std::collections::HashMap<String, MetaVal>, usize) {
+    let mut fields = std::collections::HashMap::new();
+    let mut j = lparen + 1;
+    let mut depth = 1usize;
+    while depth > 0 {
+        match toks.get(j) {
+            None => break,
+            Some(Token::LParen) => {
+                depth += 1;
+                j += 1;
+            }
+            Some(Token::RParen) => {
+                depth -= 1;
+                j += 1;
+            }
+            Some(Token::Word(key)) if depth == 1 && toks.get(j + 1) == Some(&Token::Colon) => {
+                if let Some(v) = toks.get(j + 2).and_then(token_meta_val) {
+                    fields.insert(key.clone(), v);
+                }
+                j += 3;
+            }
+            _ => j += 1,
+        }
+    }
+    (fields, j)
+}
+
+/// A token as a metadata field value (`None` for structural tokens like `(`/`,`/inline `!Kind(...)`).
+fn token_meta_val(t: &Token) -> Option<MetaVal> {
+    match t {
+        Token::Int(s) => s.parse::<u64>().ok().map(MetaVal::Int),
+        Token::Str(s) => Some(MetaVal::Str(
+            String::from_utf8_lossy(&super::lex::unescape(s)).into_owned(),
+        )),
+        Token::Meta(s) => s.parse::<u64>().ok().map(MetaVal::Ref),
+        Token::Word(s) => Some(MetaVal::Word(s.clone())),
+        _ => None,
+    }
+}
+
+/// Scan a `{ !a, !b, … }` metadata tuple's `!N` references, returning them plus the index just past
+/// the matching `}`.
+fn scan_tuple_refs(toks: &[Token], lbrace: usize) -> (Vec<u64>, usize) {
+    let mut refs = Vec::new();
+    let mut j = lbrace + 1;
+    let mut depth = 1usize;
+    while depth > 0 {
+        match toks.get(j) {
+            None => break,
+            Some(Token::LBrace) => depth += 1,
+            Some(Token::RBrace) => depth -= 1,
+            Some(Token::Meta(s)) if depth == 1 => {
+                if let Ok(id) = s.parse::<u64>() {
+                    refs.push(id);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    (refs, j)
+}
 
 /// A `%local`/`@global` name string → [`Name`]: all-digits ⇒ `Number`, else a textual `Name`.
 fn name_from_local(s: &str) -> Name {

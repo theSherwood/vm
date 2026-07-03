@@ -16,6 +16,7 @@
 //! readers → identical svm-ir) before it becomes the default; see `tests/translate.rs`.
 
 pub mod ast;
+pub mod debug;
 pub mod lex;
 pub mod parse;
 

@@ -7728,11 +7728,13 @@ fn compile_cpp(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> 
 }
 
 /// The parity assertion core: both readers must translate to byte-identical svm-ir + `entry_sp`.
-fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) {
+/// Returns the (identical) svm-ir text so debug-info callers can sanity-check it's non-trivial.
+fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) -> String {
     let from_bc = svm_llvm::translate_bc_path(bc).expect("translate via bitcode");
     let from_ll = svm_llvm::translate_ll_path(ll).expect("translate via textual .ll");
+    let bc_text = svm_text::print_module(&from_bc.module);
     assert_eq!(
-        svm_text::print_module(&from_bc.module),
+        bc_text,
         svm_text::print_module(&from_ll.module),
         "svm-ir mismatch between the bitcode and textual readers for `{name}`",
     );
@@ -7740,6 +7742,7 @@ fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) {
         from_bc.entry_sp, from_ll.entry_sp,
         "entry_sp mismatch for `{name}`",
     );
+    bc_text
 }
 
 /// Assert the bitcode and textual readers translate `src` to byte-identical svm-ir (their
@@ -7760,6 +7763,130 @@ fn assert_ll_parity_cpp(name: &str, src: &str) {
         return;
     };
     assert_paths_parity(name, &bc, &ll);
+}
+
+/// Compile C with debug info at the given `opt`/`g` levels. The source filename is embedded in
+/// `!DIFile`, so *both* compiles must use the same `.c` path for the recovered debug paths to match.
+fn compile_debug(
+    name: &str,
+    src: &str,
+    opt: &str,
+    g: &str,
+    emit: &str,
+    ext: &str,
+) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}_g.c", std::process::id(), name));
+    let out = dir.join(format!(
+        "svm_llvm_{}_{}_g.{}",
+        std::process::id(),
+        name,
+        ext
+    ));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args([opt, g, "-emit-llvm", emit])
+        .arg(&c)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Assert both readers recover identical debug info at the given `opt`/`g` levels — and that the
+/// output actually carries a `DIType` graph (guards against a trivial pass where neither reader
+/// produced any type/variable info).
+fn assert_ll_parity_debug_at(name: &str, src: &str, opt: &str, g: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_debug(name, src, opt, g, "-c", "bc"),
+        compile_debug(name, src, opt, g, "-S", "ll"),
+    ) else {
+        return;
+    };
+    let text = assert_paths_parity(name, &bc, &ll);
+    assert!(
+        text.contains("debug.type "),
+        "`{name}` produced no debug type graph — the debug parity check is trivial",
+    );
+}
+
+/// Full `-O0 -g` debug info: source positions **and** the `DIType` graph + `DILocalVariable`s
+/// (`llvm.dbg.declare` locals) + module globals — the whole §6 waist the bitcode `di` walk produces.
+fn assert_ll_parity_debug(name: &str, src: &str) {
+    assert_ll_parity_debug_at(name, src, "-O0", "-g");
+}
+
+#[test]
+fn ll_parity_debug_locals() {
+    // `-O0 -g`: each source local (params + `s`) becomes an `alloca` + `llvm.dbg.declare`. The reader
+    // must parse the `metadata`-typed call operands, correlate each declare's address to its alloca
+    // *ordinal* (→ a `Window` slot), and read the `!DILocalVariable` name/type — matching the bitcode
+    // `di` walk. Flat function (no nested block) ⇒ subprogram-scoped vars (`scope: None`).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_loc",
+        "int add3(int a, int b, int c){ int s = a + b + c; return s; }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_lexical_scope() {
+    // A shadowed variable in a nested block: the inner `s` is scoped to a `!DILexicalBlock`, so its
+    // §6 scope is `(decl_line, block_end_line)` — the block's end line derived from the max
+    // `!DILocation` line in its scope subtree (a `DILexicalBlock` carries no end line).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_scope",
+        "int f(int x){\n\
+         \x20 int s = x;\n\
+         \x20 { int s = x + 10; s = s * 2; return s; }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_args_ssa() {
+    // `-Og -g`: with locals promoted to SSA, source args are tracked by `llvm.dbg.value(metadata i32
+    // %k, …)` instead of `dbg.declare`. The reader must correlate the value to argument `k` (→ `Arg`,
+    // which the translator resolves to an `SsaList` over the arg's live range) rather than an alloca.
+    assert_ll_parity_debug_at(
+        "ll_parity_dbg_arg",
+        "int square(int x){ return x * x; }\n\
+         int lin(int a, int b){ return a * 3 + b; }\n",
+        "-Og",
+        "-g",
+    );
+}
+
+#[test]
+fn ll_parity_debug_types_globals() {
+    // `-gline-tables-only` carries no type graph, so use full `-O0 -g` but keep the only function
+    // *local-free* (no `dbg.declare`, so `di.vars` stays empty — the local-var half is a later slice).
+    // The globals exercise the `DIType` interner: base `int`, a `struct` aggregate (with fields), and
+    // an array — all must intern in the same order + shape as the bitcode `di` walk.
+    assert_ll_parity_debug(
+        "ll_parity_dbg_tg",
+        "struct Point { int x; int y; };\n\
+         int counter = 5;\n\
+         struct Point origin;\n\
+         int table[3] = {1, 2, 3};\n\
+         int getcnt(void){ return counter; }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_source_lines() {
+    // `-gline-tables-only`: each instruction's `!dbg !DILocation` (source line/column, file via the
+    // scope's `!DIFile`) + the `!DISubprogram` function name must match the bitcode reader.
+    assert_ll_parity_debug(
+        "ll_parity_dbg",
+        "int add(int a, int b){ int s = a + b; return s * 2; }\n\
+         int use(int x){ return add(x, x + 1); }\n",
+    );
 }
 
 #[test]
