@@ -1750,9 +1750,10 @@ enum PendingJit {
 /// guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
 /// [`Domain`], and — for a vCPU carrying a powerbox — the §14 domain ops (`spawn_coroutine_module`
 /// serviced internally; `instantiate`/`instantiate_module` surfacing [`VcpuEvent::Instantiate`], the
-/// child a [`Vcpu::new_confined_child`] on its own Worker). By default carries a deny-all `Host`, so
-/// an *invoked* unit that itself makes a `cap.call` is out of scope — host I/O stays the
-/// orchestrator's job.
+/// child a [`Vcpu::new_confined_child`] on its own Worker). By default carries a deny-all `Host` (an
+/// I/O `cap.call` is an inert `CapFault`); attach the run's shared powerbox with
+/// [`with_shared_host`](Vcpu::with_shared_host) (THREADS.md 4d) and `cap.call` host I/O works from
+/// every vCPU sharing it, serialized per call — `drive_parallel`'s 4c-host model.
 pub struct Vcpu<'p> {
     prog: &'p VcpuProgram,
     vt: VTask,
@@ -1762,6 +1763,14 @@ pub struct Vcpu<'p> {
     mem: Option<Mem>,
     fuel: u64,
     host: Host,
+    /// The run's **shared powerbox** (THREADS.md 4d): when set (see
+    /// [`with_shared_host`](Vcpu::with_shared_host)), every host access — `cap.call` dispatch, §14
+    /// module/authority resolution, an invoked §22 unit's calls — goes through this `Mutex<Host>`
+    /// instead of the owned `host`, exactly [`drive_parallel`]'s 4c-host model: each `cap.call` locks
+    /// only for its own dispatch, so compute/atomics between calls stay lock-free, and host I/O
+    /// (stream writes, clock) works from every vCPU of the run. `None` ⇒ the owned (default deny-all)
+    /// host, as before.
+    shared_host: Option<&'p std::sync::Mutex<Host>>,
     /// A §14 **confined child**'s own domain (its natural table over the shared source — no parent
     /// §22 install slots); `None` for a root / `thread.spawn` child, which dispatch through
     /// [`VcpuProgram::dom`]'s table (`prog.dom`). The `source` `Arc` is the same either way.
@@ -1850,6 +1859,7 @@ impl<'p> Vcpu<'p> {
             mem,
             fuel: u64::MAX,
             host,
+            shared_host: None,
             own_dom: None,
             prog,
             pending: None,
@@ -1920,12 +1930,24 @@ impl<'p> Vcpu<'p> {
             mem,
             fuel,
             host,
+            shared_host: None,
             own_dom: Some(own_dom),
             prog,
             pending: None,
             pending_jit: None,
             trap: None,
         })
+    }
+
+    /// Attach the run's **shared powerbox** (THREADS.md 4d — builder-style, on any constructor's
+    /// result): every host access of this vCPU then goes through `host` under its lock, so `cap.call`
+    /// (host I/O), §14 module/authority resolution, and invoked §22 units work from every vCPU of the
+    /// run sharing it — the resumable counterpart of [`drive_parallel`]'s 4c-host shared `Mutex<Host>`.
+    /// The embedder grants into the `Host` *before* the run (handle order is deterministic) and reads
+    /// its state (e.g. `stdout`) after; per-call serialization is the documented 4c-host model.
+    pub fn with_shared_host(mut self, host: &'p std::sync::Mutex<Host>) -> Vcpu<'p> {
+        self.shared_host = Some(host);
+        self
     }
 
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
@@ -1943,14 +1965,18 @@ impl<'p> Vcpu<'p> {
         // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `Instantiate` (+ `done`/`trap`).
         loop {
             // A §14 confined child dispatches through its OWN domain (own natural table, no parent
-            // install slots); everything else through the program's shared one.
+            // install slots); everything else through the program's shared one. Host access goes
+            // through the run's shared powerbox when attached (4d), else the owned host.
             let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
             let mut ctx = RunCtx {
                 table: &dom.table,
                 fuel: &mut self.fuel,
                 mem: &mut self.mem,
                 durable: false,
-                host: HostCell::Excl(&mut self.host),
+                host: match self.shared_host {
+                    Some(m) => HostCell::Shared(m),
+                    None => HostCell::Excl(&mut self.host),
+                },
             };
             let stop = step_vcpu(
                 &mut self.vt,
@@ -2159,9 +2185,17 @@ impl<'p> Vcpu<'p> {
         quota: i64,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
-        let (cfuncs, cmem_log2, cdata) = {
-            let g = self.host.resolve_module(mh)?;
-            (g.funcs.clone(), g.memory_log2, g.data.clone())
+        // Resolve the granted module from the run's powerbox (the shared one when attached).
+        let (cfuncs, cmem_log2, cdata) = match self.shared_host {
+            Some(m) => {
+                let g = m.lock().unwrap_or_else(|e| e.into_inner());
+                let g = g.resolve_module(mh)?;
+                (g.funcs.clone(), g.memory_log2, g.data.clone())
+            }
+            None => {
+                let g = self.host.resolve_module(mh)?;
+                (g.funcs.clone(), g.memory_log2, g.data.clone())
+            }
         };
         let child_compiled = compile_module(&cfuncs).ok_or(Trap::Malformed)?;
         let ok_entry = child_compiled
@@ -2231,9 +2265,21 @@ impl<'p> Vcpu<'p> {
         dst: u32,
     ) {
         let isz = isize;
-        // Resolve the granted module from this vCPU's own powerbox (forged/closed handle → trap).
-        let (cfuncs, cmem_log2, cdata) = match self.host.resolve_module(mh) {
-            Ok(g) => (g.funcs.clone(), g.memory_log2, g.data.clone()),
+        // Resolve the granted module from the run's powerbox — the shared one when attached, else
+        // this vCPU's own (forged/closed handle → trap).
+        let resolved = match self.shared_host {
+            Some(m) => {
+                let g = m.lock().unwrap_or_else(|e| e.into_inner());
+                g.resolve_module(mh)
+                    .map(|g| (g.funcs.clone(), g.memory_log2, g.data.clone()))
+            }
+            None => self
+                .host
+                .resolve_module(mh)
+                .map(|g| (g.funcs.clone(), g.memory_log2, g.data.clone())),
+        };
+        let (cfuncs, cmem_log2, cdata) = match resolved {
+            Ok(parts) => parts,
             Err(t) => {
                 self.trap = Some(t);
                 return;
@@ -2442,13 +2488,20 @@ impl<'p> Vcpu<'p> {
         // `&mut self.fuel/mem/host` fields the invoke needs, so the borrows split.
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
         let umod = dom.source.push(unit);
+        // The invoked unit runs over the run's powerbox — the shared one when attached (its
+        // `cap.call`s then serialize per-call like every other vCPU's, matching `drive_parallel`),
+        // else this vCPU's owned (default deny-all) host.
+        let mut cell = match self.shared_host {
+            Some(m) => HostCell::Shared(m),
+            None => HostCell::Excl(&mut self.host),
+        };
         match run_invoke(
             dom,
             umod,
             &child_args,
             &mut self.fuel,
             &mut self.mem,
-            &mut HostCell::Excl(&mut self.host),
+            &mut cell,
         ) {
             Ok(vals) => {
                 for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
