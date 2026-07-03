@@ -1193,18 +1193,28 @@ can differ from native by one digit — a pre-existing `dtoa_fix` limit, not the
 it. This unblocks running **Lua's own test suite** (self-validating, the roadmap's gold standard) — the
 next Lua slice.
 
-### Lua's own test suite — ACHIEVED ✅ (`math.lua` + 3 more files, all three engines)
-**Goal (met).** Four **unmodified files from the official Lua 5.4.7 distribution's own test suite** run
-through the whole VM: the dense **`testes/math.lua`** (its own fixture `lua_math.bc` / `tests/lua_math.rs`)
-and `testes/vararg.lua` + `testes/bwcoercion.lua` + `testes/pm.lua` (`lua_testsuite.bc` /
-`tests/lua_testsuite.rs`) — each loaded as its own chunk under `pcall`, one fresh `lua_State` per file.
-A Lua test signals failure by raising (an `assert`); a clean **exit 0** means every `assert` held,
-**identical to native Lua** (the suite's own pass/fail contract). Same outcome on the tree-walker,
-bytecode, and JIT. The files were chosen as self-contained (no `require`/`os`/`io`/`debug`/`coroutine`,
-no internal `T` module): `math` (all of integer/float arithmetic, conversions, `//`/`%`, float↔integer
-order incl. every NaN corner, the transcendentals, `modf`, `string.format`, decimal + hex float
-literals, `math.random`), `vararg` (`...`/`select`/`table.unpack`), `bwcoercion` (string↔number bitwise
-coercions, `_ENV = nil`), and `pm` (the full pattern-matching engine).
+### Lua's own test suite — ACHIEVED ✅ (`math.lua` + `utf8.lua` + 3 more files, all three engines)
+**Goal (met).** Five **unmodified files from the official Lua 5.4.7 distribution's own test suite** run
+through the whole VM: the dense **`testes/math.lua`** (fixture `lua_math.bc` / `tests/lua_math.rs`), the
+full **`testes/utf8.lua`** (`lua_utf8.bc` / `tests/lua_utf8.rs`), and `testes/vararg.lua` +
+`testes/bwcoercion.lua` + `testes/pm.lua` (`lua_testsuite.bc` / `tests/lua_testsuite.rs`) — each loaded
+as its own chunk under `pcall`, one fresh `lua_State` per file. A Lua test signals failure by raising
+(an `assert`); a clean **exit 0** means every `assert` held, **identical to native Lua** (the suite's
+own pass/fail contract — each file's harness also runs green natively as the oracle). Same outcome on
+the tree-walker, bytecode, and JIT. The files were chosen as self-contained (no `os`/`io`/`debug`/
+`coroutine`, no internal `T` module): `math` (all of integer/float arithmetic, conversions, `//`/`%`,
+float↔integer order incl. every NaN corner, the transcendentals, `modf`, `string.format`, decimal + hex
+float literals, `math.random`), `utf8` (the whole `utf8` library — `char`/`codepoint`/`len`/`offset`/
+`codes`/`charpattern`, strict vs. non-strict decoding across all 1–6-byte sequence sizes, surrogate/
+overlong rejection, `\u{…}` escapes), `vararg` (`...`/`select`/`table.unpack`), `bwcoercion`
+(string↔number bitwise coercions, `_ENV = nil`), and `pm` (the full pattern-matching engine).
+
+**`require`.** `utf8.lua` opens with `local utf8 = require'utf8'` — the first file to need `require`.
+Stock `loadlib.c`'s file and C-library searchers need a filesystem/dynamic loader the on-ramp does not
+provide (and can never run for an already-loaded module), so the harness installs a **minimal `require`**
+returning `_LOADED[name]` — exactly stock `require`'s fast path for a `luaL_requiref`'d library — and the
+official file runs unmodified. No translator or libc change was needed: the four fixes below (landed for
+`math.lua`) plus the existing shim already cover `utf8.lua` end to end.
 
 **Four real translator/library fixes this forced** (each independently valuable, each gated on all three
 engines + native):
@@ -1230,8 +1240,8 @@ engines + native):
   (`lua_testsuite_trig.c`) the base libm lacks, and `localeconv` (Lua reads `decimal_point` when
   appending `.0` to an integer-valued float in `tostring`).
 
-**Remaining** for a *full* suite: `utf8.lua` needs `require` (the package loader); the
-`os`/`io`/`coroutine`/`debug` files need those libraries + a filesystem. Each is a follow-on slice.
+**Remaining** for a *full* suite: the `os`/`io`/`coroutine`/`debug` files need those libraries + a
+filesystem. Each is a follow-on slice.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**

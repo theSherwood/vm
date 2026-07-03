@@ -171,8 +171,32 @@ forced: the guest `strtod` now parses **hex floats** (`0x1.8p3`, Lua's hex-float
 predicates (`emit_fcmp`), which Lua's `luaV_flttointeger` relies on. The guest shim adds real fdlibm
 `asin`/`acos`/`atan`/`atan2`/`modf` (`lua_testsuite_trig.c`) that the base libm lacks.
 
-Still out of reach: `utf8.lua` needs `require` (the package loader); the `os`/`io`/`coroutine`/`debug`
-files need those libraries + a filesystem. Those are follow-ups.
+Still out of reach: the `os`/`io`/`coroutine`/`debug` files need those libraries + a filesystem. Those
+are follow-ups.
+
+# Lua utf8.lua fixture
+
+`lua_utf8.bc` runs the official **`testes/utf8.lua`** (embedded in `lua_utf8_tests.c`) through the whole
+VM with base/`string`/`table`/`math`/`utf8` open. It is the full `utf8` library workout:
+`utf8.char`/`codepoint`/`len`/`offset`/`codes`/`charpattern`, strict vs. `nonstrict` decoding across
+every sequence size (1–6 bytes, up to the original-UTF-8 `0x7FFFFFFF`), surrogate and overlong
+rejection, `utf8.len` error positions, `utf8.codes` iteration errors, the `\u{…}` string escapes
+(round-tripped through `load`), and `string.gmatch(s, utf8.charpattern)`. Test `tests/lua_utf8.rs`
+asserts `Returned([I32(0)])` on all three engines; the same harness+file built natively also exits 0
+(the differential oracle).
+
+This is the first fixture to need **`require`**: `utf8.lua` opens with `local utf8 = require'utf8'`.
+Rather than compile stock `loadlib.c` — whose file and C-library searchers need a filesystem/dynamic
+loader the on-ramp does not have, and can never run for a preloaded module — the harness
+(`lua_utf8_harness.c`) installs a **minimal `require`** that returns `_LOADED[name]` (where
+`luaL_requiref` records every opened library) and raises otherwise. That is exactly stock `require`'s
+fast path for an already-loaded module, so `utf8.lua` runs unmodified. No translator or libc change was
+needed — the earlier `fcmp`/narrow-signed-op/hex-`strtod` fixes plus the existing shim cover it.
+
+## Regenerating (utf8.lua)
+
+Same as the test-suite fixture below, but with `lua_utf8_harness.c` (adds the `require`) and
+`lua_utf8_tests.c` (embeds only `utf8.lua`, count 1); `lutf8lib` stays in `LIBS`.
 
 # Lua math.lua fixture
 
