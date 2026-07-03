@@ -7726,6 +7726,22 @@ fn assert_ll_parity_debug(name: &str, src: &str) {
 }
 
 #[test]
+fn ll_parity_debug_types_globals() {
+    // `-gline-tables-only` carries no type graph, so use full `-O0 -g` but keep the only function
+    // *local-free* (no `dbg.declare`, so `di.vars` stays empty — the local-var half is a later slice).
+    // The globals exercise the `DIType` interner: base `int`, a `struct` aggregate (with fields), and
+    // an array — all must intern in the same order + shape as the bitcode `di` walk.
+    assert_ll_parity_debug(
+        "ll_parity_dbg_tg",
+        "struct Point { int x; int y; };\n\
+         int counter = 5;\n\
+         struct Point origin;\n\
+         int table[3] = {1, 2, 3};\n\
+         int getcnt(void){ return counter; }\n",
+    );
+}
+
+#[test]
 fn ll_parity_debug_source_lines() {
     // `-gline-tables-only`: each instruction's `!dbg !DILocation` (source line/column, file via the
     // scope's `!DIFile`) + the `!DISubprogram` function name must match the bitcode reader.

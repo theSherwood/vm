@@ -263,12 +263,8 @@ pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 /// coverage), packaged as a [`di::LlvmDebug`] and threaded through the same `di` argument the bitcode
 /// path uses. The variable/type graph (`DILocalVariable`/`DIType`) is a later slice.
 pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
-    let (m, func_names) =
+    let (m, di) =
         ll::parse::parse_module_with_debug(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
-    let di = (!func_names.is_empty()).then(|| di::LlvmDebug {
-        func_names: func_names.into_iter().collect(),
-        ..Default::default()
-    });
     translate_impl(&m, di.as_ref(), None)
 }
 

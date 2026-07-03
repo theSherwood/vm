@@ -63,18 +63,18 @@ pub fn parse_module(src: &str) -> PResult<Module> {
     parse_module_with_debug(src).map(|(m, _)| m)
 }
 
-/// Parse `.ll` source text into a [`Module`] plus the recovered `@linkage-name → source-name` table
-/// (the §6 function-name half of the structured debug info; empty for a non-`-g` module). The
-/// source-line half rides each instruction's `debugloc` on the returned module.
-pub fn parse_module_with_debug(
-    src: &str,
-) -> PResult<(Module, std::collections::BTreeMap<String, String>)> {
+/// Parse `.ll` source text into a [`Module`] plus the recovered structured debug info (the §6
+/// function-name table + the type graph + module globals — the same [`crate::di::LlvmDebug`] the
+/// bitcode path threads; `None` for a non-`-g` module). The source-line half rides each instruction's
+/// `debugloc` on the returned module.
+pub fn parse_module_with_debug(src: &str) -> PResult<(Module, Option<crate::di::LlvmDebug>)> {
     let toks = lex(src)
         .map_err(|e| ParseError::new(0, format!("lex error at byte {}: {}", e.offset, e.msg)))?;
     let mut p = Parser::new(toks);
     p.collect_di_metadata();
     let m = p.module()?;
-    Ok((m, p.func_names))
+    let debug = super::debug::build(&p.di_meta, &p.global_dbg, p.func_names);
+    Ok((m, debug))
 }
 
 /// The token cursor + the module-under-construction (the type interner lives in `module.types`).
@@ -98,25 +98,75 @@ struct Parser {
     /// `@linkage-name` → source name, from each defined function's `!dbg !DISubprogram(name:…)` — the
     /// §6 function-name table (the structured-debug half the translator reads via the `di` argument).
     func_names: std::collections::BTreeMap<String, String>,
+    /// `(global symbol, !dbg DIGlobalVariableExpression id)` in module order — the source globals the
+    /// type/variable-graph reader ([`super::debug`]) walks (matching the bitcode `di` walk's order).
+    global_dbg: Vec<(String, u64)>,
 }
 
-/// A debug-metadata node, reduced to what the source-line reader needs. Other kinds (`!DIBasicType`,
-/// `!{…}` tuples, module flags) are collected as nothing.
-enum DiNode {
-    /// `!DILocation(line, column, scope)` — a source position pointing at its lexical `scope`.
-    Location { line: u32, col: u32, scope: u64 },
-    /// `!DIFile(filename, directory)`.
-    File {
-        filename: String,
-        directory: Option<String>,
+/// One field value of a specialized debug-metadata node (only the first token of the value is kept;
+/// flag-sets like `spFlags: A | B` degrade to their first `Word`).
+#[derive(Clone)]
+pub(crate) enum MetaVal {
+    Int(u64),
+    Str(String),
+    /// A `!N` metadata reference.
+    Ref(u64),
+    /// A bareword (`tag: DW_TAG_…`, `encoding: DW_ATE_…`, `true`/`false`, …).
+    Word(String),
+}
+
+/// A debug-metadata node from the `!N =` table: either a specialized `!DIKind(field: value, …)` node
+/// (kept generically as its kind + field map, serving the source-line reader *and* the type/variable
+/// graph reader) or a `!{…}` tuple of `!N` references (a struct's members, a subroutine's types, …).
+pub(crate) enum DiNode {
+    Node {
+        kind: String,
+        fields: std::collections::HashMap<String, MetaVal>,
     },
-    /// A scope node carrying a `file:` edge (`!DISubprogram`/`!DILexicalBlock`/`!DICompileUnit`/…) — the
-    /// hop from a `!DILocation` to its `!DIFile`. `name` is the `!DISubprogram` source name (the §6
-    /// function-name-table value), `None` for the other scope kinds.
-    Scope {
-        file: Option<u64>,
-        name: Option<String>,
-    },
+    Tuple(Vec<u64>),
+}
+
+impl DiNode {
+    /// A field of a specialized node, or `None` if absent / this is a tuple.
+    pub(crate) fn field(&self, key: &str) -> Option<&MetaVal> {
+        match self {
+            DiNode::Node { fields, .. } => fields.get(key),
+            DiNode::Tuple(_) => None,
+        }
+    }
+    pub(crate) fn kind(&self) -> Option<&str> {
+        match self {
+            DiNode::Node { kind, .. } => Some(kind),
+            DiNode::Tuple(_) => None,
+        }
+    }
+}
+
+impl MetaVal {
+    pub(crate) fn as_ref_id(&self) -> Option<u64> {
+        match self {
+            MetaVal::Ref(n) => Some(*n),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_int(&self) -> Option<u64> {
+        match self {
+            MetaVal::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        match self {
+            MetaVal::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_word(&self) -> Option<&str> {
+        match self {
+            MetaVal::Word(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 impl Parser {
@@ -138,6 +188,7 @@ impl Parser {
             di_meta: std::collections::BTreeMap::new(),
             pending_dbg: None,
             func_names: std::collections::BTreeMap::new(),
+            global_dbg: Vec::new(),
         }
     }
 
@@ -236,26 +287,23 @@ impl Parser {
     /// `scope` node's `file:` edge reaches the `!DIFile` for filename/directory (the same fields the
     /// bitcode reader's `DebugLoc` carries).
     fn resolve_debug_loc(&self, id: u64) -> Option<DebugLoc> {
-        let (line, col, scope) = match self.di_meta.get(&id)? {
-            DiNode::Location { line, col, scope } => (*line, *col, *scope),
-            _ => return None,
-        };
-        let file_id = match self.di_meta.get(&scope)? {
-            DiNode::Scope { file, .. } => (*file)?,
-            _ => return None,
-        };
-        let (filename, directory) = match self.di_meta.get(&file_id)? {
-            DiNode::File {
-                filename,
-                directory,
-            } => (filename.clone(), directory.clone()),
-            _ => return None,
-        };
+        let loc = self.di_meta.get(&id)?;
+        if loc.kind() != Some("DILocation") {
+            return None;
+        }
+        let line = loc.field("line")?.as_int()? as u32;
+        let col = loc.field("column").and_then(MetaVal::as_int).unwrap_or(0) as u32;
+        // The lexical scope's `file:` edge reaches the `!DIFile`.
+        let scope = self.di_meta.get(&loc.field("scope")?.as_ref_id()?)?;
+        let file = self.di_meta.get(&scope.field("file")?.as_ref_id()?)?;
         Some(DebugLoc {
             line,
             col: Some(col),
-            filename,
-            directory,
+            filename: file.field("filename")?.as_str()?.to_string(),
+            directory: file
+                .field("directory")
+                .and_then(MetaVal::as_str)
+                .map(String::from),
         })
     }
 
@@ -498,8 +546,20 @@ impl Parser {
             self.pos += 1; // `,`
             if self.eat_word("align") {
                 alignment = self.int_lit_u32()?;
+            } else if matches!(self.peek(), Some(Token::Meta(_))) {
+                // `!kind !N` metadata — capture the `!dbg` `DIGlobalVariableExpression` id (§6 globals).
+                let is_dbg = matches!(self.peek(), Some(Token::Meta(k)) if k == "dbg");
+                self.pos += 1; // `!kind`
+                if let Some(Token::Meta(v)) = self.peek() {
+                    if is_dbg {
+                        if let Ok(id) = v.parse::<u64>() {
+                            self.global_dbg.push((name.clone(), id));
+                        }
+                    }
+                    self.pos += 1;
+                }
             } else {
-                // section/comdat/metadata — skip this trailing clause to the next top-level item.
+                // section/comdat/… — skip this trailing clause to the next top-level item.
                 self.skip_to_toplevel_boundary();
                 break;
             }
@@ -580,11 +640,15 @@ impl Parser {
         while !matches!(self.peek(), Some(Token::LBrace) | None) {
             if matches!(self.peek(), Some(Token::Meta(k)) if k == "dbg") {
                 if let Some(Token::Meta(v)) = self.peek2() {
-                    if let Some(DiNode::Scope {
-                        name: Some(src), ..
-                    }) = v.parse::<u64>().ok().and_then(|id| self.di_meta.get(&id))
+                    if let Some(src) = v
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|id| self.di_meta.get(&id))
+                        .filter(|n| n.kind() == Some("DISubprogram"))
+                        .and_then(|n| n.field("name"))
+                        .and_then(MetaVal::as_str)
                     {
-                        self.func_names.insert(name.clone(), src.clone());
+                        self.func_names.insert(name.clone(), src.to_string());
                     }
                 }
             }
@@ -2303,22 +2367,24 @@ fn parse_di_node(toks: &[Token], start: usize) -> (Option<DiNode>, usize) {
         (Some(Token::Meta(kind)), Some(Token::LParen)) => {
             let kind = kind.clone();
             let (fields, next) = scan_node_fields(toks, j + 1);
-            (build_di_node(&kind, &fields), next)
+            (Some(DiNode::Node { kind, fields }), next)
         }
-        // `!{ … }` — a tuple; skip the balanced braces.
-        (Some(Token::Meta(_)), Some(Token::LBrace)) => (None, skip_braced(toks, j + 1)),
+        // `!{ !a, !b, … }` — a tuple of metadata references (a struct's members, a fn's types, …).
+        (Some(Token::Meta(_)), Some(Token::LBrace)) => {
+            let (refs, next) = scan_tuple_refs(toks, j + 1);
+            (Some(DiNode::Tuple(refs)), next)
+        }
         // Any other RHS (a bare `!ref`, an `i32 7` module-flag operand, …): advance one token.
         _ => (None, j + 1),
     }
 }
 
-/// Scan a specialized node's `( key: value, … )`, returning a map of each depth-1 `key` → its first
-/// value token, plus the index just past the matching `)`. (Only the first token of a value is kept;
-/// flag-sets / trailing tokens are skipped by the depth walk.)
+/// Scan a specialized node's `( key: value, … )`, returning each depth-1 `key` → its first value
+/// token (as a [`MetaVal`]) plus the index just past the matching `)`.
 fn scan_node_fields(
     toks: &[Token],
     lparen: usize,
-) -> (std::collections::HashMap<String, Token>, usize) {
+) -> (std::collections::HashMap<String, MetaVal>, usize) {
     let mut fields = std::collections::HashMap::new();
     let mut j = lparen + 1;
     let mut depth = 1usize;
@@ -2334,8 +2400,8 @@ fn scan_node_fields(
                 j += 1;
             }
             Some(Token::Word(key)) if depth == 1 && toks.get(j + 1) == Some(&Token::Colon) => {
-                if let Some(v) = toks.get(j + 2) {
-                    fields.insert(key.clone(), v.clone());
+                if let Some(v) = toks.get(j + 2).and_then(token_meta_val) {
+                    fields.insert(key.clone(), v);
                 }
                 j += 3;
             }
@@ -2345,67 +2411,40 @@ fn scan_node_fields(
     (fields, j)
 }
 
-/// Build the [`DiNode`] for a specialized node `kind` from its scanned fields (only the node kinds
-/// the source-line reader needs; everything else is `None`).
-fn build_di_node(kind: &str, fields: &std::collections::HashMap<String, Token>) -> Option<DiNode> {
-    let meta_id = |k: &str| match fields.get(k) {
-        Some(Token::Meta(s)) => s.parse::<u64>().ok(),
-        _ => None,
-    };
-    let int_u32 = |k: &str| match fields.get(k) {
-        Some(Token::Int(s)) => s.parse::<u32>().ok(),
-        _ => None,
-    };
-    let string = |k: &str| match fields.get(k) {
-        Some(Token::Str(s)) => Some(String::from_utf8_lossy(&super::lex::unescape(s)).into_owned()),
-        _ => None,
-    };
-    match kind {
-        "DILocation" => Some(DiNode::Location {
-            line: int_u32("line")?,
-            col: int_u32("column").unwrap_or(0),
-            scope: meta_id("scope")?,
-        }),
-        "DIFile" => Some(DiNode::File {
-            filename: string("filename")?,
-            directory: string("directory"),
-        }),
-        // Scope nodes: the `file:` edge is the hop to the `!DIFile`; a `!DISubprogram` also names the
-        // source function.
-        "DISubprogram" => Some(DiNode::Scope {
-            file: meta_id("file"),
-            name: string("name"),
-        }),
-        "DILexicalBlock" | "DILexicalBlockFile" | "DICompileUnit" | "DINamespace" | "DIModule" => {
-            Some(DiNode::Scope {
-                file: meta_id("file"),
-                name: None,
-            })
-        }
+/// A token as a metadata field value (`None` for structural tokens like `(`/`,`/inline `!Kind(...)`).
+fn token_meta_val(t: &Token) -> Option<MetaVal> {
+    match t {
+        Token::Int(s) => s.parse::<u64>().ok().map(MetaVal::Int),
+        Token::Str(s) => Some(MetaVal::Str(
+            String::from_utf8_lossy(&super::lex::unescape(s)).into_owned(),
+        )),
+        Token::Meta(s) => s.parse::<u64>().ok().map(MetaVal::Ref),
+        Token::Word(s) => Some(MetaVal::Word(s.clone())),
         _ => None,
     }
 }
 
-/// Index just past the balanced `{ … }` starting at `toks[lbrace]`.
-fn skip_braced(toks: &[Token], lbrace: usize) -> usize {
-    let mut j = lbrace;
-    let mut depth = 0usize;
-    while let Some(t) = toks.get(j) {
-        match t {
-            Token::LBrace => depth += 1,
-            Token::RBrace => {
-                depth -= 1;
-                j += 1;
-                if depth == 0 {
-                    break;
+/// Scan a `{ !a, !b, … }` metadata tuple's `!N` references, returning them plus the index just past
+/// the matching `}`.
+fn scan_tuple_refs(toks: &[Token], lbrace: usize) -> (Vec<u64>, usize) {
+    let mut refs = Vec::new();
+    let mut j = lbrace + 1;
+    let mut depth = 1usize;
+    while depth > 0 {
+        match toks.get(j) {
+            None => break,
+            Some(Token::LBrace) => depth += 1,
+            Some(Token::RBrace) => depth -= 1,
+            Some(Token::Meta(s)) if depth == 1 => {
+                if let Ok(id) = s.parse::<u64>() {
+                    refs.push(id);
                 }
-                continue;
             }
             _ => {}
         }
         j += 1;
     }
-    j
+    (refs, j)
 }
 
 /// A `%local`/`@global` name string → [`Name`]: all-digits ⇒ `Number`, else a textual `Name`.
