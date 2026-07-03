@@ -7755,6 +7755,20 @@ fn ll_parity_debug_locals() {
 }
 
 #[test]
+fn ll_parity_debug_lexical_scope() {
+    // A shadowed variable in a nested block: the inner `s` is scoped to a `!DILexicalBlock`, so its
+    // §6 scope is `(decl_line, block_end_line)` — the block's end line derived from the max
+    // `!DILocation` line in its scope subtree (a `DILexicalBlock` carries no end line).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_scope",
+        "int f(int x){\n\
+         \x20 int s = x;\n\
+         \x20 { int s = x + 10; s = s * 2; return s; }\n\
+         }\n",
+    );
+}
+
+#[test]
 fn ll_parity_debug_args_ssa() {
     // `-Og -g`: with locals promoted to SSA, source args are tracked by `llvm.dbg.value(metadata i32
     // %k, …)` instead of `dbg.declare`. The reader must correlate the value to argument `k` (→ `Arg`,

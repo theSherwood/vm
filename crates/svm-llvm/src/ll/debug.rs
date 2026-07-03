@@ -1,8 +1,9 @@
 //! Build the §6 structured debug info (the [`di::LlvmDebug`](crate::di::LlvmDebug) the translator
 //! threads through its `di` argument) from the textual `.ll` metadata table — the in-house replacement
-//! for [`di`](crate::di)'s `llvm-sys` DI walk. It covers the **type graph**, **module globals**, and
-//! **local variables** (`llvm.dbg.declare` → `Window` at `-O0`; `dbg.value` → argument `Arg`) — the
-//! lexical-block scoping of shadowed variables is the one remaining follow-up.
+//! for [`di`](crate::di)'s `llvm-sys` DI walk. It covers the whole §6 structured half: the **type
+//! graph**, **module globals**, **local variables** (`llvm.dbg.declare` → `Window` at `-O0`;
+//! `dbg.value` → argument `Arg`), and **lexical-block scoping** of shadowed variables — a full
+//! textual replacement for `di.rs`.
 //!
 //! It mirrors `di.rs` field-for-field so the two readers produce byte-identical `LlvmDebug` (the
 //! `assert_ll_parity_debug` gate): the same interning order (globals walked in module order, the type
@@ -46,9 +47,17 @@ pub(crate) fn build(
     let mut interner: HashMap<u64, TypeId> = HashMap::new();
     // Functions first, then globals — the same walk order `di::read_debug` uses, so the type graph
     // interns in an identical order (and the `TypeId`s match).
+    let block_end = compute_block_ends(meta);
     let mut vars: HashMap<String, Vec<DiVar>> = HashMap::new();
     for f in &module.functions {
-        let fvars = read_function_vars(f, dbg_intrinsics, meta, &mut types, &mut interner);
+        let fvars = read_function_vars(
+            f,
+            dbg_intrinsics,
+            meta,
+            &block_end,
+            &mut types,
+            &mut interner,
+        );
         if !fvars.is_empty() {
             vars.insert(f.name.clone(), fvars);
         }
@@ -73,6 +82,7 @@ fn read_function_vars(
     f: &Function,
     dbg_intrinsics: &[DbgIntrinsic],
     meta: &Meta,
+    block_end: &HashMap<u64, u32>,
     types: &mut Vec<TypeDef>,
     interner: &mut HashMap<u64, TypeId>,
 ) -> Vec<DiVar> {
@@ -127,17 +137,59 @@ fn read_function_vars(
         let ty = type_id
             .map(|id| render_name(&types[id as usize]))
             .unwrap_or_else(|| "void".to_string());
+        // §6 lexical scope: a variable scoped to a `DILexicalBlock` (the shadowing case) is
+        // block-scoped from its declaration line to the block's last instruction line; a
+        // subprogram-scoped variable is function-wide (`None`).
+        let scope = var
+            .field("scope")
+            .and_then(MetaVal::as_ref_id)
+            .filter(|sid| meta.get(sid).and_then(DiNode::kind) == Some("DILexicalBlock"))
+            .and_then(|sid| {
+                let end = *block_end.get(&sid)?;
+                let line = var.field("line").and_then(MetaVal::as_int)? as u32;
+                Some((line, end))
+            });
         vars.push(DiVar {
             name: name.to_string(),
             loc,
             type_id,
             ty,
-            // §6 lexical-block scoping (shadowed-variable case) is a follow-up; a subprogram-scoped
-            // variable — every non-nested local — is function-wide (`None`), which is the common case.
-            scope: None,
+            scope,
         });
     }
     vars
+}
+
+/// The `(block id → last source line)` map: each `DILexicalBlock`'s end line is the greatest
+/// `!DILocation` line whose scope chain passes through it (a `DILexicalBlock` carries no end line).
+/// Mirrors `di::read_function_vars`'s `block_end` pass (computed globally here — block ids are unique).
+fn compute_block_ends(meta: &Meta) -> HashMap<u64, u32> {
+    let mut block_end: HashMap<u64, u32> = HashMap::new();
+    for node in meta.values() {
+        if node.kind() != Some("DILocation") {
+            continue;
+        }
+        let Some(line) = node.field("line").and_then(MetaVal::as_int) else {
+            continue;
+        };
+        let line = line as u32;
+        let mut scope = node.field("scope").and_then(MetaVal::as_ref_id);
+        let mut depth = 0;
+        while let Some(sid) = scope {
+            if depth >= 32 {
+                break;
+            }
+            depth += 1;
+            let Some(snode) = meta.get(&sid) else { break };
+            if snode.kind() != Some("DILexicalBlock") {
+                break;
+            }
+            let e = block_end.entry(sid).or_insert(0);
+            *e = (*e).max(line);
+            scope = snode.field("scope").and_then(MetaVal::as_ref_id);
+        }
+    }
+    block_end
 }
 
 /// Recover each source global from its `!dbg` `DIGlobalVariableExpression` → `DIGlobalVariable` (name
