@@ -1294,7 +1294,6 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Args fed to each kernel (all `(i64) -> (i64)`), incl. negatives and a large value.
 // ---- scalar floating-point (f32/f64) — the one numeric family where wasm↔native can diverge ----
 // Each guest reinterprets the i64 arg to an f64, computes, and reinterprets the result back to i64
 // **bits**, so the differential is exact — it catches NaN-payload canonicalization and rounding,
@@ -1416,6 +1415,7 @@ block0(vsp: i64, varg: i64):
 }
 "#;
 
+/// Args fed to each kernel (all `(i64) -> (i64)`), incl. negatives and a large value.
 const ARGS: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000];
 
 fn native(m: &svm_ir::Module, args: &[Value]) -> (i32, i64) {

@@ -651,6 +651,17 @@ pub extern "C" fn svm_par_powerbox_io() -> i32 {
     1
 }
 
+/// Clear every published run recipe — the next run is **plain** (compute-only, no powerbox). The
+/// recipes are last-published-wins for back-to-back runs of *different* kinds; a plain run after a
+/// powerbox run (the playground can run modes in any order) needs this explicit "none" publish, or
+/// the stale recipe would seed the new root with args its entry doesn't take.
+#[no_mangle]
+pub extern "C" fn svm_par_powerbox_none() {
+    PAR_PB.store(0, std::sync::atomic::Ordering::Release);
+    PAR_INST.store(0, std::sync::atomic::Ordering::Release);
+    PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+}
+
 /// Borrow the published I/O powerbox (`None` until [`svm_par_powerbox_io`] ran). Leaked; interior
 /// mutability is the `Mutex` (cross-Worker-safe on wasm atomics, like the `Domain`'s `ModuleSource`).
 fn par_io() -> Option<&'static ParIoCfg> {
@@ -1318,6 +1329,54 @@ pub extern "C" fn svm_snapshot_ptr() -> *const u8 {
 pub extern "C" fn svm_snapshot_len() -> usize {
     unsafe { (*core::ptr::addr_of!(SNAP)).1 }
 }
+
+// ---- playground: in-browser SVM-text front end (parse → verify → encode) ------------------------
+
+/// Compile the **SVM text** at `[src_ptr, src_len)` (UTF-8) into the `svm-encode` binary form the
+/// `svm_run*` / `svm_par_*` entries consume: parse (`svm-text`) → verify (`svm-verify`) → encode.
+/// Returns `1` and stashes the encoded module bytes, or `0` and stashes a UTF-8 error message
+/// (which stage failed and why). Read the stash via [`svm_parse_ptr`] + [`svm_parse_len`] before
+/// the next call — this is the playground's front end, so rejects must come back as *messages*,
+/// not statuses.
+#[no_mangle]
+pub extern "C" fn svm_parse(src_ptr: *const u8, src_len: usize) -> i32 {
+    let bytes: &[u8] = if src_ptr.is_null() || src_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the host guarantees `[src_ptr, src_len)` is a live allocation it just filled.
+        unsafe { core::slice::from_raw_parts(src_ptr, src_len) }
+    };
+    // SAFETY: single-threaded main-thread use; the slot is read back only via the accessors below.
+    let put = |ok: i32, data: Vec<u8>| -> i32 {
+        unsafe { stash(&mut *core::ptr::addr_of_mut!(PARSE), data) };
+        ok
+    };
+    let src = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => return put(0, format!("source is not UTF-8: {e}").into_bytes()),
+    };
+    let m = match svm_text::parse_module(src) {
+        Ok(m) => m,
+        // `ParseError`'s Display already carries the "parse error: " prefix.
+        Err(e) => return put(0, format!("{e}").into_bytes()),
+    };
+    if let Err(e) = svm_verify::verify_module(&m) {
+        return put(0, format!("verify error: {e:?}").into_bytes());
+    }
+    put(1, svm_encode::encode_module(&m))
+}
+
+/// Pointer / length of the most recent [`svm_parse`] output (module bytes on `1`, error text on `0`).
+#[no_mangle]
+pub extern "C" fn svm_parse_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(PARSE)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_parse_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(PARSE)).1 }
+}
+/// The stashed [`svm_parse`] output (same cdylib-managed lifetime as `OUT`/`ERR`).
+static mut PARSE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 /// Run `m`'s function 0 under a deterministic **3-cap powerbox** — `Stream(Out)` (type 0), `Exit`
 /// (type 1), and a host-fn (type 13), granted in that order — so the §7 reflection ops
