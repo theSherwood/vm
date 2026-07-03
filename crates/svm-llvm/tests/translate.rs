@@ -7726,6 +7726,18 @@ fn assert_ll_parity_debug(name: &str, src: &str) {
 }
 
 #[test]
+fn ll_parity_debug_locals() {
+    // `-O0 -g`: each source local (params + `s`) becomes an `alloca` + `llvm.dbg.declare`. The reader
+    // must parse the `metadata`-typed call operands, correlate each declare's address to its alloca
+    // *ordinal* (→ a `Window` slot), and read the `!DILocalVariable` name/type — matching the bitcode
+    // `di` walk. Flat function (no nested block) ⇒ subprogram-scoped vars (`scope: None`).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_loc",
+        "int add3(int a, int b, int c){ int s = a + b + c; return s; }\n",
+    );
+}
+
+#[test]
 fn ll_parity_debug_types_globals() {
     // `-gline-tables-only` carries no type graph, so use full `-O0 -g` but keep the only function
     // *local-free* (no `dbg.declare`, so `di.vars` stays empty — the local-var half is a later slice).

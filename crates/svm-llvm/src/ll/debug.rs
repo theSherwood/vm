@@ -1,7 +1,8 @@
 //! Build the §6 structured debug info (the [`di::LlvmDebug`](crate::di::LlvmDebug) the translator
 //! threads through its `di` argument) from the textual `.ll` metadata table — the in-house replacement
-//! for [`di`](crate::di)'s `llvm-sys` DI walk. This slice covers the **type graph + module globals**;
-//! the local-variable correlation (`llvm.dbg.declare`/`dbg.value`) is a follow-up slice.
+//! for [`di`](crate::di)'s `llvm-sys` DI walk. It covers the **type graph**, **module globals**, and
+//! **local variables** (`llvm.dbg.declare` → `Window` at `-O0`; `dbg.value` → argument `Arg`) — the
+//! lexical-block scoping of shadowed variables is the one remaining follow-up.
 //!
 //! It mirrors `di.rs` field-for-field so the two readers produce byte-identical `LlvmDebug` (the
 //! `assert_ll_parity_debug` gate): the same interning order (globals walked in module order, the type
@@ -9,12 +10,13 @@
 //! (LLVM-C exposes no encoding getter, so `di.rs` guesses from the name — we match that, *not* the
 //! text's `encoding:` field), and the same array count = `size_bits / elem_bits`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use svm_ir::{Encoding, Field, TypeDef, TypeId};
 
-use super::parse::{DiNode, MetaVal};
-use crate::di::{DiGlobal, LlvmDebug};
+use super::ast::{Function, Instruction, Module, Name};
+use super::parse::{DbgIntrinsic, DiNode, MetaVal};
+use crate::di::{DiGlobal, DiLoc, DiVar, LlvmDebug};
 
 /// DWARF tag names the type reader dispatches on (the textual form of `di.rs`'s numeric `tag` module).
 mod tag {
@@ -36,20 +38,106 @@ type Meta = BTreeMap<u64, DiNode>;
 pub(crate) fn build(
     meta: &Meta,
     global_dbg: &[(String, u64)],
+    dbg_intrinsics: &[DbgIntrinsic],
+    module: &Module,
     func_names: BTreeMap<String, String>,
 ) -> Option<LlvmDebug> {
     let mut types: Vec<TypeDef> = Vec::new();
     let mut interner: HashMap<u64, TypeId> = HashMap::new();
+    // Functions first, then globals — the same walk order `di::read_debug` uses, so the type graph
+    // interns in an identical order (and the `TypeId`s match).
+    let mut vars: HashMap<String, Vec<DiVar>> = HashMap::new();
+    for f in &module.functions {
+        let fvars = read_function_vars(f, dbg_intrinsics, meta, &mut types, &mut interner);
+        if !fvars.is_empty() {
+            vars.insert(f.name.clone(), fvars);
+        }
+    }
     let globals = read_globals(meta, global_dbg, &mut types, &mut interner);
-    if globals.is_empty() && func_names.is_empty() {
+    if vars.is_empty() && globals.is_empty() && func_names.is_empty() {
         return None;
     }
     Some(LlvmDebug {
         types,
-        vars: HashMap::new(),
+        vars,
         globals,
         func_names: func_names.into_iter().collect(),
     })
+}
+
+/// Recover one function's source locals from its captured `dbg.declare`/`dbg.value` intrinsics:
+/// `dbg.declare` correlates the address to an **alloca ordinal** (the Nth alloca in block/instruction
+/// order → a `Window` slot), `dbg.value` correlates the value to a **function argument** (→ `Arg`).
+/// Mirrors `di::read_function_vars` (dedup by `!DILocalVariable` identity, first binding wins).
+fn read_function_vars(
+    f: &Function,
+    dbg_intrinsics: &[DbgIntrinsic],
+    meta: &Meta,
+    types: &mut Vec<TypeDef>,
+    interner: &mut HashMap<u64, TypeId>,
+) -> Vec<DiVar> {
+    // alloca → ordinal (Nth alloca, in block then instruction order).
+    let mut alloca_ord: HashMap<&Name, usize> = HashMap::new();
+    let mut n_alloca = 0usize;
+    for bb in &f.basic_blocks {
+        for inst in &bb.instrs {
+            if let Instruction::Alloca(a) = inst {
+                alloca_ord.insert(&a.dest, n_alloca);
+                n_alloca += 1;
+            }
+        }
+    }
+    // argument → index (the `dbg.value` correlation key).
+    let mut param_index: HashMap<&Name, u32> = HashMap::new();
+    for (i, p) in f.parameters.iter().enumerate() {
+        param_index.insert(&p.name, i as u32);
+    }
+
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut vars = Vec::new();
+    for d in dbg_intrinsics.iter().filter(|d| d.func == f.name) {
+        let loc = if d.declare {
+            match d.value.as_ref().and_then(|v| alloca_ord.get(v)) {
+                Some(&ordinal) => DiLoc::Window {
+                    alloca_ordinal: ordinal,
+                },
+                None => continue, // not a tracked alloca (e.g. a field) — skip
+            }
+        } else {
+            match d.value.as_ref().and_then(|v| param_index.get(v)) {
+                Some(&index) => DiLoc::Arg { index },
+                None => continue, // not an argument (constant/poison/instruction result) — skip
+            }
+        };
+        // The `!DILocalVariable` → name + structured type.
+        let Some(var) = meta.get(&d.var) else {
+            continue;
+        };
+        if var.kind() != Some("DILocalVariable") {
+            continue;
+        }
+        let name = var.field("name").and_then(MetaVal::as_str).unwrap_or("");
+        if name.is_empty() || !seen.insert(d.var) {
+            continue; // unnamed, or this DI variable already recorded (first binding wins)
+        }
+        let type_id = var
+            .field("type")
+            .and_then(MetaVal::as_ref_id)
+            .and_then(|t| intern_type(meta, t, types, interner));
+        let ty = type_id
+            .map(|id| render_name(&types[id as usize]))
+            .unwrap_or_else(|| "void".to_string());
+        vars.push(DiVar {
+            name: name.to_string(),
+            loc,
+            type_id,
+            ty,
+            // §6 lexical-block scoping (shadowed-variable case) is a follow-up; a subprogram-scoped
+            // variable — every non-nested local — is function-wide (`None`), which is the common case.
+            scope: None,
+        });
+    }
+    vars
 }
 
 /// Recover each source global from its `!dbg` `DIGlobalVariableExpression` → `DIGlobalVariable` (name

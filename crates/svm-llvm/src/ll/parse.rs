@@ -73,7 +73,13 @@ pub fn parse_module_with_debug(src: &str) -> PResult<(Module, Option<crate::di::
     let mut p = Parser::new(toks);
     p.collect_di_metadata();
     let m = p.module()?;
-    let debug = super::debug::build(&p.di_meta, &p.global_dbg, p.func_names);
+    let debug = super::debug::build(
+        &p.di_meta,
+        &p.global_dbg,
+        &p.dbg_intrinsics,
+        &m,
+        p.func_names,
+    );
     Ok((m, debug))
 }
 
@@ -101,6 +107,13 @@ struct Parser {
     /// `(global symbol, !dbg DIGlobalVariableExpression id)` in module order — the source globals the
     /// type/variable-graph reader ([`super::debug`]) walks (matching the bitcode `di` walk's order).
     global_dbg: Vec<(String, u64)>,
+    /// The current function's linkage name (for keying captured `dbg.*` intrinsics).
+    current_func: String,
+    /// `metadata` call operands captured while parsing the current call's argument list.
+    pending_meta_args: Vec<MetaArg>,
+    /// Captured `llvm.dbg.declare`/`dbg.value` intrinsics, in encounter order (the source-variable
+    /// order the bitcode `di` walk records).
+    dbg_intrinsics: Vec<DbgIntrinsic>,
 }
 
 /// One field value of a specialized debug-metadata node (only the first token of the value is kept;
@@ -140,6 +153,30 @@ impl DiNode {
             DiNode::Tuple(_) => None,
         }
     }
+}
+
+/// A captured `metadata` call operand's payload (the AST drops it to a payloadless `MetadataOperand`,
+/// so `dbg.declare`/`dbg.value` correlation is recovered from these instead).
+pub(crate) enum MetaArg {
+    /// A wrapped SSA value (`metadata ptr %2` / `metadata i32 %5`) — the alloca (declare) or value.
+    Value(Name),
+    /// A `!N` metadata reference (`metadata !25`) — the `!DILocalVariable`.
+    Ref(u64),
+    /// A constant / `poison` / inline node (`metadata !DIExpression()`) — no tracked correlation.
+    Other,
+}
+
+/// A captured `llvm.dbg.declare`/`llvm.dbg.value` call: the located value paired with its
+/// `!DILocalVariable` id, keyed by the enclosing function's linkage name. The variable/type-graph
+/// reader ([`super::debug`]) correlates `value` to an alloca ordinal (declare) or argument (value).
+pub(crate) struct DbgIntrinsic {
+    pub func: String,
+    /// `true` for `dbg.declare` (an address/alloca), `false` for `dbg.value` (an SSA value).
+    pub declare: bool,
+    /// The wrapped SSA value (`None` for a constant/`poison`/inline located value).
+    pub value: Option<Name>,
+    /// The `!DILocalVariable` metadata id.
+    pub var: u64,
 }
 
 impl MetaVal {
@@ -189,6 +226,9 @@ impl Parser {
             pending_dbg: None,
             func_names: std::collections::BTreeMap::new(),
             global_dbg: Vec::new(),
+            current_func: String::new(),
+            pending_meta_args: Vec::new(),
+            dbg_intrinsics: Vec::new(),
         }
     }
 
@@ -625,6 +665,7 @@ impl Parser {
             other => return self.err(format!("expected function @name, found {other:?}")),
         };
         let (parameters, is_var_arg) = self.param_list()?;
+        self.current_func = name.clone();
         // Record `@name` → its function type, so a later `@name` operand (an address-of, not a direct
         // call) resolves to a `GlobalReference` carrying that pointee type.
         self.symbols.insert(
@@ -2043,6 +2084,7 @@ impl Parser {
         };
         self.expect_word("call")?;
         let (function, function_ty, arguments) = self.call_signature()?;
+        self.capture_dbg_intrinsic(&function);
         self.skip_trailing_metadata();
         Ok(Call {
             function,
@@ -2052,6 +2094,38 @@ impl Parser {
             is_tail_call,
             debugloc: None,
         })
+    }
+
+    /// If the just-parsed call is `@llvm.dbg.declare`/`@llvm.dbg.value`, record its captured operands
+    /// (`pending_meta_args[0]` = the located value, `[1]` = the `!DILocalVariable`) for the §6
+    /// variable reader — the payload the AST otherwise drops as a `MetadataOperand`.
+    fn capture_dbg_intrinsic(&mut self, function: &Either<InlineAssembly, Operand>) {
+        let Either::Right(Operand::ConstantOperand(cr)) = function else {
+            return;
+        };
+        let Constant::GlobalReference {
+            name: Name::Name(s),
+            ..
+        } = cr.as_ref()
+        else {
+            return;
+        };
+        let declare = s.as_str() == "llvm.dbg.declare";
+        if (!declare && s.as_str() != "llvm.dbg.value") || self.pending_meta_args.len() < 2 {
+            return;
+        }
+        if let MetaArg::Ref(var) = self.pending_meta_args[1] {
+            let value = match &self.pending_meta_args[0] {
+                MetaArg::Value(n) => Some(n.clone()),
+                _ => None,
+            };
+            self.dbg_intrinsics.push(DbgIntrinsic {
+                func: self.current_func.clone(),
+                declare,
+                value,
+                var,
+            });
+        }
     }
 
     /// The shared `call`/`invoke` body *after* the opcode keyword: `[fmf] [cconv/ret-attrs]
@@ -2113,6 +2187,7 @@ impl Parser {
     /// the translator only reads the operand) alongside the parsed types (to reconstruct the fn type).
     fn call_arg_list(&mut self) -> PResult<(CallArgs, Vec<TypeRef>)> {
         self.expect(&Token::LParen)?;
+        self.pending_meta_args.clear();
         let mut args = Vec::new();
         let mut types = Vec::new();
         if self.eat(&Token::RParen) {
@@ -2120,16 +2195,53 @@ impl Parser {
         }
         loop {
             let ty = self.type_()?;
-            self.skip_arg_attrs();
-            let val = self.value_as_operand(&ty)?;
+            if matches!(ty.as_ref(), Type::MetadataType) {
+                // A `metadata` operand (`metadata ptr %2` / `metadata !25` / `metadata !DIExpr()`) —
+                // the AST carries it payloadless; the payload is captured for `dbg.*` correlation.
+                let ma = self.metadata_operand_value()?;
+                self.pending_meta_args.push(ma);
+                args.push((Operand::MetadataOperand, Vec::new()));
+            } else {
+                self.skip_arg_attrs();
+                let val = self.value_as_operand(&ty)?;
+                args.push((val, Vec::new()));
+            }
             types.push(ty);
-            args.push((val, Vec::new()));
             if !self.eat(&Token::Comma) {
                 break;
             }
         }
         self.expect(&Token::RParen)?;
         Ok((args, types))
+    }
+
+    /// The value wrapped by a `metadata` call operand (after the `metadata` keyword): a typed SSA value
+    /// `<ty> <val>`, a `!N` reference, or an inline `!Kind(…)` node.
+    fn metadata_operand_value(&mut self) -> PResult<MetaArg> {
+        match self.peek() {
+            Some(Token::Meta(_)) => {
+                if matches!(self.peek2(), Some(Token::LParen)) {
+                    // Inline `!Kind(…)` — skip its balanced parens.
+                    self.pos += 1; // `!kind`
+                    self.skip_balanced_parens();
+                    Ok(MetaArg::Other)
+                } else {
+                    let id = match self.bump() {
+                        Some(Token::Meta(s)) => s.parse::<u64>().ok(),
+                        _ => None,
+                    };
+                    Ok(id.map(MetaArg::Ref).unwrap_or(MetaArg::Other))
+                }
+            }
+            _ => {
+                let ty = self.type_()?;
+                let val = self.value_as_operand(&ty)?;
+                Ok(match val {
+                    Operand::LocalOperand { name, .. } => MetaArg::Value(name),
+                    _ => MetaArg::Other,
+                })
+            }
+        }
     }
 
     /// The `( <ty>, … [, ...] )` of an explicit function-pointer type in a call.
@@ -2345,6 +2457,10 @@ impl Parser {
             "double" => {
                 self.pos += 1;
                 self.module.types.fp(FPType::Double)
+            }
+            "metadata" => {
+                self.pos += 1;
+                TypeRef::new(Type::MetadataType)
             }
             other => return self.err(format!("type `{other}` not yet supported")),
         };
