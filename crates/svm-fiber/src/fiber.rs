@@ -97,6 +97,11 @@ struct Control {
     closure: Cell<*mut ()>,
     /// Monomorphized dropper for `closure`, used only if the fiber is dropped before it ever ran.
     drop_closure: unsafe fn(*mut ()),
+    /// This control stack's lowest usable address ([`Stack::usable_low`]). Exposed to the body via
+    /// [`Yielder::stack_low`] so a caller (the svm-jit software stack-overflow guard) can pass it as
+    /// the running stack's limit. Set once at [`Fiber::new`]; the stack is address-stable for the
+    /// fiber's life.
+    usable_low: u64,
     /// ASan fiber-switch bookkeeping (see [`AsanState`]).
     #[cfg(feature = "asan")]
     asan: AsanState,
@@ -108,6 +113,13 @@ pub struct Yielder {
 }
 
 impl Yielder {
+    /// This fiber's control-stack low bound (`usable_low`) — the running native stack's limit, for a
+    /// caller's software stack-overflow guard. Constant for the fiber's life.
+    pub fn stack_low(&self) -> u64 {
+        // SAFETY: `control` outlives the body (the `Fiber` owns the `Box<Control>`).
+        unsafe { (*self.control).usable_low }
+    }
+
     /// Suspend the fiber, handing `val` back to the resumer; returns the value passed to the next
     /// [`Fiber::resume`].
     pub fn suspend(&self, val: u64) -> u64 {
@@ -248,6 +260,7 @@ impl Fiber {
             running: AtomicBool::new(false),
             closure: Cell::new(Box::into_raw(Box::new(f)) as *mut ()),
             drop_closure: drop_closure_impl::<F>,
+            usable_low: stack.usable_low() as u64,
             #[cfg(feature = "asan")]
             asan: AsanState {
                 resumer_fake: Cell::new(std::ptr::null_mut()),

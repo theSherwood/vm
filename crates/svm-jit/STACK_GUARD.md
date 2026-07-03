@@ -66,8 +66,10 @@ This keeps the check per-thread-correct with no ABI param and no TLS access-mode
 ## Security contract (what makes it escape-grade)
 
 - The JIT emits the check in **every** guest function prologue unconditionally; the guest controls
-  neither codegen nor `trap_out`, so it cannot skip or move the check.
-- `RED_ZONE` + the post-compile frame bound guarantee no single frame can jump the limit.
+  neither codegen nor the `stack_limit` param, so it cannot skip or move the check.
+- The check runs after the machine prologue's `sub rsp`, so each frame is validated directly; `RED_ZONE`
+  covers the pre-check register pushes. A single frame larger than the whole stack is the one residual
+  gap (deferred backstop — see below), astronomically unlikely for a real function.
 - The masked/confined memory model is unchanged; this only adds a native-stack bound.
 - Must be fuzzed (a differential: any recursion depth that traps `StackOverflow` under the check must
   not, under any input, have written below `usable_low`) and audited alongside the masking unit.
@@ -107,24 +109,40 @@ This keeps the check per-thread-correct with no ABI param and no TLS access-mode
   per-frame necessity — only a backstop against an absurd (> stack-size) single frame. Good news: the
   current check is more sound than §2 claimed, and the frame-size-API blocker is far less important.
 
-### 2b revised path (needs a direction decision — two real options)
+### 2b chosen + DONE: path B (per-vCPU ABI param)
 
-Per-vCPU state with no vmctx, no TLS, and a shared trap cell leaves two viable routes:
+Two routes were on the table — **A** (SP-mask + running every vCPU top on a uniform aligned managed
+stack) and **B** (thread a per-vCPU limit through the ABI). Analysing A's implications showed it caps
+every vCPU's native stack at `SLOT` (256 KiB vs the 8 MB OS stack), and drags in the durable §12.8
+root/context rework, the GC root-scan, and the spawn/root run paths — all for no security gain over B.
+So **B was chosen and is implemented**, with two refinements that made it cheaper and cleaner than the
+original sketch:
 
-- **A. SP-mask + uniform arena stacks.** Derive the limit from SP itself: `limit = SP & ~(SLOT-1)` is
-  the running arena slot's low bound (requires SLOT-aligned slots) — inherently per-thread (each vCPU
-  has its own SP), no cell, cheapest possible check (pure arithmetic, no load). Catch: the **root**
-  runs on the unaligned OS thread stack, where the mask misfires — so the root must **also** run on an
-  aligned arena slot (switch onto a managed stack at guest entry). Elegant and uniform, but changes the
-  root run path.
-- **B. Per-vCPU ABI channel.** Thread a per-vCPU stack-limit pointer alongside `mem_base`/`trap_out`
-  (a real "vmctx-lite" param), sourced per spawned vCPU. Correct and mechanism-agnostic, but an ABI
-  change touching `sig_from`, every call site, and the trampolines.
+- The limit is a **value** i64 param (not a pointer): `stack_limit`, added to `sig_from` right after
+  `trap_out`, threaded through every call by `ctx_args` (constant within a stack's call tree), and set
+  anew at each context entry. The prologue check is then `SP − RED_ZONE < limit` against a **register**
+  — no cell, no TLS, no load. Per-vCPU-correct by construction.
+- The fiber's limit is sourced from **`svm_fiber::Yielder::stack_low()`** (svm-fiber now stores the
+  control stack's `usable_low` in its `Control` and exposes it) — correct for both stack backends with
+  no alignment coupling and no root-on-managed-stack change. The **root** and each **spawned vCPU top**
+  pass `limit = 0` (they run on OS-guarded thread stacks ⇒ check inert); only fibers get a real limit.
 
-Recommendation: **A** (SP-mask + uniform stacks) — it removes per-thread plumbing entirely and is the
-cheapest check, and running everything on managed stacks is the natural end-state for the arena model.
-The frame-size bound stays a backstop (absurd frames only), addressable later via prologue-parse or an
-upstream API.
+Touch-points (all cfg-gated on `stack-check`, so the default ABI is byte-identical): `sig_from`, the
+entry block params + `pbase` + `sret` index, `Lower.limit_var`, `ctx_args`, `emit_stack_check`,
+`build_trampoline` (root ⇒ 0), `build_fiber_call_trampoline` + `FiberCallTramp` (+`stack_limit`), the
+`make_fiber` entry (passes `y.stack_low()`), and the `os_thread_rt` thread-entry (⇒ 0). The removed
+increment-2 global cell + resume-seam set/restore are gone.
+
+Tests (`tests/stack_check.rs`, feature-gated): single-vCPU unbounded recursion traps `StackOverflow`;
+a **spawned vCPU**'s fiber recursion traps `StackOverflow` on its own thread (proves per-vCPU
+correctness — a shared cell would clobber); a shallow fiber still runs. Default build/clippy/fmt clean
+under `-D warnings`; no fiber/thread-suite regression.
+
+**Still deferred** (not per-vCPU-related): the post-compile frame-size **backstop** against an absurd
+(> stack-size) single frame — Cranelift 0.132 doesn't expose the final frame size; the after-`sub rsp`
+check position means normal frames are validated directly, so this is a low-priority backstop only.
+Note: the SLOT-aligned arena slots (from the prior 2b commit, for path A's SP-mask) are now vestigial
+under B — harmless, removable later.
 3. **Windows** arena + TEB-field `Stack` surface; **GC** interaction (a reused, un-zeroed slot makes
    the conservative `gc.roots` scan over-approximate — sound but imprecise; decide zero-on-reclaim of
    only the touched high-water region vs accept the over-approximation).
