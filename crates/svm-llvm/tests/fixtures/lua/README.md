@@ -171,11 +171,34 @@ forced: the guest `strtod` now parses **hex floats** (`0x1.8p3`, Lua's hex-float
 predicates (`emit_fcmp`), which Lua's `luaV_flttointeger` relies on. The guest shim adds real fdlibm
 `asin`/`acos`/`atan`/`atan2`/`modf` (`lua_testsuite_trig.c`) that the base libm lacks.
 
-Other files from the suite need capabilities the on-ramp doesn't offer yet: `math.lua` reaches deep
-(numbers, order, NaN, hex floats, `random`) but trips on a debug-info detail — Lua's `getobjname`
-reconstructs an operand name for an error message (`number (field 'huge') has no integer
-representation`) and the on-ramp omits the `(field 'huge')` part; `utf8.lua` needs `require`; `os`/`io`
-files need a filesystem. Those are follow-ups.
+Still out of reach: `utf8.lua` needs `require` (the package loader); the `os`/`io`/`coroutine`/`debug`
+files need those libraries + a filesystem. Those are follow-ups.
+
+# Lua math.lua fixture
+
+`lua_math.bc` runs the official **`testes/math.lua`** (embedded in `lua_math_tests.c`) — the densest
+single file in the suite — through the whole VM with base/`string`/`table`/`math` open, via the same
+harness. It exercises integer/float arithmetic and conversions, `//`/`%`, float↔integer order (every
+NaN corner), `math.type`/`tointeger`/`floor`/`ceil`/`fmod`/`ult`/`min`/`max`, the transcendentals,
+`math.modf`, `string.format` number formatting, decimal **and hex** float literals (incl. a 1000-digit
+fraction), and the `math.random` distribution tests. Test `tests/lua_math.rs` asserts
+`Returned([I32(0)])` on all three engines (JIT ~1 min — the module is large).
+
+Getting `math.lua` fully green drove two on-ramp fixes beyond the ones above:
+- **Sign-extended narrow signed ops.** A `<i32` value loaded from memory is *zero-extended*
+  (canonical), so its sign bit is buried at bit `N-1`; the on-ramp's `ashr`/`sdiv`/`srem` on an
+  `i8`/`i16` now sign-extend the operand first. Previously `ashr i8 0x80,7` gave `+1` (should be `-1`)
+  — and since Lua's `testMMMode` compiles to exactly `ashr i8 luaP_opmodes[op],7`, `findsetreg` skipped
+  the wrong instruction and `getobjname` dropped the operand name in error messages (`number (field
+  'huge') has no integer representation` → `number has …`). See `narrow_signed_shift_div_rem` in
+  `tests/translate.rs`.
+- **Hex `strtod` leading zeros.** A hex fraction's leading zeros no longer consume the
+  significant-digit budget, so `0x.000…0074p4004` (1000 zeros) parses correctly.
+
+## Regenerating (math.lua)
+
+Same as the test-suite fixture below, but `lua_math_tests.c` embeds only `math.lua` (as
+`lua_tests`/`lua_test_lens`/`lua_test_names`/`lua_test_count`, count 1), and no `lutf8lib` is needed.
 
 ## Regenerating (test suite)
 

@@ -370,7 +370,11 @@ double strtod(const char *nptr, char **endptr) {
       int d = strtod_hexval((unsigned char)*hp);
       if (d < 0) break;
       anyhex = 1;
-      if (hsig < 200) {
+      if (d == 0 && bn_is_zero(&hm)) {
+        /* leading zero: adds nothing to the mantissa, only shifts a fractional exponent — must not
+           consume the significant-digit budget (else 0x.0000…0074 loses its digits). */
+        if (hseen_dot) e2 -= 4;
+      } else if (hsig < 200) {
         bn_mul_add_small(&hm, 16, (unsigned)d);
         hsig++;
         if (hseen_dot) e2 -= 4;

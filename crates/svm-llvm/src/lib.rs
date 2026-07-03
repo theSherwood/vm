@@ -17479,19 +17479,52 @@ fn bin<'d>(
         return Ok((dest, packed));
     }
     let width = int_bits(a.get_type(types).as_ref());
-    let a = ctx.operand(a)?;
-    let b = ctx.operand(b)?;
+    let mut a = ctx.operand(a)?;
+    let mut b = ctx.operand(b)?;
+    // A **signed** narrow op reads its *whole container* as signed, but the narrow canonical form is
+    // **zero-extended** (low `N` bits, high bits 0) — so the container's sign bit is 0 and the op would
+    // treat a negative `iN` value as positive. Sign-extend the operand(s) from `N` into the container
+    // first: `ShrS` needs the shifted value extended (`ashr i8 0x80,7` must be `-1`, not `+1` — the bug
+    // that dropped Lua's `getobjname` operand name, since `testMMMode` compiles to `ashr i8 opmode,7`);
+    // `DivS`/`RemS` need both operands (`(i8)-6 / 3` must be `-2`). `ShrU`/`DivU`/`RemU` are already
+    // correct on the zero-extended form; the shift *amount* of `ShrS` is a count, left as-is. §3b hazard.
+    if let Some(w) = width {
+        let cw = if w <= 32 { 32 } else { 64 };
+        if w < cw {
+            match op {
+                BinOp::ShrS => a = emit_ext(ctx, a, w, cw, true),
+                BinOp::DivS | BinOp::RemS => {
+                    a = emit_ext(ctx, a, w, cw, true);
+                    b = emit_ext(ctx, b, w, cw, true);
+                }
+                _ => {}
+            }
+        }
+    }
     let r = ctx.push(Inst::IntBin { ty, op, a, b });
     // Keep a **narrow** `iN` value **canonical**: the de-normalizing ops (`add`/`sub`/`mul`/`shl`) can
-    // set bits `≥ N`, so mask the result back to its low `N` bits. Downstream `lshr`/`trunc`/unsigned-
-    // compare/min-max then see clean bits (§3b widen-and-mask); `and`/`or`/`xor`/`lshr`/`div`/`rem` of
+    // set bits `≥ N`, and the signed ops above (`ashr`/`sdiv`/`srem`) sign-fill the high bits for a
+    // negative result — either way mask back to the low `N` bits. Downstream `lshr`/`trunc`/unsigned-
+    // compare/min-max then see clean bits (§3b widen-and-mask); `and`/`or`/`xor`/`lshr`/`udiv`/`urem` of
     // canonical inputs stay canonical (no extra mask). This covers **both** sub-32 widths held in an
     // `i32` (`i8`/`i16`) *and* the `33..63` widths held in an `i64`. Previously only `33..63` was masked;
     // a non-canonical `i8`/`i16` then silently miscompiled any width-sensitive consumer that read the
     // dirty container without re-masking (e.g. `umin.i8` of an `add i8 x,-1` — found via Embench
     // `qrduino`). 32-/64-bit ops are exact in their container, so nothing to do.
     let r = match width {
-        Some(w) if w < 64 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl) => {
+        Some(w)
+            if w < 64
+                && matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Shl
+                        | BinOp::ShrS
+                        | BinOp::DivS
+                        | BinOp::RemS
+                ) =>
+        {
             if w <= 32 {
                 mask_to(ctx, r, w)
             } else {

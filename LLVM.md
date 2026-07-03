@@ -1193,37 +1193,45 @@ can differ from native by one digit — a pre-existing `dtoa_fix` limit, not the
 it. This unblocks running **Lua's own test suite** (self-validating, the roadmap's gold standard) — the
 next Lua slice.
 
-### Lua's own test suite — ACHIEVED ✅ (first files, all three engines)
-**Goal (met).** Three **unmodified files from the official Lua 5.4.7 distribution's own test suite**
-(`testes/vararg.lua`, `testes/bwcoercion.lua`, `testes/pm.lua`) run through the whole VM with the
-base/`string`/`table`/`math`/`utf8` libraries open — each loaded as its own chunk under `pcall`, one
-fresh `lua_State` per file. A Lua test signals failure by raising (an `assert`); a clean **exit 0**
-means every `assert` held, **identical to native Lua** (the suite's own pass/fail contract). Same
-outcome on the tree-walker, bytecode, and JIT. Fixture `tests/fixtures/lua/lua_testsuite.bc`
-(harness + embedded test bytes + guest shim/trig), test `tests/lua_testsuite.rs`. The files were chosen
-as self-contained (no `require`/`os`/`io`/`debug`/`coroutine`, no internal `T` module): `vararg`
-(`...`/`select`/`table.unpack`), `bwcoercion` (string↔number bitwise coercions, `_ENV = nil`), and `pm`
-(the full pattern-matching engine — `find`/`match`/`gmatch`/`gsub`, captures, anchors, `%b`, `%f`).
+### Lua's own test suite — ACHIEVED ✅ (`math.lua` + 3 more files, all three engines)
+**Goal (met).** Four **unmodified files from the official Lua 5.4.7 distribution's own test suite** run
+through the whole VM: the dense **`testes/math.lua`** (its own fixture `lua_math.bc` / `tests/lua_math.rs`)
+and `testes/vararg.lua` + `testes/bwcoercion.lua` + `testes/pm.lua` (`lua_testsuite.bc` /
+`tests/lua_testsuite.rs`) — each loaded as its own chunk under `pcall`, one fresh `lua_State` per file.
+A Lua test signals failure by raising (an `assert`); a clean **exit 0** means every `assert` held,
+**identical to native Lua** (the suite's own pass/fail contract). Same outcome on the tree-walker,
+bytecode, and JIT. The files were chosen as self-contained (no `require`/`os`/`io`/`debug`/`coroutine`,
+no internal `T` module): `math` (all of integer/float arithmetic, conversions, `//`/`%`, float↔integer
+order incl. every NaN corner, the transcendentals, `modf`, `string.format`, decimal + hex float
+literals, `math.random`), `vararg` (`...`/`select`/`table.unpack`), `bwcoercion` (string↔number bitwise
+coercions, `_ENV = nil`), and `pm` (the full pattern-matching engine).
 
-**Two real fixes this forced** (both independently valuable, both gated on all three engines + native):
+**Four real translator/library fixes this forced** (each independently valuable, each gated on all three
+engines + native):
 - **`fcmp` NaN correctness.** The on-ramp collapsed **ordered vs unordered** float compares to one op
   (a documented fidelity gap). Lua's `luaV_flttointeger` (`n >= -2^63 && n < 2^63`, which clang emits
   as *unordered* forms after the preceding `n != floor(n)`) then accepted a NaN, so `NaN <=
   math.maxinteger` returned **true**. `emit_fcmp` now expands every predicate NaN-exactly (unordered =
   `uno(a,b) | ordered`, `one` = `a<b | a>b`), matching the interpreters' and Cranelift's `FloatCC`
   semantics. Test `fcmp_ordered_unordered_predicates` (all 11 predicates × NaN/ordinary, interp+JIT).
+- **Sign-extended narrow signed ops.** A `<i32` value loaded from memory is *zero-extended* (the
+  canonical narrow form), so its sign bit is buried at bit `N-1`, not the container's bit 31 — the
+  on-ramp's `ashr`/`sdiv`/`srem` on an `i8`/`i16` now sign-extend the operand first (`bin` in
+  `lib.rs`). Before the fix `ashr i8 0x80,7` gave `+1` (should be `-1`); since Lua's `testMMMode`
+  compiles to exactly `ashr i8 luaP_opmodes[op],7`, `findsetreg` skipped the wrong instruction and
+  `getobjname` dropped the operand name from error messages (`number (field 'huge') has no integer
+  representation`). `(i8)-6/3` gave the unsigned `83`, not `-2`. Test `narrow_signed_shift_div_rem`.
 - **Hex-float `strtod`.** The guest `strtod` now parses **hex floats** (`0x1.8p3`, `0x.ABCDEFp+24`, a
-  64-bit hex mantissa needing round-to-nearest-even, `p`-exponent over/underflow, and the malformed
-  `0x`/`0x.`/`0x3.3.3` with glibc `endptr` semantics) — the form Lua's own hex-float literals need.
-  Additive (decimal path unchanged); the accuracy grid + `demos/strtod` differential cover it.
+  64-bit hex mantissa needing round-to-nearest-even, `p`-exponent over/underflow, leading-zero fractions
+  like `0x.000…0074p4004`, and the malformed `0x`/`0x.`/`0x3.3.3` with glibc `endptr` semantics) — the
+  form Lua's own hex-float literals need. Additive (decimal path unchanged); the accuracy grid +
+  `demos/strtod` differential cover it.
+- **Guest libc gap-fills.** The shim brings real fdlibm `asin`/`acos`/`atan`/`atan2`/`modf`
+  (`lua_testsuite_trig.c`) the base libm lacks, and `localeconv` (Lua reads `decimal_point` when
+  appending `.0` to an integer-valued float in `tostring`).
 
-The guest shim also brings real fdlibm `asin`/`acos`/`atan`/`atan2`/`modf` (`lua_testsuite_trig.c`) the
-base libm lacks, and `localeconv` (Lua reads `decimal_point` when appending `.0` to an integer-valued
-float in `tostring`). **Remaining** for a *full* suite: `math.lua` reaches deep (numbers, order, NaN,
-hex floats, `random`) but trips on a debug-info cosmetic — Lua's `getobjname` reconstructs an operand
-name for an error message (`number (field 'huge') has no integer representation`) and the on-ramp omits
-the `(field 'huge')`; `utf8.lua` needs `require`; the `os`/`io`/`coroutine`/`debug` files need those
-libraries + a filesystem. Each is a follow-on slice.
+**Remaining** for a *full* suite: `utf8.lua` needs `require` (the package loader); the
+`os`/`io`/`coroutine`/`debug` files need those libraries + a filesystem. Each is a follow-on slice.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
