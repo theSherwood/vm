@@ -8257,10 +8257,15 @@ fn trap_status(t: &Trap) -> i64 {
         Trap::Unreachable => 4,
         Trap::IndirectCallType => 5,
         Trap::CapFault | Trap::Malformed | Trap::Exit(_) => 6, // bad/unsupported async request
-        Trap::MemoryFault | Trap::StackOverflow => 8,
+        Trap::MemoryFault => 8,
         Trap::FiberFault => 9,
         Trap::ThreadFault => 10,
         Trap::OutOfFuel => 11,
+        // Matches the JIT's `TrapKind::StackOverflow` (13). The JIT produces it only under the
+        // `stack-check` feature (a fiber's software stack-limit check); the default guard-page path
+        // reports a stack overflow as `MemoryFault` (8) — the hardware can't distinguish it — so the
+        // two configs report the same event under different codes, both a "stack blew up" outcome.
+        Trap::StackOverflow => 13,
     }
 }
 
