@@ -7648,11 +7648,13 @@ fn compile_cpp(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> 
 }
 
 /// The parity assertion core: both readers must translate to byte-identical svm-ir + `entry_sp`.
-fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) {
+/// Returns the (identical) svm-ir text so debug-info callers can sanity-check it's non-trivial.
+fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) -> String {
     let from_bc = svm_llvm::translate_bc_path(bc).expect("translate via bitcode");
     let from_ll = svm_llvm::translate_ll_path(ll).expect("translate via textual .ll");
+    let bc_text = svm_text::print_module(&from_bc.module);
     assert_eq!(
-        svm_text::print_module(&from_bc.module),
+        bc_text,
         svm_text::print_module(&from_ll.module),
         "svm-ir mismatch between the bitcode and textual readers for `{name}`",
     );
@@ -7660,6 +7662,7 @@ fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) {
         from_bc.entry_sp, from_ll.entry_sp,
         "entry_sp mismatch for `{name}`",
     );
+    bc_text
 }
 
 /// Assert the bitcode and textual readers translate `src` to byte-identical svm-ir (their
@@ -7682,13 +7685,17 @@ fn assert_ll_parity_cpp(name: &str, src: &str) {
     assert_paths_parity(name, &bc, &ll);
 }
 
-/// Compile C with `-O2 -gline-tables-only` — source-line debug info (`!DILocation`/`!DISubprogram`/
-/// `!DIFile`) but no variable/type graph, so both readers exercise the §6 **source-line + function-name**
-/// halves without the (not-yet-textual) `DILocalVariable`/`DIType` graph.
-fn compile_debug(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> {
+/// Compile C with debug info at the given `opt`/`g` levels. The source filename is embedded in
+/// `!DIFile`, so *both* compiles must use the same `.c` path for the recovered debug paths to match.
+fn compile_debug(
+    name: &str,
+    src: &str,
+    opt: &str,
+    g: &str,
+    emit: &str,
+    ext: &str,
+) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
-    // The source filename is embedded in `!DIFile`, so *both* compiles must use the same `.c` path for
-    // the recovered debug paths to match (the output paths still differ by `ext`).
     let c = dir.join(format!("svm_llvm_{}_{}_g.c", std::process::id(), name));
     let out = dir.join(format!(
         "svm_llvm_{}_{}_g.{}",
@@ -7698,7 +7705,7 @@ fn compile_debug(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf
     ));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args(["-O2", "-gline-tables-only", "-emit-llvm", emit])
+        .args([opt, g, "-emit-llvm", emit])
         .arg(&c)
         .arg("-o")
         .arg(&out)
@@ -7712,17 +7719,27 @@ fn compile_debug(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf
     }
 }
 
-/// Like [`assert_ll_parity`], but with `-gline-tables-only` debug info — verifies the textual reader
-/// recovers the same `!DILocation` source positions + `!DISubprogram` function names as the bitcode
-/// reader's `di` walk.
-fn assert_ll_parity_debug(name: &str, src: &str) {
+/// Assert both readers recover identical debug info at the given `opt`/`g` levels — and that the
+/// output actually carries a `DIType` graph (guards against a trivial pass where neither reader
+/// produced any type/variable info).
+fn assert_ll_parity_debug_at(name: &str, src: &str, opt: &str, g: &str) {
     let (Some(bc), Some(ll)) = (
-        compile_debug(name, src, "-c", "bc"),
-        compile_debug(name, src, "-S", "ll"),
+        compile_debug(name, src, opt, g, "-c", "bc"),
+        compile_debug(name, src, opt, g, "-S", "ll"),
     ) else {
         return;
     };
-    assert_paths_parity(name, &bc, &ll);
+    let text = assert_paths_parity(name, &bc, &ll);
+    assert!(
+        text.contains("debug.type "),
+        "`{name}` produced no debug type graph — the debug parity check is trivial",
+    );
+}
+
+/// Full `-O0 -g` debug info: source positions **and** the `DIType` graph + `DILocalVariable`s
+/// (`llvm.dbg.declare` locals) + module globals — the whole §6 waist the bitcode `di` walk produces.
+fn assert_ll_parity_debug(name: &str, src: &str) {
+    assert_ll_parity_debug_at(name, src, "-O0", "-g");
 }
 
 #[test]
