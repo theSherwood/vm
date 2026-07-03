@@ -2007,14 +2007,32 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     -gline-tables-only` — source lines + subprogram names but *no* `DILocalVariable`/`DIType`, so the
     variable/type graph stays out of scope) — **31 parity tests total.** Key gotcha found: the DIFile
     filename is embedded, so both compiles must use the *same* `.c` source path.
-  - **Next: slice 3b — the variable/type graph.** Replace di.rs's `llvm-sys` walk of
-    `DILocalVariable`/`DIType`(`DIBasicType`/`DIDerivedType`/`DICompositeType`) + the
-    `llvm.dbg.declare`/`dbg.value` correlation, building the `di::LlvmDebug` `types`/`vars`/`globals` from
-    text (`-O0 -g` for `dbg.declare`/`Window` locals; `-Og`/`-O2 -g` for `dbg.value`/`SsaList`). Gate
-    with `-O0 -g` and `-Og` `assert_ll_parity_debug` variants. This is the bigger half; once it reaches
-    parity, di.rs is fully replaced.
-- **PR4:** flip the default + drop `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/`di.rs`/the side-readers + the
-  rustc-1.81 pin (prove version-tolerance by feeding an LLVM-21 `.ll`).
+  - **Slice 3b — the variable/type graph — DONE.** A new `ll/debug.rs` fully mirrors `di.rs`,
+    building the `di::LlvmDebug` `types`/`vars`/`globals` from text so both readers produce a
+    byte-identical structured half: the **type interner** (`DIBasicType`→`Base` with the same
+    `infer_encoding(name)` heuristic, `DIDerivedType`ptr→`Pointer`, `DICompositeType` array→`Array`
+    with `count = size_bits/elem_bits`, struct/union→`Aggregate`; transparent typedef/const resolution;
+    cycle-safe placeholder; **functions walked before globals** so the interning order + `TypeId`s
+    match), **`read_globals`** (each global's `!dbg` `DIGlobalVariableExpression`→`DIGlobalVariable`),
+    **`read_function_vars`** (alloca ordinals for `dbg.declare`→`Window`, argument index for
+    `dbg.value`→`Arg`; dedup by `!DILocalVariable` identity), and **lexical-block scope** (a
+    `DILexicalBlock`-scoped var → `(decl_line, block_end)` via `compute_block_ends`). The metadata
+    pre-pass was generalized to a generic `DiNode { Node { kind, fields } | Tuple }`; `dbg.declare`/
+    `dbg.value` `metadata`-operand payloads (dropped by the AST as `MetadataOperand`) are captured in a
+    side-channel (`DbgIntrinsic`). Gates: `assert_ll_parity_debug` (`-O0 -g`, with a `debug.type`
+    non-triviality guard) + an `-Og -g` variant — five debug parity tests (source lines, func names,
+    type graph + globals, `dbg.declare` locals, `dbg.value` args, lexical scope). **`di.rs` is now
+    fully replaceable.** (Corrected a real bug mid-slice: the debug harness had used
+    `-gline-tables-only`, which emits no type/var graph, so the type/global/local tests were passing
+    trivially — switched to `-O0 -g`.)
+- **PR4 (next): flip the default + drop the libLLVM binding.** Make the textual `.ll` reader the
+  default ingest and delete `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/`di.rs`/`blockaddr`/the side-readers
+  + the rustc-1.81 pin. Sequence: (1) route `translate_bc_path`'s callers through a `clang -emit-llvm
+  -S` step (or add a `.bc`→`.ll` disassembly via `llvm-dis`) so nothing needs the bitcode reader; (2)
+  drop the `di` argument plumbing now that `ll::debug` supplies it; (3) remove the deps + the parity
+  harness's bitcode side (it becomes self-tests on the textual reader); (4) prove version-tolerance by
+  feeding an LLVM-21-emitted `.ll` through the reader. The differential parity corpus (now 35 tests:
+  30 instruction + 5 debug) is the safety net for the flip.
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
