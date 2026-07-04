@@ -2107,10 +2107,29 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     because the reader fail-closed there). **Deleted:** `from_llvm_ir.rs`, `wideint.rs`, and the
     `llvm-sys` bodies of `di.rs`/`blockaddr.rs` (their data structs stay, filled by `ll::debug`/
     `ll::parse`); **dropped the `llvm-ir`/`llvm-sys`/`either` deps.** `svm-llvm` links **no libLLVM**.
-  - **Remaining (small):** drop the rustc-1.81 pin (it existed only for `llvm-sys`); prove version
-    tolerance by feeding an LLVM-21-emitted `.ll` through the reader; optionally convert the test helpers
-    from `clang -c` + `llvm-dis` to a direct `clang -emit-llvm -S` (dropping even the `llvm-dis` runtime
-    dependency for the C-compiled tests — the pre-built `.bc` corpora still use `llvm-dis`).
+  - **DONE — version tolerance proven; the rustc-1.81 pin dropped from the breadth lane.** The Rust
+    on-ramp breadth lane (`rust_no_std_matches_native` and the `no_std`+`alloc` powerbox tests) now
+    compiles with the **default** `rustc` (1.94 → **LLVM 21**) via `--emit=llvm-ir` straight to `.ll`
+    and routes through `translate_ll_path` — so the lane *is* the version-tolerance proof: a newer LLVM
+    than the old `llvm-ir` ceiling (19) flows through the textual reader unchanged. Its `+1.81.0`
+    invocations (both `compile_rust_to_ll` and the native oracles) are gone. (The matching CI change —
+    swap `llvm-18-dev` → base `llvm-18`, rescope the 1.81 step to peval only — is a **manual
+    follow-up**: the bot's token lacks `workflow` scope, so it cannot push `.github/workflows/ci.yml`.
+    The exact edit is spelled out in Q5 below.) **The 1.81 pin survives in exactly one place:**
+    the multi-crate `peval_*` Futamura probe (`tests/common/mod.rs`), which links the fixture closure
+    with `llvm-link-18` and DCEs it with `opt-18` — LLVM-18 CLI tools that can only ingest LLVM-18 IR,
+    so the fixture must be built by a version-matched `rustc`. (Those tests auto-skip, not fail, absent
+    the toolchain; CI keeps a scoped `rustup toolchain install 1.81.0` step for them.)
+    Feeding real LLVM-21 IR surfaced three new-in-LLVM-19/20/21 constructs the reader/translator now
+    handle: **(a)** the no-op alloc-shim marker `@…__rust_no_alloc_shim_is_unstable_v2()` (dropped like
+    `llvm.lifetime`); **(b)** the `icmp samesign` poison hint (skipped in the parser); **(c)** the
+    three-way-compare intrinsics `llvm.scmp`/`llvm.ucmp` (LLVM ≥ 19, what newer `rustc` lowers
+    `Ord::cmp` into) — lowered to `(a>b) - (a<b)`, **masked to the result width** so the {-1,0,1} value
+    lands in the `switch i8` `br_table` the way the parser's width-masked case constants expect (an
+    unmasked sign-extended `-1` hit the `unreachable` default — a `BTreeMap` navigation trap).
+  - **Remaining (optional):** convert the C test helpers from `clang -c` + `llvm-dis` to a direct
+    `clang -emit-llvm -S` (dropping even the `llvm-dis` runtime dependency for the C-compiled tests —
+    the pre-built `.bc` corpora still use `llvm-dis`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
@@ -2125,19 +2144,27 @@ frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `sv
 `svm-llvm` is **excluded from the workspace** (root `Cargo.toml`, with `fuzz`/`bench`), so the
 default `cargo build/test --workspace` never resolves or links libLLVM and the cross-OS
 runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) is untouched (D54 off-the-
-runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites
-found at first light (document these for the CI lane):**
-- **`llvm-18-dev`** (headers + the `.so`), not just `llvm-18`/`libllvm18` (runtime only). The
-  runtime package ships `libLLVM.so` but no `llvm-c/*.h`, which `llvm-sys`'s build script needs.
-- **Dynamic linking**: distros ship `libLLVM.so` without the static `.a`s (no `libPolly.a`),
-  and `llvm-sys` defaults to static. We depend on `llvm-sys` directly with feature
-  **`prefer-dynamic`** (feature-unifies onto the `llvm-sys` `llvm-ir` pulls in) so it links the
-  dylib. `clang`/`llvm-config` 18 must be on `PATH` (they are in this container + the existing
-  wasm/cc CI lanes).
+runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites —
+UPDATED after the textual-reader flip (PR4):**
+- **No `-dev` package, no libLLVM link.** The on-ramp reads textual `.ll` with an in-house parser,
+  so `llvm-sys`/`llvm-ir` and the `prefer-dynamic` dance are gone. CI installs just base
+  **`llvm-18`** + **`clang-18`** — two ordinary build-time *tools*: `clang` (compile the C/C++
+  corpus to bitcode) and `llvm-dis` (disassemble it to `.ll`). Neither is linked into the crate.
+- **No Rust-toolchain pin.** The Rust lane compiles with the default stable `rustc` (`--emit=llvm-ir`);
+  its bundled LLVM (21 here) flows straight through the textual reader — the version-tolerance proof.
 
-**Q5 — remaining CI yaml (open):** add the Linux-only `svm-llvm` job to `ci.yml` (install
-`llvm-18-dev`, `cd crates/svm-llvm && cargo test`); a maintainer one-liner like the §10 miri/
-ASan items in HANDOFF.
+**Q5 — CI yaml (MANUAL FOLLOW-UP — the bot lacks `workflow` scope):** the Linux-only `svm-llvm` job
+exists in `ci.yml` and runs `cargo fmt --all --check` · `cargo clippy --all-targets -- -D warnings` ·
+`cargo test`. After the PR4 flip it needs two edits a maintainer must apply by hand (a `workflow`-scoped
+push, like the §10 miri/ASan HANDOFF items):
+1. **Drop the libLLVM dev headers.** In the "install LLVM 18" step, `llvm-18-dev clang-18` → `llvm-18
+   clang-18`. The crate no longer links libLLVM; it only shells out to `clang` + `llvm-dis`, both in
+   the base `llvm-18` package. (`llvm-link-18`/`opt-18`, used by the peval probe, are also in base.)
+2. **Rescope the 1.81 toolchain step.** It is no longer for the Rust breadth lane (that runs on the
+   default stable `rustc` now — the version-tolerance proof). Retitle it to make clear it exists solely
+   for the multi-crate `peval_*` Futamura probe, which links/DCEs its fixture with the LLVM-18 CLI tools
+   and so needs a version-matched `rustc`. Keep the `rustup toolchain install 1.81.0` line (else those
+   tests auto-skip).
 
 ---
 

@@ -97,6 +97,11 @@ pub fn parse_module_with_debug(
     Ok((m, debug, ba))
 }
 
+/// A `blockaddress` target as it appears in the text: `(@func name, %block label)`.
+type BaTarget = (String, String);
+/// A φ-threaded `blockaddress` key: `(current func name, block idx, phi ordinal, incoming idx)`.
+type BaPhiKey = (String, u32, u32, u32);
+
 /// The token cursor + the module-under-construction (the type interner lives in `module.types`).
 struct Parser {
     toks: Vec<Token>,
@@ -132,13 +137,13 @@ struct Parser {
     current_global: Option<String>,
     /// `global name → (@func, %block)` `blockaddress` payloads in initializer DFS order — the AST drops
     /// the payload (`Constant::BlockAddress`), so it's recovered here (the `blockaddr` reader's job).
-    ba_per_global: std::collections::HashMap<String, Vec<(String, String)>>,
+    ba_per_global: std::collections::HashMap<String, Vec<BaTarget>>,
     /// A `blockaddress` payload just parsed by `constant()`, so the enclosing `phi` can attribute it to
     /// its `(func, block, phi_ord, incoming)` position (clang's jump-threading case).
-    pending_ba: Option<(String, String)>,
+    pending_ba: Option<BaTarget>,
     /// φ-threaded `blockaddress`es: `(current func name, block idx, phi ordinal, incoming idx)` →
     /// `(@func, %block)`. Resolved to block indices in [`Self::take_block_addrs`].
-    ba_phi: Vec<((String, u32, u32, u32), (String, String))>,
+    ba_phi: Vec<(BaPhiKey, BaTarget)>,
     /// The index of the basic block currently being parsed (for the φ-threaded `blockaddress` key).
     cur_block_idx: u32,
     /// The φ ordinal within the current block (counts φs; the φ-threaded `blockaddress` key).
@@ -1715,6 +1720,12 @@ impl Parser {
     /// `icmp <pred> <ty> <op0>, <op1>`.
     fn icmp_inst(&mut self, dest: Name) -> PResult<ICmp> {
         self.pos += 1; // `icmp`
+                       // `samesign` (LLVM ≥ 20) is a poison-generating hint asserting both operands share a sign —
+                       // no effect on the compare's runtime result, so we drop it. It sits between `icmp` and the
+                       // predicate.
+        if matches!(self.peek(), Some(Token::Word(w)) if w.as_str() == "samesign") {
+            self.pos += 1;
+        }
         let predicate = self.int_predicate()?;
         let ty = self.type_()?;
         let operand0 = self.value_as_operand(&ty)?;

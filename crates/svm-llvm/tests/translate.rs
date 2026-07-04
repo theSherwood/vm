@@ -4904,26 +4904,25 @@ extern "C" int main() {
 }
 
 // ============================================================================================
-// Milestone 2 — Rust through the on-ramp (the D54 breadth headline). `rustc` bundles its own LLVM,
-// so the bitcode version must match our pin (LLVM 18): the container's default `rustc` ships LLVM
-// 21 (rejected by the pinned `llvm-ir`), but a **pinned LLVM-18 Rust toolchain** (1.81, LLVM 18.1)
-// emits bitcode the existing reader accepts — no re-pin needed. A `no_std`/`panic=abort` crate has
-// no EH/unwinding, so it lowers like C. (CI must `rustup toolchain install 1.81.0`, as it installs
-// `llvm-18-dev` for the bitcode lane.)
+// Milestone 2 — Rust through the on-ramp (the D54 breadth headline). Since the on-ramp now reads
+// **textual `.ll`** (not bitcode via the version-locked `llvm-ir` binding), it ingests whatever LLVM
+// the *default* `rustc` bundles — no toolchain pin. The container's `rustc 1.94` emits **LLVM-21**
+// `.ll`, so this lane doubles as the **version-tolerance proof**: a newer LLVM than the old `llvm-ir`
+// ceiling (LLVM 19) flows straight through the textual reader. A `no_std`/`panic=abort` crate has no
+// EH/unwinding, so it lowers like C.
 // ============================================================================================
 
-/// Compile a `no_std`/`panic=abort` Rust source to legalized **LLVM-18** bitcode via the pinned
-/// Rust 1.81 toolchain (its LLVM 18.1 matches our `llvm-ir` pin). `-O` runs mem2reg/SROA. Returns
-/// `None` (skip) if the toolchain is unavailable.
-fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+/// Compile a `no_std`/`panic=abort` Rust source to legalized **textual LLVM IR** (`.ll`) via the
+/// default `rustc` (whatever LLVM it bundles — LLVM 21 in this container). `-O` runs mem2reg/SROA.
+/// Returns `None` (skip) only if `rustc` is entirely absent.
+fn compile_rust_to_ll(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let rs = dir.join(format!("svm_llvm_{}_{}.rs", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_rust_{}_{}.bc", std::process::id(), name));
+    let ll = dir.join(format!("svm_llvm_rust_{}_{}.ll", std::process::id(), name));
     std::fs::write(&rs, src).expect("write Rust source");
     let status = Command::new("rustc")
         .args([
-            "+1.81.0",
-            "--emit=llvm-bc",
+            "--emit=llvm-ir",
             "--crate-type=lib",
             "-C",
             "panic=abort",
@@ -4938,12 +4937,12 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
         ])
         .arg(&rs)
         .arg("-o")
-        .arg(&bc)
+        .arg(&ll)
         .status();
     match status {
-        Ok(s) if s.success() => Some(bc),
+        Ok(s) if s.success() => Some(ll),
         _ => {
-            eprintln!("note: skipping {name} (rustc +1.81.0 unavailable — `rustup toolchain install 1.81.0`)");
+            eprintln!("note: skipping {name} (rustc unavailable)");
             None
         }
     }
@@ -4969,8 +4968,8 @@ fn rust_compute_onramp(n: i32) -> Option<i32> {
          #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
          #[no_mangle] pub extern \"C\" fn compute(n: i32) -> i32 {RUST_COMPUTE_BODY}\n"
     );
-    let bc = compile_rust_to_bc("rs_compute", &src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let ll = compile_rust_to_ll("rs_compute", &src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated Rust IR");
     // A `no_std` lib has no `main`/powerbox; the panic handler (`rust_begin_unwind`, a `loop {}`) is
@@ -4998,7 +4997,7 @@ fn rust_compute_onramp(n: i32) -> Option<i32> {
     Some(interp)
 }
 
-/// The native oracle: the **same** `compute` body compiled by `rustc 1.81` into a std binary that
+/// The native oracle: the **same** `compute` body compiled by the default `rustc` into a std binary that
 /// prints `compute(n)`, run natively. (A `no_std` lib can't be run directly; std `compute` is the
 /// identical function, so it is the ground truth — incl. the `i33` overflow/wrap path.)
 fn rust_compute_native(n: i32) -> Option<i32> {
@@ -5014,7 +5013,7 @@ fn rust_compute_native(n: i32) -> Option<i32> {
     )
     .expect("write Rust source");
     match Command::new("rustc")
-        .args(["+1.81.0", "-C", "opt-level=2", "-C", "overflow-checks=off"])
+        .args(["-C", "opt-level=2", "-C", "overflow-checks=off"])
         .arg(&rs)
         .arg("-o")
         .arg(&exe)
@@ -5034,7 +5033,7 @@ fn rust_compute_native(n: i32) -> Option<i32> {
 
 /// **Rust through the on-ramp — the D54 breadth headline.** A `no_std`/`panic=abort` Rust crate
 /// (a different frontend, its own ABI/lowering) translates and runs with no translator change beyond
-/// the C corpus, given a version-matched toolchain (Rust 1.81 / LLVM 18). The chosen function forces
+/// the C corpus, The chosen function forces
 /// LLVM's `i33` closed-form (the non-power-of-two integer support added here), and the values include
 /// `n` large enough that the `i33` intermediate **overflows 33 bits and wraps** — caught only by the
 /// native differential (interp == JIT alone would agree even if the masking were wrong). Every value
@@ -5064,8 +5063,7 @@ fn rust_no_std_matches_native() {
 // ============================================================================================
 
 /// Build a native `std` Rust binary from `src`, run it (feeding `stdin`), return its stdout. `None`
-/// (skip) if `rustc +1.81.0` is unavailable — the on-ramp lane is pinned to that toolchain, so the
-/// oracle uses it too (no behavioural difference for these programs, but keeps one toolchain).
+/// (skip) if `rustc` is unavailable.
 fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
     use std::io::Write;
     let dir = std::env::temp_dir();
@@ -5073,7 +5071,7 @@ fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
     let exe = dir.join(format!("svm_llvm_{}_{}_nat", std::process::id(), name));
     std::fs::write(&rs, src).expect("write native Rust source");
     match Command::new("rustc")
-        .args(["+1.81.0", "-C", "opt-level=2"])
+        .args(["-C", "opt-level=2"])
         .arg(&rs)
         .arg("-o")
         .arg(&exe)
@@ -5094,10 +5092,10 @@ fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
 /// Translate a `no_std`/`alloc` powerbox Rust program through the on-ramp and run it, returning its
 /// stdout. Mirrors [`powerbox_diff`]'s SVM half but for a Rust frontend: the program must produce a
 /// powerbox entry (it uses `malloc` + `write`), so we resolve §7 imports to capabilities, verify, and
-/// run through `run_powerbox`. `None` (skip) if `rustc +1.81.0` is unavailable.
+/// run through `run_powerbox`. `None` (skip) if `rustc` is unavailable.
 fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
-    let bc = compile_rust_to_bc(name, src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust heap bitcode");
+    let ll = compile_rust_to_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust heap bitcode");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "{name}: a heap-allocating Rust program must produce a powerbox entry"
@@ -5784,8 +5782,8 @@ fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
         "#![no_std]\n#![no_main]\n\
          #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n{items}\n"
     );
-    let bc = compile_rust_to_bc(name, &src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let ll = compile_rust_to_ll(name, &src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated Rust IR");
     let idx = module
@@ -5816,7 +5814,7 @@ fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
     Some(interp)
 }
 
-/// Native oracle: the same `items` (with `run`) compiled by `rustc 1.81` into a std binary printing
+/// Native oracle: the same `items` (with `run`) compiled by the default `rustc` into a std binary printing
 /// `run(n)`, run natively.
 fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
     let dir = std::env::temp_dir();
@@ -5830,7 +5828,6 @@ fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
     .expect("write Rust source");
     match Command::new("rustc")
         .args([
-            "+1.81.0",
             "--edition",
             "2021",
             "-C",
@@ -6044,8 +6041,8 @@ fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
          {items}\n\
          #[no_mangle] pub extern \"C\" fn main() -> i32 {{ compute() }}\n"
     );
-    let bc = compile_rust_to_bc(name, &src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let ll = compile_rust_to_ll(name, &src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "{name}: an alloc program must produce a powerbox entry (Memory granted)"
@@ -6075,7 +6072,6 @@ fn rust_alloc_native(name: &str, items: &str) -> Option<u8> {
     .expect("write Rust source");
     match Command::new("rustc")
         .args([
-            "+1.81.0",
             "--edition",
             "2021",
             "-C",

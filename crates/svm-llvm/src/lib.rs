@@ -12374,6 +12374,71 @@ fn lower_int_intrinsic(
     let Some(name) = callee_name(c) else {
         return Ok(None);
     };
+    // Three-way compare (`llvm.scmp`/`llvm.ucmp`, LLVM ≥ 19 — newer `rustc` lowers `Ord::cmp` into
+    // it). `<res>cmp(a,b) = (a > b) - (a < b)` ∈ {-1, 0, 1}. The mangled name carries *two* type
+    // suffixes (`llvm.ucmp.<resty>.<opnty>`), so it's matched by prefix, ahead of the single-suffix
+    // `base` dispatch below. The two `icmp`s yield `i32` 0/1 booleans; their difference is the signed
+    // {-1,0,1} result, sign-extended to i64 when the result type is `i64` (≤ i32 results sit
+    // sign-canonical in the i32 container).
+    if let Some(rest) = name
+        .strip_prefix("llvm.scmp.")
+        .or_else(|| name.strip_prefix("llvm.ucmp."))
+    {
+        let signed = name.starts_with("llvm.scmp.");
+        let res_bits = rest
+            .split('.')
+            .next()
+            .and_then(|s| s.strip_prefix('i'))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(32);
+        let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+        let opnd_ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        let (gtop, ltop) = if signed {
+            (CmpOp::GtS, CmpOp::LtS)
+        } else {
+            (CmpOp::GtU, CmpOp::LtU)
+        };
+        let gt = ctx.push(Inst::IntCmp {
+            ty: opnd_ty,
+            op: gtop,
+            a,
+            b,
+        });
+        let lt = ctx.push(Inst::IntCmp {
+            ty: opnd_ty,
+            op: ltop,
+            a,
+            b,
+        });
+        let sub = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Sub,
+            a: gt,
+            b: lt,
+        });
+        // The {-1,0,1} difference must be held in the *canonical narrow form* the rest of the
+        // translator expects for this result width — i.e. **masked to `res_bits`** (the parser stores
+        // integer constants zero-extended/masked, so a `switch i8` biases its cases off `i8 -1` == 255,
+        // not the sign-extended 0xFFFFFFFF). Without the mask, `-1` misses the `br_table` and lands on
+        // the `unreachable` default (a runtime trap in `BTreeMap`'s `Ord::cmp` navigation). An `i64`
+        // result instead sign-extends into the full 64-bit container (its switch biases off `i64 -1`).
+        let res = if res_bits == 64 {
+            emit_ext(ctx, sub, 32, 64, true)
+        } else if res_bits < 32 {
+            let mask = ctx.push(Inst::ConstI32(((1u32 << res_bits) - 1) as i32));
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: sub,
+                b: mask,
+            })
+        } else {
+            sub
+        };
+        return Ok(Some(res));
+    }
     let base = name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b); // drop the `.iN` suffix
     if !matches!(
         base,
@@ -13444,7 +13509,13 @@ fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
             // down in our overflow-only varargs ABI (§varargs); `va_start`/`va_copy` are lowered.
             || s.starts_with("llvm.va_end")
             // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
-            || s.starts_with("llvm.experimental.noalias.scope.decl");
+            || s.starts_with("llvm.experimental.noalias.scope.decl")
+            // Newer `rustc` (≥1.84) emits a `tail call void @…__rust_no_alloc_shim_is_unstable_v2()`
+            // marker in every allocating function — a no-op that only exists to keep the allocator
+            // shim from being stabilized/DCE'd. It returns `void` and has no runtime effect, so we
+            // drop it (matched on the stable v0-mangled suffix, ignoring the crate-hash prefix and
+            // the `_v1`/`_v2` version tail).
+            || s.contains("__rust_no_alloc_shim_is_unstable");
     }
     false
 }
