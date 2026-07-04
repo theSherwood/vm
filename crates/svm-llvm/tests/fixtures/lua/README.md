@@ -204,6 +204,35 @@ Edit `lua_coroutine.lua`, re-embed it into `lua_coroutine_tests.c` (same byte-ar
 `*_tests.c`), then build like the test-suite fixture below but with `lcorolib` in `LIBS` (no `lutf8lib`)
 and `lua_coroutine_harness.c`. Validate the `.lua` against native Lua first (it is the oracle).
 
+# Lua official coroutine.lua fixture
+
+`lua_coroutine_official.bc` runs the **unmodified official `testes/coroutine.lua`** (embedded in
+`lua_coroutine_official_tests.c`) with base/`string`/`table`/`math`/`coroutine`/`debug` open. Standalone
+the internal `T` C-test library is absent, so the file's own `if not T`/`if T==nil` guards skip the
+C-API sections; what remains still drives the coroutine + **debug** libraries hard: yields inside every
+metamethod and inside `for` iterators, `coroutine.close` with `<close>` variables, C-stack-overflow
+detection, and `debug.getinfo`/`getlocal`/`setlocal`/`setupvalue`/`sethook`/`traceback` (incl. debug on
+a *suspended* coroutine). Test `tests/lua_coroutine_official.rs` asserts `Returned([I32(0)])` on all
+three engines; the same harness+file built natively also exits 0 (the differential oracle). The harness
+(`lua_coroutine_official_harness.c`) opens `luaopen_debug` alongside `luaopen_coroutine`;
+`lua_coroutine_official_shim.c` adds the one libc gap the debug lib needs — `fgets`, referenced only by
+`ldblib.c`'s interactive `debug.debug()`, which `coroutine.lua` never calls.
+
+**One reference-oracle change this forced.** No translator, coroutine, or debug change was needed, but
+the file's *"infinite recursion of coroutines"* case (`a = function(a) coroutine.wrap(a)(a) end;
+assert(not pcall(a, a))`) probes Lua's own C-stack-overflow detection: it must raise a `pcall`-catchable
+"C stack overflow" via `LUAI_MAXCCALLS`. The production engines (bytecode, JIT) reach that self-limit,
+but the tree-walker reference oracle previously capped its reified call stack at `MAX_CALL_DEPTH = 256`
+and tripped first as an uncatchable §5 kill. Raising the cap to `2048` (still well under the durable
+shadow-reserve frame budget) lets the oracle observe the same catchable error the real engines do — see
+`svm_interp::MAX_CALL_DEPTH`. Verified regression-free (durable + interp + `jit_diff` suites green).
+
+## Regenerating (official coroutine.lua)
+
+Same as the test-suite fixture below, but with `lcorolib` **and** `ldblib` in `LIBS`,
+`lua_coroutine_official_harness.c` (opens coroutine + debug), and the `fgets` stub
+`lua_coroutine_official_shim.c` linked in. Validate against native Lua first (it is the oracle).
+
 # Lua utf8.lua fixture
 
 `lua_utf8.bc` runs the official **`testes/utf8.lua`** (embedded in `lua_utf8_tests.c`) through the whole

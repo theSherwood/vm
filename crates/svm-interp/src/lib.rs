@@ -199,7 +199,16 @@ pub enum Trap {
 /// the host stack stays O(1) regardless of guest depth. This is a reference-oracle limit,
 /// not the production recursion ceiling (the JIT uses the guest's guard-paged data stack,
 /// §5).
-const MAX_CALL_DEPTH: u32 = 256;
+///
+/// The bound must sit **above** a guest runtime's own C-stack-overflow detection so the
+/// oracle observes the same *catchable* error the production engines do, rather than killing
+/// the guest first. Concretely: Lua's `LUAI_MAXCCALLS` (200 nested C calls) expands to well
+/// under 2048 reified frames, so `coroutine.lua`'s "infinite recursion of coroutines" test
+/// raises a `pcall`-catchable "C stack overflow" on all three engines instead of the
+/// tree-walker uniquely tripping this cap (an uncatchable §5 kill) at 256. Kept comfortably
+/// below the durable shadow-reserve's frame budget (`DURABLE_RESERVE`, §12.7) so a deep
+/// durable freeze still traps at *this* cap, never by corrupting guest memory.
+const MAX_CALL_DEPTH: u32 = 2048;
 
 /// Run `func` with `args`, consuming up to `*fuel` execution steps.
 ///

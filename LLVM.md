@@ -1254,10 +1254,26 @@ propagation, **yield across `pcall`/`xpcall`** (the yieldable-pcall / continuati
 (native-stack switching for vCPUs/Workers) is a separate, host-side concern and is deliberately *not*
 involved.
 
-**Remaining** for a *full* suite: the `os`/`io`/`debug` files need those libraries + a filesystem. The
-official `testes/coroutine.lua` also hard-requires the `debug` library (hooks, `getinfo`,
-`getlocal`/`setlocal` on suspended coroutines, `traceback`), so it is gated on the debug slice — the
-coroutine *machinery* it depends on is already done. Each is a follow-on slice.
+**Debug library + official `coroutine.lua` — ACHIEVED ✅ (all three engines).** The unmodified official
+`testes/coroutine.lua` now runs green on the tree-walker, bytecode, and JIT + native
+(`lua_coroutine_official.bc` / `tests/lua_coroutine_official.rs`), which brought up the **`debug`
+library** (`ldblib.c`: `getinfo`/`getlocal`/`setlocal`/`getupvalue`/`setupvalue`/`sethook`/`traceback`,
+including debug on a *suspended* coroutine) alongside coroutines. Standalone the internal `T` C-test
+library is absent, so the file's own `if not T`/`if T==nil` guards skip the C-API sections; the rest
+still drives yields inside every metamethod and `for` iterator, `coroutine.close` with `<close>`
+variables, and C-stack-overflow detection. The debug lib needed only one libc gap-fill (`fgets`, for the
+never-called interactive `debug.debug()`).
+
+**One reference-oracle change this forced** (no translator/coroutine/debug change): the file's *"infinite
+recursion of coroutines"* case relies on Lua's own `LUAI_MAXCCALLS` raising a `pcall`-catchable "C stack
+overflow". The production engines reach that self-limit; the tree-walker's reified call stack previously
+capped at `MAX_CALL_DEPTH = 256` and tripped first as an *uncatchable* §5 kill. Raising the oracle cap to
+`2048` — still well under the durable shadow-reserve frame budget — lets the reference oracle observe the
+same catchable error the real engines do (its whole job). Verified regression-free: durable + interp +
+`jit_diff` (54) suites and all four prior Lua fixtures stay green.
+
+**Remaining** for a *full* suite: the `os`/`io` files need those libraries + a filesystem. Each is a
+follow-on slice.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
