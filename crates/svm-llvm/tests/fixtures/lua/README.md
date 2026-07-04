@@ -171,8 +171,38 @@ forced: the guest `strtod` now parses **hex floats** (`0x1.8p3`, Lua's hex-float
 predicates (`emit_fcmp`), which Lua's `luaV_flttointeger` relies on. The guest shim adds real fdlibm
 `asin`/`acos`/`atan`/`atan2`/`modf` (`lua_testsuite_trig.c`) that the base libm lacks.
 
-Still out of reach: the `os`/`io`/`coroutine`/`debug` files need those libraries + a filesystem. Those
-are follow-ups.
+Still out of reach: the `os`/`io`/`debug` files need those libraries + a filesystem. Those are
+follow-ups. (`coroutine` itself is now covered — see below — but the official `testes/coroutine.lua`
+also hard-requires the `debug` library, so it is gated on that separate slice.)
+
+# Lua coroutine fixture
+
+`lua_coroutine.bc` runs an **in-house coroutine differential** (`lua_coroutine.lua`, kept readable in
+this directory and embedded verbatim as bytes into `lua_coroutine_tests.c`) with
+base/`string`/`table`/`math`/`coroutine` open. It exercises the whole coroutine surface that does *not*
+need the `debug` library: `create`/`resume`/`yield` with multi-value transfer both directions, the
+`suspended`/`running`/`normal`/`dead` status transitions, `running`/`isyieldable` in the main thread
+vs. inside a coroutine, `wrap` (incl. error re-raise), error propagation out of `resume` (string and
+non-string error values), **yield across `pcall` and `xpcall`** (the yieldable-pcall / continuation
+machinery), `coroutine.close` with `<close>` to-be-closed variables, and a producer/filter/consumer
+pipeline. Test `tests/lua_coroutine.rs` asserts `Returned([I32(0)])` on all three engines; the same
+harness+file built natively also exits 0 (the differential oracle).
+
+**Why this needed no new machinery.** Lua 5.4 coroutines are *stackless* with respect to the C stack:
+each coroutine is a `lua_State` with its own heap-allocated Lua stack, and resume/yield ride the same
+`luaD_rawrunprotected` / `luaD_throw` (setjmp/longjmp) primitive `pcall` already uses (ldo.c) — there is
+no `swapcontext`/`ucontext`/assembly anywhere in Lua's core. So the on-ramp's existing `SetJmp`/`LongJmp`
+core ops (proven by every working `pcall`) carry coroutines too; **no fiber or native-stack switching is
+involved**, and no translator or libc change was needed. The harness (`lua_coroutine_harness.c`) opens
+`luaopen_coroutine` and reuses the minimal `require` from the utf8 fixture. The official
+`testes/coroutine.lua` additionally hard-requires the `debug` library (hooks, `getinfo`,
+`getlocal`/`setlocal` on suspended coroutines, `traceback`), which is the next slice.
+
+## Regenerating (coroutine)
+
+Edit `lua_coroutine.lua`, re-embed it into `lua_coroutine_tests.c` (same byte-array format as the other
+`*_tests.c`), then build like the test-suite fixture below but with `lcorolib` in `LIBS` (no `lutf8lib`)
+and `lua_coroutine_harness.c`. Validate the `.lua` against native Lua first (it is the oracle).
 
 # Lua utf8.lua fixture
 

@@ -1240,8 +1240,24 @@ engines + native):
   (`lua_testsuite_trig.c`) the base libm lacks, and `localeconv` (Lua reads `decimal_point` when
   appending `.0` to an integer-valued float in `tostring`).
 
-**Remaining** for a *full* suite: the `os`/`io`/`coroutine`/`debug` files need those libraries + a
-filesystem. Each is a follow-on slice.
+**Coroutines — ACHIEVED ✅ (library slice, all three engines).** Lua 5.4 coroutines turned out to need
+**no new machinery** — and, notably, **no fibers**. They are *stackless* with respect to the C stack:
+each coroutine is a `lua_State` with its own heap-allocated Lua stack, and resume/yield ride the exact
+same `luaD_rawrunprotected` / `luaD_throw` (setjmp/longjmp) primitive `pcall` already uses (ldo.c) —
+there is no `swapcontext`/`ucontext`/assembly anywhere in Lua's core. So the on-ramp's existing
+`SetJmp`/`LongJmp` core ops (proven by every working `pcall`) carry them unchanged. An in-house
+differential (`lua_coroutine.bc` / `tests/lua_coroutine.rs`, source `lua_coroutine.lua`) runs green on
+all three engines + native: `create`/`resume`/`yield` (multi-value both ways), the
+`suspended`/`running`/`normal`/`dead` status transitions, `running`/`isyieldable`, `wrap`, error
+propagation, **yield across `pcall`/`xpcall`** (the yieldable-pcall / continuation path),
+`coroutine.close` with `<close>` variables, and a producer/consumer pipeline. The `svm-fiber` machinery
+(native-stack switching for vCPUs/Workers) is a separate, host-side concern and is deliberately *not*
+involved.
+
+**Remaining** for a *full* suite: the `os`/`io`/`debug` files need those libraries + a filesystem. The
+official `testes/coroutine.lua` also hard-requires the `debug` library (hooks, `getinfo`,
+`getlocal`/`setlocal` on suspended coroutines, `traceback`), so it is gated on the debug slice — the
+coroutine *machinery* it depends on is already done. Each is a follow-on slice.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
