@@ -3,6 +3,9 @@
 // is cross-origin isolated (SharedArrayBuffer available), the powerbox guest printed "hello,
 // powerbox!", and one guest's vCPUs ran across real Web Workers to 4000. This closes the gap between
 // "runs on Node worker_threads" and "runs in an actual browser" — the thesis BROWSER.md rests on.
+// Also drives the **playground** (`web/play.html`) end to end: SVM text typed into the editor,
+// parsed/verified in-browser (`svm_parse`), run across Workers in every powerbox mode, plus a
+// parse-reject negative.
 //
 // Usage:  node browser-test.mjs            (after building the threads wasm + gencorpus; see below)
 //   RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
@@ -66,14 +69,68 @@ try {
   console.log(`  ${inst.text}`);
   console.log(`  ${capio.text}\n`);
 
-  const ok = isolated.status === 'true' && powerbox.status === 'pass' &&
+  const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
     threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
     capio.status === 'pass';
+
+  // --- the playground (play.html): SVM text typed into the page, parsed in-browser, run across ----
+  // Workers. Drives the page like a human: pick an example / type source, click Run, read the
+  // result + stdout panes. Covers every powerbox mode through the `svm_parse` front end, plus a
+  // parse-reject negative (garbage source → an error message, not a hang or a crash).
+  const play = await browser.newPage();
+  play.on('console', (m) => console.log(`  [play] ${m.text()}`));
+  play.on('pageerror', (e) => console.log(`  [play pageerror] ${e.message}`));
+  await play.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
+  await play.waitForFunction(() => document.getElementById('state').dataset.state === 'ready',
+    { timeout: 30_000 });
+
+  const runPlay = async (example) => {
+    if (example) await play.selectOption('#example', example);
+    await play.click('#run');
+    await play.waitForFunction(
+      () => ['done', 'error', 'stopped'].includes(document.getElementById('state').dataset.state),
+      { timeout: 30_000 },
+    );
+    return {
+      state: await play.$eval('#state', (e) => e.dataset.state),
+      status: await play.$eval('#state', (e) => e.textContent),
+      result: await play.$eval('#result', (e) => e.textContent),
+      stdout: await play.$eval('#stdout', (e) => e.textContent),
+    };
+  };
+
+  const checks = [];
+  const check = (name, got, wantResult, wantStdout = null) => {
+    const ok = got.state === (wantResult === null ? 'error' : 'done') &&
+      (wantResult === null || got.result === wantResult) &&
+      (wantStdout === null || got.stdout === wantStdout);
+    checks.push(ok);
+    console.log(`  play/${name}: state=${got.state} result=${JSON.stringify(got.result)} ` +
+      `stdout=${JSON.stringify(got.stdout)} ${ok ? 'PASS' : 'FAIL'}`);
+    return ok;
+  };
+
+  check('hello (io)', await runPlay('hello'), '14', 'hello, world!\n');
+  check('threads (plain-after-io)', await runPlay('threads'), '4000');
+  check('io ticks', await runPlay('io'), '8', 'tick\n'.repeat(8));
+  check('jit (§22)', await runPlay('jit'), '1136');
+  check('inst (§14)', await runPlay('inst'), '40');
+
+  // Negative: garbage source must come back as a parse error message (state 'error').
+  await play.fill('#src', 'func ( this is not svm text');
+  const bad = await runPlay(null);
+  const badOk = bad.state === 'error' && bad.status.includes('parse error');
+  checks.push(badOk);
+  console.log(`  play/parse-reject: state=${bad.state} msg=${JSON.stringify(bad.status)} ` +
+    `${badOk ? 'PASS' : 'FAIL'}`);
+
+  const ok = pageOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: SVM runs in a real browser — powerbox + genuine multi-Worker ` +
     `parallelism (incl. §22 guest-JIT on a shared Domain, §14 confined executor children on their ` +
     `own Workers, and 4d host I/O from worker vCPUs through one shared powerbox) over a shared ` +
-    `WebAssembly.Memory under cross-origin isolation`);
+    `WebAssembly.Memory under cross-origin isolation — plus the playground (SVM text parsed ` +
+    `in-browser via svm_parse, run across Workers in every powerbox mode)`);
 } catch (e) {
   failed = true;
   console.log(`FAIL: ${e.message}`);

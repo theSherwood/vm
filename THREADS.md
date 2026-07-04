@@ -302,6 +302,18 @@ property, so in practice:
   the browser vCPU-bomb **backstop**: a shared live-vCPU counter in the `svm_par_*` constructors
   (admit/retire around `svm_par_free`), capped at 256 — cruder than the native drivers' spawner
   `ThreadFault` (a refused construction fails the run via the JS host), but it bounds Worker creation.
+- [x] **4e — the playground (`browser/web/play.html`) — the motivating demo, live.** The "web
+  interpreter playground" this whole plan cites as its motivation now exists: SVM text typed into an
+  editor is parsed → verified → encoded **inside the wasm sandbox** (`svm_parse` — `svm-text`/
+  `svm-verify`/`svm-encode` are already in the cdylib; rejects come back as error *messages*), then
+  runs across **real Web Workers** under a selectable powerbox recipe: none (compute), 4d host I/O
+  (stdout read back onto the page), §22 guest-JIT, or a §14 root `Instantiator` (sandboxed children
+  on their own Workers). The Worker orchestration was extracted from the validation page into
+  `web/par.js` so both pages drive the same machinery; a plain run explicitly clears the
+  last-published recipe (`svm_par_powerbox_none`) since a playground runs modes in any order — the
+  one seam the recipe model (built for scripted back-to-back runs) had left open. Gated in Chromium
+  by `browser-test.mjs`: five examples through the editor (hello 14 + stdout, threads 4000, io 8 +
+  8×"tick\n", jit 1136, inst 40) plus a garbage-source parse-reject.
 - [x] **4c-wasm — the driver's vCPUs as real wasm Workers (the browser payoff).** Done: **one** guest's
   `thread.spawn`ed vCPUs now run on **separate Workers** (Node `worker_threads` here — the same
   `SharedArrayBuffer` + `Atomics` a browser uses) over the **one** shared linear-memory window, genuinely
@@ -385,7 +397,7 @@ node threads-engine.mjs   "$W" corpus/threads.svmbc 4000      # 4a: engine over 
 node threads-parallel.mjs "$W" corpus/threads.svmbc 4000 8    # 4b: 8 Workers, independent domains → 4000
 node threads-spawn.mjs    "$W" corpus/threads.svmbc 4000      # 4c-wasm: ONE guest's vCPUs across Workers
 node threads-spawn.mjs    "$W" corpus/futex.svmbc   987654    # 4c-wasm: the cross-Worker futex handoff
-node browser-test.mjs                                        # 4c-wasm in a REAL browser (Chromium): → 4000
+node browser-test.mjs             # 4c-wasm + 4d + 4e in a REAL browser (Chromium): validation page + playground
 ```
 
 The threads-build flags (`+atomics` · `--shared-memory --import-memory --max-memory` · `build-std`)
