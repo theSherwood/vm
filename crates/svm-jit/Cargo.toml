@@ -9,6 +9,16 @@ publish = false
 [features]
 # Passthrough to svm-fiber's ASan fiber-switch annotations (the sanitizer job).
 asan = ["svm-fiber/asan"]
+# PROTOTYPE: passthrough to svm-fiber's arena stack allocator (benchmark allocation cost).
+arena-stacks = ["svm-fiber/arena-stacks"]
+# PROTOTYPE: emit a software stack-limit check in every JIT function prologue (the per-call cost of
+# replacing the hardware guard page with a software guard). Benchmark only — NOT escape-grade (see
+# `emit_stack_check`); a real deployment must keep enforcement in the escape-TCB.
+stack-check = []
+
+[dev-dependencies]
+# Parse hand-written text IR in the `stack-check` guard test (svm-text → svm-ir; no dep cycle).
+svm-text = { path = "../svm-text" }
 
 [dependencies]
 cranelift-codegen = "0.132.0"

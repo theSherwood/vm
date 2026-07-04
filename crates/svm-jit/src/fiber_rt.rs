@@ -250,11 +250,24 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
 /// `call_indirect`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, trap_out, sp, arg) ->
 /// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).
+/// Under `stack-check` (§2b path B) the entry ABI gains a `stack_limit` param right after `trap_out`,
+/// so this fn-pointer type does too — kept in exact lockstep with `sig_from` / the CLIF trampoline.
+#[cfg(not(feature = "stack-check"))]
 pub(crate) type FiberCallTramp = extern "C" fn(
     code: u64,
     mem_base: u64,
     fn_table_base: u64,
     trap_out: u64,
+    sp: u64,
+    arg: u64,
+) -> u64;
+#[cfg(feature = "stack-check")]
+pub(crate) type FiberCallTramp = extern "C" fn(
+    code: u64,
+    mem_base: u64,
+    fn_table_base: u64,
+    trap_out: u64,
+    stack_limit: u64,
     sp: u64,
     arg: u64,
 ) -> u64;
@@ -655,7 +668,22 @@ unsafe fn make_fiber(
                 fault(trap_out);
                 0u64
             } else {
-                call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg)
+                // §2b path B: this fiber runs on its own control stack; pass its low bound as the
+                // stack-limit so the guest's prologue checks trap before overflowing it (per-vCPU by
+                // construction — each fiber supplies its own, threaded on as an ABI param).
+                #[cfg(feature = "stack-check")]
+                let out = call_tramp(
+                    (*entry).code(),
+                    mem_base,
+                    fn_table_base,
+                    trap_out,
+                    y.stack_low(),
+                    sp,
+                    arg,
+                );
+                #[cfg(not(feature = "stack-check"))]
+                let out = call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg);
+                out
             };
             (*current()).yielders.pop();
             result
@@ -851,6 +879,8 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // an outer fiber) when the resume returns. Stack-disciplined across nested resumes, mirroring the
     // durable shadow-SP bracket above — so a migrated fiber is named by identity, not by thread.
     let prev_fiber = svm_set_current_fiber(fiber_handle(slot_idx, slot.own.generation()));
+    // §2b path B: the fiber's stack-limit is supplied as an ABI param at its entry (see `make_fiber`),
+    // not via a shared cell here — so it is per-vCPU by construction and needs no resume-seam bracket.
     // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
     // `*fib` exclusive to this vCPU. The same `svm-fiber` instruction sequence regardless of which
     // thread the fiber last ran on (see the module header's 3c soundness argument).

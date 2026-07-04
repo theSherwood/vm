@@ -660,6 +660,7 @@ dependencies = [
  "loom",
  "svm-fiber",
  "svm-ir",
+ "svm-text",
  "windows-sys 0.59.0",
 ]
 
