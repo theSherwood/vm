@@ -2075,14 +2075,71 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     fully replaceable.** (Corrected a real bug mid-slice: the debug harness had used
     `-gline-tables-only`, which emits no type/var graph, so the type/global/local tests were passing
     trivially — switched to `-O0 -g`.)
-- **PR4 (next): flip the default + drop the libLLVM binding.** Make the textual `.ll` reader the
-  default ingest and delete `llvm-ir`/`llvm-sys`/`from_llvm_ir.rs`/`di.rs`/`blockaddr`/the side-readers
-  + the rustc-1.81 pin. Sequence: (1) route `translate_bc_path`'s callers through a `clang -emit-llvm
-  -S` step (or add a `.bc`→`.ll` disassembly via `llvm-dis`) so nothing needs the bitcode reader; (2)
-  drop the `di` argument plumbing now that `ll::debug` supplies it; (3) remove the deps + the parity
-  harness's bitcode side (it becomes self-tests on the textual reader); (4) prove version-tolerance by
-  feeding an LLVM-21-emitted `.ll` through the reader. The differential parity corpus (now 35 tests:
-  30 instruction + 5 debug) is the safety net for the flip.
+- **PR4 (in progress, branch `claude/ll-drop-libllvm`): flip the default + drop the libLLVM binding.**
+  - **Experiment (done, then reverted): route `translate_bc_path` through `llvm-dis` + the textual
+    reader and run the *whole corpus* (267 tests, not just the 35 parity shapes).** Result: the `.ll`
+    reader handled **252/267** after the parser-widening below; the mechanism works (out-of-process
+    `llvm-dis foo.bc -o -` → `translate_ll_str`, no libLLVM linked). The reverted experiment is the
+    template for the real flip. **Remaining 15 gaps** (the flip's to-do list): **10** a top-level
+    construct with `=` near the module head (`at: 17`; hits `cpp_eh_*` + `rust_*` — a comdat/alias/ifunc
+    or similar `skip_toplevel_item` doesn't handle; pin it down by dumping tokens near the failure);
+    **4** `blockaddress(@f, %bb)` + `indirectbr` (the `computed_goto_*` tests — needs the `blockaddr`
+    side-reader's payload recovered from text: parse the `blockaddress` constant + thread the
+    `BlockAddrs` the translator reads); **1** `i128_wide_constant_fails_closed` (now *obsolete* — the
+    textual reader carries full-width `i128`, so this fail-closed test's premise is gone; update it to
+    expect success, the whole point of I14). The **forward-reference** globals/functions gap (a `@f`
+    used before its def / an external `declare`) was papered over with an opaque-ptr fallback in the
+    experiment; the correct fix is a **two-pass symbol collection** (pre-scan `define`/`declare`/`@g =`
+    signatures into `symbols` before parsing bodies) — do that in the flip.
+  - **DONE this checkpoint — parser widened for real-world (Rust/C++/`llvm-dis`) IR** (all clean, green,
+    landable without the flip): the lexer drops `^N = …` ThinLTO **module-summary** lines; `type_()`
+    handles `half`/`bfloat`/`fp128`/`x86_fp80`/`ppc_fp128`; `constant()` parses **literal aggregate
+    constants** `{ <ty> <c>, … }` / packed `<{…}>` (`ll_parity_struct_constant_global`);
+    `skip_pre_signature_attrs` + `param_list` handle **paren-payload attributes**
+    (`dereferenceable(N)`/`range(…)`/`byval(<ty>)`, depth-tracked) + the newer attrs
+    (`dead_on_unwind`/`writable`/`captures`/`nofpclass`/…); and `block_label` accepts a **quoted**
+    `"name":` label. (These knocked the corpus from 215→252 in the experiment.)
+  - **DONE — the flip landed; libLLVM is unlinked.** `translate_bc_path` now `llvm-dis`-disassembles
+    to `.ll` and routes through the textual reader; **the entire 268-test behavioral corpus passes
+    through the pure textual reader** (not just the 35 parity shapes). Closing the gaps required:
+    **(a)** a **two-pass symbol collection** (a forward-ref-tolerant pass harvests every global/function/
+    `declare` type into `symbols` before the real parse, so a `@name` used before its definition
+    resolves) + parsing `declare` signatures; **(b)** the **external-global fix** — an `external
+    global/constant <ty>` has *no* initializer, so `at_constant_start` must not mistake the *next*
+    top-level `@name` for its value (this was the "top-level `=`" cluster, 10 tests); **(c)**
+    **`blockaddress` + `indirectbr` from text** — the `(@f, %bb)` payload the AST drops is captured
+    per-global (initializer DFS) and per-φ `(func, block, phi_ord, incoming)`, resolved to block indices,
+    and threaded as the `BlockAddrs` the translator reads (`ll::parse::take_block_addrs`); **(d)**
+    **global `alias`es** (`@a = alias <fnty>, ptr @b` → `module.global_aliases`, `type_maybe_fn` for the
+    alias's function type); **(e)** the obsolete `i128_wide_constant_fails_closed` test rewritten to
+    expect success (I14 is *fixed* — the reader carries full-width `i128`; NB the runtime correctness of
+    `i128 urem` by a >64-bit *divisor* is a separate pre-existing translator gap, never exercised before
+    because the reader fail-closed there). **Deleted:** `from_llvm_ir.rs`, `wideint.rs`, and the
+    `llvm-sys` bodies of `di.rs`/`blockaddr.rs` (their data structs stay, filled by `ll::debug`/
+    `ll::parse`); **dropped the `llvm-ir`/`llvm-sys`/`either` deps.** `svm-llvm` links **no libLLVM**.
+  - **DONE — version tolerance proven; the rustc-1.81 pin dropped from the breadth lane.** The Rust
+    on-ramp breadth lane (`rust_no_std_matches_native` and the `no_std`+`alloc` powerbox tests) now
+    compiles with the **default** `rustc` (1.94 → **LLVM 21**) via `--emit=llvm-ir` straight to `.ll`
+    and routes through `translate_ll_path` — so the lane *is* the version-tolerance proof: a newer LLVM
+    than the old `llvm-ir` ceiling (19) flows through the textual reader unchanged. Its `+1.81.0`
+    invocations (both `compile_rust_to_ll` and the native oracles) are gone. (The matching CI change —
+    swap `llvm-18-dev` → base `llvm-18`, rescope the 1.81 step to peval only — is a **manual
+    follow-up**: the bot's token lacks `workflow` scope, so it cannot push `.github/workflows/ci.yml`.
+    The exact edit is spelled out in Q5 below.) **The 1.81 pin survives in exactly one place:**
+    the multi-crate `peval_*` Futamura probe (`tests/common/mod.rs`), which links the fixture closure
+    with `llvm-link-18` and DCEs it with `opt-18` — LLVM-18 CLI tools that can only ingest LLVM-18 IR,
+    so the fixture must be built by a version-matched `rustc`. (Those tests auto-skip, not fail, absent
+    the toolchain; CI keeps a scoped `rustup toolchain install 1.81.0` step for them.)
+    Feeding real LLVM-21 IR surfaced three new-in-LLVM-19/20/21 constructs the reader/translator now
+    handle: **(a)** the no-op alloc-shim marker `@…__rust_no_alloc_shim_is_unstable_v2()` (dropped like
+    `llvm.lifetime`); **(b)** the `icmp samesign` poison hint (skipped in the parser); **(c)** the
+    three-way-compare intrinsics `llvm.scmp`/`llvm.ucmp` (LLVM ≥ 19, what newer `rustc` lowers
+    `Ord::cmp` into) — lowered to `(a>b) - (a<b)`, **masked to the result width** so the {-1,0,1} value
+    lands in the `switch i8` `br_table` the way the parser's width-masked case constants expect (an
+    unmasked sign-extended `-1` hit the `unreachable` default — a `BTreeMap` navigation trap).
+  - **Remaining (optional):** convert the C test helpers from `clang -c` + `llvm-dis` to a direct
+    `clang -emit-llvm -S` (dropping even the `llvm-dis` runtime dependency for the C-compiled tests —
+    the pre-built `.bc` corpora still use `llvm-dis`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
@@ -2097,19 +2154,27 @@ frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `sv
 `svm-llvm` is **excluded from the workspace** (root `Cargo.toml`, with `fuzz`/`bench`), so the
 default `cargo build/test --workspace` never resolves or links libLLVM and the cross-OS
 runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) is untouched (D54 off-the-
-runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites
-found at first light (document these for the CI lane):**
-- **`llvm-18-dev`** (headers + the `.so`), not just `llvm-18`/`libllvm18` (runtime only). The
-  runtime package ships `libLLVM.so` but no `llvm-c/*.h`, which `llvm-sys`'s build script needs.
-- **Dynamic linking**: distros ship `libLLVM.so` without the static `.a`s (no `libPolly.a`),
-  and `llvm-sys` defaults to static. We depend on `llvm-sys` directly with feature
-  **`prefer-dynamic`** (feature-unifies onto the `llvm-sys` `llvm-ir` pulls in) so it links the
-  dylib. `clang`/`llvm-config` 18 must be on `PATH` (they are in this container + the existing
-  wasm/cc CI lanes).
+runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites —
+UPDATED after the textual-reader flip (PR4):**
+- **No `-dev` package, no libLLVM link.** The on-ramp reads textual `.ll` with an in-house parser,
+  so `llvm-sys`/`llvm-ir` and the `prefer-dynamic` dance are gone. CI installs just base
+  **`llvm-18`** + **`clang-18`** — two ordinary build-time *tools*: `clang` (compile the C/C++
+  corpus to bitcode) and `llvm-dis` (disassemble it to `.ll`). Neither is linked into the crate.
+- **No Rust-toolchain pin.** The Rust lane compiles with the default stable `rustc` (`--emit=llvm-ir`);
+  its bundled LLVM (21 here) flows straight through the textual reader — the version-tolerance proof.
 
-**Q5 — remaining CI yaml (open):** add the Linux-only `svm-llvm` job to `ci.yml` (install
-`llvm-18-dev`, `cd crates/svm-llvm && cargo test`); a maintainer one-liner like the §10 miri/
-ASan items in HANDOFF.
+**Q5 — CI yaml (MANUAL FOLLOW-UP — the bot lacks `workflow` scope):** the Linux-only `svm-llvm` job
+exists in `ci.yml` and runs `cargo fmt --all --check` · `cargo clippy --all-targets -- -D warnings` ·
+`cargo test`. After the PR4 flip it needs two edits a maintainer must apply by hand (a `workflow`-scoped
+push, like the §10 miri/ASan HANDOFF items):
+1. **Drop the libLLVM dev headers.** In the "install LLVM 18" step, `llvm-18-dev clang-18` → `llvm-18
+   clang-18`. The crate no longer links libLLVM; it only shells out to `clang` + `llvm-dis`, both in
+   the base `llvm-18` package. (`llvm-link-18`/`opt-18`, used by the peval probe, are also in base.)
+2. **Rescope the 1.81 toolchain step.** It is no longer for the Rust breadth lane (that runs on the
+   default stable `rustc` now — the version-tolerance proof). Retitle it to make clear it exists solely
+   for the multi-crate `peval_*` Futamura probe, which links/DCEs its fixture with the LLVM-18 CLI tools
+   and so needs a version-matched `rustc`. Keep the `rustup toolchain install 1.81.0` line (else those
+   tests auto-skip).
 
 ---
 

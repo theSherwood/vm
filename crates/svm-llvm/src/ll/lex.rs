@@ -80,8 +80,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         let c = b[i];
         match c {
             b' ' | b'\t' | b'\r' | b'\n' => i += 1,
-            // Line comment to end of line.
-            b';' => {
+            // Line comment to end of line. `^N = …` ThinLTO module-summary entries (emitted by
+            // `llvm-dis`, never by `clang -emit-llvm -S`) carry no translation-relevant data and are
+            // skipped the same way — each is one logical line.
+            b';' | b'^' => {
                 while i < n && b[i] != b'\n' {
                     i += 1;
                 }
@@ -369,6 +371,14 @@ mod tests {
     #[test]
     fn comments_and_whitespace_are_dropped() {
         let toks = lex_ok("  ; a comment %not @real\n  ret ; trailing\n");
+        assert_eq!(toks, vec![Token::Word("ret".into())]);
+    }
+
+    #[test]
+    fn thinlto_summary_lines_are_dropped() {
+        // `llvm-dis` emits `^N = …` ThinLTO module-summary entries; they carry no translation data
+        // and are skipped like comments (each is one logical line).
+        let toks = lex_ok("^0 = module: (path: \"a.o\")\n^1 = gv: (guid: 42)\nret\n");
         assert_eq!(toks, vec![Token::Word("ret".into())]);
     }
 

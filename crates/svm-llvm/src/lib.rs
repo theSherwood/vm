@@ -164,9 +164,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-// The translator consumes our **owned** `ll` AST (LLVM.md §8 Q1b): the bitcode path feeds it via the
-// `from_llvm_ir` conversion shim, and the textual-`.ll` reader produces it directly. The `as
-// LTerm`/`LModule` aliases keep the rest of this file unchanged across the swap.
+// The translator consumes our **owned** `ll` AST (LLVM.md §8 Q1b), produced by the in-house textual
+// `.ll` reader ([`ll`]). The `as LTerm`/`LModule` aliases keep the rest of this file unchanged.
 use crate::ll::ast::{
     BasicBlock, Constant, DebugLoc, FPPredicate, FPType, Float, Function, HasDebugLoc, Instruction,
     IntPredicate, Module as LModule, Name, Operand, Terminator as LTerm, Type, Typed, Types,
@@ -178,15 +177,14 @@ use svm_ir::{
     StoreOp, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
+/// The §6 debug-info + computed-`goto` data models (built by the [`ll`] reader, consumed by the
+/// translator). The `llvm-sys` readers they once held are gone — [`ll`] recovers the structure from
+/// textual `.ll`, so no libLLVM is linked.
 pub mod blockaddr;
 pub mod di;
-/// Conversion shim from the `llvm-ir` bitcode AST to our owned [`ll`] AST (LLVM.md §8 Q1b). Transient:
-/// the bridge that keeps the bitcode path feeding the swapped translator until `llvm-ir` is dropped.
-mod from_llvm_ir;
-/// The in-house textual-`.ll` reader (LLVM.md §8 Q1a) — replacing the `llvm-ir`/libLLVM binding.
-/// Built behind a differential parity check before it becomes the default; see `tests/translate.rs`.
+/// The in-house textual-`.ll` reader (LLVM.md §8 Q1a) — the sole ingest, replacing the `llvm-ir`/
+/// libLLVM binding: full-width constants, version-tolerant, no libLLVM link.
 pub mod ll;
-pub mod wideint;
 
 /// Why a translation could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,19 +230,22 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     // word, so a wide/negative `i128` literal would silently miscompile. We can't recover the high
     // word from the truncated AST, so reject such a module up front (clean `Unsupported`, never a
     // miscompile). Constants that fit in `[0, 2^64)` round-trip exactly and are unaffected.
-    if let Some(c) = path.to_str().and_then(wideint::out_of_range_constant) {
-        return unsup(format!(
-            "wide integer constant `{c}`: a ≥2⁶⁴ / negative i128 literal is not supported \
-             (`llvm-ir` truncates it; fail-closed to avoid a miscompile — ISSUES.md I14)"
-        ));
+    // Disassemble the bitcode to textual `.ll` out-of-process (`llvm-dis`, an ordinary build-time tool
+    // like `clang` — §Q2's out-of-process decision) and route through the in-house textual reader. No
+    // libLLVM is linked into this crate; full-width `i128` and version-tolerance come for free.
+    let out = std::process::Command::new("llvm-dis")
+        .arg(path)
+        .arg("-o")
+        .arg("-")
+        .output()
+        .map_err(|e| Error::Parse(format!("llvm-dis: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Parse(format!(
+            "llvm-dis failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
     }
-    let bc = llvm_ir::Module::from_bc_path(path).map_err(Error::Parse)?;
-    // Bridge the bitcode AST into our owned `ll` AST the translator now consumes (LLVM.md §8 Q1b).
-    let m = from_llvm_ir::convert_module(&bc)?;
-    let di = path.to_str().and_then(di::read_debug);
-    // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).
-    let ba = path.to_str().and_then(blockaddr::read_block_addrs);
-    translate_impl(&m, di.as_ref(), ba.as_ref())
+    translate_ll_str(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Translate a **textual** LLVM IR file (`*.ll`) via the in-house reader (LLVM.md §8 Q1b) — the
@@ -263,9 +264,9 @@ pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 /// coverage), packaged as a [`di::LlvmDebug`] and threaded through the same `di` argument the bitcode
 /// path uses. The variable/type graph (`DILocalVariable`/`DIType`) is a later slice.
 pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
-    let (m, di) =
+    let (m, di, ba) =
         ll::parse::parse_module_with_debug(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
-    translate_impl(&m, di.as_ref(), None)
+    translate_impl(&m, di.as_ref(), ba.as_ref())
 }
 
 /// Translate an already-parsed [`ll`] module (the shape the textual-`.ll` reader produces, or the
@@ -12373,6 +12374,71 @@ fn lower_int_intrinsic(
     let Some(name) = callee_name(c) else {
         return Ok(None);
     };
+    // Three-way compare (`llvm.scmp`/`llvm.ucmp`, LLVM ≥ 19 — newer `rustc` lowers `Ord::cmp` into
+    // it). `<res>cmp(a,b) = (a > b) - (a < b)` ∈ {-1, 0, 1}. The mangled name carries *two* type
+    // suffixes (`llvm.ucmp.<resty>.<opnty>`), so it's matched by prefix, ahead of the single-suffix
+    // `base` dispatch below. The two `icmp`s yield `i32` 0/1 booleans; their difference is the signed
+    // {-1,0,1} result, sign-extended to i64 when the result type is `i64` (≤ i32 results sit
+    // sign-canonical in the i32 container).
+    if let Some(rest) = name
+        .strip_prefix("llvm.scmp.")
+        .or_else(|| name.strip_prefix("llvm.ucmp."))
+    {
+        let signed = name.starts_with("llvm.scmp.");
+        let res_bits = rest
+            .split('.')
+            .next()
+            .and_then(|s| s.strip_prefix('i'))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(32);
+        let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+        let opnd_ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        let (gtop, ltop) = if signed {
+            (CmpOp::GtS, CmpOp::LtS)
+        } else {
+            (CmpOp::GtU, CmpOp::LtU)
+        };
+        let gt = ctx.push(Inst::IntCmp {
+            ty: opnd_ty,
+            op: gtop,
+            a,
+            b,
+        });
+        let lt = ctx.push(Inst::IntCmp {
+            ty: opnd_ty,
+            op: ltop,
+            a,
+            b,
+        });
+        let sub = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Sub,
+            a: gt,
+            b: lt,
+        });
+        // The {-1,0,1} difference must be held in the *canonical narrow form* the rest of the
+        // translator expects for this result width — i.e. **masked to `res_bits`** (the parser stores
+        // integer constants zero-extended/masked, so a `switch i8` biases its cases off `i8 -1` == 255,
+        // not the sign-extended 0xFFFFFFFF). Without the mask, `-1` misses the `br_table` and lands on
+        // the `unreachable` default (a runtime trap in `BTreeMap`'s `Ord::cmp` navigation). An `i64`
+        // result instead sign-extends into the full 64-bit container (its switch biases off `i64 -1`).
+        let res = if res_bits == 64 {
+            emit_ext(ctx, sub, 32, 64, true)
+        } else if res_bits < 32 {
+            let mask = ctx.push(Inst::ConstI32(((1u32 << res_bits) - 1) as i32));
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: sub,
+                b: mask,
+            })
+        } else {
+            sub
+        };
+        return Ok(Some(res));
+    }
     let base = name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b); // drop the `.iN` suffix
     if !matches!(
         base,
@@ -13443,7 +13509,13 @@ fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
             // down in our overflow-only varargs ABI (§varargs); `va_start`/`va_copy` are lowered.
             || s.starts_with("llvm.va_end")
             // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
-            || s.starts_with("llvm.experimental.noalias.scope.decl");
+            || s.starts_with("llvm.experimental.noalias.scope.decl")
+            // Newer `rustc` (≥1.84) emits a `tail call void @…__rust_no_alloc_shim_is_unstable_v2()`
+            // marker in every allocating function — a no-op that only exists to keep the allocator
+            // shim from being stabilized/DCE'd. It returns `void` and has no runtime effect, so we
+            // drop it (matched on the stable v0-mangled suffix, ignoring the crate-hash prefix and
+            // the `_v1`/`_v2` version tail).
+            || s.contains("__rust_no_alloc_shim_is_unstable");
     }
     false
 }

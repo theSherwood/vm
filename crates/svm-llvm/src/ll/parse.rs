@@ -60,19 +60,33 @@ type CallArgs = Vec<(Operand, Vec<ParameterAttribute>)>;
 
 /// Parse `.ll` source text into a [`Module`].
 pub fn parse_module(src: &str) -> PResult<Module> {
-    parse_module_with_debug(src).map(|(m, _)| m)
+    parse_module_with_debug(src).map(|(m, _, _)| m)
 }
 
 /// Parse `.ll` source text into a [`Module`] plus the recovered structured debug info (the §6
 /// function-name table + the type graph + module globals — the same [`crate::di::LlvmDebug`] the
 /// bitcode path threads; `None` for a non-`-g` module). The source-line half rides each instruction's
 /// `debugloc` on the returned module.
-pub fn parse_module_with_debug(src: &str) -> PResult<(Module, Option<crate::di::LlvmDebug>)> {
+pub fn parse_module_with_debug(
+    src: &str,
+) -> PResult<(
+    Module,
+    Option<crate::di::LlvmDebug>,
+    Option<crate::blockaddr::BlockAddrs>,
+)> {
     let toks = lex(src)
         .map_err(|e| ParseError::new(0, format!("lex error at byte {}: {}", e.offset, e.msg)))?;
+    // Pass 1 — symbol collection: a forward-ref-tolerant parse that harvests every global/function/
+    // `declare` type into `symbols`, so the real parse can resolve a `@name` used before its definition
+    // (common in real-world IR). Its module/debug output is discarded.
+    let mut pre = Parser::new(toks.clone());
+    let _ = pre.module();
+    // Pass 2 — the real parse, with the symbol table pre-seeded.
     let mut p = Parser::new(toks);
+    p.symbols = pre.symbols;
     p.collect_di_metadata();
     let m = p.module()?;
+    let ba = p.take_block_addrs(&m);
     let debug = super::debug::build(
         &p.di_meta,
         &p.global_dbg,
@@ -80,8 +94,13 @@ pub fn parse_module_with_debug(src: &str) -> PResult<(Module, Option<crate::di::
         &m,
         p.func_names,
     );
-    Ok((m, debug))
+    Ok((m, debug, ba))
 }
+
+/// A `blockaddress` target as it appears in the text: `(@func name, %block label)`.
+type BaTarget = (String, String);
+/// A φ-threaded `blockaddress` key: `(current func name, block idx, phi ordinal, incoming idx)`.
+type BaPhiKey = (String, u32, u32, u32);
 
 /// The token cursor + the module-under-construction (the type interner lives in `module.types`).
 struct Parser {
@@ -114,6 +133,21 @@ struct Parser {
     /// Captured `llvm.dbg.declare`/`dbg.value` intrinsics, in encounter order (the source-variable
     /// order the bitcode `di` walk records).
     dbg_intrinsics: Vec<DbgIntrinsic>,
+    /// The global whose initializer is currently being parsed (for attributing `blockaddress` labels).
+    current_global: Option<String>,
+    /// `global name → (@func, %block)` `blockaddress` payloads in initializer DFS order — the AST drops
+    /// the payload (`Constant::BlockAddress`), so it's recovered here (the `blockaddr` reader's job).
+    ba_per_global: std::collections::HashMap<String, Vec<BaTarget>>,
+    /// A `blockaddress` payload just parsed by `constant()`, so the enclosing `phi` can attribute it to
+    /// its `(func, block, phi_ord, incoming)` position (clang's jump-threading case).
+    pending_ba: Option<BaTarget>,
+    /// φ-threaded `blockaddress`es: `(current func name, block idx, phi ordinal, incoming idx)` →
+    /// `(@func, %block)`. Resolved to block indices in [`Self::take_block_addrs`].
+    ba_phi: Vec<(BaPhiKey, BaTarget)>,
+    /// The index of the basic block currently being parsed (for the φ-threaded `blockaddress` key).
+    cur_block_idx: u32,
+    /// The φ ordinal within the current block (counts φs; the φ-threaded `blockaddress` key).
+    cur_phi_ord: u32,
 }
 
 /// One field value of a specialized debug-metadata node (only the first token of the value is kept;
@@ -229,6 +263,12 @@ impl Parser {
             current_func: String::new(),
             pending_meta_args: Vec::new(),
             dbg_intrinsics: Vec::new(),
+            current_global: None,
+            ba_per_global: std::collections::HashMap::new(),
+            pending_ba: None,
+            ba_phi: Vec::new(),
+            cur_block_idx: 0,
+            cur_phi_ord: 0,
         }
     }
 
@@ -347,6 +387,34 @@ impl Parser {
         })
     }
 
+    /// Build the [`crate::blockaddr::BlockAddrs`] from the captured `blockaddress` payloads, resolving
+    /// each `%bb` to its index within `@f` (definition order) — the same shape the `llvm-sys` reader
+    /// produces. `None` when the module has no computed `goto`.
+    fn take_block_addrs(&mut self, module: &Module) -> Option<crate::blockaddr::BlockAddrs> {
+        let mut per_global = std::collections::HashMap::new();
+        for (g, payloads) in &self.ba_per_global {
+            let labels: Vec<u32> = payloads
+                .iter()
+                .filter_map(|(f, b)| block_index_in(module, f, b))
+                .collect();
+            if !labels.is_empty() {
+                per_global.insert(g.clone(), labels);
+            }
+        }
+        let mut phi = std::collections::HashMap::new();
+        for ((fname, blk, ord, inc), (f, b)) in &self.ba_phi {
+            // `func_idx` counts defined functions in module order — exactly `module.functions`.
+            if let (Some(fidx), Some(target)) = (
+                module.functions.iter().position(|fn_| &fn_.name == fname),
+                block_index_in(module, f, b),
+            ) {
+                phi.insert((fidx as u32, *blk, *ord, *inc), target);
+            }
+        }
+        (!per_global.is_empty() || !phi.is_empty())
+            .then_some(crate::blockaddr::BlockAddrs { per_global, phi })
+    }
+
     // ---- module --------------------------------------------------------------------------------
 
     fn module(&mut self) -> PResult<Module> {
@@ -359,8 +427,13 @@ impl Parser {
                 }
                 // `@name = [linkage/attrs] global|constant <ty> [<init>] [, align N]`
                 Some(Token::Global(_)) if self.at_global_var() => self.global_def()?,
+                // `@name = [linkage/attrs] alias <ty>, <ptrty> @aliasee`
+                Some(Token::Global(_)) if self.at_alias() => self.alias_def()?,
                 // `%name = type { … }` — a named struct type definition.
                 Some(Token::Local(_)) if self.at_type_def() => self.type_def()?,
+                // `declare <ret> @name(<params>)` — register its function type (for a `@name` operand),
+                // then it carries no body to translate.
+                Some(Token::Word(w)) if w == "declare" => self.declare_def()?,
                 // Top-level lines/items the on-ramp ignores at this slice: target/datalayout/source,
                 // attribute groups (`attributes #N = { … }`), module flags / named metadata (`!… = …`,
                 // `!name = !{…}`), and `declare`s. Skip to the next top-level item.
@@ -540,6 +613,63 @@ impl Parser {
         false
     }
 
+    /// Is the cursor at a global `alias` definition (`@a = … alias …`)? (Distinct from a global var,
+    /// which `at_global_var` matches.)
+    fn at_alias(&self) -> bool {
+        let mut i = self.pos;
+        if !matches!(self.toks.get(i), Some(Token::Global(_)))
+            || self.toks.get(i + 1) != Some(&Token::Equals)
+        {
+            return false;
+        }
+        i += 2;
+        let mut guard = 0;
+        while guard < 32 {
+            guard += 1;
+            match self.toks.get(i) {
+                Some(Token::Word(w)) if w == "alias" => return true,
+                Some(Token::Word(w)) if w == "global" || w == "constant" || w == "ifunc" => {
+                    return false
+                }
+                Some(Token::Word(_)) => i += 1,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `@name = [linkage/attrs] alias <ty>, <ptrty> @aliasee` — the aliasee is a `GlobalReference`
+    /// (possibly through a `bitcast`); the translator resolves a call/reference through it.
+    fn alias_def(&mut self) -> PResult<()> {
+        let name = match self.bump() {
+            Some(Token::Global(s)) => s,
+            other => return self.err(format!("expected an alias @name, found {other:?}")),
+        };
+        self.expect(&Token::Equals)?;
+        while !self.eat_word("alias") {
+            match self.peek() {
+                Some(Token::Word(_)) => self.pos += 1, // linkage / visibility / unnamed_addr / …
+                other => return self.err(format!("expected `alias`, found {other:?}")),
+            }
+        }
+        let ty = self.type_maybe_fn()?;
+        self.expect(&Token::Comma)?;
+        let aliasee_ty = self.type_()?;
+        let aliasee = self.constant(&aliasee_ty)?;
+        self.symbols.insert(name.clone(), ty.clone());
+        self.module.global_aliases.push(GlobalAlias {
+            name: name_from_local(&name),
+            aliasee,
+            ty,
+        });
+        // Optional trailing `, partition "…"` — skip it *only if present* (an unconditional
+        // boundary-skip would swallow the next top-level item, whose leading `@name` this consumes).
+        if self.peek() == Some(&Token::Comma) {
+            self.skip_to_toplevel_boundary();
+        }
+        Ok(())
+    }
+
     /// `@name = [linkage/visibility/attrs] [addrspace(N)] global|constant <ty> [<init>] [, align N]
     /// [, …]`. The `GlobalVariable.ty` is the *pointer* type (as the bitcode reader records
     /// `LLVMTypeOf`); the written `<ty>` is the content type — kept in `symbols` (for `@name` operands)
@@ -551,6 +681,9 @@ impl Parser {
         };
         self.expect(&Token::Equals)?;
         let mut addr_space: AddrSpace = 0;
+        // An `external`/`extern_weak` global is *declared* here (defined elsewhere) — it has no
+        // initializer, so we must not mistake the *next* top-level `@name` for its value.
+        let mut is_declaration = false;
         let is_constant = loop {
             match self.peek() {
                 Some(Token::Word(w)) if w == "global" => {
@@ -569,15 +702,23 @@ impl Parser {
                         self.expect(&Token::RParen)?;
                     }
                 }
-                Some(Token::Word(_)) => self.pos += 1, // linkage / visibility / unnamed_addr / …
+                Some(Token::Word(w)) => {
+                    if w == "external" || w == "extern_weak" {
+                        is_declaration = true;
+                    }
+                    self.pos += 1; // linkage / visibility / unnamed_addr / …
+                }
                 other => return self.err(format!("expected `global`/`constant`, found {other:?}")),
             }
         };
         let content_ty = self.type_()?;
         self.symbols.insert(name.clone(), content_ty.clone());
-        // The initializer (absent for an `external` declaration — then the next token is `,`/a new item).
-        let initializer = if self.at_constant_start() {
-            Some(self.constant(&content_ty)?)
+        // The initializer (absent for an `external` declaration, or when a `,`/new item follows).
+        let initializer = if !is_declaration && self.at_constant_start() {
+            self.current_global = Some(name.clone());
+            let c = self.constant(&content_ty)?;
+            self.current_global = None;
+            Some(c)
         } else {
             None
         };
@@ -633,6 +774,7 @@ impl Parser {
                         | "null"
                         | "undef"
                         | "poison"
+                        | "blockaddress"
                         // constant-expression openers
                         | "getelementptr"
                         | "trunc"
@@ -652,6 +794,33 @@ impl Parser {
     }
 
     // ---- functions -----------------------------------------------------------------------------
+
+    /// `declare [attrs] <ret> @name(<params>) [attrs] [#N]` — record `@name` → its function type in
+    /// `symbols` (so a `@name` operand resolves), then skip the rest; a declaration has no body.
+    fn declare_def(&mut self) -> PResult<()> {
+        self.expect_word("declare")?;
+        self.skip_pre_signature_attrs();
+        let return_type = self.type_()?;
+        let name = match self.bump() {
+            Some(Token::Global(s)) => s,
+            other => return self.err(format!("expected declare @name, found {other:?}")),
+        };
+        let (parameters, is_var_arg) = self.param_list()?;
+        self.symbols.insert(
+            name,
+            TypeRef::new(Type::FuncType {
+                result_type: return_type,
+                param_types: parameters.iter().map(|p| p.ty.clone()).collect(),
+                is_var_arg,
+            }),
+        );
+        // Trailing attribute groups (`#N`) / `, !meta` — skip only these, not the next item.
+        while matches!(self.peek(), Some(Token::Word(w)) if w.starts_with('#')) {
+            self.pos += 1;
+        }
+        self.skip_trailing_metadata();
+        Ok(())
+    }
 
     fn function_def(&mut self) -> PResult<Function> {
         self.expect_word("define")?;
@@ -738,6 +907,11 @@ impl Parser {
             "noundef",
             "nonnull",
             "noalias",
+            "range",
+            "nofpclass",
+            "dereferenceable",
+            "dereferenceable_or_null",
+            "align",
             "ccc",
             "fastcc",
             "coldcc",
@@ -745,10 +919,17 @@ impl Parser {
             "cc",
         ];
         while let Some(Token::Word(w)) = self.peek() {
-            if PRE.contains(&w.as_str()) {
-                self.pos += 1;
-            } else {
+            if !PRE.contains(&w.as_str()) {
                 break;
+            }
+            let is_align = w == "align";
+            self.pos += 1;
+            // Attributes with a payload: `dereferenceable(N)`/`range(…)`/`nofpclass(…)` → a balanced
+            // parenthesized group; `align N` → a bare integer.
+            if self.peek() == Some(&Token::LParen) {
+                self.skip_balanced_parens();
+            } else if is_align && matches!(self.peek(), Some(Token::Int(_))) {
+                self.pos += 1;
             }
         }
     }
@@ -768,13 +949,28 @@ impl Parser {
                 break;
             }
             let ty = self.type_()?;
-            // Skip parameter attributes (barewords / `align N` / attribute-group `#N`) until the name,
-            // the comma, or the closing paren.
-            while !matches!(
-                self.peek(),
-                Some(Token::Local(_)) | Some(Token::Comma) | Some(Token::RParen) | None
-            ) {
-                self.pos += 1;
+            // Skip parameter attributes (barewords / `align N` / `byval(<ty>)` / `dereferenceable(N)` /
+            // attribute-group `#N`) until the name, the comma, or the closing paren — tracking nesting
+            // so a paren/bracket-payload attr's own delimiters aren't mistaken for the list's end.
+            let mut depth = 0i32;
+            loop {
+                match self.peek() {
+                    Some(Token::LParen) | Some(Token::LBracket) | Some(Token::Lt) => {
+                        depth += 1;
+                        self.pos += 1;
+                    }
+                    Some(Token::RParen) | Some(Token::RBracket) | Some(Token::Gt) if depth > 0 => {
+                        depth -= 1;
+                        self.pos += 1;
+                    }
+                    Some(Token::Local(_)) | Some(Token::Comma) | Some(Token::RParen) | None
+                        if depth == 0 =>
+                    {
+                        break
+                    }
+                    None => break,
+                    _ => self.pos += 1,
+                }
             }
             let name = match self.peek() {
                 Some(Token::Local(s)) => {
@@ -806,6 +1002,9 @@ impl Parser {
         let mut next_unnamed = start_unnamed;
         while !matches!(self.peek(), Some(Token::RBrace) | None) {
             let name = self.block_label(&mut next_unnamed);
+            // Track the block index + reset the φ ordinal (the φ-threaded `blockaddress` key).
+            self.cur_block_idx = blocks.len() as u32;
+            self.cur_phi_ord = 0;
             let mut instrs = Vec::new();
             // Instructions until a terminator.
             loop {
@@ -824,8 +1023,14 @@ impl Parser {
     /// A leading `name:` / `N:` block label, or — if absent — the next implicit block number.
     fn block_label(&mut self, next_unnamed: &mut usize) -> Name {
         match (self.peek(), self.peek2()) {
+            // `name:` / `"quoted name":` — a textual block label.
             (Some(Token::Word(w)), Some(Token::Colon)) => {
                 let nm = Name::from_string(w.clone());
+                self.pos += 2;
+                nm
+            }
+            (Some(Token::Str(s)), Some(Token::Colon)) => {
+                let nm = Name::from_string(s.clone());
                 self.pos += 2;
                 nm
             }
@@ -1053,6 +1258,29 @@ impl Parser {
                     debugloc: None,
                 })
             }
+            // `indirectbr ptr <addr>, [ label %d0, label %d1, … ]` — computed `goto` (the address is a
+            // `blockaddress` from the dispatch table); the destination list is the `br_table` targets.
+            "indirectbr" => {
+                self.pos += 1; // `indirectbr`
+                let ty = self.type_()?; // `ptr`
+                let operand = self.value_as_operand(&ty)?;
+                self.expect(&Token::Comma)?;
+                self.expect(&Token::LBracket)?;
+                let mut possible_dests = Vec::new();
+                while self.peek() != Some(&Token::RBracket) && self.peek().is_some() {
+                    self.expect_word("label")?;
+                    possible_dests.push(self.label_name()?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Token::RBracket)?;
+                Terminator::IndirectBr(IndirectBr {
+                    operand,
+                    possible_dests,
+                    debugloc: None,
+                })
+            }
             // `resume <ty> <val>` — re-raise the in-flight exception.
             "resume" => {
                 self.pos += 1;
@@ -1195,9 +1423,16 @@ impl Parser {
             Some(Token::Global(s)) => s,
             other => return self.err(format!("expected @global, found {other:?}")),
         };
-        let ty = self.symbols.get(&s).cloned().ok_or_else(|| {
-            ParseError::new(self.pos, format!("reference to undeclared global `@{s}`"))
-        })?;
+        // The symbol-collection pass (pass 1) pre-seeds `symbols` with every global/function/`declare`
+        // type, so a `@name` used before its definition resolves to its real pointee type. A residual
+        // miss — a construct pass 1 couldn't collect — falls back to an opaque-pointer pointee: the
+        // translator resolves globals by *name* (the `ty` is only a pointee hint), and a truly-undefined
+        // symbol is caught there, so this is robust, not a miscompile.
+        let ty = self
+            .symbols
+            .get(&s)
+            .cloned()
+            .unwrap_or_else(|| self.module.types.pointer(0));
         Ok(ConstantRef::new(Constant::GlobalReference {
             name: name_from_local(&s),
             ty,
@@ -1303,6 +1538,32 @@ impl Parser {
                 self.pos += 1;
                 Constant::Poison(ty.clone())
             }
+            // `blockaddress(@f, %bb)` — the computed-`goto` label. The AST leaf is payloadless; the
+            // `(@f, %bb)` is captured (per enclosing global initializer, and for `pending_ba`, so a
+            // φ-threaded one is attributed by its parent `phi`), then resolved to a block index.
+            Some(Token::Word(w)) if w == "blockaddress" => {
+                self.pos += 1; // `blockaddress`
+                self.expect(&Token::LParen)?;
+                let func = match self.bump() {
+                    Some(Token::Global(s)) => s,
+                    other => return self.err(format!("blockaddress function, found {other:?}")),
+                };
+                self.expect(&Token::Comma)?;
+                let block = match self.bump() {
+                    Some(Token::Local(s)) => s,
+                    other => return self.err(format!("blockaddress block label, found {other:?}")),
+                };
+                self.expect(&Token::RParen)?;
+                let payload = (func, block);
+                if let Some(g) = &self.current_global {
+                    self.ba_per_global
+                        .entry(g.clone())
+                        .or_default()
+                        .push(payload.clone());
+                }
+                self.pending_ba = Some(payload);
+                Constant::BlockAddress
+            }
             // Constant-expressions: `<op> ( … )` folded at link time (a global initialized to an offset
             // into another global, a function-pointer table entry cast, etc.).
             Some(Token::Word(w)) if w == "getelementptr" => self.const_gep()?,
@@ -1387,7 +1648,15 @@ impl Parser {
                     elements,
                 }
             }
-            // `< <ty> <c>, … >` — a vector constant.
+            // `{ <ty> <c>, … }` — a literal struct constant.
+            Some(Token::LBrace) => self.struct_constant(false)?,
+            // `< <ty> <c>, … >` — a vector constant, or `<{ … }>` a packed struct constant.
+            Some(Token::Lt) if matches!(self.peek2(), Some(Token::LBrace)) => {
+                self.pos += 1; // `<`
+                let c = self.struct_constant(true)?;
+                self.expect(&Token::Gt)?;
+                c
+            }
             Some(Token::Lt) => {
                 self.pos += 1; // `<`
                 let mut elements = Vec::new();
@@ -1406,6 +1675,28 @@ impl Parser {
             other => return self.err(format!("constant not yet supported: {other:?}")),
         };
         Ok(ConstantRef::new(c))
+    }
+
+    /// A literal struct constant `{ <ty> <c>, … }` (`is_packed` for the `<{ … }>` form). The caller
+    /// has consumed a leading `<` for the packed form; this consumes `{ … }`.
+    fn struct_constant(&mut self, is_packed: bool) -> PResult<Constant> {
+        self.expect(&Token::LBrace)?;
+        let mut values = Vec::new();
+        if self.peek() != Some(&Token::RBrace) {
+            loop {
+                let ety = self.type_()?;
+                values.push(self.constant(&ety)?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Constant::Struct {
+            name: None,
+            values,
+            is_packed,
+        })
     }
 
     // ---- conversions / compares / select -------------------------------------------------------
@@ -1429,6 +1720,12 @@ impl Parser {
     /// `icmp <pred> <ty> <op0>, <op1>`.
     fn icmp_inst(&mut self, dest: Name) -> PResult<ICmp> {
         self.pos += 1; // `icmp`
+                       // `samesign` (LLVM ≥ 20) is a poison-generating hint asserting both operands share a sign —
+                       // no effect on the compare's runtime result, so we drop it. It sits between `icmp` and the
+                       // predicate.
+        if matches!(self.peek(), Some(Token::Word(w)) if w.as_str() == "samesign") {
+            self.pos += 1;
+        }
         let predicate = self.int_predicate()?;
         let ty = self.type_()?;
         let operand0 = self.value_as_operand(&ty)?;
@@ -1504,17 +1801,32 @@ impl Parser {
         self.pos += 1; // `phi`
         let to_type = self.type_()?;
         let mut incoming_values = Vec::new();
+        let mut inc_idx = 0u32;
         loop {
             self.expect(&Token::LBracket)?;
+            // A `blockaddress` incoming value is φ-threaded — capture it keyed by its position so the
+            // translator's `branch_args` reconstruction (`blockaddr::phi`) resolves it.
+            self.pending_ba = None;
             let val = self.value_as_operand(&to_type)?;
+            if let Some(payload) = self.pending_ba.take() {
+                let key = (
+                    self.current_func.clone(),
+                    self.cur_block_idx,
+                    self.cur_phi_ord,
+                    inc_idx,
+                );
+                self.ba_phi.push((key, payload));
+            }
             self.expect(&Token::Comma)?;
             let block = self.label_name()?;
             self.expect(&Token::RBracket)?;
             incoming_values.push((val, block));
+            inc_idx += 1;
             if !self.eat(&Token::Comma) {
                 break;
             }
         }
+        self.cur_phi_ord += 1;
         Ok(Phi {
             incoming_values,
             dest,
@@ -2290,6 +2602,13 @@ impl Parser {
             "writeonly",
             "immarg",
             "nofree",
+            "dead_on_unwind",
+            "dead_on_return",
+            "writable",
+            "captures",
+            "range",
+            "nofpclass",
+            "initializes",
             "align",
             "dereferenceable",
             "dereferenceable_or_null",
@@ -2458,6 +2777,26 @@ impl Parser {
                 self.pos += 1;
                 self.module.types.fp(FPType::Double)
             }
+            "half" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::Half)
+            }
+            "bfloat" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::BFloat)
+            }
+            "fp128" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::FP128)
+            }
+            "x86_fp80" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::X86_FP80)
+            }
+            "ppc_fp128" => {
+                self.pos += 1;
+                self.module.types.fp(FPType::PPC_FP128)
+            }
             "metadata" => {
                 self.pos += 1;
                 TypeRef::new(Type::MetadataType)
@@ -2465,6 +2804,22 @@ impl Parser {
             other => return self.err(format!("type `{other}` not yet supported")),
         };
         Ok(ty)
+    }
+
+    /// A type that may be a **function type** `<ret>(<params>)` — a base type optionally followed by a
+    /// parameter list (an alias's type). Kept separate from [`Self::type_`] because a call's return
+    /// type is *also* followed by `(<args>)` but is handled distinctly there.
+    fn type_maybe_fn(&mut self) -> PResult<TypeRef> {
+        let ret = self.type_()?;
+        if self.peek() == Some(&Token::LParen) {
+            let (param_types, is_var_arg) = self.fn_type_params()?;
+            return Ok(TypeRef::new(Type::FuncType {
+                result_type: ret,
+                param_types,
+                is_var_arg,
+            }));
+        }
+        Ok(ret)
     }
 }
 
@@ -2561,6 +2916,17 @@ fn scan_tuple_refs(toks: &[Token], lbrace: usize) -> (Vec<u64>, usize) {
         j += 1;
     }
     (refs, j)
+}
+
+/// The index of block label `block` within function `func` (definition order), for `blockaddress`
+/// resolution — matching the `llvm-sys` reader's `block_index`.
+fn block_index_in(module: &Module, func: &str, block: &str) -> Option<u32> {
+    let f = module.functions.iter().find(|fn_| fn_.name == func)?;
+    let target = name_from_local(block);
+    f.basic_blocks
+        .iter()
+        .position(|bb| bb.name == target)
+        .map(|i| i as u32)
 }
 
 /// A `%local`/`@global` name string → [`Name`]: all-digits ⇒ `Number`, else a textual `Name`.
