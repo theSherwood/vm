@@ -1680,15 +1680,8 @@ fn computed_goto_lowers_indirectbr_to_br_table() {
     let Some(bc) = compile_to_bc("computed_goto_struct", COMPUTED_GOTO_SRC) else {
         return;
     };
-    // The recovery found the dispatch table's blockaddress labels (one global, ≥ 2 entries).
-    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
-        .expect("blockaddress recovery should find the dispatch table");
-    assert!(
-        ba.per_global.values().any(|labels| labels.len() >= 2),
-        "expected a dispatch-table global with multiple blockaddress labels, got {:?}",
-        ba.per_global
-    );
-    // The `indirectbr` lowered to a `br_table` terminator.
+    // The reader recovered the dispatch table's `blockaddress` labels (internally, via `ll::parse`),
+    // so the `indirectbr` lowered to a `br_table` terminator.
     let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
     let has_br_table = t
@@ -1732,14 +1725,9 @@ fn computed_goto_phi_recovery_finds_operand_blockaddress() {
     let Some(bc) = compile_to_bc("computed_goto_phi_struct", COMPUTED_GOTO_PHI_SRC) else {
         return;
     };
-    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
-        .expect("recovery should find blockaddresses");
-    assert!(
-        !ba.phi.is_empty(),
-        "expected a φ-threaded (operand-position) blockaddress, got phi map {:?}",
-        ba.phi
-    );
-    // And it still translates + verifies (the operand-position label resolved, no fail-closed).
+    // The φ-threaded (operand-position) `blockaddress` recovery path resolves internally, so the
+    // module translates + verifies (no fail-closed). Its runtime correctness is covered by
+    // `computed_goto_phi_threaded_blockaddress` (a native differential).
     let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
 }
@@ -7618,7 +7606,12 @@ fn i128_sdiv_srem() {
 /// outside `[0, 2⁶⁴)` with a clean `Unsupported` — never a wrong answer. Both a ≥2⁶⁴ literal (clang
 /// folds `0xFFFF…FFFF + 2` to `i128 18446744073709551617`) and a negative one (`add i128 %x, -5`).
 #[test]
-fn i128_wide_constant_fails_closed() {
+fn i128_wide_constant_now_translates() {
+    // I14 — **fixed** by the textual reader. The old `llvm-ir` path truncated a ≥2⁶⁴ / negative `i128`
+    // literal to its low word, so the on-ramp fail-closed (`Unsupported`) to avoid a miscompile; the
+    // in-house `.ll` reader carries the full 128-bit width, so these modules now **translate** instead.
+    // (The runtime correctness of `i128 urem` by a >64-bit *divisor* is a separate translator concern —
+    // that path was never exercised before, since the reader fail-closed here.)
     for (name, src) in [
         (
             "i128_widec",
@@ -7637,12 +7630,9 @@ fn i128_wide_constant_fails_closed() {
         let Some(bc) = compile_to_bc(name, src) else {
             return;
         };
-        match svm_llvm::translate_bc_path(&bc) {
-            Err(svm_llvm::Error::Unsupported(m)) => {
-                assert!(m.contains("wide integer constant"), "{name}: {m}")
-            }
-            other => panic!("{name}: expected a fail-closed Unsupported, got {other:?}"),
-        }
+        svm_llvm::translate_bc_path(&bc).unwrap_or_else(|e| {
+            panic!("{name}: expected the wide i128 constant to translate, got {e:?}")
+        });
     }
 }
 

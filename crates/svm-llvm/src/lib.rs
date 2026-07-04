@@ -164,9 +164,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-// The translator consumes our **owned** `ll` AST (LLVM.md §8 Q1b): the bitcode path feeds it via the
-// `from_llvm_ir` conversion shim, and the textual-`.ll` reader produces it directly. The `as
-// LTerm`/`LModule` aliases keep the rest of this file unchanged across the swap.
+// The translator consumes our **owned** `ll` AST (LLVM.md §8 Q1b), produced by the in-house textual
+// `.ll` reader ([`ll`]). The `as LTerm`/`LModule` aliases keep the rest of this file unchanged.
 use crate::ll::ast::{
     BasicBlock, Constant, DebugLoc, FPPredicate, FPType, Float, Function, HasDebugLoc, Instruction,
     IntPredicate, Module as LModule, Name, Operand, Terminator as LTerm, Type, Typed, Types,
@@ -178,15 +177,14 @@ use svm_ir::{
     StoreOp, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
+/// The §6 debug-info + computed-`goto` data models (built by the [`ll`] reader, consumed by the
+/// translator). The `llvm-sys` readers they once held are gone — [`ll`] recovers the structure from
+/// textual `.ll`, so no libLLVM is linked.
 pub mod blockaddr;
 pub mod di;
-/// Conversion shim from the `llvm-ir` bitcode AST to our owned [`ll`] AST (LLVM.md §8 Q1b). Transient:
-/// the bridge that keeps the bitcode path feeding the swapped translator until `llvm-ir` is dropped.
-mod from_llvm_ir;
-/// The in-house textual-`.ll` reader (LLVM.md §8 Q1a) — replacing the `llvm-ir`/libLLVM binding.
-/// Built behind a differential parity check before it becomes the default; see `tests/translate.rs`.
+/// The in-house textual-`.ll` reader (LLVM.md §8 Q1a) — the sole ingest, replacing the `llvm-ir`/
+/// libLLVM binding: full-width constants, version-tolerant, no libLLVM link.
 pub mod ll;
-pub mod wideint;
 
 /// Why a translation could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,19 +230,22 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     // word, so a wide/negative `i128` literal would silently miscompile. We can't recover the high
     // word from the truncated AST, so reject such a module up front (clean `Unsupported`, never a
     // miscompile). Constants that fit in `[0, 2^64)` round-trip exactly and are unaffected.
-    if let Some(c) = path.to_str().and_then(wideint::out_of_range_constant) {
-        return unsup(format!(
-            "wide integer constant `{c}`: a ≥2⁶⁴ / negative i128 literal is not supported \
-             (`llvm-ir` truncates it; fail-closed to avoid a miscompile — ISSUES.md I14)"
-        ));
+    // Disassemble the bitcode to textual `.ll` out-of-process (`llvm-dis`, an ordinary build-time tool
+    // like `clang` — §Q2's out-of-process decision) and route through the in-house textual reader. No
+    // libLLVM is linked into this crate; full-width `i128` and version-tolerance come for free.
+    let out = std::process::Command::new("llvm-dis")
+        .arg(path)
+        .arg("-o")
+        .arg("-")
+        .output()
+        .map_err(|e| Error::Parse(format!("llvm-dis: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Parse(format!(
+            "llvm-dis failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
     }
-    let bc = llvm_ir::Module::from_bc_path(path).map_err(Error::Parse)?;
-    // Bridge the bitcode AST into our owned `ll` AST the translator now consumes (LLVM.md §8 Q1b).
-    let m = from_llvm_ir::convert_module(&bc)?;
-    let di = path.to_str().and_then(di::read_debug);
-    // Computed-`goto` support needs the `blockaddress` operands `llvm-ir` erases (see [`blockaddr`]).
-    let ba = path.to_str().and_then(blockaddr::read_block_addrs);
-    translate_impl(&m, di.as_ref(), ba.as_ref())
+    translate_ll_str(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Translate a **textual** LLVM IR file (`*.ll`) via the in-house reader (LLVM.md §8 Q1b) — the
@@ -263,9 +264,9 @@ pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 /// coverage), packaged as a [`di::LlvmDebug`] and threaded through the same `di` argument the bitcode
 /// path uses. The variable/type graph (`DILocalVariable`/`DIType`) is a later slice.
 pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
-    let (m, di) =
+    let (m, di, ba) =
         ll::parse::parse_module_with_debug(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
-    translate_impl(&m, di.as_ref(), None)
+    translate_impl(&m, di.as_ref(), ba.as_ref())
 }
 
 /// Translate an already-parsed [`ll`] module (the shape the textual-`.ll` reader produces, or the

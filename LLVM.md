@@ -2089,12 +2089,28 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     (`dereferenceable(N)`/`range(…)`/`byval(<ty>)`, depth-tracked) + the newer attrs
     (`dead_on_unwind`/`writable`/`captures`/`nofpclass`/…); and `block_label` accepts a **quoted**
     `"name":` label. (These knocked the corpus from 215→252 in the experiment.)
-  - **Then finish the flip:** (1) re-apply the `llvm-dis` route to `translate_bc_path` (or convert the
-    test helpers to `clang -emit-llvm -S`); (2) close the 15 gaps above; (3) two-pass symbol collection;
-    (4) drop the `di` argument plumbing (`ll::debug` supplies it) + delete `llvm-ir`/`llvm-sys`/
-    `from_llvm_ir.rs`/`di.rs`/`blockaddr`/`wideint` + the rustc-1.81 pin; (5) prove version-tolerance
-    with an LLVM-21-emitted `.ll`. The differential parity corpus (now 36 tests: 31 instruction + 5
-    debug) + the 267-test behavioral corpus are the safety net.
+  - **DONE — the flip landed; libLLVM is unlinked.** `translate_bc_path` now `llvm-dis`-disassembles
+    to `.ll` and routes through the textual reader; **the entire 268-test behavioral corpus passes
+    through the pure textual reader** (not just the 35 parity shapes). Closing the gaps required:
+    **(a)** a **two-pass symbol collection** (a forward-ref-tolerant pass harvests every global/function/
+    `declare` type into `symbols` before the real parse, so a `@name` used before its definition
+    resolves) + parsing `declare` signatures; **(b)** the **external-global fix** — an `external
+    global/constant <ty>` has *no* initializer, so `at_constant_start` must not mistake the *next*
+    top-level `@name` for its value (this was the "top-level `=`" cluster, 10 tests); **(c)**
+    **`blockaddress` + `indirectbr` from text** — the `(@f, %bb)` payload the AST drops is captured
+    per-global (initializer DFS) and per-φ `(func, block, phi_ord, incoming)`, resolved to block indices,
+    and threaded as the `BlockAddrs` the translator reads (`ll::parse::take_block_addrs`); **(d)**
+    **global `alias`es** (`@a = alias <fnty>, ptr @b` → `module.global_aliases`, `type_maybe_fn` for the
+    alias's function type); **(e)** the obsolete `i128_wide_constant_fails_closed` test rewritten to
+    expect success (I14 is *fixed* — the reader carries full-width `i128`; NB the runtime correctness of
+    `i128 urem` by a >64-bit *divisor* is a separate pre-existing translator gap, never exercised before
+    because the reader fail-closed there). **Deleted:** `from_llvm_ir.rs`, `wideint.rs`, and the
+    `llvm-sys` bodies of `di.rs`/`blockaddr.rs` (their data structs stay, filled by `ll::debug`/
+    `ll::parse`); **dropped the `llvm-ir`/`llvm-sys`/`either` deps.** `svm-llvm` links **no libLLVM**.
+  - **Remaining (small):** drop the rustc-1.81 pin (it existed only for `llvm-sys`); prove version
+    tolerance by feeding an LLVM-21-emitted `.ll` through the reader; optionally convert the test helpers
+    from `clang -c` + `llvm-dis` to a direct `clang -emit-llvm -S` (dropping even the `llvm-dis` runtime
+    dependency for the C-compiled tests — the pre-built `.bc` corpora still use `llvm-dis`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
