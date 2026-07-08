@@ -346,8 +346,8 @@ jobs:
     # native bytecode. The harness prints `MISCOMPILE` on a mismatch but doesn't itself exit non-zero,
     # so this step greps for it — and asserts the row actually ran, so a missing cdylib/node can't pass
     # silently. Linux-only, like `svm-llvm` (the on-ramp shells out to clang/llvm-dis). The perf
-    # numbers it also prints are informational — the perf signal is the separate non-gating `bench` job.    name: cross-engine differential (svm-bytecode-wasm vs native)
-
+    # numbers it also prints are informational — the perf signal is the separate non-gating `bench` job.
+    name: cross-engine differential (svm-bytecode-wasm vs native)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -359,7 +359,7 @@ jobs:
             crates/svm-llvm
             browser
       - name: install LLVM/clang 18 (clang for the kernels, llvm-dis for the on-ramp)
-         run: |
+        run: |
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
