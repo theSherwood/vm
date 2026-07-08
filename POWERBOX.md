@@ -461,6 +461,41 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   `malloc` heap (reserved tail, above the `SNAP_CAP` low-window snapshot) across `call_export`, and
   freeze/thaw a live `Session` (the DURABILITY.md §12 machinery is per-run, not per-session). Revisit
   when a consumer needs a persistent guest heap or session snapshot/restore.
+- **F12 — dynamic capability minting from host-defined capabilities.** A `HostFn` closure receives
+  `(op, args, guest_mem)` but no `Host` access, so an embedder-defined capability cannot **mint**
+  attenuated sub-handles at runtime (e.g. an `Fs` op `open_dir(path) -> handle` returning a capability
+  rooted at that subdirectory) or register names mid-run — dynamic minting today is reserved to
+  built-ins (`AddressSpace.create_region`, the §14 `Instantiator`'s child powerboxes). The seam is
+  already borrow-clean: dispatch takes the closure *out* of `host_fns` before running it, so a `HostFn`
+  variant receiving a host context (`mint(HostFn) -> handle`, `register_cap_name`) can be threaded
+  without aliasing. Because the F7 directory is **live** (`cap.self.resolve` reads it at call time),
+  anything minted + named mid-run becomes guest-resolvable immediately — dynamic *discovery* of new
+  capabilities falls out for free. Keeps the object-capability idiom: authority appears because a held
+  capability minted it, never by ambient mutation.
+- **F13 — general capability revocation.** The handle table is structurally ready — every slot is
+  `{generation, entry: Option<Binding>, type_id}`, handles pack `(generation, slot)`, and
+  `Trap::CapFault` already documents "closed/revoked (dead generation)"; `Jit.release` does per-slot
+  revocation for `CompiledCode` — but there is no general `Host::revoke_handle`, and the F7 `cap_names`
+  directory is append-only (no unregister). Two layers, both legitimate and worth supporting
+  deliberately: (1) **first-class revoke** — clear the slot / bump the generation so any later use of
+  the stale handle is a fail-closed `CapFault` (strict: using revoked authority is a program fault);
+  (2) the **caretaker pattern** — the embedder wraps a `HostFn` around shared state
+  (`Arc<AtomicBool>`) and flips it, turning every op into a graceful `-EACCES`, guest-recoverable and
+  workable *today* with zero VM changes (an outside thread can even revoke while the guest runs). The
+  open decision is which semantics a first-class revoke commits to, and whether names unregister with
+  their handle.
+- **F14 — op-level discovery stays a convention, not a VM surface.** `cap.self.*` reflection is
+  deliberately **handle-level** (`count`/`get`/`resolve`/`label`); ops are numbers in the interface
+  contract (`cap.call type_id op`), like syscall numbers. Two idiomatic routes already cover op-by-name
+  without teaching the VM an IDL: (1) **statically**, import names pin ops — a wasm-style
+  `"module.field"` import resolves to `(type_id, op)` at link time (`Imports::provide_module` groups a
+  module's fields over one shared provider instance, matching wasm's one-instance-per-imported-module
+  semantics); (2) **dynamically**, an interface can reserve a *describe op* that writes its own op
+  directory (names, arg shapes, a version) into a guest buffer — pure embedder convention, expressible
+  today via `__vm_host_call`. If demand emerges across many capabilities, the principled extension is
+  one more reflection op (`cap.self.ops(handle)` populated at grant time like F7/F9) — logged here so
+  the choice is deliberate; the default is to keep op vocabularies wholly between embedder and guest
+  (§2a: the VM stays mechanism, never semantics).
 
 ---
 
