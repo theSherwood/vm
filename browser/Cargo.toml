@@ -40,6 +40,9 @@ svm-verify = { path = "../crates/svm-verify" }
 # The durability transform (freeze/thaw IR rewrite) — used by the `gencorpus` ground truth and the
 # `run_durable` probe to instrument a module + seed the durable window. Pure (only `svm-ir`).
 svm-durable = { path = "../crates/svm-durable" }
+# The wasm-JIT emitter (browser wasm-JIT tier, slice 1). Pure (only `svm-ir`); its output is
+# compiled + run by the JS host against this cdylib's own linear memory — see `svm_wasmjit_compile`.
+svm-wasmjit = { path = "../crates/svm-wasmjit" }
 
 [profile.release]
 panic = "abort"

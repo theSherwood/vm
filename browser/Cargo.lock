@@ -28,6 +28,7 @@ dependencies = [
  "svm-ir",
  "svm-text",
  "svm-verify",
+ "svm-wasmjit",
 ]
 
 [[package]]
@@ -79,6 +80,13 @@ dependencies = [
 
 [[package]]
 name = "svm-verify"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+]
+
+[[package]]
+name = "svm-wasmjit"
 version = "0.0.0"
 dependencies = [
  "svm-ir",

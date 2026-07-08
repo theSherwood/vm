@@ -540,9 +540,28 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    kinds* over an arg sweep incl. `i64::MIN/-1`, guard-crossing addresses, and fuel exhaustion; 15
    kernels green, plus a `fail_closed` test pinning the refused families (float/fiber/thread/tailcall).
    Remaining for this slice's PR: none — browser wiring is slice 2.
-2. **Browser linking.** Table registration, per-Worker instantiate, transmute-call from the engine;
-   AOT the suspension-free functions of a module at `svm_par_compile`; single Worker; Chromium gate
-   (a `#wasmjit` work item in `browser-test.mjs`).
+2. **[in progress] Browser linking.** Landed: the cdylib FFI `svm_wasmjit_compile(mod_ptr, mod_len)`
+   emits a wasm module for a JIT-eligible SVM module (via `svm_wasmjit::compile_module_shared`) and
+   stashes the bytes (`svm_wasmjit_ptr`/`_len`), returning `0` — the fail-closed signal to stay on
+   the interpreter — for anything the emitter refuses. The JS linker (`web/wasmjit.js`,
+   `compileJit`) compiles those bytes, instantiates the emitted module against **the cdylib's own
+   (shared) linear memory** so an `svm_alloc`ed window + env cell are addressable in both, and calls
+   the exported `f0(win, env, …args)` **directly** from JS. That last choice resolves the trap
+   model: because JS — not a Rust engine frame — is the top-level caller, a guest trap's
+   `unreachable` surfaces as a catchable `WebAssembly.RuntimeError` (the host reads the code its
+   `env.trap` import recorded), exactly the slice-1 differential model; a Rust caller would have died
+   with the callee. Proven in real **Chromium** (`#wasmjit` work item: the `alu` kernel emitted, run
+   in-browser, byte-identical to `svm_run` over an arg sweep, **~20× faster** than the interpreter,
+   stable across repeats) and by the Node twin `wasmjit.mjs` (equality + trap parity + the speedup).
+   **Deviations from the original plan, noted:** (a) the emitter emits a *shared* memory import
+   (`compile_module_shared`) because the browser links against the threads build's shared memory —
+   `wasmi` has no shared-memory support, so the slice-1 differential keeps the non-shared
+   `compile_module`, and since only the 3-byte import-limits differ the wasmi gate still covers the
+   shared path's codegen; (b) this slice runs the whole eligible module as one emitted unit called
+   from JS on a single thread — table registration, the transmute-call *from the Rust engine*, and
+   per-Worker instantiation are deferred to the tiering (3) and threads (4) slices, where a
+   mixed-tier guest actually needs the engine to call emitted code mid-run. AOT-at-`svm_par_compile`
+   likewise moves to slice 3 (it belongs with the eligibility/partitioning analysis).
 3. **Tiering + deopt.** Suspension-point partitioning (JIT-eligible function analysis), interp
    fallback wiring in the `Vcpu`, deopt on `map_region`/`protect`; the §13 corpus cases through the
    JIT tier.
