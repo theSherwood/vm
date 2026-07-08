@@ -2195,18 +2195,16 @@ UPDATED after the textual-reader flip (PR4):**
 - **No Rust-toolchain pin.** The Rust lane compiles with the default stable `rustc` (`--emit=llvm-ir`);
   its bundled LLVM (21 here) flows straight through the textual reader — the version-tolerance proof.
 
-**Q5 — CI yaml (DONE for the `svm-llvm` lane; three sibling jobs pending the same one-liner):** the
-Linux-only `svm-llvm` job installs base `llvm-18`/`clang-18` (build tools only — `clang` + `llvm-dis`;
-no `-dev` headers, nothing links libLLVM) and keeps a `rustup toolchain install 1.81.0` step scoped to
-the multi-crate `peval_*` Futamura probe alone (its `llvm-link-18`/`opt-18` can only ingest LLVM-18
-IR, so that fixture needs a version-matched `rustc`; the Rust *breadth* lane runs on default stable —
-the version-tolerance proof). Landed by a maintainer push (the bot token lacks `workflow` scope);
-verified green on CI run 1193 with the peval probe running, not skipping.
-**Remaining (needs the same `workflow`-scoped manual push):** three other jobs still
-`apt-get install llvm-18-dev` — `asan-jit-setjmp`, `embench-differential`, `cross-engine-differential`.
-Each only *runs* `svm-llvm` tests/examples (which shell out to `clang`/`llvm-dis`), so it's
-`llvm-18-dev` → `llvm-18` in all three, plus updating their step names/comments that still say
-"libLLVM for the on-ramp" / "the on-ramp links libLLVM".
+**Q5 — CI yaml (DONE):** no job installs `llvm-18-dev` anymore — nothing links libLLVM. The
+Linux-only `svm-llvm` job installs base `llvm-18`/`clang-18` (build tools only — `clang` + `llvm-dis`)
+and keeps a `rustup toolchain install 1.81.0` step scoped to the multi-crate `peval_*` Futamura probe
+alone (its `llvm-link-18`/`opt-18` can only ingest LLVM-18 IR, so that fixture needs a version-matched
+`rustc`; the Rust *breadth* lane runs on default stable — the version-tolerance proof). The three
+sibling jobs that run `svm-llvm` tests/examples (`asan-jit-setjmp`, `embench-differential`,
+`cross-engine-differential`) got the same `llvm-18-dev` → `llvm-18` swap. All landed by maintainer
+pushes (the bot token lacks `workflow` scope): the `svm-llvm` lane verified green on CI run 1193 with
+the peval probe running (not skipping); embench + cross-engine verified green on the run for
+`31bcfcd` (asan-jit-setjmp is schedule-gated, exercised on the nightly).
 
 ---
 
