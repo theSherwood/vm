@@ -189,10 +189,33 @@ after the join to place the trigger.)* The **bytecode** engine's durable-capture
 **declines** §14 modules (falling back to the tree-walker, which owns the durable nesting rules —
 svm-run's bytecode backend already falls back on decline), exactly as it declines `thread.*`: its
 own instantiate arm has neither the admission check nor the fail-closed, and would otherwise mint
-the same thaw-faulting artifact. What this slice does *not* yet do: freeze a subtree as a
-unit — §14 children riding the artifact as residue (per-subtree STW trigger + subtree handle
-capture) are the next nesting slices; this makes the invariant they rely on real and the gap
-fail-closed rather than silently corrupt in the meantime.
+the same thaw-faulting artifact. **Subtree freeze — first slice landed (stage A+B, interp, in-memory).** The fail-closed is
+**lifted for the covered shape**: a freeze over a **live same-module depth-1 child** now freezes
+the subtree as a unit. The mechanics exploit the §4 structure directly — the child's window is a
+sub-range of the parent's, so its *entire* state (window bytes, durable reserve: shadow regions,
+state + SP words, its unwound continuation) already rides the parent's window image. What lands:
+**(i)** the subtree STW broadcast — at the parent's freeze-unwind, `UNWINDING` is written into
+each live child's carve state word; the child (a scheduler task the run drains before the window
+is snapshotted) self-unwinds into its carve's own reserve at its next poll; **(ii)**
+[`FrozenNested`] residue — slot + carve geometry + entry, the small host-side re-attach record
+(`Host::frozen_nested`/`set_frozen_nested`, the in-memory transport); **(iii)** thaw re-attach —
+the carve is `begin_thaw`'d in place (its freeze word cleared, its context-0 thaw word set), the
+child domain is re-created around it (nested view, fresh attenuated powerbox with the *same
+grants in the same order* so reloaded handle values resolve), re-entered `REWINDING` from the
+extent its carve's shadow-SP word holds, and the root's join table is rebuilt at the recorded
+slot — the root's re-executed `join` parks until the rewound child completes, exactly as
+pre-freeze. Pinned by `durable_nesting.rs::freeze_with_live_nested_child_thaws_and_completes` (a
+looping child frozen live; the thaw reproduces the uninterrupted total). **Still fail-closed**
+(refusal preserved + pinned): suspended coroutines (host-side native continuations),
+separate-module children (module identity can't ride yet), completed-but-unjoined children (the
+result lives only in the scheduler; detected via a non-destructive `has_result` probe),
+nested-in-nested, mixing with unjoined `thread.spawn` children (the two thaw seedings would
+contend for the join table), and a nested child owning fibers (child-local residue). The
+**snapshot codec refuses** nested residue (`FreezeError::NestedResidue`) until the Section-2
+nested encoding lands (stage C) — in-memory freeze → thaw only, like the pre-codec fiber slices.
+Next: stage C (codec + canonical re-freeze), completed-result residue, separate-module children
+(module identity in the artifact — the durable `ModuleGrant` binding question), deeper nesting,
+JIT parity.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the

@@ -118,6 +118,10 @@ pub enum PageProt {
 /// Why a domain can't be frozen.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FreezeError {
+    /// The freeze left §14 nested-child residue (`Host::frozen_nested`, DURABILITY.md §4), which
+    /// this container format cannot carry yet — serializing would silently drop the children on
+    /// restore, so freeze refuses all-or-nothing. Carries the residue count.
+    NestedResidue(usize),
     /// A live handle isn't re-grantable, so freeze refuses rather than dropping authority
     /// (§12.5). The domain must close/drain it first.
     NonDurableHandle(NonDurableHandle),
@@ -207,6 +211,12 @@ pub fn freeze_with_prots(
     let handles = host
         .capture_durable_handles()
         .map_err(FreezeError::NonDurableHandle)?;
+    // §4 subtree freeze: nested-child residue is not yet in the container format — refuse rather
+    // than serialize an artifact whose restore would silently drop the children (all-or-nothing,
+    // like the handle-table refusal). The Section-2 nested encoding is the follow-up stage.
+    if !host.frozen_nested().is_empty() {
+        return Err(FreezeError::NestedResidue(host.frozen_nested().len()));
+    }
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
     fibers.sort_by_key(|f| f.slot);

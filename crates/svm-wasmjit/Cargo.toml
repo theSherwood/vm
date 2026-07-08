@@ -1,0 +1,21 @@
+[package]
+name = "svm-wasmjit"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Runtime deps: svm-ir only — the emitter is escape-TCB-adjacent (its output confines guest
+# addresses), so it stays dependency-free and auditable, like svm-mask/svm-verify.
+[dependencies]
+svm-ir.workspace = true
+
+# Dev-only: the differential harness runs emitted wasm on `wasmi` (a pure-Rust wasm interpreter —
+# far lighter than Wasmtime, which stays out of the workspace per the bench/ precedent) against the
+# bytecode-engine oracle.
+[dev-dependencies]
+svm-text.workspace = true
+svm-verify.workspace = true
+svm-interp.workspace = true
+wasmi = "0.40"

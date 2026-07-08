@@ -15019,10 +15019,17 @@ impl<'a> BlockCtx<'a> {
 
     /// Resolve a value-id already available in this block (a parameter or an earlier result).
     fn id(&self, vid: ValueId) -> Result<ValIdx, Error> {
-        self.idx_of
-            .get(&vid)
-            .copied()
-            .ok_or_else(|| Error::Unsupported(format!("value {vid} not available in block")))
+        self.idx_of.get(&vid).copied().ok_or_else(|| {
+            let name = self
+                .s
+                .name2id
+                .iter()
+                .find(|(_, &v)| v == vid)
+                .map(|(n, _)| n);
+            Error::Unsupported(format!(
+                "value {vid} (name {name:?}) not available in block"
+            ))
+        })
     }
 
     /// Resolve an operand to a block-local index, materializing a constant as a `const` inst
@@ -15157,9 +15164,30 @@ impl<'a> BlockCtx<'a> {
                 // A constexpr interior pointer, or a pointer materialized from an integer
                 // (`inttoptr`/`ptrtoint` over constants — e.g. Rust's `NonNull::dangling()` for an
                 // empty `Vec`, an `inttoptr(align)`), folds to its constant `i64` window value.
-                Constant::GetElementPtr(_) | Constant::IntToPtr(_) | Constant::PtrToInt(_) => {
+                Constant::GetElementPtr(_) | Constant::IntToPtr(_) => {
                     let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
                     Ok(self.push(Inst::ConstI64(v)))
+                }
+                // A constexpr `ptrtoint` folds the same way, but honors its **target width**: a
+                // `ptrtoint (ptr @g to i32)` (pointer-difference idioms over globals, e.g. ltests'
+                // `strchr(ops, op) - ops` as `int`) is an `i32` value — emitting the raw `i64`
+                // address would feed an I64 into I32 arithmetic (verify TypeMismatch). Mirrors the
+                // instruction-level `PtrToInt` (`emit_trunc(64, to)`); ≤32-bit targets mask to the
+                // canonical zero-extended narrow form.
+                Constant::PtrToInt(u) => {
+                    let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
+                    let to = int_bits(u.to_type.as_ref())
+                        .ok_or_else(|| Error::Unsupported("const ptrtoint to non-int".into()))?;
+                    if to <= 32 {
+                        let mask = if to == 32 {
+                            u32::MAX as u64
+                        } else {
+                            (1u64 << to) - 1
+                        };
+                        Ok(self.push(Inst::ConstI32((v as u64 & mask) as i32)))
+                    } else {
+                        Ok(self.push(Inst::ConstI64(v)))
+                    }
                 }
                 other => unsup(format!("constant operand {other:?}")),
             },
@@ -17379,6 +17407,96 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             let addr = ctx.operand(&l.address)?;
             let parts = ctx.wide_load(addr, layout);
             ctx.bind_wide(&l.dest, parts);
+            Ok(true)
+        }
+        // `freeze` on a chunked vector: identity on the parts (our IR is total — §3c; mirrors the
+        // scalar/i128/mask freeze arms). Found via an SLP-vectorized 4-byte compare (`load <4 x i8>`
+        // + `freeze` + `bitcast i32`) in the fs-capability probe.
+        I::Freeze(x) => {
+            let Some(layout) = wide_vec_layout(x.operand.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let parts = ctx.wide_operand(&x.operand, layout)?;
+            ctx.bind_wide(&x.dest, parts);
+            Ok(true)
+        }
+        // `bitcast <N x iK> → iM` — SLP's whole-small-vector-to-scalar view (e.g. a 4-byte compare
+        // becoming `load <4 x i8>` + `bitcast` to `i32`). Only the **all-tail** (≤ 64-bit) integer
+        // shape: reassemble the lane scalars little-endian (mask each lane to its width, shift into
+        // place, OR-accumulate). Chunk-bearing (>128-bit) or float-lane casts stay fail-closed.
+        I::BitCast(bc) => {
+            let Some(layout) = wide_vec_layout(bc.operand.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let Type::IntegerType { bits } = bc.to_type.as_ref() else {
+                return Ok(false); // vector→vector reshapes take the generic path below
+            };
+            let lane_bits = layout.shape.lane_bytes() * 8;
+            if layout.full_chunks != 0
+                || layout.shape.is_float()
+                || *bits > 64
+                || *bits as usize != layout.total_lanes() * lane_bits as usize
+            {
+                return unsup(format!(
+                    "bitcast of a chunked vector to i{bits} (only an all-tail integer vector ≤ 64 bits)"
+                ));
+            }
+            let wide = *bits > 32;
+            let ty = if wide { IntTy::I64 } else { IntTy::I32 };
+            let parts = ctx.wide_operand(&bc.operand, layout)?;
+            let lane_mask = if lane_bits >= 64 {
+                -1i64
+            } else {
+                (1i64 << lane_bits) - 1
+            };
+            let mut acc: Option<ValIdx> = None;
+            for (i, &part) in parts.iter().enumerate() {
+                // Lane containers may carry dirty high bits (§3b narrow-int) — mask to lane width.
+                let mut v = part;
+                if wide {
+                    v = ctx.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: v,
+                    });
+                }
+                let k = ctx.push(if wide {
+                    Inst::ConstI64(lane_mask)
+                } else {
+                    Inst::ConstI32(lane_mask as i32)
+                });
+                v = ctx.push(Inst::IntBin {
+                    ty,
+                    op: BinOp::And,
+                    a: v,
+                    b: k,
+                });
+                if i > 0 {
+                    let sh = ctx.push(if wide {
+                        Inst::ConstI64((i as u32 * lane_bits) as i64)
+                    } else {
+                        Inst::ConstI32((i as u32 * lane_bits) as i32)
+                    });
+                    v = ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Shl,
+                        a: v,
+                        b: sh,
+                    });
+                }
+                acc = Some(match acc {
+                    None => v,
+                    Some(a) => ctx.push(Inst::IntBin {
+                        ty,
+                        op: BinOp::Or,
+                        a,
+                        b: v,
+                    }),
+                });
+            }
+            let r = acc.expect("nonzero lanes");
+            if let Some(&vid) = ctx.s.name2id.get(&bc.dest) {
+                ctx.idx_of.insert(vid, r);
+            }
             Ok(true)
         }
         I::Add(x) => wide_int_binop(

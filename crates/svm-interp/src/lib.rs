@@ -1869,6 +1869,7 @@ fn drive(
     // Thaw seeding (slice 3.2.1): spawned vCPUs a freeze flattened, re-attached by the root's rewound
     // `thread.spawn` (in ascending task order). Taken here; empty for a freeze or ordinary run.
     let thaw_vcpus = std::mem::take(&mut host.frozen_vcpus);
+    let thaw_nested = std::mem::take(&mut host.frozen_nested);
     // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
     // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
     let thaw_root_sp = host.frozen_root_sp.take();
@@ -2024,6 +2025,85 @@ fn drive(
             root.registry.seed_vcpu_mask(vcpu_mask);
             // Enqueue every re-spawned child, parents first (ascending task via the `BTreeMap`).
             for (_, child) in children {
+                s.runnable.push_back(child);
+            }
+        }
+        // §4 subtree thaw (DURABILITY.md): re-attach the §14 nested children a subtree freeze
+        // recorded. Each child's whole state — window, durable reserve, unwound continuation —
+        // is already in the restored image (its carve is a sub-range of the root's window); this
+        // re-creates the child *domain* around it: a nested view of the carve, a fresh attenuated
+        // powerbox (the same grants, in the same order, as `instantiate` minted — so the child's
+        // reloaded handle values still resolve), and a `REWINDING` re-entry from the extent its
+        // carve's own shadow-SP word holds. The root's join table is rebuilt at each recorded
+        // slot, so the root's reloaded child handle resolves; the root's re-executed `join` then
+        // parks until the rewound child completes, exactly as pre-freeze.
+        {
+            let mut nseed: Vec<FrozenNested> = thaw_nested;
+            nseed.sort_by_key(|n| n.slot);
+            for fnr in nseed {
+                let csize = 1u64 << fnr.size_log2;
+                // Flip the child's carve from its frozen phase to a thaw: clear its own global
+                // freeze word and set its context-0 thaw word — `begin_thaw`, carve-relative.
+                if let Some(m) = root.mem.as_mut() {
+                    let _ = m.write_bytes(fnr.carve_off + STATE_OFF, &STATE_NORMAL.to_le_bytes());
+                    let _ = m.write_bytes(
+                        fnr.carve_off + thaw_state_off(0),
+                        &STATE_REWINDING.to_le_bytes(),
+                    );
+                }
+                let child_extent = root
+                    .mem
+                    .as_ref()
+                    .map(|m| m.durable_get_sp(fnr.carve_off + SHADOW_SP_OFF))
+                    .unwrap_or(SHADOW_BASE);
+                let child_mem = root
+                    .mem
+                    .as_ref()
+                    .map(|m| m.nested_view(m.window.base() + fnr.carve_off, fnr.size_log2));
+                let mut ch = Host::new();
+                ch.set_durable(true);
+                let cinst = ch.grant_instantiator(0, csize);
+                let want_as = funcs
+                    .get(fnr.entry as usize)
+                    .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
+                let child_args = if want_as {
+                    let cas = ch.grant_address_space(0, csize);
+                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                } else {
+                    vec![Value::I64(cinst as i64)]
+                };
+                let cid = s.next_task;
+                s.next_task += 1;
+                s.live += 1;
+                let cdt = Arc::new(DomainTable::new(&funcs, 0));
+                let mut child = Box::new(VCpu::new(
+                    Arc::clone(&funcs),
+                    fnr.entry,
+                    &child_args,
+                    child_mem,
+                    Arc::new(Mutex::new(ch)),
+                    *fuel,
+                    1, // depth: a nested child (depth-1 covered shape)
+                    cid,
+                    SchedRef::Real(Arc::clone(&sched)),
+                    quota,
+                    cdt,
+                ));
+                child.durable = true;
+                child.nested_child = true;
+                child.dstate = STATE_REWINDING;
+                child.root_shadow_sp = child_extent;
+                while root.threads.len() <= fnr.slot {
+                    root.threads.push(None);
+                }
+                root.threads[fnr.slot] = Some(cid);
+                root.nested_children.push(NestedChildInfo {
+                    slot: fnr.slot,
+                    carve_off: fnr.carve_off,
+                    size_log2: fnr.size_log2,
+                    entry: fnr.entry,
+                    same_module: true,
+                });
                 s.runnable.push_back(child);
             }
         }
@@ -3569,21 +3649,59 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
             // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
             // drive trap (out-of-scope module) surfaces as the run's result.
-            let result = if froze
-                && (v
-                    .nested_slots
+            // §4 subtree freeze (DURABILITY.md): handle this vCPU's live §14 children before its
+            // own residue is recorded. The **covered** shape — depth-1, same-module, still-running
+            // children of a non-nested parent, no unjoined `thread.spawn` siblings — is frozen for
+            // real: broadcast `UNWINDING` into each live child's carve state word (the subtree STW;
+            // the child self-unwinds into its carve's own durable reserve, which is inside this
+            // window's image, at its next poll) and record it as [`FrozenNested`] re-attach residue.
+            // Everything else stays **fail-closed** (`ThreadFault`, like the join-deadlock): a
+            // suspended coroutine (host-side native continuation), a separate-module child (its
+            // module identity can't ride the artifact yet), a completed-but-unjoined child (its
+            // result lives only in the scheduler), nested-in-nested, and mixing with unjoined
+            // `thread.spawn` children (the two thaw seedings would contend for the join table).
+            let nested_refused = froze && {
+                let live: Vec<NestedChildInfo> = v
+                    .nested_children
                     .iter()
-                    .any(|&s| v.threads.get(s).is_some_and(Option::is_some))
-                    || v.coroutines.iter().any(Option::is_some))
-            {
-                // §4 fail-closed (DURABILITY.md): a live-or-unjoined §14 child (an `instantiate`d
-                // domain or a suspended coroutine) cannot ride the artifact — it is its own domain
-                // (own host/window/program) whose continuation and pending join result live
-                // host-side only. An artifact minted here would fault at thaw (the parent reloads
-                // its child handle into an empty table), so the freeze **refuses** instead
-                // (`ThreadFault`, like the join-deadlock fail-closed). Subtree residue — §14
-                // children riding the artifact — is the follow-up nesting slice. `thread.spawn`
-                // children are unaffected (they ride as `FrozenVCpu` residue).
+                    .filter(|c| v.threads.get(c.slot).is_some_and(Option::is_some))
+                    .copied()
+                    .collect();
+                if v.coroutines.iter().any(Option::is_some) {
+                    true
+                } else if live.is_empty() {
+                    false
+                } else if v.nested_child
+                    || live.iter().any(|c| !c.same_module)
+                    || live.iter().any(|c| {
+                        v.sched
+                            .has_result(v.threads[c.slot].expect("filtered to Some"))
+                    })
+                    || v.threads.iter().enumerate().any(|(slot, t)| {
+                        t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
+                    })
+                {
+                    true
+                } else if let Some(m) = v.mem.as_mut() {
+                    for c in &live {
+                        m.write_bytes(c.carve_off + STATE_OFF, &STATE_UNWINDING.to_le_bytes());
+                        v.host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .frozen_nested
+                            .push(FrozenNested {
+                                slot: c.slot,
+                                carve_off: c.carve_off,
+                                size_log2: c.size_log2,
+                                entry: c.entry,
+                            });
+                    }
+                    false
+                } else {
+                    true // a durable freeze without a window is malformed — refuse
+                }
+            };
+            let result = if nested_refused {
                 Err(Trap::ThreadFault)
             } else if froze {
                 // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
@@ -3608,7 +3726,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             shadow_sp: self_sp,
                             completed_result: None, // interp runs durable single-worker
                         });
-                } else {
+                } else if !v.nested_child {
                     // The root: record its extent (the shared active-SP word will be overwritten by a
                     // later child, so the root's residue can't ride the window).
                     v.host
@@ -3616,17 +3734,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         .unwrap_or_else(|e| e.into_inner())
                         .frozen_root_sp = Some(self_sp);
                 }
-                let r = v.freeze_drive().and(result);
+                // (A §14 nested child records nothing: its extent is its carve's own shadow-SP
+                // word, inside the parent's window image — carve-self-describing.)
+                let mut r = v.freeze_drive().and(result);
                 // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
                 // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
                 // makes the accumulation order irrelevant to the artifact.
                 if !v.frozen.is_empty() {
                     let frozen = std::mem::take(&mut v.frozen);
-                    v.host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .frozen_fibers
-                        .extend(frozen);
+                    if v.nested_child {
+                        // A nested child's fiber residue is child-local (its slots/extents name
+                        // its own registry + carve) — it cannot ride the parent's tables. Fail
+                        // closed until per-child fiber residue lands (DURABILITY.md §4).
+                        drop(frozen);
+                        r = Err(Trap::ThreadFault);
+                    } else {
+                        v.host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .frozen_fibers
+                            .extend(frozen);
+                    }
                 }
                 r
             } else {
@@ -3740,6 +3868,15 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.lock().results.remove(&id),
             SchedRef::Det(d) => d.lock().results.remove(&id),
+        }
+    }
+    /// Whether `id` has already completed (result posted, unjoined) — a non-destructive probe the
+    /// §14 subtree freeze uses to tell a **live** child (broadcast + residue) from a
+    /// **completed-but-unjoined** one (refused fail-closed until completed-result residue lands).
+    fn has_result(&self, id: TaskId) -> bool {
+        match self {
+            SchedRef::Real(s) => s.lock().results.contains_key(&id),
+            SchedRef::Det(d) => d.lock().results.contains_key(&id),
         }
     }
 }
@@ -4438,6 +4575,45 @@ pub struct FrozenVCpu {
     pub completed_result: Option<i64>,
 }
 
+/// A vCPU's record of one live §14 child it instantiated: the child's join-table slot, its carve
+/// geometry (window-relative), and its entry — everything the subtree freeze needs to broadcast
+/// into the child's carve and record it as [`FrozenNested`] residue (DURABILITY.md §4).
+#[derive(Clone, Copy, Debug)]
+struct NestedChildInfo {
+    /// The [`VCpu::threads`] slot the child's join handle names.
+    slot: usize,
+    /// The carve's **window-relative** base (holder base + requested offset) — the child's window
+    /// is `[carve_off, carve_off + (1 << size_log2))` of the parent's.
+    carve_off: u64,
+    size_log2: u8,
+    /// The child's entry function index (into the parent's own table — same-module children only;
+    /// a separate-module child is refused at freeze until its module identity rides the artifact).
+    entry: u32,
+    /// Whether the child's module is the parent's own (`instantiate`, op 0) vs. a granted separate
+    /// module (op 5). Only same-module children are freezable today.
+    same_module: bool,
+}
+
+/// A **§14 instantiated child** flattened for freeze (DURABILITY.md §4 "STW quiesces the subtree
+/// as a unit" — first slice: depth-1, same-module, interp). The child's entire state — its window,
+/// its durable reserve (shadow regions, state/SP words), its unwound continuation — lives in its
+/// carve, a sub-range of the parent's window, so it is **already in the artifact's window image**;
+/// this is the small host-side residue a thaw needs to re-attach it: where the carve is, how to
+/// re-enter it, and which join slot the parent's reloaded handle names. (Not yet in the snapshot
+/// codec — `svm-snapshot::freeze` refuses an artifact with nested residue until the Section-2
+/// encoding lands; in-memory freeze → thaw carries it via [`Host::frozen_nested`].)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenNested {
+    /// The parent's join-table slot for this child (the guest-held handle value).
+    pub slot: usize,
+    /// The carve's window-relative base.
+    pub carve_off: u64,
+    /// The carve's (= the child window's) size, `log2`.
+    pub size_log2: u8,
+    /// The child's entry function index (the parent's own table — same-module).
+    pub entry: u32,
+}
+
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
 /// continuation is exactly its reified call stack. `cont.new` makes one (`Pending`);
 /// `cont.resume` claims and switches into it; `suspend` parks it back, claimable again
@@ -4871,12 +5047,18 @@ struct VCpu {
     /// joined (a re-join is inert).
     threads: Vec<Option<TaskId>>,
     /// Which [`VCpu::threads`] slots were created by a §14 **`Instantiator.instantiate`** (vs. a §12
-    /// `thread.spawn`). A durable freeze must distinguish them: a spawned vCPU rides the artifact as
-    /// `FrozenVCpu` residue, but a §14 child is its **own domain** (own host/window/program) whose
-    /// continuation and pending join result live host-side only — an artifact minted while one is
-    /// live-or-unjoined would fault at thaw (the reloaded handle resolves in an empty table), so the
-    /// freeze fails closed instead (DURABILITY.md §4; subtree residue is the follow-up slice).
-    nested_slots: Vec<usize>,
+    /// `thread.spawn`), with each child's carve geometry + entry. A durable freeze must distinguish
+    /// them: a spawned vCPU rides the artifact as `FrozenVCpu` residue, while a §14 child is its
+    /// **own domain** whose window (a sub-range of this vCPU's — shadow regions and state words
+    /// included) already rides the parent's window image. On a freeze, a **live** same-module child
+    /// is driven to self-unwind into its carve (the subtree STW broadcast) and recorded as
+    /// [`FrozenNested`] residue; the un-covered shapes (separate-module child, completed-but-unjoined
+    /// child, nested-in-nested) still fail closed (DURABILITY.md §4).
+    nested_children: Vec<NestedChildInfo>,
+    /// This vCPU **is** a §14 instantiated child (depth-1). Its freeze-unwind is self-describing —
+    /// its extent lives in its carve's shadow-SP word, inside the parent's window image — so its
+    /// freeze completion records no host-side residue (and must not clobber the root's).
+    nested_child: bool,
     /// This vCPU's §14 **co-fiber** children (`Instantiator.spawn_coroutine`): suspended continuations
     /// (their own frames/mem/host) driven *inline* by `resume`, by handle (slot). `None` once the
     /// coroutine has run to completion (a later `resume` is inert). Distinct from `threads` — a
@@ -4982,7 +5164,8 @@ impl VCpu {
             host,
             fuel,
             threads: Vec::new(),
-            nested_slots: Vec::new(),
+            nested_children: Vec::new(),
+            nested_child: false,
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
@@ -5048,7 +5231,8 @@ impl VCpu {
             host,
             fuel,
             threads: Vec::new(),
-            nested_slots: Vec::new(),
+            nested_children: Vec::new(),
+            nested_child: false,
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
@@ -5390,7 +5574,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         host,
         fuel,
         threads,
-        nested_slots,
+        nested_children,
+        nested_child: _,
         coroutines,
         fault_yields,
         depth,
@@ -5817,15 +6002,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // instantiated child runs durable (freezable module enforced
                                     // at the admission check above).
                                     child.durable = durable;
+                                    // Its freeze-unwind is carve-self-describing: record no
+                                    // host-side extent (see `VCpu::nested_child`).
+                                    child.nested_child = true;
                                     Box::new(child)
                                 });
                                 match made {
                                     Some(child_id) => {
                                         threads.push(Some(child_id));
                                         // §14 children are tracked apart from `thread.spawn`
-                                        // vCPUs: a durable freeze must fail closed on them
-                                        // (see `VCpu::nested_slots`).
-                                        nested_slots.push(threads.len() - 1);
+                                        // vCPUs, with their carve geometry: a durable freeze
+                                        // broadcasts into a live child's carve and records it
+                                        // as residue — or fails closed on the un-covered
+                                        // shapes (see `VCpu::nested_children`).
+                                        nested_children.push(NestedChildInfo {
+                                            slot: threads.len() - 1,
+                                            carve_off: ibase + off,
+                                            size_log2: size_log2 as u8,
+                                            entry: entry as u32,
+                                            same_module: child_mod.is_none(),
+                                        });
                                         frames[top]
                                             .vals
                                             .push(Reg::from_i32((threads.len() - 1) as i32));
@@ -8994,6 +9190,8 @@ pub struct Host {
     /// (the root's re-executed `thread.spawn` re-attaches these, in spawn order, under `REWINDING`).
     /// Empty for a single-vCPU or ordinary run.
     frozen_vcpus: Vec<FrozenVCpu>,
+    /// §14 nested-child residue of a subtree freeze (DURABILITY.md §4) — see [`FrozenNested`].
+    frozen_nested: Vec<FrozenNested>,
     /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
     /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
     /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
@@ -9118,6 +9316,7 @@ impl Host {
             durable: false,
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
+            frozen_nested: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
         }
@@ -9161,6 +9360,20 @@ impl Host {
     /// alongside the restored (REWINDING) window and [`Host::set_durable`].
     pub fn set_frozen_vcpus(&mut self, frozen: Vec<FrozenVCpu>) {
         self.frozen_vcpus = frozen;
+    }
+
+    /// The §14 nested children a subtree freeze flattened on the last freeze run (DURABILITY.md §4
+    /// — each child's continuation is in its own carve inside the captured window; this is the
+    /// re-attach residue). Empty unless a live nested child was frozen. **Not yet carried by the
+    /// snapshot codec** — `svm-snapshot::freeze` refuses while this is non-empty.
+    pub fn frozen_nested(&self) -> &[FrozenNested] {
+        &self.frozen_nested
+    }
+
+    /// Seed the §14 nested children a **thaw** must re-attach, alongside the restored window and
+    /// [`Host::set_durable`] (the in-memory counterpart of [`Host::set_frozen_vcpus`]).
+    pub fn set_frozen_nested(&mut self, frozen: Vec<FrozenNested>) {
+        self.frozen_nested = frozen;
     }
 
     /// The root vCPU's flattened shadow-SP extent from the last multi-vCPU freeze (slice 3.2.1), or

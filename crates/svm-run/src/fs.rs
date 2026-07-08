@@ -23,6 +23,8 @@
 //! | 4 | `close` | `(fd, _, _, _)` | 0 |
 //! | 5 | `remove` | `(path_ptr, path_len, _, _)` | 0 |
 //! | 6 | `rename` | `(from_ptr, from_len, to_ptr, to_len)` | 0 |
+//! | 7 | `truncate` | `(fd, new_len, _, _)` | 0 |
+//! | 8 | `sync` | `(fd, _, _, _)` | 0 |
 //!
 //! Errors are negative errno values ([`ENOENT`]/[`EBADF`]/[`EINVAL`]/[`EACCES`]/[`EFAULT`]). `flags`
 //! is a bitset ([`O_READ`]/[`O_WRITE`]/[`O_APPEND`]/[`O_TRUNC`]/[`O_CREATE`]) the guest libc derives
@@ -43,6 +45,8 @@ pub const FS_SEEK: u32 = 3;
 pub const FS_CLOSE: u32 = 4;
 pub const FS_REMOVE: u32 = 5;
 pub const FS_RENAME: u32 = 6;
+pub const FS_TRUNCATE: u32 = 7;
+pub const FS_SYNC: u32 = 8;
 
 pub const O_READ: i64 = 1;
 pub const O_WRITE: i64 = 2;
@@ -249,6 +253,31 @@ impl MemFsState {
                 self.files.insert(to, d);
                 0
             }
+            FS_TRUNCATE => {
+                let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
+                    return -EBADF;
+                };
+                if !o.writable {
+                    return -EBADF; // POSIX ftruncate needs a writable descriptor
+                }
+                let len = a(1);
+                if len < 0 {
+                    return -EINVAL;
+                }
+                // POSIX: shrink discards, grow zero-fills; the cursor is untouched.
+                o.data
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .resize(len as usize, 0);
+                0
+            }
+            FS_SYNC => {
+                // Memory is always "durable" here — validate the fd, nothing to flush.
+                let Some(Some(_)) = self.open.get(a(0) as usize) else {
+                    return -EBADF;
+                };
+                0
+            }
             _ => -EINVAL,
         }
     }
@@ -409,6 +438,31 @@ impl HostFsState {
                     Err(e) => return e,
                 };
                 match std::fs::rename(from, to) {
+                    Ok(()) => 0,
+                    Err(e) => -io_errno(&e),
+                }
+            }
+            FS_TRUNCATE => {
+                let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
+                    return -EBADF;
+                };
+                if !o.writable {
+                    return -EBADF;
+                }
+                let len = a(1);
+                if len < 0 {
+                    return -EINVAL;
+                }
+                match o.file.set_len(len as u64) {
+                    Ok(()) => 0,
+                    Err(e) => -io_errno(&e),
+                }
+            }
+            FS_SYNC => {
+                let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
+                    return -EBADF;
+                };
+                match o.file.sync_all() {
                     Ok(()) => 0,
                     Err(e) => -io_errno(&e),
                 }
