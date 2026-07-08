@@ -557,26 +557,78 @@ fn bytecode_durable_capture_declines_a_nesting_module() {
     );
 }
 
-/// The snapshot codec cannot carry nested residue yet: `svm_snapshot::freeze` refuses
-/// all-or-nothing (like the non-durable-handle refusal) rather than serialize an artifact whose
-/// restore would silently drop the children. Stage C (the Section-2 nested encoding) lifts this.
+/// Stage C — the nested artifact through the **snapshot codec** (format v8): freeze the live
+/// nested child, serialize the real §12 artifact (the child's carve rides the window image; the
+/// `FrozenNested` re-attach record rides Section 2), restore into a fresh host, assert the §12.6
+/// **canonical re-freeze is byte-identical**, then thaw — the re-attached child completes its
+/// loop and the parent's join delivers the uninterrupted total.
 #[test]
-fn snapshot_codec_refuses_nested_residue() {
+fn nested_artifact_serializes_restores_and_thaws_through_the_codec() {
     let parent = instrument(PARENT_SELF_LOOP);
-    let mut host = Host::new();
-    host.set_durable(true);
-    host.set_frozen_nested(vec![svm_interp::FrozenNested {
-        slot: 0,
-        carve_off: 131072,
-        size_log2: 17,
-        entry: 1,
-    }]);
-    let win = init_durable_window(WINDOW);
-    assert!(
-        matches!(
-            svm_snapshot::freeze(&parent, &win, &host),
-            Err(svm_snapshot::FreezeError::NestedResidue(1))
-        ),
-        "the codec refuses nested residue until the Section-2 encoding lands"
+
+    // Freeze with the child live (as in the in-memory test).
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(fih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
     );
+    assert!(fr.is_ok(), "subtree freeze placeholder: {fr:?}");
+    assert_eq!(
+        fhost.frozen_nested().len(),
+        1,
+        "one nested child in residue"
+    );
+
+    // Serialize the real artifact: window image (parent + child carve) + Section-2 nested record.
+    let artifact =
+        svm_snapshot::freeze(&parent, &fsnap, &fhost).expect("nested artifact serializes");
+
+    // Restore into a FRESH host: handles re-pinned, nested residue re-seeded.
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = svm_snapshot::restore(&artifact, &parent, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_nested(),
+        fhost.frozen_nested(),
+        "restore re-seeded the nested re-attach residue"
+    );
+
+    // §12.6 invariant 1 — canonical: re-serializing the restored domain is byte-identical.
+    assert_eq!(
+        svm_snapshot::freeze(&parent, &window, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze of a restored nested artifact is byte-identical"
+    );
+
+    // Thaw: the child re-attaches from its carve and completes; join delivers the total.
+    let mut twin = window;
+    begin_thaw(&mut twin, 0);
+    let caps = thost.capture_durable_handles().expect("durable handles");
+    let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let mut fuel = 50_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih)],
+        &mut fuel,
+        &twin,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(4950)]),
+        "the codec-restored nested child completed; join delivered its total"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
