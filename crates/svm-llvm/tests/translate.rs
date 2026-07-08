@@ -2628,6 +2628,163 @@ fn demo_sqlite_vs_native() {
     powerbox_diff_cc_flags("sqlite", &bc, &demo, b"", &[&inc]);
 }
 
+/// Fetch (and cache) sqllogictest script files — SQLite's own SQL Logic Tests corpus
+/// (https://sqlite.org/sqllogictest/), via the long-stable gregrahn GitHub mirror (the fossil
+/// tarball endpoint rate-limits). Returns `(name, path)` pairs for whatever fetched; files that
+/// fail to download are skipped with a note (offline ⇒ empty vec ⇒ the test skips).
+fn fetch_sqllogictest_scripts() -> Vec<(&'static str, PathBuf)> {
+    const BASE: &str = "https://raw.githubusercontent.com/gregrahn/sqllogictest/master/test";
+    const FILES: &[(&str, &str)] = &[
+        ("select1", "select1.test"),
+        ("select2", "select2.test"),
+        ("select3", "select3.test"),
+        ("random_expr_0", "random/expr/slt_good_0.test"),
+        ("random_agg_0", "random/aggregates/slt_good_0.test"),
+        ("random_groupby_0", "random/groupby/slt_good_0.test"),
+        ("random_select_0", "random/select/slt_good_0.test"),
+    ];
+    let cache = std::env::temp_dir().join("svm_sqllogictest_cache");
+    let _ = std::fs::create_dir_all(&cache);
+    let mut out = Vec::new();
+    for (name, rel) in FILES {
+        let dst = cache.join(format!("{name}.test"));
+        if !dst.exists() {
+            let ok = Command::new("curl")
+                .args(["-sfL", "--max-time", "120", "-o"])
+                .arg(&dst)
+                .arg(format!("{BASE}/{rel}"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                let _ = std::fs::remove_file(&dst);
+                eprintln!("note: sqllogictest {name} fetch failed — skipping");
+                continue;
+            }
+        }
+        out.push((*name, dst.clone()));
+    }
+    out
+}
+
+#[test]
+fn demo_sqlite_logictest() {
+    // **SQLite's own test corpus in the sandbox.** A compact sqllogictest runner
+    // (`demos/sqlite/sqlite_logictest.c` — record parser, reference-exact value formatting,
+    // rowsort/valuesort, embedded MD5 for the `N values hashing to <md5>` form) reads each script
+    // from stdin and checks every record against the expected results SQLite's own corpus bakes
+    // in. Two independent gates per script:
+    //  1. **self-validation** — the guest's summary must report `failed=0`: tens of thousands of
+    //     SQLite's own expected query results hold when the engine runs in the sandbox;
+    //  2. **differential** — guest stdout must be byte-identical to the native build of the same
+    //     runner over the same stdin.
+    // This default test runs `select1.test` (1031 records) to keep the debug-build suite time
+    // sane; `demo_sqlite_logictest_full` (#[ignore]) sweeps all seven fetched scripts (~46k
+    // records / ~56k queries — per-record guest cost is small; a 15k-record file runs in ~4-5 s
+    // in release, but the debug-build test binary is ~15× slower).
+    run_sqllogictest(1);
+}
+
+/// The full seven-script sweep (select1-3 + four `random/*` torture files, ~46k records). Ignored
+/// by default (adds ~8 min to a debug-build run); run it locally / nightly with
+/// `cargo test --test translate demo_sqlite_logictest_full -- --ignored`.
+#[test]
+#[ignore]
+fn demo_sqlite_logictest_full() {
+    run_sqllogictest(usize::MAX);
+}
+
+fn run_sqllogictest(max_scripts: usize) {
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let mut scripts = fetch_sqllogictest_scripts();
+    scripts.truncate(max_scripts);
+    if scripts.is_empty() {
+        return;
+    }
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/sqlite/sqlite_logictest.c");
+    let inc = format!("-I{}", amalg.display());
+    let pid = std::process::id();
+
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_slt.bc"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_logictest (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{pid}_slt"));
+    match Command::new("cc")
+        .arg(&inc)
+        .arg(&demo)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_logictest (cc unavailable)");
+            return;
+        }
+    }
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate sqllogictest runner");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
+    svm_verify::verify_module(&module).expect("verify");
+
+    for (name, path) in scripts {
+        let script = std::fs::read(&path).expect("read script");
+        let native = {
+            use std::io::Write;
+            let mut child = Command::new(&exe)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn native");
+            child.stdin.take().unwrap().write_all(&script).ok();
+            child.wait_with_output().expect("run native")
+        };
+        let run = svm_run::run_powerbox(&module, &script).expect("powerbox run");
+        let out = String::from_utf8_lossy(&run.stdout);
+        let summary = out.lines().last().unwrap_or("");
+        assert!(
+            summary.contains(" failed=0 "),
+            "{name}: sqllogictest failures in the sandbox — {summary}
+first FAILs:
+{}",
+            out.lines()
+                .filter(|l| l.starts_with("FAIL"))
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(
+                    "
+"
+                )
+        );
+        assert_eq!(
+            run.stdout, native.stdout,
+            "{name}: guest stdout differs from native"
+        );
+        eprintln!("sqllogictest {name}: {summary}");
+    }
+}
+
 #[test]
 fn demo_sqlite_fs_cap_vs_native() {
     // **SQLite Phase B — disk-backed persistence through the Fs capability** (LLVM.md §8, the
