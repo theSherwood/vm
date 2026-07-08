@@ -250,6 +250,143 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
     Ok(tys)
 }
 
+// ---- tiering analysis (slice 3): which functions the JIT tier emits vs. leaves to the interp ------
+
+/// Per-function tiering classification for a module (`BROWSER.md` § "wasm-JIT tier", slice 3).
+/// The JIT tier emits the **in-subset** functions and routes a call to an **interp-callable** one
+/// through the engine (a cross-tier call); a guest is `mixed_ok` when func 0 and everything it
+/// reaches is one or the other (and nothing reachable suspends — a JITted frame can't unwind, so
+/// suspension anywhere forces the whole guest to the interpreter).
+#[derive(Clone, Debug)]
+pub struct Analysis {
+    /// `in_subset[i]` — function `i` is entirely within the integer compute subset the emitter
+    /// lowers directly (it becomes an emitted `f{i}`).
+    pub in_subset: Vec<bool>,
+    /// `interp_leaf[i]` — function `i` is **not** in-subset but is safe to run on the bytecode
+    /// engine as a cross-tier leaf: an all-integer signature (so the call ABI marshals only i64
+    /// slots), **memory-free**, makes no calls (a true leaf, so no transitive window/state to
+    /// share), and no concurrency / capability ops. A JITted caller reaches it via `env.call_interp`.
+    pub interp_leaf: Vec<bool>,
+    /// `reachable[i]` — function `i` is reachable from func 0 through call edges.
+    pub reachable: Vec<bool>,
+    /// Every reachable function is in-subset or an interp leaf, func 0 is in-subset, and nothing
+    /// reachable uses concurrency — i.e. the guest can run on the JIT tier (with cross-tier calls).
+    pub mixed_ok: bool,
+}
+
+/// A block terminator the emitter lowers (tail calls are not in the v1 subset).
+fn term_in_subset(t: &Terminator) -> bool {
+    matches!(
+        t,
+        Terminator::Br { .. }
+            | Terminator::BrIf { .. }
+            | Terminator::BrTable { .. }
+            | Terminator::Return(_)
+            | Terminator::Unreachable
+    )
+}
+
+/// Whether every instruction, terminator, and value type of `f` is in the emitter's integer compute
+/// subset — reusing [`block_value_types`] (which errors on any out-of-subset instruction) as the
+/// single source of truth, plus a type check (all values i32/i64) and the terminator check.
+fn func_in_subset(m: &Module, f: &Func) -> bool {
+    f.blocks.iter().all(|b| {
+        block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
+            && term_in_subset(&b.term)
+    })
+}
+
+/// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
+/// reachability sound even though a tail call itself isn't emitted).
+fn func_callees(f: &Func) -> Vec<u32> {
+    let mut out = Vec::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Inst::Call { func, .. } = inst {
+                out.push(*func);
+            }
+        }
+        if let Terminator::ReturnCall { func, .. } = &b.term {
+            out.push(*func);
+        }
+    }
+    out
+}
+
+/// Whether `f` is safe to run as a cross-tier interpreter leaf (see [`Analysis::interp_leaf`]).
+fn interp_leaf(f: &Func) -> bool {
+    let int_sig = f
+        .params
+        .iter()
+        .chain(&f.results)
+        .all(|t| matches!(t, ValType::I32 | ValType::I64));
+    if !int_sig || f.uses_concurrency() {
+        return false;
+    }
+    f.blocks.iter().all(|b| {
+        !matches!(
+            b.term,
+            Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
+        ) && b.insts.iter().all(|i| {
+            !matches!(
+                i,
+                // memory ops (a leaf's fresh window would diverge from the shared one),
+                Inst::Load { .. }
+                        | Inst::Store { .. }
+                        | Inst::AtomicLoad { .. }
+                        | Inst::AtomicStore { .. }
+                        | Inst::AtomicRmw { .. }
+                        | Inst::AtomicCmpxchg { .. }
+                        | Inst::V128Load { .. }
+                        | Inst::V128Store { .. }
+                        // calls (a true leaf only — transitive tiers are a later refinement),
+                        | Inst::Call { .. }
+                        | Inst::CallIndirect { .. }
+                        // and host/capability ops (no powerbox in the cross-tier callback).
+                        | Inst::CapCall { .. }
+                        | Inst::CallImport { .. }
+            )
+        })
+    })
+}
+
+/// Classify every function of a **verified** `m` for tiering (see [`Analysis`]).
+pub fn analyze(m: &Module) -> Analysis {
+    let n = m.funcs.len();
+    let in_subset: Vec<bool> = m.funcs.iter().map(|f| func_in_subset(m, f)).collect();
+    let interp_leaf: Vec<bool> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| !in_subset[i] && interp_leaf(f))
+        .collect();
+
+    // Reachability from func 0 through call edges.
+    let mut reachable = vec![false; n];
+    if n > 0 {
+        let mut stack = vec![0u32];
+        reachable[0] = true;
+        while let Some(fi) = stack.pop() {
+            for c in func_callees(&m.funcs[fi as usize]) {
+                if (c as usize) < n && !reachable[c as usize] {
+                    reachable[c as usize] = true;
+                    stack.push(c);
+                }
+            }
+        }
+    }
+
+    let mixed_ok =
+        n > 0 && in_subset[0] && (0..n).all(|i| !reachable[i] || in_subset[i] || interp_leaf[i]);
+
+    Analysis {
+        in_subset,
+        interp_leaf,
+        reachable,
+        mixed_ok,
+    }
+}
+
 // ---- the emitter ---------------------------------------------------------------------------------
 
 /// Compile every function of a **verified** `m` into one wasm module, importing a **non-shared**
