@@ -398,7 +398,9 @@ in session discussion; collected here so the next slice has a home to be picked 
 - [ ] **wasm-JIT tier** — compile SVM IR to wasm at the explicit compile points and run hot compute
   near-natively in the browser. The largest remaining browser project; full design + slice plan
   below (§ "wasm-JIT tier"). Highest leverage *after* the real-language playground tab makes browser
-  guests compute-hot.
+  guests compute-hot. Ships with its own **`svm-wasmjit` cross-engine bench row** next to
+  `svm-bytecode-wasm` (same driver, same MISCOMPILE cross-check) — the projected ~5–20× is a claim
+  until that row measures it.
 
 ## wasm-JIT tier — design & implementation plan
 
