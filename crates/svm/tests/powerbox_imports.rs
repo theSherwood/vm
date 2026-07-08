@@ -72,6 +72,71 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
     );
 }
 
+/// The **wasm two-level import**: a module of named bindings backed by **one shared instance**
+/// ([`Imports::provide_module`]). The guest imports `kv.set` and `kv.get` — the `"{module}.{name}"`
+/// encoding `svm-wasm` emits for `(import "kv" "set" …)` — and wasm semantics require both fields to
+/// reach the *same* provider instance. The provider is a stateful cell (op 0 stores, op 1 loads):
+/// the guest stores 41 through the `kv.set` handle (stash slot 0), loads through the `kv.get` handle
+/// (slot 1), adds the handle difference (must be 0 — one grant, one handle) and 1, and returns 42.
+/// A per-name (non-shared) grant would read a fresh cell (0) and return 1 — so the value itself
+/// proves the instance is shared. All three backends.
+const MODULE_SRC: &str = "\
+memory 15
+export \"entry\" 0
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.const 41
+  v4 = call.import \"kv.set\" (i64) -> (i64) v2 (v3)
+  v5 = i64.const 4
+  v6 = i32.load v5
+  v7 = i64.const 0
+  v8 = call.import \"kv.get\" (i64) -> (i64) v6 (v7)
+  v9 = i32.sub v2 v6
+  v10 = i64.extend_i32_s v9
+  v11 = i64.add v8 v10
+  v12 = i64.const 1
+  v13 = i64.add v11 v12
+  return v13
+}
+";
+
+#[test]
+fn module_bindings_share_one_instance() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let module = svm_text::parse_module(MODULE_SRC).expect("parse");
+        let with_start = svm_ir::synth_powerbox_start(module, 0, 2, false).expect("synth");
+        // One provider, two fields: `set` is op 0, `get` is op 1 — one closure, one cell.
+        let imports = Imports::new().provide_module(
+            "kv",
+            HostCap::host_fn(0, || {
+                let mut cell = 0i64;
+                Box::new(move |op, args, _mem| {
+                    Ok(vec![match op {
+                        0 => {
+                            cell = args[0];
+                            0
+                        }
+                        _ => cell,
+                    }])
+                })
+            }),
+            &[("set", 0), ("get", 1)],
+        );
+        let instance = instantiate_with_imports(with_start, imports).expect("instantiate");
+        let run = instance
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
+        assert_eq!(
+            run.outcome,
+            Outcome::Returned(vec![Value::I64(42)]),
+            "{backend:?}: set(41) through one field, get() through the other — shared instance, \
+             identical handles"
+        );
+    }
+}
+
 /// An imported name with no entry in the registry is fail-closed at instantiation — wasm-style
 /// "unsatisfied import", surfaced before anything runs.
 #[test]

@@ -9202,7 +9202,10 @@ impl Host {
 
     /// Resolve a capability `name` to the handle it was registered under ([`Host::register_cap_name`]),
     /// or `None` if no grant carries that name. The backing for the guest's `cap.self` op-2 resolve.
-    fn resolve_cap_name(&self, name: &str) -> Option<i32> {
+    /// `pub` as the read half of [`Host::register_cap_name`]: an embedder that adds its own names can
+    /// also look them up — e.g. `svm_run`'s module-grouped imports grant one provider instance per
+    /// module by registering the module name at first grant and resolving it for the siblings.
+    pub fn resolve_cap_name(&self, name: &str) -> Option<i32> {
         self.cap_names
             .iter()
             .find(|(n, _)| n == name)
