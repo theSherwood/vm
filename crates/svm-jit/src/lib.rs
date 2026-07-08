@@ -4931,7 +4931,7 @@ fn lower_block(
             // status:i32. `trap_out` carries the §12.8 thaw fail-closed (a re-issued wait that would
             // park on the single worker traps `ThreadFault`); on a fresh run it is never written.
             let w = atomic_width(*ty);
-            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
+            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, w);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
             let sched = b.ins().iconst(I64, lower.thread.sched_addr);
             let exp_raw = get(&vals, *expected)?;
@@ -4961,7 +4961,7 @@ fn lower_block(
         if let Inst::MemoryNotify { addr, count } = inst {
             // thread_notify(sched, phys:i64, count:i32) -> woken:i32. Accesses no memory (the address
             // is only confined, no alignment requirement — matching the interpreter).
-            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
+            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, 4);
             let sched = b.ins().iconst(I64, lower.thread.sched_addr);
             let cnt = get(&vals, *count)?;
             let mut tsig = module.make_signature();
@@ -5108,7 +5108,7 @@ fn lower_block(
             Inst::V128Load { addr, offset, .. } => {
                 // The 16-byte masked access — the lone escape-TCB delta SIMD adds (§17/D58).
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
                 b.ins().load(I8X16, mem_flags(), phys, 0)
             }
             Inst::V128Store {
@@ -5118,7 +5118,7 @@ fn lower_block(
                 ..
             } => {
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
                 b.ins().store(mem_flags(), get(&vals, *value)?, phys, 0);
                 continue; // store produces no value
             }
@@ -5596,7 +5596,7 @@ fn lower_block(
                 op, addr, offset, ..
             } => {
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
                 lower_load(b, *op, phys)
             }
             Inst::Store {
@@ -5607,7 +5607,7 @@ fn lower_block(
                 ..
             } => {
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
@@ -5621,7 +5621,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
                 b.ins().atomic_load(int_clif_ty(*ty), atomic_flags(), phys)
             }
@@ -5634,7 +5634,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
                 b.ins()
                     .atomic_store(atomic_flags(), get(&vals, *value)?, phys);
@@ -5650,7 +5650,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
                 b.ins().atomic_rmw(
                     int_clif_ty(*ty),
@@ -5670,7 +5670,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w); // type is inferred from the operands
                 b.ins().atomic_cas(
                     atomic_flags(),
@@ -6396,6 +6396,7 @@ fn mask_addr(
     addr: Value,
     offset: u64,
     elide: bool,
+    width: u32,
 ) -> Value {
     // Fold the immediate only when non-zero, so an offset-0 access keeps a minimal address
     // expression (helps Cranelift's GVN / store-to-load forwarding recognize equal addresses).
@@ -6405,6 +6406,35 @@ fn mask_addr(
         let off = b.ins().iconst(I64, offset as i64);
         b.ins().iadd(addr, off)
     };
+    // A non-elided **top-level** access is confined by a bounds check + cold trap (invariant I1): the
+    // access `[addr+offset, addr+offset+width)` must lie in the backed window `[0, mapped)`, else a
+    // clear `MemoryFault` fires *at the offending access* (vs the mask silently wrapping a wild access
+    // to some other in-window byte). The check compares the dynamic `addr` against the compile-time
+    // constant `mapped - offset - width`, so it never itself overflows, and it sits *off* the address's
+    // latency path (the load issues speculatively past the predicted-not-taken branch). The trap block
+    // is cold, so Cranelift keeps the fast path inline. Elided accesses (proven `< reserved`) need no
+    // check; a stray `[mapped, reserved)` access still faults on the guard region (§4/§5). Nested
+    // sub-windows (`sub_base != 0`) and the no-memory case keep the mask.
+    if !elide && lower.sub_base == 0 && lower.mask != 0 {
+        let need = (width as u64).saturating_add(offset);
+        let oob = match lower.mapped.checked_sub(need) {
+            Some(limit) => {
+                let lim = b.ins().iconst(I64, limit as i64);
+                b.ins().icmp(IntCC::UnsignedGreaterThan, addr, lim)
+            }
+            // `offset + width` alone exceeds the backed window ⇒ no `addr` is in-bounds; always trap.
+            None => b.ins().iconst(I8, 1),
+        };
+        let cont = b.create_block();
+        let trap_blk = b.create_block();
+        b.set_cold_block(trap_blk); // branch hint: OOB is the unlikely path
+        b.ins().brif(oob, trap_blk, &[], cont, &[]);
+        b.switch_to_block(trap_blk);
+        emit_trap(b, lower, TrapKind::MemoryFault);
+        b.switch_to_block(cont);
+        let base = b.use_var(lower.mem_var);
+        return b.ins().iadd(base, eff);
+    }
     let confined = if elide {
         eff
     } else {
