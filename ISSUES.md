@@ -528,7 +528,7 @@ query once, not by weakening the production assertion.
 
 ---
 
-### I16 — libFuzzer `diff` target crashes on 1–4-byte inputs — recurring, untriaged (S2 until proven otherwise)
+### I16 — libFuzzer `diff` target crashes on 1–4-byte inputs (S2 until triaged) — **TRIAGED: harness-level, not an escape; FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (pending nightly confirmation)
 
 **Where:** nightly `cargo-fuzz (escape-TCB targets)` job, target `diff`
 (`fuzz/fuzz_targets/diff.rs`).
@@ -547,11 +547,28 @@ one.
 surfaces. A deadly signal (not an rss/timeout) reachable from a ≤4-byte input in the diff path is
 presumptively a guest-triggerable host crash until triaged down.
 
-**Next step:** reproduce locally — `cargo fuzz run diff` on the recorded byte strings (they are
-tiny; paste as artifact files) — classify abort-vs-SEGV, then fix the decode/diff path or, if it
-turns out to be the harness (e.g. an intentional `panic=abort` on malformed input the target should
-reject), make the target encode that contract. Add the minimized inputs to the in-tree corpus /
-regression tests so the nightly stops re-discovering them.
+**Triage (2026-07-08).** Reproduced on stable via `Gen::from_bytes` + `fuzz_one` (the same path the
+target drives): the Jun 19 / Jul 2 / Jul 4 inputs still crashed; Jun 11 / Jun 14 no longer
+reproduce (the byte→module mapping drifts as the generator evolves). **Root cause — a JIT
+compile-time rejection of a verifier-valid module, not a guest-triggerable host crash.** Each
+crashing input generates a `cap.call` to the Instantiator interface (type_id 6, ops 5/6/7 —
+`instantiate_module` / `spawn[_demand]_coroutine_module`) whose declared sig has fewer args than
+the op's contract. The verifier checks args against the *declared* sig only (it knows nothing of
+host-iface shapes), but `svm-jit`'s `lower_instantiator` dispatches on `op` statically and indexed
+the missing args at compile time → `JitError::Malformed` → the differential's "JIT failed to
+compile a verified module" panic → libFuzzer "deadly signal". The interpreter, by contrast,
+resolves the handle at runtime and CapFaults (the generated handle is garbage). So the S2 concern
+is retired: no memory unsafety, no interp/JIT *result* divergence — but any real guest module with
+such a call would run on the interpreter and fail to compile on the JIT, which is still a
+backend-parity bug.
+
+**Fix (landed on this branch):** `lower_instantiator` now validates the declared `(op, sig)` shape
+against each op's contract (arg-prefix types + exact result types); any mismatch — including an
+unknown op, matching the interpreter's default arm — lowers to an unconditional **runtime
+CapFault** instead of failing the compile, with zero-value placeholders keeping the verifier's
+value accounting for the (dead) rest of the block. All six recorded inputs are pinned in
+`jit_fuzz.rs::DIFF_REGRESSIONS`, so the stable CI sweep replays them on every PR and the nightly
+stops re-discovering them. Confirm by watching the next few nightly `fuzz(diff)` runs stay green.
 
 ---
 
