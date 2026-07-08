@@ -1312,6 +1312,36 @@ With that, **every self-contained file in Lua's official suite is covered** (mat
 bwcoercion, pm, coroutine+debug, files/io/os). Out of scope: `main.lua` (tests the standalone `lua`
 binary) and the internal `T`-library C-API sections.
 
+**The suite sweep — ACHIEVED ✅ (21 more official files; 28 of 33 total).** With the full library
+surface in place, the remaining candidates were swept in one batch: `tracegc`, `verybig`, `big`,
+`gengc`, `goto`, `events`, `code`, `bitwise`, `closure`, `tpack`, `literals`, `errors`, `nextvar`,
+`sort`, `db`, `constructs`, `locals`, `cstack`, `strings`, `gc`, `calls` — all **byte-for-byte
+unmodified**, bundled as `lua_sweep.bc` / `tests/lua_sweep.rs` (JIT in CI; the interpreter runs are
+`#[ignore]`d full-depth gates, long like the extended fuzz; native oracle exit 0). The sweep harness
+adds what the wider suite needs: a **real free-list allocator** (the bump arena exhausted under
+`gc.lua`'s collector stress), **sibling-module `require`** + the stock preload searcher (suite files
+require each other; `bitwise` installs a `bit32` shim via `package.preload`), a faithful
+`package.loaded`/`preload`, and `@`-style chunknames (`db.lua` asserts its own `source`). The
+bundle's Lua is built with `LUAI_MAXSTACK = 250000` (an edit to `luaconf.h`, Lua's own embedder
+porting header, identical on the native side): `locals.lua`'s stack-overflow-with-`<close>` test
+costs ~190 B/frame ≈ 93 MiB at the default 1M-slot ceiling, past the reference JIT's 64 MiB window —
+the tests only need *a* ceiling to overflow, not that specific one.
+
+**One real translator bug fell out** (strings.lua's longest-number test): the bignum float
+formatter's big integers (`BIG_NLIMBS = 40`, sized for a double's exact value ≈ `2^1074`) did not
+account for the `10^prec` scaling of fixed formats — `%.99f` of a near-maximum double reaches
+`2^1023 · 10^99 ≈ 2^1352` and the digits were **silently truncated** (388 chars instead of 410).
+Now 48 limbs (1536 bits), covering every finite double at C-cap precision; scratch layout shifted
+(`FMT_*_O`, `FLOAT_SCRATCH_SIZE` 2304 → 2432). The guest `snprintf` also gained the ISO corners the
+suite observes: `%p` width, `%a`/`%A` hex-floats (exact form for `%q` round-trips + precision with
+round-half-to-even carry), zero-value-at-zero-precision integers, and guest-side `0`/`#`/width
+handling for floats.
+
+Excluded and why: `api.lua` (273 `T.` references — *is* the C-API test; needs Lua's internal
+`ltests.c` T library, the natural next slice), `attrib.lua` (the real `package` searchers),
+`main.lua` (the standalone `lua` binary), `all.lua` (the driver; needs the excluded files),
+`heavy.lua` (deliberate memory exhaustion).
+
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
 runs a *float* script identical on the tree-walker, bytecode, and JIT — and identical to a native build
