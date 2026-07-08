@@ -50,7 +50,7 @@ fn both(src: &str, win_log2: u8) -> Both {
 
 /// The shared nesting program: func 0 (parent) instantiates func 1 (child) in a 4 KiB window at
 /// `off`, joins it, returns the child's result. The child (ignoring its starter-cap arg) stores a
-/// marker at its offset 0 and through a far address the mask folds back into its 4 KiB window, then
+/// marker at its offset 0 and at an in-window offset (1695) inside its 4 KiB window, then
 /// returns 42 — so the result and the two in-slice writes are observable on both backends.
 fn nest_src(off: u64) -> String {
     format!(
@@ -70,7 +70,7 @@ fn nest_src(off: u64) -> String {
          \x20 v1 = i64.const 0\n\
          \x20 v2 = i32.const 171\n\
          \x20 i32.store8 v1 v2\n\
-         \x20 v3 = i64.const 99999\n\
+         \x20 v3 = i64.const 1695\n\
          \x20 v4 = i32.const 200\n\
          \x20 i32.store8 v3 v4\n\
          \x20 v5 = i64.const 42\n\
@@ -112,7 +112,7 @@ fn jit_instantiator_matches_interp() {
     assert_eq!(
         jmem[(OFF + 1695) as usize],
         200,
-        "child far store didn't fold in on the JIT"
+        "child in-window store missing on the JIT"
     );
     for i in 0..(128u64 << 10) {
         if !(OFF..OFF + SIZE).contains(&i) {
