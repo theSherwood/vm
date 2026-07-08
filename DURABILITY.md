@@ -171,9 +171,24 @@ durable domain refuses it fail-closed until a host-side instrumentation hook lan
 no `svm-durable` dependency). The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
-domains are unaffected (`separate_module.rs` unchanged). What this slice does *not* yet do:
-freeze a subtree as a unit (per-subtree STW trigger + subtree handle capture are the next
-nesting slices); it makes the invariant those slices rely on real.
+domains are unaffected (`separate_module.rs` unchanged).
+
+**Freeze × live §14 children — fail-closed (same PR).** A freeze that completes while a §14
+child is **live-or-unjoined** (an `instantiate`d domain still running / its join pending, or a
+**suspended coroutine**) now **refuses** (`ThreadFault`, like the join-deadlock fail-closed)
+instead of minting a corrupt artifact: the child is its own domain, and its continuation +
+pending join result live host-side only, so a thaw of such an artifact faulted (the parent's
+reloaded child handle resolved in an empty table — found by a deterministic probe, pre-existing
+on main). `VCpu.nested_slots` distinguishes §14 children from `thread.spawn` vCPUs in the shared
+join table (the latter legitimately ride the artifact as `FrozenVCpu` residue and are untouched).
+A freeze landing **after** the child is joined mints a valid artifact whose thaw **reloads** the
+join result — the child is never re-run (`durable_nesting.rs::freeze_after_nested_child_joined_…`).
+*(Aside: the deterministic `arm_freeze_after` trigger deliberately ticks only on
+`cont.resume`/`suspend` — cap.call is not counted — so the freeze-after-join test drives a fiber
+after the join to place the trigger.)* What this slice does *not* yet do: freeze a subtree as a
+unit — §14 children riding the artifact as residue (per-subtree STW trigger + subtree handle
+capture) are the next nesting slices; this makes the invariant they rely on real and the gap
+fail-closed rather than silently corrupt in the meantime.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the

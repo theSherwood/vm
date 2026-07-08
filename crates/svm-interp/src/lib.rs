@@ -3568,7 +3568,23 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
             // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
             // drive trap (out-of-scope module) surfaces as the run's result.
-            let result = if froze {
+            let result = if froze
+                && (v
+                    .nested_slots
+                    .iter()
+                    .any(|&s| v.threads.get(s).is_some_and(Option::is_some))
+                    || v.coroutines.iter().any(Option::is_some))
+            {
+                // §4 fail-closed (DURABILITY.md): a live-or-unjoined §14 child (an `instantiate`d
+                // domain or a suspended coroutine) cannot ride the artifact — it is its own domain
+                // (own host/window/program) whose continuation and pending join result live
+                // host-side only. An artifact minted here would fault at thaw (the parent reloads
+                // its child handle into an empty table), so the freeze **refuses** instead
+                // (`ThreadFault`, like the join-deadlock fail-closed). Subtree residue — §14
+                // children riding the artifact — is the follow-up nesting slice. `thread.spawn`
+                // children are unaffected (they ride as `FrozenVCpu` residue).
+                Err(Trap::ThreadFault)
+            } else if froze {
                 // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
                 // repoints the active-SP word to flatten idle fibers and restores it to this extent.
                 let self_sp = v
@@ -4853,6 +4869,13 @@ struct VCpu {
     /// This vCPU's spawned children, by `thread.join` handle (slot) ⇒ child [`TaskId`]; `None` once
     /// joined (a re-join is inert).
     threads: Vec<Option<TaskId>>,
+    /// Which [`VCpu::threads`] slots were created by a §14 **`Instantiator.instantiate`** (vs. a §12
+    /// `thread.spawn`). A durable freeze must distinguish them: a spawned vCPU rides the artifact as
+    /// `FrozenVCpu` residue, but a §14 child is its **own domain** (own host/window/program) whose
+    /// continuation and pending join result live host-side only — an artifact minted while one is
+    /// live-or-unjoined would fault at thaw (the reloaded handle resolves in an empty table), so the
+    /// freeze fails closed instead (DURABILITY.md §4; subtree residue is the follow-up slice).
+    nested_slots: Vec<usize>,
     /// This vCPU's §14 **co-fiber** children (`Instantiator.spawn_coroutine`): suspended continuations
     /// (their own frames/mem/host) driven *inline* by `resume`, by handle (slot). `None` once the
     /// coroutine has run to completion (a later `resume` is inert). Distinct from `threads` — a
@@ -4958,6 +4981,7 @@ impl VCpu {
             host,
             fuel,
             threads: Vec::new(),
+            nested_slots: Vec::new(),
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
@@ -5023,6 +5047,7 @@ impl VCpu {
             host,
             fuel,
             threads: Vec::new(),
+            nested_slots: Vec::new(),
             coroutines: Vec::new(),
             fault_yields: false,
             depth,
@@ -5364,6 +5389,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         host,
         fuel,
         threads,
+        nested_slots,
         coroutines,
         fault_yields,
         depth,
@@ -5795,6 +5821,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 match made {
                                     Some(child_id) => {
                                         threads.push(Some(child_id));
+                                        // §14 children are tracked apart from `thread.spawn`
+                                        // vCPUs: a durable freeze must fail closed on them
+                                        // (see `VCpu::nested_slots`).
+                                        nested_slots.push(threads.len() - 1);
                                         frames[top]
                                             .vals
                                             .push(Reg::from_i32((threads.len() - 1) as i32));

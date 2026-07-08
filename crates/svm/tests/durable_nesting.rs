@@ -15,8 +15,11 @@
 //!   installation) fails closed until a host-side instrumentation hook exists.
 
 use std::sync::Arc;
-use svm_durable::{init_durable_window, transform_module};
-use svm_interp::{run_capture_reserved_with_host, Host, Value};
+use svm_durable::{
+    arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,
+    STATE_NORMAL, STATE_UNWINDING,
+};
+use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use svm_ir::{Func, Module};
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -223,4 +226,195 @@ block0():
         matches!(host.jit_compile(jh, b"unit").expect("no trap"), Err(e) if e == EINVAL),
         "durable: guest JIT compile is refused fail-closed"
     );
+}
+
+// ---- Freeze × §14 children (the fail-closed half of "STW quiesces the subtree as a unit") ----
+
+/// Durable parent: instantiate + join a same-module child, then drive a fiber that suspends once
+/// (the armed freeze trigger ticks on `cont.resume`, so `arm = 2` lands the freeze at the second
+/// resume — after the join, with the fiber parked: the covered residue shape). Returns child
+/// result + fiber result = 777 + 55 = 832.
+const PARENT_JOIN_THEN_FIBER: &str = "memory 18
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v7 = ref.func 2
+  v8 = i64.const 4096
+  v9 = cont.new v7 v8
+  v10 = i64.const 0
+  v11, v12 = cont.resume v9 v10
+  v13, v14 = cont.resume v9 v12
+  v15 = i64.add v6 v14
+  return v15
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 777
+  return v2
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = i64.const 55
+  return v4
+}
+";
+
+/// Durable parent that spawns a §14 coroutine child (op 2) and never resumes it — the child stays
+/// suspended (host-side native continuation) when the freeze lands.
+const PARENT_CORO: &str = "memory 18
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  return v5
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 9
+  return v1
+}
+";
+
+/// §4 fail-closed: a freeze landing while a §14 child is **live-or-unjoined** refuses cleanly
+/// (`ThreadFault`) instead of minting an artifact whose thaw would fault — the child is its own
+/// domain, and its continuation/pending join result live host-side only (subtree residue is the
+/// follow-up slice). The freeze-from-start unwinds the parent at its first post-instantiate poll,
+/// deterministically catching the unjoined child.
+#[test]
+fn freeze_with_live_nested_child_fails_closed() {
+    let parent = instrument(PARENT_SELF);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 5_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        r,
+        Err(Trap::ThreadFault),
+        "a freeze with a live §14 child must refuse, not mint a thaw-faulting artifact"
+    );
+}
+
+/// Same fail-closed for a suspended §14 **coroutine** child (its native continuation can't ride
+/// the artifact either).
+#[test]
+fn freeze_with_suspended_coroutine_fails_closed() {
+    let parent = instrument(PARENT_CORO);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 5_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        r,
+        Err(Trap::ThreadFault),
+        "a freeze with a suspended §14 coroutine must refuse"
+    );
+}
+
+/// The refusal must not over-fire: a freeze landing **after** the §14 child was joined mints a
+/// valid artifact, and the thaw **reloads** the child's join result (reload-not-reissue — the
+/// child is never re-run) and reproduces the uninterrupted total.
+#[test]
+fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
+    let parent = instrument(PARENT_JOIN_THEN_FIBER);
+
+    // Control: uninterrupted total.
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 5_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(base, Ok(vec![Value::I64(777 + 55)]), "uninterrupted total");
+
+    // Armed freeze: tick 1 at the first resume (runs; the fiber parks), tick 2 at the second —
+    // the freeze lands with the child already joined (its result checkpointed in the parent's
+    // shadow frame) and the fiber parked (rides as Section-2 residue).
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    arm_freeze_after(&mut win, 2);
+    let mut fuel = 5_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(fih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(
+        fr.is_ok(),
+        "freeze-after-join returns a placeholder: {fr:?}"
+    );
+    assert_eq!(
+        read_state(&fsnap),
+        STATE_UNWINDING,
+        "the armed freeze landed (joined child does not refuse it)"
+    );
+
+    // Thaw: the parent rewinds, reloading the instantiate handle and the join result from its
+    // shadow frame — the child never re-runs — and completes to the uninterrupted total.
+    let mut twin = fsnap.clone();
+    begin_thaw(&mut twin, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.set_frozen_fibers(fhost.frozen_fibers().to_vec());
+    let tih = thost.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 5_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih)],
+        &mut fuel,
+        &twin,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(777 + 55)]),
+        "thaw reproduces the total — the §14 join result reloaded, the child never re-ran"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
