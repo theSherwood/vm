@@ -13,7 +13,7 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I3 — `durable_jit` cross-backend fuzz flakes on Windows CI under cumulative JIT-commit pressure (S4)
+### I3 — Windows CI memory-pressure aborts under `cargo test --workspace` (S3) — **ROOT CAUSE FOUND + FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (pending windows-lane confirmation)
 
 **Where:** `crates/svm/tests/durable_jit.rs::freeze_thaw_cross_backend_over_generated_modules`
 (the no-nightly cross-backend freeze/thaw driver), via `support/durjit.rs::fuzz_one_xbackend` →
@@ -78,7 +78,42 @@ Additional fix levers beyond the sketch above (they apply to the whole family, n
 binaries don't stack their commit charge; shrink the per-window reservation/commit sizes under
 `cfg(windows)` in test drivers; make `fiber_rt::fiber_new`'s allocation-failure path report/unwind
 instead of nounwind-aborting the whole test binary (turns a process kill into one failed test); and
-consider a larger runner or explicit pagefile bump for the windows lane.
+consider a larger runner or explicit pagefile bump for the windows lane. (The `fiber_new` item
+was already delivered by I1's fallible `Stack::new`, landed Jun 19 — all "fiber stack VirtualAlloc
+failed" abort sightings above pre-date it.)
+
+**ROOT CAUSE FOUND (2026-07-08): the JIT leaked its entire code arena — 256 MiB of
+eagerly-committed VA — on every compile.** cranelift-jit deliberately *leaks* all code memory when
+a `JITModule` is dropped (its `Memory::drop` `mem::forget`s every allocation so stale `fn`
+pointers can never fault); reclaiming requires the explicit unsafe `free_memory()`, which
+`svm-jit` never called — a comment even asserted the opposite ("`JITModule` frees its executable
+memory on drop"). Both compile paths install a 256 MiB `ArenaMemoryProvider` (the
+i32-relocation-overflow mitigation), and on Windows the region crate allocates it
+`MEM_RESERVE | MEM_COMMIT` (noted in cranelift's own `arena.rs`) — so **every JIT compile
+permanently charged 256 MiB against the system commit limit**. A fuzz/differential loop pins the
+runner's commit ceiling within dozens of compiles; from then on the arena alloc fails (silently
+falling back to the small system provider — itself leaked on drop), *unrelated* heap allocations
+abort (`memory allocation of N bytes failed` → `0xc0000409`, killing the whole test binary),
+fiber-stack `VirtualAlloc`s return null, and window commits fail `os error 1455` — every symptom
+in this family, including the "different test binaries, same abort" spread above. On Linux/macOS,
+overcommit hid the identical leak as unbounded VA growth: measured at **+4.9 GiB of address space
+over 50 differential iterations** before the fix, **0 MiB** after.
+
+**Fix (landed on this branch):** `OwnedJit` — the `JITModule` owners (`CompiledModule`,
+`ChildCode`) now call cranelift's `free_memory()` on drop. Sound because both structs already pin
+the lifetime contract "nothing that points into the code may outlive the struct" (the module
+field is declared/dropped last, after the runtimes/tables/trampolines whose addresses are baked
+into the code). Regression-pinned by `crates/svm/tests/jit_code_memory.rs` (Linux: VA growth over
+a 50-iteration compile loop must stay < 512 MiB; the Windows commit exhaustion is the same leak
+seen through eager commit charging).
+
+**After windows-lane confirmation:** re-test and lift the mitigation caps in the "skips & caps"
+inventory (the reduced Windows iteration counts, and the `#[cfg(not(windows))]` recycled
+cross-backend fuzz — its cranelift PC-relative-drift rationale was *also* this leak accumulating
+address-space distance between arenas). Watch whether I15 (`pal::release` fragment flake) and the
+`jit_diff` thread stack overflows disappear with the pressure gone. Also watch the nightly ASan
+lane: freeing on drop turns any latent stale-pointer use (previously masked by the leak) into a
+reported use-after-free instead of silent luck.
 
 ---
 
