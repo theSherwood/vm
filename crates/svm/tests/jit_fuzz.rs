@@ -22,7 +22,25 @@ use irgen::{fuzz_one, Gen};
 ///   `svm-run`'s `jit_native_op` catch-all used to return `-EINVAL` as a value and clear the
 ///   trap cell, so the JIT *returned* — an interp↔JIT divergence on the cap.call trap path.
 ///   Fixed by faulting on an unknown Jit op (§3c: an out-of-range op-index traps).
-const DIFF_REGRESSIONS: &[&[u8]] = &[&[0xad, 0xa9, 0xac]];
+/// - `[0xe8, 0x01, 0xde, 0xcd]`, `[0x2a, 0x93, 0x00]`, `[0x00, 0x71, 0x04, 0x1c]` (ISSUES.md I16;
+///   nightlies Jun 19 / Jul 2 / Jul 4): a `cap.call` to the Instantiator interface (type_id 6,
+///   ops 5/6/7) whose declared sig has fewer args than the op's contract. The static
+///   `lower_instantiator` dispatch indexed the missing args and failed the whole compile with
+///   `JitError::Malformed` — a compile-time rejection of a verifier-valid module (the interpreter
+///   just CapFaults on the forged handle at runtime), which the differential reports as a crash.
+///   Fixed by lowering any shape-mismatched / unknown-op Instantiator call to a runtime CapFault.
+/// - `[0x54]`, `[0x79, 0x7c, 0x00, 0x02]` (I16; nightlies Jun 11 / Jun 14): crashed the `diff`
+///   target at those dates but no longer reproduce — the byte→module mapping drifts as the
+///   generator evolves, so the original modules may be unconstructible from these bytes today.
+///   Pinned anyway: they are free, and they cover whatever these bytes generate *now*.
+const DIFF_REGRESSIONS: &[&[u8]] = &[
+    &[0xad, 0xa9, 0xac],
+    &[0xe8, 0x01, 0xde, 0xcd],
+    &[0x2a, 0x93, 0x00],
+    &[0x00, 0x71, 0x04, 0x1c],
+    &[0x54],
+    &[0x79, 0x7c, 0x00, 0x02],
+];
 
 #[test]
 fn jit_matches_interp_on_pinned_regressions() {

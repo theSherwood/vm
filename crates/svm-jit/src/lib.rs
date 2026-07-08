@@ -4550,7 +4550,7 @@ fn lower_block(
             // needs the host compiler, which the flat `cap.call` thunk can't reach. Otherwise (a child
             // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
             if *type_id == 6 && lower.inst.is_active() {
-                lower_instantiator(module, b, lower, *op, *handle, args, &mut vals)?;
+                lower_instantiator(module, b, lower, *op, sig, *handle, args, &mut vals)?;
             } else if let Some(target) = fast_cap_target(lower, *type_id, *op, sig) {
                 // D45 devirtualized fast path: a register-to-register direct call to the specialized
                 // host fn the resolver claimed for this `(type_id, op)`.
@@ -5884,6 +5884,16 @@ fn read_call_results(
 /// every trap in the entry function (or its dispatch), so that suffices; propagating a
 /// trap *out of a callee* would need a post-call check, added when a case needs it.
 fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
+    emit_trap_set(b, lower, kind);
+    emit_trap_return(b, lower);
+}
+
+/// Record a trap in the cell (with the §5 W3 backtrace capture) **without** terminating the block.
+/// Callers pair it with [`emit_trap_return`] (an unconditional trap, via [`emit_trap`]) or with
+/// [`emit_trap_propagate`] (the shared branch-on-cell exit) when compilation of the rest of the
+/// block must continue — the branch keeps the continuation formally reachable, so later
+/// instructions still lower against a well-formed value stack even though they are dead at runtime.
+fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     // §5 W3 Stage 2: record a source backtrace for this explicit trap *before* it unwinds — the trap
     // stores its kind and returns, and that return propagates up tearing down every guest frame, so
     // the helper must walk the frame-pointer chain from this live site now. The current op's
@@ -5901,7 +5911,6 @@ fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     let cell = b.use_var(lower.trap_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
     b.ins().store(MemFlags::trusted(), code, cell, 0);
-    emit_trap_return(b, lower);
 }
 
 /// Emit the function `return` on a trap / early-exit path: **void** for an sret function (its results
@@ -6242,15 +6251,57 @@ fn lower_cap_call(
 /// `instantiate(entry, off, size_log2, fuel) -> child_handle` and `op 1` `join(child_handle) ->
 /// result` call the baked thunks, threading `mem_base` (the live parent window) + `trap_out`; a thunk
 /// that sets the trap cell (forged handle, bad carve, child trap) propagates here like any `cap.call`.
+#[allow(clippy::too_many_arguments)] // mirrors the CapCall fields + the shared lowering context
 fn lower_instantiator(
     module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
     op: u32,
+    sig: &FuncType,
     handle: u32,
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
+    // §3c: the verifier checks a `cap.call`'s args against its *declared* `sig` only — it knows
+    // nothing about host interfaces, so a verifier-valid module can call iface 6 with any
+    // `(op, sig)` shape. The interpreter discovers a mismatch at **runtime** (handle resolution
+    // first → `CapFault` on a forged handle; then per-op arg indexing → `Malformed`), but this
+    // lowering dispatches on `op` **statically** and can neither index missing args nor pass
+    // mistyped values through the fixed thunk ABIs. So: a call whose declared shape doesn't match
+    // the op's contract (arg prefix / result types below), or whose op is unknown (the
+    // interpreter's default arm is `CapFault`), lowers to an unconditional runtime `CapFault` —
+    // never a compile-time rejection of a verified module. (Found by the libFuzzer `diff` target:
+    // ops 5/6/7 with short args made the compile fail `Malformed`, crashing the differential —
+    // nightlies Jun 19 / Jul 2 / Jul 4, ISSUES.md I16.) Extra trailing args beyond the contract
+    // prefix are tolerated exactly like the interpreter (it never indexes past the op's arity).
+    use ValType::{I32 as VI32, I64 as VI64};
+    let contract: Option<(&[ValType], &[ValType])> = match op {
+        // instantiate / spawn_coroutine / spawn_demand_coroutine: (entry, off, size_log2, fuel)
+        0 | 2 | 4 => Some((&[VI64, VI64, VI64, VI64], &[VI32])),
+        // *_module variants: a leading `Module` handle (i64 slot), then the same four
+        5..=7 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
+        // join(child) -> result
+        1 => Some((&[VI32], &[VI64])),
+        // coro_resume(child, value) -> (status, value)
+        3 => Some((&[VI32, VI64], &[VI32, VI64])),
+        _ => None,
+    };
+    let shape_ok = contract.is_some_and(|(need, res)| {
+        sig.params.len() >= need.len()
+            && sig.params[..need.len()] == *need
+            && sig.results.as_slice() == res
+    });
+    if !shape_ok {
+        emit_trap_set(b, lower, TrapKind::CapFault);
+        emit_trap_propagate(b, lower);
+        // Dead at runtime (the cell is already set), but keep the verifier's value accounting for
+        // the rest of the block: push zeros of the *declared* result types.
+        for t in &sig.results {
+            let z = zero_of(b, clif_ty(*t));
+            vals.push(z);
+        }
+        return Ok(());
+    }
     let nursery = b.ins().iconst(I64, lower.inst.nursery_addr);
     let mem_base = b.use_var(lower.mem_var);
     let trap_out = b.use_var(lower.trap_var);
@@ -6368,7 +6419,9 @@ fn lower_instantiator(
             vals.push(status);
             vals.push(value_out);
         }
-        _ => return Err(JitError::Unsupported("unknown Instantiator op")),
+        // Unknown ops were rejected by the shape check above (→ runtime CapFault, matching the
+        // interpreter's default arm) — this match only sees contract-validated ops.
+        _ => unreachable!("shape check admitted an unknown Instantiator op"),
     }
     Ok(())
 }

@@ -48,6 +48,38 @@ made to trap gracefully — once commit is exhausted, *some* allocation aborts. 
 Until then, treat a `STATUS_STACK_BUFFER_OVERRUN` / `os error 1455` abort in this specific test on
 Windows as a flake: re-run the failed job (`rerun_failed_jobs`).
 
+**Scope update (2026-07-08 CI-flakiness audit over runs Jun 3 – Jul 8).** This entry is written
+against `durable_jit`, but the same Windows memory-pressure family is the repo's **#1 CI failure by
+far** and hits at least five other test binaries. Observed in the run history:
+
+- `jit_fuzz` (`jit_matches_interp_on_generated_modules`): the most frequent single offender — the
+  256 KiB/128 KiB alloc-abort (`0xc0000409`) killed main pushes 27078313769, 27230183986,
+  27231558406, 27343150519, 27573684058, 28162141664, nightly 28575211654, plus one explicit
+  `window commit failed (err 1455)` (27225507614).
+- `fiber_fuzz` (`generated_migration_schedules_agree_on_interp_and_jit`): "fiber stack VirtualAlloc
+  failed" (`svm-fiber/src/stack_windows.rs:42`) — runs 27584519722, 27568759548.
+- `jit_threads`: svm-vcpu worker threads panic "fiber stack VirtualAlloc failed" in
+  `fiber_rt::fiber_new` (a **nounwind** path, so the panic is an instant process abort that kills the
+  whole binary) — runs 27716659364, 27713453924.
+- `jit_diff`: thread stack overflows `0xc00000fd` in `return_call_indirect`/`rem_s_int_min_neg_one`
+  (28166517444) — same pressure, different symptom.
+- `durable_jit` itself: 27585086455 (heap alloc), 27581152487 (`window commit failed (err 0)`),
+  27583202387 (`freeze_thaw_cross_backend_over_generated_modules` seed-panic that cleared on retry).
+
+Frequency: 6 of the 6 fail→pass re-runs in the audit window were this family; 15 of 104 PR CI
+failures failed **only** the `build · test (windows-latest)` job with every other lane green; ~10
+main-push failures. **Escalation signal:** run 27716659364 (`claude/durable-active-resume-chain`,
+commit `e549ea6`) failed identically on **both** attempts — at that commit the exhaustion was
+reproducible, not transient. Severity should be treated as **S3** now (it is the dominant
+PR-blocking failure and consumes a manual re-run each time), even though each incident is S4.
+
+Additional fix levers beyond the sketch above (they apply to the whole family, not just
+`durable_jit`): cap `cargo test` parallelism on Windows (`--test-threads` / `-j`) so concurrent
+binaries don't stack their commit charge; shrink the per-window reservation/commit sizes under
+`cfg(windows)` in test drivers; make `fiber_rt::fiber_new`'s allocation-failure path report/unwind
+instead of nounwind-aborting the whole test binary (turns a process kill into one failed test); and
+consider a larger runner or explicit pagefile bump for the windows lane.
+
 ---
 
 ### I4 — Rare macOS-CI `SIGABRT` in the `svm-wasm` threaded-import test (S4, surface reduced) — `claude/vcpu-context-recycling`
@@ -88,6 +120,15 @@ If it keeps tripping unrelated PRs' CI, the cheap unblock (until root-caused) is
 itself — serialize it (`--test-threads=1` for the `imports` binary, or a process-global lock so the
 6-worker spawn doesn't overlap other tests) or lengthen the `memory.atomic.wait32` timeout — rather than
 re-running the whole macOS job by hand each time.
+
+**Sighting update (2026-07-08 CI-flakiness audit).** More macOS-only occurrences than the two above:
+run 28183991685 (Jun 25, the PR #126 merge push to main) — the `imports.rs` binary died `SIGABRT`
+after 8/9 tests passed, same signature; and three more macOS-`cargo test` attempt-1 failures that
+cleared on plain re-run of the same SHA (runs 28019319661, 27835056463; 28069421356 is the PR #92
+recurrence already recorded above). Four further PR runs failed **only** the macOS job with all
+other lanes green (27687656906, 27776754171, 27778073561, 27837565343 — failing test not
+re-verified per-run). macOS is the #2 flake source after I3; the de-flake sketch above (serialize
+the `imports` binary) is now worth doing rather than deferring.
 
 ---
 
@@ -252,6 +293,14 @@ path and could **not** reproduce a wedge nor find a defect by inspection:
    mutex/futex layer; if all workers are spinning in JIT code (`??` frames) with `g_remaining > 0` it's
    a guest termination-detection / steal-loop livelock; if the stall is host-side (a Rust frame in
    `os_thread_rt`/`fiber_rt`) it's the migration/teardown path. Then fix the specific race.
+
+**Sighting update (2026-07-08 CI-flakiness audit).** A second wedge was found in the run history,
+predating the fail-fast landing: run 27778162761 (Jun 18, `claude/llvm-c-breadth`, commit `d3360b4`)
+— the ubuntu `check` job's `cargo test --workspace` sat wedged for **54 minutes** (17:41→18:35)
+until manually cancelled; the re-run was also cancelled by a superseding push, so no diagnostics
+were captured. That makes ~2 sightings in ~1,200 runs, consistent with the 1e-3–1e-4 estimate. The
+`timeout-minutes` + `run_demo_failfast` backstops landed after this occurrence; the next recurrence
+should self-capture the thread dump.
 
 ---
 
@@ -464,7 +513,212 @@ fail-closed, never miscompile).
 
 ---
 
+### I15 — Windows `pal::release` placeholder-fragment leak assertion flake (S4)
+
+**Where:** `crates/svm-jit/src/mem.rs` lib test
+`mem::tests::pal_release_frees_all_placeholder_fragments_no_leak`, Windows only.
+
+**Symptom (observed once):** run 27291252672 attempt 1 (Jun 10, a push to main, commit `c29e07c`)
+failed with `pal::release leaked 69632 bytes of the placeholder reservation (fragments past the
+first not freed)` (left: `69632` = 17 pages, right: `0`, `mem.rs:1069`). A plain re-run of the same
+SHA passed; every other job in the run was green.
+
+**Suspected cause.** Distinct from the I3 commit-exhaustion family: this is the
+`VirtualAlloc2`/`VirtualFree` **placeholder split/coalesce** path itself behaving
+environment-dependently — either a genuine race/ordering bug in fragment release that only a
+particular split pattern exposes, or the OS declining/deferring a `MEM_RELEASE` on a fragment under
+memory pressure. Because it asserts on exact byte counts of OS-visible state, any nondeterminism in
+how the reservation got fragmented shows up as a "leak".
+
+**Next step:** on recurrence, log the fragment list (offset/size of each region in the reservation)
+before the assertion so the failure shows *which* fragment survived; audit the release loop for an
+ordering assumption (e.g. releasing a coalesced range while a neighbor is still a placeholder). If
+the OS behavior is legitimately loose here, make the test tolerate deferred release by retrying the
+query once, not by weakening the production assertion.
+
+---
+
+### I16 — libFuzzer `diff` target crashes on 1–4-byte inputs (S2 until triaged) — **TRIAGED: harness-level, not an escape; FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (pending nightly confirmation)
+
+**Where:** nightly `cargo-fuzz (escape-TCB targets)` job, target `diff`
+(`fuzz/fuzz_targets/diff.rs`).
+
+**Symptom:** libFuzzer "deadly signal" on tiny inputs, six separate nightly/dispatch runs across
+the audit window — each found a *different* crashing input, so this is being re-found nightly, not
+a single cached artifact: Jun 11 (27334653221) input `[0x54]`; Jun 14 (27493229934)
+`[0x79,0x7C,0x00,0x02]`; Jun 15 dispatch (27563212001) `[0xAD,0xA9,0xAC]`; Jun 19 (27815739473)
+`[0xE8,0x01,0xDE,0xCD]`; Jul 2 (28575211654) `[0x2A,0x93,0x00]`; Jul 4 (28701938264)
+`[0x00,0x71,0x04,0x1C]`. Crash artifacts were written to `fuzz/artifacts/diff/` on each failed run
+(e.g. `crash-9149fee…` on 27563212001). Nightlies Jul 5–8 were green, but fuzzing is
+nondeterministic — absence of a crash is not evidence of a fix, and no commit in that window claims
+one.
+
+**Why S2-classified for now:** the fuzz lane exists precisely because these are **escape-TCB**
+surfaces. A deadly signal (not an rss/timeout) reachable from a ≤4-byte input in the diff path is
+presumptively a guest-triggerable host crash until triaged down.
+
+**Triage (2026-07-08).** Reproduced on stable via `Gen::from_bytes` + `fuzz_one` (the same path the
+target drives): the Jun 19 / Jul 2 / Jul 4 inputs still crashed; Jun 11 / Jun 14 no longer
+reproduce (the byte→module mapping drifts as the generator evolves). **Root cause — a JIT
+compile-time rejection of a verifier-valid module, not a guest-triggerable host crash.** Each
+crashing input generates a `cap.call` to the Instantiator interface (type_id 6, ops 5/6/7 —
+`instantiate_module` / `spawn[_demand]_coroutine_module`) whose declared sig has fewer args than
+the op's contract. The verifier checks args against the *declared* sig only (it knows nothing of
+host-iface shapes), but `svm-jit`'s `lower_instantiator` dispatches on `op` statically and indexed
+the missing args at compile time → `JitError::Malformed` → the differential's "JIT failed to
+compile a verified module" panic → libFuzzer "deadly signal". The interpreter, by contrast,
+resolves the handle at runtime and CapFaults (the generated handle is garbage). So the S2 concern
+is retired: no memory unsafety, no interp/JIT *result* divergence — but any real guest module with
+such a call would run on the interpreter and fail to compile on the JIT, which is still a
+backend-parity bug.
+
+**Fix (landed on this branch):** `lower_instantiator` now validates the declared `(op, sig)` shape
+against each op's contract (arg-prefix types + exact result types); any mismatch — including an
+unknown op, matching the interpreter's default arm — lowers to an unconditional **runtime
+CapFault** instead of failing the compile, with zero-value placeholders keeping the verifier's
+value accounting for the (dead) rest of the block. All six recorded inputs are pinned in
+`jit_fuzz.rs::DIFF_REGRESSIONS`, so the stable CI sweep replays them on every PR and the nightly
+stops re-discovering them. Confirm by watching the next few nightly `fuzz(diff)` runs stay green.
+
+---
+
+### I17 — `bench/baseline.txt` is stale: the nightly bench lane has been red ~every night (S4, non-gating but signal-destroying)
+
+**Where:** nightly `bench regression check (non-gating)` job — `bench … --check baseline.txt --tol 0.4`.
+
+**Symptom:** 24 of the 25 failed nightlies in Jun 4 – Jul 4 include this job failing, always the
+same shape: **cold-start** and **wasmtime** ratio rows exceed the 40 % tolerance (`alu` +72–92 %,
+`memsum` +82–88 %, `scatter` +89–93 %, `alu_c` +44–54 %, `locals_c` +43–50 %, `hostcall` +38–41 %,
+`hostbuf` +40 %), with magnitudes drifting upward over the month, while compute ratios stay in
+tolerance — and several kernels (`simd`, `float`, `calli`, `cache`, `irreducible`) report
+**MISSING** from the baseline entirely. `baseline.txt` was last regenerated Jun 19 (PR #86) and the
+cold/wasmtime columns have drifted continuously since. The job is `continue-on-error`, so it never
+blocks — but a lane that is red every night by construction can no longer flag a *real* gross
+regression (its stated purpose), and it pads every nightly failure report.
+
+**Fix:** regenerate `bench/baseline.txt` on the current bench machine including the missing
+kernels; consider excluding the cold/wasmtime columns from `--check` (or giving them their own,
+wider tolerance) — cold-start wall-clock on shared runners is exactly the noise the 40 % tol was
+supposed to absorb, and empirically it does not.
+
+---
+
+### I18 — CI transients: crates.io network resets and rolling-nightly toolchain breakage (S4)
+
+Two environmental failure classes from the audit window, recorded so recurrences are recognized
+instead of re-investigated:
+
+1. **crates.io download reset.** Run 28253766023 attempt 1 (Jun 26, `embench differential` job,
+   step "build the in-process Wasmtime runner"): `download of 3/s/syn failed … curl [56] Recv
+   failure: Connection reset by peer` → exit 101; re-run of the same SHA passed. Any job doing a
+   cold `cargo build`/`cargo install` can hit this.
+   *Mitigation:* jobs already use lockfiles + `Swatinem/rust-cache`; add `CARGO_NET_RETRY=10` (and
+   `CARGO_HTTP_TIMEOUT=60`) to the workflow `env:` so cargo itself rides out resets.
+2. **`cargo install cargo-fuzz --locked` broken by the rolling nightly.** Jun 4–9 (runs
+   26940471925, 27004283086, 27056872718, 27087106040, 27193280846) all 3–4 fuzz matrix jobs failed
+   before fuzzing started: cargo-fuzz 0.13.1's locked `rustix 0.36.5` stopped compiling on the new
+   nightly (`rustc_layout_scalar_valid_range_*` became reserved). Self-resolved upstream by Jun 11 —
+   five nights of **zero fuzz coverage, silently**.
+   *Mitigation:* pin the fuzz job's nightly to a dated toolchain (bumped deliberately), or cache
+   the built `cargo-fuzz` binary keyed on that date, so lane health doesn't depend on
+   `nightly-latest × crates.io` compiling at 07:00 UTC.
+
+---
+
+## Platform-coverage skips & caps — inventory (2026-07-08 audit)
+
+Every place the suite deliberately runs *less* on some platform to dodge the failure families
+above. Each is a tracked coverage hole: when the underlying issue (I3/I4/I7) is fixed, the cap
+should be lifted; until then this is what Windows/macOS are **not** testing.
+
+**Windows-reduced iteration counts (all motivated by the I3 commit-limit family):**
+
+| Site | Windows | Elsewhere |
+|---|---|---|
+| `crates/svm/tests/jit_fuzz.rs:43` (JIT↔interp differential sweep) | 500 seeds | 4000 |
+| `crates/svm/tests/fiber_fuzz.rs:331` (migration-schedule fuzz) | 400 iters | 1500 |
+| `crates/svm/tests/fiber_fuzz.rs:462` | 80 iters | 250 |
+| `crates/svm/tests/jit_threads.rs:576` (thread-spawn reps) | 10 reps | 30 |
+| `crates/svm/tests/concurrent_escape_fuzz.rs:153` (concurrent escape programs) | 40 | 150 |
+| `crates/svm/tests/durable_jit.rs` (cross-backend seeds, bounded per I3) | 64 | 64 |
+
+**Windows-excluded tests:**
+
+- `crates/svm/tests/durable_jit.rs:39` —
+  `recycled_fiber_freeze_thaw_cross_backend_over_generated_modules` is `#[cfg(not(windows))]`
+  (cranelift PC-relative relocation overflows `i32` under cumulative JIT allocation drift; see the
+  in-file comment). Windows keeps partial coverage via the hand-written recycled test + the no-JIT
+  400-seed interp fuzz, but has **no recycled cross-backend JIT fuzz** at all.
+
+**Linux-only tests (`cfg(all(unix, target_arch = "x86_64"))`) — Windows *and* macOS skip these:**
+
+- `crates/svm-run/tests/run.rs` (~4 sites, from :141) — the work-stealing fiber demos (the I7
+  surface). Only the ubuntu `check` lane ever runs them.
+- `crates/svm/tests/c_frontend.rs` (~4 tests, from :1900) — chibicc-built C end-to-end runs.
+- `crates/svm-llvm/tests/translate.rs` (~10 sites, e.g. :2632–:2765, :3964–:4163) — the
+  setjmp/longjmp-family and other JIT-adjacent on-ramp tests.
+
+**Whole-crate platform holes:**
+
+- `crates/svm-llvm` is **excluded from the root workspace** (root `Cargo.toml` `exclude`), so the
+  `cross-os` jobs' `cargo test --workspace` never builds or tests it — the on-ramp has **zero
+  Windows/macOS coverage** by design (its CI job is Linux-only; the harness shells out to
+  Linux-installed LLVM 18 tools).
+- `crates/svm-llvm` tests auto-skip at runtime when tools are absent (`tests/common/mod.rs:14`
+  guard; ~30 `eprintln!("note: skipping …")` sites across `translate.rs`, `snprintf.rs`,
+  `llvm_alias.rs`, `dap_over_llvm.rs`): missing `clang`/`cc`/`llvm-as-18` ⇒ silent skip; missing
+  `rustc +1.81.0`/`llvm-link-18`/`opt-18` ⇒ the `peval_futamura`/`peval_jit`/`peval_in_sandbox`
+  probes skip (documented in `ci.yml`). **Risk:** if a CI setup step silently stops installing a
+  tool, these tests all "pass" while testing nothing — worth a canary assertion in the svm-llvm CI
+  job that the expected tools were actually found.
+
+**CI-workflow-level scoping (`.github/workflows/ci.yml`):**
+
+- `fuzz`, `bench`, `ASan (svm-fiber)`, `TSan (svm-mem)`, `ASan (JIT setjmp/longjmp)` run **only** on
+  `schedule`/`workflow_dispatch` — PRs get no sanitizer or fuzz coverage (accepted trade-off, but it
+  means I16-class bugs land first and are found nightly).
+- `cargo-audit` is gated off `pull_request` (deliberate, documented in-file).
+- `loom`, `miri`, wasm32/wasm64 differentials, `browser-real`, `embench`, `cross-engine` are
+  ubuntu-only lanes.
+- The windows-**gnu** target gets `cargo check` + `clippy` only (no test execution); windows-MSVC
+  tests run in `cross-os`.
+- `bench` is `continue-on-error` (non-gating) — see I17 for why that lane is currently signal-free.
+- Runtime capability gating: ~10 JIT test sites early-return when `svm_jit::fiber_supported()` is
+  false (`jit_instantiator.rs`, `jit_killpath.rs`, `jit_trap_backtrace.rs`,
+  `jit_separate_module.rs`, …) — correct-by-construction platform gating (single source of truth);
+  `jit_diff.rs:831` asserts the gate matches the platform so silent regressions of the gate itself
+  are caught (that assertion itself failed once on Windows: run 27225054386, Jun 9 — worth a look
+  if it recurs).
+
+**In-product mitigations that paper over runner pressure (fine, but they mask I3's frequency):**
+
+- `crates/svm-jit/src/mem.rs:608-721` — bounded retry (6×, ~0.3 s backoff) on
+  `ERROR_COMMITMENT_LIMIT` in the Windows commit path.
+- `miri` job disables weak-memory emulation (`-Zmiri-disable-weak-memory-emulation`, documented
+  Miri bug); ASan lanes run `detect_leaks=0` (documented intentional leak).
+
+---
+
 ## Resolved
+
+### I19 — TSan lane never ran: svm-mem doctests broke the build with a `-Zsanitizer` ABI mismatch (S4) — **fixed**
+
+15 consecutive nightlies Jun 16–30 (27606473990 → 28430367633): the `TSan (svm-mem concurrency)`
+job failed at build — rustdoc compiled the svm-mem **doctests** without `-Zsanitizer=thread`
+against TSan-built deps ("mixing `-Zsanitizer` will cause an ABI mismatch", 18 errors). A toolchain
+change around Jun 16 turned the mismatch into a hard error; before that the job passed. Net effect:
+**no TSan coverage at all for two weeks** while the job showed generic red. Fixed by scoping the
+job to `--tests` (commit `2197c7a`, Jun 30); nightlies green from Jul 1. Alternative had it recurred:
+matching `RUSTDOCFLAGS`.
+
+### I20 — ASan (JIT setjmp/longjmp) lane never ran: `package ID specification 'svm-llvm' did not match any packages` (S4) — **fixed**
+
+6 consecutive nightlies Jun 25–30 (28156456664 → 28430367633): the job invoked cargo with
+`-p svm-llvm` from the root workspace, which **excludes** `crates/svm-llvm`, so cargo errored
+before building anything — no ASan coverage of the setjmp path those nights. Fixed by invoking via
+`--manifest-path crates/svm-llvm/Cargo.toml --tests` (commit `2197c7a`, Jun 30); green from Jul 1. Lesson recorded
+in the skips inventory above: lanes that fail during *setup* look like test failures but are
+coverage gaps.
 
 ### I13 — `<2 x i32>` (packed-`i64`) lane arithmetic miscompiled (soundness, S2) — found via Embench `edn`/`fir_no_red_ld` — **fixed**
 
