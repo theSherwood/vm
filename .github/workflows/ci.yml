@@ -115,15 +115,23 @@ jobs:
         with: { components: rustfmt, clippy }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/svm-llvm }
-      - name: install LLVM 18 (dev headers + dynamic lib)
+      - name: install LLVM/clang 18 (out-of-process build tools, no dev headers)
+        # The on-ramp now reads **textual `.ll`** via an in-house parser — it no longer links
+        # libLLVM, so the `-dev` headers/lib are gone. The test harness still shells out to two
+        # ordinary build-time tools: `clang` (compile the C/C++ corpus to bitcode) and `llvm-dis`
+        # (disassemble it to `.ll` for the reader). Both ship in the base `llvm-18`/`clang-18`
+        # packages, as do the `llvm-link-18`/`opt-18` the peval probe uses.
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18-dev clang-18
+          sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
-      - name: install Rust 1.81 (LLVM 18) for the Rust on-ramp lane
-        # `rustc +1.81.0` emits LLVM-18 bitcode the pinned `llvm-ir` reader accepts (the default
-        # stable toolchain bundles a newer LLVM, which the reader rejects). Without this the Rust
-        # breadth test (`rust_no_std_matches_native`) skips; with it, it runs vs native `rustc`.
+      - name: install Rust 1.81 (LLVM 18) for the peval Futamura probe only
+        # NOT for the Rust breadth lane anymore — that runs on the default stable `rustc` (its LLVM
+        # flows through the textual reader; the version-tolerance proof). This pin remains solely for
+        # the multi-crate `peval_*` probe (`tests/common/mod.rs`): it links the whole fixture closure
+        # with `llvm-link-18` and DCEs it with `opt-18`, and those LLVM-18 CLI tools can only ingest
+        # LLVM-18 IR — so the fixture must be built by a version-matched `rustc` (1.81 = LLVM 18.1).
+        # Without it the `peval_futamura`/`peval_jit`/`peval_in_sandbox` tests auto-skip (don't fail).
         run: rustup toolchain install 1.81.0 --profile minimal
       - name: fmt · clippy · test
         working-directory: crates/svm-llvm
