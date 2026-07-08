@@ -97,6 +97,38 @@ block0(v0: i64):
 }
 ";
 
+/// `PARENT_SELF` with a **looping** child (func 1 sums 0..100 with back-edge polls — a real
+/// mid-computation continuation for the subtree freeze). Total = 4950.
+const PARENT_SELF_LOOP: &str = "memory 18
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  v3 = i64.const 0
+  br block1(v2, v3)
+block1(v4: i64, v5: i64):
+  v6 = i64.const 100
+  v7 = i64.lt_s v4 v6
+  br_if v7 block2(v4, v5) block3(v5)
+block2(v8: i64, v9: i64):
+  v10 = i64.add v9 v8
+  v11 = i64.const 1
+  v12 = i64.add v8 v11
+  br block1(v12, v10)
+block3(v13: i64):
+  return v13
+}
+";
+
 /// Run a durable-instrumented `parent` with an `Instantiator` over the whole window plus the
 /// given extra handle args, on a durable host over a durable window.
 fn run_durable(parent: &Module, host: &mut Host, args: &[Value]) -> Vec<Value> {
@@ -285,24 +317,103 @@ block0(v0: i64):
 }
 ";
 
-/// §4 fail-closed: a freeze landing while a §14 child is **live-or-unjoined** refuses cleanly
-/// (`ThreadFault`) instead of minting an artifact whose thaw would fault — the child is its own
-/// domain, and its continuation/pending join result live host-side only (subtree residue is the
-/// follow-up slice). The freeze-from-start unwinds the parent at its first post-instantiate poll,
-/// deterministically catching the unjoined child.
+/// §4 subtree freeze (the covered shape): a freeze landing while a same-module §14 child is
+/// **live** no longer refuses — the child is driven to unwind into its own carve (the subtree STW
+/// broadcast), rides as `FrozenNested` residue, and a thaw re-attaches it under `REWINDING`; the
+/// parent's re-executed `join` then delivers the child's result, reproducing the uninterrupted
+/// total. The child loops with back-edge polls, so its continuation is a *real* mid-computation
+/// capture path (frozen at its entry poll here — freeze-from-start broadcasts before it starts).
 #[test]
-fn freeze_with_live_nested_child_fails_closed() {
-    let parent = instrument(PARENT_SELF);
+fn freeze_with_live_nested_child_thaws_and_completes() {
+    let parent = instrument(PARENT_SELF_LOOP);
+
+    // Control.
     let mut host = Host::new();
     host.set_durable(true);
     let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(base, Ok(vec![Value::I64(4950)]), "uninterrupted loop total");
+
+    // Freeze-from-start: the parent unwinds at its post-instantiate poll with the child live; the
+    // broadcast drives the child to unwind into its carve; the run returns a placeholder (NOT the
+    // old ThreadFault refusal) and records the re-attach residue.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(fih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(fr.is_ok(), "subtree freeze returns a placeholder: {fr:?}");
+    assert_eq!(read_state(&fsnap), STATE_UNWINDING, "artifact frozen");
+    assert_eq!(
+        fhost.frozen_nested().len(),
+        1,
+        "one nested child rode as residue"
+    );
+    let residue = fhost.frozen_nested().to_vec();
+    assert_eq!(residue[0].slot, 0);
+    assert_eq!(residue[0].carve_off, 131072);
+
+    // Thaw: re-attach the child from its carve; the parent reloads its handle, re-executes join,
+    // and the rewound child completes its loop — the uninterrupted total, reproduced.
+    let mut twin = fsnap.clone();
+    begin_thaw(&mut twin, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.set_frozen_nested(residue);
+    let tih = thost.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih)],
+        &mut fuel,
+        &twin,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(4950)]),
+        "thaw re-attached the nested child; join delivered its total"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// A **separate-module** live child stays fail-closed at freeze (its module identity cannot ride
+/// the artifact yet), even though its grant was durable-attested and it instantiated fine.
+#[test]
+fn freeze_with_live_separate_module_child_still_fails_closed() {
+    let parent = instrument(PARENT_JOIN);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mh = host.grant_durable_module(&child());
     let mut win = init_durable_window(WINDOW);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 5_000_000u64;
     let (r, _) = run_capture_reserved_with_host(
         &parent,
         0,
-        &[Value::I32(ih)],
+        &[Value::I32(ih), Value::I64(mh as i64)],
         &mut fuel,
         &win,
         SIZE_LOG2,
@@ -311,7 +422,7 @@ fn freeze_with_live_nested_child_fails_closed() {
     assert_eq!(
         r,
         Err(Trap::ThreadFault),
-        "a freeze with a live §14 child must refuse, not mint a thaw-faulting artifact"
+        "a live separate-module child still refuses the freeze"
     );
 }
 
@@ -443,5 +554,29 @@ fn bytecode_durable_capture_declines_a_nesting_module() {
     assert!(
         r.is_none(),
         "the bytecode durable entry must decline §14 modules (tree-walker owns the nesting rules)"
+    );
+}
+
+/// The snapshot codec cannot carry nested residue yet: `svm_snapshot::freeze` refuses
+/// all-or-nothing (like the non-durable-handle refusal) rather than serialize an artifact whose
+/// restore would silently drop the children. Stage C (the Section-2 nested encoding) lifts this.
+#[test]
+fn snapshot_codec_refuses_nested_residue() {
+    let parent = instrument(PARENT_SELF_LOOP);
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.set_frozen_nested(vec![svm_interp::FrozenNested {
+        slot: 0,
+        carve_off: 131072,
+        size_log2: 17,
+        entry: 1,
+    }]);
+    let win = init_durable_window(WINDOW);
+    assert!(
+        matches!(
+            svm_snapshot::freeze(&parent, &win, &host),
+            Err(svm_snapshot::FreezeError::NestedResidue(1))
+        ),
+        "the codec refuses nested residue until the Section-2 encoding lands"
     );
 }
