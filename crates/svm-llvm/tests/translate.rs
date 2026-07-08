@@ -1300,10 +1300,23 @@ int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
 /// **and** exit code match native. Exercises the whole Lane C on-ramp end-to-end (the synthesized
 /// `_start`, the handle stash, libc → `Stream`/`Exit`). Skips silently if `cc` is unavailable.
 fn powerbox_diff(name: &str, bc: &std::path::Path, c_src: &std::path::Path, stdin: &[u8]) {
+    powerbox_diff_cc_flags(name, bc, c_src, stdin, &[]);
+}
+
+/// [`powerbox_diff`] with extra `cc` flags for the **native oracle** build (e.g. the `-I` pointing
+/// at a fetched amalgamation). The bitcode side's extra flags are the caller's business.
+fn powerbox_diff_cc_flags(
+    name: &str,
+    bc: &std::path::Path,
+    c_src: &std::path::Path,
+    stdin: &[u8],
+    cc_extra: &[&str],
+) {
     // Native oracle: build with `cc`, run, capture stdout + exit code.
     let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{}_{}", std::process::id(), name));
     // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
     match Command::new("cc")
+        .args(cc_extra)
         .arg(c_src)
         .arg("-lm")
         .arg("-o")
@@ -1427,6 +1440,48 @@ fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&s
 /// place* so its same-directory `#include "…"`s resolve.
 fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
     check_demo_vs_native_flags(name, rel, stdin, &[]);
+}
+
+/// Fetch (and cache in the temp dir) the SQLite amalgamation for the Phase A capstone. Public
+/// domain, ~9 MB — deliberately **not vendored**; fetched once per machine and reused. Returns the
+/// directory containing `sqlite3.c`/`sqlite3.h`, or `None` (skip, with a note) when offline.
+/// Needs ≥ 3.47: earlier amalgamations carry `long double` literals in `sqlite3FpDecode`
+/// (`x86_fp80` in the IR); 3.47+ replaced that path with Dekker double-double arithmetic.
+fn fetch_sqlite_amalgamation() -> Option<PathBuf> {
+    const VERSION_DIR: &str = "sqlite-amalgamation-3500200";
+    const URL: &str = "https://sqlite.org/2025/sqlite-amalgamation-3500200.zip";
+    let cache = std::env::temp_dir().join("svm_sqlite_cache");
+    let dir = cache.join(VERSION_DIR);
+    if dir.join("sqlite3.c").exists() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    let zip = cache.join("amalgamation.zip");
+    let fetched = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(&zip)
+        .arg(URL)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !fetched {
+        eprintln!("note: skipping sqlite (amalgamation fetch failed — offline?)");
+        return None;
+    }
+    let unzipped = Command::new("unzip")
+        .arg("-o")
+        .arg("-q")
+        .arg(&zip)
+        .arg("-d")
+        .arg(&cache)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !unzipped || !dir.join("sqlite3.c").exists() {
+        eprintln!("note: skipping sqlite (unzip failed)");
+        return None;
+    }
+    Some(dir)
 }
 
 /// Like [`check_demo_vs_native`] but threads `extra` clang flags into the **bitcode** compile only
@@ -2528,6 +2583,49 @@ fn demo_stb_image_vs_native() {
         b"",
         &["-fno-vectorize", "-fno-slp-vectorize"],
     );
+}
+
+#[test]
+fn demo_sqlite_vs_native() {
+    // **SQLite Phase A — the in-memory SQL-engine capstone (LLVM.md §8 ladder #5).** The unmodified
+    // SQLite amalgamation (3.50.2, ~257k lines — fetched + cached, public domain) compiled as a
+    // guest: `:memory:` database, deterministic `SQLITE_OS_OTHER` VFS (fixed-seed randomness, fixed
+    // clock, xOpen fail-closed — no file I/O can even be attempted), running a 29-statement breadth
+    // script: DDL + indexes, recursive-CTE inserts, aggregates, GROUP BY/HAVING, a self-join,
+    // string/CASE/NULL semantics, float formatting through SQLite's own %!.15g (Dekker double-double
+    // in 3.47+), CASTs, window functions, date/time off the pinned clock, random() off the pinned
+    // PRNG, UPDATE/DELETE + transactions, quote()/blobs, subqueries/EXISTS, PRAGMA integrity_check,
+    // and a deliberate error. Byte-identical stdout vs the same file built natively with `cc`.
+    // Vectorization off for the on-ramp like the other capstones; the oracle keeps vectorizing.
+    // (This slice forced exactly two on-ramp additions: `strcspn` + `strrchr`.)
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/sqlite/sqlite_demo.c");
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_sqlite.bc", std::process::id()));
+    let inc = format!("-I{}", amalg.display());
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite (clang unavailable)");
+            return;
+        }
+    }
+    powerbox_diff_cc_flags("sqlite", &bc, &demo, b"", &[&inc]);
 }
 
 #[test]

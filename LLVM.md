@@ -696,6 +696,30 @@ malloc/realloc/free. It rides on the **sparse-switch compare chain** (Slice D, `
 - Configured `STBI_NO_THREAD_LOCALS` (the incidental `_Thread_local` failure-string → `llvm.threadlocal.address`,
   out of scope) and vectorization off, like BG. Test: `demo_stb_image_vs_native`.
 
+**Slice BI (DONE) — SQLite Phase A, in-memory (the SQL-engine capstone; ladder #5).** The unmodified
+**SQLite 3.50.2 amalgamation** (~257k lines, public domain — fetched + cached at test time, not
+vendored) runs as a guest **byte-identical to native**: a `:memory:` database executing a
+29-statement breadth script — DDL + indexes, recursive-CTE inserts, aggregates, GROUP BY/HAVING,
+self-joins, string/CASE/NULL semantics, float output through SQLite's own `%!.15g` (Dekker
+double-double), CASTs, **window functions**, date/time, `random()`/`randomblob()`, UPDATE/DELETE +
+transactions, `quote()`/blobs, subqueries/EXISTS, `PRAGMA integrity_check`, and a deliberate error.
+Design points:
+- **Determinism is pinned in a `SQLITE_OS_OTHER=1` VFS** (`demos/sqlite/sqlite_demo.c`): xRandomness
+  is a fixed-seed SplitMix64, xCurrentTime/Int64 a fixed instant (2024-01-01Z), xSleep a no-op — so
+  `datetime('now')` and `random()` agree between the native and SVM runs. `:memory:` +
+  `SQLITE_TEMP_STORE=3` means **no file I/O exists**; xOpen fail-closes (`SQLITE_CANTOPEN`), proving
+  no path can even reach for disk. (Phase B replaces exactly this shim with a storage capability.)
+- **Needs SQLite ≥ 3.47**: earlier amalgamations carry `long double` literals in `sqlite3FpDecode`
+  (`x86_fp80` in the IR — outside the f64 on-ramp); 3.47+ replaced that path with Dekker
+  double-double arithmetic, so the build is f64-clean with no source patching.
+- **The on-ramp needed exactly two additions**: synthesized `__svm_strcspn` (the `strspn` scan with
+  the continue condition inverted) and `__svm_strrchr` (one forward scan, select-tracked last match)
+  — everything else (1448 functions, translate ≈ 2.4 s, full script ≈ 3.4 s on the interpreter) rode
+  the existing surface: malloc/realloc/free, mem\*/str\* helpers, the guest printf, sparse switches,
+  and the varargs ABI (`sqlite3_str_vappendf`).
+Test: `demo_sqlite_vs_native` (skips cleanly offline). Follow-ups: Phase B (the storage capability +
+a guest VFS bridging `sqlite3_vfs` to it) and, for scale, running SQLite's own SQL-logic scripts.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
@@ -1485,11 +1509,13 @@ slice 1 the Lua-core translation advances past the four varargs defs to the libc
 ### SQLite — the north star (in-memory, then disk via the powerbox)
 SQLite is the gold-standard target (≈600:1 test-to-code ratio, ships as one amalgamation `.c`). Two
 phases, both worth doing:
-- **Phase A — in-memory (`:memory:` / `memdb` VFS).** Build `SQLITE_THREADSAFE=0`,
-  `SQLITE_OMIT_LOAD_EXTENSION`, run its SQL logic scripts; the differential is native-SQLite vs
-  on-ramp-SQLite over the same script. **No filesystem needed** — SQLite's built-in in-memory VFS
-  keeps the whole DB in `malloc`'d pages. This phase is gated by *computed goto* (VDBE) + *float
-  formatting* above, not by any I/O capability.
+- **Phase A — in-memory (`:memory:`). ACHIEVED ✅ (slice BI).** Built `SQLITE_THREADSAFE=0`,
+  `SQLITE_OMIT_LOAD_EXTENSION`, `SQLITE_OS_OTHER=1` (a deterministic guest VFS — fixed PRNG/clock,
+  file-open fail-closed); the differential is native-SQLite vs on-ramp-SQLite over the same
+  breadth script, **byte-identical**. No filesystem needed — the whole DB lives in `malloc`'d
+  pages. The gates named here (computed goto for the VDBE + float formatting) both held: the VDBE
+  dispatch and `%!.15g` output work unmodified. Scaling up to SQLite's own SQL-logic scripts is the
+  natural extension; the capability story is Phase B.
 - **Phase B — disk-backed (real persistence through a powerbox capability).** In-memory proves the SQL
   engine; **disk proves the capability story** — that a sandboxed guest can do real, durable I/O
   *only* through explicitly granted authority. SQLite is built for exactly this: its **VFS** (`sqlite3_vfs`)
@@ -1580,7 +1606,8 @@ phases, both worth doing:
    **EH** on top (reuses the stack-transfer core) next.
 4. **`%f` / `%g` float formatting** (Dragon4 bignum) — **DONE** (the `__svm_dtoa_*` family + the
    float `0`/`#` flags; see the printf slices above). SQLite/Postgres unblocked on this front.
-5. **SQLite Phase A (in-memory)** — the SQL-engine capstone (gated on goto + float-format).
+5. **SQLite Phase A (in-memory)** — **DONE** (slice BI: the 3.50.2 amalgamation byte-identical
+   to native over a breadth script; deterministic OS_OTHER VFS; two on-ramp additions).
 6. **The storage capability** → **SQLite Phase B** (read/write VFS) and **libmdbx** (file-backed mmap) —
    two distinct storage shapes proving real durable I/O under zero ambient authority.
 7. **Postgres `--single`** — the setjmp + File-capability capstone ("SQLite Phase B at 100×").
