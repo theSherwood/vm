@@ -1,14 +1,14 @@
 //! Build the §6 structured debug info (the [`di::LlvmDebug`](crate::di::LlvmDebug) the translator
-//! threads through its `di` argument) from the textual `.ll` metadata table — the in-house replacement
-//! for [`di`](crate::di)'s `llvm-sys` DI walk. It covers the whole §6 structured half: the **type
-//! graph**, **module globals**, **local variables** (`llvm.dbg.declare` → `Window` at `-O0`;
-//! `dbg.value` → argument `Arg`), and **lexical-block scoping** of shadowed variables — a full
-//! textual replacement for `di.rs`.
+//! threads through its `di` argument) from the textual `.ll` metadata table. It covers the whole §6
+//! structured half: the **type graph**, **module globals**, **local variables** (`llvm.dbg.declare`
+//! → `Window` at `-O0`; `dbg.value` → argument `Arg`), and **lexical-block scoping** of shadowed
+//! variables.
 //!
-//! It mirrors `di.rs` field-for-field so the two readers produce byte-identical `LlvmDebug` (the
-//! `assert_ll_parity_debug` gate): the same interning order (globals walked in module order, the type
-//! recursion reserving a placeholder id before descending), the same `infer_encoding(name)` heuristic
-//! (LLVM-C exposes no encoding getter, so `di.rs` guesses from the name — we match that, *not* the
+//! It replaced `di.rs`'s `llvm-sys` DI walk (deleted in PR4) and was validated field-for-field
+//! against it — byte-identical `LlvmDebug` via the `assert_ll_parity_debug` gate — so it keeps that
+//! walk's conventions: the same interning order (globals walked in module order, the type recursion
+//! reserving a placeholder id before descending), the same `infer_encoding(name)` heuristic (LLVM-C
+//! exposed no encoding getter, so the old walk guessed from the name — we match that, *not* the
 //! text's `encoding:` field), and the same array count = `size_bits / elem_bits`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};

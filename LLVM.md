@@ -2195,18 +2195,16 @@ UPDATED after the textual-reader flip (PR4):**
 - **No Rust-toolchain pin.** The Rust lane compiles with the default stable `rustc` (`--emit=llvm-ir`);
   its bundled LLVM (21 here) flows straight through the textual reader — the version-tolerance proof.
 
-**Q5 — CI yaml (MANUAL FOLLOW-UP — the bot lacks `workflow` scope):** the Linux-only `svm-llvm` job
-exists in `ci.yml` and runs `cargo fmt --all --check` · `cargo clippy --all-targets -- -D warnings` ·
-`cargo test`. After the PR4 flip it needs two edits a maintainer must apply by hand (a `workflow`-scoped
-push, like the §10 miri/ASan HANDOFF items):
-1. **Drop the libLLVM dev headers.** In the "install LLVM 18" step, `llvm-18-dev clang-18` → `llvm-18
-   clang-18`. The crate no longer links libLLVM; it only shells out to `clang` + `llvm-dis`, both in
-   the base `llvm-18` package. (`llvm-link-18`/`opt-18`, used by the peval probe, are also in base.)
-2. **Rescope the 1.81 toolchain step.** It is no longer for the Rust breadth lane (that runs on the
-   default stable `rustc` now — the version-tolerance proof). Retitle it to make clear it exists solely
-   for the multi-crate `peval_*` Futamura probe, which links/DCEs its fixture with the LLVM-18 CLI tools
-   and so needs a version-matched `rustc`. Keep the `rustup toolchain install 1.81.0` line (else those
-   tests auto-skip).
+**Q5 — CI yaml (DONE):** no job installs `llvm-18-dev` anymore — nothing links libLLVM. The
+Linux-only `svm-llvm` job installs base `llvm-18`/`clang-18` (build tools only — `clang` + `llvm-dis`)
+and keeps a `rustup toolchain install 1.81.0` step scoped to the multi-crate `peval_*` Futamura probe
+alone (its `llvm-link-18`/`opt-18` can only ingest LLVM-18 IR, so that fixture needs a version-matched
+`rustc`; the Rust *breadth* lane runs on default stable — the version-tolerance proof). The three
+sibling jobs that run `svm-llvm` tests/examples (`asan-jit-setjmp`, `embench-differential`,
+`cross-engine-differential`) got the same `llvm-18-dev` → `llvm-18` swap. All landed by maintainer
+pushes (the bot token lacks `workflow` scope): the `svm-llvm` lane verified green on CI run 1193 with
+the peval probe running (not skipping); embench + cross-engine verified green on the run for
+`31bcfcd` (asan-jit-setjmp is schedule-gated, exercised on the nightly).
 
 ---
 

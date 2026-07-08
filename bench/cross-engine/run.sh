@@ -17,7 +17,8 @@
 #     native uses AVX2 (-mavx2, 256-bit), wasm + svm-jit use 128-bit SIMD (the wasm v128 spec / the
 #     on-ramp's determinism-fixed legalization), so native leads vadd by ~2x and svm-jit ≈ wasm.
 #
-# Requires: clang, node, python3; the SVM rows additionally need libLLVM-18 (for svm-llvm). Run:
+# Requires: clang, node, python3; the SVM rows additionally need the LLVM-18 CLI tools
+# (llvm-dis, for svm-llvm's textual reader — no libLLVM is linked). Run:
 #   bench/cross-engine/run.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -36,9 +37,10 @@ node wasmrun.mjs k32.wasm k64.wasm
 node js.mjs
 
 # --- SVM engines via the real LLVM frontend (clang → bitcode → svm-llvm → SVM IR) ---
-# svm-llvm links libLLVM-18 and is excluded from the workspace, so it builds independently.
+# svm-llvm is excluded from the workspace (its tests/examples shell out to clang/llvm-dis),
+# so it builds independently.
 if ! ( cd "$ROOT/crates/svm-llvm" && cargo run --release --quiet --example cross_engine ); then
-  echo "note: SVM rows skipped (svm-llvm needs libLLVM-18 + clang)" >&2
+  echo "note: SVM rows skipped (svm-llvm needs clang + llvm-dis on PATH)" >&2
 fi
 
 # --- CPython ---

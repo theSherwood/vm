@@ -218,18 +218,12 @@ pub struct Translated {
     pub exports: Vec<(String, u32)>,
 }
 
-/// Translate a legalized LLVM bitcode file (`*.bc`). The bitcode must come from the pinned LLVM
-/// (18); off-version input is an [`Error::Parse`].
-///
-/// A `-g` build additionally feeds the §6 debug-info waist's *variable/type half*: the structured
-/// `!DILocalVariable`/DI-type graph (which the `llvm-ir` AST doesn't expose) is read by a direct
-/// `llvm-sys` walk ([`di`]) over the same file and correlated to the IR ([`di::read_debug`]).
+/// Translate a legalized LLVM bitcode file (`*.bc`). Needs `llvm-dis` on `PATH` (the bitcode is
+/// disassembled to text and read by the in-house `.ll` reader); a disassembly failure is an
+/// [`Error::Parse`]. A `-g` build feeds both §6 debug-info halves from the same text: per-instruction
+/// `!DILocation` source lines and the structured `!DILocalVariable`/DI-type graph ([`ll::debug`]).
 pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let path = path.as_ref();
-    // I14 fail-closed guard: `llvm-ir` 0.11.3 truncates a `bits > 64` integer constant to its low
-    // word, so a wide/negative `i128` literal would silently miscompile. We can't recover the high
-    // word from the truncated AST, so reject such a module up front (clean `Unsupported`, never a
-    // miscompile). Constants that fit in `[0, 2^64)` round-trip exactly and are unaffected.
     // Disassemble the bitcode to textual `.ll` out-of-process (`llvm-dis`, an ordinary build-time tool
     // like `clang` — §Q2's out-of-process decision) and route through the in-house textual reader. No
     // libLLVM is linked into this crate; full-width `i128` and version-tolerance come for free.
@@ -249,9 +243,9 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 }
 
 /// Translate a **textual** LLVM IR file (`*.ll`) via the in-house reader (LLVM.md §8 Q1b) — the
-/// migration target (no libLLVM link, full-width constants, version-tolerant). The structured debug
-/// graph (`di`/`blockaddr`, recovered via `llvm-sys` on the bitcode path) is not yet read from text,
-/// so it passes `None`; the source-line half still rides each instruction's `!DILocation`.
+/// default input layer since PR4 (no libLLVM link, full-width constants, version-tolerant). The
+/// debug graph and `blockaddress` payloads are recovered from the same text parse
+/// ([`ll::parse::parse_module_with_debug`]).
 pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let src = std::fs::read_to_string(path).map_err(|e| Error::Parse(e.to_string()))?;
     translate_ll_str(&src)
@@ -260,19 +254,19 @@ pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 /// Translate textual LLVM IR from a string (the textual-reader entry; see [`translate_ll_path`]).
 ///
 /// The §6 source-line half rides each instruction's `!DILocation` (parsed onto its `debugloc`); the
-/// structured half is, for now, just the `!DISubprogram` **function-name** table (`-gline-tables-only`
-/// coverage), packaged as a [`di::LlvmDebug`] and threaded through the same `di` argument the bitcode
-/// path uses. The variable/type graph (`DILocalVariable`/`DIType`) is a later slice.
+/// structured half — function names, plus the `-g` variable/type graph
+/// (`DILocalVariable`/`DIType`, [`ll::debug`]) — is packaged as a [`di::LlvmDebug`] and threaded
+/// into the translator alongside the `blockaddress` payloads ([`blockaddr::BlockAddrs`]).
 pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
     let (m, di, ba) =
         ll::parse::parse_module_with_debug(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
     translate_impl(&m, di.as_ref(), ba.as_ref())
 }
 
-/// Translate an already-parsed [`ll`] module (the shape the textual-`.ll` reader produces, or the
-/// bitcode path's [`from_llvm_ir`] conversion). The neutral core's source-line half is populated from
-/// each instruction's `!DILocation`; the structured variable/type half requires the bitcode path's
-/// `llvm-sys` debug walk (see [`translate_bc_path`]).
+/// Translate an already-parsed [`ll`] module. The neutral core's source-line half is populated from
+/// each instruction's `!DILocation`; the structured variable/type half and `blockaddress` payloads
+/// are only available via the string/file entries (they ride the parse — see [`translate_ll_str`]),
+/// so this entry passes neither.
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
     translate_impl(m, None, None)
 }
@@ -941,11 +935,9 @@ const VARARG_SCRATCH: ValueId = usize::MAX - 1;
 /// waist — the analog of the wasm producer's `.debug_line` ingest (W4 slice 15), demonstrating the
 /// waist is genuinely frontend-neutral across a third frontend.
 ///
-/// The **variable / type half** (`llvm.dbg.value` → `VarLoc` location lists, the DI type graph →
-/// `TypeDef`) is *not* reachable here: the pinned `llvm-ir` reader (0.11.3) leaves the structured
-/// metadata graph unimplemented (`Metadata::from_llvm_ref` is `unimplemented!`, `MetadataOperand`
-/// is payloadless), so the `DILocalVariable`/`DIType` nodes never reach this crate. Recovering them
-/// needs a metadata-capable reader (a direct `llvm-sys` DI walk) — its own effort (see `LLVM.md`).
+/// The **variable / type half** (`llvm.dbg.declare` → variable windows, the DI type graph →
+/// `TypeDef`) arrives pre-built as a [`di::LlvmDebug`]: the textual reader captures the `!DI*`
+/// metadata nodes during the parse and [`ll::debug`] walks them into the structs merged here.
 #[derive(Default)]
 struct DebugAcc {
     files: Vec<String>,

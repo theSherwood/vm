@@ -1,9 +1,9 @@
 //! **Footprint — code size & memory (deployed-sandbox view).** Measures the *size* axis the speed
 //! benchmarks miss, from the perspective of the **actual runtime**: this binary links only the SVM
-//! runtime crates (`svm-ir`/`encode`/`interp`/`jit`) — **no libLLVM**. The LLVM frontend is an *AOT*
-//! tool (`svm-llvm-translate`) that produces SVM IR (`.svm`/`.svmb`); that IR is what travels to the
-//! sandbox, and this probe consumes it just like a deployment would. So the RSS numbers here are the
-//! real per-guest footprint, with none of the ~50 MB libLLVM the frontend carries.
+//! runtime crates (`svm-ir`/`encode`/`interp`/`jit`) — **no LLVM anywhere**. The LLVM frontend is an
+//! *AOT* tool (`svm-llvm-translate`) that produces SVM IR (`.svm`/`.svmb`); that IR is what travels
+//! to the sandbox, and this probe consumes it just like a deployment would. So the RSS numbers here
+//! are the real per-guest footprint, with none of the frontend's toolchain (clang/llvm-dis) present.
 //!
 //! For a module file (`.svmb` binary or `.svm` text) it reports:
 //!   * **IR** bytes (`svm_encode::encode_module`) + instruction count — the shippable program;
@@ -12,7 +12,7 @@
 //!   * **peak process RSS** to build + hold each engine's artifact (re-exec'd per engine so the JIT's
 //!     transient Cranelift compile working set is captured), minus a load-only baseline.
 //!
-//! Produce the input AOT (the frontend step, the only place libLLVM is used), then probe (no libLLVM):
+//! Produce the input AOT (the frontend step, the only place LLVM tools are used), then probe:
 //!   clang -O2 -emit-llvm -c bench/cross-engine/kernels.c -o /tmp/k.bc
 //!   ( cd crates/svm-llvm && cargo run --release --bin svm-llvm-translate -- /tmp/k.bc -o /tmp/k.svmb )
 //!   cargo run -p svm-run --release --example footprint -- /tmp/k.svmb

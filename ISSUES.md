@@ -452,6 +452,16 @@ fail-closed, never miscompile).
    i128 literals ever show up in real corpora, revisit the fork. With this, **i128 is feature-complete**
    in the on-ramp modulo that fail-closed case.
 
+7. **Wide constants — fixed at the root** *(LANDED — PR #169, the textual-reader flip; LLVM.md §8
+   Q1b PR4)*. The on-ramp now reads **textual `.ll`** with an in-house parser, and text carries
+   integer constants at full width — so a `≥ 2⁶⁴` / negative i128 literal parses exactly and
+   translates instead of fail-closing. The [`wideint`] guard and the `llvm-ir` dependency it
+   compensated for are **deleted**; `i128_wide_constant_fails_closed` became
+   `i128_wide_constant_now_translates`. (One pre-existing, newly *reachable* translator gap noted
+   there: the runtime correctness of `i128 urem` by a >64-bit constant *divisor* — never exercised
+   while the reader fail-closed on such constants.) With this, **I14 is fully resolved** at the
+   input layer.
+
 ---
 
 ## Resolved

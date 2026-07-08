@@ -214,7 +214,7 @@ takes an AOT-produced `.svmb`/`.svm` and reports each representation's size plus
 build + hold each engine's artifact (re-exec'd per engine):
 
 ```sh
-# AOT (the only place libLLVM is used — produces the shippable IR):
+# AOT (the only place LLVM tools are used — produces the shippable IR):
 clang -O2 -emit-llvm -c bench/cross-engine/kernels.c -o /tmp/k.bc
 ( cd crates/svm-llvm && cargo run --release --bin svm-llvm-translate -- /tmp/k.bc -o /tmp/k.svmb )
 # Runtime probe (no libLLVM — the real sandbox view):
@@ -235,8 +235,9 @@ baseline is **~2.6 MB**; holding the module (tree-walk) or its bytecode adds **~
 adds ~3.4 MB resident** (Cranelift's working set) for this small module. So per-guest steady-state
 memory is dominated by the *JIT compiler's working set*, not the emitted code — another argument (with
 the compile-latency section) for a compiled-module cache and for running short-lived / many guests on
-the bytecode tier. **None of the ~50 MB libLLVM the frontend carries is in the sandbox** — it's AOT
-only. (New `svm_jit::CompiledModule::code_byte_count` and `svm_interp::bytecode::Compiled::op_count`
+the bytecode tier. **None of the frontend's LLVM toolchain is in the sandbox** — the AOT step shells
+out to `clang`/`llvm-dis`, and even the frontend itself links no libLLVM (textual `.ll` reader).
+(New `svm_jit::CompiledModule::code_byte_count` and `svm_interp::bytecode::Compiled::op_count`
 accessors expose the exact sizes.)
 
 ## Capability-call (host-boundary) overhead
@@ -357,9 +358,10 @@ doubles as a whole-stack differential test on programs we didn't write.
 bench/cross-engine/run.sh        # prints engine,kernel,ns_per_iter CSV
 ```
 
-Needs `clang`, `node`, `python3`; the SVM rows additionally need **libLLVM-18** (for `svm-llvm`), and
-`run.sh` skips them with a note if it's absent. (`crates/svm/examples/megabench.rs` is a separate
-hand-written-IR variant that needs no libLLVM, with its own simpler kernels — not part of this table.)
+Needs `clang`, `node`, `python3`; the SVM rows additionally need the **LLVM-18 CLI tools**
+(`llvm-dis`, for `svm-llvm`'s textual reader — no libLLVM is linked), and `run.sh` skips them with a
+note if they're absent. (`crates/svm/examples/megabench.rs` is a separate hand-written-IR variant
+that needs no LLVM toolchain at all, with its own simpler kernels — not part of this table.)
 
 To also compare against **Wasmtime** (Cranelift JIT, like `svm-jit`) and **Pulley** (its bytecode
 interpreter, the `svm-bytecode` baseline), run it against the wasm modules `run.sh` built. Two drivers:
