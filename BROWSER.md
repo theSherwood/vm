@@ -523,10 +523,23 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
 
 ### Slice plan (each its own PR, oracle-gated like everything above)
 
-1. **Emitter core, proven natively first.** Compute ops + dispatcher control flow + masking + traps
-   + fuel back-edges → wasm bytes; run them under **Wasmtime via the existing `browser/wt`
-   embedding** against the corpus ground truth — the whole differential gate works before any
-   browser/JS exists. Biggest slice (~3–6k lines).
+1. **[in progress] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
+   masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any
+   browser/JS exists. Landed as **`crates/svm-wasmjit`** (`compile_module(&svm_ir::Module) →
+   Vec<u8>`, `svm-ir`-only runtime dep, `#![forbid(unsafe_code)]`, module-granular
+   `Error::Unsupported` fail-closed): the integer compute subset (i32/i64 const/arith/bitwise/
+   shift/rotate/cmp/`clz`/`ctz`/`popcnt`/`extend`/`wrap`/`select`/`eqz`), all load/store widths with
+   the exact `svm_mask::Window::checked` mask+guard inline (`MASK = (1<<40)-1`, `mapped =
+   1<<size_log2`), the `loop`+`br_table` block dispatcher with SSA values in wasm locals (reverse-pop
+   edge protocol so a param-permuting self-branch is safe), direct+multi-value `call` (env-threaded),
+   an `env.trap` import for SVM-specific faults (memory/fuel; div0/overflow/`unreachable` reuse
+   wasm's), and a per-dispatch fuel debit. Gate: `tests/differential.rs` runs every kernel on
+   `bytecode::compile_and_run` (oracle) **and** the emitted wasm under `wasmi` (a pure-Rust wasm
+   interpreter, dev-dep only — lighter than the `browser/wt` Wasmtime path first planned, and it runs
+   in the normal `cargo test --workspace` CI lane with no build-std), comparing results *and trap
+   kinds* over an arg sweep incl. `i64::MIN/-1`, guard-crossing addresses, and fuel exhaustion; 15
+   kernels green, plus a `fail_closed` test pinning the refused families (float/fiber/thread/tailcall).
+   Remaining for this slice's PR: none — browser wiring is slice 2.
 2. **Browser linking.** Table registration, per-Worker instantiate, transmute-call from the engine;
    AOT the suspension-free functions of a module at `svm_par_compile`; single Worker; Chromium gate
    (a `#wasmjit` work item in `browser-test.mjs`).
