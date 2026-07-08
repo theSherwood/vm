@@ -602,7 +602,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
             }
             // §17 SIMD (D58): every v128 op, so they ride the interp↔JIT differential. Vector
             // arithmetic is register-only (no escape surface); a v128.load/store is the 16-byte
-            // masked access exercising `svm-mask`'s wider width under the oracle.
+            // bounds-checked access exercising `svm-mask`'s wider width under the oracle.
             25 => gen_simd(bb, has_mem),
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }
@@ -736,8 +736,8 @@ fn atomic_w(ty: IntTy) -> u64 {
 }
 
 /// Generate a `ty`-aligned i64 address: take an arbitrary value and clear its low alignment bits.
-/// (Confinement masks into a power-of-two window ≥ the width, which preserves the low bits, so the
-/// effective address stays aligned and the atomic takes its real — non-trapping — path when mapped.)
+/// (An aligned address avoids the misalignment trap, so an in-window atomic takes its real atomic
+/// path; an out-of-window one still trap-agrees on both backends under trap-confinement.)
 fn atomic_addr(bb: &mut BB, ty: IntTy) -> ValIdx {
     let width = atomic_w(ty) as i64;
     let raw = bb.want(ValType::I64);

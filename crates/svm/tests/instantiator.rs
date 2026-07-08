@@ -1,7 +1,7 @@
 //! §14 `Instantiator` (iface 6) — VM-in-VM nesting on the interpreter's §12 executor. A parent
 //! guest holding an `Instantiator` capability `instantiate`s a child confined to a power-of-two
 //! sub-window of its own window, then `join`s it (parking only the calling fiber). The child runs
-//! the same module's entry on the same M:N executor, confined by masking to its slice, with an
+//! the same module's entry on the same M:N executor, confined by trap-confinement to its slice, with an
 //! attenuated powerbox over its own window — an `Instantiator` (so it can recurse) and an
 //! `AddressSpace` (so it can manage its own pages) — and a fuel quota. These tests pin: the child
 //! runs and its result returns through `join`; its writes land **only** in its sub-window of the
@@ -17,8 +17,8 @@ use svm_text::parse_module;
 use svm_verify::verify_module;
 
 /// A module whose func 0 (parent) instantiates func 1 (child) in a 4 KiB sub-window at `off`,
-/// joins it, and returns the child's result. The child stores a marker at its offset 0 and again
-/// through a far address that the mask folds back into its 4 KiB window, then returns 42.
+/// joins it, and returns the child's result. The child stores a marker at its offset 0 and at an
+/// in-window offset (1695) inside its 4 KiB slice, then returns 42.
 fn nest_src(off: u64, size_log2: u64) -> String {
     format!(
         "memory 17\n\
@@ -37,7 +37,7 @@ fn nest_src(off: u64, size_log2: u64) -> String {
          \x20 v1 = i64.const 0\n\
          \x20 v2 = i32.const 171\n\
          \x20 i32.store8 v1 v2\n\
-         \x20 v3 = i64.const 99999\n\
+         \x20 v3 = i64.const 1695\n\
          \x20 v4 = i32.const 200\n\
          \x20 i32.store8 v3 v4\n\
          \x20 v5 = i64.const 42\n\
@@ -74,7 +74,7 @@ fn instantiate_child_runs_confined_and_joins() {
     );
 
     // Its two stores landed in the child's sub-window of the *shared parent backing* — at child
-    // offset 0 (→ window OFF) and at the far address folded back in (99999 & 4095 = 1695).
+    // offset 0 (→ window OFF) and at in-window child offset 1695.
     let init: Vec<u8> = (0..(128u64 << 10))
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
         .collect();
@@ -85,7 +85,7 @@ fn instantiate_child_runs_confined_and_joins() {
     assert_eq!(
         mem[(OFF + 1695) as usize],
         200,
-        "child far store didn't fold into its window"
+        "child in-window store missing"
     );
 
     // Confinement: every byte *outside* the child's slice is exactly as the parent seeded it — the
@@ -106,8 +106,8 @@ fn nesting_composes_to_depth_two() {
     // func 0 (parent) instantiates func 1 (child) in a 4 KiB window at 64 KiB; the child — handed an
     // `Instantiator` over *its* window — instantiates func 2 (grandchild) in a 1 KiB window at child
     // offset 2 KiB (→ window 64 KiB + 2 KiB). Each level writes a marker into its own slice; the
-    // parent (the superset) sees all of them, and a far store at each level folds back into that
-    // level's window — proving the grandchild is masked to its 1 KiB, nested two deep.
+    // parent (the superset) sees all of them, and an in-window store at each level lands in that
+    // level's window — proving the grandchild is confined to its 1 KiB, nested two deep.
     let src = "memory 17\n\
          func (i32) -> (i64) {\n\
          block0(v0: i32):\n\
@@ -138,7 +138,7 @@ fn nesting_composes_to_depth_two() {
          \x20 v1 = i64.const 0\n\
          \x20 v2 = i32.const 200\n\
          \x20 i32.store8 v1 v2\n\
-         \x20 v3 = i64.const 99999\n\
+         \x20 v3 = i64.const 671\n\
          \x20 v4 = i32.const 222\n\
          \x20 i32.store8 v3 v4\n\
          \x20 v5 = i64.const 77\n\
@@ -158,11 +158,11 @@ fn nesting_composes_to_depth_two() {
     const GRAND: u64 = CHILD + 2048; // grandchild window [66 KiB, 67 KiB)
     assert_eq!(mem[CHILD as usize], 171, "child marker missing");
     assert_eq!(mem[GRAND as usize], 200, "grandchild marker missing");
-    // The grandchild's far store (99999 & 1023 = 671) folds into its 1 KiB window, not the child's.
+    // The grandchild's in-window store at offset 671 lands in its 1 KiB window, not the child's.
     assert_eq!(
         mem[(GRAND + 671) as usize],
         222,
-        "grandchild far store escaped its 1 KiB slice"
+        "grandchild in-window store escaped its 1 KiB slice"
     );
     // Confinement: every byte outside the child's 4 KiB window is exactly as the parent seeded it.
     for i in 0..(128u64 << 10) {

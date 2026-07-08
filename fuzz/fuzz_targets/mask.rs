@@ -1,9 +1,11 @@
-//! libFuzzer target for the **confinement masking unit** (`DESIGN.md` §4, I1; §14; §18).
+//! libFuzzer target for the **trap-confinement unit** (`DESIGN.md` §4, I1; §14; §18).
 //!
-//! The masking unit is the part of escape-freedom the verifier does *not* cover, so
+//! The confinement unit is the part of escape-freedom the verifier does *not* cover, so
 //! it is fuzzed in isolation against its crisp invariant: for any inputs,
-//! `Window::checked` is total (never panics) and, when it returns `Some(a)`,
-//! `a == confine(addr, offset)` and `[a, a+width) ⊆ [base, base+mapped) ⊆ [base, base+reserved)`.
+//! `Window::checked` is total (never panics) and returns `Some(a)` **iff**
+//! `[addr+offset, addr+offset+width) ⊆ [0, mapped)`, in which case `a == confine(addr, offset)`
+//! (the raw, *unmasked* `base + addr + offset`) and `[a, a+width) ⊆ [base, base+mapped) ⊆
+//! [base, base+reserved)`. Every out-of-window access **faults** (`None`) — no aliasing back in.
 //! All three constructors are driven — the fully-mapped form ([`Window::new`]), the decoupled
 //! reserved/mapped form ([`Window::with_mapped`], §4), and the **§14 nested sub-window**
 //! ([`Window::sub`], at an arbitrary `base`) — so the confinement-stays-in-its-(sub-)region property
@@ -15,10 +17,10 @@
 use libfuzzer_sys::fuzz_target;
 use svm_mask::Window;
 
-/// Assert the crisp invariant for one window (top-level or §14 sub-window): `confine` folds the
-/// effective address into this window's region `[base, base+reserved)` as `base + (x & mask)`, and
-/// `checked` either rejects or returns that confined address within the backed `[base, base+mapped)`.
-/// Total — never panics.
+/// Assert the crisp invariant for one window (top-level or §14 sub-window) under **trap-confinement**:
+/// `confine` is the raw effective address `base + addr + offset` (no masking), and `checked` admits an
+/// access iff it lies fully within the backed `[base, base+mapped)`, returning that address, and
+/// otherwise faults. Total — never panics.
 fn check(w: Window, addr: u64, offset: u64, width: u32) {
     let base = w.base();
     let reserved = w.reserved();
@@ -30,15 +32,23 @@ fn check(w: Window, addr: u64, offset: u64, width: u32) {
         "base + (reserved-1) must not overflow"
     );
 
-    let rel = addr.wrapping_add(offset) & (reserved - 1); // child-relative, in [0, reserved)
+    // `confine` is the raw (unmasked) effective address — trap-confinement, no `& mask`.
     let a = w.confine(addr, offset);
-    assert_eq!(a, base + rel, "confine = base + masked offset");
-    // The decisive property: the confined address stays inside this window's (sub-)region.
-    assert!(a >= base, "confined address fell below its window base");
-    assert!(a - base < reserved, "confined address reached/passed its window top");
+    assert_eq!(
+        a,
+        base.wrapping_add(addr.wrapping_add(offset)),
+        "confine = base + addr + offset"
+    );
+
+    // In bounds iff `[addr+offset, addr+offset+width) ⊆ [0, mapped)`, computed overflow-free.
+    let in_bounds = addr
+        .checked_add(offset)
+        .and_then(|e| e.checked_add(width as u64))
+        .is_some_and(|end| end <= mapped);
 
     match w.checked(addr, offset, width) {
         Some(c) => {
+            assert!(in_bounds, "admitted an out-of-window access");
             assert_eq!(c, a, "checked must return the confined address");
             assert!(c >= base, "checked address below base");
             assert!(
@@ -46,10 +56,7 @@ fn check(w: Window, addr: u64, offset: u64, width: u32) {
                 "confined access escaped the backed [base, base+mapped)"
             );
         }
-        None => assert!(
-            rel + width as u64 > mapped,
-            "faulted on an in-mapped access"
-        ),
+        None => assert!(!in_bounds, "faulted on an in-mapped access"),
     }
 }
 

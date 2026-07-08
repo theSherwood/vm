@@ -4993,7 +4993,7 @@ fn lower_block(
             // status:i32. `trap_out` carries the §12.8 thaw fail-closed (a re-issued wait that would
             // park on the single worker traps `ThreadFault`); on a fresh run it is never written.
             let w = atomic_width(*ty);
-            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
+            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, w);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
             let sched = b.ins().iconst(I64, lower.thread.sched_addr);
             let exp_raw = get(&vals, *expected)?;
@@ -5023,7 +5023,7 @@ fn lower_block(
         if let Inst::MemoryNotify { addr, count } = inst {
             // thread_notify(sched, phys:i64, count:i32) -> woken:i32. Accesses no memory (the address
             // is only confined, no alignment requirement — matching the interpreter).
-            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
+            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, 4);
             let sched = b.ins().iconst(I64, lower.thread.sched_addr);
             let cnt = get(&vals, *count)?;
             let mut tsig = module.make_signature();
@@ -5170,7 +5170,7 @@ fn lower_block(
             Inst::V128Load { addr, offset, .. } => {
                 // The 16-byte masked access — the lone escape-TCB delta SIMD adds (§17/D58).
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
                 b.ins().load(I8X16, mem_flags(), phys, 0)
             }
             Inst::V128Store {
@@ -5180,7 +5180,7 @@ fn lower_block(
                 ..
             } => {
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
                 b.ins().store(mem_flags(), get(&vals, *value)?, phys, 0);
                 continue; // store produces no value
             }
@@ -5658,7 +5658,7 @@ fn lower_block(
                 op, addr, offset, ..
             } => {
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
                 lower_load(b, *op, phys)
             }
             Inst::Store {
@@ -5669,7 +5669,7 @@ fn lower_block(
                 ..
             } => {
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
@@ -5683,7 +5683,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
                 b.ins().atomic_load(int_clif_ty(*ty), atomic_flags(), phys)
             }
@@ -5696,7 +5696,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
                 b.ins()
                     .atomic_store(atomic_flags(), get(&vals, *value)?, phys);
@@ -5712,7 +5712,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
                 b.ins().atomic_rmw(
                     int_clif_ty(*ty),
@@ -5732,7 +5732,7 @@ fn lower_block(
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w); // type is inferred from the operands
                 b.ins().atomic_cas(
                     atomic_flags(),
@@ -6063,6 +6063,13 @@ fn zero_of(b: &mut FunctionBuilder, t: Type) -> Value {
         b.ins().f32const(0.0)
     } else if t == F64 {
         b.ins().f64const(0.0)
+    } else if t.is_vector() {
+        // A vector result (e.g. a `float4`/v128 returned in a register, per §17): `iconst` is
+        // scalar-integer only and produces malformed IR (the verifier hits an internal `unreachable`),
+        // so materialize an all-zero vector constant instead — the same idiom the SIMD lowering uses.
+        let bytes = vec![0u8; t.bytes() as usize];
+        let zc = b.func.dfg.constants.insert(ConstantData::from(&bytes[..]));
+        b.ins().vconst(t, zc)
     } else {
         b.ins().iconst(t, 0)
     }
@@ -6511,6 +6518,7 @@ fn mask_addr(
     addr: Value,
     offset: u64,
     elide: bool,
+    width: u32,
 ) -> Value {
     // Fold the immediate only when non-zero, so an offset-0 access keeps a minimal address
     // expression (helps Cranelift's GVN / store-to-load forwarding recognize equal addresses).
@@ -6520,6 +6528,53 @@ fn mask_addr(
         let off = b.ins().iconst(I64, offset as i64);
         b.ins().iadd(addr, off)
     };
+    // A non-elided access is confined by a bounds check + cold trap (invariant I1, **trap-confinement**):
+    // the access `[addr+offset, addr+offset+width)` must lie in the reserved domain `[0, reserved)`, else
+    // a clear `MemoryFault` fires *at the offending access* (vs the old mask silently wrapping a wild
+    // access to some other in-window byte). The check compares the dynamic `addr` against the
+    // compile-time constant `reserved - offset - width`, so it never itself overflows, and it sits *off*
+    // the address's latency path (the load issues speculatively past the predicted-not-taken branch); the
+    // trap block is cold, so Cranelift keeps the fast path inline. Within the reservation, the
+    // committed-ness of `[0, mapped)` (and any page the guest `grow`s into the tail) is enforced by the
+    // `PROT_NONE` guard region — a stray `[mapped, reserved)` access faults there. This exactly mirrors
+    // the interpreter's `confine_checked` (reserved-domain bound) + `check_prot` (per-page), so the two
+    // agree on the same fault under the §18 escape oracle, and a `memory.grow` that commits tail pages
+    // stays accessible on both (the baked bound is `reserved`, which never changes; the guard shrinks).
+    // A §14 nested child (`sub_base != 0`) bounds-checks the same way and then shifts the in-bounds offset
+    // into its parent slice (`+ sub_base`), so it too faults out-of-child instead of aliasing. Elided
+    // accesses (proven `< reserved`) need no check. The no-memory / degenerate `mask == 0` case keeps
+    // the mask (a 1-byte / memoryless window has no reservation to bound against).
+    if !elide && lower.mask != 0 {
+        // `reserved = mask + 1` (a power of two ≤ 2^63); the reservation this window is confined to.
+        let reserved = lower.mask.wrapping_add(1);
+        let need = (width as u64).saturating_add(offset);
+        let oob = match reserved.checked_sub(need) {
+            Some(limit) => {
+                let lim = b.ins().iconst(I64, limit as i64);
+                b.ins().icmp(IntCC::UnsignedGreaterThan, addr, lim)
+            }
+            // `offset + width` alone exceeds the reservation ⇒ no `addr` is in-bounds; always trap.
+            None => b.ins().iconst(I8, 1),
+        };
+        let cont = b.create_block();
+        let trap_blk = b.create_block();
+        b.set_cold_block(trap_blk); // branch hint: OOB is the unlikely path
+        b.ins().brif(oob, trap_blk, &[], cont, &[]);
+        b.switch_to_block(trap_blk);
+        emit_trap(b, lower, TrapKind::MemoryFault);
+        b.switch_to_block(cont);
+        // The bounds check proved `addr+offset+width <= mapped`, so `eff` is in `[0, mapped)`; shift it
+        // into the §14 sub-window slice (`+ sub_base`) before adding the window base — elided for a
+        // top-level window so ordinary codegen is byte-identical to before nesting existed.
+        let shifted = if lower.sub_base == 0 {
+            eff
+        } else {
+            let sb = b.ins().iconst(I64, lower.sub_base as i64);
+            b.ins().iadd(eff, sb)
+        };
+        let base = b.use_var(lower.mem_var);
+        return b.ins().iadd(base, shifted);
+    }
     let confined = if elide {
         eff
     } else {
