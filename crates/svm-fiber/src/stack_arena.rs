@@ -196,3 +196,42 @@ impl Drop for Stack {
         free_slot(self.base);
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Allocate more than one arena's worth of slots, holding them so none free — this drives the
+    /// cursor past `SLOTS_PER_ARENA` and forces a **second arena reservation**, the new commit-on-demand
+    /// path the Fiber-level tests never reach (they don't create 4096+ concurrent fibers). Every slot
+    /// must be non-null, `SLOT`-aligned, distinct (no overlap across the arena boundary), and **usable
+    /// memory** (writing its top exercises the per-slot commit). Unix only: `MAP_NORESERVE` keeps the
+    /// ~1 GiB reservation VA-only/lazy (on Windows this would `MEM_COMMIT` it).
+    #[test]
+    fn crosses_arena_boundary_with_usable_slots() {
+        let n = SLOTS_PER_ARENA + 8; // > one arena ⇒ a second `reserve_arena`
+        let mut stacks = Vec::with_capacity(n);
+        let mut bases = HashSet::new();
+        for _ in 0..n {
+            let s = Stack::new(SLOT).expect("arena slot");
+            let base = s.base as usize;
+            assert!(!s.base.is_null());
+            assert_eq!(base % SLOT, 0, "slot base must be SLOT-aligned");
+            assert!(base.checked_add(SLOT).is_some(), "slot must not wrap");
+            assert!(
+                bases.insert(base),
+                "slots must be distinct across the arena boundary"
+            );
+            // The slot is committed usable memory: writing near its top must not fault.
+            // SAFETY: `[base, base+SLOT)` is this slot's own committed region; `base+SLOT-8` is in it.
+            unsafe {
+                s.base
+                    .add(SLOT - 8)
+                    .cast::<u64>()
+                    .write_volatile(base as u64)
+            };
+            stacks.push(s);
+        }
+    }
+}
