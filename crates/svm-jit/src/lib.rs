@@ -432,7 +432,12 @@ pub enum TrapKind {
     /// each prologue when `feature = "stack-check"` (the arena/software-guard fiber model, which drops
     /// the per-fiber hardware guard page). A function whose frame would grow the native stack past the
     /// running fiber's low bound traps here rather than corrupting an adjacent fiber's stack —
-    /// detect-and-kill (§5). With the hardware guard page (the default), overflow is a `MemoryFault`.
+    /// detect-and-kill (§5). NOTE: on the default guard-page backend a *fiber* overflow is NOT a clean
+    /// `MemoryFault` — the fault happens at stack exhaustion and the SIGSEGV handler (`SA_ONSTACK` set,
+    /// but no `sigaltstack` installed) double-faults on the exhausted stack and kills the process. Only
+    /// in-window memory faults (handler has ample stack) surface as `MemoryFault`. The software check
+    /// here traps through `trap_out` with no signal, so it is the only path that catches fiber overflow
+    /// survivably (see `svm-jit/STACK_GUARD_FLIP.md`, "sigaltstack finding").
     StackOverflow = 13,
 }
 
