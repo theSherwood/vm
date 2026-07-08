@@ -1413,8 +1413,27 @@ Native oracle exit 0, including ltests' real `atexit` leak check. One more trans
 constexpr **`ptrtoint (ptr @g to i32)` ignored its target width** (raw i64 address into i32
 arithmetic, verify TypeMismatch) — fixed + `const_ptrtoint_i32_width` differential.
 
-Still excluded: `attrib.lua` (the real `package` searchers), `main.lua` (the standalone `lua`
-binary), `all.lua` (the driver), `heavy.lua` (deliberate memory exhaustion).
+**The official suite under its own driver — ACHIEVED ✅ (`all.lua`, the capstone).** The unmodified
+`testes/all.lua` — the Lua distribution's own test *driver* — runs on the on-ramp: the whole
+`testes/` tree is seeded onto the **in-memory Fs**, and `all.lua` `dofile`s each file through its own
+`loadfile → string.dump → load` round-trip, `require`s sibling modules, and ends at `final OK !!!`.
+It finds and loads every file off the (in-memory) disk via the **real** `luaopen_package`
+(`loadlib.c`) searching `package.path` — the minimal-`require` shim is retired for stock
+`require`/`package`/`searchpath`/`loadlib` (the ANSI C-library searcher returns `"absent"`, which the
+suite guards for). T library active, one shared `lua_State`, the suite's own `_port`/`_soft`/`_nomsg`
+knobs → **26 files** run (`main.lua` early-returns under `_port`, `big.lua` under `_soft`), including
+`attrib.lua` (real `require`/`searchpath`/`package.config`, asserted `== 27`). `lua_all.bc` /
+`tests/lua_all.rs` (JIT gates CI ~20 s; interpreter runs `#[ignore]`d full-depth); native oracle exit
+0 incl. ltests' `atexit` leak check. The guest allocator became a **coalescing explicit-free-list**
+(dlmalloc-lite, boundary tags): the whole suite in one state peaks ~19 MiB live, and coalescing keeps
+the arena high-water near that — the earlier power-of-two-class allocator fragmented ~3× and overran
+the reference JIT's 64 MiB window.
+
+So the claim is now the strongest form: **the on-ramp runs Lua 5.4.7's official test suite, as
+shipped, driven by the suite's own `all.lua`** — on the JIT, bytecode, and tree-walker. Only
+`main.lua` (spawns the standalone `lua` binary; needs `os.execute` of a real process) and `heavy.lua`
+(deliberate multi-GiB exhaustion) are outside scope, both of which `all.lua` itself omits from this
+configuration.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
