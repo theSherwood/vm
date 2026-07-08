@@ -10,21 +10,21 @@
 //!
 //! Linux-only: `/proc/self/status` is the cheap, deterministic observable. The Windows symptom
 //! (commit exhaustion) is this same leak seen through eager commit charging, so pinning VA
-//! growth here covers both.
+//! growth here covers both. (The whole file is gated — on other targets even the imports would
+//! trip `-D unused-imports`.)
+#![cfg(target_os = "linux")]
 
 #[path = "support/irgen.rs"]
 mod irgen;
 
 use irgen::{fuzz_one, Gen};
 
-#[cfg(target_os = "linux")]
 fn vm_size_kib() -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap();
     let line = s.lines().find(|l| l.starts_with("VmSize:")).unwrap();
     line.split_whitespace().nth(1).unwrap().parse().unwrap()
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn repeated_compiles_do_not_grow_address_space() {
     // Warm-up: allocator arenas, lazy runtime setup, thread-local init — growth from these is
