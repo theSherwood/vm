@@ -48,10 +48,11 @@ Already escape-grade about the design (see `STACK_GUARD.md`):
 | 1 | **Soundness fuzz** — differential: any overflow must trap `StackOverflow`, never write below `usable_low`. Oracle: run the guard-page backend WITH `stack-check`; a `MemoryFault` (or crash) then proves a hole. Sweep frame size across/past `RED_ZONE`. | Blocker (escape-TCB) | **landed** — `tests/stack_guard_fuzz.rs` (needs CI job #3 to run it) |
 | 2 | **Audit** the check + arena as an escape-TCB unit (like masking). | Blocker | **done** — `STACK_GUARD_AUDIT.md`: no escape vector; F1 (pin probestack) + F2 (stale docs) fixed; F3→#5, F4→#4 |
 | 3 | **CI coverage** — build/test `--features stack-check[,arena-stacks]` on Linux + macOS-aarch64, and give the Windows arena its first runtime coverage. Without it the guard bit-rots while off by default. | Blocker | **mostly done** — `stack-guard` job exists; fuzz runs under it on merge; needs the guard-page-oracle run added (below) |
-| 4 | **GC precision** — reused, un-zeroed arena slots make the conservative root scan over-approximate. Decide zero-on-reclaim of the touched high-water region vs. accepting the (sound) superset. | Decision | open |
+| 4 | **GC precision** — reused, un-zeroed arena slots add *false roots* to the conservative scan. **NOT a flip-blocker** (audit): soundness is preserved — a superset only *retains* dead objects, never premature-frees; retention is bounded by the reused region below high-water. Root cause is `full_extent()` scanning `[usable_low, top)` for running fibers; the fix is a tighter `[live_sp, top)` scan (bounds already tracked: `parked_extent` exact, `resumer_sp()`/`current_sp()` for running), which makes zeroing moot. Decoupled → GC follow-up. | Follow-up (not gating) | open |
 | 5 | **Frame-size backstop** — reject any function whose frame exceeds `SLOT − RED_ZONE`. The audit (F3) **raises this**: under the arena the check is the *sole* defense (no guard-page backstop), so this single-frame gap should close *with* the flip, not after. Cranelift 0.132 doesn't expose `frame_size` (needs a prologue-parse or a Cranelift upgrade). | Low escape-prob, but arena-critical | open |
 
-Items 1–3 are the gate. #4 is an either-way decision; the audit reclassifies **#5 as should-land-with-the-flip** (F3).
+Items 1–3 are the gate. The audit reclassifies **#4 as a non-gating GC follow-up** (sound-but-imprecise
+interim is acceptable) and **#5 as should-land-with-the-flip** (F3 — the arena has no hardware backstop).
 
 ## sigaltstack finding (surfaced while building blocker #1)
 
@@ -102,7 +103,7 @@ so the fuzz also runs there:
 - [ ] Fuzz (#1) lands and runs clean in CI over a sustained seed sweep, including frames past `RED_ZONE`.
 - [ ] CI job (#3) builds + runs the guard/arena suites on Linux + macOS-aarch64; Windows arena has runtime coverage.
 - [ ] Escape-TCB audit (#2) signs off the check + arena.
-- [ ] GC precision (#4) decided and documented.
+- [ ] GC precision (#4) — **not gating**; accepted as sound-but-imprecise interim, tracked as a GC follow-up (tighter running-scan).
 - [ ] Frame-size residual (#5) either closed or explicitly accepted with rationale.
 
 Then flip **both** flags together, per platform, and move the check into the always-on verifier-trusted path.
