@@ -19725,7 +19725,7 @@ mod bigint_tests {
     #[test]
     fn dtoa_digits_works() {
         let scratch = 1024usize;
-        let dbuf = scratch + 496;
+        let dbuf = scratch + FMT_DBUF_O as usize;
         let cases: &[(f64, usize)] = &[
             (3.25, 3),
             (1.0, 3),
@@ -19760,7 +19760,7 @@ mod bigint_tests {
     #[test]
     fn dtoa_sci_works() {
         let scratch = 4096usize;
-        let out = scratch + 1536;
+        let out = scratch + FMT_OUT_O as usize;
         // (value, prec); no flags, no width
         let cases: &[(f64, usize)] = &[
             (3.25, 2),
@@ -19856,7 +19856,7 @@ mod bigint_tests {
     #[test]
     fn dtoa_fix_big_works() {
         let scratch = 4096usize;
-        let out = scratch + 1536;
+        let out = scratch + FMT_OUT_O as usize;
         let fns = || {
             vec![
                 synth_dtoa_fix_big(1, 2, 3, 4, 5, 6, 7),
@@ -19932,7 +19932,7 @@ mod bigint_tests {
     #[test]
     fn dtoa_gen_works() {
         let scratch = 4096usize;
-        let out = scratch + 1536;
+        let out = scratch + FMT_OUT_O as usize;
         let cases: &[(f64, usize)] = &[
             (3.375, 6),
             (100000.0, 6),  // E=5 < P ⇒ f-mode "100000"
