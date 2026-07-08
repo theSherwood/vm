@@ -143,10 +143,12 @@ under `-D warnings`; no fiber/thread-suite regression.
 check position means normal frames are validated directly, so this is a low-priority backstop only.
 Note: the SLOT-aligned arena slots (from the prior 2b commit, for path A's SP-mask) are now vestigial
 under B — harmless, removable later.
-3. **[Windows arena done — cross-check only]** `stack_arena.rs` is now cross-platform: `mmap`+
-   `MAP_NORESERVE` on unix, `VirtualAlloc(MEM_RESERVE|MEM_COMMIT)` on x86-64 Windows (no
-   `MAP_NORESERVE` analogue ⇒ the arena is committed up front — a pagefile charge, physical stays
-   demand-zero; per-slot commit-on-demand is a follow-up). Provides the Windows `Stack` surface
+3. **[Windows arena done]** `stack_arena.rs` is cross-platform with **commit-on-demand**: the arena is
+   only *reserved* (`mmap`+`MAP_NORESERVE` on unix; `VirtualAlloc(MEM_RESERVE)` on x86-64 Windows), and
+   a slot is committed on first hand-out (a no-op on unix; `MEM_COMMIT` on Windows) and stays committed
+   when freed, so recycling is a free-list pop. The *commit* footprint therefore tracks peak concurrent
+   fibers, not the reserved arena size — so a large arena is cheap and Windows no longer pays a
+   whole-arena pagefile charge. Provides the Windows `Stack` surface
    (`base_ptr`/`limit_ptr`/`top` for the TEB seed). Verified with `cargo check --target
    x86_64-pc-windows-gnu --features arena-stacks` under `-D warnings`; **runtime-untested** (no Windows
    host / CI — needs the CI job below). **`#3` exit-code parity done:** the interp's `trap_status` now
