@@ -1385,6 +1385,54 @@ fn run_inner(
     cm.run(args, init_mem, snapshot_cap, async_hooks)
 }
 
+/// A [`JITModule`] whose memory is actually **released on drop**. cranelift-jit deliberately
+/// leaks all code memory when a bare `JITModule` drops (its `Memory` `mem::forget`s every
+/// allocation so stale `fn` pointers can never fault) — reclaiming it requires the explicit
+/// `unsafe free_memory()`, which this crate never called. That leak is per *compile*, and the
+/// [`ArenaMemoryProvider`] both compile paths install reserves **256 MiB per module** — which on
+/// Windows is `MEM_RESERVE | MEM_COMMIT` (the region crate commits eagerly; see the note in
+/// cranelift's `arena.rs`), i.e. every compile permanently charged 256 MiB against the system
+/// commit limit. A compile-heavy process (the differential fuzz loops, `durable_jit`
+/// freeze/thaw, a §14 nursery, a REPL) pinned the runner's commit ceiling within ~dozens of
+/// compiles, after which *unrelated* heap allocations abort (`memory allocation of N bytes
+/// failed` → `0xc0000409`) and window commits fail (`os error 1455`) — the ISSUES.md **I3**
+/// Windows CI flake family. On unix, overcommit hid the same leak as unbounded VA growth.
+///
+/// Freeing on drop is sound because both owners ([`CompiledModule`], [`ChildCode`]) already pin
+/// the lifetime contract "nothing that points into the code may outlive this struct": the field
+/// is declared last, so runtimes/tables/trampolines drop first, and no fiber, thread, or
+/// installed table entry survives the owner (documented on the structs).
+struct OwnedJit(Option<JITModule>);
+
+impl OwnedJit {
+    fn new(m: JITModule) -> OwnedJit {
+        OwnedJit(Some(m))
+    }
+}
+
+impl core::ops::Deref for OwnedJit {
+    type Target = JITModule;
+    fn deref(&self) -> &JITModule {
+        self.0.as_ref().expect("JITModule present until drop")
+    }
+}
+
+impl core::ops::DerefMut for OwnedJit {
+    fn deref_mut(&mut self) -> &mut JITModule {
+        self.0.as_mut().expect("JITModule present until drop")
+    }
+}
+
+impl Drop for OwnedJit {
+    fn drop(&mut self) {
+        if let Some(m) = self.0.take() {
+            // SAFETY: per the owners' documented contract, by the time this field drops no guest
+            // code from this module is executing and no `fn` pointer into it is ever called again.
+            unsafe { m.free_memory() };
+        }
+    }
+}
+
 /// A compiled module whose executable code **outlives a single run** (DESIGN.md §22: the
 /// long-lived `JITModule` split). Owns the [`JITModule`] (the executable memory lives until
 /// drop), the power-of-two-padded function table, the entry's buffer-ABI trampoline, and the
@@ -1719,8 +1767,9 @@ pub struct CompiledModule {
     /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
     debug_types: Vec<svm_ir::TypeDef>,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
-    /// (declaration order), after everything that points into it.
-    module: JITModule,
+    /// (declaration order), after everything that points into it — and the drop **releases** the
+    /// code arena back to the OS (see [`OwnedJit`]; a bare `JITModule` would leak it).
+    module: OwnedJit,
 }
 
 impl CompiledModule {
@@ -2613,7 +2662,7 @@ impl CompiledModule {
                 .as_ref()
                 .map(|di| di.types.clone())
                 .unwrap_or_default(),
-            module,
+            module: OwnedJit::new(module),
         })
     }
 
@@ -3525,15 +3574,17 @@ pub(crate) struct ChildCode {
     pub(crate) fn_table: Box<[FnEntry]>,
     /// The entry trampoline (buffer ABI, [`mem::run_guarded`]-compatible).
     pub(crate) code: *const u8,
-    /// Owns the executable memory; dropped last.
-    module: JITModule,
+    /// Owns the executable memory; dropped last, and the drop **releases** the code arena back to
+    /// the OS (see [`OwnedJit`] — a bare `JITModule` would leak 256 MiB of reservation per child,
+    /// eagerly commit-charged on Windows).
+    module: OwnedJit,
 }
 
 #[cfg(fiber_rt)]
 impl Drop for ChildCode {
     fn drop(&mut self) {
-        // `JITModule` frees its executable memory on drop; nothing extra to do — this impl exists to
-        // document that `code`/`fn_table` die with the struct (no use may outlive it).
+        // This impl exists to document that `code`/`fn_table` die with the struct (no use may
+        // outlive it) — that contract is what makes the [`OwnedJit`] free-on-drop sound here.
         let _ = &self.module;
     }
 }
@@ -3682,7 +3733,7 @@ fn compile_child(
     Ok(ChildCode {
         fn_table,
         code,
-        module,
+        module: OwnedJit::new(module),
     })
 }
 
