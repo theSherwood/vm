@@ -3137,6 +3137,60 @@ fn printf_float_fixed_bignum() {
 }
 
 #[test]
+fn printf_float_zero_pad() {
+    // The float `0` flag (previously fail-closed): pad with '0' between the sign and the digits,
+    // right-justified only. Covers all three kinds (`%f`/`%e`/`%g`), signed values (the sign must
+    // stay at column 0 with zeros after it), the `+`/space sign flags under zero-fill, left-justify
+    // (C ignores `0` with `-`), a width narrower than the content (no padding), precision combos,
+    // inf/nan (C pads those with *spaces*, not zeros), and — the flag-bit-aliasing regression —
+    // `%010g` of 42.0, where zero-fill must NOT suppress `%g`'s trailing-zero strip (the `0` and
+    // `#` flag bits are distinct). Byte-for-byte stdout vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"[%08.3f]\\n\", 3.5); \
+                 printf(\"[%08.3f]\\n\", -3.5); \
+                 printf(\"[%+09.2f]\\n\", 42.0); \
+                 printf(\"[% 09.2f]\\n\", 42.0); \
+                 printf(\"[%-08.3f]\\n\", -3.5); \
+                 printf(\"[%03.2f]\\n\", 12345.678); \
+                 printf(\"[%015.4e]\\n\", -1234.5678); \
+                 printf(\"[%012.2e]\\n\", 9.6); \
+                 printf(\"[%010g]\\n\", -3.14159); \
+                 printf(\"[%010.3g]\\n\", 12345.678); \
+                 printf(\"[%010g]\\n\", 42.0); \
+                 printf(\"[%020f]\\n\", 1e10); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"[%08f][%08f][%08e][%08g]\\n\", inf, -inf, nan, inf); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_zero_pad", src, b"");
+}
+
+#[test]
+fn printf_float_alt_form() {
+    // The float `#` flag (previously fail-closed): keep the decimal point at precision 0
+    // (`%#.0f`/`%#.0e`) and keep trailing zeros + the point for `%#g` (C alternate form). Covers
+    // both `%g` layout branches (f-form and e-form), a `%#g` whose fraction is entirely zeros
+    // (100000 → \"100000.\"), no-op `#` on a value that already has a point, and `#` combined with
+    // the `0` and sign flags. Byte-for-byte stdout vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"[%#.0f][%.0f]\\n\", 6.0, 6.0); \
+                 printf(\"[%#.0f]\\n\", -5.5); \
+                 printf(\"[%#.0e][%.0e]\\n\", 9.6, 9.6); \
+                 printf(\"[%#g][%g]\\n\", 42.0, 42.0); \
+                 printf(\"[%#g]\\n\", 100000.0); \
+                 printf(\"[%#g][%#g]\\n\", 1e300, 0.0001); \
+                 printf(\"[%#.1g][%#.10g]\\n\", 1e300, 1.0/3.0); \
+                 printf(\"[%#.3f][%#e]\\n\", 3.5, 3.14); \
+                 printf(\"[%#010.0f][%+#.0f]\\n\", -6.0, 6.0); \
+                 printf(\"[%#g][%#G]\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"[%#08.0f][%#g]\\n\", inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_alt", src, b"");
+}
+
+#[test]
 fn printf_float_fixed() {
     // `%f` via the synthesized exact-decimal helper (`__svm_dtoa_fixed`, fixed 128-bit integer
     // arithmetic — no host float formatting). Covers: default precision (6), explicit precision,

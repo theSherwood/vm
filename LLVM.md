@@ -601,7 +601,8 @@ code**; only the bytes cross the boundary. Tests: `demo_hexdump_vs_native` (a `h
 native, with stdin) + `printf_unsigned_formats` (mixed widths/pads/`%lx`/`%c`/`%%`).
 - *Deferred:* `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`,
   non-constant format strings. **(`%s`, the flags, and precision landed — slices BA–BD below; float
-  stays fail-closed, needing exact-decimal/bignum formatting.)**
+  landed later via the exact bignum `dtoa` family — `__svm_dtoa_{fix_big,sci,gen}` — incl. the float
+  `0`/`#` flags; only `*` and non-constant formats remain deferred.)**
 
 **Slices BA–BD (DONE) — the `printf` breadth batch (no new demo; the format engine widened, each
 checked byte-for-byte vs native `printf`).**
@@ -623,6 +624,11 @@ checked byte-for-byte vs native `printf`).**
   exact decimal conversion* (Dragon4/Ryū-class **big-integer** arithmetic — the fraction numerator
   alone needs > 64 bits for small magnitudes), which an `f64`-arithmetic approximation cannot give
   without silently breaking the on-ramp's byte-exact contract. Deferred to a bignum-backed formatter.
+  **(Since landed:** the bignum family — `dtoa_digits` (Dragon4 digit engine) + `__svm_dtoa_sci`
+  (`%e`), `__svm_dtoa_gen` (`%g`), `__svm_dtoa_fix_big` (`%f`, no magnitude ceiling) — correctly
+  rounded across the whole double range; tests `printf_float_{fixed,fixed_bignum,scientific,general,
+  nonfinite,zero_pad,alt_form}`. The float `0` (zero-pad after the sign) and `#` (keep the point /
+  trailing zeros) flags landed last, byte-for-byte vs glibc.)**
 - *Also still deferred:* `*` (dynamic width/precision) and non-constant format strings.
 
 **Slice BE (DONE) — `argc`/`argv` (the §3e powerbox args buffer).** A `main(int argc, char** argv)`
@@ -1143,10 +1149,10 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   the `ASan (JIT setjmp/longjmp)` CI lane runs the differential under `-Zsanitizer=address`. **EH next**
   (`invoke`/`landingpad`/`resume` + cleanups) reuses this stack-transfer core; the JIT `longjmp` + EH
   unblock Postgres `--single` and throwing C++ respectively.
-- **`%f` / `%g` / `%e` float formatting** — deliberately **fail-closed** (LLVM.md printf notes): an
-  `f64`-arithmetic approximation diverges from glibc at the rounding boundary; matching byte-for-byte
-  needs a **correctly-rounded exact-decimal (Ryū / Dragon4, big-integer)** formatter. SQLite,
-  `printf`-heavy programs, and any numeric output force this.
+- **`%f` / `%g` / `%e` float formatting** — **DONE**: the correctly-rounded exact-decimal (Dragon4,
+  big-integer) formatter family landed (`__svm_dtoa_{fix_big,sci,gen}` over the `big_*` primitives),
+  exact across the whole double range (1e±300, subnormals, nonfinite), plus the float `0`/`#` flags.
+  Remaining printf tail: `*` (dynamic width/precision), non-constant formats, `%a`.
 - **`qsort` + comparator function pointers** — the libc callback ABI (an indirect call from synthesized
   libc into guest code); confirm it lands cleanly when a target needs it.
 - **`__int128` / `long double` (`x86_fp80`/`fp128`)** — rejected (§7 deferred). SQLite has a few `i128`
@@ -1188,9 +1194,9 @@ than a new translate-time synthesis:
 Fixture `tests/fixtures/lua/lua_fmt.bc` (core + base/`string`/`table`/`math` + guest shim/libm/strtod +
 guest `snprintf`), test `tests/lua_fmt.rs`, asserts the exact **stdout bytes** across
 `%d`/`%x`/`%#x`/`%o`, width/precision/flags (`%5d`/`%-5d`/`%05d`/`%+d`/`%10s`/`%.3s`), `%c`, `%.2f`/
-`%8.3f`/`%+.1f`, `%.3e`/`%g`/`%.10g`, `%q`, and `%%`. Known edge: `%f` of an extreme magnitude (`1e300`)
-can differ from native by one digit — a pre-existing `dtoa_fix` limit, not the bridge; the script avoids
-it. This unblocks running **Lua's own test suite** (self-validating, the roadmap's gold standard) — the
+``8.3f`/`%+.1f`, `%.3e`/`%g`/`%.10g`, `%q`, and `%%`. (A known edge at the time — `%f` of an extreme
+magnitude could differ by one digit, a 128-bit `dtoa_fix` limit — is gone: `__svm_dtoa_fix_big`
+replaced that path with the exact bignum engine; `printf_float_fixed_bignum` asserts `1e300` exact.) This unblocks running **Lua's own test suite** (self-validating, the roadmap's gold standard) — the
 next Lua slice.
 
 ### Lua's own test suite — ACHIEVED ✅ (`math.lua` + `utf8.lua` + 3 more files, all three engines)
@@ -1572,7 +1578,8 @@ phases, both worth doing:
    operand-position). Robust for real interpreters.
 3. **`setjmp`/`longjmp`** — DONE on the interpreter (slice AX); JIT `longjmp` (native-stack switch) +
    **EH** on top (reuses the stack-transfer core) next.
-4. **`%f` / `%g` float formatting** (Ryū/Dragon4) — needed by SQLite/Postgres and broadly.
+4. **`%f` / `%g` float formatting** (Dragon4 bignum) — **DONE** (the `__svm_dtoa_*` family + the
+   float `0`/`#` flags; see the printf slices above). SQLite/Postgres unblocked on this front.
 5. **SQLite Phase A (in-memory)** — the SQL-engine capstone (gated on goto + float-format).
 6. **The storage capability** → **SQLite Phase B** (read/write VFS) and **libmdbx** (file-backed mmap) —
    two distinct storage shapes proving real durable I/O under zero ambient authority.
@@ -1793,8 +1800,8 @@ Slices, smallest meaningful first (do **not** aim at clang first):
    SQLite Phase B needs. Shared prerequisite, not extra.
 4. **Translate-time scale** — the `svm-llvm` translator is demo-sized today; a multi-hundred-MB bitcode
    module is a different regime (translator memory + throughput). Needs measurement, possibly streaming.
-5. **Stragglers** — `%f`/`%g` exact-decimal formatting (textual IR output), a few inline-asm spots
-   (mostly avoidable), possibly computed-goto in clang's lexer (the `indirectbr` work above).
+5. **Stragglers** — a few inline-asm spots (mostly avoidable), possibly computed-goto in clang's
+   lexer (the `indirectbr` work above). (`%f`/`%g` exact-decimal formatting is DONE.)
 
 **Why it sequences after SQLite (not a detour).** SQLite and LLVM share their three biggest
 prerequisites — the **File/Storage capability**, **float formatting**, and **large-program scaling** —
