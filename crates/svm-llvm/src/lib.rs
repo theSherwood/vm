@@ -2595,7 +2595,7 @@ const FMT_BUF_END: u64 = 128;
 /// just above the data-stack reserve in the window (a fixed, reusable region — no per-call alloc),
 /// reserved only when `need_dtoa`. Sized for the bignum formatters (three 40-limb big integers, the
 /// digit buffer, content, padded field, and scalar locals — see the `FMT_*_O` offsets).
-const FLOAT_SCRATCH_SIZE: u64 = 2304;
+const FLOAT_SCRATCH_SIZE: u64 = 2432;
 
 // ── C++ exception-handling (Itanium ABI on-ramp) reserved scratch ──────────────────────────────
 // EH state rides in a fixed window region just above the float scratch (`eh_base`, reserved only
@@ -7053,10 +7053,13 @@ impl Bdr {
 }
 
 /// Fixed limb count for the bignum float formatter (`%f`/`%e`/`%g`). A double's exact value `f·2^e`
-/// needs a denominator up to `2^1074` (≈ 34 u32 limbs) plus decimal scaling headroom; 40 limbs
-/// (1280 bits) covers every finite double with margin. Each big integer is a little-endian array of
-/// `BIG_NLIMBS` u32 limbs at a byte address passed to these helpers.
-const BIG_NLIMBS: i64 = 40;
+/// needs a denominator up to `2^1074` (≈ 34 u32 limbs), and a fixed format additionally scales the
+/// numerator by `10^prec` — `%.99f` of the maximum double reaches `2^1023 · 10^99 ≈ 2^1352` (≈ 43
+/// limbs), which 40 limbs silently truncated (strings.lua's longest-number test caught it). 48 limbs
+/// (1536 bits) covers every finite double at the C-cap precision (≤ 99) with margin. Each big
+/// integer is a little-endian array of `BIG_NLIMBS` u32 limbs at a byte address passed to these
+/// helpers.
+const BIG_NLIMBS: i64 = 48;
 
 /// `__svm_big_is_zero(a) -> i64` — 1 if every limb of the big integer at `a` is zero, else 0.
 #[allow(dead_code)]
@@ -7623,16 +7626,16 @@ fn synth_dtoa_digits(zero: u32, copy: u32, cmp: u32, sub: u32, mul: u32, shl: u3
     use BinOp::{Add, And, Mul, Or, ShrS, ShrU, Sub};
     use CmpOp::{Eq, GeS, LtS, Ne};
     let i64t = ValType::I64;
-    // `scratch` layout (byte offsets): three 40-limb (160-byte) big integers, the digit buffer, then
+    // `scratch` layout (byte offsets): three 48-limb (192-byte) big integers, the digit buffer, then
     // the two stashed scalars `nsig`/`E` (so blocks thread only `scratch` + loop vars).
     let num_o = 0i64;
-    let den_o = 160i64;
-    let tmp_o = 320i64;
-    // The two scalars sit just above the three 40-limb (160-byte) big integers, so the digit buffer
+    let den_o = 192i64;
+    let tmp_o = 384i64;
+    // The two scalars sit just above the three 48-limb (192-byte) big integers, so the digit buffer
     // that follows can grow as large as high-precision / large-magnitude formats need.
-    let nsig_o = 480i64;
-    let e_o = 488i64;
-    let dbuf_o = 496i64;
+    let nsig_o = 576i64;
+    let e_o = 584i64;
+    let dbuf_o = 592i64;
 
     const ZEROCASE: u32 = 1;
     const ZCASE_LOOP: u32 = 2;
@@ -8493,23 +8496,23 @@ fn synth_big_inc() -> Func {
 }
 
 // Scratch byte offsets shared by the bignum formatters (`%e`/`%g`/big `%f`): the `dtoa_digits` region
-// [0,496) (three 40-limb big integers + the nsig/E scalars), then the digit buffer, the assembled
+// [0,592) (three 48-limb big integers + the nsig/E scalars), then the digit buffer, the assembled
 // content, the padded output field, and the formatter's scalar locals.
-const FMT_DBUF_O: i64 = 496; // up to ~528 decimal digit values
-const FMT_CBUF_O: i64 = 1024; // assembled "[sign]d.dddde±dd" content
-const FMT_OUT_O: i64 = 1536; // padded field (what the lowering writes)
-const FMT_WIDTH_O: i64 = 2048;
-const FMT_FLAGS_O: i64 = 2056;
-const FMT_SIGN_O: i64 = 2064;
-const FMT_CLEN_O: i64 = 2072; // content cursor → content length
-const FMT_E_O: i64 = 2080;
-const FMT_PREC_O: i64 = 2088;
-const FMT_TOTAL_O: i64 = 2096; // padded field length
-const FMT_LEAD_O: i64 = 2104; // leading-pad count (right-justify)
-const FMT_P_O: i64 = 2112; // %g significant-digit count P
-const FMT_SIGEND_O: i64 = 2120; // %g: content cursor just past the last significant fraction digit
-const FMT_FILL_O: i64 = 2128; // pad fill byte: ' ', or '0' when the `0` flag is active
-const FMT_SKIP_O: i64 = 2136; // sign bytes kept at out[0..skip) under zero-fill (0 or 1)
+const FMT_DBUF_O: i64 = 592; // up to ~560 decimal digit values
+const FMT_CBUF_O: i64 = 1152; // assembled "[sign]d.dddde±dd" content
+const FMT_OUT_O: i64 = 1664; // padded field (what the lowering writes)
+const FMT_WIDTH_O: i64 = 2176;
+const FMT_FLAGS_O: i64 = 2184;
+const FMT_SIGN_O: i64 = 2192;
+const FMT_CLEN_O: i64 = 2200; // content cursor → content length
+const FMT_E_O: i64 = 2208;
+const FMT_PREC_O: i64 = 2216;
+const FMT_TOTAL_O: i64 = 2224; // padded field length
+const FMT_LEAD_O: i64 = 2232; // leading-pad count (right-justify)
+const FMT_P_O: i64 = 2240; // %g significant-digit count P
+const FMT_SIGEND_O: i64 = 2248; // %g: content cursor just past the last significant fraction digit
+const FMT_FILL_O: i64 = 2256; // pad fill byte: ' ', or '0' when the `0` flag is active
+const FMT_SKIP_O: i64 = 2264; // sign bytes kept at out[0..skip) under zero-fill (0 or 1)
 
 /// Emit the sign byte for a float field: `'-'` if the sign bit is set, else `'+'`/`' '` for the
 /// `+`/space flags, else `0` (none). `sign`/`flags` are loaded from the scratch locals at `scratch`.
