@@ -155,6 +155,26 @@ is a parser over attacker-controlled frames in the host.
 only freezable modules and may only spawn durable children.* STW quiesces the subtree
 as a unit.
 
+**Status: enforcement landed** (`crates/svm/tests/durable_nesting.rs`) — the first slice of
+nested-guest durability. The freezable bit is a **grant-time attestation**:
+`Host::grant_durable_module` marks a `Module` grant as instrumented (the host ran
+`svm_durable::transform_module` — a compile-mode fact the runtime cannot re-derive from the
+IR, so it is attested like verification; plain `grant_module` grants unmarked). A **durable**
+domain's §14 ops then enforce the rule fail-closed (`-EINVAL`, like a bad carve): `instantiate`
+/ `spawn_coroutine` (module forms 5/6/7) refuse an **unmarked** grant; a **same-module** child
+stays admissible (it runs the parent's own instrumented funcs); and the admitted child
+**inherits durability** — its `Host` + vCPU run durable, so its own spawns/fibers reserve
+shadow state and its own nested instantiates re-apply the same admission rule (the subtree
+property, recursively). Guest-driven `Jit.compile` (§22) is a module installation too: a
+durable domain refuses it fail-closed until a host-side instrumentation hook lands (the
+"host runs the pass on submitted IR" composition above; `svm-interp` cannot run the pass —
+no `svm-durable` dependency). The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
+closed under a durable run (its child runner re-compiles children with no durable state; the
+interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
+domains are unaffected (`separate_module.rs` unchanged). What this slice does *not* yet do:
+freeze a subtree as a unit (per-subtree STW trigger + subtree handle capture are the next
+nesting slices); it makes the invariant those slices rely on real.
+
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
 shared edge (consistent-cut). Decide as a `SharedRegion` constraint: either a durable

@@ -4770,7 +4770,7 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
 /// A resolved §14 `Module` grant's pieces, as the eval loop carries them: the child module's
 /// functions, declared window size, and data segments (`Arc`s — spawning shares, never copies).
-type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>);
+type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>, bool);
 
 /// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
 /// **awaiting a resume value** — i.e. parked at a `yield` (so the next `resume` delivers its argument
@@ -5640,7 +5640,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let g = {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 let g = hg.resolve_module(mh)?;
-                                (g.funcs.clone(), g.memory_log2, g.data.clone())
+                                (g.funcs.clone(), g.memory_log2, g.data.clone(), g.durable)
                             };
                             (
                                 match mop {
@@ -5655,7 +5655,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => (o, None, 0),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _)| f);
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _)| f);
                     match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
@@ -5696,12 +5696,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
-                            if !ok_entry || !fits || !mod_ok {
+                            // §4 enforcement: *a durable domain admits only freezable modules* — a
+                            // separate-module child must carry the grant's durable attestation
+                            // (`grant_durable_module`); an un-instrumented child could never
+                            // drain-then-unwind, so admitting it would stop the subtree being
+                            // snapshottable as a unit. A same-module child (`None`) runs the
+                            // parent's own (already instrumented) funcs — always admissible.
+                            let mod_durable_ok =
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d)| *d);
+                            if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
                                 // `ibase`/`off` are holder-relative; the backing-absolute base
@@ -5717,7 +5725,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // bounded them to its declared window == the carve). RO protection of
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
-                                if let (Some((_, _, data)), Some(m)) = (&child_mod, mem.as_ref()) {
+                                if let (Some((_, _, data, _)), Some(m)) = (&child_mod, mem.as_ref())
+                                {
                                     for d in data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
                                             <= child_size
@@ -5735,6 +5744,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // arguments. (Pass-through of the parent's *other* handles is a
                                 // follow-up.)
                                 let mut ch = Host::new();
+                                // §4: *a durable domain may only spawn durable children* — the
+                                // subtree freezes as a unit, so the child's own spawns/fibers must
+                                // reserve shadow state like the parent's (and its own nested
+                                // instantiates re-apply this same admission rule).
+                                ch.set_durable(durable);
                                 let cinst = ch.grant_instantiator(0, child_size);
                                 let cas = ch.grant_address_space(0, child_size);
                                 let child_host = Arc::new(Mutex::new(ch));
@@ -5749,9 +5763,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 } else {
                                     (quota as u64).min(*fuel)
                                 };
-                                let cfuncs = child_mod
-                                    .as_ref()
-                                    .map_or_else(|| Arc::clone(&funcs), |(f, _, _)| Arc::clone(f));
+                                let cfuncs = child_mod.as_ref().map_or_else(
+                                    || Arc::clone(&funcs),
+                                    |(f, _, _, _)| Arc::clone(f),
+                                );
                                 let csched = sched.clone();
                                 let made = sched.spawn(move |id| {
                                     // A nested child is its **own** domain (own host/window/program),
@@ -5771,6 +5786,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         cdt,
                                     );
                                     child.memop = memop;
+                                    // §4: durability is a subtree property — a durable parent's
+                                    // instantiated child runs durable (freezable module enforced
+                                    // at the admission check above).
+                                    child.durable = durable;
                                     Box::new(child)
                                 });
                                 match made {
@@ -5827,12 +5846,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // transparency), exactly as for `instantiate_module`.
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
-                            if !ok_entry || !fits || !mod_ok {
+                            // §4 enforcement, exactly as for `instantiate`: a durable domain
+                            // admits only freezable (durable-attested) separate-module children.
+                            let mod_durable_ok =
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d)| *d);
+                            if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
                                 // `ibase`/`off` are holder-relative; the backing-absolute base
@@ -5852,7 +5875,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // in the parent's backing while the child's pages start unmapped — so
                                 // a plugin's data segments are *supplied lazily*, page by page, as it
                                 // first touches them (the §14 parent-as-pager model, for free).
-                                if let (Some((_, _, data)), Some(m)) = (&child_mod, mem.as_ref()) {
+                                if let (Some((_, _, data, _)), Some(m)) = (&child_mod, mem.as_ref())
+                                {
                                     for d in data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
                                             <= child_size
@@ -5864,11 +5888,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     }
                                 }
                                 let mut ch = Host::new();
+                                // §4: a durable parent's co-fiber child is durable too (see
+                                // `instantiate`); its module admission was enforced above.
+                                ch.set_durable(durable);
                                 let cy = ch.grant_yielder(); // the child's handle to suspend back to us
                                 let child_host = Arc::new(Mutex::new(ch));
-                                let cfuncs = child_mod
-                                    .as_ref()
-                                    .map_or_else(|| Arc::clone(&funcs), |(f, _, _)| Arc::clone(f));
+                                let cfuncs = child_mod.as_ref().map_or_else(
+                                    || Arc::clone(&funcs),
+                                    |(f, _, _, _)| Arc::clone(f),
+                                );
                                 // A co-fiber child is its own domain → its own dispatch table.
                                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                                 let mut child = VCpu::new(
@@ -5885,6 +5913,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     cdt,
                                 );
                                 child.fault_yields = true; // its page faults suspend to us, not trap
+                                child.durable = durable; // §4: durability is a subtree property
                                 coroutines.push(Some(Coro {
                                     vcpu: Box::new(child),
                                     awaiting_resume: false,
@@ -9018,6 +9047,11 @@ struct ModuleGrant {
     memory_log2: Option<u8>,
     data: Arc<[Data]>,
     exports: Arc<[svm_ir::Export]>,
+    /// DURABILITY.md §4: the granting host attests this module is **freezable** (it ran
+    /// `svm_durable::transform_module` on it — a compile-mode fact only the host knows, like
+    /// verification). A durable domain refuses to instantiate a grant without this bit, so its
+    /// nesting subtree stays snapshottable as a unit.
+    durable: bool,
 }
 
 impl Default for Host {
@@ -9620,12 +9654,27 @@ impl Host {
     /// verified** (`svm_verify::verify_module`): like every run entry, the host is trusted to grant
     /// only verifier-passing modules — a guest can never inject code, only spawn what it was given.
     pub fn grant_module(&mut self, m: &Module) -> i32 {
+        self.grant_module_inner(m, false)
+    }
+
+    /// [`Host::grant_module`], additionally attesting the module is **freezable** (DURABILITY.md
+    /// §4): the host ran `svm_durable::transform_module` on `m` before granting, so a *durable*
+    /// domain may instantiate it as a child (an unmarked grant is refused there — the child could
+    /// never drain-then-unwind, making the subtree non-snapshottable). Like verification, the
+    /// attestation is the trusted host's: instrumentation is a compile-mode fact the runtime
+    /// cannot re-derive from the IR.
+    pub fn grant_durable_module(&mut self, m: &Module) -> i32 {
+        self.grant_module_inner(m, true)
+    }
+
+    fn grant_module_inner(&mut self, m: &Module, durable: bool) -> i32 {
         let id = self.modules.len() as u32;
         self.modules.push(ModuleGrant {
             funcs: m.funcs.clone().into(),
             memory_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone().into(),
             exports: m.exports.clone().into(),
+            durable,
         });
         self.grant(iface::MODULE, Binding::Module(id))
     }
@@ -9770,6 +9819,15 @@ impl Host {
         symtab: &[u8],
     ) -> Result<Result<JitCompiled, i64>, Trap> {
         let domain = self.resolve_jit_domain(handle)?;
+        // §4 (DURABILITY.md): *a durable domain admits only freezable modules* — and a §22
+        // guest-submitted unit is a module installation. The durable transform is a host-side
+        // compile pass this crate cannot run (no `svm-durable` dependency), so until an embedder
+        // instrumentation hook exists, a durable domain's `compile` fails closed (`-EINVAL`,
+        // guest-reachable errno like the other refusals here): an un-instrumented unit could
+        // never drain-then-unwind, silently making the domain non-snapshottable.
+        if self.durable {
+            return Ok(Err(EINVAL));
+        }
         let Some(validate) = self.jit_validator else {
             return Ok(Err(EINVAL));
         };

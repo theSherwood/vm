@@ -2793,6 +2793,17 @@ impl CompiledModule {
         if args.len() < n_params {
             return Err(JitError::Malformed);
         }
+        // §4 (DURABILITY.md): a durable run's §14 nursery must know it — its `instantiate` /
+        // `coro_spawn` thunks fail closed there (this JIT child runner cannot yet run a durable
+        // child; the interpreter is the reference for durable nesting). Set here, the common
+        // bottom of every run entry, because the durable flag is applied by the entry wrappers
+        // *after* compile (where the nursery is built).
+        {
+            let t = &*this;
+            if let Some(n) = &t._nursery {
+                n.set_durable(t.durable);
+            }
+        }
         // ---- Setup: references into `*this` live only inside this block. ----
         // Allocate the guest window for this run: `mapped` backed RW bytes inside the reserved
         // virtual range planned at compile time (§4); zero-sized when the module has no memory.
