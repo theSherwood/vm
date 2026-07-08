@@ -438,7 +438,8 @@ harness+bundles against real libc, exit 0 — including ltests' real `atexit` al
 Support files: `lua_tlib_harness.c` (single-state, ltests' own `lua_newstate(debug_realloc,
 &l_memcontrol)` + `luaL_requiref("T", luaB_opentests)` recipe, plus the sweep harness's require/
 package/knob setup); `lua_tlib_malloc.c` (guest `malloc`/`free`/`realloc` — `debug_realloc` sits on
-plain libc malloc — as segregated free lists over a 56 MiB arena); `lua_tlib_shim.c`
+plain libc malloc — a coalescing explicit-free-list allocator over a 56 MiB arena; see the `all.lua`
+section); `lua_tlib_shim.c`
 (`__assert_fail`/`abort` as loud nonzero exits, the `LUA_COMPAT_MATHLIB` hyperbolics, `strtoul`, a
 real guest `printf` — ltests' reports use `%X`, which the constant-format lowering doesn't carry —
 `sprintf`, string helpers, and the `atexit` note). `loadlib.c` joins the build (`ltests.c`
