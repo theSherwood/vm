@@ -264,10 +264,10 @@ jobs:
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/svm-llvm }
-      - name: install LLVM 18 (dev headers + dynamic lib)
+      - name: install LLVM/clang 18 (build tools for the svm-llvm test harness)
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18-dev clang-18
+          sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - name: cargo test -p svm-llvm setjmp (ASan, JIT path live)
         run: cargo test --manifest-path crates/svm-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
@@ -323,10 +323,10 @@ jobs:
           workspaces: |
             crates/svm-llvm
             bench/cross-engine/wasmtime-rs
-      - name: install LLVM 18 (libLLVM for the on-ramp + clang for the kernels & wasm)
+      - name: install LLVM/clang 18 (clang for the kernels & wasm, llvm-dis for the on-ramp)
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18-dev clang-18
+          sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
         run: |
@@ -345,9 +345,9 @@ jobs:
     # `svm-bytecode-wasm` row, via browser/bench.mjs on Node) and cross-checks every result against
     # native bytecode. The harness prints `MISCOMPILE` on a mismatch but doesn't itself exit non-zero,
     # so this step greps for it — and asserts the row actually ran, so a missing cdylib/node can't pass
-    # silently. Linux-only, like `svm-llvm` (the on-ramp links libLLVM). The perf numbers it also prints
-    # are informational — the perf signal is the separate non-gating `bench` job.
-    name: cross-engine differential (svm-bytecode-wasm vs native)
+    # silently. Linux-only, like `svm-llvm` (the on-ramp shells out to clang/llvm-dis). The perf
+    # numbers it also prints are informational — the perf signal is the separate non-gating `bench` job.    name: cross-engine differential (svm-bytecode-wasm vs native)
+
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -358,10 +358,10 @@ jobs:
           workspaces: |
             crates/svm-llvm
             browser
-      - name: install LLVM 18 (libLLVM for the on-ramp + clang for the kernels)
-        run: |
+      - name: install LLVM/clang 18 (clang for the kernels, llvm-dis for the on-ramp)
+         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18-dev clang-18
+          sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - run: rustup target add wasm32-unknown-unknown
       - name: build the svm-browser wasm32 cdylib (so the svm-bytecode-wasm row runs)
