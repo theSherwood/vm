@@ -1195,9 +1195,38 @@ pub(crate) unsafe extern "C" fn gc_roots(
     let rt = &*rt;
     let mut roots: BTreeSet<u64> = BTreeSet::new();
 
+    // Tight low bounds for the **running** fibers on this vCPU (the resume chain). A running fiber's
+    // live frames are `[sp, top)`; scanning its whole usable stack instead (`full_extent`) also reads
+    // the *unused* region below `sp`, which on the recycled arena backend holds a previous fiber's
+    // stale bytes → false roots (sound but imprecise; STACK_GUARD_FLIP.md #4). Each `sp` is
+    // recoverable: a fiber saved its SP into its child's `resumer` when it resumed that child, so the
+    // child's `resumer_sp` *is* the parent's live SP; the innermost fiber (this `gc.roots` caller) is
+    // `current_sp()`. `yielders[k]` is the fiber at resume-depth `k` on this vCPU (0 = outermost). We
+    // key by `control_id` so the table loop below can look each running fiber up. Parked fibers keep
+    // their already-exact `[ctx, top)` extent and don't appear here.
+    let sp_now = current_sp();
+    let running_low: Vec<(usize, usize)> = {
+        let ys = &rt.yielders;
+        ys.iter()
+            .enumerate()
+            .map(|(k, &y)| {
+                // SAFETY: each `Yielder` pointer is live for its resume (pushed on resume, popped on
+                // return); this vCPU's chain is quiescent inside this synchronous thunk.
+                let cid = unsafe { (*y).control_id() };
+                let sp = if k + 1 < ys.len() {
+                    // SAFETY: as above; the child at depth k+1 saved this fiber's SP in its resumer.
+                    unsafe { (*ys[k + 1]).resumer_sp() as usize }
+                } else {
+                    sp_now
+                };
+                (cid, sp)
+            })
+            .collect()
+    };
+
     // (1)+(2) Every live fiber in the domain-shared table: a parked fiber's exact saved extent, or a
-    // running fiber's whole usable stack (a sound superset — its exact SP is not known here). A
-    // `FREE` (completed) slot holds no fiber (`take`n on finish) and is skipped.
+    // running fiber's tight `[sp, top)` live extent (from `running_low`). A `FREE` (completed) slot
+    // holds no fiber (`take`n on finish) and is skipped.
     {
         let t = rt.table.lock();
         for slot in t.slots.iter() {
@@ -1208,12 +1237,20 @@ pub(crate) unsafe extern "C" fn gc_roots(
                     // caller is **not** under STW — scanning its live, mutating native stack would be
                     // a data race. Refuse (fail closed with `FiberFault`) rather than read it. A
                     // fiber running on *this* vCPU is the caller's own resume chain (quiescent while
-                    // this synchronous thunk runs) and is scanned as a superset.
+                    // this synchronous thunk runs).
                     if slot.running_on.load(Ordering::Relaxed) != rt.me {
                         fault(trap_out);
                         return 0;
                     }
-                    fib.full_extent()
+                    // Tight `[sp, top)` from the resume chain. A running fiber on this vCPU is always
+                    // in `running_low` (guaranteed by the STW check just above), so the `full_extent`
+                    // low-bound fallback is defensive only — never narrower than the truth.
+                    let low = running_low
+                        .iter()
+                        .find(|(cid, _)| *cid == fib.control_id())
+                        .map(|&(_, sp)| sp as *const u8)
+                        .unwrap_or(fib.full_extent().0);
+                    (low, fib.stack_top())
                 } else {
                     fib.parked_extent()
                 };
