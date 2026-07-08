@@ -351,6 +351,51 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (hello 14 + stdout, threads 4000, io 8 + 8×"tick\n", jit 1136, inst 40) plus a garbage-source
   parse-reject, all asserted.
 
+## Remaining work / follow-ons
+
+Everything in the phase tracker is landed; this is the open list — each item its own slice, none a
+blocker for what's shipped. (Previously these lived only as scattered "Follow-up:" notes above and
+in session discussion; collected here so the next slice has a home to be picked from.)
+
+- [ ] **Combined powerbox recipe (io + jit + inst in one `Host`).** The `svm_par_powerbox*` run
+  recipes are exclusive (last-published-wins), so a browser guest can compute in parallel, JIT,
+  sandbox children, *and* print — but not all in the same run. One combined recipe (a single `Host`
+  granting `Stream(Out)` + `Jit` + `Instantiator`, seeded by entry arity like `powerbox_exec`) would
+  make the playground's modes composable instead of either/or.
+- [ ] **Graceful stop / cooperative cancellation.** The playground's Stop terminates Workers
+  mid-run, which can wedge shared state (a held `Mutex<Host>`, the live-vCPU counter) — the page
+  currently just asks for a reload. A cooperative cancel (a run-wide stop flag in shared memory the
+  engine polls at its fuel/epoch check points, DESIGN.md §5) would let a stopped run leave the
+  instance reusable.
+- [ ] **Run-wide fuel budget across Workers.** Fuel is per-vCPU today (`new_confined_child` takes a
+  quota; a §14 parent can cut a child's budget), but a run has no *aggregate* bound — 8 workers ×
+  per-vCPU fuel is 8× the intended ceiling. A shared fuel pool (an atomic in shared linear memory,
+  debited in the engine's existing fuel decrements) would give the browser the §5 metering story the
+  native drivers have.
+- [ ] **vCPU-bomb backstop → spawner `ThreadFault`.** The 256-cap live-vCPU counter refuses
+  construction, which fails the *whole run* via the JS host — cruder than the native drivers, where
+  the spawner gets a clean `ThreadFault` and can handle it. Surface the refusal as a fault delivered
+  to the spawning vCPU (via `deliver_handle`'s error path) instead of a dead child.
+- [ ] **ABI cleanup: result structs instead of `static mut` stashes.** Multi-value returns
+  (`svm_run_pb` streams, `svm_run_capture` snapshots, `svm_parse` output, `svm_par_stdout`) all go
+  through single-reader `static mut` slots with ptr/len accessor pairs. An `svm_alloc`-returned
+  result struct would drop the statics and the call-order contracts ("call `len` first").
+  Same slice: the `--features live` path still uses fixed scratch buffers — the one entry the
+  `svm_alloc`/`svm_dealloc` ABI conversion skipped.
+- [ ] **A real-language playground tab.** The playground takes SVM text; the repo already runs Lua
+  on SVM through the `svm-llvm` on-ramp (official `coroutine.lua` + debug library green). Wiring a
+  Lua (or C via `frontend/chibicc`) tab needs the frontend path available to the browser —
+  pre-compiled modules first, in-wasm compilation later.
+- [ ] **wasm64 in the browser (external: V8 table64).** Blocked on V8 shipping 64-bit tables
+  (tracked under **Status** #3); the browser path stays wasm32 until then. When it lands: unify
+  wasm64 with the threads build (`+atomics` + memory64 in one target) so the browser gets the native
+  `u64` address path — re-run the corpus differential and the Chromium lane on it.
+- [ ] **Chromium first-run timeout flake (watch item).** `browser-test.mjs` has twice hit a one-off
+  timeout on the first run after a cold wasm build (~1 in 8 locally; once with a
+  `memory access out of bounds` pageerror), never reproducing on re-run and never on Node. Diagnose
+  (suspect: a stale view or an init race visible only under a cold Worker spin-up) or, failing
+  that, make the CI lane retry once so a known flake doesn't red a PR.
+
 ## Verification
 
 - **Builds:** the two `cargo build` lines under **Reproduce** (wasm64 via build-std; wasm32 smoke).
