@@ -6544,7 +6544,7 @@ fn mask_addr(
     // into its parent slice (`+ sub_base`), so it too faults out-of-child instead of aliasing. Elided
     // accesses (proven `< reserved`) need no check. The no-memory / degenerate `mask == 0` case keeps
     // the mask (a 1-byte / memoryless window has no reservation to bound against).
-    if !elide && lower.mask != 0 {
+    if !elide && lower.mask != 0 && confine_mode() != ConfineMode::Mask {
         // `reserved = mask + 1` (a power of two ≤ 2^63); the reservation this window is confined to.
         let reserved = lower.mask.wrapping_add(1);
         let need = (width as u64).saturating_add(offset);
@@ -6563,6 +6563,23 @@ fn mask_addr(
         b.switch_to_block(trap_blk);
         emit_trap(b, lower, TrapKind::MemoryFault);
         b.switch_to_block(cont);
+        // Spectre-v1 hardening spike (bench-only): clamp the address to 0 on the speculative
+        // path with a branchless conditional move, so a misspeculated OOB load reads window
+        // byte 0 instead of an arbitrary address (Wasmtime's `heap_access_spectre_mitigation`).
+        let eff = match confine_mode() {
+            ConfineMode::Cmov => {
+                let zero = b.ins().iconst(I64, 0);
+                b.ins().select_spectre_guard(oob, zero, eff)
+            }
+            // check-for-trap + the old AND as the speculative clamp: a misspeculated OOB
+            // access is masked back into `[0, reserved)` (the old model's Spectre-v1 posture)
+            // while the architectural path still traps at the check.
+            ConfineMode::Both => {
+                let m = b.ins().iconst(I64, lower.mask as i64);
+                b.ins().band(eff, m)
+            }
+            _ => eff,
+        };
         // The bounds check proved `addr+offset+width <= mapped`, so `eff` is in `[0, mapped)`; shift it
         // into the §14 sub-window slice (`+ sub_base`) before adding the window base — elided for a
         // top-level window so ordinary codegen is byte-identical to before nesting existed.
@@ -6591,6 +6608,27 @@ fn mask_addr(
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)
+}
+
+/// Bench-only confinement-mode override (`SVM_CONFINE`): `check` (default, trap-confinement as
+/// merged), `cmov` (check + Spectre-v1 cmov clamp), `mask` (the old wrap-confinement AND) — so one
+/// binary can A/B/C the three lowerings. Not for production use: `mask` restores wrap semantics.
+#[derive(PartialEq, Clone, Copy)]
+enum ConfineMode {
+    Check,
+    Cmov,
+    Mask,
+    Both,
+}
+
+fn confine_mode() -> ConfineMode {
+    static MODE: std::sync::OnceLock<ConfineMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SVM_CONFINE").as_deref() {
+        Ok("cmov") => ConfineMode::Cmov,
+        Ok("mask") => ConfineMode::Mask,
+        Ok("both") => ConfineMode::Both,
+        _ => ConfineMode::Check,
+    })
 }
 
 /// Unknown upper bound — the value may be anything (so its accesses must be masked).
