@@ -15164,9 +15164,30 @@ impl<'a> BlockCtx<'a> {
                 // A constexpr interior pointer, or a pointer materialized from an integer
                 // (`inttoptr`/`ptrtoint` over constants — e.g. Rust's `NonNull::dangling()` for an
                 // empty `Vec`, an `inttoptr(align)`), folds to its constant `i64` window value.
-                Constant::GetElementPtr(_) | Constant::IntToPtr(_) | Constant::PtrToInt(_) => {
+                Constant::GetElementPtr(_) | Constant::IntToPtr(_) => {
                     let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
                     Ok(self.push(Inst::ConstI64(v)))
+                }
+                // A constexpr `ptrtoint` folds the same way, but honors its **target width**: a
+                // `ptrtoint (ptr @g to i32)` (pointer-difference idioms over globals, e.g. ltests'
+                // `strchr(ops, op) - ops` as `int`) is an `i32` value — emitting the raw `i64`
+                // address would feed an I64 into I32 arithmetic (verify TypeMismatch). Mirrors the
+                // instruction-level `PtrToInt` (`emit_trunc(64, to)`); ≤32-bit targets mask to the
+                // canonical zero-extended narrow form.
+                Constant::PtrToInt(u) => {
+                    let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
+                    let to = int_bits(u.to_type.as_ref())
+                        .ok_or_else(|| Error::Unsupported("const ptrtoint to non-int".into()))?;
+                    if to <= 32 {
+                        let mask = if to == 32 {
+                            u32::MAX as u64
+                        } else {
+                            (1u64 << to) - 1
+                        };
+                        Ok(self.push(Inst::ConstI32((v as u64 & mask) as i32)))
+                    } else {
+                        Ok(self.push(Inst::ConstI64(v)))
+                    }
                 }
                 other => unsup(format!("constant operand {other:?}")),
             },

@@ -1052,6 +1052,24 @@ fn narrow_signed_shift_div_rem() {
 }
 
 #[test]
+fn const_ptrtoint_i32_width() {
+    // A constexpr `ptrtoint (ptr @g to i32)` is an **i32** value: the translator folds constant
+    // pointers to their `i64` window address, but must honor ptrtoint's target width — emitting the
+    // raw I64 fed an i32 subtract and failed verification (TypeMismatch), hit by ltests.c's
+    // `strchr(ops, op) - ops` as `int`. The difference is address-independent, so the differential
+    // checks the value, not the (different) native vs guest addresses.
+    let src = "static const char ops[] = \"ZBRGLTIF\";\n\
+               int run(int s);\n\
+               int run(int s){\n\
+                 const char *p = ops + (s % 7) + 1;\n\
+                 int off = (int)(long)p - (int)(long)ops;   /* sub i32 …, ptrtoint(@ops to i32) */\n\
+                 return off * 3 + 1;\n\
+               }\n\
+               int main(void){ return run(4); }";
+    check_vs_native("const_ptrtoint_i32_width", src, 4);
+}
+
+#[test]
 fn signed_narrow_minmax() {
     // Companion to `narrow_minmax_noncanonical`: a `signed char` min reduction that `-O2` lowers to a
     // scalar `llvm.smin.i8` whose operand is a *negative* i8 (here -100). Narrow values are held
