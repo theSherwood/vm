@@ -27,6 +27,7 @@ use svm_ir::{FuncIdx, Module, Resolved, ValType};
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
 pub use svm_interp::{Quota, Value};
+pub mod fs;
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 pub use svm_peval::{SpecArg, SpecConfig};
 
@@ -3176,6 +3177,21 @@ impl Instance {
     /// the uniform "pick a backend, set the knobs, run" entry. Returns the outcome + captured output,
     /// or `Err` on a guest trap / compile failure.
     pub fn run(&self, backend: Backend, config: &RunConfig) -> Result<Run, String> {
+        self.run_with_caps(backend, config, &[])
+    }
+
+    /// [`run`](Instance::run), plus **extra named capabilities** granted for this run only — the
+    /// wasm-style configurable-import path for capabilities *outside* the fixed §3e prefix (e.g. a
+    /// [`fs`](crate::fs) backend). Each `(name, cap)` is granted on the host and registered in the
+    /// §7 capability-name directory (F7); the guest reaches it at runtime via
+    /// `cap.self.resolve(name)` (`__vm_cap_resolve` from C) + `cap.call` (`__vm_host_call`) — no
+    /// stash slot, no ABI change, no authority unless the embedder injects it.
+    pub fn run_with_caps(
+        &self,
+        backend: Backend,
+        config: &RunConfig,
+        extra_caps: &[(&str, HostCap)],
+    ) -> Result<Run, String> {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
@@ -3185,6 +3201,10 @@ impl Instance {
         host.stdin = config.stdin.clone();
         host.set_quota(config.limits.quota());
         let args = self.grant_caps(&mut host, win);
+        for (name, cap) in extra_caps {
+            let handle = (cap.grant)(&mut host, win);
+            host.register_cap_name(name, handle);
+        }
 
         let outcome = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
