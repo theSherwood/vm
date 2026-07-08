@@ -357,3 +357,56 @@ llvm-link $CORE.bc $LIBS.bc harness.bc tests.bc guest_shim.bc guest_trig.bc gues
 `-fno-strict-aliasing` (exactly as fdlibm does natively).
 ```
 
+
+# Lua suite-sweep fixture (21 more official files)
+
+`lua_sweep.bc` runs **twenty-one more unmodified official test files** in one bundle — light-to-heavy:
+`tracegc`, `verybig`, `big`, `gengc`, `goto`, `events`, `code`, `bitwise`, `closure`, `tpack`,
+`literals`, `errors`, `nextvar`, `sort`, `db`, `constructs`, `locals`, `cstack`, `strings`, `gc`,
+`calls` — each as its own chunk in a fresh `lua_State` under `pcall`, with every guest-available
+library open. Test `tests/lua_sweep.rs` asserts `Returned([I32(0)])`; the JIT run gates CI, the
+interpreter runs are `#[ignore]`d full-depth gates (long, like the extended fuzz). The same
+harness+bundle built natively also exits 0 (the differential oracle). With this, **28 of the suite's
+33 files run** — excluded are `api`/`main`/`all` (need the internal `T` C-test library / the
+standalone `lua` binary), `attrib` (the real `package` searchers), and `heavy` (deliberate memory
+exhaustion).
+
+The harness (`lua_sweep_harness.c`) extends the files.lua one with what the wider suite needs:
+- a **real allocator** — segregated power-of-two free lists over the 48 MiB static arena (the
+  bump-only arena exhausted under `gc.lua`'s collector stress; freed blocks now recycle), reset per
+  file. 48 MiB keeps the guest window inside the reference JIT's 64 MiB cap; to make `locals.lua`'s
+  stack-overflow-with-`<close>` test fit (a 1M-slot Lua stack costs ~190 B/frame ≈ 93 MiB at
+  overflow), the bundle's Lua is built with **`LUAI_MAXSTACK = 250000`** — an edit to `luaconf.h`,
+  Lua's own embedder porting header (the tests only need *a* ceiling to overflow, not that specific
+  one; native uses the identical header, so the differential is symmetric);
+- **sibling-module `require`**: suite files require each other (`bitwise` → `bwcoercion`,
+  `cstack`/`locals` → `tracegc`); the embedded module sources are pre-run into the registry `_LOADED`
+  table, exactly where stock `require` caches them — plus the stock **preload searcher**
+  (`package.preload[name]`, how `bitwise.lua` installs its `bit32` shim);
+- a faithful **`package` global** (`loaded` = `_LOADED`, `preload` = `_PRELOAD`, and
+  `_LOADED["package"]` set — `nextvar.lua`'s global sweep erases any global not in `package.loaded`);
+- **`@name.lua` chunknames** (how `dofile` names file chunks) — `db.lua` asserts
+  `debug.getinfo(...).source` matches `^@.*db%.lua$`.
+
+**One real translator bug and three guest-snprintf gaps fell out** (each caught by `strings.lua`,
+each verified against native):
+- **`BIG_NLIMBS` 40 → 48.** The bignum float formatter's big integers were sized for a double's exact
+  value (`2^1074` ≈ 34 limbs) — but a fixed format also scales by `10^prec`, and `%.99f` of a
+  near-maximum double reaches `2^1023 · 10^99 ≈ 2^1352` (43 limbs): the 40-limb ceiling **silently
+  truncated the digits** (388 chars instead of 410). 48 limbs (1536 bits) covers every finite double
+  at C-cap precision; the scratch layout shifted accordingly (`FMT_*_O`, `FLOAT_SCRATCH_SIZE`).
+- Guest `snprintf`: `%p` honors width/`-`; `%a`/`%A` hex-floats exist (exact trailing-zero-trimmed
+  form for Lua's `%q` float round-trip, plus precision with round-half-to-even and carry — the
+  `%+.2A` modifier checks); integer conversions print nothing for a zero value at zero precision
+  (ISO); float conversions apply `0`-padding, `#` (point at precision 0), and field width in the
+  guest layer (the bignum helpers now produce unpadded content).
+
+## Regenerating (sweep)
+
+Like the files.lua fixture but with `lua_sweep_harness.c`, and `lua_sweep_tests.c` generated from the
+21 files (in the order above) plus `tracegc.lua` + `bwcoercion.lua` as the embedded sibling modules
+(the `lua_modules` arrays). Build from a **copy of the Lua sources with `luaconf.h` edited** to
+`LUAI_MAXSTACK 250000` — note that `-DLUAI_MAXSTACK` does *not* work (luaconf.h redefines it
+unconditionally) and `-include`-ing an edited copy silently breaks (`l_likely` is `LUA_CORE`-gated);
+the quoted `#include "luaconf.h"` resolves against the source directory, so the edited copy must sit
+next to the `.c` files. Native oracle: same source copy against real libc.
