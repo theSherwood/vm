@@ -18,8 +18,12 @@ const LARGE: i32 = 2_000_000;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let src = args.next().expect("usage: spectre_bench <kernels.c> <sym,sym,...>");
-    let syms = args.next().expect("usage: spectre_bench <kernels.c> <sym,sym,...>");
+    let src = args
+        .next()
+        .expect("usage: spectre_bench <kernels.c> <sym,sym,...>");
+    let syms = args
+        .next()
+        .expect("usage: spectre_bench <kernels.c> <sym,sym,...>");
     let bc = std::env::temp_dir().join(format!("svm_spectre_bench_{}.bc", std::process::id()));
     let ok = Command::new("clang")
         .args(["-O2", "-emit-llvm", "-c"])
@@ -52,7 +56,9 @@ fn main() {
             &[svm_interp::Value::I64(sp), svm_interp::Value::I32(SMALL)],
             &mut fuel,
         );
-        let (got, _mem) = cm.run(&[sp, SMALL as i64], None, None, None).expect("jit runs");
+        let (got, _mem) = cm
+            .run(&[sp, SMALL as i64], None, None, None)
+            .expect("jit runs");
         let got0 = match got {
             svm_jit::JitOutcome::Returned(vals) => vals[0],
             other => panic!("JIT did not return on {sym}: {other:?}"),
@@ -61,7 +67,10 @@ fn main() {
         // zero-extends into the i64 return slot.
         let want0 = as_i64(want.expect("interp runs")[0]) as i32;
         let got0 = got0 as i32;
-        assert_eq!(want0, got0, "MISCOMPILE on {sym}: interp={want0} jit={got0}");
+        assert_eq!(
+            want0, got0,
+            "MISCOMPILE on {sym}: interp={want0} jit={got0}"
+        );
         let ns = per_iter(large, |n| {
             let r = cm.run(&[sp, n as i64], None, None, None).expect("jit runs");
             black_box(&r);

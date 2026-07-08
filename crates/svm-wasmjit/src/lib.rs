@@ -19,15 +19,17 @@
 //!
 //! ## Confinement (the load-bearing part)
 //!
-//! Every guest access replicates `svm_mask::Window::checked` **exactly** (§4): with
-//! `mask = (1 << DEFAULT_RESERVED_LOG2) - 1` and `mapped = 1 << size_log2`,
+//! Every guest access replicates the trap-confinement `svm_mask::Window::checked` **exactly**
+//! (§4, D38): with `mask = (1 << DEFAULT_RESERVED_LOG2) - 1` and `mapped = 1 << size_log2`,
 //!
 //! ```text
-//! rel = (addr + offset) & mask;   if rel > mapped - width { trap(MemoryFault) }
-//! access linear memory at win + rel
+//! eff = addr + offset;   if eff > mapped - width { trap(MemoryFault) }   // unmasked check
+//! access linear memory at win + (eff & mask)   // clamp: no-op past the check
 //! ```
 //!
-//! both constants baked at compile time. SVM-specific traps (memory fault, fuel) route through the
+//! both constants baked at compile time. An out-of-window address **faults at the offending
+//! access** — it is never wrapped back into the window (the `& mask` after the check mirrors the
+//! native JIT's check+clamp lowering and cannot change a passing address). SVM-specific traps (memory fault, fuel) route through the
 //! imported `env.trap(code)` (the host records the code; the following `unreachable` aborts);
 //! div/rem-by-zero, signed-overflow, and `unreachable` map to wasm's own identical traps.
 //!
@@ -52,8 +54,8 @@ use svm_ir::{
 
 /// Trap code delivered through `env.trap` when the per-dispatch fuel counter goes negative.
 pub const TRAP_OUT_OF_FUEL: i32 = 1;
-/// Trap code delivered through `env.trap` when a confined access fails the guard check
-/// (`rel + width > mapped` — the §4 guard-region fault).
+/// Trap code delivered through `env.trap` when an access fails the trap-confinement bounds
+/// check (`addr + offset + width > mapped` — the §4 `MemoryFault` at the offending access).
 pub const TRAP_MEMORY_FAULT: i32 = 2;
 
 /// Why a module was refused. Fail-closed: the caller runs the module on the interpreter tier.
@@ -508,9 +510,13 @@ fn emit_trap(code: &mut Vec<u8>, trap_code: i32) {
     code.push(OP_UNREACHABLE);
 }
 
-/// Confine + guard-check the effective address for a `width`-byte access, leaving the confined
-/// 32-bit linear-memory address on the stack: `win + ((addr + offset) & MASK)`, trapping
-/// `MemoryFault` unless `rel <= mapped - width` (exactly `svm_mask::Window::checked`).
+/// Confine the effective address for a `width`-byte access under **trap-confinement** (§4, D38),
+/// leaving the confined 32-bit linear-memory address on the stack: bounds-check the *unmasked*
+/// `eff = addr + offset` (trap `MemoryFault` unless `eff <= mapped - width` — exactly the
+/// trap-confinement `svm_mask::Window::checked`, so an out-of-window address faults instead of
+/// wrapping back in), then compute `win + (eff & MASK)`. The `& MASK` clamp is a no-op past the
+/// check (`eff < mapped ≤ reserved`), kept to mirror the native JIT's check+clamp lowering and to
+/// keep the following `i32.wrap` in-window as defense-in-depth.
 fn emit_confine(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
@@ -523,15 +529,12 @@ fn emit_confine(
     uleb(code, addr_local as u64);
     code.push(OP_I64_CONST);
     sleb64(code, offset as i64);
-    code.push(0x7c); // i64.add
-    code.push(OP_I64_CONST);
-    sleb64(code, MASK as i64);
-    code.push(0x83); // i64.and → rel
+    code.push(0x7c); // i64.add → eff (unmasked)
     code.push(OP_LOCAL_TEE);
     uleb(code, cx.ea_l as u64);
     code.push(OP_I64_CONST);
     sleb64(code, mapped.wrapping_sub(width) as i64);
-    code.push(0x56); // i64.gt_u: rel > mapped - width ?
+    code.push(0x56); // i64.gt_u: eff > mapped - width ?
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
@@ -540,6 +543,9 @@ fn emit_confine(
     cx.depth -= 1;
     code.push(OP_LOCAL_GET);
     uleb(code, cx.ea_l as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, MASK as i64);
+    code.push(0x83); // i64.and → clamp (no-op past the check)
     code.push(0xa7); // i32.wrap_i64
     code.push(OP_LOCAL_GET);
     uleb(code, 0); // win
