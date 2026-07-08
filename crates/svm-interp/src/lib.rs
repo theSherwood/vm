@@ -9422,6 +9422,57 @@ impl Host {
         Ok(out)
     }
 
+    /// **Drain the live non-durable handles** so the domain becomes snapshottable (DURABILITY.md §12.5
+    /// "drainable non-durable bindings" / Phase-4 handle hardening). Closes every live slot holding a
+    /// binding [`Self::capture_durable_handles`] would refuse on — the ones carrying out-of-line host
+    /// state or native pointers (`SharedRegion`/`Module`/`IoRing`/`Blocking`/`JitDomain`/`JitCode`/
+    /// `HostFn`) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
+    /// generation** (D37), so a guest's stale handle value becomes a dead generation and any later
+    /// `cap.call` on it is an inert `CapFault`, never authority into a recycled slot. Returns the drained
+    /// handles in ascending slot order (for the embedder to audit the relinquished authority). The exact
+    /// complement of [`Self::capture_durable_handles`]'s refusal set: after a drain, `capture` succeeds,
+    /// so a subtree that held non-durable authority can now be frozen.
+    ///
+    /// This is authority **relinquishment**, the embedder's counterpart to "freeze refuses unless the
+    /// non-durable handles are closed/drained first": the guest could never reach these capabilities
+    /// across a restore (they aren't re-grantable), so dropping them is the only way to make the freeze
+    /// proceed. Call at a freeze safepoint — the STW quiesce + §12.8 4A.7 guarantee no vCPU is mid-host
+    /// call, and the embedder drains any async offload residue ([`Self::quiesce_pool`]) first, so closing
+    /// the slot orphans no in-flight work. The out-of-line backings (`rings`/`blockings`/`host_fns`/…)
+    /// are released when this per-run `Host` is dropped after the snapshot.
+    pub fn drain_non_durable(&mut self) -> Vec<NonDurableHandle> {
+        let mut drained = Vec::new();
+        for slot in 0..self.table.len() {
+            let Some(binding) = self.table[slot].entry else {
+                continue;
+            };
+            let kind = match binding {
+                // Durable (value-typed) — re-grantable on restore, so keep them.
+                Binding::Stream(_)
+                | Binding::Exit
+                | Binding::Clock
+                | Binding::Memory
+                | Binding::Yielder
+                | Binding::AddressSpace { .. }
+                | Binding::Instantiator { .. } => continue,
+                Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
+                Binding::Module(_) => NonDurableKind::Module,
+                Binding::IoRing(_) => NonDurableKind::IoRing,
+                Binding::Blocking(_) => NonDurableKind::Blocking,
+                Binding::JitDomain(_) => NonDurableKind::JitDomain,
+                Binding::JitCode { .. } => NonDurableKind::JitCode,
+                Binding::HostFn(_) => NonDurableKind::HostFn,
+            };
+            drained.push(NonDurableHandle {
+                slot: slot as u32,
+                type_id: self.table[slot].type_id,
+                kind,
+            });
+            self.table[slot].entry = None; // close: free the slot, retain the generation (D37)
+        }
+        drained
+    }
+
     fn non_durable(&self, slot: usize, kind: NonDurableKind) -> NonDurableHandle {
         NonDurableHandle {
             slot: slot as u32,

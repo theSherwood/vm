@@ -361,9 +361,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   deterministically), the **`atomic.wait` thaw fail-closed lift** (concurrent-thaw rework: frozen waiters
   re-run as real OS threads), **4A.6** (recycled-context async freeze — sparse-residue payoff, through the
   snapshot codec), and **4A.7** (parked-vCPU / `Blocking.work` latency — a durable vCPU fails closed rather
-  than enter a new blocking host call once a freeze has landed, narrowing R6). **Remaining:** the non-STW
-  Phase-4 items — handle hardening (drainable non-durable bindings), CoW clone, `SharedRegion` consistent-cut
-  (R4), and full `Blocking.work` offload cancellation (R2).
+  than enter a new blocking host call once a freeze has landed, narrowing R6), and **handle hardening**
+  (`Host::drain_non_durable` closes the live non-durable handles so a domain that held out-of-line authority
+  becomes snapshottable — the actionable form of "freeze refuses unless drained"; §12.5). **Remaining:** the
+  rest of the non-STW Phase-4 items — CoW clone, `SharedRegion` consistent-cut (R4), full `Blocking.work`
+  offload cancellation (R2), and in-flight `IoRing`/`Blocking` residue draining (idle handles drain today).
 
 ---
 
@@ -511,7 +513,8 @@ Per **live** slot (`Slot.entry.is_some()`, `svm-interp` `:4427`), sparse:
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
 presence in a live, non-drainable state makes the subtree non-snapshottable, so
-**freeze refuses** unless they're closed/drained first:
+**freeze refuses** unless they're closed/drained first (the drain is
+`Host::drain_non_durable`, below):
 
 `SharedRegion(u32)` (R4), `Module(u32)`, `IoRing(u32)` (drain residue §5),
 `Blocking(u32)` (§5 + cancellation R2), `JitDomain(u32)`, `JitCode{domain,unit}`.
@@ -530,6 +533,24 @@ slot — freeze is all-or-nothing), `restore_durable_handles` + the `grant_at` p
 `handle_capacity()` for the codec's bounds check. The value-typed descriptors
 (`DurableBinding`/`DurableHandle`) are public; `Binding` stays private. The byte-level
 **Section 3** serialization is now wired into the `svm-snapshot` container (§12.6 below).
+
+**Handle hardening — `drain_non_durable` landed (Phase-4).** The complement to the capture refusal:
+`Host::drain_non_durable() -> Vec<NonDurableHandle>` **closes every live non-durable handle** (the exact
+set `capture_durable_handles` refuses on) and returns them in ascending slot order for the embedder to
+audit the relinquished authority, leaving the durable handles untouched. Each close frees the slot but
+**retains its generation** (D37), so a guest's stale handle value becomes a dead generation — any later
+`cap.call` on it is an inert `CapFault`, never authority into the recycled slot. After a drain, `capture`
+succeeds, so a subtree that held non-durable authority becomes **snapshottable** — the actionable form of
+"freeze refuses unless the non-durable handles are closed/drained first". The freeze is host-driven (STW),
+so the embedder calls this at a freeze safepoint (the STW quiesce + §12.8 4A.7 guarantee no vCPU is
+mid-host-call; async offload residue drains via `quiesce_pool` first). Pinned by
+`svm-interp/tests/handle_durability.rs` (drain makes a clock+io_ring+host_fn domain snapshottable; a
+drained handle faults at its use site; an all-durable drain is a no-op) and
+`svm-snapshot/tests/roundtrip.rs::freeze_succeeds_after_draining_a_non_durable_handle` (the freeze
+*refusal* becomes a successful serialize after the drain). *In-flight residue* draining for a busy
+`IoRing`/`Blocking` (vs. an idle handle) rides the §5 run-end pool quiesce / the deferred `Blocking`
+cancellation (R2); the guest-facing first-class `cap.self.close` op (vs. this host primitive) is a possible
+ergonomics follow-up.
 
 ### 12.6 Round-trip / equivalence contract
 
