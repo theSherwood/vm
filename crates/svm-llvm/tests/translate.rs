@@ -937,6 +937,49 @@ fn fcmp_unordered_ordered() {
 }
 
 #[test]
+fn fcmp_ordered_unordered_predicates() {
+    // Every LLVM float compare predicate must be **NaN-correct**: the ordered forms (`olt`/`ole`/
+    // `ogt`/`oge`/`oeq`, and `one` via `islessgreater`) are false when an operand is NaN; the
+    // unordered forms (`une` from C `!=`, and `uge`/`ugt`/`ule`/`ult` from negating an ordered
+    // compare) are true. Earlier the on-ramp collapsed ordered/unordered to one op, so e.g. Lua's
+    // `luaV_flttointeger` (`n >= -2^63 && n < 2^63` after clang emits *unordered* forms) accepted a
+    // NaN and `NaN <= math.maxinteger` returned true. Differential interp+JIT with a runtime NaN.
+    let src = "int f(int which, double a, double b){ switch(which){ \
+               case 0: return a <  b;    /* olt */ \
+               case 1: return a <= b;    /* ole */ \
+               case 2: return a >  b;    /* ogt */ \
+               case 3: return a >= b;    /* oge */ \
+               case 4: return a == b;    /* oeq */ \
+               case 5: return a != b;    /* une */ \
+               case 6: return !(a <  b); /* uge */ \
+               case 7: return !(a <= b); /* ugt */ \
+               case 8: return !(a >  b); /* ule */ \
+               case 9: return !(a >= b); /* ult */ \
+               case 10: return __builtin_islessgreater(a, b); /* one */ \
+               default: return 0; } }";
+    // Expected truth of each predicate for (NaN, 1.0) and for the ordinary (1.0, 2.0).
+    let nan_expected = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0];
+    let norm_expected = [1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1];
+    let nan = f64::NAN;
+    for (which, &e) in nan_expected.iter().enumerate() {
+        check(
+            &format!("fcmp_nan_{which}"),
+            src,
+            &[Value::I32(which as i32), Value::F64(nan), Value::F64(1.0)],
+            &[Value::I32(e)],
+        );
+    }
+    for (which, &e) in norm_expected.iter().enumerate() {
+        check(
+            &format!("fcmp_norm_{which}"),
+            src,
+            &[Value::I32(which as i32), Value::F64(1.0), Value::F64(2.0)],
+            &[Value::I32(e)],
+        );
+    }
+}
+
+#[test]
 fn bitreverse_intrinsic() {
     // A bit-reversal loop `-O2` folds into `llvm.bitreverse.i32`; lowered inline via the log-N
     // swap network. Checked against native `cc`.
@@ -977,6 +1020,35 @@ fn narrow_minmax_noncanonical() {
                }\n\
                int main(void){ return run(18); }";
     check_vs_native("narrow_minmax", src, 18);
+}
+
+#[test]
+fn narrow_signed_shift_div_rem() {
+    // A **signed** narrow op reads its whole i32 container as signed, but a narrow `iN` value loaded
+    // from memory is *zero-extended* (canonical) — its sign bit is buried at bit N-1, not the
+    // container's bit 31. So `ashr`/`sdiv`/`srem` on an `i8`/`i16` must sign-extend the operand first.
+    // Before the fix `ashr i8 0x80,7` gave `+1` (should be `-1`), which dropped Lua's `getobjname`
+    // operand name (`testMMMode` compiles to exactly `ashr i8 luaP_opmodes[op],7`); `(i8)-6/3` gave the
+    // unsigned `83`, not `-2`. `volatile` forces the values through memory (a real `load i8`), and the
+    // negatives exercise the sign path. Differential interp+JIT+native `cc`.
+    let src = "int run(int s);\n\
+               int run(int s){\n\
+                 volatile unsigned char ub = (unsigned char)(0x80 ^ (s & 0x20));\n\
+                 signed char sb = ub;                 /* negative i8 */\n\
+                 volatile unsigned short uh = (unsigned short)(0x8000 ^ (s << 4));\n\
+                 short sh = uh;                        /* negative i16 */\n\
+                 int r = 0;\n\
+                 r = r * 37 + (int)(sb >> 2);          /* ashr i8  */\n\
+                 r = r * 37 + (int)(sh >> 4);          /* ashr i16 */\n\
+                 r = r * 37 + (int)(sb / 3);           /* sdiv i8  */\n\
+                 r = r * 37 + (int)(sb % 3);           /* srem i8  */\n\
+                 r = r * 37 + (int)(sh / 7);           /* sdiv i16 */\n\
+                 r = r * 37 + (int)(sh % 7);           /* srem i16 */\n\
+                 r = r * 37 + (int)((unsigned char)ub >> 2);  /* lshr i8 stays unsigned */\n\
+                 return r & 0xff;\n\
+               }\n\
+               int main(void){ return run(5); }";
+    check_vs_native("narrow_signed_shift_div_rem", src, 5);
 }
 
 #[test]
@@ -1608,15 +1680,8 @@ fn computed_goto_lowers_indirectbr_to_br_table() {
     let Some(bc) = compile_to_bc("computed_goto_struct", COMPUTED_GOTO_SRC) else {
         return;
     };
-    // The recovery found the dispatch table's blockaddress labels (one global, ≥ 2 entries).
-    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
-        .expect("blockaddress recovery should find the dispatch table");
-    assert!(
-        ba.per_global.values().any(|labels| labels.len() >= 2),
-        "expected a dispatch-table global with multiple blockaddress labels, got {:?}",
-        ba.per_global
-    );
-    // The `indirectbr` lowered to a `br_table` terminator.
+    // The reader recovered the dispatch table's `blockaddress` labels (internally, via `ll::parse`),
+    // so the `indirectbr` lowered to a `br_table` terminator.
     let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
     let has_br_table = t
@@ -1660,14 +1725,9 @@ fn computed_goto_phi_recovery_finds_operand_blockaddress() {
     let Some(bc) = compile_to_bc("computed_goto_phi_struct", COMPUTED_GOTO_PHI_SRC) else {
         return;
     };
-    let ba = svm_llvm::blockaddr::read_block_addrs(bc.to_str().unwrap())
-        .expect("recovery should find blockaddresses");
-    assert!(
-        !ba.phi.is_empty(),
-        "expected a φ-threaded (operand-position) blockaddress, got phi map {:?}",
-        ba.phi
-    );
-    // And it still translates + verifies (the operand-position label resolved, no fail-closed).
+    // The φ-threaded (operand-position) `blockaddress` recovery path resolves internally, so the
+    // module translates + verifies (no fail-closed). Its runtime correctness is covered by
+    // `computed_goto_phi_threaded_blockaddress` (a native differential).
     let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
     svm_verify::verify_module(&t.module).expect("verify");
 }
@@ -2056,6 +2116,297 @@ fn libc_ldexp_bit_exact() {
         }\n\
         int main(void){ return run(0); }";
     check_run_byte_vs_native("libc_ldexp", src, 0);
+}
+
+#[test]
+fn libc_frexp_bit_exact() {
+    // The synthesized `__svm_frexp` over a grid spanning the normal range, a power-of-two boundary,
+    // ±0, a negative value, a subnormal (`1e-310`), and the special path (±inf). For each input both
+    // the returned mantissa's raw f64 bits and the written exponent are folded into the checksum, so
+    // the result *and* the `*e` out-param are pinned bit-identical to libc `frexp` on all three
+    // engines. `volatile` inputs keep the calls past `-O2`.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {1.0, 0.5, 3.14159265358979, 1e300, 1e-300,\n\
+                                    0.0, -2.5, 1024.0, 1e-310, 1.0/0.0};\n\
+          volatile double neg = -1.0/0.0;\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) {\n\
+            int e; double m = frexp(xs[i], &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL;\n\
+          }\n\
+          { int e; double m = frexp(neg, &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL; }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_frexp", src, 0);
+}
+
+#[test]
+fn libc_fmod_bit_exact() {
+    // The synthesized `__svm_fmod` (musl's exact 64-bit remainder) over a 10×8 grid of (x, y) pairs:
+    // normal/normal, |x|<|y| (early return), |x|==|y| (±0), every sign combination, a large quotient
+    // (many loop iterations — `1e300 % 7`), subnormal inputs (`1e-310`, the smallest subnormal
+    // `4.9e-324`, a subnormal divisor `1e-311`), and the special paths (`y==0` and `x==inf` → NaN).
+    // A finite result is folded by its raw f64 bits (so it is pinned bit-identical to libc); a NaN
+    // result is folded as a canonical constant (payload-independent) so the check still verifies that
+    // both sides produce NaN without depending on the exact NaN payload. `volatile` keeps the calls.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {5.5, 7.0, -7.0, 1e300, 3.0, 2.0, -2.0, 1e-310, 4.9e-324, 1.0/0.0};\n\
+          volatile double ys[8]  = {2.0, 3.0, -3.0, 1e300, 7.0, 2.0, 1e-311, 0.0};\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) for (int j=0;j<8;j++) {\n\
+            double r = fmod(xs[i], ys[j]);\n\
+            unsigned long long bits;\n\
+            if (r != r) bits = 0x7ff8000000000000ULL; /* canonicalize any NaN */\n\
+            else { union { double d; unsigned long long u; } cvt; cvt.d = r; bits = cvt.u; }\n\
+            acc = (acc ^ bits) * 1099511628211ULL;\n\
+          }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_fmod", src, 0);
+}
+
+#[test]
+fn libc_localeconv_c_locale() {
+    // `localeconv()` returns the synthesized read-only C-locale `lconv` struct. Read `decimal_point`
+    // (".", plus its NUL), an empty string field (`thousands_sep`/`grouping` → ""), and two of the
+    // `char` fields (`frac_digits`/`p_sign_posn` → CHAR_MAX). With no `setlocale`, native runs in the
+    // "C" locale, so every field matches the synthesized struct — same byte on all three engines.
+    let src = "#include <locale.h>\n\
+        int run(int seed){\n\
+          struct lconv *lc = localeconv();\n\
+          int acc = 0;\n\
+          acc += (unsigned char)lc->decimal_point[0];\n\
+          acc += (unsigned char)lc->decimal_point[1];\n\
+          acc += (unsigned char)lc->thousands_sep[0];\n\
+          acc += (unsigned char)lc->grouping[0];\n\
+          acc += (lc->frac_digits & 0xff);\n\
+          acc += (lc->p_sign_posn & 0xff);\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_localeconv", src, 0);
+}
+
+#[test]
+fn demo_libm_vs_native() {
+    // The bundled **guest `libm`** (`demos/libm/libm.c`, fdlibm `exp`/`log`/`pow`/`sin`/`cos`): a
+    // program that needs the transcendentals brings them as ordinary guest C — no host math
+    // capability, no translator intrinsic — and a guest definition shadows the libc-name binding the
+    // on-ramp would otherwise synthesize. The driver evaluates each over runtime grids and writes the
+    // raw f64 image; since the math is guest code, native `cc` compiles the same source, so the bytes
+    // are identical across the tree-walker, the bytecode VM, the JIT, and native. `pow` also exercises
+    // `sqrt` (→ the SVM `f64.sqrt` op, `y=0.5`) and `scalbn` (→ `__svm_ldexp`).
+    //
+    // Built with `-fno-vectorize -fno-slp-vectorize`: clang would auto-SIMD some of the polynomial
+    // evaluation into `<2 x double>` (the §17 vector lane, outside this scalar on-ramp's scope), and
+    // exact IEEE arithmetic gives the identical bytes scalar-vs-vectorized — so the on-ramp consumes
+    // scalar bitcode while the native oracle keeps vectorizing (the split the corpus demos use).
+    check_demo_vs_native_flags(
+        "libm",
+        "libm/libm_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn libm_guest_exp_log_accurate_vs_system() {
+    // Accuracy gate (native only): the byte-identical differential above proves the on-ramp *executes*
+    // the guest libm faithfully, but — same source on both lanes — it cannot catch a transcription
+    // error (both lanes would be equally wrong). So compile `libm.c` with its symbols renamed
+    // (`-Dexp=svm_exp -Dlog=svm_log`) and compare against the system `<math.h>` over a grid, asserting
+    // each result is within 2 ULP. This validates the fdlibm transcription against a real libm.
+    let probe = "#include <math.h>\n\
+        #include <stdint.h>\n\
+        double svm_exp(double); double svm_log(double); double svm_pow(double,double);\n\
+        double svm_sin(double); double svm_cos(double);\n\
+        static int ulp_ok(double a, double b){\n\
+          if (a==b) return 1;\n\
+          if (a!=a && b!=b) return 1; /* both NaN */\n\
+          int64_t ia, ib; __builtin_memcpy(&ia,&a,8); __builtin_memcpy(&ib,&b,8);\n\
+          if (ia<0) ia = (int64_t)0x8000000000000000ULL - ia;\n\
+          if (ib<0) ib = (int64_t)0x8000000000000000ULL - ib;\n\
+          int64_t d = ia>ib ? ia-ib : ib-ia; return d <= 2;\n\
+        }\n\
+        int main(void){\n\
+          double xs[] = {0.0,0.5,1.0,2.0,3.14159265,10.0,-1.0,-5.0,100.0,0.001,709.0,-700.0};\n\
+          double ls[] = {1.0,2.0,0.5,2.718281828459045,10.0,1e10,1e-10,0.001,1e300,123456.789};\n\
+          double pb[] = {2.0,3.0,-2.0,-2.0,10.0,0.5,9.0,-1.0,1.5,2.0,-3.0,0.5,7.0};\n\
+          double pe[] = {10.0,3.0,3.0,4.0,-2.0,0.5,0.5,2.0,2.5,0.5,3.0,-1.0,2.0};\n\
+          /* sin/cos: generic O(1)-result args (avoid exact multiples of pi where the residual is\n\
+             pathologically tiny), spanning every quadrant up to the medium-path bound (~1.6e6). */\n\
+          double ts[] = {0.3,0.5,0.7853981633974483,1.0,1.5,2.0,2.5,3.0,5.0,10.0,100.0,\n\
+                         1000.0,12345.678,1e5,1e6,-0.5,-3.0,-100.0};\n\
+          for (unsigned i=0;i<sizeof xs/sizeof*xs;i++) if(!ulp_ok(svm_exp(xs[i]), exp(xs[i]))) return 1;\n\
+          for (unsigned i=0;i<sizeof ls/sizeof*ls;i++) if(!ulp_ok(svm_log(ls[i]), log(ls[i]))) return 2;\n\
+          for (unsigned i=0;i<sizeof pb/sizeof*pb;i++) if(!ulp_ok(svm_pow(pb[i],pe[i]), pow(pb[i],pe[i]))) return 3;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(svm_sin(ts[i]), sin(ts[i]))) return 4;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(svm_cos(ts[i]), cos(ts[i]))) return 5;\n\
+          return 0;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_libm_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("svm_libm_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("svm_libm_acc_{}", std::process::id()));
+    let libm =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/libm/libm.c");
+    std::fs::write(&c, probe).expect("write probe");
+    // Compile the guest libm with its symbols renamed (`exp`→`svm_exp`, `log`→`svm_log`) so the probe
+    // can hold both it *and* the system `exp`/`log` for comparison.
+    let built = Command::new("cc")
+        .args([
+            "-O2",
+            "-fno-builtin",
+            "-Dexp=svm_exp",
+            "-Dlog=svm_log",
+            "-Dpow=svm_pow",
+            "-Dsin=svm_sin",
+            "-Dcos=svm_cos",
+            "-c",
+        ])
+        .arg(&libm)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping libm accuracy (cc unavailable)");
+            return;
+        }
+    }
+    // Link the probe (its own `exp`/`log` are the system libm) against the renamed guest object.
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest libm vs system: failing stage {code} (1=exp, 2=log, 3=pow, 4=sin, 5=cos)"
+    );
+}
+
+#[test]
+fn demo_strtod_vs_native() {
+    // The guest **`strtod`** (`demos/strtod/strtod.c`): a program that needs decimal→f64 parsing
+    // brings it as ordinary guest C, and the guest definition shadows the on-ramp's `strtod` trap
+    // stub. The driver parses a grid of decimal strings and writes each result's raw f64 image + the
+    // `endptr` offset; since the parser is guest code, native `cc` compiles the same source, so the
+    // bytes are identical across the tree-walker, the bytecode VM, the JIT, and native.
+    //
+    // Built `-fno-vectorize -fno-slp-vectorize` (the bignum limb loops would auto-SIMD to `<… x i32>`,
+    // the v128 lane outside this scalar on-ramp; exact integer arithmetic is identical
+    // scalar-vs-vectorized, the corpus-demo split).
+    check_demo_vs_native_flags(
+        "strtod",
+        "strtod/strtod_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn strtod_guest_correctly_rounded_vs_system() {
+    // Correctness gate (native only): the byte-identical differential proves the on-ramp *executes*
+    // the guest `strtod` faithfully, but — same source on both lanes — cannot catch an algorithm
+    // error. Correctly-rounded decimal→f64 is *unique*, so a correct guest `strtod` matches glibc's
+    // bit-for-bit. Compile `strtod.c` renamed (`-Dstrtod=svm_strtod`) and assert the returned bits
+    // *and* the `endptr` offset match the system `strtod` over a grid spanning the hard cases:
+    // subnormals + the smallest-subnormal halfway tie, the 2^53 boundary, max-double, overflow→inf,
+    // underflow→0, the 1e22/1e23 fast-path boundary, `0.30000000000000004`, and long digit strings —
+    // plus **hex floats** (`0x7.4`, `0x.ABCDEFp+24`, a 64-bit hex mantissa needing rounding, sub/
+    // overflow via `p`-exponents, and the malformed `0x`/`0x.`/`0x3.3.3` that must stop at the right
+    // `endptr`), the form Lua's own hex-float literals need.
+    let probe = "#include <stdlib.h>\n\
+        #include <string.h>\n\
+        double svm_strtod(const char*, char**);\n\
+        static int bad;\n\
+        static void chk(const char* s){\n\
+          char *e1,*e2; double a=svm_strtod(s,&e1), b=strtod(s,&e2);\n\
+          unsigned long long ua,ub; memcpy(&ua,&a,8); memcpy(&ub,&b,8);\n\
+          if (ua!=ub || (e1-s)!=(e2-s)) bad=1;\n\
+        }\n\
+        int main(void){\n\
+          const char* t[] = {\n\
+            \"0\",\"0.0\",\"-0.0\",\"1\",\"3.14\",\"0.5\",\"2.5\",\"100.0\",\"-2.5\",\"1e10\",\"1e-10\",\n\
+            \"1e100\",\"1e-100\",\"1.5e3\",\"123456789.123456789\",\"0.1\",\"0.3\",\n\
+            \"9007199254740992\",\"9007199254740993\",\"1.7976931348623157e308\",\n\
+            \"2.2250738585072014e-308\",\"5e-324\",\"4.9e-324\",\"2.4703282292062327e-324\",\n\
+            \"1e309\",\"1e-400\",\"0.0000001\",\"  42.0\",\"  -3.25e2\",\"1000000000000000000000\",\n\
+            \"0.30000000000000004\",\"1e22\",\"1e23\",\"0.000244140625\",\"1.25e-1\",\".5\",\"5.\",\n\
+            \"+1.5\",\"3.141592653589793\",\"1234567890123456789012345678901234567890\",\n\
+            \"9.881312916824931e-324\",\"1.1125369292536007e-308\",\"8.98846567431158e307\",\n\
+            \"abc\",\"\",\"17.0\",\"0.000244140625e3\",\n\
+            \"0x7.4\",\"0x.ABCDEFp+24\",\"0x0.51p+8\",\"0x.0p-3\",\"0xa.aP4\",\"0x4P-2\",\n\
+            \"0x0.7a7040a5a323c9d6\",\"0x.00000001\",\"0x1.8p1\",\"-0x1.8p1\",\"0x1.8\",\n\
+            \"0x1.fffffffffffffp1023\",\"0x1p1024\",\"0x1p-1074\",\"0x1p-1075\",\"0Xabcdef.0\",\n\
+            \"0x0.00000000000001\",\"0x.0000000000000000000000000000000000000000000074p4004\",\n\
+            \"0x\",\"0x.\",\"0x3.3.3\",\"0xGG\",\n\
+          };\n\
+          for (unsigned i=0;i<sizeof t/sizeof*t;i++) chk(t[i]);\n\
+          return bad;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_strtod_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("svm_strtod_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("svm_strtod_acc_{}", std::process::id()));
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/strtod/strtod.c");
+    std::fs::write(&c, probe).expect("write probe");
+    let built = Command::new("cc")
+        .args(["-O2", "-fno-builtin", "-Dstrtod=svm_strtod", "-c"])
+        .arg(&src)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping strtod accuracy (cc unavailable)");
+            return;
+        }
+    }
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest strtod != system strtod (bit/endptr mismatch)"
+    );
 }
 
 #[test]
@@ -4553,26 +4904,25 @@ extern "C" int main() {
 }
 
 // ============================================================================================
-// Milestone 2 — Rust through the on-ramp (the D54 breadth headline). `rustc` bundles its own LLVM,
-// so the bitcode version must match our pin (LLVM 18): the container's default `rustc` ships LLVM
-// 21 (rejected by the pinned `llvm-ir`), but a **pinned LLVM-18 Rust toolchain** (1.81, LLVM 18.1)
-// emits bitcode the existing reader accepts — no re-pin needed. A `no_std`/`panic=abort` crate has
-// no EH/unwinding, so it lowers like C. (CI must `rustup toolchain install 1.81.0`, as it installs
-// `llvm-18-dev` for the bitcode lane.)
+// Milestone 2 — Rust through the on-ramp (the D54 breadth headline). Since the on-ramp now reads
+// **textual `.ll`** (not bitcode via the version-locked `llvm-ir` binding), it ingests whatever LLVM
+// the *default* `rustc` bundles — no toolchain pin. The container's `rustc 1.94` emits **LLVM-21**
+// `.ll`, so this lane doubles as the **version-tolerance proof**: a newer LLVM than the old `llvm-ir`
+// ceiling (LLVM 19) flows straight through the textual reader. A `no_std`/`panic=abort` crate has no
+// EH/unwinding, so it lowers like C.
 // ============================================================================================
 
-/// Compile a `no_std`/`panic=abort` Rust source to legalized **LLVM-18** bitcode via the pinned
-/// Rust 1.81 toolchain (its LLVM 18.1 matches our `llvm-ir` pin). `-O` runs mem2reg/SROA. Returns
-/// `None` (skip) if the toolchain is unavailable.
-fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+/// Compile a `no_std`/`panic=abort` Rust source to legalized **textual LLVM IR** (`.ll`) via the
+/// default `rustc` (whatever LLVM it bundles — LLVM 21 in this container). `-O` runs mem2reg/SROA.
+/// Returns `None` (skip) only if `rustc` is entirely absent.
+fn compile_rust_to_ll(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let rs = dir.join(format!("svm_llvm_{}_{}.rs", std::process::id(), name));
-    let bc = dir.join(format!("svm_llvm_rust_{}_{}.bc", std::process::id(), name));
+    let ll = dir.join(format!("svm_llvm_rust_{}_{}.ll", std::process::id(), name));
     std::fs::write(&rs, src).expect("write Rust source");
     let status = Command::new("rustc")
         .args([
-            "+1.81.0",
-            "--emit=llvm-bc",
+            "--emit=llvm-ir",
             "--crate-type=lib",
             "-C",
             "panic=abort",
@@ -4587,12 +4937,12 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
         ])
         .arg(&rs)
         .arg("-o")
-        .arg(&bc)
+        .arg(&ll)
         .status();
     match status {
-        Ok(s) if s.success() => Some(bc),
+        Ok(s) if s.success() => Some(ll),
         _ => {
-            eprintln!("note: skipping {name} (rustc +1.81.0 unavailable — `rustup toolchain install 1.81.0`)");
+            eprintln!("note: skipping {name} (rustc unavailable)");
             None
         }
     }
@@ -4618,8 +4968,8 @@ fn rust_compute_onramp(n: i32) -> Option<i32> {
          #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
          #[no_mangle] pub extern \"C\" fn compute(n: i32) -> i32 {RUST_COMPUTE_BODY}\n"
     );
-    let bc = compile_rust_to_bc("rs_compute", &src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let ll = compile_rust_to_ll("rs_compute", &src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated Rust IR");
     // A `no_std` lib has no `main`/powerbox; the panic handler (`rust_begin_unwind`, a `loop {}`) is
@@ -4647,7 +4997,7 @@ fn rust_compute_onramp(n: i32) -> Option<i32> {
     Some(interp)
 }
 
-/// The native oracle: the **same** `compute` body compiled by `rustc 1.81` into a std binary that
+/// The native oracle: the **same** `compute` body compiled by the default `rustc` into a std binary that
 /// prints `compute(n)`, run natively. (A `no_std` lib can't be run directly; std `compute` is the
 /// identical function, so it is the ground truth — incl. the `i33` overflow/wrap path.)
 fn rust_compute_native(n: i32) -> Option<i32> {
@@ -4663,7 +5013,7 @@ fn rust_compute_native(n: i32) -> Option<i32> {
     )
     .expect("write Rust source");
     match Command::new("rustc")
-        .args(["+1.81.0", "-C", "opt-level=2", "-C", "overflow-checks=off"])
+        .args(["-C", "opt-level=2", "-C", "overflow-checks=off"])
         .arg(&rs)
         .arg("-o")
         .arg(&exe)
@@ -4683,7 +5033,7 @@ fn rust_compute_native(n: i32) -> Option<i32> {
 
 /// **Rust through the on-ramp — the D54 breadth headline.** A `no_std`/`panic=abort` Rust crate
 /// (a different frontend, its own ABI/lowering) translates and runs with no translator change beyond
-/// the C corpus, given a version-matched toolchain (Rust 1.81 / LLVM 18). The chosen function forces
+/// the C corpus, The chosen function forces
 /// LLVM's `i33` closed-form (the non-power-of-two integer support added here), and the values include
 /// `n` large enough that the `i33` intermediate **overflows 33 bits and wraps** — caught only by the
 /// native differential (interp == JIT alone would agree even if the masking were wrong). Every value
@@ -4713,8 +5063,7 @@ fn rust_no_std_matches_native() {
 // ============================================================================================
 
 /// Build a native `std` Rust binary from `src`, run it (feeding `stdin`), return its stdout. `None`
-/// (skip) if `rustc +1.81.0` is unavailable — the on-ramp lane is pinned to that toolchain, so the
-/// oracle uses it too (no behavioural difference for these programs, but keeps one toolchain).
+/// (skip) if `rustc` is unavailable.
 fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
     use std::io::Write;
     let dir = std::env::temp_dir();
@@ -4722,7 +5071,7 @@ fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
     let exe = dir.join(format!("svm_llvm_{}_{}_nat", std::process::id(), name));
     std::fs::write(&rs, src).expect("write native Rust source");
     match Command::new("rustc")
-        .args(["+1.81.0", "-C", "opt-level=2"])
+        .args(["-C", "opt-level=2"])
         .arg(&rs)
         .arg("-o")
         .arg(&exe)
@@ -4743,10 +5092,10 @@ fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
 /// Translate a `no_std`/`alloc` powerbox Rust program through the on-ramp and run it, returning its
 /// stdout. Mirrors [`powerbox_diff`]'s SVM half but for a Rust frontend: the program must produce a
 /// powerbox entry (it uses `malloc` + `write`), so we resolve §7 imports to capabilities, verify, and
-/// run through `run_powerbox`. `None` (skip) if `rustc +1.81.0` is unavailable.
+/// run through `run_powerbox`. `None` (skip) if `rustc` is unavailable.
 fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
-    let bc = compile_rust_to_bc(name, src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust heap bitcode");
+    let ll = compile_rust_to_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust heap bitcode");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "{name}: a heap-allocating Rust program must produce a powerbox entry"
@@ -5433,8 +5782,8 @@ fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
         "#![no_std]\n#![no_main]\n\
          #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n{items}\n"
     );
-    let bc = compile_rust_to_bc(name, &src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let ll = compile_rust_to_ll(name, &src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated Rust IR");
     let idx = module
@@ -5465,7 +5814,7 @@ fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
     Some(interp)
 }
 
-/// Native oracle: the same `items` (with `run`) compiled by `rustc 1.81` into a std binary printing
+/// Native oracle: the same `items` (with `run`) compiled by the default `rustc` into a std binary printing
 /// `run(n)`, run natively.
 fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
     let dir = std::env::temp_dir();
@@ -5479,7 +5828,6 @@ fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
     .expect("write Rust source");
     match Command::new("rustc")
         .args([
-            "+1.81.0",
             "--edition",
             "2021",
             "-C",
@@ -5693,8 +6041,8 @@ fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
          {items}\n\
          #[no_mangle] pub extern \"C\" fn main() -> i32 {{ compute() }}\n"
     );
-    let bc = compile_rust_to_bc(name, &src)?;
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let ll = compile_rust_to_ll(name, &src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "{name}: an alloc program must produce a powerbox entry (Memory granted)"
@@ -5724,7 +6072,6 @@ fn rust_alloc_native(name: &str, items: &str) -> Option<u8> {
     .expect("write Rust source");
     match Command::new("rustc")
         .args([
-            "+1.81.0",
             "--edition",
             "2021",
             "-C",
@@ -7255,7 +7602,12 @@ fn i128_sdiv_srem() {
 /// outside `[0, 2⁶⁴)` with a clean `Unsupported` — never a wrong answer. Both a ≥2⁶⁴ literal (clang
 /// folds `0xFFFF…FFFF + 2` to `i128 18446744073709551617`) and a negative one (`add i128 %x, -5`).
 #[test]
-fn i128_wide_constant_fails_closed() {
+fn i128_wide_constant_now_translates() {
+    // I14 — **fixed** by the textual reader. The old `llvm-ir` path truncated a ≥2⁶⁴ / negative `i128`
+    // literal to its low word, so the on-ramp fail-closed (`Unsupported`) to avoid a miscompile; the
+    // in-house `.ll` reader carries the full 128-bit width, so these modules now **translate** instead.
+    // (The runtime correctness of `i128 urem` by a >64-bit *divisor* is a separate translator concern —
+    // that path was never exercised before, since the reader fail-closed here.)
     for (name, src) in [
         (
             "i128_widec",
@@ -7274,12 +7626,9 @@ fn i128_wide_constant_fails_closed() {
         let Some(bc) = compile_to_bc(name, src) else {
             return;
         };
-        match svm_llvm::translate_bc_path(&bc) {
-            Err(svm_llvm::Error::Unsupported(m)) => {
-                assert!(m.contains("wide integer constant"), "{name}: {m}")
-            }
-            other => panic!("{name}: expected a fail-closed Unsupported, got {other:?}"),
-        }
+        svm_llvm::translate_bc_path(&bc).unwrap_or_else(|e| {
+            panic!("{name}: expected the wide i128 constant to translate, got {e:?}")
+        });
     }
 }
 
@@ -7305,4 +7654,509 @@ fn i128_small_constant_still_runs() {
             &[Value::I64(want as i64)],
         );
     }
+}
+
+// ---- Textual `.ll` reader: differential parity vs the bitcode reader (LLVM.md §8 Q1b) -----------
+//
+// The migration's gate: the *same* C, compiled to **both** `.bc` and `.ll`, must translate to
+// **identical svm-ir** through the two readers — the bitcode→`ll` conversion shim
+// (`from_llvm_ir`) vs the in-house textual reader (`ll::parse`). Both now feed the same translator
+// (it consumes the owned `ll` AST), so a match proves the textual reader produced an equivalent AST.
+// This lets `parse.rs` grow incrementally with confidence; today it covers the core slice, so the
+// parity tests track real `clang -O2` output one shape at a time.
+
+/// Compile C to a textual `.ll` (the in-house reader's input), mirroring [`compile_to_bc`].
+fn compile_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}_ll.c", std::process::id(), name));
+    let ll = dir.join(format!("svm_llvm_{}_{}.ll", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&ll)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(ll),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Compile C++ (with exceptions) to a `.bc`/`.ll` — the EH constructs (`invoke`/`landingpad`/`resume`,
+/// `personality`) only appear from a C++ front end. `emit` is `-c` (bitcode) or `-S` (textual).
+fn compile_cpp(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let cpp = dir.join(format!(
+        "svm_llvm_{}_{}_{}.cpp",
+        std::process::id(),
+        name,
+        ext
+    ));
+    let out = dir.join(format!("svm_llvm_{}_{}.{}", std::process::id(), name, ext));
+    std::fs::write(&cpp, src).expect("write C++ source");
+    let status = Command::new("clang++")
+        .args(["-O1", "-fexceptions", "-emit-llvm", emit])
+        .arg(&cpp)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang++ unavailable)");
+            None
+        }
+    }
+}
+
+/// The parity assertion core: both readers must translate to byte-identical svm-ir + `entry_sp`.
+/// Returns the (identical) svm-ir text so debug-info callers can sanity-check it's non-trivial.
+fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) -> String {
+    let from_bc = svm_llvm::translate_bc_path(bc).expect("translate via bitcode");
+    let from_ll = svm_llvm::translate_ll_path(ll).expect("translate via textual .ll");
+    let bc_text = svm_text::print_module(&from_bc.module);
+    assert_eq!(
+        bc_text,
+        svm_text::print_module(&from_ll.module),
+        "svm-ir mismatch between the bitcode and textual readers for `{name}`",
+    );
+    assert_eq!(
+        from_bc.entry_sp, from_ll.entry_sp,
+        "entry_sp mismatch for `{name}`",
+    );
+    bc_text
+}
+
+/// Assert the bitcode and textual readers translate `src` to byte-identical svm-ir (their
+/// `print_module` text) and the same `entry_sp`. Skips cleanly if `clang` is unavailable.
+fn assert_ll_parity(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (compile_to_bc(name, src), compile_to_ll(name, src)) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+/// Like [`assert_ll_parity`], but the source is C++ compiled with exceptions (for EH constructs).
+fn assert_ll_parity_cpp(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_cpp(name, src, "-c", "bc"),
+        compile_cpp(name, src, "-S", "ll"),
+    ) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+/// Compile C with debug info at the given `opt`/`g` levels. The source filename is embedded in
+/// `!DIFile`, so *both* compiles must use the same `.c` path for the recovered debug paths to match.
+fn compile_debug(
+    name: &str,
+    src: &str,
+    opt: &str,
+    g: &str,
+    emit: &str,
+    ext: &str,
+) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}_g.c", std::process::id(), name));
+    let out = dir.join(format!(
+        "svm_llvm_{}_{}_g.{}",
+        std::process::id(),
+        name,
+        ext
+    ));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args([opt, g, "-emit-llvm", emit])
+        .arg(&c)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Assert both readers recover identical debug info at the given `opt`/`g` levels — and that the
+/// output actually carries a `DIType` graph (guards against a trivial pass where neither reader
+/// produced any type/variable info).
+fn assert_ll_parity_debug_at(name: &str, src: &str, opt: &str, g: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_debug(name, src, opt, g, "-c", "bc"),
+        compile_debug(name, src, opt, g, "-S", "ll"),
+    ) else {
+        return;
+    };
+    let text = assert_paths_parity(name, &bc, &ll);
+    assert!(
+        text.contains("debug.type "),
+        "`{name}` produced no debug type graph — the debug parity check is trivial",
+    );
+}
+
+/// Full `-O0 -g` debug info: source positions **and** the `DIType` graph + `DILocalVariable`s
+/// (`llvm.dbg.declare` locals) + module globals — the whole §6 waist the bitcode `di` walk produces.
+fn assert_ll_parity_debug(name: &str, src: &str) {
+    assert_ll_parity_debug_at(name, src, "-O0", "-g");
+}
+
+#[test]
+fn ll_parity_debug_locals() {
+    // `-O0 -g`: each source local (params + `s`) becomes an `alloca` + `llvm.dbg.declare`. The reader
+    // must parse the `metadata`-typed call operands, correlate each declare's address to its alloca
+    // *ordinal* (→ a `Window` slot), and read the `!DILocalVariable` name/type — matching the bitcode
+    // `di` walk. Flat function (no nested block) ⇒ subprogram-scoped vars (`scope: None`).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_loc",
+        "int add3(int a, int b, int c){ int s = a + b + c; return s; }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_lexical_scope() {
+    // A shadowed variable in a nested block: the inner `s` is scoped to a `!DILexicalBlock`, so its
+    // §6 scope is `(decl_line, block_end_line)` — the block's end line derived from the max
+    // `!DILocation` line in its scope subtree (a `DILexicalBlock` carries no end line).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_scope",
+        "int f(int x){\n\
+         \x20 int s = x;\n\
+         \x20 { int s = x + 10; s = s * 2; return s; }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_args_ssa() {
+    // `-Og -g`: with locals promoted to SSA, source args are tracked by `llvm.dbg.value(metadata i32
+    // %k, …)` instead of `dbg.declare`. The reader must correlate the value to argument `k` (→ `Arg`,
+    // which the translator resolves to an `SsaList` over the arg's live range) rather than an alloca.
+    assert_ll_parity_debug_at(
+        "ll_parity_dbg_arg",
+        "int square(int x){ return x * x; }\n\
+         int lin(int a, int b){ return a * 3 + b; }\n",
+        "-Og",
+        "-g",
+    );
+}
+
+#[test]
+fn ll_parity_debug_types_globals() {
+    // `-gline-tables-only` carries no type graph, so use full `-O0 -g` but keep the only function
+    // *local-free* (no `dbg.declare`, so `di.vars` stays empty — the local-var half is a later slice).
+    // The globals exercise the `DIType` interner: base `int`, a `struct` aggregate (with fields), and
+    // an array — all must intern in the same order + shape as the bitcode `di` walk.
+    assert_ll_parity_debug(
+        "ll_parity_dbg_tg",
+        "struct Point { int x; int y; };\n\
+         int counter = 5;\n\
+         struct Point origin;\n\
+         int table[3] = {1, 2, 3};\n\
+         int getcnt(void){ return counter; }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_source_lines() {
+    // `-gline-tables-only`: each instruction's `!dbg !DILocation` (source line/column, file via the
+    // scope's `!DIFile`) + the `!DISubprogram` function name must match the bitcode reader.
+    assert_ll_parity_debug(
+        "ll_parity_dbg",
+        "int add(int a, int b){ int s = a + b; return s * 2; }\n\
+         int use(int x){ return add(x, x + 1); }\n",
+    );
+}
+
+#[test]
+fn ll_parity_trivial_add() {
+    // The simplest real `clang -O2` function: `define dso_local i32 @add(i32 %0, i32 %1) … { %3 =
+    // add nsw i32 %1, %0; ret i32 %3 }` — exercising the function header (linkage/param attrs/
+    // attribute-group ref), a flagged binop, and `ret`.
+    assert_ll_parity("ll_parity_add", "int add(int a, int b){ return a + b; }");
+}
+
+#[test]
+fn ll_parity_arith_chain() {
+    // A chain of binops with immediate operands, incl. a negative constant (`add … -7`) — exercises
+    // constant-int operands and operand ordering across `add`/`mul`.
+    assert_ll_parity("ll_parity_poly", "int poly(int x){ return x*x + 3*x - 7; }");
+}
+
+#[test]
+fn ll_parity_bitwise_shifts() {
+    // `shl`/`lshr`/`or` over an unsigned — the bitwise/shift core-slice ops.
+    assert_ll_parity(
+        "ll_parity_shifts",
+        "unsigned s(unsigned x){ return (x << 3) | (x >> 2); }",
+    );
+}
+
+#[test]
+fn ll_parity_sext_widen() {
+    // `sext i32 … to i64` + an `i64` add — the conversion path (a widening cast).
+    assert_ll_parity("ll_parity_widen", "long w(int x){ return (long)x + 1; }");
+}
+
+#[test]
+fn ll_parity_icmp_zext() {
+    // `icmp sgt` + `zext i1 … to i32` — a signed compare materialized to an int (the `a > b` shape).
+    assert_ll_parity("ll_parity_cmp", "int gt(int a, int b){ return a > b; }");
+}
+
+#[test]
+fn ll_parity_float_add() {
+    // `fadd float` — float arithmetic (no float *constant*, which is a later slice: hex-float parsing).
+    assert_ll_parity(
+        "ll_parity_fadd",
+        "float a(float x, float y){ return x + y; }",
+    );
+}
+
+#[test]
+fn ll_parity_phi_loop() {
+    // A `for`-loop sum: multi-block CFG with an unlabeled entry, `icmp`/`br i1`/labels, and a `phi`
+    // merging the two predecessors. Exercises implicit block numbering (the phi's `%entry`/`%body`
+    // refs must resolve to the same names the bitcode reader assigns).
+    assert_ll_parity(
+        "ll_parity_loop",
+        "int sum(int n){ int s = 0; for (int i = 0; i < n; i++) s += i; return s; }",
+    );
+}
+
+#[test]
+fn ll_parity_branch_phi() {
+    // An explicit `if`/`else` returning different values — a diamond CFG whose join is a `phi`.
+    assert_ll_parity(
+        "ll_parity_diamond",
+        "int pick(int c, int a, int b){ if (c) return a + 1; else return b - 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_direct() {
+    // A direct `call` to a defined (noinline) function in the same module, whose result feeds an add —
+    // the callee becomes a GlobalReference carrying the reconstructed `i32 (i32)` function type.
+    assert_ll_parity(
+        "ll_parity_call",
+        "static __attribute__((noinline)) int dbl(int x){ return x + x; } \
+         int f(int x){ return dbl(x) + 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_two_args() {
+    // A two-argument direct call (`i32 (i32, i32)`), exercising the arg list + fn-type reconstruction.
+    assert_ll_parity(
+        "ll_parity_call2",
+        "static __attribute__((noinline)) int sub(int a, int b){ return a - b; } \
+         int g(int a, int b){ return sub(a, b); }",
+    );
+}
+
+#[test]
+fn ll_parity_call_intrinsic() {
+    // `a > b ? a : b` lowers to `tail call i32 @llvm.smax.i32(i32 %0, i32 %1)` at -O2 — an intrinsic
+    // call (the shape that first forced calls; the translator lowers `llvm.smax` to `icmp`+`select`).
+    assert_ll_parity(
+        "ll_parity_smax",
+        "int mx(int a, int b){ return a > b ? a : b; }",
+    );
+}
+
+#[test]
+fn ll_parity_gep_load() {
+    // `getelementptr inbounds i32, ptr %p, i64 %i` + `load i32, ptr …` — pointer indexing + a load.
+    assert_ll_parity(
+        "ll_parity_gepload",
+        "int idx(const int *p, long i){ return p[i]; }",
+    );
+}
+
+#[test]
+fn ll_parity_gep_store() {
+    // `getelementptr` + a result-less `store i32 %v, ptr …` (the second dest-less instruction shape).
+    assert_ll_parity(
+        "ll_parity_gepstore",
+        "void wr(int *p, long i, int v){ p[i] = v; }",
+    );
+}
+
+#[test]
+fn ll_parity_alloca_volatile() {
+    // A `volatile` local forces `alloca i32` + `store volatile`/`load volatile` (defeating mem2reg).
+    assert_ll_parity(
+        "ll_parity_alloca",
+        "int viadd(int x){ volatile int t = x; return t + 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_scalar() {
+    // A mutable scalar global (`@counter = global i32 0`) read + written by a function
+    // (`load`/`add`/`store` through `ptr @counter`).
+    assert_ll_parity(
+        "ll_parity_gscalar",
+        "int counter = 0; int bump(void){ return ++counter; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_array() {
+    // A `constant [4 x i32]` lookup table indexed by a function — array type + array constant
+    // initializer + a `getelementptr [4 x i32], ptr @TBL, …`.
+    assert_ll_parity(
+        "ll_parity_garray",
+        "static const int TBL[4] = {10, 20, 30, 40}; int lookup(int i){ return TBL[i & 3]; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_string() {
+    // A `private constant [N x i8] c\"…\\00\"` string returned by a function (`ret ptr @.str`) —
+    // byte-string constant + a `@.str` operand reference.
+    assert_ll_parity(
+        "ll_parity_gstring",
+        "const char *greeting(void){ return \"hi\"; }",
+    );
+}
+
+#[test]
+fn ll_parity_float_const_single() {
+    // `x * 0.5f` → `fmul float %…, 5.000000e-01` — a float constant in decimal form.
+    assert_ll_parity(
+        "ll_parity_fconst",
+        "float half(float x){ return x * 0.5f; }",
+    );
+}
+
+#[test]
+fn ll_parity_float_const_hex_double() {
+    // `x * 3.14` → `fmul double %…, 0x40091EB8…` — a double constant clang emits in `0x` hex form
+    // (3.14 isn't exactly representable), exercising the hex-image decode.
+    assert_ll_parity(
+        "ll_parity_dconst",
+        "double scale(double x){ return x * 3.14; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_float_array() {
+    // A `constant [3 x double]` initializer — float constants in a global aggregate (decimal + hex).
+    assert_ll_parity(
+        "ll_parity_gfloat",
+        "static const double K[3] = {0.5, 3.14, 2.0}; double kth(int i){ return K[i]; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_add() {
+    // A `<4 x i32>` vector binop — vector types in operands/results.
+    assert_ll_parity(
+        "ll_parity_vadd",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vadd(v4i a, v4i b){ return a + b; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_splat() {
+    // A splat: `insertelement <4 x i32> poison, i32 %x, i64 0` + `shufflevector … zeroinitializer` —
+    // insertelement/shufflevector + `poison`/`zeroinitializer` vector constants.
+    assert_ll_parity(
+        "ll_parity_vsplat",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vsplat(int x){ return (v4i){x,x,x,x}; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_reduce() {
+    // `llvm.vector.reduce.add.v4i32` — a vector-reduction intrinsic call over a `<4 x i32>`.
+    assert_ll_parity(
+        "ll_parity_vreduce",
+        "typedef int v4i __attribute__((vector_size(16))); \
+         int vsum(v4i a){ return a[0]+a[1]+a[2]+a[3]; }",
+    );
+}
+
+#[test]
+fn ll_parity_const_gep() {
+    // A global initialized to a constant-expression GEP into another global
+    // (`@p = global ptr getelementptr inbounds ([10 x i32], ptr @arr, i64 0, i64 3)`).
+    assert_ll_parity("ll_parity_cgep", "int arr[10]; int *p = &arr[3];");
+}
+
+#[test]
+fn ll_parity_const_ptrtoint() {
+    // A nested constant-expression: `ptrtoint (ptr getelementptr(…) to i64)` as a global initializer.
+    assert_ll_parity("ll_parity_cptr", "int arr[10]; long addr = (long)&arr[1];");
+}
+
+#[test]
+fn ll_parity_invoke_landingpad() {
+    // C++ try/catch → `invoke … to label %ok unwind label %lpad` (a value-producing terminator),
+    // `landingpad { ptr, i32 } catch ptr null`, `extractvalue`, and the `__cxa_*` runtime calls. The
+    // translator only reserves the EH region when the module has a `main`, so include one.
+    let src = "int may_throw(int x){ if (x < 0) throw x; return x * 2; } \
+               int f(int x){ try { return may_throw(x); } catch (...) { return -1; } } \
+               int main(){ return f(-1) + f(3); }";
+    assert_ll_parity_cpp("ll_parity_eh", src);
+}
+
+#[test]
+fn ll_parity_atomics() {
+    // `atomicrmw`, `cmpxchg`, and `load atomic` — the atomic memory ops (orderings + syncscope), via
+    // `<stdatomic.h>`. (`fence` is omitted: the translator itself doesn't lower it.)
+    let src = "#include <stdatomic.h>\n\
+               int rmw(_Atomic int *p, int v){ return atomic_fetch_add(p, v); }\n\
+               int cx(_Atomic int *p, int a, int b){ atomic_compare_exchange_strong(p, &a, b); return a; }\n\
+               int ld(_Atomic int *p){ return atomic_load(p); }\n";
+    assert_ll_parity("ll_parity_atomic", src);
+}
+
+#[test]
+fn ll_parity_switch() {
+    // A `switch` terminator with a constant→label jump table (sparse cases + default).
+    assert_ll_parity(
+        "ll_parity_switch",
+        "int sw(int x){ switch(x){ case 0: return 10; case 1: return 20; case 7: return 30; \
+         default: return -1; } }",
+    );
+}
+
+#[test]
+fn ll_parity_struct_constant_global() {
+    // A global initialized to a **literal struct constant** (`@gp = global %struct.P { i32 7, i64 42 }`)
+    // — the `{ <ty> <c>, … }` aggregate-constant form real-world (Rust/C++) IR leans on heavily.
+    assert_ll_parity(
+        "ll_parity_structconst",
+        "struct P { int a; long b; }; struct P gp = { 7, 42 }; \
+         long gets(void){ return gp.a + gp.b; }",
+    );
+}
+
+#[test]
+fn ll_parity_struct_field() {
+    // A named struct type (`%struct.P = type { i32, i32 }`) + struct GEP
+    // (`getelementptr %struct.P, ptr %p, i64 0, i32 1`) for field access.
+    assert_ll_parity(
+        "ll_parity_struct",
+        "struct P { int a; int b; }; int field(const struct P *s){ return s->a + s->b; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_void() {
+    // A result-less `call void @sink(...)` — the dest-less instruction shape (`tail call void …`).
+    assert_ll_parity(
+        "ll_parity_callvoid",
+        "static int g; static __attribute__((noinline)) void sink(int x){ g = x; } \
+         void v(int x){ sink(x); }",
+    );
 }

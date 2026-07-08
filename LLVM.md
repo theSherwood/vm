@@ -584,9 +584,10 @@ Notes:
   (constant) format string at translate time and lowers each conversion to int→string / float→string
   helpers → `Stream.write`; only the bytes cross the boundary. `%f` pulls in float formatting (defer
   to demo 3/6 if demo 1 stays integer/hex). Non-constant format strings stay `Unsupported`.
-- **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
-  `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
-  already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
+- **transcendentals/libm**: a **guest** `libm` (guest code, not a host math capability) — keeps math
+  in the sandbox. `sqrt` lowers to the SVM op (slice F); `exp`/`log`/`pow` now have fdlibm
+  implementations in `crates/svm-run/demos/libm/libm.c` (a guest def shadows the on-ramp's trap stub);
+  `sin`/`cos`/… are the remaining additions. See the "Transcendentals → a guest `libm`" bullet above.
 - **`argc`/`argv`**: **DONE** — see *Slice BE* below. `envp`/`getenv`: **DONE** — see *Slice BF*.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
@@ -1153,6 +1154,141 @@ Picking a target is really picking the *gap* it drives to completion. Current st
 - **Larger libc surface** — `memmem`/`strtod`/`strtol`/`snprintf` family, `qsort_r`, etc. The on-ramp
   synthesizes a growing subset; each real program extends it (or the program brings its own, the model).
 
+### Lua standard library + real stdout — ACHIEVED ✅ (all three engines)
+**Goal (met).** Lua 5.4.7 with the **base/`string`/`table`/`math`** libraries open runs a script that
+`print`s, and the on-ramp captures the exact **stdout bytes** the guest writes through the
+`Stream.write` capability — byte-identical on the tree-walker, bytecode, and JIT, and to a native build.
+The first end-to-end Lua producing *real output* (prior Lua tests checked a return value). Exercised:
+`print`, `string.upper`/`rep`/`sub`/`#`, `table.sort`/`concat`/`insert`/`remove`, `math.sqrt`/`pi`/
+`floor`/`max`/`abs`, `ipairs`, `pairs`, `type`, `tostring`. Fixture `tests/fixtures/lua/lua_stdlib.bc`
+(harness + guest-libc shim), test `tests/lua_stdlib.rs`. Translator work it forced: synthesized
+`__svm_strncmp`; `fputs`/`puts` of a **non-literal** string now emit a runtime `__svm_strlen`; the guest
+shim brings `log10`/`log2`/`tan` (+ fail-closed `acos`/`asin`/`atan2`), `strstr`, and a no-filesystem
+`stdio`.
+
+### Lua `string.format` (runtime format engine) — ACHIEVED ✅ (all three engines)
+**Goal (met).** `string.format` now works end to end, byte-identical to native on all three engines.
+Lua's `str_format` builds its per-directive spec **at runtime** and calls `snprintf` once per directive
+— the path the on-ramp's translate-time *constant*-format engine cannot lower (a non-constant or
+unsupported-conversion `%a` format fail-closes to the `snprintf_rt` trap so the enclosing function still
+lowers). The runtime format engine fills that gap with the **guest-brings-its-own-libc** model rather
+than a new translate-time synthesis:
+
+- **Guest runtime `snprintf`** (`tests/fixtures/lua/lua_fmt_snprintf.c`) `llvm-link`ed alongside Lua
+  **shadows** the `snprintf_rt` trap. It parses flags/width/precision/length/conversion at runtime and
+  formats `d`/`i`/`u`/`o`/`x`/`X`/`c`/`s`/`p` in C (matching glibc). One definition covers both the
+  core's *constant* `%lld`/`%.14g` and `string.format`'s runtime directives.
+- **Float bridges** `__vm_fmt_{fix,sci,gen}` — three new vm-builtins recognized in `lower_vm_builtin`.
+  The guest `snprintf` delegates `f`/`F`/`e`/`E`/`g`/`G` to `extern int __vm_fmt_*(char *out, double,
+  int prec, int width, int flags)`; the on-ramp lowers each to the existing correctly-rounded bignum
+  **dtoa** helper (`dtoa_fix`/`dtoa_sci`/`dtoa_gen`) writing to float scratch, then `memcpy`s the result
+  to the guest `out`. Gated by `uses_fmt_float`, which also forces a powerbox entry (so the float
+  scratch is set up) and pulls in `dtoa`/`memcpy`.
+
+Fixture `tests/fixtures/lua/lua_fmt.bc` (core + base/`string`/`table`/`math` + guest shim/libm/strtod +
+guest `snprintf`), test `tests/lua_fmt.rs`, asserts the exact **stdout bytes** across
+`%d`/`%x`/`%#x`/`%o`, width/precision/flags (`%5d`/`%-5d`/`%05d`/`%+d`/`%10s`/`%.3s`), `%c`, `%.2f`/
+`%8.3f`/`%+.1f`, `%.3e`/`%g`/`%.10g`, `%q`, and `%%`. Known edge: `%f` of an extreme magnitude (`1e300`)
+can differ from native by one digit — a pre-existing `dtoa_fix` limit, not the bridge; the script avoids
+it. This unblocks running **Lua's own test suite** (self-validating, the roadmap's gold standard) — the
+next Lua slice.
+
+### Lua's own test suite — ACHIEVED ✅ (`math.lua` + `utf8.lua` + 3 more files, all three engines)
+**Goal (met).** Five **unmodified files from the official Lua 5.4.7 distribution's own test suite** run
+through the whole VM: the dense **`testes/math.lua`** (fixture `lua_math.bc` / `tests/lua_math.rs`), the
+full **`testes/utf8.lua`** (`lua_utf8.bc` / `tests/lua_utf8.rs`), and `testes/vararg.lua` +
+`testes/bwcoercion.lua` + `testes/pm.lua` (`lua_testsuite.bc` / `tests/lua_testsuite.rs`) — each loaded
+as its own chunk under `pcall`, one fresh `lua_State` per file. A Lua test signals failure by raising
+(an `assert`); a clean **exit 0** means every `assert` held, **identical to native Lua** (the suite's
+own pass/fail contract — each file's harness also runs green natively as the oracle). Same outcome on
+the tree-walker, bytecode, and JIT. The files were chosen as self-contained (no `os`/`io`/`debug`/
+`coroutine`, no internal `T` module): `math` (all of integer/float arithmetic, conversions, `//`/`%`,
+float↔integer order incl. every NaN corner, the transcendentals, `modf`, `string.format`, decimal + hex
+float literals, `math.random`), `utf8` (the whole `utf8` library — `char`/`codepoint`/`len`/`offset`/
+`codes`/`charpattern`, strict vs. non-strict decoding across all 1–6-byte sequence sizes, surrogate/
+overlong rejection, `\u{…}` escapes), `vararg` (`...`/`select`/`table.unpack`), `bwcoercion`
+(string↔number bitwise coercions, `_ENV = nil`), and `pm` (the full pattern-matching engine).
+
+**`require`.** `utf8.lua` opens with `local utf8 = require'utf8'` — the first file to need `require`.
+Stock `loadlib.c`'s file and C-library searchers need a filesystem/dynamic loader the on-ramp does not
+provide (and can never run for an already-loaded module), so the harness installs a **minimal `require`**
+returning `_LOADED[name]` — exactly stock `require`'s fast path for a `luaL_requiref`'d library — and the
+official file runs unmodified. No translator or libc change was needed: the four fixes below (landed for
+`math.lua`) plus the existing shim already cover `utf8.lua` end to end.
+
+**Four real translator/library fixes this forced** (each independently valuable, each gated on all three
+engines + native):
+- **`fcmp` NaN correctness.** The on-ramp collapsed **ordered vs unordered** float compares to one op
+  (a documented fidelity gap). Lua's `luaV_flttointeger` (`n >= -2^63 && n < 2^63`, which clang emits
+  as *unordered* forms after the preceding `n != floor(n)`) then accepted a NaN, so `NaN <=
+  math.maxinteger` returned **true**. `emit_fcmp` now expands every predicate NaN-exactly (unordered =
+  `uno(a,b) | ordered`, `one` = `a<b | a>b`), matching the interpreters' and Cranelift's `FloatCC`
+  semantics. Test `fcmp_ordered_unordered_predicates` (all 11 predicates × NaN/ordinary, interp+JIT).
+- **Sign-extended narrow signed ops.** A `<i32` value loaded from memory is *zero-extended* (the
+  canonical narrow form), so its sign bit is buried at bit `N-1`, not the container's bit 31 — the
+  on-ramp's `ashr`/`sdiv`/`srem` on an `i8`/`i16` now sign-extend the operand first (`bin` in
+  `lib.rs`). Before the fix `ashr i8 0x80,7` gave `+1` (should be `-1`); since Lua's `testMMMode`
+  compiles to exactly `ashr i8 luaP_opmodes[op],7`, `findsetreg` skipped the wrong instruction and
+  `getobjname` dropped the operand name from error messages (`number (field 'huge') has no integer
+  representation`). `(i8)-6/3` gave the unsigned `83`, not `-2`. Test `narrow_signed_shift_div_rem`.
+- **Hex-float `strtod`.** The guest `strtod` now parses **hex floats** (`0x1.8p3`, `0x.ABCDEFp+24`, a
+  64-bit hex mantissa needing round-to-nearest-even, `p`-exponent over/underflow, leading-zero fractions
+  like `0x.000…0074p4004`, and the malformed `0x`/`0x.`/`0x3.3.3` with glibc `endptr` semantics) — the
+  form Lua's own hex-float literals need. Additive (decimal path unchanged); the accuracy grid +
+  `demos/strtod` differential cover it.
+- **Guest libc gap-fills.** The shim brings real fdlibm `asin`/`acos`/`atan`/`atan2`/`modf`
+  (`lua_testsuite_trig.c`) the base libm lacks, and `localeconv` (Lua reads `decimal_point` when
+  appending `.0` to an integer-valued float in `tostring`).
+
+**Coroutines — ACHIEVED ✅ (library slice, all three engines).** Lua 5.4 coroutines turned out to need
+**no new machinery** — and, notably, **no fibers**. They are *stackless* with respect to the C stack:
+each coroutine is a `lua_State` with its own heap-allocated Lua stack, and resume/yield ride the exact
+same `luaD_rawrunprotected` / `luaD_throw` (setjmp/longjmp) primitive `pcall` already uses (ldo.c) —
+there is no `swapcontext`/`ucontext`/assembly anywhere in Lua's core. So the on-ramp's existing
+`SetJmp`/`LongJmp` core ops (proven by every working `pcall`) carry them unchanged. An in-house
+differential (`lua_coroutine.bc` / `tests/lua_coroutine.rs`, source `lua_coroutine.lua`) runs green on
+all three engines + native: `create`/`resume`/`yield` (multi-value both ways), the
+`suspended`/`running`/`normal`/`dead` status transitions, `running`/`isyieldable`, `wrap`, error
+propagation, **yield across `pcall`/`xpcall`** (the yieldable-pcall / continuation path),
+`coroutine.close` with `<close>` variables, and a producer/consumer pipeline. The `svm-fiber` machinery
+(native-stack switching for vCPUs/Workers) is a separate, host-side concern and is deliberately *not*
+involved.
+
+**Debug library + official `coroutine.lua` — ACHIEVED ✅ (all three engines).** The unmodified official
+`testes/coroutine.lua` now runs green on the tree-walker, bytecode, and JIT + native
+(`lua_coroutine_official.bc` / `tests/lua_coroutine_official.rs`), which brought up the **`debug`
+library** (`ldblib.c`: `getinfo`/`getlocal`/`setlocal`/`getupvalue`/`setupvalue`/`sethook`/`traceback`,
+including debug on a *suspended* coroutine) alongside coroutines. Standalone the internal `T` C-test
+library is absent, so the file's own `if not T`/`if T==nil` guards skip the C-API sections; the rest
+still drives yields inside every metamethod and `for` iterator, `coroutine.close` with `<close>`
+variables, and C-stack-overflow detection. The debug lib needed only one libc gap-fill (`fgets`, for the
+never-called interactive `debug.debug()`).
+
+**One reference-oracle change this forced** (no translator/coroutine/debug change): the file's *"infinite
+recursion of coroutines"* case relies on Lua's own `LUAI_MAXCCALLS` raising a `pcall`-catchable "C stack
+overflow". The production engines reach that self-limit; the tree-walker's reified call stack previously
+capped at `MAX_CALL_DEPTH = 256` and tripped first as an *uncatchable* §5 kill. Raising the oracle cap to
+`2048` — still well under the durable shadow-reserve frame budget — lets the reference oracle observe the
+same catchable error the real engines do (its whole job). Verified regression-free: durable + interp +
+`jit_diff` (54) suites and all four prior Lua fixtures stay green.
+
+**Remaining** for a *full* suite: the `os`/`io` files need those libraries + a filesystem. Each is a
+follow-on slice.
+
+### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
+**Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
+runs a *float* script identical on the tree-walker, bytecode, and JIT — and identical to a native build
+of the same sources. The script (`tests/fixtures/lua/lua_floats_harness.c`) computes
+`(3.14 + 2.0^0.5 + (10.5 % 3.0) + 1.5e3 + 0.25) * 1000.0` → `1506304`, reaching **every new piece of
+this work in one run**: the guest **`strtod`** (every numeric literal, in the lexer), the guest
+**`pow`** (the `^` operator), and the synthesized **`fmod`** (the `%` operator) — plus
+`frexp`/`localeconv`/`snprintf`/`setjmp` referenced by the core. The guest `pow`/`strtod` definitions
+**shadow** the on-ramp's would-be trap stubs (the `llvm-link` is all it takes); `fmod`/`frexp`/`localeconv`/
+`sqrt`/`ldexp`/the string ops stay undefined and the on-ramp synthesizes/recognizes them. Test
+`tests/lua_floats.rs` (committed fixture `lua_floats.bc`); regenerate per the fixtures README. This
+closes the loop: the per-function units validate each guest impl bit-exact vs the system, and this
+proves they **compose into a real interpreter's float path** end to end.
+
 ### Lua first light — ACHIEVED ✅ (all three engines)
 **Goal (met).** A pure-compute Lua 5.4.7 script (`local x=0; for i=1,10 do x=x+i end; return x` → 55)
 runs through the on-ramp **identical to native Lua on the tree-walker, bytecode, *and* JIT**
@@ -1169,10 +1305,67 @@ below), and `time()` returns `0` (the `makeseed` RNG seed is result-irrelevant).
 so the module lowers and the executed path is fully real; replacing them is what graduates first light
 to *general* Lua (float arithmetic, `string.format`, error messages).
 
-**Next (post-first-light):** real `pow`/`fmod` (a **host-libm delegation** decision — bit-exact vs
-native requires the *same* libm; synthesis can't match a specific libm's last-ULP rounding), `strtod`
-+ `snprintf` (reuse the bignum dtoa), `localeconv`/`errno` (real C-locale struct + a window slot), then
-`print`/stdlib for a script that does I/O. Each is now a localized swap of a stub for an implementation.
+**Next (post-first-light) — the remaining-libm slices.** `snprintf` is **DONE** (the number→string
+direction, via the printf engine — merged). What's left, each a localized swap of a fail-closed stub
+for a real implementation, split by whether it needs a *host-libm decision*:
+
+- **Exact, decision-free (synthesizable bit-for-bit, no libm dependency):**
+  - **`frexp`** — **DONE.** `synth_frexp` (5 blocks): pure bit ops extracting exponent + mantissa,
+    writing `*e`; bit-exact to glibc incl. the subnormal (`×2^54` renormalize) and special (zero/
+    inf/nan → `*e=0`, return `x+x`) paths. Test `libc_frexp_bit_exact` (a grid incl. a subnormal
+    and ±inf), all three engines == native.
+  - **`fmod`** — **DONE.** `synth_fmod` (28-block CFG): a faithful translation of musl's exact 64-bit
+    remainder (special→NaN, `|x|≤|y|` early returns, subnormal-normalize loops for x and y, the
+    bit-shift remainder loop, result renormalize + scale). The remainder is mathematically *exact*
+    (always representable), so it is bit-for-bit identical to libc with **no `frem` op and no libm
+    decision** — the earlier "`pow`/`fmod` need host-libm delegation" framing was imprecise: only the
+    *transcendentals* do. Test `libc_fmod_bit_exact` (a 10×8 grid incl. subnormals, a large quotient,
+    and the `y==0`/`x==inf`→NaN paths), all three engines == native.
+  - **`localeconv`** — **DONE.** `build_locale_data` lays a read-only C-locale `lconv` struct as
+    module data (`decimal_point="."`, the other strings `""`, the numeric/monetary `char` fields
+    `CHAR_MAX`), and `localeconv()` returns its address (a `synth_const_i64`). No powerbox needed
+    (the struct rides in the globals region like the ctype tables). Test `libc_localeconv_c_locale`,
+    all three engines == native's C locale.
+  - **`__errno_location`** — a writable `errno` int slot. Deferred and **bundled with `strtod`**: it
+    needs the powerbox page-0 layout (a writable persistent slot), which entangles it with the
+    powerbox test harness, and it is only ever *set* by `strtod` (`ERANGE`) — so it lands where it is
+    exercised end to end.
+- **Hard but decision-free:** **`strtod`** (string→double) — **DONE, as guest code** (the keystone for
+  *float* Lua: every decimal float literal hits it). `crates/svm-run/demos/strtod/strtod.c` is a
+  correctly-rounded decimal→`f64` parser. Correctly-rounded is *unique*, so it matches glibc bit-for-
+  bit — and the method needs **no precomputed power-of-ten table** (nothing to mis-transcribe): parse
+  every significant digit into a big integer, form the exact rational `N/Dn`, and take the nearest
+  double by an **exact big-integer division** with round-to-nearest-even (normal / subnormal incl. the
+  boundary / overflow→±inf). A guest def shadows the on-ramp's `strtod` trap stub (`llvm-link
+  lua_core.bc strtod.bc`). Two gates: `demo_strtod_vs_native` (raw-f64-image + `endptr` differential,
+  all three engines == native) and `strtod_guest_correctly_rounded_vs_system` (native-only, bit + `endptr`
+  vs the system `strtod` over the hard cases — subnormal halfway ties, the `2^53` boundary, max-double,
+  over/underflow, 40-digit strings). *Scope:* decimal only; hex floats (`0x1p4` — Lua's core parses
+  these itself), the `inf`/`nan` spellings, and `errno`/`ERANGE` are follow-ups.
+- **Transcendentals → a guest `libm` (DECIDED — keep math in the sandbox).** `pow`/`exp`/`log`/
+  `sin`/… can't be synthesized bit-exact to a *specific* host libm, and a host math capability would
+  leak math out of the sandbox — so they ride as **guest code** (the §"transcendentals" preference,
+  the way the raytrace demo bundled `sin`/`exp`). **Started:** `crates/svm-run/demos/libm/libm.c` is a
+  small self-contained guest libm — faithful **fdlibm** transcriptions of `exp`, `log`, and **`pow`**
+  (genuinely accurate, not poly approximations), using only IEEE `+−*/`, compares, and union word
+  access. A guest definition **shadows** the on-ramp's would-be `pow`/`exp`/`log` trap stubs, so
+  `llvm-link lua_core.bc libm.bc` makes them real. `pow` reuses `sqrt` (→ the SVM `f64.sqrt` op) and
+  `scalbn` (→ `__svm_ldexp`); **`sin`/`cos`** add fdlibm's `__kernel_sin`/`__kernel_cos` + the
+  **medium-path** argument reduction (accurate for `|x| ≤ 2²⁰·π/2 ≈ 1.65e6`, the bound where `n·pio2_1`
+  stays an exact product — covering all realistic use; the `npio2_hw` fast-path table is dropped since
+  always running the cancellation-correction is equally correct, and the full Payne-Hanek
+  `__kernel_rem_pio2` table for astronomically large args is the documented future addition).
+  Two gates: `demo_libm_vs_native` (raw-f64-image differential, all three engines == native —
+  byte-identical *because* the math is guest code, unfused on both lanes; built `-fno-*-vectorize` so
+  the on-ramp takes scalar bitcode while the oracle vectorizes, the corpus-demo split) and
+  `libm_guest_exp_log_accurate_vs_system` (a native-only `-D`-renamed build vs the system `<math.h>`,
+  ≤2 ULP — validates the fdlibm transcription, which a same-source differential cannot).
+  **Remaining:** `tan` + inverses/hyperbolics, the Payne-Hanek table for huge `sin`/`cos` args.
+  **End to end — DONE:** the guest libm + guest `strtod` `llvm-link`ed into the real Lua 5.4.7 core run
+  a float script (`x^0.5`, `x%y`, decimal/scientific literals) **identical on all three engines and to
+  a native build** — see *Lua with floats* below.
+
+After the float-number surface lands, `print`/stdlib graduates first-light to a script that does I/O.
 
 **Build recipe (reproducible).** Lua's core (no standard libraries, no `lauxlib`) + a tiny C-API harness
 that drives `lua_newstate`/`lua_load`/`lua_pcall`/`lua_tointeger` with its own allocator (`realloc`) and
@@ -1205,10 +1398,14 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    `Unsupported` (Lua's are all int/ptr/double/ptrdiff ≤8B). **Tests:** `varargs_int_double_mixed`,
    `varargs_many_and_copy` — all three engines == native cc. **217 translate tests green, fmt+clippy
    clean.**
-2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). Reuses the
-   bignum dtoa float formatter + the varargs-call marshaling from (1). Reachable.
-3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. Needs correctly-rounded
-   decimal→`f64` (the parse direction of the existing Ryū/Dragon dtoa). Reachable.
+2. **`snprintf`** (a varargs *call*) — Lua's number→string (`lua_number2str`/`tostringbuff`). **DONE:**
+   routed through the shared `printf` format engine (`lower_snprintf`) with output redirected into the
+   caller's buffer; reuses the bignum dtoa float formatter + the varargs-call marshaling from (1).
+   Merged (PR #155), incl. the page-0 `FMT_BUF` write-protect fix for `snprintf`-into-stack-buffer + `%p`.
+3. **`strtod`** (string→double) — numeric-literal parsing in `llex`/`lobject`. **DONE, as guest code**
+   (`demos/strtod/strtod.c`): correctly-rounded decimal→`f64` via an exact big-integer division (no
+   power-of-ten table); a guest def shadows the trap stub. Bit-identical to glibc; see the "remaining-
+   libm slices" section above. Decimal only (hex floats / `inf`/`nan` / `errno` are follow-ups).
 4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
    `memcmp`/`strlen`). **Done (slice 2):** `strcmp`/`strchr`/`strcoll`(→`strcmp`),
    `strcpy`/`strspn`/`strpbrk` — synthesized `__svm_*` byte loops (the nested-scan pair for
@@ -1732,18 +1929,249 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
   `llvm-sys`/`di.rs`/`blockaddr.rs`/`wideint.rs` + the rustc-1.81 pin; prove version-tolerance *here*
   by feeding `rustc 1.94`'s LLVM-21 `.ll` (`rustc --emit=llvm-ir`) through the parser. (CI `ci.yml`
   edits need `workflow` scope the bot lacks → manual follow-up.)
-- **Current state (this branch, `claude/charming-johnson-pmlsnr`).** PR1 *foundation* committed: the
-  `ll` module compiles (fmt+clippy green), wired into `lib.rs` as a **dormant** module (no behavior
-  change). `ast.rs` has the type system (`Type`/`TypeRef`/`Types` interner/`Typed`), constants (with
-  the `u128` fix), operands, predicates, module structure, and a *seed* of the instruction/terminator
-  enums. `lex.rs`/`parse.rs` are stubbed (token set + entry points only).
-- **Next steps, in order.** (a) implement `lex::lex` (names `%`/`@`/`!`, full-width int/float literals,
-  types, strings, punctuation). (b) implement `parse::parse_module` simplest-first; grow the AST enums
-  by compiling `lib.rs` against `crate::ll`. (c) add `translate_ll_path` (`lib.rs`) + `assert_ll_parity`
-  (`tests/translate.rs`, alongside `compile_to_bc`/`check`); iterate to parity on a representative slice,
-  then widen. Reference shapes: the `llvm-ir` 0.11.3 source in the cargo registry cache
-  (`…/llvm-ir-0.11.3/src/{instruction,constant,types,terminator}.rs`) — copy the *data definitions*, not
-  the `from_llvm` FFI.
+- **Current state (branch `claude/ll-translator-swap`, off latest `main`; PR #158).** The lexer +
+  parser-core-slice landed via PR #151 (merged to `main`); this branch carries the AST expansion **and
+  the translator type-swap + conversion shim** on top. **The translator now consumes the owned `ll`
+  AST** — `lib.rs`'s `Instruction`/`Constant`/`Terminator`/`Type`/`Operand`/`Types` are
+  `crate::ll::ast::*`, fed on the bitcode path by [`from_llvm_ir`]; the textual reader will feed it
+  directly. **All 223 tests pass** (the whole bitcode corpus translates byte-identically through the
+  `ll` AST), fmt + clippy (`-D warnings`) green. Done so far:
+  - `ast.rs` — **the data model + type system are now complete** (the swap prerequisite, "until the AST
+    enums are complete"). The full **`Instruction`** set (all 48 LLVM-18 variants), the full
+    **`Terminator`** set (all 12), and the **`Constant`** set incl. the const-expr ops the on-ramp folds,
+    each modeling **only the fields the translator reads** (`nuw`/`nsw`/`exact`/calling-conv/attributes
+    omitted — the consumed-subset convention, so we avoid `llvm-ir`'s attribute/CC types). The type
+    system is the **read-only** `Types` (no interning — structural `PartialEq` on `TypeRef` makes equal
+    types compare equal; constructors hand back a fresh `TypeRef`) with `type_of`/`named_struct_def`
+    (`NamedStructDef::{Opaque,Defined}`), and faithful **`Typed`** impls for `TypeRef`/`Operand`/
+    `Constant`/`ConstantRef`/`Float`/`Instruction` (the per-instruction result-type logic mirrored from
+    `llvm-ir`: binop→operand0, conversion→`to_type`, `icmp`/`fcmp`→`i1`/`<N x i1>`, `cmpxchg`→`{ty,i1}`,
+    opaque `alloca`/`gep`→`ptr`, `call`→`function_ty` result, …). Plus `Instruction::try_get_result`,
+    `Operand::as_constant`, `HasDebugLoc`, a dependency-free `Either`, and minimal `InlineAssembly`/
+    `ParameterAttribute`/`Atomicity`/`RMWBinOp`/`LandingPadClause`. The `u128` I14 fix is retained.
+  - `lex.rs` — **complete**, fully unit-tested: `%`/`@`/`!` names (numbered/quoted), full-width int +
+    decimal/hex float literals (kept as text, so no truncation), strings (escapes left encoded;
+    `unescape` decodes), types, punctuation, attribute-group refs, debug-metadata flag-sets.
+  - `parse.rs` — **core slice only** (not yet grown to the full AST), 4 unit tests: `define` functions
+    (integer types, binary ops, `ret`/`br`/`condbr`/`unreachable`, `%local`/const-int operands),
+    skipping top-level cruft (target/datalayout, attribute groups, module metadata, `declare`) via a
+    balanced-delimiter scan. The I14 fix is proven end-to-end (`full_width_i128_constant_survives`
+    round-trips `i128::MAX`). Out-of-slice constructs fail closed (clean `ParseError`).
+  - **`from_llvm_ir.rs` (the bc→ll conversion shim) — DONE.** `translate_impl` now takes a
+    `crate::ll::Module`, so the bitcode path decouples: `translate_bc_path` reads an `llvm_ir::Module`
+    via `from_bc_path`, then `from_llvm_ir::convert_module` maps it field-for-field to the `ll` AST.
+    **Faithful + fail-closed**: it drops the `nuw`/`nsw`/attribute/calling-conv fields the translator
+    ignores, and rejects (clean `Unsupported`) anything outside the modeled subset — a non-folded const
+    expression (`Xor`/`Shl`/`ICmp`/… as a constant), funclet EH (`catchpad`/`cleanupret`/`callbr`), a
+    target-ext type. That is **zero-regression** because `translate_impl` already lowers *every* defined
+    function + global initializer eagerly and rejects those same forms via its `const_eval`/`const_bytes`
+    `other => unsup` arms, so a program that translates today converts losslessly and one that doesn't
+    fails the same way. `llvm-ir`/`llvm-sys` stay normal deps (+ `either`, named directly for the callee
+    `Either`); the shim is **transient** — it goes when they're dropped (PR4). The swap also needed a few
+    `ll::ast` additions the translator relies on: `Deref` for `TypeRef`/`ConstantRef` (deref coercion),
+    `Display` for `Type`/`TypeRef` (error messages), `HasDebugLoc` for `Instruction`; and `Constant::Int`
+    being `u128` (I14) forced `as u64` casts at the ~7 size/priority/switch read sites (all ≤64-bit).
+  - **`translate_ll_path`/`translate_ll_str` + the `assert_ll_parity` harness — DONE.** `lib.rs` now
+    exposes the textual entry (`ll::parse::parse_module` → `translate`), and `tests/translate.rs` has
+    `compile_to_ll` (`clang -O2 -emit-llvm -S`) + `assert_ll_parity(name, c_src)`: compile each test C
+    to **both** `.bc` and `.ll`, translate both, assert byte-identical svm-ir (`svm_text::print_module`)
+    and `entry_sp`. Three parity tests pass on real `clang -O2` output the **core-slice parser already
+    handles**: `ll_parity_trivial_add` (header + flagged binop + `ret`), `ll_parity_arith_chain`
+    (binop chain with `±` immediates), `ll_parity_bitwise_shifts` (`shl`/`lshr`/`or`). The textual path
+    is proven end-to-end through the unified (`ll`-consuming) translator.
+  - **Parser — single-block instruction set + multi-block/`phi` landed.** `parse.rs` now covers (each
+    with an `assert_ll_parity` test on real `clang -O2` output): integer **+ float binops**,
+    **conversions** (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`, with `nneg`/flag skipping),
+    **`icmp`/`fcmp`** (full predicate sets + fast-math-flag skipping), **`select`**, **`fneg`/`freeze`**,
+    **`phi`**, and **multi-block CFGs**. The multi-block enabler was **LLVM implicit slot numbering**:
+    the unnamed counter is shared across (unnamed) params + blocks + value instructions, so `basic_blocks`
+    seeds `next_unnamed` at the parameter count — an unlabeled entry then takes `%{nparams}` and the
+    phi/branch refs into it match the bitcode reader's `Name`s. Eight parity tests green (`add`, arith
+    chain, shifts, `sext`-widen, `icmp`+`zext`, `fadd`, a `for`-loop sum, an `if/else` diamond). Constant
+    operands: int (full width) + `true`/`false`; **float constants are deferred** (LLVM's `0x…` hex-float
+    image needs exact bit parsing — a small dedicated slice).
+  - **Parser — `call` landed.** `parse.rs` now parses `[%d =] [tail] call [fmf] [cconv/ret-attrs]
+    <retty>|<fnty> <callee>(<args>) [#N] [,!meta]`: direct `@f` (a `GlobalReference` whose `ty` is the
+    **reconstructed** `<ret>(<argtys>)` function type — or the explicit `<ret>(<params>,...)` signature
+    for varargs) and indirect `%fp` callees, the **result-less `void` call** (which forced
+    `instruction()` to look ahead via `at_call()` before assuming the leading `%dest =`), and dropped
+    arg/return attribute lists. Four parity tests green: direct 1-arg, direct 2-arg, `void`, and the
+    `llvm.smax` intrinsic (the `a>b?a:b` lowering — the translator turns it back into `icmp`+`select`).
+    **Twelve parity tests total.**
+  - **Parser — memory landed.** `parse.rs` now parses `alloca [inalloca] <ty> [, <cty> <count>] [, align
+    N] [, addrspace(N)]` (implicit count → the `i32 1` operand the bitcode reader materializes), `load
+    [volatile] <ty>, ptr <addr> [, align N]`, `store [volatile] <ty> <val>, ptr <addr> [, align N]` (the
+    **second result-less** instruction — the `at_call`/`store` lookahead in `instruction()` routes both),
+    and `getelementptr [inbounds] [nuw|nusw] <srcty>, ptr <addr> [, <ity> <idx>]…`. Three parity tests:
+    `p[i]` (gep+load), `p[i]=v` (gep+store), and a `volatile` local (alloca + volatile load/store + the
+    `llvm.lifetime` intrinsics, which the call path already handles). **Fifteen parity tests total.**
+  - **Parser — module-level globals landed.** `parse.rs` now parses `@g = [linkage/attrs] [addrspace(N)]
+    global|constant <ty> [<init>] [, align N]` into `module.global_vars` (`ty` = the *pointer* type, as
+    the bitcode reader records `LLVMTypeOf`; the written content type parses the initializer). New AST
+    coverage: `[N x T]` **array types** in `type_()`, a `constant(&ty)` parser (int/`true`/`false`/
+    `zeroinitializer`/`null`/`undef`/`poison`/`@g`-refs/`[…]` arrays/`c"…"` byte strings — the `c` prefix
+    lexes as its own `Word`), and a `@name → pointee-type` **symbol table** (populated from each global +
+    function as parsed) so a `@g` *operand* resolves to a `GlobalReference` carrying the pointee type the
+    translator reads (e.g. GEP base). Also fixed `skip_to_toplevel_boundary` to stop before a depth-0
+    `@global` (an unbraced `target … = "…"` line was swallowing the globals after it) and added
+    `nonnull`/`noalias` to the return/pre-signature attribute skip. Three parity tests: a mutable scalar
+    (`@counter`, load/add/store), a `constant [4 x i32]` lookup table (array type + array init + gep), and
+    a `c"hi\00"` string returned as `ptr @.str`. **Eighteen parity tests total.**
+  - **Parser — named struct types landed.** `parse.rs` now parses `%s = type { … }` / `%s = type opaque`
+    top-level defs (→ `module.types.add_named_struct_def`, matching the bitcode reader's
+    `all_struct_names` registration), and `type_()` resolves a `%s` **reference** (a `Local` in type
+    position) + a literal `{ i32, i32 }` struct type. `skip_to_toplevel_boundary` also now stops before a
+    depth-0 `%local` (same fix as `@global` — an unbraced `target … = "…"` line was swallowing the
+    `%s = type …` defs after it). One parity test: struct field access (`%struct.P` + `getelementptr
+    %struct.P, ptr %p, i64 0, i32 1`). **Nineteen parity tests total.**
+  - **Parser — float constants landed.** `value_as_operand`/`constant` now decode `float`/`double`
+    literals — decimal (`5.000000e-01`) or the `0x` + 16-hex-digit `double`-image form (used even for
+    `float`) — into `Float::Single(f64 as f32)`/`Float::Double(f64)`, exactly matching the bitcode reader
+    (`LLVMConstRealGetDouble`, cast to `f32` for single). `half`/`bfloat`/`fp128`/`x86_fp80`/`ppc_fp128`
+    stay payload-free AST variants. Three parity tests: `x*0.5f` (decimal single), `x*3.14` (hex-image
+    double), and a `constant [3 x double]` global (float aggregate init). **Twenty-two parity tests
+    total.** This was the last deferred *primitive* — the parser now covers scalar/pointer/struct/array
+    computation + memory + calls + globals end-to-end.
+  - **Parser — `switch` + SIMD vectors landed.** `switch <ty> <v>, label %default [ <cty> <c>, label
+    %l … ]` (whitespace-separated case entries) is parsed in `terminator()`. Vectors: `<N x T>` (+ packed
+    `<{…}>` struct, `<vscale x …>`) types in `type_()`, `<T …>` vector constants, and
+    `extractelement`/`insertelement`/`shufflevector` — the shuffle **mask canonicalized to a
+    `Constant::Vector` of `i32` indices** (`zeroinitializer`/`poison`/explicit all normalized), exactly
+    as the bitcode reader does via `LLVMGetMaskValue` (the translator's `<4×>` path *requires* `Vector`).
+    `value_as_operand` was refactored to delegate every non-`%local` value to `constant()`, so
+    `poison`/`undef`/`zeroinitializer`/`null`/vector constants all reach operand position. Four parity
+    tests: sparse `switch`, `<4 x i32>` add, a splat (insertelement + shuffle), and a
+    `llvm.vector.reduce.add` reduction. **Twenty-six parity tests total.**
+  - **Parser — constant-expressions landed.** `constant()` now parses folded const-exprs: `getelementptr
+    [inbounds] ( <srcty>, ptr <addr>, <idx>… )` → `ConstGetElementPtr`, the conversions
+    `trunc`/`zext`/`sext`/`ptrtoint`/`inttoptr`/`bitcast`/`addrspacecast` `( <c> to <ty> )` →
+    `Const{…}(ConstUnaryOp)`, and `add`/`sub`/`mul` `( <c0>, <c1> )` → `Const{…}(ConstBinaryOp)`
+    (recursive, so nested `ptrtoint(getelementptr(…))` works). `at_constant_start` recognizes these op
+    words so a global initializer that *is* a const-expr isn't skipped. Two parity tests: `&arr[3]` (a
+    `getelementptr` global init) and `(long)&arr[1]` (`ptrtoint` of a `getelementptr`). **NB:** a
+    function-pointer table (`[N x ptr] [ptr @fa, …]`) is rejected by the *translator itself*
+    (`Unsupported("constexpr reference to @fa")`) on **both** paths — a translator gap, not a parser one,
+    so no parity test covers it. **Twenty-eight parity tests total.**
+  - **Parser — C++ exception handling landed.** `invoke [%r =] … to label %ok unwind label %lpad` is
+    parsed in `terminator()` (which now takes `next_unnamed` and handles the value-producing terminator's
+    `%r =` prefix; `at_terminator` looks past it). The `call`/`invoke` callee+arg grammar is factored into
+    a shared `call_signature`. Added the `resume <ty> <v>` terminator, `landingpad <ty> [cleanup]
+    [catch|filter <ty> <c>]…` (clauses → opaque `LandingPadClause {}` markers + the `cleanup` flag, as the
+    shim maps them), and `extractvalue`/`insertvalue <ty> <agg>, … , <idx>…`. The function `personality`
+    clause is skipped (already handled by the pre-`{` attr skip). The harness gained `assert_ll_parity_cpp`
+    (`clang++ -O1 -fexceptions`). One parity test: a `try/catch` (invoke + landingpad + extractvalue +
+    `__cxa_*`) — **NB** the translator only reserves the EH region when the module has a `main`
+    (`need_eh = uses_eh && has_main`), so the test source includes one. **Twenty-nine parity tests total.**
+    The instruction set is now broadly saturated for `clang`-emitted C/C++.
+  - **Parser — atomics landed.** `atomicrmw [volatile] <op> ptr <a>, <ty> <v> [syncscope("…")]
+    <ordering>` (all 15 `RMWBinOp`s), `cmpxchg [weak] [volatile] ptr <a>, <ty> <exp>, <ty> <new>
+    <success> <failure>`, `fence <ordering>` (result-less, routed like `store`), and the `load atomic`/
+    `store atomic` variants (an `atomic` keyword + trailing `[syncscope] <ordering>` before `, align`).
+    Shared `atomicity()`/`mem_ordering()`/`rmw_op()` helpers; no-`syncscope` ⇒ system scope. One parity
+    test: `atomic_fetch_add` + `atomic_compare_exchange_strong` + `atomic_load` — **NB** `fence` parses
+    but the *translator* doesn't lower it (`Unsupported`), so it's excluded from the test. **Thirty parity
+    tests total.**
+- **PR2 landed + merged (PR #158).** The instruction set is saturated for `clang -O2`/`clang++` (30
+  parity tests). Loose ends remaining, each a small `clang -O2`-shape + `assert_ll_parity` addition:
+  **literal aggregate constants** `{ i32 1, i8 2 }`, **`indirectbr` + `blockaddress`** (AST already has
+  `Constant::BlockAddress`), **scalable-vector** ops — all rare in `-O2` output.
+- **PR3 (in progress, branch `claude/ll-debug-metadata`): debug metadata from `.ll` text, replacing the
+  `di.rs` `llvm-sys` walk.**
+  - **Slice 3a — source-line half + function names — DONE.** A metadata pre-pass
+    (`Parser::collect_di_metadata`, run before `module()` since the `!N` table is emitted *after* the
+    functions that `!dbg`-reference it) parses the reduced `DiNode` table (`!DILocation`/`!DIFile`/scope
+    nodes via a generic `parse_di_node`/`scan_node_fields` field-scanner). `skip_trailing_metadata`
+    captures each instruction's `!dbg !N` into `pending_dbg`; `instruction()` resolves it
+    (`DILocation` → `scope.file` → `DIFile`) and attaches a `DebugLoc` via the new
+    `Instruction::set_debug_loc`. `!DISubprogram(name:)` feeds a `@linkage → source` **func-names** table,
+    exposed by `parse_module_with_debug`; `translate_ll_str` packages it as a `di::LlvmDebug` (the same
+    `di` arg the bitcode path uses). Parity gate: **`assert_ll_parity_debug`** (`clang -O2
+    -gline-tables-only` — source lines + subprogram names but *no* `DILocalVariable`/`DIType`, so the
+    variable/type graph stays out of scope) — **31 parity tests total.** Key gotcha found: the DIFile
+    filename is embedded, so both compiles must use the *same* `.c` source path.
+  - **Slice 3b — the variable/type graph — DONE.** A new `ll/debug.rs` fully mirrors `di.rs`,
+    building the `di::LlvmDebug` `types`/`vars`/`globals` from text so both readers produce a
+    byte-identical structured half: the **type interner** (`DIBasicType`→`Base` with the same
+    `infer_encoding(name)` heuristic, `DIDerivedType`ptr→`Pointer`, `DICompositeType` array→`Array`
+    with `count = size_bits/elem_bits`, struct/union→`Aggregate`; transparent typedef/const resolution;
+    cycle-safe placeholder; **functions walked before globals** so the interning order + `TypeId`s
+    match), **`read_globals`** (each global's `!dbg` `DIGlobalVariableExpression`→`DIGlobalVariable`),
+    **`read_function_vars`** (alloca ordinals for `dbg.declare`→`Window`, argument index for
+    `dbg.value`→`Arg`; dedup by `!DILocalVariable` identity), and **lexical-block scope** (a
+    `DILexicalBlock`-scoped var → `(decl_line, block_end)` via `compute_block_ends`). The metadata
+    pre-pass was generalized to a generic `DiNode { Node { kind, fields } | Tuple }`; `dbg.declare`/
+    `dbg.value` `metadata`-operand payloads (dropped by the AST as `MetadataOperand`) are captured in a
+    side-channel (`DbgIntrinsic`). Gates: `assert_ll_parity_debug` (`-O0 -g`, with a `debug.type`
+    non-triviality guard) + an `-Og -g` variant — five debug parity tests (source lines, func names,
+    type graph + globals, `dbg.declare` locals, `dbg.value` args, lexical scope). **`di.rs` is now
+    fully replaceable.** (Corrected a real bug mid-slice: the debug harness had used
+    `-gline-tables-only`, which emits no type/var graph, so the type/global/local tests were passing
+    trivially — switched to `-O0 -g`.)
+- **PR4 (in progress, branch `claude/ll-drop-libllvm`): flip the default + drop the libLLVM binding.**
+  - **Experiment (done, then reverted): route `translate_bc_path` through `llvm-dis` + the textual
+    reader and run the *whole corpus* (267 tests, not just the 35 parity shapes).** Result: the `.ll`
+    reader handled **252/267** after the parser-widening below; the mechanism works (out-of-process
+    `llvm-dis foo.bc -o -` → `translate_ll_str`, no libLLVM linked). The reverted experiment is the
+    template for the real flip. **Remaining 15 gaps** (the flip's to-do list): **10** a top-level
+    construct with `=` near the module head (`at: 17`; hits `cpp_eh_*` + `rust_*` — a comdat/alias/ifunc
+    or similar `skip_toplevel_item` doesn't handle; pin it down by dumping tokens near the failure);
+    **4** `blockaddress(@f, %bb)` + `indirectbr` (the `computed_goto_*` tests — needs the `blockaddr`
+    side-reader's payload recovered from text: parse the `blockaddress` constant + thread the
+    `BlockAddrs` the translator reads); **1** `i128_wide_constant_fails_closed` (now *obsolete* — the
+    textual reader carries full-width `i128`, so this fail-closed test's premise is gone; update it to
+    expect success, the whole point of I14). The **forward-reference** globals/functions gap (a `@f`
+    used before its def / an external `declare`) was papered over with an opaque-ptr fallback in the
+    experiment; the correct fix is a **two-pass symbol collection** (pre-scan `define`/`declare`/`@g =`
+    signatures into `symbols` before parsing bodies) — do that in the flip.
+  - **DONE this checkpoint — parser widened for real-world (Rust/C++/`llvm-dis`) IR** (all clean, green,
+    landable without the flip): the lexer drops `^N = …` ThinLTO **module-summary** lines; `type_()`
+    handles `half`/`bfloat`/`fp128`/`x86_fp80`/`ppc_fp128`; `constant()` parses **literal aggregate
+    constants** `{ <ty> <c>, … }` / packed `<{…}>` (`ll_parity_struct_constant_global`);
+    `skip_pre_signature_attrs` + `param_list` handle **paren-payload attributes**
+    (`dereferenceable(N)`/`range(…)`/`byval(<ty>)`, depth-tracked) + the newer attrs
+    (`dead_on_unwind`/`writable`/`captures`/`nofpclass`/…); and `block_label` accepts a **quoted**
+    `"name":` label. (These knocked the corpus from 215→252 in the experiment.)
+  - **DONE — the flip landed; libLLVM is unlinked.** `translate_bc_path` now `llvm-dis`-disassembles
+    to `.ll` and routes through the textual reader; **the entire 268-test behavioral corpus passes
+    through the pure textual reader** (not just the 35 parity shapes). Closing the gaps required:
+    **(a)** a **two-pass symbol collection** (a forward-ref-tolerant pass harvests every global/function/
+    `declare` type into `symbols` before the real parse, so a `@name` used before its definition
+    resolves) + parsing `declare` signatures; **(b)** the **external-global fix** — an `external
+    global/constant <ty>` has *no* initializer, so `at_constant_start` must not mistake the *next*
+    top-level `@name` for its value (this was the "top-level `=`" cluster, 10 tests); **(c)**
+    **`blockaddress` + `indirectbr` from text** — the `(@f, %bb)` payload the AST drops is captured
+    per-global (initializer DFS) and per-φ `(func, block, phi_ord, incoming)`, resolved to block indices,
+    and threaded as the `BlockAddrs` the translator reads (`ll::parse::take_block_addrs`); **(d)**
+    **global `alias`es** (`@a = alias <fnty>, ptr @b` → `module.global_aliases`, `type_maybe_fn` for the
+    alias's function type); **(e)** the obsolete `i128_wide_constant_fails_closed` test rewritten to
+    expect success (I14 is *fixed* — the reader carries full-width `i128`; NB the runtime correctness of
+    `i128 urem` by a >64-bit *divisor* is a separate pre-existing translator gap, never exercised before
+    because the reader fail-closed there). **Deleted:** `from_llvm_ir.rs`, `wideint.rs`, and the
+    `llvm-sys` bodies of `di.rs`/`blockaddr.rs` (their data structs stay, filled by `ll::debug`/
+    `ll::parse`); **dropped the `llvm-ir`/`llvm-sys`/`either` deps.** `svm-llvm` links **no libLLVM**.
+  - **DONE — version tolerance proven; the rustc-1.81 pin dropped from the breadth lane.** The Rust
+    on-ramp breadth lane (`rust_no_std_matches_native` and the `no_std`+`alloc` powerbox tests) now
+    compiles with the **default** `rustc` (1.94 → **LLVM 21**) via `--emit=llvm-ir` straight to `.ll`
+    and routes through `translate_ll_path` — so the lane *is* the version-tolerance proof: a newer LLVM
+    than the old `llvm-ir` ceiling (19) flows through the textual reader unchanged. Its `+1.81.0`
+    invocations (both `compile_rust_to_ll` and the native oracles) are gone. (The matching CI change —
+    swap `llvm-18-dev` → base `llvm-18`, rescope the 1.81 step to peval only — is a **manual
+    follow-up**: the bot's token lacks `workflow` scope, so it cannot push `.github/workflows/ci.yml`.
+    The exact edit is spelled out in Q5 below.) **The 1.81 pin survives in exactly one place:**
+    the multi-crate `peval_*` Futamura probe (`tests/common/mod.rs`), which links the fixture closure
+    with `llvm-link-18` and DCEs it with `opt-18` — LLVM-18 CLI tools that can only ingest LLVM-18 IR,
+    so the fixture must be built by a version-matched `rustc`. (Those tests auto-skip, not fail, absent
+    the toolchain; CI keeps a scoped `rustup toolchain install 1.81.0` step for them.)
+    Feeding real LLVM-21 IR surfaced three new-in-LLVM-19/20/21 constructs the reader/translator now
+    handle: **(a)** the no-op alloc-shim marker `@…__rust_no_alloc_shim_is_unstable_v2()` (dropped like
+    `llvm.lifetime`); **(b)** the `icmp samesign` poison hint (skipped in the parser); **(c)** the
+    three-way-compare intrinsics `llvm.scmp`/`llvm.ucmp` (LLVM ≥ 19, what newer `rustc` lowers
+    `Ord::cmp` into) — lowered to `(a>b) - (a<b)`, **masked to the result width** so the {-1,0,1} value
+    lands in the `switch i8` `br_table` the way the parser's width-masked case constants expect (an
+    unmasked sign-extended `-1` hit the `unreachable` default — a `BTreeMap` navigation trap).
+  - **Remaining (optional):** convert the C test helpers from `clang -c` + `llvm-dis` to a direct
+    `clang -emit-llvm -S` (dropping even the `llvm-dis` runtime dependency for the C-compiled tests —
+    the pre-built `.bc` corpora still use `llvm-dis`).
 
 **Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
 -fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
@@ -1758,19 +2186,27 @@ frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `sv
 `svm-llvm` is **excluded from the workspace** (root `Cargo.toml`, with `fuzz`/`bench`), so the
 default `cargo build/test --workspace` never resolves or links libLLVM and the cross-OS
 runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) is untouched (D54 off-the-
-runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites
-found at first light (document these for the CI lane):**
-- **`llvm-18-dev`** (headers + the `.so`), not just `llvm-18`/`libllvm18` (runtime only). The
-  runtime package ships `libLLVM.so` but no `llvm-c/*.h`, which `llvm-sys`'s build script needs.
-- **Dynamic linking**: distros ship `libLLVM.so` without the static `.a`s (no `libPolly.a`),
-  and `llvm-sys` defaults to static. We depend on `llvm-sys` directly with feature
-  **`prefer-dynamic`** (feature-unifies onto the `llvm-sys` `llvm-ir` pulls in) so it links the
-  dylib. `clang`/`llvm-config` 18 must be on `PATH` (they are in this container + the existing
-  wasm/cc CI lanes).
+runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites —
+UPDATED after the textual-reader flip (PR4):**
+- **No `-dev` package, no libLLVM link.** The on-ramp reads textual `.ll` with an in-house parser,
+  so `llvm-sys`/`llvm-ir` and the `prefer-dynamic` dance are gone. CI installs just base
+  **`llvm-18`** + **`clang-18`** — two ordinary build-time *tools*: `clang` (compile the C/C++
+  corpus to bitcode) and `llvm-dis` (disassemble it to `.ll`). Neither is linked into the crate.
+- **No Rust-toolchain pin.** The Rust lane compiles with the default stable `rustc` (`--emit=llvm-ir`);
+  its bundled LLVM (21 here) flows straight through the textual reader — the version-tolerance proof.
 
-**Q5 — remaining CI yaml (open):** add the Linux-only `svm-llvm` job to `ci.yml` (install
-`llvm-18-dev`, `cd crates/svm-llvm && cargo test`); a maintainer one-liner like the §10 miri/
-ASan items in HANDOFF.
+**Q5 — CI yaml (MANUAL FOLLOW-UP — the bot lacks `workflow` scope):** the Linux-only `svm-llvm` job
+exists in `ci.yml` and runs `cargo fmt --all --check` · `cargo clippy --all-targets -- -D warnings` ·
+`cargo test`. After the PR4 flip it needs two edits a maintainer must apply by hand (a `workflow`-scoped
+push, like the §10 miri/ASan HANDOFF items):
+1. **Drop the libLLVM dev headers.** In the "install LLVM 18" step, `llvm-18-dev clang-18` → `llvm-18
+   clang-18`. The crate no longer links libLLVM; it only shells out to `clang` + `llvm-dis`, both in
+   the base `llvm-18` package. (`llvm-link-18`/`opt-18`, used by the peval probe, are also in base.)
+2. **Rescope the 1.81 toolchain step.** It is no longer for the Rust breadth lane (that runs on the
+   default stable `rustc` now — the version-tolerance proof). Retitle it to make clear it exists solely
+   for the multi-crate `peval_*` Futamura probe, which links/DCEs its fixture with the LLVM-18 CLI tools
+   and so needs a version-matched `rustc`. Keep the `rustup toolchain install 1.81.0` line (else those
+   tests auto-skip).
 
 ---
 

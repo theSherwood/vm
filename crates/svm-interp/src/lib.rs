@@ -199,7 +199,16 @@ pub enum Trap {
 /// the host stack stays O(1) regardless of guest depth. This is a reference-oracle limit,
 /// not the production recursion ceiling (the JIT uses the guest's guard-paged data stack,
 /// §5).
-const MAX_CALL_DEPTH: u32 = 256;
+///
+/// The bound must sit **above** a guest runtime's own C-stack-overflow detection so the
+/// oracle observes the same *catchable* error the production engines do, rather than killing
+/// the guest first. Concretely: Lua's `LUAI_MAXCCALLS` (200 nested C calls) expands to well
+/// under 2048 reified frames, so `coroutine.lua`'s "infinite recursion of coroutines" test
+/// raises a `pcall`-catchable "C stack overflow" on all three engines instead of the
+/// tree-walker uniquely tripping this cap (an uncatchable §5 kill) at 256. Kept comfortably
+/// below the durable shadow-reserve's frame budget (`DURABLE_RESERVE`, §12.7) so a deep
+/// durable freeze still traps at *this* cap, never by corrupting guest memory.
+const MAX_CALL_DEPTH: u32 = 2048;
 
 /// Run `func` with `args`, consuming up to `*fuel` execution steps.
 ///
@@ -8257,10 +8266,15 @@ fn trap_status(t: &Trap) -> i64 {
         Trap::Unreachable => 4,
         Trap::IndirectCallType => 5,
         Trap::CapFault | Trap::Malformed | Trap::Exit(_) => 6, // bad/unsupported async request
-        Trap::MemoryFault | Trap::StackOverflow => 8,
+        Trap::MemoryFault => 8,
         Trap::FiberFault => 9,
         Trap::ThreadFault => 10,
         Trap::OutOfFuel => 11,
+        // Matches the JIT's `TrapKind::StackOverflow` (13). The JIT produces it only under the
+        // `stack-check` feature (a fiber's software stack-limit check); the default guard-page path
+        // reports a stack overflow as `MemoryFault` (8) — the hardware can't distinguish it — so the
+        // two configs report the same event under different codes, both a "stack blew up" outcome.
+        Trap::StackOverflow => 13,
     }
 }
 

@@ -326,6 +326,30 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `Atomics.wait`/`notify`. Verified: **crossOriginIsolated**, powerbox PASS, and the 8-vCPU counter
   kernel → **4000 across 9 Workers** (1 root + 8 spawned), stable across repeats. So the genuinely
   multithreaded SVM-in-wasm runs end-to-end in a real browser, not just Node.
+- [x] **Performance — the sandbox tax (cross-engine `svm-bytecode-wasm` row).** Everything above
+  proves *correctness*; this measures *cost*. The cross-engine benchmark
+  (`crates/svm-llvm/examples/cross_engine.rs`) now times the bytecode engine **compiled to wasm** (the
+  `svm_run_bench` export, driven by `browser/bench.mjs` on V8) running the same LLVM-frontend IR as its
+  native `svm-bytecode` row — so the ratio *is* the double-sandboxing overhead, and every result is
+  cross-checked against native bytecode (a mismatch is a loud `MISCOMPILE`). Indicative: **~1.2–1.4× on
+  pure-compute kernels** (V8 JITs the dispatch loop, so the engine's own work is barely taxed) but
+  **~1.9× / ~3.4× on the `chase` / `chase_rand` dependent-load kernels** — each guest load pays *both*
+  SVM's mask/guard confinement and wasm's linear-memory bounds, and the serial chain can't hide that
+  latency. The honest browser-path cost: cheap for compute, real for pointer-chasing. (See
+  `bench/cross-engine/README.md` § "SVM-in-wasm".)
+- [x] **The playground (`web/play.html`)** — the human-facing demo the whole path builds toward:
+  type SVM text into an editor, it is parsed → verified → encoded **inside the wasm sandbox**
+  (`svm_parse`: `svm-text`/`svm-verify`/`svm-encode` compiled into the cdylib; a reject comes back
+  as an error *message*, not a status), and runs across **real Web Workers** under a selectable
+  powerbox recipe — none (compute), 4d host I/O (stdout read back onto the page), §22 guest-JIT, or
+  a §14 root `Instantiator` (sandboxed children, each on its own Worker). The Worker orchestration
+  is `web/par.js`, extracted from `main.js` so the validation page and the playground drive the
+  *same* machinery (a plain run now explicitly clears the last-published recipe via
+  `svm_par_powerbox_none`, since a playground runs modes in any order). The window is sized from the
+  source's `memory N` declaration; Stop tears the Workers down (shared state may be wedged after —
+  the page says to reload). `browser-test.mjs` drives it like a human in Chromium: all five examples
+  (hello 14 + stdout, threads 4000, io 8 + 8×"tick\n", jit 1136, inst 40) plus a garbage-source
+  parse-reject, all asserted.
 
 ## Verification
 
@@ -339,6 +363,8 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `node browser/live.mjs` (host-import demo, `--features live`). The 16 embedded `--invoke` probes under
   **Reproduce** spot-check each feature on wasm64 directly.
 - **Runs in a real browser:** `node browser/browser-test.mjs` (Chromium via Playwright) — cross-origin
-  isolated, the powerbox prints `"hello, powerbox!"`, and one guest's vCPUs run across real Web Workers
-  → 4000. (Build the threads module + `gencorpus` first; see the header of `browser-test.mjs`.)
+  isolated, the powerbox prints `"hello, powerbox!"`, one guest's vCPUs run across real Web Workers
+  → 4000, and the **playground** (`/web/play.html`) parses typed SVM text in-browser and runs it in
+  every powerbox mode, incl. the parse-reject negative. (Build the threads module + `gencorpus`
+  first; see the header of `browser-test.mjs`.)
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.

@@ -428,6 +428,12 @@ pub enum TrapKind {
     /// host `setjmp` table's lookup before the (skipped) `_longjmp` (§3b totality). Matches the
     /// interpreters' `Trap::Malformed` for the same condition (LLVM.md §"JIT `longjmp`").
     SetjmpFault = 12,
+    /// A guest **control-stack overflow** caught by the software stack-limit check the JIT emits in
+    /// each prologue when `feature = "stack-check"` (the arena/software-guard fiber model, which drops
+    /// the per-fiber hardware guard page). A function whose frame would grow the native stack past the
+    /// running fiber's low bound traps here rather than corrupting an adjacent fiber's stack —
+    /// detect-and-kill (§5). With the hardware guard page (the default), overflow is a `MemoryFault`.
+    StackOverflow = 13,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -448,6 +454,7 @@ impl TrapKind {
             10 => TrapKind::ThreadFault,
             11 => TrapKind::OutOfFuel,
             12 => TrapKind::SetjmpFault,
+            13 => TrapKind::StackOverflow,
             _ => return None,
         })
     }
@@ -2328,9 +2335,28 @@ impl CompiledModule {
                 srcloc_map.as_ref(),
                 var_labels,
             )?;
+            // Optional codegen dump for performance work: `SVM_JIT_DUMP_CLIF=1` prints each function's
+            // CLIF and (post-compile) the Cranelift VCODE disassembly to stderr. A pure diagnostic — no
+            // effect unless the env var is set; used to compare svm-jit's generated code against other
+            // backends (e.g. the Embench cross-engine bench).
+            let dump_codegen = std::env::var_os("SVM_JIT_DUMP_CLIF").is_some();
+            if dump_codegen {
+                eprintln!("=== SVM-JIT CLIF fn{fi} ===\n{}", ctx.func.display());
+                ctx.set_disasm(true);
+            }
             module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            // NOTE (feature `stack-check`, STACK_GUARD.md §2): soundness wants a post-compile bound
+            // rejecting any function whose frame exceeds `RED_ZONE` (so a function can't grow the stack
+            // past the limit before its callee re-checks). Cranelift 0.132 doesn't expose the final
+            // frame size on `CompiledCode` (`FrameLayout`/`total_stacksize` are ABI-internal), so this
+            // bound is DEFERRED — see the increment plan. Until then the check assumes frames ≤ RED_ZONE.
+            if dump_codegen {
+                if let Some(d) = ctx.compiled_code().and_then(|c| c.vcode.as_ref()) {
+                    eprintln!("=== SVM-JIT VCODE fn{fi} ===\n{d}");
+                }
+            }
             base_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
             if srcloc_map.is_some() {
                 if let Some(cc) = ctx.compiled_code() {
@@ -3707,6 +3733,12 @@ fn sig_from(
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
     sig.params.push(AbiParam::new(I64)); // trap_out (host-owned trap cell)
+                                         // §2b path B: a 4th context param — the running stack's low bound (`usable_low`), or 0 for the
+                                         // root/thread-top (which keeps its OS-guarded stack). Threaded through every call (constant within
+                                         // a stack's call tree; set anew at each fiber/root entry), so the prologue check reads a per-vCPU
+                                         // limit from a register with no cell and no TLS. Only present under `stack-check`.
+    #[cfg(feature = "stack-check")]
+    sig.params.push(AbiParam::new(I64)); // stack_limit
     let sret = uses_sret(results);
     if sret {
         // The return-area pointer: the callee writes its results here (8-byte slots) instead of
@@ -4019,6 +4051,10 @@ struct Lower<'a> {
     /// Holds `trap_out`, the host-owned `*mut i64` trap cell a trap (or the cap thunk)
     /// writes before returning (the host reads it to learn the run trapped, §5).
     trap_var: Variable,
+    /// §2b path B: holds `stack_limit` (the running stack's `usable_low`, or 0 for the root), for the
+    /// prologue [`emit_stack_check`] and to thread on to callees. Only under `stack-check`.
+    #[cfg(feature = "stack-check")]
+    limit_var: Variable,
     /// This function's result CLIF types, so a trapping path can `return` dummy zeros.
     result_tys: Vec<Type>,
     /// The §4 confinement mask (`reserved - 1`); `0` when the module has no memory.
@@ -4155,6 +4191,8 @@ fn build_clif(
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
     b.append_block_param(entry, I64); // trap_out
+    #[cfg(feature = "stack-check")]
+    b.append_block_param(entry, I64); // stack_limit (§2b path B) — mirrors sig_from
     if sret {
         b.append_block_param(entry, I64); // return-area pointer (results spilled here, not returned)
     }
@@ -4174,10 +4212,22 @@ fn build_clif(
     b.def_var(fn_table_var, fn_table_base);
     let trap_var = b.declare_var(I64);
     b.def_var(trap_var, trap_out);
-    // The return-area pointer (when sret) is likewise needed in the `Return`/tail-call blocks.
-    let sret_var = if sret {
+    // §2b path B: stash the stack-limit param (block index 3, right after the context pointers) so the
+    // prologue check and every call can reach it.
+    #[cfg(feature = "stack-check")]
+    let limit_var = {
         let var = b.declare_var(I64);
         b.def_var(var, b.block_params(entry)[3]);
+        var
+    };
+    // The return-area pointer (when sret) is likewise needed in the `Return`/tail-call blocks. Its
+    // block index is after the context pointers (+1 for the stack-limit param under `stack-check`).
+    let sret_var = if sret {
+        let var = b.declare_var(I64);
+        b.def_var(
+            var,
+            b.block_params(entry)[3 + cfg!(feature = "stack-check") as usize],
+        );
         Some(var)
     } else {
         None
@@ -4197,6 +4247,8 @@ fn build_clif(
         mem_var,
         fn_table_var,
         trap_var,
+        #[cfg(feature = "stack-check")]
+        limit_var,
         sret_var,
         funcs,
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
@@ -4223,12 +4275,13 @@ fn build_clif(
     // before any work): this is what stops unbounded recursion and tail-call loops — each (re-)entry
     // polls the interrupt cell. Intra-function loops are caught by the per-back-edge check in
     // `lower_block`.
-    let pbase = 3 + usize::from(sret);
+    let pbase = 3 + cfg!(feature = "stack-check") as usize + usize::from(sret);
     let entry_args: Vec<BlockArg> = b.block_params(entry)[pbase..]
         .iter()
         .map(|v| BlockArg::from(*v))
         .collect();
     emit_epoch_check(&mut b, &lower);
+    emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
@@ -4271,6 +4324,13 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
     // (8-byte `encode_slot` slots) straight into the buffer Rust reads, so no register read-back.
     let sret = uses_sret(&entry.results);
     let mut call_args = vec![mem_base, fn_table_base, trap_out];
+    // §2b path B: the root runs on the OS thread stack (OS-guarded), so its stack-limit is 0 ⇒ the
+    // prologue check is inert for the root computation; fibers get a real limit at their own entry.
+    #[cfg(feature = "stack-check")]
+    {
+        let zero = b.ins().iconst(I64, 0);
+        call_args.push(zero);
+    }
     if sret {
         call_args.push(results_ptr);
     }
@@ -4376,8 +4436,12 @@ fn module_uses_instantiator(m: &IrModule) -> bool {
 /// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
 #[cfg(fiber_rt)]
 fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
-    for _ in 0..6 {
-        clif.signature.params.push(AbiParam::new(I64)); // code, mem_base, fn_table_base, trap_out, sp, arg
+    // Params: `code`, then the guest entry's Tail args in order — mem_base, fn_table_base, trap_out,
+    // [stack_limit under §2b path B], sp, arg -> i64. `stack_limit` sits in the same relative slot as
+    // in `sig_from`, so the entry call args are exactly `p[1..]` in both configs (see [`FiberCallTramp`]).
+    let np = 6 + cfg!(feature = "stack-check") as usize;
+    for _ in 0..np {
+        clif.signature.params.push(AbiParam::new(I64));
     }
     clif.signature.returns.push(AbiParam::new(I64));
     clif.name = UserFuncName::user(0, 2);
@@ -4385,22 +4449,20 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     let mut fbctx = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(clif, &mut fbctx);
     let blk = b.create_block();
-    for _ in 0..6 {
+    for _ in 0..np {
         b.append_block_param(blk, I64);
     }
     b.switch_to_block(blk);
     b.seal_block(blk);
     let p = b.block_params(blk).to_vec();
-    let (code, mem_base, fn_table_base, trap_out, sp, arg) = (p[0], p[1], p[2], p[3], p[4], p[5]);
-    // The guest entry's natural Tail signature: (mem_base, fn_table_base, trap_out, sp, arg) -> i64.
+    let code = p[0];
+    let call_args = p[1..].to_vec(); // (mem_base, fn_table_base, trap_out, [stack_limit], sp, arg)
     let sig = b.import_signature(sig_from(
         module,
         &[ValType::I64, ValType::I64],
         &[ValType::I64],
     ));
-    let call = b
-        .ins()
-        .call_indirect(sig, code, &[mem_base, fn_table_base, trap_out, sp, arg]);
+    let call = b.ins().call_indirect(sig, code, &call_args);
     let r = b.inst_results(call)[0];
     b.ins().return_(&[r]);
     b.seal_all_blocks();
@@ -5760,11 +5822,16 @@ fn lower_block(
 /// The leading context arguments threaded into every guest call: `(mem_base,
 /// fn_table_base, trap_out)`.
 fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
-    vec![
+    #[cfg_attr(not(feature = "stack-check"), allow(unused_mut))]
+    let mut a = vec![
         b.use_var(lower.mem_var),
         b.use_var(lower.fn_table_var),
         b.use_var(lower.trap_var),
-    ]
+    ];
+    // §2b path B: pass our own stack-limit on to the callee (same stack, same limit) — mirrors sig_from.
+    #[cfg(feature = "stack-check")]
+    a.push(b.use_var(lower.limit_var));
+    a
 }
 
 /// For a callee whose `results` use the sret ABI ([`uses_sret`]), allocate a stack **return-area**,
@@ -5878,6 +5945,46 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
     b.switch_to_block(cont);
     // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
 }
+
+/// The software stack-overflow guard's per-thread limit cell + tunables (feature `stack-check`). See
+/// `crates/svm-jit/STACK_GUARD.md`. The prologue check ([`emit_stack_check`]) reads [`STACK_LIMIT`];
+/// the fiber runtime writes each resumed fiber's `usable_low` across the resume seam
+/// ([`stack_check::set_limit`]/[`stack_check::restore_limit`]).
+#[cfg(feature = "stack-check")]
+pub(crate) mod stack_check {
+    /// Headroom (bytes) the prologue check reserves below the limit. Because the check runs *after* the
+    /// machine prologue's `sub rsp` (it's in the entry block), it validates this function's frame
+    /// directly; `RED_ZONE` only needs to cover the prologue's pre-check register pushes plus the
+    /// check's own scratch. A single frame larger than the whole stack is a residual backstop concern
+    /// (STACK_GUARD.md §2b) — Cranelift 0.132 doesn't expose the final frame size to enforce it.
+    pub(crate) const RED_ZONE: u64 = 1 << 14; // 16 KiB
+}
+
+/// PROTOTYPE (feature `stack-check`): the per-prologue software stack-limit check — overflow protection
+/// for the arena/software-guard fiber model, which drops the per-fiber hardware guard page. Modelled on
+/// [`emit_epoch_check`]: load the running fiber's low bound from [`stack_check::STACK_LIMIT`], get the
+/// current SP, and trap [`TrapKind::StackOverflow`] if `SP - RED_ZONE < limit` — this function's frame
+/// (bounded to `RED_ZONE` post-compile) would grow the native stack past the fiber's low bound.
+/// `limit == 0` (the root, on the OS stack) ⇒ `SP - RED_ZONE` is a huge address, never `< 0`, so the
+/// check is inert there. The **atomic** load is opaque to the optimizer (like the epoch poll), so it
+/// isn't hoisted/folded. Emitted once per function entry; the callee re-checks before its own frame.
+#[cfg(feature = "stack-check")]
+fn emit_stack_check(b: &mut FunctionBuilder, lower: &Lower) {
+    let cont = b.create_block();
+    let trap_blk = b.create_block();
+    // §2b path B: the running stack's low bound, from our own ABI param (per-vCPU by construction — no
+    // cell, no TLS). 0 for the root/thread-top ⇒ `SP - RED_ZONE < 0` is never true ⇒ inert (OS guard).
+    let limit = b.use_var(lower.limit_var);
+    let sp = b.ins().get_stack_pointer(I64);
+    let guard = b.ins().iadd_imm(sp, -(stack_check::RED_ZONE as i64)); // SP - RED_ZONE
+    let lt = b.ins().icmp(IntCC::UnsignedLessThan, guard, limit);
+    b.ins().brif(lt, trap_blk, &[], cont, &[]);
+    b.switch_to_block(trap_blk);
+    emit_trap(b, lower, TrapKind::StackOverflow);
+    b.switch_to_block(cont);
+}
+#[cfg(not(feature = "stack-check"))]
+fn emit_stack_check(_b: &mut FunctionBuilder, _lower: &Lower) {}
 
 /// A zero constant of CLIF type `t` (for a trapping path's dummy return).
 fn zero_of(b: &mut FunctionBuilder, t: Type) -> Value {

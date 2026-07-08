@@ -195,7 +195,7 @@ jobs:
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo test -p svm-mem (TSan)
-        run: cargo test -p svm-mem -Z build-std --target x86_64-unknown-linux-gnu
+        run: cargo test -p svm-mem --tests -Z build-std --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
 
@@ -255,13 +255,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: crates/svm-llvm }
       - name: install LLVM 18 (dev headers + dynamic lib)
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - name: cargo test -p svm-llvm setjmp (ASan, JIT path live)
-        run: cargo test -p svm-llvm -Z build-std --target x86_64-unknown-linux-gnu setjmp
+        run: cargo test --manifest-path crates/svm-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
         env:
           # -Zsanitizer=address replaces the workflow-global `-D warnings`: -Z build-std recompiles
           # std from source, which would trip warnings-as-errors (same reason the wasm64 lane clears it).
@@ -298,4 +299,73 @@ jobs:
             -Clink-arg=--export=__wasm_init_tls" \
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
           node browser-test.mjs
+
+  embench-differential:
+    # Whole-stack differential on the real Embench-IoT suite — every engine's `verify` must equal
+    # native's (1). EMBENCH_STRICT makes a MISCOMPILE or an on-ramp build/translate failure fail the
+    # job. This is the net that caught the qrduino soundness bug, so it gates every PR.
+    name: embench differential (all engines · wasm32/wasm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            crates/svm-llvm
+            bench/cross-engine/wasmtime-rs
+      - name: install LLVM 18 (libLLVM for the on-ramp + clang for the kernels & wasm)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
+        run: |
+          curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
+          echo "EMBENCH=/tmp/embench-iot-master" >> "$GITHUB_ENV"
+      - name: build the in-process Wasmtime runner (populates the wt/* columns)
+        run: cargo build --release --bin embench_one --manifest-path bench/cross-engine/wasmtime-rs/Cargo.toml
+      - name: embench differential (strict — MISCOMPILE or on-ramp failure ⇒ red)
+        env:
+          EMBENCH_STRICT: "1"
+        run: cargo run --release --example embench --manifest-path crates/svm-llvm/Cargo.toml
+
+  cross-engine-differential:
+    # Soundness gate for the cross-engine bench harness (crates/svm-llvm/examples/cross_engine.rs).
+    # It runs each kernel's LLVM-frontend IR on the bytecode engine *compiled to wasm* (the
+    # `svm-bytecode-wasm` row, via browser/bench.mjs on Node) and cross-checks every result against
+    # native bytecode. The harness prints `MISCOMPILE` on a mismatch but doesn't itself exit non-zero,
+    # so this step greps for it — and asserts the row actually ran, so a missing cdylib/node can't pass
+    # silently. Linux-only, like `svm-llvm` (the on-ramp links libLLVM). The perf numbers it also prints
+    # are informational — the perf signal is the separate non-gating `bench` job.
+    name: cross-engine differential (svm-bytecode-wasm vs native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            crates/svm-llvm
+            browser
+      - name: install LLVM 18 (libLLVM for the on-ramp + clang for the kernels)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - run: rustup target add wasm32-unknown-unknown
+      - name: build the svm-browser wasm32 cdylib (so the svm-bytecode-wasm row runs)
+        run: cargo build --release --lib --target wasm32-unknown-unknown --manifest-path browser/Cargo.toml
+      - name: cross-engine differential (MISCOMPILE ⇒ red)
+        run: |
+          set -o pipefail
+          cargo run --release --example cross_engine --manifest-path crates/svm-llvm/Cargo.toml 2>&1 | tee xe.log
+          if grep -q MISCOMPILE xe.log; then
+            echo "::error::cross-engine differential found a MISCOMPILE"; exit 1
+          fi
+          if ! grep -q '^svm-bytecode-wasm,' xe.log; then
+            echo "::error::svm-bytecode-wasm row did not run (node or svm-browser cdylib missing?)"; exit 1
+          fi
 

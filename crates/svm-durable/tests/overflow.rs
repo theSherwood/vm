@@ -1,10 +1,11 @@
 //! The shadow stack traps on overflow instead of corrupting guest memory (R9 / §12.7).
 //!
 //! The shadow stack mirrors the call stack; the freeze-path `UNWIND` check refuses to push
-//! a frame whose top would cross `DURABLE_RESERVE` into the guest's region. On the interp a
-//! real overflow is unreachable (its own `MAX_CALL_DEPTH` caps recursion long before 64 KiB
-//! of frames accrue), so we drive the guard directly: seed the shadow-SP near the top of the
-//! reserve, so the very next push would cross it.
+//! a frame whose top would cross `DURABLE_RESERVE` into the guest's region. Reaching a real
+//! overflow by natural recursion is impractical for typical frames (`MAX_CALL_DEPTH` caps the
+//! reified call stack), so we drive the guard directly: seed the shadow-SP near the top of the
+//! reserve, so the very next push would cross it. This is exactly why the check exists — a
+//! large-frame guest recursing near the cap must trap here, never write past the reserve.
 
 use svm_durable::{
     init_durable_window, transform_module, write_state, DURABLE_RESERVE, SHADOW_BASE,

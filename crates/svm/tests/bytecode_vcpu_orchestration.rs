@@ -250,12 +250,13 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::Notify { addr, count } => {
                 vcpu.deliver_code(host.notify(addr, count));
             }
-            // §22 JIT events: out of scope for these compute/threads/futex kernels (covered by
-            // `bytecode_vcpu_orchestration_jit.rs`) — never raised here.
+            // §22 JIT / §14 instantiate events: out of scope for these compute/threads/futex kernels
+            // (covered by the dedicated orchestration tests) — never raised here.
             bytecode::VcpuEvent::JitInstall { .. }
             | bytecode::VcpuEvent::JitUninstall { .. }
-            | bytecode::VcpuEvent::JitInvoke { .. } => {
-                unreachable!("no JIT in the compute/threads/futex orchestration kernels")
+            | bytecode::VcpuEvent::JitInvoke { .. }
+            | bytecode::VcpuEvent::Instantiate { .. } => {
+                unreachable!("no JIT/§14 in the compute/threads/futex orchestration kernels")
             }
         }
     }

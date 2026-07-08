@@ -9,9 +9,9 @@ publish = false
 # a verifier-checked `Module` and is never a dependency of `svm-jit`/`svm-interp`. Its output is
 # re-verified, so a translation bug is a clean error, not an escape (§2a).
 #
-# It links libLLVM (via `llvm-ir` → `llvm-sys`) at **build/dev time only**, so it is **excluded
-# from the workspace** (root `Cargo.toml`) and built as an opt-in, Linux-dev-only lane — the
-# cross-OS runtime matrix never links libLLVM (D54 "off the runtime path"; LLVM.md §8 Q4).
+# It reads **textual LLVM IR** (`.ll`) with an in-house, pure-Rust reader (`ll`) — **no libLLVM link**
+# (LLVM.md §8 Q1a). The legacy `translate_bc_path` disassembles a `.bc` out-of-process via `llvm-dis`
+# (an ordinary build-time tool, like `clang` — §Q2), so nothing links libLLVM into this crate.
 
 [dependencies]
 svm-ir = { path = "../svm-ir" }
@@ -19,14 +19,6 @@ svm-ir = { path = "../svm-ir" }
 # pure-Rust serializers (no LLVM), shared with the runtime crates.
 svm-text = { path = "../svm-text" }
 svm-encode = { path = "../svm-encode" }
-# Reads legalized bitcode into an owned, pure-Rust AST (LLVM.md §8 Q1). Pinned to the LLVM-18
-# feature to match the container's `clang`/`libLLVM` (LLVM.md §2). Off-version bitcode is rejected.
-llvm-ir = { version = "0.11.3", features = ["llvm-18"] }
-# `llvm-ir` pulls in `llvm-sys` (181.x = LLVM 18); we depend on it directly only to flip its
-# link mode to **dynamic** (feature unification), since distros ship `libLLVM.so` without the
-# static `.a`s (`llvm-18-dev` provides headers + the dylib, not Polly/static archives). Build/dev
-# only — never linked into the runtime crates (LLVM.md §8 Q4).
-llvm-sys = { version = "181", features = ["prefer-dynamic"] }
 
 [dev-dependencies]
 svm-verify = { path = "../svm-verify" }
