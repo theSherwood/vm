@@ -13,6 +13,17 @@ use std::ffi::c_void;
 use svm_interp::{run_with_host, Host, Value};
 use svm_jit::{compile_and_run_with_host, JitOutcome};
 
+/// Serialize this binary's tests (ISSUES.md I4). `spawn_alongside_capability_import` runs 6 real
+/// OS-thread workers doing futex park/notify; on macOS CI the binary intermittently died `SIGABRT`
+/// in that path while *sibling* tests ran concurrently in the same process — and because tests
+/// interleave, the abort could never be attributed to one test. Every test takes this lock, so the
+/// threaded run has the process to itself and any recurrence is localized to the single test that
+/// held the lock. A poisoned lock (an earlier test failed) is fine to reuse — take the inner guard.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Transpile WAT importing one capability, verify, then run export `entry` on interp + JIT under a
 /// `Host` the same `grant` populates on each (so the handle encoding matches). The granted handle is
 /// passed as the leading argument (the threaded capability handle), followed by `extra_args`. Asserts
@@ -93,6 +104,7 @@ fn mix(arg: i64) -> i64 {
 /// `0+1+…+(N-1)` on both backends.
 #[test]
 fn import_clock_now_loop_sum() {
+    let _serial = serial();
     let wat = r#"
 (module
   (import "2" "0" (func $now (result i64)))
@@ -116,6 +128,7 @@ fn import_clock_now_loop_sum() {
 /// marshalling through the `cap.call` (the `hostcall` bench shape) on both backends.
 #[test]
 fn import_blocking_work_sum() {
+    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))
@@ -145,6 +158,7 @@ fn import_blocking_work_sum() {
 /// leading handle param is forwarded, not just held by the entry).
 #[test]
 fn import_handle_threads_through_defined_call() {
+    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))
@@ -168,6 +182,7 @@ fn import_handle_threads_through_defined_call() {
 /// capability. A 2-entry dispatch picks `work(arg)` vs `work(arg)+1` by index.
 #[test]
 fn import_handle_threads_through_call_indirect() {
+    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))
@@ -203,6 +218,7 @@ fn import_handle_threads_through_call_indirect() {
 /// `name`=op convention still produces an inline `cap.call`.
 #[test]
 fn import_non_numeric_name_is_a_named_import() {
+    let _serial = serial();
     let wasm = wat::parse_str(
         r#"(module (import "env" "host_fn" (func (result i64))) (func (export "f") (result i64) (call 0)))"#,
     )
@@ -275,6 +291,7 @@ fn run_import_multi(
 /// (type_id 2) gets slot 0 and Blocking (type_id 10) slot 1; the guest calls both in one function.
 #[test]
 fn import_multiple_interfaces_bind_to_distinct_handles() {
+    let _serial = serial();
     let wat = r#"
 (module
   (import "2" "0" (func $now (result i64)))
@@ -299,6 +316,7 @@ fn import_multiple_interfaces_bind_to_distinct_handles() {
 /// the entry). The helper sums clock + work; the entry calls it twice.
 #[test]
 fn import_two_handles_thread_through_defined_call() {
+    let _serial = serial();
     let wat = r#"
 (module
   (import "2" "0" (func $now (result i64)))
@@ -329,6 +347,7 @@ fn import_two_handles_thread_through_defined_call() {
 /// agree). This proves capabilities reach spawned threads, the gap this slice closes.
 #[test]
 fn spawn_alongside_capability_import() {
+    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))     ;; Blocking cap (handle slot 0)
@@ -371,6 +390,7 @@ fn spawn_alongside_capability_import() {
 /// 0. (Imported table/global/tag stay unsupported.)
 #[test]
 fn import_memory_is_supported() {
+    let _serial = serial();
     let wasm = wat::parse_str(
         r#"(module (import "env" "memory" (memory 1)) (func (export "f") (result i32)
              (i32.store (i32.const 0) (i32.const 42)) (i32.load (i32.const 0))))"#,

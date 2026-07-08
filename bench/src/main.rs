@@ -1794,9 +1794,16 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
             continue;
         };
         let r = raw.ratios();
-        let mut row = |metric: &str, baseline: f64, current: f64| {
+        // `gating: false` prints the drift but never fails the check. Used for `cold/wasmtime`:
+        // cold-start wall-clock against an *external* wasmtime is dominated by runner generation
+        // and wasmtime-version drift, not by our codegen — the 2026-07 CI audit (ISSUES.md I17)
+        // found that row past any sane tolerance on 24 of 25 red nightlies (drifting +40→108%
+        // over a month) while every compute ratio stayed put, making the lane red-by-construction
+        // and therefore signal-free. The same-run svm/wasm ratios remain the gate.
+        let mut row = |metric: &str, baseline: f64, current: f64, gating: bool| {
             let delta = current / baseline - 1.0;
-            let regressed = delta > tol;
+            let over = delta > tol;
+            let regressed = over && gating;
             ok &= !regressed;
             println!(
                 "{:<11} {:<16} {:>9.3} {:>9.3} {:>+7.1}%  {}",
@@ -1805,19 +1812,25 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
                 baseline,
                 current,
                 delta * 100.0,
-                if regressed { "REGRESSED" } else { "ok" }
+                if regressed {
+                    "REGRESSED"
+                } else if over {
+                    "high (info-only)"
+                } else {
+                    "ok"
+                }
             );
         };
-        row("compute/wasm32", b.compute32, r.compute32);
+        row("compute/wasm32", b.compute32, r.compute32, true);
         if let (Some(bv), Some(cv)) = (b.compute64, r.compute64) {
-            row("compute/wasm64", bv, cv);
+            row("compute/wasm64", bv, cv, true);
         }
-        row("cold/wasmtime", b.cold, r.cold);
+        row("cold/wasmtime", b.cold, r.cold, false);
         if let (Some(bv), Some(cv)) = (b.interp_vs_jit, r.interp_vs_jit) {
-            row("interp/jit", bv, cv);
+            row("interp/jit", bv, cv, true);
         }
         if let (Some(bv), Some(cv)) = (b.jit_vs_native, r.jit_vs_native) {
-            row("jit/native", bv, cv);
+            row("jit/native", bv, cv, true);
         }
     }
     if ok {

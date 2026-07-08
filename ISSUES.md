@@ -165,6 +165,14 @@ other lanes green (27687656906, 27776754171, 27778073561, 27837565343 — failin
 re-verified per-run). macOS is the #2 flake source after I3; the de-flake sketch above (serialize
 the `imports` binary) is now worth doing rather than deferring.
 
+**Mitigation landed (2026-07-08, `claude/ci-flakiness-audit-fw9023`):** the de-flake sketch's
+process-global lock — every test in `imports.rs` now takes a shared `serial()` mutex, so the
+6-worker threaded test has the process to itself and a recurrence is localized to the single test
+that held the lock (the interleaving that blocked attribution is gone). Root cause remains open;
+if it recurs *serialized*, capture the core/backtrace per the next-step note above. Two things may
+also make it vanish outright: I3's code-arena leak fix (memory pressure was one suspected trigger)
+and the serialization itself (scheduler contention was the other).
+
 ---
 
 ### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — **FIX LANDED** on `claude/dap-function-names` (pending `windows-latest` CI confirmation)
@@ -617,7 +625,7 @@ stops re-discovering them. Confirm by watching the next few nightly `fuzz(diff)`
 
 ---
 
-### I17 — `bench/baseline.txt` is stale: the nightly bench lane has been red ~every night (S4, non-gating but signal-destroying)
+### I17 — nightly bench lane red ~every night: cold/wasmtime rows drift past any tolerance (S4) — **FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (cold row now info-only; baseline regen still pending)
 
 **Where:** nightly `bench regression check (non-gating)` job — `bench … --check baseline.txt --tol 0.4`.
 
@@ -635,6 +643,15 @@ regression (its stated purpose), and it pads every nightly failure report.
 kernels; consider excluding the cold/wasmtime columns from `--check` (or giving them their own,
 wider tolerance) — cold-start wall-clock on shared runners is exactly the noise the 40 % tol was
 supposed to absorb, and empirically it does not.
+
+**Landed (2026-07-08):** the second half — `check_baseline` now treats `cold/wasmtime` as
+**info-only** (printed with its drift, marked `high (info-only)`, never fails the check): it
+measures runner generation + external-wasmtime version drift, not our codegen, and it was the sole
+gating-failure cause in all 24 red bench nights. The same-run svm/wasm compute ratios (the
+machine-portable signal the baseline header itself calls the tracked one) still gate. **Still
+pending:** regenerate `baseline.txt` on the designated bench machine so the five MISSING kernels
+(`simd`, `float`, `calli`, `cache`, `irreducible`) get rows — MISSING never gated, but those
+kernels currently have no regression tracking at all.
 
 ---
 
