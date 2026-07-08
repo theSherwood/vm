@@ -32,6 +32,17 @@ The test asserts three directions: guest (`mem_fs`) stdout byte-matches native o
 create → close → reopen → verify; under `host_fs` the guest's `test.db` really lands on disk and
 **native SQLite opens the guest-written file**; and the guest reads a native-written database.
 
+## `sqlite_logictest.c` — SQLite's own test corpus (tests: `demo_sqlite_logictest`, `_full`)
+
+A compact **sqllogictest** runner (https://sqlite.org/sqllogictest/): reads a script from stdin,
+runs every record against the same in-memory build as Phase A, and checks results against the
+expected values the corpus bakes in (including the `N values hashing to <md5>` form — an RFC-1321
+MD5 is embedded, and value formatting matches the reference runner byte-for-byte). Doubly gated:
+the summary must report `failed=0` (self-validation) and guest stdout must byte-match the native
+build over the same stdin (differential). The scripts are fetched-with-cache from the stable
+GitHub mirror; CI runs `select1.test` (1031 records), the `_full` `#[ignore]`d sweep covers all
+seven fetched scripts (~46k records).
+
 ## Running by hand
 
 ```sh
