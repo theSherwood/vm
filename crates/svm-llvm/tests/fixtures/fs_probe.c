@@ -1,8 +1,12 @@
 /* Probe for the **configurable Fs capability** (svm-run's `fs::mem_fs`/`fs::host_fs`): resolve the
  * embedder-granted capability by name (`__vm_cap_resolve`, §7 cap.self.resolve) and drive the whole
  * op protocol through `__vm_host_call` (§7 host-defined capability, the wasm-import analogue) —
- * open/write/close, reopen/seek/read-back, rename, append, remove, and the attenuation refusals
- * (`..`/absolute paths). Exit 0 iff every step behaved; any failure returns its step number.
+ * open/write/close, reopen/seek/read-back, rename, append, remove, truncate (shrink-discard /
+ * grow-zero-fill / read-only refusal), sync, and the attenuation refusals (`..`/absolute paths).
+ * Exit 0 iff every step behaved; any failure returns its step number.
+ *
+ * The committed `fs_probe.bc` is this file compiled with `clang -O2 -emit-llvm -c` (regenerate the
+ * same way after editing).
  *
  * Phase B (host-fs verification) is keyed on a `seed.txt` the embedder may pre-place in the granted
  * root: when present, its content is verified and an `out.txt` is written AND LEFT BEHIND, so the
