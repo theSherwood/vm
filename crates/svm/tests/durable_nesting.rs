@@ -418,3 +418,30 @@ fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
+
+/// The bytecode engine's durable-capture entry must **decline** a §14 module (fall back to the
+/// tree-walker, which owns the durable nesting rules): its own instantiate arm has neither the
+/// admission check nor the fail-closed, so driving a durable §14 module there would mint the exact
+/// thaw-faulting artifact the tree-walker refuses. (svm-run's bytecode backend falls back on
+/// `None`, so an embedder always lands on the enforced path.)
+#[test]
+fn bytecode_durable_capture_declines_a_nesting_module() {
+    let parent = instrument(PARENT_SELF);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 5_000_000u64;
+    let r = svm_interp::bytecode::compile_and_run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert!(
+        r.is_none(),
+        "the bytecode durable entry must decline §14 modules (tree-walker owns the nesting rules)"
+    );
+}

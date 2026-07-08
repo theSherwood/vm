@@ -185,7 +185,11 @@ A freeze landing **after** the child is joined mints a valid artifact whose thaw
 join result — the child is never re-run (`durable_nesting.rs::freeze_after_nested_child_joined_…`).
 *(Aside: the deterministic `arm_freeze_after` trigger deliberately ticks only on
 `cont.resume`/`suspend` — cap.call is not counted — so the freeze-after-join test drives a fiber
-after the join to place the trigger.)* What this slice does *not* yet do: freeze a subtree as a
+after the join to place the trigger.)* The **bytecode** engine's durable-capture entry now
+**declines** §14 modules (falling back to the tree-walker, which owns the durable nesting rules —
+svm-run's bytecode backend already falls back on decline), exactly as it declines `thread.*`: its
+own instantiate arm has neither the admission check nor the fail-closed, and would otherwise mint
+the same thaw-faulting artifact. What this slice does *not* yet do: freeze a subtree as a
 unit — §14 children riding the artifact as residue (per-subtree STW trigger + subtree handle
 capture) are the next nesting slices; this makes the invariant they rely on real and the gap
 fail-closed rather than silently corrupt in the meantime.

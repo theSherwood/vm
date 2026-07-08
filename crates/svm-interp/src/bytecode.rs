@@ -2542,13 +2542,19 @@ pub fn compile_and_run_capture_reserved_with_host(
 ) -> Option<Capture> {
     // Multi-vCPU durability (`thread.*`) is out of scope: a durable thread spawn needs the
     // multi-worker freeze the engine doesn't drive, so always refuse it (the caller falls back to the
-    // tree-walker), lest it write a silently-wrong artifact.
-    let threadish = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts
-            .iter()
-            .any(|i| matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. }))
+    // tree-walker), lest it write a silently-wrong artifact. §14 **nesting** (`Instantiator`
+    // cap.calls) is likewise out of scope (DURABILITY.md §4): the tree-walker owns the durable
+    // nesting rules — the freezable-module admission check, child durability inheritance, and the
+    // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
+    // instantiate arm has none of them, so driving a durable §14 module here would both skip the
+    // admission rule and mint the exact thaw-faulting artifact the tree-walker refuses.
+    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
+                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::iface::INSTANTIATOR)
+        })
     });
-    if threadish {
+    if outside {
         return None;
     }
     // `cont.*` durability is fully supported (DURABILITY.md §12.8): the per-fiber shadow-SP swap keeps
