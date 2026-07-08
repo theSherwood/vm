@@ -13920,7 +13920,12 @@ fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
             // shim from being stabilized/DCE'd. It returns `void` and has no runtime effect, so we
             // drop it (matched on the stable v0-mangled suffix, ignoring the crate-hash prefix and
             // the `_v1`/`_v2` version tail).
-            || s.contains("__rust_no_alloc_shim_is_unstable");
+            || s.contains("__rust_no_alloc_shim_is_unstable")
+            // `llvm.trap`/`llvm.debugtrap` (`__builtin_trap()`, a UBSan/assert hard-stop) is always
+            // emitted immediately followed by an `unreachable` terminator — which the on-ramp already
+            // lowers to a guest trap — so the intrinsic call itself is a no-op we drop.
+            || s.starts_with("llvm.trap")
+            || s.starts_with("llvm.debugtrap");
     }
     false
 }
