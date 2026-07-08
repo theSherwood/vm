@@ -351,6 +351,200 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (hello 14 + stdout, threads 4000, io 8 + 8×"tick\n", jit 1136, inst 40) plus a garbage-source
   parse-reject, all asserted.
 
+## Remaining work / follow-ons
+
+Everything in the phase tracker is landed; this is the open list — each item its own slice, none a
+blocker for what's shipped. (Previously these lived only as scattered "Follow-up:" notes above and
+in session discussion; collected here so the next slice has a home to be picked from.)
+
+- [ ] **Combined powerbox recipe (io + jit + inst in one `Host`).** The `svm_par_powerbox*` run
+  recipes are exclusive (last-published-wins), so a browser guest can compute in parallel, JIT,
+  sandbox children, *and* print — but not all in the same run. One combined recipe (a single `Host`
+  granting `Stream(Out)` + `Jit` + `Instantiator`, seeded by entry arity like `powerbox_exec`) would
+  make the playground's modes composable instead of either/or.
+- [ ] **Graceful stop / cooperative cancellation.** The playground's Stop terminates Workers
+  mid-run, which can wedge shared state (a held `Mutex<Host>`, the live-vCPU counter) — the page
+  currently just asks for a reload. A cooperative cancel (a run-wide stop flag in shared memory the
+  engine polls at its fuel/epoch check points, DESIGN.md §5) would let a stopped run leave the
+  instance reusable.
+- [ ] **Run-wide fuel budget across Workers.** Fuel is per-vCPU today (`new_confined_child` takes a
+  quota; a §14 parent can cut a child's budget), but a run has no *aggregate* bound — 8 workers ×
+  per-vCPU fuel is 8× the intended ceiling. A shared fuel pool (an atomic in shared linear memory,
+  debited in the engine's existing fuel decrements) would give the browser the §5 metering story the
+  native drivers have.
+- [ ] **vCPU-bomb backstop → spawner `ThreadFault`.** The 256-cap live-vCPU counter refuses
+  construction, which fails the *whole run* via the JS host — cruder than the native drivers, where
+  the spawner gets a clean `ThreadFault` and can handle it. Surface the refusal as a fault delivered
+  to the spawning vCPU (via `deliver_handle`'s error path) instead of a dead child.
+- [ ] **ABI cleanup: result structs instead of `static mut` stashes.** Multi-value returns
+  (`svm_run_pb` streams, `svm_run_capture` snapshots, `svm_parse` output, `svm_par_stdout`) all go
+  through single-reader `static mut` slots with ptr/len accessor pairs. An `svm_alloc`-returned
+  result struct would drop the statics and the call-order contracts ("call `len` first").
+  Same slice: the `--features live` path still uses fixed scratch buffers — the one entry the
+  `svm_alloc`/`svm_dealloc` ABI conversion skipped.
+- [ ] **A real-language playground tab.** The playground takes SVM text; the repo already runs Lua
+  on SVM through the `svm-llvm` on-ramp (official `coroutine.lua` + debug library green). Wiring a
+  Lua (or C via `frontend/chibicc`) tab needs the frontend path available to the browser —
+  pre-compiled modules first, in-wasm compilation later.
+- [ ] **wasm64 in the browser (external: V8 table64).** Blocked on V8 shipping 64-bit tables
+  (tracked under **Status** #3); the browser path stays wasm32 until then. When it lands: unify
+  wasm64 with the threads build (`+atomics` + memory64 in one target) so the browser gets the native
+  `u64` address path — re-run the corpus differential and the Chromium lane on it.
+- [ ] **Chromium first-run timeout flake (watch item).** `browser-test.mjs` has twice hit a one-off
+  timeout on the first run after a cold wasm build (~1 in 8 locally; once with a
+  `memory access out of bounds` pageerror), never reproducing on re-run and never on Node. Diagnose
+  (suspect: a stale view or an init race visible only under a cold Worker spin-up) or, failing
+  that, make the CI lane retry once so a known flake doesn't red a PR.
+- [ ] **wasm-JIT tier** — compile SVM IR to wasm at the explicit compile points and run hot compute
+  near-natively in the browser. The largest remaining browser project; full design + slice plan
+  below (§ "wasm-JIT tier"). Highest leverage *after* the real-language playground tab makes browser
+  guests compute-hot. Ships with its own **`svm-wasmjit` cross-engine bench row** next to
+  `svm-bytecode-wasm` (same driver, same MISCOMPILE cross-check) — the projected ~5–20× is a claim
+  until that row measures it.
+
+## wasm-JIT tier — design & implementation plan
+
+Compile SVM IR to WebAssembly in the browser (the v86 move: generate wasm bytes at runtime, compile
+with `new WebAssembly.Module`, dispatch through a funcref table) so hot guest compute runs on V8's
+optimizing tiers instead of the bytecode dispatch loop. Assessed 2026-07; not started.
+
+### Why, and how much
+
+From `bench/cross-engine/README.md` (measured, this machine class):
+
+| fact | number |
+|---|--:|
+| bytecode interp vs `svm-jit`, native | interp **~20–50×** slower (~30–70 ns/iter vs ~1–2) |
+| interp-in-wasm tax, compute kernels | ~1.2–1.4× |
+| interp-in-wasm tax, dependent loads | ~1.9× / ~3.4× (`chase` / `chase_rand`) |
+| clang-emitted wasm on V8 (TurboFan) | ≈ native |
+
+The upper bound is that last row. Emitted-by-us wasm (dispatcher control flow, inline masking, fuel
+checks) will plausibly sit 2–4× off clang quality at first, netting **~5–20× on hot compute** over
+today's interp-in-wasm, **~2–5× on pointer-chasing** (the SVM-mask + wasm-bounds double indirection
+is structural — every engine pays the memory hierarchy on `chase_rand`), and **~1× on
+`cap.call`/schedule-bound guests** (never in the interpreter's hot loop to begin with). Break-even
+logic carries over from the native tiers (JIT repays compile past ~10⁵–10⁶ iterations; bytecode cold
+is ~30 µs): the interp stays the always-there floor, the JIT is the opt-in tier at explicit compile
+points. Payoff is proportional to how compute-hot browser guests are — today's demos are
+schedule/IO-shaped; the real-language playground tab is what makes this the highest-leverage slice.
+
+### Why this is simpler than v86
+
+v86 JITs discovered x86 *machine code*: decode, self-modifying-code invalidation, lazy hot-block
+discovery. SVM has none of that. Code arrives as **complete, verified, immutable IR units at exactly
+three explicit points** — module load (`svm_par_compile`), §22 `jit_compile`/`install` (already
+literally the API for "compile this unit"), §14 `instantiate_module` — and uninstall is drop, never
+patch. And SVM IR is deliberately wasm-flavored (`i64.mul`, `br_if`, `call_indirect`, `v128`, typed
+SSA blocks): the compute long tail translates ~1:1. What's left of v86's architecture is the easy
+80%: codegen at unit granularity, dispatch through a real funcref table, state in linear memory at
+suspension boundaries.
+
+### Architecture
+
+- **Two tiers, not three.** wasm-JIT over the **bytecode interpreter**. The tree-walker is not on
+  the browser path (fail-closed, § "Decisions") and stays the *native* oracle; "fall back to the
+  interp" always means: that function/domain executes as bytecode ops inside the same resumable
+  `Vcpu` (same window, same `own_dom`, same shared `Mutex<Host>`) that would otherwise have called
+  the JITted function.
+- **Emitter**: pure-Rust SVM-IR→wasm-bytes in the cdylib (no heavy deps; it must itself build for
+  wasm32). Control flow v1 = the `loop + br_table` block dispatcher with SSA values in locals
+  (simple, handles any CFG); a relooper/stackifier for reducible CFGs later recovers straight-line
+  speed. Guest access = `win_base + (addr & mask)` inline. Traps: wasm traps surface as catchable
+  `RuntimeError` at the JS boundary; SVM-specific faults become explicit checks.
+- **Linking**: JS compiles the emitted bytes (`new WebAssembly.Module` — sync compile is fine on
+  Workers, where every vCPU already runs), instantiates against the same imported shared memory,
+  and registers the export into the engine instance's **exported funcref table**; Rust calls it by
+  transmuting the table index to a `fn` pointer (wasm function pointers *are* table indices).
+  Constraint: **tables are not shareable across Workers** (only memory is), so each Worker
+  instantiates the module (a `WebAssembly.Module` structured-clones cheaply; V8 shares the compiled
+  code) and registers it at the *same reserved index* — per-Worker bookkeeping layered on the
+  existing `SharedSlots` Acquire/Release dispatch.
+- **Preemption is mandatory, not optional**: an infinite loop in JITted code on a Worker is
+  otherwise unkillable. Emit a fuel/epoch check (shared-memory flag load + `br_if`) at loop
+  back-edges and calls. Dovetails with the run-wide fuel budget item above — one shared cell serves
+  both.
+- **Suspension points end the compiled region.** wasm has no shipped stack switching, so
+  `thread.join`/`memory.wait`/spawn/instantiate return to the vCPU event loop (state spilled at the
+  boundary), exactly v86's dispatch-loop shape. Note `cap.call` host I/O on the browser path is
+  **synchronous in-Rust** (the 4d shared powerbox) — it does *not* force a fallback, just a call.
+- **CSP footnote**: runtime wasm compilation needs `wasm-unsafe-eval` (or a permissive default) on
+  the embedding page. Our pages are fine; document for embedders.
+
+### Features with no wasm analog
+
+Three classes, all with existing precedent in this repo:
+
+1. **Control-plane ops are host calls — no analog needed.** `AddressSpace.map/unmap/protect`,
+   `SharedRegion.*`, `Instantiator.*`, freeze/thaw are `cap.call`s; JITted code hits the identical
+   host boundary the interp does. (`svm-mem`'s `Region` has no protection machinery at all — `unmap`
+   is *re-zero*; there is no OS anywhere on the wasm path already.)
+2. **Data plane: the software MMU + deopt-on-`cap.call`.** The reference `Mem` already models §13
+   aliasing/protection in software: `map_region` inserts `PageProt::Backed` page entries and flips
+   `has_regions`; only from then on does the per-byte path consult the address space. Natively the
+   Cranelift JIT uses hardware instead (`MprotectWindow`); wasm has none — but it has something
+   better: **every op that can break the flat-memory assumption is a `cap.call`, so the engine is
+   standing at the host boundary at the exact moment it breaks**. The JIT tier compiles the pure
+   fast path (mask+base, no page checks) and *deoptimizes that domain* (back to interp, or
+   recompile with the checked slow path) when the guest maps a region or changes protection. v86
+   needs dirty-page tracking because x86 invalidates pages with plain stores; our guests can only
+   do it by asking the host. Guests that never touch §13/§5 page ops — nearly all compute — pay
+   zero.
+3. **Execution-model features: tier fallback, per the native JIT's own precedent.** Fibers
+   (`cont.*`/`suspend`), coroutine yield, durable unwind points, `gc.roots`, debug single-step need
+   a scannable/switchable stack; wasm locals are invisible and stack switching hasn't shipped.
+   `svm-jit` already bails these `Unsupported` where the fiber substrate is missing ("the
+   interpreter covers it" — module-granular fallback); the wasm tier inherits the posture.
+   `gc.roots` bails unconditionally on this tier (natively it thunks into a runtime stack-walk;
+   on wasm even a thunk can't see JITted locals). Atomics: wasm atomics are all seq-cst — a safe
+   over-approximation of SVM's acquire/release. Tail calls: wasm `return_call` shipped (V8 stable);
+   maps directly.
+
+| feature | wasm-tier strategy | hot-path cost |
+|---|---|---|
+| masking / bounds | inline `and` + `add` | ~2 ops |
+| `AddressSpace` / `SharedRegion` / `Instantiator` ops | host call (already are) | none |
+| §13 aliasing, page protection | fast path + deopt on the `cap.call` that creates it | zero until used |
+| atomics orderings | wasm seq-cst (safe over-approx) | negligible |
+| fibers / suspend / durable unwind | interp fallback (`Unsupported`, svm-jit precedent) | n/a |
+| `gc.roots` | interp fallback (locals unscannable) | n/a |
+| debug / single-step | interp tier | n/a |
+| `thread.spawn`/`join`/`wait` | end region, return to the vCPU event loop | boundary only |
+
+### TCB posture
+
+The emitter joins the escape-TCB: an emitted-masking bug lets a guest scribble over *engine* state
+inside the wasm sandbox — the browser stays safe (wasm bounds hold), but SVM's guest→host isolation
+story doesn't. Mitigations are this repo's home turf: the masking/bounds codegen is a handful of
+auditable patterns (not a general optimizer); the full corpus differential runs emitted-wasm vs
+interp (a mismatch is a `MISCOMPILE`, same as the `svm-bytecode-wasm` bench row); fuzz the emitter
+alongside the existing escape-TCB targets. The §22 `browser_jit_validator` already encodes the
+"JIT-eligible subset" concept this tier generalizes.
+
+### Slice plan (each its own PR, oracle-gated like everything above)
+
+1. **Emitter core, proven natively first.** Compute ops + dispatcher control flow + masking + traps
+   + fuel back-edges → wasm bytes; run them under **Wasmtime via the existing `browser/wt`
+   embedding** against the corpus ground truth — the whole differential gate works before any
+   browser/JS exists. Biggest slice (~3–6k lines).
+2. **Browser linking.** Table registration, per-Worker instantiate, transmute-call from the engine;
+   AOT the suspension-free functions of a module at `svm_par_compile`; single Worker; Chromium gate
+   (a `#wasmjit` work item in `browser-test.mjs`).
+3. **Tiering + deopt.** Suspension-point partitioning (JIT-eligible function analysis), interp
+   fallback wiring in the `Vcpu`, deopt on `map_region`/`protect`; the §13 corpus cases through the
+   JIT tier.
+4. **Threads.** Per-Worker registration over `SharedSlots`; the proven schedule-independent kernels
+   (4000 / futex / io) run with compute regions JITted, differential vs the interp path.
+5. **§22 + §14 as real codegen.** Guest `jit_compile`/`install` emits wasm (validator-gated) — the
+   guest-JIT ops become an actual JIT; `instantiate_module` units compile on push.
+6. **Long tail + measurement.** SIMD/v128 (mostly 1:1), remaining ops; an `svm-wasmjit` row in the
+   cross-engine bench next to `svm-bytecode-wasm` so the gain is *measured*; a playground toggle.
+
+Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
+deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
+whether `gc.roots`-bearing functions bail at function or module granularity (function, if the
+partitioning is per-function anyway). Revisit fibers when JSPI / core stack-switching ships.
+
 ## Verification
 
 - **Builds:** the two `cargo build` lines under **Reproduce** (wasm64 via build-std; wasm32 smoke).
