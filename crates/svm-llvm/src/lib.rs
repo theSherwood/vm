@@ -2540,6 +2540,12 @@ fn callee_name(c: &crate::ll::ast::Call) -> Option<String> {
 // The handle stash is the public powerbox layout ([`svm_ir::POWERBOX_STASH_BASE`] + `i*4`), shared
 // with the frontend-independent [`svm_ir::synth_powerbox_start`]; the per-`VM_CAP_*` slots derive
 // from it so this and the public synthesizer can never drift.
+/// The `HostFn` interface id (`svm_interp::iface::HOST_FN`) — the **embedder-registered** capability
+/// (§7 "host-defined capabilities"), reached from C via `__vm_host_call`. Pinned here numerically
+/// (svm-llvm produces `svm-ir` and does not depend on the interpreter crate); `svm-run`'s
+/// `host_fn_type_id_matches` test locks the two together.
+const HOST_FN_TYPE_ID: u32 = 13;
+
 const STASH_STDOUT: u64 = svm_ir::POWERBOX_STASH_BASE;
 const STASH_STDIN: u64 = STASH_STDOUT + 4;
 const STASH_EXIT: u64 = STASH_STDOUT + 8;
@@ -11217,6 +11223,52 @@ fn lower_vm_builtin(
                 align: 0,
             }); // *type_id_out = type_id
             ctx.bind_dest(&c.dest, rs[0]); // the capability handle
+            Ok(true)
+        }
+        // §7 `cap.self.resolve`: `int __vm_cap_resolve(const char *name, long len)` resolves a
+        // capability **name** (registered by the host, e.g. an `Imports`-provided or extra-granted
+        // cap) to its handle — the runtime complement of the fixed stash for capabilities granted
+        // *outside* the 8-slot §3e prefix. Negative on unknown name / out-of-window buffer.
+        "__vm_cap_resolve" => {
+            let name_ptr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let name_len = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let r = ctx.push(Inst::CapSelfResolve { name_ptr, name_len });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §7 host-defined capability call: `long __vm_host_call(int handle, int op, long a, long b,
+        // long c, long d)` → `cap.call HOST_FN op handle (a,b,c,d)`. The generic bridge to an
+        // **embedder-registered** capability (`Host::grant_host_fn` — the wasm-import analogue): the
+        // handler's semantics live entirely in the host closure, the translator stays pure mechanism.
+        // `op` selects the operation and must be a compile-time constant (it is nominal in the IR,
+        // like the type id). The fixed `(i64×4) -> i64` shape covers the embedder-cap ABI; unused
+        // args are passed as 0 by the caller.
+        "__vm_host_call" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let op_const = vm_arg(c, 1)?
+                .as_constant()
+                .and_then(|k| match k {
+                    Constant::Int { value, .. } => Some(*value as u32),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::Unsupported("__vm_host_call: `op` must be a constant int".into())
+                })?;
+            let args = (2..6)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64; 4],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: HOST_FN_TYPE_ID,
+                op: op_const,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
         // §12 per-vCPU TLS register: `__vm_vcpu_tls_get()` reads the current vCPU's word (seeded to the

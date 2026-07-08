@@ -27,6 +27,7 @@ use svm_ir::{FuncIdx, Module, Resolved, ValType};
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
 pub use svm_interp::{Quota, Value};
+pub mod fs;
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 pub use svm_peval::{SpecArg, SpecConfig};
 
@@ -3043,6 +3044,41 @@ impl Imports {
         self.map.insert(name.into(), cap);
         self
     }
+
+    /// Offer a **module** of named bindings backed by **one shared instance** — the wasm two-level
+    /// import: a wasm `(import "fs" "open" …)` arrives (via `svm-wasm`'s `"{module}.{name}"`
+    /// encoding) as the import `"fs.open"`, and *every* field of a module must reach the same
+    /// provider instance, exactly as wasm instantiation supplies one instance per imported module.
+    ///
+    /// Each `(field, op)` is registered as `"{module}.{field}"`, pinned to `cap`'s interface with
+    /// that `op`. The provider is granted **once per host**: the first member granted (in import
+    /// order) runs `cap`'s grant and registers the handle under the bare module name in the §7
+    /// capability-name directory (F7); its siblings resolve that name instead of granting anew, so
+    /// all members share one handle — and one state — per run. (Without this, N `provide` calls of
+    /// N `HostCap::host_fn`s would mint N independent closures — N filesystems.) Bonus symmetry:
+    /// the guest can also `cap.self.resolve("{module}")` for the shared handle at runtime.
+    pub fn provide_module(mut self, module: &str, cap: HostCap, fields: &[(&str, u32)]) -> Imports {
+        for &(field, op) in fields {
+            let provider = cap.clone();
+            let module_name = module.to_string();
+            self.map.insert(
+                format!("{module}.{field}"),
+                HostCap {
+                    type_id: cap.type_id,
+                    op,
+                    grant: Arc::new(move |h, win| match h.resolve_cap_name(&module_name) {
+                        Some(handle) => handle,
+                        None => {
+                            let handle = (provider.grant)(h, win);
+                            h.register_cap_name(&module_name, handle);
+                            handle
+                        }
+                    }),
+                },
+            );
+        }
+        self
+    }
 }
 
 /// The name-bound capability set captured at [`instantiate_with_imports`]: the registry plus the
@@ -3176,6 +3212,21 @@ impl Instance {
     /// the uniform "pick a backend, set the knobs, run" entry. Returns the outcome + captured output,
     /// or `Err` on a guest trap / compile failure.
     pub fn run(&self, backend: Backend, config: &RunConfig) -> Result<Run, String> {
+        self.run_with_caps(backend, config, &[])
+    }
+
+    /// [`run`](Instance::run), plus **extra named capabilities** granted for this run only — the
+    /// wasm-style configurable-import path for capabilities *outside* the fixed §3e prefix (e.g. a
+    /// [`fs`](crate::fs) backend). Each `(name, cap)` is granted on the host and registered in the
+    /// §7 capability-name directory (F7); the guest reaches it at runtime via
+    /// `cap.self.resolve(name)` (`__vm_cap_resolve` from C) + `cap.call` (`__vm_host_call`) — no
+    /// stash slot, no ABI change, no authority unless the embedder injects it.
+    pub fn run_with_caps(
+        &self,
+        backend: Backend,
+        config: &RunConfig,
+        extra_caps: &[(&str, HostCap)],
+    ) -> Result<Run, String> {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
@@ -3185,6 +3236,10 @@ impl Instance {
         host.stdin = config.stdin.clone();
         host.set_quota(config.limits.quota());
         let args = self.grant_caps(&mut host, win);
+        for (name, cap) in extra_caps {
+            let handle = (cap.grant)(&mut host, win);
+            host.register_cap_name(name, handle);
+        }
 
         let outcome = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
