@@ -28,6 +28,15 @@
 //! can name a byte outside its backed region. `base + (addr+offset)` cannot overflow on a
 //! passing access because it implies `addr+offset < mapped ≤ reserved` and `base+reserved ≤ 2^64`.
 //!
+//! ## The JIT's speculative clamp (§4, D38) — invisible to this spec
+//! The production JIT lowering additionally ANDs the checked address with `reserved − 1` on its
+//! way to the access. For every access this spec admits, that clamp is a **no-op**
+//! (`addr+offset < mapped ≤ reserved`), so the architectural semantics — what this crate
+//! specifies and what the escape oracle differentials — are exactly `checked`-then-access. The
+//! clamp exists for the *speculative* path only (a data dependency confining misspeculated OOB
+//! accesses to `[0, reserved)`, the Spectre-v1 hardening); an interpreter doesn't speculate, so
+//! it has no analogue there.
+//!
 //! ## Nesting (§14)
 //! A window can be a power-of-two-aligned **sub-region** of an enclosing window — a parent grants a
 //! child the slice `[base, base + reserved)` ([`Window::sub`]). Trap-confinement admits a child

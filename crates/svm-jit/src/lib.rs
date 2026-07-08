@@ -25,23 +25,28 @@
 //! *observable semantics* are identical, so the differential harness checks the JIT and
 //! interpreter agree on traps too.
 //!
-//! ## The masking lowering (§4, invariant I1)
-//! Every access masks the **final effective address** into the window —
-//! `(addr + offset) & (size - 1)` — then adds the window base. This is exactly
-//! [`svm_mask::Window::confine`] (the isolated, separately-fuzzed spec), so the JIT
-//! and that unit lower the same arithmetic. The window allocation carries a small
-//! guard margin so a masked base near the top plus the access width never escapes the
-//! allocation (a real deployment uses guard *pages* + a fault for the width overrun).
+//! ## The confinement lowering (§4, invariant I1, trap-confinement)
+//! Every access **bounds-checks the final effective address** against the reserved
+//! window (`addr + offset` vs the compile-time constant `reserved − offset − width`;
+//! cold `MemoryFault` trap on failure — this is [`svm_mask::Window::checked`], the
+//! isolated, separately-fuzzed spec), then **clamps** the address feeding the access
+//! with `& (reserved − 1)` before adding the window base. The clamp is architecturally
+//! a no-op past the check; on the *speculative* path it is a data dependency that
+//! confines misspeculated OOB accesses to the window+guard — the Spectre-v1 hardening
+//! (§4, D38). The window allocation carries a small guard margin so a base near the top
+//! plus the access width never escapes the allocation (a real deployment uses guard
+//! *pages* + a fault for the width overrun).
 //!
-//! **Mask elision (§1a "mask-when-not", D36–D38).** A conservative per-block upper-bound
-//! analysis ([`ub_of`]) proves some effective addresses are *already* `< size`; for those
-//! the `& mask` is dropped ([`in_window`] / `mask_addr`'s `elide`), since the unmasked
-//! address already equals the masked one and stays in-window — closing part of the gap to
-//! wasm32's free guard-page accesses. This is the subset of guard-when-bounded that needs no
-//! guard region (it only elides *provably in-window* accesses, never relying on a fault); the
-//! full wasm32-style large-guard version awaits real guard pages (§5). A wrong bound would be
-//! a confinement escape, so the analysis is upper-bound-only (unknown ⇒ mask) and the
-//! elision is differentially guarded by the escape-oracle (final-memory equality, §18).
+//! **Check/clamp elision (§1a guard-when-bounded, D36–D38).** A conservative per-block
+//! upper-bound analysis ([`ub_of`]) proves some effective addresses are *already* `< size`;
+//! for those the check and clamp are both dropped ([`in_window`] / `mask_addr`'s `elide`) —
+//! closing part of the gap to wasm32's free guard-page accesses (the proof is over data
+//! dependencies, so it holds speculatively too). This is the subset of guard-when-bounded
+//! that needs no guard region (it only elides *provably in-window* accesses, never relying
+//! on a fault); the full wasm32-style large-guard version awaits real guard pages (§5). A
+//! wrong bound would be a confinement escape, so the analysis is upper-bound-only
+//! (unknown ⇒ check+clamp) and the elision is differentially guarded by the escape-oracle
+//! (final-memory equality, §18).
 //!
 //! ## Indirect-call dispatch (§3c, invariant I2)
 //! `call_indirect` masks the guest index into a host-owned, power-of-two-padded
@@ -6499,19 +6504,23 @@ fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {
     vals.get(i as usize).copied().ok_or(JitError::Malformed)
 }
 
-/// The §4 confinement masking lowering (invariant I1): compute the physical address
-/// `mem_base + sub_base + ((addr + offset) & mask)`. The `sub_base + ((addr + offset) & mask)`
-/// is exactly `svm_mask::Window::sub(...).confine`, so the JIT and the isolated masking unit
-/// agree — and for a top-level window (`sub_base == 0`) it collapses to the plain
-/// `mem_base + ((addr + offset) & mask)` of [`svm_mask::Window::confine`].
+/// The §4 confinement lowering (invariant I1, trap-confinement): bounds-check the final
+/// effective address `addr + offset` against `[0, reserved − width]` (cold `MemoryFault`
+/// trap on failure — the architectural fault, mirroring `svm_mask::Window::checked`), then
+/// compute the physical address `mem_base + sub_base + ((addr + offset) & mask)`. The
+/// `& mask` clamp is architecturally a no-op (every access past the check satisfies
+/// `addr+offset < reserved = mask+1`) but is a data dependency on the *speculative* path,
+/// confining misspeculated OOB accesses to `[0, reserved)` — the Spectre-v1 hardening
+/// (§4, D38).
 ///
-/// When `elide` is set the `& mask` is dropped — but **only** the caller's
-/// [`in_window`] proof (the address is provably `< size`) may set it, so the unmasked
-/// `addr + offset` already equals the masked value and stays in `[0, size)`. This is the
-/// "mask-when-not" / elide-when-provably-bounded half of §1a (D36–D38); a wrong proof is a
-/// confinement escape, caught by the escape-oracle (final-memory differential, §18). The
-/// `+ sub_base` is independent of elision (it shifts the whole `[0, size)` child window into
-/// its parent slice) and is itself elided when `sub_base == 0`.
+/// When `elide` is set the check and clamp are both dropped — but **only** the caller's
+/// [`in_window`] proof (the address is provably `< size`) may set it, so the unclamped
+/// `addr + offset` already stays in `[0, size)` (a proven bound holds speculatively too:
+/// the proof is over data dependencies, e.g. `(i & K)*W`). This is the
+/// elide-when-provably-bounded half of §1a (D36–D38); a wrong proof is a confinement
+/// escape, caught by the escape-oracle (final-memory differential, §18). The `+ sub_base`
+/// is independent of elision (it shifts the whole `[0, size)` child window into its parent
+/// slice) and is itself elided when `sub_base == 0`.
 fn mask_addr(
     b: &mut FunctionBuilder,
     lower: &Lower,
@@ -6528,23 +6537,26 @@ fn mask_addr(
         let off = b.ins().iconst(I64, offset as i64);
         b.ins().iadd(addr, off)
     };
-    // A non-elided access is confined by a bounds check + cold trap (invariant I1, **trap-confinement**):
-    // the access `[addr+offset, addr+offset+width)` must lie in the reserved domain `[0, reserved)`, else
-    // a clear `MemoryFault` fires *at the offending access* (vs the old mask silently wrapping a wild
-    // access to some other in-window byte). The check compares the dynamic `addr` against the
-    // compile-time constant `reserved - offset - width`, so it never itself overflows, and it sits *off*
-    // the address's latency path (the load issues speculatively past the predicted-not-taken branch); the
-    // trap block is cold, so Cranelift keeps the fast path inline. Within the reservation, the
-    // committed-ness of `[0, mapped)` (and any page the guest `grow`s into the tail) is enforced by the
-    // `PROT_NONE` guard region — a stray `[mapped, reserved)` access faults there. This exactly mirrors
-    // the interpreter's `confine_checked` (reserved-domain bound) + `check_prot` (per-page), so the two
-    // agree on the same fault under the §18 escape oracle, and a `memory.grow` that commits tail pages
-    // stays accessible on both (the baked bound is `reserved`, which never changes; the guard shrinks).
-    // A §14 nested child (`sub_base != 0`) bounds-checks the same way and then shifts the in-bounds offset
-    // into its parent slice (`+ sub_base`), so it too faults out-of-child instead of aliasing. Elided
-    // accesses (proven `< reserved`) need no check. The no-memory / degenerate `mask == 0` case keeps
-    // the mask (a 1-byte / memoryless window has no reservation to bound against).
-    if !elide && lower.mask != 0 && confine_mode() != ConfineMode::Mask {
+    // A non-elided access is confined by a bounds check + cold trap, then a clamp (invariant I1,
+    // **trap-confinement**, §4/D38): the access `[addr+offset, addr+offset+width)` must lie in the
+    // reserved domain `[0, reserved)`, else a clear `MemoryFault` fires *at the offending access* (vs
+    // the old mask silently wrapping a wild access to some other in-window byte). The check compares
+    // the dynamic `addr` against the compile-time constant `reserved - offset - width`, so it never
+    // itself overflows; the trap block is cold, so Cranelift keeps the fast path inline. The address
+    // that feeds the access is then ANDed with `mask` — the Spectre-v1 clamp (see below at the
+    // emission site). Within the reservation, the committed-ness of `[0, mapped)` (and any page the
+    // guest `grow`s into the tail) is enforced by the `PROT_NONE` guard region — a stray
+    // `[mapped, reserved)` access faults there. This exactly mirrors the interpreter's
+    // `confine_checked` (reserved-domain bound) + `check_prot` (per-page) — the clamp is invisible to
+    // that mirror (a no-op past the check; the interpreter doesn't speculate) — so the two agree on
+    // the same fault under the §18 escape oracle, and a `memory.grow` that commits tail pages stays
+    // accessible on both (the baked bound is `reserved`, which never changes; the guard shrinks).
+    // A §14 nested child (`sub_base != 0`) bounds-checks the same way and then shifts the in-bounds
+    // offset into its parent slice (`+ sub_base`), so it too faults out-of-child instead of aliasing.
+    // Elided accesses (proven `< reserved`) need no check or clamp. The no-memory / degenerate
+    // `mask == 0` case keeps the mask (a 1-byte / memoryless window has no reservation to bound
+    // against).
+    if !elide && lower.mask != 0 {
         // `reserved = mask + 1` (a power of two ≤ 2^63); the reservation this window is confined to.
         let reserved = lower.mask.wrapping_add(1);
         let need = (width as u64).saturating_add(offset);
@@ -6563,23 +6575,18 @@ fn mask_addr(
         b.switch_to_block(trap_blk);
         emit_trap(b, lower, TrapKind::MemoryFault);
         b.switch_to_block(cont);
-        // Spectre-v1 hardening spike (bench-only): clamp the address to 0 on the speculative
-        // path with a branchless conditional move, so a misspeculated OOB load reads window
-        // byte 0 instead of an arbitrary address (Wasmtime's `heap_access_spectre_mitigation`).
-        let eff = match confine_mode() {
-            ConfineMode::Cmov => {
-                let zero = b.ins().iconst(I64, 0);
-                b.ins().select_spectre_guard(oob, zero, eff)
-            }
-            // check-for-trap + the old AND as the speculative clamp: a misspeculated OOB
-            // access is masked back into `[0, reserved)` (the old model's Spectre-v1 posture)
-            // while the architectural path still traps at the check.
-            ConfineMode::Both => {
-                let m = b.ins().iconst(I64, lower.mask as i64);
-                b.ins().band(eff, m)
-            }
-            _ => eff,
-        };
+        // Spectre-v1 clamp (§4, D38): AND the address feeding the access with `reserved−1`.
+        // Architecturally a no-op — every access that reaches here passed the bounds check,
+        // so `addr+offset < reserved` and the AND changes nothing. On the *speculative* path
+        // it is a data dependency the CPU cannot skip: a misspeculated OOB access is confined
+        // to `[0, reserved)` (the window + its own guard) exactly as under the old
+        // wrap-confinement mask, and can never speculatively read a neighbouring window or
+        // host memory. Same role as Wasmtime's `heap_access_spectre_mitigation` cmov-clamp
+        // for bounds-checked heaps, one op cheaper — the power-of-two reservation makes a
+        // 1-op AND sufficient where Wasmtime needs `cmp→cmov` (measured 20–50% cheaper on
+        // confinement-dense kernels; see TRAP_CONFINEMENT.md).
+        let m = b.ins().iconst(I64, lower.mask as i64);
+        let eff = b.ins().band(eff, m);
         // The bounds check proved `addr+offset+width <= mapped`, so `eff` is in `[0, mapped)`; shift it
         // into the §14 sub-window slice (`+ sub_base`) before adding the window base — elided for a
         // top-level window so ordinary codegen is byte-identical to before nesting existed.
@@ -6608,27 +6615,6 @@ fn mask_addr(
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)
-}
-
-/// Bench-only confinement-mode override (`SVM_CONFINE`): `check` (default, trap-confinement as
-/// merged), `cmov` (check + Spectre-v1 cmov clamp), `mask` (the old wrap-confinement AND) — so one
-/// binary can A/B/C the three lowerings. Not for production use: `mask` restores wrap semantics.
-#[derive(PartialEq, Clone, Copy)]
-enum ConfineMode {
-    Check,
-    Cmov,
-    Mask,
-    Both,
-}
-
-fn confine_mode() -> ConfineMode {
-    static MODE: std::sync::OnceLock<ConfineMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("SVM_CONFINE").as_deref() {
-        Ok("cmov") => ConfineMode::Cmov,
-        Ok("mask") => ConfineMode::Mask,
-        Ok("both") => ConfineMode::Both,
-        _ => ConfineMode::Check,
-    })
 }
 
 /// Unknown upper bound — the value may be anything (so its accesses must be masked).

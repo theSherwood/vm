@@ -54,16 +54,45 @@ because a passing check implies `addr+offset < mapped ≤ reserved` and `base+re
 - [x] **Docs** — DESIGN §1a/§2a/§4/§18, invariant I1/I5, escape-vector table, C-ABI, the D38/D39
       decision notes; `fuzz/mask.rs`; `svm-mask`/`svm-interp`/`svm-wasm`/`svm-jit` headers.
 
-## ⚠️ Security tradeoff surfaced (needs a decision)
+## ⚠️ Security tradeoff surfaced — RESOLVED: check + clamp
 
 The earlier mask model masked the address with a single **AND** — a *data dependency* that also
 executes on the speculative path, i.e. it doubled as **Spectre-v1 hardening** (DESIGN §4 explicitly
 claimed this). Trap-confinement's bounds-check branch does **not** have that property: the very
 mechanism that buys the perf win (the load issuing speculatively past a predicted-not-taken branch)
-*is* the Spectre-v1 exposure. This matches what native wasm engines that bounds-check accept, but it
-is a real change to a security property the old design advertised. I documented it honestly in §4;
-if Spectre-v1 hardening must be preserved, it needs a separate mechanism (an index mask on the
-speculative path, or a fence) — flagged for your call.
+*is* the Spectre-v1 exposure.
+
+**Decision: keep the bounds check for the architectural trap and re-emit the old AND as a
+speculative clamp on the address feeding the access** (`& (reserved−1)`; architecturally a no-op
+for any access that passes the check, since `addr+offset < reserved` — the power-of-two
+reservation is what makes the clamp this cheap). A misspeculated OOB access is confined to
+`[0, reserved)` exactly as under wrap-confinement; the trap semantics and the §18 escape oracle
+are untouched (the interpreter needs no change — it doesn't speculate).
+
+**Why not Wasmtime's cmov guard.** Four lowerings were measured on identical LLVM-frontend IR
+(confinement-dense kernels, every access through an unprovable base; `SVM_CONFINE` spike,
+ns/iter, min over 5 interleaved rounds, spread ≤2%):
+
+| kernel | mask (old wrap) | check (trap only) | check+AND (adopted) | check+cmov (Wasmtime-style) |
+|---|---|---|---|---|
+| chase2 (serial load chain) | 2.12 | 1.83 | 2.29 | 2.86 |
+| dot (2 loads/iter, ILP) | 0.98 | 1.36 | 1.81 | 2.35 |
+| matmul (i64, dense inner) | 9.4µs | +61% | +94% | +120% |
+| bytes / stream / fnv (slack) | — | ±0% | ±0% | ±0% |
+
+The cmov (`select_spectre_guard`, what Wasmtime's `heap_access_spectre_mitigation` emits for
+bounds-checked heaps) puts `cmp→cmov` on the address-latency path — one op *more* than the AND —
+and loses to check+AND on every memory-dense kernel by 20–50%. The AND clamp is available to SVM
+(and not to Wasmtime) because the reservation is a power of two.
+
+**The honest cost:** the clamp puts the AND back on the address-latency path, so the check-only
+lowering's memory-bound win (edn −9%, picojpeg −8% on the JIT spike, PR #175) is spent buying
+back the old speculative confinement — net ≈ old-mask performance plus the check's small
+throughput cost on load-dense loops (these dense kernels amplify it ~4–8× vs the embench-scale
+±5–9%). Trap-confinement's yield is therefore **semantics** (clean `MemoryFault` at the offending
+access, wasm-parity UX), not raw speed. No unhardened check-only tier is offered: one fuzzed
+configuration (D38); revisit only if a real deployment justifies trading Spectre-v1 confinement
+for single-digit %.
 
 ## Progress log
 

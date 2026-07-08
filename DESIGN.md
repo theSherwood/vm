@@ -69,20 +69,21 @@ is spent *around* compute, where wasm is weak:
   inlinable to ~free; batched async rings (§9, §13).
   *This is the strongest, most defensible win.*
 - **64-bit address space:** a clean 64-bit window with **no 32-bit index type**.
-  Against wasm32, confinement is **"guard-when-bounded, bounds-check-when-not"**
-  (trap-confinement, D36): where the effective address is *provably bounded* (the
-  common indexed-array case — `(i & K)*W`), the check elides and we approach wasm32's
-  free guarded access (bench: ~1.2–1.4× wasm32). Where the base is an **unbounded
-  value** — notably the threaded data-SP in C-frontend locals (`sp + (i & 255)*8`) —
-  we emit a bounds check + cold trap. Because the check is against a compile-time
-  constant and sits *off* the load's latency path (the load issues speculatively past
-  a predicted-not-taken branch), it is measurably cheaper than the earlier
-  final-address AND on memory-bound kernels (isolated on the JIT: edn −9%,
-  picojpeg −8%) and a small cost on compute-bound ones (matmult +5%); elision removes
-  it where it would hurt. This replaced the mask model, whose AND sat on the address
-  latency chain; the tradeoff (D36) is Spectre-v1 exposure — see §4. Closing the
-  wasm32 gap entirely would need wasm32-style **32-bit window addressing**; we keep
-  the clean 64-bit model (D50).
+  Against wasm32, confinement is **"guard-when-bounded, check-and-clamp-when-not"**
+  (trap-confinement, D38): where the effective address is *provably bounded* (the
+  common indexed-array case — `(i & K)*W`), everything elides and we approach
+  wasm32's free guarded access (bench: ~1.2–1.4× wasm32). Where the base is an
+  **unbounded value** — notably the threaded data-SP in C-frontend locals
+  (`sp + (i & 255)*8`) — we emit a bounds check + cold trap for the architectural
+  fault, plus a `& (reserved−1)` clamp on the address feeding the access for
+  Spectre-v1 confinement (§4). The clamp AND sits on the load's address-latency
+  path (as the old wrap-confinement mask did), so per-access cost ≈ the old mask
+  model; the raw check-only lowering measured faster on memory-bound kernels
+  (edn −9%, picojpeg −8%, JIT-only spike) but that win is deliberately spent on
+  keeping speculative confinement — see the §4 Spectre-v1 note. Against wasm64 we
+  still win: Wasmtime's bounds-checked heaps pay a `cmp→cmov` Spectre guard on the
+  same path, one op more than our AND. Closing the wasm32 gap entirely would need
+  wasm32-style **32-bit window addressing**; we keep the clean 64-bit model (D50).
 - **Startup / JIT latency:** faster — SSA on the wire (no SSA reconstruction);
   decls-before-bodies ⇒ parallel per-function verify+JIT (§3a).
 - **Irregular control flow:** marginally faster — native irreducible CFG avoids
@@ -230,9 +231,10 @@ Escape-freedom decomposes into five sub-invariants; their conjunction is the the
 ### Microarchitectural posture (one precise statement)
 I1–I5 prevent **architectural** escape. They do **not** prevent **microarchitectural**
 leakage (Spectre, covert channels); that is *mitigated, not eliminated* —
-mask-not-branch (I1 doubles as Spectre-v1), retpoline/eIBRS on indirect dispatch,
-IBPB/BHB + VERW + L1D flush on distrust-domain switch, no SMT across distrusting
-domains (§9). **The robust distrust boundary is a separate process** (§2). In-process
+the confinement clamp (I1's `& (reserved−1)` on the access address is a data
+dependency, so it confines Spectre-v1 speculation too — §4), retpoline/eIBRS on
+indirect dispatch, IBPB/BHB + VERW + L1D flush on distrust-domain switch, no SMT
+across distrusting domains (§9). **The robust distrust boundary is a separate process** (§2). In-process
 isolation (tiers 0/1) is defense-in-depth, never a hard Spectre boundary.
 
 ### Fail-closed
@@ -928,33 +930,44 @@ the Phase-1 core loop.
     small immediate), emit **no instruction at all** — a large guard region behind
     the window catches any escape, exactly as Wasmtime does. Zero hot-path cost,
     matching wasm32.
-  - *Unbounded case (the 64-bit window):* **bounds-check the final effective address**
-    (after folding base + dynamic offset + immediate offset + `ptr.add`) against the
-    reserved domain and trap out-of-line on failure — no masking. **Bounding the final
-    address is load-bearing for security:** checking only the offset operand and then
-    adding a large C immediate could land past the guard region in a neighbouring
-    window. The check compares the dynamic address against a *compile-time constant*
-    (`reserved − offset − width`), so it never itself overflows; it sits **off** the
-    load's address-latency path (the load issues speculatively past a predicted-not-
-    taken branch) and its trap block is **cold**, so the fast path stays inline. Within
-    the reservation, per-page committedness (`[0, mapped)` plus any page the guest
-    `grow`s into the tail) is enforced by the `PROT_NONE` guard region.
+  - *Unbounded case (the 64-bit window):* **bounds-check the final effective address,
+    then clamp it.** The check (after folding base + dynamic offset + immediate offset
+    + `ptr.add`) compares against the reserved domain and traps out-of-line on
+    failure; the address feeding the access is additionally ANDed with `reserved−1` —
+    architecturally a no-op, since every access that passes the check already
+    satisfies `addr+offset < reserved` (the power-of-two reservation is what makes the
+    clamp this cheap). **Bounding the final address is load-bearing for security:**
+    checking only the offset operand and then adding a large C immediate could land
+    past the guard region in a neighbouring window. The check compares the dynamic
+    address against a *compile-time constant* (`reserved − offset − width`), so it
+    never itself overflows, and its trap block is **cold**, so the fast path stays
+    inline. Within the reservation, per-page committedness (`[0, mapped)` plus any
+    page the guest `grow`s into the tail) is enforced by the `PROT_NONE` guard region.
   A guard region backs both cases; any out-of-window / unmapped / wrongly-protected
   access faults to the host.
-  - *Spectre-v1 note (a deliberate tradeoff vs the earlier mask model).* The previous
-    design masked the address with a single AND, a data dependency that also executed
-    on the speculative path (Spectre-v1 hardening). The bounds-check branch does **not**
-    have that property — the very mechanism that buys the perf win (the load issuing
-    speculatively past the branch) is also the Spectre-v1 exposure. This matches what
-    native wasm engines that bounds-check accept; where Spectre-v1 hardening is
-    required it must come from a separate mechanism (an index mask on the speculative
-    path, or a fence), not from confinement.
-- **Confinement is one isolated lowering pass.** The bounds-check/guard logic is a
-  single, separately-fuzzable JIT component ([`svm_mask`] is its shared reference)
+  - *Spectre-v1: the clamp IS the hardening.* The AND is a data dependency that also
+    executes on the speculative path, so a misspeculated out-of-bounds access is
+    confined to `[0, reserved)` — the window plus its own guard — exactly as under
+    the old wrap-confinement model; it can never speculatively read a neighbouring
+    window or host memory. This matches (and mechanically beats) what default-config
+    Wasmtime does for bounds-checked heaps: its `heap_access_spectre_mitigation`
+    clamps to address 0 via `cmp→cmov` on the address path, while our AND is one op
+    cheaper (measured on confinement-dense kernels: check+AND beats check+cmov by
+    20–50%). The cost is honest and measured: the AND sits back on the load's
+    address-latency path, so trap-confinement's raw memory-bound win over the old
+    mask model (edn −9%, picojpeg −8%, JIT-only) is **spent buying trap semantics
+    while keeping the old speculative confinement** — net ≈ old-mask performance,
+    plus the check's small throughput cost on load-dense loops. A per-domain
+    unhardened mode (check only, no clamp) would be a small isolated delta to the
+    same lowering, but is deliberately NOT offered today: one fuzzed configuration
+    (D38), and no deployment has justified trading the hardening for single-digit %.
+- **Confinement is one isolated lowering pass.** The bounds-check/clamp/guard logic is
+  a single, separately-fuzzable JIT component ([`svm_mask`] is its shared reference)
   with the invariant *"every memory access is either proven bounded (guard-backed) or
-  dominated by a bounds check of the final effective address into `[0, reserved)`,
-  faulting otherwise"* — not diffused through general codegen. This is the security
-  hinge (§1a, §18): it is the part the verifier does **not** cover, so it is fuzzed and
+  dominated by a bounds check of the final effective address into `[0, reserved)`
+  (faulting otherwise) whose address is clamped by `& (reserved−1)` on the way to the
+  access"* — not diffused through general codegen. This is the security hinge (§1a,
+  §18): it is the part the verifier does **not** cover, so it is fuzzed and
   differential-tested in isolation against the interpreter and native.
 
 **Guard sizing & the 64-bit framing (clarification).** The window is a *64-bit*
@@ -1281,7 +1294,7 @@ capability; the host decides the realization.
 ### Domains, tiers, sharing
 - Threads + shared memory are **intra-domain** (cooperating, native speed).
   Distrust is **cross-domain**.
-- Tiers: **0** (same address space, mask + MMU — cooperating only), **1** (same
+- Tiers: **0** (same address space, check+clamp + MMU — cooperating only), **1** (same
   process, MPK/PKU — fast architectural path + defense-in-depth, *not* a
   Spectre guarantee), **3** (separate process — robust distrust boundary).
 - Explicit **memory consistency model**: the C/C++11 model (§12) — specified, not
@@ -1300,7 +1313,8 @@ capability; the host decides the realization.
 ## 9. Spectre hardening, scheduling, split host & exfil stance  [SETTLED]
 
 **Hardening contract for generated code & transitions:**
-- Mask-not-branch confinement (already in §4).
+- Bounds-check-then-clamp confinement — the clamp AND executes on the speculative
+  path, confining misspeculated accesses to the window+guard (already in §4).
 - Retpolines / eIBRS for indirect-branch control.
 - IBPB + BHB flush on domain switch.
 - VERW (MDS) and L1D flush (L1TF) on transitions.
@@ -2776,7 +2790,7 @@ as open-ended, not a byproduct of the build.
 | D1 | Block-local typed SSA, no phi, explicit block params | Settled | Linear verifier, no dominance analysis; great producer/consumer target |
 | D2 | Native irreducible control flow | Settled | No relooper; direct LLVM target |
 | D3 | Reserved VA window + host MMU for virtual memory | Settled | Real paging, zero software translation, bounded → escape-proof |
-| D4 | Mask (not branch) for confinement | Settled | Hot-path speed + Spectre-v1 robustness |
+| D4 | ~~Mask (not branch) for confinement~~ **Superseded by trap-confinement (D38): bounds-check for the architectural trap + `& (reserved−1)` clamp on the access address for Spectre-v1** | Superseded | Wrap-confinement's silent aliasing was bad UX and diverged from wasm semantics; the clamp keeps the mask's Spectre-v1 robustness (a data dependency on the speculative path) while the check gives a clean `MemoryFault` at the offending access. Measured: clamp ≈ old-mask perf; the check-only variant's memory-bound win (edn −9%/picojpeg −8%) is spent on hardening — see §4 |
 | D5 | Control stack out of guest memory | Settled | Control-flow integrity; no ROP into host |
 | D6 | Tail calls, multi-return, stack switching | Settled | Broad language coverage |
 | D7 | Domain = unit; threads/shared-mem intra-domain; distrust cross-domain | Settled | Matches OS reality; pairs with Spectre scheduling |
@@ -2810,7 +2824,7 @@ as open-ended, not a byproduct of the build.
 | D35 | Phase-1 IR spec pinned: instruction set, trap/wrap/saturate semantics, little-endian + IEEE FP, complete verifier rules, entry/instantiation contract | Settled | The concrete spec the verifier+interpreter are built from (§3b) |
 | D36 | Goal = relative to wasm: as secure as wasm (host), faster on interface/64-bit/startup with **compute pegged at Wasmtime parity** (shared Cranelift), simpler+more flexible interface | Settled | Absolute "escape impossible" not certifiable by this team; relative bar is reachable and measurable (§1a) |
 | D37 | Capabilities are **inert typed table indices**, not a sealed value class; a forged index traps or re-selects an own grant (authority binds to the table entry) | Settled | Removes §3a/§7 contradiction; lets handle/funcref live in registers/memory and lets C function pointers lower to function-table indices |
-| D38 | Confinement = **guard-when-bounded, mask-when-not**, masking the **final effective address**, implemented as one isolated separately-fuzzable lowering pass | Settled | Matches wasm32 hot path (zero instructions), beats wasm64; final-address masking closes the large-immediate escape; isolation makes it fuzzable as the security hinge |
+| D38 | Confinement = **guard-when-bounded, check-and-clamp-when-not** (trap-confinement): bounds-check the **final effective address** against `[0, reserved)` with a cold `MemoryFault` trap, and clamp the address feeding the access with `& (reserved−1)` (architecturally a no-op past the check; on the speculative path it confines Spectre-v1 exactly as the old mask did). One isolated separately-fuzzable lowering pass; ONE configuration — no unhardened check-only tier | Settled (revised from mask-when-not) | Matches wasm32 hot path (zero instructions when elided), beats wasm64 (Wasmtime's bounds-checked heaps pay cmp→cmov for the same Spectre guard; our power-of-two reservation makes the clamp a 1-op AND); final-address checking closes the large-immediate escape; trap-at-the-access matches wasm UX and keeps the §18 escape oracle; isolation makes it fuzzable as the security hinge |
 | D39 | C ABI: forced **two-stack split** (out-of-band control stack + in-window guard-paged data stack); address-taken→data stack, scalar non-address-taken→SSA; LP64/little-endian; **by-value aggregates by hidden pointer** (sret); clang-wasm-style vararg buffer | Settled | Window+trap-confinement (§4) and out-of-band control stack (§5) force the split; by-pointer is simplest-correct and ~wasm parity; whole-program MVP needs no external-ABI match (§3d) |
 | D40 | Const globals + string literals in a **read-only data segment** (`protect` at instantiation) | Settled | One extra protect call → writes to const data fault → §5 detect-and-kill; cheap self-corruption detection |
 | D41 | A fiber owns a **stack pair** (in-window data stack + out-of-band control stack); stacks are **per-fiber**; the control stack is unreachable by guest masking (CFI) but **charged to the guest's memory quota** (so a fiber-bomb self-OOMs, not the host) | Settled | Reconciles the §3d two-stack split with §12 fibers; keeps both CFI (§5) and "fibers metered/sandbox-safe" (§12/§15); switch swaps both SPs, ~ns |
