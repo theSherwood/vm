@@ -556,31 +556,6 @@ fail-closed, never miscompile).
 
 ---
 
-### I15 — Windows `pal::release` placeholder-fragment leak assertion flake (S4)
-
-**Where:** `crates/svm-jit/src/mem.rs` lib test
-`mem::tests::pal_release_frees_all_placeholder_fragments_no_leak`, Windows only.
-
-**Symptom (observed once):** run 27291252672 attempt 1 (Jun 10, a push to main, commit `c29e07c`)
-failed with `pal::release leaked 69632 bytes of the placeholder reservation (fragments past the
-first not freed)` (left: `69632` = 17 pages, right: `0`, `mem.rs:1069`). A plain re-run of the same
-SHA passed; every other job in the run was green.
-
-**Suspected cause.** Distinct from the I3 commit-exhaustion family: this is the
-`VirtualAlloc2`/`VirtualFree` **placeholder split/coalesce** path itself behaving
-environment-dependently — either a genuine race/ordering bug in fragment release that only a
-particular split pattern exposes, or the OS declining/deferring a `MEM_RELEASE` on a fragment under
-memory pressure. Because it asserts on exact byte counts of OS-visible state, any nondeterminism in
-how the reservation got fragmented shows up as a "leak".
-
-**Next step:** on recurrence, log the fragment list (offset/size of each region in the reservation)
-before the assertion so the failure shows *which* fragment survived; audit the release loop for an
-ordering assumption (e.g. releasing a coalesced range while a neighbor is still a placeholder). If
-the OS behavior is legitimately loose here, make the test tolerate deferred release by retrying the
-query once, not by weakening the production assertion.
-
----
-
 ### I16 — libFuzzer `diff` target crashes on 1–4-byte inputs (S2 until triaged) — **TRIAGED: harness-level, not an escape; FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (pending nightly confirmation)
 
 **Where:** nightly `cargo-fuzz (escape-TCB targets)` job, target `diff`
@@ -675,6 +650,15 @@ instead of re-investigated:
    the built `cargo-fuzz` binary keyed on that date, so lane health doesn't depend on
    `nightly-latest × crates.io` compiling at 07:00 UTC.
 
+**Patch prepared (2026-07-08, attached to the audit PR):** both mitigations —
+`CARGO_NET_RETRY=10` + `CARGO_HTTP_TIMEOUT=60` in the workflow-global `env:`, and the fuzz job's
+toolchain pinned to `nightly-2026-07-01` (a deliberate-bump pin; the fuzz *targets* need nightly
+features, not the newest nightly — the other nightly lanes keep the rolling channel). The change
+touches `.github/workflows/ci.yml`, which bot tokens cannot push (no `workflow` scope) — a
+maintainer needs to `git apply` the patch from the PR. Move to Resolved once applied and a few
+nightlies confirm. If the dated toolchain ever lacks a component the job needs, bump the date
+rather than reverting to the channel.
+
 ---
 
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
@@ -752,6 +736,23 @@ should be lifted; until then this is what Windows/macOS are **not** testing.
 ---
 
 ## Resolved
+
+### I15 — Windows `pal::release` placeholder-fragment leak assertion flake (S4) — **resolved** (was already fixed before filing)
+
+**Where:** `crates/svm-jit/src/mem.rs` lib test
+`mem::tests::pal_release_frees_all_placeholder_fragments_no_leak`, Windows only.
+
+**Symptom (observed once):** run 27291252672 attempt 1 (Jun 10, a push to main, commit `c29e07c`)
+failed with `pal::release leaked 69632 bytes of the placeholder reservation (fragments past the
+first not freed)`. A plain re-run of the same SHA passed; every other job in the run was green.
+
+**Resolution.** Filed from the 2026-07-08 CI audit with a suspected split/coalesce bug — but the
+real cause was already root-caused and fixed on **Jun 19** (`3dfb15e`, before the audit): a **false
+positive in the test itself**. The no-leak check releases its reservation and then walks the VA
+range asserting every byte is `MEM_FREE`; cargo runs unit tests in parallel, so a *sibling* test's
+fresh reservation could land inside the just-freed range mid-walk and read as a "leak". The fix
+serializes the reserving PAL tests behind `PAL_TEST_LOCK` (`mem.rs::tests`). The one recorded
+sighting (Jun 10) predates the fix; none since. No production `pal::release` bug existed.
 
 ### I19 — TSan lane never ran: svm-mem doctests broke the build with a `-Zsanitizer` ABI mismatch (S4) — **fixed**
 
