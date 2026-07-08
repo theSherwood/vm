@@ -1272,8 +1272,39 @@ capped at `MAX_CALL_DEPTH = 256` and tripped first as an *uncatchable* §5 kill.
 same catchable error the real engines do (its whole job). Verified regression-free: durable + interp +
 `jit_diff` (54) suites and all four prior Lua fixtures stay green.
 
-**Remaining** for a *full* suite: the `os`/`io` files need those libraries + a filesystem. Each is a
-follow-on slice.
+**io/os + official `files.lua` — ACHIEVED ✅ (all three engines, over a configurable Fs capability).**
+The unmodified official `testes/files.lua` runs green on all three engines
+(`lua_files.bc` / `tests/lua_files.rs`), bringing up the **io** and **os** libraries — and, more
+importantly, the general mechanism they ride on:
+
+- **Host-defined capabilities from C** (two new on-ramp builtins, both generic): `__vm_cap_resolve`
+  (§7 `cap.self.resolve` — resolve an embedder-granted capability by *name* at runtime, the
+  complement of the fixed 8-slot stash for capabilities granted outside the §3e prefix) and
+  `__vm_host_call` (`cap.call HOST_FN op handle(a,b,c,d)` — the bridge to an **embedder-registered**
+  `HostFn`, the wasm-import analogue). The translator stays pure mechanism: no fs semantics live in
+  it, and *any* embedder capability is now reachable from C. No stash/ABI change.
+- **A configurable Fs capability** (`svm_run::fs`, *not* part of the default powerbox): a 7-op
+  protocol (open/read/write/seek/close/remove/rename, negative-errno results, window-relative
+  buffers) with two interchangeable backends behind it — `mem_fs()` (deterministic in-memory; the
+  hermetic test default) and `host_fs(root)` (the **real** filesystem attenuated to a root
+  directory; `..`/absolute refused by protocol on both backends). Injected per run via
+  `Instance::run_with_caps` — dependency injection at the capability boundary, exactly the wasm
+  embedding model; no filesystem authority exists unless the embedder grants it. The C probe
+  `fs_probe.c`/`tests/fs_cap.rs` covers the raw protocol incl. attenuation + real-disk assertions.
+- **A real guest stdio (FILE) layer** (`lua_files_stdio.c`: mode parsing, `ungetc`, EOF/error flags,
+  seek/tell, **setvbuf-honoring write buffering** — files.lua observes full/line/none visibility
+  through a second reader — and POSIX-style unlinked `tmpfile`) and a **guest time/date layer**
+  (`lua_files_time.c`: proleptic-Gregorian `gmtime`/`mktime`/`strftime`, UTC, exact round-trips).
+
+files.lua runs byte-for-byte unmodified under the suite's own `_port`/`_soft` portability knobs
+(skipping `popen`/`os.execute`/huge-data — process spawning is genuinely out of scope). Asserted on
+all three engines against `mem_fs`, plus a `host_fs` run proving the same guest drives **real disk
+I/O** end to end (temp root left clean). Native oracle: the same core+harness against real libc in a
+scratch directory, exit 0.
+
+With that, **every self-contained file in Lua's official suite is covered** (math, utf8, vararg,
+bwcoercion, pm, coroutine+debug, files/io/os). Out of scope: `main.lua` (tests the standalone `lua`
+binary) and the internal `T`-library C-API sections.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**

@@ -171,9 +171,54 @@ forced: the guest `strtod` now parses **hex floats** (`0x1.8p3`, Lua's hex-float
 predicates (`emit_fcmp`), which Lua's `luaV_flttointeger` relies on. The guest shim adds real fdlibm
 `asin`/`acos`/`atan`/`atan2`/`modf` (`lua_testsuite_trig.c`) that the base libm lacks.
 
-Still out of reach: the `os`/`io`/`debug` files need those libraries + a filesystem. Those are
-follow-ups. (`coroutine` itself is now covered — see below — but the official `testes/coroutine.lua`
-also hard-requires the `debug` library, so it is gated on that separate slice.)
+Everything self-contained in the suite is now covered — including `debug` + the official
+`coroutine.lua` (see below) and **io/os via `files.lua`** (see the files.lua fixture, riding the
+configurable Fs capability). Only `main.lua` (tests the standalone `lua` binary itself) and the
+`T`-library C-API tests remain out of scope.
+
+# Lua files.lua fixture (io/os over the configurable Fs capability)
+
+`lua_files.bc` runs the official **`testes/files.lua`** (embedded in `lua_files_tests.c`) with
+base/`string`/`table`/`math`/`coroutine`/`debug` + **`io`** + **`os`** open. The io library rides a
+real guest **stdio (FILE) layer** (`lua_files_stdio.c`) and the os library a guest **time/date
+layer** (`lua_files_time.c`); `lua_files_shim.c` carries the usual non-stdio odds and ends
+(derived math, `strerror`, `localeconv`, `setlocale`, `system`). The harness
+(`lua_files_harness.c`) sets the suite's own portability knobs — `_port = true` (skips
+`io.popen`/`os.execute`/OS-specific sections) and `_soft = true` (skips the huge-data stress) — the
+documented configuration the suite itself honors, so the file runs **byte-for-byte unmodified**.
+
+**The filesystem is a configurable capability, not ambient authority.** The guest stdio layer
+resolves an embedder-granted capability by name (`__vm_cap_resolve("fs")` → §7 `cap.self.resolve`)
+and drives a 7-op protocol (open/read/write/seek/close/remove/rename) through `__vm_host_call`
+(§7 host-defined capability — the wasm-import analogue; both builtins were added for this). The
+fixed §3e powerbox is untouched: a run has **no** filesystem unless the embedder injects one via
+`svm_run::Instance::run_with_caps`. Two interchangeable backends live in `svm_run::fs`:
+
+- `mem_fs()` — deterministic in-memory fs (fresh per run); `tests/lua_files.rs` asserts
+  `Returned([I32(0)])` on **all three engines** against it.
+- `host_fs(root)` — the **real** filesystem attenuated to a root directory (relative paths only;
+  `..`/absolute refused by protocol on *both* backends). The same unmodified guest runs against a
+  temp root, and the test asserts host-side that the root is left clean (files.lua removes
+  everything it creates; `io.tmpfile` is created unlinked, POSIX-style).
+
+The C probe `tests/fixtures/fs_probe.c` / `tests/fs_cap.rs` covers the raw capability protocol
+(incl. attenuation refusals and real-disk assertions) independently of Lua.
+
+Guest-layer details that files.lua actually observes: **setvbuf-honoring write buffering** (full by
+default like glibc; the test watches full/line/none visibility through a second reader of the same
+file), a write-only read failing with `ferror`+`errno` (not EOF), `ungetc` pushback vs. seek/tell,
+and a proleptic-Gregorian `gmtime`/`mktime`/`strftime` (UTC, C locale) whose round-trips
+(`os.time(os.date("*t", t)) == t`) hold exactly. `time()` is a fixed synthetic epoch (no ambient
+clock; the suite only needs internal consistency). `os.getenv` rides the synthesized env-blob
+`getenv` (the test seeds `PATH`).
+
+## Regenerating (files.lua)
+
+Same as the test-suite fixture below, but `LIBS` adds `lcorolib ldblib liolib loslib`, the harness is
+`lua_files_harness.c`, the tests embed is `lua_files_tests.c`, and the guest layers
+`lua_files_stdio.c` + `lua_files_time.c` + `lua_files_shim.c` replace `lua_testsuite_shim.c` (keep
+trig/snprintf/libm/strtod). The native oracle builds the same core+harness against **real libc**
+(no guest layers) and runs in a scratch directory.
 
 # Lua coroutine fixture
 
