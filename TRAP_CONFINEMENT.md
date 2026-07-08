@@ -94,6 +94,24 @@ access, wasm-parity UX), not raw speed. No unhardened check-only tier is offered
 configuration (D38); revisit only if a real deployment justifies trading Spectre-v1 confinement
 for single-digit %.
 
+**Placed against Wasmtime** (`bench/`, both engines at default hardening — Wasmtime's
+`heap_access_spectre_mitigation` cmov is on by default for its bounds-checked heaps; `--csv
+--reps 7`, best-of, svm÷wasm ratios; `mask` = old model, `both` = adopted check+clamp):
+
+| kernel | svm/w32 mask → both | svm/w64 mask → both |
+|---|---|---|
+| memsum | 0.91 → 0.92 | 0.51 → 0.52 |
+| scatter | 0.93 → 0.94 | 0.48 → 0.48 |
+| cache | 0.96 → 1.28 (svm ns +6.7%) | 0.64 → 0.75 |
+| locals_c (threaded data-SP, the check+clamp case) | 2.20 → **1.81** | 1.24 → **1.02** |
+| alu / alu_c / float / simd / calli | ~1.0 ± 3% (unchanged) | ~1.0 ± 3% (unchanged) |
+
+Adoption moved the suite vs the old mask model by ±0–3% everywhere except `cache` (+6.7%, the
+check's branch on a miss-bound loop) and `locals_c` (**−18%, faster** — the C-locals
+store→load path improves under check+clamp), which lands at **parity with hardened wasm64**
+(1.02×), the honest same-width Cranelift-vs-Cranelift comparison. The remaining >1× vs wasm32
+(`locals_c` 1.81×) is the known 32-bit-index structural gap (§1a/D50), not the clamp.
+
 ## Progress log
 
 - (start) Branch `claude/trap-confinement` off main. Mapped every confinement call site; wrote
