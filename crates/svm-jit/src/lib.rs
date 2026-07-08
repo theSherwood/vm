@@ -2100,6 +2100,13 @@ impl CompiledModule {
         // address computations weren't CSE'd and constants were pool loads. "SSA on the wire" (no SSA
         // reconstruction) keeps cold start ahead even with the optimizer on.
         let _ = flags.set("opt_level", "speed");
+        // Pin `enable_probestack` OFF (its 0.132 default). The software stack-overflow guard
+        // (`stack-check`) is sound *because* a large frame's `sub rsp` is a pure pointer move that
+        // touches no pages before the entry-block check runs — a probestack that page-walked the frame
+        // downward would touch below the fiber's low bound *before* the check (silent neighbour-slot
+        // corruption under the arena, which has no guard page). Pinning it locks that escape-TCB
+        // assumption against a future Cranelift default flip. See `emit_stack_check` / STACK_GUARD.md.
+        let _ = flags.set("enable_probestack", "false");
         let isa = cranelift_native::builder()
             .map_err(|e| JitError::Backend(e.to_string()))?
             .finish(settings::Flags::new(flags))
@@ -3656,6 +3663,9 @@ fn compile_child(
     let _ = flags.set("is_pic", "false");
     let _ = flags.set("preserve_frame_pointers", "true");
     let _ = flags.set("opt_level", "speed"); // match the top-level compile (GVN/CSE/const-mat)
+                                             // Pin `enable_probestack` OFF, as in the top-level compile — the software stack guard's soundness
+                                             // depends on `sub rsp` touching no pages before the entry-block check (see the other flag builder).
+    let _ = flags.set("enable_probestack", "false");
     let isa = cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -6022,10 +6032,11 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
     // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
 }
 
-/// The software stack-overflow guard's per-thread limit cell + tunables (feature `stack-check`). See
-/// `crates/svm-jit/STACK_GUARD.md`. The prologue check ([`emit_stack_check`]) reads [`STACK_LIMIT`];
-/// the fiber runtime writes each resumed fiber's `usable_low` across the resume seam
-/// ([`stack_check::set_limit`]/[`stack_check::restore_limit`]).
+/// The software stack-overflow guard's tunables (feature `stack-check`). See
+/// `crates/svm-jit/STACK_GUARD.md`. Under §2b **path B** the per-thread limit is NOT a global cell: it
+/// is a value ABI param (`stack_limit`, [`Lower::limit_var`]) threaded through every call and set anew
+/// at each fiber entry from `Yielder::stack_low()` — per-vCPU by construction, no cell and no TLS. The
+/// prologue check ([`emit_stack_check`]) reads it straight from that register.
 #[cfg(feature = "stack-check")]
 pub(crate) mod stack_check {
     /// Headroom (bytes) the prologue check reserves below the limit. Because the check runs *after* the
@@ -6037,13 +6048,16 @@ pub(crate) mod stack_check {
 }
 
 /// PROTOTYPE (feature `stack-check`): the per-prologue software stack-limit check — overflow protection
-/// for the arena/software-guard fiber model, which drops the per-fiber hardware guard page. Modelled on
-/// [`emit_epoch_check`]: load the running fiber's low bound from [`stack_check::STACK_LIMIT`], get the
-/// current SP, and trap [`TrapKind::StackOverflow`] if `SP - RED_ZONE < limit` — this function's frame
-/// (bounded to `RED_ZONE` post-compile) would grow the native stack past the fiber's low bound.
-/// `limit == 0` (the root, on the OS stack) ⇒ `SP - RED_ZONE` is a huge address, never `< 0`, so the
-/// check is inert there. The **atomic** load is opaque to the optimizer (like the epoch poll), so it
-/// isn't hoisted/folded. Emitted once per function entry; the callee re-checks before its own frame.
+/// for the arena/software-guard fiber model, which drops the per-fiber hardware guard page. Reads the
+/// running fiber's low bound from our own `stack_limit` ABI param ([`Lower::limit_var`], §2b path B —
+/// per-vCPU by construction, no cell and no TLS), gets the current SP, and traps
+/// [`TrapKind::StackOverflow`] if `SP - RED_ZONE < limit` — i.e. this function's frame would grow the
+/// native stack past the fiber's low bound. The check sits in the entry block, *after* the machine
+/// prologue's `sub rsp`, so `get_stack_pointer` already reflects this frame and it is validated
+/// directly (soundness relies on Cranelift not page-probing during `sub rsp` — `enable_probestack` is
+/// off; see the ISA flags). `limit == 0` (the root / spawned-vCPU top, on OS-guarded stacks) ⇒
+/// `SP - RED_ZONE` is a huge address, never unsigned-`< 0`, so the check is inert there. The limit is a
+/// constant within a stack's call tree, so the callee re-checks before its own frame.
 #[cfg(feature = "stack-check")]
 fn emit_stack_check(b: &mut FunctionBuilder, lower: &Lower) {
     let cont = b.create_block();

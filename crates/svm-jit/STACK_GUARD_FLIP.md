@@ -46,12 +46,12 @@ Already escape-grade about the design (see `STACK_GUARD.md`):
 | # | Blocker | Severity | Status |
 |---|---------|----------|--------|
 | 1 | **Soundness fuzz** — differential: any overflow must trap `StackOverflow`, never write below `usable_low`. Oracle: run the guard-page backend WITH `stack-check`; a `MemoryFault` (or crash) then proves a hole. Sweep frame size across/past `RED_ZONE`. | Blocker (escape-TCB) | **landed** — `tests/stack_guard_fuzz.rs` (needs CI job #3 to run it) |
-| 2 | **Audit** the check + arena as an escape-TCB unit (like masking). | Blocker | not started |
+| 2 | **Audit** the check + arena as an escape-TCB unit (like masking). | Blocker | **done** — `STACK_GUARD_AUDIT.md`: no escape vector; F1 (pin probestack) + F2 (stale docs) fixed; F3→#5, F4→#4 |
 | 3 | **CI coverage** — build/test `--features stack-check[,arena-stacks]` on Linux + macOS-aarch64, and give the Windows arena its first runtime coverage. Without it the guard bit-rots while off by default. | Blocker | **mostly done** — `stack-guard` job exists; fuzz runs under it on merge; needs the guard-page-oracle run added (below) |
 | 4 | **GC precision** — reused, un-zeroed arena slots make the conservative root scan over-approximate. Decide zero-on-reclaim of the touched high-water region vs. accepting the (sound) superset. | Decision | open |
-| 5 | **Frame-size backstop** — can't statically prove no function has a pathological (> stack) single frame; Cranelift 0.132 doesn't expose `frame_size`. The after-`sub rsp` check position makes normal/large frames sound in practice. | Low (assurance) | open |
+| 5 | **Frame-size backstop** — reject any function whose frame exceeds `SLOT − RED_ZONE`. The audit (F3) **raises this**: under the arena the check is the *sole* defense (no guard-page backstop), so this single-frame gap should close *with* the flip, not after. Cranelift 0.132 doesn't expose `frame_size` (needs a prologue-parse or a Cranelift upgrade). | Low escape-prob, but arena-critical | open |
 
-Items 1–3 are the gate. 4–5 are documentable either-way decisions.
+Items 1–3 are the gate. #4 is an either-way decision; the audit reclassifies **#5 as should-land-with-the-flip** (F3).
 
 ## sigaltstack finding (surfaced while building blocker #1)
 
