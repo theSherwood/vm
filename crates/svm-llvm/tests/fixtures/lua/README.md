@@ -410,3 +410,49 @@ Like the files.lua fixture but with `lua_sweep_harness.c`, and `lua_sweep_tests.
 unconditionally) and `-include`-ing an edited copy silently breaks (`l_likely` is `LUA_CORE`-gated);
 the quoted `#include "luaconf.h"` resolves against the source directory, so the edited copy must sit
 next to the `.c` files. Native oracle: same source copy against real libc.
+
+# Lua T-library fixtures (ltests.c: internal assertions + api.lua)
+
+`lua_tlib.bc` and `lua_tapi.bc` run the suite with **Lua's internal `T` C-test library** active: the
+whole core is compiled with `-DLUA_USER_H='"ltests.h"'` — internal assertions live (`LUAI_ASSERT`:
+every `lua_assert` in the VM runs, including `lua_checkmemory`'s full GC-structure walks), the
+tracking + failure-injecting `debug_realloc` allocator, debug sizes (`LUAL_BUFFERSIZE 23`, tiny
+string tables), `LUAI_MAXSTACK 50000`, jump tables off. With `T` present the `if T` sections that
+every other fixture skips **run**, and `testes/api.lua` — the C-API test proper (`T.testC`'s
+string-driven interpreter over raw `lua_*` calls, allocation failure at every site, GC internals,
+upvalue surgery) — runs byte-for-byte unmodified.
+
+Two bundles, each **one shared `lua_State`** (the official `all.lua` execution model): ltests'
+`warnf` keeps its warning mode in process statics, which must line up with the per-state `_WARN`
+global — and cumulative T-mode memory in one state must fit the reference JIT's 64 MiB window, so
+the load splits:
+- `lua_tlib.bc` — `cstack code events gengc errors nextvar locals coroutine` (the substantive `T`
+  sections: yields inside hooks, GC-age probes, C-stack limits, C-level locals/upvalues);
+- `lua_tapi.bc` — `gc` + `api` (the two `warn`-using files, together in a fresh state/arena).
+
+`tests/lua_tlib.rs` asserts `Returned([I32(0)])`; the JIT runs gate CI, the interpreter runs are
+`#[ignore]`d full-depth gates (api.lua alone is ~7 min on the bytecode engine). Native oracle: same
+harness+bundles against real libc, exit 0 — including ltests' real `atexit` all-memory-freed check
+(the guest's `atexit` is a recorded no-op; see `lua_tlib_shim.c`).
+
+Support files: `lua_tlib_harness.c` (single-state, ltests' own `lua_newstate(debug_realloc,
+&l_memcontrol)` + `luaL_requiref("T", luaB_opentests)` recipe, plus the sweep harness's require/
+package/knob setup); `lua_tlib_malloc.c` (guest `malloc`/`free`/`realloc` — `debug_realloc` sits on
+plain libc malloc — as segregated free lists over a 56 MiB arena); `lua_tlib_shim.c`
+(`__assert_fail`/`abort` as loud nonzero exits, the `LUA_COMPAT_MATHLIB` hyperbolics, `strtoul`, a
+real guest `printf` — ltests' reports use `%X`, which the constant-format lowering doesn't carry —
+`sprintf`, string helpers, and the `atexit` note). `loadlib.c` joins the build (`ltests.c`
+references `luaopen_package`; the ANSI build has no dlopen).
+
+**One more translator bug fell out**: a constexpr `ptrtoint (ptr @g to i32)` folded to its raw
+`i64` window address, feeding I64 into i32 arithmetic — verify-time `TypeMismatch` on ltests'
+`strchr(ops, op) - ops`-as-`int` idiom. Fixed to honor the target width (≤32-bit targets mask to
+the canonical zero-extended narrow form); test `const_ptrtoint_i32_width` in `tests/translate.rs`.
+
+## Regenerating (T library)
+
+Compile CORE + LIBS (+ `loadlib`) **and the harness** with `-DLUA_USER_H='"ltests.h"'
+-I<tests>/ltests` (stock `luaconf.h` — ltests.h sets its own stack/ccalls limits), plus
+`<tests>/ltests/ltests.c` itself; link with the guest layers above + the files-fixture stdio/time
+layers + trig/snprintf/libm/strtod. `lua_tlib_tests.c` / `lua_tapi_tests.c` embed the two file sets
+(with `tracegc`/`bwcoercion` as sibling modules). Native oracle: same sources on real libc.

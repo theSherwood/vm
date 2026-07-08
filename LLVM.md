@@ -1384,10 +1384,22 @@ suite observes: `%p` width, `%a`/`%A` hex-floats (exact form for `%q` round-trip
 round-half-to-even carry), zero-value-at-zero-precision integers, and guest-side `0`/`#`/width
 handling for floats.
 
-Excluded and why: `api.lua` (273 `T.` references — *is* the C-API test; needs Lua's internal
-`ltests.c` T library, the natural next slice), `attrib.lua` (the real `package` searchers),
-`main.lua` (the standalone `lua` binary), `all.lua` (the driver; needs the excluded files),
-`heavy.lua` (deliberate memory exhaustion).
+**The T library + `api.lua` — ACHIEVED ✅ (ltests.c active; internal assertions on).** The whole
+core recompiled with `-DLUA_USER_H='"ltests.h"'` — every internal `lua_assert` live (including
+`lua_checkmemory`'s GC walks), the failure-injecting `debug_realloc` allocator, debug sizes — and
+**`api.lua` runs byte-for-byte unmodified**: `T.testC`'s string-driven interpreter drives raw
+`lua_*` call sequences and allocation-failure paths no pure-Lua file can reach. The previously
+skipped `if T` sections in `cstack`/`code`/`events`/`gengc`/`errors`/`nextvar`/`locals`/`coroutine`
+now run (plus `gc` + `api` in their own bundle — ltests' `warnf` keeps warning state in process
+statics, so each bundle is one shared `lua_State`, the official `all.lua` model; cumulative T-mode
+memory bounds the reference JIT's 64 MiB window, hence the split). Fixtures `lua_tlib.bc` /
+`lua_tapi.bc`, tests `tests/lua_tlib.rs` (JIT gates CI; interpreter runs `#[ignore]`d full-depth).
+Native oracle exit 0, including ltests' real `atexit` leak check. One more translator bug fell out:
+constexpr **`ptrtoint (ptr @g to i32)` ignored its target width** (raw i64 address into i32
+arithmetic, verify TypeMismatch) — fixed + `const_ptrtoint_i32_width` differential.
+
+Still excluded: `attrib.lua` (the real `package` searchers), `main.lua` (the standalone `lua`
+binary), `all.lua` (the driver), `heavy.lua` (deliberate memory exhaustion).
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
