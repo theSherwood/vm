@@ -13,7 +13,7 @@ extern int __vm_cap_resolve(const char *name, long len);
 extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
 int printf(const char *, ...);
 
-enum { OPEN = 0, READ = 1, WRITE = 2, SEEK = 3, CLOSE = 4, REMOVE = 5, RENAME = 6 };
+enum { OPEN = 0, READ = 1, WRITE = 2, SEEK = 3, CLOSE = 4, REMOVE = 5, RENAME = 6, TRUNCATE = 7, SYNC = 8 };
 enum { O_READ = 1, O_WRITE = 2, O_APPEND = 4, O_TRUNC = 8, O_CREATE = 16 };
 
 static int fs;
@@ -62,6 +62,25 @@ int main(void) {
   if (hc(REMOVE, (long)"world.txt", 9, 0, 0) != 0) return 22;
   if (hc(OPEN, (long)"world.txt", 9, O_READ, 0) >= 0) return 23;
   if (hc(REMOVE, (long)"world.txt", 9, 0, 0) >= 0) return 24;
+
+  /* truncate: shrink discards, grow zero-fills; read-only fds refuse; sync succeeds on any fd */
+  fd = hc(OPEN, (long)"trunc.txt", 9, O_READ | O_WRITE | O_CREATE | O_TRUNC, 0);
+  if (fd < 0) return 34;
+  if (hc(WRITE, fd, (long)"0123456789", 10, 0) != 10) return 35;
+  if (hc(TRUNCATE, fd, 4, 0, 0) != 0) return 36;
+  if (hc(SYNC, fd, 0, 0, 0) != 0) return 37;
+  if (hc(SEEK, fd, 2, 0, 0) != 4) return 38; /* shrunk */
+  if (hc(TRUNCATE, fd, 6, 0, 0) != 0) return 39;
+  if (hc(SEEK, fd, 0, 3, 0) != 3) return 40;
+  n = hc(READ, fd, (long)buf, 16, 0);
+  if (n != 3) return 41;
+  if (buf[0] != '3' || buf[1] != 0 || buf[2] != 0) return 42; /* grow zero-filled */
+  if (hc(CLOSE, fd, 0, 0, 0) != 0) return 43;
+  fd = hc(OPEN, (long)"trunc.txt", 9, O_READ, 0);
+  if (fd < 0) return 44;
+  if (hc(TRUNCATE, fd, 0, 0, 0) >= 0) return 45; /* read-only fd refuses truncate */
+  if (hc(CLOSE, fd, 0, 0, 0) != 0) return 46;
+  if (hc(REMOVE, (long)"trunc.txt", 9, 0, 0) != 0) return 47;
 
   /* attenuation: `..` and absolute paths are refused by protocol, on every backend */
   if (hc(OPEN, (long)"../escape", 9, O_WRITE | O_CREATE, 0) >= 0) return 25;

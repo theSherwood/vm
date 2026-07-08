@@ -2629,6 +2629,166 @@ fn demo_sqlite_vs_native() {
 }
 
 #[test]
+fn demo_sqlite_fs_cap_vs_native() {
+    // **SQLite Phase B — disk-backed persistence through the Fs capability** (LLVM.md §8, the
+    // north star's second half). Same amalgamation as Phase A, but the database is a real *file*:
+    // in the guest build every byte flows through the embedder-granted `fs` capability via a guest
+    // `sqlite3_vfs` (`demos/sqlite/sqlite_cap_vfs.c`) — xOpen/xRead/xWrite/xTruncate/xSync/
+    // xFileSize/xDelete/xAccess over `__vm_cap_resolve("fs")` + `__vm_host_call`. The rollback
+    // journal (default DELETE mode) is created, written, replayed (an explicit ROLLBACK), and
+    // deleted through the capability. Three assertions:
+    //  1. **stdout differential** — the guest (mem_fs) byte-matches the native oracle (stock unix
+    //     VFS in a temp dir) over create → close → reopen → verify;
+    //  2. **the capability story** — under `host_fs` the guest's `test.db` really lands on disk,
+    //     and the *native* binary opens that guest-written file and verifies it (byte-identical to
+    //     its own verify output): cross-implementation file-format proof, capability-written;
+    //  3. **the reverse direction** — the guest (host_fs) reads a *native-written* `test.db`.
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/sqlite/sqlite_cap_vfs.c");
+    let inc = format!("-I{}", amalg.display());
+    let pid = std::process::id();
+
+    // Guest bitcode (-DSVM_GUEST → SQLITE_OS_OTHER + the capability VFS).
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_sqlite_fs.bc"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_fs (clang unavailable)");
+            return;
+        }
+    }
+    // Native oracle (stock unix VFS).
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{pid}_sqlite_fs"));
+    match Command::new("cc")
+        .arg(&inc)
+        .arg(&demo)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_fs (cc unavailable)");
+            return;
+        }
+    }
+
+    // Oracle bytes: create (fresh dir) + verify (same dir).
+    let nat_root = std::env::temp_dir().join(format!("svm-sqlite-fs-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle_create = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native create");
+    assert!(oracle_create.status.success(), "native create failed");
+    let oracle_verify = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&nat_root)
+        .output()
+        .expect("native verify");
+    assert!(oracle_verify.status.success(), "native verify failed");
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate sqlite_fs bitcode");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+    };
+
+    // 1. mem_fs: hermetic create → reopen → verify, byte-identical stdout.
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", svm_run::fs::mem_fs())],
+        )
+        .expect("guest run (mem_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "sqlite_fs: guest (mem_fs) stdout vs native"
+    );
+
+    // 2. host_fs: the guest writes a real test.db; the NATIVE binary then verifies it.
+    let guest_root = std::env::temp_dir().join(format!("svm-sqlite-fs-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", svm_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "sqlite_fs: guest (host_fs) stdout vs native"
+    );
+    assert!(
+        guest_root.join("test.db").exists(),
+        "the guest-written database must land on the real disk"
+    );
+    assert!(
+        !guest_root.join("test.db-journal").exists(),
+        "the rollback journal must have been deleted through the capability"
+    );
+    let native_reads_guest = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&guest_root)
+        .output()
+        .expect("native verify of guest db");
+    assert_eq!(
+        String::from_utf8_lossy(&native_reads_guest.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "sqlite_fs: native SQLite must read the capability-written database"
+    );
+
+    // 3. The reverse: the guest (host_fs over the native dir) reads a native-written test.db.
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![b"sqlite_fs".to_vec(), b"verify".to_vec()]),
+            &[("fs", svm_run::fs::host_fs(nat_root.clone()))],
+        )
+        .expect("guest verify (host_fs over native dir)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "sqlite_fs: the guest must read the native-written database"
+    );
+
+    let _ = std::fs::remove_dir_all(&nat_root);
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays

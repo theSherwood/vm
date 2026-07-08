@@ -720,6 +720,29 @@ Design points:
 Test: `demo_sqlite_vs_native` (skips cleanly offline). Follow-ups: Phase B (the storage capability +
 a guest VFS bridging `sqlite3_vfs` to it) and, for scale, running SQLite's own SQL-logic scripts.
 
+**Slice BJ (DONE) — SQLite Phase B: disk-backed persistence through the Fs capability (the
+north star's second half).** Same amalgamation, but the database is a real **file**, and in the
+guest build every byte of it flows through the embedder-granted `fs` capability: a **guest
+`sqlite3_vfs`** (`demos/sqlite/sqlite_cap_vfs.c` — the "guest VFS shim" this doc planned) bridges
+xOpen/xRead/xWrite/xTruncate/xSync/xFileSize/xDelete/xAccess to `__vm_cap_resolve("fs")` +
+`__vm_host_call`, exactly how Lua's `io` runs. The rollback journal (default DELETE mode) is
+created, written, **replayed** (an explicit `ROLLBACK` restores 200 rows), and deleted through the
+capability. Zero ambient authority: no cap ⇒ `sqlite3_os_init` fails and no filesystem exists.
+The test (`demo_sqlite_fs_cap_vs_native`) asserts three directions:
+1. **stdout differential** — guest (`mem_fs`) byte-matches the native oracle (stock unix VFS in a
+   temp dir) over create → close → reopen → verify;
+2. **the capability story** — under `host_fs` the guest's `test.db` really lands on disk (journal
+   really deleted), and the **native binary opens the guest-written file** and verifies it
+   byte-identically: cross-implementation file-format proof, capability-written;
+3. **the reverse** — the guest reads a native-written `test.db` through `host_fs`.
+Supporting work: the fs protocol grew **`truncate` (op 7) + `sync` (op 8)** on both backends (the
+probe covers shrink-discard/grow-zero-fill/read-only-refusal), and feeding the enlarged probe
+through the on-ramp surfaced two chunked-vector gaps clang's SLP can emit — **`freeze <N x iK>`**
+(now identity-on-parts, like the scalar/i128/mask freeze arms) and **`bitcast <N x iK> → iM`**
+(lane reassembly: mask, shift, OR — the vectorized 4-byte-compare shape). What remains for a
+first-class story: promoting the prototype `IoRing`/`Blocking` route vs the dedicated cap decision
+(this slice used the direct `HostCap` surface), and SQLite's own SQL-logic scripts for scale.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
@@ -1516,7 +1539,9 @@ phases, both worth doing:
   pages. The gates named here (computed goto for the VDBE + float formatting) both held: the VDBE
   dispatch and `%!.15g` output work unmodified. Scaling up to SQLite's own SQL-logic scripts is the
   natural extension; the capability story is Phase B.
-- **Phase B — disk-backed (real persistence through a powerbox capability).** In-memory proves the SQL
+- **Phase B — disk-backed (real persistence through a granted capability). ACHIEVED ✅ (slice BJ):**
+  the guest VFS shim over the configurable `fs` capability (`mem_fs`/`host_fs`), native SQLite
+  reading a capability-written database file and vice versa. In-memory proves the SQL
   engine; **disk proves the capability story** — that a sandboxed guest can do real, durable I/O
   *only* through explicitly granted authority. SQLite is built for exactly this: its **VFS** (`sqlite3_vfs`)
   is a narrow, swappable I/O shim (`xOpen`/`xRead`/`xWrite`/`xTruncate`/`xSync`/`xFileSize`/locking).
