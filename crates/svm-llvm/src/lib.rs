@@ -347,6 +347,8 @@ fn translate_impl(
     let need_strchr = calls_external(m, &defined_names, "strchr");
     let need_strcpy = calls_external(m, &defined_names, "strcpy");
     let need_strspn = calls_external(m, &defined_names, "strspn");
+    let need_strcspn = calls_external(m, &defined_names, "strcspn");
+    let need_strrchr = calls_external(m, &defined_names, "strrchr");
     let need_strpbrk = calls_external(m, &defined_names, "strpbrk");
     let need_ldexp =
         calls_external(m, &defined_names, "ldexp") || calls_external(m, &defined_names, "scalbn");
@@ -565,6 +567,8 @@ fn translate_impl(
         strchr: take(need_strchr),
         strcpy: take(need_strcpy),
         strspn: take(need_strspn),
+        strcspn: take(need_strcspn),
+        strrchr: take(need_strrchr),
         strpbrk: take(need_strpbrk),
         ldexp: take(need_ldexp),
         pow_stub: take(need_pow),
@@ -821,6 +825,12 @@ fn translate_impl(
     }
     if need_strspn {
         funcs.push(synth_strspn());
+    }
+    if need_strcspn {
+        funcs.push(synth_strcspn());
+    }
+    if need_strrchr {
+        funcs.push(synth_strrchr());
     }
     if need_strpbrk {
         funcs.push(synth_strpbrk());
@@ -3682,6 +3692,11 @@ struct Helpers {
     strcpy: Option<u32>,
     /// `__svm_strspn(s:i64, set:i64) -> i64` — length of the initial run of `s` within `set`.
     strspn: Option<u32>,
+    /// `__svm_strcspn(s:i64, set:i64) -> i64` — length of the initial run of `s` *outside* `set`.
+    strcspn: Option<u32>,
+    /// `__svm_strrchr(s:i64, c:i32) -> i64` — last `(unsigned char)c` in `s`, or NULL (`c==0` → the
+    /// terminating NUL). Backs `strrchr`.
+    strrchr: Option<u32>,
     /// `__svm_strpbrk(s:i64, set:i64) -> i64` — first byte of `s` that is in `set`, or NULL.
     strpbrk: Option<u32>,
     /// `__svm_ldexp(x:f64, n:i32) -> f64` — `x · 2^n` (the `scalbn` algorithm), bit-exact to libc.
@@ -5554,6 +5569,227 @@ fn synth_strspn() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, outer, inner, inner_done, done],
+    }
+}
+
+/// Synthesize `__svm_strcspn(s:i64, set:i64) -> i64` — the length of the initial segment of `s`
+/// containing **no** byte from the NUL-terminated `set` (the complement of [`synth_strcspn`]'s
+/// sibling `__svm_strspn`: identical outer/inner scan, inverted continue condition).
+fn synth_strcspn() -> Func {
+    use svm_ir::LoadOp;
+    let l8 = |addr: u32| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let params = vec![ValType::I64, ValType::I64]; // s, set
+                                                   // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 0],
+        },
+    };
+    // block1 outer(p=0, set=1, s0=2)
+    let outer = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            l8(0),             // v3 = cp = *p
+            Inst::ConstI32(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 4,
+            }, // v5 = cp == 0
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 4,
+            then_args: vec![0, 2], // done(p, s0)
+            else_blk: 2,
+            else_args: vec![1, 3, 0, 1, 2], // inner(q=set, cp, p, set, s0)
+        },
+    };
+    // block2 inner(q=0, cp=1, p=2, set=3, s0=4)
+    let inner = Block {
+        params: vec![
+            ValType::I64,
+            ValType::I32,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ],
+        insts: vec![
+            l8(0),             // v5 = cq = *q
+            Inst::ConstI32(0), // v6
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 6,
+            }, // v7 = cq == 0
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 1,
+            }, // v8 = cq == cp
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: 7,
+                b: 8,
+            }, // v9 = stop
+            Inst::ConstI64(1), // v10
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 10,
+            }, // v11 = q + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 3,
+            then_args: vec![5, 1, 2, 3, 4], // inner_done(cq, cp, p, set, s0)
+            else_blk: 2,
+            else_args: vec![11, 1, 2, 3, 4], // inner(q+1, cp, p, set, s0)
+        },
+    };
+    // block3 inner_done(cq=0, cp=1, p=2, set=3, s0=4) — the inversion vs `strspn`: a match means
+    // `cp` IS in `set`, which for strCspn ENDS the run; no match continues the outer scan.
+    let inner_done = Block {
+        params: vec![
+            ValType::I32,
+            ValType::I32,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ],
+        insts: vec![
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 1,
+            }, // v5 = match = cq == cp
+            Inst::ConstI64(1), // v6
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 2,
+                b: 6,
+            }, // v7 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 4,
+            then_args: vec![2, 4], // done(p, s0)  — cp in set: the run ends here
+            else_blk: 1,
+            else_args: vec![7, 3, 4], // outer(p+1, set, s0)  — cp not in set: keep scanning
+        },
+    };
+    // block4 done(p=0, s0=1)
+    let done = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Sub,
+            a: 0,
+            b: 1,
+        }], // v2 = p - s0
+        term: Terminator::Return(vec![2]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, outer, inner, inner_done, done],
+    }
+}
+
+/// Synthesize `__svm_strrchr(s:i64, c:i32) -> i64` — a pointer to the **last** occurrence of
+/// `(unsigned char)c` in `s`, or NULL; `c == 0` finds the terminating NUL (C semantics). One forward
+/// scan tracking the most recent match (no second pass), select-updated per byte.
+fn synth_strrchr() -> Func {
+    use svm_ir::LoadOp;
+    let l8 = |addr: u32| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let params = vec![ValType::I64, ValType::I32]; // s, c
+                                                   // block0 entry(s=0, c=1): loop(p=s, c8=c&255, best=NULL)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![
+            Inst::ConstI32(255), // v2
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: 1,
+                b: 2,
+            }, // v3 = c8
+            Inst::ConstI64(0),   // v4 = best = NULL
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 3, 4],
+        },
+    };
+    // block1 loop(p=0, c8=1, best=2)
+    let scan = Block {
+        params: vec![ValType::I64, ValType::I32, ValType::I64],
+        insts: vec![
+            l8(0), // v3 = cp = *p
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 1,
+            }, // v4 = cp == c8
+            Inst::Select {
+                cond: 4,
+                a: 0,
+                b: 2,
+            }, // v5 = newbest (p on a match — incl. the NUL when c8==0)
+            Inst::ConstI32(0), // v6
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 3,
+                b: 6,
+            }, // v7 = end of string
+            Inst::ConstI64(1), // v8
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 8,
+            }, // v9 = p + 1
+        ],
+        term: Terminator::BrIf {
+            cond: 7,
+            then_blk: 2,
+            then_args: vec![5], // done(newbest)
+            else_blk: 1,
+            else_args: vec![9, 1, 5], // loop(p+1, c8, newbest)
+        },
+    };
+    // block2 done(best=0)
+    let done = Block {
+        params: vec![ValType::I64],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, scan, done],
     }
 }
 
@@ -11624,6 +11860,34 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let r = ctx.push(Inst::Call {
                 func: f,
                 args: vec![s, set],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strcspn(s, set)`: the synthesized complement scan.
+        "strcspn" => {
+            let Some(f) = ctx.helpers.strcspn else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let set = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, set],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `strrchr(s, c)`: the synthesized last-occurrence scan.
+        "strrchr" => {
+            let Some(f) = ctx.helpers.strrchr else {
+                return Ok(false);
+            };
+            let s = ctx.operand(&c.arguments[0].0)?;
+            let ch = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![s, ch],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
