@@ -2161,10 +2161,11 @@ pub fn run_capture(
     run_capture_reserved(m, func, args, fuel, init_mem, DEFAULT_RESERVED_LOG2)
 }
 
-/// Like [`run_capture`], but with a host **reservation policy**: confinement masks into
-/// `[0, 2^reserved_log2)` while only the declared `1 << size_log2` bytes are backed, so an
-/// access into the reserved-but-unmapped tail faults (`Trap::MemoryFault`) instead of wrapping
-/// (the deliberate I1 change for the §4 "guard-when-bounded" model). `reserved_log2` is raised
+/// Like [`run_capture`], but with a host **reservation policy**: only the declared `1 << size_log2`
+/// bytes are backed within a `2^reserved_log2` reservation, so an access outside `[0, mapped)` —
+/// whether past the backed prefix, into the reserved-but-unmapped tail, or wildly out of range —
+/// faults (`Trap::MemoryFault`) under trap-confinement (the §4 "guard-when-bounded" model; no
+/// wrapping/aliasing). `reserved_log2` is raised
 /// to at least `size_log2` (so `0` ⇒ fully mapped). This is the interpreter side of the
 /// escape-oracle under the decoupled model and must be driven with the **same** `reserved_log2`
 /// as the JIT's [`svm_jit::compile_and_run_capture_reserved`] to stay in differential lockstep.
@@ -2295,8 +2296,8 @@ pub fn run_capture_reserved_with_host_prots(
 
 /// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
 /// parent of `parent_bytes` (the child runs over the parent's `Region`; `size = 1 << size_log2` is
-/// the module's declared memory). The masking unit ([`svm_mask::Window::sub`]) confines every child
-/// access into its slice, so a *verified* guest reaches only `[base, base+size)`. This is the
+/// the module's declared memory). The confinement unit ([`svm_mask::Window::sub`]) bounds every child
+/// access to its slice (faulting otherwise), so a *verified* guest reaches only `[base, base+size)`. This is the
 /// interpreter side of the **sub-window escape-oracle**: pair it with the JIT's
 /// [`svm_jit::compile_and_run_capture_sub`] and byte-compare the whole parent — every byte outside
 /// the slice must stay as seeded (confinement) and the slice must match the JIT (codegen). `init_mem`
@@ -11132,7 +11133,7 @@ impl Host {
 }
 
 // ----------------------------------------------------------------------------
-// Linear memory — the confinement-masking *reference* (§4, invariant I1)
+// Linear memory — the trap-confinement *reference* (§4, invariant I1)
 // ----------------------------------------------------------------------------
 
 /// The **host** page size — the granularity of the protection model (RO/unmap) *and* the lazy
@@ -11329,8 +11330,9 @@ impl Mem {
 
     /// A fully-mapped **§14 sub-window**: a `1 << size_log2`-byte child window at absolute offset
     /// `base` inside a parent backing of `parent_bytes` bytes (the child runs over the parent's
-    /// `Region`). The masking unit ([`svm_mask::Window::sub`], fuzzed as the escape hinge) confines
-    /// every child access into `[base, base + size)`, so the child can reach **only its slice** — never
+    /// `Region`). The confinement unit ([`svm_mask::Window::sub`], fuzzed as the escape hinge) bounds
+    /// every child access to `[base, base + size)` (faulting otherwise), so the child can reach **only
+    /// its slice** — never
     /// the parent's other memory or outside the parent window. `base` is size-aligned by `Window::sub`;
     /// the whole slice is backed (no `map`-growth inside a child yet). The backing is sized to hold
     /// `[0, base + size)`.
@@ -11385,7 +11387,7 @@ impl Mem {
     /// bytes — so the parent intrinsically sees all of the child's bytes (the superset, §14) — but
     /// **confines** the child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)`
     /// (window-absolute, in the shared backing's coordinates). The child sees a zero-based `[0, size)`
-    /// and cannot learn it is nested; masking ([`Window::sub`]) does the base+mask in one step.
+    /// and cannot learn it is nested; trap-confinement ([`Window::sub`]) bounds the child to its slice.
     ///
     /// Unlike [`fork_for_thread`](Mem::fork_for_thread), the child gets its **own** address space (a
     /// fresh, empty page-protection map + §13 region set), *not* the parent's: page protections are a
@@ -11474,7 +11476,7 @@ impl Mem {
     /// supplies the page and resumes. The parent virtualizes the whole sub-window.
     fn demand_page(&self) {
         // `div_ceil` so a child smaller than one host page (e.g. a 4 KiB sub-window on a 16 KiB-page
-        // host) still gets its single covering page marked — masking keeps its accesses in-window.
+        // host) still gets its single covering page marked — confinement keeps its accesses in-window.
         let pages = self.window.reserved().div_ceil(self.page).max(1);
         let mut space = self.space_write();
         for p in 0..pages {
@@ -11490,22 +11492,27 @@ impl Mem {
         self.space_write().prot.insert(page, PageProt::Rw);
     }
 
-    /// Confine the final effective address into `[0, reserved)` (the masking security op, §4) and
-    /// reject a `width`-byte access that would overrun the reserved domain. Per-page committed-ness
-    /// is enforced separately by [`Mem::check_prot`] (the functional bound), so a masked-but-
-    /// uncommitted page faults there — matching the JIT's `PROT_NONE` page tables.
+    /// **Trap-confinement** (§4): bounds-check the `width`-byte access and reject any that leaves the
+    /// window — there is no masking. An access is admitted iff `[addr+offset, addr+offset+width)` lies
+    /// within `[0, reserved)` (the reserved domain, which the tail-committed-by-`grow` case can reach);
+    /// per-page committed-ness — including the reserved tail's unmapped default and the mapped prefix —
+    /// is then enforced by [`Mem::check_prot`], so an in-reserved-but-uncommitted access still faults,
+    /// matching the JIT's bounds-trap + `PROT_NONE` page tables. The arithmetic is `checked` (matching
+    /// [`Window::checked`]) so a wild `addr+offset` that would overflow `u64` faults rather than
+    /// wrapping into a valid offset.
     fn confine_checked(&self, addr: u64, offset: u64, width: u32) -> Result<u64, Trap> {
-        // `confine` returns the **absolute** address `base + rel` (`base == 0` for a top-level window,
-        // the sub-window base for a §14 child). The reserved-domain guard is on the window-relative
-        // `rel`; per-page committed-ness is enforced by `check_prot` (also window-relative). The
-        // returned absolute address indexes the (possibly parent-sized) backing.
+        // `confine` returns the **absolute** address `base + (addr+offset)` (`base == 0` for a
+        // top-level window, the sub-window base for a §14 child); the guest `addr`/`offset` are
+        // window-relative, so the bound is on `addr+offset` directly. The returned absolute address
+        // indexes the (possibly parent-sized) backing.
         self.last_fault.store(NO_FAULT, Ordering::Relaxed); // fresh: clear any prior page fault
-        let abs = self.window.confine(addr, offset);
-        let rel = abs.wrapping_sub(self.window.base());
-        match rel.checked_add(width as u64) {
+        match addr
+            .checked_add(offset)
+            .and_then(|e| e.checked_add(width as u64))
+        {
             // An out-of-window fault is a real trap (not a recoverable page fault) — leave `last_fault`
             // cleared so `take_fault` returns `None` and the coroutine path propagates the trap.
-            Some(end) if end <= self.window.reserved() => Ok(abs),
+            Some(end) if end <= self.window.reserved() => Ok(self.window.confine(addr, offset)),
             _ => Err(Trap::MemoryFault),
         }
     }
@@ -11581,7 +11588,7 @@ impl Mem {
         self.store(addr, offset, op, Value::I64(lo as i64))
     }
 
-    /// §17 `v128.load`: the **16-byte** masked access — the sole escape-TCB delta SIMD adds
+    /// §17 `v128.load`: the **16-byte** bounds-checked access — the sole escape-TCB delta SIMD adds
     /// (D58). Shares the exact confinement + page-protection path as the scalar `load`, just
     /// with `width = 16`, so `svm-mask`'s width-parametric guard covers it unchanged.
     fn load_v128(&self, addr: u64, offset: u64) -> Result<Value, Trap> {
@@ -11594,7 +11601,7 @@ impl Mem {
         Ok(Value::V128(b))
     }
 
-    /// §17 `v128.store`: the 16-byte masked write (see [`Mem::load_v128`]).
+    /// §17 `v128.store`: the 16-byte bounds-checked write (see [`Mem::load_v128`]).
     fn store_v128(&mut self, addr: u64, offset: u64, b: [u8; 16]) -> Result<(), Trap> {
         let base = self.confine_checked(addr, offset, 16)?;
         self.check_prot(base, 16, true)?;
@@ -11607,7 +11614,7 @@ impl Mem {
 
     /// §12 atomics share the confinement + page-protection path with `load`/`store`, and add a
     /// **natural-alignment** requirement: a misaligned effective address traps (`MemoryFault`). The
-    /// window base and mask domain are width-aligned, so checking the confined address suffices.
+    /// window base and reserved domain are width-aligned, so checking the confined address suffices.
     /// Single-threaded, an atomic's *value* semantics equal the non-atomic op; the JIT lowers these
     /// to hardware atomics so they stay correct once threads exist (§12). All operate on the full
     /// `ty` width (`i32`/`i64`).
@@ -11810,7 +11817,7 @@ impl Mem {
 
     /// Like [`init_data`], but place each (child-relative) segment at `win_base + offset` — the §14
     /// sub-window's slice base, so segment bytes and their read-only protections land in the child's
-    /// region of the parent backing (matching the masking, which confines child accesses to
+    /// region of the parent backing (matching trap-confinement, which confines child accesses to
     /// `[win_base, win_base + size)`). `win_base == 0` is the ordinary top-level window.
     fn init_data_at(&mut self, data: &[Data], win_base: u64) {
         // Byte writes first (no §13 regions exist at init ⇒ `set_byte` is lock-free)...
@@ -11820,7 +11827,7 @@ impl Mem {
             }
         }
         // ...then the read-only protections, under one address-space write lock. The prot map is
-        // keyed by window-relative page (the masking confines accesses to this window, and
+        // keyed by window-relative page (trap-confinement confines accesses to this window, and
         // `check_prot` looks up relative pages), so fold the window base out of the absolute address.
         let mut space = self.space_write();
         for d in data {
@@ -12907,10 +12914,11 @@ mod prot_tests {
         assert_eq!(child.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
     }
 
-    /// §14 nesting (interp `Mem` plumbing): a sub-window child confines every access into its own
-    /// slice `[base, base + size)` of the parent backing — far/out-of-child offsets alias back into the
-    /// slice, and every parent byte outside the slice is unreachable (stays zero). This is the
-    /// interpreter half of running a guest in a nested child window.
+    /// §14 nesting (interp `Mem` plumbing) under **trap-confinement**: a sub-window child admits an
+    /// access iff it lies within its own slice `[base, base + size)` of the parent backing and **faults**
+    /// on any out-of-child address (no aliasing back into the slice); every parent byte outside the slice
+    /// is therefore unreachable (stays zero). This is the interpreter half of running a guest in a nested
+    /// child window.
     #[test]
     fn sub_window_child_confined_to_its_slice() {
         let base = 1u64 << 16; // child at 64 KiB
@@ -12919,21 +12927,26 @@ mod prot_tests {
         let parent = 1u64 << 17; // 128 KiB parent backing
         let mut mem = Mem::sub_window(base, size_log2, parent);
 
-        // A store at child offset 8 lands at absolute base+8; a far offset (size+8) wraps to slot 8.
+        // A store at child offset 8 lands at absolute base+8; a far offset (size+8) now **faults**
+        // (trap-confinement: no wrap), leaving the earlier write intact.
         assert!(mem.store(8, 0, StoreOp::I64, Value::I64(0x1111)).is_ok());
-        assert!(mem
-            .store(size + 8, 0, StoreOp::I64, Value::I64(0x2222))
-            .is_ok());
-        assert_eq!(mem.load(8, 0, LoadOp::I64), Ok(Value::I64(0x2222))); // last write wins at slot 8
+        assert_eq!(
+            mem.store(size + 8, 0, StoreOp::I64, Value::I64(0x2222)),
+            Err(Trap::MemoryFault),
+            "an out-of-child store faults, it does not wrap"
+        );
+        assert_eq!(mem.load(8, 0, LoadOp::I64), Ok(Value::I64(0x1111))); // untouched by the faulted store
         assert_eq!(mem.confine_checked(8, 0, 8), Ok(base + 8)); // confined to the child's slice
 
-        // Every (even wildly out-of-child) address aliases *into* `[base, base+size)` — never below
-        // `base`, never at/above `base+size`.
-        for &a in &[0u64, size, size * 1000, u64::MAX, base, parent] {
-            let abs = mem.confine_checked(a, 0, 1).unwrap();
-            assert!(
-                abs >= base && abs < base + size,
-                "child escaped its slice: {abs:#x}"
+        // In-child offsets confine to `[base, base+size)`; every out-of-child address **faults**
+        // (never aliased back in).
+        assert_eq!(mem.confine_checked(0, 0, 1), Ok(base));
+        assert_eq!(mem.confine_checked(size - 1, 0, 1), Ok(base + size - 1));
+        for &a in &[size, size * 1000, u64::MAX, base, parent] {
+            assert_eq!(
+                mem.confine_checked(a, 0, 1),
+                Err(Trap::MemoryFault),
+                "out-of-child address {a:#x} must fault, not alias into the slice"
             );
         }
 
@@ -13004,7 +13017,7 @@ mod prot_tests {
         assert_eq!(m.map(0, 1 << 20, PROT_WRITE), EINVAL); // len past reserved
     }
 
-    /// A window whose reserved mask domain (`1 MiB`) is larger than the initial backed prefix
+    /// A window whose reserved domain (`1 MiB`) is larger than the initial backed prefix
     /// (`64 KiB`): the tail `[64 KiB, 1 MiB)` is reserved-but-unmapped and the guest can grow into
     /// it. `Mem::with_reservation(reserved_log2=20, mapped_log2=16)`.
     fn mem_growable() -> Mem {

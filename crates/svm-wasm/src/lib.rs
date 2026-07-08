@@ -120,17 +120,18 @@ const NAMED_IMPORT: u32 = u32::MAX - 1;
 /// i32))`. The synthesized spawn shim adapts SVM's `(i64 sp, i64 arg)` thread-entry ABI to it.
 const WASI_THREAD_START_EXPORT: &str = "wasi_thread_start";
 /// `memory.grow` on an **unbounded** wasm memory may extend up to this many pages. The window must
-/// hold the whole growable span (SVM masks accesses into the window rather than bounds-checking-and-
-/// trapping — the documented confinement difference), so for unbounded memory this is a modest cap
-/// (16 MiB) that keeps the eagerly-committed window small. A declared `maximum` is honored instead.
+/// hold the whole growable span (it is eagerly committed, so a grown page is reachable; an access
+/// past it traps under SVM's trap-confinement), so for unbounded memory this is a modest cap
+/// (16 MiB) that keeps the committed window small. A declared `maximum` is honored instead.
 const DEFAULT_MAX_GROW_PAGES: u64 = 256;
 /// Hard ceiling on the growable span regardless of a declared `maximum`, so a pathological `maximum`
 /// can't blow up the committed window (256 MiB).
 const MAX_GROW_PAGES: u64 = 4096;
 
 /// `table.grow` on an **unbounded** wasm table may extend up to this many slots. As with memory the
-/// window must hold the whole growable span (mask-confine, not bounds-check-and-trap), so for an
-/// unbounded table this is a modest cap (4 KiB of slots) keeping the committed window small. A
+/// window must hold the whole growable span (eagerly committed; an over-span access traps under
+/// trap-confinement), so for an unbounded table this is a modest cap (4 KiB of slots) keeping the
+/// committed window small. A
 /// declared table `maximum` is honored instead.
 const DEFAULT_MAX_GROW_SLOTS: u64 = 1024;
 /// Hard ceiling on the growable table span regardless of a declared `maximum` (256 KiB of slots).
@@ -189,10 +190,11 @@ const REF_NULL: i32 = -1;
 /// globals/table regions above it, so growth never collides with them. A runtime **size cell** (an
 /// 8-byte window slot just above the linear memory, initialized to the initial page count) holds the
 /// current size: `memory.size` loads it and `memory.grow` updates it branch-free (set to the new size
-/// on success / unchanged on a past-cap failure, returning the old size or `-1`). Because SVM masks
-/// accesses into the window rather than bounds-checking-and-trapping, a grown page is simply reachable;
-/// the size cell only governs the `size`/`grow` *return values*. A module that never grows is
-/// unchanged (no cell, the tight initial-sized window, `memory.size` a constant).
+/// on success / unchanged on a past-cap failure, returning the old size or `-1`). The whole growable
+/// span is eagerly committed (`mapped`) in the window, so a grown page is simply reachable and the size
+/// cell only governs the `size`/`grow` *return values*; an access past the reserved span traps under
+/// SVM's trap-confinement (matching wasm's out-of-bounds trap). A module that never grows is unchanged
+/// (no cell, the tight initial-sized window, `memory.size` a constant).
 pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // Fail-closed on malformed / invalid wasm *before* any lowering. The lowering pass below indexes
     // attacker-controlled type/function/global/local/table/branch indices and derives operand-stack
@@ -495,8 +497,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // Linear-memory layout. The linear memory sits at window offset 0 (so wasm address `a` is window
     // address `a`); the page count it may occupy is its initial size, or — when `memory.grow` is used —
     // up to its declared `maximum` (a default cap for unbounded memory, bounded by `MAX_GROW_PAGES`).
-    // The window must hold that whole span because SVM masks accesses into the window rather than
-    // bounds-checking-and-trapping (so a grown page is reachable, an over-grow access just masks).
+    // The window must hold that whole span (it is eagerly committed), so a grown page is reachable;
+    // an access past the window traps under SVM's trap-confinement (matching wasm's OOB trap).
     let initial_pages = mem.as_ref().map(|m| m.initial).unwrap_or(0);
     let max_pages = if uses_grow {
         mem.as_ref()
@@ -528,7 +530,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // **above** the linear memory (and the size cell) and lower `global.get`/`set` to load/store there
     // (8-byte slots, the standard "globals in memory" lowering). Initializers become `data` segments. A
     // valid guest's linear-memory accesses stay in `[0, mem_bytes)` and so never reach the globals; only
-    // an OOB access would (which wasm traps and we don't — the documented confinement difference).
+    // an OOB access would. Under trap-confinement an access past the whole window traps (as wasm's OOB
+    // does), but one landing in this in-window globals/table region does not — the residual confinement
+    // difference (wasm would trap it as past-linear-memory; co-locating the regions in one window keeps
+    // it reachable). An exact-sized per-region window would remove even that, but is not needed here.
     let globals_base = after_mem.div_ceil(8) * 8; // 8-byte aligned, just past the linear memory + cell
     let globals_types: Vec<ValType> = globals.iter().map(|(t, _)| *t).collect();
     for (g, (_, bytes)) in globals.iter().enumerate() {
@@ -547,7 +552,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let tsize = table_size.unwrap_or(0);
     // When `table.grow` is used the table region must span its growable maximum — the declared table
     // `maximum`, or a default cap for an unbounded table, bounded by `MAX_GROW_SLOTS` — so a grown slot
-    // is reachable under the mask-confine model (exactly the memory.grow span argument). A non-growing
+    // is reachable (eagerly committed, exactly the memory.grow span argument). A non-growing
     // module reserves only its initial slots and transpiles byte-identically to before.
     let table_max_slots = if uses_table_grow {
         table_max
@@ -726,10 +731,11 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         }
     }
 
-    // Our window is a power-of-two byte range (masking confines to it); size it to hold the linear
-    // memory (its full growable span) **and** the size cell + globals + function-table regions. (wasm
-    // bounds-checks-and-traps on out-of-range access while we mask-confine to the ≥ power-of-two
-    // window — identical for in-bounds accesses.) Globals/table-only modules still need a window.
+    // Our window is a power-of-two byte range (SVM's reserved domain rounds up to it); size it to hold
+    // the linear memory (its full growable span) **and** the size cell + globals + function-table
+    // regions. Both wasm and SVM bounds-check-and-trap on an out-of-range access; the residual
+    // difference is only that an OOB linear-memory access landing in this window's globals/table region
+    // stays reachable here (co-located) rather than trapping. Globals/table-only modules still need a window.
     let needed = table_end
         .max(globals_end)
         .max(after_mem)
@@ -2075,7 +2081,7 @@ fn v128_store(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
 // ---- SIMD memory variants (splat-load / load-extend / load-zero / load+store-lane) ----
 // None need new IR: each composes a scalar `Load`/`Store` with `Splat`/`ReplaceLane`/`ExtractLane`/
 // `VWiden` (the lane immediates are wasm-validated `< lanes`). Synthesized scalar accesses carry
-// `align: 0` (advisory only; SVM masks rather than trapping on misalignment).
+// `align: 0` (advisory only; SVM does not trap on misalignment for non-atomic accesses).
 
 /// `v128.loadN_splat`: load a scalar of width N and broadcast it across every lane of `shape`.
 fn v_load_splat(lo: &mut Lower, shape: VShape, op: LoadOp, m: MemArg) -> Result<(), Error> {

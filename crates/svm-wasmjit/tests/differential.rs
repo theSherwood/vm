@@ -279,8 +279,9 @@ block0(v0: i64):
 
 #[test]
 fn mem_oob() {
-    // In-window, boundary-straddling (65536-7..65536-1), masked-back-in-window (2^40 + 8 → 8),
-    // and far outside — the sweep crosses the guard on both sides.
+    // In-window, boundary-straddling (65536-7..65536-1), past the reservation (2^40 + 8 — under
+    // trap-confinement this faults; the old wrap model aliased it to byte 8), and far outside —
+    // the sweep crosses the window bound on both sides.
     let probe: &[i64] = &[
         0,
         8,
