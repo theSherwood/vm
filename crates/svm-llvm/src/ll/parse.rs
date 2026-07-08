@@ -388,8 +388,8 @@ impl Parser {
     }
 
     /// Build the [`crate::blockaddr::BlockAddrs`] from the captured `blockaddress` payloads, resolving
-    /// each `%bb` to its index within `@f` (definition order) — the same shape the `llvm-sys` reader
-    /// produces. `None` when the module has no computed `goto`.
+    /// each `%bb` to its index within `@f` (definition order) — the same shape the deleted `llvm-sys`
+    /// reader produced. `None` when the module has no computed `goto`.
     fn take_block_addrs(&mut self, module: &Module) -> Option<crate::blockaddr::BlockAddrs> {
         let mut per_global = std::collections::HashMap::new();
         for (g, payloads) in &self.ba_per_global {
@@ -2919,7 +2919,7 @@ fn scan_tuple_refs(toks: &[Token], lbrace: usize) -> (Vec<u64>, usize) {
 }
 
 /// The index of block label `block` within function `func` (definition order), for `blockaddress`
-/// resolution — matching the `llvm-sys` reader's `block_index`.
+/// resolution — matching the deleted `llvm-sys` reader's `block_index`.
 fn block_index_in(module: &Module, func: &str, block: &str) -> Option<u32> {
     let f = module.functions.iter().find(|fn_| fn_.name == func)?;
     let target = name_from_local(block);

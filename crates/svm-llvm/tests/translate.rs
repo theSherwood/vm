@@ -1645,9 +1645,9 @@ fn variable_length_memset_loop() {
 /// A **threaded (computed-`goto`) bytecode interpreter** — the canonical `indirectbr`/`blockaddress`
 /// idiom (`static void *tbl[] = {&&l0,…}; goto *tbl[op];`), the dispatch shape every real bytecode VM
 /// (SQLite's VDBE, Lua, QuickJS) is built on. clang `-O2` lowers `&&label` to `blockaddress` constants
-/// in the dispatch-table global and `goto *p` to an `indirectbr`. The on-ramp recovers the (otherwise
-/// `llvm-ir`-erased) blockaddress targets via `llvm-sys` ([`svm_llvm::blockaddr`]) — baking each as its
-/// block index into the table global — and lowers the `indirectbr` to a `br_table` over those indices.
+/// in the dispatch-table global and `goto *p` to an `indirectbr`. The on-ramp recovers the blockaddress
+/// targets from the text parse ([`svm_llvm::blockaddr::BlockAddrs`]) — baking each as its block index
+/// into the table global — and lowers the `indirectbr` to a `br_table` over those indices.
 /// The program is **derived from `n` at runtime** so no dispatch target constant-folds (which would let
 /// clang thread a `blockaddress` through a φ — an operand-position use, the deferred follow-up); every
 /// blockaddress stays in the table global. Verified byte-for-byte vs native on both backends.
@@ -1674,7 +1674,7 @@ fn computed_goto_threaded_interpreter() {
 
 /// Structural companion to [`computed_goto_threaded_interpreter`]: prove the computed-`goto` path is
 /// actually exercised (not optimized away) — clang emitted `blockaddress`es into the dispatch global,
-/// the `llvm-sys` recovery found them, and the `indirectbr` lowered to a `br_table`.
+/// the text parse recovered them, and the `indirectbr` lowered to a `br_table`.
 #[test]
 fn computed_goto_lowers_indirectbr_to_br_table() {
     let Some(bc) = compile_to_bc("computed_goto_struct", COMPUTED_GOTO_SRC) else {
@@ -1697,7 +1697,7 @@ fn computed_goto_lowers_indirectbr_to_br_table() {
 /// AW) — an *operand-position* blockaddress, not a global-table entry. This is the shape a real
 /// interpreter produces (and the AV follow-up): the program has a constant first dispatch
 /// (`prog[0] == 2`), so clang knows the entry target and threads `blockaddress(@run, …)` into a φ that
-/// feeds the `indirectbr`. The on-ramp recovers it via `llvm-sys` (`blockaddr::phi`, keyed by φ
+/// feeds the `indirectbr`. The on-ramp recovers it from the text parse (`blockaddr::phi`, keyed by φ
 /// position) and materializes the block-index constant. Byte-identical to native on both backends.
 const COMPUTED_GOTO_PHI_SRC: &str = r#"
 int run(int n) {
@@ -4278,8 +4278,8 @@ int main(void) {
 // Milestone 2 — beyond chibicc's C subset: the D54 **breadth proof**. The on-ramp consumes any
 // LLVM frontend's bitcode, so a freestanding C++ TU (`-fno-exceptions -fno-rtti`) — classes,
 // virtual dispatch (vtables → `call_indirect`), templates, mangled names — must run byte-identical
-// to native `clang++`, with no translator change beyond what the C corpus already proved. (Rust is
-// gated on a toolchain re-pin: `rustc`'s bundled LLVM is newer than our pinned 18.)
+// to native `clang++`, with no translator change beyond what the C corpus already proved. (The Rust
+// lane runs further down, on the default `rustc` via textual `.ll` — no toolchain pin.)
 // ============================================================================================
 
 /// Compile a freestanding C++ snippet to legalized LLVM-18 bitcode: `-fno-exceptions -fno-rtti`
@@ -5480,8 +5480,8 @@ fn llvm_without_g_has_no_debug_info() {
     assert!(m.debug_info.is_none(), "no -g ⇒ no debug section");
 }
 
-/// The §6 **variable/type half** for LLVM: a direct `llvm-sys` walk of the `-O0 -g` DI metadata
-/// recovers each source local's name + structured type and correlates it to the IR by alloca
+/// The §6 **variable/type half** for LLVM: the textual metadata reader (`ll::debug`) walks the
+/// `-O0 -g` DI metadata to recover each source local's name + structured type, correlated to the IR by alloca
 /// ordinal, landing it in the waist as a `Window` var — the LLVM analog of the wasm DWARF
 /// aggregate/pointer/array ingest (DEBUGGING.md slice 25). Mirrors the wasm
 /// `wasm_dwarf_ingests_aggregate_pointer_and_array_types` test over the same struct/array/pointer
