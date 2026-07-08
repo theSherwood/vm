@@ -64,14 +64,19 @@ global `STACK_LIMIT` cell with `set_limit`/`restore_limit` across the resume sea
 opaque to the optimizer". The shipped code uses path B (a value ABI param, `limit_var`). **Fix:** docs
 rewritten to describe path B and the after-`sub rsp` check position.
 
-### F3 — [accept / tracked as #5] Arena has no hardware backstop; the check is the *sole* defense
+### F3 — [resolved by follow-up analysis] Arena has no hardware backstop; the check is the *sole* defense
 On the guard-page backend a check hole is caught by the `PROT_NONE` page (a fault, not corruption). The
-arena drops that page, so under the flip a check hole = silent neighbour-fiber corruption = escape.
-This is by design (the VMA win requires dropping the page) and is *why* the check is escape-TCB — but
-it means the residual single-frame-larger-than-the-slot gap (STACK_GUARD_FLIP.md #5) has no
-defense-in-depth under the arena. **Recommendation:** land the frame-size backstop (#5) as part of the
-flip, not after — reject at compile time any function whose frame exceeds `SLOT − RED_ZONE`. (Cranelift
-0.132 doesn't expose the final frame size; a prologue-parse or an upgraded Cranelift is the path.)
+arena drops that page, so under the flip a check hole would be silent neighbour-fiber corruption. This
+is by design (the VMA win requires dropping the page) and is *why* the check is escape-TCB. This audit
+initially flagged a "single-frame-larger-than-the-slot" residual and routed it to a compile-time
+frame-size backstop (#5). **A follow-up scoping of #5 (STACK_GUARD_FLIP.md) retired that concern:** the
+check is sound for *every frame the compiler can realistically emit*. It runs after `sub rsp` with
+`enable_probestack` pinned off (F1), so no page is touched before it; the only pre-check writes are the
+return-address push + callee-saved spills, ABI-bounded to ≤ ~224 B ≪ `RED_ZONE` (16 KiB). Any frame that
+lowers SP below `limit + RED_ZONE` therefore traps *before* its first frame write — regardless of size
+(the compare is size-independent), up to a frame large enough to *wrap* the address space (~2^47 B),
+which the compiler cannot emit (a mere 264 KiB frame already hangs regalloc). So the arena's sole-defense
+posture is safe as-is; the backstop is defense-in-depth against an unreachable case, **not** a flip gate.
 
 ### F4 — [not an escape; decide under #4] Un-zeroed slot reuse is intra-guest data residue
 A recycled arena slot is not zeroed, so a new fiber's stack initially holds the previous fiber's bytes

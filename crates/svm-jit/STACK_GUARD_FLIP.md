@@ -49,10 +49,36 @@ Already escape-grade about the design (see `STACK_GUARD.md`):
 | 2 | **Audit** the check + arena as an escape-TCB unit (like masking). | Blocker | **done** — `STACK_GUARD_AUDIT.md`: no escape vector; F1 (pin probestack) + F2 (stale docs) fixed; F3→#5, F4→#4 |
 | 3 | **CI coverage** — build/test `--features stack-check[,arena-stacks]` on Linux + macOS-aarch64, and give the Windows arena its first runtime coverage. Without it the guard bit-rots while off by default. | Blocker | **mostly done** — `stack-guard` job exists; fuzz runs under it on merge; needs the guard-page-oracle run added (below) |
 | 4 | **GC precision** — reused, un-zeroed arena slots added *false roots* to the conservative scan (never unsound — a superset only retains). **FIXED (minimal):** `gc_roots` now scans running fibers over the tight `[live_sp, top)` instead of `[usable_low, top)` — `live_sp` from the resume chain (`resumer_sp()` for ancestors, `current_sp()` for the innermost). The unused region below `live_sp` (where arena stale bytes live) is no longer read, so **zeroing is unnecessary**. Parked fibers were already exact (`[ctx, top)`). A broader precise-stack-map GC redesign is deferred separately (user). | Follow-up | **done (minimal)** — tight running-scan + regression test `gc_roots_scans_running_ancestor_fiber_on_the_jit` |
-| 5 | **Frame-size backstop** — reject any function whose frame exceeds `SLOT − RED_ZONE`. The audit (F3) **raises this**: under the arena the check is the *sole* defense (no guard-page backstop), so this single-frame gap should close *with* the flip, not after. Cranelift 0.132 doesn't expose `frame_size` (needs a prologue-parse or a Cranelift upgrade). | Low escape-prob, but arena-critical | open |
+| 5 | **Frame-size backstop** — **scoped out as a gate (not needed for realistic code).** The check is sound for every frame the compiler can emit (see "Frame-size scoping" below); the residual is only an address-space *wrap* (~2^47 B), which is unreachable. Cranelift 0.132 doesn't expose the frame size anyway (`CompiledCode` = buffer/vcode/labels/bb only). A belt-and-suspenders prologue-parse remains *possible* but is fragile and unnecessary. | Theoretical — no action | **retired as gate** |
 
-Items 1–3 are the gate. The audit reclassifies **#4 as a non-gating GC follow-up** (sound-but-imprecise
-interim is acceptable) and **#5 as should-land-with-the-flip** (F3 — the arena has no hardware backstop).
+Items 1–3 are the gate; all effectively done. **#4** is a non-gating GC follow-up (the minimal tight
+running-scan already landed). **#5** is retired as a gate (frame-size scoping below). ⇒ the technical
+blockers are cleared; what remains is execution (apply the CI line, flip the default features, move the
+check into the always-on verifier-trusted path).
+
+## Frame-size scoping (#5 — why it is not a gate)
+
+The check is `SP - RED_ZONE <u limit`, emitted in each function's entry block **after** the machine
+prologue's `sub rsp`, with `enable_probestack` pinned **off** (audit F1). Consequences:
+
+- `sub rsp` (even for a huge frame) is a pure pointer move — it touches no page before the check.
+- The **only** writes before a callee's check are the `call` return-address push + the callee-saved
+  register spills in its prologue — ABI-bounded to ≤ ~224 B (x64 SysV 6 GPR = 48 B; Win64 + XMM6–15 ≈
+  224 B), i.e. **≪ `RED_ZONE` (16 KiB)**. The caller's passed check guarantees ≥ `RED_ZONE` headroom,
+  which covers them with ~70× margin.
+- Any frame that lowers SP below `limit + RED_ZONE` therefore **traps before its first frame write**,
+  independent of frame size (the compare has no size term). The fuzz confirms clean `StackOverflow`
+  for frames past `RED_ZONE`; the mechanism is identical for larger frames.
+- The one regime the runtime compare can't catch is `sub rsp` **wrapping** the address space (frame
+  ≈ 2^47 B). That is unreachable: the compiler cannot emit it — a 264 KiB (33 000-slot) frame already
+  hangs regalloc past 10 min, so a 2^47 frame can't be compiled at all. (Pathological frames are thus a
+  *compile-time* resource concern, not a runtime escape — orthogonal to the guard.)
+
+Cranelift 0.132 exposes no frame size (`CompiledCode`: `buffer`, `vcode`, `value_labels_ranges`,
+`bb_starts/edges`; `code_info()` = code `total_size` only), so a compile-time bound would need a
+dependency bump (unproven it's exposed later; risky for escape-TCB) or a machine-code prologue-parse of
+`code_buffer()` for the `sub rsp, imm` (fragile, per-arch). Given the analysis above, neither is
+warranted. **Recommendation: ship the flip without a frame-size backstop.**
 
 ## sigaltstack finding (surfaced while building blocker #1)
 
@@ -104,6 +130,16 @@ so the fuzz also runs there:
 - [ ] CI job (#3) builds + runs the guard/arena suites on Linux + macOS-aarch64; Windows arena has runtime coverage.
 - [ ] Escape-TCB audit (#2) signs off the check + arena.
 - [x] GC precision (#4) — **done (minimal)**: tight `[live_sp, top)` running-scan lands the arena-imprecision fix; zeroing unnecessary. Broader GC redesign deferred separately.
-- [ ] Frame-size residual (#5) either closed or explicitly accepted with rationale.
+- [x] Frame-size residual (#5) — **explicitly accepted**: sound for all emittable frames; residual is an unreachable address-space wrap (frame-size scoping above). No backstop shipped.
 
 Then flip **both** flags together, per platform, and move the check into the always-on verifier-trusted path.
+
+## Status: technical blockers cleared
+
+#1 fuzz ✅ · #2 audit ✅ (no escape vector; F1/F2 fixed) · #3 CI ✅ (job runs the fuzz on merge; one
+guard-page-oracle line for `main`) · #4 GC ✅ (minimal tight running-scan; zeroing unnecessary) ·
+#5 frame-size ✅ (retired as a gate). Remaining is **execution**, not open risk: (1) apply the CI
+guard-page line on `main`; (2) flip `svm-fiber/arena-stacks` + `svm-jit/stack-check` on by default,
+per platform; (3) move the software check into the always-on verifier-trusted path (drop the feature
+gate) so it cannot be compiled out. A broader precise-stack-map GC redesign remains a separate,
+non-blocking follow-up.
