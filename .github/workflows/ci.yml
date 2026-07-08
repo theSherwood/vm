@@ -12,6 +12,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Ride out transient crates.io connection resets instead of failing the job (ISSUES.md I18:
+  # a cold `cargo build`'s registry download died `curl [56] Connection reset by peer` and cost a
+  # manual re-run). Cargo's default is 3 quick retries; 10 with the longer timeout spans a
+  # multi-second registry blip.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_TIMEOUT: "60"
+
 jobs:
 
   check:
@@ -66,7 +73,14 @@ jobs:
         target: [decode_verify, diff, mask, wasm_transpile]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Pinned to a dated nightly, unlike the other nightly lanes (ISSUES.md I18): this job's first
+      # step *builds cargo-fuzz from source*, so its health depends on `latest nightly × cargo-fuzz's
+      # locked dep tree` compiling at 07:00 UTC — which broke for 5 straight nights (Jun 4-9, rustix
+      # vs a new reserved attribute) and silently produced zero fuzz coverage. The fuzz *targets*
+      # need nightly features, not the newest nightly. Bump the date deliberately (with the
+      # cargo-fuzz version) rather than riding the channel.
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { toolchain: nightly-2026-07-01 }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: fuzz }
       - run: cargo install cargo-fuzz --locked
