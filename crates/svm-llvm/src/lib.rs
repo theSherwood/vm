@@ -154,9 +154,9 @@
 //!   `fmuladd` (unfused), `fma` (fused, shared `Inst::VFma`/`Fma`), `+−*∕` — are IEEE on both sides). Lands the **`raytrace`** demo (an ASCII
 //!   sphere raytracer: `sqrt` intersection + guest `g_sin`/`g_exp` shading) byte-identical to native.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): `printf` float conversions
-//! (`%f`/`%e`/`%g` — need exact-decimal/bignum formatting), `*` (dynamic width/precision), and
-//! non-constant formats; general (non-rotate) funnel shifts with a *non-constant* amount (the
+//! Out of the current subset (clean [`Error::Unsupported`]): `printf` `%a` (hex float), `*`
+//! (dynamic width/precision), and non-constant formats (float `%f`/`%e`/`%g` conversions are IN —
+//! exact bignum formatters incl. the `0`/`#` flags); general (non-rotate) funnel shifts with a *non-constant* amount (the
 //! constant-amount i32/i64 case is lowered), `llvm.bitreverse`, transcendental math
 //! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
 //! (`<2 x double>`, `<8 x i16>`, dynamic lanes), and `i33`.
@@ -8502,6 +8502,8 @@ const FMT_TOTAL_O: i64 = 2096; // padded field length
 const FMT_LEAD_O: i64 = 2104; // leading-pad count (right-justify)
 const FMT_P_O: i64 = 2112; // %g significant-digit count P
 const FMT_SIGEND_O: i64 = 2120; // %g: content cursor just past the last significant fraction digit
+const FMT_FILL_O: i64 = 2128; // pad fill byte: ' ', or '0' when the `0` flag is active
+const FMT_SKIP_O: i64 = 2136; // sign bytes kept at out[0..skip) under zero-fill (0 or 1)
 
 /// Emit the sign byte for a float field: `'-'` if the sign bit is set, else `'+'`/`' '` for the
 /// `+`/space flags, else `0` (none). `sign`/`flags` are loaded from the scratch locals at `scratch`.
@@ -8538,7 +8540,7 @@ fn fmt_sign_byte(b: &mut Bdr, scratch: ValIdx) -> ValIdx {
 #[allow(dead_code)]
 fn synth_dtoa_sci(dd: u32) -> Func {
     use BinOp::{Add, And, DivU, RemU, ShrU, Sub};
-    use CmpOp::{Eq, GtS, LtS, Ne};
+    use CmpOp::{Eq, GtS, LtS, LtU, Ne};
     let i64t = ValType::I64;
 
     const SPECIAL: u32 = 1;
@@ -8605,6 +8607,10 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let kf = b.k(FMT_FLAGS_O);
         let fa = b.bin(Add, 0, kf);
         let flags = b.load64(fa);
+        // C ignores the `0` flag for inf/nan — clear bit4 so the pad stage space-fills.
+        let nz = b.k(!16i64);
+        let f2 = b.bin(And, flags, nz);
+        b.store64(fa, f2);
         let c8 = b.k(8);
         let upf = b.bin(And, flags, c8);
         let upper = b.cmpi(Ne, upf, 0);
@@ -8700,10 +8706,20 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let pa = b.bin(Add, 0, kp);
         let prec = b.load64(pa);
         let pos = b.cmpi(GtS, prec, 0);
+        // `#` (bit5): still write the '.' at prec==0 (C alternate form) — DOT falls straight
+        // through FRAC_LOOP (j=1 > prec) to EXPSTART, leaving just the point.
+        let kf2 = b.k(FMT_FLAGS_O);
+        let fa2 = b.bin(Add, 0, kf2);
+        let flags2 = b.load64(fa2);
+        let c32 = b.k(32);
+        let af = b.bin(And, flags2, c32);
+        let one1 = b.k(1);
+        let dotsel = b.sel(pos, one1, af);
+        let godot = b.cmpi(Ne, dotsel, 0);
         b.block(
             vec![i64t],
             Terminator::BrIf {
-                cond: pos,
+                cond: godot,
                 then_blk: DOT,
                 then_args: vec![0],
                 else_blk: EXPSTART,
@@ -8897,6 +8913,26 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let kl = b.k(FMT_LEAD_O);
         let lla = b.bin(Add, 0, kl);
         b.store64(lla, lead);
+        // `0` flag (bit4): fill with '0' (not spaces) and keep the sign at out[0] — right-justified
+        // only (C ignores `0` with `-`; SPECIAL cleared it for inf/nan).
+        let c16 = b.k(16);
+        let zf = b.bin(And, flags, c16);
+        let zeff = b.sel(isleft, zero, zf);
+        let iszfill = b.cmpi(Ne, zeff, 0);
+        let spch = b.k(b' ' as i64);
+        let zch = b.k(b'0' as i64);
+        let fill = b.sel(iszfill, zch, spch);
+        let kfl = b.k(FMT_FILL_O);
+        let fla = b.bin(Add, 0, kfl);
+        b.store64(fla, fill);
+        let sgn = fmt_sign_byte(&mut b, 0);
+        let hassign = b.cmpi(Ne, sgn, 0);
+        let one = b.k(1);
+        let skip0 = b.sel(hassign, one, zero);
+        let skip = b.sel(iszfill, skip0, zero);
+        let ksk = b.k(FMT_SKIP_O);
+        let ska = b.bin(Add, 0, ksk);
+        b.store64(ska, skip);
         let z = b.k(0);
         b.block(
             vec![i64t],
@@ -8907,7 +8943,7 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         )
     };
 
-    // 10: PAD_FILL_TEST(scratch, j) — fill out[0..total] with spaces.
+    // 10: PAD_FILL_TEST(scratch, j) — fill out[0..total] with the fill byte.
     let b_pad_fill_test = {
         let mut b = Bdr::new(2);
         let kt = b.k(FMT_TOTAL_O);
@@ -8927,13 +8963,15 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         )
     };
 
-    // 11: PAD_FILL_BODY(scratch, j) — out[j] = ' '.
+    // 11: PAD_FILL_BODY(scratch, j) — out[j] = fill byte (' ', or '0' under the `0` flag).
     let b_pad_fill_body = {
         let mut b = Bdr::new(2);
         let ko = b.k(FMT_OUT_O);
         let ob = b.bin(Add, 0, ko);
         let a = b.bin(Add, ob, 1);
-        let sp = b.k(b' ' as i64);
+        let kfl = b.k(FMT_FILL_O);
+        let fla = b.bin(Add, 0, kfl);
+        let sp = b.load64(fla);
         b.store8(a, sp);
         let one = b.k(1);
         let nj = b.bin(Add, 1, one);
@@ -8965,7 +9003,8 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         )
     };
 
-    // 13: PAD_COPY_BODY(scratch, k) — out[lead+k] = content[k].
+    // 13: PAD_COPY_BODY(scratch, k) — out[lead+k] = content[k]; under zero-fill the sign stays at
+    // out[0..skip) (byte k < skip lands at k, the '0' fill occupies the gap).
     let b_pad_copy_body = {
         let mut b = Bdr::new(2);
         let kc = b.k(FMT_CBUF_O);
@@ -8977,7 +9016,12 @@ fn synth_dtoa_sci(dd: u32) -> Func {
         let lead = b.load64(lla);
         let ko = b.k(FMT_OUT_O);
         let ob = b.bin(Add, 0, ko);
-        let off = b.bin(Add, lead, 1);
+        let ksk = b.k(FMT_SKIP_O);
+        let ska = b.bin(Add, 0, ksk);
+        let skip = b.load64(ska);
+        let insign = b.cmp(LtU, 1, skip);
+        let off0 = b.bin(Add, lead, 1);
+        let off = b.sel(insign, 1, off0);
         let oa = b.bin(Add, ob, off);
         b.store8(oa, ch);
         let one = b.k(1);
@@ -9031,7 +9075,7 @@ fn synth_dtoa_sci(dd: u32) -> Func {
 #[allow(dead_code)]
 fn synth_dtoa_gen(dd: u32) -> Func {
     use BinOp::{Add, And, DivU, RemU, ShrU, Sub};
-    use CmpOp::{Eq, GeS, GtS, LtS, Ne};
+    use CmpOp::{Eq, GeS, GtS, LtS, LtU, Ne};
     let i64t = ValType::I64;
 
     const SPECIAL: u32 = 1;
@@ -9122,6 +9166,10 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let kf = b.k(FMT_FLAGS_O);
         let fa = b.bin(Add, 0, kf);
         let flags = b.load64(fa);
+        // C ignores the `0` flag for inf/nan — clear bit4 so the pad stage space-fills.
+        let nz = b.k(!16i64);
+        let fcleared = b.bin(And, flags, nz);
+        b.store64(fa, fcleared);
         let c8 = b.k(8);
         let upf = b.bin(And, flags, c8);
         let upper = b.cmpi(Ne, upf, 0);
@@ -9275,7 +9323,7 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let mut b = Bdr::new(1);
         let fa = b.bini(Add, 0, FMT_FLAGS_O);
         let flags = b.load64(fa);
-        let altf = b.bini(And, flags, 16);
+        let altf = b.bini(And, flags, 32);
         let isalt = b.cmpi(Ne, altf, 0);
         let cla = b.bini(Add, 0, FMT_CLEN_O);
         let cur = b.load64(cla);
@@ -9505,7 +9553,7 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let mut b = Bdr::new(1);
         let fa = b.bini(Add, 0, FMT_FLAGS_O);
         let flags = b.load64(fa);
-        let altf = b.bini(And, flags, 16);
+        let altf = b.bini(And, flags, 32);
         let isalt = b.cmpi(Ne, altf, 0);
         let cla = b.bini(Add, 0, FMT_CLEN_O);
         let cur = b.load64(cla);
@@ -9542,6 +9590,23 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         b.store64(ta, total);
         let lla = b.bini(Add, 0, FMT_LEAD_O);
         b.store64(lla, lead);
+        // `0` flag (bit4): fill with '0' (not spaces) and keep the sign at out[0] — right-justified
+        // only (C ignores `0` with `-`; SPECIAL cleared it for inf/nan).
+        let zf = b.bini(And, flags, 16);
+        let zeff = b.sel(isleft, zero, zf);
+        let iszfill = b.cmpi(Ne, zeff, 0);
+        let spch = b.k(b' ' as i64);
+        let zch = b.k(b'0' as i64);
+        let fill = b.sel(iszfill, zch, spch);
+        let fla = b.bini(Add, 0, FMT_FILL_O);
+        b.store64(fla, fill);
+        let sgn = fmt_sign_byte(&mut b, 0);
+        let hassign = b.cmpi(Ne, sgn, 0);
+        let one = b.k(1);
+        let skip0 = b.sel(hassign, one, zero);
+        let skip = b.sel(iszfill, skip0, zero);
+        let ska = b.bini(Add, 0, FMT_SKIP_O);
+        b.store64(ska, skip);
         let z = b.k(0);
         b.block(
             vec![i64t],
@@ -9576,7 +9641,8 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let mut b = Bdr::new(2);
         let ob = b.bini(Add, 0, FMT_OUT_O);
         let a = b.bin(Add, ob, 1);
-        let sp = b.k(b' ' as i64);
+        let fla = b.bini(Add, 0, FMT_FILL_O);
+        let sp = b.load64(fla);
         b.store8(a, sp);
         let nj = b.bini(Add, 1, 1);
         b.block(
@@ -9615,7 +9681,13 @@ fn synth_dtoa_gen(dd: u32) -> Func {
         let lla = b.bini(Add, 0, FMT_LEAD_O);
         let lead = b.load64(lla);
         let ob = b.bini(Add, 0, FMT_OUT_O);
-        let off = b.bin(Add, lead, 1);
+        // Under zero-fill the sign stays at out[0..skip): byte k < skip lands at k, the rest at
+        // lead+k (the '0' fill occupies the gap).
+        let ska = b.bini(Add, 0, FMT_SKIP_O);
+        let skip = b.load64(ska);
+        let insign = b.cmp(LtU, 1, skip);
+        let off0 = b.bin(Add, lead, 1);
+        let off = b.sel(insign, 1, off0);
         let oa = b.bin(Add, ob, off);
         b.store8(oa, ch);
         let nk = b.bini(Add, 1, 1);
@@ -9683,7 +9755,7 @@ fn synth_dtoa_fix_big(
     iszero: u32,
 ) -> Func {
     use BinOp::{Add, And, Or, ShrU, Sub};
-    use CmpOp::{Eq, GeS, GtS, LeS, LtS, Ne};
+    use CmpOp::{Eq, GeS, GtS, LeS, LtS, LtU, Ne};
     let i64t = ValType::I64;
     let a_o = 0i64; // the big integer A / N
     let dcnt_o = FMT_SIGEND_O; // digit count D
@@ -9783,6 +9855,10 @@ fn synth_dtoa_fix_big(
         let count = b.sel(hassign, one, zero);
         let fa = b.bini(Add, 0, FMT_FLAGS_O);
         let flags = b.load64(fa);
+        // C ignores the `0` flag for inf/nan — clear bit4 so the pad stage space-fills.
+        let nz = b.k(!16i64);
+        let fcleared = b.bin(And, flags, nz);
+        b.store64(fa, fcleared);
         let upf = b.bini(And, flags, 8);
         let upper = b.cmpi(Ne, upf, 0);
         let mant = b.bini(And, 1, (1i64 << 52) - 1);
@@ -10152,8 +10228,14 @@ fn synth_dtoa_fix_big(
         let dot = b.k(b'.' as i64);
         b.store8(a, dot);
         let pos = b.cmpi(GtS, prec, 0);
+        // `#` (bit5): keep the '.' even at prec==0 (C alternate form).
+        let fa2 = b.bini(Add, 0, FMT_FLAGS_O);
+        let flags2 = b.load64(fa2);
+        let af = b.bini(And, flags2, 32);
+        let hasalt = b.cmpi(Ne, af, 0);
         let curp = b.bini(Add, cur, 1);
-        let cur2 = b.sel(pos, curp, cur);
+        let curalt = b.sel(hasalt, curp, cur);
+        let cur2 = b.sel(pos, curp, curalt);
         b.store64(cla, cur2);
         let istart = b.bini(Sub, prec, 1);
         b.block(
@@ -10227,6 +10309,23 @@ fn synth_dtoa_fix_big(
         b.store64(ta, total);
         let lla = b.bini(Add, 0, FMT_LEAD_O);
         b.store64(lla, lead);
+        // `0` flag (bit4): fill with '0' (not spaces) and keep the sign at out[0] — right-justified
+        // only (C ignores `0` with `-`; SPECIAL cleared it for inf/nan).
+        let zf = b.bini(And, flags, 16);
+        let zeff = b.sel(isleft, zero, zf);
+        let iszfill = b.cmpi(Ne, zeff, 0);
+        let spch = b.k(b' ' as i64);
+        let zch = b.k(b'0' as i64);
+        let fill = b.sel(iszfill, zch, spch);
+        let fla = b.bini(Add, 0, FMT_FILL_O);
+        b.store64(fla, fill);
+        let sgn = fmt_sign_byte(&mut b, 0);
+        let hassign = b.cmpi(Ne, sgn, 0);
+        let one = b.k(1);
+        let skip0 = b.sel(hassign, one, zero);
+        let skip = b.sel(iszfill, skip0, zero);
+        let ska = b.bini(Add, 0, FMT_SKIP_O);
+        b.store64(ska, skip);
         let z = b.k(0);
         b.block(
             vec![i64t],
@@ -10261,7 +10360,8 @@ fn synth_dtoa_fix_big(
         let mut b = Bdr::new(2);
         let ob = b.bini(Add, 0, FMT_OUT_O);
         let a = b.bin(Add, ob, 1);
-        let sp = b.k(b' ' as i64);
+        let fla = b.bini(Add, 0, FMT_FILL_O);
+        let sp = b.load64(fla);
         b.store8(a, sp);
         let nj = b.bini(Add, 1, 1);
         b.block(
@@ -10300,7 +10400,13 @@ fn synth_dtoa_fix_big(
         let lla = b.bini(Add, 0, FMT_LEAD_O);
         let lead = b.load64(lla);
         let ob = b.bini(Add, 0, FMT_OUT_O);
-        let off = b.bin(Add, lead, 1);
+        // Under zero-fill the sign stays at out[0..skip): byte k < skip lands at k, the rest at
+        // lead+k (the '0' fill occupies the gap).
+        let ska = b.bini(Add, 0, FMT_SKIP_O);
+        let skip = b.load64(ska);
+        let insign = b.cmp(LtU, 1, skip);
+        let off0 = b.bin(Add, lead, 1);
+        let off = b.sel(insign, 1, off0);
         let oa = b.bin(Add, ob, off);
         b.store8(oa, ch);
         let nk = b.bini(Add, 1, 1);
@@ -10723,16 +10829,10 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
             }
             b'c' => FmtSeg::Char,
             b's' => FmtSeg::Str { width, prec },
-            // Fixed-notation float (`%f`). Exact (correctly-rounded) decimal conversion via the
-            // synthesized `__svm_dtoa_fixed` (fixed 128-bit integer arithmetic — no host float
-            // formatting, so interp≡JIT≡native). `prec` defaults to 6 (C); capped at 31 so the
-            // `m·5^prec` intermediate fits 128 bits (`5^31·2^53 < 2^128`), and `width` is bounded to
-            // the helper's scratch field. A value so large that `round(|v|·10^prec)` exceeds 128 bits
-            // traps deterministically (never a silent mis-format; bignum lifts both limits later). The
-            // `0`/`#` flags are not yet handled for floats (only sign / space-pad / left-justify).
             // Fixed-notation float (`%f`/`%F`). Exact decimal via the bignum `__svm_dtoa_fix_big`
             // (Dragon-style big-integer `N = round(|v|·10^prec)`), so correctly-rounded with no
-            // magnitude ceiling — large values that overflowed the old 128-bit path now format.
+            // magnitude ceiling. `prec` defaults to 6 (C). Flags: sign/space/left-justify and the
+            // `0` zero-pad (fill between the sign and the digits); `#` stays a later slice.
             b'f' | b'F' => {
                 let p = prec.unwrap_or(6);
                 if p > 510 {
@@ -10740,9 +10840,6 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
                 }
                 if width > 200 {
                     return Err(bad("float field width > 200 (scratch cap)"));
-                }
-                if flags.zero || flags.alt {
-                    return Err(bad("float `0`/`#` flag (later slice)"));
                 }
                 FmtSeg::Float {
                     width,
@@ -10762,9 +10859,6 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
                 if width > 200 {
                     return Err(bad("float field width > 200 (scratch cap)"));
                 }
-                if flags.zero || flags.alt {
-                    return Err(bad("float `0`/`#` flag (later slice)"));
-                }
                 FmtSeg::Float {
                     width,
                     prec: p,
@@ -10782,9 +10876,6 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
                 }
                 if width > 200 {
                     return Err(bad("float field width > 200 (scratch cap)"));
-                }
-                if flags.zero || flags.alt {
-                    return Err(bad("float `0`/`#` flag (later slice)"));
                 }
                 FmtSeg::Float {
                     width,
@@ -11875,11 +11966,14 @@ fn lower_format(
                 });
                 let precv = ctx.const_i64(prec as i64);
                 let widthv = ctx.const_i64(width as i64);
-                // flags: bit0 left-justify, bit1 `+`, bit2 space, bit3 uppercase (all compile-time).
+                // flags: bit0 left-justify, bit1 `+`, bit2 space, bit3 uppercase, bit4 zero-pad,
+                // bit5 `#` alternate form (all compile-time).
                 let fbits = (flags.left as i64)
                     | ((flags.plus as i64) << 1)
                     | ((flags.space as i64) << 2)
-                    | ((upper as i64) << 3);
+                    | ((upper as i64) << 3)
+                    | ((flags.zero as i64) << 4)
+                    | ((flags.alt as i64) << 5);
                 let flagsv = ctx.const_i64(fbits);
                 // Every float kind uses the exact bignum engine: the formatter fills the scratch
                 // output field and returns its length; we write `scratch+FMT_OUT_O .. +len`.
