@@ -1378,6 +1378,62 @@ pub extern "C" fn svm_parse_len() -> usize {
 /// The stashed [`svm_parse`] output (same cdylib-managed lifetime as `OUT`/`ERR`).
 static mut PARSE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
+// ---- wasm-JIT tier (BROWSER.md § "wasm-JIT tier"), slice 2: emit + expose to the JS host ---------
+
+/// Trap codes the emitted wasm delivers through its `env.trap` import — re-exported from the
+/// emitter so the JS linker names them without hard-coding. `f{i}` calls `env.trap(code)` then
+/// `unreachable`; because the JS host calls the emitted function **directly** (not via this
+/// cdylib), that `unreachable` surfaces as a catchable `RuntimeError` at the JS boundary — the host
+/// reads the code it recorded to classify the trap (exactly the slice-1 differential model).
+pub const WASMJIT_TRAP_OUT_OF_FUEL: i32 = svm_wasmjit::TRAP_OUT_OF_FUEL;
+pub const WASMJIT_TRAP_MEMORY_FAULT: i32 = svm_wasmjit::TRAP_MEMORY_FAULT;
+
+/// Compile the encoded SVM module at `[mod_ptr, mod_len)` to a **WebAssembly module** (the wasm-JIT
+/// tier). Returns `1` and stashes the emitted wasm bytes when the whole module is JIT-eligible (its
+/// every function is in the emitter's v1 subset), or `0` when it is not — the fail-closed signal for
+/// the host to keep running the module on the bytecode interpreter (`svm_run`). Read the bytes via
+/// [`svm_wasmjit_ptr`] + [`svm_wasmjit_len`] before the next call.
+///
+/// The emitted module imports `env.memory` + `env.trap`; the host instantiates it against **this
+/// cdylib's own linear memory** (its exported `memory`) so an `svm_alloc`ed window/`env` cell is
+/// addressable in both, then calls the exported `f{i}(win, env, ...args)` directly. `size_log2` of
+/// the module's declared memory bakes the guard bound into the emitted confinement, so the host
+/// need only size the window ≥ `1 << size_log2`.
+#[no_mangle]
+pub extern "C" fn svm_wasmjit_compile(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    let bytes: &[u8] = if mod_ptr.is_null() || mod_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live allocation it just filled.
+        unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) }
+    };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return 0;
+    };
+    // Shared-memory import: the emitted module links against this cdylib's shared linear memory
+    // (the threads build) — the host instantiates it with the same `WebAssembly.Memory`.
+    match svm_wasmjit::compile_module_shared(&m) {
+        Ok(wasm) => {
+            // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Pointer / length of the most recent [`svm_wasmjit_compile`] output (emitted wasm bytes).
+#[no_mangle]
+pub extern "C" fn svm_wasmjit_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(WASMJIT)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_wasmjit_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(WASMJIT)).1 }
+}
+/// The stashed emitted-wasm bytes (same cdylib-managed lifetime as `OUT`/`ERR`).
+static mut WASMJIT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+
 /// Run `m`'s function 0 under a deterministic **3-cap powerbox** — `Stream(Out)` (type 0), `Exit`
 /// (type 1), and a host-fn (type 13), granted in that order — so the §7 reflection ops
 /// `cap.self.count` / `cap.self.get` see a fixed, known capability table. Passes `arg` only if the

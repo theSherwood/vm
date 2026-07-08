@@ -50,7 +50,7 @@ try {
 
   // Wait until every work item leaves 'pending' (or time out).
   await page.waitForFunction(
-    () => ['powerbox', 'threads', 'jit', 'inst', 'capio'].every((id) => document.getElementById(id).dataset.status !== 'pending'),
+    () => ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit'].every((id) => document.getElementById(id).dataset.status !== 'pending'),
     { timeout: 30_000 },
   );
 
@@ -61,17 +61,19 @@ try {
   const jit = await read('jit');
   const inst = await read('inst');
   const capio = await read('capio');
+  const wasmjit = await read('wasmjit');
 
   console.log(`\n  ${isolated.text}`);
   console.log(`  ${powerbox.text}`);
   console.log(`  ${threads.text}`);
   console.log(`  ${jit.text}`);
   console.log(`  ${inst.text}`);
-  console.log(`  ${capio.text}\n`);
+  console.log(`  ${capio.text}`);
+  console.log(`  ${wasmjit.text}\n`);
 
   const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
     threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
-    capio.status === 'pass';
+    capio.status === 'pass' && wasmjit.status === 'pass';
 
   // --- the playground (play.html): SVM text typed into the page, parsed in-browser, run across ----
   // Workers. Drives the page like a human: pick an example / type source, click Run, read the
@@ -130,7 +132,8 @@ try {
     `parallelism (incl. §22 guest-JIT on a shared Domain, §14 confined executor children on their ` +
     `own Workers, and 4d host I/O from worker vCPUs through one shared powerbox) over a shared ` +
     `WebAssembly.Memory under cross-origin isolation — plus the playground (SVM text parsed ` +
-    `in-browser via svm_parse, run across Workers in every powerbox mode)`);
+    `in-browser via svm_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
+    `(SVM IR compiled to wasm in-browser, f0 called directly, matching the interpreter)`);
 } catch (e) {
   failed = true;
   console.log(`FAIL: ${e.message}`);

@@ -252,11 +252,28 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
 
 // ---- the emitter ---------------------------------------------------------------------------------
 
-/// Compile every function of a **verified** `m` into one wasm module. Exports `f{i}` per SVM
-/// function; imports `env.memory` and `env.trap (i32) -> ()`. Returns the binary bytes, or
-/// [`Error::Unsupported`] if *any* function uses something outside the v1 subset (module-granular
-/// fail-closed, like `compile_module`'s `None` — per-function tiering is slice 3).
+/// Compile every function of a **verified** `m` into one wasm module, importing a **non-shared**
+/// `env.memory`. See [`compile_module_shared`] for the browser (threads-build) link target.
 pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
+    compile_module_with(m, false)
+}
+
+/// Like [`compile_module`] but the imported `env.memory` is declared **shared** — the browser
+/// wasm-JIT tier links the emitted module against the cdylib's shared linear memory (the threads
+/// build), and wasm requires the import's shared flag to match the provided memory's. The emitted
+/// code is otherwise byte-identical to the non-shared form (only the memory-import limits differ),
+/// so the `compile_module` differential (`tests/differential.rs`, under `wasmi`, which has no
+/// shared-memory support) fully covers this variant's codegen.
+pub fn compile_module_shared(m: &Module) -> Result<Vec<u8>, Error> {
+    compile_module_with(m, true)
+}
+
+/// Compile every function of a **verified** `m` into one wasm module. Exports `f{i}` per SVM
+/// function; imports `env.memory` (shared iff `shared_memory`) and `env.trap (i32) -> ()`. Returns
+/// the binary bytes, or [`Error::Unsupported`] if *any* function uses something outside the v1
+/// subset (module-granular fail-closed, like `compile_module`'s `None` — per-function tiering is
+/// slice 3).
+pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
     if !m.imports.is_empty() {
         return Err(Error::Unsupported("unresolved imports"));
     }
@@ -310,10 +327,22 @@ pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
     }
     section(&mut out, 1, &sec);
 
-    let mut sec = Vec::new(); // import section (2): env.memory (min 0), env.trap (type 0)
+    let mut sec = Vec::new(); // import section (2): env.memory, env.trap (type 0)
     uleb(&mut sec, 2);
     import_name(&mut sec, "env", "memory");
-    sec.extend_from_slice(&[0x02, 0x00, 0x00]); // memory, limits: min-only, min 0
+    sec.push(0x02); // memory
+    if shared_memory {
+        // Flag 0x03 = shared + has-max; min 0, max 65536 (wasm32's 4 GiB / 64 KiB-page ceiling). A
+        // min-0/max-ceiling import is satisfied by any shared memory the host provides, and the
+        // shared flag must match the provided memory's (the browser threads build's shared memory).
+        sec.push(0x03);
+        uleb(&mut sec, 0);
+        uleb(&mut sec, 65536);
+    } else {
+        // Flag 0x00 = min-only, non-shared (the `wasmi` differential + a plain cdylib build).
+        sec.push(0x00);
+        uleb(&mut sec, 0);
+    }
     import_name(&mut sec, "env", "trap");
     sec.push(0x00); // func
     uleb(&mut sec, 0); // type index 0
