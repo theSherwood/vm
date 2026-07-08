@@ -6052,6 +6052,13 @@ fn zero_of(b: &mut FunctionBuilder, t: Type) -> Value {
         b.ins().f32const(0.0)
     } else if t == F64 {
         b.ins().f64const(0.0)
+    } else if t.is_vector() {
+        // A vector result (e.g. a `float4`/v128 returned in a register, per §17): `iconst` is
+        // scalar-integer only and produces malformed IR (the verifier hits an internal `unreachable`),
+        // so materialize an all-zero vector constant instead — the same idiom the SIMD lowering uses.
+        let bytes = vec![0u8; t.bytes() as usize];
+        let zc = b.func.dfg.constants.insert(ConstantData::from(&bytes[..]));
+        b.ins().vconst(t, zc)
     } else {
         b.ins().iconst(t, 0)
     }

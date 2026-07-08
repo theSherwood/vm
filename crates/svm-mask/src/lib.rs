@@ -257,7 +257,7 @@ mod tests {
                     );
                     assert!(a + width as u64 <= size, "access escaped the window");
                 }
-                None => assert!(in_bounds == false, "faulted on an in-window access"),
+                None => assert!(!in_bounds, "faulted on an in-window access"),
             }
         }
     }
@@ -298,7 +298,7 @@ mod tests {
                     assert_eq!(a, addr.wrapping_add(offset));
                     assert!(a + width as u64 <= w.mapped(), "access escaped mapped");
                 }
-                None => assert!(in_bounds == false, "faulted on a fully-mapped access"),
+                None => assert!(!in_bounds, "faulted on a fully-mapped access"),
             }
         }
     }
@@ -435,7 +435,7 @@ mod tests {
                         "access left [base, base+mapped)"
                     );
                 }
-                None => assert!(in_bounds == false, "faulted on an in-mapped access"),
+                None => assert!(!in_bounds, "faulted on an in-mapped access"),
             }
         }
 
