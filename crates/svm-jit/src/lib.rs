@@ -72,10 +72,10 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use std::sync::Arc;
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
-    FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
-    VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func,
+    FuncIdx, FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator,
+    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VPMinMaxOp, VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod dwarf;
@@ -4245,8 +4245,20 @@ fn build_clif(
     emit_epoch_check(&mut b, &lower);
     b.ins().jump(blocks[0], &entry_args);
 
+    // Sound per-block-param upper bounds (§1a mask elision across loop back-edges): lets a
+    // loop-carried induction address `base + i` elide its confinement mask when the loop guard
+    // bounds `i`. Upper-bound-only, so a wrong bound can only over-mask; the escape-oracle catches
+    // any regression. Skipped (no elision gain) for a module with no memory (`mask == 0`).
+    let param_ubs: Vec<Vec<u64>> = if mask == 0 {
+        Vec::new()
+    } else {
+        let fn_results: Vec<usize> = funcs.iter().map(|ff| ff.results.len()).collect();
+        compute_param_ubs(f, &fn_results)
+    };
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, i, blocks[i], &blocks, &lower)?;
+        lower_block(
+            module, &mut b, blk, i, blocks[i], &blocks, &lower, &param_ubs,
+        )?;
     }
 
     b.seal_all_blocks();
@@ -4430,6 +4442,7 @@ fn lower_block(
     cb: cranelift_codegen::ir::Block,
     blocks: &[cranelift_codegen::ir::Block],
     lower: &Lower,
+    param_ubs: &[Vec<u64>],
 ) -> Result<(), JitError> {
     b.switch_to_block(cb);
     // The CLIF block params are the IR block params; seed the value map with them.
@@ -4438,6 +4451,15 @@ fn lower_block(
     // with `vals` so `ubs[i]` always describes IR value `i` (a misalignment could mis-elide,
     // so it is grown at the same points `vals` is). `size` confines via `mask` (= size−1).
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
+    // Seed loop-carried block params with the precomputed cross-block upper bounds (empty ⇒ no
+    // memory / not computed), so an induction address elides its mask (see `compute_param_ubs`).
+    if let Some(bounds) = param_ubs.get(block_idx) {
+        for (i, &u) in bounds.iter().enumerate() {
+            if let Some(slot) = ubs.get_mut(i) {
+                *slot = u;
+            }
+        }
+    }
     let size = lower.mask.wrapping_add(1);
 
     for (inst_idx, inst) in blk.insts.iter().enumerate() {
@@ -6368,6 +6390,191 @@ fn ub_of(inst: &Inst, ubs: &[u64]) -> u64 {
         } => 0xFFFF_FFFF,
         _ => UB_TOP,
     }
+}
+
+/// A param bound that rises past this in the [`compute_param_ubs`] fixpoint is snapped to [`UB_TOP`]
+/// (already useless for elision — larger than any real window) so the ascending iteration terminates.
+/// Sound: widening only ever *raises* a bound (⇒ more masking), never lowers it.
+const UB_WIDEN: u64 = 1 << 48;
+
+/// The block-local upper bounds for every value of `blk` (params first, then one per instruction
+/// result), given this block's param bounds — the same numbering the lowering builds in `lower_block`,
+/// via [`Inst::result_count`]. Single-result instructions get [`ub_of`]; anything else is [`UB_TOP`].
+fn block_local_ubs(blk: &Block, param_ubs: &[u64], fn_results: &[usize]) -> Vec<u64> {
+    let mut ubs = param_ubs.to_vec();
+    ubs.resize(blk.params.len(), UB_TOP);
+    for inst in &blk.insts {
+        match inst.result_count(fn_results) {
+            1 => ubs.push(ub_of(inst, &ubs)),
+            n => ubs.extend(std::iter::repeat(UB_TOP).take(n)),
+        }
+    }
+    ubs
+}
+
+/// Map each of `blk`'s values to the instruction that defines it (its first result), or `None` for a
+/// block param — so a guard/const lookup can recover the defining `IntCmp`/`ConstI*`.
+fn val_def_map(blk: &Block, fn_results: &[usize]) -> Vec<Option<usize>> {
+    let mut m = vec![None; blk.params.len()];
+    for (ii, inst) in blk.insts.iter().enumerate() {
+        for _ in 0..inst.result_count(fn_results) {
+            m.push(Some(ii));
+        }
+    }
+    m
+}
+
+/// The `u64` value of `v` if it is a `ConstI32`/`ConstI64` in `blk`, else `None`.
+fn const_of(blk: &Block, def: &[Option<usize>], v: u32) -> Option<u64> {
+    match blk.insts.get((*def.get(v as usize)?)?)? {
+        Inst::ConstI32(c) => Some(*c as u32 as u64),
+        Inst::ConstI64(c) => Some(*c as u64),
+        _ => None,
+    }
+}
+
+/// Swap a comparison's sense (`a op b` ⇔ `b swap(op) a`), so a const on the *left* can be normalized
+/// to the right.
+fn swap_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::LtU => CmpOp::GtU,
+        CmpOp::LeU => CmpOp::GeU,
+        CmpOp::GtU => CmpOp::LtU,
+        CmpOp::GeU => CmpOp::LeU,
+        other => other,
+    }
+}
+
+/// If `cond` is an unsigned compare of a variable against a constant (`v <u N` etc.), return the
+/// variable and a sound upper bound on it along the (then, else) edges of the `brif` — `None` on an
+/// edge that yields no upper bound. Only unsigned `<`/`<=`/`>`/`>=` are modelled (loop guards); all
+/// else returns `None` (⇒ no narrowing ⇒ masked). Never under-approximates.
+fn edge_guard(
+    blk: &Block,
+    def: &[Option<usize>],
+    cond: u32,
+) -> Option<(u32, Option<u64>, Option<u64>)> {
+    let Inst::IntCmp { op, a, b, .. } = blk.insts.get((*def.get(cond as usize)?)?)? else {
+        return None;
+    };
+    let (var, n, op) = if let Some(n) = const_of(blk, def, *b) {
+        (*a, n, *op)
+    } else if let Some(n) = const_of(blk, def, *a) {
+        (*b, n, swap_cmp(*op))
+    } else {
+        return None;
+    };
+    // Upper bound on `var` when the compare is true (then) / false (else).
+    let (t, e) = match op {
+        CmpOp::LtU => (n.checked_sub(1), None), // v<N ⇒ v≤N-1 ; else v≥N (no upper)
+        CmpOp::LeU => (Some(n), None),          // v≤N
+        CmpOp::GtU => (None, Some(n)),          // else v≤N
+        CmpOp::GeU => (None, n.checked_sub(1)), // else v≤N-1
+        _ => return None,
+    };
+    Some((var, t, e))
+}
+
+/// Precompute a sound upper bound for every block param of `f`, so mask elision can prove
+/// loop-carried induction addresses in-window (the common `for i<N { a[i] }` phi that otherwise masks
+/// every iteration). An ascending fixpoint from ⊥ (entry params = unknown): each param's bound is the
+/// max over incoming edges of the arg's block-local bound, **narrowed by that edge's `brif` guard**.
+/// Upper-bound-only — anything unmodelled stays [`UB_TOP`] and is still masked — so a bug can only
+/// *over*-mask, never under-mask; the escape-oracle differential (§18) is the final backstop.
+/// Returns `param_ubs[block][param]`.
+///
+/// STATUS: sound and correct but **currently recovers no masks on real `-O2` kernels** (measured on
+/// edn/matmult), for two compounding reasons this pass does not yet model — the foundation is here,
+/// but firing it needs both:
+///   1. **`!=`-counted loops.** LLVM canonicalizes `for (i=0; i<N; i++)` to an `i != N` exit test, not
+///      `i <u N`. [`edge_guard`] only narrows unsigned `</<=/>/>=`, so the induction var stays unknown.
+///      Needs recurrence analysis: a monotone `p += c` (c const > 0) with a constant initial `p0 < N`
+///      and `(N - p0) % c == 0` is bounded by `N - c`.
+///   2. **`sp`-relative base pointers.** The masked address is usually `base + i` where `base` is a
+///      loop-invariant stack pointer (a function argument ⇒ `UB_TOP`), so even a bounded `i` gives
+///      `UB_TOP + bounded = UB_TOP`. Needs an ABI-aware seed that `sp` is `< mapped` (in-window).
+/// Both are a real scalar-evolution + pointer-bounds effort; see the branch notes / commit.
+fn compute_param_ubs(f: &Func, fn_results: &[usize]) -> Vec<Vec<u64>> {
+    let init = || -> Vec<Vec<u64>> {
+        f.blocks
+            .iter()
+            .enumerate()
+            .map(|(b, blk)| vec![if b == 0 { UB_TOP } else { 0 }; blk.params.len()])
+            .collect()
+    };
+    let mut pubs = init();
+    for _ in 0..32 {
+        let mut next = init();
+        for (bidx, blk) in f.blocks.iter().enumerate() {
+            let local = block_local_ubs(blk, &pubs[bidx], fn_results);
+            let def = val_def_map(blk, fn_results);
+            // (target, args, upper-bound-for-narrowed-var, narrowed-var) per outgoing edge.
+            let mut edges: Vec<(u32, &[u32], Option<u64>, Option<u32>)> = Vec::new();
+            match &blk.term {
+                Terminator::Br { target, args } => edges.push((*target, args, None, None)),
+                Terminator::BrIf {
+                    cond,
+                    then_blk,
+                    then_args,
+                    else_blk,
+                    else_args,
+                } => match edge_guard(blk, &def, *cond) {
+                    Some((v, t, e)) => {
+                        edges.push((*then_blk, then_args, t, Some(v)));
+                        edges.push((*else_blk, else_args, e, Some(v)));
+                    }
+                    None => {
+                        edges.push((*then_blk, then_args, None, None));
+                        edges.push((*else_blk, else_args, None, None));
+                    }
+                },
+                Terminator::BrTable {
+                    targets, default, ..
+                } => {
+                    for edg in targets.iter().chain(std::iter::once(default)) {
+                        edges.push((edg.0, &edg.1, None, None));
+                    }
+                }
+                _ => {}
+            }
+            for (target, args, bound, nvar) in edges {
+                let Some(tgt) = next.get_mut(target as usize) else {
+                    continue;
+                };
+                for (pi, &arg) in args.iter().enumerate() {
+                    if pi >= tgt.len() {
+                        break;
+                    }
+                    let mut ub = local.get(arg as usize).copied().unwrap_or(UB_TOP);
+                    if let (Some(b), Some(v)) = (bound, nvar) {
+                        if v == arg {
+                            ub = ub.min(b);
+                        }
+                    }
+                    tgt[pi] = tgt[pi].max(ub);
+                }
+            }
+        }
+        // Ascending merge with widening; converged ⇒ a sound post-fixed-point.
+        let mut changed = false;
+        for (b, blk_ubs) in next.iter().enumerate() {
+            for (p, &nv) in blk_ubs.iter().enumerate() {
+                let nv = if nv >= UB_WIDEN { UB_TOP } else { nv };
+                if nv > pubs[b][p] {
+                    pubs[b][p] = nv;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return pubs;
+        }
+    }
+    // Didn't converge in budget → all-unknown (sound; simply no elision improvement).
+    f.blocks
+        .iter()
+        .map(|blk| vec![UB_TOP; blk.params.len()])
+        .collect()
 }
 
 /// True iff every access `[addr+offset, addr+offset+width)` is provably within `[0, size)`
