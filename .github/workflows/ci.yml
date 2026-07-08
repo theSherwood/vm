@@ -377,3 +377,46 @@ jobs:
             echo "::error::svm-bytecode-wasm row did not run (node or svm-browser cdylib missing?)"; exit 1
           fi
 
+  stack-guard:
+    # The fiber-scaling PROTOTYPE features, both OFF by default: the arena stack allocator
+    # (`arena-stacks`) and the JIT software stack-overflow guard (`stack-check`). The gating `check`
+    # job builds with neither, so this is the ONLY lane that compiles + runs the feature-gated code —
+    # incl. the `svm-jit` guard tests (single- and multi-vCPU fiber recursion must trap StackOverflow).
+    # Linux runtime + a windows-gnu cross-check for compile parity (the arena's VirtualAlloc path and
+    # the ABI-param threading) without needing a Windows runtime runner.
+    name: fiber-scaling features (stack-check + arena-stacks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets -- -D warnings
+      - run: cargo test -p svm-jit --features stack-check,arena-stacks
+      - run: cargo test -p svm-fiber --features arena-stacks
+      # Compile parity for the feature-gated code on Windows. mingw is needed for the §5 trap-capture
+      # C shim (as in the `check` job's cross-check).
+      - run: rustup target add x86_64-pc-windows-gnu
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+
+  stack-guard-cross-os:
+    # Runtime coverage of the feature-gated code on aarch64 (macOS) + x86-64 Windows — the arena's
+    # VirtualAlloc path and the software guard have not run there yet. NON-GATING (continue-on-error)
+    # until proven green, mirroring the `cross-os` posture for the unverified windows guard; drop
+    # continue-on-error to make it gating once it passes.
+    name: fiber-scaling features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test -p svm-jit --features stack-check,arena-stacks
+      - run: cargo test -p svm-fiber --features arena-stacks
