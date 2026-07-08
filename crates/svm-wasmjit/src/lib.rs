@@ -405,12 +405,67 @@ pub fn compile_module_shared(m: &Module) -> Result<Vec<u8>, Error> {
     compile_module_with(m, true)
 }
 
-/// Compile every function of a **verified** `m` into one wasm module. Exports `f{i}` per SVM
-/// function; imports `env.memory` (shared iff `shared_memory`) and `env.trap (i32) -> ()`. Returns
-/// the binary bytes, or [`Error::Unsupported`] if *any* function uses something outside the v1
-/// subset (module-granular fail-closed, like `compile_module`'s `None` — per-function tiering is
-/// slice 3).
+/// Two imported functions precede every emitted function, so a defined function's wasm index is
+/// `IMPORTED_FUNCS + its position among the emitted functions`.
+const IMPORTED_FUNCS: u32 = 2;
+/// `env.call_interp` scratch: the cross-tier call marshals its i64 arg/result slots starting at
+/// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
+/// `env` cell at least [`ENV_CELL_BYTES`] large.
+const ENV_SCRATCH_OFF: u64 = 16;
+/// Max i64 slots the cross-tier scratch holds (a call with more args-or-results than this is refused
+/// — 64 is absurdly generous for a function signature).
+const XCALL_MAX_SLOTS: usize = 64;
+/// Bytes the host must allocate for the `env` cell: the `i64` fuel counter + the cross-tier scratch.
+pub const ENV_CELL_BYTES: usize = ENV_SCRATCH_OFF as usize + XCALL_MAX_SLOTS * 8;
+
+/// Compile every function of a **verified** `m` into one wasm module (whole-module, all-integer).
+/// Exports `f{i}` per SVM function; imports `env.memory` (shared iff `shared_memory`), `env.trap`,
+/// and `env.call_interp`. Returns [`Error::Unsupported`] if *any* function is outside the v1 subset
+/// — for a mixed integer/interp guest use [`compile_module_mixed`].
 pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let n = m.funcs.len();
+    let emitted: Vec<usize> = (0..n).collect();
+    let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
+    emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
+}
+
+/// Compile a **mixed-tier** guest (`BROWSER.md` § "wasm-JIT tier", slice 3): emit the in-subset
+/// functions and route a call to an interp leaf through `env.call_interp` (the engine runs it on the
+/// bytecode interpreter — see [`Analysis`]). [`Error::Unsupported`] unless [`Analysis::mixed_ok`].
+pub fn compile_module_mixed(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.mixed_ok {
+        return Err(Error::Unsupported("guest is not mixed-tier runnable"));
+    }
+    // Emit the in-subset functions in SVM-index order; each gets the next wasm index. Interp leaves
+    // (and unreachable non-subset functions) get no wasm index — a call to a leaf goes to the import.
+    let mut wasm_of: Vec<Option<u32>> = vec![None; m.funcs.len()];
+    let mut emitted: Vec<usize> = Vec::new();
+    for (i, &in_sub) in a.in_subset.iter().enumerate() {
+        if in_sub {
+            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+            emitted.push(i);
+        }
+    }
+    emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
+}
+
+/// Assemble the wasm module: emit the functions listed in `emitted` (SVM indices, in the order they
+/// take wasm indices), routing each `Call` via `wasm_of` (a direct wasm call) or, for an interp
+/// leaf, through `env.call_interp`. See the module docs for the emitted shape.
+fn emit_module(
+    m: &Module,
+    shared_memory: bool,
+    emitted: &[usize],
+    wasm_of: &[Option<u32>],
+    interp_leaf: &[bool],
+) -> Result<Vec<u8>, Error> {
     if !m.imports.is_empty() {
         return Err(Error::Unsupported("unresolved imports"));
     }
@@ -422,10 +477,12 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         None => 0,
     };
 
-    // Type section entries: index 0 = env.trap's (i32) -> (); then one per function (dedup'd).
-    let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![])];
-    let mut fn_type_idx: Vec<u32> = Vec::with_capacity(m.funcs.len());
-    for f in &m.funcs {
+    // Types: 0 = env.trap `(i32) -> ()`, 1 = env.call_interp `(i32 func, i32 args_ptr) -> ()`, then
+    // one per emitted function (dedup'd).
+    let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![]), (vec![0x7f, 0x7f], vec![])];
+    let mut fn_type_idx: Vec<u32> = Vec::with_capacity(emitted.len());
+    for &fi in emitted {
+        let f = &m.funcs[fi];
         let mut params = vec![0x7f, 0x7f]; // win: i32, env: i32
         for p in &f.params {
             params.push(valtype_byte(*p)?);
@@ -445,9 +502,9 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         fn_type_idx.push(idx as u32);
     }
 
-    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(m.funcs.len());
-    for f in &m.funcs {
-        bodies.push(emit_func(m, f, mapped)?);
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(emitted.len());
+    for &fi in emitted {
+        bodies.push(emit_func(m, &m.funcs[fi], mapped, wasm_of, interp_leaf)?);
     }
 
     // ---- assemble the module ----
@@ -464,8 +521,8 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     }
     section(&mut out, 1, &sec);
 
-    let mut sec = Vec::new(); // import section (2): env.memory, env.trap (type 0)
-    uleb(&mut sec, 2);
+    let mut sec = Vec::new(); // import section (2): env.memory, env.trap (type 0), env.call_interp (type 1)
+    uleb(&mut sec, 3);
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
     if shared_memory {
@@ -483,23 +540,26 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     import_name(&mut sec, "env", "trap");
     sec.push(0x00); // func
     uleb(&mut sec, 0); // type index 0
+    import_name(&mut sec, "env", "call_interp");
+    sec.push(0x00); // func
+    uleb(&mut sec, 1); // type index 1
     section(&mut out, 2, &sec);
 
     let mut sec = Vec::new(); // function section (3)
-    uleb(&mut sec, m.funcs.len() as u64);
+    uleb(&mut sec, emitted.len() as u64);
     for ti in &fn_type_idx {
         uleb(&mut sec, *ti as u64);
     }
     section(&mut out, 3, &sec);
 
-    let mut sec = Vec::new(); // export section (7): "f{i}" → func 1+i (trap import is func 0)
-    uleb(&mut sec, m.funcs.len() as u64);
-    for i in 0..m.funcs.len() {
-        let name = format!("f{i}");
+    let mut sec = Vec::new(); // export section (7): "f{svm_idx}" → its wasm index
+    uleb(&mut sec, emitted.len() as u64);
+    for &fi in emitted {
+        let name = format!("f{fi}");
         uleb(&mut sec, name.len() as u64);
         sec.extend_from_slice(name.as_bytes());
         sec.push(0x00);
-        uleb(&mut sec, 1 + i as u64);
+        uleb(&mut sec, wasm_of[fi].unwrap() as u64);
     }
     section(&mut out, 7, &sec);
 
@@ -546,7 +606,13 @@ impl FnCtx {
     }
 }
 
-fn emit_func(m: &Module, f: &Func, mapped: u64) -> Result<Vec<u8>, Error> {
+fn emit_func(
+    m: &Module,
+    f: &Func,
+    mapped: u64,
+    wasm_of: &[Option<u32>],
+    interp_leaf: &[bool],
+) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
     // Allocate locals: every block's value list, then $next/$ea/$fuel.
@@ -610,7 +676,18 @@ fn emit_func(m: &Module, f: &Func, mapped: u64) -> Result<Vec<u8>, Error> {
     for (k, b) in f.blocks.iter().enumerate() {
         code.push(OP_END); // close block k; code_k follows
         cx.depth -= 1;
-        emit_block_body(m, f, &mut cx, &mut code, k, b, &per_block_types[k], mapped)?;
+        emit_block_body(
+            m,
+            f,
+            &mut cx,
+            &mut code,
+            k,
+            b,
+            &per_block_types[k],
+            mapped,
+            wasm_of,
+            interp_leaf,
+        )?;
     }
     code.push(OP_END); // close the loop
     cx.depth -= 1;
@@ -745,6 +822,8 @@ fn emit_block_body(
     b: &Block,
     value_types: &[ValType],
     mapped: u64,
+    wasm_of: &[Option<u32>],
+    interp_leaf: &[bool],
 ) -> Result<(), Error> {
     let mut next_val = b.params.len(); // where the next instruction's results land
     let get = |code: &mut Vec<u8>, cx: &FnCtx, v: svm_ir::ValIdx| {
@@ -839,20 +918,74 @@ fn emit_block_body(
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
             }
             Inst::Call { func, args } => {
-                code.push(OP_LOCAL_GET); // thread win
-                uleb(code, 0);
-                code.push(OP_LOCAL_GET); // thread env
-                uleb(code, 1);
-                for a in args {
-                    get(code, cx, *a);
-                }
-                code.push(OP_CALL);
-                uleb(code, 1 + *func as u64); // imports (trap) precede defined funcs
-                let n_results = m.funcs[*func as usize].results.len();
-                // Results are pushed in order; pop into the destination locals in reverse.
-                for i in (0..n_results).rev() {
-                    code.push(OP_LOCAL_SET);
-                    uleb(code, cx.local_of[k][next_val + i] as u64);
+                let callee = &m.funcs[*func as usize];
+                let n_results = callee.results.len();
+                match wasm_of[*func as usize] {
+                    // Same-tier: a direct wasm call to the emitted function (win/env threaded).
+                    Some(widx) => {
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 0); // win
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 1); // env
+                        for a in args {
+                            get(code, cx, *a);
+                        }
+                        code.push(OP_CALL);
+                        uleb(code, widx as u64);
+                        // Results pushed in order; pop into destination locals in reverse.
+                        for i in (0..n_results).rev() {
+                            code.push(OP_LOCAL_SET);
+                            uleb(code, cx.local_of[k][next_val + i] as u64);
+                        }
+                    }
+                    // Cross-tier: `func` is an interp leaf. Marshal args as i64 slots into the env
+                    // scratch, call `env.call_interp(func, args_ptr)` (the engine runs it on the
+                    // bytecode interpreter and writes results back to the same slots), then reload.
+                    None => {
+                        if !interp_leaf[*func as usize] {
+                            return Err(Error::Unsupported("call to a non-emitted, non-leaf func"));
+                        }
+                        if args.len().max(n_results) > XCALL_MAX_SLOTS {
+                            return Err(Error::Unsupported("cross-tier call arity too large"));
+                        }
+                        // Store each arg to env + ENV_SCRATCH_OFF + i*8 (widen an i32 to the slot).
+                        for (i, a) in args.iter().enumerate() {
+                            code.push(OP_LOCAL_GET);
+                            uleb(code, 1); // env
+                            code.push(OP_I32_CONST);
+                            sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                            code.push(0x6a); // i32.add → slot addr
+                            get(code, cx, *a);
+                            if callee.params[i] == ValType::I32 {
+                                code.push(0xad); // i64.extend_i32_u
+                            }
+                            code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8
+                        }
+                        // env.call_interp(func_svm_idx, args_ptr = env + ENV_SCRATCH_OFF).
+                        code.push(OP_I32_CONST);
+                        sleb32(code, *func as i32);
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 1); // env
+                        code.push(OP_I32_CONST);
+                        sleb32(code, ENV_SCRATCH_OFF as i32);
+                        code.push(0x6a); // i32.add
+                        code.push(OP_CALL);
+                        uleb(code, 1); // func 1 = env.call_interp
+                                       // Load results back from the scratch slots (narrow to i32 where needed).
+                        for i in 0..n_results {
+                            code.push(OP_LOCAL_GET);
+                            uleb(code, 1); // env
+                            code.push(OP_I32_CONST);
+                            sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                            code.push(0x6a); // i32.add
+                            code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8
+                            if callee.results[i] == ValType::I32 {
+                                code.push(0xa7); // i32.wrap_i64
+                            }
+                            code.push(OP_LOCAL_SET);
+                            uleb(code, cx.local_of[k][next_val + i] as u64);
+                        }
+                    }
                 }
                 next_val += n_results;
             }

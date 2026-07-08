@@ -562,9 +562,25 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    per-Worker instantiation are deferred to the tiering (3) and threads (4) slices, where a
    mixed-tier guest actually needs the engine to call emitted code mid-run. AOT-at-`svm_par_compile`
    likewise moves to slice 3 (it belongs with the eligibility/partitioning analysis).
-3. **Tiering + deopt.** Suspension-point partitioning (JIT-eligible function analysis), interp
-   fallback wiring in the `Vcpu`, deopt on `map_region`/`protect`; the §13 corpus cases through the
-   JIT tier.
+3. **[in progress] Tiering + deopt.** Landed natively: `analyze(m)` classifies each function
+   **in-subset** (the JIT emits it), an **interp leaf** (all-integer signature, memory-free, a true
+   leaf, no concurrency/caps — the engine runs it), or neither, and decides `mixed_ok` (func 0
+   in-subset, everything reachable in-subset-or-leaf, nothing reachable suspends — a JITted frame
+   can't unwind across a suspension). `compile_module_mixed` emits the in-subset functions and lowers
+   a call to an interp leaf as `env.call_interp(func, args_ptr)`: the emitted code marshals i64
+   arg/result slots through the `env` scratch, the host callback runs the leaf on the **bytecode
+   engine** and writes results back. Crucially the JS/host stays the top-level caller, so a leaf
+   trap surfaces as a caught `RuntimeError` (the callback traps the wasm) — no trap-return protocol,
+   the slice-1/2 model preserved. Proven natively by `tests/mixed.rs`: an integer caller + a float
+   leaf (both i64- and i32-signature, exercising the arg widen / result narrow), emitted `f0` under
+   `wasmi` with `env.call_interp` wired to the real engine, matching the full-interpreter oracle over
+   an arg sweep. `tests/analysis.rs` (7 cases) pins the classification. **Deferred to 3c (browser):**
+   an `svm_wasmjit_call_interp` cdylib entry that re-enters the engine over the shared window + the
+   real `env.call_interp` in the JS linker (a throwing stub today, since a fully-eligible guest never
+   reaches it) + a Chromium mixed-tier item. **Deopt is a genuine no-op until a later slice** brings
+   `cap.call` into the JIT subset — an eligible guest can't call a domain-mutating cap today (it's
+   out-of-subset → the guest isn't eligible → it stays on the interpreter), so there is nothing to
+   deopt yet; the analysis/fallback substrate is the part that lands now.
 4. **Threads.** Per-Worker registration over `SharedSlots`; the proven schedule-independent kernels
    (4000 / futex / io) run with compute regions JITted, differential vs the interp path.
 5. **§22 + §14 as real codegen.** Guest `jit_compile`/`install` emits wasm (validator-gated) — the
