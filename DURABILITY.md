@@ -155,6 +155,45 @@ is a parser over attacker-controlled frames in the host.
 only freezable modules and may only spawn durable children.* STW quiesces the subtree
 as a unit.
 
+**Status: enforcement landed** (`crates/svm/tests/durable_nesting.rs`) — the first slice of
+nested-guest durability. The freezable bit is a **grant-time attestation**:
+`Host::grant_durable_module` marks a `Module` grant as instrumented (the host ran
+`svm_durable::transform_module` — a compile-mode fact the runtime cannot re-derive from the
+IR, so it is attested like verification; plain `grant_module` grants unmarked). A **durable**
+domain's §14 ops then enforce the rule fail-closed (`-EINVAL`, like a bad carve): `instantiate`
+/ `spawn_coroutine` (module forms 5/6/7) refuse an **unmarked** grant; a **same-module** child
+stays admissible (it runs the parent's own instrumented funcs); and the admitted child
+**inherits durability** — its `Host` + vCPU run durable, so its own spawns/fibers reserve
+shadow state and its own nested instantiates re-apply the same admission rule (the subtree
+property, recursively). Guest-driven `Jit.compile` (§22) is a module installation too: a
+durable domain refuses it fail-closed until a host-side instrumentation hook lands (the
+"host runs the pass on submitted IR" composition above; `svm-interp` cannot run the pass —
+no `svm-durable` dependency). The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
+closed under a durable run (its child runner re-compiles children with no durable state; the
+interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
+domains are unaffected (`separate_module.rs` unchanged).
+
+**Freeze × live §14 children — fail-closed (same PR).** A freeze that completes while a §14
+child is **live-or-unjoined** (an `instantiate`d domain still running / its join pending, or a
+**suspended coroutine**) now **refuses** (`ThreadFault`, like the join-deadlock fail-closed)
+instead of minting a corrupt artifact: the child is its own domain, and its continuation +
+pending join result live host-side only, so a thaw of such an artifact faulted (the parent's
+reloaded child handle resolved in an empty table — found by a deterministic probe, pre-existing
+on main). `VCpu.nested_slots` distinguishes §14 children from `thread.spawn` vCPUs in the shared
+join table (the latter legitimately ride the artifact as `FrozenVCpu` residue and are untouched).
+A freeze landing **after** the child is joined mints a valid artifact whose thaw **reloads** the
+join result — the child is never re-run (`durable_nesting.rs::freeze_after_nested_child_joined_…`).
+*(Aside: the deterministic `arm_freeze_after` trigger deliberately ticks only on
+`cont.resume`/`suspend` — cap.call is not counted — so the freeze-after-join test drives a fiber
+after the join to place the trigger.)* The **bytecode** engine's durable-capture entry now
+**declines** §14 modules (falling back to the tree-walker, which owns the durable nesting rules —
+svm-run's bytecode backend already falls back on decline), exactly as it declines `thread.*`: its
+own instantiate arm has neither the admission check nor the fail-closed, and would otherwise mint
+the same thaw-faulting artifact. What this slice does *not* yet do: freeze a subtree as a
+unit — §14 children riding the artifact as residue (per-subtree STW trigger + subtree handle
+capture) are the next nesting slices; this makes the invariant they rely on real and the gap
+fail-closed rather than silently corrupt in the meantime.
+
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
 shared edge (consistent-cut). Decide as a `SharedRegion` constraint: either a durable

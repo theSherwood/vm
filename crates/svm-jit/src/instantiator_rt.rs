@@ -15,6 +15,7 @@
 
 use crate::{mem, CapThunk, TrapKind};
 use std::cell::{Cell, UnsafeCell};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use svm_ir::{Data, Func, FuncIdx, ValType};
 
@@ -79,6 +80,14 @@ pub(crate) struct Nursery {
     /// `Box` is taken out for the duration of a switch (so a re-entrant/concurrent resume of the same
     /// child sees `None` → `CapFault`), then reinserted if the child suspended.
     coros: Mutex<Vec<Option<Box<Coro>>>>,
+    /// DURABILITY.md §4: the run is **durable** (set by [`Nursery::set_durable`] at run entry —
+    /// the durable flag is applied after compile, where this nursery is built). A durable run's
+    /// `instantiate`/`coro_spawn` **fail closed** (`-EINVAL`): this child runner re-compiles and
+    /// runs children with no durable state (no shadow init, no instrumented-admission check), so a
+    /// child it spawned could never drain-then-unwind — silently breaking "the snapshot unit is
+    /// the domain closed over its nesting subtree". The interpreter is the reference for durable
+    /// nesting; JIT parity is a follow-up.
+    durable: AtomicBool,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -205,7 +214,15 @@ impl Nursery {
             epoch_addr,
             children: Mutex::new(Vec::new()),
             coros: Mutex::new(Vec::new()),
+            durable: AtomicBool::new(false),
         }
+    }
+
+    /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field: the nesting
+    /// thunks then fail closed. Called at run entry (`run_code_raw`), after the entry wrappers
+    /// have applied the compile-side durable flag.
+    pub(crate) fn set_durable(&self, durable: bool) {
+        self.durable.store(durable, Ordering::Release);
     }
 
     /// Resolve a spawn's child source (§14): `module < 0` ⇒ a **self** child (the parent's own
@@ -325,6 +342,11 @@ pub(crate) unsafe extern "C" fn instantiate(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
+    // §4 (DURABILITY.md): a durable run fails nesting closed — this runner can't run a durable
+    // child (see the `Nursery::durable` field). Guest-reachable errno, like a bad carve.
+    if rt.durable.load(Ordering::Acquire) {
+        return EINVAL as i32;
+    }
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
@@ -496,6 +518,11 @@ pub(crate) unsafe extern "C" fn coro_spawn(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
+    // §4 (DURABILITY.md): a durable run fails nesting closed — this runner can't run a durable
+    // child (see the `Nursery::durable` field). Guest-reachable errno, like a bad carve.
+    if rt.durable.load(Ordering::Acquire) {
+        return EINVAL as i32;
+    }
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
