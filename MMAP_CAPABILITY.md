@@ -223,8 +223,11 @@ Proposed order:
    - Proof: `demo_lmdb_mmap_zerocopy_vs_native` — LMDB reads/writes its B-tree straight out of the
      file alias and produces a native-readable `data.mdb` (both directions), plus unit tests for the
      backing, the ABI, and the op.
-3. **Multi-mapping / mixed pwrite** — only if a target (e.g. LMDB without WRITEMAP, or a second
-   reader) is chosen that needs it. The bridge's real aliasing from (2) largely provides it.
+3. **Multi-mapping** (§4e). The *two-window-offsets* magic-ring-buffer case is ✅ **shipped** (slice
+   3a): `demo_ring_buffer_magic_mapping_vs_native` proves it on both backends (`native == interp ==
+   jit`). The *map-reads-mixed-with-`pwrite`* case (e.g. LMDB without WRITEMAP) is **not** done — see
+   §7. The bridge's real aliasing from (2) makes it coherent for free, so it would be a proof, not
+   new plumbing.
 
 Rationale for (1) before (2): the durability *contract* is what makes "a database in the sandbox"
 mean something; it's backend-independent, so writing it against the emulation is not throwaway — the
@@ -258,3 +261,44 @@ which is all LMDB needs); and the macOS/Windows `map_region` backends (Linux-onl
 Bridge questions resolved earlier (§4b): the capability shape (fs mints a `SharedRegion` backing, not
 a dedicated `FileMapping` iface — no fs duplication, no new escape-TCB code) and the escape-surface
 review (a file-backed `MAP_SHARED` region is the same surface as a memfd one).
+
+## 7. Remaining gaps (as of slice 3a)
+
+The core thesis is proven end-to-end: durable, crash-safe (§4c/§4d), zero-copy real aliasing (§4b),
+and the two-offset ring primitive (§4e), on interpreter and JIT. What's left is **deliberately
+deferred** — each is optional, none blocks the story. Captured here so it can be picked up cold.
+
+**G1 — LMDB without WRITEMAP (map-reads + `pwrite` coherence).** The one unshipped §4e sub-case.
+Default LMDB maps the file *read-only* and writes via `pwrite`; readers must see the `pwrite`'d bytes
+through the map. Our `FileBacking` already shares one page cache with the fs cap's fd, so it *should*
+be coherent — but it's untested. *Cost:* low (flip `MDB_WRITEMAP` off in the demo, route writes
+through `FS_WRITE`; a differential like the existing LMDB ones). *Value:* proof only — real
+`MAP_SHARED` gives this for free; the doc rates it low priority.
+
+**G2 — mid-run region reclaim (a real, if minor, leak).** `FS_MAP_REGION` pushes each `FileBacking`
+into `Host::regions`, which is never freed until the run ends; `SharedRegion` has no release op, and
+`FS_MUNMAP`/`munmap` drop the *mapping* but not the *backing*. A guest that maps/unmaps repeatedly
+(reopen loops, many short-lived rings) grows `Host::regions` unboundedly. *Cost:* small but touches
+the capability surface — either a `SharedRegion` release op the shim calls on `munmap`, or fs-cap
+tracking that releases the backing when its last mapping goes. *Value:* fixes an actual defect in
+landed code (the most defensible remaining item).
+
+**G3 — non-zero `FS_MAP_REGION` file offset.** v1 requires `file_offset == 0` (all LMDB needs). A
+guest that wants to map a *window* of a large file at a non-zero offset can't. *Cost:* small — thread
+`file_offset` into the `FileBacking` (mmap the file at that offset, or carry it as the region's base)
+and relax the `foff != 0` check. *Value:* generality; no current target needs it.
+
+**G4 — macOS / Windows `map_region` backends.** The whole file-backed bridge is Linux-only
+(`FileBacking` is `#[cfg(unix)]`; `map_region`'s Windows arm predates file backings). On other
+platforms `FS_MAP_REGION` returns `-EINVAL` and the guest falls back to the copy-in emulation (correct,
+just not zero-copy). *Cost:* per-OS FFI, following `SharedRegion`'s existing per-OS story
+(`CreateFileMapping` + placeholder reservations on Windows). *Value:* portability parity.
+
+**G5 — JIT coverage of the LMDB/SQLite zero-copy path.** The *ring* differential runs on both backends
+(so the JIT's real double-`mmap` is proven), but `demo_lmdb_mmap_zerocopy_vs_native` runs on
+`Bytecode` only, matching the other DB demos. The JIT file-backed single-mapping path is exercised by
+the ring test, so this is a small completeness gap, not a hole. *Cost:* low (add `Backend::Jit` to the
+LMDB zero-copy run). *Value:* symmetry.
+
+Priority if resumed: **G2** (real defect) > **G1** (closes §4e) > **G3/G5** (cheap generality/symmetry)
+> **G4** (portability, larger). None is urgent.
