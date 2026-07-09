@@ -4373,6 +4373,7 @@ fn unresolved_extern_funcptr_stub() {
     use svm_llvm::TranslateOptions;
     let stub = TranslateOptions {
         stub_unresolved_externs: true,
+        ..TranslateOptions::default()
     };
     // `gate ? mystery : other` takes the address of the undefined `mystery`; with `gate` a volatile 0
     // the live target is `other`, so the run is clean and the `mystery` funcref (a stub) is never
