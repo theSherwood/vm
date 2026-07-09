@@ -110,8 +110,10 @@ fn valtype_byte(t: ValType) -> Result<u8, Error> {
     match t {
         ValType::I32 => Ok(0x7f),
         ValType::I64 => Ok(0x7e),
-        // Floats/v128/ref are interpreter-tier for now (the compute subset is integer).
-        _ => Err(Error::Unsupported("non-integer value type")),
+        ValType::F32 => Ok(0x7d),
+        ValType::F64 => Ok(0x7c),
+        // v128/ref are interpreter-tier for now (SIMD is a later slice).
+        _ => Err(Error::Unsupported("v128/ref value type")),
     }
 }
 
@@ -183,12 +185,125 @@ fn intun_opcode(ty: IntTy, op: IntUnOp) -> Result<u8, Error> {
     })
 }
 
+// ---- scalar float opcodes (all map 1:1 to core wasm; `Fma` has no core-wasm scalar op) ----------
+
+fn fbin_opcode(ty: svm_ir::FloatTy, op: svm_ir::FBinOp) -> u8 {
+    use svm_ir::FBinOp::*;
+    // wasm f32 add..copysign are 0x92..0x98, f64 add..copysign 0xa0..0xa6, in FBinOp's exact order.
+    let idx = match op {
+        Add => 0,
+        Sub => 1,
+        Mul => 2,
+        Div => 3,
+        Min => 4,
+        Max => 5,
+        Copysign => 6,
+    };
+    match ty {
+        svm_ir::FloatTy::F32 => 0x92 + idx,
+        svm_ir::FloatTy::F64 => 0xa0 + idx,
+    }
+}
+
+fn fun_opcode(ty: svm_ir::FloatTy, op: svm_ir::FUnOp) -> u8 {
+    use svm_ir::FUnOp::*;
+    // wasm orders abs neg ceil floor trunc nearest sqrt; FUnOp orders sqrt before ceil — map explicitly.
+    let (f32op, f64op) = match op {
+        Abs => (0x8b, 0x99),
+        Neg => (0x8c, 0x9a),
+        Ceil => (0x8d, 0x9b),
+        Floor => (0x8e, 0x9c),
+        Trunc => (0x8f, 0x9d),
+        Nearest => (0x90, 0x9e),
+        Sqrt => (0x91, 0x9f),
+    };
+    match ty {
+        svm_ir::FloatTy::F32 => f32op,
+        svm_ir::FloatTy::F64 => f64op,
+    }
+}
+
+fn fcmp_opcode(ty: svm_ir::FloatTy, op: svm_ir::FCmpOp) -> u8 {
+    use svm_ir::FCmpOp::*;
+    // wasm orders eq ne lt gt le ge; FCmpOp orders le before gt — map explicitly.
+    let (f32op, f64op) = match op {
+        Eq => (0x5b, 0x61),
+        Ne => (0x5c, 0x62),
+        Lt => (0x5d, 0x63),
+        Le => (0x5f, 0x65),
+        Gt => (0x5e, 0x64),
+        Ge => (0x60, 0x66),
+    };
+    match ty {
+        svm_ir::FloatTy::F32 => f32op,
+        svm_ir::FloatTy::F64 => f64op,
+    }
+}
+
+/// `i32/i64.trunc_sat_f32/f64_{s,u}` — the `0xFC` prefix + subopcode (saturating float→int).
+fn ftoisat_subop(op: svm_ir::FToI) -> u8 {
+    let (fty, ity, signed) = op.parts();
+    // subopcode = (int:i32=0/i64=4) + (float:f32=0/f64=2) + (signed?0:1).
+    let base = match ity {
+        IntTy::I32 => 0,
+        IntTy::I64 => 4,
+    } + match fty {
+        svm_ir::FloatTy::F32 => 0,
+        svm_ir::FloatTy::F64 => 2,
+    };
+    base + if signed { 0 } else { 1 }
+}
+
+/// `i32/i64.trunc_f32/f64_{s,u}` — the trapping float→int opcodes (NaN / out-of-range trap).
+fn ftoitrap_opcode(op: svm_ir::FToI) -> u8 {
+    let (fty, ity, signed) = op.parts();
+    match (ity, fty, signed) {
+        (IntTy::I32, svm_ir::FloatTy::F32, true) => 0xa8,
+        (IntTy::I32, svm_ir::FloatTy::F32, false) => 0xa9,
+        (IntTy::I32, svm_ir::FloatTy::F64, true) => 0xaa,
+        (IntTy::I32, svm_ir::FloatTy::F64, false) => 0xab,
+        (IntTy::I64, svm_ir::FloatTy::F32, true) => 0xae,
+        (IntTy::I64, svm_ir::FloatTy::F32, false) => 0xaf,
+        (IntTy::I64, svm_ir::FloatTy::F64, true) => 0xb0,
+        (IntTy::I64, svm_ir::FloatTy::F64, false) => 0xb1,
+    }
+}
+
+/// `f32/f64.convert_i32/i64_{s,u}` — int→float.
+fn itof_opcode(op: svm_ir::IToF) -> u8 {
+    let (ity, fty, signed) = op.parts();
+    match (fty, ity, signed) {
+        (svm_ir::FloatTy::F32, IntTy::I32, true) => 0xb2,
+        (svm_ir::FloatTy::F32, IntTy::I32, false) => 0xb3,
+        (svm_ir::FloatTy::F32, IntTy::I64, true) => 0xb4,
+        (svm_ir::FloatTy::F32, IntTy::I64, false) => 0xb5,
+        (svm_ir::FloatTy::F64, IntTy::I32, true) => 0xb7,
+        (svm_ir::FloatTy::F64, IntTy::I32, false) => 0xb8,
+        (svm_ir::FloatTy::F64, IntTy::I64, true) => 0xb9,
+        (svm_ir::FloatTy::F64, IntTy::I64, false) => 0xba,
+    }
+}
+
+/// `demote`/`promote`/`reinterpret` cast opcode.
+fn cast_opcode(op: svm_ir::CastOp) -> u8 {
+    use svm_ir::CastOp::*;
+    match op {
+        Demote => 0xb6,
+        Promote => 0xbb,
+        ReinterpI32F32 => 0xbe,
+        ReinterpF32I32 => 0xbc,
+        ReinterpI64F64 => 0xbf,
+        ReinterpF64I64 => 0xbd,
+    }
+}
+
 /// `(opcode, access width, result type)` for a load.
 fn load_op(op: LoadOp) -> Result<(u8, u64, ValType), Error> {
     Ok(match op {
         LoadOp::I32 => (0x28, 4, ValType::I32),
         LoadOp::I64 => (0x29, 8, ValType::I64),
-        LoadOp::F32 | LoadOp::F64 => return Err(Error::Unsupported("float load")),
+        LoadOp::F32 => (0x2a, 4, ValType::F32),
+        LoadOp::F64 => (0x2b, 8, ValType::F64),
         LoadOp::I32_8S => (0x2c, 1, ValType::I32),
         LoadOp::I32_8U => (0x2d, 1, ValType::I32),
         LoadOp::I32_16S => (0x2e, 2, ValType::I32),
@@ -207,7 +322,8 @@ fn store_op(op: StoreOp) -> Result<(u8, u64), Error> {
     Ok(match op {
         StoreOp::I32 => (0x36, 4),
         StoreOp::I64 => (0x37, 8),
-        StoreOp::F32 | StoreOp::F64 => return Err(Error::Unsupported("float store")),
+        StoreOp::F32 => (0x38, 4),
+        StoreOp::F64 => (0x39, 8),
         StoreOp::I32_8 => (0x3a, 1),
         StoreOp::I32_16 => (0x3b, 2),
         StoreOp::I64_8 => (0x3c, 1),
@@ -237,6 +353,15 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
                     .ok_or(Error::Unsupported("select operand"))?;
                 tys.push(t);
             }
+            Inst::ConstF32(_) => tys.push(ValType::F32),
+            Inst::ConstF64(_) => tys.push(ValType::F64),
+            Inst::FBin { ty, .. } | Inst::FUn { ty, .. } => tys.push(ty.val()),
+            Inst::FCmp { .. } => tys.push(ValType::I32),
+            Inst::FToISat { op, .. } | Inst::FToITrap { op, .. } => tys.push(op.parts().1.val()),
+            Inst::IToFConv { op, .. } => tys.push(op.parts().1.val()),
+            Inst::Cast { op, .. } => tys.push(op.sig().2),
+            // `Fma` has no core-wasm scalar opcode (relaxed-SIMD only), so it stays interpreter-tier.
+            Inst::Fma { .. } => return Err(Error::Unsupported("scalar fma (no core-wasm op)")),
             Inst::Load { op, .. } => tys.push(load_op(*op)?.2),
             Inst::Store { .. } => {}
             Inst::Call { func, .. } => {
@@ -945,6 +1070,55 @@ fn emit_block_body(
                 );
                 get(code, cx, *value);
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
+            }
+            // ---- scalar floats (all 1:1 with core wasm) ----
+            Inst::ConstF32(bits) => {
+                code.push(0x43); // f32.const
+                code.extend_from_slice(&bits.to_le_bytes());
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::ConstF64(bits) => {
+                code.push(0x44); // f64.const
+                code.extend_from_slice(&bits.to_le_bytes());
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FBin { ty, op, a, b: rb } => {
+                get(code, cx, *a);
+                get(code, cx, *rb);
+                code.push(fbin_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FUn { ty, op, a } => {
+                get(code, cx, *a);
+                code.push(fun_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FCmp { ty, op, a, b: rb } => {
+                get(code, cx, *a);
+                get(code, cx, *rb);
+                code.push(fcmp_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FToISat { op, a } => {
+                get(code, cx, *a);
+                code.push(0xfc); // saturating-truncation prefix
+                code.push(ftoisat_subop(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FToITrap { op, a } => {
+                get(code, cx, *a);
+                code.push(ftoitrap_opcode(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::IToFConv { op, a } => {
+                get(code, cx, *a);
+                code.push(itof_opcode(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::Cast { op, a } => {
+                get(code, cx, *a);
+                code.push(cast_opcode(*op));
+                set_result(cx, code, k, &mut next_val);
             }
             Inst::Call { func, args } => {
                 let callee = &m.funcs[*func as usize];

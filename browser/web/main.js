@@ -136,7 +136,7 @@ async function main() {
   // instantiated against the page's OWN linear memory, and its `f0` called directly on the page
   // (compute-only → no Atomics.wait, so the main thread is fine). Assert it equals the `svm_run`
   // interpreter over an arg sweep, then time a heavy run to show the JIT's win over interp-in-wasm.
-  // Then a **mixed-tier** guest (3c): a JITted integer caller whose float leaf runs on the
+  // Then a **mixed-tier** guest (3c): a JITted integer caller whose SIMD leaf runs on the
   // interpreter via `env.call_interp` — same result as the whole-guest interpreter.
   const interpBytes = (bytes, arg) => {
     const p = ex.svm_alloc(bytes.length);
@@ -179,11 +179,10 @@ block3(v14: i64):
 }
 func (i64) -> (i64) {
 block0(v0: i64):
-  v1 = f64.convert_i64_s v0
-  v2 = f64.add v1 v1
-  v3 = f64.mul v1 v2
-  v4 = i64.trunc_sat_f64_s v3
-  return v4
+  v1 = i64x2.splat v0
+  v2 = i64x2.add v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
 }`;
   try {
     const bytes = await fetchBytes('/corpus/alu.svmbc');
@@ -201,7 +200,7 @@ block0(v0: i64):
     const t2 = performance.now();
     const jitMs = t1 - t0, intMs = t2 - t1;
 
-    // Mixed-tier: the JITted caller sums a float leaf run on the interpreter via env.call_interp.
+    // Mixed-tier: the JITted caller sums a SIMD leaf run on the interpreter via env.call_interp.
     const mbytes = encode(MIXED_SRC);
     const mjit = await compileJit(ex, mbytes, { memory });
     let mixEq = mjit !== null;
@@ -212,7 +211,7 @@ block0(v0: i64):
     const ok = eq && jv === iv && mixEq;
     set('wasmjit', ok ? 'pass' : 'fail',
       `wasmjit: alu f0 in-browser → ${jv} (interp ${iv}) ${eq && jv === iv ? 'ok' : 'FAIL'} · ` +
-      `mixed-tier (JIT caller + interp float leaf) ${mixEq ? 'ok' : 'FAIL'} · ` +
+      `mixed-tier (JIT caller + interp SIMD leaf) ${mixEq ? 'ok' : 'FAIL'} · ` +
       `alu n=${N}: jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}× ` +
       `${ok ? 'PASS' : 'FAIL'}`);
     log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}`);
