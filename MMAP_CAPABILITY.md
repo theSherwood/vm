@@ -181,10 +181,20 @@ the emulation, **independent of the bridge (§4b)**.
 
 ### 4e. Multi-mapping coherence
 
-Real `MAP_SHARED` gives this for free (OS page cache). The emulation does not. LMDB's chosen config
-(single WRITEMAP mapping, NOLOCK) never needs it, so it only matters if we target a program that maps
-a file at two window offsets, or mixes map-reads with `pwrite`. Low priority unless a target demands
-it; the bridge's real aliasing (§4a/§4b) dissolves it anyway.
+Real `MAP_SHARED` gives this for free (OS page cache). The emulation does not. Two sub-cases:
+
+- **One file mapped at two window offsets** — the **magic-ring-buffer** primitive `SharedRegion` was
+  built for: alias the same pages at adjacent offsets so a span running off the end of a ring
+  continues at the start, and a single `memcpy` handles the wrap. ✅ **Proven** (slice 3):
+  `demo_ring_buffer_magic_mapping_vs_native` has a guest double-map one file-backed region (two
+  `SharedRegion.map`s via `__vm_region_call`) and byte-match a native `memfd` double-mapped with raw
+  `mmap(MAP_SHARED|MAP_FIXED)`, wrap-alias included — on **both backends** (`native == interp == jit`):
+  the JIT does the *real* hardware double-mapping over its window (`MprotectWindow::map_region`), the
+  interpreter models it in software. (The `Mem`-level aliasing was already unit-tested; this proves a
+  real guest program *uses* it end-to-end.)
+- **Mixing map-reads with `pwrite`** — e.g. LMDB *without* WRITEMAP. Not yet exercised; low priority
+  unless a target demands it. The bridge's real aliasing (§4a/§4b) makes it coherent for free (one
+  page cache), so it would be a *proof*, not new plumbing.
 
 ## 5. Recommendation & sequencing
 
