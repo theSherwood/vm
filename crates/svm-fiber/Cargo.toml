@@ -14,12 +14,15 @@ publish = false
 # every stack switch, so ASan-instrumented code can run on fiber stacks. Enabled by the dedicated
 # sanitizer job (nightly, -Zsanitizer=address); zero-cost otherwise.
 asan = []
-# PROTOTYPE (unix only): sub-allocate control stacks from large arenas with a free-list instead of one
-# mmap + mprotect guard per fiber, so concurrency scales past the `vm.max_map_count` VMA wall (each
-# fiber is then ~0 extra VMAs instead of 2). Drops the hardware overflow guard — overflow protection is
-# meant to move to a software stack-limit check (svm-jit `stack-check`). For benchmarking allocation
-# cost; NOT for production (no overflow guard on its own).
+# The arena control-stack allocator is now the DEFAULT (see `lib.rs`): stacks are sub-allocated from
+# large arenas with a free-list instead of one mmap+guard per fiber, so concurrency scales past the
+# `vm.max_map_count` VMA wall (~0 extra VMAs/fiber). Overflow protection is the always-on svm-jit
+# software stack-check. This feature is retained as a no-op only so existing `--features arena-stacks`
+# invocations keep working.
 arena-stacks = []
+# Opt OUT of the arena back to the per-fiber hardware guard page (`stack_unix.rs`/`stack_windows.rs`):
+# a rollback switch, and the backend the `stack_guard_fuzz` guard-page overflow oracle needs.
+guard-page-stacks = []
 
 [dependencies]
 

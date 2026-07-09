@@ -9,8 +9,12 @@ publish = false
 [features]
 # Passthrough to svm-fiber's ASan fiber-switch annotations (the sanitizer job).
 asan = ["svm-fiber/asan"]
-# PROTOTYPE: passthrough to svm-fiber's arena stack allocator (benchmark allocation cost).
+# The arena stack allocator is now svm-fiber's DEFAULT backend; this passthrough is a retained no-op so
+# existing `--features arena-stacks` invocations keep working.
 arena-stacks = ["svm-fiber/arena-stacks"]
+# Opt svm-fiber back to the guard-paged control-stack backend (rollback, or the guard-page overflow
+# oracle the `stack_guard_fuzz` test needs — run it with `--features guard-page-stacks`).
+guard-page-stacks = ["svm-fiber/guard-page-stacks"]
 # The software stack-limit check in every JIT function prologue is now ALWAYS emitted (it is the
 # escape-TCB overflow defense once the arena drops the guard page; see `emit_stack_check`), so this
 # feature no longer gates the check. It is retained as a no-op only so the existing CI invocations
