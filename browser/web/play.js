@@ -301,6 +301,15 @@ block0(v0: i64):
       'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
       'below is the guest’s real stdout.',
   },
+  'Lua (5.4.7 stdlib)': {
+    kind: 'module',
+    url: './assets/lua_stdlib.svmb',
+    mode: 'io',
+    desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM with setjmp/longjmp error handling) ' +
+      'plus the base/string/table/math libraries, compiled through the LLVM on-ramp — running a ' +
+      'script that print()s string/table/math results. The output below is real Lua stdout, ' +
+      'byte-identical to native. Build via build-onramp-assets.mjs.',
+  },
   'SQLite (Phase A, :memory:)': {
     kind: 'module',
     url: './assets/sqlite_demo.svmb',

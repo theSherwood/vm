@@ -42,6 +42,15 @@ function buildC(name, src, includes = [], defines = []) {
   console.log(`  ✓ ${name}.svmb (${size} B)`);
 }
 
+// Translate an **already-committed** `.bc` fixture to a 64 KiB-page `.svmb` (no clang step — the
+// bitcode is a golden input in the tree, e.g. the Lua test fixtures).
+function buildBc(name, bcPath) {
+  const svmb = join(ASSETS, `${name}.svmb`);
+  execFileSync(TR, [bcPath, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
+  console.log(`  ✓ ${name}.svmb (${size} B)`);
+}
+
 ensureTranslator();
 
 // 1) hello — the tiny always-present example (also committed so the playground works out of the box).
@@ -77,6 +86,14 @@ if (ensureAmalgamation()) {
   }
 } else {
   console.log('  – sqlite_demo skipped (amalgamation fetch failed — offline?)');
+}
+
+// 3) Lua (stdlib) — Lua 5.4.7 core + base/string/table/math libraries running a script that print()s
+//    string/table/math results. The bitcode is a committed golden fixture (no Lua source needed).
+try {
+  buildBc('lua_stdlib', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_stdlib.bc'));
+} catch (e) {
+  console.log(`  ✗ lua_stdlib: ${e.message}`);
 }
 
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');
