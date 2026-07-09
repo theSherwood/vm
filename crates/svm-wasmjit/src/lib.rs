@@ -352,8 +352,15 @@ fn interp_leaf(f: &Func) -> bool {
     })
 }
 
-/// Classify every function of a **verified** `m` for tiering (see [`Analysis`]).
+/// Classify every function of a **verified** `m` for tiering rooted at func 0 (see [`Analysis`]).
 pub fn analyze(m: &Module) -> Analysis {
+    analyze_from(m, 0)
+}
+
+/// Like [`analyze`] but reachability and `mixed_ok` are rooted at `entry` — the function the host
+/// will call (the JIT entry). The cross-engine bench runs an arbitrary kernel function, not
+/// necessarily func 0.
+pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
     let n = m.funcs.len();
     let in_subset: Vec<bool> = m.funcs.iter().map(|f| func_in_subset(m, f)).collect();
     let interp_leaf: Vec<bool> = m
@@ -363,11 +370,11 @@ pub fn analyze(m: &Module) -> Analysis {
         .map(|(i, f)| !in_subset[i] && interp_leaf(f))
         .collect();
 
-    // Reachability from func 0 through call edges.
+    // Reachability from `entry` through call edges.
     let mut reachable = vec![false; n];
-    if n > 0 {
-        let mut stack = vec![0u32];
-        reachable[0] = true;
+    if (entry as usize) < n {
+        let mut stack = vec![entry];
+        reachable[entry as usize] = true;
         while let Some(fi) = stack.pop() {
             for c in func_callees(&m.funcs[fi as usize]) {
                 if (c as usize) < n && !reachable[c as usize] {
@@ -378,8 +385,9 @@ pub fn analyze(m: &Module) -> Analysis {
         }
     }
 
-    let mixed_ok =
-        n > 0 && in_subset[0] && (0..n).all(|i| !reachable[i] || in_subset[i] || interp_leaf[i]);
+    let mixed_ok = (entry as usize) < n
+        && in_subset[entry as usize]
+        && (0..n).all(|i| !reachable[i] || in_subset[i] || interp_leaf[i]);
 
     Analysis {
         in_subset,
@@ -441,17 +449,30 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
 /// functions and route a call to an interp leaf through `env.call_interp` (the engine runs it on the
 /// bytecode interpreter — see [`Analysis`]). [`Error::Unsupported`] unless [`Analysis::mixed_ok`].
 pub fn compile_module_mixed(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
-    let a = analyze(m);
+    compile_module_mixed_entry(m, 0, shared_memory)
+}
+
+/// Like [`compile_module_mixed`] but eligibility is rooted at `entry` (the function the host calls),
+/// not func 0 — for a module whose entry kernel isn't func 0 (the cross-engine bench). Every emitted
+/// function is still exported as `f{svm_idx}`, so the host calls `f{entry}`.
+pub fn compile_module_mixed_entry(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+) -> Result<Vec<u8>, Error> {
+    let a = analyze_from(m, entry);
     if !a.mixed_ok {
         return Err(Error::Unsupported("guest is not mixed-tier runnable"));
     }
-    // Emit the in-subset functions in SVM-index order; each gets the next wasm index. Interp leaves
-    // (and unreachable non-subset functions) get no wasm index — a call to a leaf goes to the import.
+    // Emit the reachable in-subset functions in SVM-index order; each gets the next wasm index.
+    // Interp leaves (and unreachable / non-subset functions) get no wasm index — a call to a leaf
+    // goes to the import. Restricting to `reachable` keeps an unreachable in-subset function (whose
+    // own callees `mixed_ok` never checked) from being emitted with an unroutable call.
     let mut wasm_of: Vec<Option<u32>> = vec![None; m.funcs.len()];
     let mut emitted: Vec<usize> = Vec::new();
-    for (i, &in_sub) in a.in_subset.iter().enumerate() {
-        if in_sub {
-            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+    for (i, slot) in wasm_of.iter_mut().enumerate() {
+        if a.reachable[i] && a.in_subset[i] {
+            *slot = Some(IMPORTED_FUNCS + emitted.len() as u32);
             emitted.push(i);
         }
     }
@@ -471,9 +492,11 @@ fn emit_module(
     if !m.imports.is_empty() {
         return Err(Error::Unsupported("unresolved imports"));
     }
-    if !m.data.is_empty() {
-        return Err(Error::Unsupported("data segments"));
-    }
+    // `data` segments are *not* rejected: the emitted code only loads/stores, so the **host** must
+    // materialize the module's data into the window before the run (as the interpreter's window
+    // init does) — the browser/bench linkers write `m.data` into the window first. An unwritten
+    // segment simply reads as zero (and any resulting divergence is caught by the bench's
+    // result-vs-native cross-check). Read-only enforcement (D40) is deferred with the §13 page ops.
     let mapped: u64 = match &m.memory {
         Some(mc) => 1u64 << mc.size_log2,
         None => 0,
