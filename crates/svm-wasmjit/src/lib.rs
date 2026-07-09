@@ -346,8 +346,8 @@ fn store_op(op: StoreOp) -> Result<(u8, u64), Error> {
 // **relaxed** SIMD (`VFma`, `VDotI8` — no core-wasm opcode, like scalar `Fma`).
 
 use svm_ir::{
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VPMinMaxOp, VSatBinOp, VShape,
-    VShiftOp,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp,
 };
 
 const OP_SIMD_PREFIX: u8 = 0xfd;
@@ -616,6 +616,61 @@ fn vconvert_sub(op: svm_ir::VCvtOp) -> u32 {
     }
 }
 
+// ---- deferred SIMD family (widening / reduction) — added in the simd2 slice ---------------------
+//
+// wasm lays these out as `{low_s, high_s, low_u, high_u}` contiguously per result shape (a different
+// order than [`VWidenOp`]'s `{LowS, LowU, HighS, HighU}`), so map the op to that lane-order offset.
+fn widen_lane_offset(op: VWidenOp) -> u32 {
+    match op {
+        VWidenOp::LowS => 0,
+        VWidenOp::HighS => 1,
+        VWidenOp::LowU => 2,
+        VWidenOp::HighU => 3,
+    }
+}
+
+/// Lane **widen** (`extend_low/high_<src>_s/u`) subopcode; `shape` is the wider **result** shape.
+fn vwiden_sub(shape: VShape, op: VWidenOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I16x8 => 135, // from i8x16
+        VShape::I32x4 => 167, // from i16x8
+        VShape::I64x2 => 199, // from i32x4
+        _ => return None,
+    };
+    Some(base + widen_lane_offset(op))
+}
+
+/// Lane **narrow** (`narrow_<src>_s/u`) subopcode; `shape` is the narrow **result** shape.
+fn vnarrow_sub(shape: VShape, op: VNarrowOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I8x16 => 101, // from i16x8
+        VShape::I16x8 => 133, // from i32x4
+        _ => return None,
+    };
+    Some(base + op.index() as u32) // S=+0, U=+1
+}
+
+/// Extended (widening) multiply (`extmul_low/high_<src>_s/u`) subopcode; `shape` is the wide result.
+fn vextmul_sub(shape: VShape, op: VWidenOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I16x8 => 156, // from i8x16
+        VShape::I32x4 => 188, // from i16x8
+        VShape::I64x2 => 220, // from i32x4
+        _ => return None,
+    };
+    Some(base + widen_lane_offset(op))
+}
+
+/// Extended pairwise add (`extadd_pairwise_<src>_s/u`) subopcode; `shape` is the wide result.
+fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
+    let base = match shape {
+        VShape::I16x8 => 124, // from i8x16
+        VShape::I32x4 => 126, // from i16x8
+        _ => return None,
+    };
+    Some(base + if signed { 0 } else { 1 })
+}
+
 // ---- per-function value typing (mirrors the verifier's block-scoped numbering) -------------------
 
 /// The types of one block's value list: params first, then each instruction's results in order.
@@ -686,7 +741,16 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
             | Inst::VNot { .. }
             | Inst::Bitselect { .. }
             | Inst::Shuffle { .. }
-            | Inst::Swizzle { .. } => tys.push(ValType::V128),
+            | Inst::Swizzle { .. }
+            // simd2: the widening / reduction family (all yield a `v128`). The two **relaxed** ops
+            // (`VFma`/`VDotI8`) have no core-wasm opcode, so they fall through to the `_` arm and stay
+            // interpreter-tier.
+            | Inst::VWiden { .. }
+            | Inst::VNarrow { .. }
+            | Inst::VExtMul { .. }
+            | Inst::VExtAddPairwise { .. }
+            | Inst::VDot { .. }
+            | Inst::VQ15MulrSat { .. } => tys.push(ValType::V128),
             Inst::V128Store { .. } => {}
             Inst::ExtractLane { shape, .. } => tys.push(shape.lane_val()),
             Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {
@@ -1880,6 +1944,53 @@ fn emit_block_body(
                 get(code, cx, *a);
                 get(code, cx, *b);
                 emit_simd(code, 14); // i8x16.swizzle
+                set_result(cx, code, k, &mut next_val);
+            }
+            // ---- simd2: the widening / reduction family ----
+            Inst::VWiden { shape, op, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    vwiden_sub(*shape, *op).ok_or(Error::Unsupported("v128 widen shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VNarrow { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vnarrow_sub(*shape, *op).ok_or(Error::Unsupported("v128 narrow shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VExtMul { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vextmul_sub(*shape, *op).ok_or(Error::Unsupported("v128 extmul shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VExtAddPairwise { shape, signed, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    vextadd_sub(*shape, *signed).ok_or(Error::Unsupported("v128 extadd shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VDot { a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, 186); // i32x4.dot_i16x8_s
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VQ15MulrSat { a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, 130); // i16x8.q15mulr_sat_s
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::SimdWidthBytes => {

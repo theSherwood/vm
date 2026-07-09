@@ -101,14 +101,14 @@ fn bytecode_run(m: &svm_ir::Module, entry: u32, arg: i64, fuel: &mut u64) -> Opt
 }
 
 /// Two kernels; **func 1** (not func 0) is the JIT entry — proving entry-rooted eligibility and that
-/// the emitted export is `f1`. Func 0 uses a **deferred SIMD** op (`i32x4.dot_i16x8_s` — the core
+/// the emitted export is `f1`. Func 0 uses a **deferred SIMD** op (`i16x8.dot_i8x16_s` — the core
 /// v128 lane ops are now in-subset, but the widening/reduction family isn't), so it's out of subset,
 /// which entry-rooting at func 1 correctly ignores.
 const ENTRY_ONE: &str = r#"
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }

@@ -164,7 +164,7 @@ fn env_layout_fits() {
 const ARGS: &[i64] = &[0, 1, 2, 5, 20, 100, -1, -5, 1000];
 
 /// Integer caller sums a **deferred-SIMD leaf** over `0..n`. The caller is emitted; the leaf (a
-/// `i32x4.dot_i16x8_s` reduction — out of the emitter's subset, i64 signature, memory-free) runs via
+/// `i16x8.dot_i8x16_s` reduction — out of the emitter's subset, i64 signature, memory-free) runs via
 /// `env.call_interp`. (The core v128 lane ops are now in-subset, so the cross-tier exemplar is the
 /// deferred `dot` reduction — whatever it computes, the mixed run and the whole-interp oracle agree.)
 const SUM_FLOAT_LEAF: &str = r#"
@@ -188,7 +188,7 @@ block3(v14: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }
@@ -231,7 +231,7 @@ block3(v16: i64):
 func (i32) -> (i32) {
 block0(v0: i32):
   v1 = i32x4.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i32x4.extract_lane 0 v2
   return v3
 }
@@ -250,7 +250,7 @@ fn sum_i32_leaf() {
 }
 
 /// **Trap propagation across the tier boundary.** The leaf is deferred-SIMD-gated (a
-/// `i32x4.dot_i16x8_s` keeps it out of subset → cross-tier) and computes `100 / arg`, which traps
+/// `i16x8.dot_i8x16_s` keeps it out of subset → cross-tier) and computes `100 / arg`, which traps
 /// (div-by-zero) exactly when `arg == 0` — the dot result is folded in *after* the divide, so the
 /// trap is purely arg-driven. The mixed run must trap iff the full-interpreter oracle traps —
 /// proving the `env.call_interp` callback's trap path (it traps the wasm, which unwinds to the
@@ -264,7 +264,7 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v1
   v4 = i64.const 100
   v5 = i64.div_s v4 v3

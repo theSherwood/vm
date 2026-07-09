@@ -759,9 +759,9 @@ fn fail_closed() {
     for (name, src) in [
         (
             // The core v128 lane ops are now in-subset; the *deferred* SIMD family
-            // (widening/reduction — here `i32x4.dot_i16x8_s`) is what still fails closed.
+            // (widening/reduction — here `i16x8.dot_i8x16_s`) is what still fails closed.
             "simd_dot",
-            "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64x2.splat v0\n  v2 = i32x4.dot_i16x8_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}\n",
+            "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64x2.splat v0\n  v2 = i16x8.dot_i8x16_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}\n",
         ),
         (
             // scalar `fma` has no core-wasm opcode (relaxed-SIMD only), so it stays interpreter-tier.
