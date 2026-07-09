@@ -645,12 +645,21 @@ pub enum RMWBinOp {
 
 // ---- inline asm / attributes / EH (modeled minimally) ------------------------------------------
 
-/// An inline-assembly callee. The on-ramp fails closed on inline asm, so it only needs to *exist* as
-/// the `Left` of a call's `Either` callee — its contents are never inspected. Mirrors the consumed
-/// shape of `llvm_ir::instruction::InlineAssembly` (the LLVM-18 C-API form is just its type).
+/// An inline-assembly callee. The on-ramp does not *execute* asm (that would be opaque, unmaskable
+/// machine code — the whole sandbox thesis is that everything is re-verified); instead a fixed
+/// **recognize-and-lower** allowlist matches the handful of template strings known C headers emit
+/// (compiler barriers, `popcnt`, the x86 atomics) and re-emits their semantics as ordinary verified
+/// IR, failing closed on anything else. So it carries the `template`/`constraints` the recognizer
+/// keys on. Mirrors the consumed shape of `llvm_ir::instruction::InlineAssembly` plus the two strings
+/// the LLVM-C API exposes (`LLVMGetInlineAsmAsmString`/`…ConstraintString`).
 #[derive(PartialEq, Clone, Debug)]
 pub struct InlineAssembly {
     pub ty: TypeRef,
+    /// The asm template with `\XX` escapes still encoded (as the `.ll` prints them); the recognizer
+    /// decodes before matching.
+    pub template: String,
+    /// The constraint string (`"=q,=*m,0,*m,~{memory},…"`) — pins operand in/out/clobber roles.
+    pub constraints: String,
 }
 
 /// A call/parameter attribute. The on-ramp ignores these (it reads only the operand of each

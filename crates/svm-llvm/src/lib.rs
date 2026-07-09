@@ -12767,6 +12767,69 @@ fn lower_fp_sat_intrinsic(
     })))
 }
 
+/// Recognize-and-lower for **inline assembly** (the Postgres asm surface, LLVM.md slice BM follow-on).
+/// The on-ramp never *executes* asm — opaque machine code can't be masked or re-verified, which is the
+/// whole sandbox thesis (§2a). Instead a **fixed allowlist** matches the handful of template strings
+/// known C headers emit and re-emits their *semantics* as ordinary verified IR, failing closed on
+/// anything else. Returns `Ok(true)` when it handled an inline-asm call (binding the dest, if any),
+/// `Ok(false)` when the callee is not inline asm; an unrecognized template is a clean `Unsupported`.
+///
+/// Handled here — the **irreducible** residue plus the popcount fast-path:
+/// - **compiler / memory barriers** (`""` with a `~{memory}` clobber, `lock; addl $$0,0(%rsp)`) and
+///   the **PAUSE** spin hint (`rep; nop` / `pause`) → **dropped**. The guest is a single
+///   address space and — under the single-threaded contract this lowering assumes — one thread of
+///   control, so there is nothing to reorder against and no sibling core to yield to. (Postgres emits
+///   these from `pg_compiler_barrier`/`pg_memory_barrier`/`pg_spin_delay`; no config lever removes
+///   them, unlike the x86 atomics, so the recognizer *must* cover them.)
+/// - **`popcnt`** (`popcntq`/`popcntl $1,$0`, from `pg_bitutils`' hardware fast-path) → the `Popcnt`
+///   unary op, exactly as `llvm.ctpop` lowers.
+///
+/// Deliberately **not** here: the x86 atomic-RMW templates (`xchgb`/`xaddl`/`cmpxchgl`). Postgres'
+/// portable-atomics build emits those as `atomicrmw`/`cmpxchg` **instructions**, which the on-ramp
+/// already lowers single-threaded (`atom_width`/`lower_narrow_atomic_cas`) — one lowering, not two
+/// front doors — and `cpuid` disappears with the same popcount-dispatch config lever.
+fn lower_inline_asm(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+    types: &Types,
+) -> Result<bool, Error> {
+    let Some(asm) = c.function.as_ref().left() else {
+        return Ok(false); // an ordinary (direct/indirect) call — not our business
+    };
+    let decoded = crate::ll::lex::unescape(&asm.template);
+    let t = String::from_utf8_lossy(&decoded);
+    let t = t.trim();
+    // Barriers + the PAUSE hint: no architectural effect for this guest → drop. Always `void`.
+    if t.is_empty() || t == "lock; addl $$0,0(%rsp)" || t == "rep; nop" || t == "pause" {
+        if c.dest.is_some() {
+            return unsup(format!("inline-asm barrier with a result: {t:?}"));
+        }
+        return Ok(true);
+    }
+    // `popcntq $1,$0` / `popcntl $1,$0`: population count of the one input operand → `Popcnt`, whose
+    // width follows the operand (`i64`/`i32`), matching the `.ll` result type the dest expects.
+    if t.contains("popcnt") {
+        let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+        if args.len() != 1 {
+            return unsup(format!("inline `popcnt` asm with {} operands", args.len()));
+        }
+        let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
+        let a = ctx.operand(args[0])?;
+        let idx = ctx.push(Inst::IntUn {
+            ty,
+            op: IntUnOp::Popcnt,
+            a,
+        });
+        if let Some(dest) = &c.dest {
+            if let Some(&vid) = ctx.s.name2id.get(dest) {
+                ctx.idx_of.insert(vid, idx);
+            }
+        }
+        return Ok(true);
+    }
+    unsup(format!("inline asm (unrecognized template): {t:?}"))
+}
+
 /// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
 /// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
 /// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
@@ -16174,6 +16237,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     if let I::Call(c) = instr {
         if is_droppable_call(c) {
             return Ok(()); // a no-op intrinsic (lifetime/dbg/assume)
+        }
+        // Inline asm: the fixed recognize-and-lower allowlist (barriers→drop, `popcnt`→`Popcnt`);
+        // any unrecognized template fails closed. Checked early — an asm callee has no `callee_name`,
+        // so the ordinary direct/indirect-call path would otherwise mis-handle it.
+        if lower_inline_asm(ctx, c, types)? {
+            return Ok(());
         }
         // `llvm.va_start`/`llvm.va_copy` set up the `__va_list_tag` for the overflow-only varargs ABI.
         if let Some(name) = callee_name(c) {

@@ -843,6 +843,35 @@ license). What the spike established:
   --single` on a fixed SQL script, byte-identical to native; (4) a `pg_regress` subset. This slice
   is the **map**; the follow-ons are the territory.
 
+**Slice BN (DONE) — inline-asm recognize-and-lower: barriers + `popcnt` (Postgres gap #1, part 1).**
+The first translator gap from slice BM. The on-ramp does **not** execute asm — opaque machine code
+can't be masked or re-verified, which is the whole §2a sandbox thesis — so a **fixed allowlist**
+matches the handful of template strings known C headers emit and re-emits their *semantics* as
+ordinary verified IR, failing closed on anything else. Landed:
+- **Parser.** `InlineAssembly` now carries the `template`/`constraints` strings (was type-only);
+  `call_signature` parses `asm [sideeffect|alignstack|inteldialect|unwind] "<tmpl>", "<cons>"` in the
+  callee position (covers `call` **and** `invoke`, which share it), and `skip_arg_attrs` learns
+  `elementtype(<ty>)` (the pointee type an indirect `*m` memory operand carries). Inline asm was
+  previously unparseable (`expected a call callee, found asm`).
+- **Recognizer (`lower_inline_asm`).** Dispatched early in the call chain (an asm callee has no
+  `callee_name`): **compiler/memory barriers** (`""`+`~{memory}`, `lock; addl $$0,0(%rsp)`) and the
+  **PAUSE** hint (`rep; nop`) → **dropped** — no architectural effect for a single-address-space,
+  single-threaded guest (and correct in tail position: the drop falls through to the real `ret`);
+  **`popcnt`** (`popcntq`/`popcntl $1,$0`, `pg_bitutils`' fast-path) → the `Popcnt` unary op (as
+  `llvm.ctpop`). Any **unrecognized** template is a clean `Unsupported` (§2a fail-closed) — never a
+  silent drop. The x86 atomic-RMW templates are deliberately left for the config lever (portable
+  atomics emit `atomicrmw`/`cmpxchg` **instructions**, which the on-ramp *already* lowers
+  single-threaded — one lowering, not two front doors), and `cpuid` disappears with the same
+  popcount-dispatch lever.
+- **Tests** (`inline_asm_barriers_dropped`, `inline_asm_popcnt_lowers`,
+  `inline_asm_unrecognized_is_fail_closed`) — differential vs native (the asm survives `-O2` into the
+  bitcode, verified), plus the fail-closed contract. **279 translate tests green, fmt + clippy clean.**
+- **Effect on the capstone:** the full 78 MB Postgres module now **parses past the entire 921-site
+  inline-asm surface** — asm is no longer the blocker. The next gap is elsewhere entirely
+  (`Unsupported("constexpr reference to @hash_numeric")` — the fmgr builtin function table, a separate
+  slice). Remaining asm follow-on: the atomic-RMW templates (via the portable-atomics config, gap #2)
+  and `cpuid`.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
