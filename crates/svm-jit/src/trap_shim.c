@@ -89,6 +89,7 @@ static void svm_capture_frame(void *uc) {
 
 static struct sigaction g_old_segv;
 static struct sigaction g_old_bus;
+static struct sigaction g_old_ill;
 
 static void svm_chain(struct sigaction *old, int sig, siginfo_t *info, void *uc) {
     if (old->sa_flags & SA_SIGINFO) {
@@ -106,6 +107,21 @@ static void svm_chain(struct sigaction *old, int sig, siginfo_t *info, void *uc)
 
 static void svm_handler(int sig, siginfo_t *info, void *uc) {
     uintptr_t addr = (uintptr_t)info->si_addr;
+    /* SIGILL = the confinement bounds-check trap (Cranelift `trapnz` → `ud2`/`udf`, the memory-fault
+     * lowering, DESIGN.md §4/§5). Unlike a guard-page SIGSEGV, `si_addr` is the faulting *instruction*
+     * PC (in JIT code), not a window data address, so the [lo,hi) range test does not apply: an
+     * illegal instruction inside an armed guarded guest call is always our emitted trap. Recover
+     * exactly like a guarded data fault (capture the frame, then siglongjmp out reporting a memory
+     * fault). Not armed ⇒ a genuine host illegal instruction: chain to the previous disposition. */
+    if (sig == SIGILL) {
+        if (g_armed) {
+            g_armed = 0;
+            svm_capture_frame(uc);
+            siglongjmp(g_buf, 1);
+        }
+        svm_chain(&g_old_ill, sig, info, uc);
+        return;
+    }
     /* Recoverable demand fault first (the demand range lies inside the armed child window, so this
      * check must precede detect-and-kill). The callback suspends the child's fiber to its parent
      * *from this handler frame* (on the child's fiber stack — it stays live across the suspension);
@@ -137,6 +153,8 @@ void svm_install_trap_handler(void) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, &g_old_segv);
     sigaction(SIGBUS, &sa, &g_old_bus);
+    /* SIGILL: the Cranelift `trapnz` confinement trap (see svm_handler). Same handler/flags. */
+    sigaction(SIGILL, &sa, &g_old_ill);
 }
 
 /* Run `fn(a, r, m, t, tc)` (a JIT entry trampoline) with faults in [lo, hi) caught.
