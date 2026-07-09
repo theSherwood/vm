@@ -7,3 +7,9 @@
 /corpus.json
 # scratch wasm patches
 patched*.wasm
+# on-ramp playground assets built by `build-onramp-assets.mjs` (regenerable). The tiny
+# `hello_c.svmb` is committed so the playground has a working example out of the box; the big
+# guests (Lua/SQLite) are built on demand / by the Pages pipeline.
+/web/assets/*.bc
+/web/assets/*.svmb
+!/web/assets/hello_c.svmb
