@@ -463,24 +463,92 @@ fn mem() {
     diff("mem", MEM, ARGS);
 }
 
-/// The SIMD ops this slice defers (fail-closed → the module stays on the interpreter): the
-/// widening / reduction family and relaxed SIMD. A module containing any is Unsupported as a whole.
+/// Lane **widening** (`extend_low/high_s/u` across all three width steps) and **narrowing**
+/// (`narrow_s`, i16x8→i8x16 and i32x4→i16x8).
+const WIDEN_NARROW: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i8x16.splat v1
+  v3 = i16x8.extend_low_s v2
+  v4 = i16x8.extend_high_u v2
+  v5 = i16x8.add v3 v4
+  v6 = i32x4.extend_low_s v5
+  v7 = i32x4.extend_high_u v5
+  v8 = i32x4.add v6 v7
+  v9 = i64x2.extend_low_s v8
+  v10 = i64x2.extend_high_u v8
+  v11 = i64x2.add v9 v10
+  v12 = i8x16.narrow_s v5 v5
+  v13 = i16x8.narrow_s v8 v8
+  v14 = i64x2.extract_lane 0 v11
+  v15 = i8x16.extract_lane_s 0 v12
+  v16 = i16x8.extract_lane_s 0 v13
+  v17 = i32.add v15 v16
+  v18 = i64.extend_i32_s v17
+  v19 = i64.add v14 v18
+  return v19
+}
+"#;
+
+#[test]
+fn widen_narrow() {
+    diff("widen_narrow", WIDEN_NARROW, ARGS);
+}
+
+/// Extended multiply (`extmul_low/high_<src>_s/u` at every width), the `dot`/`q15mulr_sat`
+/// reductions, and extended pairwise add (`extadd_pairwise_<src>_s/u`).
+const EXTMUL_DOT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i8x16.splat v1
+  v3 = i16x8.extmul_low_i8x16_s v2 v2
+  v4 = i16x8.extmul_high_i8x16_u v2 v2
+  v5 = i16x8.add v3 v4
+  v6 = i16x8.splat v1
+  v7 = i32x4.extmul_low_i16x8_s v6 v6
+  v8 = i32x4.extmul_high_i16x8_u v6 v6
+  v9 = i32x4.add v7 v8
+  v10 = i32x4.dot_i16x8_s v6 v6
+  v11 = i32x4.add v9 v10
+  v12 = i32x4.extadd_pairwise_i16x8_s v6
+  v13 = i32x4.add v11 v12
+  v14 = i16x8.extadd_pairwise_i8x16_u v2
+  v15 = i16x8.add v5 v14
+  v16 = i16x8.q15mulr_sat_s v6 v6
+  v17 = i16x8.add v15 v16
+  v18 = i64x2.extmul_low_i32x4_s v9 v9
+  v19 = i32x4.extract_lane 0 v13
+  v20 = i16x8.extract_lane_s 0 v17
+  v21 = i64x2.extract_lane 0 v18
+  v22 = i32.add v19 v20
+  v23 = i64.extend_i32_s v22
+  v24 = i64.add v23 v21
+  return v24
+}
+"#;
+
+#[test]
+fn extmul_dot() {
+    diff("extmul_dot", EXTMUL_DOT, ARGS);
+}
+
+/// The SIMD ops that stay deferred (fail-closed → the module stays on the interpreter): **relaxed**
+/// SIMD only — `VFma` (`fma`/`fnma`) and `VDotI8` (`i16x8.dot_i8x16_s`), neither of which has a
+/// core-wasm opcode. A module containing either is Unsupported as a whole.
 #[test]
 fn fail_closed_simd() {
     for (name, body) in [
-        ("dot", "v1 = i64x2.splat v0\n  v2 = i32x4.dot_i16x8_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
-        ("widen", "v1 = i64x2.splat v0\n  v2 = i16x8.extend_low_s v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
-        ("narrow", "v1 = i64x2.splat v0\n  v2 = i8x16.narrow_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
-        ("extmul", "v1 = i64x2.splat v0\n  v2 = i16x8.extmul_low_i8x16_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
-        ("q15", "v1 = i64x2.splat v0\n  v2 = i16x8.q15mulr_sat_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
-        ("extadd", "v1 = i64x2.splat v0\n  v2 = i16x8.extadd_pairwise_i8x16_s v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
+        ("fma", "vf = f64.reinterpret_i64 v0\n  v1 = f64x2.splat vf\n  v2 = f64x2.fma v1 v1 v1\n  v3 = f64x2.extract_lane 0 v2\n  v4 = i64.reinterpret_f64 v3\n  return v4"),
+        ("dot_i8", "v1 = i64x2.splat v0\n  v2 = i16x8.dot_i8x16_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3"),
     ] {
         let src = format!("func (i64) -> (i64) {{\nblock0(v0: i64):\n  {body}\n}}\n");
         let m = svm_text::parse_module(&src).unwrap_or_else(|e| panic!("{name}: {e}"));
         svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
         assert!(
             compile_module(&m).is_err(),
-            "{name}: deferred SIMD op must be Unsupported on the wasm tier"
+            "{name}: relaxed SIMD op must be Unsupported on the wasm tier"
         );
     }
 }

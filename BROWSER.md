@@ -622,19 +622,19 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    lane arithmetic / compares / shifts / unary, saturating add-sub + `avgr` + `popcnt`, whole-vector
    bitwise + `bitselect` + `any/all_true` + `bitmask`, `pmin`/`pmax`, `shuffle`/`swizzle`, the
    int↔float lane conversions, and `v128.load`/`store` through the **same** trap-confinement path as
-   scalar memory (the one 16-byte widened masked access — §17/D58). The widening/reduction family
-   (`extend`/`narrow`/`extmul`/`extadd_pairwise`/`dot`/`q15mulr`) and **relaxed** SIMD (`VFma`/`VDotI8`
-   — no core-wasm opcode) fail closed to the interpreter, a clean second SIMD increment. Because
-   wasm leaves the sign/payload of a *generated* NaN nondeterministic, the emitter is correct but the
-   differential canonicalizes NaN for float-bit kernels (finite results stay exact). Proven by 13
+   scalar memory (the one 16-byte widened masked access — §17/D58). A follow-up increment added the
+   **widening / reduction family** (`extend`/`narrow`/`extmul`/`extadd_pairwise`/`dot`/`q15mulr`), so
+   the only SIMD left interpreter-tier is **relaxed** SIMD (`VFma`/`VDotI8` — no core-wasm opcode);
+   that `dot_i8` is now the out-of-subset exemplar for the cross-tier/analysis tests. Because wasm
+   leaves the sign/payload of a *generated* NaN nondeterministic, the emitter is correct but the
+   differential canonicalizes NaN for float-bit kernels (finite results stay exact). Proven by 15
    `tests/simd.rs` differential kernels vs the bytecode oracle (every opcode helper exercised — a
    wrong `0xFD` number fails wasmi validation or diverges) — the wasmi dev-dep moved to 0.47 for its
    `simd` feature — plus the Node + Chromium browser proofs. With `v128` in-subset the cross-engine
    bench's **whole** bundled module is now emittable, so **every** kernel gets an `svm-wasmjit` row —
    `vadd` at **~0.3 ns/iter** (~108× over interpreter-in-wasm, ~3× off native Cranelift SIMD), and
    `call_indirect` too (its whole-module requirement finally met).
-   The deferred `dot` reduction is the new out-of-subset exemplar for the cross-tier/analysis tests
-   (the core lane ops it replaced are now emitted). Remaining for the slice: a playground toggle.
+   Remaining for the slice: a playground toggle.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);

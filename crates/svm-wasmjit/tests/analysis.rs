@@ -26,7 +26,7 @@ block0(v0: i64):
 }
 
 /// An integer caller with an **out-of-subset SIMD leaf** (integer signature — takes/returns i64 —
-/// but uses a *deferred* v128 op, `i32x4.dot_i16x8_s`, which this slice doesn't emit): the caller is
+/// but uses a *deferred* v128 op, `i16x8.dot_i8x16_s`, which this slice doesn't emit): the caller is
 /// in-subset, the leaf is interp-callable, the guest is mixed_ok. This is the motivating mixed-tier
 /// shape. (The core v128 lane ops are now in-subset, so the out-of-subset exemplar is the deferred
 /// widening/reduction family — here the `dot` reduction.)
@@ -41,7 +41,7 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }"#));
@@ -62,7 +62,7 @@ fn simd_entry_not_mixed() {
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }"#));
@@ -84,7 +84,7 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   v4 = i64.const 0
   i64.store v4 v3
@@ -112,7 +112,7 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   v4 = call 2 (v3)
   return v4
@@ -199,7 +199,7 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i32x4.dot_i16x8_s v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }"#));
