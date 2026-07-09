@@ -948,3 +948,192 @@ fn freeze_with_completed_unjoined_child_rides_and_reloads() {
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
+
+// ---- Depth-2 durable nesting (DURABILITY.md §4 — "STW quiesces the subtree as a unit", extended
+// from depth-1 parent→child to depth-2 parent→child→grandchild; interpreter + in-memory only) ----
+
+/// A 512 KiB root window for the depth-2 geometry (below), large enough that each of the three
+/// nesting levels holds its own 64 KiB durable reserve without overlap:
+///   • root       window `[0, 512 KiB)`   — reserve `[0, 64 KiB)`
+///   • child      carve  `[256 KiB, 512 KiB)`, `size_log2 18` — reserve `[256 KiB, 320 KiB)`
+///   • grandchild carve  `[384 KiB, 512 KiB)`, `size_log2 17` — reserve `[384 KiB, 448 KiB)`
+/// The child's `Instantiator` is over its own window base 0, so the grandchild carve is named
+/// **child-relative** `[128 KiB, 256 KiB)` (offset `131072`) — the freeze records that child-relative
+/// offset, and the thaw composes it with the child's absolute base to land the grandchild at
+/// `[384 KiB, 512 KiB)` of the root image.
+const D2_SIZE_LOG2: u8 = 19;
+const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
+
+/// A **same-module depth-2** durable parent:
+///   • func 0 (root): instantiates func 1 as a same-module child at the `[256 KiB, 512 KiB)` carve
+///     (op 0), joins it, returns its result.
+///   • func 1 (child): instantiates func 2 as a same-module grandchild at its child-relative
+///     `[128 KiB, 256 KiB)` sub-carve (op 0), joins it, returns the grandchild's total.
+///   • func 2 (grandchild): the `0..100 = 4950` back-edge-polled loop (a real mid-computation
+///     continuation), same body as `PARENT_SELF_LOOP`'s child.
+///
+/// **Handle ABI note.** A §14 child receives its `Instantiator` as an `i64` entry arg (the
+/// `instantiate` op's slot ABI passes `Value::I64(cinst)`), but a `cap.call` handle **operand** must
+/// be `i32` (the verifier's forgeable-index type). The Phase-1 durable transform rejects both scalar
+/// conversions (`i32.wrap_i64` → `UnsupportedInst`) and *any* guest linear-memory op (`GuestUsesMemory`),
+/// so the child cannot truncate its `i64` handle at all. It doesn't need to: a nested child's powerbox
+/// is a fresh `Host` whose **first** grant is its `Instantiator` (slot 0, generation 1), a deterministic
+/// handle value `(1 << CAP_LOG2) | 0 == 256`. So the child ignores its `i64` entry arg and names its own
+/// `Instantiator` with the constant `i32.const 256` — the same value the fresh-host grant returns on both
+/// the freeze and the thaw re-attach (which re-grants the `Instantiator` first, too).
+const PARENT_DEPTH2: &str = "memory 19
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 262144
+  v3 = i64.const 18
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.const 256
+  v2 = i64.const 2
+  v3 = i64.const 131072
+  v4 = i64.const 17
+  v5 = i64.const 0
+  v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
+  return v7
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v1, v2)
+block1(v3: i64, v4: i64):
+  v5 = i64.const 100
+  v6 = i64.lt_s v3 v5
+  br_if v6 block2(v3, v4) block3(v4)
+block2(v7: i64, v8: i64):
+  v9 = i64.add v8 v7
+  v10 = i64.const 1
+  v11 = i64.add v7 v10
+  br block1(v11, v9)
+block3(v12: i64):
+  return v12
+}
+";
+
+/// §4 depth-2 subtree freeze/thaw: a freeze landing while a **child and a grandchild** are both live
+/// records *two* [`svm_interp::FrozenNested`] re-attach records — the child (tagged `parent_task == 0`,
+/// the root) and the grandchild (tagged `parent_task == <child's task id>`) — coalesced in the root
+/// host via the shared freeze-residue sink, exactly as `thread.spawn`'s shared host coalesces
+/// [`svm_interp::FrozenVCpu`] across levels. A thaw groups the residue by `parent_task`, rebuilds each
+/// parent's join table (the grandchild re-attaches into the *child's* table, not the root's), and both
+/// levels rewind: the grandchild completes its loop, its join delivers the total up to the child, and
+/// the child's join delivers it up to the root — reproducing the uninterrupted result across **two**
+/// nesting levels. (Interpreter + in-memory only; the codec refuses depth-2 for now — see
+/// `svm-snapshot`.)
+#[test]
+fn freeze_with_live_depth2_grandchild_thaws_and_completes() {
+    let parent = instrument(PARENT_DEPTH2);
+
+    // (1) Control: uninterrupted, the grandchild's 4950 propagates up through both joins.
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, D2_WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init_durable_window(D2_WINDOW),
+        D2_SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        base,
+        Ok(vec![Value::I64(4950)]),
+        "uninterrupted depth-2 total propagates through both joins"
+    );
+
+    // (2) Freeze-from-start: the root unwinds under `UNWINDING`, and — because a mid-freeze
+    // `instantiate` seeds the child's carve `UNWINDING` too (the subtree STW) — the child runs its
+    // own `instantiate`/`join` under `UNWINDING`, recording its live grandchild before it drains. The
+    // run returns a placeholder and both re-attach records ride the root host.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, D2_WINDOW as u64);
+    let mut win = init_durable_window(D2_WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(fih)],
+        &mut fuel,
+        &win,
+        D2_SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(
+        fr.is_ok(),
+        "depth-2 subtree freeze returns a placeholder: {fr:?}"
+    );
+    assert_eq!(read_state(&fsnap), STATE_UNWINDING, "artifact frozen");
+
+    let residue = fhost.frozen_nested().to_vec();
+    assert_eq!(
+        residue.len(),
+        2,
+        "two nested children rode as residue (child + grandchild)"
+    );
+    // The child: a direct child of the root (`parent_task == 0`) at the `[256 KiB, ..)` carve.
+    let child_rec = residue
+        .iter()
+        .find(|n| n.parent_task == 0)
+        .expect("a root-child record (parent_task == 0)");
+    assert_eq!(child_rec.slot, 0);
+    assert_eq!(
+        child_rec.carve_off, 262144,
+        "child carve is root-relative 256 KiB"
+    );
+    // The grandchild: tagged with the child's task id (non-zero), at the child-relative `[128 KiB, ..)`
+    // sub-carve — the record the depth-2 slice adds.
+    let gchild_rec = residue
+        .iter()
+        .find(|n| n.parent_task != 0)
+        .expect("a grandchild record (parent_task == child's task id)");
+    assert_ne!(
+        gchild_rec.parent_task, 0,
+        "the grandchild is tagged with its parent-child's task id, not the root's"
+    );
+    assert_eq!(
+        gchild_rec.carve_off, 131072,
+        "grandchild carve is child-relative 128 KiB (composed with the child's base on thaw)"
+    );
+
+    // (3) Thaw: re-attach both levels from their carves; each rewinds, and the two joins deliver the
+    // grandchild's total all the way up to the root — freeze→thaw ≡ uninterrupted across TWO levels.
+    let mut twin = fsnap.clone();
+    begin_thaw(&mut twin, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.set_frozen_nested(residue);
+    let tih = thost.grant_instantiator(0, D2_WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih)],
+        &mut fuel,
+        &twin,
+        D2_SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(4950)]),
+        "thaw re-attached the child and grandchild; both joins delivered the total"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}

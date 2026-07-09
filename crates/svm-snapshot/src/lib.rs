@@ -141,6 +141,13 @@ pub enum FreezeError {
     WindowGeometry(usize),
     /// The supplied per-page protection map's length doesn't match the window's page count.
     ProtCount { pages: usize, prots: usize },
+    /// A §14 subtree freeze recorded a **depth-2+** nested child (a `FrozenNested` whose
+    /// `parent_task` is non-zero — a grandchild of the root). The in-memory interpreter supports
+    /// this, but the snapshot wire format does not yet carry `parent_task` (adding it, with a
+    /// `FORMAT_VERSION` bump, is a follow-up slice). Refuse fail-closed rather than silently drop
+    /// the deeper nesting, which would mis-attach the grandchild to the root on restore. Depth-1
+    /// artifacts, where every `parent_task` is zero, are unaffected and stay byte-identical.
+    NestedTooDeep,
 }
 
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
@@ -234,6 +241,13 @@ pub fn freeze_with_prots(
     // The §14 nested-child residue (DURABILITY.md §4, v8), canonical = ascending slot. Each child's
     // continuation is in its own carve inside the window image; this is the re-attach record.
     let mut nested = host.frozen_nested().to_vec();
+    // Depth-2+ (a grandchild, `parent_task != 0`) is interpreter-only for now: the wire format has
+    // no `parent_task` field yet (a follow-up slice adds it + bumps `FORMAT_VERSION`). Refuse
+    // fail-closed rather than drop the deeper nesting; depth-1 residue (all `parent_task == 0`)
+    // encodes exactly as before, byte-identical.
+    if nested.iter().any(|n| n.parent_task != 0) {
+        return Err(FreezeError::NestedTooDeep);
+    }
     nested.sort_by_key(|n| n.slot);
     let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
     let digest = digest256(&encode_module(module));
@@ -622,6 +636,10 @@ fn decode_control(
                 _ => Some(cr.uleb()? as i64),
             };
             nested.push(FrozenNested {
+                // The wire format carries only depth-1 residue (freeze refuses deeper nesting), so
+                // every restored child is a direct child of the root — `parent_task == 0`. A
+                // follow-up slice adds the field to the wire and bumps `FORMAT_VERSION`.
+                parent_task: 0,
                 slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
                 carve_off,
                 size_log2,
