@@ -279,6 +279,35 @@ which also retires the v11 `FreezeError::NestedTooDeep` freeze-time refusal. Pin
 through the real artifact, plus the §12.6 canonical re-freeze byte-identity). Next: JIT parity for the
 whole nesting subsystem (depth-1 and depth-2).
 
+**JIT parity (design; the interpreter is the oracle).** All of the above — depth-1, depth-2, and the
+codec — is **interpreter-only**. The JIT's durable `instantiate`/`coro_spawn` **fail closed**
+(`svm-jit/instantiator_rt.rs`: `if rt.durable { -EINVAL }`; the nursery's `durable` flag is set at the
+common bottom of every run entry, `set_durable`), and `FrozenNested` has no JIT analog. Parity re-walks
+the interpreter's own arc, each slice **differential** against it — a byte-identical durable reserve is
+the all-or-nothing oracle (D-notes, §18):
+1. **Run.** Drop the fail-closed for a durable child: durable-*transform* the child before
+   `compile_child_and_run` (§4 already requires a durable domain to nest only freezable children, so
+   the child carries the transform), and seed its **own** durable control words (state + per-context
+   shadow-SP, §12.8 4A.5) into its carve so a later freeze can unwind it. Same-module first, then
+   separate-module (the host-supplied-module path, as the interp got in v11).
+2. **Freeze.** When the parent unwinds, the child runs under `UNWINDING` too (subtree STW — the JIT
+   analog of the interp's mid-freeze `instantiate` seeding the child's carve `UNWINDING`) and flattens
+   into its carve; the JIT **exports a `FrozenNested`** residue (slot, carve geometry, entry,
+   `parent_task`, `completed_result`) with the same byte layout the interpreter emits — the oracle.
+3. **Thaw.** Re-attach the child from its carve under the JIT's re-entrant nested detect-and-kill
+   guard, `REWINDING` from the carve's own shadow-SP word, grouped by `parent_task` (parents before
+   children), exactly as the interp thaw.
+4. **Depth-2+.** Thread the shared freeze-residue sink (the root nursery) down the subtree so a
+   grandchild's residue coalesces at the root — the JIT analog of `VCpu::freeze_sink`.
+
+**Security hinge.** A nested durable child's confinement is still the masking lowering (§4): every
+access masked to its carve `[base+off, base+off+child_size)`, and the child's durable reserve (control
+words + shadow stack) lives *inside* that carve, so the same mask confines it — no escape surface
+beyond flat-durable + non-durable nesting, both already masked. Fuzz the child-carve masking as its own
+unit. The current fail-closed boundary is pinned by `durable_nesting_jit.rs` (interp admits a durable
+same-module `instantiate`; the JIT returns `-EINVAL`), which flips to a positive byte-identical
+differential as slice 1 lands.
+
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
 shared edge (consistent-cut). Decide as a `SharedRegion` constraint: either a durable
