@@ -263,10 +263,21 @@ the chain). The freeze refusal drops the old `v.nested_child` blocker but keeps 
 fail-closed case. Pinned by `durable_nesting.rs::freeze_with_live_depth2_grandchild_thaws_and_completes`
 (a same-module 3-level module: root → child → `0..100=4950` grandchild loop; the armed freeze records
 **two** residue records with the right `parent_task` tags; the thaw rewinds both levels and both joins
-deliver 4950 up to the root). **Codec:** depth-2 is interp-only for now — `svm-snapshot::freeze`
-refuses (`FreezeError::NestedTooDeep`) a residue with any non-zero `parent_task` rather than drop it,
-so depth-1 artifacts stay byte-identical (no `FORMAT_VERSION` bump); carrying `parent_task` on the wire
-is the next slice. Next: depth-2 codec (wire `parent_task` + version bump), then JIT parity.
+deliver 4950 up to the root). **Codec (v12).** The subtree now survives the on-disk `svm-snapshot`
+artifact, not just the in-memory arc: each `FrozenNested` wire record carries its `parent_task`
+(a `uleb` right after `slot`), so the format represents nesting to **arbitrary depth**, and `restore`
+re-seeds the residue byte-for-byte — the grandchild's non-zero tag round-trips, not just the live
+hand-off. Two subtleties the bump forced: (1) canonical order is `(parent_task, slot)`, **not** `slot`
+alone — `slot` is only unique *within* a parent's namespace, so the root's first child and that child's
+first grandchild are *both* `slot 0`; the parent tag is the primary key (matching the interp thaw's own
+sort), and for a depth-1 artifact (all `parent_task == 0`) this reduces to the old ascending-slot order.
+(2) `FORMAT_VERSION` bumps 11→12: the extra `parent_task` `uleb` changes even a depth-1 record's bytes
+(the field is `0` there but still emitted), so a v11 nested record mis-parses — a real format revision,
+which also retires the v11 `FreezeError::NestedTooDeep` freeze-time refusal. Pinned by
+`durable_nesting.rs::{freeze_with_live_depth2_grandchild_thaws_and_completes` (in-memory),
+`depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec}` (freeze→serialize→restore→thaw
+through the real artifact, plus the §12.6 canonical re-freeze byte-identity). Next: JIT parity for the
+whole nesting subsystem (depth-1 and depth-2).
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
