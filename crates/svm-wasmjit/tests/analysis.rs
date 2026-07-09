@@ -148,6 +148,63 @@ block0(vsp: i64, v0: i64):
     );
 }
 
+/// A `call_indirect` dispatcher over two in-subset integer targets: the whole module is in-subset,
+/// so it's mixed_ok — and because an indirect call can reach *any* function, `has_indirect` forces
+/// every function reachable (the funcref table populates one slot per function).
+#[test]
+fn indirect_all_in_subset_mixed() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 7
+  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  return v3
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i64.add v0 v1
+  return v2
+}"#));
+    assert_eq!(a.in_subset, vec![true, true, true]);
+    assert!(a.reachable.iter().all(|&r| r), "indirect ⇒ all reachable");
+    assert!(a.mixed_ok, "all-in-subset indirect dispatch is mixed_ok");
+}
+
+/// With a `call_indirect` present, an out-of-subset (SIMD) function anywhere in the module blocks
+/// mixed_ok — even though no *direct* edge reaches it — because the indirect call could select it,
+/// and its table slot has no emitted target. The conservative first-increment rule (all indirect
+/// targets must be in-subset) fails closed to the interpreter.
+#[test]
+fn indirect_with_simd_func_not_mixed() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 7
+  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  return v3
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64x2.splat v0
+  v2 = i64x2.extract_lane 0 v1
+  return v2
+}"#));
+    assert_eq!(a.in_subset, vec![true, false]);
+    assert!(
+        !a.mixed_ok,
+        "an out-of-subset indirect target must fail closed"
+    );
+}
+
 /// An UNREACHABLE out-of-subset function doesn't block mixed_ok — only reachable functions matter.
 #[test]
 fn unreachable_out_of_subset_ok() {

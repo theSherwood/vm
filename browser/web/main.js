@@ -184,6 +184,44 @@ block0(v0: i64):
   v3 = i64x2.extract_lane 0 v2
   return v3
 }`;
+  // call_indirect (wasm-JIT next slice): a loop dispatches to func1 (double) / func2 (+100) by index
+  // parity through the emitted funcref table — the same masked index + wasm signature check the
+  // interpreter's identity table does. All-in-subset, so it JITs whole-module.
+  const DISPATCH_SRC = `
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 1
+  v11 = i64.and v9 v10
+  v12 = i64.const 1
+  v13 = i64.add v11 v12
+  v14 = i32.wrap_i64 v13
+  v15 = call_indirect (i64) -> (i64) v14 (v9)
+  v16 = i64.add v8 v15
+  v17 = i64.const 1
+  v18 = i64.add v9 v17
+  br block1(v7, v16, v18)
+block3(v19: i64):
+  return v19
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i64.add v0 v1
+  return v2
+}`;
   try {
     const bytes = await fetchBytes('/corpus/alu.svmbc');
     const jit = await compileJit(ex, bytes, { memory });
@@ -208,13 +246,22 @@ block0(v0: i64):
       if (mjit.call([arg]).value !== interpBytes(mbytes, arg)) { mixEq = false; break; }
     }
 
-    const ok = eq && jv === iv && mixEq;
+    // call_indirect: the emitted funcref table + masked-index dispatch matches the interpreter.
+    const dbytes = encode(DISPATCH_SRC);
+    const djit = await compileJit(ex, dbytes, { memory });
+    let ciEq = djit !== null;
+    if (djit) for (const arg of [0n, 1n, 2n, 5n, 64n, 1000n, -1n]) {
+      if (djit.call([arg]).value !== interpBytes(dbytes, arg)) { ciEq = false; break; }
+    }
+
+    const ok = eq && jv === iv && mixEq && ciEq;
     set('wasmjit', ok ? 'pass' : 'fail',
       `wasmjit: alu f0 in-browser → ${jv} (interp ${iv}) ${eq && jv === iv ? 'ok' : 'FAIL'} · ` +
       `mixed-tier (JIT caller + interp SIMD leaf) ${mixEq ? 'ok' : 'FAIL'} · ` +
+      `call_indirect dispatch ${ciEq ? 'ok' : 'FAIL'} · ` +
       `alu n=${N}: jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}× ` +
       `${ok ? 'PASS' : 'FAIL'}`);
-    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}`);
+    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}; call_indirect ${ciEq ? 'ok' : 'FAIL'}`);
   } catch (e) {
     set('wasmjit', 'fail', `wasmjit: error ${e}`);
   }

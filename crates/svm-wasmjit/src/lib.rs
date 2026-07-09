@@ -48,8 +48,8 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator,
-    ValType, DEFAULT_RESERVED_LOG2,
+    BinOp, Block, CmpOp, ConvOp, Func, FuncType, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp,
+    Terminator, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 /// Trap code delivered through `env.trap` when the per-dispatch fuel counter goes negative.
@@ -371,6 +371,10 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
                     .ok_or(Error::Unsupported("call target"))?;
                 tys.extend(callee.results.iter().copied());
             }
+            // A funcref is a plain `i32` (the function index, §3c) — a bare `i32.const`.
+            Inst::RefFunc { .. } => tys.push(ValType::I32),
+            // Indirect call: results come from the call site's own signature immediate.
+            Inst::CallIndirect { ty, .. } => tys.extend(ty.results.iter().copied()),
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }
     }
@@ -438,6 +442,16 @@ fn func_callees(f: &Func) -> Vec<u32> {
         }
     }
     out
+}
+
+/// Whether `f` makes an indirect call (`call_indirect`), which can dispatch to **any** function
+/// through the identity funcref table — an edge direct-call reachability can't see.
+fn func_uses_indirect(f: &Func) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::CallIndirect { .. }))
+    })
 }
 
 /// Whether `f` is safe to run as a cross-tier interpreter leaf (see [`Analysis::interp_leaf`]).
@@ -510,9 +524,25 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
         }
     }
 
+    // `call_indirect` dispatches through the identity funcref table and can reach **any** function —
+    // an edge the direct-call walk above can't follow. If a reachable function makes an indirect
+    // call, conservatively treat every function as reachable and require them **all** in-subset: the
+    // emitted funcref table populates one slot per function, so an index the interpreter would run
+    // must resolve to an emitted target rather than a null slot (which would trap). This is the
+    // first-increment restriction (all indirect targets in-subset); cross-tier indirect is a later
+    // refinement.
+    let has_indirect = (0..n).any(|i| reachable[i] && func_uses_indirect(&m.funcs[i]));
+    if has_indirect {
+        reachable.iter_mut().for_each(|r| *r = true);
+    }
+
     let mixed_ok = (entry as usize) < n
         && in_subset[entry as usize]
-        && (0..n).all(|i| !reachable[i] || in_subset[i] || interp_leaf[i]);
+        && if has_indirect {
+            (0..n).all(|i| in_subset[i])
+        } else {
+            (0..n).all(|i| !reachable[i] || in_subset[i] || interp_leaf[i])
+        };
 
     Analysis {
         in_subset,
@@ -652,9 +682,39 @@ fn emit_module(
         fn_type_idx.push(idx as u32);
     }
 
+    // `call_indirect` needs its (prepended-env) signature declared in the type section too; add any
+    // not already present, and note whether the module needs a funcref table + element segment.
+    let mut needs_table = false;
+    for &fi in emitted {
+        for b in &m.funcs[fi].blocks {
+            for inst in &b.insts {
+                if let Inst::CallIndirect { ty, .. } = inst {
+                    needs_table = true;
+                    let key = indirect_type_bytes(ty)?;
+                    if !types.contains(&key) {
+                        types.push(key);
+                    }
+                }
+            }
+        }
+    }
+    // The identity funcref table (`RefFunc`/`dispatch_indirect` semantics): slot `s` = SVM function
+    // `s`, power-of-two length, trapping (null) padding — matching the interpreter's `DomainTable`
+    // (`funcs.len().next_power_of_two()`, `reserve_log2 = 0`). Masking `idx & (table_size - 1)` in
+    // the lowering reproduces `dispatch_indirect`'s `idx & (len - 1)`.
+    let table_size = m.funcs.len().next_power_of_two().max(1) as u32;
+
     let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(emitted.len());
     for &fi in emitted {
-        bodies.push(emit_func(m, &m.funcs[fi], mapped, wasm_of, interp_leaf)?);
+        bodies.push(emit_func(
+            m,
+            &m.funcs[fi],
+            mapped,
+            wasm_of,
+            interp_leaf,
+            &types,
+            table_size,
+        )?);
     }
 
     // ---- assemble the module ----
@@ -702,6 +762,15 @@ fn emit_module(
     }
     section(&mut out, 3, &sec);
 
+    if needs_table {
+        let mut sec = Vec::new(); // table section (4): one funcref table, min = table_size
+        uleb(&mut sec, 1);
+        sec.push(0x70); // funcref elemtype
+        sec.push(0x00); // limits flag 0x00 = min only
+        uleb(&mut sec, table_size as u64);
+        section(&mut out, 4, &sec);
+    }
+
     let mut sec = Vec::new(); // export section (7): "f{svm_idx}" → its wasm index
     uleb(&mut sec, emitted.len() as u64);
     for &fi in emitted {
@@ -713,6 +782,32 @@ fn emit_module(
     }
     section(&mut out, 7, &sec);
 
+    if needs_table {
+        // Element section (9): one active segment filling the identity table `[0, funcs.len())` with
+        // each function's wasm index; padding slots `[funcs.len(), table_size)` stay null (they trap
+        // like the interpreter's `TABLE_EMPTY` slots). Every real slot must be an emitted function —
+        // the `has_indirect` analysis guarantees this (all funcs in-subset when indirect is present).
+        let mut segment = Vec::new();
+        for (fi, slot) in wasm_of.iter().enumerate().take(m.funcs.len()) {
+            match slot {
+                Some(widx) => uleb(&mut segment, *widx as u64),
+                None => {
+                    let _ = fi;
+                    return Err(Error::Unsupported("indirect call target not emitted"));
+                }
+            }
+        }
+        let mut sec = Vec::new();
+        uleb(&mut sec, 1); // one segment
+        sec.push(0x00); // flags 0: active, table 0, i32 offset expr, funcidx vec
+        sec.push(OP_I32_CONST); // offset expr: i32.const 0; end
+        sleb32(&mut sec, 0);
+        sec.push(OP_END);
+        uleb(&mut sec, m.funcs.len() as u64);
+        sec.extend_from_slice(&segment);
+        section(&mut out, 9, &sec);
+    }
+
     let mut sec = Vec::new(); // code section (10)
     uleb(&mut sec, bodies.len() as u64);
     for b in &bodies {
@@ -722,6 +817,32 @@ fn emit_module(
     section(&mut out, 10, &sec);
 
     Ok(out)
+}
+
+/// The wasm function-type of a `call_indirect` signature: the two prepended env params (`win`,
+/// `env`) ahead of the SVM param/result types — identical in shape to how [`emit_module`] types the
+/// emitted functions, so wasm's built-in `call_indirect` signature check **is** the §3c type-id
+/// check (a mismatch traps, exactly like `dispatch_indirect`'s `IndirectCallType`).
+fn indirect_type_bytes(ty: &FuncType) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let mut params = vec![0x7f, 0x7f]; // win: i32, env: i32
+    for p in &ty.params {
+        params.push(valtype_byte(*p)?);
+    }
+    let mut results = Vec::with_capacity(ty.results.len());
+    for r in &ty.results {
+        results.push(valtype_byte(*r)?);
+    }
+    Ok((params, results))
+}
+
+/// The type-section index of a `call_indirect` signature (pre-added to `types` by [`emit_module`]).
+fn indirect_type_index(types: &[(Vec<u8>, Vec<u8>)], ty: &FuncType) -> Result<u32, Error> {
+    let key = indirect_type_bytes(ty)?;
+    types
+        .iter()
+        .position(|t| *t == key)
+        .map(|i| i as u32)
+        .ok_or(Error::Unsupported("indirect call type not declared"))
 }
 
 fn section(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
@@ -756,12 +877,15 @@ impl FnCtx {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_func(
     m: &Module,
     f: &Func,
     mapped: u64,
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
+    types: &[(Vec<u8>, Vec<u8>)],
+    table_size: u32,
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
@@ -837,6 +961,8 @@ fn emit_func(
             mapped,
             wasm_of,
             interp_leaf,
+            types,
+            table_size,
         )?;
     }
     code.push(OP_END); // close the loop
@@ -978,6 +1104,8 @@ fn emit_block_body(
     mapped: u64,
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
+    types: &[(Vec<u8>, Vec<u8>)],
+    table_size: u32,
 ) -> Result<(), Error> {
     let mut next_val = b.params.len(); // where the next instruction's results land
     let get = |code: &mut Vec<u8>, cx: &FnCtx, v: svm_ir::ValIdx| {
@@ -1189,6 +1317,40 @@ fn emit_block_body(
                             uleb(code, cx.local_of[k][next_val + i] as u64);
                         }
                     }
+                }
+                next_val += n_results;
+            }
+            // A funcref is the function index as plain `i32` data (§3c) — `RefFunc { func }` ⇒
+            // `i32.const func`. The value it feeds a `CallIndirect` is masked into the table there.
+            Inst::RefFunc { func } => {
+                code.push(OP_I32_CONST);
+                sleb32(code, *func as i32);
+                set_result(cx, code, k, &mut next_val);
+            }
+            // Indirect call through the funcref table (§3c). Push win/env/args, then the masked table
+            // index (`idx & (table_size - 1)` — exactly `dispatch_indirect`'s `idx & (len - 1)`), and
+            // `call_indirect` the declared signature: wasm's built-in signature check is the type-id
+            // check (a mismatch traps `IndirectCallType`); a null padding slot traps too (an empty
+            // interpreter slot). No fuel debit here — the callee debits on entry to its own loop.
+            Inst::CallIndirect { ty, idx, args } => {
+                let n_results = ty.results.len();
+                code.push(OP_LOCAL_GET);
+                uleb(code, 0); // win
+                code.push(OP_LOCAL_GET);
+                uleb(code, 1); // env
+                for a in args {
+                    get(code, cx, *a);
+                }
+                get(code, cx, *idx);
+                code.push(OP_I32_CONST);
+                sleb32(code, (table_size - 1) as i32);
+                code.push(0x71); // i32.and → mask into the table
+                code.push(0x11); // call_indirect
+                uleb(code, indirect_type_index(types, ty)? as u64);
+                uleb(code, 0); // table index 0
+                for i in (0..n_results).rev() {
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, cx.local_of[k][next_val + i] as u64);
                 }
                 next_val += n_results;
             }

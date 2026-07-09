@@ -37,6 +37,11 @@ enum TrapKind {
     MemoryFault,
     Unreachable,
     OutOfFuel,
+    /// A `call_indirect` fault: an empty (null) table slot **or** a signature mismatch. The
+    /// interpreter labels both `IndirectCallType`; wasm splits them into `IndirectCallToNull` /
+    /// `BadSignature` — an unobservable internal distinction, so they share one bucket (like
+    /// `OverflowOrConv`). A non-trap or the wrong bucket still fails the differential.
+    IndirectCall,
     Other,
 }
 
@@ -51,6 +56,7 @@ fn oracle(m: &svm_ir::Module, args: &[Value], fuel: u64) -> Outcome {
             Trap::MemoryFault => TrapKind::MemoryFault,
             Trap::Unreachable => TrapKind::Unreachable,
             Trap::OutOfFuel => TrapKind::OutOfFuel,
+            Trap::IndirectCallType => TrapKind::IndirectCall,
             _ => TrapKind::Other,
         }),
     }
@@ -135,6 +141,9 @@ fn wasm_run(m: &svm_ir::Module, wasm: &[u8], args: &[Value], fuel: u64) -> Outco
                         TrapKind::OverflowOrConv
                     }
                     Some(TrapCode::UnreachableCodeReached) => TrapKind::Unreachable,
+                    Some(TrapCode::IndirectCallToNull | TrapCode::BadSignature) => {
+                        TrapKind::IndirectCall
+                    }
                     other => panic!("unexpected wasm trap: {other:?} ({e})"),
                 }
             };
@@ -623,6 +632,124 @@ block0(v0: i64):
 #[test]
 fn f64_trunc_trap() {
     diff("f64_trunc_trap", F64_TRUNC_TRAP, F64_BITS, FUEL);
+}
+
+/// `call_indirect` through the identity funcref table: a loop dispatches to `func1` (double) or
+/// `func2` (+100) by index parity, exercising `ref.func`-style integer funcrefs, the masked table
+/// index, wasm's signature check, and env/arg/result threading through the indirect edge. Three
+/// funcs ⇒ a 4-slot table (slot 3 null); the computed index is always 1 or 2, so it never traps.
+const CALL_INDIRECT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 1
+  v11 = i64.and v9 v10
+  v12 = i64.const 1
+  v13 = i64.add v11 v12
+  v14 = i32.wrap_i64 v13
+  v15 = call_indirect (i64) -> (i64) v14 (v9)
+  v16 = i64.add v8 v15
+  v17 = i64.const 1
+  v18 = i64.add v9 v17
+  br block1(v7, v16, v18)
+block3(v19: i64):
+  return v19
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i64.add v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn call_indirect() {
+    diff(
+        "call_indirect",
+        CALL_INDIRECT,
+        &[0, 1, 2, 5, 64, 1000, -1, 100_000],
+        FUEL,
+    );
+}
+
+/// The **null-slot** trap: the index (the arg) selects any of the 4 table slots; slot 3 is empty
+/// padding (only 3 funcs), so an index masking to 3 must trap `IndirectCallType` on both engines —
+/// exactly where the interpreter's `TABLE_EMPTY` check fires. Indices masking to 0 re-enter `func0`
+/// with the fixed inner arg 5 (both engines recurse identically), so results still match.
+const CALL_INDIRECT_NULL: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 5
+  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  return v3
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i64.add v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn call_indirect_null_trap() {
+    diff(
+        "call_indirect_null_trap",
+        CALL_INDIRECT_NULL,
+        &[1, 2, 3, 5, 6, 7, -1],
+        FUEL,
+    );
+}
+
+/// The **signature-mismatch** trap: `call_indirect` declares `(i32) -> (i32)` but index 1 selects
+/// `func1`, whose real signature is `(i64) -> (i64)`. wasm's built-in type check (the §3c type-id
+/// check) traps `BadSignature`; the interpreter traps `IndirectCallType` — one bucket, both trap.
+const CALL_INDIRECT_BADSIG: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 1
+  v2 = i32.wrap_i64 v1
+  v3 = i32.wrap_i64 v0
+  v4 = call_indirect (i32) -> (i32) v2 (v3)
+  v5 = i64.extend_i32_s v4
+  return v5
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn call_indirect_badsig_trap() {
+    diff(
+        "call_indirect_badsig_trap",
+        CALL_INDIRECT_BADSIG,
+        &[0, 1, 42],
+        FUEL,
+    );
 }
 
 /// Everything the tier must REFUSE (fail-closed): the op families a later slice will route to the
