@@ -957,6 +957,34 @@ translate-time error for ordinary programs); opt in via `translate_bc_path_with_
   under the `cpuid`→0 stub but still compiled). That vector category (#4) is the next slice — either
   per-lane scalarization in the on-ramp, or a config lever compiling the SIMD fast-paths out.
 
+**Slice BS (DONE) — per-lane vector shifts + address-taken extern stubs (two Postgres-tail slices).**
+Two independent gaps the module hit after BR, each a clean, tested advance:
+- **Per-lane (non-constant-splat) vector shifts.** `VShift` (§17) takes one scalar count for *all*
+  lanes; clang's usual constant-splat amount maps directly, but real SSE/AVX SIMD (Postgres' `simd.h`)
+  emits **per-lane** amounts (`lshr <4 x i32> %a, %amt`, `ashr <16 x i32>`, …). The on-ramp now
+  **scalarizes** those: `v128_lane_shift` extracts each lane + its own count (`ExtractLane`), shifts in
+  the lane's integer type (`IntBin`), and repacks (`build_v128_from_lanes`) — the shift analog of the
+  existing vector funnel-shift path. Wired into **both** the 128-bit `bin` path (`<4 x i32>`/`<2 x i64>`)
+  and the wide `wide_int_shift` path (per-`v128`-chunk, e.g. `<8 x i32>`). Restricted to full-width
+  lanes (`I32x4`/`I64x2`); a narrow (`i8`/`i16`) variable shift stays fail-closed (clang keeps those as
+  constant splats — the native `VShift` handles them). Test `vector_shift_per_lane_amount` (runtime
+  `volatile` seed + amounts so nothing constant-folds; all result lanes folded to one `%u`) is
+  byte-identical to native across 128-bit + wide shapes.
+- **Address-taken extern stubs.** BR stubbed undefined externals at *call sites*; a **function pointer**
+  to an undefined extern (a comparator/dispatch-table entry — what blocked Postgres on `@memcmp`, e.g.
+  `select …, ptr @string_compare, ptr @memcmp`) reaches the operand resolver as an opaque `ptr` with no
+  call to derive a signature from. Fixed: the parser now records each `declare` prototype in
+  `func_declarations` (it previously kept the type only in the internal `symbols` map), so
+  `StubTable::get_or_insert_extern` recovers the declared signature and mints the funcref stub; the
+  `@global` operand resolver returns its index (the address-of counterpart to the call-site path).
+  `None` for an undefined *data* global (no funcref — stays fail-closed). Test
+  `unresolved_extern_funcptr_stub`: strict fail-closes on the address-taken `mystery`; opt-in resolves
+  the funcref and runs clean when the pointer's live target is the real function (an unselected stub is
+  inert). **286 translate tests green, fmt + clippy clean.**
+- **Effect on the capstone:** the Postgres module now translates past the vector-shift wall **and** the
+  address-taken `@memcmp`; the next gap is the **`<4 x i1>` mask type** (`type <4 x i1> (Milestone 1+)`)
+  — the SIMD vector tail continues (mask legalization next), then `<4 x i64>` wide-type support.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

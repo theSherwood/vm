@@ -242,14 +242,19 @@ struct StubTable {
     base: u32,
     order: Vec<(String, svm_ir::FuncType)>,
     idx: HashMap<String, u32>,
+    /// Declared-external signatures (from `m.func_declarations`), for **address-taken** undefined
+    /// externals: a function *pointer* to an undefined extern (e.g. `@memcmp` in a comparator table)
+    /// has no call site to derive a signature from, so its stub uses the declared prototype's type.
+    extern_sigs: HashMap<String, svm_ir::FuncType>,
 }
 
 impl StubTable {
-    fn new(base: u32) -> Self {
+    fn new(base: u32, extern_sigs: HashMap<String, svm_ir::FuncType>) -> Self {
         Self {
             base,
             order: Vec::new(),
             idx: HashMap::new(),
+            extern_sigs,
         }
     }
     /// The stub index for `name`, minting a new one (keyed by name, using the *first* signature seen)
@@ -264,6 +269,35 @@ impl StubTable {
         self.idx.insert(name.to_string(), i);
         i
     }
+    /// The stub index for an **address-taken** undefined external — using its declared prototype's
+    /// signature. `None` if `name` is not a declared function (e.g. an undefined *data* global, which
+    /// has no funcref and stays fail-closed).
+    fn get_or_insert_extern(&mut self, name: &str) -> Option<u32> {
+        if let Some(&i) = self.idx.get(name) {
+            return Some(i);
+        }
+        let sig = self.extern_sigs.get(name)?.clone();
+        Some(self.get_or_insert(name, sig))
+    }
+}
+
+/// The SVM signature of a **declared** external (`m.func_declarations`): the threaded data-SP (§3d)
+/// plus the prototype's fixed params, and its results. `None` if a param/result type isn't a scalar
+/// value type (an aggregate-by-value prototype — rare for a plain extern; stays fail-closed).
+fn decl_extern_sig(
+    params: &[crate::ll::ast::Parameter],
+    return_type: &Type,
+    types: &Types,
+) -> Option<svm_ir::FuncType> {
+    let mut sp_params = vec![ValType::I64]; // the prepended data-SP
+    for p in params {
+        sp_params.push(val_type(p.ty.as_ref()).ok()?);
+    }
+    let results = result_types(return_type, types).ok()?;
+    Some(svm_ir::FuncType {
+        params: sp_params,
+        results,
+    })
 }
 
 /// The SVM signature of a trap stub for a direct call to an undefined external: the threaded data-SP
@@ -681,9 +715,19 @@ fn translate_impl(
     // start here. `stubs` is threaded (as `Option<&RefCell<StubTable>>`) into every function's
     // translation; call sites that fall through to an unresolved external mint a stub on demand.
     let stub_base = next_helper;
-    let stubs: Option<RefCell<StubTable>> = opts
-        .stub_unresolved_externs
-        .then(|| RefCell::new(StubTable::new(stub_base)));
+    let stubs: Option<RefCell<StubTable>> = opts.stub_unresolved_externs.then(|| {
+        // Declared-external signatures, for address-taken undefined externs (function pointers).
+        let mut extern_sigs = HashMap::new();
+        for d in &m.func_declarations {
+            if !defined_names.contains_key(&d.name) {
+                if let Some(sig) = decl_extern_sig(&d.parameters, d.return_type.as_ref(), &m.types)
+                {
+                    extern_sigs.insert(d.name.clone(), sig);
+                }
+            }
+        }
+        RefCell::new(StubTable::new(stub_base, extern_sigs))
+    });
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
@@ -15487,9 +15531,17 @@ impl<'a> BlockCtx<'a> {
                 // widened to the `i64` pointer representation (a function pointer is `ptr`/`i64`).
                 Constant::GlobalReference { name, .. } => {
                     let n = name_str(name);
+                    // An address-taken **undefined external function** (a funcref into a comparator /
+                    // dispatch table) resolves to a trap stub's index under `stub_unresolved_externs`
+                    // — the address-of counterpart to the call-site stubbing. `get_or_insert_extern`
+                    // is `None` for a non-function extern (undefined *data* global), which stays
+                    // fail-closed below.
+                    let stub_idx = self
+                        .stubs
+                        .and_then(|cell| cell.borrow_mut().get_or_insert_extern(&n));
                     if let Some(&a) = self.globals.get(&n) {
                         Ok(self.push(Inst::ConstI64(a as i64)))
-                    } else if let Some(&func) = self.name2idx.get(&n) {
+                    } else if let Some(func) = self.name2idx.get(&n).copied().or(stub_idx) {
                         let r = self.push(Inst::RefFunc { func });
                         Ok(self.push(Inst::Convert {
                             op: ConvOp::ExtendI32U,
@@ -17564,10 +17616,27 @@ fn wide_int_shift(
     let Some(layout) = wide_vec_layout(a.get_type(types).as_ref()) else {
         return Ok(false);
     };
+    // A **per-lane** (non-uniform) amount — real SSE/AVX SIMD over a >128-bit vector (e.g. Postgres'
+    // `lshr <4 x i64>` / `ashr <16 x i32>`): scalarize each `v128` chunk lane-wise (and each scalar tail
+    // lane) against the matching amount lane. `tail_op` is the `BinOp` form of the shift.
     let Some(amt) = const_splat_int(b) else {
-        return unsup(format!(
-            "wide vector shift {op:?} with non-constant-splat amount"
-        ));
+        let pa = ctx.wide_operand(a, layout)?;
+        let pb = ctx.wide_operand(b, layout)?;
+        let tail_ty = int_ty(layout.shape.lane_val())?;
+        let mut out = Vec::with_capacity(layout.nparts());
+        for i in 0..layout.full_chunks {
+            out.push(v128_lane_shift(ctx, layout.shape, tail_op, pa[i], pb[i])?);
+        }
+        for i in layout.full_chunks..layout.nparts() {
+            out.push(ctx.push(Inst::IntBin {
+                ty: tail_ty,
+                op: tail_op,
+                a: pa[i],
+                b: pb[i],
+            }));
+        }
+        ctx.bind_wide(dest, out);
+        return Ok(true);
     };
     let pa = ctx.wide_operand(a, layout)?;
     let tail_ty = int_ty(layout.shape.lane_val())?;
@@ -18387,25 +18456,25 @@ fn bin<'d>(
                 a: av,
                 b: bv,
             },
-            // Lane-wise shift by a uniform amount → `VShift` (§17). clang emits the amount as a
-            // constant splat; a non-uniform (per-lane) amount stays fail-closed (rare in auto-vec code).
+            // Lane-wise shift: a **uniform** amount (clang's usual constant splat) maps to the native
+            // `VShift` (one scalar count for all lanes); a **per-lane** (non-uniform) amount — which
+            // real SSE/AVX SIMD emits (e.g. Postgres' `simd.h`) — is scalarized per lane and repacked.
             BinOp::Shl | BinOp::ShrU | BinOp::ShrS => {
-                let Some(amt) = const_splat_int(b) else {
-                    return unsup(format!(
-                        "vector shift {op:?} with non-constant-splat amount"
-                    ));
-                };
-                let vop = match op {
-                    BinOp::Shl => svm_ir::VShiftOp::Shl,
-                    BinOp::ShrU => svm_ir::VShiftOp::ShrU,
-                    _ => svm_ir::VShiftOp::ShrS,
-                };
-                let amtv = ctx.push(Inst::ConstI32(amt as i32));
-                Inst::VShift {
-                    shape,
-                    op: vop,
-                    a: av,
-                    amt: amtv,
+                if let Some(amt) = const_splat_int(b) {
+                    let vop = match op {
+                        BinOp::Shl => svm_ir::VShiftOp::Shl,
+                        BinOp::ShrU => svm_ir::VShiftOp::ShrU,
+                        _ => svm_ir::VShiftOp::ShrS,
+                    };
+                    let amtv = ctx.push(Inst::ConstI32(amt as i32));
+                    Inst::VShift {
+                        shape,
+                        op: vop,
+                        a: av,
+                        amt: amtv,
+                    }
+                } else {
+                    return Ok((dest, v128_lane_shift(ctx, shape, op, av, bv)?));
                 }
             }
             other => {
@@ -19137,6 +19206,51 @@ fn build_v128_from_lanes(ctx: &mut BlockCtx, shape: svm_ir::VShape, lanes: &[Val
         });
     }
     v
+}
+
+/// Per-lane (**non-uniform**) vector shift of one `v128`: svm-ir's `VShift` takes a single scalar count
+/// for *every* lane, so a per-lane amount vector is scalarized — extract each lane of `data` and its own
+/// count from `amt`, shift in the lane's integer type, repack. `op` is `Shl`/`ShrU`/`ShrS` (the SVM
+/// shift matches C/LLVM: the count is masked mod the lane width, and `ShrS` is arithmetic). Restricted
+/// to **full-width** integer lanes (`I32x4`/`I64x2`) where the lane *is* its container, so `ExtractLane`
+/// needs no §3b sign-extend/mask; a narrow (`i8`/`i16`) lane stays fail-closed (no such variable shift
+/// arises — clang keeps narrow vector shifts as constant splats, handled by the native `VShift`).
+fn v128_lane_shift(
+    ctx: &mut BlockCtx,
+    shape: svm_ir::VShape,
+    op: BinOp,
+    data: ValIdx,
+    amt: ValIdx,
+) -> Result<ValIdx, Error> {
+    if !matches!(shape, svm_ir::VShape::I32x4 | svm_ir::VShape::I64x2) {
+        return unsup(format!(
+            "per-lane vector shift on {shape:?} (only i32x4/i64x2 full-width lanes)"
+        ));
+    }
+    let lane_ty = int_ty(shape.lane_val())?;
+    let mut out = Vec::with_capacity(shape.lanes() as usize);
+    for i in 0..shape.lanes() {
+        // Full-width lanes (`i32`/`i64`) fill the container exactly, so `signed` is immaterial here.
+        let d = ctx.push(Inst::ExtractLane {
+            shape,
+            lane: i,
+            a: data,
+            signed: false,
+        });
+        let s = ctx.push(Inst::ExtractLane {
+            shape,
+            lane: i,
+            a: amt,
+            signed: false,
+        });
+        out.push(ctx.push(Inst::IntBin {
+            ty: lane_ty,
+            op,
+            a: d,
+            b: s,
+        }));
+    }
+    Ok(build_v128_from_lanes(ctx, shape, &out))
 }
 
 /// Repack `N` lane scalars into the destination vector `to_type`, binding `dest` in whichever
