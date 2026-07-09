@@ -833,14 +833,23 @@ impl HostFsState {
                 };
                 // Give the backing its **own** fd (dup) over the same OS file, so it outlives the
                 // guest's fd and both share one page cache — the map and the fs cap's pread/pwrite/
-                // fsync stay coherent.
-                let dup = match o.file.try_clone() {
-                    Ok(f) => f,
-                    Err(e) => return -io_errno(&e),
-                };
-                match crate::new_file_region(dup, len as usize) {
-                    Ok(backing) => minter.grant_region(backing) as i64,
-                    Err(e) => -io_errno(&e),
+                // fsync stay coherent. Unix only for now (the `FileBacking` is `#[cfg(unix)]`);
+                // elsewhere the op is unavailable and the guest shim falls back to copy-in.
+                #[cfg(unix)]
+                {
+                    let dup = match o.file.try_clone() {
+                        Ok(f) => f,
+                        Err(e) => return -io_errno(&e),
+                    };
+                    match crate::new_file_region(dup, len as usize) {
+                        Ok(backing) => minter.grant_region(backing) as i64,
+                        Err(e) => -io_errno(&e),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (minter, o, len); // region-mapping is unix-only for now
+                    -EINVAL
                 }
             }
             _ => -EINVAL,
