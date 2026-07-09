@@ -80,7 +80,11 @@ is spent *around* compute, where wasm is weak:
   path (as the old wrap-confinement mask did), so per-access cost ≈ the old mask
   model; the raw check-only lowering measured faster on memory-bound kernels
   (edn −9%, picojpeg −8%, JIT-only spike) but that win is deliberately spent on
-  keeping speculative confinement — see the §4 Spectre-v1 note. Against wasm64 we
+  keeping speculative confinement — see the §4 Spectre-v1 note. The residual
+  per-loop cost on unbounded-base loops (`matmult +5%`, `cache +6.7%`) is the
+  target of the staged **guard-relying base-hoist** (§4, D61 — proposed): hoist
+  one check+clamp of the invariant base to the preheader and elide the per-access
+  ones, gated on a `trusted_reach ≤ guard_size` invariant. Against wasm64 we
   still win: Wasmtime's bounds-checked heaps pay a `cmp→cmov` Spectre guard on the
   same path, one op more than our AND. Closing the wasm32 gap entirely would need
   wasm32-style **32-bit window addressing**; we keep the clean 64-bit model (D50).
@@ -985,6 +989,70 @@ follow, and they differ in what they trust:
 - *Guard-relying:* only the base is proven in-window; an `offset+width` overrun off
   the top is caught by the guard fault. Sound **only where the guard region exists**
   (see Platform support). This is the wasm32-style win, and it is gated on the guard.
+
+#### Guard-relying base-hoist elision  [PROPOSED — not built; gated on the `trusted_reach ≤ guard_size` invariant below]
+
+*Motivation.* Trap-confinement's one measured regression is load-dense loops over an
+**unbounded base** — a pointer or the C-frontend data-SP the JIT can't prove in-window,
+so every access in the loop pays the per-access check+clamp (the `matmult +5%`, `cache
++6.7%` tail; §1a). The elision analysis today is purely *conservative* (proves the whole
+access `< size` from data alone), so it can never touch these: `base` has upper bound
+`⊤`, so `base + (i&K)·W` is `⊤`.
+
+*The transform.* For a loop whose accesses are `base + off_i` with `base` loop-invariant
+and `off_i` **provably** `≤ B` (the existing `ub_of` analysis already yields `B` for the
+`(i&K)·W` shape), lower **one** check+clamp of `base` in the loop preheader —
+`if base > reserved − B − maxwidth { trap }`, then `base ← base & (reserved−1)` — and
+**elide** the per-access check+clamp for every access proven within reach `B`.
+
+*Architectural soundness (the easy half).* A passing preheader check gives
+`base ≤ reserved − B − maxwidth`; the clamp is then a no-op. Every loop access satisfies
+`base + off_i + width ≤ base + B + maxwidth ≤ reserved`, so it lands in `[0, reserved)` —
+backed prefix or the `[mapped, reserved)` guard — exactly like a checked access. No new
+architectural trust; the interpreter is unchanged (it re-checks every access; the hoist is
+a JIT-only codegen optimization the escape oracle already covers by final-memory + trap
+equality).
+
+*Spectre-overshoot (the hard half — the reason this is gated).* On the **speculative**
+path the preheader branch is bypassed, so `base` is un-checked. The clamp bounds it to
+`base & (reserved−1) ∈ [0, reserved)`, but the elided accesses then reach
+`base_clamped + off_i ∈ [0, reserved + B)`. `off_i ≤ B` holds even speculatively (it is a
+data dependency — `(i&K)·W`), but the sum can **overshoot `reserved` by up to `B`**. For
+the misspeculated access to stay confined (never read a neighbouring window or host
+memory), the inaccessible guard behind the window must cover `[reserved, reserved + B)`.
+This yields the binding contract:
+
+> **Invariant (proposed): `trusted_reach ≤ guard_size`.** The JIT may elide a guard-relying
+> access only if its proven reach `B + width ≤ guard_size`, where `guard_size` is the
+> inaccessible span the allocator commits **beyond `reserved`**. A wrong bound here is a
+> *speculative* confinement escape — so the two numbers are one coupled unit, owned by the
+> confinement pass (§18 security hinge), fuzzed together, never set independently.
+
+*The concrete blocker.* `crates/svm-jit/src/mem.rs` today reserves `round_up(reserved) +
+**one** guard page` (4 KiB). That single page is exactly right for the *checked* path (the
+clamp forces `< reserved`; `offset+width` can only nick the first guard page) but caps
+`trusted_reach` at `4 KiB − width`. So the transform is safe **today only** for sub-page
+reaches.
+
+*Two scopes (the decision to lock before any escape-TCB code):*
+- **Scope A — 4 KiB cap, zero allocator change.** Trust reaches `≤ 4 KiB − width` against
+  the existing one-page guard. Captures the C stack-locals pattern (`sp + (i&255)·8` =
+  2040 B, the §1a-named case; `locals_c`). Misses the arrays (`dot` 16 KiB; `matmult`
+  ~3.2 KiB borderline). No change to the allocation or the escape-TCB memory model.
+- **Scope B — enlarged guard, captures arrays.** Grow the trailing guard in `mem.rs` to a
+  configurable `guard_size` (pages→MiB) and cap `trusted_reach` to match under the
+  invariant above. Captures `dot`/`matmult`/`cache`. Changes the escape-TCB allocation and
+  adds the cross-cutting invariant — the higher-risk half.
+
+*Verification plan (both scopes).* (1) The existing interp↔JIT **escape oracle** already
+catches an architectural mis-elision (final-memory + trap divergence). (2) A **new
+speculative-overshoot fuzz probe** is required for Scope B: assert the allocator's
+`guard_size` ≥ every reach the elision analysis will trust, as a property test over random
+`(reserved, mapped, B, width)` — the `trusted_reach ≤ guard_size` invariant made
+executable, sitting beside the `svm_mask` unit. (3) Bench: `dot`/`matmul`/`cache` recover
+toward mask-mode numbers; `mem_oob`-style probes prove the guard actually faults the elided
+overruns. **No escape-TCB code lands until this invariant is signed off** (the escape hinge,
+no expert reviewer — §18).
 
 *Reconciling "virtual memory" with "fast":* don't emulate an MMU — borrow the
 host's. The guest gets genuine paging semantics with zero software translation,
@@ -2847,3 +2915,4 @@ as open-ended, not a byproduct of the build.
 | D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (§23 "verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `svm-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `svm-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full design + verification story + demo evidence in **§23** |
 | D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (cap.call trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |
 | D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`svm-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`svm-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |
+| D61 | **Guard-relying base-hoist elision to claw back trap-confinement's load-dense-loop cost (§4).** Hoist one check+clamp of a loop-invariant unbounded base into the preheader, then elide the per-access check+clamp for accesses of proven reach `B`. Architecturally sound with the existing guard; the risk is the **speculative overshoot** `base_clamped + off_i ∈ [0, reserved + B)`, which binds the JIT elision analysis to the allocator by the invariant **`trusted_reach ≤ guard_size`** (a wrong bound = *speculative* escape). Blocker found: `mem.rs` reserves only **one** trailing guard page, capping safe reach at 4 KiB (Scope A, zero allocator change — captures the C stack-locals case) unless the guard is enlarged (Scope B — captures `dot`/`matmult`/`cache`, changes escape-TCB allocation). | **Proposed — design only; no escape-TCB code until the invariant is signed off** | The one measured trap-confinement regression is load-dense loops over an unbounded base (§1a `matmult +5%`, `cache +6.7%`); this is the staged wasm32-style guard-relying win (§4), deferred not on value but because its speculative-overshoot correctness turns on a coupled security-hinge invariant with no expert reviewer (§18). Verification: escape oracle (architectural) + a new `trusted_reach ≤ guard_size` fuzz probe (speculative) |
