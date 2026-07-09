@@ -301,14 +301,32 @@ block0(v0: i64):
       'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
       'below is the guest’s real stdout.',
   },
-  'Lua (5.4.7 stdlib)': {
+  'Lua (5.4.7 — write & run)': {
     kind: 'module',
-    url: './assets/lua_stdlib.svmb',
+    editable: true,
+    url: './assets/lua_eval.svmb',
     mode: 'io',
-    desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM with setjmp/longjmp error handling) ' +
-      'plus the base/string/table/math libraries, compiled through the LLVM on-ramp — running a ' +
-      'script that print()s string/table/math results. The output below is real Lua stdout, ' +
-      'byte-identical to native. Build via build-onramp-assets.mjs.',
+    desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math ' +
+      'libraries, compiled through the LLVM on-ramp. Edit the Lua on the left and click Run: your ' +
+      'code is piped to the guest as stdin, evaluated, and its print() output appears below. Real ' +
+      'Lua, running client-side in the sandbox.',
+    src: `-- Write Lua here, then click Run.
+print("Hello from " .. _VERSION)
+
+-- recursion
+local function fib(n) return n < 2 and n or fib(n - 1) + fib(n - 2) end
+local out = {}
+for i = 1, 10 do out[i] = fib(i) end
+print("fib(1..10):", table.concat(out, " "))
+
+-- tables + sort
+local t = { 5, 3, 8, 1, 9, 2, 7 }
+table.sort(t)
+print("sorted:", table.concat(t, ", "))
+
+-- string.format + math
+print(string.format("pi ~ %.4f, 255 in hex = 0x%X", math.pi, 255))
+`,
   },
   'SQLite (Phase A, :memory:)': {
     kind: 'module',
@@ -334,13 +352,14 @@ function loadExample(name) {
   const ex = EXAMPLES[name];
   $('mode').value = ex.mode;
   $('desc').textContent = ex.desc;
-  if (ex.kind === 'module') {
-    // A pre-built on-ramp module: the "source" is binary, not editable SVM text. Show a note.
+  if (ex.kind === 'module' && !ex.editable) {
+    // A pre-built on-ramp module with a fixed program: the "source" is binary, not editable. Show a note.
     $('src').value =
       `// ${name}\n// A pre-built on-ramp module: ${ex.url}\n// Click Run — it executes as a real ` +
       `C/C++ guest via svm_run_onramp,\n// and its stdout appears in the pane on the right.`;
     $('src').readOnly = true;
   } else {
+    // Text examples, and **editable** modules (whose source is fed to the guest as stdin), stay editable.
     $('src').value = ex.src;
     $('src').readOnly = false;
   }
@@ -376,17 +395,30 @@ async function runModule(ex) {
     return;
   }
   log(`fetched ${ex.url}: ${bytes.length}B module`);
-  const u8 = () => new Uint8Array(eng.memory.buffer);
   const p = eng.ex.svm_alloc(bytes.length);
-  u8().set(bytes, p); // re-fetch the view: svm_alloc may have grown (detached) the old buffer
+  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua). Alloc
+  // both buffers *before* filling: svm_alloc may grow (detach) the linear memory, so take one fresh
+  // view after all allocations and write into it.
+  let stdinP = 0, stdinLen = 0, stdinBytes = null;
+  if (ex.editable) {
+    stdinBytes = new TextEncoder().encode($('src').value);
+    if (stdinBytes.length > 0) {
+      stdinP = eng.ex.svm_alloc(stdinBytes.length);
+      stdinLen = stdinBytes.length;
+    }
+  }
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(bytes, p);
+  if (stdinP) view.set(stdinBytes, stdinP);
   setState('running', 'running…');
   const t0 = performance.now();
-  const rv = eng.ex.svm_run_onramp(p, bytes.length, 0, 0);
+  const rv = eng.ex.svm_run_onramp(p, bytes.length, stdinP, stdinLen);
   const status = eng.ex.svm_status();
   const sp = eng.ex.svm_stdout_ptr();
   const sl = eng.ex.svm_stdout_len();
-  const stdout = new TextDecoder().decode(u8().slice(sp, sp + sl));
+  const stdout = new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
   eng.ex.svm_dealloc(p, bytes.length);
+  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
   const ms = (performance.now() - t0).toFixed(0);
   $('stdout').textContent = stdout;
   $('result').textContent = `${rv}`;

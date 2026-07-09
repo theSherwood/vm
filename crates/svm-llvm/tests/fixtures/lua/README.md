@@ -152,6 +152,37 @@ gen}` floats stay undefined and are recognized by the on-ramp. Pin `EXPECT` in `
 against a native build of the identical sources (guest `snprintf`/shim/strtod shadowing libc, `-lm`).
 ```
 
+# Lua eval-from-stdin fixture (the interactive playground guest)
+
+`lua_eval.bc` is the same build as `lua_fmt` (Lua 5.4.7 core + base/`string`/`table`/`math` +
+`lua_stdlib_shim` + the guest `snprintf` + guest libm + guest `strtod`), but the harness
+(`lua_eval_harness.c`) **reads a Lua chunk from `stdin`** (`extern long read(int, void *, long)` — the
+`Stream.read` capability, like `sqlite_logictest.c`), `luaL_loadbuffer`s + `lua_pcall`s it, and prints
+any error to stdout. This is the guest the **browser playground** (`browser/web/play.js`) pipes the
+editor's text into as stdin, so a user can write and run their own Lua client-side. Test
+`tests/lua_eval.rs` seeds a small script via `RunConfig::stdin` and asserts the exact stdout on all
+three engines (identical to native). The `.svmb` for the page is built by `browser/build-onramp-assets.mjs`
+at `--host-page 65536`.
+
+## Regenerating (eval)
+
+Identical to the `string.format` recipe, but the harness is `lua_eval_harness.c` (no embedded script):
+
+```sh
+NV="-fno-vectorize -fno-slp-vectorize"
+CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
+      lstate lstring ltable ltm lundump lvm lzio"
+LIBS="lbaselib lstrlib ltablib lmathlib lauxlib"
+for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
+clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_eval_harness.c   -o harness.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_stdlib_shim.c    -o guest_shim.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c                 lua_fmt_snprintf.c   -o guest_snprintf.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c               -o guest_libm.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/strtod/strtod.c           -o guest_strtod.bc
+llvm-link $CORE.bc $LIBS.bc harness.bc guest_shim.bc guest_snprintf.bc guest_libm.bc \
+          guest_strtod.bc -o lua_eval.bc   # (expand globs; do NOT glob *.bc — it re-links outputs)
+```
+
 # Lua test-suite fixture
 
 `lua_testsuite.bc` runs **three unmodified files from the official Lua 5.4.7 distribution's own test
