@@ -1172,6 +1172,17 @@ policy and the demand-paging/userfaultfd plumbing are deferred.
   divide-by-zero, an explicit `trap` / `assert` op (for language-level checks
   and sanitizers), and resource metering (fuel / instruction counting + timer
   preemption).
+- **Trap lowering (JIT).** The confinement bounds check (§4) lowers to a native
+  Cranelift conditional trap (`trapnz`), not an explicit branch to a return-based
+  trap block: one inline instruction, and Cranelift out-of-lines the `ud2`/`udf` to
+  a shared sink. This avoids the per-access CFG fragmentation + register spilling a
+  cold trap block per access caused in check-dense unrolled loops (matmul: VCODE
+  1333→613 lines, spills 708→310 `movq`, ≈10% faster). The `ud2`/`udf` raises SIGILL
+  (unix) / `STATUS_ILLEGAL_INSTRUCTION` (windows); the guard handler (`trap_shim.c` /
+  the windows VEH) recognises an illegal instruction inside an armed guarded call as
+  a memory fault and unwinds to `run_guarded` exactly like a guard-page fault —
+  reporting `MemoryFault` through the same path, so the observable trap is unchanged.
+  (Arithmetic/alignment/`assert` traps stay on the explicit return-based path.)
 - Optional **hardened/instrumented tier** (shadow memory, software bounds via
   pointer provenance) that can be swapped for the fast tier once a module is
   trusted.

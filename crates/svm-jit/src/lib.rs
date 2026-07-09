@@ -6587,13 +6587,19 @@ fn mask_addr(
             // `offset + width` alone exceeds the reservation ⇒ no `addr` is in-bounds; always trap.
             None => b.ins().iconst(I8, 1),
         };
-        let cont = b.create_block();
-        let trap_blk = b.create_block();
-        b.set_cold_block(trap_blk); // branch hint: OOB is the unlikely path
-        b.ins().brif(oob, trap_blk, &[], cont, &[]);
-        b.switch_to_block(trap_blk);
-        emit_trap(b, lower, TrapKind::MemoryFault);
-        b.switch_to_block(cont);
+        // Confine via a **native Cranelift conditional trap** (`trapnz`) rather than an explicit
+        // `brif` to a cold return-based trap block: one inline instruction, no per-access block
+        // split, and Cranelift out-of-lines the trap (`ud2`/`udf`) to a shared sink. This avoids the
+        // CFG fragmentation + spilling that a per-access cont/trap block pair caused in check-dense
+        // unrolled loops (matmul VCODE 1333→613 lines, register spills 708→310; see the trap-lowering
+        // note in DESIGN.md §4/§5). The `ud2`/`udf` raises SIGILL (unix) / STATUS_ILLEGAL_INSTRUCTION
+        // (windows); the guard handler (`trap_shim.c` / the windows VEH in `mem.rs`) recognises an
+        // illegal instruction inside an armed guarded call as this memory-fault trap and unwinds to
+        // `run_guarded` exactly like a guard-page fault — reporting [`TrapKind::MemoryFault`] through
+        // the same `faulted ⇒ FAULT_TRAP` path. Semantically identical to the old brif+return trap
+        // (a clear `MemoryFault` at the offending access); only the lowering differs.
+        b.ins()
+            .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
         // Spectre-v1 clamp (§4, D38): AND the address feeding the access with `reserved−1`.
         // Architecturally a no-op — every access that reaches here passed the bounds check,
         // so `addr+offset < reserved` and the AND changes nothing. On the *speculative* path

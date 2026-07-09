@@ -619,6 +619,9 @@ mod pal {
     const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
     const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
     const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
+    // The Cranelift `trapnz` confinement trap surfaces as an illegal-instruction exception (the
+    // windows analogue of unix SIGILL); see `veh` and DESIGN.md §4/§5.
+    const STATUS_ILLEGAL_INSTRUCTION: i32 = 0xC000_001Du32 as i32;
 
     pub(super) fn page_size() -> usize {
         // SAFETY: GetSystemInfo only writes the out-param; always safe.
@@ -919,6 +922,18 @@ mod pal {
                     core::ptr::copy_nonoverlapping(f.ctx, ep.ContextRecord, 1);
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
+            }
+        } else if rec.ExceptionCode == STATUS_ILLEGAL_INSTRUCTION {
+            // The Cranelift `trapnz` confinement bounds-check trap (memory-fault lowering, §4/§5) —
+            // the windows analogue of unix SIGILL. There is no faulting data address (the fault is
+            // the instruction itself), so unlike an access violation the [lo,hi) test does not apply:
+            // an illegal instruction inside an armed guarded guest call is our emitted memory-fault
+            // trap. Recover exactly like a guarded access violation (unwind to `run_guarded`).
+            if let Some(f) = GUARD.with(|g| g.get()) {
+                TRIPPED.with(|t| t.set(true));
+                capture_trap_frame(&*ep.ContextRecord);
+                core::ptr::copy_nonoverlapping(f.ctx, ep.ContextRecord, 1);
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
         EXCEPTION_CONTINUE_SEARCH
