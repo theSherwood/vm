@@ -1,7 +1,3 @@
-# NOTE: move this file to .github/workflows/pages.yml to activate it.
-# It is parked here because the automation token lacks GitHub 'workflow' scope and cannot write
-# under .github/workflows/. From a clone with workflow scope:  git mv .github/pages-workflow.yml .github/workflows/pages.yml
-#
 # Deploy the SVM playground to GitHub Pages.
 #
 # The playground (`browser/web/play.html`) runs SVM guests **client-side**: the bytecode interpreter
