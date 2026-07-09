@@ -4,7 +4,11 @@
 // nested Workers) and never blocks (a browser bans main-thread `Atomics.wait`); the Workers do all
 // the blocking (`worker.js`).
 
-const WASM = '/target/wasm32-unknown-unknown/release/svm_browser.wasm';
+// Resolved relative to this module's URL (not the document root) so the page works both at the
+// origin root (local `serve.mjs`) and under a subpath (GitHub Pages serves a project site at
+// `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
+// resolves correctly under either base.
+const WASM = new URL('../target/wasm32-unknown-unknown/release/svm_browser.wasm', import.meta.url);
 const STACK = 1 << 20, SLOT = 16;
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
@@ -77,7 +81,7 @@ export function makeRunner({ module, memory, ex }) {
         }
         const startVcpu = (cfg) => {
           started++;
-          const w = new Worker('/web/worker.js', { type: 'module' });
+          const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
           workers.add(w);
           w.onmessage = (e) => {
             const m = e.data;

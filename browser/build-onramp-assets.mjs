@@ -51,10 +51,24 @@ try {
   console.log(`  ✗ hello_c: ${e.message}`);
 }
 
-// 2) SQLite Phase A — the `:memory:` breadth script printing query results to stdout. Needs the
-//    amalgamation (the svm-llvm test harness fetches it to /tmp/svm_sqlite_cache).
-const AMALG = '/tmp/svm_sqlite_cache/sqlite-amalgamation-3500200';
-if (existsSync(join(AMALG, 'sqlite3.c'))) {
+// 2) SQLite Phase A — the `:memory:` breadth script printing query results to stdout. Fetch-and-cache
+//    the 3.50.2 amalgamation (same version + cache dir the svm-llvm test harness uses); skip offline.
+const CACHE = '/tmp/svm_sqlite_cache';
+const AMALG = join(CACHE, 'sqlite-amalgamation-3500200');
+function ensureAmalgamation() {
+  if (existsSync(join(AMALG, 'sqlite3.c'))) return true;
+  mkdirSync(CACHE, { recursive: true });
+  const zip = join(CACHE, 'amalgamation.zip');
+  try {
+    execFileSync('curl', ['-sfL', '--max-time', '120', '-o', zip,
+      'https://sqlite.org/2025/sqlite-amalgamation-3500200.zip'], { stdio: 'inherit' });
+    execFileSync('unzip', ['-o', '-q', zip, '-d', CACHE], { stdio: 'inherit' });
+    return existsSync(join(AMALG, 'sqlite3.c'));
+  } catch {
+    return false;
+  }
+}
+if (ensureAmalgamation()) {
   try {
     buildC('sqlite_demo', join(REPO, 'crates', 'svm-run', 'demos', 'sqlite', 'sqlite_demo.c'),
       [AMALG], ['-DSVM_GUEST']);
@@ -62,7 +76,7 @@ if (existsSync(join(AMALG, 'sqlite3.c'))) {
     console.log(`  ✗ sqlite_demo: ${e.message}`);
   }
 } else {
-  console.log('  – sqlite_demo skipped (amalgamation not cached; run the svm-llvm sqlite test once)');
+  console.log('  – sqlite_demo skipped (amalgamation fetch failed — offline?)');
 }
 
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');

@@ -5,7 +5,7 @@
 // a §14 root `Instantiator` (sandboxed children on their own Workers). The page services no
 // authority either way — all of it is Rust-side, in shared linear memory.
 
-import { loadEngine, makeRunner, readParStdout } from '/web/par.js';
+import { loadEngine, makeRunner, readParStdout } from './par.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -295,7 +295,7 @@ block0(v0: i64):
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
   'hello (C → SVM)': {
     kind: 'module',
-    url: '/web/assets/hello_c.svmb',
+    url: './assets/hello_c.svmb',
     mode: 'io',
     desc: 'crates/svm-run/demos/hello.c — a C program compiled with stock clang, translated by the ' +
       'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
@@ -303,7 +303,7 @@ block0(v0: i64):
   },
   'SQLite (Phase A, :memory:)': {
     kind: 'module',
-    url: '/web/assets/sqlite_demo.svmb',
+    url: './assets/sqlite_demo.svmb',
     mode: 'io',
     desc: 'The SQLite 3.50.2 amalgamation (~257k lines of C) running a 29-statement breadth script ' +
       'over an in-memory database — DDL, aggregates, GROUP BY, window functions, transactions — its ' +
@@ -341,7 +341,10 @@ function loadExample(name) {
 const moduleCache = new Map();
 async function fetchModule(url) {
   if (moduleCache.has(url)) return moduleCache.get(url);
-  const r = await fetch(url);
+  // Resolve module URLs relative to this script (not the document), so they work under any base path
+  // (origin root locally, `/<repo>/` on GitHub Pages).
+  const resolved = new URL(url, import.meta.url);
+  const r = await fetch(resolved);
   if (!r.ok) throw new Error(`fetch ${url}: ${r.status}`);
   const bytes = new Uint8Array(await r.arrayBuffer());
   moduleCache.set(url, bytes);

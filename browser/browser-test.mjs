@@ -126,6 +126,12 @@ try {
   console.log(`  play/parse-reject: state=${bad.state} msg=${JSON.stringify(bad.status)} ` +
     `${badOk ? 'PASS' : 'FAIL'}`);
 
+  // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
+  // `svm_run_onramp` (not the text/`svm_parse` path). Uses the committed `web/assets/hello_c.svmb`.
+  // Runs last: selecting it makes the source textarea read-only (it's a binary module, not editable
+  // SVM text), which would trip the `page.fill` in the parse-reject check above.
+  check('hello (C → SVM, on-ramp module)', await runPlay('hello (C → SVM)'), '0', 'hello, sandbox!\n');
+
   const ok = pageOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: SVM runs in a real browser — powerbox + genuine multi-Worker ` +

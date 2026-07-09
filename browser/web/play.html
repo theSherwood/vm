@@ -2,6 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!-- Re-adds COOP/COEP on static hosts (GitHub Pages) so the page is cross-origin isolated and
+         SharedArrayBuffer is available. Must run before the module scripts. No-op locally (serve.mjs
+         already sets the headers). Sibling to this file, so its SW scope covers everything under web/;
+         the same-origin wasm under target/ loads without CORP (COEP exempts same-origin). -->
+    <script src="coi-serviceworker.js"></script>
     <title>SVM playground</title>
     <style>
       body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 72rem; }
@@ -57,6 +62,6 @@
         <pre id="log"></pre>
       </div>
     </div>
-    <script type="module" src="/web/play.js"></script>
+    <script type="module" src="play.js"></script>
   </body>
 </html>
