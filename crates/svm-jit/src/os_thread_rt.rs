@@ -473,22 +473,12 @@ extern "C" fn child_entry(
         // §2b path B: a spawned vCPU's top-level entry runs on its own OS thread stack (OS-guarded),
         // so its stack-limit is 0 ⇒ the prologue check is inert for it; fibers it resumes get a real
         // limit at their own entry.
-        #[cfg(feature = "stack-check")]
         let v = (env.call_tramp)(
             (*c).code,
             env.mem_base,
             env.fn_table_base,
             env.trap_out as u64,
             0, // stack_limit
-            (*c).sp,
-            (*c).arg,
-        );
-        #[cfg(not(feature = "stack-check"))]
-        let v = (env.call_tramp)(
-            (*c).code,
-            env.mem_base,
-            env.fn_table_base,
-            env.trap_out as u64,
             (*c).sp,
             (*c).arg,
         );
