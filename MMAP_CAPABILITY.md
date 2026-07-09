@@ -66,12 +66,15 @@ window-aliasing capabilities, and DESIGN.md §13/§14 is the frame:
 - **`HostFn` (iface 13)** — the embedder-registered escape hatch the fs cap (and the BL emulation)
   rides. Semantics live in the embedder's closure, *outside* the VM's escape-TCB match.
 
-The key architectural fact: a **first-class file mmap = `SharedRegion`-style real aliasing, but the
-backing `os_fd` is a host-opened file instead of a memfd.** On Linux that is one `mmap` of the file
-fd `MAP_SHARED|MAP_FIXED` over a window sub-range; writes land in the page cache; `msync`/`fsync`
-persist. Zero-copy and coherent *for free* from the OS — no copy-in, no flush-out, no coherence
-bookkeeping. The emulation exists only because the fs cap is a `HostFn` (no window-mapping authority);
-a dedicated cap in the `SharedRegion` family gets the real thing.
+The key architectural fact — and the whole bridge (§4b) — is that `map_region` (`svm-run`) already
+aliases **any `os_fd`** into the window via `mmap(MAP_SHARED | MAP_FIXED, fd, …)`; today that `os_fd`
+is a memfd, but **a real file's fd is an equally valid `os_fd` for `MAP_SHARED`.** So
+`mmap(win_off, len, MAP_SHARED|MAP_FIXED, file_fd, file_off)` *is* zero-copy, OS-coherent,
+file-into-window mapping — performed by code that is **already blessed** for the escape-TCB. A
+first-class file mmap is therefore not a new escape-TCB primitive; it is the existing `SharedRegion`
+aliasing with a file-backed `os_fd`. The emulation exists only because the fs cap is a `HostFn`
+(no window-mapping authority) — but the fs `HostFn` doesn't need that authority: it only needs to
+**mint the backing** and let the built-in `SharedRegion` do the mapping (§4b).
 
 ## 4. Design axes
 
@@ -84,24 +87,58 @@ a dedicated cap in the `SharedRegion` family gets the real thing.
 | large DB | copies whole geometry | maps lazily (demand paging) |
 | window cost | a heap buffer per map | a window sub-range reservation |
 | portability | pure Rust, all OSes | needs the `map_region` FFI path (Linux done; macOS/Win follow) |
-| escape-TCB | none (HostFn) | it's `MAP_FIXED` into the guest window — **same TCB as SharedRegion** |
+| escape-TCB | none (HostFn) | reuses `SharedRegion`'s already-audited `MAP_FIXED` — no new TCB code |
 
-Real aliasing is the right long-term answer and reuses `map_region`. The cost is it must live in a
-window-mapping capability (not `HostFn`), and it inherits `SharedRegion`'s per-OS story.
+Real aliasing is the right long-term answer and reuses `map_region` unchanged. It doesn't require a
+new window-mapping *capability*: the fs `HostFn` mints the backing and the built-in `SharedRegion`
+does the aliasing (§4b). The only inherited cost is `SharedRegion`'s per-OS story (Linux done;
+macOS/Windows follow).
 
-### 4b. Capability shape: fs op-protocol vs a dedicated iface
+### 4b. The bridge: fs mints a `SharedRegion` backing; the built-in machinery does the aliasing
 
-- **Stay on the fs `HostFn`** (BL): `mmap`/`msync`/`munmap` are ops 9–11 on the fs handle. Cheap,
-  already shipped, but can never do real window aliasing (a `HostFn` closure has no authority to
-  `MAP_FIXED` into the window — that's escape-TCB, reserved for the built-in iface match).
-- **A dedicated `FileMapping` iface (14)** in the `SharedRegion` family: `open`/`map`/`msync`/
-  `unmap`/`len`/`sync`. Real aliasing, clean attenuation (a mapping handle *is* the authority to a
-  file region), discoverable, composes with `AddressSpace.sub`. This is the DESIGN §13/§14-consistent
-  home. Cost: a new type_id in the escape-TCB match + the host backing + a guest shim rewrite.
+The tension is real and is the security boundary working: a `HostFn` closure runs **outside the
+escape-TCB** — it reads/writes the window through a masked `GuestMem`, but it has **no authority to
+change window page mappings**, because `MAP_FIXED`-ing host memory into the window *is* the escape
+surface, reserved for the built-in iface match. Zero-copy mmap needs exactly that `MAP_FIXED`. So the
+fs `HostFn` can never *itself* alias a file into the window. The resolution is not to promote fs into
+the TCB, but to **split the roles**:
 
-The emulation and the dedicated cap are **not** mutually exclusive: the fs-cap emulation stays valid
-as the portable/hermetic `mem_fs` path (and for hosts without the FFI); the dedicated cap is the
-zero-copy real-file path. The guest shim can pick by which capability the embedder granted.
+- **The fs `HostFn` stays thin and outside the TCB.** On an mmap-open it opens the real file (authority
+  the embedder already granted it) and asks the host to **mint a `SharedRegion` backing over that
+  file's fd**, returning the region handle to the guest. It never maps anything itself. Minting a
+  *host-granted* region is already supported (DESIGN §13 — only *guest*-minted regions, `create`/
+  `grant`, are the §14 follow-up), so this is a small, existing-shaped new power for the closure.
+- **The built-in `SharedRegion.map` (iface 4) does the window aliasing** — real `MAP_SHARED|MAP_FIXED`
+  of the file fd, zero-copy, hardware-coherent, over **unchanged, already-audited** escape-TCB code
+  (`map_region`). The only new thing it sees is a backing whose `os_fd` is a file, not a memfd.
+- **The guest shim** ties them: `open` via fs → receive a region handle → `SharedRegion.map(win_off,
+  0, len)` into a window sub-range it owns → read/write real file pages directly; `msync`/`fsync`
+  become flush ops. It falls back to the fs-cap **emulation** when only a `HostFn` fs cap was granted.
+
+Why this is the chosen shape over a dedicated `FileMapping` iface (14):
+
+- **Zero new escape-TCB code.** The one blessed operation — `MAP_FIXED` of an `os_fd` into the window
+  — already exists; we only broaden its backing to a file fd. A dedicated iface would re-implement
+  the same mapping under a new type_id.
+- **No duplication of file I/O.** LMDB `pread`s the header before mapping and (non-WRITEMAP) `pwrite`s;
+  a self-contained `FileMapping` would have to carry `pread`/`pwrite`/`ftruncate` too, duplicating fs.
+  The bridge keeps *file I/O in fs* and *only the aliasing in `SharedRegion`*, sharing one host `File`.
+- **fs stays a `HostFn`** — its semantics remain in the embedder's closure, outside the VM's match.
+- **Attenuation falls out**: the region handle *is* the authority to that one file region — the same
+  model as memfd sharing.
+
+**Security check.** A `MAP_SHARED` mapping of a granted file into the window has the **same escape
+surface as the existing memfd `SharedRegion`**: the guest can read/write exactly the file region the
+embedder handed over — the granted authority, nothing more. No new escape class; this wants a review
+note when it lands, not new machinery.
+
+**The one genuinely new question** (see §6, §4e, and §5 step 2): the region maps into a **window
+sub-range the guest must own** — via `AddressSpace.sub` or a powerbox-reserved region. That coupling
+to §14 is shared with `SharedRegion` today and is the only unsettled mechanism in the bridge.
+
+The emulation and the bridge are **not** mutually exclusive: the fs-cap emulation stays valid as the
+portable/hermetic `mem_fs` path (and for hosts without the `map_region` FFI); the bridge is the
+zero-copy real-file path. The guest shim picks by which capability the embedder granted.
 
 ### 4c. Durability contract (the part with no code today)
 
@@ -126,14 +163,14 @@ N host writes, or on an explicit "crash now" op, drop all un-`msync`'d state (an
 / tear the last write) and refuse further I/O. Then a `demo_lmdb_crash_recovery` test: fill → crash
 mid-txn → reopen → assert the DB is consistent to the last *committed* transaction (LMDB guarantees
 this by design — its meta pages are double-buffered and checksummed). This is the highest-narrative
-slice and is **mostly independent** of 4a/4b — it can run on the emulation.
+slice and is **independent of the bridge (§4b)** — it runs on the emulation.
 
 ### 4e. Multi-mapping coherence
 
 Real `MAP_SHARED` gives this for free (OS page cache). The emulation does not. LMDB's chosen config
 (single WRITEMAP mapping, NOLOCK) never needs it, so it only matters if we target a program that maps
 a file at two window offsets, or mixes map-reads with `pwrite`. Low priority unless a target demands
-it; real aliasing (4a) dissolves it anyway.
+it; the bridge's real aliasing (§4a/§4b) dissolves it anyway.
 
 ## 5. Recommendation & sequencing
 
@@ -147,17 +184,21 @@ Proposed order:
    normative contract; add a crash-injection hook to the fs cap (drop un-synced buffer state on a
    "crash" op); ship `demo_lmdb_crash_recovery` proving LMDB recovers to the last committed txn.
    Highest narrative value, self-contained, no FFI. *Recommended first.*
-2. **Dedicated `FileMapping` capability (iface 14) with real `MAP_SHARED` aliasing.** Reuse
-   `map_region`; the guest shim resolves `filemap` when granted, falls back to the fs-cap emulation
-   otherwise. Zero-copy, OS-coherent; carries the durability contract from (1). Linux first;
-   macOS/Windows follow `SharedRegion`'s existing per-OS path.
+2. **Zero-copy real aliasing via the bridge (§4b).** Teach the fs `HostFn` to mint a **file-backed
+   `SharedRegion`** on mmap-open (broaden the region backing from memfd-only to a real file fd —
+   `svm-run` `new_shared_region`/`RegionBacking`), and have the guest shim map it with the existing
+   built-in `SharedRegion.map`, falling back to the emulation otherwise. No new escape-TCB code —
+   `map_region` is reused unchanged; carries the durability contract from (1). Linux first;
+   macOS/Windows follow `SharedRegion`'s existing per-OS path. **This is where DESIGN §13 and the
+   `SHARED_REGION` iface doc-comment get updated** — file-backed regions become part of shipped
+   reality only when this lands.
 3. **Multi-mapping / mixed pwrite** — only if a target (e.g. LMDB without WRITEMAP, or a second
-   reader) is chosen that needs it. Real aliasing from (2) largely provides it.
+   reader) is chosen that needs it. The bridge's real aliasing from (2) largely provides it.
 
 Rationale for (1) before (2): the durability *contract* is what makes "a database in the sandbox"
 mean something; it's backend-independent, so writing it against the emulation is not throwaway — the
-dedicated cap must honor the same contract. And crash-recovery is the single most compelling demo of
-the capability model ("the guest can't corrupt the host's file even when it dies mid-write").
+bridge must honor the same contract. And crash-recovery is the single most compelling demo of the
+capability model ("the guest can't corrupt the host's file even when it dies mid-write").
 
 ## 6. Open questions (to resolve before slice 1)
 
@@ -165,7 +206,14 @@ the capability model ("the guest can't corrupt the host's file even when it dies
   (LMDB's meta pages are checksummed → exposing tears is a *stronger* test.)
 - **Where does the crash hook live** so it's test-only and never in a shipping grant? (A wrapper
   cap? A `mem_fs`/`host_fs` constructor variant? A feature flag?)
-- **Does the dedicated cap subsume the fs cap's file ops**, or stack on top (open via fs, map via
-  filemap, sharing the fd)? Fewer caps vs cleaner separation.
-- **Window budget**: real aliasing reserves a window sub-range per mapping — who owns that address
-  space (the guest via `AddressSpace.sub`, or the cap picks)? Ties into §14.
+- **Window budget** (the bridge's one unsettled mechanism, §4b): the file-backed region maps into a
+  window sub-range the guest must own — who reserves it (the guest via `AddressSpace.sub`, or the
+  powerbox carves a region at grant time)? Ties into §14; shared with `SharedRegion` today.
+- **How the fs `HostFn` hands the region handle to the guest**: return value from the mmap-open op,
+  or a powerbox stash? (Host-granted regions exist; the delivery path for a *closure*-minted one is new.)
+- **`RegionBacking` lifetime**: the file `File` is shared by fs I/O (`pread`/`pwrite`) and the region
+  alias — one owner, two references. Where does it live so both outlast the mapping and close once?
+
+Bridge questions **already resolved** (§4b): the capability shape (fs mints a `SharedRegion` backing,
+not a dedicated `FileMapping` iface — no fs duplication, no new escape-TCB code) and the escape-surface
+review (a file-backed `MAP_SHARED` region is the same surface as a memfd one).
