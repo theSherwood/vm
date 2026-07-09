@@ -15,7 +15,7 @@ probably wrong. When in doubt, do less.
 
 - **Tests from the first commit.** Every component lands with tests. The
   interpreter is the oracle: differential-test the JIT against it (D-notes in
-  `DESIGN.md` §18).
+  `DESIGN.md` §18). Tests should gate the CI.
 - **Fuzz from day one.** Two invariants get fuzzed continuously:
   1. *verified ⇒ cannot escape* (fuzz the verifier),
   2. *every memory access is masked to `[0, size)` or proven bounded* (fuzz the
@@ -24,6 +24,7 @@ probably wrong. When in doubt, do less.
   early and watch it over time; we are measured *relative to wasm/Wasmtime*
   (`DESIGN.md` §1a). Catch regressions when they're one commit old, not one
   release old.
+  **Update ISSUES.md with any flaky CI problems.** Catch and log flakiness early so that we have visibility and can track a fix.
 
 ## Performance philosophy: data-oriented design
 
