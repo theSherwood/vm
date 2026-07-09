@@ -431,10 +431,18 @@ fn main() {
             continue;
         }
 
-        // JIT per-iter timing (the comparability headline).
-        let jit_ns = per_iter(large, |n| {
-            black_box(svm_jit::compile_and_run(&t.module, e, &[sp, n]).unwrap());
-        });
+        // JIT per-iter timing (the comparability headline). Compile **once** and time many `run`s
+        // (matching `cross_engine.rs` and the `bench/confine` harness, and the Wasmtime lane which
+        // compiles once via `embench_one`): the one-shot `compile_and_run` recompiles every call
+        // (~5–6 ms of Cranelift codegen), and its jitter does not cancel cleanly through the
+        // large/small subtraction — a per-iter measurement bias that inflates the JIT row (esp. on
+        // light-per-iter kernels where compile ≳ signal), unfairly vs the compile-once Wasmtime row.
+        let jit_ns = {
+            let mut cm = svm_jit::compile(&t.module, e).expect("jit compiles");
+            per_iter(large, |n| {
+                black_box(cm.run(&[sp, n], None, None, None).unwrap());
+            })
+        };
         jit_ratios.push((name, jit_ns / nat_ns));
         for (slot, e) in [
             (&mut v8_32_ratios, v8_32),
@@ -512,8 +520,8 @@ fn time_wasm(cmd: &mut Command, wasm: &std::path::Path, large: i64) -> Option<(f
     Some((ns, chk))
 }
 
-fn per_iter(large: i64, run_one: impl Fn(i64)) -> f64 {
-    let m = |n: i64| {
+fn per_iter(large: i64, mut run_one: impl FnMut(i64)) -> f64 {
+    let mut m = |n: i64| {
         run_one(n);
         let mut best = f64::MAX;
         for _ in 0..9 {
