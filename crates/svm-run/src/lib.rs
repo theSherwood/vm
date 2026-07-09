@@ -3125,6 +3125,22 @@ impl HostCap {
             grant: Arc::new(move |h, _| h.grant_host_fn(make())),
         }
     }
+    /// An **mmap-capable** host-defined capability (§4b): like [`host_fn`](HostCap::host_fn) but the
+    /// handler is registered via [`Host::grant_host_fn_region`], so it is also handed a
+    /// [`svm_interp::RegionMinter`] and can mint a file-backed `SharedRegion` to hand the guest for
+    /// zero-copy aliasing. Resolves under the same [`iface::HOST_FN`], so the guest reaches it exactly
+    /// like a plain `host_fn`.
+    pub fn host_fn_region(
+        op: u32,
+        make: impl Fn() -> svm_interp::HostFnRegion + Send + Sync + 'static,
+    ) -> HostCap {
+        let make = Arc::new(make);
+        HostCap {
+            type_id: iface::HOST_FN,
+            op,
+            grant: Arc::new(move |h, _| h.grant_host_fn_region(make())),
+        }
+    }
     /// A fully custom binding: an explicit `(type_id, op)` and a re-grantable grant action. The escape
     /// hatch for any capability the named constructors don't cover (e.g. `Memory`, `AddressSpace`).
     pub fn custom(

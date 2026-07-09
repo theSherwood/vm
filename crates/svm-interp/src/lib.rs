@@ -8557,7 +8557,10 @@ pub mod iface {
     /// magic-ring-buffer primitive); op 1 `unmap(window_offset, len)` drops the alias; op 2
     /// `len() -> i64` reports the region size; op 3 `page_size() -> i64`. Granting the handle is how
     /// two domains come to share memory; `create`/`grant` (guest-minted regions, cross-domain) are a
-    /// §14 follow-up — today regions are host-granted, like `Memory`.
+    /// §14 follow-up — today regions are host-granted, like `Memory`. A backing may be a fresh OS
+    /// shared object (`memfd`) **or a real host file** (`svm-run`'s `FileBacking`, minted by an
+    /// mmap-capable fs cap): mapping the latter aliases the file into the window zero-copy — the
+    /// file-backed-mmap bridge (MMAP_CAPABILITY.md §4b).
     pub const SHARED_REGION: u32 = 4;
     /// `AddressSpace` — the §14 memory-management capability, **attenuable to a power-of-two
     /// window sub-range** `[base, base+size)`. Like `Memory` but every op is confined to the

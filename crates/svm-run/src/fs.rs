@@ -29,9 +29,11 @@
 //! | 10 | `msync` | `(win_buf, len, _, _)` | 0 |
 //! | 11 | `munmap` | `(win_buf, _, _, _)` | 0 |
 //! | 12 | `crash_arm` | `(n, _, _, _)` | 0 / `-EINVAL` |
+//! | 13 | `map_region` | `(fd, file_offset, len, _)` | region handle / `-errno` |
 //!
-//! Op 12 (`crash_arm`) exists **only on the `*_crashy` test variants** (see [`FS_CRASH_ARM`]); the
-//! default [`mem_fs`]/[`host_fs`] return `-EINVAL` for it (unknown op).
+//! Op 12 (`crash_arm`) exists **only on the `*_crashy` test variants** (see [`FS_CRASH_ARM`]); op 13
+//! (`map_region`, the §4b zero-copy path — see [`FS_MAP_REGION`]) exists **only on [`host_fs_mmap`]**.
+//! The default [`mem_fs`]/[`host_fs`] return `-EINVAL` for both (unknown op / no minting authority).
 //!
 //! ## The file-backed-mmap surface (`mmap`/`msync`/`munmap`) — the second storage shape
 //!
@@ -55,7 +57,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use svm_interp::{GuestMem, HostFn};
+use svm_interp::{GuestMem, HostFn, HostFnRegion, RegionMinter};
 
 pub const FS_OPEN: u32 = 0;
 pub const FS_READ: u32 = 1;
@@ -69,6 +71,13 @@ pub const FS_SYNC: u32 = 8;
 pub const FS_MMAP: u32 = 9;
 pub const FS_MSYNC: u32 = 10;
 pub const FS_MUNMAP: u32 = 11;
+/// `map_region(fd, file_offset, len)` — the **zero-copy** file-mmap path (§4b of `MMAP_CAPABILITY.md`).
+/// Mint a file-backed `SharedRegion` over `[file_offset, file_offset+len)` of the open file `fd` and
+/// return its **handle** (a `SharedRegion` cap the guest maps into its window with `SharedRegion.map`),
+/// so guest loads/stores hit the real file's pages with no copy-in and no per-access host call. Present
+/// ONLY on the `host_fs_mmap` variant (which is granted with region-minting authority); returns
+/// `-EINVAL` on `mem_fs`/`host_fs` (no minter, or no real fd). v1 requires `file_offset == 0`.
+pub const FS_MAP_REGION: u32 = 13;
 /// `crash_arm(n)` — **test-only** crash injection (§4d of `MMAP_CAPABILITY.md`). Present ONLY on the
 /// `*_crashy` backend variants; the default [`mem_fs`]/[`host_fs`] leave the controller absent so this
 /// op is an unknown op (`-EINVAL`) on a shipping grant. Arms a simulated power loss: after `n` further
@@ -546,7 +555,13 @@ impl HostFsState {
         self.crash.as_ref().is_some_and(|c| c.crashed)
     }
 
-    fn handle(&mut self, op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>) -> i64 {
+    fn handle(
+        &mut self,
+        op: u32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        minter: Option<&mut dyn RegionMinter>,
+    ) -> i64 {
         let mut mem = mem;
         let a = |i: usize| args.get(i).copied().unwrap_or(0);
         // `read_path` already refused anything that could escape (absolute / `..` / empty), so the
@@ -803,6 +818,31 @@ impl HostFsState {
                 0
             }
             FS_CRASH_ARM => arm_crash(self.crash.as_mut(), a(0)),
+            // §4b zero-copy: mint a file-backed `SharedRegion` over the open file and return its
+            // handle for the guest to `SharedRegion.map` into its window (real MAP_SHARED aliasing).
+            FS_MAP_REGION => {
+                let Some(minter) = minter else {
+                    return -EINVAL; // not an mmap-capable grant (plain host_fs / mem_fs)
+                };
+                let (fd, foff, len) = (a(0), a(1), a(2));
+                if foff != 0 || len <= 0 {
+                    return -EINVAL; // v1 maps the whole file from offset 0
+                }
+                let Some(Some(o)) = self.open.get(fd as usize) else {
+                    return -EBADF;
+                };
+                // Give the backing its **own** fd (dup) over the same OS file, so it outlives the
+                // guest's fd and both share one page cache — the map and the fs cap's pread/pwrite/
+                // fsync stay coherent.
+                let dup = match o.file.try_clone() {
+                    Ok(f) => f,
+                    Err(e) => return -io_errno(&e),
+                };
+                match crate::new_file_region(dup, len as usize) {
+                    Ok(backing) => minter.grant_region(backing) as i64,
+                    Err(e) => -io_errno(&e),
+                }
+            }
             _ => -EINVAL,
         }
     }
@@ -825,6 +865,29 @@ pub fn host_fs_crashy(root: PathBuf) -> HostCap {
     host_fs_impl(root, true)
 }
 
+/// Like [`host_fs`] but **mmap-capable** (§4b): granted with region-minting authority so the
+/// [`FS_MAP_REGION`] op is live. A guest that maps a file gets a **real** `MAP_SHARED` alias of that
+/// file into its window (zero-copy, page-cache coherent with the same file's `pread`/`pwrite`) instead
+/// of the copy-in emulation. The guest shim falls back to `FS_MMAP` when granted a plain `host_fs`.
+pub fn host_fs_mmap(root: PathBuf) -> HostCap {
+    HostCap::host_fn_region(0, move || {
+        let mut st = HostFsState {
+            root: root.clone(),
+            open: Vec::new(),
+            maps: Vec::new(),
+            crash: None,
+        };
+        Box::new(
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  minter: &mut dyn RegionMinter| {
+                Ok(vec![st.handle(op, args, mem, Some(minter))])
+            },
+        ) as HostFnRegion
+    })
+}
+
 fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
     HostCap::host_fn(0, move || {
         let mut st = HostFsState {
@@ -835,7 +898,7 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
         };
         Box::new(
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
-                Ok(vec![st.handle(op, args, mem)])
+                Ok(vec![st.handle(op, args, mem, None)])
             },
         ) as HostFn
     })
@@ -848,5 +911,92 @@ mod tests {
     #[test]
     fn host_fn_type_id_matches() {
         assert_eq!(svm_interp::iface::HOST_FN, 13);
+    }
+
+    /// `svm-llvm` pins `SharedRegion`'s interface id numerically (`SHARED_REGION_TYPE_ID`, for the
+    /// `__vm_region_call` the zero-copy bridge lowers to); this locks that pin to the real constant.
+    #[test]
+    fn shared_region_type_id_matches() {
+        assert_eq!(svm_interp::iface::SHARED_REGION, 4);
+    }
+
+    /// The §4b zero-copy op end to end at the capability boundary: `host_fs_mmap`'s `FS_MAP_REGION`
+    /// opens a real file and mints a **file-backed `SharedRegion`** whose size matches, while a plain
+    /// `host_fs` refuses the op (no minting authority). Combined with `file_region_tests` (which prove
+    /// a `FileBacking` aliases the real file's bytes), this establishes the whole delivery path:
+    /// `FS_MAP_REGION` → `FileBacking` → a live `SharedRegion` the guest can `SharedRegion.map`.
+    #[cfg(unix)]
+    #[test]
+    fn map_region_op_mints_a_file_backed_region_only_on_the_mmap_grant() {
+        use super::*;
+        use std::io::Write;
+        use svm_interp::{iface, Host, WindowMem};
+
+        let dir = std::env::temp_dir().join(format!("svm_fs_mapregion_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut f = std::fs::File::create(dir.join("data")).unwrap();
+            f.write_all(b"ZEROCOPY").unwrap();
+            f.set_len(8192).unwrap();
+        }
+
+        // A tiny flat window holding the path "data" at offset 0.
+        let mut win = vec![0u8; 4096];
+        win[..4].copy_from_slice(b"data");
+        let open_args = [0i64, 4, O_READ | O_WRITE, 0];
+
+        // 1. The mmap-capable grant: open → map_region mints a live region of the file's size.
+        {
+            let mut host = Host::new();
+            let cap = host_fs_mmap(dir.clone());
+            let fs_h = (cap.grant)(&mut host, 0);
+            let mut wm = WindowMem::new(&mut win, 4096);
+            let fd = host
+                .cap_dispatch_slots(iface::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .unwrap()[0];
+            assert!(fd >= 0, "open failed: {fd}");
+            let region = host
+                .cap_dispatch_slots(
+                    iface::HOST_FN,
+                    FS_MAP_REGION,
+                    fs_h,
+                    &[fd, 0, 8192],
+                    Some(&mut wm),
+                )
+                .unwrap()[0];
+            assert!(
+                region >= 0,
+                "FS_MAP_REGION should mint a region on host_fs_mmap: {region}"
+            );
+            // The returned handle is a live SharedRegion; op 2 `len()` reports the mapped size.
+            let len = host
+                .cap_dispatch_slots(iface::SHARED_REGION, 2, region as i32, &[], Some(&mut wm))
+                .unwrap()[0];
+            assert_eq!(len, 8192, "the minted region maps the whole file");
+        }
+
+        // 2. A plain host_fs has no minting authority → the op is unavailable (-EINVAL).
+        {
+            let mut host = Host::new();
+            let cap = host_fs(dir.clone());
+            let fs_h = (cap.grant)(&mut host, 0);
+            let mut wm = WindowMem::new(&mut win, 4096);
+            let fd = host
+                .cap_dispatch_slots(iface::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .unwrap()[0];
+            let region = host
+                .cap_dispatch_slots(
+                    iface::HOST_FN,
+                    FS_MAP_REGION,
+                    fs_h,
+                    &[fd, 0, 8192],
+                    Some(&mut wm),
+                )
+                .unwrap()[0];
+            assert_eq!(region, -EINVAL, "plain host_fs must refuse FS_MAP_REGION");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

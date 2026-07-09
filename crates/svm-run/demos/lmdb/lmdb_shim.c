@@ -32,12 +32,19 @@ extern int fputs(const char *, FILE *);
 
 extern int __vm_cap_resolve(const char *name, long len);
 extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
+/* SharedRegion (§13) call bridge — same shape as __vm_host_call but the §13 interface id, so it can
+ * be invoked on the region handle FS_MAP_REGION returns (map = op 0, unmap = op 1). */
+extern long __vm_region_call(int h, int op, long a, long b, long c, long d);
 
 enum {
   FS_OPEN = 0, FS_READ, FS_WRITE, FS_SEEK, FS_CLOSE, FS_REMOVE, FS_RENAME,
-  FS_TRUNCATE, FS_SYNC, FS_MMAP, FS_MSYNC, FS_MUNMAP, FS_CRASH_ARM
+  FS_TRUNCATE, FS_SYNC, FS_MMAP, FS_MSYNC, FS_MUNMAP, FS_CRASH_ARM, FS_MAP_REGION
 };
 enum { CAP_O_READ = 1, CAP_O_WRITE = 2, CAP_O_APPEND = 4, CAP_O_TRUNC = 8, CAP_O_CREATE = 16 };
+/* SharedRegion ops (called on the region handle FS_MAP_REGION returns, not on the fs handle). */
+enum { SR_MAP = 0, SR_UNMAP = 1 };
+/* Capability prot bits (map_region in svm-run): read = 1, write = 2. */
+enum { CAP_PROT_READ = 1, CAP_PROT_WRITE = 2 };
 
 static int g_fs = -2; /* -2 = unresolved, -1 = unavailable, ≥0 = handle */
 static int fs(void) {
@@ -128,28 +135,109 @@ int fstat(int fd, struct stat *st) {
 
 /* ---- mmap → fs capability --------------------------------------------------------------------- */
 
+/* Two mmap backends behind one shim (MMAP_CAPABILITY.md §4b):
+ *   - zero-copy region path (host_fs_mmap): FS_MAP_REGION mints a file-backed SharedRegion whose
+ *     handle we `SharedRegion.map` (SR_MAP) over a page-aligned window buffer — the real file is
+ *     aliased into the window, loads/stores hit its pages directly.
+ *   - copy-in emulation (plain host_fs / mem_fs): FS_MMAP copies the file into a buffer.
+ * A small table remembers which each mapping is, so munmap/msync route correctly. `region < 0`
+ * marks an emulation mapping; `base` is the allocation to free (the region path over-allocates to
+ * page-align `addr`). */
+#define SHIM_MAXMAPS 4
+#define SHIM_PAGE 4096
+static struct maprec {
+  void *addr;         /* the page-aligned pointer handed to LMDB */
+  void *base;         /* the underlying malloc to free */
+  unsigned long len;
+  int fd;
+  long region;        /* SharedRegion handle, or -1 for an emulation mapping */
+} g_maps[SHIM_MAXMAPS];
+
+static struct maprec *map_alloc(void) {
+  for (int i = 0; i < SHIM_MAXMAPS; i++)
+    if (!g_maps[i].addr) return &g_maps[i];
+  return 0;
+}
+static struct maprec *map_containing(void *addr) {
+  unsigned long a = (unsigned long)addr;
+  for (int i = 0; i < SHIM_MAXMAPS; i++)
+    if (g_maps[i].addr && a >= (unsigned long)g_maps[i].addr &&
+        a < (unsigned long)g_maps[i].addr + g_maps[i].len)
+      return &g_maps[i];
+  return 0;
+}
+
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
   (void)addr;
-  (void)prot;
   (void)flags;
+  struct maprec *m = map_alloc();
+  if (!m) return MAP_FAILED;
+  long cprot = CAP_PROT_READ | ((prot & PROT_WRITE) ? CAP_PROT_WRITE : 0);
+
+  /* Zero-copy path: mint a file-backed region and alias it over a page-aligned buffer. v1 maps the
+   * whole file from offset 0 (what LMDB does); a non-zero offset or an unsupporting grant returns
+   * < 0 and we fall through to the copy-in emulation. */
+  if (off == 0) {
+    long region = hc(FS_MAP_REGION, fd, 0, (long)len, 0);
+    if (region >= 0) {
+      void *base = __builtin_malloc(len + SHIM_PAGE);
+      if (base) {
+        void *aligned =
+            (void *)(((unsigned long)base + SHIM_PAGE - 1) & ~((unsigned long)SHIM_PAGE - 1));
+        if (__vm_region_call((int)region, SR_MAP, (long)aligned, 0, (long)len, cprot) == 0) {
+          m->addr = aligned;
+          m->base = base;
+          m->len = len;
+          m->fd = fd;
+          m->region = region;
+          return aligned;
+        }
+        __builtin_free(base);
+      }
+      /* region minted but the map failed → fall back (the region handle leaks until run end). */
+    }
+  }
+
+  /* Copy-in emulation. */
   void *buf = __builtin_malloc(len);
   if (!buf) return MAP_FAILED;
   if (hc(FS_MMAP, fd, off, (long)len, (long)buf) != 0) {
     __builtin_free(buf);
     return MAP_FAILED;
   }
+  m->addr = buf;
+  m->base = buf;
+  m->len = len;
+  m->fd = fd;
+  m->region = -1;
   return buf;
 }
 
 int munmap(void *addr, size_t len) {
   (void)len;
-  hc(FS_MUNMAP, (long)addr, 0, 0, 0);
-  __builtin_free(addr);
+  struct maprec *m = map_containing(addr);
+  if (!m) return 0;
+  if (m->region >= 0) {
+    __vm_region_call((int)m->region, SR_UNMAP, (long)m->addr, (long)m->len, 0, 0);
+  } else {
+    hc(FS_MUNMAP, (long)m->addr, 0, 0, 0);
+  }
+  __builtin_free(m->base);
+  m->addr = 0;
+  m->base = 0;
+  m->region = -1;
   return 0;
 }
 
 int msync(void *addr, size_t len, int flags) {
   (void)flags;
+  struct maprec *m = map_containing(addr);
+  if (m && m->region >= 0) {
+    /* Region-mapped: writes are already in the file's shared page cache, so the durability barrier
+     * is an fsync of the fd (msync-range granularity collapses to whole-file — correct, coarser). */
+    return (int)hc(FS_SYNC, m->fd, 0, 0, 0);
+  }
+  /* Emulation mapping: flush the sub-range back to the file. */
   return (int)hc(FS_MSYNC, (long)addr, (long)len, 0, 0);
 }
 

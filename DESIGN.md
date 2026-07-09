@@ -834,7 +834,9 @@ The first concrete interfaces the §3c handle table dispatches and the §3d C ru
 calls (`malloc` over `map`, stdio, `exit`). Resolves the §18 checklist item. Four
 interfaces — `Stream`, `Exit`, `Clock`, `Memory` — plus the powerbox layout. (A fifth,
 `SharedRegion` (§13), has since landed as a host-granted interface — *aliasing only*; its
-`create`/`grant` are a §14 follow-up.)
+`create`/`grant` are a §14 follow-up. A backing can now be a real host **file** as well as a
+`memfd`, so an mmap-capable fs cap aliases a granted file into the window zero-copy —
+the file-backed-mmap bridge, `MMAP_CAPABILITY.md` §4b.)
 **These four are not special:** they are ordinary instances of the general,
 host-extensible capability mechanism (§7 "Host-defined capabilities &
 discoverability") — a host adds new capabilities the same way the runtime provides
