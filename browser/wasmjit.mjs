@@ -176,6 +176,32 @@ block0(v0: i64):
   return v2
 }`;
 
+// SIMD (slice: next): a v128 kernel — splat the arg across i32x4 lanes, run lane arithmetic +
+// a compare/bitmask reduction + a store→load through the confined window, and reduce back to i64.
+// Proves the emitted 0xFD SIMD opcodes (and the one 16-byte widened confined access) run on V8
+// against the cdylib's own memory, matching the interpreter. All-in-subset, so it JITs whole-module.
+const SIMD = `
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i32x4.splat v1
+  v3 = i32.const 3
+  v4 = i32x4.splat v3
+  v5 = i32x4.add v2 v4
+  v6 = i32x4.mul v5 v4
+  v7 = i64.const 32
+  v128.store v7 v6
+  v8 = v128.load v7
+  v9 = i32x4.max_s v8 v2
+  v10 = i32x4.gt_s v9 v4
+  v11 = i8x16.bitmask v10
+  v12 = i32x4.extract_lane 0 v9
+  v13 = i32.add v12 v11
+  v14 = i64.extend_i32_s v13
+  return v14
+}`;
+
 async function main() {
   console.log(`module: ${wasmPath}\n`);
 
@@ -235,6 +261,22 @@ async function main() {
       }
     }
     report(`call_indirect equality (funcref-table dispatch over ${sweep.length} args)`, allEq);
+  }
+
+  // --- SIMD: emitted v128 opcodes + a confined 16-byte access run on V8, match the interpreter ---
+  {
+    const bytes = encode(SIMD);
+    const jit = await compileJit(ex, bytes, { memory });
+    let allEq = jit !== null;
+    if (!jit) report('simd (eligible)', false, 'svm_wasmjit_compile refused an in-subset v128 module');
+    else for (const arg of sweep) {
+      const { st, r } = interp(bytes, arg);
+      if (st !== 0) { allEq = false; break; }
+      if (jit.call([arg], { winSize: 1 << 16 }).value !== BigInt.asIntN(64, r)) {
+        allEq = false; console.log(`    simd(${arg}): jit != interp ${r}`); break;
+      }
+    }
+    report(`SIMD equality (v128 lane ops + confined load/store over ${sweep.length} args)`, allEq);
   }
 
   // --- speedup: the whole point. Time a heavy alu loop on both tiers. ---

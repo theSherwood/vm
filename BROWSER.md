@@ -614,10 +614,27 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    in-subset when a reachable function makes one (fail-closed otherwise); cross-tier indirect (a
    trampoline routing null slots to `env.call_interp`) is a later refinement. Proven by three
    differential kernels (parity dispatch, null-slot trap, signature-mismatch trap) vs the bytecode
-   oracle, two `analyze` tests, and the Node + Chromium browser proofs. *(No cross-engine bench row:
-   that bench bundles every kernel — including SIMD/`fma` — into one module, so the whole-module
-   indirect requirement fails closed there; a dedicated all-in-subset dispatch kernel carries the
-   browser proof instead.)* Remaining for the slice: SIMD/v128 (mostly 1:1); a playground toggle.
+   oracle, two `analyze` tests, and the Node + Chromium browser proofs. *(The cross-engine
+   `call_indirect` row was blocked while that bench's bundled module still held an out-of-subset
+   SIMD kernel; it lights up once `v128` moves in-subset — see below.)*
+   **§17 SIMD (`v128`) now in-subset:** the emitter lowers the core `v128` lane ops to their fixed
+   `0xFD`-prefixed core-wasm opcodes — `const`/`splat`/`extract`/`replace_lane`, integer & float
+   lane arithmetic / compares / shifts / unary, saturating add-sub + `avgr` + `popcnt`, whole-vector
+   bitwise + `bitselect` + `any/all_true` + `bitmask`, `pmin`/`pmax`, `shuffle`/`swizzle`, the
+   int↔float lane conversions, and `v128.load`/`store` through the **same** trap-confinement path as
+   scalar memory (the one 16-byte widened masked access — §17/D58). The widening/reduction family
+   (`extend`/`narrow`/`extmul`/`extadd_pairwise`/`dot`/`q15mulr`) and **relaxed** SIMD (`VFma`/`VDotI8`
+   — no core-wasm opcode) fail closed to the interpreter, a clean second SIMD increment. Because
+   wasm leaves the sign/payload of a *generated* NaN nondeterministic, the emitter is correct but the
+   differential canonicalizes NaN for float-bit kernels (finite results stay exact). Proven by 13
+   `tests/simd.rs` differential kernels vs the bytecode oracle (every opcode helper exercised — a
+   wrong `0xFD` number fails wasmi validation or diverges) — the wasmi dev-dep moved to 0.47 for its
+   `simd` feature — plus the Node + Chromium browser proofs. With `v128` in-subset the cross-engine
+   bench's **whole** bundled module is now emittable, so **every** kernel gets an `svm-wasmjit` row —
+   `vadd` at **~0.3 ns/iter** (~108× over interpreter-in-wasm, ~3× off native Cranelift SIMD), and
+   `call_indirect` too (its whole-module requirement finally met).
+   The deferred `dot` reduction is the new out-of-subset exemplar for the cross-tier/analysis tests
+   (the core lane ops it replaced are now emitted). Remaining for the slice: a playground toggle.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);

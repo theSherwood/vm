@@ -23,7 +23,7 @@ fn jit_run(m: &svm_ir::Module, entry: u32, arg: i64) -> i64 {
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("emitted wasm validates");
     let mut store: Store<i32> = Store::new(&engine, 0);
-    let memory = Memory::new(&mut store, MemoryType::new(2, None).unwrap()).unwrap();
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
     memory
         .write(
             &mut store,
@@ -101,13 +101,14 @@ fn bytecode_run(m: &svm_ir::Module, entry: u32, arg: i64, fuel: &mut u64) -> Opt
 }
 
 /// Two kernels; **func 1** (not func 0) is the JIT entry — proving entry-rooted eligibility and that
-/// the emitted export is `f1`. Func 0 is a **SIMD** kernel (out of subset — floats are now in-subset,
-/// so a float func 0 would be eligible; v128 is not), which entry-rooting at func 1 correctly ignores.
+/// the emitted export is `f1`. Func 0 uses a **deferred SIMD** op (`i32x4.dot_i16x8_s` — the core
+/// v128 lane ops are now in-subset, but the widening/reduction family isn't), so it's out of subset,
+/// which entry-rooting at func 1 correctly ignores.
 const ENTRY_ONE: &str = r#"
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.add v1 v1
+  v2 = i32x4.dot_i16x8_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }
