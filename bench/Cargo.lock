@@ -1346,11 +1346,19 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-llvm",
  "svm-text",
  "svm-wasm",
  "wasmtime",
  "wasmtime-wasi-threads",
  "wat",
+]
+
+[[package]]
+name = "svm-encode"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
 ]
 
 [[package]]
@@ -1366,6 +1374,7 @@ name = "svm-interp"
 version = "0.0.0"
 dependencies = [
  "page_size",
+ "svm-encode",
  "svm-ir",
  "svm-mask",
  "svm-mem",
@@ -1391,6 +1400,15 @@ dependencies = [
  "svm-fiber",
  "svm-ir",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "svm-llvm"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-ir",
+ "svm-text",
 ]
 
 [[package]]

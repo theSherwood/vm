@@ -20,6 +20,10 @@ svm-interp = { path = "../crates/svm-interp" }
 # The wasm→IR transpiler, for `--from-wasm`: run the *same* wasm bytes on SVM (transpiled to IR)
 # and on Wasmtime — the apples-to-apples comparison, instead of hand-paired IR/WAT.
 svm-wasm = { path = "../crates/svm-wasm" }
+# The LLVM->IR on-ramp: the production svm-jit path (C -> clang -O2 bitcode -> SVM IR),
+# for the confinement-cost harness (`--bin confine`) that compares svm-jit vs Wasmtime-w64
+# on the same LP64 kernels the embench differential uses.
+svm-llvm = { path = "../crates/svm-llvm" }
 # Minimal Wasmtime: the Cranelift compiler + the runtime, nothing else (no component
 # model / gc / async), so we compare like-for-like (both lower core wasm via Cranelift).
 wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }
