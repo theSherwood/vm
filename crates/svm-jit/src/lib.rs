@@ -6575,7 +6575,7 @@ fn mask_addr(
     // Elided accesses (proven `< reserved`) need no check or clamp. The no-memory / degenerate
     // `mask == 0` case keeps the mask (a 1-byte / memoryless window has no reservation to bound
     // against).
-    if !elide && lower.mask != 0 && confine_mode() != ConfineMode::Mask {
+    if !elide && lower.mask != 0 {
         // `reserved = mask + 1` (a power of two ≤ 2^63); the reservation this window is confined to.
         let reserved = lower.mask.wrapping_add(1);
         let need = (width as u64).saturating_add(offset);
@@ -6604,14 +6604,8 @@ fn mask_addr(
         // for bounds-checked heaps, one op cheaper — the power-of-two reservation makes a
         // 1-op AND sufficient where Wasmtime needs `cmp→cmov` (measured 20–50% cheaper on
         // confinement-dense kernels; see TRAP_CONFINEMENT.md).
-        // [A/B gate] `check` mode omits the clamp (trap-only, no Spectre-v1 hardening); `both`
-        // (production default) applies it. Env-gated for the embench confinement-cost A/B only.
-        let eff = if confine_mode() == ConfineMode::Both {
-            let m = b.ins().iconst(I64, lower.mask as i64);
-            b.ins().band(eff, m)
-        } else {
-            eff
-        };
+        let m = b.ins().iconst(I64, lower.mask as i64);
+        let eff = b.ins().band(eff, m);
         // The bounds check proved `addr+offset+width <= mapped`, so `eff` is in `[0, mapped)`; shift it
         // into the §14 sub-window slice (`+ sub_base`) before adding the window base — elided for a
         // top-level window so ordinary codegen is byte-identical to before nesting existed.
@@ -6640,27 +6634,6 @@ fn mask_addr(
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)
-}
-
-/// **[Temporary A/B gate — measurement only, not production behaviour.]** `SVM_CONFINE` selects the
-/// confinement lowering so one binary can measure the confinement cost on the embench suite:
-/// `mask` = old wrap-confinement (`& mask`, no check — pre-#184 semantics, valid only for OOB-free
-/// programs like embench); `check` = bounds-check + trap, no Spectre-v1 clamp; `both` (default) =
-/// the production check+clamp (D38). Reverted after the A/B; production is unconditionally `both`.
-#[derive(PartialEq, Clone, Copy)]
-enum ConfineMode {
-    Check,
-    Mask,
-    Both,
-}
-
-fn confine_mode() -> ConfineMode {
-    static MODE: std::sync::OnceLock<ConfineMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("SVM_CONFINE").as_deref() {
-        Ok("mask") => ConfineMode::Mask,
-        Ok("check") => ConfineMode::Check,
-        _ => ConfineMode::Both,
-    })
 }
 
 /// Unknown upper bound — the value may be anything (so its accesses must be masked).
