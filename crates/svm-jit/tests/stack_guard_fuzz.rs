@@ -8,26 +8,26 @@
 //!
 //! ## Oracle
 //!
-//! We run the **default guard-page** fiber backend (i.e. NOT `arena-stacks`) with `stack-check` on,
-//! so BOTH guards are live at once. A `PROT_NONE` guard page sits exactly at the fiber's `usable_low`;
-//! the software check is designed to fire ~`RED_ZONE` *above* it. So for any generated recursion a
-//! real overflow MUST surface as `StackOverflow` — the software check fired first, cleanly, before the
-//! stack pointer ever reached the guard page.
+//! For any generated recursion a real overflow MUST surface as `StackOverflow` — the software check
+//! fired first, cleanly, before the stack pointer crossed the fiber's low bound. **Any other outcome is
+//! a guard hole** (a frame slipped past the check) and fails this test.
 //!
-//! Any *other* outcome is a **guard hole**: a frame slipped past the software check and reached the
-//! guard page. Empirically that surfaces two ways, and this test fails on both:
+//! The strength of the "hole" detector depends on the fiber backend, which this test runs on whichever
+//! is selected (it does not force one):
 //!
-//! * `Trapped(MemoryFault)` — the SIGSEGV handler had enough stack to run (asserted against below);
-//! * a **hard process crash** (`SIGSEGV`, signal 11) — the fault happens *at stack exhaustion*, and
-//!   the trap handler (`trap_shim.c`, `SA_ONSTACK` set but no `sigaltstack` installed) double-faults
-//!   on the exhausted stack. A crash of the test binary is a cargo test failure, so the invariant is
-//!   still enforced — just abruptly. (This double-fault is exactly why the guard page *alone* does
-//!   not survivably catch fiber overflow, and why the software check — which traps through
-//!   `trap_out`, no signal — is load-bearing even before the arena drops the page. See
-//!   STACK_GUARD_FLIP.md "sigaltstack finding".)
+//! * **Guard-page backend** (`--features guard-page-stacks`): a `PROT_NONE` page sits at the fiber's
+//!   `usable_low`, so a hole is caught *in hardware* — surfacing as `Trapped(MemoryFault)` (asserted
+//!   against below) or, when the fault hits at stack exhaustion, a hard `SIGSEGV` crash of the test
+//!   binary (the `trap_shim.c` handler has `SA_ONSTACK` but no installed `sigaltstack`, so it
+//!   double-faults). Either way the test fails. This is the ground-truth oracle for "wrote below
+//!   `usable_low`" — run this lane to exercise it.
+//! * **Arena backend** (the default): there is no guard page — the software check is the *sole*
+//!   defense. A hole here surfaces as a non-`StackOverflow` outcome (a wrong `Returned`, a different
+//!   trap, or a crash from neighbour-slot corruption), all of which this test rejects. Weaker than the
+//!   hardware oracle, but it validates the check on the backend actually shipped.
 //!
-//! The guard page is thus a ground-truth oracle for "wrote below `usable_low`", and needs no arena —
-//! so this runs on stock Linux/macOS CI.
+//! So the assertion (`overflow ⇒ StackOverflow`, anything else fails) is identical on both; the
+//! guard-page lane just adds the hardware backstop that makes a missed frame impossible to hide.
 //!
 //! ## Forcing genuinely large frames (the hard part)
 //!

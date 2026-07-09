@@ -1,7 +1,10 @@
 # Software stack-overflow guard (production design)
 
-Status: **design + foundational plumbing landed; check wiring is the next increment.**
-Feature-gated behind `svm-jit/stack-check` + `svm-fiber/arena-stacks` (both off by default).
+Status: **SHIPPED as the default.** The software check is always emitted (no longer behind
+`stack-check`) and the arena is the default fiber backend (no longer behind `arena-stacks`); opt back
+to the guard-paged backend with `svm-fiber/guard-page-stacks`. See `STACK_GUARD_FLIP.md` for the
+decision/rollout and `STACK_GUARD_AUDIT.md` for the escape-TCB audit. (Historical note: the increments
+below were written while these were off-by-default prototypes.)
 
 ## Why
 

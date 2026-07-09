@@ -1,13 +1,15 @@
-//! Arena-allocated control stacks — PROTOTYPE, feature `arena-stacks` (unix + x86-64 Windows).
+//! Arena-allocated control stacks — the **default** control-stack backend (unix + x86-64 Windows);
+//! opt out to the guard-paged backend with `guard-page-stacks`.
 //!
 //! Instead of one guarded reservation per fiber (`stack_unix.rs` = `mmap`+`mprotect`, 2 VMAs/fiber;
 //! `stack_windows.rs` = `VirtualAlloc`+`VirtualProtect`), this sub-allocates fixed-size 256 KiB stack
 //! slots from a few large reservations with a free-list, so `cont.new`/finish become a free-list
-//! pop/push instead of syscalls and a fiber costs ~0 extra VMAs (unix). Overflow protection moves to
-//! the JIT's software stack-limit check (`svm-jit` feature `stack-check`), so this **drops the
-//! hardware guard page** and must not ship without that check. A reclaimed slot is not zeroed
-//! (zeroing would defeat the alloc win); a conservative GC scan over a reused slot over-approximates
-//! roots (sound superset — noted).
+//! pop/push instead of syscalls and a fiber costs ~0 extra VMAs (unix) — lifting concurrency past the
+//! `vm.max_map_count` VMA wall. It **drops the hardware guard page**; overflow protection is the
+//! always-on JIT software stack-limit check (`emit_stack_check`), which is why that check lives in the
+//! always-on escape-TCB path (it is the *sole* overflow defense here). A reclaimed slot is not zeroed
+//! (zeroing would defeat the alloc win); the conservative GC scan skips the unused region below each
+//! running fiber's live SP (`fiber_rt::gc_roots`), so stale slot bytes are not read as roots.
 //!
 //! **Commit-on-demand.** An arena is only *reserved* (address space, no backing) up front; a slot is
 //! *committed* the first time it is handed out and stays committed when freed (so recycling is a
