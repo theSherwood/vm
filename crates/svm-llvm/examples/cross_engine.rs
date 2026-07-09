@@ -85,6 +85,7 @@ fn main() {
     let browser = root.join("browser");
     let wasm = browser.join("target/wasm32-unknown-unknown/release/svm_browser.wasm");
     let bench_mjs = browser.join("bench.mjs");
+    let bench_jit_mjs = browser.join("bench_jit.mjs");
     let have_node = Command::new("node")
         .arg("--version")
         .output()
@@ -194,6 +195,59 @@ fn main() {
                 ),
                 Err(err) => {
                     eprintln!("note: svm-bytecode-wasm {disp} failed to launch node: {err}")
+                }
+            }
+
+            // svm-wasmjit: the SAME kernel JIT-compiled to wasm (`svm-wasmjit` emitter) on V8, timed
+            // via `browser/bench_jit.mjs`. Sits beside svm-bytecode-wasm — interpreter-in-wasm vs
+            // JIT-in-wasm on identical IR. A kernel outside the integer subset exits 4 (n/a, skipped
+            // silently); a successful run's result@SMALL is cross-checked against native bytecode (a
+            // mismatch is a loud MISCOMPILE — the emitter's differential inside the bench).
+            let out = Command::new("node")
+                .arg(&bench_jit_mjs)
+                .arg(&wasm)
+                .arg(&svmbc)
+                .arg(e.to_string())
+                .arg(sp.to_string())
+                .arg(SMALL.to_string())
+                .arg(LARGE.to_string())
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    let mut it = s.lines();
+                    if let (Some(ns), Some(res)) = (
+                        it.next().and_then(|l| l.trim().parse::<f64>().ok()),
+                        it.next().and_then(|l| l.trim().parse::<i64>().ok()),
+                    ) {
+                        let mut fuel = u64::MAX;
+                        let want = as_i64(
+                            bytecode::compile_and_run(
+                                &t.module,
+                                e,
+                                &[Value::I64(sp), Value::I32(SMALL)],
+                                &mut fuel,
+                            )
+                            .expect("bytecode")
+                            .unwrap()[0],
+                        );
+                        if res != want {
+                            eprintln!(
+                                "svm-wasmjit MISCOMPILE on {disp}: wasm-jit={res} native-bytecode={want}"
+                            );
+                        }
+                        println!("svm-wasmjit,{disp},{ns:.4}");
+                    }
+                }
+                // Exit 4 = kernel outside the JIT's integer subset (float / SIMD / call_indirect): no
+                // row, no note. Any other failure gets a note.
+                Ok(out) if out.status.code() == Some(4) => {}
+                Ok(out) => eprintln!(
+                    "note: svm-wasmjit {disp} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(err) => {
+                    eprintln!("note: svm-wasmjit {disp} failed to launch node: {err}")
                 }
             }
         }

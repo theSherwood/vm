@@ -398,9 +398,10 @@ in session discussion; collected here so the next slice has a home to be picked 
 - [ ] **wasm-JIT tier** — compile SVM IR to wasm at the explicit compile points and run hot compute
   near-natively in the browser. The largest remaining browser project; full design + slice plan
   below (§ "wasm-JIT tier"). Highest leverage *after* the real-language playground tab makes browser
-  guests compute-hot. Ships with its own **`svm-wasmjit` cross-engine bench row** next to
-  `svm-bytecode-wasm` (same driver, same MISCOMPILE cross-check) — the projected ~5–20× is a claim
-  until that row measures it.
+  guests compute-hot. **The `svm-wasmjit` cross-engine bench row now measures it** (next to
+  `svm-bytecode-wasm`, same driver, same MISCOMPILE cross-check): **~16–112× over interp-in-wasm**,
+  landing at or below native Cranelift `svm-jit` — the projected number, confirmed and cross-checked
+  (`bench/cross-engine/README.md` § "SVM-in-wasm, the JIT tier").
 
 ## wasm-JIT tier — design & implementation plan
 
@@ -589,8 +590,14 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (4000 / futex / io) run with compute regions JITted, differential vs the interp path.
 5. **§22 + §14 as real codegen.** Guest `jit_compile`/`install` emits wasm (validator-gated) — the
    guest-JIT ops become an actual JIT; `instantiate_module` units compile on push.
-6. **Long tail + measurement.** SIMD/v128 (mostly 1:1), remaining ops; an `svm-wasmjit` row in the
-   cross-engine bench next to `svm-bytecode-wasm` so the gain is *measured*; a playground toggle.
+6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
+   row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
+   over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),
+   at-or-below native Cranelift `svm-jit` — the row also generalized the emitter with **entry-rooting**
+   (`compile_module_mixed_entry` / `analyze_from` — the JIT entry needn't be func 0) and **`data`
+   tolerance** (the host materializes `m.data` into the window via `svm_wasmjit_init_window`; the
+   emitter no longer rejects data segments). Remaining for the slice: SIMD/v128 (mostly 1:1) +
+   `call_indirect` + the remaining ops in the subset; a playground toggle.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);

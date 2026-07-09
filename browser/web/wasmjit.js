@@ -68,6 +68,7 @@ export async function compileJit(ex, moduleBytes, { memory = null } = {}) {
     call(args = [], { fuel = DEFAULT_FUEL, winSize = 1 << 16 } = {}) {
       // Window + env cell in the cdylib's memory (both addressable by the emitted module).
       const win = Number(ex.svm_alloc(winSize));
+      ex.svm_wasmjit_init_window(win, winSize); // lay the module's data segments into the window
       const env = Number(ex.svm_alloc(envBytes));
       new DataView(mem.buffer).setBigInt64(env, BigInt(fuel), true);
       lastTrap = 0;

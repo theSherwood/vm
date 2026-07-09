@@ -1401,6 +1401,23 @@ pub const WASMJIT_TRAP_MEMORY_FAULT: i32 = svm_wasmjit::TRAP_MEMORY_FAULT;
 /// need only size the window ≥ `1 << size_log2`.
 #[no_mangle]
 pub extern "C" fn svm_wasmjit_compile(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    // The browser default: entry func 0, shared memory (`shared = 1`) — the emitted module links
+    // against this cdylib's shared linear memory (the threads build). See [`svm_wasmjit_compile_full`].
+    svm_wasmjit_compile_full(mod_ptr, mod_len, 0, 1)
+}
+
+/// [`svm_wasmjit_compile`] with the JIT entry and memory-shared flag exposed. `entry` is the SVM
+/// function the host will call (the emitted export is `f{entry}`; the cross-engine bench runs an
+/// arbitrary kernel, not always func 0). `shared` selects the `env.memory` import's shared flag —
+/// `1` for the browser threads build (shared memory), `0` for a plain cdylib (the bench, whose
+/// exported memory is non-shared); it must match the memory the host links against.
+#[no_mangle]
+pub extern "C" fn svm_wasmjit_compile_full(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    entry: u32,
+    shared: i32,
+) -> i32 {
     let bytes: &[u8] = if mod_ptr.is_null() || mod_len == 0 {
         &[]
     } else {
@@ -1410,12 +1427,10 @@ pub extern "C" fn svm_wasmjit_compile(mod_ptr: *const u8, mod_len: usize) -> i32
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return 0;
     };
-    // Shared-memory import: the emitted module links against this cdylib's shared linear memory
-    // (the threads build) — the host instantiates it with the same `WebAssembly.Memory`.
-    // `compile_module_mixed` (slice 3) emits the in-subset functions and routes a call to an interp
-    // leaf through `env.call_interp` → [`svm_wasmjit_call_interp`]; a fully-in-subset guest is the
-    // special case with no leaves (identical output to the old all-integer path).
-    match svm_wasmjit::compile_module_mixed(&m, true) {
+    // `compile_module_mixed_entry` (slice 3) emits the reachable in-subset functions and routes a
+    // call to an interp leaf through `env.call_interp` → [`svm_wasmjit_call_interp`]; a
+    // fully-in-subset guest is the special case with no leaves.
+    match svm_wasmjit::compile_module_mixed_entry(&m, entry, shared != 0) {
         Ok(wasm) => {
             // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
             unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
@@ -1447,6 +1462,30 @@ static mut WASMJIT_MOD: Option<svm_ir::Module> = None;
 #[no_mangle]
 pub extern "C" fn svm_wasmjit_env_bytes() -> usize {
     svm_wasmjit::ENV_CELL_BYTES
+}
+
+/// Materialize the most recent [`svm_wasmjit_compile`] module's **data segments** into the window at
+/// `[win_ptr, win_ptr + win_size)` — the emitted code only loads/stores, so the host must lay the
+/// module's initialized data into the window before running `f{entry}` (exactly what the
+/// interpreter's window init does). Writes each `data.bytes` at `data.offset`, clamped to the
+/// window. Call once, after allocating the window, before the first run.
+#[no_mangle]
+pub extern "C" fn svm_wasmjit_init_window(win_ptr: *mut u8, win_size: usize) {
+    // SAFETY: set by the preceding `svm_wasmjit_compile`; single-threaded page use.
+    let Some(m) = (unsafe { (*core::ptr::addr_of!(WASMJIT_MOD)).as_ref() }) else {
+        return;
+    };
+    for seg in &m.data {
+        let off = seg.offset as usize;
+        let end = off.saturating_add(seg.bytes.len());
+        if end > win_size {
+            continue; // a segment past the window is the host's error; skip rather than corrupt
+        }
+        // SAFETY: `[win_ptr, win_ptr+win_size)` is a live host allocation; `[off, end) ⊆ window`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(seg.bytes.as_ptr(), win_ptr.add(off), seg.bytes.len());
+        }
+    }
 }
 
 /// Service one cross-tier call (BROWSER.md § "wasm-JIT tier", slice 3c). The emitted mixed-tier
