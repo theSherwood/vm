@@ -48,14 +48,14 @@ as a target: it means matching **Wasmtime's** posture, not proving a theorem.
 explicit non-guarantee in-process (distrust ⇒ separate process — exactly §2). By
 choosing Cranelift (§18) we **share Wasmtime's single most security-critical
 component** — the codegen where escape bugs actually live. The TCB *delta* we own
-is therefore small and bounded: our verifier (tiny, fuzzable) + our CLIF-with-
-masking lowering + our memory/capability plumbing. Caveat: Wasmtime's security is
+is therefore small and bounded: our verifier (tiny, fuzzable) + our CLIF
+confinement lowering + our memory/capability plumbing. Caveat: Wasmtime's security is
 also years of continuous fuzzing + expert CVE response, so design-equivalence is
 not practice-equivalence until the §18 validation plan is executed. The hinge:
-**isolate confinement masking into one tiny, separately-fuzzable lowering pass**
-with a crisp invariant (every access dominated by a mask of the *final effective
-address* into `[0, size)`), differential-tested against the interpreter and
-native — see §4, §18.
+**isolate confinement into one tiny, separately-fuzzable lowering pass**
+with a crisp invariant (every access proven bounded, or dominated by a bounds check of
+the *final effective address* into `[0, reserved)`, trapping out-of-window),
+differential-tested against the interpreter and native — see §4, §18.
 
 **Speed: achievable only if we say *where*.** Sharing Cranelift means
 **steady-state compute-bound code runs at ≈ Wasmtime speed by construction** — we
@@ -68,18 +68,22 @@ is spent *around* compute, where wasm is weak:
   copy-out (vs browser wasm's mandatory linear-memory→JS hop); trampolines
   inlinable to ~free; batched async rings (§9, §13).
   *This is the strongest, most defensible win.*
-- **64-bit address space:** faster than wasm64 (one AND mask vs explicit bounds
-  check) — confirmed across all memory kernels. Against wasm32 confinement is
-  **"guard-when-bounded, mask-when-not"**: where the effective address is *provably
-  bounded* (the common indexed-array case — `(i & K)*W`), the mask elides and we
-  approach wasm32's free guarded access (bench: ~1.2–1.4× wasm32, well under
-  wasm64). Where the base is an **unbounded value** — notably the threaded data-SP
-  in C-frontend locals (`sp + (i & 255)*8`) — we **mask** (bench `locals_c`: ~2.26×
-  wasm32, still under wasm64). Closing that last gap would need wasm32-style
-  **32-bit window addressing** (so the address is `< 2^32` by construction); we
-  **accept the mask cost instead, keeping the clean 64-bit model** (D50). So the
-  honest claim is: **beats wasm64 everywhere; matches wasm32 on bounded offsets and
-  pays ~1 mask on unbounded-base accesses.**
+- **64-bit address space:** a clean 64-bit window with **no 32-bit index type**.
+  Against wasm32, confinement is **"guard-when-bounded, check-and-clamp-when-not"**
+  (trap-confinement, D38): where the effective address is *provably bounded* (the
+  common indexed-array case — `(i & K)*W`), everything elides and we approach
+  wasm32's free guarded access (bench: ~1.2–1.4× wasm32). Where the base is an
+  **unbounded value** — notably the threaded data-SP in C-frontend locals
+  (`sp + (i & 255)*8`) — we emit a bounds check + cold trap for the architectural
+  fault, plus a `& (reserved−1)` clamp on the address feeding the access for
+  Spectre-v1 confinement (§4). The clamp AND sits on the load's address-latency
+  path (as the old wrap-confinement mask did), so per-access cost ≈ the old mask
+  model; the raw check-only lowering measured faster on memory-bound kernels
+  (edn −9%, picojpeg −8%, JIT-only spike) but that win is deliberately spent on
+  keeping speculative confinement — see the §4 Spectre-v1 note. Against wasm64 we
+  still win: Wasmtime's bounds-checked heaps pay a `cmp→cmov` Spectre guard on the
+  same path, one op more than our AND. Closing the wasm32 gap entirely would need
+  wasm32-style **32-bit window addressing**; we keep the clean 64-bit model (D50).
 - **Startup / JIT latency:** faster — SSA on the wire (no SSA reconstruction);
   decls-before-bodies ⇒ parallel per-function verify+JIT (§3a).
 - **Irregular control flow:** marginally faster — native irreducible CFG avoids
@@ -125,9 +129,9 @@ post-MVP aspiration wasm shares.
 
 **Net:** the design supports the restated goals, contingent on three commitments —
 (1) state speed as around-compute + compute-parity; (2) confinement is
-guard-when-bounded / mask-when-not, masking the *final effective address*;
-(3) confinement masking is one isolated, fuzzed unit. All three are folded in
-below (§4, §18) and logged (D36–D38).
+guard-when-bounded / bounds-check-when-not, bounding the *final effective address*
+and trapping out-of-window (trap-confinement); (3) confinement is one isolated,
+fuzzed unit. All three are folded in below (§4, §18) and logged (D36–D38).
 
 ---
 
@@ -167,14 +171,14 @@ and the smallest. The true statement:
 > **Verified(module) ∧ Correct(JIT) ∧ Correct(runtime/memory-model) ∧
 > Correct(host OS + MMU + CPU) ⟹ escape-free.**
 
-The dominant escape-TCB component is the **JIT** (Cranelift + our masking lowering +
+The dominant escape-TCB component is the **JIT** (Cranelift + our trap-confinement lowering +
 our CLIF generation), not the verifier. Stating this is the point: it puts the risk
 where it actually lives (§18).
 
 ### What "escape-free" buys — the load-bearing theorem
 Even a guest with **arbitrary write access to its entire window** (conceded — §1
 self-corruption is a non-goal) **cannot escape**, because the three escape-bearing
-things are out of reach: memory access is mask-confined (I1); return addresses live
+things are out of reach: memory access is trap-confined (I1); return addresses live
 on an out-of-band stack it cannot name (I2/I5); indirect control flow is
 table-confined to its own verified functions (I2). Its only authority is the
 capabilities it was handed (I3). *That* is what verification + the memory model +
@@ -182,7 +186,7 @@ the out-of-band stack buy — not "the verifier makes it safe."
 
 ### The TCB, in two tiers
 - **Escape-TCB** (a bug breaks the sandbox for everyone): verifier; JIT incl.
-  masking lowering; runtime memory-model plumbing (window setup, guard pages,
+  trap-confinement lowering; runtime memory-model plumbing (window setup, guard pages,
   mmap/mprotect, signal/fault handlers); handle-table + control-stack management;
   supervisor; and below us the host kernel / MMU / CPU.
 - **Authority-TCB** (a bug lets *one capability* misuse/leak *its own* authority,
@@ -208,11 +212,11 @@ Escape-freedom decomposes into five sub-invariants; their conjunction is the the
 
 | Invariant | Owner | Validated by |
 |---|---|---|
-| **I1 Memory confinement** — every access ∈ `[base, base+size)` | masking lowering (JIT) | the isolated masking-fuzz unit + differential vs interpreter (§18) |
+| **I1 Memory confinement** — every access ∈ `[base, base+size)`, out-of-window ⇒ `MemoryFault` | trap-confinement lowering (JIT) | the isolated confinement-fuzz unit (`fuzz/mask`) + differential vs interpreter (§18) |
 | **I2 Control-flow integrity** — transfers only to verified entries/blocks/out-of-band returns; indirect calls table-confined | verifier + out-of-band stack (runtime) + table dispatch | verifier fuzzing; CFI self-tests |
 | **I3 Capability integrity** — authority only via held handles; host-owned table; no opcode mints authority; fail-closed signature check | verifier (sealing-as-typing) + runtime | verifier fuzzing; forged-index tests |
 | **I4 IR totality** — no UB; every op = defined value or defined trap | IR semantics (JIT + interpreter) + verifier | differential JIT-vs-interpreter |
-| **I5 Stack integrity** — control stack unreachable by masking; data overflow → guard fault | runtime (placement) + JIT (stack probes) | guard-page + stack-clash tests |
+| **I5 Stack integrity** — control stack unreachable by confinement; data overflow → guard fault | runtime (placement) + JIT (stack probes) | guard-page + stack-clash tests |
 
 ### Scope
 - **In scope:** architectural escape; hostile/malformed/adversarial IR; **Spectre**
@@ -227,9 +231,10 @@ Escape-freedom decomposes into five sub-invariants; their conjunction is the the
 ### Microarchitectural posture (one precise statement)
 I1–I5 prevent **architectural** escape. They do **not** prevent **microarchitectural**
 leakage (Spectre, covert channels); that is *mitigated, not eliminated* —
-mask-not-branch (I1 doubles as Spectre-v1), retpoline/eIBRS on indirect dispatch,
-IBPB/BHB + VERW + L1D flush on distrust-domain switch, no SMT across distrusting
-domains (§9). **The robust distrust boundary is a separate process** (§2). In-process
+the confinement clamp (I1's `& (reserved−1)` on the access address is a data
+dependency, so it confines Spectre-v1 speculation too — §4), retpoline/eIBRS on
+indirect dispatch, IBPB/BHB + VERW + L1D flush on distrust-domain switch, no SMT
+across distrusting domains (§9). **The robust distrust boundary is a separate process** (§2). In-process
 isolation (tiers 0/1) is defense-in-depth, never a hard Spectre boundary.
 
 ### Fail-closed
@@ -247,7 +252,7 @@ are what keep an authority-TCB bug from becoming an escape.
 ### Residual risk (honest)
 Per the contract, escape-freedom rests on JIT/runtime correctness, which **this team
 cannot certify** (§18). The mitigations are the differential interpreter-oracle, the
-isolated masking-fuzz unit, and verifier fuzzing — strong bug-finders, not proofs.
+isolated confinement-fuzz unit, and verifier fuzzing — strong bug-finders, not proofs.
 **Closing the gap to "certified" is the separate post-MVP workstream** (expert
 review, fuzzing infra, audit), tracked as open-ended in §18.
 
@@ -308,8 +313,9 @@ Continuation of §3 — the actual IR, its types, and how it serializes. Verific
 forgeable too, but inert because authority lives in the per-domain table, not the
 index.** The split is defined by what a forged value can do:
 - **Plain data** — scalars (`i32`/`i64`/`f32`/`f64`/`v128`) and **pointers**. A
-  forged pointer is harmless: every access is masked + MMU-confined to the window
-  (§4), so the worst case is the guest corrupting its *own* memory (allowed). So
+  forged pointer is harmless: every access is bounds-checked + MMU-confined to the window
+  (§4) and traps if out-of-window, so the worst case is the guest corrupting its *own*
+  memory (allowed). So
   plain data is **freely forgeable and interconvertible** (int↔ptr↔float-bits,
   pointer arithmetic, tagging) — non-negotiable, because C/Rust do exactly this.
   `i8`/`i16` exist only as memory access *widths*, not SSA value types (tiny
@@ -356,21 +362,21 @@ index.** The split is defined by what a forged value can do:
     *both* backends — pinned by `jit_threads::fiber_suspended_on_root_migrates_to_spawned_vcpu`
     and the randomized-migration differential in `fiber_fuzz`.
 - **Pointers** are a CHERI-ready-but-erasable refinement of `i64` (§10): off-CHERI
-  a no-op; the type exists for the JIT's masking and a future CHERI *host* backend.
+  a no-op; the type exists for the JIT's confinement and a future CHERI *host* backend.
 
 **Central safety theorem (what the verifier + runtime buy):** escape is impossible
-because (a) the memory model confines all plain-data access (mask of the final
-effective address + guard region, JIT-enforced — §4), (b) **the authority tables
+because (a) the memory model confines all plain-data access (bounds check of the final
+effective address + guard region, trapping out-of-window, JIT-enforced — §4), (b) **the authority tables
 contain only granted capabilities, so a forged index is inert** — it traps or
 re-selects one of the domain's own grants, type-re-checked at the call (D37),
 (c) control transfers are typed + the control stack is out-of-band (§5). The guest
 may mangle plain data arbitrarily — including handle/funcref *indices* — and still
 cannot escape: the index space is confined to the domain's own tables, and the
 tables are the only thing that maps an index to authority. Note (a) is enforced by
-**JIT codegen (the masking lowering), not the verifier** — the verifier secures
+**JIT codegen (the trap-confinement lowering), not the verifier** — the verifier secures
 typing, control flow, and table-index ranges; confinement of memory is the
-masking pass (§4, §18). "Verified ⇒ cannot escape" is shorthand for "verified
-**and** the masking lowering is correct."
+confinement pass (§4, §18). "Verified ⇒ cannot escape" is shorthand for "verified
+**and** the trap-confinement lowering is correct."
 
 ### Binary encoding
 Design goal: **decode and verification fuse into one linear forward pass, no
@@ -456,7 +462,7 @@ security — UB in a sandbox IR would void the escape guarantee.
   arithmetic).
 - **Memory:** `{i32,i64,f32,f64}.load/store`; narrow `load8_s/u load16_s/u load32_s/u`
   + `store8/16/32` (C char/short). Address operand + immediate offset + alignment
-  *hint* (unaligned allowed). Confinement masking is implicit (JIT-inserted).
+  *hint* (unaligned allowed). Trap-confinement is implicit (JIT-inserted).
 - **Atomics** (C11, §12): atomic load/store at orderings; RMW `add sub and or xor
   exchange cmpxchg` at orderings; `fence`; `wait`/`notify` (futex). *(**Implemented**
   (Phase-4 concurrency, ahead of the original plan): in the IR, interpreter, and JIT,
@@ -578,7 +584,7 @@ at *use* or by *out-of-band storage*:
 
 | Escape vector | Confined by |
 |---|---|
-| memory access | mask of final effective address (§4) — use-site |
+| memory access | bounds check of final effective address, trap out-of-window (§4) — use-site |
 | indirect call `call_indirect` | function-table bounds + type check — use-site |
 | capability call `cap.call` | handle-table bounds + type + liveness, **host-owned table** — use-site |
 | direct call / branch | static targets, verifier-checked — no runtime value |
@@ -706,7 +712,7 @@ powerbox (instantiation fills the first N entries, §3b) reuse the existing mech
 — zero extra surface.
 
 **Buffer args** (`(ptr,len)` + own/borrow, §7) are validated at the trampoline: the
-ptr is a guest window offset, so the trampoline masks/bounds-checks `(ptr,len)`
+ptr is a guest window offset, so the trampoline bounds-checks `(ptr,len)`
 against the window before the host borrows it in place (§9's "arg bounds-check").
 
 ### Verifier delta
@@ -723,15 +729,15 @@ against the window before the host borrows it in place (§9's "arg bounds-check"
 
 How the chibicc-style frontend lowers C to the IR. Resolves the §18 "C ABI"
 checklist item. Two settled decisions — the **out-of-band control stack** (§5) and
-**windowed/masked memory** (§4) — *force* most of the ABI's shape; the rest is
+**windowed (trap-confined) memory** (§4) — *force* most of the ABI's shape; the rest is
 chosen for simplicity (AGENTS.md) and wasm-parity (§1a), since the MVP is a
 whole-program single module that links to no external platform ABI.
 
 ### The forced two-stack split
 A pointer to an address-taken local must be a **window offset** (so access through
-it is masked + confined, §4). The control stack is **out-of-band** (§5), *not* in
-the window — so an address-taken local cannot live there, or its `&` would mask to
-the wrong window location. Hence the SafeStack split:
+it is bounds-checked + confined, §4). The control stack is **out-of-band** (§5), *not* in
+the window — so an address-taken local cannot live there, or its `&` would name a
+location outside the window (and trap). Hence the SafeStack split:
 
 | Stack | Where | Holds | Guest-addressable |
 |---|---|---|---|
@@ -916,41 +922,65 @@ the Phase-1 core loop.
 - Real **demand-paged virtual memory via the host's MMU**: `map` / `unmap` /
   `protect`, file-backed mappings, guard pages, and COW are **host
   capabilities**, implemented with `mmap` / `mprotect` / `userfaultfd`.
-- **No hot-path software bounds checks.** Confinement is **guard-when-bounded,
-  mask-when-not** (D36):
+- **Trap-confinement (guard-when-bounded, bounds-check-when-not)** (D36). An
+  out-of-window access raises `Trap::MemoryFault` **at the offending access** — it is
+  never masked/aliased back into the window:
   - *Bounded case (wasm32-style, the common one):* when the JIT can prove the
     effective address stays within a small reach (e.g. a 32-bit dynamic offset +
     small immediate), emit **no instruction at all** — a large guard region behind
     the window catches any escape, exactly as Wasmtime does. Zero hot-path cost,
     matching wasm32.
-  - *Unbounded case (the 64-bit window):* mask **the final effective address**
-    (after folding base + dynamic offset + immediate offset + `ptr.add`) to the
-    window width — a single AND. **Masking the final address is load-bearing for
-    security:** masking only the offset operand and then adding a large C immediate
-    could land past the guard region in a neighbouring window. Overflow/wrap of the
-    masked address stays in-window and is mere guest self-corruption (allowed).
-  Masking is also Spectre-v1 hardening: a mask is a data dependency, not a branch,
-  so it executes on the speculative path too. A guard region backs both cases; any
-  out-of-window / unmapped / wrongly-protected access faults to the host.
-- **Confinement is one isolated lowering pass.** The masking/guard logic is a
-  single, separately-fuzzable JIT component with the invariant *"every memory
-  access is dominated by a mask of the final effective address into `[0, size)`,
-  or proven bounded with a guard"* — not diffused through general codegen. This is
-  the security hinge (§1a, §18): it is the part the verifier does **not** cover, so
-  it is fuzzed and differential-tested in isolation against the interpreter and
-  native.
+  - *Unbounded case (the 64-bit window):* **bounds-check the final effective address,
+    then clamp it.** The check (after folding base + dynamic offset + immediate offset
+    + `ptr.add`) compares against the reserved domain and traps out-of-line on
+    failure; the address feeding the access is additionally ANDed with `reserved−1` —
+    architecturally a no-op, since every access that passes the check already
+    satisfies `addr+offset < reserved` (the power-of-two reservation is what makes the
+    clamp this cheap). **Bounding the final address is load-bearing for security:**
+    checking only the offset operand and then adding a large C immediate could land
+    past the guard region in a neighbouring window. The check compares the dynamic
+    address against a *compile-time constant* (`reserved − offset − width`), so it
+    never itself overflows, and its trap block is **cold**, so the fast path stays
+    inline. Within the reservation, per-page committedness (`[0, mapped)` plus any
+    page the guest `grow`s into the tail) is enforced by the `PROT_NONE` guard region.
+  A guard region backs both cases; any out-of-window / unmapped / wrongly-protected
+  access faults to the host.
+  - *Spectre-v1: the clamp IS the hardening.* The AND is a data dependency that also
+    executes on the speculative path, so a misspeculated out-of-bounds access is
+    confined to `[0, reserved)` — the window plus its own guard — exactly as under
+    the old wrap-confinement model; it can never speculatively read a neighbouring
+    window or host memory. This matches (and mechanically beats) what default-config
+    Wasmtime does for bounds-checked heaps: its `heap_access_spectre_mitigation`
+    clamps to address 0 via `cmp→cmov` on the address path, while our AND is one op
+    cheaper (measured on confinement-dense kernels: check+AND beats check+cmov by
+    20–50%). The cost is honest and measured: the AND sits back on the load's
+    address-latency path, so trap-confinement's raw memory-bound win over the old
+    mask model (edn −9%, picojpeg −8%, JIT-only) is **spent buying trap semantics
+    while keeping the old speculative confinement** — net ≈ old-mask performance,
+    plus the check's small throughput cost on load-dense loops. A per-domain
+    unhardened mode (check only, no clamp) would be a small isolated delta to the
+    same lowering, but is deliberately NOT offered today: one fuzzed configuration
+    (D38), and no deployment has justified trading the hardening for single-digit %.
+- **Confinement is one isolated lowering pass.** The bounds-check/clamp/guard logic is
+  a single, separately-fuzzable JIT component ([`svm_mask`] is its shared reference)
+  with the invariant *"every memory access is either proven bounded (guard-backed) or
+  dominated by a bounds check of the final effective address into `[0, reserved)`
+  (faulting otherwise) whose address is clamped by `& (reserved−1)` on the way to the
+  access"* — not diffused through general codegen. This is the security hinge (§1a,
+  §18): it is the part the verifier does **not** cover, so it is fuzzed and
+  differential-tested in isolation against the interpreter and native.
 
 **Guard sizing & the 64-bit framing (clarification).** The window is a *64-bit*
 address space (e.g. 2^40 above); there is **no 32-bit index type** as in wasm32,
 so the guard region behind the window does **not** need to span 2^32. It only has
 to cover the largest *immediate offset + access width* the bounded case will trust
 without re-proving the full base bound (pages-to-MiB of reach), because the base
-itself is either proven in-window or masked. "Bounded" here means *proven by the
+itself is either proven in-window or bounds-checked. "Bounded" here means *proven by the
 JIT's upper-bound analysis*, **not** free-by-type; a genuinely unknown 64-bit
-address always masks. Two strengths of elision follow, and they differ in what
-they trust:
+address is always bounds-checked (and traps out-of-window). Two strengths of elision
+follow, and they differ in what they trust:
 - *Conservative (no guard reliance):* the whole access `[addr+offset, +width)` is
-  proven `< size`, so the unmasked address already equals the masked one. Sound on
+  proven `< size`, so no check is needed — the address is already in-window. Sound on
   **every** target — it never depends on a fault.
 - *Guard-relying:* only the base is proven in-window; an `offset+width` overrun off
   the top is caught by the guard fault. Sound **only where the guard region exists**
@@ -962,7 +992,7 @@ and the bounded window makes escape impossible without per-access checks.
 
 ### Platform support  [Linux + macOS + Windows green]
 
-Confinement itself is portable arithmetic (the masking pass, §16/D51); only the
+Confinement itself is portable arithmetic (the trap-confinement pass, §16/D51); only the
 **non-TCB PAL** — VA reserve/commit/protect/release + guard-fault→trap recovery —
 differs per OS. `crates/svm-jit/src/mem.rs` is a portable window model over a small
 PAL seam, cfg-selected per target. The full test suite — confinement,
@@ -1264,7 +1294,7 @@ capability; the host decides the realization.
 ### Domains, tiers, sharing
 - Threads + shared memory are **intra-domain** (cooperating, native speed).
   Distrust is **cross-domain**.
-- Tiers: **0** (same address space, mask + MMU — cooperating only), **1** (same
+- Tiers: **0** (same address space, check+clamp + MMU — cooperating only), **1** (same
   process, MPK/PKU — fast architectural path + defense-in-depth, *not* a
   Spectre guarantee), **3** (separate process — robust distrust boundary).
 - Explicit **memory consistency model**: the C/C++11 model (§12) — specified, not
@@ -1283,7 +1313,8 @@ capability; the host decides the realization.
 ## 9. Spectre hardening, scheduling, split host & exfil stance  [SETTLED]
 
 **Hardening contract for generated code & transitions:**
-- Mask-not-branch confinement (already in §4).
+- Bounds-check-then-clamp confinement — the clamp AND executes on the speculative
+  path, confining misspeculated accesses to the window+guard (already in §4).
 - Retpolines / eIBRS for indirect-branch control.
 - IBPB + BHB flush on domain switch.
 - VERW (MDS) and L1D flush (L1TF) on transitions.
@@ -1756,7 +1787,7 @@ our components.
 
 ### Platform abstraction & portability  [SETTLED — Linux/macOS/Windows at parity (Phase 3.5 done); seL4 backend still future]
 
-The escape-critical core is **already portable**: confinement masking (§4) is pure
+The escape-critical core is **already portable**: trap-confinement (§4) is pure
 arithmetic (`svm-mask` is `no_std`, dependency-free), so the security hinge carries no
 OS-specific code. Portability concentrates in two **non-TCB** layers, isolated behind a thin
 **Platform Abstraction Layer** (PAL) in the runtime/JIT — never in the audited crates:
@@ -2319,11 +2350,11 @@ unit, matching structural semantics by construction.
 The escape contract (§2a) `Verified ∧ Correct(JIT) ∧ Correct(runtime) ⟹ escape-free` extends to
 guest-submitted code: it passes the *same* `decode`+`verify` gate before a single instruction reaches
 Cranelift, so a malicious/garbage blob is rejected fail-closed. **The one new authority-TCB precondition
-that keeps "no escape-TCB change" true:** confinement masking (I1) masks into `[0, size)` for the
+that keeps "no escape-TCB change" true:** trap-confinement (I1) bounds accesses to `[0, reserved)` for the
 *declared* memory; a blob declaring a *larger* memory, compiled against its own size, would get the JIT to
-mask into a larger region — an escape, without touching the masking lowering. The fix lives in the
+bound against a larger region — an escape, without touching the confinement lowering. The fix lives in the
 authority-TCB `Jit` handler: **reject any submitted module whose declared memory ≠ the parent window**
-(the host then compiles the blob with the parent's base/mask, so I1 confines it exactly as the main
+(the host then compiles the blob with the parent's base/reserved, so I1 confines it exactly as the main
 module). The handler also rejects data segments and §12 concurrency ops inside a *submitted unit* (a
 JIT'd blob stays single-threaded; the *parent* may be multi-threaded). A per-domain **compile quota**
 (`-ENOMEM`) bounds a looping guest. Net: **Model A adds no escape-TCB surface (authority-TCB only); B2
@@ -2672,7 +2703,7 @@ team has **no expert safety net**.
   deep debugging concentrate.
 - **Phase 3.5 — Cross-platform parity** — port the runtime to **Windows** and lock
   parity across **Linux / Windows / macOS** from here on. The escape-critical core
-  is already portable (confinement masking is pure arithmetic), so only the non-TCB
+  is already portable (confinement is pure arithmetic), so only the non-TCB
   **Platform Abstraction Layer** differs (§16/D51): VA management
   (`VirtualAlloc`/`VirtualProtect`), the detect-and-kill safety net (Windows
   **VEH/SEH**; macOS **Mach exceptions**, which can intercept ahead of BSD
@@ -2721,12 +2752,12 @@ as open-ended, not a byproduct of the build.
   expert eyes. This is the §3 parity invariant (three backends, one observable behavior).
 - **Fuzz the verifier from day one** (invariant: verified ⇒ cannot escape) — the
   one security validation that doesn't need a continuous expert in the loop.
-- **Fuzz the confinement-masking lowering as its own unit** (D38) — it is the part
+- **Fuzz the trap-confinement lowering as its own unit** (D38) — it is the part
   the verifier does *not* cover and the true escape hinge. Invariant: *every
-  generated memory access is dominated by a mask of the final effective address
-  into `[0, size)`, or proven bounded behind a guard.* Differential-test masked
-  addresses against the interpreter's checked addresses; add a self-test that
-  asserts no access instruction reaches a raw, unmasked, unbounded address.
+  generated memory access is dominated by a bounds check of the final effective address
+  into `[0, reserved)` (trapping out-of-window), or proven bounded behind a guard.*
+  Differential-test confined addresses against the interpreter's checked addresses;
+  add a self-test that asserts no access instruction reaches a raw, unbounded address.
 - **Lean on Cranelift** (removes the hardest codegen risk) — and note it *is* the
   security story: sharing Wasmtime's backend is how we are simultaneously
   "as secure as wasm" and "compute-parity with wasm" (§1a, D36).
@@ -2759,7 +2790,7 @@ as open-ended, not a byproduct of the build.
 | D1 | Block-local typed SSA, no phi, explicit block params | Settled | Linear verifier, no dominance analysis; great producer/consumer target |
 | D2 | Native irreducible control flow | Settled | No relooper; direct LLVM target |
 | D3 | Reserved VA window + host MMU for virtual memory | Settled | Real paging, zero software translation, bounded → escape-proof |
-| D4 | Mask (not branch) for confinement | Settled | Hot-path speed + Spectre-v1 robustness |
+| D4 | ~~Mask (not branch) for confinement~~ **Superseded by trap-confinement (D38): bounds-check for the architectural trap + `& (reserved−1)` clamp on the access address for Spectre-v1** | Superseded | Wrap-confinement's silent aliasing was bad UX and diverged from wasm semantics; the clamp keeps the mask's Spectre-v1 robustness (a data dependency on the speculative path) while the check gives a clean `MemoryFault` at the offending access. Measured: clamp ≈ old-mask perf; the check-only variant's memory-bound win (edn −9%/picojpeg −8%) is spent on hardening — see §4 |
 | D5 | Control stack out of guest memory | Settled | Control-flow integrity; no ROP into host |
 | D6 | Tail calls, multi-return, stack switching | Settled | Broad language coverage |
 | D7 | Domain = unit; threads/shared-mem intra-domain; distrust cross-domain | Settled | Matches OS reality; pairs with Spectre scheduling |
@@ -2793,8 +2824,8 @@ as open-ended, not a byproduct of the build.
 | D35 | Phase-1 IR spec pinned: instruction set, trap/wrap/saturate semantics, little-endian + IEEE FP, complete verifier rules, entry/instantiation contract | Settled | The concrete spec the verifier+interpreter are built from (§3b) |
 | D36 | Goal = relative to wasm: as secure as wasm (host), faster on interface/64-bit/startup with **compute pegged at Wasmtime parity** (shared Cranelift), simpler+more flexible interface | Settled | Absolute "escape impossible" not certifiable by this team; relative bar is reachable and measurable (§1a) |
 | D37 | Capabilities are **inert typed table indices**, not a sealed value class; a forged index traps or re-selects an own grant (authority binds to the table entry) | Settled | Removes §3a/§7 contradiction; lets handle/funcref live in registers/memory and lets C function pointers lower to function-table indices |
-| D38 | Confinement = **guard-when-bounded, mask-when-not**, masking the **final effective address**, implemented as one isolated separately-fuzzable lowering pass | Settled | Matches wasm32 hot path (zero instructions), beats wasm64; final-address masking closes the large-immediate escape; isolation makes it fuzzable as the security hinge |
-| D39 | C ABI: forced **two-stack split** (out-of-band control stack + in-window guard-paged data stack); address-taken→data stack, scalar non-address-taken→SSA; LP64/little-endian; **by-value aggregates by hidden pointer** (sret); clang-wasm-style vararg buffer | Settled | Window+masking (§4) and out-of-band control stack (§5) force the split; by-pointer is simplest-correct and ~wasm parity; whole-program MVP needs no external-ABI match (§3d) |
+| D38 | Confinement = **guard-when-bounded, check-and-clamp-when-not** (trap-confinement): bounds-check the **final effective address** against `[0, reserved)` with a cold `MemoryFault` trap, and clamp the address feeding the access with `& (reserved−1)` (architecturally a no-op past the check; on the speculative path it confines Spectre-v1 exactly as the old mask did). One isolated separately-fuzzable lowering pass; ONE configuration — no unhardened check-only tier | Settled (revised from mask-when-not) | Matches wasm32 hot path (zero instructions when elided), beats wasm64 (Wasmtime's bounds-checked heaps pay cmp→cmov for the same Spectre guard; our power-of-two reservation makes the clamp a 1-op AND); final-address checking closes the large-immediate escape; trap-at-the-access matches wasm UX and keeps the §18 escape oracle; isolation makes it fuzzable as the security hinge |
+| D39 | C ABI: forced **two-stack split** (out-of-band control stack + in-window guard-paged data stack); address-taken→data stack, scalar non-address-taken→SSA; LP64/little-endian; **by-value aggregates by hidden pointer** (sret); clang-wasm-style vararg buffer | Settled | Window+trap-confinement (§4) and out-of-band control stack (§5) force the split; by-pointer is simplest-correct and ~wasm parity; whole-program MVP needs no external-ABI match (§3d) |
 | D40 | Const globals + string literals in a **read-only data segment** (`protect` at instantiation) | Settled | One extra protect call → writes to const data fault → §5 detect-and-kill; cheap self-corruption detection |
 | D41 | A fiber owns a **stack pair** (in-window data stack + out-of-band control stack); stacks are **per-fiber**; the control stack is unreachable by guest masking (CFI) but **charged to the guest's memory quota** (so a fiber-bomb self-OOMs, not the host) | Settled | Reconciles the §3d two-stack split with §12 fibers; keeps both CFI (§5) and "fibers metered/sandbox-safe" (§12/§15); switch swaps both SPs, ~ns |
 | D42 | MVP cap ops use a **negative-errno `i64`** result (`≥0` success value, `<0` `-errno`); errors never trap; buffer args are borrow-only `(ptr,len)` validated at the trampoline (`-EFAULT` on overflow) | Settled | Syscall-shaped (§7), 1:1 with the C libc shim; keeps traps reserved for escape/fatal (§3b) |
@@ -2806,7 +2837,7 @@ as open-ended, not a byproduct of the build.
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
 | D50 | **Accept the mask cost on unbounded-base accesses; do not pursue 32-bit window addressing.** Mask elision (§4 guard-when-bounded) covers *provably-bounded* addresses; for an unbounded base (the threaded data-SP in C locals) we keep the single AND mask (`locals_c` ~2.26× wasm32, still < wasm64) rather than lower window addresses as 32-bit | Settled | The 64-bit address space is a core goal (D36/§1a); the only sound way to elide an unbounded-base access is the wasm32 trick (32-bit address arithmetic, address `< 2^32` by construction so it matches the interp and elides) — masking the i64 data-SP alone is un-elidable or diverges from the interp (an escape). That trick caps the elided window at 4 GiB and reworks the frontend's pointer model for one benchmark; not worth trading the clean 64-bit model. Revisit only if a real workload makes the data-SP mask a measured bottleneck |
-| D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement masking stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
+| D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
 | D52 | **Capability-boundary record/replay** as the primary debugging differentiator: in deterministic mode (§12) nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + seeding that mode gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5). **Caveat:** under multicore + relaxed atomics (§12/§23) race outcomes bypass the cap boundary, so faithful replay must also record schedule/memory-order choices (the interp's DPOR `explore_all` already reifies these) | Proposed (premises built; surfaces unbuilt) | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary *in single-vCPU mode*; the control stack survives heap corruption |
 | D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`). **Status:** premises built (control stack, deterministic interp, SSA promotion); no stepping API, cap.call log, or §3a debug side-table yet — the side-table is step zero for DWARF | Proposed (premises built; surfaces unbuilt) | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
 | D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset, `crates/svm-llvm`) and wasm→IR bridge (compat, `svm-wasm`).** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | **Settled + built** (§20a): LLVM on-ramp passes the **exit criterion** — all 8 chibicc corpus libraries run byte-identical to native `clang` on both backends; general-C breadth (varargs `printf`, wider SIMD, libm) ongoing | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |

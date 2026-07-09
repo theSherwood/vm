@@ -239,6 +239,83 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
     );
 }
 
+/// **`gc.roots` scans a running *ancestor* fiber** — the path the tight running-scan
+/// (`fiber_rt::gc_roots`; STACK_GUARD_FLIP.md #4) validates. Chain: root → A → B, all RUNNING; B calls
+/// `gc.roots`. B is the innermost (scanned via `current_sp`); A is a running *ancestor* (scanned via
+/// its child B's `resumer_sp` — the SP A saved when it resumed B). A holds the heap pointer `0x7ab8`
+/// (its resume-arg *parameter*, so regalloc can't rematerialize it) live across resuming B by storing
+/// it afterward, so `0x7ab8` sits on A's stack above A's saved SP. B never sees it (its arg is 0) and
+/// the root passes it only as A's immediately-dead resume arg — so `0x7ab8`'s presence proves the
+/// *ancestor* scan specifically. `heap_lo` (`0x7ab0`) lives only on B, proving the innermost scan;
+/// finding both in one scan pins the whole running-chain walk (a too-tight ancestor bound would drop
+/// `0x7ab8`).
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
+    use svm_jit::{compile_and_run, JitOutcome};
+    // 16-byte heap window [0x7ab0, 0x7ac0): only 0x7ab0 (heap_lo, on B) and 0x7ab8 (P_A, on A) fall in
+    // it (a stray stack word in a 16-byte range is ~2^-60). buf at 0, cap 4. A stores P_A at offset
+    // 0x1000 — outside both the buffer and the heap window — purely to keep it live past the resume.
+    let src = "memory 16\n\
+        func () -> (i64, i64, i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 31416\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 0\n\
+        \x20 v7 = i64.load v6\n\
+        \x20 v8 = i64.const 8\n\
+        \x20 v9 = i64.load v8\n\
+        \x20 return v5 v7 v9\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = ref.func 2\n\
+        \x20 v3 = i64.const 4096\n\
+        \x20 v4 = cont.new v2 v3\n\
+        \x20 v5 = i64.const 0\n\
+        \x20 v6, v7 = cont.resume v4 v5\n\
+        \x20 v8 = i64.const 4096\n\
+        \x20 i64.store v8 v1\n\
+        \x20 return v7\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 31408\n\
+        \x20 v3 = i64.const 31424\n\
+        \x20 v4 = i64.const 0\n\
+        \x20 v5 = i64.const 4\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v6 = gc.roots v2 v3 vmask v4 v5\n\
+        \x20 return v6\n\
+        }\n";
+    let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).expect("verify");
+    let slots = match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Returned(s) => s,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    let (count, buf0, buf1) = (slots[0], slots[1], slots[2]);
+    assert!(
+        count >= 2,
+        "both the caller (B) and ancestor (A) roots must be found (count {count})"
+    );
+    assert_eq!(
+        buf0, 0x7ab0,
+        "heap_lo 0x7ab0 (on innermost B) must be enumerated; got {buf0:#x}"
+    );
+    assert_eq!(
+        buf1, 0x7ab8,
+        "running ancestor A's live pointer 0x7ab8 must be enumerated; got {buf1:#x}"
+    );
+}
+
 /// **End-to-end cross-vCPU stop-the-world root scan** (GC.md §2 + §3) — the motivating case the op
 /// exists for. A *collector* vCPU (the root) enumerates the roots of a *mutator* fiber that is parked
 /// on a **different** vCPU, over the domain-shared fiber table, synchronized by a real futex

@@ -8,6 +8,7 @@
 // page mirrors `threads-spawn.mjs` exactly.
 
 import { fetchBytes, loadEngine, makeRunner, readParStdout } from '/web/par.js';
+import { compileJit } from '/web/wasmjit.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -128,6 +129,44 @@ async function main() {
     log(`capio → ${value}, stdout ${out.length}B across ${started} Workers in ${ms}ms`);
   } catch (e) {
     set('capio', 'fail', `capio: error ${e}`);
+  }
+
+  // --- 6) wasm-JIT tier: SVM IR compiled to wasm, run in-browser (BROWSER.md wasm-JIT slice 2) ----
+  // The `alu` compute kernel is emitted to a wasm module by the cdylib (`svm_wasmjit_compile`),
+  // instantiated against the page's OWN linear memory, and its `f0` called directly on the page
+  // (compute-only → no Atomics.wait, so the main thread is fine). Assert it equals the `svm_run`
+  // interpreter over an arg sweep, then time a heavy run to show the JIT's win over interp-in-wasm.
+  try {
+    const bytes = await fetchBytes('/corpus/alu.svmbc');
+    const jit = await compileJit(ex, bytes, { memory });
+    if (!jit) throw new Error('svm_wasmjit_compile refused an in-subset module');
+    const interp = (arg) => {
+      const p = ex.svm_alloc(bytes.length);
+      u8().set(bytes, p);
+      const r = ex.svm_run(p, bytes.length, BigInt(arg));
+      const st = ex.svm_status();
+      ex.svm_dealloc(p, bytes.length);
+      if (st !== 0) throw new Error(`svm_run status ${st}`);
+      return BigInt.asIntN(64, r);
+    };
+    let eq = true;
+    for (const arg of [0n, 1n, 2n, 5n, 1000n, -1n, 100000n]) {
+      if (jit.call([arg]).value !== interp(arg)) { eq = false; break; }
+    }
+    const N = 5_000_000n;
+    const t0 = performance.now();
+    const jv = jit.call([N]).value;
+    const t1 = performance.now();
+    const iv = interp(N);
+    const t2 = performance.now();
+    const jitMs = t1 - t0, intMs = t2 - t1;
+    const ok = eq && jv === iv;
+    set('wasmjit', ok ? 'pass' : 'fail',
+      `wasmjit: SVM IR → wasm, f0 called in-browser → ${jv} (interp ${iv}) ${ok ? 'PASS' : 'FAIL'} ` +
+      `· alu n=${N}: jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}×`);
+    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter`);
+  } catch (e) {
+    set('wasmjit', 'fail', `wasmjit: error ${e}`);
   }
 }
 

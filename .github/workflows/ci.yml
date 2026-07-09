@@ -408,6 +408,11 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets -- -D warnings
       - run: cargo test -p svm-jit --features stack-check,arena-stacks
+      # The stack-guard soundness fuzz's hole-oracle is the PROT_NONE guard page, present only on the
+      # default (non-arena) backend. The line above runs the check on the arena backend it ships with;
+      # this runs the fuzz on the guard-page backend so a frame that slips past the check faults
+      # (MemoryFault/crash) instead of silently corrupting a neighbour slot. (STACK_GUARD_FLIP.md #1.)
+      - run: cargo test -p svm-jit --features stack-check --test stack_guard_fuzz
       - run: cargo test -p svm-fiber --features arena-stacks
       # Compile parity for the feature-gated code on Windows. mingw is needed for the §5 trap-capture
       # C shim (as in the `check` job's cross-check).
