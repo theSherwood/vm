@@ -35,7 +35,7 @@ extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
 
 enum {
   FS_OPEN = 0, FS_READ, FS_WRITE, FS_SEEK, FS_CLOSE, FS_REMOVE, FS_RENAME,
-  FS_TRUNCATE, FS_SYNC, FS_MMAP, FS_MSYNC, FS_MUNMAP
+  FS_TRUNCATE, FS_SYNC, FS_MMAP, FS_MSYNC, FS_MUNMAP, FS_CRASH_ARM
 };
 enum { CAP_O_READ = 1, CAP_O_WRITE = 2, CAP_O_APPEND = 4, CAP_O_TRUNC = 8, CAP_O_CREATE = 16 };
 
@@ -45,6 +45,10 @@ static int fs(void) {
   return g_fs;
 }
 static long hc(int op, long a, long b, long c, long d) { return __vm_host_call(fs(), op, a, b, c, d); }
+
+/* Test-only: arm a simulated power loss on the fs capability (see `FS_CRASH_ARM` in fs.rs). A no-op
+ * on grants that lack the crash controller (returns -EINVAL, ignored). Guest-only symbol. */
+void svm_fs_crash_arm(long n) { (void)hc(FS_CRASH_ARM, n, 0, 0, 0); }
 
 static long cstrlen(const char *s) {
   long n = 0;
