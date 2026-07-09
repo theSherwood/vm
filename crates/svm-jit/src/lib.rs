@@ -2220,7 +2220,9 @@ impl CompiledModule {
                 new_thunk: fiber_rt::fiber_new as *const () as i64,
                 resume_thunk: fiber_rt::fiber_resume as *const () as i64,
                 suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
-                roots_thunk: fiber_rt::gc_roots as *const () as i64,
+                // The register-flush trampoline (not `gc_roots` directly): it spills the callee-saved
+                // registers before the scan so a guest root parked in one is captured (see its docs).
+                roots_thunk: fiber_rt::svm_gc_roots_flush as *const () as i64,
             }
         } else {
             FiberEnv::null()
@@ -4918,29 +4920,39 @@ fn lower_block(
             let mappedv = b.ins().iconst(I64, lower.mapped as i64);
             let subv = b.ins().iconst(I64, lower.sub_base as i64);
             let trap_out = b.use_var(lower.trap_var);
-            let mut tsig = module.make_signature();
-            for _ in 0..10 {
-                tsig.params.push(AbiParam::new(I64));
+            // Marshal the ten args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
+            // `#[repr(C)]` field order) and pass a single pointer. The thunk is the register-flush
+            // trampoline, which spills the callee-saved registers before the scan; a one-pointer ABI
+            // lets it do so with no per-argument reshuffle (see `fiber_rt::svm_gc_roots_flush`).
+            let slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                80, // 10 × 8 bytes
+                3,  // 8-byte aligned
+            ));
+            for (i, v) in [
+                lo,
+                hi,
+                payload_mask,
+                dst,
+                cap_v,
+                mem_base,
+                maskv,
+                mappedv,
+                subv,
+                trap_out,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                b.ins().stack_store(v, slot, (i * 8) as i32);
             }
+            let args_ptr = b.ins().stack_addr(I64, slot, 0);
+            let mut tsig = module.make_signature();
+            tsig.params.push(AbiParam::new(I64)); // args pointer
             tsig.returns.push(AbiParam::new(I64));
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.roots_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[
-                    lo,
-                    hi,
-                    payload_mask,
-                    dst,
-                    cap_v,
-                    mem_base,
-                    maskv,
-                    mappedv,
-                    subv,
-                    trap_out,
-                ],
-            );
+            let call = b.ins().call_indirect(tref, thunk, &[args_ptr]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);

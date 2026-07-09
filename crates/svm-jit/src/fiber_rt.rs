@@ -1156,8 +1156,12 @@ unsafe fn scan_words(
 /// `mask`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
 /// out-of-window `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that
 /// clears more than the top byte faults (`FiberFault`).
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "C" fn gc_roots(
+/// The ten `gc.roots` arguments, marshalled by the JIT into one stack slot so the flush trampoline
+/// ([`svm_gc_roots_flush`]) can hand them to [`gc_roots`] as a single pointer with no per-argument
+/// register/stack reshuffle. Field order is the historical argument order. `#[repr(C)]` so the JIT's
+/// 8-byte-slot stores line up with these reads.
+#[repr(C)]
+pub(crate) struct GcRootsArgs {
     heap_lo: u64,
     heap_hi: u64,
     payload_mask: u64,
@@ -1168,7 +1172,30 @@ pub(crate) unsafe extern "C" fn gc_roots(
     mapped: u64,
     sub_base: u64,
     trap_out: u64,
-) -> i64 {
+}
+
+/// The scan itself. Reached **only** via [`svm_gc_roots_flush`], which has already spilled the
+/// callee-saved registers onto the scanned stack — so a guest heap root the Tail ABI parked in one
+/// (rather than spilling) is captured by the ambient stack walk below. Calling this directly would
+/// reintroduce the register-flush gap (GC.md; the "spilled-only" note above).
+///
+/// # Safety
+/// `args` points at a live [`GcRootsArgs`] (the JIT's stack slot, valid for the call).
+pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
+    // SAFETY: the JIT hands the address of a live 10-field slot; the flush trampoline is the only caller.
+    let a = unsafe { &*args };
+    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base, trap_out) = (
+        a.heap_lo,
+        a.heap_hi,
+        a.payload_mask,
+        a.buf,
+        a.cap,
+        a.mem_base,
+        a.mask,
+        a.mapped,
+        a.sub_base,
+        a.trap_out,
+    );
     let rt = current();
     if rt.is_null() {
         fault(trap_out);
@@ -1294,6 +1321,97 @@ pub(crate) unsafe extern "C" fn gc_roots(
         }
     }
     total as i64
+}
+
+// The JIT calls `gc.roots` through this **register-flush trampoline** rather than [`gc_roots`]
+// directly. The Tail ABI preserves the callee-saved registers, so Cranelift may park a guest heap
+// root that is live across the `gc.roots` call in one of them instead of spilling it — and the ambient
+// stack walk in [`gc_roots`] scans *memory*, not registers, so such a root would be missed (a
+// conservative-GC under-report; not a VM escape — it stays within the guest window). Each trampoline
+// spills every callee-saved register onto the stack *before* [`gc_roots`] runs, so those roots land in
+// the scanned `[current_sp, top)` region. The single `args` pointer rides in the first argument
+// register untouched, so there is no per-argument reshuffle. The cost (a handful of push/pops) is paid
+// only on a `gc.roots` call — a gc-opting guest; other guests never reach it.
+#[cfg(all(unix, target_arch = "x86_64"))]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn svm_gc_roots_flush(args: *const GcRootsArgs) -> i64 {
+    // SysV callee-saved GPRs: rbx, rbp, r12-r15. `args` is in rdi (untouched). Entry `rsp % 16 == 8`;
+    // 6 pushes keep it at 8, so `sub rsp, 8` re-aligns to 0 (SysV requires `rsp % 16 == 0` at `call`).
+    core::arch::naked_asm!(
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "sub rsp, 8",
+        "call {scan}",
+        "add rsp, 8",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        scan = sym gc_roots,
+    )
+}
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn svm_gc_roots_flush(args: *const GcRootsArgs) -> i64 {
+    // AArch64 callee-saved: x19-x28 + fp(x29)/lr(x30). `args` is in x0 (untouched). Each `stp`
+    // pre-decrements sp by 16 (kept 16-aligned). d8-d15 (callee-saved FP) can't hold an integer heap
+    // pointer, so flushing the GPRs (+ fp/lr) suffices.
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-16]!",
+        "stp x19, x20, [sp, #-16]!",
+        "stp x21, x22, [sp, #-16]!",
+        "stp x23, x24, [sp, #-16]!",
+        "stp x25, x26, [sp, #-16]!",
+        "stp x27, x28, [sp, #-16]!",
+        "bl {scan}",
+        "ldp x27, x28, [sp], #16",
+        "ldp x25, x26, [sp], #16",
+        "ldp x23, x24, [sp], #16",
+        "ldp x21, x22, [sp], #16",
+        "ldp x19, x20, [sp], #16",
+        "ldp x29, x30, [sp], #16",
+        "ret",
+        scan = sym gc_roots,
+    )
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn svm_gc_roots_flush(args: *const GcRootsArgs) -> i64 {
+    // Win64 callee-saved GPRs: rbx, rbp, rdi, rsi, r12-r15 (8). `args` is in rcx (untouched). Reserve
+    // the 32-byte shadow space + 8 for alignment before the call: entry `rsp % 16 == 8`, 8 pushes keep
+    // it at 8, so `sub rsp, 40` re-aligns to 0. (xmm6-15 are callee-saved but hold no integer root.)
+    core::arch::naked_asm!(
+        "push rbp",
+        "push rbx",
+        "push rdi",
+        "push rsi",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "sub rsp, 40",
+        "call {scan}",
+        "add rsp, 40",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rsi",
+        "pop rdi",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        scan = sym gc_roots,
+    )
 }
 
 #[cfg(all(test, not(loom)))]
