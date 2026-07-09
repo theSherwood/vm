@@ -1782,6 +1782,17 @@ pub struct Vcpu<'p> {
     pending_jit: Option<PendingJit>,
     /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
     trap: Option<Trap>,
+    /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
+    /// means function `f`'s whole reachable region is JIT-compilable and suspension-free, so a direct
+    /// `Call` to it is surfaced as a [`VcpuEvent::TierUp`] — the host runs the emitted `f{f}` on the
+    /// Worker (top-level caller, so a guest trap is a catchable `RuntimeError`) and delivers the
+    /// result back via [`deliver_tierup`](Vcpu::deliver_tierup). `None` ⇒ everything interprets, as
+    /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
+    /// embedder computes it (e.g. from `svm_wasmjit::analyze`).
+    jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame dst slot
+    /// the emitted region's results land in, and how many there are.
+    pending_tierup: Option<(u32, usize)>,
 }
 
 impl<'p> Vcpu<'p> {
@@ -1865,6 +1876,8 @@ impl<'p> Vcpu<'p> {
             pending: None,
             pending_jit: None,
             trap: None,
+            jit_eligible: None,
+            pending_tierup: None,
         })
     }
 
@@ -1936,6 +1949,8 @@ impl<'p> Vcpu<'p> {
             pending: None,
             pending_jit: None,
             trap: None,
+            jit_eligible: None,
+            pending_tierup: None,
         })
     }
 
@@ -1947,6 +1962,16 @@ impl<'p> Vcpu<'p> {
     /// its state (e.g. `stdout`) after; per-call serialization is the documented 4c-host model.
     pub fn with_shared_host(mut self, host: &'p std::sync::Mutex<Host>) -> Vcpu<'p> {
         self.shared_host = Some(host);
+        self
+    }
+
+    /// Attach the **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice, builder-style). A
+    /// direct `Call` to a function `f` with `eligible[f] == true` then surfaces as
+    /// [`VcpuEvent::TierUp`] instead of interpreting `f` — the host runs the emitted region and
+    /// `deliver_tierup`s the result. `eligible.len()` should cover the primary module's functions;
+    /// an out-of-range index is treated as not-eligible (interprets).
+    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> Vcpu<'p> {
+        self.jit_eligible = Some(eligible);
         self
     }
 
