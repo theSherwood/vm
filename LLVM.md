@@ -1003,6 +1003,31 @@ field), so the svm-llvm lane didn't compile — fixed with `..Default::default()
 green, fmt + clippy clean.** Effect: the Postgres module now translates past the mask type; the next
 gap is an unrelated SSA-liveness corner (`value … not available in block`) in a later function.
 
+**Slice BU (DONE) — `freeze` of an aggregate + vector `ctpop`/`reduce` scalarization (the popcount
+dispatch tail).** Three small on-ramp fixes that carry the Postgres module through its `pg_popcount_*`
+functions, plus a diagnostics win:
+- **Function-named errors.** A whole-program error is now prefixed `in `@fn`: …` (a bare "value N not
+  available" is opaque across 14 k functions). This is what isolated the liveness gap below.
+- **`freeze` of an aggregate.** The BT liveness error (`value … not available in block`, in
+  `pg_popcount_masked_choose`) was a `freeze { i32, i32, i32, i32 }` — the `cpuid` result the recognizer
+  binds *field-wise* in the `agg` table. The scalar `freeze` arm `ctx.operand`-ed it as a scalar and
+  failed. `freeze` of an aggregate is the identity (its fields are already defined, §3c) → rebind the
+  same fields. Test `freeze_of_aggregate` (a hand `.ll` `insertvalue`→`freeze`→`extractvalue`, since
+  clang rarely emits an aggregate `freeze` from C).
+- **Vector `ctpop` on any width.** Only `i8x16` had a native vector `ctpop`; `pg_popcount_slow`'s
+  `llvm.ctpop.v2i64` now scalarizes (extract lane → `Popcnt` → repack — zero-extension leaves a
+  popcount unchanged, so it is correct for every width).
+- **Wide / 2-lane `vector.reduce`.** The horizontal reduce was 128-bit-only; it now also folds a
+  **wide** (>128-bit) accumulator lane-wise across chunks (`pg_popcount_avx512`'s `reduce.add.v8i64`)
+  and a **2-lane** packed `<2 x i32>` (via `vec_explode`, which covers both non-wide reps).
+- Test `vector_ctpop_and_wide_reduce` (a popcount-sum loop clang `-O2` vectorizes into vector `ctpop`
+  + a wide reduce) is byte-identical to native on interp + JIT. **289 translate tests green, fmt +
+  clippy clean.** Effect: the module now translates past the popcount dispatch; the next gap is
+  `pg_popcount_avx512` proper — full AVX-512 (`<64 x i1>` mask registers, `<8 x i64>`,
+  `llvm.masked.load`), which is **dead at runtime** under the `cpuid`→0 stub and is best removed by a
+  **build-config lever** (compile Postgres without the AVX-512 popcount fast-path) rather than teaching
+  the on-ramp the whole AVX-512 surface — the next slice.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

@@ -786,7 +786,13 @@ fn translate_impl(
             ba,
             &mut dbg,
             stubs.as_ref(),
-        )?;
+        )
+        // Name the function in the error — a bare "value N not available" is opaque in a
+        // whole-program module of thousands of functions (the Postgres bring-up).
+        .map_err(|e| match e {
+            Error::Unsupported(m) => Error::Unsupported(format!("in `@{}`: {m}", f.name)),
+            other => other,
+        })?;
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
@@ -13329,13 +13335,26 @@ fn lower_int_intrinsic(
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
         }
-        // Per-lane popcount — wasm has it only for `i8x16` (the sole vector `ctpop` width).
+        // Per-lane popcount. `i8x16` has a native `VPopcnt` (the sole wasm vector `ctpop` width); any
+        // other lane width (`<2 x i64>` in Postgres' `pg_popcount_slow`, `<4 x i32>`, …) is scalarized:
+        // extract each lane, `Popcnt`, repack. Zero-extending a narrow lane doesn't change its popcount,
+        // so the unsigned explode is correct for every width.
         if base == "llvm.ctpop" {
-            if shape != svm_ir::VShape::I8x16 {
-                return unsup(format!("vector ctpop on {shape:?} (only i8x16)"));
+            if shape == svm_ir::VShape::I8x16 {
+                let a = ctx.operand(args[0])?;
+                return Ok(Some(ctx.push(Inst::VPopcnt { a })));
             }
-            let a = ctx.operand(args[0])?;
-            return Ok(Some(ctx.push(Inst::VPopcnt { a })));
+            let lane_ty = int_ty(shape.lane_val())?;
+            let lanes = vec_explode(ctx, args[0], types, false)?;
+            let mut out = Vec::with_capacity(lanes.len());
+            for &l in &lanes {
+                out.push(ctx.push(Inst::IntUn {
+                    ty: lane_ty,
+                    op: IntUnOp::Popcnt,
+                    a: l,
+                }));
+            }
+            return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
         }
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
@@ -13717,29 +13736,45 @@ fn lower_vector_reduce(
     let kind = rest.split('.').next().unwrap_or(""); // "add"/"mul"/… (before the `.vNiM` suffix)
     let vec_op = &c.arguments[0].0;
     let vty = vec_op.get_type(types);
-    let Some(shape) = vec128_shape(vty.as_ref()) else {
-        return unsup(format!("vector.reduce on non-128-bit vector ({kind})"));
-    };
-    if shape.is_float() {
-        return unsup(format!("float vector.reduce.{kind} (later slice)"));
-    }
+    let signed = matches!(kind, "smax" | "smin");
     // The fold runs in the lane scalar type: `i32` for i8/i16/i32 lanes (narrow lanes widen, §3b —
     // the result is consumed truncated to the lane width, and modular add/mul stays exact), `i64`
     // for i64 lanes. A signed min/max needs sign-extended narrow lanes so the `i32` compare orders
-    // them correctly; every other reduce is bit-identical under zero-extension.
-    let lane_ty = int_ty(shape.lane_val())?;
-    let signed = matches!(kind, "smax" | "smin");
-    let v = ctx.operand(vec_op)?;
-    let lanes: Vec<ValIdx> = (0..shape.lanes())
-        .map(|l| {
-            ctx.push(Inst::ExtractLane {
-                shape,
-                lane: l,
-                signed,
-                a: v,
-            })
-        })
-        .collect();
+    // them correctly; every other reduce is bit-identical under zero-extension. The lanes come from a
+    // 128-bit `v128` directly, or — for a **wide** (>128-bit) vector (`<8 x i64>` in Postgres'
+    // `pg_popcount_avx512`) — every lane of every `v128` chunk plus the scalar tail.
+    let (lane_ty, lanes): (IntTy, Vec<ValIdx>) = if let Some(layout) = wide_vec_layout(vty.as_ref())
+    {
+        if layout.shape.is_float() {
+            return unsup(format!("float wide vector.reduce.{kind} (later slice)"));
+        }
+        let parts = ctx.wide_operand(vec_op, layout)?;
+        let mut lanes = Vec::with_capacity(layout.shape.lanes() as usize * layout.full_chunks);
+        for &chunk in parts.iter().take(layout.full_chunks) {
+            for l in 0..layout.shape.lanes() {
+                lanes.push(ctx.push(Inst::ExtractLane {
+                    shape: layout.shape,
+                    lane: l,
+                    signed,
+                    a: chunk,
+                }));
+            }
+        }
+        // The scalar tail lanes (odd lane count) are already lane-typed.
+        lanes.extend(parts.iter().skip(layout.full_chunks).copied());
+        (int_ty(layout.shape.lane_val())?, lanes)
+    } else if let Some(sh) = vec_lane_shape(vty.as_ref()) {
+        // A 128-bit `v128` *or* a 2-lane packed-`i64` (`<2 x i32>`) vector — `vec_explode` covers both.
+        if sh.is_float() {
+            return unsup(format!("float vector.reduce.{kind} (later slice)"));
+        }
+        (
+            int_ty(sh.lane_val())?,
+            vec_explode(ctx, vec_op, types, signed)?,
+        )
+    } else {
+        return unsup(format!("vector.reduce on a non-vector ({kind})"));
+    };
     let fold_bin = |ctx: &mut BlockCtx, op: BinOp| {
         let mut acc = lanes[0];
         for &l in &lanes[1..] {
@@ -16528,6 +16563,19 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     // `Ok(false)` ⇒ not an i128 op (fall through); an unsupported i128 shape fails closed.
     if lower_i128(ctx, instr, types)? {
         return Ok(());
+    }
+
+    // `freeze` of an **aggregate** value (a small by-value struct held field-wise in the `agg` table —
+    // e.g. the `{i32,i32,i32,i32}` a `cpuid`/multi-result call yields) is the identity (its fields are
+    // already defined, §3c): rebind the dest to the same fields. Without this the scalar `freeze` arm
+    // below `ctx.operand`s the aggregate as a scalar and fails ("value … not available in block").
+    if let I::Freeze(x) = instr {
+        if let Some(fields) = ctx.agg_of(&x.operand) {
+            if let Some(&vid) = ctx.s.name2id.get(&x.dest) {
+                ctx.agg.insert(vid, fields);
+            }
+            return Ok(());
+        }
     }
 
     // No-result instructions (effects only): handle and return early.

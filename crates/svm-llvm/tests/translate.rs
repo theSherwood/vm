@@ -4537,6 +4537,48 @@ fn unresolved_extern_funcptr_stub() {
 }
 
 #[test]
+fn vector_ctpop_and_wide_reduce() {
+    // Two SIMD gaps from Postgres' `pg_popcount_*`, in one vectorizable loop: (1) `llvm.ctpop.vNiM` on
+    // a non-`i8x16` lane width (`pg_popcount_slow`'s `<2 x i64>`) — only `i8x16` has a native vector
+    // `ctpop`, so the on-ramp scalarizes any other width; (2) a **wide** `llvm.vector.reduce.add` over
+    // a >128-bit accumulator (`pg_popcount_avx512`'s `reduce.add.v8i64`) — folded across every chunk
+    // lane. A popcount-sum loop vectorizes at `-O2` into exactly this; the count matches native
+    // (hardware `popcnt`) on interp + JIT. `seed` is the runtime `main` arg so nothing constant-folds.
+    let src = "int main(int seed){\n\
+        unsigned long long arr[32];\n\
+        for (int i=0;i<32;i++) arr[i] = (unsigned long long)(i+seed) * 0x0102040810204080ULL ^ (0x5555ULL*(i+1));\n\
+        int c = 0;\n\
+        for (int i=0;i<32;i++) c += __builtin_popcountll(arr[i]);\n\
+        return c & 0x7f; }";
+    check_vs_native("vctpop", src, 1);
+}
+
+#[test]
+fn freeze_of_aggregate() {
+    // `freeze` of an **aggregate** value (a small by-value struct held field-wise in `agg` — e.g. the
+    // `{i32,i32,i32,i32}` a `cpuid`/multi-result call yields, which blocked Postgres' `pg_popcount_*`
+    // dispatch) is the identity: rebind the fields. A hand-written `.ll` (`insertvalue` → `freeze` →
+    // `extractvalue`) exercises exactly that path (clang rarely emits an aggregate `freeze` from C).
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %s0 = insertvalue {i32, i32} undef, i32 7, 0\n  \
+        %s1 = insertvalue {i32, i32} %s0, i32 35, 1\n  \
+        %f = freeze {i32, i32} %s1\n  \
+        %x = extractvalue {i32, i32} %f, 1\n  \
+        ret i32 %x\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate freeze-agg .ll");
+    svm_verify::verify_module(&t.module).expect("verify freeze-agg");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run freeze-agg");
+    assert_eq!(
+        r,
+        vec![Value::I32(35)],
+        "freeze of {{7,35}} then extractvalue 1 = 35"
+    );
+}
+
+#[test]
 fn vector_shift_per_lane_amount() {
     // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
     // Postgres' `simd.h`). svm-ir's `VShift` takes one scalar count for all lanes, so the on-ramp
