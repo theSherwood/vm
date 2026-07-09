@@ -166,6 +166,14 @@ impl Yielder {
         // cannot be dropped while suspended inside its own body), and only this side is live.
         unsafe { (*self.control).resumer.get() as *const u8 }
     }
+
+    /// A stable identity for this fiber's `Control` — the box address, equal to the owning
+    /// [`Fiber::control_id`]. Lets a GC scanner correlate a running fiber (found via its `Fiber` in
+    /// the shared table) with its live `Yielder` in the resume chain, to read a tight scan low bound
+    /// (`resumer_sp`) instead of the whole usable stack. Pointer identity only — never dereferenced.
+    pub fn control_id(&self) -> usize {
+        self.control as usize
+    }
 }
 
 /// A first-class suspendable computation running on its own native stack.
@@ -304,6 +312,18 @@ impl Fiber {
     /// untouched/zeroed reserved pages or stale non-root bytes, harmless to a conservative scan).
     pub fn full_extent(&self) -> (*const u8, *const u8) {
         (self._stack.usable_low(), self._stack.top() as *const u8)
+    }
+
+    /// The high end (`top`) of this fiber's usable stack — the upper bound of any scan extent.
+    pub fn stack_top(&self) -> *const u8 {
+        self._stack.top() as *const u8
+    }
+
+    /// A stable identity for this fiber's `Control` — the `Box<Control>` address, equal to the
+    /// [`Yielder::control_id`] handed to its body. Used by the GC scanner to correlate a running
+    /// fiber with its `Yielder` in the resume chain (see `Yielder::control_id`). Identity only.
+    pub fn control_id(&self) -> usize {
+        &*self.control as *const Control as usize
     }
 
     /// Resume the fiber, passing `val`; returns whether it yielded or completed.
