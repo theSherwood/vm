@@ -574,13 +574,17 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    the slice-1/2 model preserved. Proven natively by `tests/mixed.rs`: an integer caller + a float
    leaf (both i64- and i32-signature, exercising the arg widen / result narrow), emitted `f0` under
    `wasmi` with `env.call_interp` wired to the real engine, matching the full-interpreter oracle over
-   an arg sweep. `tests/analysis.rs` (7 cases) pins the classification. **Deferred to 3c (browser):**
-   an `svm_wasmjit_call_interp` cdylib entry that re-enters the engine over the shared window + the
-   real `env.call_interp` in the JS linker (a throwing stub today, since a fully-eligible guest never
-   reaches it) + a Chromium mixed-tier item. **Deopt is a genuine no-op until a later slice** brings
-   `cap.call` into the JIT subset — an eligible guest can't call a domain-mutating cap today (it's
-   out-of-subset → the guest isn't eligible → it stays on the interpreter), so there is nothing to
-   deopt yet; the analysis/fallback substrate is the part that lands now.
+   an arg sweep. `tests/analysis.rs` (7 cases) pins the classification. **3c — in the browser too:**
+   `svm_wasmjit_compile` now emits via `compile_module_mixed`, `svm_wasmjit_call_interp(func,
+   args_ptr)` runs an interp leaf on the bytecode engine over the shared memory's arg slots (returns
+   nonzero on a leaf trap), and the JS linker's `env.call_interp` calls it and **throws** on nonzero
+   — which unwinds the emitted wasm to the top-level `f0` call (the trap model, preserved). The env
+   cell is sized by `svm_wasmjit_env_bytes` (fuel + cross-tier scratch). Proven in **Chromium** (the
+   `#wasmjit` item now also runs a mixed guest: a JITted integer caller summing a float leaf,
+   matching the interpreter) and by the Node `wasmjit.mjs` mixed case. **Deopt is a genuine no-op
+   until a later slice** brings `cap.call` into the JIT subset — an eligible guest can't call a
+   domain-mutating cap today (it's out-of-subset → the guest isn't eligible → it stays on the
+   interpreter), so there is nothing to deopt yet; the analysis/fallback substrate is what landed.
 4. **Threads.** Per-Worker registration over `SharedSlots`; the proven schedule-independent kernels
    (4000 / futex / io) run with compute regions JITted, differential vs the interp path.
 5. **§22 + §14 as real codegen.** Guest `jit_compile`/`install` emits wasm (validator-gated) — the
