@@ -140,30 +140,44 @@ The emulation and the bridge are **not** mutually exclusive: the fs-cap emulatio
 portable/hermetic `mem_fs` path (and for hosts without the `map_region` FFI); the bridge is the
 zero-copy real-file path. The guest shim picks by which capability the embedder granted.
 
-### 4c. Durability contract (the part with no code today)
+### 4c. Durability contract (normative — **shipped in slice 1**)
 
-A capability that persists needs a *specified* crash model, independent of backend:
+The persistence model, backend-independent (holds on the emulation today and must hold on the bridge):
 
-- **`msync(range)` is the barrier**: after it returns, that range is durable (survives a crash).
-  Buffer/map writes **not** covered by a completed `msync` may be lost.
-- **Ordering**: two `msync`s are ordered; the cap must not reorder them (a DB's meta-page commit
-  depends on data pages being durable first — LMDB's whole double-buffered-meta scheme).
-- **Atomicity granularity**: a single-page `msync` is all-or-nothing (torn writes are the classic DB
-  hazard; do we promise page-atomic, or expose the tear and let the DB's checksum catch it?).
-- **`fsync` vs `msync`**: LMDB uses both — `msync` the map, then `fdatasync` the fd. The contract
-  must say whether they're distinct barriers or one.
+- **A durability barrier is `msync(range)` or `sync(fd)`.** After a barrier *completes*, every write it
+  covers is durable (survives a crash). Writes **not** yet covered by a completed barrier may be lost.
+- **Barriers are ordered and not reordered.** A write made durable by an earlier barrier stays durable
+  regardless of what a later barrier does — this is what lets a DB sequence "data pages, *then* the
+  meta page that references them" (LMDB's double-buffered-meta commit).
+- **A crash loses exactly the un-barriered tail.** On power loss, the backing file equals its bytes as
+  of the last *completed* barrier; everything after is gone. Post-crash writes never reach the file.
+- **Torn writes are exposed, not hidden.** The contract does **not** promise page-atomic barriers; a
+  crash *during* a barrier drops that barrier wholesale (the emulation's model) — and a store that
+  wants safety past that must checksum its own critical pages (LMDB checksums its meta pages, so a
+  torn meta is rejected and the reader falls back to the previous good one). This is the *stronger*
+  test posture — the DB's own integrity machinery is what we verify, not a crutch under it.
 
-This is the actual intellectual content of "first-class mmap" and is **backend-independent** — worth
-writing down even if we keep the emulation.
+This is the actual intellectual content of "a database in the sandbox," and writing it against the
+emulation is not throwaway: the bridge (§4b) must honor the *same* contract.
 
-### 4d. Crash injection & recovery proof
+### 4d. Crash injection & recovery proof (**shipped in slice 1**)
 
-To *demonstrate* the contract (not just assert it), the cap needs a test-only **crash hook**: after
-N host writes, or on an explicit "crash now" op, drop all un-`msync`'d state (and optionally reorder
-/ tear the last write) and refuse further I/O. Then a `demo_lmdb_crash_recovery` test: fill → crash
-mid-txn → reopen → assert the DB is consistent to the last *committed* transaction (LMDB guarantees
-this by design — its meta pages are double-buffered and checksummed). This is the highest-narrative
-slice and is **independent of the bridge (§4b)** — it runs on the emulation.
+Implemented as a **test-only** crash hook: the `*_crashy` fs backends (`mem_fs_crashy`/`host_fs_crashy`,
+`crates/svm-run/src/fs.rs`) add op `FS_CRASH_ARM(n)` — arm a simulated power loss after `n` further
+durability barriers. When it trips, every persisting op (`msync`/`sync`/`munmap` flush/`write`/
+`truncate`) silently drops its effect (the file freezes at the last completed barrier) while reads keep
+working (a dead process's file is still readable on reopen). The default `mem_fs`/`host_fs` grants have
+**no** crash controller, so `FS_CRASH_ARM` is an unknown op (`-EINVAL`) there — the hook cannot exist
+on a shipping grant. (Resolves open questions §6.1 *expose torn writes* and §6.2 *crashy constructor
+variant*.)
+
+The proof is `demo_lmdb_crash_recovery` (`crates/svm-llvm/tests/translate.rs`): the guest commits
+snapshot **v1** durably, arms the crash, commits snapshot **v2** (same keys, different values) whose
+durability the crash may swallow, then reopens and prints the surviving scan. Sweeping the crash point
+across *every* barrier of v2's commit, the recovered state must byte-match either the committed v1 or
+the committed v2 at every point — **never a torn mix** (transaction atomicity under power loss) — and
+the sweep asserts both outcomes actually occur, so the coverage isn't vacuous. This runs entirely on
+the emulation, **independent of the bridge (§4b)**.
 
 ### 4e. Multi-mapping coherence
 
@@ -180,10 +194,10 @@ multi-mapping if a concrete target needs it.
 
 Proposed order:
 
-1. **Durability contract + crash-torture (slice; on the emulation).** Write §4c into this doc as a
-   normative contract; add a crash-injection hook to the fs cap (drop un-synced buffer state on a
-   "crash" op); ship `demo_lmdb_crash_recovery` proving LMDB recovers to the last committed txn.
-   Highest narrative value, self-contained, no FFI. *Recommended first.*
+1. **Durability contract + crash-torture (on the emulation).** ✅ **Shipped.** §4c is now normative;
+   the `*_crashy` fs backends add `FS_CRASH_ARM` (§4d); `demo_lmdb_crash_recovery` sweeps the crash
+   point across a transaction's commit and proves LMDB recovers to the last committed snapshot at
+   every barrier — never a torn mix. Self-contained, no FFI.
 2. **Zero-copy real aliasing via the bridge (§4b).** Teach the fs `HostFn` to mint a **file-backed
    `SharedRegion`** on mmap-open (broaden the region backing from memfd-only to a real file fd —
    `svm-run` `new_shared_region`/`RegionBacking`), and have the guest shim map it with the existing
@@ -200,12 +214,14 @@ mean something; it's backend-independent, so writing it against the emulation is
 bridge must honor the same contract. And crash-recovery is the single most compelling demo of the
 capability model ("the guest can't corrupt the host's file even when it dies mid-write").
 
-## 6. Open questions (to resolve before slice 1)
+## 6. Open questions
 
-- **Crash granularity**: page-atomic `msync`, or expose torn writes and rely on the DB's checksum?
-  (LMDB's meta pages are checksummed → exposing tears is a *stronger* test.)
-- **Where does the crash hook live** so it's test-only and never in a shipping grant? (A wrapper
-  cap? A `mem_fs`/`host_fs` constructor variant? A feature flag?)
+Resolved in slice 1 (§4c/§4d): **crash granularity** — we expose torn writes (a crash drops the
+whole in-flight barrier) and rely on the store's own checksums, the stronger posture; **where the
+crash hook lives** — a `*_crashy` constructor variant, so the default grants have no such op.
+
+Remaining, gating slice 2 (the bridge, §4b):
+
 - **Window budget** (the bridge's one unsettled mechanism, §4b): the file-backed region maps into a
   window sub-range the guest must own — who reserves it (the guest via `AddressSpace.sub`, or the
   powerbox carves a region at grant time)? Ties into §14; shared with `SharedRegion` today.

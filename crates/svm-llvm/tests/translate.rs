@@ -3033,6 +3033,174 @@ fn demo_lmdb_mmap_cap_vs_native() {
 }
 
 #[test]
+fn demo_lmdb_crash_recovery() {
+    // **Crash-consistency of a memory-mapped store under the Fs capability** (MMAP_CAPABILITY.md
+    // slice 1). The mmap emulation's durability contract (§4c) says a write is durable only once a
+    // completed `msync`/`sync` barrier covers it; a power loss drops everything after the last such
+    // barrier. This test *demonstrates* the contract by injecting the crash: `mem_fs_crashy` arms a
+    // simulated power loss (`FS_CRASH_ARM`) after N durability barriers, and we sweep N across the
+    // whole of a second transaction's commit.
+    //
+    // The guest (`lmdb_demo.c` mode `crash`) commits snapshot v1 durably, arms the crash, then
+    // commits snapshot v2 (same 200 keys, different values) whose durability the crash may swallow,
+    // then reopens and prints the surviving scan. LMDB's double-buffered, checksummed meta pages
+    // guarantee **transaction atomicity under power loss**: the reopened database is either the
+    // fully-committed v1 or the fully-committed v2 — never a torn mix. So at *every* crash point the
+    // recovered snapshot must byte-match one of the two golden states; anything else is corruption.
+    // This is the capability-model payoff — the guest cannot corrupt the host's file even when it
+    // "dies" mid-write, because durability is mediated, not ambient.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one .bc.
+    // (Distinct tag from demo_lmdb_mmap_cap_vs_native so the two tests can run in parallel.)
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-c",
+        "-DSVM_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("svm_llvm_lmdbcrash_{pid}_{tag}.bc"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb crash-recovery (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("svm_llvm_lmdbcrash_{pid}.bc"));
+    let linked_ok = Command::new("llvm-link-18")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .or_else(|_| {
+            Command::new("llvm-link")
+                .args(&bcs)
+                .arg("-o")
+                .arg(&linked)
+                .status()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb crash-recovery (llvm-link unavailable)");
+        return;
+    }
+
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+    };
+    // Each run gets a FRESH crashy in-memory fs (empty, disarmed); the guest arms it internally.
+    let run = |args: Vec<Vec<u8>>| -> String {
+        let out = inst
+            .run_with_caps(
+                svm_run::Backend::Bytecode,
+                &config(args),
+                &[("fs", svm_run::fs::mem_fs_crashy())],
+            )
+            .expect("guest run (mem_fs_crashy)");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Golden states: v1 = a single committed snapshot (mode 's'); v2 = crash mode with the crash
+    // DISARMED (n = -1), so txn2 always commits. They must be well-formed and distinct.
+    let golden_v1 = run(vec![b"lmdb".to_vec(), b"snap".to_vec()]);
+    let golden_v2 = run(vec![b"lmdb".to_vec(), b"crash".to_vec(), b"-1".to_vec()]);
+    assert!(
+        golden_v1.contains("snapshot: 200 entries"),
+        "v1 golden malformed: {golden_v1:?}"
+    );
+    assert!(
+        golden_v2.contains("snapshot: 200 entries"),
+        "v2 golden malformed: {golden_v2:?}"
+    );
+    assert_ne!(
+        golden_v1, golden_v2,
+        "the two committed snapshots must have distinct checksums"
+    );
+
+    // Sweep the crash point across every durability barrier of txn2's commit. n = 0 crashes on the
+    // very first barrier (→ rolls back to v1); large n never trips (→ v2 survives). Every point in
+    // between must still land on exactly one committed snapshot.
+    let mut seen_v1 = false;
+    let mut seen_v2 = false;
+    for n in 0..=24 {
+        let out = run(vec![
+            b"lmdb".to_vec(),
+            b"crash".to_vec(),
+            n.to_string().into_bytes(),
+        ]);
+        if out == golden_v1 {
+            seen_v1 = true;
+        } else if out == golden_v2 {
+            seen_v2 = true;
+        } else {
+            panic!(
+                "crash after {n} barriers left a TORN/corrupt state — durability contract violated:\n\
+                 got:  {out:?}\n  v1: {golden_v1:?}\n  v2: {golden_v2:?}"
+            );
+        }
+    }
+    // Coverage: the sweep must actually exercise the transition (a rollback *and* a survival),
+    // otherwise the "always consistent" result would be vacuous.
+    assert!(
+        seen_v1,
+        "no crash point rolled back to txn1 — sweep never hit the txn2 commit window"
+    );
+    assert!(
+        seen_v2,
+        "no crash point preserved txn2 — widen the sweep upper bound"
+    );
+
+    let _ = std::fs::remove_file(&linked);
+    for bc in &bcs {
+        let _ = std::fs::remove_file(bc);
+    }
+}
+
+#[test]
 fn demo_sqlite_fs_cap_vs_native() {
     // **SQLite Phase B — disk-backed persistence through the Fs capability** (LLVM.md §8, the
     // north star's second half). Same amalgamation as Phase A, but the database is a real *file*:
