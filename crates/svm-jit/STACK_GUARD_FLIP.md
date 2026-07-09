@@ -4,7 +4,10 @@ Companion to `STACK_GUARD.md` (which covers the *mechanism*). This file tracks t
 promote `svm-fiber/arena-stacks` + `svm-jit/stack-check` from off-by-default prototypes to the default
 fiber model, and the blockers gating it.
 
-Status: **blockers in progress.** Both features are still off by default.
+Status: **executing the staged flip.** Blockers cleared. Staged rollout: PR1 (cross-os gating) —
+user-applied on `main`; **PR2 (software check always-on) — DONE (this change)**; PR3 (arena default)
+— next. `arena-stacks` is still off by default (guard-page backend remains default until PR3); the
+software check is now **always emitted** (no longer behind `stack-check`).
 
 ## Why flip
 
@@ -102,9 +105,13 @@ software check), independent of the flip:
      double-fault) and is the *only* path that converts fiber overflow into a survivable trap. Value
      beyond VMA scaling.
 
-Two independent follow-ups fall out (neither blocks the flip, both worth filing):
-- **(a)** Install a `sigaltstack` in the trap-handler setup so guard-page stack overflow is survivably
-  caught even on the default backend (fixes the DoS above). Small, self-contained.
+Two independent follow-ups fell out:
+- **(a) — RESOLVED for fibers by PR2.** Making the software check always-on means a *fiber* overflow now
+  traps `StackOverflow` through `trap_out` (no signal) ~`RED_ZONE` above the guard page, so it never
+  reaches the page and never double-faults — the DoS is gone for fibers on the default guard-page
+  backend. (The root / spawned-vCPU tops still run `limit = 0` on OS stacks, so a `sigaltstack` would
+  only matter for a deeply-recursive *root* JIT computation — a much narrower, still-open case. A
+  dedicated `sigaltstack` install is therefore optional now, not a DoS fix.)
 - **(b)** Correct the `TrapKind::StackOverflow` / `MemoryFault` docs re: stack-exhaustion faults.
 
 ## CI: guard-page-oracle run for the fuzz (apply on `main`)

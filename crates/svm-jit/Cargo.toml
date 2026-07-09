@@ -11,9 +11,11 @@ publish = false
 asan = ["svm-fiber/asan"]
 # PROTOTYPE: passthrough to svm-fiber's arena stack allocator (benchmark allocation cost).
 arena-stacks = ["svm-fiber/arena-stacks"]
-# PROTOTYPE: emit a software stack-limit check in every JIT function prologue (the per-call cost of
-# replacing the hardware guard page with a software guard). Benchmark only — NOT escape-grade (see
-# `emit_stack_check`); a real deployment must keep enforcement in the escape-TCB.
+# The software stack-limit check in every JIT function prologue is now ALWAYS emitted (it is the
+# escape-TCB overflow defense once the arena drops the guard page; see `emit_stack_check`), so this
+# feature no longer gates the check. It is retained as a no-op only so the existing CI invocations
+# (`--features stack-check`) keep working and to gate the guard-specific test suites
+# (`tests/stack_check.rs`, `tests/stack_guard_fuzz.rs`) into the dedicated lanes.
 stack-check = []
 
 [dev-dependencies]
