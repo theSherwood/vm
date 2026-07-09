@@ -41,16 +41,17 @@ unprivileged user if invoked as root.
 | 1 | **inline `asm`** (~9 distinct templates) | 921 | **DONE** (slices BN/BO): barriers/PAUSE → drop; `popcnt` → `Popcnt`; `xchg`/`xadd`/`cmpxchg` → the runtime atomic ops (genuinely atomic); `cpuid` → zeroed → software fallbacks |
 | 2 | **`atomicrmw`/`cmpxchg` instrs** | 110 | already lowered by the on-ramp (the asm atomics route to the same ops) |
 | 3 | **`i128`** (numeric/aggregate widening) | 252 | on-ramp already lowers i128 div/rem; general i128 arith is tier-3'd — verify on demand |
-| 4 | **libm** (`log`/`exp`/`pow`/trig) | 18 | **bundle a guest libm** (musl/openlibm double funcs, llvm-linked) — no transcendental SVM op |
+| 4 | **libm** (`log`/`exp`/`pow`/trig) | 18 | **DONE** (slice BQ): openlibm's double funcs bundled as guest code, llvm-linked; on-ramp reproduces them bit-for-bit vs native (`libm_bundled_vs_native`) |
 | 5 | **file/OS syscalls** | ~30 | the **`fs` capability** shim: `open`/`pread`/`pwrite`/`fsync`/`stat`/`mkdir`/`opendir`/`mmap`/… |
 | 6 | **proc/time/signal** | ~24 | deterministic stubs: `getpid`/`geteuid`/`clock_gettime`/`sigaction`/`fork`/`kill`/… |
 | 7 | **other libc** | ~180 | `strtod`/`snprintf`/`qsort`/`setlocale`/`strftime`/`memmem`/… — some synthesized, many not yet |
 | 8 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap |
 
 **Where it stands:** the complete module (834 modules / 14 730 functions) translates past the **entire
-921-site inline-asm surface** (slices BN/BO, tested). Translation now fail-closes at the **first
-undefined external** (`log`): **251 distinct externals** (libm / syscalls / proc+signal / other-libc)
-must each resolve — synthesized helper, `fs` capability, bundled guest code, or stub — before the
-module translates, then verify + the runtime (initdb data dir, storage manager, WAL, single-process
-shmem, catalog bootstrap) must work. That external waist + runtime is the **multi-week bulk** of the
-capstone; the asm slices were the tractable translator corner. See `LLVM.md` slices BM–BP.
+921-site inline-asm surface** (BN/BO) and, with the **bundled openlibm** llvm-linked (BQ), past all 18
+**libm** transcendentals. Translation now fail-closes at the next undefined external (`strchrnul`):
+the remaining ~230 externals (file/OS syscalls, proc+signal, other libc) must each resolve —
+synthesized helper, `fs` capability, bundled guest code, or stub — before the module translates, then
+verify + the runtime (initdb data dir, storage manager, WAL, single-process shmem, catalog bootstrap)
+must work. That external waist + runtime is the **multi-week bulk** of the capstone. See `LLVM.md`
+slices BM–BQ.

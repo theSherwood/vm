@@ -908,6 +908,25 @@ that reshape the capstone estimate:
   slices (BN/BO) were the tractable translator corner; the external waist is the mountain. The map
   above is the plan of record; each category is a follow-on slice.
 
+**Slice BQ (DONE) — the bundled guest libm (Postgres external category #4: the 18 transcendentals).**
+The SVM has no transcendental op (only the hardware float ops sqrt/floor/…), so `log`/`exp`/`pow`/
+`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sinh`/`cosh`/`tanh`/`cbrt`/`log10`/`log2`/`exp2`/`fmod`
+stay **guest code** — the raytrace "bring-your-own-libm" model, but a *real* libm (openlibm) rather than
+poly approximations, `llvm-link`ed into the module. Findings + deliverable:
+- **openlibm's double math translates through the on-ramp with zero gaps.** Its C sources carry no
+  inline asm (the asm is in separate `amd64/`/`i387/` dirs we don't compile); the 28-file double set
+  (entry points + the `k_*`/`e_rem_pio2` kernels + `k_exp`/`expm1`/scaling) compiles to bitcode and
+  translates clean. `sqrt`/`fabs` the code calls resolve to on-ramp float ops (no `e_sqrt` needed).
+- **Bit-exact differential.** `libm_bundled_vs_native` links the *same* openlibm on **both** sides
+  (guest bitcode *and* native oracle — not the system `-lm`), so any last-ulp choice is identical by
+  construction and the test isolates the *math translation*. The driver (`demos/postgres/libm_probe.c`)
+  FNV-hashes the **raw IEEE bits** of every result and prints hex via `putchar`, so float formatting is
+  out of the loop — the on-ramp reproduces openlibm **bit-for-bit** over ~3600 evaluations. Openlibm is
+  fetched-not-vendored (BSD); the test skips offline. **282 translate tests green, fmt + clippy clean.**
+- **Effect on the capstone:** with libm llvm-linked, the full Postgres module translates past all 18
+  transcendentals; the next undefined external is `strchrnul` (the "other libc" category — a synthesized
+  string helper).
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
