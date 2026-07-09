@@ -18444,8 +18444,50 @@ fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             bind_mask(ctx, &f.dest, lanes);
             Ok(true)
         }
+        // Bitwise combination of masks (`and`/`or`/`xor <N x i1>`) — how SIMD folds several
+        // comparison masks into one (e.g. Postgres' `simd.h` "any lane matches": `or` the per-value
+        // masks, then `sext` to a full-width vector). Lane-wise `IntBin` on the `0`/`1` lanes keeps the
+        // result canonical (`and`/`or`/`xor` of booleans is a boolean); a `xor` with an all-ones mask
+        // is the mask NOT.
+        I::And(x) if i1_vector_lanes(x.operand0.get_type(types).as_ref()).is_some() => {
+            lower_mask_bitwise(ctx, &x.dest, &x.operand0, &x.operand1, BinOp::And, types)
+        }
+        I::Or(x) if i1_vector_lanes(x.operand0.get_type(types).as_ref()).is_some() => {
+            lower_mask_bitwise(ctx, &x.dest, &x.operand0, &x.operand1, BinOp::Or, types)
+        }
+        I::Xor(x) if i1_vector_lanes(x.operand0.get_type(types).as_ref()).is_some() => {
+            lower_mask_bitwise(ctx, &x.dest, &x.operand0, &x.operand1, BinOp::Xor, types)
+        }
         _ => Ok(false),
     }
+}
+
+/// Lane-wise bitwise op over two `<N x i1>` masks (`and`/`or`/`xor`). The lanes are `0`/`1` in `i32`
+/// containers, so an `i32` `IntBin` per lane stays canonical (a boolean in/boolean out); the result is
+/// bound as scalarized mask lanes ([`bind_mask`]).
+fn lower_mask_bitwise(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    a_op: &Operand,
+    b_op: &Operand,
+    op: BinOp,
+    types: &Types,
+) -> Result<bool, Error> {
+    let n = i1_vector_lanes(a_op.get_type(types).as_ref())
+        .ok_or_else(|| Error::Unsupported("mask bitwise on a non-mask".into()))?;
+    let a = mask_operand(ctx, a_op, n)?;
+    let b = mask_operand(ctx, b_op, n)?;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        out.push(ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op,
+            a: a[k],
+            b: b[k],
+        }));
+    }
+    bind_mask(ctx, dest, out);
+    Ok(true)
 }
 
 /// Record `dest`'s scalarized mask lanes. A mask's `N` lanes live in the `agg` table (an `[i32; N]`
