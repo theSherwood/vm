@@ -71,6 +71,11 @@ export function makeRunner({ module, memory, ex }) {
       }
     }
 
+    // wasm-JIT tier-up: a shared i32 cell every Worker atomically bumps on each tier-up, so the
+    // caller can prove the seam actually fired (a result match alone can't tell "tiered up" from
+    // "silently interpreted"). Read back after the run.
+    const tierupCell = tierup ? ex.svm_par_alloc(4) : 0;
+
     const workers = new Set();
     let started = 0;
     try {
@@ -99,7 +104,7 @@ export function makeRunner({ module, memory, ex }) {
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
           // `tierup` + the guest bytes (kept live at `gptr` for the run) let each Worker JIT-compile
           // the guest locally and run eligible compute regions on the emitted wasm (threads slice).
-          w.postMessage({ module, memory, prog, win, winSize, tierup, gptr, glen: guest.length, ...cfg });
+          w.postMessage({ module, memory, prog, win, winSize, tierup, gptr, glen: guest.length, tierupCell, ...cfg });
         };
         // The root vCPU runs on its own Worker (the page can't Atomics.wait).
         const rootSlot = ex.svm_par_alloc(SLOT);
@@ -107,7 +112,8 @@ export function makeRunner({ module, memory, ex }) {
         const rootTlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
         startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
       });
-      return { value, started };
+      const tierups = tierup ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
+      return { value, started, tierups };
     } finally {
       for (const w of workers) w.terminate();
     }

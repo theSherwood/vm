@@ -50,7 +50,7 @@ try {
 
   // Wait until every work item leaves 'pending' (or time out).
   await page.waitForFunction(
-    () => ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit'].every((id) => document.getElementById(id).dataset.status !== 'pending'),
+    () => ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup'].every((id) => document.getElementById(id).dataset.status !== 'pending'),
     { timeout: 30_000 },
   );
 
@@ -62,6 +62,7 @@ try {
   const inst = await read('inst');
   const capio = await read('capio');
   const wasmjit = await read('wasmjit');
+  const tierup = await read('tierup');
 
   console.log(`\n  ${isolated.text}`);
   console.log(`  ${powerbox.text}`);
@@ -69,11 +70,12 @@ try {
   console.log(`  ${jit.text}`);
   console.log(`  ${inst.text}`);
   console.log(`  ${capio.text}`);
-  console.log(`  ${wasmjit.text}\n`);
+  console.log(`  ${wasmjit.text}`);
+  console.log(`  ${tierup.text}\n`);
 
   const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
     threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
-    capio.status === 'pass' && wasmjit.status === 'pass';
+    capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass';
 
   // --- the playground (play.html): SVM text typed into the page, parsed in-browser, run across ----
   // Workers. Drives the page like a human: pick an example / type source, click Run, read the
@@ -139,7 +141,9 @@ try {
     `own Workers, and 4d host I/O from worker vCPUs through one shared powerbox) over a shared ` +
     `WebAssembly.Memory under cross-origin isolation — plus the playground (SVM text parsed ` +
     `in-browser via svm_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
-    `(SVM IR compiled to wasm in-browser, f0 called directly, matching the interpreter)`);
+    `(SVM IR compiled to wasm in-browser, f0 called directly, matching the interpreter) — including ` +
+    `per-Worker JIT tier-up: a threaded guest's compute leaves run on emitted wasm on their own ` +
+    `Workers over the shared memory, byte-identical to the all-interpreter run`);
 } catch (e) {
   failed = true;
   console.log(`FAIL: ${e.message}`);

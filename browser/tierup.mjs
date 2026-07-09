@@ -93,7 +93,6 @@ async function main() {
   // JIT-compile the guest, enable the per-instance eligibility bitmap, instantiate the emitted module
   // against the ONE shared memory, and return a driver that services PAR_TIERUP via `f{func}`.
   const buildDriver = async ({ gptr, glen }) => {
-    if (ex.svm_wasmjit_compile(gptr, glen) !== 1) throw new Error('svm_wasmjit_compile rejected the guest');
     if (ex.svm_par_enable_jit(gptr, glen) !== 1) throw new Error('svm_par_enable_jit rejected the guest');
     const wptr = Number(ex.svm_wasmjit_ptr()), wlen = ex.svm_wasmjit_len();
     return WebAssembly.instantiate(

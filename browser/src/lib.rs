@@ -494,15 +494,23 @@ fn par_jit_eligible() -> Option<std::sync::Arc<[bool]>> {
     unsafe { (*core::ptr::addr_of!(PAR_JIT_ELIGIBLE)).clone() }
 }
 
-/// Enable wasm-JIT **tier-up** for the module at `[mod_ptr, mod_len)`: compute which functions the
-/// interpreter should surface as [`PAR_TIERUP`] (the browser then runs the emitted `f{func}` on the
-/// Worker instead of interpreting). A function is eligible iff it is **emitted** in the mixed-tier
-/// module rooted at func 0 (in-subset + reachable) **and** has an **all-i64** signature — so the
-/// Worker passes every arg / reads every result as a plain `BigInt` i64 slot with no per-param type
-/// info (which the emitted `WebAssembly.Module` doesn't expose to JS). Non-i64 scalar params (i32,
-/// floats) are a later refinement. Returns `1` if the guest is mixed-tier compilable (tier-up on),
-/// else `0` (everything interprets). Call on **every** instance (page + each Worker) before building
-/// vCPUs, with the same guest bytes.
+/// Enable wasm-JIT **tier-up** for the module at `[mod_ptr, mod_len)` (`BROWSER.md` § "wasm-JIT
+/// tier", per-Worker JIT): emit the tier-up module and compute which functions the interpreter
+/// should surface as [`PAR_TIERUP`] (the browser then runs the emitted `f{func}` on the Worker
+/// instead of interpreting). Unlike the whole-module `svm_wasmjit_compile`, this does **not** need
+/// the guest's func 0 to be JITtable — the guest keeps running on the resumable interpreter (which
+/// drives `thread.spawn`/`join`, atomics, `memory.wait`), and only a direct `Call` to an emitted
+/// pure region tiers up. So a compute leaf reachable **only** through `thread.spawn` still tiers up,
+/// which is the whole point of the threads tier ([`svm_wasmjit::compile_module_tierup`]).
+///
+/// A function is eligible iff it is **emitted** (in-subset, all its calls route) **and** has an
+/// **all-i64** signature — so the Worker passes every arg / reads every result as a plain `BigInt`
+/// i64 slot with no per-param type info (which the emitted `WebAssembly.Module` doesn't expose to
+/// JS). Non-i64 scalar params (i32, floats) are a later refinement. On success this stashes the
+/// emitted wasm (read via [`svm_wasmjit_ptr`]/[`svm_wasmjit_len`]) and the decoded module (for the
+/// cross-tier [`svm_wasmjit_call_interp`]), so the Worker needs only this one call — no separate
+/// `svm_wasmjit_compile`. Returns `1` when at least one function tier-ups, else `0` (everything
+/// interprets). Call on **every** instance (page + each Worker) before building vCPUs, same bytes.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
     // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
@@ -510,21 +518,29 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return 0;
     };
-    // Only meaningful when the guest actually compiles mixed-tier (every reachable func in-subset or a
-    // leaf, suspension-free); else no function is safely tier-up-able and we leave everything on interp.
-    if svm_wasmjit::compile_module_mixed_entry(&m, 0, true).is_err() {
+    // Emit the tier-up module against the shared linear memory (the browser threads build) and take
+    // its per-function emit set. `Err` only if the assembler itself rejects the set — treat as "no
+    // tier-up" (fail-closed: the guest keeps interpreting).
+    let Ok((wasm, emit)) = svm_wasmjit::compile_module_tierup(&m, true) else {
         return 0;
-    }
-    let a = svm_wasmjit::analyze(&m);
+    };
     let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
     let eligible: Vec<bool> = m
         .funcs
         .iter()
         .enumerate()
-        .map(|(i, f)| a.in_subset[i] && a.reachable[i] && all_i64(&f.params) && all_i64(&f.results))
+        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
         .collect();
-    // SAFETY: single-threaded per instance; set once before the run's vCPUs are built.
-    unsafe { *core::ptr::addr_of_mut!(PAR_JIT_ELIGIBLE) = Some(std::sync::Arc::from(eligible)) };
+    if !eligible.iter().any(|&e| e) {
+        return 0; // nothing safely tier-up-able → leave everything on the interpreter
+    }
+    // SAFETY: single-threaded per instance (the page, or one Worker); set once before the run's
+    // vCPUs are built — the same single-reader stash model as `svm_wasmjit_compile`.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm);
+        *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m);
+        *core::ptr::addr_of_mut!(PAR_JIT_ELIGIBLE) = Some(std::sync::Arc::from(eligible));
+    }
     1
 }
 

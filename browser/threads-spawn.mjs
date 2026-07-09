@@ -24,12 +24,12 @@ const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 // Event codes (must match browser/src/lib.rs PAR_*).
-const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6;
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7;
 
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel } = workerData;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -42,6 +42,25 @@ async function worker() {
   const i64 = () =>
     i64v.byteLength === memory.buffer.byteLength ? i64v : (i64v = new BigInt64Array(memory.buffer));
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
+
+  // wasm-JIT tier-up (per-Worker JIT): this Worker enables the tier-up bitmap for its instance
+  // (`svm_par_enable_jit` emits the tier-up module — a pure leaf reachable only via `thread.spawn`
+  // still emits) and instantiates the emitted module against the ONE shared memory. Each Worker
+  // instantiates its own (wasm tables aren't shareable across Workers). On TIERUP it runs `f{func}`.
+  let emitted = null, envCell = 0;
+  if (tierup && ex.svm_par_enable_jit(gptr, glen) === 1) {
+    const wptr = Number(ex.svm_wasmjit_ptr()), wlen = ex.svm_wasmjit_len();
+    const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    const emod = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
+      env: {
+        memory,
+        trap: () => {}, // SVM fault; the following `unreachable` throws, caught below as a vCPU trap
+        call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+      },
+    });
+    emitted = emod.exports;
+    envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+  }
 
   // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
   // offset) — a confined child is just a child with a shifted, smaller window (DESIGN.md §14).
@@ -133,6 +152,26 @@ async function worker() {
       ex.svm_par_deliver_code(v, woke);
       continue;
     }
+    if (ev === TIERUP) {
+      // Run the emitted `f{func}(win, env, ...i64 args)` on this Worker instead of interpreting. A
+      // trap throws (SVM fault → env.trap + unreachable, or a wasm trap) → surface as a vCPU trap.
+      const tfunc = Number(ex.svm_par_ev_a(v));
+      const argvPtr = Number(ex.svm_par_tierup_argv_ptr(v)), n = Number(ex.svm_par_tierup_argv_len(v));
+      const args = [];
+      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
+      new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel
+      if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
+      try {
+        const ret = emitted['f' + tfunc](win, envCell, ...args);
+        const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+        const rptr = Number(ex.svm_par_alloc(Math.max(1, rets.length) * 8));
+        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+        ex.svm_par_deliver_tierup(v, rptr, rets.length);
+      } catch {
+        ex.svm_par_deliver_tierup_trap(v);
+      }
+      continue;
+    }
   }
 }
 
@@ -192,6 +231,14 @@ async function main() {
   console.log(`module: ${WASM}  shared=${memory.buffer instanceof SharedArrayBuffer}`);
   console.log(`  prog@0x${prog.toString(16)}  window@0x${win.toString(16)} (${winSize >> 10}KiB)  TLS ${tlsSize}B`);
 
+  // wasm-JIT tier-up (SVM_TIERUP=1): each Worker enables the tier-up bitmap from the guest bytes
+  // (kept live at `gptr`) and runs eligible compute regions on emitted wasm. The guest still runs on
+  // the interpreter — only direct calls to emitted pure leaves tier up.
+  const tierup = process.env.SVM_TIERUP === '1';
+  // A shared i32 cell every Worker atomically bumps on each tier-up — proves the seam actually fired
+  // (a result match alone couldn't distinguish "tiered up" from "silently interpreted").
+  const tierupCell = tierup ? ex.svm_par_alloc(4) : 0;
+
   const workers = new Set();
   let started = 0;
   const t0 = process.hrtime.bigint();
@@ -199,7 +246,7 @@ async function main() {
   const startVcpu = (cfg) => {
     started++;
     const w = new Worker(new URL(import.meta.url), {
-      workerData: { module, memory, prog, win, winSize, ...cfg },
+      workerData: { module, memory, prog, win, winSize, tierup, gptr, glen: guest.length, tierupCell, ...cfg },
     });
     workers.add(w);
     w.on('message', (m) => {
@@ -228,6 +275,13 @@ async function main() {
     console.log(`  vCPUs started: ${started} (1 root + ${started - 1} spawned), ${ms.toFixed(0)} ms`);
     if (err) console.log(`  error: ${err}`);
     else console.log(`  root returned ${value}  expect ${EXPECT}  ${ok ? '✓' : '✗'}`);
+    // Tier-up non-vacuity: with SVM_TIERUP the workers must have actually run emitted regions.
+    if (tierup) {
+      const tiered = Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2);
+      const tieredOk = tiered > 0;
+      console.log(`  tier-ups fired: ${tiered}  ${tieredOk ? '✓ (ran emitted wasm)' : '✗ (vacuous — never tiered up)'}`);
+      ok = ok && tieredOk;
+    }
     // 4d I/O mode: read the shared powerbox's accumulated stdout back and check the expected
     // schedule-independent bytes ("tick\n" × SVM_IO_LINES, default 8).
     if (process.env.SVM_IO === '1') {

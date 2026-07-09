@@ -16,7 +16,7 @@ const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen } = e.data;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell } = e.data;
   const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -32,12 +32,14 @@ self.onmessage = async (e) => {
 
   // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
   // offset) — a confined child is just a child with a shifted, smaller window (DESIGN.md §14).
-  // wasm-JIT tier-up (threads slice): this Worker JIT-compiles the guest (setting WASMJIT_MOD so a
-  // cross-tier leaf's `call_interp` works) + enables the tier-up bitmap in this instance, then
-  // instantiates the emitted module against the ONE shared memory. Each Worker instantiates its own
-  // (wasm tables aren't shareable across Workers). On PAR_TIERUP it calls `f{func}` here.
+  // wasm-JIT tier-up (threads slice): this Worker enables the tier-up bitmap in this instance —
+  // `svm_par_enable_jit` emits the tier-up module (a pure leaf reachable only via `thread.spawn`
+  // still emits, since the guest keeps interpreting), stashes its bytes + the decoded module (so a
+  // cross-tier leaf's `call_interp` works), and reports whether anything tier-ups. This Worker then
+  // instantiates the emitted module against the ONE shared memory (each Worker instantiates its own —
+  // wasm tables aren't shareable across Workers). On PAR_TIERUP it calls `f{func}` here.
   let emitted = null, envCell = 0;
-  if (tierup && ex.svm_wasmjit_compile(gptr, glen) === 1 && ex.svm_par_enable_jit(gptr, glen) === 1) {
+  if (tierup && ex.svm_par_enable_jit(gptr, glen) === 1) {
     const wptr = Number(ex.svm_wasmjit_ptr()), wlen = ex.svm_wasmjit_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const emod = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
@@ -144,6 +146,7 @@ self.onmessage = async (e) => {
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel; preempt = write < 0
+      if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
       try {
         const ret = emitted['f' + func](win, envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
