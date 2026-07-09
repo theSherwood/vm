@@ -8557,7 +8557,10 @@ pub mod iface {
     /// magic-ring-buffer primitive); op 1 `unmap(window_offset, len)` drops the alias; op 2
     /// `len() -> i64` reports the region size; op 3 `page_size() -> i64`. Granting the handle is how
     /// two domains come to share memory; `create`/`grant` (guest-minted regions, cross-domain) are a
-    /// §14 follow-up — today regions are host-granted, like `Memory`.
+    /// §14 follow-up — today regions are host-granted, like `Memory`. A backing may be a fresh OS
+    /// shared object (`memfd`) **or a real host file** (`svm-run`'s `FileBacking`, minted by an
+    /// mmap-capable fs cap): mapping the latter aliases the file into the window zero-copy — the
+    /// file-backed-mmap bridge (MMAP_CAPABILITY.md §4b).
     pub const SHARED_REGION: u32 = 4;
     /// `AddressSpace` — the §14 memory-management capability, **attenuable to a power-of-two
     /// window sub-range** `[base, base+size)`. Like `Memory` but every op is confined to the
@@ -8927,6 +8930,9 @@ enum Binding {
     /// handler closure in [`Host::host_fns`] (out-of-line so `Binding` stays `Copy`, like
     /// [`Binding::Blocking`]). All ops dispatch to that one closure, which interprets `op`.
     HostFn(u32),
+    /// An mmap-capable host-function capability (§4b): like [`Binding::HostFn`] but its handler in
+    /// [`Host::host_fns_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
+    HostFnRegion(u32),
 }
 
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
@@ -9226,6 +9232,40 @@ impl AsyncCounter for RegionCounter {
 pub type HostFn =
     Box<dyn FnMut(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send>;
 
+/// The **one** extra authority an mmap-capable [`HostFnRegion`] handler gets over a plain [`HostFn`]:
+/// mint a §13 `SharedRegion` and receive its handle. Deliberately narrow — the handler still cannot
+/// reach the rest of the `Host` (no slot table, no other backings), so the escape hatch widens by
+/// exactly this one capability (MMAP_CAPABILITY.md §4b, "a small, existing-shaped new power for the
+/// closure"). Implemented by [`Host`] as a thin forward to [`Host::grant_shared_region_backed`].
+pub trait RegionMinter {
+    /// Grant a `SharedRegion` over `backing` and return the guest handle value (`< 0` on failure, e.g.
+    /// the handle table is full). The guest maps it with the built-in `SharedRegion.map`.
+    fn grant_region(&mut self, backing: RegionBacking) -> i32;
+}
+
+/// Like [`HostFn`] but the handler is also handed a [`RegionMinter`] — the escape hatch for the
+/// zero-copy file-mmap bridge (§4b): an mmap-capable fs handler opens a file, mints a file-backed
+/// `SharedRegion` over it, and returns the handle so the guest aliases the real file into its window.
+/// Registered with [`Host::grant_host_fn_region`]; resolves under the same [`iface::HOST_FN`] as a
+/// plain `HostFn`, so a guest reaches it identically.
+pub type HostFnRegion = Box<
+    dyn FnMut(
+            u32,
+            &[i64],
+            Option<&mut dyn GuestMem>,
+            &mut dyn RegionMinter,
+        ) -> Result<Vec<i64>, Trap>
+        + Send,
+>;
+
+// The `Host` *is* the region minter — the narrow authority a `HostFnRegion` handler is handed. It
+// forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
+impl RegionMinter for Host {
+    fn grant_region(&mut self, backing: RegionBacking) -> i32 {
+        self.grant_shared_region_backed(backing)
+    }
+}
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -9260,6 +9300,10 @@ pub struct Host {
     /// §7 embedder-registered host-capability handlers, indexed by the id a [`Binding::HostFn`]
     /// carries ([`Host::grant_host_fn`]). A dispatch takes the closure out, runs it, and restores it.
     host_fns: Vec<HostFn>,
+    /// §4b mmap-capable host-capability handlers (indexed by the id a [`Binding::HostFnRegion`]
+    /// carries, [`Host::grant_host_fn_region`]) — a `HostFn` plus a [`RegionMinter`]. Same
+    /// take-out/run/restore dispatch as `host_fns`.
+    host_fns_region: Vec<HostFnRegion>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -9454,6 +9498,7 @@ impl Host {
             region_factory: None,
             blockings: Vec::new(),
             host_fns: Vec::new(),
+            host_fns_region: Vec::new(),
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -9575,6 +9620,7 @@ impl Host {
             && self.blockings.is_empty()
             && self.rings.is_empty()
             && self.host_fns.is_empty()
+            && self.host_fns_region.is_empty()
             && self.jit_domains.is_empty()
     }
 
@@ -9842,7 +9888,9 @@ impl Host {
                 Binding::JitCode { .. } => {
                     return Err(self.non_durable(slot, NonDurableKind::JitCode))
                 }
-                Binding::HostFn(_) => return Err(self.non_durable(slot, NonDurableKind::HostFn)),
+                Binding::HostFn(_) | Binding::HostFnRegion(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::HostFn))
+                }
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -9893,7 +9941,7 @@ impl Host {
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::JitDomain(_) => NonDurableKind::JitDomain,
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
-                Binding::HostFn(_) => NonDurableKind::HostFn,
+                Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -10004,6 +10052,18 @@ impl Host {
         let idx = self.host_fns.len() as u32;
         self.host_fns.push(f);
         self.grant(iface::HOST_FN, Binding::HostFn(idx))
+    }
+
+    /// §4b Register an **mmap-capable** embedder host-capability handler and grant a handle to it
+    /// (also iface [`iface::HOST_FN`], so a guest resolves it exactly like a plain [`grant_host_fn`]).
+    /// Identical to `grant_host_fn` except the handler is additionally handed a [`RegionMinter`] on
+    /// each call, so it can mint a file-backed `SharedRegion` and return the handle — the delivery
+    /// mechanism for the zero-copy file-mmap bridge. The extra authority is exactly region-minting
+    /// (nothing else of the `Host` is reachable).
+    pub fn grant_host_fn_region(&mut self, f: HostFnRegion) -> i32 {
+        let idx = self.host_fns_region.len() as u32;
+        self.host_fns_region.push(f);
+        self.grant(iface::HOST_FN, Binding::HostFnRegion(idx))
     }
 
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
@@ -10619,6 +10679,20 @@ impl Host {
                 };
                 let r = f(op, args, mem);
                 self.host_fns[idx as usize] = f;
+                r
+            }
+            // §4b mmap-capable host-cap: same take-out/run/restore as `HostFn`, but also hand the
+            // handler `self` as the `RegionMinter`. Taking the closure out first means `self` is no
+            // longer aliased by `host_fns_region[idx]`, so the `&mut dyn RegionMinter` borrow is sound.
+            Binding::HostFnRegion(idx) => {
+                let mut f = match self.host_fns_region.get_mut(idx as usize) {
+                    Some(slot) => {
+                        std::mem::replace(slot, Box::new(|_, _, _, _| Err(Trap::CapFault)))
+                    }
+                    None => return Err(Trap::CapFault),
+                };
+                let r = f(op, args, mem, self);
+                self.host_fns_region[idx as usize] = f;
                 r
             }
             Binding::Exit => {
@@ -12945,6 +13019,60 @@ fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
         .filter(|l| l.block as usize == block && l.inst as usize <= inst)
         .max_by_key(|l| l.inst)
         .map(|l| l.value)
+}
+
+#[cfg(test)]
+mod region_minter_tests {
+    //! The §4b `RegionMinter` ABI: an mmap-capable `HostFnRegion` handler is handed exactly one extra
+    //! authority — minting a `SharedRegion` — and nothing else of the `Host`. These pin that the
+    //! handler can mint a region and hand its handle back to the guest, and that the minted handle is
+    //! a live `SharedRegion` (the delivery mechanism for the zero-copy file-mmap bridge).
+    use super::*;
+
+    #[test]
+    fn host_fn_region_handler_mints_a_region_and_returns_a_live_handle() {
+        let mut host = Host::new();
+        // Op 0: mint a 64-byte region and hand back its handle — the shape an mmap-capable fs uses.
+        let h = host.grant_host_fn_region(Box::new(|op, _args, _mem, minter| {
+            if op == 0 {
+                let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
+                Ok(vec![minter.grant_region(backing) as i64])
+            } else {
+                Ok(vec![-22])
+            }
+        }));
+        assert!(
+            h >= 0,
+            "grant_host_fn_region should yield a handle under iface HOST_FN"
+        );
+
+        // Dispatch op 0 → the handler mints via the `RegionMinter` and returns the region handle.
+        let out = host
+            .cap_dispatch_slots(iface::HOST_FN, 0, h, &[], None)
+            .expect("host_fn_region dispatch");
+        let region_h = out[0];
+        assert!(
+            region_h >= 0,
+            "the minted region handle must be valid: {region_h}"
+        );
+
+        // The returned handle really is a live `SharedRegion` (resolves under iface 4), and its
+        // backing is the 64-byte object the handler minted.
+        match host.resolve(region_h as i32, iface::SHARED_REGION) {
+            Ok(Binding::SharedRegion(id)) => {
+                assert_eq!(host.regions[id as usize].size(), 64, "minted region size");
+            }
+            other => panic!("minted handle should resolve as a SharedRegion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn region_and_plain_host_fn_are_distinct_handles_under_the_same_iface() {
+        let mut host = Host::new();
+        let plain = host.grant_host_fn(Box::new(|_, _, _| Ok(vec![0])));
+        let region = host.grant_host_fn_region(Box::new(|_, _, _, _| Ok(vec![0])));
+        assert!(plain >= 0 && region >= 0 && plain != region);
+    }
 }
 
 #[cfg(test)]

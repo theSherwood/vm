@@ -2555,6 +2555,10 @@ fn callee_name(c: &crate::ll::ast::Call) -> Option<String> {
 /// (svm-llvm produces `svm-ir` and does not depend on the interpreter crate); `svm-run`'s
 /// `host_fn_type_id_matches` test locks the two together.
 const HOST_FN_TYPE_ID: u32 = 13;
+/// The `SharedRegion` interface id (`svm_interp::iface::SHARED_REGION`) — the §13 window-aliasing
+/// capability, reached from C via `__vm_region_call` (the zero-copy file-mmap bridge, §4b). Pinned
+/// numerically like [`HOST_FN_TYPE_ID`]; `svm-run`'s `shared_region_type_id_matches` test locks them.
+const SHARED_REGION_TYPE_ID: u32 = 4;
 
 const STASH_STDOUT: u64 = svm_ir::POWERBOX_STASH_BASE;
 const STASH_STDIN: u64 = STASH_STDOUT + 4;
@@ -11609,6 +11613,39 @@ fn lower_vm_builtin(
             };
             let r = ctx.push(Inst::CapCall {
                 type_id: HOST_FN_TYPE_ID,
+                op: op_const,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §13/§4b `SharedRegion` call: `long __vm_region_call(int handle, int op, long a, long b,
+        // long c, long d)` → `cap.call SHARED_REGION op handle (a,b,c,d)`. The bridge a guest uses to
+        // `map`/`unmap` a file-backed region an mmap-capable fs minted (`FS_MAP_REGION`) — same fixed
+        // `(i64×4) -> i64` shape as `__vm_host_call`, but the §13 interface id. `op` is a nominal
+        // compile-time constant (0 = map, 1 = unmap).
+        "__vm_region_call" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let op_const = vm_arg(c, 1)?
+                .as_constant()
+                .and_then(|k| match k {
+                    Constant::Int { value, .. } => Some(*value as u32),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::Unsupported("__vm_region_call: `op` must be a constant int".into())
+                })?;
+            let args = (2..6)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64; 4],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: SHARED_REGION_TYPE_ID,
                 op: op_const,
                 sig,
                 handle,

@@ -3469,6 +3469,189 @@ fn demo_lmdb_crash_recovery() {
 }
 
 #[test]
+fn demo_lmdb_mmap_zerocopy_vs_native() {
+    // **Zero-copy file-mmap through the capability bridge** (MMAP_CAPABILITY.md §4b, slice 2). Same
+    // LMDB guest as `demo_lmdb_mmap_cap_vs_native`, but granted `host_fs_mmap`: its `mmap` shim takes
+    // the **region path** (FS_MAP_REGION mints a file-backed `SharedRegion`; the guest `SharedRegion.
+    // map`s it over a page-aligned window buffer), so LMDB reads and writes its B-tree straight out of
+    // a **real MAP_SHARED alias of the file** — no copy-in, no per-access host call. (The fs-level
+    // `fs::tests::map_region_*` and `file_region_tests` prove the op mints a working file-backed
+    // region; this proves LMDB actually runs over it and the result is a native-compatible database.)
+    //
+    // Two directions, exactly like the copy-in differential, so a regression in the region path shows
+    // up as a mismatch: (1) the guest writes `data.mdb` through the alias and **native LMDB reads it**
+    // byte-for-byte; (2) the guest reads a **native-written** `data.mdb` through the alias.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode (same recipe; distinct tag so it can run in parallel with the other LMDB tests).
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-c",
+        "-DSVM_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("svm_llvm_lmdbzc_{pid}_{tag}.bc"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb zero-copy (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("svm_llvm_lmdbzc_{pid}.bc"));
+    let linked_ok = Command::new("llvm-link-18")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .or_else(|_| {
+            Command::new("llvm-link")
+                .args(&bcs)
+                .arg("-o")
+                .arg(&linked)
+                .status()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb zero-copy (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle.
+    let exe = tmp.join(format!("svm_llvm_pb_{pid}_lmdbzc"));
+    let native_ok = Command::new("cc")
+        .arg("-O2")
+        .arg(&inc)
+        .arg(lmdb.join("mdb.c"))
+        .arg(lmdb.join("midl.c"))
+        .arg(&demo)
+        .args(["-lpthread", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !native_ok {
+        eprintln!("note: skipping lmdb zero-copy (cc unavailable)");
+        return;
+    }
+
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+    };
+
+    // Native create + verify (oracle stdout).
+    let nat_root = tmp.join(format!("svm-lmdbzc-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle_create = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native create");
+    assert!(oracle_create.status.success(), "native create failed");
+    let oracle_verify = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&nat_root)
+        .output()
+        .expect("native verify");
+    assert!(oracle_verify.status.success(), "native verify failed");
+
+    // 1. Guest over host_fs_mmap writes a real data.mdb *through the file alias*; native reads it.
+    let guest_root = tmp.join(format!("svm-lmdbzc-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", svm_run::fs::host_fs_mmap(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs_mmap)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "lmdb zero-copy: guest (host_fs_mmap) stdout vs native"
+    );
+    assert!(
+        guest_root.join("data.mdb").exists(),
+        "the guest-written LMDB database must land on the real disk"
+    );
+    let native_reads_guest = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&guest_root)
+        .output()
+        .expect("native verify of guest db");
+    assert_eq!(
+        String::from_utf8_lossy(&native_reads_guest.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb zero-copy: native LMDB must read the region-aliased database the guest wrote"
+    );
+
+    // 2. Reverse: the guest reads a native-written data.mdb through the alias.
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![b"lmdb".to_vec(), b"verify".to_vec()]),
+            &[("fs", svm_run::fs::host_fs_mmap(nat_root.clone()))],
+        )
+        .expect("guest verify (host_fs_mmap over native dir)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb zero-copy: the guest must read the native-written database through the alias"
+    );
+
+    let _ = std::fs::remove_dir_all(&nat_root);
+    let _ = std::fs::remove_dir_all(&guest_root);
+    let _ = std::fs::remove_file(&linked);
+    for bc in &bcs {
+        let _ = std::fs::remove_file(bc);
+    }
+}
+
+#[test]
 fn demo_sqlite_fs_cap_vs_native() {
     // **SQLite Phase B — disk-backed persistence through the Fs capability** (LLVM.md §8, the
     // north star's second half). Same amalgamation as Phase A, but the database is a real *file*:
