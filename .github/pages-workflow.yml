@@ -1,0 +1,103 @@
+# NOTE: move this file to .github/workflows/pages.yml to activate it.
+# It is parked here because the automation token lacks GitHub 'workflow' scope and cannot write
+# under .github/workflows/. From a clone with workflow scope:  git mv .github/pages-workflow.yml .github/workflows/pages.yml
+#
+# Deploy the SVM playground to GitHub Pages.
+#
+# The playground (`browser/web/play.html`) runs SVM guests **client-side**: the bytecode interpreter
+# compiled to wasm, driving SVM-text kernels across real Web Workers and real C/C++ guests (Lua,
+# SQLite) via the LLVM on-ramp. It needs `crossOriginIsolated` (SharedArrayBuffer for the shared
+# WebAssembly.Memory) — which Pages can't grant via headers, so the page ships a `coi-serviceworker`
+# that re-adds COOP/COEP on the client.
+#
+# This job reproduces the `browser-real` CI build (the threads engine) + the on-ramp asset build, then
+# assembles a static site that preserves the `browser/` layout (so the page's `import.meta.url`-relative
+# paths resolve under the `/<repo>/` project-site base) and deploys it.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # manual runs (e.g. to preview from a feature branch)
+
+# One in-flight deploy at a time; don't cancel a running one (a half-published site is worse than a
+# slightly stale one).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Nightly + rust-src for the threads engine (shared memory + atomics needs `-Z build-std`), and
+      # LLVM/clang 18 for the on-ramp assets (clang → bitcode, llvm-dis → .ll for the reader).
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      - name: install LLVM/clang 18 (on-ramp build tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+
+      # The threads engine — the exact `browser-real` recipe (shared, imported memory + the TLS
+      # exports the Workers call). Output: browser/target/wasm32-unknown-unknown/release/svm_browser.wasm
+      - name: build threads wasm engine
+        working-directory: browser
+        run: |
+          rustup target add wasm32-unknown-unknown --toolchain nightly
+          RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
+            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
+            -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
+            -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
+            -Clink-arg=--export=__wasm_init_tls" \
+            cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+
+      # The on-ramp .svmb assets (hello + SQLite Phase A) at --host-page 65536 (the wasm page). The
+      # committed hello_c.svmb is regenerated too; SQLite's amalgamation is fetched-and-cached.
+      - name: build on-ramp assets
+        working-directory: browser
+        run: node build-onramp-assets.mjs
+
+      # Assemble the site, preserving the browser/ structure so the relative paths resolve under the
+      # project-site subpath. Root index.html redirects to the playground.
+      - name: assemble site
+        working-directory: browser
+        run: |
+          SITE="$GITHUB_WORKSPACE/_site"
+          mkdir -p "$SITE/web/assets" "$SITE/target/wasm32-unknown-unknown/release"
+          cp web/*.html web/*.js "$SITE/web/"
+          cp web/assets/*.svmb "$SITE/web/assets/"
+          cp target/wasm32-unknown-unknown/release/svm_browser.wasm "$SITE/target/wasm32-unknown-unknown/release/"
+          cat > "$SITE/index.html" <<'HTML'
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8" />
+          <meta http-equiv="refresh" content="0; url=web/play.html" />
+          <title>SVM playground</title></head>
+          <body><p>Redirecting to the <a href="web/play.html">SVM playground</a>…</p></body></html>
+          HTML
+          echo "assembled:"; find "$SITE" -type f | sed "s|$SITE|_site|"
+
+      - uses: actions/configure-pages@v5
+        with: { enablement: true }
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: _site }
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
