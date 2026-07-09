@@ -34,8 +34,9 @@ fn oracle(m: &svm_ir::Module, arg: i64) -> i64 {
 }
 
 /// Mixed run: emit func 0 (and any other in-subset function) to wasm; wire `env.call_interp` to the
-/// bytecode engine so an interp-leaf call runs on the interpreter. Returns f0's i64 result.
-fn mixed(m: &svm_ir::Module, arg: i64) -> i64 {
+/// bytecode engine so an interp-leaf call runs on the interpreter. `Ok(result)`, or `Err` if the run
+/// trapped (an interp leaf that traps makes the callback trap the wasm — it surfaces here).
+fn mixed(m: &svm_ir::Module, arg: i64) -> Result<i64, ()> {
     let wasm = compile_module_mixed(m, false).expect("mixed-eligible");
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("emitted wasm validates");
@@ -124,7 +125,7 @@ fn mixed(m: &svm_ir::Module, arg: i64) -> i64 {
         .unwrap();
     let f0 = instance.get_func(&store, "f0").expect("f0");
     let mut results = [Val::I64(0)];
-    f0.call(
+    match f0.call(
         &mut store,
         &[
             Val::I32(WIN_BASE as i32),
@@ -132,13 +133,23 @@ fn mixed(m: &svm_ir::Module, arg: i64) -> i64 {
             Val::I64(arg),
         ],
         &mut results,
-    )
-    .expect("mixed run trapped unexpectedly");
-    match results[0] {
-        Val::I64(x) => x,
-        Val::I32(x) => x as i64,
-        _ => panic!("unexpected result type"),
+    ) {
+        Ok(()) => Ok(match results[0] {
+            Val::I64(x) => x,
+            Val::I32(x) => x as i64,
+            _ => panic!("unexpected result type"),
+        }),
+        Err(_) => Err(()),
     }
+}
+
+/// Whether the full-interpreter oracle traps running the whole module's func 0 with `arg`.
+fn oracle_traps(m: &svm_ir::Module, arg: i64) -> bool {
+    let mut fuel = u64::MAX;
+    matches!(
+        bytecode::compile_and_run(m, 0, &[Value::I64(arg)], &mut fuel),
+        Some(Err(_))
+    )
 }
 
 /// `env` cell must be at least `ENV_CELL_BYTES`; we put it at ENV_PTR with 2 pages of memory, so
@@ -185,7 +196,7 @@ fn sum_float_leaf() {
     let m = parse(SUM_FLOAT_LEAF);
     for &arg in ARGS {
         assert_eq!(
-            mixed(&m, arg),
+            mixed(&m, arg).expect("no trap"),
             oracle(&m, arg),
             "mixed != oracle for arg {arg}"
         );
@@ -228,9 +239,52 @@ fn sum_i32_leaf() {
     let m = parse(SUM_I32_LEAF);
     for &arg in ARGS {
         assert_eq!(
-            mixed(&m, arg),
+            mixed(&m, arg).expect("no trap"),
             oracle(&m, arg),
             "mixed != oracle for arg {arg}"
         );
+    }
+}
+
+/// **Trap propagation across the tier boundary.** The float leaf traps (a trapping `f64 → i64`
+/// conversion of `NaN`) exactly when `arg == 0`: the caller passes `arg` to the leaf, which computes
+/// `arg/arg` (`NaN` at 0) and `i64.trunc_f64_s` it. The mixed run must trap iff the full-interpreter
+/// oracle traps — proving the `env.call_interp` callback's trap path (it traps the wasm, which
+/// unwinds to the top-level `f0` caller, like the browser's JS import throwing).
+const TRAPPING_LEAF: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = call 1 (v0)
+  return v1
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.convert_i64_s v0
+  v2 = f64.div v1 v1
+  v3 = i64.trunc_f64_s v2
+  return v3
+}
+"#;
+
+#[test]
+fn trapping_leaf_propagates() {
+    let m = parse(TRAPPING_LEAF);
+    for &arg in &[0i64, 1, 2, 5, -3, 100] {
+        let want_trap = oracle_traps(&m, arg);
+        let got_trap = mixed(&m, arg).is_err();
+        assert_eq!(
+            want_trap, got_trap,
+            "cross-tier trap parity broke for arg {arg} (oracle_traps={want_trap})"
+        );
+        // At arg 0 the leaf must actually trap on both tiers (the test would be vacuous otherwise).
+        if arg == 0 {
+            assert!(want_trap, "expected the leaf to trap at arg 0");
+        } else {
+            assert_eq!(
+                mixed(&m, arg).expect("no trap"),
+                oracle(&m, arg),
+                "non-trapping arg {arg} must still match"
+            );
+        }
     }
 }
