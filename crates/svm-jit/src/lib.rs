@@ -6598,11 +6598,8 @@ fn mask_addr(
         // `run_guarded` exactly like a guard-page fault — reporting [`TrapKind::MemoryFault`] through
         // the same `faulted ⇒ FAULT_TRAP` path. Semantically identical to the old brif+return trap
         // (a clear `MemoryFault` at the offending access); only the lowering differs.
-        // [A/B gate, uncommitted] `mask` mode skips the check (old wrap-confinement).
-        if confine_mode() != ConfineMode::Mask {
-            b.ins()
-                .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
-        }
+        b.ins()
+            .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
         // Spectre-v1 clamp (§4, D38): AND the address feeding the access with `reserved−1`.
         // Architecturally a no-op — every access that reaches here passed the bounds check,
         // so `addr+offset < reserved` and the AND changes nothing. On the *speculative* path
@@ -6613,13 +6610,8 @@ fn mask_addr(
         // for bounds-checked heaps, one op cheaper — the power-of-two reservation makes a
         // 1-op AND sufficient where Wasmtime needs `cmp→cmov` (measured 20–50% cheaper on
         // confinement-dense kernels; see TRAP_CONFINEMENT.md).
-        // [A/B gate, uncommitted] `check` mode omits the clamp (trap-only, no Spectre-v1 hardening).
-        let eff = if confine_mode() == ConfineMode::Check {
-            eff
-        } else {
-            let m = b.ins().iconst(I64, lower.mask as i64);
-            b.ins().band(eff, m)
-        };
+        let m = b.ins().iconst(I64, lower.mask as i64);
+        let eff = b.ins().band(eff, m);
         // The bounds check proved `addr+offset+width <= mapped`, so `eff` is in `[0, mapped)`; shift it
         // into the §14 sub-window slice (`+ sub_base`) before adding the window base — elided for a
         // top-level window so ordinary codegen is byte-identical to before nesting existed.
@@ -6648,27 +6640,6 @@ fn mask_addr(
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)
-}
-
-/// **[Temporary A/B gate — measurement only, reverted after; see PR #212 / D61.]** `SVM_CONFINE`
-/// selects the confinement lowering so one binary can measure the confinement cost on the embench
-/// suite *with Fix A's native-trap lowering in place*: `mask` = old wrap (`& mask`, no check —
-/// valid only for OOB-free programs like embench); `check` = trapnz bounds check, no clamp; `both`
-/// (default) = the production trapnz check + clamp (D38). Production is unconditionally `both`.
-#[derive(PartialEq, Clone, Copy)]
-enum ConfineMode {
-    Check,
-    Mask,
-    Both,
-}
-
-fn confine_mode() -> ConfineMode {
-    static MODE: std::sync::OnceLock<ConfineMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("SVM_CONFINE").as_deref() {
-        Ok("mask") => ConfineMode::Mask,
-        Ok("check") => ConfineMode::Check,
-        _ => ConfineMode::Both,
-    })
 }
 
 /// Unknown upper bound — the value may be anything (so its accesses must be masked).

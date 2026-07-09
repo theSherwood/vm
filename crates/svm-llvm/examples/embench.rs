@@ -144,26 +144,6 @@ const SMALL: i64 = 10;
 const VERIFY_N: i64 = 1; // verify is n-independent (≥1); 1 rep is the cheapest correctness probe
 
 fn main() {
-    // [TEMPORARY A/B — confinement-cost measurement with Fix A's native-trap lowering; reverted
-    // after; see PR #212 / D61.] When SVM_CONFINE is unset (the default embench-differential CI
-    // invocation), re-run this example binary once per confinement lowering so the job log carries
-    // all three tables (mask=old wrap / check=trapnz, no clamp / both=production trapnz+clamp). Each
-    // child sets SVM_CONFINE, so it runs the suite once in that mode (no recursion); children inherit
-    // EMBENCH/EMBENCH_STRICT/PATH so the strict gate still holds and the parent propagates failures.
-    if std::env::var_os("SVM_CONFINE").is_none() {
-        let exe = std::env::current_exe().expect("current exe");
-        let mut any_fail = false;
-        for mode in ["mask", "check", "both"] {
-            println!("\n===== SVM_CONFINE={mode} =====");
-            let status = Command::new(&exe)
-                .env("SVM_CONFINE", mode)
-                .status()
-                .expect("re-exec embench");
-            any_fail |= !status.success();
-        }
-        std::process::exit(i32::from(any_fail));
-    }
-
     let Ok(embench) = std::env::var("EMBENCH") else {
         eprintln!("set EMBENCH=/path/to/embench-iot checkout (see this file's header). skipping.");
         return;
