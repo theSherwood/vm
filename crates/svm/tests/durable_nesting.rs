@@ -1030,8 +1030,8 @@ block3(v12: i64):
 /// parent's join table (the grandchild re-attaches into the *child's* table, not the root's), and both
 /// levels rewind: the grandchild completes its loop, its join delivers the total up to the child, and
 /// the child's join delivers it up to the root — reproducing the uninterrupted result across **two**
-/// nesting levels. (Interpreter + in-memory only; the codec refuses depth-2 for now — see
-/// `svm-snapshot`.)
+/// nesting levels. (In-memory arc; the codec round-trip is covered by
+/// `depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec`.)
 #[test]
 fn freeze_with_live_depth2_grandchild_thaws_and_completes() {
     let parent = instrument(PARENT_DEPTH2);
@@ -1134,6 +1134,86 @@ fn freeze_with_live_depth2_grandchild_thaws_and_completes() {
         tr,
         Ok(vec![Value::I64(4950)]),
         "thaw re-attached the child and grandchild; both joins delivered the total"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// Depth-2 through the **snapshot codec** (format v12): the same 3-level module, but the two
+/// re-attach records (child `parent_task == 0` + grandchild `parent_task == <child's task>`) ride
+/// the real §12 artifact instead of an in-memory hand-off. v12 carries `parent_task` on the wire, so
+/// `restore` re-seeds the residue *byte-for-byte identically* (asserted) — proving the grandchild's
+/// non-zero tag survives serialize/restore, not just the in-memory arc. Then the §12.6 canonical
+/// re-freeze is byte-identical, and the thaw rewinds both levels so the grandchild's total propagates
+/// up through both joins to the root — freeze→serialize→restore→thaw ≡ uninterrupted across two levels.
+#[test]
+fn depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec() {
+    let parent = instrument(PARENT_DEPTH2);
+
+    // Freeze with the child and grandchild both live (as in the in-memory depth-2 test).
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, D2_WINDOW as u64);
+    let mut win = init_durable_window(D2_WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(fih)],
+        &mut fuel,
+        &win,
+        D2_SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(fr.is_ok(), "depth-2 subtree freeze placeholder: {fr:?}");
+    assert_eq!(
+        fhost.frozen_nested().len(),
+        2,
+        "two nested children in residue (child + grandchild)"
+    );
+
+    // Serialize the real artifact: window image (root + child carve + grandchild sub-carve) + the two
+    // Section-2 nested records, each now carrying its `parent_task` (v12).
+    let artifact =
+        svm_snapshot::freeze(&parent, &fsnap, &fhost).expect("depth-2 artifact serializes");
+
+    // Restore into a FRESH host: the residue re-seeds byte-for-byte — so the grandchild's non-zero
+    // `parent_task` round-tripped through the wire, not just the in-memory arc.
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = svm_snapshot::restore(&artifact, &parent, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_nested(),
+        fhost.frozen_nested(),
+        "restore re-seeded both re-attach records incl. the grandchild's parent_task"
+    );
+
+    // §12.6 invariant 1 — canonical: re-serializing the restored domain is byte-identical.
+    assert_eq!(
+        svm_snapshot::freeze(&parent, &window, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze of a restored depth-2 artifact is byte-identical"
+    );
+
+    // Thaw: both levels re-attach from their carves and rewind; both joins deliver the total up.
+    let mut twin = window;
+    begin_thaw(&mut twin, 0);
+    let caps = thost.capture_durable_handles().expect("durable handles");
+    let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let mut fuel = 50_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih)],
+        &mut fuel,
+        &twin,
+        D2_SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(4950)]),
+        "the codec-restored depth-2 subtree completed; both joins delivered the total"
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
