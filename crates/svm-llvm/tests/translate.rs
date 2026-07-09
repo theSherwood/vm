@@ -4364,6 +4364,79 @@ fn unresolved_extern_stub_opt_in() {
 }
 
 #[test]
+fn unresolved_extern_funcptr_stub() {
+    // The **address-taken** counterpart to `unresolved_extern_stub_opt_in`: a *function pointer* to an
+    // undefined external (e.g. a comparator/dispatch-table entry — what blocked Postgres on `@memcmp`)
+    // resolves to the trap stub's funcref index. The undefined extern's signature comes from its
+    // `declare` prototype (the reference site carries only an opaque `ptr`). Under strict default this
+    // is a clean translate-time error; opt-in, the funcref is inert unless the pointer is *called*.
+    use svm_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+    };
+    // `gate ? mystery : other` takes the address of the undefined `mystery`; with `gate` a volatile 0
+    // the live target is `other`, so the run is clean and the `mystery` funcref (a stub) is never
+    // selected — proving an address-taken stub is inert until actually invoked.
+    let Some(bc) = compile_to_bc(
+        "extern_funcptr",
+        "#include <stdio.h>\n\
+         extern int mystery(int, int);\n\
+         static int other(int a, int b){ return a + b; }\n\
+         volatile int gate = 0;\n\
+         int main(void){ int (*p)(int,int) = gate ? mystery : other; \
+           printf(\"%d\\n\", p(3, 4)); return 0; }",
+    ) else {
+        return;
+    };
+    match svm_llvm::translate_bc_path(&bc) {
+        Err(svm_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
+        other => {
+            panic!("strict default should fail closed on address-taken `mystery`, got {other:?}")
+        }
+    }
+    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify funcptr-stub module");
+    let run = svm_run::run_powerbox(&module, b"").expect("run (funcref stub inert)");
+    assert_eq!(
+        run.stdout, b"7\n",
+        "the unselected funcref stub must not perturb the run"
+    );
+}
+
+#[test]
+fn vector_shift_per_lane_amount() {
+    // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
+    // Postgres' `simd.h`). svm-ir's `VShift` takes one scalar count for all lanes, so the on-ramp
+    // scalarizes: shift each lane by its own amount and repack. Exercises 128-bit (`<4 x i32>`
+    // shl/lshr/ashr, `<2 x i64>` shl/lshr) and **wide** (`<8 x i32>` lshr/shl, 256-bit → the chunked
+    // i32x4 wide path). The seed + shift amounts are runtime (`volatile`), so clang can't constant-fold
+    // the shifts, and every result lane is folded into one `%u` (no wide-int printf). Byte-identical to
+    // native — the scalarized lanes must match the hardware vector shift.
+    let src = "#include <stdio.h>\n\
+        typedef unsigned int v4u __attribute__((vector_size(16)));\n\
+        typedef int v4i __attribute__((vector_size(16)));\n\
+        typedef unsigned long long v2u __attribute__((vector_size(16)));\n\
+        typedef unsigned int v8u __attribute__((vector_size(32)));\n\
+        volatile unsigned SEED = 7;\n\
+        int main(void){\n\
+          unsigned s = SEED;\n\
+          v4u a = {s, s*85u, s<<16, 0x80000000u|s}, shu = {s&3u, (s+1u)&7u, 3u, 2u};\n\
+          v4u rl = a << shu, rr = a >> shu;\n\
+          v4i sv = {-(int)s, 100, -1, 65536}, ra = sv >> (v4i){1, 2, 3, (int)(s&7u)};\n\
+          v2u b = {(unsigned long long)s, ((unsigned long long)s)<<32}, shb = {s&31u, 33u};\n\
+          v2u rb = b << shb, rb2 = b >> (v2u){1u, s&15u};\n\
+          v8u c = {s, 2u*s, s<<8, 0xFF00u^s, s|0x10000u, 5u*s, s>>1, 3u*s};\n\
+          v8u rc = c >> (v8u){3u,10u,s&7u,4u,1u,2u,s&15u,7u}, rc2 = c << (v8u){1u,2u,s&3u,4u,0u,1u,2u,3u};\n\
+          unsigned acc = 0;\n\
+          for (int i=0;i<4;i++){ acc = acc*131u + rl[i]; acc = acc*131u + rr[i]; acc = acc*131u + (unsigned)ra[i]; }\n\
+          for (int i=0;i<2;i++){ acc = acc*131u + (unsigned)rb[i] + (unsigned)(rb[i]>>32) + (unsigned)rb2[i]; }\n\
+          for (int i=0;i<8;i++){ acc = acc*131u + rc[i] + rc2[i]; }\n\
+          printf(\"%u\\n\", acc); return 0; }";
+    check_powerbox_vs_native("vshift_per_lane", src, b"");
+}
+
+#[test]
 fn tail_call_lowers_and_runs() {
     // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
     // `return_call` terminators, verifies, and runs to completion at 2,000,000 depth — which only
