@@ -50,6 +50,46 @@ block0(v0: i64):
     )
 }
 
+/// A **separate** child plugin with a *looping* entry (sums 0..100 = 4950 with back-edge polls),
+/// so a freeze reliably catches it live — the separate-module analog of `PARENT_SELF_LOOP`'s child.
+fn child_loop() -> Module {
+    instrument(
+        "memory 17
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v1, v2)
+block1(v3: i64, v4: i64):
+  v5 = i64.const 100
+  v6 = i64.lt_s v3 v5
+  br_if v6 block2(v3, v4) block3(v4)
+block2(v7: i64, v8: i64):
+  v9 = i64.add v8 v7
+  v10 = i64.const 1
+  v11 = i64.add v7 v10
+  br block1(v11, v9)
+block3(v12: i64):
+  return v12
+}
+",
+    )
+}
+
+/// A *different* separate module (returns 8888) for the thaw identity-gate test — its digest
+/// differs from `child_loop`, so re-granting it in place of the frozen child fails closed.
+fn child_other() -> Module {
+    instrument(
+        "memory 17
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 8888
+  return v1
+}
+",
+    )
+}
+
 /// Durable parent that `instantiate_module`s (op 5) its granted child at the aligned carve
 /// `[128 KiB, 256 KiB)` and returns the op's i32 status — the refusal probe (no join). The module
 /// handle arrives as an `i64` entry arg (the op's slot ABI) since the Phase-1 durable transform
@@ -398,31 +438,146 @@ fn freeze_with_live_nested_child_thaws_and_completes() {
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
 
-/// A **separate-module** live child stays fail-closed at freeze (its module identity cannot ride
-/// the artifact yet), even though its grant was durable-attested and it instantiated fine.
+/// Freeze a live **separate-module** child (host-supplied at restore): its module identity rides
+/// the artifact as a content digest only; the thaw re-attaches it against the restore host's
+/// **re-granted** module and reproduces the total. Covers the in-memory arc *and* the codec (the
+/// non-durable `Module` handle is drained before serialize; the module is re-granted after the
+/// §12.6 canonical re-freeze check so the re-freeze still sees only durable handles).
 #[test]
-fn freeze_with_live_separate_module_child_still_fails_closed() {
+fn freeze_with_live_separate_module_child_thaws_through_the_codec() {
     let parent = instrument(PARENT_JOIN);
-    let mut host = Host::new();
-    host.set_durable(true);
-    let ih = host.grant_instantiator(0, WINDOW as u64);
-    let mh = host.grant_durable_module(&child());
+
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let ih = fhost.grant_instantiator(0, WINDOW as u64);
+    let mh = fhost.grant_durable_module(&child_loop());
     let mut win = init_durable_window(WINDOW);
     write_state(&mut win, STATE_UNWINDING);
-    let mut fuel = 5_000_000u64;
-    let (r, _) = run_capture_reserved_with_host(
+    let mut fuel = 50_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
         &parent,
         0,
         &[Value::I32(ih), Value::I64(mh as i64)],
         &mut fuel,
         &win,
         SIZE_LOG2,
-        &mut host,
+        &mut fhost,
+    );
+    assert!(fr.is_ok(), "freeze placeholder: {fr:?}");
+    assert_eq!(read_state(&fsnap), STATE_UNWINDING, "child frozen live");
+    let residue = fhost.frozen_nested().to_vec();
+    assert_eq!(residue.len(), 1);
+    assert!(
+        residue[0].module_digest.is_some(),
+        "separate-module child carries a digest"
+    );
+
+    // Drain the non-durable Module handle so the domain is snapshottable, then serialize.
+    fhost.drain_non_durable();
+    let artifact = svm_snapshot::freeze(&parent, &fsnap, &fhost).expect("serializes after drain");
+
+    // Restore; §12.6 canonical re-freeze BEFORE re-granting the module (only durable handles live).
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = svm_snapshot::restore(&artifact, &parent, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_nested(),
+        fhost.frozen_nested(),
+        "residue re-seeded"
     );
     assert_eq!(
-        r,
+        svm_snapshot::freeze(&parent, &window, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze byte-identical"
+    );
+
+    // Recover the restored Instantiator handle *before* re-granting the (non-durable) Module — the
+    // embedder then supplies the matching module (host-supplied at restore) and thaws.
+    let caps = thost
+        .capture_durable_handles()
+        .expect("only durable handles restored");
+    let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let tmh = thost.grant_durable_module(&child_loop());
+    let mut twin = window;
+    begin_thaw(&mut twin, 0);
+    let mut fuel = 50_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih), Value::I64(tmh as i64)],
+        &mut fuel,
+        &twin,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(4950)]),
+        "re-attached separate-module child reproduces the total"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// The per-child R5 identity gate: thawing a separate-module artifact **without** re-granting the
+/// child's module (or with a *different* module) fails closed — `module_by_digest` finds no match,
+/// so the parent's re-executed `join` traps rather than mis-running a wrong module in the carve.
+#[test]
+fn thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module() {
+    let parent = instrument(PARENT_JOIN);
+    let freeze = || {
+        let mut fhost = Host::new();
+        fhost.set_durable(true);
+        let ih = fhost.grant_instantiator(0, WINDOW as u64);
+        let mh = fhost.grant_durable_module(&child_loop());
+        let mut win = init_durable_window(WINDOW);
+        write_state(&mut win, STATE_UNWINDING);
+        let mut fuel = 50_000_000u64;
+        let (_, fsnap) = run_capture_reserved_with_host(
+            &parent,
+            0,
+            &[Value::I32(ih), Value::I64(mh as i64)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut fhost,
+        );
+        (fhost.frozen_nested().to_vec(), fsnap)
+    };
+    let (residue, fsnap) = freeze();
+    if read_state(&fsnap) != STATE_UNWINDING {
+        return; // freeze didn't catch it live (rare) — nothing to gate
+    }
+
+    // Thaw with NO module re-granted → join fails closed.
+    let run_thaw = |granted: Option<Module>| -> Result<Vec<Value>, Trap> {
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        let ih = thost.grant_instantiator(0, WINDOW as u64);
+        let tmh = granted.map(|m| thost.grant_durable_module(&m)).unwrap_or(0);
+        thost.set_frozen_nested(residue.clone());
+        let mut twin = fsnap.clone();
+        begin_thaw(&mut twin, 0);
+        let mut fuel = 50_000_000u64;
+        run_capture_reserved_with_host(
+            &parent,
+            0,
+            &[Value::I32(ih), Value::I64(tmh as i64)],
+            &mut fuel,
+            &twin,
+            SIZE_LOG2,
+            &mut thost,
+        )
+        .0
+    };
+    assert_eq!(
+        run_thaw(None),
         Err(Trap::ThreadFault),
-        "a live separate-module child still refuses the freeze"
+        "missing module: thaw fails closed"
+    );
+    assert_eq!(
+        run_thaw(Some(child_other())),
+        Err(Trap::ThreadFault),
+        "mismatched module (wrong digest): thaw fails closed"
     );
 }
 

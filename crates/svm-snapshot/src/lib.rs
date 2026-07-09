@@ -38,7 +38,7 @@
 
 #![forbid(unsafe_code)]
 
-use svm_encode::encode_module;
+use svm_encode::{digest256, encode_module};
 use svm_interp::{
     DurableBinding, DurableHandle, FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle,
     StreamRole, SHADOW_BASE,
@@ -83,8 +83,12 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// concurrency ceiling. The residue's `generation`/`slot` fields are still stored *separately* as
 /// `uleb`, so the Section-2 byte layout is unchanged — but a fiber handle the guest held **packed** in
 /// its window across the freeze would decode to a different `(slot, generation)` under the new shift,
-/// so a v9 artifact is rejected rather than mis-resolved.
-const FORMAT_VERSION: u16 = 10;
+/// so a v9 artifact is rejected rather than mis-resolved. v11 (§4 separate-module children): each
+/// nested record gains a 32-byte **module digest** (a content hash of the child's granted module,
+/// emitted only for a separate-module child — one `uleb` `0` for a same-module child, else `1` + the
+/// 32 bytes), so the thaw resolves the child against the restore host's re-granted modules. One extra
+/// `uleb` (0) per same-module nested record otherwise, so a v10 nested record mis-parses.
+const FORMAT_VERSION: u16 = 11;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -326,6 +330,16 @@ pub fn freeze_with_prots(
                     write_uleb(b, n.carve_off);
                     write_uleb(b, n.size_log2 as u64);
                     write_uleb(b, n.entry as u64);
+                    // v11: a separate-module child carries its module content digest (1 + 32 bytes)
+                    // so a thaw resolves it against the restore host's re-granted modules; a
+                    // same-module child writes 0 (runs the parent's own funcs).
+                    match n.module_digest {
+                        None => write_uleb(b, 0),
+                        Some(d) => {
+                            write_uleb(b, 1);
+                            b.extend_from_slice(&d);
+                        }
+                    }
                     // v9: a completed-but-unjoined child carries its join result (1 + the i64); a
                     // still-running child writes 0 (re-attached + rewound on thaw instead).
                     match n.completed_result {
@@ -593,6 +607,15 @@ fn decode_control(
             let carve_off = cr.uleb()?;
             let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            // v11: separate-module child's module content digest.
+            let module_digest = match cr.uleb()? {
+                0 => None,
+                _ => Some(
+                    cr.take(32)?
+                        .try_into()
+                        .map_err(|_| RestoreError::Malformed)?,
+                ),
+            };
             // v9: completed-but-unjoined child's join result.
             let completed_result = match cr.uleb()? {
                 0 => None,
@@ -603,6 +626,7 @@ fn decode_control(
                 carve_off,
                 size_log2,
                 entry,
+                module_digest,
                 completed_result,
             });
         }
@@ -736,34 +760,6 @@ impl<'a> Reader<'a> {
 /// lanes with distinct odd primes, length-mixed. Guards *accidental* restore-into-wrong-module
 /// (§12.6 invariant 2), not an adversary (a guest can't forge past confinement — §3), so no
 /// crypto-hash dependency is pulled into the toolchain.
-fn digest256(bytes: &[u8]) -> [u8; 32] {
-    const PRIMES: [u64; 4] = [
-        0x0000_0100_0000_01b3, // FNV-1a 64-bit prime
-        0xff51_afd7_ed55_8ccd, // murmur3 fmix constant (odd)
-        0xc4ce_b9fe_1a85_ec53, // murmur3 fmix constant (odd)
-        0x9e37_79b9_7f4a_7c15, // golden-ratio odd constant
-    ];
-    let mut lanes: [u64; 4] = [
-        0xcbf2_9ce4_8422_2325,
-        0x1234_5678_9abc_def0,
-        0x0f1e_2d3c_4b5a_6978,
-        0xa5a5_5a5a_3c3c_c3c3,
-    ];
-    for &byte in bytes {
-        for (lane, prime) in lanes.iter_mut().zip(PRIMES) {
-            *lane = (*lane ^ byte as u64).wrapping_mul(prime);
-        }
-    }
-    for (lane, prime) in lanes.iter_mut().zip(PRIMES) {
-        *lane = (*lane ^ bytes.len() as u64).wrapping_mul(prime);
-    }
-    let mut out = [0u8; 32];
-    for (i, lane) in lanes.iter().enumerate() {
-        out[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
-    }
-    out
-}
-
 #[cfg(test)]
 mod binding_window_tests {
     use super::*;
