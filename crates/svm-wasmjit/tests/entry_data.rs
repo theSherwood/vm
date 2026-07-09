@@ -101,14 +101,15 @@ fn bytecode_run(m: &svm_ir::Module, entry: u32, arg: i64, fuel: &mut u64) -> Opt
 }
 
 /// Two kernels; **func 1** (not func 0) is the JIT entry — proving entry-rooted eligibility and that
-/// the emitted export is `f1`. Func 0 is a float kernel (would block a func-0-rooted compile), which
-/// entry-rooting at func 1 correctly ignores (func 1 doesn't reach it).
+/// the emitted export is `f1`. Func 0 is a **SIMD** kernel (out of subset — floats are now in-subset,
+/// so a float func 0 would be eligible; v128 is not), which entry-rooting at func 1 correctly ignores.
 const ENTRY_ONE: &str = r#"
 func (i64) -> (i64) {
 block0(v0: i64):
-  v1 = f64.convert_i64_s v0
-  v2 = i64.trunc_sat_f64_s v1
-  return v2
+  v1 = i64x2.splat v0
+  v2 = i64x2.add v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
 }
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -123,7 +124,7 @@ block0(v0: i64):
 #[test]
 fn entry_not_func_zero() {
     let m = parse(ENTRY_ONE);
-    // func 0 is float → not eligible as an entry; func 1 is pure integer → eligible.
+    // func 0 is SIMD → not eligible as an entry; func 1 is pure integer → eligible.
     assert!(!analyze_from(&m, 0).mixed_ok);
     assert!(analyze_from(&m, 1).mixed_ok);
     for arg in [0i64, 1, 7, -5, 1000] {

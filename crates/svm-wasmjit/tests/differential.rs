@@ -27,10 +27,21 @@ enum Outcome {
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum TrapKind {
     DivByZero,
-    IntOverflow,
+    /// Integer signed-overflow (`INT_MIN / -1`) **and** out-of-domain float→int trunc (NaN / ±inf /
+    /// out-of-range) are one bucket: the two engines label these differently (the interpreter splits
+    /// `IntOverflow` vs `BadConversion` where wasm merges them under `BadConversionToInteger` /
+    /// `IntegerOverflow` on different inputs), and the exact label is an unobservable internal
+    /// distinction — both simply trap. They can't collide across ops, so merging keeps the check
+    /// meaningful (a non-trap vs trap, or the wrong bucket, still fails).
+    OverflowOrConv,
     MemoryFault,
     Unreachable,
     OutOfFuel,
+    /// A `call_indirect` fault: an empty (null) table slot **or** a signature mismatch. The
+    /// interpreter labels both `IndirectCallType`; wasm splits them into `IndirectCallToNull` /
+    /// `BadSignature` — an unobservable internal distinction, so they share one bucket (like
+    /// `OverflowOrConv`). A non-trap or the wrong bucket still fails the differential.
+    IndirectCall,
     Other,
 }
 
@@ -41,10 +52,11 @@ fn oracle(m: &svm_ir::Module, args: &[Value], fuel: u64) -> Outcome {
         Some(Ok(vals)) => Outcome::Vals(vals),
         Some(Err(t)) => Outcome::Trap(match t {
             Trap::DivByZero => TrapKind::DivByZero,
-            Trap::IntOverflow => TrapKind::IntOverflow,
+            Trap::IntOverflow | Trap::BadConversion => TrapKind::OverflowOrConv,
             Trap::MemoryFault => TrapKind::MemoryFault,
             Trap::Unreachable => TrapKind::Unreachable,
             Trap::OutOfFuel => TrapKind::OutOfFuel,
+            Trap::IndirectCallType => TrapKind::IndirectCall,
             _ => TrapKind::Other,
         }),
     }
@@ -125,8 +137,13 @@ fn wasm_run(m: &svm_ir::Module, wasm: &[u8], args: &[Value], fuel: u64) -> Outco
                 use wasmi::core::TrapCode;
                 match e.as_trap_code() {
                     Some(TrapCode::IntegerDivisionByZero) => TrapKind::DivByZero,
-                    Some(TrapCode::IntegerOverflow) => TrapKind::IntOverflow,
+                    Some(TrapCode::IntegerOverflow | TrapCode::BadConversionToInteger) => {
+                        TrapKind::OverflowOrConv
+                    }
                     Some(TrapCode::UnreachableCodeReached) => TrapKind::Unreachable,
+                    Some(TrapCode::IndirectCallToNull | TrapCode::BadSignature) => {
+                        TrapKind::IndirectCall
+                    }
                     other => panic!("unexpected wasm trap: {other:?} ({e})"),
                 }
             };
@@ -530,14 +547,226 @@ fn i32_fn() {
     diff("i32_fn", I32FN, ARGS, FUEL);
 }
 
-/// Everything the tier must REFUSE (fail-closed): the op families slice 3+ will route to the
-/// interpreter. A module containing any of them is Unsupported as a whole in slice 1.
+/// Interesting f64 bit patterns (fed as the i64 arg, reinterpreted to f64 inside): ±0, ±1, ±inf,
+/// a quiet NaN, min/max subnormal + normal, and π-ish — the corners where a backend could diverge
+/// (NaN propagation, rounding, min/max-of-NaN).
+const F64_BITS: &[i64] = &[
+    0x0000_0000_0000_0000u64 as i64, // +0.0
+    0x8000_0000_0000_0000u64 as i64, // -0.0
+    0x3FF0_0000_0000_0000u64 as i64, // 1.0
+    0xBFF0_0000_0000_0000u64 as i64, // -1.0
+    0x7FF0_0000_0000_0000u64 as i64, // +inf
+    0xFFF0_0000_0000_0000u64 as i64, // -inf
+    0x7FF8_0000_0000_0000u64 as i64, // quiet NaN
+    0x0000_0000_0000_0001u64 as i64, // smallest subnormal
+    0x4009_21FB_5444_2D18u64 as i64, // ~π
+    0x4059_0000_0000_0000u64 as i64, // 100.0
+];
+
+/// f64 arithmetic / unary / compare / reinterpret cast: reinterpret the i64 arg to f64, run
+/// `add`/`sub`/`mul`/`div`/`min`/`max`/`sqrt`/`abs`/`neg` + an `lt` compare, reinterpret the result
+/// back to i64 **bits**, and fold in the compare — so the differential is exact (NaN payloads and
+/// rounding must match wasm↔interpreter).
+const F64_ARITH: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  vf = f64.reinterpret_i64 v0
+  va = f64.add vf vf
+  vb = f64.mul vf va
+  vc = f64.div vb vf
+  vd = f64.sub vc vf
+  ve = f64.sqrt vd
+  vg = f64.abs ve
+  vh = f64.neg vg
+  vi = f64.min vh vf
+  vj = f64.max vi vf
+  vk = f64.copysign vj vf
+  vcmp = f64.lt vk vf
+  vcmp64 = i64.extend_i32_u vcmp
+  vbits = i64.reinterpret_f64 vk
+  vr = i64.add vbits vcmp64
+  return vr
+}
+"#;
+
+#[test]
+fn f64_arith() {
+    diff("f64_arith", F64_ARITH, F64_BITS, FUEL);
+}
+
+/// Conversions: i64→f64 (`convert`, signed+unsigned via the low/high halves), f64→i64 saturating
+/// (`trunc_sat`) and f32 round-trip (`demote`/`promote`). Result is i64 bits, exact.
+const F64_CONV: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  vs = f64.convert_i64_s v0
+  vu = f64.convert_i64_u v0
+  vsum = f64.add vs vu
+  vf32 = f32.demote_f64 vsum
+  vback = f64.promote_f32 vf32
+  vsat = i64.trunc_sat_f64_s vback
+  v32 = i32.wrap_i64 v0
+  vc32 = f64.convert_i32_s v32
+  vc32bits = i64.reinterpret_f64 vc32
+  vr = i64.add vsat vc32bits
+  return vr
+}
+"#;
+
+#[test]
+fn f64_conv() {
+    diff("f64_conv", F64_CONV, ARGS, FUEL);
+}
+
+/// f64→i64 **trapping** conversion (`i64.trunc_f64_s`): traps on NaN / out-of-range, so the JIT must
+/// trap exactly where the interpreter does. Fed the same f64 bit patterns (inf/NaN trap).
+const F64_TRUNC_TRAP: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  vf = f64.reinterpret_i64 v0
+  vi = i64.trunc_f64_s vf
+  return vi
+}
+"#;
+
+#[test]
+fn f64_trunc_trap() {
+    diff("f64_trunc_trap", F64_TRUNC_TRAP, F64_BITS, FUEL);
+}
+
+/// `call_indirect` through the identity funcref table: a loop dispatches to `func1` (double) or
+/// `func2` (+100) by index parity, exercising `ref.func`-style integer funcrefs, the masked table
+/// index, wasm's signature check, and env/arg/result threading through the indirect edge. Three
+/// funcs ⇒ a 4-slot table (slot 3 null); the computed index is always 1 or 2, so it never traps.
+const CALL_INDIRECT: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 1
+  v11 = i64.and v9 v10
+  v12 = i64.const 1
+  v13 = i64.add v11 v12
+  v14 = i32.wrap_i64 v13
+  v15 = call_indirect (i64) -> (i64) v14 (v9)
+  v16 = i64.add v8 v15
+  v17 = i64.const 1
+  v18 = i64.add v9 v17
+  br block1(v7, v16, v18)
+block3(v19: i64):
+  return v19
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i64.add v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn call_indirect() {
+    diff(
+        "call_indirect",
+        CALL_INDIRECT,
+        &[0, 1, 2, 5, 64, 1000, -1, 100_000],
+        FUEL,
+    );
+}
+
+/// The **null-slot** trap: the index (the arg) selects any of the 4 table slots; slot 3 is empty
+/// padding (only 3 funcs), so an index masking to 3 must trap `IndirectCallType` on both engines —
+/// exactly where the interpreter's `TABLE_EMPTY` check fires. Indices masking to 0 re-enter `func0`
+/// with the fixed inner arg 5 (both engines recurse identically), so results still match.
+const CALL_INDIRECT_NULL: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 5
+  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  return v3
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 100
+  v2 = i64.add v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn call_indirect_null_trap() {
+    diff(
+        "call_indirect_null_trap",
+        CALL_INDIRECT_NULL,
+        &[1, 2, 3, 5, 6, 7, -1],
+        FUEL,
+    );
+}
+
+/// The **signature-mismatch** trap: `call_indirect` declares `(i32) -> (i32)` but index 1 selects
+/// `func1`, whose real signature is `(i64) -> (i64)`. wasm's built-in type check (the §3c type-id
+/// check) traps `BadSignature`; the interpreter traps `IndirectCallType` — one bucket, both trap.
+const CALL_INDIRECT_BADSIG: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 1
+  v2 = i32.wrap_i64 v1
+  v3 = i32.wrap_i64 v0
+  v4 = call_indirect (i32) -> (i32) v2 (v3)
+  v5 = i64.extend_i32_s v4
+  return v5
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn call_indirect_badsig_trap() {
+    diff(
+        "call_indirect_badsig_trap",
+        CALL_INDIRECT_BADSIG,
+        &[0, 1, 42],
+        FUEL,
+    );
+}
+
+/// Everything the tier must REFUSE (fail-closed): the op families a later slice will route to the
+/// interpreter. A module containing any of them is Unsupported as a whole.
 #[test]
 fn fail_closed() {
     for (name, src) in [
         (
-            "float",
-            "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = f64.convert_i64_s v0\n  v2 = i64.trunc_sat_f64_s v1\n  return v2\n}\n",
+            // `v128` (SIMD) is not in the subset yet — a later slice. (Scalar floats now ARE, so
+            // this exemplar switched from float to SIMD.)
+            "simd",
+            "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64x2.splat v0\n  v2 = i64x2.extract_lane 0 v1\n  return v2\n}\n",
+        ),
+        (
+            // scalar `fma` has no core-wasm opcode (relaxed-SIMD only), so it stays interpreter-tier.
+            "fma",
+            "func (f64) -> (f64) {\nblock0(v0: f64):\n  v1 = f64.fma v0 v0 v0\n  return v1\n}\n",
         ),
         (
             "fiber",

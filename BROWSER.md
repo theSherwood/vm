@@ -596,8 +596,28 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    at-or-below native Cranelift `svm-jit` — the row also generalized the emitter with **entry-rooting**
    (`compile_module_mixed_entry` / `analyze_from` — the JIT entry needn't be func 0) and **`data`
    tolerance** (the host materializes `m.data` into the window via `svm_wasmjit_init_window`; the
-   emitter no longer rejects data segments). Remaining for the slice: SIMD/v128 (mostly 1:1) +
-   `call_indirect` + the remaining ops in the subset; a playground toggle.
+   emitter no longer rejects data segments). **Scalar floats now in-subset:** f32/f64 const / arith /
+   unary / compare / conversions (`trunc_sat` + trapping `trunc` + `convert`) / casts
+   (`demote`/`promote`/`reinterpret`) / loads+stores — all 1:1 with core wasm (the one exception is
+   scalar `Fma`, which has no core-wasm opcode → stays interpreter-tier). Proven by three float
+   differential kernels (arith/unary/compare, conversions, trapping trunc) over ±0/±1/±inf/NaN/
+   subnormal bit patterns, compared **exactly** (NaN payloads + rounding) vs the bytecode oracle; and
+   the cross-engine `fma` kernel now JITs (the frontend lowers it to mul+add) at ~2.7 ns, near native.
+   **`call_indirect` now in-subset:** the emitter lays an identity **funcref table** (slot `s` =
+   function `s`, power-of-two length, trapping null padding — the interpreter's `DomainTable`) via a
+   wasm table + active element segment, and lowers `call_indirect` to a masked index (`idx &
+   (table_size − 1)`, exactly `dispatch_indirect`'s `idx & (len − 1)`) + wasm's native
+   `call_indirect`, whose built-in signature check **is** the §3c type-id check (a mismatch, or a
+   null padding slot, traps `IndirectCallType` on both tiers). `ref.func` lowers to its `i32` index.
+   First increment: indirect targets must be **in-subset** — an indirect call can reach any function,
+   an edge direct-call reachability can't see, so `analyze` conservatively requires the whole module
+   in-subset when a reachable function makes one (fail-closed otherwise); cross-tier indirect (a
+   trampoline routing null slots to `env.call_interp`) is a later refinement. Proven by three
+   differential kernels (parity dispatch, null-slot trap, signature-mismatch trap) vs the bytecode
+   oracle, two `analyze` tests, and the Node + Chromium browser proofs. *(No cross-engine bench row:
+   that bench bundles every kernel — including SIMD/`fma` — into one module, so the whole-module
+   indirect requirement fails closed there; a dedicated all-in-subset dispatch kernel carries the
+   browser proof instead.)* Remaining for the slice: SIMD/v128 (mostly 1:1); a playground toggle.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);

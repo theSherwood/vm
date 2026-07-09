@@ -206,11 +206,10 @@ extent its carve's shadow-SP word holds, and the root's join table is rebuilt at
 slot — the root's re-executed `join` parks until the rewound child completes, exactly as
 pre-freeze. Pinned by `durable_nesting.rs::freeze_with_live_nested_child_thaws_and_completes` (a
 looping child frozen live; the thaw reproduces the uninterrupted total). **Still fail-closed**
-(refusal preserved + pinned): suspended coroutines (host-side native continuations),
-separate-module children (module identity can't ride yet), a completed child that **trapped**
-(its trap can't ride yet), nested-in-nested, mixing with unjoined `thread.spawn` children (the two
-thaw seedings would contend for the join table), and a nested child owning fibers (child-local
-residue). **Completed-result residue (v9).** A freeze landing while a §14 child is
+(refusal preserved + pinned): suspended coroutines (host-side native continuations), a completed
+child that **trapped** (its trap can't ride yet), nested-in-nested, mixing with unjoined
+`thread.spawn` children (the two thaw seedings would contend for the join table), and a nested child
+owning fibers (child-local residue). **Completed-result residue (v9).** A freeze landing while a §14 child is
 **completed-but-unjoined** (finished before the freeze, its result posted to the scheduler but not
 yet joined) no longer refuses: the freeze **takes** that result and records it as
 `FrozenNested::completed_result` (no `UNWINDING` broadcast — nothing to unwind), and the thaw posts
@@ -222,7 +221,7 @@ joined-first/long loop, B completes unjoined; the armed freeze catches B done-bu
 residue carries `completed_result: Some(33)`; the thaw reloads it, in-memory and through the
 codec with a byte-identical canonical re-freeze). With this, a depth-1 same-module child survives a
 freeze in **any** state — live mid-run, completed-unjoined, or already joined. **Stage C — codec landed
-(`FORMAT_VERSION` 7→8; v9 adds the completed-result field per nested record).** The nested artifact is now a real §12 artifact: the `FrozenNested`
+(`FORMAT_VERSION` 7→8; v9 adds the completed-result field, v11 the separate-module digest, per nested record).** The nested artifact is now a real §12 artifact: the `FrozenNested`
 re-attach records ride **Section 2**, appended after the fiber + vCPU residue and only when
 present (canonical ascending slot; fiber-/vCPU-only artifacts keep the pre-nesting Section-2
 byte layout — only the container version differs), and `restore` re-seeds `Host::frozen_nested`.
@@ -232,9 +231,19 @@ window image, so the encoding is just the re-attach record. Pinned by
 live child → serialize → restore into a fresh host → **§12.6 canonical re-freeze byte-identical**
 → thaw completes the child's loop and the join delivers the uninterrupted total — the full
 `freeze → serialize → restore → thaw ≡ uninterrupted` contract across the nesting boundary.
-Next: separate-module children — the module is **host-supplied at restore** (the artifact records
-only the instrumented-module digest, D-scope; the embedder re-grants matching modules, like the
-handle table), so the child's module identity need not bloat the artifact — then deeper nesting and
+**Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
+too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
+32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared
+`svm_encode::digest256`, the same function behind the codec's root R5 gate), never the module bytes.
+The thaw resolves that digest against the restore host's re-granted modules (`Host::module_by_digest`)
+and runs the *child*'s funcs; a **missing or mismatched** re-grant fails closed — the parent's
+re-executed `join` traps rather than mis-run a wrong module in the carve (the per-child R5 identity
+gate). Since a live `Module` handle is non-durable (§12.5), the embedder `drain_non_durable`s it before
+serializing (the digest was already captured at instantiate); the §12.6 canonical re-freeze then sees
+only durable handles, and the module is re-granted after it. Pinned by
+`durable_nesting.rs::{freeze_with_live_separate_module_child_thaws_through_the_codec,
+thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module}`. This completes depth-1
+nesting for **both** module kinds (same- and separate-module) in every child state. Next: deeper nesting and
 JIT parity.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight

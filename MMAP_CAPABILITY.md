@@ -198,14 +198,21 @@ Proposed order:
    the `*_crashy` fs backends add `FS_CRASH_ARM` (§4d); `demo_lmdb_crash_recovery` sweeps the crash
    point across a transaction's commit and proves LMDB recovers to the last committed snapshot at
    every barrier — never a torn mix. Self-contained, no FFI.
-2. **Zero-copy real aliasing via the bridge (§4b).** Teach the fs `HostFn` to mint a **file-backed
-   `SharedRegion`** on mmap-open (broaden the region backing from memfd-only to a real file fd —
-   `svm-run` `new_shared_region`/`RegionBacking`), and have the guest shim map it with the existing
-   built-in `SharedRegion.map`, falling back to the emulation otherwise. No new escape-TCB code —
-   `map_region` is reused unchanged; carries the durability contract from (1). Linux first;
-   macOS/Windows follow `SharedRegion`'s existing per-OS path. **This is where DESIGN §13 and the
-   `SHARED_REGION` iface doc-comment get updated** — file-backed regions become part of shipped
-   reality only when this lands.
+2. **Zero-copy real aliasing via the bridge (§4b).** ✅ **Shipped.** Concretely:
+   - `FileBacking` (`svm-run`) — a `SharedRegion` backing whose `os_fd` is a real host file; the
+     interpreter/JIT aliasing paths are backing-agnostic, so it aliases the file into a window with
+     **no new escape-TCB code** (`map_region` reused unchanged). `new_file_region(file, len)`.
+   - `RegionMinter` + `HostFnRegion` (`svm-interp`) — the delivery mechanism: the narrow authority
+     (mint a `SharedRegion`, nothing else of the `Host`) handed to an opt-in mmap-capable fs handler,
+     so the closure can return a region handle. Resolves the "how does the fs `HostFn` deliver the
+     handle" question below.
+   - `host_fs_mmap` + `FS_MAP_REGION` (op 13) — mints a file-backed region over an open fd (dup'd, so
+     the map and the fs cap's `pread`/`pwrite`/`fsync` share one file/page-cache) and returns its
+     handle. The guest shim `SharedRegion.map`s it (via a new `__vm_region_call` intrinsic) over a
+     page-aligned window buffer, **falling back to the copy-in emulation** when granted a plain `fs`.
+   - Proof: `demo_lmdb_mmap_zerocopy_vs_native` — LMDB reads/writes its B-tree straight out of the
+     file alias and produces a native-readable `data.mdb` (both directions), plus unit tests for the
+     backing, the ABI, and the op.
 3. **Multi-mapping / mixed pwrite** — only if a target (e.g. LMDB without WRITEMAP, or a second
    reader) is chosen that needs it. The bridge's real aliasing from (2) largely provides it.
 
@@ -220,16 +227,24 @@ Resolved in slice 1 (§4c/§4d): **crash granularity** — we expose torn writes
 whole in-flight barrier) and rely on the store's own checksums, the stronger posture; **where the
 crash hook lives** — a `*_crashy` constructor variant, so the default grants have no such op.
 
-Remaining, gating slice 2 (the bridge, §4b):
+Resolved in slice 2 (§4b, §5.2):
 
-- **Window budget** (the bridge's one unsettled mechanism, §4b): the file-backed region maps into a
-  window sub-range the guest must own — who reserves it (the guest via `AddressSpace.sub`, or the
-  powerbox carves a region at grant time)? Ties into §14; shared with `SharedRegion` today.
-- **How the fs `HostFn` hands the region handle to the guest**: return value from the mmap-open op,
-  or a powerbox stash? (Host-granted regions exist; the delivery path for a *closure*-minted one is new.)
-- **`RegionBacking` lifetime**: the file `File` is shared by fs I/O (`pread`/`pwrite`) and the region
-  alias — one owner, two references. Where does it live so both outlast the mapping and close once?
+- **How the fs `HostFn` hands the region handle to the guest** — a `RegionMinter` threaded into an
+  opt-in `HostFnRegion` handler (`grant_host_fn_region`); the handler returns the minted handle as
+  the `FS_MAP_REGION` result. The escape hatch widens by exactly region-minting, only for opt-in
+  handlers.
+- **Window budget** — the guest reserves the window sub-range itself: the shim page-aligns an
+  ordinary heap allocation and `SharedRegion.map`s the file over it (the same place the copy-in
+  emulation got its buffer). No new §14 mechanism needed for the single-mapping case.
+- **`FileBacking` lifetime** — the backing owns its **own** `dup`'d fd over the file, independent of
+  the guest's fd, so it outlives the mapping and both share one OS file / page cache; it is dropped
+  with the `Host` at run end (regions aren't reclaimed mid-run — matching `SharedRegion` today).
 
-Bridge questions **already resolved** (§4b): the capability shape (fs mints a `SharedRegion` backing,
-not a dedicated `FileMapping` iface — no fs duplication, no new escape-TCB code) and the escape-surface
+Still open (deferred, not blocking): reclaiming a region mid-run (today it lives until run end, a
+minor leak on repeated map/unmap); a non-zero file offset in `FS_MAP_REGION` (v1 requires offset 0,
+which is all LMDB needs); and the macOS/Windows `map_region` backends (Linux-only, following
+`SharedRegion`'s existing per-OS story).
+
+Bridge questions resolved earlier (§4b): the capability shape (fs mints a `SharedRegion` backing, not
+a dedicated `FileMapping` iface — no fs duplication, no new escape-TCB code) and the escape-surface
 review (a file-backed `MAP_SHARED` region is the same surface as a memfd one).

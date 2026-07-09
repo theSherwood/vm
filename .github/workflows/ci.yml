@@ -18,6 +18,9 @@ env:
   # multi-second registry blip.
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_TIMEOUT: "60"
+  # Pin stable so a channel roll can't silently introduce new clippy/rustc lints
+  # under -D warnings (bump deliberately, same posture as the nightly-pinned fuzz job).
+  RUST_STABLE: "1.97.0"
 
 jobs:
 
@@ -33,7 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with: { components: rustfmt, clippy }
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -59,6 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --workspace
       - run: cargo test --workspace
@@ -100,6 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: bench }
       # `cargo run` builds the chibicc fork itself (for the `alu_c` kernel); make + cc are
@@ -114,6 +121,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: loom model check
         run: cargo test -p svm-jit --lib loom
@@ -126,7 +134,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with: { components: rustfmt, clippy }
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/svm-llvm }
       - name: install LLVM/clang 18 (out-of-process build tools, no dev headers)
@@ -183,6 +193,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
@@ -227,6 +238,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: browser }
       - run: rustup target add wasm32-unknown-unknown
@@ -332,6 +344,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -367,6 +380,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -404,7 +418,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with: { components: clippy }
+        with: { toolchain: "${{ env.RUST_STABLE }}", components: clippy }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets -- -D warnings
       - run: cargo test -p svm-jit --features stack-check,arena-stacks
@@ -436,6 +450,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test -p svm-jit --features stack-check,arena-stacks
       - run: cargo test -p svm-fiber --features arena-stacks

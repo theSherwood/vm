@@ -2064,6 +2064,23 @@ fn drive(
                     continue;
                 }
                 let csize = 1u64 << fnr.size_log2;
+                // Resolve the child's function table: the parent's own for a same-module child, or a
+                // re-granted **separate module** matched by content digest (host-supplied at restore).
+                // A missing / mismatched re-grant leaves the join slot empty, so the parent's
+                // re-executed `thread.join` fails closed — the per-child R5 identity gate.
+                let cfuncs = match fnr.module_digest {
+                    None => Some(Arc::clone(&funcs)),
+                    Some(d) => host_shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .module_by_digest(&d),
+                };
+                let Some(cfuncs) = cfuncs else {
+                    while root.threads.len() <= fnr.slot {
+                        root.threads.push(None);
+                    }
+                    continue;
+                };
                 // Flip the child's carve from its frozen phase to a thaw: clear its own global
                 // freeze word and set its context-0 thaw word — `begin_thaw`, carve-relative.
                 if let Some(m) = root.mem.as_mut() {
@@ -2085,7 +2102,7 @@ fn drive(
                 let mut ch = Host::new();
                 ch.set_durable(true);
                 let cinst = ch.grant_instantiator(0, csize);
-                let want_as = funcs
+                let want_as = cfuncs
                     .get(fnr.entry as usize)
                     .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
                 let child_args = if want_as {
@@ -2097,9 +2114,9 @@ fn drive(
                 let cid = s.next_task;
                 s.next_task += 1;
                 s.live += 1;
-                let cdt = Arc::new(DomainTable::new(&funcs, 0));
+                let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                 let mut child = Box::new(VCpu::new(
-                    Arc::clone(&funcs),
+                    Arc::clone(&cfuncs),
                     fnr.entry,
                     &child_args,
                     child_mem,
@@ -2124,7 +2141,7 @@ fn drive(
                     carve_off: fnr.carve_off,
                     size_log2: fnr.size_log2,
                     entry: fnr.entry,
-                    same_module: true,
+                    module_digest: fnr.module_digest,
                 });
                 s.runnable.push_back(child);
             }
@@ -3698,7 +3715,6 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else if live.is_empty() {
                     false
                 } else if v.nested_child
-                    || live.iter().any(|c| !c.same_module)
                     || v.threads.iter().enumerate().any(|(slot, t)| {
                         t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
                     })
@@ -3742,6 +3758,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 carve_off: c.carve_off,
                                 size_log2: c.size_log2,
                                 entry: c.entry,
+                                module_digest: c.module_digest,
                                 completed_result,
                             });
                     }
@@ -4675,12 +4692,13 @@ struct NestedChildInfo {
     /// is `[carve_off, carve_off + (1 << size_log2))` of the parent's.
     carve_off: u64,
     size_log2: u8,
-    /// The child's entry function index (into the parent's own table — same-module children only;
-    /// a separate-module child is refused at freeze until its module identity rides the artifact).
+    /// The child's entry function index — into the parent's own table for a same-module child, or
+    /// into the child's granted module for a separate-module child (resolved by `module_digest`).
     entry: u32,
-    /// Whether the child's module is the parent's own (`instantiate`, op 0) vs. a granted separate
-    /// module (op 5). Only same-module children are freezable today.
-    same_module: bool,
+    /// The child's module content digest, or `None` for a **same-module** child (`instantiate`,
+    /// op 0) that runs the parent's own funcs. `Some` for a **separate-module** child (op 5): its
+    /// module is host-supplied at restore, and this digest resolves the re-granted module on thaw.
+    module_digest: Option<[u8; 32]>,
 }
 
 /// A **§14 instantiated child** flattened for freeze (DURABILITY.md §4 "STW quiesces the subtree
@@ -4698,8 +4716,14 @@ pub struct FrozenNested {
     pub carve_off: u64,
     /// The carve's (= the child window's) size, `log2`.
     pub size_log2: u8,
-    /// The child's entry function index (the parent's own table — same-module).
+    /// The child's entry function index — into the parent's own table (`module_digest == None`) or
+    /// the child's granted module (`module_digest == Some`).
     pub entry: u32,
+    /// `None` for a **same-module** child (runs the parent's funcs); `Some(digest)` for a
+    /// **separate-module** child, whose module a thaw resolves against the restore host's re-granted
+    /// modules (host-supplied at restore, D-scope — the module bytes never ride the artifact). A
+    /// missing / mismatched re-grant makes the thaw fail closed (per-child R5 identity gate).
+    pub module_digest: Option<[u8; 32]>,
     /// `Some(result)` for a **completed-but-unjoined** child — one that finished before the freeze
     /// point, so its `thread.join` result must survive in the artifact (its continuation is gone; the
     /// scheduler result cell isn't captured). The thaw delivers this straight into the parent's join
@@ -5058,7 +5082,7 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
 /// A resolved §14 `Module` grant's pieces, as the eval loop carries them: the child module's
 /// functions, declared window size, and data segments (`Arc`s — spawning shares, never copies).
-type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>, bool);
+type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>, bool, [u8; 32]);
 
 /// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
 /// **awaiting a resume value** — i.e. parked at a `yield` (so the next `resume` delivers its argument
@@ -5947,7 +5971,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let g = {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 let g = hg.resolve_module(mh)?;
-                                (g.funcs.clone(), g.memory_log2, g.data.clone(), g.durable)
+                                (
+                                    g.funcs.clone(),
+                                    g.memory_log2,
+                                    g.data.clone(),
+                                    g.durable,
+                                    g.digest,
+                                )
                             };
                             (
                                 match mop {
@@ -5962,7 +5992,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => (o, None, 0),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _)| f);
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _)| f);
                     match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
@@ -6003,7 +6033,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -6015,7 +6045,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // snapshottable as a unit. A same-module child (`None`) runs the
                             // parent's own (already instrumented) funcs — always admissible.
                             let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d)| *d);
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6032,7 +6062,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // bounded them to its declared window == the carve). RO protection of
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
-                                if let (Some((_, _, data, _)), Some(m)) = (&child_mod, mem.as_ref())
+                                if let (Some((_, _, data, _, _)), Some(m)) =
+                                    (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
@@ -6072,7 +6103,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 };
                                 let cfuncs = child_mod.as_ref().map_or_else(
                                     || Arc::clone(&funcs),
-                                    |(f, _, _, _)| Arc::clone(f),
+                                    |(f, _, _, _, _)| Arc::clone(f),
                                 );
                                 let csched = sched.clone();
                                 let made = sched.spawn(move |id| {
@@ -6115,7 +6146,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             carve_off: ibase + off,
                                             size_log2: size_log2 as u8,
                                             entry: entry as u32,
-                                            same_module: child_mod.is_none(),
+                                            module_digest: child_mod
+                                                .as_ref()
+                                                .map(|(_, _, _, _, d)| *d),
                                         });
                                         frames[top]
                                             .vals
@@ -6168,7 +6201,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // transparency), exactly as for `instantiate_module`.
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -6176,7 +6209,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // §4 enforcement, exactly as for `instantiate`: a durable domain
                             // admits only freezable (durable-attested) separate-module children.
                             let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d)| *d);
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6197,7 +6230,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // in the parent's backing while the child's pages start unmapped — so
                                 // a plugin's data segments are *supplied lazily*, page by page, as it
                                 // first touches them (the §14 parent-as-pager model, for free).
-                                if let (Some((_, _, data, _)), Some(m)) = (&child_mod, mem.as_ref())
+                                if let (Some((_, _, data, _, _)), Some(m)) =
+                                    (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
@@ -6217,7 +6251,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let cfuncs = child_mod.as_ref().map_or_else(
                                     || Arc::clone(&funcs),
-                                    |(f, _, _, _)| Arc::clone(f),
+                                    |(f, _, _, _, _)| Arc::clone(f),
                                 );
                                 // A co-fiber child is its own domain → its own dispatch table.
                                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
@@ -8523,7 +8557,10 @@ pub mod iface {
     /// magic-ring-buffer primitive); op 1 `unmap(window_offset, len)` drops the alias; op 2
     /// `len() -> i64` reports the region size; op 3 `page_size() -> i64`. Granting the handle is how
     /// two domains come to share memory; `create`/`grant` (guest-minted regions, cross-domain) are a
-    /// §14 follow-up — today regions are host-granted, like `Memory`.
+    /// §14 follow-up — today regions are host-granted, like `Memory`. A backing may be a fresh OS
+    /// shared object (`memfd`) **or a real host file** (`svm-run`'s `FileBacking`, minted by an
+    /// mmap-capable fs cap): mapping the latter aliases the file into the window zero-copy — the
+    /// file-backed-mmap bridge (MMAP_CAPABILITY.md §4b).
     pub const SHARED_REGION: u32 = 4;
     /// `AddressSpace` — the §14 memory-management capability, **attenuable to a power-of-two
     /// window sub-range** `[base, base+size)`. Like `Memory` but every op is confined to the
@@ -8893,6 +8930,9 @@ enum Binding {
     /// handler closure in [`Host::host_fns`] (out-of-line so `Binding` stays `Copy`, like
     /// [`Binding::Blocking`]). All ops dispatch to that one closure, which interprets `op`.
     HostFn(u32),
+    /// An mmap-capable host-function capability (§4b): like [`Binding::HostFn`] but its handler in
+    /// [`Host::host_fns_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
+    HostFnRegion(u32),
 }
 
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
@@ -9192,6 +9232,40 @@ impl AsyncCounter for RegionCounter {
 pub type HostFn =
     Box<dyn FnMut(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send>;
 
+/// The **one** extra authority an mmap-capable [`HostFnRegion`] handler gets over a plain [`HostFn`]:
+/// mint a §13 `SharedRegion` and receive its handle. Deliberately narrow — the handler still cannot
+/// reach the rest of the `Host` (no slot table, no other backings), so the escape hatch widens by
+/// exactly this one capability (MMAP_CAPABILITY.md §4b, "a small, existing-shaped new power for the
+/// closure"). Implemented by [`Host`] as a thin forward to [`Host::grant_shared_region_backed`].
+pub trait RegionMinter {
+    /// Grant a `SharedRegion` over `backing` and return the guest handle value (`< 0` on failure, e.g.
+    /// the handle table is full). The guest maps it with the built-in `SharedRegion.map`.
+    fn grant_region(&mut self, backing: RegionBacking) -> i32;
+}
+
+/// Like [`HostFn`] but the handler is also handed a [`RegionMinter`] — the escape hatch for the
+/// zero-copy file-mmap bridge (§4b): an mmap-capable fs handler opens a file, mints a file-backed
+/// `SharedRegion` over it, and returns the handle so the guest aliases the real file into its window.
+/// Registered with [`Host::grant_host_fn_region`]; resolves under the same [`iface::HOST_FN`] as a
+/// plain `HostFn`, so a guest reaches it identically.
+pub type HostFnRegion = Box<
+    dyn FnMut(
+            u32,
+            &[i64],
+            Option<&mut dyn GuestMem>,
+            &mut dyn RegionMinter,
+        ) -> Result<Vec<i64>, Trap>
+        + Send,
+>;
+
+// The `Host` *is* the region minter — the narrow authority a `HostFnRegion` handler is handed. It
+// forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
+impl RegionMinter for Host {
+    fn grant_region(&mut self, backing: RegionBacking) -> i32 {
+        self.grant_shared_region_backed(backing)
+    }
+}
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -9226,6 +9300,10 @@ pub struct Host {
     /// §7 embedder-registered host-capability handlers, indexed by the id a [`Binding::HostFn`]
     /// carries ([`Host::grant_host_fn`]). A dispatch takes the closure out, runs it, and restores it.
     host_fns: Vec<HostFn>,
+    /// §4b mmap-capable host-capability handlers (indexed by the id a [`Binding::HostFnRegion`]
+    /// carries, [`Host::grant_host_fn_region`]) — a `HostFn` plus a [`RegionMinter`]. Same
+    /// take-out/run/restore dispatch as `host_fns`.
+    host_fns_region: Vec<HostFnRegion>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -9376,6 +9454,28 @@ struct ModuleGrant {
     /// verification). A durable domain refuses to instantiate a grant without this bit, so its
     /// nesting subtree stays snapshottable as a unit.
     durable: bool,
+    /// Content digest of the granted module's semantic image (§4 separate-module nesting): a §14
+    /// **separate-module** child records this in its `FrozenNested` residue so a thaw can resolve it
+    /// against the restore host's re-granted modules (host-supplied at restore, D-scope — the module
+    /// bytes never ride the artifact). Computed by [`module_digest`], shared with the codec's R5 gate.
+    digest: [u8; 32],
+}
+
+/// The §4 nested-child module-identity digest: a content hash of a grant's **semantic image**
+/// (functions, memory, data, exports), computed the same way at freeze-grant and thaw-grant so a
+/// separate-module child re-attaches against the matching re-granted module. Debug info and
+/// (already-resolved) imports are excluded — they don't affect execution, and stripping them keeps
+/// the identity tolerant of a debug-stripped re-grant.
+fn module_digest(m: &Module) -> [u8; 32] {
+    let canon = Module {
+        funcs: m.funcs.clone(),
+        memory: m.memory,
+        data: m.data.clone(),
+        exports: m.exports.clone(),
+        imports: Vec::new(),
+        debug_info: None,
+    };
+    svm_encode::digest256(&svm_encode::encode_module(&canon))
 }
 
 impl Default for Host {
@@ -9398,6 +9498,7 @@ impl Host {
             region_factory: None,
             blockings: Vec::new(),
             host_fns: Vec::new(),
+            host_fns_region: Vec::new(),
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -9519,6 +9620,7 @@ impl Host {
             && self.blockings.is_empty()
             && self.rings.is_empty()
             && self.host_fns.is_empty()
+            && self.host_fns_region.is_empty()
             && self.jit_domains.is_empty()
     }
 
@@ -9786,7 +9888,9 @@ impl Host {
                 Binding::JitCode { .. } => {
                     return Err(self.non_durable(slot, NonDurableKind::JitCode))
                 }
-                Binding::HostFn(_) => return Err(self.non_durable(slot, NonDurableKind::HostFn)),
+                Binding::HostFn(_) | Binding::HostFnRegion(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::HostFn))
+                }
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -9837,7 +9941,7 @@ impl Host {
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::JitDomain(_) => NonDurableKind::JitDomain,
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
-                Binding::HostFn(_) => NonDurableKind::HostFn,
+                Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -9950,6 +10054,18 @@ impl Host {
         self.grant(iface::HOST_FN, Binding::HostFn(idx))
     }
 
+    /// §4b Register an **mmap-capable** embedder host-capability handler and grant a handle to it
+    /// (also iface [`iface::HOST_FN`], so a guest resolves it exactly like a plain [`grant_host_fn`]).
+    /// Identical to `grant_host_fn` except the handler is additionally handed a [`RegionMinter`] on
+    /// each call, so it can mint a file-backed `SharedRegion` and return the handle — the delivery
+    /// mechanism for the zero-copy file-mmap bridge. The extra authority is exactly region-minting
+    /// (nothing else of the `Host` is reachable).
+    pub fn grant_host_fn_region(&mut self, f: HostFnRegion) -> i32 {
+        let idx = self.host_fns_region.len() as u32;
+        self.host_fns_region.push(f);
+        self.grant(iface::HOST_FN, Binding::HostFnRegion(idx))
+    }
+
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
     /// root grant is normally the whole window (`base = 0`, `size` the window size); the guest then
     /// `sub`-attenuates it to carve children. `size` must be a power of two and `base` a multiple of
@@ -10017,8 +10133,20 @@ impl Host {
             data: m.data.clone().into(),
             exports: m.exports.clone().into(),
             durable,
+            digest: module_digest(m),
         });
         self.grant(iface::MODULE, Binding::Module(id))
+    }
+
+    /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore
+    /// host re-grants the child's module, and its re-attach residue names it by [`module_digest`].
+    /// Returns the grant's function table, or `None` (a missing / mismatched re-grant ⇒
+    /// the thaw fails closed, the per-child R5 identity gate).
+    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+        self.modules
+            .iter()
+            .find(|g| g.durable && &g.digest == digest)
+            .map(|g| Arc::clone(&g.funcs))
     }
 
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
@@ -10551,6 +10679,20 @@ impl Host {
                 };
                 let r = f(op, args, mem);
                 self.host_fns[idx as usize] = f;
+                r
+            }
+            // §4b mmap-capable host-cap: same take-out/run/restore as `HostFn`, but also hand the
+            // handler `self` as the `RegionMinter`. Taking the closure out first means `self` is no
+            // longer aliased by `host_fns_region[idx]`, so the `&mut dyn RegionMinter` borrow is sound.
+            Binding::HostFnRegion(idx) => {
+                let mut f = match self.host_fns_region.get_mut(idx as usize) {
+                    Some(slot) => {
+                        std::mem::replace(slot, Box::new(|_, _, _, _| Err(Trap::CapFault)))
+                    }
+                    None => return Err(Trap::CapFault),
+                };
+                let r = f(op, args, mem, self);
+                self.host_fns_region[idx as usize] = f;
                 r
             }
             Binding::Exit => {
@@ -12877,6 +13019,60 @@ fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
         .filter(|l| l.block as usize == block && l.inst as usize <= inst)
         .max_by_key(|l| l.inst)
         .map(|l| l.value)
+}
+
+#[cfg(test)]
+mod region_minter_tests {
+    //! The §4b `RegionMinter` ABI: an mmap-capable `HostFnRegion` handler is handed exactly one extra
+    //! authority — minting a `SharedRegion` — and nothing else of the `Host`. These pin that the
+    //! handler can mint a region and hand its handle back to the guest, and that the minted handle is
+    //! a live `SharedRegion` (the delivery mechanism for the zero-copy file-mmap bridge).
+    use super::*;
+
+    #[test]
+    fn host_fn_region_handler_mints_a_region_and_returns_a_live_handle() {
+        let mut host = Host::new();
+        // Op 0: mint a 64-byte region and hand back its handle — the shape an mmap-capable fs uses.
+        let h = host.grant_host_fn_region(Box::new(|op, _args, _mem, minter| {
+            if op == 0 {
+                let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
+                Ok(vec![minter.grant_region(backing) as i64])
+            } else {
+                Ok(vec![-22])
+            }
+        }));
+        assert!(
+            h >= 0,
+            "grant_host_fn_region should yield a handle under iface HOST_FN"
+        );
+
+        // Dispatch op 0 → the handler mints via the `RegionMinter` and returns the region handle.
+        let out = host
+            .cap_dispatch_slots(iface::HOST_FN, 0, h, &[], None)
+            .expect("host_fn_region dispatch");
+        let region_h = out[0];
+        assert!(
+            region_h >= 0,
+            "the minted region handle must be valid: {region_h}"
+        );
+
+        // The returned handle really is a live `SharedRegion` (resolves under iface 4), and its
+        // backing is the 64-byte object the handler minted.
+        match host.resolve(region_h as i32, iface::SHARED_REGION) {
+            Ok(Binding::SharedRegion(id)) => {
+                assert_eq!(host.regions[id as usize].size(), 64, "minted region size");
+            }
+            other => panic!("minted handle should resolve as a SharedRegion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn region_and_plain_host_fn_are_distinct_handles_under_the_same_iface() {
+        let mut host = Host::new();
+        let plain = host.grant_host_fn(Box::new(|_, _, _| Ok(vec![0])));
+        let region = host.grant_host_fn_region(Box::new(|_, _, _, _| Ok(vec![0])));
+        assert!(plain >= 0 && region >= 0 && plain != region);
+    }
 }
 
 #[cfg(test)]

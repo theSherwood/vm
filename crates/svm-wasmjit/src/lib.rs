@@ -48,8 +48,8 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator,
-    ValType, DEFAULT_RESERVED_LOG2,
+    BinOp, Block, CmpOp, ConvOp, Func, FuncType, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp,
+    Terminator, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 /// Trap code delivered through `env.trap` when the per-dispatch fuel counter goes negative.
@@ -110,8 +110,10 @@ fn valtype_byte(t: ValType) -> Result<u8, Error> {
     match t {
         ValType::I32 => Ok(0x7f),
         ValType::I64 => Ok(0x7e),
-        // Floats/v128/ref are interpreter-tier for now (the compute subset is integer).
-        _ => Err(Error::Unsupported("non-integer value type")),
+        ValType::F32 => Ok(0x7d),
+        ValType::F64 => Ok(0x7c),
+        // v128/ref are interpreter-tier for now (SIMD is a later slice).
+        _ => Err(Error::Unsupported("v128/ref value type")),
     }
 }
 
@@ -183,12 +185,125 @@ fn intun_opcode(ty: IntTy, op: IntUnOp) -> Result<u8, Error> {
     })
 }
 
+// ---- scalar float opcodes (all map 1:1 to core wasm; `Fma` has no core-wasm scalar op) ----------
+
+fn fbin_opcode(ty: svm_ir::FloatTy, op: svm_ir::FBinOp) -> u8 {
+    use svm_ir::FBinOp::*;
+    // wasm f32 add..copysign are 0x92..0x98, f64 add..copysign 0xa0..0xa6, in FBinOp's exact order.
+    let idx = match op {
+        Add => 0,
+        Sub => 1,
+        Mul => 2,
+        Div => 3,
+        Min => 4,
+        Max => 5,
+        Copysign => 6,
+    };
+    match ty {
+        svm_ir::FloatTy::F32 => 0x92 + idx,
+        svm_ir::FloatTy::F64 => 0xa0 + idx,
+    }
+}
+
+fn fun_opcode(ty: svm_ir::FloatTy, op: svm_ir::FUnOp) -> u8 {
+    use svm_ir::FUnOp::*;
+    // wasm orders abs neg ceil floor trunc nearest sqrt; FUnOp orders sqrt before ceil — map explicitly.
+    let (f32op, f64op) = match op {
+        Abs => (0x8b, 0x99),
+        Neg => (0x8c, 0x9a),
+        Ceil => (0x8d, 0x9b),
+        Floor => (0x8e, 0x9c),
+        Trunc => (0x8f, 0x9d),
+        Nearest => (0x90, 0x9e),
+        Sqrt => (0x91, 0x9f),
+    };
+    match ty {
+        svm_ir::FloatTy::F32 => f32op,
+        svm_ir::FloatTy::F64 => f64op,
+    }
+}
+
+fn fcmp_opcode(ty: svm_ir::FloatTy, op: svm_ir::FCmpOp) -> u8 {
+    use svm_ir::FCmpOp::*;
+    // wasm orders eq ne lt gt le ge; FCmpOp orders le before gt — map explicitly.
+    let (f32op, f64op) = match op {
+        Eq => (0x5b, 0x61),
+        Ne => (0x5c, 0x62),
+        Lt => (0x5d, 0x63),
+        Le => (0x5f, 0x65),
+        Gt => (0x5e, 0x64),
+        Ge => (0x60, 0x66),
+    };
+    match ty {
+        svm_ir::FloatTy::F32 => f32op,
+        svm_ir::FloatTy::F64 => f64op,
+    }
+}
+
+/// `i32/i64.trunc_sat_f32/f64_{s,u}` — the `0xFC` prefix + subopcode (saturating float→int).
+fn ftoisat_subop(op: svm_ir::FToI) -> u8 {
+    let (fty, ity, signed) = op.parts();
+    // subopcode = (int:i32=0/i64=4) + (float:f32=0/f64=2) + (signed?0:1).
+    let base = match ity {
+        IntTy::I32 => 0,
+        IntTy::I64 => 4,
+    } + match fty {
+        svm_ir::FloatTy::F32 => 0,
+        svm_ir::FloatTy::F64 => 2,
+    };
+    base + if signed { 0 } else { 1 }
+}
+
+/// `i32/i64.trunc_f32/f64_{s,u}` — the trapping float→int opcodes (NaN / out-of-range trap).
+fn ftoitrap_opcode(op: svm_ir::FToI) -> u8 {
+    let (fty, ity, signed) = op.parts();
+    match (ity, fty, signed) {
+        (IntTy::I32, svm_ir::FloatTy::F32, true) => 0xa8,
+        (IntTy::I32, svm_ir::FloatTy::F32, false) => 0xa9,
+        (IntTy::I32, svm_ir::FloatTy::F64, true) => 0xaa,
+        (IntTy::I32, svm_ir::FloatTy::F64, false) => 0xab,
+        (IntTy::I64, svm_ir::FloatTy::F32, true) => 0xae,
+        (IntTy::I64, svm_ir::FloatTy::F32, false) => 0xaf,
+        (IntTy::I64, svm_ir::FloatTy::F64, true) => 0xb0,
+        (IntTy::I64, svm_ir::FloatTy::F64, false) => 0xb1,
+    }
+}
+
+/// `f32/f64.convert_i32/i64_{s,u}` — int→float.
+fn itof_opcode(op: svm_ir::IToF) -> u8 {
+    let (ity, fty, signed) = op.parts();
+    match (fty, ity, signed) {
+        (svm_ir::FloatTy::F32, IntTy::I32, true) => 0xb2,
+        (svm_ir::FloatTy::F32, IntTy::I32, false) => 0xb3,
+        (svm_ir::FloatTy::F32, IntTy::I64, true) => 0xb4,
+        (svm_ir::FloatTy::F32, IntTy::I64, false) => 0xb5,
+        (svm_ir::FloatTy::F64, IntTy::I32, true) => 0xb7,
+        (svm_ir::FloatTy::F64, IntTy::I32, false) => 0xb8,
+        (svm_ir::FloatTy::F64, IntTy::I64, true) => 0xb9,
+        (svm_ir::FloatTy::F64, IntTy::I64, false) => 0xba,
+    }
+}
+
+/// `demote`/`promote`/`reinterpret` cast opcode.
+fn cast_opcode(op: svm_ir::CastOp) -> u8 {
+    use svm_ir::CastOp::*;
+    match op {
+        Demote => 0xb6,
+        Promote => 0xbb,
+        ReinterpI32F32 => 0xbe,
+        ReinterpF32I32 => 0xbc,
+        ReinterpI64F64 => 0xbf,
+        ReinterpF64I64 => 0xbd,
+    }
+}
+
 /// `(opcode, access width, result type)` for a load.
 fn load_op(op: LoadOp) -> Result<(u8, u64, ValType), Error> {
     Ok(match op {
         LoadOp::I32 => (0x28, 4, ValType::I32),
         LoadOp::I64 => (0x29, 8, ValType::I64),
-        LoadOp::F32 | LoadOp::F64 => return Err(Error::Unsupported("float load")),
+        LoadOp::F32 => (0x2a, 4, ValType::F32),
+        LoadOp::F64 => (0x2b, 8, ValType::F64),
         LoadOp::I32_8S => (0x2c, 1, ValType::I32),
         LoadOp::I32_8U => (0x2d, 1, ValType::I32),
         LoadOp::I32_16S => (0x2e, 2, ValType::I32),
@@ -207,7 +322,8 @@ fn store_op(op: StoreOp) -> Result<(u8, u64), Error> {
     Ok(match op {
         StoreOp::I32 => (0x36, 4),
         StoreOp::I64 => (0x37, 8),
-        StoreOp::F32 | StoreOp::F64 => return Err(Error::Unsupported("float store")),
+        StoreOp::F32 => (0x38, 4),
+        StoreOp::F64 => (0x39, 8),
         StoreOp::I32_8 => (0x3a, 1),
         StoreOp::I32_16 => (0x3b, 2),
         StoreOp::I64_8 => (0x3c, 1),
@@ -237,6 +353,15 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
                     .ok_or(Error::Unsupported("select operand"))?;
                 tys.push(t);
             }
+            Inst::ConstF32(_) => tys.push(ValType::F32),
+            Inst::ConstF64(_) => tys.push(ValType::F64),
+            Inst::FBin { ty, .. } | Inst::FUn { ty, .. } => tys.push(ty.val()),
+            Inst::FCmp { .. } => tys.push(ValType::I32),
+            Inst::FToISat { op, .. } | Inst::FToITrap { op, .. } => tys.push(op.parts().1.val()),
+            Inst::IToFConv { op, .. } => tys.push(op.parts().1.val()),
+            Inst::Cast { op, .. } => tys.push(op.sig().2),
+            // `Fma` has no core-wasm scalar opcode (relaxed-SIMD only), so it stays interpreter-tier.
+            Inst::Fma { .. } => return Err(Error::Unsupported("scalar fma (no core-wasm op)")),
             Inst::Load { op, .. } => tys.push(load_op(*op)?.2),
             Inst::Store { .. } => {}
             Inst::Call { func, .. } => {
@@ -246,6 +371,10 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
                     .ok_or(Error::Unsupported("call target"))?;
                 tys.extend(callee.results.iter().copied());
             }
+            // A funcref is a plain `i32` (the function index, §3c) — a bare `i32.const`.
+            Inst::RefFunc { .. } => tys.push(ValType::I32),
+            // Indirect call: results come from the call site's own signature immediate.
+            Inst::CallIndirect { ty, .. } => tys.extend(ty.results.iter().copied()),
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }
     }
@@ -313,6 +442,16 @@ fn func_callees(f: &Func) -> Vec<u32> {
         }
     }
     out
+}
+
+/// Whether `f` makes an indirect call (`call_indirect`), which can dispatch to **any** function
+/// through the identity funcref table — an edge direct-call reachability can't see.
+fn func_uses_indirect(f: &Func) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::CallIndirect { .. }))
+    })
 }
 
 /// Whether `f` is safe to run as a cross-tier interpreter leaf (see [`Analysis::interp_leaf`]).
@@ -385,9 +524,25 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
         }
     }
 
+    // `call_indirect` dispatches through the identity funcref table and can reach **any** function —
+    // an edge the direct-call walk above can't follow. If a reachable function makes an indirect
+    // call, conservatively treat every function as reachable and require them **all** in-subset: the
+    // emitted funcref table populates one slot per function, so an index the interpreter would run
+    // must resolve to an emitted target rather than a null slot (which would trap). This is the
+    // first-increment restriction (all indirect targets in-subset); cross-tier indirect is a later
+    // refinement.
+    let has_indirect = (0..n).any(|i| reachable[i] && func_uses_indirect(&m.funcs[i]));
+    if has_indirect {
+        reachable.iter_mut().for_each(|r| *r = true);
+    }
+
     let mixed_ok = (entry as usize) < n
         && in_subset[entry as usize]
-        && (0..n).all(|i| !reachable[i] || in_subset[i] || interp_leaf[i]);
+        && if has_indirect {
+            (0..n).all(|i| in_subset[i])
+        } else {
+            (0..n).all(|i| !reachable[i] || in_subset[i] || interp_leaf[i])
+        };
 
     Analysis {
         in_subset,
@@ -527,9 +682,39 @@ fn emit_module(
         fn_type_idx.push(idx as u32);
     }
 
+    // `call_indirect` needs its (prepended-env) signature declared in the type section too; add any
+    // not already present, and note whether the module needs a funcref table + element segment.
+    let mut needs_table = false;
+    for &fi in emitted {
+        for b in &m.funcs[fi].blocks {
+            for inst in &b.insts {
+                if let Inst::CallIndirect { ty, .. } = inst {
+                    needs_table = true;
+                    let key = indirect_type_bytes(ty)?;
+                    if !types.contains(&key) {
+                        types.push(key);
+                    }
+                }
+            }
+        }
+    }
+    // The identity funcref table (`RefFunc`/`dispatch_indirect` semantics): slot `s` = SVM function
+    // `s`, power-of-two length, trapping (null) padding — matching the interpreter's `DomainTable`
+    // (`funcs.len().next_power_of_two()`, `reserve_log2 = 0`). Masking `idx & (table_size - 1)` in
+    // the lowering reproduces `dispatch_indirect`'s `idx & (len - 1)`.
+    let table_size = m.funcs.len().next_power_of_two().max(1) as u32;
+
     let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(emitted.len());
     for &fi in emitted {
-        bodies.push(emit_func(m, &m.funcs[fi], mapped, wasm_of, interp_leaf)?);
+        bodies.push(emit_func(
+            m,
+            &m.funcs[fi],
+            mapped,
+            wasm_of,
+            interp_leaf,
+            &types,
+            table_size,
+        )?);
     }
 
     // ---- assemble the module ----
@@ -577,6 +762,15 @@ fn emit_module(
     }
     section(&mut out, 3, &sec);
 
+    if needs_table {
+        let mut sec = Vec::new(); // table section (4): one funcref table, min = table_size
+        uleb(&mut sec, 1);
+        sec.push(0x70); // funcref elemtype
+        sec.push(0x00); // limits flag 0x00 = min only
+        uleb(&mut sec, table_size as u64);
+        section(&mut out, 4, &sec);
+    }
+
     let mut sec = Vec::new(); // export section (7): "f{svm_idx}" → its wasm index
     uleb(&mut sec, emitted.len() as u64);
     for &fi in emitted {
@@ -588,6 +782,32 @@ fn emit_module(
     }
     section(&mut out, 7, &sec);
 
+    if needs_table {
+        // Element section (9): one active segment filling the identity table `[0, funcs.len())` with
+        // each function's wasm index; padding slots `[funcs.len(), table_size)` stay null (they trap
+        // like the interpreter's `TABLE_EMPTY` slots). Every real slot must be an emitted function —
+        // the `has_indirect` analysis guarantees this (all funcs in-subset when indirect is present).
+        let mut segment = Vec::new();
+        for (fi, slot) in wasm_of.iter().enumerate().take(m.funcs.len()) {
+            match slot {
+                Some(widx) => uleb(&mut segment, *widx as u64),
+                None => {
+                    let _ = fi;
+                    return Err(Error::Unsupported("indirect call target not emitted"));
+                }
+            }
+        }
+        let mut sec = Vec::new();
+        uleb(&mut sec, 1); // one segment
+        sec.push(0x00); // flags 0: active, table 0, i32 offset expr, funcidx vec
+        sec.push(OP_I32_CONST); // offset expr: i32.const 0; end
+        sleb32(&mut sec, 0);
+        sec.push(OP_END);
+        uleb(&mut sec, m.funcs.len() as u64);
+        sec.extend_from_slice(&segment);
+        section(&mut out, 9, &sec);
+    }
+
     let mut sec = Vec::new(); // code section (10)
     uleb(&mut sec, bodies.len() as u64);
     for b in &bodies {
@@ -597,6 +817,32 @@ fn emit_module(
     section(&mut out, 10, &sec);
 
     Ok(out)
+}
+
+/// The wasm function-type of a `call_indirect` signature: the two prepended env params (`win`,
+/// `env`) ahead of the SVM param/result types — identical in shape to how [`emit_module`] types the
+/// emitted functions, so wasm's built-in `call_indirect` signature check **is** the §3c type-id
+/// check (a mismatch traps, exactly like `dispatch_indirect`'s `IndirectCallType`).
+fn indirect_type_bytes(ty: &FuncType) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let mut params = vec![0x7f, 0x7f]; // win: i32, env: i32
+    for p in &ty.params {
+        params.push(valtype_byte(*p)?);
+    }
+    let mut results = Vec::with_capacity(ty.results.len());
+    for r in &ty.results {
+        results.push(valtype_byte(*r)?);
+    }
+    Ok((params, results))
+}
+
+/// The type-section index of a `call_indirect` signature (pre-added to `types` by [`emit_module`]).
+fn indirect_type_index(types: &[(Vec<u8>, Vec<u8>)], ty: &FuncType) -> Result<u32, Error> {
+    let key = indirect_type_bytes(ty)?;
+    types
+        .iter()
+        .position(|t| *t == key)
+        .map(|i| i as u32)
+        .ok_or(Error::Unsupported("indirect call type not declared"))
 }
 
 fn section(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
@@ -631,12 +877,15 @@ impl FnCtx {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_func(
     m: &Module,
     f: &Func,
     mapped: u64,
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
+    types: &[(Vec<u8>, Vec<u8>)],
+    table_size: u32,
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
@@ -712,6 +961,8 @@ fn emit_func(
             mapped,
             wasm_of,
             interp_leaf,
+            types,
+            table_size,
         )?;
     }
     code.push(OP_END); // close the loop
@@ -853,6 +1104,8 @@ fn emit_block_body(
     mapped: u64,
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
+    types: &[(Vec<u8>, Vec<u8>)],
+    table_size: u32,
 ) -> Result<(), Error> {
     let mut next_val = b.params.len(); // where the next instruction's results land
     let get = |code: &mut Vec<u8>, cx: &FnCtx, v: svm_ir::ValIdx| {
@@ -946,6 +1199,55 @@ fn emit_block_body(
                 get(code, cx, *value);
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
             }
+            // ---- scalar floats (all 1:1 with core wasm) ----
+            Inst::ConstF32(bits) => {
+                code.push(0x43); // f32.const
+                code.extend_from_slice(&bits.to_le_bytes());
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::ConstF64(bits) => {
+                code.push(0x44); // f64.const
+                code.extend_from_slice(&bits.to_le_bytes());
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FBin { ty, op, a, b: rb } => {
+                get(code, cx, *a);
+                get(code, cx, *rb);
+                code.push(fbin_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FUn { ty, op, a } => {
+                get(code, cx, *a);
+                code.push(fun_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FCmp { ty, op, a, b: rb } => {
+                get(code, cx, *a);
+                get(code, cx, *rb);
+                code.push(fcmp_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FToISat { op, a } => {
+                get(code, cx, *a);
+                code.push(0xfc); // saturating-truncation prefix
+                code.push(ftoisat_subop(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::FToITrap { op, a } => {
+                get(code, cx, *a);
+                code.push(ftoitrap_opcode(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::IToFConv { op, a } => {
+                get(code, cx, *a);
+                code.push(itof_opcode(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::Cast { op, a } => {
+                get(code, cx, *a);
+                code.push(cast_opcode(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
             Inst::Call { func, args } => {
                 let callee = &m.funcs[*func as usize];
                 let n_results = callee.results.len();
@@ -1015,6 +1317,40 @@ fn emit_block_body(
                             uleb(code, cx.local_of[k][next_val + i] as u64);
                         }
                     }
+                }
+                next_val += n_results;
+            }
+            // A funcref is the function index as plain `i32` data (§3c) — `RefFunc { func }` ⇒
+            // `i32.const func`. The value it feeds a `CallIndirect` is masked into the table there.
+            Inst::RefFunc { func } => {
+                code.push(OP_I32_CONST);
+                sleb32(code, *func as i32);
+                set_result(cx, code, k, &mut next_val);
+            }
+            // Indirect call through the funcref table (§3c). Push win/env/args, then the masked table
+            // index (`idx & (table_size - 1)` — exactly `dispatch_indirect`'s `idx & (len - 1)`), and
+            // `call_indirect` the declared signature: wasm's built-in signature check is the type-id
+            // check (a mismatch traps `IndirectCallType`); a null padding slot traps too (an empty
+            // interpreter slot). No fuel debit here — the callee debits on entry to its own loop.
+            Inst::CallIndirect { ty, idx, args } => {
+                let n_results = ty.results.len();
+                code.push(OP_LOCAL_GET);
+                uleb(code, 0); // win
+                code.push(OP_LOCAL_GET);
+                uleb(code, 1); // env
+                for a in args {
+                    get(code, cx, *a);
+                }
+                get(code, cx, *idx);
+                code.push(OP_I32_CONST);
+                sleb32(code, (table_size - 1) as i32);
+                code.push(0x71); // i32.and → mask into the table
+                code.push(0x11); // call_indirect
+                uleb(code, indirect_type_index(types, ty)? as u64);
+                uleb(code, 0); // table index 0
+                for i in (0..n_results).rev() {
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, cx.local_of[k][next_val + i] as u64);
                 }
                 next_val += n_results;
             }

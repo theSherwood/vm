@@ -260,6 +260,39 @@ pub enum DecodeError {
 // ----------------------------------------------------------------------------
 
 /// Encode a module to bytes. (Producer-side; not part of the untrusted-input TCB.)
+/// A 256-bit content digest over `bytes` — a deterministic, dependency-free mix (four independent
+/// 64-bit FNV-1a-style lanes, length-finalized). **Not cryptographic**; it identifies content (a
+/// module image) so a mismatch is caught, not to resist a forger. The single source of truth shared
+/// by the snapshot codec's module-identity gate (DURABILITY.md §12.1 / R5) and the durable runtime's
+/// §14 nested-child module resolution, so both compute the same digest for the same module bytes.
+pub fn digest256(bytes: &[u8]) -> [u8; 32] {
+    const PRIMES: [u64; 4] = [
+        0x0000_0100_0000_01b3, // FNV-1a 64-bit prime
+        0xff51_afd7_ed55_8ccd, // murmur3 fmix constant (odd)
+        0xc4ce_b9fe_1a85_ec53, // murmur3 fmix constant (odd)
+        0x9e37_79b9_7f4a_7c15, // golden-ratio odd constant
+    ];
+    let mut lanes: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325,
+        0x1234_5678_9abc_def0,
+        0x0f1e_2d3c_4b5a_6978,
+        0xa5a5_5a5a_3c3c_c3c3,
+    ];
+    for &byte in bytes {
+        for (lane, prime) in lanes.iter_mut().zip(PRIMES) {
+            *lane = (*lane ^ byte as u64).wrapping_mul(prime);
+        }
+    }
+    for (lane, prime) in lanes.iter_mut().zip(PRIMES) {
+        *lane = (*lane ^ bytes.len() as u64).wrapping_mul(prime);
+    }
+    let mut out = [0u8; 32];
+    for (i, lane) in lanes.iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
+    }
+    out
+}
+
 pub fn encode_module(m: &Module) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);

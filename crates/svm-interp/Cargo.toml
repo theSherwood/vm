@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 svm-ir.workspace = true
+svm-encode.workspace = true
 svm-mask.workspace = true
 # The shared guest-memory substrate (§12/§13): a demand-zeroed, raw-addressable region with real
 # hardware atomics. All the `unsafe` lives there, so this crate stays `#![forbid(unsafe_code)]` while
@@ -34,3 +35,4 @@ svm-text.workspace = true
 # Test-only: name `svm_ir::Func` in the JIT Miri check's blob validator (THREADS.md 4c-domain). Pure
 # IR types (no platform surface), so it keeps the test crate Miri-buildable.
 svm-ir.workspace = true
+svm-encode.workspace = true

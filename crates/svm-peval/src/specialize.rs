@@ -1631,7 +1631,7 @@ impl Spec<'_> {
                         Some(prev) if *prev != sig => return Err(SpecError::Unsupported),
                         _ => self.out_cells = Some(sig),
                     }
-                    for (_, &(_, val)) in mem.iter() {
+                    for &(_, val) in mem.values() {
                         vals.push(materialize(val, out, rnext));
                     }
                 }

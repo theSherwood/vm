@@ -1530,6 +1530,193 @@ fn fetch_sqlite_amalgamation() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Fetch (and cache) openlibm — the standalone BSD libm (JuliaMath/openlibm) — for the **bundled
+/// guest libm** (Postgres' transcendentals: the SVM has no transcendental op, so `log`/`exp`/`pow`/…
+/// stay guest code, llvm-linked in). Fetched-not-vendored; returns the extracted dir or `None`
+/// (skip) offline. Its C sources carry no inline asm (the asm lives in separate `amd64/`/`i387/`
+/// dirs we don't compile), and the double set translates through the on-ramp with zero gaps.
+fn fetch_openlibm() -> Option<PathBuf> {
+    const VER: &str = "0.8.5";
+    let cache = std::env::temp_dir().join("svm_openlibm_cache");
+    let dir = cache.join(format!("openlibm-{VER}"));
+    if dir.join("src/e_log.c").exists() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    let tgz = cache.join("openlibm.tar.gz");
+    let url = format!("https://github.com/JuliaMath/openlibm/archive/refs/tags/v{VER}.tar.gz");
+    let ok = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(&tgz)
+        .arg(&url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("note: skipping libm (openlibm fetch failed — offline?)");
+        return None;
+    }
+    let ok = Command::new("tar")
+        .arg("xf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&cache)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !dir.join("src/e_log.c").exists() {
+        eprintln!("note: skipping libm (untar failed)");
+        return None;
+    }
+    Some(dir)
+}
+
+/// The openlibm double-precision source set the bundled libm needs — the 18 Postgres transcendentals'
+/// entry points plus their kernels (argument reduction `k_*`/`e_rem_pio2`, `k_exp`, `expm1`, scaling).
+/// `sqrt`/`fabs` the openlibm code calls resolve to on-ramp float ops (so no `e_sqrt` needed).
+const OPENLIBM_SRCS: &[&str] = &[
+    "e_log",
+    "e_log10",
+    "e_log2",
+    "e_exp",
+    "s_exp2",
+    "e_pow",
+    "s_sin",
+    "s_cos",
+    "s_tan",
+    "k_sin",
+    "k_cos",
+    "k_tan",
+    "e_rem_pio2",
+    "k_rem_pio2",
+    "e_asin",
+    "e_acos",
+    "s_atan",
+    "e_atan2",
+    "e_sinh",
+    "e_cosh",
+    "s_tanh",
+    "s_cbrt",
+    "e_fmod",
+    "s_scalbn",
+    "s_copysign",
+    "s_fabs",
+    "k_exp",
+    "s_expm1",
+];
+
+#[test]
+fn libm_bundled_vs_native() {
+    // **Bundle a real guest libm (openlibm) — the Postgres transcendental surface.** The SVM has no
+    // transcendental op, so `log`/`exp`/`pow`/`sin`/… stay **guest code** (the raytrace model, but a
+    // *real* libm, llvm-linked). This proves the on-ramp reproduces openlibm **bit-for-bit** vs
+    // native: both sides link the *same* openlibm (not the system `-lm`), so the differential isolates
+    // the math translation, and the driver (`demos/postgres/libm_probe.c`) FNV-hashes raw IEEE result
+    // bits + prints hex — so float formatting is out of the loop and the test asserts the math itself,
+    // over ~3600 evaluations. Unblocks the Postgres libm externals. Fetched-not-vendored; skips offline.
+    let Some(ol) = fetch_openlibm() else {
+        return;
+    };
+    let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/libm_probe.c");
+    let pid = std::process::id();
+    let incs = [
+        format!("-I{}", ol.display()),
+        format!("-I{}/include", ol.display()),
+        format!("-I{}/src", ol.display()),
+        format!("-I{}/amd64", ol.display()),
+    ];
+    let cflags = [
+        "-O2",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-DASSEMBLER=0",
+    ];
+
+    // Guest: each openlibm source + the driver → bitcode, then `llvm-link` into one module.
+    let mut bcs: Vec<PathBuf> = Vec::new();
+    for name in OPENLIBM_SRCS
+        .iter()
+        .copied()
+        .chain(std::iter::once("__driver"))
+    {
+        let (src, out) = if name == "__driver" {
+            (
+                driver.clone(),
+                std::env::temp_dir().join(format!("olbc_{pid}_driver.bc")),
+            )
+        } else {
+            (
+                ol.join("src").join(format!("{name}.c")),
+                std::env::temp_dir().join(format!("olbc_{pid}_{name}.bc")),
+            )
+        };
+        let mut cmd = Command::new("clang");
+        cmd.args(cflags).args(["-emit-llvm", "-c"]);
+        for i in &incs {
+            cmd.arg(i);
+        }
+        cmd.arg(&src).arg("-o").arg(&out);
+        match cmd.status() {
+            Ok(s) if s.success() => bcs.push(out),
+            _ => {
+                eprintln!("note: skipping libm (clang unavailable / compile failed on {name})");
+                return;
+            }
+        }
+    }
+    let linked = std::env::temp_dir().join(format!("olbc_{pid}_libm.bc"));
+    if !Command::new("llvm-link")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("note: skipping libm (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle: the same driver + openlibm sources, **no `-lm`** (so both sides run openlibm).
+    let exe = std::env::temp_dir().join(format!("olbc_{pid}_native"));
+    let mut cc = Command::new("cc");
+    cc.args(["-O2", "-DASSEMBLER=0"]);
+    for i in &incs {
+        cc.arg(i);
+    }
+    cc.arg(&driver);
+    for name in OPENLIBM_SRCS {
+        cc.arg(ol.join("src").join(format!("{name}.c")));
+    }
+    cc.arg("-o").arg(&exe);
+    match cc.status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping libm (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe).output().expect("run native libm");
+
+    // Guest: translate → resolve caps → verify → run (JIT via the powerbox).
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate bundled libm");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify libm module");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run libm");
+    assert!(
+        !native.stdout.is_empty() && native.status.success(),
+        "native libm oracle produced no output"
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "libm: guest hash {} vs native {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
 /// Like [`check_demo_vs_native`] but threads `extra` clang flags into the **bitcode** compile only
 /// — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
 /// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
@@ -3282,6 +3469,189 @@ fn demo_lmdb_crash_recovery() {
 }
 
 #[test]
+fn demo_lmdb_mmap_zerocopy_vs_native() {
+    // **Zero-copy file-mmap through the capability bridge** (MMAP_CAPABILITY.md §4b, slice 2). Same
+    // LMDB guest as `demo_lmdb_mmap_cap_vs_native`, but granted `host_fs_mmap`: its `mmap` shim takes
+    // the **region path** (FS_MAP_REGION mints a file-backed `SharedRegion`; the guest `SharedRegion.
+    // map`s it over a page-aligned window buffer), so LMDB reads and writes its B-tree straight out of
+    // a **real MAP_SHARED alias of the file** — no copy-in, no per-access host call. (The fs-level
+    // `fs::tests::map_region_*` and `file_region_tests` prove the op mints a working file-backed
+    // region; this proves LMDB actually runs over it and the result is a native-compatible database.)
+    //
+    // Two directions, exactly like the copy-in differential, so a regression in the region path shows
+    // up as a mismatch: (1) the guest writes `data.mdb` through the alias and **native LMDB reads it**
+    // byte-for-byte; (2) the guest reads a **native-written** `data.mdb` through the alias.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode (same recipe; distinct tag so it can run in parallel with the other LMDB tests).
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-c",
+        "-DSVM_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("svm_llvm_lmdbzc_{pid}_{tag}.bc"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb zero-copy (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("svm_llvm_lmdbzc_{pid}.bc"));
+    let linked_ok = Command::new("llvm-link-18")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .or_else(|_| {
+            Command::new("llvm-link")
+                .args(&bcs)
+                .arg("-o")
+                .arg(&linked)
+                .status()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb zero-copy (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle.
+    let exe = tmp.join(format!("svm_llvm_pb_{pid}_lmdbzc"));
+    let native_ok = Command::new("cc")
+        .arg("-O2")
+        .arg(&inc)
+        .arg(lmdb.join("mdb.c"))
+        .arg(lmdb.join("midl.c"))
+        .arg(&demo)
+        .args(["-lpthread", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !native_ok {
+        eprintln!("note: skipping lmdb zero-copy (cc unavailable)");
+        return;
+    }
+
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+    };
+
+    // Native create + verify (oracle stdout).
+    let nat_root = tmp.join(format!("svm-lmdbzc-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle_create = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native create");
+    assert!(oracle_create.status.success(), "native create failed");
+    let oracle_verify = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&nat_root)
+        .output()
+        .expect("native verify");
+    assert!(oracle_verify.status.success(), "native verify failed");
+
+    // 1. Guest over host_fs_mmap writes a real data.mdb *through the file alias*; native reads it.
+    let guest_root = tmp.join(format!("svm-lmdbzc-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", svm_run::fs::host_fs_mmap(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs_mmap)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "lmdb zero-copy: guest (host_fs_mmap) stdout vs native"
+    );
+    assert!(
+        guest_root.join("data.mdb").exists(),
+        "the guest-written LMDB database must land on the real disk"
+    );
+    let native_reads_guest = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&guest_root)
+        .output()
+        .expect("native verify of guest db");
+    assert_eq!(
+        String::from_utf8_lossy(&native_reads_guest.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb zero-copy: native LMDB must read the region-aliased database the guest wrote"
+    );
+
+    // 2. Reverse: the guest reads a native-written data.mdb through the alias.
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![b"lmdb".to_vec(), b"verify".to_vec()]),
+            &[("fs", svm_run::fs::host_fs_mmap(nat_root.clone()))],
+        )
+        .expect("guest verify (host_fs_mmap over native dir)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb zero-copy: the guest must read the native-written database through the alias"
+    );
+
+    let _ = std::fs::remove_dir_all(&nat_root);
+    let _ = std::fs::remove_dir_all(&guest_root);
+    let _ = std::fs::remove_file(&linked);
+    for bc in &bcs {
+        let _ = std::fs::remove_file(bc);
+    }
+}
+
+#[test]
 fn demo_sqlite_fs_cap_vs_native() {
     // **SQLite Phase B — disk-backed persistence through the Fs capability** (LLVM.md §8, the
     // north star's second half). Same amalgamation as Phase A, but the database is a real *file*:
@@ -3932,6 +4302,65 @@ fn atomics_wide_lowers_and_runs() {
     svm_verify::verify_module(&module).expect("verify translated IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     assert_eq!(run.stdout, b"10 100 1 0 99 1000000000001\n");
+}
+
+#[test]
+fn unresolved_extern_stub_opt_in() {
+    // The opt-in `stub_unresolved_externs` (TranslateOptions): a call to a genuinely undefined external
+    // (no recognizer/helper/capability handles it) lowers to a trap stub instead of failing
+    // translation — deferring the fail-closed from translate time to run time. This is what lets a
+    // whole-program module (Postgres) with hundreds of externals *dead on the exercised path* translate
+    // + verify. The stub is ordinary re-verified IR: a *called* stub traps cleanly (never an escape), a
+    // dead one is inert. Three checks below pin exactly that.
+    use svm_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+
+    // (1) A dead undefined extern behind an opaque gate (`gate` is `volatile 0`, so clang can't prove
+    // the branch dead and keeps the `call @mystery` in the IR — yet it is never taken at runtime).
+    let Some(bc) = compile_to_bc(
+        "extern_stub_dead",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         volatile int gate = 0;\n\
+         int main(void){ int r = 7; if (gate) r = mystery(42); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    // Strict default: a clean, fail-closed translate-time error.
+    match svm_llvm::translate_bc_path(&bc) {
+        Err(svm_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
+        other => panic!("strict default should fail closed on `mystery`, got {other:?}"),
+    }
+    // Opt-in: translates + verifies, and runs to a clean exit — the dead stub never executes.
+    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify stubbed module");
+    let run = svm_run::run_powerbox(&module, b"").expect("run (dead stub inert)");
+    assert_eq!(
+        run.stdout, b"7\n",
+        "the gated-off stub must not perturb the run"
+    );
+
+    // (2) The same extern, now on the *taken* path: the called stub must trap (run errors), never
+    // silently return or escape.
+    let Some(bc2) = compile_to_bc(
+        "extern_stub_called",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         int main(void){ int r = mystery(1); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    let t2 = svm_llvm::translate_bc_path_with_options(&bc2, stub).expect("stub translate 2");
+    let module2 = svm_run::resolve_capability_imports(t2.module).expect("resolve caps 2");
+    svm_verify::verify_module(&module2).expect("verify stubbed module 2");
+    assert!(
+        svm_run::run_powerbox(&module2, b"").is_err(),
+        "a called stub must trap (fail-closed at run time)"
+    );
 }
 
 #[test]
