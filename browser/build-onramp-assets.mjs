@@ -88,12 +88,13 @@ if (ensureAmalgamation()) {
   console.log('  – sqlite_demo skipped (amalgamation fetch failed — offline?)');
 }
 
-// 3) Lua (stdlib) — Lua 5.4.7 core + base/string/table/math libraries running a script that print()s
-//    string/table/math results. The bitcode is a committed golden fixture (no Lua source needed).
+// 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math libraries + a guest snprintf, with a
+//    harness that reads a Lua chunk from **stdin** and runs it. The page pipes the editor's text in as
+//    stdin, so the user writes and runs their own Lua. Committed golden fixture (no Lua source needed).
 try {
-  buildBc('lua_stdlib', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_stdlib.bc'));
+  buildBc('lua_eval', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_eval.bc'));
 } catch (e) {
-  console.log(`  ✗ lua_stdlib: ${e.message}`);
+  console.log(`  ✗ lua_eval: ${e.message}`);
 }
 
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');
