@@ -38,15 +38,19 @@ unprivileged user if invoked as root.
 
 | # | Gap | Sites | Route |
 |---|-----|------:|-------|
-| 1 | **inline `asm`** (~9 distinct templates) | 921 | recognize-and-lower table: empty/`lock;addl`/`rep;nop` → no-op (barriers/PAUSE); `xchgb`/`xaddl`/`cmpxchg` → single-threaded load-op-store; `cpuid`/`popcnt` → fixed-value / `Popcount` |
-| 2 | **`atomicrmw`** (generic `__atomic` path) | 110 | single-threaded lowering to load-op-store (shares #1's lowering) |
-| 3 | **`i128`** (numeric/aggregate widening) | 252 | config lever `#undef HAVE_INT128` (pure-64-bit fallback), or i128-as-`{i64,i64}` |
-| 4 | **vectors `<N x …>`** (mostly `<16 x i8>` struct `memcpy`) | ~3638 | general lane-wise scalarize-vector-memory pass; width census first |
-| 5 | **varargs** (`llvm.va_start`; 0 `va_arg` instrs) | 43 | confirm the `printf` varargs shape covers `elog`/`ereport` |
-| 6 | **fs/syscall shim** (runtime, not IR) | — | bridge `open`/`pread`/`pwrite`/`fsync`/`stat`/… to the `fs` capability; stub `getpid`/`geteuid`/clock; gate the root check |
-| 7 | **data dir** | — | `initdb` natively, expose read/write via the `fs` cap (SQLite Phase B pattern) |
+| 1 | **inline `asm`** (~9 distinct templates) | 921 | **DONE** (slices BN/BO): barriers/PAUSE → drop; `popcnt` → `Popcnt`; `xchg`/`xadd`/`cmpxchg` → the runtime atomic ops (genuinely atomic); `cpuid` → zeroed → software fallbacks |
+| 2 | **`atomicrmw`/`cmpxchg` instrs** | 110 | already lowered by the on-ramp (the asm atomics route to the same ops) |
+| 3 | **`i128`** (numeric/aggregate widening) | 252 | on-ramp already lowers i128 div/rem; general i128 arith is tier-3'd — verify on demand |
+| 4 | **libm** (`log`/`exp`/`pow`/trig) | 18 | **bundle a guest libm** (musl/openlibm double funcs, llvm-linked) — no transcendental SVM op |
+| 5 | **file/OS syscalls** | ~30 | the **`fs` capability** shim: `open`/`pread`/`pwrite`/`fsync`/`stat`/`mkdir`/`opendir`/`mmap`/… |
+| 6 | **proc/time/signal** | ~24 | deterministic stubs: `getpid`/`geteuid`/`clock_gettime`/`sigaction`/`fork`/`kill`/… |
+| 7 | **other libc** | ~180 | `strtod`/`snprintf`/`qsort`/`setlocale`/`strftime`/`memmem`/… — some synthesized, many not yet |
+| 8 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap |
 
-**Staged plan:** (1) portable-atomics + no-`int128` config + the asm/`atomicrmw` recognizer → the
-module translates; (2) the vector-memory scalarization pass; (3) the fs/syscall shim + pre-`initdb`
-data dir → boot `postgres --single` on a fixed SQL script byte-identical to native; (4) a
-`pg_regress` subset. See `LLVM.md` slice BM for the full write-up.
+**Where it stands:** the complete module (834 modules / 14 730 functions) translates past the **entire
+921-site inline-asm surface** (slices BN/BO, tested). Translation now fail-closes at the **first
+undefined external** (`log`): **251 distinct externals** (libm / syscalls / proc+signal / other-libc)
+must each resolve — synthesized helper, `fs` capability, bundled guest code, or stub — before the
+module translates, then verify + the runtime (initdb data dir, storage manager, WAL, single-process
+shmem, catalog bootstrap) must work. That external waist + runtime is the **multi-week bulk** of the
+capstone; the asm slices were the tractable translator corner. See `LLVM.md` slices BM–BP.

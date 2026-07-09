@@ -867,10 +867,46 @@ ordinary verified IR, failing closed on anything else. Landed:
   `inline_asm_unrecognized_is_fail_closed`) — differential vs native (the asm survives `-O2` into the
   bitcode, verified), plus the fail-closed contract. **279 translate tests green, fmt + clippy clean.**
 - **Effect on the capstone:** the full 78 MB Postgres module now **parses past the entire 921-site
-  inline-asm surface** — asm is no longer the blocker. The next gap is elsewhere entirely
-  (`Unsupported("constexpr reference to @hash_numeric")` — the fmgr builtin function table, a separate
-  slice). Remaining asm follow-on: the atomic-RMW templates (via the portable-atomics config, gap #2)
-  and `cpuid`.
+  inline-asm surface** — asm is no longer the blocker.
+
+**Slice BO (DONE) — inline-asm atomics + cpuid: the whole Postgres asm surface clears.** Extends the
+recognizer (BN) with the remaining templates, so the complete backend module (see BP) translates past
+**all 921** inline-asm sites:
+- **x86 atomic RMW / CAS** (`arch-x86.h` `pg_atomic_*` + `s_lock.h` TAS): `xchg{b,w,l,q}` →
+  `AtomicRmw::Xchg`, `xadd{b,w,l,q}` → `AtomicRmw::Add`, `cmpxchg{l,q}; setz` → `AtomicCmpxchg` +
+  the `{old, success}` aggregate. These lower to the **same runtime atomic ops** the on-ramp already
+  emits for `atomicrmw`/`cmpxchg` **instructions** — so they are *genuinely atomic* (not a racy
+  load-op-store) and need **no single-threaded gate**, superseding BM's framing. Operand roles are
+  pinned by asserting the exact constraint signature (`=q,=*m,0,*m` / `={ax},=*m,=q,{ax},r,*m`),
+  fail-closed otherwise; narrow (i8/i16) variants route through the existing narrow CAS-loop helpers
+  (`uses_narrow_atomic` now also spots a narrow atomic *asm* call so the helper registers).
+- **`cpuid`** (`xchgq %rbx; cpuid; xchgq %rbx`, the `pg_bitutils`/`pg_crc32c` feature probe) → an
+  all-zero `{eax,ebx,ecx,edx}`, so Postgres takes its **portable software** popcount/CRC paths, which
+  compute identical results → still byte-identical to native.
+- Test `inline_asm_x86_atomics` mirrors `arch-x86.h`'s exact asm (TAS/fetch-add/CAS), differential vs
+  native. **280 translate tests green, fmt + clippy clean.**
+
+**Slice BP (IN PROGRESS) — the complete Postgres module + the external-surface map.** Two findings
+that reshape the capstone estimate:
+- **The link set must be complete.** An earlier incomplete link (a fragile bitcode-emit step) left
+  functions like `hash_numeric` *declared-only*, surfacing as a spurious `constexpr reference to
+  @hash_numeric`. Fixed the pipeline (`emit_bc.py` now bumps the source mtime instead of deleting the
+  `.o`, so it's idempotent and never corrupts the native tree; a clean rebuild + regenerated
+  `objfiles.txt` restores every object): the complete module is **834 modules / 14 730 defined
+  functions**, and it now translates cleanly past all asm.
+- **The remaining surface is the OS/libc waist, and it is large.** With asm cleared, translation
+  fail-closes at the **first undefined external** (`log`). The module has **251 distinct declared-only
+  externals**: **libm** (18 — `log`/`exp`/`pow`/`sin`/`cos`/… — transcendentals the SVM has no op for;
+  need a **bundled guest libm**, the raytrace "bring-your-own-libm" model, llvm-linked in), **file/OS
+  syscalls** (~30 — `open`/`pread`/`pwrite`/`fsync`/`stat`/`mkdir`/`opendir`/`mmap`/… → the **`fs`
+  capability** shim, gap #6), **proc/time/signal** (~24 — `getpid`/`geteuid`/`clock_gettime`/
+  `sigaction`/`fork`/`kill`/… → deterministic stubs), and **~180 other libc** (`strtod`/`snprintf`/
+  `qsort`/`setlocale`/`strftime`/`memmem`/… — some the on-ramp synthesizes, many not yet). **Every one**
+  must resolve (synthesized helper / capability / bundled guest code / stub) before the module
+  translates, and then verify + the runtime (initdb data dir, storage manager, WAL, single-process
+  shmem, catalog bootstrap) must all work. **This is the multi-week bulk of the capstone** — the asm
+  slices (BN/BO) were the tractable translator corner; the external waist is the mountain. The map
+  above is the plan of record; each category is a follow-on slice.
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
