@@ -71,8 +71,14 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// region (at `STATE_IN_REGION_OFF` = 8 past its shadow-SP word), with frames now starting another 8
 /// bytes later (`REGION_HEADER_LEN` 8→16). The **freeze** word (`UNWINDING`) stays global. The window
 /// image layout changed (in-region state word + an 8-byte frame shift), so a v6 artifact mis-thaws and
-/// is rejected.
-const FORMAT_VERSION: u16 = 8;
+/// is rejected. v8 (§4 subtree freeze): the §14 **nested-child** re-attach residue (`FrozenNested`:
+/// slot + carve geometry + entry) is appended to Section 2 after the vCPU residue, only when present —
+/// so a nested-free artifact keeps the pre-nesting Section-2 byte layout (only the version differs). v9
+/// (§4 subtree freeze, completed children): each nested record gains a `completed_result` flag (+ the
+/// i64 when set) — a §14 child that finished before the freeze but wasn't yet joined rides its
+/// `thread.join` result and the thaw delivers it without re-running the child (reload-not-reissue). One
+/// extra `uleb` (0) per nested record otherwise, so a v8 nested record mis-parses.
+const FORMAT_VERSION: u16 = 9;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -314,6 +320,15 @@ pub fn freeze_with_prots(
                     write_uleb(b, n.carve_off);
                     write_uleb(b, n.size_log2 as u64);
                     write_uleb(b, n.entry as u64);
+                    // v9: a completed-but-unjoined child carries its join result (1 + the i64); a
+                    // still-running child writes 0 (re-attached + rewound on thaw instead).
+                    match n.completed_result {
+                        None => write_uleb(b, 0),
+                        Some(r) => {
+                            write_uleb(b, 1);
+                            write_uleb(b, r as u64);
+                        }
+                    }
                 }
             }
         });
@@ -572,11 +587,17 @@ fn decode_control(
             let carve_off = cr.uleb()?;
             let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            // v9: completed-but-unjoined child's join result.
+            let completed_result = match cr.uleb()? {
+                0 => None,
+                _ => Some(cr.uleb()? as i64),
+            };
             nested.push(FrozenNested {
                 slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
                 carve_off,
                 size_log2,
                 entry,
+                completed_result,
             });
         }
     }

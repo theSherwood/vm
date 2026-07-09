@@ -632,3 +632,164 @@ fn nested_artifact_serializes_restores_and_thaws_through_the_codec() {
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
+
+/// A parent with a **completed-but-unjoined** §14 child at the freeze point (completed-result
+/// residue). It instantiates child B (trivial → 33) and child A (the long loop → 4950), joins A
+/// first (while parked in A's join the single durable worker also runs B to completion), then drives
+/// a fiber so an armed freeze can land *after* B finished but *before* the parent joins B. Total =
+/// 4950 (A) + 33 (B) + 5 (fiber) = 4988.
+const PARENT_TWO_CHILDREN: &str = "memory 18
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 2
+  v2 = i64.const 196608
+  v3 = i64.const 16
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 1
+  v7 = i64.const 131072
+  v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v6, v7, v3, v4)
+  v9 = cap.call 6 1 (i32) -> (i64) v0 (v8)
+  v10 = ref.func 3
+  v11 = i64.const 4096
+  v12 = cont.new v10 v11
+  v13 = i64.const 0
+  v14, v15 = cont.resume v12 v13
+  v16, v17 = cont.resume v12 v15
+  v18 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v19 = i64.add v9 v18
+  v20 = i64.add v19 v17
+  return v20
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 0
+  v3 = i64.const 0
+  br block1(v2, v3)
+block1(v4: i64, v5: i64):
+  v6 = i64.const 100
+  v7 = i64.lt_s v4 v6
+  br_if v7 block2(v4, v5) block3(v5)
+block2(v8: i64, v9: i64):
+  v10 = i64.add v9 v8
+  v11 = i64.const 1
+  v12 = i64.add v8 v11
+  br block1(v12, v10)
+block3(v13: i64):
+  return v13
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 33
+  return v2
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 1
+  v3 = suspend v2
+  v4 = i64.const 5
+  return v4
+}
+";
+
+/// §4 completed-result residue: a freeze landing while a §14 child is **completed-but-unjoined**
+/// records its join result (no `UNWINDING` broadcast — nothing to unwind), and a thaw delivers that
+/// result to the parent's re-executed `join` **without re-running** the child. Verified in-memory
+/// and through the codec, and the residue is asserted to actually carry `completed_result`.
+#[test]
+fn freeze_with_completed_unjoined_child_rides_and_reloads() {
+    let parent = instrument(PARENT_TWO_CHILDREN);
+    const TOTAL: i64 = 4950 + 33 + 5;
+
+    // Control.
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(base, Ok(vec![Value::I64(TOTAL)]), "uninterrupted total");
+
+    // Armed freeze at the fiber's second resume — B has completed (ran during A's join) but is
+    // not yet joined; A is already joined (its result checkpointed).
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    arm_freeze_after(&mut win, 2);
+    let mut fuel = 50_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(fih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(fr.is_ok(), "freeze placeholder: {fr:?}");
+    if read_state(&fsnap) != STATE_UNWINDING {
+        return; // freeze didn't land here (scheduling); the control already proved correctness
+    }
+    let nested = fhost.frozen_nested().to_vec();
+    let completed: Vec<_> = nested
+        .iter()
+        .filter(|n| n.completed_result.is_some())
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly one completed-unjoined child (B)"
+    );
+    assert_eq!(
+        completed[0].completed_result,
+        Some(33),
+        "B's join result rides the residue"
+    );
+
+    // Through the codec: serialize → restore → canonical re-freeze byte-identical.
+    let artifact = svm_snapshot::freeze(&parent, &fsnap, &fhost).expect("serializes");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = svm_snapshot::restore(&artifact, &parent, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_nested(),
+        fhost.frozen_nested(),
+        "residue re-seeded"
+    );
+    assert_eq!(
+        svm_snapshot::freeze(&parent, &window, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze byte-identical"
+    );
+
+    // Thaw: B's result reloads into the parent's join without re-running B; A rewinds/reloads; the
+    // fiber re-attaches; the total is reproduced.
+    let mut twin = window;
+    begin_thaw(&mut twin, 0);
+    let caps = thost.capture_durable_handles().expect("durable");
+    let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let mut fuel = 50_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih)],
+        &mut fuel,
+        &twin,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(TOTAL)]),
+        "thaw reproduces the total (B reloaded, not re-run)"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}

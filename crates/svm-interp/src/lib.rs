@@ -2041,6 +2041,28 @@ fn drive(
             let mut nseed: Vec<FrozenNested> = thaw_nested;
             nseed.sort_by_key(|n| n.slot);
             for fnr in nseed {
+                // A **completed** child is not re-created (reload-not-reissue): its result is posted
+                // straight into the scheduler and mapped to the parent's join slot, so the parent's
+                // re-executed `thread.join` delivers it without re-running the child.
+                if let Some(r) = fnr.completed_result {
+                    let cid = s.next_task;
+                    s.next_task += 1;
+                    s.results.insert(
+                        cid,
+                        Outcome {
+                            result: Ok(vec![Value::I64(r)]),
+                            mem: None,
+                            fuel: *fuel,
+                            trap_bt: Vec::new(),
+                            trap_fiber: None,
+                        },
+                    );
+                    while root.threads.len() <= fnr.slot {
+                        root.threads.push(None);
+                    }
+                    root.threads[fnr.slot] = Some(cid);
+                    continue;
+                }
                 let csize = 1u64 << fnr.size_log2;
                 // Flip the child's carve from its frozen phase to a thaw: clear its own global
                 // freeze word and set its context-0 thaw word — `begin_thaw`, carve-relative.
@@ -3655,11 +3677,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // real: broadcast `UNWINDING` into each live child's carve state word (the subtree STW;
             // the child self-unwinds into its carve's own durable reserve, which is inside this
             // window's image, at its next poll) and record it as [`FrozenNested`] re-attach residue.
-            // Everything else stays **fail-closed** (`ThreadFault`, like the join-deadlock): a
-            // suspended coroutine (host-side native continuation), a separate-module child (its
-            // module identity can't ride the artifact yet), a completed-but-unjoined child (its
-            // result lives only in the scheduler), nested-in-nested, and mixing with unjoined
-            // `thread.spawn` children (the two thaw seedings would contend for the join table).
+            // A **completed-but-unjoined** child rides via `completed_result` (its result taken from
+            // the scheduler; no `UNWINDING` broadcast — nothing to unwind). Everything else stays
+            // **fail-closed** (`ThreadFault`, like the join-deadlock): a suspended coroutine
+            // (host-side native continuation), a separate-module child (its module identity can't ride
+            // the artifact yet), a completed child that **trapped** (its trap can't ride yet),
+            // nested-in-nested, and mixing with unjoined `thread.spawn` children (the two thaw seedings
+            // would contend for the join table).
             let nested_refused = froze && {
                 let live: Vec<NestedChildInfo> = v
                     .nested_children
@@ -3673,18 +3697,40 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     false
                 } else if v.nested_child
                     || live.iter().any(|c| !c.same_module)
-                    || live.iter().any(|c| {
-                        v.sched
-                            .has_result(v.threads[c.slot].expect("filtered to Some"))
-                    })
                     || v.threads.iter().enumerate().any(|(slot, t)| {
                         t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
                     })
+                    || v.mem.is_none()
                 {
-                    true
-                } else if let Some(m) = v.mem.as_mut() {
+                    true // uncovered shape / malformed durable freeze
+                } else {
+                    let mut refuse = false;
                     for c in &live {
-                        m.write_bytes(c.carve_off + STATE_OFF, &STATE_UNWINDING.to_le_bytes());
+                        let cid = v.threads[c.slot].expect("filtered to Some");
+                        let completed_result = if v.sched.has_result(cid) {
+                            // Take the finished child's result; a clean `Ok(i64)` rides the artifact,
+                            // a completed-with-trap child is not yet representable — fail closed.
+                            match v.sched.take_result(cid).map(|o| o.result) {
+                                Some(Ok(vals)) => Some(match vals.first() {
+                                    Some(Value::I64(x)) => *x,
+                                    Some(Value::I32(x)) => *x as i64,
+                                    _ => 0,
+                                }),
+                                _ => {
+                                    refuse = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Still running: broadcast `UNWINDING` into its carve; it self-unwinds.
+                            if let Some(m) = v.mem.as_mut() {
+                                m.write_bytes(
+                                    c.carve_off + STATE_OFF,
+                                    &STATE_UNWINDING.to_le_bytes(),
+                                );
+                            }
+                            None
+                        };
                         v.host
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -3694,11 +3740,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 carve_off: c.carve_off,
                                 size_log2: c.size_log2,
                                 entry: c.entry,
+                                completed_result,
                             });
                     }
-                    false
-                } else {
-                    true // a durable freeze without a window is malformed — refuse
+                    refuse
                 }
             };
             let result = if nested_refused {
@@ -4599,9 +4644,8 @@ struct NestedChildInfo {
 /// its durable reserve (shadow regions, state/SP words), its unwound continuation — lives in its
 /// carve, a sub-range of the parent's window, so it is **already in the artifact's window image**;
 /// this is the small host-side residue a thaw needs to re-attach it: where the carve is, how to
-/// re-enter it, and which join slot the parent's reloaded handle names. (Not yet in the snapshot
-/// codec — `svm-snapshot::freeze` refuses an artifact with nested residue until the Section-2
-/// encoding lands; in-memory freeze → thaw carries it via [`Host::frozen_nested`].)
+/// re-enter it, and which join slot the parent's reloaded handle names. (Carried through the
+/// snapshot codec's Section 2 from `FORMAT_VERSION` v8.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrozenNested {
     /// The parent's join-table slot for this child (the guest-held handle value).
@@ -4612,6 +4656,13 @@ pub struct FrozenNested {
     pub size_log2: u8,
     /// The child's entry function index (the parent's own table — same-module).
     pub entry: u32,
+    /// `Some(result)` for a **completed-but-unjoined** child — one that finished before the freeze
+    /// point, so its `thread.join` result must survive in the artifact (its continuation is gone; the
+    /// scheduler result cell isn't captured). The thaw delivers this straight into the parent's join
+    /// table **without re-running** the child (reload-not-reissue — no double side effects); its carve
+    /// gets no `UNWINDING` broadcast (nothing to unwind). `None` for a still-running child (re-attached
+    /// + rewound on thaw). Mirrors [`FrozenVCpu::completed_result`] for `thread.spawn` children.
+    pub completed_result: Option<i64>,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
