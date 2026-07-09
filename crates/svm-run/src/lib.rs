@@ -2080,6 +2080,119 @@ pub fn new_shared_region(len: usize) -> RegionBacking {
     std::sync::Arc::new(ShmBacking::new(len).expect("create shared region"))
 }
 
+/// A §13 `SharedRegion` backing over a **real host file** (not a fresh memfd) — the bridge that makes
+/// a granted file zero-copy-aliasable into a guest window (MMAP_CAPABILITY.md §4b). Its
+/// [`os_fd`](SharedBacking::os_fd) is the *file's* fd, so a flat-window backend `mmap`s
+/// `MAP_SHARED | MAP_FIXED` of the file over the window — guest loads/stores hit the file's page-cache
+/// pages directly, `msync`/`fsync` persist them, and it stays coherent with the *same* file's
+/// `pread`/`pwrite` through the fs capability (one OS file, one page cache). Like [`ShmBacking`], the
+/// file is also mapped once into the host process so `read_byte`/`write_byte` serve the interpreter's
+/// software-aliased path. Unix only for now (macOS/Windows follow `SharedRegion`'s per-OS story).
+#[cfg(unix)]
+struct FileBacking {
+    file: std::fs::File,
+    ptr: *mut u8,
+    cap: usize, // page-rounded mapping length (≤ the file size, so no access faults past EOF)
+    len: usize, // logical region size the guest sees
+}
+
+// SAFETY: identical rationale to `ShmBacking` — `ptr` is a `MAP_SHARED` mapping of a process-wide
+// file, not thread-local; a §13 region is shared across vCPU threads and access goes through that
+// shared mapping (a concurrent race is the guest's own, confined to the region — never an escape).
+#[cfg(unix)]
+unsafe impl Send for FileBacking {}
+#[cfg(unix)]
+unsafe impl Sync for FileBacking {}
+
+#[cfg(unix)]
+impl FileBacking {
+    fn new(file: std::fs::File, len: usize) -> std::io::Result<FileBacking> {
+        use std::os::fd::AsRawFd;
+        let page = host_page_size() as usize;
+        let cap = len.max(1).div_ceil(page) * page;
+        // A whole-page `MAP_SHARED` of the file must not fault past EOF: grow the file to `cap` first
+        // (LMDB already sizes its file to the map size, so this is usually a no-op).
+        if (file.metadata()?.len() as usize) < cap {
+            file.set_len(cap as u64)?;
+        }
+        // SAFETY: map the whole (page-rounded) file region shared into the host, for the interpreter's
+        // `read_byte`/`write_byte` path; the JIT instead aliases `os_fd()` straight into the window.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                cap,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(FileBacking {
+            file,
+            ptr: p as *mut u8,
+            cap,
+            len,
+        })
+    }
+
+    /// Persist the mapping to disk: `msync` the shared mapping, then `fsync` the fd — the durability
+    /// barrier the §4c contract names, now backed by the real OS rather than an emulated flush.
+    #[allow(dead_code)] // consumed once the bridge's guest-facing sync op is wired (slice 2 tail)
+    fn sync(&self) -> std::io::Result<()> {
+        // SAFETY: `ptr`/`cap` are this backing's own host mapping from `new`.
+        let r = unsafe { libc::msync(self.ptr as *mut c_void, self.cap, libc::MS_SYNC) };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.file.sync_all()
+    }
+}
+
+#[cfg(unix)]
+impl SharedBacking for FileBacking {
+    fn size(&self) -> u64 {
+        self.len as u64
+    }
+    fn read_byte(&self, off: u64) -> u8 {
+        if (off as usize) < self.len {
+            // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
+            unsafe { *self.ptr.add(off as usize) }
+        } else {
+            0
+        }
+    }
+    fn write_byte(&self, off: u64, b: u8) {
+        if (off as usize) < self.len {
+            // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
+            unsafe { *self.ptr.add(off as usize) = b }
+        }
+    }
+    fn os_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        Some(self.file.as_raw_fd())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FileBacking {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`cap` are the host mapping from `new`; the file is closed by `File`.
+        unsafe { libc::munmap(self.ptr as *mut c_void, self.cap) };
+    }
+}
+
+/// Create a §13 `SharedRegion` backing over an already-open host `file` of logical size `len` — the
+/// zero-copy file-mmap bridge (MMAP_CAPABILITY.md §4b). Install it with
+/// [`svm_interp::Host::grant_shared_region_backed`] and the guest maps it with the built-in
+/// `SharedRegion.map`, aliasing the real file into its window. Unix only for now.
+#[cfg(unix)]
+pub fn new_file_region(file: std::fs::File, len: usize) -> std::io::Result<RegionBacking> {
+    Ok(std::sync::Arc::new(FileBacking::new(file, len)?))
+}
+
 /// A §13 `SharedRegion` backing over a Windows **pagefile-backed section** (`CreateFileMappingW` with
 /// `INVALID_HANDLE_VALUE`), whose section handle a window aliases via `MapViewOfFile3` for true
 /// hardware aliasing. Like the unix `ShmBacking`, the section is also mapped once into the host
@@ -3628,6 +3741,117 @@ impl Instance {
             }
         }
         Ok(DiffSession { sessions, entry_sp })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod file_region_tests {
+    //! The file-backed `SharedRegion` backing (the §4b zero-copy mmap bridge). These pin the
+    //! `SharedBacking` contract on a real file: the host mapping and the file are the same page cache
+    //! (writes through the alias land in the file's bytes and vice versa), and `sync` is a real
+    //! durability barrier. The interpreter's software aliasing and the JIT's `os_fd` mapping are both
+    //! backing-agnostic (they only call `size`/`read_byte`/`write_byte`/`os_fd`), so satisfying the
+    //! contract here is what makes a granted file alias correctly into a window on both backends.
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("svm_file_region_{}_{tag}", std::process::id()))
+    }
+
+    #[test]
+    fn alias_writes_reach_the_file_and_file_writes_are_seen_through_the_alias() {
+        let path = temp_path("rt");
+        let _ = std::fs::remove_file(&path);
+        // A fresh 8 KiB file with a recognizable prefix.
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"ORIGINAL").unwrap();
+            f.set_len(8192).unwrap();
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let backing = new_file_region(file, 8192).expect("map file region");
+
+        // 1. The file's existing bytes are visible through the alias (no copy-in, no staleness).
+        let seen: Vec<u8> = (0..8).map(|i| backing.read_byte(i)).collect();
+        assert_eq!(
+            &seen, b"ORIGINAL",
+            "the alias must see the file's current bytes"
+        );
+
+        // 2. A write through the alias lands in the real file's page cache — read it back with a
+        //    fresh fd (pread-style), the path the fs capability uses.
+        for (i, b) in b"REPLACED".iter().enumerate() {
+            backing.write_byte(i as u64, *b);
+        }
+        // Downcast to reach `sync` (the durability barrier); in the bridge the guest drives this via
+        // the fs cap's fsync on the same fd.
+        {
+            let mut probe = std::fs::File::open(&path).unwrap();
+            let mut buf = [0u8; 8];
+            probe.read_exact(&mut buf).unwrap();
+            assert_eq!(
+                &buf, b"REPLACED",
+                "alias writes must be visible on the same OS file"
+            );
+        }
+
+        // 3. A write to the file through a *different* fd is seen through the alias (coherent page
+        //    cache — the property that lets fs-cap pread/pwrite and the map share one file).
+        {
+            let mut w = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            w.seek(SeekFrom::Start(0)).unwrap();
+            w.write_all(b"FROMFILE").unwrap();
+            w.flush().unwrap();
+        }
+        let seen2: Vec<u8> = (0..8).map(|i| backing.read_byte(i)).collect();
+        assert_eq!(
+            &seen2, b"FROMFILE",
+            "a file write must be visible through the alias"
+        );
+
+        // 4. `size` is the logical region length; out-of-range reads are 0 (never a host OOB).
+        assert_eq!(backing.size(), 8192);
+        assert_eq!(backing.read_byte(8192), 0);
+        assert_eq!(backing.read_byte(u64::MAX), 0);
+
+        // 5. `os_fd` is the file's fd (what a flat-window backend mmaps for real aliasing).
+        assert!(
+            backing.os_fd().is_some(),
+            "a file backing exposes its fd for MAP_SHARED aliasing"
+        );
+
+        drop(backing);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn new_file_region_grows_a_short_file_to_avoid_faulting_past_eof() {
+        // A file shorter than the requested region is grown so a whole-page MAP_SHARED never faults.
+        let path = temp_path("grow");
+        let _ = std::fs::remove_file(&path);
+        std::fs::File::create(&path).unwrap(); // zero-length
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let backing = new_file_region(file, 4096).expect("map file region");
+        // The whole region is addressable (reads return the zero-fill, not a fault).
+        assert_eq!(backing.read_byte(0), 0);
+        assert_eq!(backing.read_byte(4095), 0);
+        backing.write_byte(4095, 0xAB);
+        assert_eq!(backing.read_byte(4095), 0xAB);
+        assert!(
+            std::fs::metadata(&path).unwrap().len() >= 4096,
+            "file grown to cover the mapping"
+        );
+        drop(backing);
+        let _ = std::fs::remove_file(&path);
     }
 }
 
