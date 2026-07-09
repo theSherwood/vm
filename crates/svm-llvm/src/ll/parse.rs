@@ -2459,6 +2459,52 @@ impl Parser {
         } else {
             None
         };
+        // An **inline-asm** callee: `asm [sideeffect] [alignstack] [inteldialect] [unwind]
+        // "<template>", "<constraints>"` sits where a `@global`/`%local` callee otherwise would. The
+        // on-ramp does not execute asm; a fixed recognize-and-lower allowlist (`lower_inline_asm`)
+        // matches the template/constraints and re-emits the semantics as verified IR, else fails
+        // closed. Here we only capture the two strings + reconstruct the function type.
+        if matches!(self.peek(), Some(Token::Word(w)) if w == "asm") {
+            self.pos += 1; // `asm`
+            while matches!(self.peek(),
+                Some(Token::Word(w)) if matches!(w.as_str(), "sideeffect" | "alignstack" | "inteldialect" | "unwind"))
+            {
+                self.pos += 1;
+            }
+            let template = match self.bump() {
+                Some(Token::Str(s)) => s,
+                other => {
+                    return self.err(format!("expected an asm template string, found {other:?}"))
+                }
+            };
+            self.expect(&Token::Comma)?;
+            let constraints = match self.bump() {
+                Some(Token::Str(s)) => s,
+                other => {
+                    return self.err(format!(
+                        "expected an asm constraint string, found {other:?}"
+                    ))
+                }
+            };
+            let (arguments, arg_types) = self.call_arg_list()?;
+            let function_ty = explicit_fnty.unwrap_or_else(|| {
+                TypeRef::new(Type::FuncType {
+                    result_type: ret_ty,
+                    param_types: arg_types,
+                    is_var_arg: false,
+                })
+            });
+            let asm = InlineAssembly {
+                ty: function_ty.clone(),
+                template,
+                constraints,
+            };
+            // Trailing attribute-group refs (`#4`).
+            while matches!(self.peek(), Some(Token::Word(w)) if w.starts_with('#')) {
+                self.pos += 1;
+            }
+            return Ok((Either::Left(asm), function_ty, arguments));
+        }
         enum Callee {
             Global(Name),
             Reg(Name),
@@ -2612,6 +2658,9 @@ impl Parser {
             "align",
             "dereferenceable",
             "dereferenceable_or_null",
+            // `elementtype(<ty>)` — the pointee type an indirect memory operand (`*m`) needs; appears
+            // on inline-asm pointer args (and `llvm.preserve.*`). Payload skipped balanced, below.
+            "elementtype",
         ];
         while let Some(Token::Word(w)) = self.peek() {
             if !ATTRS.contains(&w.as_str()) {

@@ -1588,6 +1588,87 @@ fn powerbox_echo_stdin() {
 }
 
 #[test]
+fn inline_asm_barriers_dropped() {
+    // Inline-asm recognizer — the **barrier** templates the on-ramp drops (no architectural effect
+    // for a single-threaded, single-address-space guest): the empty compiler barrier (`""` +
+    // `~{memory}`), Postgres' `pg_memory_barrier` (`lock; addl $0,0(%rsp)`), and the PAUSE spin hint
+    // (`rep; nop`). The arithmetic around them must stay byte-identical to native — proving the drop
+    // neither perturbs the value flow nor breaks the `ret` in tail position.
+    let src = "#include <stdio.h>\n\
+        int main(void){ int x = 0; \
+          for (int i = 0; i < 5; i++) { \
+            x += i * 3; \
+            __asm__ __volatile__(\"\" ::: \"memory\"); \
+            __asm__ __volatile__(\"lock; addl $0,0(%%rsp)\" ::: \"memory\",\"cc\"); \
+          } \
+          __asm__ __volatile__(\"rep; nop\"); \
+          printf(\"%d\\n\", x); return 0; }";
+    check_powerbox_vs_native("asm_barriers", src, b"");
+}
+
+#[test]
+fn inline_asm_popcnt_lowers() {
+    // Inline-asm recognizer — the hardware `popcnt` fast-path (`pg_bitutils`' `pg_popcount*_asm`):
+    // `popcntq $1,$0` / `popcntl $1,$0` lower to the `Popcnt` unary op (as `llvm.ctpop` does), so the
+    // guest matches the native `popcnt` instruction (incl. the defined `popcnt(0) == 0`).
+    let src = "#include <stdio.h>\n\
+        static inline unsigned long pcq(unsigned long v){ unsigned long r; \
+          __asm__(\"popcntq %1,%0\" : \"=r\"(r) : \"rm\"(v) : \"cc\"); return r; } \
+        static inline unsigned int pcl(unsigned int v){ unsigned int r; \
+          __asm__(\"popcntl %1,%0\" : \"=r\"(r) : \"rm\"(v) : \"cc\"); return r; } \
+        int main(void){ \
+          printf(\"%d %d %d\\n\", (int)pcq(0xF0F0F0F0F0F0F0F0UL), (int)pcl(0xABCDu), (int)pcq(0)); \
+          return 0; }";
+    check_powerbox_vs_native("asm_popcnt", src, b"");
+}
+
+#[test]
+fn inline_asm_x86_atomics() {
+    // Inline-asm recognizer — the x86 atomic templates from Postgres' `arch-x86.h` (`pg_atomic_*`) and
+    // `s_lock.h` (TAS): `xchgb` (test-and-set), `xaddl` (fetch-add), `cmpxchgl; setz` (compare-exchange).
+    // Each lowers to the on-ramp's real atomic op (`AtomicRmw`/`AtomicCmpxchg`) — the identical IR the
+    // `atomicrmw`/`cmpxchg` *instructions* produce — so results match native byte-for-byte. Exercised
+    // single-threaded (deterministic), but the lowering is genuinely atomic (not a racy load-op-store).
+    let src = "#include <stdio.h>\n\
+        static inline char tas(volatile char *lock){ char _res = 1; \
+          __asm__ __volatile__(\"lock\\n\\txchgb %0,%1\\n\" : \"+q\"(_res), \"+m\"(*lock) :: \"memory\"); \
+          return _res; } \
+        static inline int xadd(volatile int *p, int add_){ int res; \
+          __asm__ __volatile__(\"lock\\n\\txaddl %0,%1\\n\" : \"=q\"(res), \"=m\"(*p) : \"0\"(add_), \"m\"(*p) : \"memory\",\"cc\"); \
+          return res; } \
+        static inline int cas(volatile int *p, int *expected, int newval){ char ret; \
+          __asm__ __volatile__(\"lock\\n\\tcmpxchgl %4,%5\\n   setz\\t%2\\n\" \
+            : \"=a\"(*expected), \"=m\"(*p), \"=q\"(ret) : \"a\"(*expected), \"r\"(newval), \"m\"(*p) : \"memory\",\"cc\"); \
+          return (int)ret; } \
+        int main(void){ \
+          char lock = 0; int a1 = tas(&lock); int a2 = tas(&lock); \
+          int cnt = 100; int o1 = xadd(&cnt, 5); int o2 = xadd(&cnt, -3); \
+          int v = 102, exp = 102; int ok = cas(&v, &exp, 999); \
+          int exp2 = 5; int ok2 = cas(&v, &exp2, 7); \
+          printf(\"%d %d %d %d %d %d %d %d %d\\n\", a1, a2, o1, o2, cnt, ok, v, ok2, exp2); return 0; }";
+    check_powerbox_vs_native("asm_atomics", src, b"");
+}
+
+#[test]
+fn inline_asm_unrecognized_is_fail_closed() {
+    // The asm allowlist is **closed**: a template that is not a recognized barrier/`popcnt`/… must be
+    // a clean `Unsupported`, never silently dropped or mis-lowered. This is the §2a chokepoint —
+    // executing opaque machine code would defeat the sandbox, so an unknown template fails closed.
+    let Some(bc) = compile_to_bc(
+        "asm_unknown",
+        "int f(int x){ int r; __asm__(\"movl %1,%0; incl %0\" : \"=r\"(r) : \"r\"(x) : \"cc\"); \
+           return r; } \
+         int main(void){ return f(41); }",
+    ) else {
+        return;
+    };
+    match svm_llvm::translate_bc_path(&bc) {
+        Err(svm_llvm::Error::Unsupported(_)) => {}
+        other => panic!("expected Unsupported for unrecognized inline asm, got {other:?}"),
+    }
+}
+
+#[test]
 fn powerbox_computed_output() {
     // Compose the on-ramp's existing machinery with I/O: build a string in a stack buffer (a real
     // data frame + stores), then write it out — the byte-exact stdout must match native.
