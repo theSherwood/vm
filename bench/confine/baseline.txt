@@ -1,3 +1,4 @@
-matmul 1.0533
-fir 0.5896
-bytes 0.9933
+matmul 1.0605
+matmul_eb 1.3313
+fir 0.5836
+bytes 0.9847

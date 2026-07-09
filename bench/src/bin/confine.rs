@@ -35,6 +35,7 @@ const REPS: u32 = 25;
 /// needs a far smaller count than the light streaming kernels.
 const KERNELS: &[(&str, i64, i64)] = &[
     ("matmul", 100, 20_000),
+    ("matmul_eb", 100, 20_000),
     ("fir", 1_000, 12_000_000),
     ("bytes", 1_000, 12_000_000),
 ];
@@ -81,6 +82,7 @@ fn wt_lane(cfile: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)> {
         .args([
             "--target=wasm64",
             "-O2",
+            "-mbulk-memory", // lower memcpy/memset to wasm memory.copy/fill (matches embench build)
             "-nostdlib",
             "-Wl,--no-entry",
             "-Wl,--export=run",
