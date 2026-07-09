@@ -175,6 +175,34 @@ and the serialization itself (scheduler contention was the other).
 
 ---
 
+### I21 — Rare macOS-CI `Bus error: 10` (SIGBUS) at a test-binary launch under `cargo test --workspace` (S4)
+
+**Where:** `build · test (macos-latest)`. Observed on PR #202 (run 28986379444, a durable
+nested-freeze `svm-interp`/`svm-snapshot` change): after `tests/c_frontend.rs` passed 71/71, the
+harness printed `Running tests/cap_self.rs` and immediately died —
+`…​.sh: line 1: 25515 Bus error: 10   cargo test --workspace`, exit code 138 (128 + SIGBUS 10). **No
+test in `cap_self.rs` ran** (no `test …` line, no `test result`); the crash is at the binary's launch,
+before any test body.
+
+**Why a flake, not a regression.** `cap_self.rs` is the §7 capability-reflection suite
+(`count`/`get`/`resolve`/`label`) — no threads, no durable freeze, and nothing the PR's diff touches.
+The **same** `cargo test --workspace` ran green on Linux (`build · test · fmt · clippy`, where
+`cap_self` passed) and on `build · test (windows-latest)` in that very run; `cargo test -p svm --test
+cap_self` passes locally (7/7). macOS-only, unrelated binary, clears on re-run — the same
+**macOS-runner-crash family as I4**, but a distinct signature: SIGBUS (not SIGABRT), a *non-threaded*
+binary, and a crash *at launch* rather than mid-run after a sibling's `ok`. That points away from I4's
+real-thread futex-teardown hypothesis and toward a transient runner fault (a page-in/`mmap` SIGBUS, or
+a bad static-init/dylib map on the shared runner) during test-binary startup.
+
+**Not reproduced deterministically** (macOS can't be run-tested in this environment). **Next step if it
+recurs:** capture the macOS core/backtrace for the `cap_self` binary's launch, and check whether it
+tracks memory pressure like I3/I4 (it followed a large `c_frontend` binary). Until root-caused, treat a
+`Bus error: 10` / exit 138 at a test-binary launch on the macOS job as a flake and re-run it. If it
+keeps tripping unrelated PRs, the cheap unblock is the I4-style mitigation (or making the macOS
+`cross-os` lane non-gating, as its comment already contemplates).
+
+---
+
 ### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
 
 **Where:** the trap-time backtrace capture sites — `crates/svm-jit/src/trap_shim.c` (the SIGSEGV/BUS
