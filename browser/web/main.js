@@ -222,6 +222,30 @@ block0(v0: i64):
   v2 = i64.add v0 v1
   return v2
 }`;
+  // SIMD (wasm-JIT next slice): v128 lane arithmetic + a compare/bitmask reduction + a store→load
+  // through the confined window — the emitted 0xFD opcodes and the one 16-byte widened access run
+  // in-browser against the page's own memory, matching the interpreter. All-in-subset.
+  const SIMD_SRC = `
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  v2 = i32x4.splat v1
+  v3 = i32.const 3
+  v4 = i32x4.splat v3
+  v5 = i32x4.add v2 v4
+  v6 = i32x4.mul v5 v4
+  v7 = i64.const 32
+  v128.store v7 v6
+  v8 = v128.load v7
+  v9 = i32x4.max_s v8 v2
+  v10 = i32x4.gt_s v9 v4
+  v11 = i8x16.bitmask v10
+  v12 = i32x4.extract_lane 0 v9
+  v13 = i32.add v12 v11
+  v14 = i64.extend_i32_s v13
+  return v14
+}`;
   try {
     const bytes = await fetchBytes('/corpus/alu.svmbc');
     const jit = await compileJit(ex, bytes, { memory });
@@ -254,14 +278,23 @@ block0(v0: i64):
       if (djit.call([arg]).value !== interpBytes(dbytes, arg)) { ciEq = false; break; }
     }
 
-    const ok = eq && jv === iv && mixEq && ciEq;
+    // SIMD: emitted v128 opcodes + a confined 16-byte access match the interpreter in-browser.
+    const sbytes = encode(SIMD_SRC);
+    const sjit = await compileJit(ex, sbytes, { memory });
+    let simdEq = sjit !== null;
+    if (sjit) for (const arg of [0n, 1n, 2n, 5n, 64n, 1000n, -1n, 100000n]) {
+      if (sjit.call([arg], { winSize: 1 << 16 }).value !== interpBytes(sbytes, arg)) { simdEq = false; break; }
+    }
+
+    const ok = eq && jv === iv && mixEq && ciEq && simdEq;
     set('wasmjit', ok ? 'pass' : 'fail',
       `wasmjit: alu f0 in-browser → ${jv} (interp ${iv}) ${eq && jv === iv ? 'ok' : 'FAIL'} · ` +
       `mixed-tier (JIT caller + interp SIMD leaf) ${mixEq ? 'ok' : 'FAIL'} · ` +
       `call_indirect dispatch ${ciEq ? 'ok' : 'FAIL'} · ` +
+      `SIMD v128 ${simdEq ? 'ok' : 'FAIL'} · ` +
       `alu n=${N}: jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}× ` +
       `${ok ? 'PASS' : 'FAIL'}`);
-    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}; call_indirect ${ciEq ? 'ok' : 'FAIL'}`);
+    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}; call_indirect ${ciEq ? 'ok' : 'FAIL'}; SIMD ${simdEq ? 'ok' : 'FAIL'}`);
   } catch (e) {
     set('wasmjit', 'fail', `wasmjit: error ${e}`);
   }
