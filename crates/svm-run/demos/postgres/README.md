@@ -43,7 +43,7 @@ unprivileged user if invoked as root.
 | 3 | **`i128`** (numeric/aggregate widening) | 252 | on-ramp already lowers i128 div/rem; general i128 arith is tier-3'd — verify on demand |
 | 4 | **libm** (`log`/`exp`/`pow`/trig) | 18 | **DONE** (slice BQ): openlibm's double funcs bundled as guest code, llvm-linked; on-ramp reproduces them bit-for-bit vs native (`libm_bundled_vs_native`) |
 | 5 | **the whole external surface (~250)** — file/OS syscalls, proc/time/signal, other libc | ~250 | **DONE at translate time** (slice BR): opt-in `--stub-externs` lowers every undefined external to a trap-if-called stub, so the ~200 dead on the `--single` path don't block. Only the ~50 the query path *calls* need real impls (fs cap / stubs) for the **runtime** |
-| 6 | **SIMD vector ops** (from SSE/AVX code) | — | **in progress** (slice BS): per-lane vector shifts done (`v128_lane_shift`, 128-bit + wide); next is the `<4 x i1>` mask type, then `<4 x i64>` wide-type support |
+| 6 | **SIMD vector ops** (from SSE/AVX code) | — | **in progress** (slices BS/BT): per-lane vector shifts + mask-mask bitwise (`or <4 x i1>`) done; next is an SSA-liveness corner, then `<4 x i64>` wide-type support |
 | 7 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap — the ~50 *live* externals resolve here |
 
 **Where it stands:** the complete module (834 modules / 14 730 functions) translates past the **entire

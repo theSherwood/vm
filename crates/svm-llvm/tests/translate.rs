@@ -4472,6 +4472,29 @@ fn unresolved_extern_stub_opt_in() {
 }
 
 #[test]
+fn vector_mask_bitwise_any_match() {
+    // The SIMD "**any lane matches**" idiom (Postgres' `simd.h`): several `<N x i1>` comparison masks
+    // combined with `or`/`and`, then `sext` to a full-width vector. clang `-O2` folds
+    // `sext(m1)|sext(m2)|sext(m3)` into `or <4 x i1>` masks + one `sext <4 x i1> to <4 x i32>` — the
+    // exact construct that blocked Postgres. The on-ramp now lowers mask-mask bitwise ops lane-wise
+    // (`sext` of a mask was already handled). Runtime `volatile` seed so nothing constant-folds; the
+    // 0/-1 result lanes fold to one `%u`. Byte-identical to native.
+    let src = "#include <stdio.h>\n\
+        typedef int v4i __attribute__((vector_size(16)));\n\
+        volatile int SEED = 7;\n\
+        int main(void){\n\
+          int s = SEED;\n\
+          v4i a = {s, s*2, s+5, s^3};\n\
+          v4i t1 = {7, 99, 12, 4}, t2 = {14, 8, 12, 100}, t3 = {0, 14, 3, 4};\n\
+          v4i any = (a == t1) | (a == t2) | (a == t3);\n\
+          v4i all = (a != t1) & (a != t2);\n\
+          unsigned acc = 0;\n\
+          for (int i=0;i<4;i++) acc = acc*131u + (unsigned)any[i] + 7u*(unsigned)all[i];\n\
+          printf(\"%u\\n\", acc); return 0; }";
+    check_powerbox_vs_native("vmask_any", src, b"");
+}
+
+#[test]
 fn unresolved_extern_funcptr_stub() {
     // The **address-taken** counterpart to `unresolved_extern_stub_opt_in`: a *function pointer* to an
     // undefined external (e.g. a comparator/dispatch-table entry — what blocked Postgres on `@memcmp`)

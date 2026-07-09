@@ -985,6 +985,24 @@ Two independent gaps the module hit after BR, each a clean, tested advance:
   address-taken `@memcmp`; the next gap is the **`<4 x i1>` mask type** (`type <4 x i1> (Milestone 1+)`)
   — the SIMD vector tail continues (mask legalization next), then `<4 x i64>` wide-type support.
 
+**Slice BT (DONE) — mask-mask bitwise (`and`/`or`/`xor <N x i1>`): the SIMD "any-match" idiom.** The
+`<4 x i1>` blocker from BS. `lower_mask` already scalarized vector compares/select/extract/insert/
+shuffle/movemask/`freeze` and (via `lower_vec_int_convert`) `sext`/`zext` of a mask, but **not** the
+bitwise *combination* of masks — `or <4 x i1> %m1, %m2`, which is how SIMD folds several comparison
+masks into one ("does any of these lanes match?", then `sext` to a full-width vector; Postgres'
+`simd.h`). Those `or`/`and`/`xor <N x i1>` fell through `lower_mask` to the scalar `bin` path →
+`val_type(<4 x i1>)` → the `type <4 x i1> (Milestone 1+)` error. Now lowered lane-wise
+(`lower_mask_bitwise`: `IntBin` per `0`/`1` lane, result bound as scalarized mask lanes) — the mask
+analog of the vector int binop. Cross-block-safe for free: the scan classifies *any* `<N x i1>`-typed
+value into its `[i32; N]` fan-out `agg_layout`, so a mask combined in one block and consumed in another
+threads through block params like any mask. Test `vector_mask_bitwise_any_match` (the `(a==t1) |
+(a==t2) | (a==t3)` idiom clang `-O2` folds to `or <4 x i1>` + one `sext` — verified present in the
+bitcode) is byte-identical to native. Also repairs a **pre-existing `main` break**: the upstream
+`TranslateOptions { stack_page }` addition left one test's struct literal un-reconciled (missing the
+field), so the svm-llvm lane didn't compile — fixed with `..Default::default()`. **287 translate tests
+green, fmt + clippy clean.** Effect: the Postgres module now translates past the mask type; the next
+gap is an unrelated SSA-liveness corner (`value … not available in block`) in a later function.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
