@@ -598,7 +598,7 @@ fn fiber_residue_generation_round_trips_through_the_codec() {
 // slot 0 and bumps its generation to 1 — then creates the real fiber B (func 1) which reuses slot 0
 // at **generation 1**, resumes B once (it suspends/parks), and resumes it again to completion (7 +
 // 100). Freezing while B is parked must flatten B carrying generation 1, and the thaw must re-seed it
-// there so B's guest handle ((1 << 16) | 0) still resolves. This is the case the freeze-before-start
+// there so B's guest handle ((1 << 24) | 0) still resolves. This is the case the freeze-before-start
 // harness can't reach: a recycled parked fiber needs a prior fiber-finish (a prior safepoint), so the
 // freeze has to land *mid-run* — which `arm_freeze_after` makes deterministic.
 const SRC_RECYCLE: &str = r#"
@@ -683,7 +683,7 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     assert_eq!(
         thost.frozen_fibers()[0].generation,
         1,
-        "the re-seeded fiber is at generation 1 (its handle is (1 << 16) | 0)"
+        "the re-seeded fiber is at generation 1 (its handle is (1 << 24) | 0)"
     );
 
     // §12.6 invariant 1 — canonical re-serialize is byte-identical.

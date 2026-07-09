@@ -2353,8 +2353,10 @@ pub const POWERBOX_MAX_HANDLES: usize = 8;
 
 /// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
 /// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
-/// [`Quota`] can only *tighten* below this, never raise it.
-pub const MAX_FIBERS: usize = 1 << 16;
+/// [`Quota`] can only *tighten* below this, never raise it. `1 << 24` (~16.7M) — the ceiling equals the
+/// cross-backend fiber-handle index width (`FIBER_GEN_SHIFT`), raised from `1 << 16` once the arena
+/// stack backend removed the `vm.max_map_count` VMA wall that used to bind concurrency lower.
+pub const MAX_FIBERS: usize = 1 << 24;
 
 /// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
 /// `ThreadFault` past it. The interpreter bounds *concurrently-live* vCPUs; the JIT's table is

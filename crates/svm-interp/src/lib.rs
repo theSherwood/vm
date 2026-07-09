@@ -3286,8 +3286,10 @@ fn dispatch_indirect(
 /// Maximum number of fibers a single run may create (§12). Bounds the fiber table so a
 /// fiber-bomb yields a clean [`Trap::FiberFault`] instead of unbounded host allocation —
 /// the reference-oracle analogue of the quota that charges out-of-band stacks to the
-/// guest, so a fiber-bomb OOMs *itself*, never the host.
-const MAX_FIBERS: usize = 1 << 16;
+/// guest, so a fiber-bomb OOMs *itself*, never the host. `1 << 24` (~16.7M): the hard ceiling equals
+/// the fiber-handle index width ([`FIBER_GEN_SHIFT`]); the per-run spawn quota (`SVM_MAX_FIBERS`,
+/// clamped to this) is the tunable anti-bomb policy.
+const MAX_FIBERS: usize = 1 << 24;
 
 /// Maximum number of **concurrently live** vCPUs (`thread.spawn`) across a run (§12). With the M:N
 /// executor a vCPU is a cheap green thread (a parked one costs only its continuation, not an OS
@@ -4460,21 +4462,23 @@ fn shadow_region_fits(ctx_idx: usize) -> bool {
 const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
-/// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
-/// low 16 bits and the generation occupies bits 16.. of the **`i64`** handle. A handle is
+/// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 24`, so a slot always fits in the
+/// low 24 bits and the generation occupies bits 24.. of the **`i64`** handle. A handle is
 /// `(generation << FIBER_GEN_SHIFT) | slot` — and since a fresh slot's generation is 0, a non-recycled
 /// run's handle is exactly its slot (byte-identical to before, and to the JIT, which likewise hands out
 /// `slot`). The generation lets a later **recycled** slot reject a stale handle to its former occupant
-/// (the ABA guard the JIT's `Ownership` word already carries internally).
-const FIBER_GEN_SHIFT: u32 = 16;
+/// (the ABA guard the JIT's `Ownership` word already carries internally). Widened 16→24 (from a 65 536
+/// concurrent-fiber ceiling): the arena stack backend removed the `vm.max_map_count` VMA wall, so the
+/// handle index became the binding limit — 24 bits allows ~16.7M concurrent fibers.
+const FIBER_GEN_SHIFT: u32 = 24;
 
 /// The generation bits a fiber guest handle carries (the field above the slot): an `i64` handle leaves
-/// **48 bits** for the generation, so a stale handle is rejected modulo `2^48` — an ABA window so vast
-/// (≈ centuries of recycling even at 10⁶ finishes/s) that wraparound is unreachable in practice.
-/// Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
-const FIBER_GEN_MASK: u64 = (1 << 48) - 1;
+/// **40 bits** for the generation, so a stale handle is rejected modulo `2^40` — an ABA window so vast
+/// (≈ a trillion recycles of one slot) that wraparound is unreachable in practice. Matches `svm_jit`'s
+/// `FIBER_HANDLE_GEN_MASK`.
+const FIBER_GEN_MASK: u64 = (1 << 40) - 1;
 
-/// Encode a fiber guest handle from its registry `slot` and `generation` (low 48 bits).
+/// Encode a fiber guest handle from its registry `slot` and `generation` (low 40 bits).
 fn fiber_handle(slot: usize, generation: u64) -> i64 {
     (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
 }
@@ -4482,6 +4486,46 @@ fn fiber_handle(slot: usize, generation: u64) -> i64 {
 /// The generation field a guest fiber handle carries (the high bits above the slot).
 fn fiber_handle_generation(handle: i64) -> u64 {
     (handle as u64) >> FIBER_GEN_SHIFT
+}
+
+#[cfg(test)]
+mod fiber_handle_layout_tests {
+    //! The fiber-handle index was widened 16→24 bits (`MAX_FIBERS` 1<<16 → 1<<24) once the arena stack
+    //! backend removed the `vm.max_map_count` VMA wall. These pin that the wider index round-trips and
+    //! that the slot decode (a `next_power_of_two(len)-1` mask, as `claim`/`resolve` use) stays clear of
+    //! the generation bits at any slot up to the new ceiling — i.e. > 65 535 fibers are addressable.
+    use super::{fiber_handle, fiber_handle_generation, FIBER_GEN_SHIFT, MAX_FIBERS};
+
+    #[test]
+    fn index_width_is_24_bits() {
+        assert_eq!(FIBER_GEN_SHIFT, 24);
+        assert_eq!(MAX_FIBERS, 1 << 24);
+    }
+
+    #[test]
+    fn handle_round_trips_beyond_the_old_16_bit_ceiling() {
+        // A slot the old 16-bit index could not represent (> 65 535), with a non-zero generation.
+        let slot = 1_000_000usize; // < MAX_FIBERS (1<<24 = 16 777 216)
+        let generation = 0x3_ABCD_1234u64;
+        let handle = fiber_handle(slot, generation);
+        // Generation decodes back exactly.
+        assert_eq!(fiber_handle_generation(handle), generation);
+        // Slot decodes back via the same dynamic mask `claim`/`resolve` use (padded to the table len);
+        // the generation bits sit strictly above it, so the slot is recovered cleanly.
+        let mask = (slot + 1).next_power_of_two() - 1;
+        assert_eq!((handle as u64 as usize) & mask, slot);
+    }
+
+    #[test]
+    fn top_slot_and_generation_do_not_overlap() {
+        // The largest addressable slot and a full-width generation must not collide in the i64 handle.
+        let slot = (1usize << 24) - 1;
+        let generation = (1u64 << 40) - 1;
+        let handle = fiber_handle(slot, generation);
+        assert_eq!(fiber_handle_generation(handle), generation);
+        let mask = (1u64 << FIBER_GEN_SHIFT) - 1;
+        assert_eq!((handle as u64) & mask, slot as u64);
+    }
 }
 
 /// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
@@ -4581,7 +4625,7 @@ pub struct FrozenFiber {
     /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
     pub shadow_sp: u64,
     /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
-    /// *recycled* (generation > 0) fiber still resolves (`(generation << 16) | slot`). 0 for a
+    /// *recycled* (generation > 0) fiber still resolves (`(generation << 24) | slot`). 0 for a
     /// non-recycled fiber — then the handle is exactly its slot. 48-bit field (the `i64` handle's
     /// generation bits); serialized as `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
     pub generation: u64,
@@ -4882,7 +4926,7 @@ impl FiberRegistry {
         }
         // Generation check (recycling step 1/3): reject a handle whose generation doesn't match the
         // slot's current one — a stale handle to a slot's former occupant after the slot was recycled
-        // (`finish` bumped the generation). Compared modulo `2^48` (the handle's field width); a forged
+        // (`finish` bumped the generation). Compared modulo `2^40` (the handle's field width); a forged
         // non-zero generation is rejected, exactly as a forged slot is masked-and-lost.
         if fiber_handle_generation(handle) != (t.gens[slot] & FIBER_GEN_MASK) {
             return Err(Trap::FiberFault);

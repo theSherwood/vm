@@ -77,8 +77,14 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// (§4 subtree freeze, completed children): each nested record gains a `completed_result` flag (+ the
 /// i64 when set) — a §14 child that finished before the freeze but wasn't yet joined rides its
 /// `thread.join` result and the thaw delivers it without re-running the child (reload-not-reissue). One
-/// extra `uleb` (0) per nested record otherwise, so a v8 nested record mis-parses.
-const FORMAT_VERSION: u16 = 9;
+/// extra `uleb` (0) per nested record otherwise, so a v8 nested record mis-parses. v10 (fiber-handle
+/// index widening): the cross-backend fiber-handle encoding changed from `(gen << 16) | slot` to
+/// `(gen << 24) | slot` (24-bit index / 40-bit generation) once the arena stack backend lifted the
+/// concurrency ceiling. The residue's `generation`/`slot` fields are still stored *separately* as
+/// `uleb`, so the Section-2 byte layout is unchanged — but a fiber handle the guest held **packed** in
+/// its window across the freeze would decode to a different `(slot, generation)` under the new shift,
+/// so a v9 artifact is rejected rather than mis-resolved.
+const FORMAT_VERSION: u16 = 10;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
