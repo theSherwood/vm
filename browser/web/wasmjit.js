@@ -47,7 +47,14 @@ export async function compileJit(ex, moduleBytes, { memory = null } = {}) {
   let lastTrap = 0;
   const module = await WebAssembly.compile(wasm);
   const instance = await WebAssembly.instantiate(module, {
-    env: { memory: mem, trap: (code) => { lastTrap = code; } },
+    env: {
+      memory: mem,
+      trap: (code) => { lastTrap = code; },
+      // Cross-tier call into the interpreter (mixed-tier guests, slice 3). A fully-eligible guest
+      // (all that `svm_wasmjit_compile` emits today) never reaches it; wiring it to re-enter the
+      // engine over the shared window is the browser half of slice 3 (`3c`).
+      call_interp: () => { throw new Error('cross-tier call_interp not wired in-browser yet (slice 3c)'); },
+    },
   });
   const f0 = instance.exports.f0;
 

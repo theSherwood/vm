@@ -69,6 +69,17 @@ fn wasm_run(m: &svm_ir::Module, wasm: &[u8], args: &[Value], fuel: u64) -> Outco
             *caller.data_mut() = code;
         })
         .unwrap();
+    // These pure kernels are all fully in-subset (no interp leaves), so `call_interp` is imported
+    // but never called — a panicking stub asserts that (a mixed guest is exercised by `mixed.rs`).
+    linker
+        .func_wrap::<_, ()>(
+            "env",
+            "call_interp",
+            |_: Caller<'_, i32>, _func: i32, _args: i32| {
+                unreachable!("no cross-tier call in a fully in-subset kernel");
+            },
+        )
+        .unwrap();
     let instance = linker
         .instantiate(&mut store, &module)
         .unwrap()
