@@ -161,6 +161,7 @@
 //! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
 //! (`<2 x double>`, `<8 x i16>`, dynamic lanes), and `i33`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -218,11 +219,89 @@ pub struct Translated {
     pub exports: Vec<(String, u32)>,
 }
 
+/// Opt-in translation knobs. The default is the strict, fail-closed on-ramp — every entry point that
+/// takes no options uses [`TranslateOptions::default`].
+#[derive(Default, Clone, Copy)]
+pub struct TranslateOptions {
+    /// Lower a call to an **undefined external** — one that no recognizer, synthesized helper, or
+    /// capability handles — to a synthesized **trap stub** (a function whose body is `unreachable`,
+    /// which traps if ever reached) instead of failing translation. This defers "is this external
+    /// actually reachable?" from translate time to run time: a whole-program module (e.g. Postgres)
+    /// with hundreds of externals that are dead on the exercised path then translates + verifies, and
+    /// only a *called* stub traps — never an escape, since the stub is ordinary re-verified IR (§2a).
+    /// **Off by default** so a typo'd or genuinely-missing callee stays a clean translate-time error
+    /// for ordinary programs; opt in only for a bring-up experiment on a large real program.
+    pub stub_unresolved_externs: bool,
+}
+
+/// Lazily-assigned trap stubs for undefined externals ([`TranslateOptions::stub_unresolved_externs`]).
+/// Shared across all function translations via a `RefCell`; each distinct name gets one stub, assigned
+/// index `base + ordinal` (the stubs are appended to `funcs` last, after `_start` + defined + helpers,
+/// so `base` = that total count and the assigned indices match the final vector positions).
+struct StubTable {
+    base: u32,
+    order: Vec<(String, svm_ir::FuncType)>,
+    idx: HashMap<String, u32>,
+}
+
+impl StubTable {
+    fn new(base: u32) -> Self {
+        Self {
+            base,
+            order: Vec::new(),
+            idx: HashMap::new(),
+        }
+    }
+    /// The stub index for `name`, minting a new one (keyed by name, using the *first* signature seen)
+    /// on the first reference. A later call to the same name with a mismatched signature keeps this
+    /// index; the shape mismatch then surfaces as a clean `svm-verify` type-id error, not an escape.
+    fn get_or_insert(&mut self, name: &str, sig: svm_ir::FuncType) -> u32 {
+        if let Some(&i) = self.idx.get(name) {
+            return i;
+        }
+        let i = self.base + self.order.len() as u32;
+        self.order.push((name.to_string(), sig));
+        self.idx.insert(name.to_string(), i);
+        i
+    }
+}
+
+/// The SVM signature of a trap stub for a direct call to an undefined external: the threaded data-SP
+/// (§3d) followed by the call's fixed parameters (varargs, if any, are marshaled into scratch by the
+/// call site, not passed as IR args — so a varargs external stubs on its fixed prefix), and its result
+/// types. Matches exactly the `args = [callee_sp, fixed…]` the call site builds, so `svm-verify`'s
+/// type-id check passes.
+fn extern_stub_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<svm_ir::FuncType, Error> {
+    let Type::FuncType {
+        result_type,
+        param_types,
+        ..
+    } = c.function_ty.as_ref()
+    else {
+        return unsup("extern stub for a call through a non-function type");
+    };
+    let mut params = vec![ValType::I64]; // the prepended data-SP
+    for p in param_types {
+        params.push(val_type(p.as_ref())?);
+    }
+    let results = result_types(result_type.as_ref(), types)?;
+    Ok(svm_ir::FuncType { params, results })
+}
+
 /// Translate a legalized LLVM bitcode file (`*.bc`). Needs `llvm-dis` on `PATH` (the bitcode is
 /// disassembled to text and read by the in-house `.ll` reader); a disassembly failure is an
 /// [`Error::Parse`]. A `-g` build feeds both §6 debug-info halves from the same text: per-instruction
 /// `!DILocation` source lines and the structured `!DILocalVariable`/DI-type graph ([`ll::debug`]).
 pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
+    translate_bc_path_with_options(path, TranslateOptions::default())
+}
+
+/// [`translate_bc_path`] with explicit [`TranslateOptions`] (e.g. `stub_unresolved_externs` for a
+/// large-program bring-up).
+pub fn translate_bc_path_with_options(
+    path: impl AsRef<Path>,
+    opts: TranslateOptions,
+) -> Result<Translated, Error> {
     let path = path.as_ref();
     // Disassemble the bitcode to textual `.ll` out-of-process (`llvm-dis`, an ordinary build-time tool
     // like `clang` — §Q2's out-of-process decision) and route through the in-house textual reader. No
@@ -239,7 +318,7 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
             String::from_utf8_lossy(&out.stderr)
         )));
     }
-    translate_ll_str(&String::from_utf8_lossy(&out.stdout))
+    translate_ll_str_with_options(&String::from_utf8_lossy(&out.stdout), opts)
 }
 
 /// Translate a **textual** LLVM IR file (`*.ll`) via the in-house reader (LLVM.md §8 Q1b) — the
@@ -258,9 +337,17 @@ pub fn translate_ll_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
 /// (`DILocalVariable`/`DIType`, [`ll::debug`]) — is packaged as a [`di::LlvmDebug`] and threaded
 /// into the translator alongside the `blockaddress` payloads ([`blockaddr::BlockAddrs`]).
 pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
+    translate_ll_str_with_options(src, TranslateOptions::default())
+}
+
+/// [`translate_ll_str`] with explicit [`TranslateOptions`].
+pub fn translate_ll_str_with_options(
+    src: &str,
+    opts: TranslateOptions,
+) -> Result<Translated, Error> {
     let (m, di, ba) =
         ll::parse::parse_module_with_debug(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
-    translate_impl(&m, di.as_ref(), ba.as_ref())
+    translate_impl(&m, di.as_ref(), ba.as_ref(), opts)
 }
 
 /// Translate an already-parsed [`ll`] module. The neutral core's source-line half is populated from
@@ -268,13 +355,14 @@ pub fn translate_ll_str(src: &str) -> Result<Translated, Error> {
 /// are only available via the string/file entries (they ride the parse — see [`translate_ll_str`]),
 /// so this entry passes neither.
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
-    translate_impl(m, None, None)
+    translate_impl(m, None, None, TranslateOptions::default())
 }
 
 fn translate_impl(
     m: &LModule,
     di: Option<&di::LlvmDebug>,
     ba: Option<&blockaddr::BlockAddrs>,
+    opts: TranslateOptions,
 ) -> Result<Translated, Error> {
     // Pass 0: assign each *defined* function an IR index (its position among defined functions),
     // so a `call` can resolve its target by name. Declaration-only functions (extern/intrinsic
@@ -588,6 +676,15 @@ fn translate_impl(
         eh_subtype_ids,
     };
 
+    // All non-stub function indices are now fixed (`next_helper` = `_start` + defined + helpers). Any
+    // trap stubs for undefined externals (opt-in) get appended *after* the helpers, so their indices
+    // start here. `stubs` is threaded (as `Option<&RefCell<StubTable>>`) into every function's
+    // translation; call sites that fall through to an unresolved external mint a stub on demand.
+    let stub_base = next_helper;
+    let stubs: Option<RefCell<StubTable>> = opts
+        .stub_unresolved_externs
+        .then(|| RefCell::new(StubTable::new(stub_base)));
+
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
                                // §6 debug-info: each defined function's final index is `base + i` (the synth `_start`, inserted
@@ -614,6 +711,7 @@ fn translate_impl(
             di,
             ba,
             &mut dbg,
+            stubs.as_ref(),
         )?;
         any_frame |= frame_size > 0;
         funcs.push(func);
@@ -873,6 +971,21 @@ fn translate_impl(
     if need_snprintf {
         // Fail-closed trap for a non-constant-format snprintf (string.format) — takes no args → i32.
         funcs.push(synth_trap_stub(vec![], vec![ValType::I32]));
+    }
+    // Opt-in trap stubs for undefined externals, appended last — after every helper — so each lands at
+    // its assigned `stub_base + ordinal` index (see `StubTable`); at this point `funcs.len()` equals
+    // `stub_base`. Each is ordinary `unreachable`-trapping IR: a *called* stub aborts the guest cleanly
+    // (never an escape), a dead one is inert.
+    if let Some(cell) = &stubs {
+        let table = cell.borrow();
+        debug_assert_eq!(
+            funcs.len() as u32,
+            table.base,
+            "stub_base must equal the non-stub function count"
+        );
+        for (_name, sig) in &table.order {
+            funcs.push(synth_trap_stub(sig.params.clone(), sig.results.clone()));
+        }
     }
     Ok(Translated {
         module: Module {
@@ -2055,6 +2168,7 @@ fn translate_func(
     di: Option<&di::LlvmDebug>,
     ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
+    stubs: Option<&RefCell<StubTable>>,
 ) -> Result<(Func, u64), Error> {
     // A `(...)`-defined function (`f.is_var_arg`) lowers like any other: its IR signature is
     // `(sp, fixed-params…)` — the variadic arguments are not IR parameters but are read by `va_start`
@@ -2153,6 +2267,7 @@ fn translate_func(
             ba,
             dbg,
             &mut aux_blocks,
+            stubs,
         )?);
     }
     blocks.extend(aux_blocks);
@@ -14668,6 +14783,10 @@ struct BlockCtx<'a> {
     /// Recovered `blockaddress` labels ([`blockaddr`]) — the `phi` map resolves an operand-position
     /// (φ-threaded) blockaddress to its target block index.
     blockaddrs: Option<&'a blockaddr::BlockAddrs>,
+    /// Opt-in trap-stub table for undefined externals ([`TranslateOptions::stub_unresolved_externs`]);
+    /// `None` in the strict default. A direct call that resolves to no defined function / helper /
+    /// capability mints (or reuses) a stub index here instead of failing translation.
+    stubs: Option<&'a RefCell<StubTable>>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
@@ -15422,6 +15541,7 @@ fn translate_block(
     ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
     aux_blocks: &mut Vec<Block>,
+    stubs: Option<&RefCell<StubTable>>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
@@ -15466,6 +15586,7 @@ fn translate_block(
         types,
         func_idx: bc_func_idx,
         blockaddrs: ba,
+        stubs,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
@@ -16535,9 +16656,23 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // a function-pointer value) lowers to `call_indirect <sig>` (§3c: mask + type-id check).
         let inst = match callee_name(c) {
             Some(name) => {
-                let func = *ctx.name2idx.get(&name).ok_or_else(|| {
-                    Error::Unsupported(format!("call to external/undefined function `{name}`"))
-                })?;
+                // Reaching here means every recognizer/synthesizer/capability declined `name` — it is a
+                // genuinely undefined external. Strict default: fail closed. With `stub_unresolved_externs`:
+                // mint (or reuse) a trap stub and call it, deferring the fail-closed to run time (§2a).
+                let func = match ctx.name2idx.get(&name) {
+                    Some(&idx) => idx,
+                    None => match ctx.stubs {
+                        Some(cell) => {
+                            let sig = extern_stub_sig(c, types)?;
+                            cell.borrow_mut().get_or_insert(&name, sig)
+                        }
+                        None => {
+                            return Err(Error::Unsupported(format!(
+                                "call to external/undefined function `{name}`"
+                            )))
+                        }
+                    },
+                };
                 Inst::Call { func, args }
             }
             None => {

@@ -4122,6 +4122,64 @@ fn atomics_wide_lowers_and_runs() {
 }
 
 #[test]
+fn unresolved_extern_stub_opt_in() {
+    // The opt-in `stub_unresolved_externs` (TranslateOptions): a call to a genuinely undefined external
+    // (no recognizer/helper/capability handles it) lowers to a trap stub instead of failing
+    // translation — deferring the fail-closed from translate time to run time. This is what lets a
+    // whole-program module (Postgres) with hundreds of externals *dead on the exercised path* translate
+    // + verify. The stub is ordinary re-verified IR: a *called* stub traps cleanly (never an escape), a
+    // dead one is inert. Three checks below pin exactly that.
+    use svm_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+    };
+
+    // (1) A dead undefined extern behind an opaque gate (`gate` is `volatile 0`, so clang can't prove
+    // the branch dead and keeps the `call @mystery` in the IR — yet it is never taken at runtime).
+    let Some(bc) = compile_to_bc(
+        "extern_stub_dead",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         volatile int gate = 0;\n\
+         int main(void){ int r = 7; if (gate) r = mystery(42); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    // Strict default: a clean, fail-closed translate-time error.
+    match svm_llvm::translate_bc_path(&bc) {
+        Err(svm_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
+        other => panic!("strict default should fail closed on `mystery`, got {other:?}"),
+    }
+    // Opt-in: translates + verifies, and runs to a clean exit — the dead stub never executes.
+    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify stubbed module");
+    let run = svm_run::run_powerbox(&module, b"").expect("run (dead stub inert)");
+    assert_eq!(
+        run.stdout, b"7\n",
+        "the gated-off stub must not perturb the run"
+    );
+
+    // (2) The same extern, now on the *taken* path: the called stub must trap (run errors), never
+    // silently return or escape.
+    let Some(bc2) = compile_to_bc(
+        "extern_stub_called",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         int main(void){ int r = mystery(1); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    let t2 = svm_llvm::translate_bc_path_with_options(&bc2, stub).expect("stub translate 2");
+    let module2 = svm_run::resolve_capability_imports(t2.module).expect("resolve caps 2");
+    svm_verify::verify_module(&module2).expect("verify stubbed module 2");
+    assert!(
+        svm_run::run_powerbox(&module2, b"").is_err(),
+        "a called stub must trap (fail-closed at run time)"
+    );
+}
+
+#[test]
 fn tail_call_lowers_and_runs() {
     // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
     // `return_call` terminators, verifies, and runs to completion at 2,000,000 depth — which only
