@@ -131,40 +131,91 @@ async function main() {
     set('capio', 'fail', `capio: error ${e}`);
   }
 
-  // --- 6) wasm-JIT tier: SVM IR compiled to wasm, run in-browser (BROWSER.md wasm-JIT slice 2) ----
+  // --- 6) wasm-JIT tier: SVM IR compiled to wasm, run in-browser (BROWSER.md wasm-JIT slice 2/3c) --
   // The `alu` compute kernel is emitted to a wasm module by the cdylib (`svm_wasmjit_compile`),
   // instantiated against the page's OWN linear memory, and its `f0` called directly on the page
   // (compute-only → no Atomics.wait, so the main thread is fine). Assert it equals the `svm_run`
   // interpreter over an arg sweep, then time a heavy run to show the JIT's win over interp-in-wasm.
+  // Then a **mixed-tier** guest (3c): a JITted integer caller whose float leaf runs on the
+  // interpreter via `env.call_interp` — same result as the whole-guest interpreter.
+  const interpBytes = (bytes, arg) => {
+    const p = ex.svm_alloc(bytes.length);
+    u8().set(bytes, p);
+    const r = ex.svm_run(p, bytes.length, BigInt(arg));
+    const st = ex.svm_status();
+    ex.svm_dealloc(p, bytes.length);
+    if (st !== 0) throw new Error(`svm_run status ${st}`);
+    return BigInt.asIntN(64, r);
+  };
+  // Compile SVM text → encoded module via the cdylib's front end (svm_parse), like the playground.
+  const encode = (src) => {
+    const s = new TextEncoder().encode(src);
+    const p = ex.svm_alloc(s.length);
+    u8().set(s, p);
+    const ok = ex.svm_parse(p, s.length);
+    ex.svm_dealloc(p, s.length);
+    const optr = ex.svm_parse_ptr();
+    const out = u8().slice(optr, optr + ex.svm_parse_len());
+    if (ok !== 1) throw new Error(`parse: ${new TextDecoder().decode(out)}`);
+    return out;
+  };
+  const MIXED_SRC = `
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = call 1 (v9)
+  v11 = i64.add v8 v10
+  v12 = i64.const 1
+  v13 = i64.add v9 v12
+  br block1(v7, v11, v13)
+block3(v14: i64):
+  return v14
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.convert_i64_s v0
+  v2 = f64.add v1 v1
+  v3 = f64.mul v1 v2
+  v4 = i64.trunc_sat_f64_s v3
+  return v4
+}`;
   try {
     const bytes = await fetchBytes('/corpus/alu.svmbc');
     const jit = await compileJit(ex, bytes, { memory });
     if (!jit) throw new Error('svm_wasmjit_compile refused an in-subset module');
-    const interp = (arg) => {
-      const p = ex.svm_alloc(bytes.length);
-      u8().set(bytes, p);
-      const r = ex.svm_run(p, bytes.length, BigInt(arg));
-      const st = ex.svm_status();
-      ex.svm_dealloc(p, bytes.length);
-      if (st !== 0) throw new Error(`svm_run status ${st}`);
-      return BigInt.asIntN(64, r);
-    };
     let eq = true;
     for (const arg of [0n, 1n, 2n, 5n, 1000n, -1n, 100000n]) {
-      if (jit.call([arg]).value !== interp(arg)) { eq = false; break; }
+      if (jit.call([arg]).value !== interpBytes(bytes, arg)) { eq = false; break; }
     }
     const N = 5_000_000n;
     const t0 = performance.now();
     const jv = jit.call([N]).value;
     const t1 = performance.now();
-    const iv = interp(N);
+    const iv = interpBytes(bytes, N);
     const t2 = performance.now();
     const jitMs = t1 - t0, intMs = t2 - t1;
-    const ok = eq && jv === iv;
+
+    // Mixed-tier: the JITted caller sums a float leaf run on the interpreter via env.call_interp.
+    const mbytes = encode(MIXED_SRC);
+    const mjit = await compileJit(ex, mbytes, { memory });
+    let mixEq = mjit !== null;
+    if (mjit) for (const arg of [0n, 1n, 2n, 5n, 20n, 100n]) {
+      if (mjit.call([arg]).value !== interpBytes(mbytes, arg)) { mixEq = false; break; }
+    }
+
+    const ok = eq && jv === iv && mixEq;
     set('wasmjit', ok ? 'pass' : 'fail',
-      `wasmjit: SVM IR → wasm, f0 called in-browser → ${jv} (interp ${iv}) ${ok ? 'PASS' : 'FAIL'} ` +
-      `· alu n=${N}: jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}×`);
-    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter`);
+      `wasmjit: alu f0 in-browser → ${jv} (interp ${iv}) ${eq && jv === iv ? 'ok' : 'FAIL'} · ` +
+      `mixed-tier (JIT caller + interp float leaf) ${mixEq ? 'ok' : 'FAIL'} · ` +
+      `alu n=${N}: jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}× ` +
+      `${ok ? 'PASS' : 'FAIL'}`);
+    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}`);
   } catch (e) {
     set('wasmjit', 'fail', `wasmjit: error ${e}`);
   }
