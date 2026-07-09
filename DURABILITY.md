@@ -210,12 +210,19 @@ looping child frozen live; the thaw reproduces the uninterrupted total). **Still
 separate-module children (module identity can't ride yet), completed-but-unjoined children (the
 result lives only in the scheduler; detected via a non-destructive `has_result` probe),
 nested-in-nested, mixing with unjoined `thread.spawn` children (the two thaw seedings would
-contend for the join table), and a nested child owning fibers (child-local residue). The
-**snapshot codec refuses** nested residue (`FreezeError::NestedResidue`) until the Section-2
-nested encoding lands (stage C) — in-memory freeze → thaw only, like the pre-codec fiber slices.
-Next: stage C (codec + canonical re-freeze), completed-result residue, separate-module children
-(module identity in the artifact — the durable `ModuleGrant` binding question), deeper nesting,
-JIT parity.
+contend for the join table), and a nested child owning fibers (child-local residue). **Stage C — codec landed
+(`FORMAT_VERSION` 7→8).** The nested artifact is now a real §12 artifact: the `FrozenNested`
+re-attach records ride **Section 2**, appended after the fiber + vCPU residue and only when
+present (canonical ascending slot; fiber-/vCPU-only artifacts keep the pre-nesting Section-2
+byte layout — only the container version differs), and `restore` re-seeds `Host::frozen_nested`.
+The child's carve — window bytes, durable reserve, unwound continuation — was already in the
+window image, so the encoding is just the re-attach record. Pinned by
+`durable_nesting.rs::nested_artifact_serializes_restores_and_thaws_through_the_codec`: freeze the
+live child → serialize → restore into a fresh host → **§12.6 canonical re-freeze byte-identical**
+→ thaw completes the child's loop and the join delivers the uninterrupted total — the full
+`freeze → serialize → restore → thaw ≡ uninterrupted` contract across the nesting boundary.
+Next: completed-result residue, separate-module children (module identity in the artifact — the
+durable `ModuleGrant` binding question), deeper nesting, JIT parity.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
@@ -1153,7 +1160,7 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 **B.1′** (concurrent child-fiber *mid-resume-chain*, verified) are **landed** (the first three merged,
 all-platform CI green; the rest on `claude/durable-next-slices-tracker`). The remaining queue — **lift
 the `atomic.wait` thaw fail-closed** (concurrent-thaw rework: **design + 3-stage plan now written** under
-*"Concurrent thaw"* below; stage 1 = per-context thaw-state relocation, `FORMAT_VERSION` v6→v7), then
+*"Concurrent thaw"* below; stage 1 = per-context thaw-state relocation, `FORMAT_VERSION` v6→v7; the §4 nested residue is v7→v8), then
 **4A.6 / 4A.7** — is detailed in the *"Phase 4 Slice A.5 — per-context shadow-SP"* follow-up notes below.
 
 **Out of scope (separate Phase-4 items):** handle hardening (drainable non-durable bindings), CoW clone,

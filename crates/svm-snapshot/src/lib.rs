@@ -40,8 +40,8 @@
 
 use svm_encode::encode_module;
 use svm_interp::{
-    DurableBinding, DurableHandle, FrozenFiber, FrozenVCpu, Host, NonDurableHandle, StreamRole,
-    SHADOW_BASE,
+    DurableBinding, DurableHandle, FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle,
+    StreamRole, SHADOW_BASE,
 };
 use svm_ir::Module;
 
@@ -72,7 +72,7 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// bytes later (`REGION_HEADER_LEN` 8→16). The **freeze** word (`UNWINDING`) stays global. The window
 /// image layout changed (in-region state word + an 8-byte frame shift), so a v6 artifact mis-thaws and
 /// is rejected.
-const FORMAT_VERSION: u16 = 7;
+const FORMAT_VERSION: u16 = 8;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -118,10 +118,6 @@ pub enum PageProt {
 /// Why a domain can't be frozen.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FreezeError {
-    /// The freeze left §14 nested-child residue (`Host::frozen_nested`, DURABILITY.md §4), which
-    /// this container format cannot carry yet — serializing would silently drop the children on
-    /// restore, so freeze refuses all-or-nothing. Carries the residue count.
-    NestedResidue(usize),
     /// A live handle isn't re-grantable, so freeze refuses rather than dropping authority
     /// (§12.5). The domain must close/drain it first.
     NonDurableHandle(NonDurableHandle),
@@ -211,12 +207,6 @@ pub fn freeze_with_prots(
     let handles = host
         .capture_durable_handles()
         .map_err(FreezeError::NonDurableHandle)?;
-    // §4 subtree freeze: nested-child residue is not yet in the container format — refuse rather
-    // than serialize an artifact whose restore would silently drop the children (all-or-nothing,
-    // like the handle-table refusal). The Section-2 nested encoding is the follow-up stage.
-    if !host.frozen_nested().is_empty() {
-        return Err(FreezeError::NestedResidue(host.frozen_nested().len()));
-    }
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
     fibers.sort_by_key(|f| f.slot);
@@ -225,6 +215,10 @@ pub fn freeze_with_prots(
     // shared active-SP word holds only the last child's extent at freeze end).
     let mut vcpus = host.frozen_vcpus().to_vec();
     vcpus.sort_by_key(|v| v.task);
+    // The §14 nested-child residue (DURABILITY.md §4, v8), canonical = ascending slot. Each child's
+    // continuation is in its own carve inside the window image; this is the re-attach record.
+    let mut nested = host.frozen_nested().to_vec();
+    nested.sort_by_key(|n| n.slot);
     let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
     let digest = digest256(&encode_module(module));
     let reserved_log2 = window.len().trailing_zeros() as u8;
@@ -277,7 +271,7 @@ pub fn freeze_with_prots(
     // this records the small host-side residue needed to re-enter it on thaw. Emitted only when there
     // are fibers or spawned vCPUs. The vCPU residue is **appended** after the fiber residue and only
     // when present, so a fiber-only (or single-vCPU no-fiber) artifact is byte-identical to before.
-    if !fibers.is_empty() || !vcpus.is_empty() {
+    if !fibers.is_empty() || !vcpus.is_empty() || !nested.is_empty() {
         section(&mut out, TAG_CONTROL, |b| {
             write_uleb(b, fibers.len() as u64);
             for f in &fibers {
@@ -309,6 +303,18 @@ pub fn freeze_with_prots(
                     }
                 }
                 write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
+            }
+            // §4 subtree freeze (v8): the nested-child re-attach residue is **appended** after the
+            // fiber + vCPU residue and only when present, so fiber-/vCPU-only artifacts keep the
+            // pre-nesting Section-2 byte layout (only the container version differs).
+            if !nested.is_empty() {
+                write_uleb(b, nested.len() as u64);
+                for n in &nested {
+                    write_uleb(b, n.slot as u64);
+                    write_uleb(b, n.carve_off);
+                    write_uleb(b, n.size_log2 as u64);
+                    write_uleb(b, n.entry as u64);
+                }
             }
         });
     }
@@ -457,11 +463,15 @@ pub fn restore_with_prots(
     // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
     // thaw. The section is present iff there are fibers or spawned vCPUs (canonical); restore re-seeds
     // the Host so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
-    let (fibers, vcpus, root_sp) = decode_control(control_body, fiber_count, spawned_count)?;
+    let (fibers, vcpus, root_sp, nested) =
+        decode_control(control_body, fiber_count, spawned_count)?;
     host.set_frozen_fibers(fibers);
     if !vcpus.is_empty() {
         host.set_frozen_vcpus(vcpus);
         host.set_frozen_root_sp(root_sp);
+    }
+    if !nested.is_empty() {
+        host.set_frozen_nested(nested);
     }
 
     Ok((window, prots))
@@ -470,15 +480,15 @@ pub fn restore_with_prots(
 /// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when
 /// `spawned_count > 0` (slice 3.2.1) — the spawned-vCPU residue (canonical ascending task) and the
 /// root's extent. Enforces the header's counts. A `None` body is valid only when both counts are zero
-/// (the section is elided then). Returns `(fibers, vcpus, root_sp)`.
+/// (the section is elided then). Returns `(fibers, vcpus, root_sp, nested)`.
 #[allow(clippy::type_complexity)]
 fn decode_control(
     body: Option<&[u8]>,
     fiber_count: u64,
     spawned_count: u64,
-) -> Result<(Vec<FrozenFiber>, Vec<FrozenVCpu>, u64), RestoreError> {
+) -> Result<(Vec<FrozenFiber>, Vec<FrozenVCpu>, u64, Vec<FrozenNested>), RestoreError> {
     let body = match (body, fiber_count, spawned_count) {
-        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), SHADOW_BASE)), // no residue ⇒ no section
+        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), SHADOW_BASE, Vec::new())), // no residue ⇒ no section
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
         (Some(b), _, _) => b,
     };
@@ -547,10 +557,33 @@ fn decode_control(
         }
         root_sp = cr.uleb()?;
     }
+    // §4 subtree freeze (v8): the optional nested-child residue trails the section; its presence is
+    // exactly "bytes remain" (canonical: absent when empty, ascending slot).
+    let mut nested = Vec::new();
+    if !cr.at_end() {
+        let nn = cr.uleb()?;
+        let mut last: Option<u64> = None;
+        for _ in 0..nn {
+            let slot = cr.uleb()?;
+            if last.is_some_and(|p| slot <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: slots must ascend
+            }
+            last = Some(slot);
+            let carve_off = cr.uleb()?;
+            let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            nested.push(FrozenNested {
+                slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+                carve_off,
+                size_log2,
+                entry,
+            });
+        }
+    }
     if !cr.at_end() {
         return Err(RestoreError::Malformed);
     }
-    Ok((fibers, vcpus, root_sp))
+    Ok((fibers, vcpus, root_sp, nested))
 }
 
 // ---- Binding (de)serialization (§12.5) ----
