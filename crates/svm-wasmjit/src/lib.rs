@@ -470,9 +470,9 @@ pub fn compile_module_mixed_entry(
     // own callees `mixed_ok` never checked) from being emitted with an unroutable call.
     let mut wasm_of: Vec<Option<u32>> = vec![None; m.funcs.len()];
     let mut emitted: Vec<usize> = Vec::new();
-    for i in 0..m.funcs.len() {
+    for (i, slot) in wasm_of.iter_mut().enumerate() {
         if a.reachable[i] && a.in_subset[i] {
-            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+            *slot = Some(IMPORTED_FUNCS + emitted.len() as u32);
             emitted.push(i);
         }
     }
