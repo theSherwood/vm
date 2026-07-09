@@ -3658,8 +3658,10 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
     // (`FS_MAP_REGION` + two `SharedRegion.map`s via `__vm_region_call`), so a span running off the
     // end of the ring wraps seamlessly to the start — a single `memcpy` crosses the boundary. The
     // `Mem`-level aliasing is unit-tested (`shared_region_aliases_two_window_offsets`); this proves a
-    // real guest program *uses* the primitive end-to-end and matches the OS one byte-for-byte: the
-    // native oracle double-maps a `memfd` with raw `mmap(MAP_SHARED|MAP_FIXED)`.
+    // real guest program *uses* the primitive end-to-end on **both backends** and matches the OS one
+    // byte-for-byte: the native oracle double-maps a `memfd` with raw `mmap(MAP_SHARED|MAP_FIXED)`,
+    // and the JIT does the same real double-mapping over its window (the interpreter models it in
+    // software) — so `native == interp == jit`.
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../svm-run/demos/ring/ring_demo.c");
     let pid = std::process::id();
@@ -3719,30 +3721,40 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
         env: vec![],
     };
 
-    // The region must be file-backed, so grant host_fs_mmap over a real temp dir.
-    let root = tmp.join(format!("svm-ring-{pid}"));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("ring root");
-    let out = inst
-        .run_with_caps(
-            svm_run::Backend::Bytecode,
-            &config,
-            &[("fs", svm_run::fs::host_fs_mmap(root.clone()))],
-        )
-        .expect("guest run (host_fs_mmap)");
-    let guest_stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        guest_stdout,
-        String::from_utf8_lossy(&native.stdout),
-        "ring buffer: guest (double-mapped region) vs native (double-mapped memfd)"
-    );
-    // Non-vacuous: the alias must have physically wrapped (a broken alias leaves offset 0 zeroed).
-    assert!(
-        guest_stdout.contains("wrap-alias: RAPWRAP"),
-        "the wrap overflow must be visible at offset 0 via the second mapping: {guest_stdout:?}"
-    );
+    // Run on BOTH backends. The interpreter models the alias in software (loads/stores route through
+    // the backing's read_byte/write_byte); the JIT does the REAL hardware double-mapping — two
+    // `mmap(MAP_SHARED | MAP_FIXED)` of the file's fd over the window sub-ranges
+    // (`MprotectWindow::map_region`), exactly like the native oracle. Both must match native
+    // byte-for-byte, so `native == interp == jit`. The region must be file-backed, so each run gets a
+    // fresh `host_fs_mmap` over its own temp dir.
+    for (backend, tag) in [
+        (svm_run::Backend::Bytecode, "interp"),
+        (svm_run::Backend::Jit, "jit"),
+    ] {
+        let root = tmp.join(format!("svm-ring-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("ring root");
+        let out = inst
+            .run_with_caps(
+                backend,
+                &config,
+                &[("fs", svm_run::fs::host_fs_mmap(root.clone()))],
+            )
+            .unwrap_or_else(|e| panic!("guest ring run ({tag}) failed: {e:?}"));
+        let guest_stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            guest_stdout,
+            String::from_utf8_lossy(&native.stdout),
+            "ring buffer: guest ({tag}, double-mapped region) vs native (double-mapped memfd)"
+        );
+        // Non-vacuous: the alias must have physically wrapped (a broken alias leaves offset 0 zeroed).
+        assert!(
+            guest_stdout.contains("wrap-alias: RAPWRAP"),
+            "the wrap overflow must be visible at offset 0 via the second mapping ({tag}): {guest_stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-    let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_file(&bc);
     let _ = std::fs::remove_file(&exe);
 }

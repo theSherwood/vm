@@ -188,8 +188,10 @@ Real `MAP_SHARED` gives this for free (OS page cache). The emulation does not. T
   continues at the start, and a single `memcpy` handles the wrap. ✅ **Proven** (slice 3):
   `demo_ring_buffer_magic_mapping_vs_native` has a guest double-map one file-backed region (two
   `SharedRegion.map`s via `__vm_region_call`) and byte-match a native `memfd` double-mapped with raw
-  `mmap(MAP_SHARED|MAP_FIXED)`, wrap-alias included. (The `Mem`-level aliasing was already unit-tested;
-  this proves a real guest program *uses* it end-to-end.)
+  `mmap(MAP_SHARED|MAP_FIXED)`, wrap-alias included — on **both backends** (`native == interp == jit`):
+  the JIT does the *real* hardware double-mapping over its window (`MprotectWindow::map_region`), the
+  interpreter models it in software. (The `Mem`-level aliasing was already unit-tested; this proves a
+  real guest program *uses* it end-to-end.)
 - **Mixing map-reads with `pwrite`** — e.g. LMDB *without* WRITEMAP. Not yet exercised; low priority
   unless a target demands it. The bridge's real aliasing (§4a/§4b) makes it coherent for free (one
   page cache), so it would be a *proof*, not new plumbing.

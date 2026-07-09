@@ -11,5 +11,7 @@ exists for; here a guest reaches it through the granted `host_fs_mmap` capabilit
 - **native oracle**: a `memfd` double-mapped with raw `mmap(MAP_SHARED | MAP_FIXED)` — the classic
   magic-ring-buffer setup.
 
-Same driver → byte-identical stdout: the capability primitive matches the OS one. Driven by
-`demo_ring_buffer_magic_mapping_vs_native` in `crates/svm-llvm/tests/translate.rs`.
+Same driver → byte-identical stdout: the capability primitive matches the OS one, on **both
+backends** (`native == interp == jit`). The interpreter models the alias in software; the JIT does the
+*real* hardware double-mapping over its window (two `mmap(MAP_SHARED | MAP_FIXED)`), like native.
+Driven by `demo_ring_buffer_magic_mapping_vs_native` in `crates/svm-llvm/tests/translate.rs`.
