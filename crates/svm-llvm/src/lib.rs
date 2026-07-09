@@ -3816,6 +3816,22 @@ fn uses_narrow_atomic(m: &LModule) -> bool {
             Instruction::AtomicRMW(r) => narrow(&r.value),
             Instruction::CmpXchg(cx) => narrow(&cx.expected),
             Instruction::Store(st) => st.atomicity.is_some() && narrow(&st.value),
+            // A narrow (i8/i16) x86 atomic **inline-asm** call (`xchgb`/`xaddw`/`cmpxchg…`, the
+            // `arch-x86.h`/`s_lock.h` TAS) lowers through the same narrow helper (see `lower_inline_asm`);
+            // the width-carrying operand is arg 1 (value / expected). `cpuid` shares the `xchg` mnemonic
+            // but isn't atomic, so it's excluded.
+            Instruction::Call(c) => c
+                .function
+                .as_ref()
+                .left()
+                .map(|asm| {
+                    let d = crate::ll::lex::unescape(&asm.template);
+                    let t = String::from_utf8_lossy(&d);
+                    let atomic = !t.contains("cpuid")
+                        && (t.contains("xchg") || t.contains("xadd") || t.contains("cmpxchg"));
+                    atomic && c.arguments.get(1).map(|(a, _)| narrow(a)).unwrap_or(false)
+                })
+                .unwrap_or(false),
             _ => false,
         })
     })
@@ -12767,6 +12783,169 @@ fn lower_fp_sat_intrinsic(
     })))
 }
 
+/// Recognize-and-lower for **inline assembly** (the Postgres asm surface, LLVM.md slice BM follow-on).
+/// The on-ramp never *executes* asm — opaque machine code can't be masked or re-verified, which is the
+/// whole sandbox thesis (§2a). Instead a **fixed allowlist** matches the handful of template strings
+/// known C headers emit and re-emits their *semantics* as ordinary verified IR, failing closed on
+/// anything else. Returns `Ok(true)` when it handled an inline-asm call (binding the dest, if any),
+/// `Ok(false)` when the callee is not inline asm; an unrecognized template is a clean `Unsupported`.
+///
+/// Handled here — the **irreducible** residue plus the popcount fast-path:
+/// - **compiler / memory barriers** (`""` with a `~{memory}` clobber, `lock; addl $$0,0(%rsp)`) and
+///   the **PAUSE** spin hint (`rep; nop` / `pause`) → **dropped**. The guest is a single
+///   address space and — under the single-threaded contract this lowering assumes — one thread of
+///   control, so there is nothing to reorder against and no sibling core to yield to. (Postgres emits
+///   these from `pg_compiler_barrier`/`pg_memory_barrier`/`pg_spin_delay`; no config lever removes
+///   them, unlike the x86 atomics, so the recognizer *must* cover them.)
+/// - **`popcnt`** (`popcntq`/`popcntl $1,$0`, from `pg_bitutils`' hardware fast-path) → the `Popcnt`
+///   unary op, exactly as `llvm.ctpop` lowers.
+///
+/// Deliberately **not** here: the x86 atomic-RMW templates (`xchgb`/`xaddl`/`cmpxchgl`). Postgres'
+/// portable-atomics build emits those as `atomicrmw`/`cmpxchg` **instructions**, which the on-ramp
+/// already lowers single-threaded (`atom_width`/`lower_narrow_atomic_cas`) — one lowering, not two
+/// front doors — and `cpuid` disappears with the same popcount-dispatch config lever.
+fn lower_inline_asm(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+    types: &Types,
+) -> Result<bool, Error> {
+    let Some(asm) = c.function.as_ref().left() else {
+        return Ok(false); // an ordinary (direct/indirect) call — not our business
+    };
+    let decoded = crate::ll::lex::unescape(&asm.template);
+    let t = String::from_utf8_lossy(&decoded);
+    let t = t.trim();
+    // Barriers + the PAUSE hint: no architectural effect for this guest → drop. Always `void`.
+    if t.is_empty() || t == "lock; addl $$0,0(%rsp)" || t == "rep; nop" || t == "pause" {
+        if c.dest.is_some() {
+            return unsup(format!("inline-asm barrier with a result: {t:?}"));
+        }
+        return Ok(true);
+    }
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let bind = |ctx: &mut BlockCtx, idx: ValIdx| {
+        if let Some(dest) = &c.dest {
+            if let Some(&vid) = ctx.s.name2id.get(dest) {
+                ctx.idx_of.insert(vid, idx);
+            }
+        }
+    };
+    // `popcntq $1,$0` / `popcntl $1,$0`: population count of the one input operand → `Popcnt`, whose
+    // width follows the operand (`i64`/`i32`), matching the `.ll` result type the dest expects.
+    // (Guarded away from `cpuid`, whose template also mentions no popcnt — order-independent here.)
+    if t.contains("popcnt") {
+        if args.len() != 1 {
+            return unsup(format!("inline `popcnt` asm with {} operands", args.len()));
+        }
+        let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
+        let a = ctx.operand(args[0])?;
+        let idx = ctx.push(Inst::IntUn {
+            ty,
+            op: IntUnOp::Popcnt,
+            a,
+        });
+        bind(ctx, idx);
+        return Ok(true);
+    }
+    // **CPUID** (`xchgq %rbx; cpuid; xchgq %rbx`, `pg_bitutils`/`pg_crc32c` feature probe): return an
+    // all-zero `{eax,ebx,ecx,edx}` so Postgres' runtime dispatch sees *no* POPCNT/SSE4.2 and takes its
+    // portable software paths — which compute the **same** popcount/CRC as the hardware ones, so the
+    // guest still matches native byte-for-byte (checked ahead of the `xchg` atomics, whose mnemonic it
+    // shares). §17 note: this sidesteps the hardware fast-paths entirely rather than modeling CPUID.
+    if t.contains("cpuid") {
+        let zero = ctx.push(Inst::ConstI32(0));
+        if let Some(dest) = &c.dest {
+            if let Some(&vid) = ctx.s.name2id.get(dest) {
+                // The `{i32,i32,i32,i32}` result — all four leaves zeroed.
+                ctx.agg.insert(vid, vec![zero, zero, zero, zero]);
+            }
+        }
+        return Ok(true);
+    }
+    // **x86 atomic RMW / CAS** (`arch-x86.h`'s `pg_atomic_*` + `s_lock.h` TAS). These lower to the SAME
+    // runtime atomic ops the on-ramp emits for `atomicrmw`/`cmpxchg` **instructions** (`AtomicRmw`/
+    // `AtomicCmpxchg` for i32/i64, the narrow helpers for i8/i16) — so they are *genuinely atomic*, not
+    // a racy load-op-store, and need no single-threaded gate. The operand roles are pinned by asserting
+    // the exact constraint signature (fail-closed otherwise), so positional binding is safe on LLVM 18.
+    //
+    // TAS/exchange (`xchg{b,w,l,q} $0,$1`) and fetch-add (`xadd{b,w,l,q} $0,$1`): `(ptr, value, ptr)`,
+    // constraints `=q,=*m,0,*m,…`; the result is the **old** value.
+    if !t.contains("cmpxchg") && (t.contains("xchg") || t.contains("xadd")) {
+        if !asm.constraints.starts_with("=q,=*m,0,*m") || args.len() != 3 {
+            return unsup(format!("inline atomic asm with unexpected shape: {t:?}"));
+        }
+        let addr = ctx.operand(args[0])?;
+        let value = ctx.operand(args[1])?;
+        let is_add = t.contains("xadd");
+        let old = match atom_width(args[1].get_type(types).as_ref())? {
+            AtomWidth::Wide(ty) => ctx.push(Inst::AtomicRmw {
+                ty,
+                op: if is_add {
+                    AtomicRmwOp::Add
+                } else {
+                    AtomicRmwOp::Xchg
+                },
+                addr,
+                value,
+                offset: 0,
+                order: Ordering::SeqCst,
+            }),
+            AtomWidth::Narrow(w) => {
+                let opcode = if is_add {
+                    NARROW_RMW_ADD
+                } else {
+                    NARROW_RMW_XCHG
+                };
+                lower_narrow_atomic_rmw(ctx, addr, value, w, opcode)?
+            }
+        };
+        bind(ctx, old);
+        return Ok(true);
+    }
+    // Compare-exchange (`cmpxchg{l,q} $4,$5; setz $2`): `(ptr, expected, desired, ptr)`, constraints
+    // `={ax},=*m,=q,{ax},r,*m,…`; the result is `{ iN old, i8 setz }` (`setz` = `old == expected`),
+    // the same `{old, success}` aggregate the `cmpxchg` **instruction** yields.
+    if t.contains("cmpxchg") {
+        if !asm.constraints.starts_with("={ax},=*m,=q,{ax},r,*m") || args.len() != 4 {
+            return unsup(format!("inline cmpxchg asm with unexpected shape: {t:?}"));
+        }
+        let addr = ctx.operand(args[0])?;
+        let expected = ctx.operand(args[1])?;
+        let replacement = ctx.operand(args[2])?;
+        let (old, exp_cmp, cmp_ty) = match atom_width(args[1].get_type(types).as_ref())? {
+            AtomWidth::Wide(ty) => {
+                let old = ctx.push(Inst::AtomicCmpxchg {
+                    ty,
+                    addr,
+                    expected,
+                    replacement,
+                    offset: 0,
+                    order: Ordering::SeqCst,
+                });
+                (old, expected, ty)
+            }
+            AtomWidth::Narrow(w) => {
+                let (old, masked_exp) =
+                    lower_narrow_atomic_cas(ctx, addr, expected, replacement, w)?;
+                (old, masked_exp, IntTy::I32)
+            }
+        };
+        let success = ctx.push(Inst::IntCmp {
+            ty: cmp_ty,
+            op: CmpOp::Eq,
+            a: old,
+            b: exp_cmp,
+        });
+        if let Some(dest) = &c.dest {
+            if let Some(&vid) = ctx.s.name2id.get(dest) {
+                ctx.agg.insert(vid, vec![old, success]);
+            }
+        }
+        return Ok(true);
+    }
+    unsup(format!("inline asm (unrecognized template): {t:?}"))
+}
+
 /// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
 /// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
 /// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
@@ -13920,7 +14099,12 @@ fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
             // shim from being stabilized/DCE'd. It returns `void` and has no runtime effect, so we
             // drop it (matched on the stable v0-mangled suffix, ignoring the crate-hash prefix and
             // the `_v1`/`_v2` version tail).
-            || s.contains("__rust_no_alloc_shim_is_unstable");
+            || s.contains("__rust_no_alloc_shim_is_unstable")
+            // `llvm.trap`/`llvm.debugtrap` (`__builtin_trap()`, a UBSan/assert hard-stop) is always
+            // emitted immediately followed by an `unreachable` terminator — which the on-ramp already
+            // lowers to a guest trap — so the intrinsic call itself is a no-op we drop.
+            || s.starts_with("llvm.trap")
+            || s.starts_with("llvm.debugtrap");
     }
     false
 }
@@ -16169,6 +16353,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     if let I::Call(c) = instr {
         if is_droppable_call(c) {
             return Ok(()); // a no-op intrinsic (lifetime/dbg/assume)
+        }
+        // Inline asm: the fixed recognize-and-lower allowlist (barriers→drop, `popcnt`→`Popcnt`);
+        // any unrecognized template fails closed. Checked early — an asm callee has no `callee_name`,
+        // so the ordinary direct/indirect-call path would otherwise mis-handle it.
+        if lower_inline_asm(ctx, c, types)? {
+            return Ok(());
         }
         // `llvm.va_start`/`llvm.va_copy` set up the `__va_list_tag` for the overflow-only varargs ABI.
         if let Some(name) = callee_name(c) {

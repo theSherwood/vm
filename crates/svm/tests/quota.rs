@@ -186,8 +186,18 @@ fn quota_clamps_to_ceiling() {
         max_vcpus: usize::MAX,
     });
     let q = host.quota();
-    assert!(q.max_fibers <= (1 << 16), "max_fibers clamped to ceiling");
-    assert!(q.max_vcpus <= (1 << 16), "max_vcpus clamped to ceiling");
+    // A `usize::MAX` request clamps to exactly the hard ceiling. Assert against the real constants so
+    // this can't silently drift when a ceiling changes (max_fibers is 1<<24 since the handle widening).
+    assert_eq!(
+        q.max_fibers,
+        svm_ir::MAX_FIBERS,
+        "max_fibers clamped to ceiling"
+    );
+    assert_eq!(
+        q.max_vcpus,
+        svm_ir::MAX_VCPUS,
+        "max_vcpus clamped to ceiling"
+    );
     // And never below 1 (the root must exist).
     host.set_quota(Quota {
         max_fibers: 0,

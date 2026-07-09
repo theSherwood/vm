@@ -362,7 +362,7 @@ debug.loc 2 0 0 0 9 3
 // generation guard is enforced identically end-to-end on both backends.
 
 /// A genuine handle (slot 0, generation 0) resumes; a forged generation-1 handle for the same slot
-/// (`(1 << 16) | 0 == 65536`, which the slot mask clamps back to slot 0) faults — on both backends.
+/// (`(1 << 24) | 0 == 16777216`, which the slot mask clamps back to slot 0) faults — on both backends.
 #[test]
 fn fiber_forged_generation_faults_identically() {
     // Genuine handle: the fiber runs and returns 99.
@@ -382,14 +382,14 @@ fn fiber_forged_generation_faults_identically() {
         \x20 return v2\n\
         }\n",
     );
-    // Forged handle `(1 << 16) | 0`: same slot 0, generation 1 ≠ 0 ⇒ FiberFault on both backends.
+    // Forged handle `(1 << 24) | 0`: same slot 0, generation 1 ≠ 0 ⇒ FiberFault on both backends.
     assert_jit_matches_interp(
         "func () -> (i64) {\n\
         block0():\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
         \x20 v2 = cont.new v0 v1\n\
-        \x20 v3 = i64.const 65536\n\
+        \x20 v3 = i64.const 16777216\n\
         \x20 v4 = i64.const 0\n\
         \x20 v5, v6 = cont.resume v3 v4\n\
         \x20 return v6\n\
@@ -403,12 +403,12 @@ fn fiber_forged_generation_faults_identically() {
 }
 
 /// A finished fiber's slot is recycled at a bumped generation: the next `cont.new` reuses slot 0 at
-/// generation 1 (handle `(1 << 16) | 0 == 65536`), and the *stale* generation-0 handle to the former
-/// occupant then faults even though slot 0 is live. Both backends must agree on each.
+/// generation 1 (handle `(1 << 24) | 0 == 16777216`), and the *stale* generation-0 handle to the
+/// former occupant then faults even though slot 0 is live. Both backends must agree on each.
 #[test]
 fn recycled_slot_generation_guard_agrees() {
-    // Fiber A (slot 0, gen 0) finishes; the next cont.new reuses slot 0 at gen 1 — returning the i32
-    // handle makes the reuse observable (65536). Both backends must produce the same handle.
+    // Fiber A (slot 0, gen 0) finishes; the next cont.new reuses slot 0 at gen 1 — returning the i64
+    // handle makes the reuse observable (16777216). Both backends must produce the same handle.
     assert_jit_matches_interp(
         "func () -> (i64) {\n\
         block0():\n\

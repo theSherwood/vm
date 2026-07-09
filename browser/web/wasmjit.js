@@ -45,9 +45,20 @@ export async function compileJit(ex, moduleBytes, { memory = null } = {}) {
   // The env.trap import records the last trap code; a trap is followed by `unreachable`, so the
   // recorded code + the caught RuntimeError together classify the fault.
   let lastTrap = 0;
+  const envBytes = ex.svm_wasmjit_env_bytes(); // fuel counter + cross-tier scratch
   const module = await WebAssembly.compile(wasm);
   const instance = await WebAssembly.instantiate(module, {
-    env: { memory: mem, trap: (code) => { lastTrap = code; } },
+    env: {
+      memory: mem,
+      trap: (code) => { lastTrap = code; },
+      // Cross-tier call into the interpreter (mixed-tier guests, slice 3c): the emitted JITted code
+      // hit an interp leaf. Re-enter the engine in-Rust (`svm_wasmjit_call_interp` runs the leaf on
+      // the bytecode interpreter over the shared memory's arg slots); a nonzero return is a trap, so
+      // we throw — unwinding the emitted wasm to the top-level `f0` call below (the trap model).
+      call_interp: (func, argsPtr) => {
+        if (ex.svm_wasmjit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier trap');
+      },
+    },
   });
   const f0 = instance.exports.f0;
 
@@ -57,22 +68,25 @@ export async function compileJit(ex, moduleBytes, { memory = null } = {}) {
     call(args = [], { fuel = DEFAULT_FUEL, winSize = 1 << 16 } = {}) {
       // Window + env cell in the cdylib's memory (both addressable by the emitted module).
       const win = Number(ex.svm_alloc(winSize));
-      const env = Number(ex.svm_alloc(8));
+      ex.svm_wasmjit_init_window(win, winSize); // lay the module's data segments into the window
+      const env = Number(ex.svm_alloc(envBytes));
       new DataView(mem.buffer).setBigInt64(env, BigInt(fuel), true);
       lastTrap = 0;
       try {
         const value = f0(win, env, ...args);
         return { value: BigInt(value) };
       } catch (e) {
-        if (!(e instanceof WebAssembly.RuntimeError)) throw e;
-        const trap =
-          lastTrap === TRAP_OUT_OF_FUEL ? 'out_of_fuel'
-          : lastTrap === TRAP_MEMORY_FAULT ? 'memory_fault'
-          : 'wasm'; // div0 / overflow / guest `unreachable` — wasm's own trap
-        throw { trap, wasmError: e };
+        if (e instanceof WebAssembly.RuntimeError || e.message === 'cross-tier trap') {
+          const trap =
+            lastTrap === TRAP_OUT_OF_FUEL ? 'out_of_fuel'
+            : lastTrap === TRAP_MEMORY_FAULT ? 'memory_fault'
+            : 'wasm'; // div0 / overflow / guest `unreachable` / a cross-tier leaf trap
+          throw { trap, wasmError: e };
+        }
+        throw e;
       } finally {
         ex.svm_dealloc(win, winSize);
-        ex.svm_dealloc(env, 8);
+        ex.svm_dealloc(env, envBytes);
       }
     },
   };

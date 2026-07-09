@@ -4268,17 +4268,14 @@ fn drive(
                     durable: true,
                     host: HostCell::Excl(&mut *host),
                 };
-                {
-                    let frozen = freeze_drive(
-                        &mut fibers,
-                        &mut fiber_sp,
-                        &mut fiber_meta,
-                        &dom,
-                        &mut ctx,
-                        budget,
-                    )?;
-                    host.frozen_fibers = frozen
-                }
+                host.frozen_fibers = freeze_drive(
+                    &mut fibers,
+                    &mut fiber_sp,
+                    &mut fiber_meta,
+                    &dom,
+                    &mut ctx,
+                    budget,
+                )?;
             }
             return res;
         }

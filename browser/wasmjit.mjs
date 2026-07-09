@@ -107,6 +107,36 @@ block0(v0: i64):
   unreachable
 }`;
 
+// Mixed-tier (slice 3c): an integer caller (JITted) sums a SIMD leaf f(i)=2i over 0..n. The leaf
+// (v128 internally → out of subset, memory-free) runs on the bytecode interpreter via
+// env.call_interp; the whole-guest interp oracle (svm_run) must agree. (Floats are now in-subset,
+// so a float leaf would be JITted directly rather than crossing tiers.)
+const MIXED = `
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = call 1 (v9)
+  v11 = i64.add v8 v10
+  v12 = i64.const 1
+  v13 = i64.add v9 v12
+  br block1(v7, v11, v13)
+block3(v14: i64):
+  return v14
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64x2.splat v0
+  v2 = i64x2.add v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
+}`;
+
 async function main() {
   console.log(`module: ${wasmPath}\n`);
 
@@ -134,6 +164,22 @@ async function main() {
     let trapped = false;
     try { jit.call([0n]); } catch (e) { trapped = e.trap === 'wasm'; }
     report('trap parity (unreachable)', st === 3 && trapped, `interp status=${st}, jit trapped=${trapped}`);
+  }
+
+  // --- mixed-tier (slice 3c): JITted integer caller + interp SIMD leaf via env.call_interp ---
+  {
+    const bytes = encode(MIXED);
+    const jit = await compileJit(ex, bytes, { memory });
+    let allEq = jit !== null;
+    if (!jit) report('mixed (eligible)', false, 'svm_wasmjit_compile refused a mixed-tier module');
+    else for (const arg of sweep) {
+      const { st, r } = interp(bytes, arg);
+      if (st !== 0) { allEq = false; break; }
+      if (jit.call([arg]).value !== BigInt.asIntN(64, r)) {
+        allEq = false; console.log(`    mixed(${arg}): jit != interp ${r}`); break;
+      }
+    }
+    report(`mixed-tier equality (JITted caller + interp SIMD leaf over ${sweep.length} args)`, allEq);
   }
 
   // --- speedup: the whole point. Time a heavy alu loop on both tiers. ---

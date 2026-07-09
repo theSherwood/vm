@@ -398,9 +398,10 @@ in session discussion; collected here so the next slice has a home to be picked 
 - [ ] **wasm-JIT tier** — compile SVM IR to wasm at the explicit compile points and run hot compute
   near-natively in the browser. The largest remaining browser project; full design + slice plan
   below (§ "wasm-JIT tier"). Highest leverage *after* the real-language playground tab makes browser
-  guests compute-hot. Ships with its own **`svm-wasmjit` cross-engine bench row** next to
-  `svm-bytecode-wasm` (same driver, same MISCOMPILE cross-check) — the projected ~5–20× is a claim
-  until that row measures it.
+  guests compute-hot. **The `svm-wasmjit` cross-engine bench row now measures it** (next to
+  `svm-bytecode-wasm`, same driver, same MISCOMPILE cross-check): **~16–112× over interp-in-wasm**,
+  landing at or below native Cranelift `svm-jit` — the projected number, confirmed and cross-checked
+  (`bench/cross-engine/README.md` § "SVM-in-wasm, the JIT tier").
 
 ## wasm-JIT tier — design & implementation plan
 
@@ -562,15 +563,47 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    per-Worker instantiation are deferred to the tiering (3) and threads (4) slices, where a
    mixed-tier guest actually needs the engine to call emitted code mid-run. AOT-at-`svm_par_compile`
    likewise moves to slice 3 (it belongs with the eligibility/partitioning analysis).
-3. **Tiering + deopt.** Suspension-point partitioning (JIT-eligible function analysis), interp
-   fallback wiring in the `Vcpu`, deopt on `map_region`/`protect`; the §13 corpus cases through the
-   JIT tier.
+3. **[in progress] Tiering + deopt.** Landed natively: `analyze(m)` classifies each function
+   **in-subset** (the JIT emits it), an **interp leaf** (all-integer signature, memory-free, a true
+   leaf, no concurrency/caps — the engine runs it), or neither, and decides `mixed_ok` (func 0
+   in-subset, everything reachable in-subset-or-leaf, nothing reachable suspends — a JITted frame
+   can't unwind across a suspension). `compile_module_mixed` emits the in-subset functions and lowers
+   a call to an interp leaf as `env.call_interp(func, args_ptr)`: the emitted code marshals i64
+   arg/result slots through the `env` scratch, the host callback runs the leaf on the **bytecode
+   engine** and writes results back. Crucially the JS/host stays the top-level caller, so a leaf
+   trap surfaces as a caught `RuntimeError` (the callback traps the wasm) — no trap-return protocol,
+   the slice-1/2 model preserved. Proven natively by `tests/mixed.rs`: an integer caller + a float
+   leaf (both i64- and i32-signature, exercising the arg widen / result narrow), emitted `f0` under
+   `wasmi` with `env.call_interp` wired to the real engine, matching the full-interpreter oracle over
+   an arg sweep. `tests/analysis.rs` (7 cases) pins the classification. **3c — in the browser too:**
+   `svm_wasmjit_compile` now emits via `compile_module_mixed`, `svm_wasmjit_call_interp(func,
+   args_ptr)` runs an interp leaf on the bytecode engine over the shared memory's arg slots (returns
+   nonzero on a leaf trap), and the JS linker's `env.call_interp` calls it and **throws** on nonzero
+   — which unwinds the emitted wasm to the top-level `f0` call (the trap model, preserved). The env
+   cell is sized by `svm_wasmjit_env_bytes` (fuel + cross-tier scratch). Proven in **Chromium** (the
+   `#wasmjit` item now also runs a mixed guest: a JITted integer caller summing a float leaf,
+   matching the interpreter) and by the Node `wasmjit.mjs` mixed case. **Deopt is a genuine no-op
+   until a later slice** brings `cap.call` into the JIT subset — an eligible guest can't call a
+   domain-mutating cap today (it's out-of-subset → the guest isn't eligible → it stays on the
+   interpreter), so there is nothing to deopt yet; the analysis/fallback substrate is what landed.
 4. **Threads.** Per-Worker registration over `SharedSlots`; the proven schedule-independent kernels
    (4000 / futex / io) run with compute regions JITted, differential vs the interp path.
 5. **§22 + §14 as real codegen.** Guest `jit_compile`/`install` emits wasm (validator-gated) — the
    guest-JIT ops become an actual JIT; `instantiate_module` units compile on push.
-6. **Long tail + measurement.** SIMD/v128 (mostly 1:1), remaining ops; an `svm-wasmjit` row in the
-   cross-engine bench next to `svm-bytecode-wasm` so the gain is *measured*; a playground toggle.
+6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
+   row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
+   over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),
+   at-or-below native Cranelift `svm-jit` — the row also generalized the emitter with **entry-rooting**
+   (`compile_module_mixed_entry` / `analyze_from` — the JIT entry needn't be func 0) and **`data`
+   tolerance** (the host materializes `m.data` into the window via `svm_wasmjit_init_window`; the
+   emitter no longer rejects data segments). **Scalar floats now in-subset:** f32/f64 const / arith /
+   unary / compare / conversions (`trunc_sat` + trapping `trunc` + `convert`) / casts
+   (`demote`/`promote`/`reinterpret`) / loads+stores — all 1:1 with core wasm (the one exception is
+   scalar `Fma`, which has no core-wasm opcode → stays interpreter-tier). Proven by three float
+   differential kernels (arith/unary/compare, conversions, trapping trunc) over ±0/±1/±inf/NaN/
+   subnormal bit patterns, compared **exactly** (NaN payloads + rounding) vs the bytecode oracle; and
+   the cross-engine `fma` kernel now JITs (the frontend lowers it to mul+add) at ~2.7 ns, near native.
+   Remaining for the slice: SIMD/v128 (mostly 1:1) + `call_indirect`; a playground toggle.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);

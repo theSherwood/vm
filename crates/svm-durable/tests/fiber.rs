@@ -457,14 +457,14 @@ block0(v0: i64, v1: i64):
   return v2
 }
 "#;
-    // Forged handle `(1 << 16) | 0`: same slot 0 (the mask clamps it), generation 1 ≠ 0 ⇒ FiberFault.
+    // Forged handle `(1 << 24) | 0`: same slot 0 (the mask clamps it), generation 1 ≠ 0 ⇒ FiberFault.
     const FORGED: &str = r#"
 func () -> (i64) {
 block0():
   v0 = ref.func 1
   v1 = i64.const 4096
   v2 = cont.new v0 v1
-  v3 = i64.const 65536
+  v3 = i64.const 16777216
   v4 = i64.const 0
   v5, v6 = cont.resume v3 v4
   return v6
@@ -503,7 +503,7 @@ block0(v0: i64, v1: i64):
 #[test]
 fn recycling_reuses_a_freed_slot_with_a_bumped_generation() {
     // Fiber A (handle slot 0, gen 0) runs to completion; the next cont.new reuses slot 0 at gen 1, so
-    // its handle is `(1 << 16) | 0 == 65536`. Returning the i64 handle makes the reuse observable.
+    // its handle is `(1 << 24) | 0 == 16777216`. Returning the i64 handle makes the reuse observable.
     const REUSE: &str = r#"
 func () -> (i64) {
 block0():
@@ -527,8 +527,8 @@ block0(v0: i64, v1: i64):
     });
     assert_eq!(
         run_normal(&reuse),
-        Ok(vec![Value::I64(65536)]),
-        "the freed slot 0 is reused at generation 1 ⇒ handle (1<<16)|0"
+        Ok(vec![Value::I64(16777216)]),
+        "the freed slot 0 is reused at generation 1 ⇒ handle (1<<24)|0"
     );
 
     // After slot 0 is recycled (now holds fiber B at gen 1), resuming A's stale gen-0 handle (i64 0)

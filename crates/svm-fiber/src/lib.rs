@@ -45,29 +45,33 @@ mod switch;
 #[path = "switch_x86_64_windows.rs"]
 mod switch;
 
-// OS-specific guard-paged control stack (the unix mmap one backs both unix arches). Selected when the
-// PROTOTYPE `arena-stacks` allocator is OFF.
+// Arena allocator — the DEFAULT control-stack backend on every supported target: sub-allocate stacks
+// from a few large reservations with a free-list instead of one guarded `mmap`/`VirtualAlloc` per
+// fiber, so concurrency scales past the `vm.max_map_count` VMA wall (each fiber is ~0 extra VMAs).
+// Overflow protection is the always-on svm-jit software stack-check (there is no per-fiber guard page).
+// See `stack_arena.rs`. Opt back to the guard-paged backend with `guard-page-stacks` (rollback, or the
+// guard-page overflow oracle the `stack_guard_fuzz` test needs).
 #[cfg(all(
-    not(feature = "arena-stacks"),
-    unix,
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-#[path = "stack_unix.rs"]
-mod stack;
-#[cfg(all(not(feature = "arena-stacks"), windows, target_arch = "x86_64"))]
-#[path = "stack_windows.rs"]
-mod stack;
-// PROTOTYPE arena allocator (feature `arena-stacks`) — replaces the per-fiber guarded reservation on
-// every supported target (overflow protection moves to the svm-jit software `stack-check`); see
-// `stack_arena.rs`.
-#[cfg(all(
-    feature = "arena-stacks",
+    not(feature = "guard-page-stacks"),
     any(
         all(unix, any(target_arch = "x86_64", target_arch = "aarch64")),
         all(windows, target_arch = "x86_64")
     )
 ))]
 #[path = "stack_arena.rs"]
+mod stack;
+// OS-specific guard-paged control stack (the unix mmap one backs both unix arches), the opt-out
+// backend (`guard-page-stacks`): one `mmap`+`PROT_NONE` (unix) / `VirtualAlloc`+`PAGE_NOACCESS`
+// (windows) reservation per fiber, with a hardware overflow guard page.
+#[cfg(all(
+    feature = "guard-page-stacks",
+    unix,
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "stack_unix.rs"]
+mod stack;
+#[cfg(all(feature = "guard-page-stacks", windows, target_arch = "x86_64"))]
+#[path = "stack_windows.rs"]
 mod stack;
 
 // Safe RAII asymmetric-coroutine wrapper (ABI-agnostic; built on `switch` + `stack`).

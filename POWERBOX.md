@@ -496,6 +496,34 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   one more reflection op (`cap.self.ops(handle)` populated at grant time like F7/F9) — logged here so
   the choice is deliberate; the default is to keep op vocabularies wholly between embedder and guest
   (§2a: the VM stays mechanism, never semantics).
+- **F15 — a process substrate (the execution half; svm as a base for shells and OSes).** *Vision,
+  not yet scheduled — logged so the design intent is captured.* The long-term aim is for svm to be a
+  substrate a **shell or OS personality** runs on. Two halves: a *filesystem* (the **Fs capability**,
+  `svm_run::fs` — the VFS `open`/`read`/…, plus the file-backed `mmap`/`msync` storage shape) and a
+  *process model*. The filesystem half exists; this is the process half.
+
+  The primitives are largely already here — a **process is a confined child domain**: DESIGN.md §14's
+  `Instantiator` already spawns a child in an **attenuated power-of-two sub-window** ("a sub-window is
+  indistinguishable from a top-level window"), `thread.spawn` gives OS-thread vCPUs, the `Exit`
+  capability carries an exit *code*, and **F13** (capability revocation) is the cap-level analogue of
+  `kill`. And §2/§9 already name **"a separate process" as the robust distrust boundary**, so a
+  first-class process model *aligns with* the isolation-tier design rather than fighting it. What a
+  shell would additionally need, none of it a departure from the model:
+  1. **A `Process`/`Spawn` capability** — launch a program (an svm module for an in-VM child; or, for
+     the standalone-binary case, a real host process behind a `HostFn`) with **argv/env**, returning a
+     handle, and **`wait` for its exit status** (the parent observing the child's `Exit` code — today
+     `Exit` terminates but is not *waitable* by a parent).
+  2. **Stdio plumbing between children** — mint a connected `Stream` *pair* (pipe) and hand each end to
+     a different child, so `a | b` works. The `Stream` capability already models endpoints; this needs
+     a way to create a joined pair (cf. the §13 `SharedRegion` ring for the zero-copy data plane).
+  3. **Lifecycle/signals** — `wait`, terminate (F13 revocation), exit-status propagation, and a minimal
+     signal surface.
+
+  Concretely this unblocks Lua's `main.lua` (the one official suite file still out of scope — it
+  drives `os.execute` of the standalone `lua` binary) and, more importantly, positions the powerbox as
+  a real OS-personality substrate. The building blocks (§14 child domains, Fs, `Exit`, F13) mean this
+  is composition of existing mechanism, not new VM semantics — consistent with keeping the VM pure
+  mechanism (§2a).
 
 ---
 

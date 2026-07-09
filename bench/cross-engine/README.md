@@ -15,6 +15,7 @@ feeds every engine — including the SVM ones, which run IR produced by the **re
 | `svm-jit` | this repo's Cranelift JIT (`svm_jit::compile` once → `CompiledModule::run`), on **LLVM-frontend** IR |
 | `svm-bytecode` | this repo's bytecode engine (`bytecode::compile_and_run`), on LLVM-frontend IR |
 | `svm-bytecode-wasm` | the **same bytecode engine compiled to wasm** (the `BROWSER.md` `svm-browser` cdylib) running the same IR on Node/V8 — the cost of double-sandboxing the interpreter (optional: needs `node`) |
+| `svm-wasmjit` | the same IR **JIT-compiled to wasm** (the `svm-wasmjit` emitter, `BROWSER.md` § "wasm-JIT tier") and run on Node/V8 — beside `svm-bytecode-wasm` it is JIT-in-wasm vs interpreter-in-wasm on identical IR. Integer + scalar-float subset (a SIMD/`call_indirect`/`fma` kernel has no row); `result@small` is cross-checked against native bytecode (a mismatch is a loud `MISCOMPILE`). Driven by `browser/bench_jit.mjs` (optional: needs `node` + the cdylib) |
 | `svm-tree-walk` | this repo's tree-walking oracle (`svm_interp::run`), on LLVM-frontend IR |
 | `python` | CPython 3 |
 | `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `svm-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
@@ -177,6 +178,40 @@ serial, so that latency can't be hidden by ILP. That's the honest picture of the
 modest tax on compute, a real one on pointer-chasing workloads. (Optional row: it needs `node` and the
 `svm-browser` wasm32 cdylib — the driver builds it once on demand, or skips the row with a note. wasm32
 on V8 is the actual browser target; no Wasmtime/`build-std` required.)
+
+## SVM-in-wasm, the JIT tier (`svm-wasmjit` vs `svm-bytecode-wasm`)
+
+The `svm-bytecode-wasm` row runs the *interpreter* inside wasm. The `svm-wasmjit` row runs the same IR
+**JIT-compiled to wasm** (the `svm-wasmjit` emitter — `BROWSER.md` § "wasm-JIT tier"): SVM IR → a
+WebAssembly module, which V8 then tiers up to native. Side by side, the two rows isolate exactly what
+the browser JIT tier buys — JIT-in-wasm vs interpreter-in-wasm, identical IR, same V8. The integer +
+scalar-float subset is emitted (a SIMD or `call_indirect` kernel, or a fused-`fma` one, has no
+`svm-wasmjit` row); every row's `result@small` is cross-checked against native bytecode, so the row
+doubles as a wasm-JIT-vs-native differential — a mismatch prints a loud `MISCOMPILE`.
+
+Indicative shape (per-iter ns; absolute numbers machine-dependent):
+
+| kernel | `svm-bytecode-wasm` | `svm-wasmjit` | interp/jit | `svm-jit` (native Cranelift) |
+|---|--:|--:|--:|--:|
+| alu | ~65 | ~1.8 | **~36×** | ~1.9 |
+| xorshift | ~82 | ~2.0 | **~41×** | ~1.9 |
+| call | ~120 | ~7.0 | ~17× | ~6.4 |
+| mem | ~67 | ~1.8 | **~37×** | ~2.0 |
+| chase | ~176 | ~2.6 | **~68×** | ~1.6 |
+| chase_rand | ~351 | ~21 | ~16× | ~22 |
+| fnv | ~160 | ~1.4 | **~112×** | ~1.3 |
+| fma (f64 `a*b+c`) | ~34 | ~2.7 | ~13× | ~2.8 |
+
+Reading: JITting the IR to wasm is **~16–112× faster than interpreting it inside wasm**, and lands
+**at or below native Cranelift `svm-jit`** on most kernels — V8's TurboFan optimizes the emitted wasm as
+well as (sometimes better than) our `-O` Cranelift backend, and it pays none of the interpreter's
+double-sandbox tax because the guest's masking/bounds are *compiled in*, not re-checked per op. The
+pointer-chase kernels (`chase_rand`) still bottleneck on memory latency (the same wall every compiled
+engine hits), so their speedup is smaller. So the honest browser-JIT picture: **near-native compute for
+the integer + scalar-float subset** (`fma`'s f64 recurrence JITs to ~2.7 ns, on top of native
+Cranelift), converging on the memory hierarchy for pointer-chasing — the payoff the wasm-JIT tier
+exists for, now measured, not asserted. (Same optionality as `svm-bytecode-wasm`: needs `node` +
+the cdylib; a non-eligible kernel is simply skipped.)
 
 ## End-to-end real programs
 

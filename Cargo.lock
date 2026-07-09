@@ -684,6 +684,7 @@ name = "svm-interp"
 version = "0.0.0"
 dependencies = [
  "page_size",
+ "svm-encode",
  "svm-ir",
  "svm-mask",
  "svm-mem",

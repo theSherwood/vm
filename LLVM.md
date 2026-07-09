@@ -744,6 +744,28 @@ first-class story: promoting the prototype `IoRing`/`Blocking` route vs the dedi
 (this slice used the direct `HostCap` surface). (The SQL-logic-scripts scale follow-up landed —
 slice BK below.)
 
+**Slice BL (DONE) — LMDB: an embedded memory-mapped B-tree in the sandbox (the *second* storage
+shape).** SQLite proved the read/write VFS shape; **LMDB** (OpenLDAP's Lightning MDB — the original
+mmap'd B-tree that libmdbx later hardened; ~12k lines vs libmdbx's 37k and a fraction of its OS
+surface) proves the **memory-mapped** shape, where the data plane *is* the file-backed mapping —
+readers walk the B-tree straight out of the map, no per-access host calls. The Fs capability grew a
+**file-backed-mmap surface** — `FS_MMAP`/`FS_MSYNC`/`FS_MUNMAP` (ops 9/10/11, both backends): `mmap`
+binds a guest window buffer to a file region (copy-in), `msync` flushes a sub-range back, `munmap`
+drops it. A guest shim (`demos/lmdb/lmdb_shim.c`) bridges LMDB's `mmap`/`msync`/`pread`/`open`/… to
+`__vm_cap_resolve("fs")` + `__vm_host_call`, plus single-thread no-op stubs (pthread/sysconf/uname/…)
+for the OS odds-and-ends `MDB_NOLOCK` never exercises — everything else (malloc/mem\*/str\*/printf/…)
+the on-ramp already synthesizes. Opened `MDB_WRITEMAP|MDB_NOLOCK|MDB_NOSUBDIR`, so every page (data +
+meta) lands in the map, making the copy-in/flush-out emulation coherent (the buffer is the sole
+authority). The one on-ramp addition: **`llvm.trap`/`llvm.debugtrap`** (from `__builtin_trap()`) is
+now dropped — clang always follows it with an `unreachable` terminator, which already traps. The
+test (`demo_lmdb_mmap_cap_vs_native`) asserts three directions, as Phase B did: guest (`mem_fs`)
+stdout byte-matches native over fill → delete → reopen → point-lookups + full ordered cursor scan (a
+running checksum over the B-tree walk) + stat; under `host_fs` the guest's `data.mdb` lands on disk
+and **native LMDB reads the capability-written mmap database** byte-identically; and the guest reads
+a native-written one. LMDB is fetched-not-vendored (OpenLDAP license), skips offline. Follow-on: a
+dedicated (non-`HostCap`) file-mmap capability + multi-mapping/shared-memory coherence for a
+crash-torture-grade story.
+
 **Slice BK (DONE) — SQLite's own test corpus in the sandbox (sqllogictest).** A compact
 **sqllogictest runner** as a guest program (`demos/sqlite/sqlite_logictest.c`): record parser
 (statement/query, `skipif`/`onlyif`, `halt`, CRLF-tolerant), **reference-exact value formatting**
@@ -757,6 +779,134 @@ records / ~56k queries**, and every one passes **twice over**: the guest's own s
 the native build of the same runner. Per-record guest cost is small: a 15k-record file runs in
 ~4-5 s (release). CI runs `select1` by default; `demo_sqlite_logictest_full` (#[ignore]) sweeps all
 seven (`cargo test --test translate demo_sqlite_logictest_full -- --ignored`).
+
+**Slice BM (SPIKE) — Postgres `--single`: whole-program bitcode pipeline + gap inventory (the
+setjmp + File-capability capstone; ladder #7).** The feasibility spike for the *biggest* real
+program on the ladder — "SQLite Phase B at 100×." Establishes the pipeline and, crucially, turns
+"integrate Postgres" into a **concrete, quantified gap list** (the point of picking a target is
+picking the gap it drives — §"Translator gaps these programs force"). The reproduction lives in
+`crates/svm-run/demos/postgres/` (`build_bitcode.sh` + `emit_bc.py` — fetched-not-vendored, PostgreSQL
+license). What the spike established:
+- **Native oracle works.** Postgres **17.5** builds with `clang-18` (minimal config: no
+  icu/ssl/zlib/readline/xml/gssapi), and `postgres --single -D <data> -O -j postgres` reads SQL on
+  **stdin** and prints results (`SELECT 1+1 AS two, upper('hi')` → `2` / `HI`). This is the
+  differential target, exactly as SQLite/LMDB are validated. (`--single` sheds the whole category-3
+  postmaster: no fork-per-connection, no SysV shmem across processes, no listening socket, no
+  signals-driven concurrency — one process, one private address space, SQL on stdin.)
+- **The on-ramp reader scales to whole-Postgres.** Postgres is **not** a single amalgamation, so the
+  pipeline is `-flto`-free per-TU bitcode (`clang -O2 -emit-llvm -fno-vectorize -fno-slp-vectorize`,
+  flags lifted verbatim from the makefile's own compile lines) → **`llvm-link`** the exact
+  `postgres` link set (833 modules: the backend + `libpgcommon_srv`/`libpgport_srv` + timezone) →
+  one **17.8 MB `.bc`** / **78 MB, 1.59 M-line `.ll`** (**14 563** defined functions). The in-house
+  textual-`.ll` reader ingests it and **fail-closes cleanly** on the first unsupported construct
+  (~19 s, mostly the `llvm-dis` subprocess) — no OOM, no mis-parse. Scale is **not** the blocker.
+- **Confirmed non-blockers.** `invoke`/`landingpad`/`resume` = **0** — `--single`'s entire
+  `PG_TRY`/`ereport` error model is `sigsetjmp`/`siglongjmp` (**DONE**, all three engines incl. JIT),
+  **not** C++ EH; EH stays a C++ concern. Also **0** `x86_fp80`/`fp128`, **0** `thread_local`, **0**
+  `llvm.stacksave` (no VLAs survive `-O2`). The named prerequisites (setjmp/longjmp, the Fs
+  capability, Dragon4 `%f`/`%g`) are all landed — Postgres is genuinely *next*, not primitive-blocked.
+- **The gap list (the deliverable).** Static inventory over the linked module:
+  1. **Inline `asm` — 921 sites, but only ~9 distinct templates.** 559 are **empty memory-barrier**
+     asm (`""` + `~{memory}` — compiler fences) → **drop** (no-op); `lock;addl $$0,0(%rsp)` /
+     `rep;nop` (barrier / PAUSE) → **drop**; `xchgb` / `xaddl` / `xaddq` / `cmpxchgl` / `cmpxchgq`
+     (spinlock TAS + `arch-x86.h` atomics) → **atomic-RMW, and single-threaded under `--single` ⇒
+     plain load-op-store**; `cpuid` / `popcntq` / `popcntl` (`pg_bitutils` runtime dispatch) →
+     recognize `popcnt`→`Popcount`, feature-detect `cpuid`→fixed value (fall to the SW path). A small
+     fixed **recognize-and-lower table** — the same shape as the `setjmp`/`memcpy`/`llvm.trap`
+     recognizers — not open-ended asm support. **#1 blocker; the biggest single lever.**
+  2. **`atomicrmw` — 110 sites** (the `__atomic`/`__sync` generic path). Single-threaded lowering to
+     load-op-store; pairs with the asm-atomic recognizer (same lowering, two front doors).
+  3. **`i128` — 252 sites** (64×64→128 widening in the `numeric`/aggregate accumulators). Two routes:
+     the **config lever** `#undef HAVE_INT128`/`PG_INT128_TYPE` (Postgres ships a pure-64-bit
+     `int128.h` fallback — zero translator work), or on-ramp i128-as-`{i64,i64}` emulation. Config first.
+  4. **Vectors — ~3.6 k `<N x …>` sites** even under `-fno-vectorize`: mostly `<16 x i8>`/`<N x i8>`
+     from **small-struct `memcpy`/`memset` lowering** (+ some `<2 x double>`/`<4 x i32>`). The on-ramp
+     scalarizes 2-lane (slice V) and 4-lane float (slice Y); wide **integer** vector *memory* ops
+     want a general "scalarize any vector load/store/`memcpy` lane-wise" pass. The **fuzziest** gap —
+     needs a width census before scoping; some fall away under `-fno-builtin-mem*`.
+  5. **Varargs breadth — 43 `llvm.va_start`** (`elog`/`ereport`/`snprintf` family; **0** `va_arg`
+     instrs — clang inlines the SysV `va_arg` as GEP+load). The on-ramp's varargs `printf` covers the
+     shape; confirm it holds across Postgres' `appendStringInfo`/`errmsg` sites.
+  6. **The OS waist — the fs/syscall shim (runtime, not an IR gap).** Postgres calls raw
+     `open`/`pread`/`pwrite`/`fsync`/`ftruncate`/`unlink`/`mkdir`/`opendir`/`readdir`/`stat` +
+     `getpid`/`geteuid`/`getpwuid`/`time`/`clock_gettime`/`sysconf` — far more surface than SQLite's
+     tidy `sqlite3_vfs`, but the same play: bridge the file ops to the granted **`fs` capability**
+     (Phase B / LMDB machinery), deterministically stub the rest (fixed pid/euid/clock, single-thread
+     no-ops), and gate the root-check (`geteuid()==0`).
+  7. **Data-dir strategy.** `--single` needs an initialized cluster; the cheap first move is `initdb`
+     **natively**, then expose the dir read/write through the `fs` cap (mirroring SQLite Phase B,
+     where the file is cap-written but the schema is guest-driven) — deferring in-sandbox `initdb`
+     (`postgres --boot`, another backend program) to a later slice.
+  **Staged plan:** (1) portable-atomics/no-`int128` config + the asm/`atomicrmw`
+  recognize-and-lower table → the module translates; (2) the vector-memory scalarization census +
+  pass; (3) the fs/syscall shim over the `fs` cap + a pre-`initdb` data dir → boot `postgres
+  --single` on a fixed SQL script, byte-identical to native; (4) a `pg_regress` subset. This slice
+  is the **map**; the follow-ons are the territory.
+
+**Slice BN (DONE) — inline-asm recognize-and-lower: barriers + `popcnt` (Postgres gap #1, part 1).**
+The first translator gap from slice BM. The on-ramp does **not** execute asm — opaque machine code
+can't be masked or re-verified, which is the whole §2a sandbox thesis — so a **fixed allowlist**
+matches the handful of template strings known C headers emit and re-emits their *semantics* as
+ordinary verified IR, failing closed on anything else. Landed:
+- **Parser.** `InlineAssembly` now carries the `template`/`constraints` strings (was type-only);
+  `call_signature` parses `asm [sideeffect|alignstack|inteldialect|unwind] "<tmpl>", "<cons>"` in the
+  callee position (covers `call` **and** `invoke`, which share it), and `skip_arg_attrs` learns
+  `elementtype(<ty>)` (the pointee type an indirect `*m` memory operand carries). Inline asm was
+  previously unparseable (`expected a call callee, found asm`).
+- **Recognizer (`lower_inline_asm`).** Dispatched early in the call chain (an asm callee has no
+  `callee_name`): **compiler/memory barriers** (`""`+`~{memory}`, `lock; addl $$0,0(%rsp)`) and the
+  **PAUSE** hint (`rep; nop`) → **dropped** — no architectural effect for a single-address-space,
+  single-threaded guest (and correct in tail position: the drop falls through to the real `ret`);
+  **`popcnt`** (`popcntq`/`popcntl $1,$0`, `pg_bitutils`' fast-path) → the `Popcnt` unary op (as
+  `llvm.ctpop`). Any **unrecognized** template is a clean `Unsupported` (§2a fail-closed) — never a
+  silent drop. The x86 atomic-RMW templates are deliberately left for the config lever (portable
+  atomics emit `atomicrmw`/`cmpxchg` **instructions**, which the on-ramp *already* lowers
+  single-threaded — one lowering, not two front doors), and `cpuid` disappears with the same
+  popcount-dispatch lever.
+- **Tests** (`inline_asm_barriers_dropped`, `inline_asm_popcnt_lowers`,
+  `inline_asm_unrecognized_is_fail_closed`) — differential vs native (the asm survives `-O2` into the
+  bitcode, verified), plus the fail-closed contract. **279 translate tests green, fmt + clippy clean.**
+- **Effect on the capstone:** the full 78 MB Postgres module now **parses past the entire 921-site
+  inline-asm surface** — asm is no longer the blocker.
+
+**Slice BO (DONE) — inline-asm atomics + cpuid: the whole Postgres asm surface clears.** Extends the
+recognizer (BN) with the remaining templates, so the complete backend module (see BP) translates past
+**all 921** inline-asm sites:
+- **x86 atomic RMW / CAS** (`arch-x86.h` `pg_atomic_*` + `s_lock.h` TAS): `xchg{b,w,l,q}` →
+  `AtomicRmw::Xchg`, `xadd{b,w,l,q}` → `AtomicRmw::Add`, `cmpxchg{l,q}; setz` → `AtomicCmpxchg` +
+  the `{old, success}` aggregate. These lower to the **same runtime atomic ops** the on-ramp already
+  emits for `atomicrmw`/`cmpxchg` **instructions** — so they are *genuinely atomic* (not a racy
+  load-op-store) and need **no single-threaded gate**, superseding BM's framing. Operand roles are
+  pinned by asserting the exact constraint signature (`=q,=*m,0,*m` / `={ax},=*m,=q,{ax},r,*m`),
+  fail-closed otherwise; narrow (i8/i16) variants route through the existing narrow CAS-loop helpers
+  (`uses_narrow_atomic` now also spots a narrow atomic *asm* call so the helper registers).
+- **`cpuid`** (`xchgq %rbx; cpuid; xchgq %rbx`, the `pg_bitutils`/`pg_crc32c` feature probe) → an
+  all-zero `{eax,ebx,ecx,edx}`, so Postgres takes its **portable software** popcount/CRC paths, which
+  compute identical results → still byte-identical to native.
+- Test `inline_asm_x86_atomics` mirrors `arch-x86.h`'s exact asm (TAS/fetch-add/CAS), differential vs
+  native. **280 translate tests green, fmt + clippy clean.**
+
+**Slice BP (IN PROGRESS) — the complete Postgres module + the external-surface map.** Two findings
+that reshape the capstone estimate:
+- **The link set must be complete.** An earlier incomplete link (a fragile bitcode-emit step) left
+  functions like `hash_numeric` *declared-only*, surfacing as a spurious `constexpr reference to
+  @hash_numeric`. Fixed the pipeline (`emit_bc.py` now bumps the source mtime instead of deleting the
+  `.o`, so it's idempotent and never corrupts the native tree; a clean rebuild + regenerated
+  `objfiles.txt` restores every object): the complete module is **834 modules / 14 730 defined
+  functions**, and it now translates cleanly past all asm.
+- **The remaining surface is the OS/libc waist, and it is large.** With asm cleared, translation
+  fail-closes at the **first undefined external** (`log`). The module has **251 distinct declared-only
+  externals**: **libm** (18 — `log`/`exp`/`pow`/`sin`/`cos`/… — transcendentals the SVM has no op for;
+  need a **bundled guest libm**, the raytrace "bring-your-own-libm" model, llvm-linked in), **file/OS
+  syscalls** (~30 — `open`/`pread`/`pwrite`/`fsync`/`stat`/`mkdir`/`opendir`/`mmap`/… → the **`fs`
+  capability** shim, gap #6), **proc/time/signal** (~24 — `getpid`/`geteuid`/`clock_gettime`/
+  `sigaction`/`fork`/`kill`/… → deterministic stubs), and **~180 other libc** (`strtod`/`snprintf`/
+  `qsort`/`setlocale`/`strftime`/`memmem`/… — some the on-ramp synthesizes, many not yet). **Every one**
+  must resolve (synthesized helper / capability / bundled guest code / stub) before the module
+  translates, and then verify + the runtime (initdb data dir, storage manager, WAL, single-process
+  shmem, catalog bootstrap) must all work. **This is the multi-week bulk of the capstone** — the asm
+  slices (BN/BO) were the tractable translator corner; the external waist is the mountain. The map
+  above is the plan of record; each category is a follow-on slice.
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
@@ -1413,8 +1563,27 @@ Native oracle exit 0, including ltests' real `atexit` leak check. One more trans
 constexpr **`ptrtoint (ptr @g to i32)` ignored its target width** (raw i64 address into i32
 arithmetic, verify TypeMismatch) — fixed + `const_ptrtoint_i32_width` differential.
 
-Still excluded: `attrib.lua` (the real `package` searchers), `main.lua` (the standalone `lua`
-binary), `all.lua` (the driver), `heavy.lua` (deliberate memory exhaustion).
+**The official suite under its own driver — ACHIEVED ✅ (`all.lua`, the capstone).** The unmodified
+`testes/all.lua` — the Lua distribution's own test *driver* — runs on the on-ramp: the whole
+`testes/` tree is seeded onto the **in-memory Fs**, and `all.lua` `dofile`s each file through its own
+`loadfile → string.dump → load` round-trip, `require`s sibling modules, and ends at `final OK !!!`.
+It finds and loads every file off the (in-memory) disk via the **real** `luaopen_package`
+(`loadlib.c`) searching `package.path` — the minimal-`require` shim is retired for stock
+`require`/`package`/`searchpath`/`loadlib` (the ANSI C-library searcher returns `"absent"`, which the
+suite guards for). T library active, one shared `lua_State`, the suite's own `_port`/`_soft`/`_nomsg`
+knobs → **26 files** run (`main.lua` early-returns under `_port`, `big.lua` under `_soft`), including
+`attrib.lua` (real `require`/`searchpath`/`package.config`, asserted `== 27`). `lua_all.bc` /
+`tests/lua_all.rs` (JIT gates CI ~20 s; interpreter runs `#[ignore]`d full-depth); native oracle exit
+0 incl. ltests' `atexit` leak check. The guest allocator became a **coalescing explicit-free-list**
+(dlmalloc-lite, boundary tags): the whole suite in one state peaks ~19 MiB live, and coalescing keeps
+the arena high-water near that — the earlier power-of-two-class allocator fragmented ~3× and overran
+the reference JIT's 64 MiB window.
+
+So the claim is now the strongest form: **the on-ramp runs Lua 5.4.7's official test suite, as
+shipped, driven by the suite's own `all.lua`** — on the JIT, bytecode, and tree-walker. Only
+`main.lua` (spawns the standalone `lua` binary; needs `os.execute` of a real process) and `heavy.lua`
+(deliberate multi-GiB exhaustion) are outside scope, both of which `all.lua` itself omits from this
+configuration.
 
 ### Lua with floats — ACHIEVED ✅ (all three engines, end to end)
 **Goal (met).** Real Lua 5.4.7 core **`llvm-link`ed with the bundled guest `libm` + guest `strtod`**
@@ -1693,6 +1862,11 @@ phases, both worth doing:
 6. **The storage capability** → **SQLite Phase B** (read/write VFS) and **libmdbx** (file-backed mmap) —
    two distinct storage shapes proving real durable I/O under zero ambient authority.
 7. **Postgres `--single`** — the setjmp + File-capability capstone ("SQLite Phase B at 100×").
+   **SPIKE DONE (slice BM):** native oracle runs, the whole-program bitcode pipeline is established
+   (833 modules → one 78 MB `.ll` the reader ingests + fail-closes on), and the translator gap list
+   is quantified — inline-`asm` (~9 templates), `atomicrmw`, `i128`, vector-memory, the fs/syscall
+   shim. Config levers (portable atomics, no-`int128`) + a small asm recognize-and-lower table clear
+   the top blockers. See `crates/svm-run/demos/postgres/` for the reproduction.
 8. **The WebGPU capability** (its own section below) and **the network/egress capability** (curl/git) —
    the remaining capability frontiers.
 

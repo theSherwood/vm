@@ -1460,6 +1460,34 @@ fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
     check_demo_vs_native_flags(name, rel, stdin, &[]);
 }
 
+/// Fetch (and cache) LMDB's source (`mdb.c`/`midl.c`/`lmdb.h`/`midl.h`) from the upstream GitHub
+/// mirror. OpenLDAP Public License — **not vendored** (fetched once per machine, like the SQLite
+/// amalgamation). Returns the cache dir, or `None` (skip) when offline.
+fn fetch_lmdb() -> Option<PathBuf> {
+    const BASE: &str = "https://raw.githubusercontent.com/LMDB/lmdb/mdb.master/libraries/liblmdb";
+    let cache = std::env::temp_dir().join("svm_lmdb_cache");
+    let _ = std::fs::create_dir_all(&cache);
+    for f in ["mdb.c", "midl.c", "lmdb.h", "midl.h"] {
+        let dst = cache.join(f);
+        if dst.exists() {
+            continue;
+        }
+        let ok = Command::new("curl")
+            .args(["-sfL", "--max-time", "120", "-o"])
+            .arg(&dst)
+            .arg(format!("{BASE}/{f}"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&dst);
+            eprintln!("note: skipping lmdb ({f} fetch failed — offline?)");
+            return None;
+        }
+    }
+    Some(cache)
+}
+
 /// Fetch (and cache in the temp dir) the SQLite amalgamation for the Phase A capstone. Public
 /// domain, ~9 MB — deliberately **not vendored**; fetched once per machine and reused. Returns the
 /// directory containing `sqlite3.c`/`sqlite3.h`, or `None` (skip, with a note) when offline.
@@ -1557,6 +1585,87 @@ fn powerbox_echo_stdin() {
                int main(void){ char buf[64]; long n; \
                while ((n = read(0, buf, sizeof buf)) > 0) write(1, buf, n); return 0; }";
     check_powerbox_vs_native("pb_echo", src, b"ping pong\n");
+}
+
+#[test]
+fn inline_asm_barriers_dropped() {
+    // Inline-asm recognizer — the **barrier** templates the on-ramp drops (no architectural effect
+    // for a single-threaded, single-address-space guest): the empty compiler barrier (`""` +
+    // `~{memory}`), Postgres' `pg_memory_barrier` (`lock; addl $0,0(%rsp)`), and the PAUSE spin hint
+    // (`rep; nop`). The arithmetic around them must stay byte-identical to native — proving the drop
+    // neither perturbs the value flow nor breaks the `ret` in tail position.
+    let src = "#include <stdio.h>\n\
+        int main(void){ int x = 0; \
+          for (int i = 0; i < 5; i++) { \
+            x += i * 3; \
+            __asm__ __volatile__(\"\" ::: \"memory\"); \
+            __asm__ __volatile__(\"lock; addl $0,0(%%rsp)\" ::: \"memory\",\"cc\"); \
+          } \
+          __asm__ __volatile__(\"rep; nop\"); \
+          printf(\"%d\\n\", x); return 0; }";
+    check_powerbox_vs_native("asm_barriers", src, b"");
+}
+
+#[test]
+fn inline_asm_popcnt_lowers() {
+    // Inline-asm recognizer — the hardware `popcnt` fast-path (`pg_bitutils`' `pg_popcount*_asm`):
+    // `popcntq $1,$0` / `popcntl $1,$0` lower to the `Popcnt` unary op (as `llvm.ctpop` does), so the
+    // guest matches the native `popcnt` instruction (incl. the defined `popcnt(0) == 0`).
+    let src = "#include <stdio.h>\n\
+        static inline unsigned long pcq(unsigned long v){ unsigned long r; \
+          __asm__(\"popcntq %1,%0\" : \"=r\"(r) : \"rm\"(v) : \"cc\"); return r; } \
+        static inline unsigned int pcl(unsigned int v){ unsigned int r; \
+          __asm__(\"popcntl %1,%0\" : \"=r\"(r) : \"rm\"(v) : \"cc\"); return r; } \
+        int main(void){ \
+          printf(\"%d %d %d\\n\", (int)pcq(0xF0F0F0F0F0F0F0F0UL), (int)pcl(0xABCDu), (int)pcq(0)); \
+          return 0; }";
+    check_powerbox_vs_native("asm_popcnt", src, b"");
+}
+
+#[test]
+fn inline_asm_x86_atomics() {
+    // Inline-asm recognizer — the x86 atomic templates from Postgres' `arch-x86.h` (`pg_atomic_*`) and
+    // `s_lock.h` (TAS): `xchgb` (test-and-set), `xaddl` (fetch-add), `cmpxchgl; setz` (compare-exchange).
+    // Each lowers to the on-ramp's real atomic op (`AtomicRmw`/`AtomicCmpxchg`) — the identical IR the
+    // `atomicrmw`/`cmpxchg` *instructions* produce — so results match native byte-for-byte. Exercised
+    // single-threaded (deterministic), but the lowering is genuinely atomic (not a racy load-op-store).
+    let src = "#include <stdio.h>\n\
+        static inline char tas(volatile char *lock){ char _res = 1; \
+          __asm__ __volatile__(\"lock\\n\\txchgb %0,%1\\n\" : \"+q\"(_res), \"+m\"(*lock) :: \"memory\"); \
+          return _res; } \
+        static inline int xadd(volatile int *p, int add_){ int res; \
+          __asm__ __volatile__(\"lock\\n\\txaddl %0,%1\\n\" : \"=q\"(res), \"=m\"(*p) : \"0\"(add_), \"m\"(*p) : \"memory\",\"cc\"); \
+          return res; } \
+        static inline int cas(volatile int *p, int *expected, int newval){ char ret; \
+          __asm__ __volatile__(\"lock\\n\\tcmpxchgl %4,%5\\n   setz\\t%2\\n\" \
+            : \"=a\"(*expected), \"=m\"(*p), \"=q\"(ret) : \"a\"(*expected), \"r\"(newval), \"m\"(*p) : \"memory\",\"cc\"); \
+          return (int)ret; } \
+        int main(void){ \
+          char lock = 0; int a1 = tas(&lock); int a2 = tas(&lock); \
+          int cnt = 100; int o1 = xadd(&cnt, 5); int o2 = xadd(&cnt, -3); \
+          int v = 102, exp = 102; int ok = cas(&v, &exp, 999); \
+          int exp2 = 5; int ok2 = cas(&v, &exp2, 7); \
+          printf(\"%d %d %d %d %d %d %d %d %d\\n\", a1, a2, o1, o2, cnt, ok, v, ok2, exp2); return 0; }";
+    check_powerbox_vs_native("asm_atomics", src, b"");
+}
+
+#[test]
+fn inline_asm_unrecognized_is_fail_closed() {
+    // The asm allowlist is **closed**: a template that is not a recognized barrier/`popcnt`/… must be
+    // a clean `Unsupported`, never silently dropped or mis-lowered. This is the §2a chokepoint —
+    // executing opaque machine code would defeat the sandbox, so an unknown template fails closed.
+    let Some(bc) = compile_to_bc(
+        "asm_unknown",
+        "int f(int x){ int r; __asm__(\"movl %1,%0; incl %0\" : \"=r\"(r) : \"r\"(x) : \"cc\"); \
+           return r; } \
+         int main(void){ return f(41); }",
+    ) else {
+        return;
+    };
+    match svm_llvm::translate_bc_path(&bc) {
+        Err(svm_llvm::Error::Unsupported(_)) => {}
+        other => panic!("expected Unsupported for unrecognized inline asm, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2800,6 +2909,375 @@ first FAILs:
             "{name}: guest stdout differs from native"
         );
         eprintln!("sqllogictest {name}: {summary}");
+    }
+}
+
+#[test]
+fn demo_lmdb_mmap_cap_vs_native() {
+    // **LMDB — an embedded memory-mapped B-tree KV store in the sandbox** (LLVM.md storage ladder,
+    // the *second* storage shape after SQLite's read/write VFS). LMDB (OpenLDAP's Lightning MDB, the
+    // original mmap'd B-tree that libmdbx later hardened) reads its B-tree straight out of a
+    // file-backed mmap — the data plane *is* the mapping. Here that mmap goes through the granted Fs
+    // capability's **mmap surface** (`FS_MMAP`/`FS_MSYNC`/`FS_MUNMAP`, `crates/svm-run/src/fs.rs`): a
+    // guest shim (`demos/lmdb/lmdb_shim.c`) bridges LMDB's `mmap`/`msync`/`pread`/`open`/… to
+    // `__vm_cap_resolve("fs")` + `__vm_host_call`, so the whole memory-mapped data plane flows through
+    // explicitly granted authority — zero ambient access. `MDB_WRITEMAP` makes every page (data +
+    // meta) land in the map, so the copy-in/flush-out emulation is coherent (the buffer is the sole
+    // authority); `MDB_NOLOCK|MDB_NOSUBDIR` keep it single-file, single-process (no lock table).
+    //
+    // Three assertions, mirroring SQLite Phase B:
+    //  1. **stdout differential** — the guest (mem_fs) byte-matches the native oracle (real mmap in a
+    //     temp dir) over fill → delete → close → reopen → point-lookups + full cursor scan (a running
+    //     checksum over the in-order B-tree walk) + stat;
+    //  2. **the capability story** — under `host_fs` the guest's `data.mdb` really lands on disk, and
+    //     the *native* LMDB binary opens that guest-written file and verifies it byte-identically:
+    //     cross-implementation on-disk-format proof, capability-written;
+    //  3. **the reverse** — the guest reads a native-written `data.mdb` through `host_fs`.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one .bc.
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-c",
+        "-DSVM_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("svm_llvm_lmdb_{pid}_{tag}.bc"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("svm_llvm_lmdb_{pid}.bc"));
+    let linked_ok = Command::new("llvm-link-18")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .or_else(|_| {
+            Command::new("llvm-link")
+                .args(&bcs)
+                .arg("-o")
+                .arg(&linked)
+                .status()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle: mdb.c + midl.c + demo (no shim → real glibc/mmap).
+    let exe = tmp.join(format!("svm_llvm_pb_{pid}_lmdb"));
+    let native_ok = Command::new("cc")
+        .arg("-O2")
+        .arg(&inc)
+        .arg(lmdb.join("mdb.c"))
+        .arg(lmdb.join("midl.c"))
+        .arg(&demo)
+        .args(["-lpthread", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !native_ok {
+        eprintln!("note: skipping lmdb (cc unavailable)");
+        return;
+    }
+
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+    };
+
+    // Oracle bytes: create (fresh dir) + verify (same dir).
+    let nat_root = tmp.join(format!("svm-lmdb-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle_create = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native create");
+    assert!(oracle_create.status.success(), "native create failed");
+    let oracle_verify = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&nat_root)
+        .output()
+        .expect("native verify");
+    assert!(oracle_verify.status.success(), "native verify failed");
+
+    // 1. mem_fs: hermetic fill → reopen → verify, byte-identical stdout.
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", svm_run::fs::mem_fs())],
+        )
+        .expect("guest run (mem_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "lmdb: guest (mem_fs) stdout vs native"
+    );
+
+    // 2. host_fs: the guest writes a real data.mdb; the NATIVE binary then verifies it.
+    let guest_root = tmp.join(format!("svm-lmdb-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", svm_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "lmdb: guest (host_fs) stdout vs native"
+    );
+    assert!(
+        guest_root.join("data.mdb").exists(),
+        "the guest-written LMDB database must land on the real disk"
+    );
+    let native_reads_guest = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&guest_root)
+        .output()
+        .expect("native verify of guest db");
+    assert_eq!(
+        String::from_utf8_lossy(&native_reads_guest.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb: native LMDB must read the capability-written mmap database"
+    );
+
+    // 3. The reverse: the guest (host_fs over the native dir) reads a native-written data.mdb.
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(vec![b"lmdb".to_vec(), b"verify".to_vec()]),
+            &[("fs", svm_run::fs::host_fs(nat_root.clone()))],
+        )
+        .expect("guest verify (host_fs over native dir)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb: the guest must read the native-written mmap database"
+    );
+
+    let _ = std::fs::remove_dir_all(&nat_root);
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
+fn demo_lmdb_crash_recovery() {
+    // **Crash-consistency of a memory-mapped store under the Fs capability** (MMAP_CAPABILITY.md
+    // slice 1). The mmap emulation's durability contract (§4c) says a write is durable only once a
+    // completed `msync`/`sync` barrier covers it; a power loss drops everything after the last such
+    // barrier. This test *demonstrates* the contract by injecting the crash: `mem_fs_crashy` arms a
+    // simulated power loss (`FS_CRASH_ARM`) after N durability barriers, and we sweep N across the
+    // whole of a second transaction's commit.
+    //
+    // The guest (`lmdb_demo.c` mode `crash`) commits snapshot v1 durably, arms the crash, then
+    // commits snapshot v2 (same 200 keys, different values) whose durability the crash may swallow,
+    // then reopens and prints the surviving scan. LMDB's double-buffered, checksummed meta pages
+    // guarantee **transaction atomicity under power loss**: the reopened database is either the
+    // fully-committed v1 or the fully-committed v2 — never a torn mix. So at *every* crash point the
+    // recovered snapshot must byte-match one of the two golden states; anything else is corruption.
+    // This is the capability-model payoff — the guest cannot corrupt the host's file even when it
+    // "dies" mid-write, because durability is mediated, not ambient.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode: compile mdb.c/midl.c/demo/shim (-DSVM_GUEST) each, then llvm-link into one .bc.
+    // (Distinct tag from demo_lmdb_mmap_cap_vs_native so the two tests can run in parallel.)
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-c",
+        "-DSVM_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("svm_llvm_lmdbcrash_{pid}_{tag}.bc"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb crash-recovery (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("svm_llvm_lmdbcrash_{pid}.bc"));
+    let linked_ok = Command::new("llvm-link-18")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .or_else(|_| {
+            Command::new("llvm-link")
+                .args(&bcs)
+                .arg("-o")
+                .arg(&linked)
+                .status()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb crash-recovery (llvm-link unavailable)");
+        return;
+    }
+
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate lmdb guest");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+    };
+    // Each run gets a FRESH crashy in-memory fs (empty, disarmed); the guest arms it internally.
+    let run = |args: Vec<Vec<u8>>| -> String {
+        let out = inst
+            .run_with_caps(
+                svm_run::Backend::Bytecode,
+                &config(args),
+                &[("fs", svm_run::fs::mem_fs_crashy())],
+            )
+            .expect("guest run (mem_fs_crashy)");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Golden states: v1 = a single committed snapshot (mode 's'); v2 = crash mode with the crash
+    // DISARMED (n = -1), so txn2 always commits. They must be well-formed and distinct.
+    let golden_v1 = run(vec![b"lmdb".to_vec(), b"snap".to_vec()]);
+    let golden_v2 = run(vec![b"lmdb".to_vec(), b"crash".to_vec(), b"-1".to_vec()]);
+    assert!(
+        golden_v1.contains("snapshot: 200 entries"),
+        "v1 golden malformed: {golden_v1:?}"
+    );
+    assert!(
+        golden_v2.contains("snapshot: 200 entries"),
+        "v2 golden malformed: {golden_v2:?}"
+    );
+    assert_ne!(
+        golden_v1, golden_v2,
+        "the two committed snapshots must have distinct checksums"
+    );
+
+    // Sweep the crash point across every durability barrier of txn2's commit. n = 0 crashes on the
+    // very first barrier (→ rolls back to v1); large n never trips (→ v2 survives). Every point in
+    // between must still land on exactly one committed snapshot.
+    let mut seen_v1 = false;
+    let mut seen_v2 = false;
+    for n in 0..=24 {
+        let out = run(vec![
+            b"lmdb".to_vec(),
+            b"crash".to_vec(),
+            n.to_string().into_bytes(),
+        ]);
+        if out == golden_v1 {
+            seen_v1 = true;
+        } else if out == golden_v2 {
+            seen_v2 = true;
+        } else {
+            panic!(
+                "crash after {n} barriers left a TORN/corrupt state — durability contract violated:\n\
+                 got:  {out:?}\n  v1: {golden_v1:?}\n  v2: {golden_v2:?}"
+            );
+        }
+    }
+    // Coverage: the sweep must actually exercise the transition (a rollback *and* a survival),
+    // otherwise the "always consistent" result would be vacuous.
+    assert!(
+        seen_v1,
+        "no crash point rolled back to txn1 — sweep never hit the txn2 commit window"
+    );
+    assert!(
+        seen_v2,
+        "no crash point preserved txn2 — widen the sweep upper bound"
+    );
+
+    let _ = std::fs::remove_file(&linked);
+    for bc in &bcs {
+        let _ = std::fs::remove_file(bc);
     }
 }
 

@@ -2041,7 +2041,46 @@ fn drive(
             let mut nseed: Vec<FrozenNested> = thaw_nested;
             nseed.sort_by_key(|n| n.slot);
             for fnr in nseed {
+                // A **completed** child is not re-created (reload-not-reissue): its result is posted
+                // straight into the scheduler and mapped to the parent's join slot, so the parent's
+                // re-executed `thread.join` delivers it without re-running the child.
+                if let Some(r) = fnr.completed_result {
+                    let cid = s.next_task;
+                    s.next_task += 1;
+                    s.results.insert(
+                        cid,
+                        Outcome {
+                            result: Ok(vec![Value::I64(r)]),
+                            mem: None,
+                            fuel: *fuel,
+                            trap_bt: Vec::new(),
+                            trap_fiber: None,
+                        },
+                    );
+                    while root.threads.len() <= fnr.slot {
+                        root.threads.push(None);
+                    }
+                    root.threads[fnr.slot] = Some(cid);
+                    continue;
+                }
                 let csize = 1u64 << fnr.size_log2;
+                // Resolve the child's function table: the parent's own for a same-module child, or a
+                // re-granted **separate module** matched by content digest (host-supplied at restore).
+                // A missing / mismatched re-grant leaves the join slot empty, so the parent's
+                // re-executed `thread.join` fails closed — the per-child R5 identity gate.
+                let cfuncs = match fnr.module_digest {
+                    None => Some(Arc::clone(&funcs)),
+                    Some(d) => host_shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .module_by_digest(&d),
+                };
+                let Some(cfuncs) = cfuncs else {
+                    while root.threads.len() <= fnr.slot {
+                        root.threads.push(None);
+                    }
+                    continue;
+                };
                 // Flip the child's carve from its frozen phase to a thaw: clear its own global
                 // freeze word and set its context-0 thaw word — `begin_thaw`, carve-relative.
                 if let Some(m) = root.mem.as_mut() {
@@ -2063,7 +2102,7 @@ fn drive(
                 let mut ch = Host::new();
                 ch.set_durable(true);
                 let cinst = ch.grant_instantiator(0, csize);
-                let want_as = funcs
+                let want_as = cfuncs
                     .get(fnr.entry as usize)
                     .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
                 let child_args = if want_as {
@@ -2075,9 +2114,9 @@ fn drive(
                 let cid = s.next_task;
                 s.next_task += 1;
                 s.live += 1;
-                let cdt = Arc::new(DomainTable::new(&funcs, 0));
+                let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                 let mut child = Box::new(VCpu::new(
-                    Arc::clone(&funcs),
+                    Arc::clone(&cfuncs),
                     fnr.entry,
                     &child_args,
                     child_mem,
@@ -2102,7 +2141,7 @@ fn drive(
                     carve_off: fnr.carve_off,
                     size_log2: fnr.size_log2,
                     entry: fnr.entry,
-                    same_module: true,
+                    module_digest: fnr.module_digest,
                 });
                 s.runnable.push_back(child);
             }
@@ -3264,8 +3303,10 @@ fn dispatch_indirect(
 /// Maximum number of fibers a single run may create (§12). Bounds the fiber table so a
 /// fiber-bomb yields a clean [`Trap::FiberFault`] instead of unbounded host allocation —
 /// the reference-oracle analogue of the quota that charges out-of-band stacks to the
-/// guest, so a fiber-bomb OOMs *itself*, never the host.
-const MAX_FIBERS: usize = 1 << 16;
+/// guest, so a fiber-bomb OOMs *itself*, never the host. `1 << 24` (~16.7M): the hard ceiling equals
+/// the fiber-handle index width ([`FIBER_GEN_SHIFT`]); the per-run spawn quota (`SVM_MAX_FIBERS`,
+/// clamped to this) is the tunable anti-bomb policy.
+const MAX_FIBERS: usize = 1 << 24;
 
 /// Maximum number of **concurrently live** vCPUs (`thread.spawn`) across a run (§12). With the M:N
 /// executor a vCPU is a cheap green thread (a parked one costs only its continuation, not an OS
@@ -3655,11 +3696,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // real: broadcast `UNWINDING` into each live child's carve state word (the subtree STW;
             // the child self-unwinds into its carve's own durable reserve, which is inside this
             // window's image, at its next poll) and record it as [`FrozenNested`] re-attach residue.
-            // Everything else stays **fail-closed** (`ThreadFault`, like the join-deadlock): a
-            // suspended coroutine (host-side native continuation), a separate-module child (its
-            // module identity can't ride the artifact yet), a completed-but-unjoined child (its
-            // result lives only in the scheduler), nested-in-nested, and mixing with unjoined
-            // `thread.spawn` children (the two thaw seedings would contend for the join table).
+            // A **completed-but-unjoined** child rides via `completed_result` (its result taken from
+            // the scheduler; no `UNWINDING` broadcast — nothing to unwind). Everything else stays
+            // **fail-closed** (`ThreadFault`, like the join-deadlock): a suspended coroutine
+            // (host-side native continuation), a separate-module child (its module identity can't ride
+            // the artifact yet), a completed child that **trapped** (its trap can't ride yet),
+            // nested-in-nested, and mixing with unjoined `thread.spawn` children (the two thaw seedings
+            // would contend for the join table).
             let nested_refused = froze && {
                 let live: Vec<NestedChildInfo> = v
                     .nested_children
@@ -3672,19 +3715,40 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else if live.is_empty() {
                     false
                 } else if v.nested_child
-                    || live.iter().any(|c| !c.same_module)
-                    || live.iter().any(|c| {
-                        v.sched
-                            .has_result(v.threads[c.slot].expect("filtered to Some"))
-                    })
                     || v.threads.iter().enumerate().any(|(slot, t)| {
                         t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
                     })
+                    || v.mem.is_none()
                 {
-                    true
-                } else if let Some(m) = v.mem.as_mut() {
+                    true // uncovered shape / malformed durable freeze
+                } else {
+                    let mut refuse = false;
                     for c in &live {
-                        m.write_bytes(c.carve_off + STATE_OFF, &STATE_UNWINDING.to_le_bytes());
+                        let cid = v.threads[c.slot].expect("filtered to Some");
+                        let completed_result = if v.sched.has_result(cid) {
+                            // Take the finished child's result; a clean `Ok(i64)` rides the artifact,
+                            // a completed-with-trap child is not yet representable — fail closed.
+                            match v.sched.take_result(cid).map(|o| o.result) {
+                                Some(Ok(vals)) => Some(match vals.first() {
+                                    Some(Value::I64(x)) => *x,
+                                    Some(Value::I32(x)) => *x as i64,
+                                    _ => 0,
+                                }),
+                                _ => {
+                                    refuse = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Still running: broadcast `UNWINDING` into its carve; it self-unwinds.
+                            if let Some(m) = v.mem.as_mut() {
+                                m.write_bytes(
+                                    c.carve_off + STATE_OFF,
+                                    &STATE_UNWINDING.to_le_bytes(),
+                                );
+                            }
+                            None
+                        };
                         v.host
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -3694,11 +3758,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 carve_off: c.carve_off,
                                 size_log2: c.size_log2,
                                 entry: c.entry,
+                                module_digest: c.module_digest,
+                                completed_result,
                             });
                     }
-                    false
-                } else {
-                    true // a durable freeze without a window is malformed — refuse
+                    refuse
                 }
             };
             let result = if nested_refused {
@@ -4415,21 +4479,23 @@ fn shadow_region_fits(ctx_idx: usize) -> bool {
 const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
-/// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
-/// low 16 bits and the generation occupies bits 16.. of the **`i64`** handle. A handle is
+/// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 24`, so a slot always fits in the
+/// low 24 bits and the generation occupies bits 24.. of the **`i64`** handle. A handle is
 /// `(generation << FIBER_GEN_SHIFT) | slot` — and since a fresh slot's generation is 0, a non-recycled
 /// run's handle is exactly its slot (byte-identical to before, and to the JIT, which likewise hands out
 /// `slot`). The generation lets a later **recycled** slot reject a stale handle to its former occupant
-/// (the ABA guard the JIT's `Ownership` word already carries internally).
-const FIBER_GEN_SHIFT: u32 = 16;
+/// (the ABA guard the JIT's `Ownership` word already carries internally). Widened 16→24 (from a 65 536
+/// concurrent-fiber ceiling): the arena stack backend removed the `vm.max_map_count` VMA wall, so the
+/// handle index became the binding limit — 24 bits allows ~16.7M concurrent fibers.
+const FIBER_GEN_SHIFT: u32 = 24;
 
 /// The generation bits a fiber guest handle carries (the field above the slot): an `i64` handle leaves
-/// **48 bits** for the generation, so a stale handle is rejected modulo `2^48` — an ABA window so vast
-/// (≈ centuries of recycling even at 10⁶ finishes/s) that wraparound is unreachable in practice.
-/// Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
-const FIBER_GEN_MASK: u64 = (1 << 48) - 1;
+/// **40 bits** for the generation, so a stale handle is rejected modulo `2^40` — an ABA window so vast
+/// (≈ a trillion recycles of one slot) that wraparound is unreachable in practice. Matches `svm_jit`'s
+/// `FIBER_HANDLE_GEN_MASK`.
+const FIBER_GEN_MASK: u64 = (1 << 40) - 1;
 
-/// Encode a fiber guest handle from its registry `slot` and `generation` (low 48 bits).
+/// Encode a fiber guest handle from its registry `slot` and `generation` (low 40 bits).
 fn fiber_handle(slot: usize, generation: u64) -> i64 {
     (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
 }
@@ -4437,6 +4503,46 @@ fn fiber_handle(slot: usize, generation: u64) -> i64 {
 /// The generation field a guest fiber handle carries (the high bits above the slot).
 fn fiber_handle_generation(handle: i64) -> u64 {
     (handle as u64) >> FIBER_GEN_SHIFT
+}
+
+#[cfg(test)]
+mod fiber_handle_layout_tests {
+    //! The fiber-handle index was widened 16→24 bits (`MAX_FIBERS` 1<<16 → 1<<24) once the arena stack
+    //! backend removed the `vm.max_map_count` VMA wall. These pin that the wider index round-trips and
+    //! that the slot decode (a `next_power_of_two(len)-1` mask, as `claim`/`resolve` use) stays clear of
+    //! the generation bits at any slot up to the new ceiling — i.e. > 65 535 fibers are addressable.
+    use super::{fiber_handle, fiber_handle_generation, FIBER_GEN_SHIFT, MAX_FIBERS};
+
+    #[test]
+    fn index_width_is_24_bits() {
+        assert_eq!(FIBER_GEN_SHIFT, 24);
+        assert_eq!(MAX_FIBERS, 1 << 24);
+    }
+
+    #[test]
+    fn handle_round_trips_beyond_the_old_16_bit_ceiling() {
+        // A slot the old 16-bit index could not represent (> 65 535), with a non-zero generation.
+        let slot = 1_000_000usize; // < MAX_FIBERS (1<<24 = 16 777 216)
+        let generation = 0x3_ABCD_1234u64;
+        let handle = fiber_handle(slot, generation);
+        // Generation decodes back exactly.
+        assert_eq!(fiber_handle_generation(handle), generation);
+        // Slot decodes back via the same dynamic mask `claim`/`resolve` use (padded to the table len);
+        // the generation bits sit strictly above it, so the slot is recovered cleanly.
+        let mask = (slot + 1).next_power_of_two() - 1;
+        assert_eq!((handle as u64 as usize) & mask, slot);
+    }
+
+    #[test]
+    fn top_slot_and_generation_do_not_overlap() {
+        // The largest addressable slot and a full-width generation must not collide in the i64 handle.
+        let slot = (1usize << 24) - 1;
+        let generation = (1u64 << 40) - 1;
+        let handle = fiber_handle(slot, generation);
+        assert_eq!(fiber_handle_generation(handle), generation);
+        let mask = (1u64 << FIBER_GEN_SHIFT) - 1;
+        assert_eq!((handle as u64) & mask, slot as u64);
+    }
 }
 
 /// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
@@ -4536,7 +4642,7 @@ pub struct FrozenFiber {
     /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
     pub shadow_sp: u64,
     /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
-    /// *recycled* (generation > 0) fiber still resolves (`(generation << 16) | slot`). 0 for a
+    /// *recycled* (generation > 0) fiber still resolves (`(generation << 24) | slot`). 0 for a
     /// non-recycled fiber — then the handle is exactly its slot. 48-bit field (the `i64` handle's
     /// generation bits); serialized as `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
     pub generation: u64,
@@ -4586,12 +4692,13 @@ struct NestedChildInfo {
     /// is `[carve_off, carve_off + (1 << size_log2))` of the parent's.
     carve_off: u64,
     size_log2: u8,
-    /// The child's entry function index (into the parent's own table — same-module children only;
-    /// a separate-module child is refused at freeze until its module identity rides the artifact).
+    /// The child's entry function index — into the parent's own table for a same-module child, or
+    /// into the child's granted module for a separate-module child (resolved by `module_digest`).
     entry: u32,
-    /// Whether the child's module is the parent's own (`instantiate`, op 0) vs. a granted separate
-    /// module (op 5). Only same-module children are freezable today.
-    same_module: bool,
+    /// The child's module content digest, or `None` for a **same-module** child (`instantiate`,
+    /// op 0) that runs the parent's own funcs. `Some` for a **separate-module** child (op 5): its
+    /// module is host-supplied at restore, and this digest resolves the re-granted module on thaw.
+    module_digest: Option<[u8; 32]>,
 }
 
 /// A **§14 instantiated child** flattened for freeze (DURABILITY.md §4 "STW quiesces the subtree
@@ -4599,9 +4706,8 @@ struct NestedChildInfo {
 /// its durable reserve (shadow regions, state/SP words), its unwound continuation — lives in its
 /// carve, a sub-range of the parent's window, so it is **already in the artifact's window image**;
 /// this is the small host-side residue a thaw needs to re-attach it: where the carve is, how to
-/// re-enter it, and which join slot the parent's reloaded handle names. (Not yet in the snapshot
-/// codec — `svm-snapshot::freeze` refuses an artifact with nested residue until the Section-2
-/// encoding lands; in-memory freeze → thaw carries it via [`Host::frozen_nested`].)
+/// re-enter it, and which join slot the parent's reloaded handle names. (Carried through the
+/// snapshot codec's Section 2 from `FORMAT_VERSION` v8.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrozenNested {
     /// The parent's join-table slot for this child (the guest-held handle value).
@@ -4610,8 +4716,21 @@ pub struct FrozenNested {
     pub carve_off: u64,
     /// The carve's (= the child window's) size, `log2`.
     pub size_log2: u8,
-    /// The child's entry function index (the parent's own table — same-module).
+    /// The child's entry function index — into the parent's own table (`module_digest == None`) or
+    /// the child's granted module (`module_digest == Some`).
     pub entry: u32,
+    /// `None` for a **same-module** child (runs the parent's funcs); `Some(digest)` for a
+    /// **separate-module** child, whose module a thaw resolves against the restore host's re-granted
+    /// modules (host-supplied at restore, D-scope — the module bytes never ride the artifact). A
+    /// missing / mismatched re-grant makes the thaw fail closed (per-child R5 identity gate).
+    pub module_digest: Option<[u8; 32]>,
+    /// `Some(result)` for a **completed-but-unjoined** child — one that finished before the freeze
+    /// point, so its `thread.join` result must survive in the artifact (its continuation is gone; the
+    /// scheduler result cell isn't captured). The thaw delivers this straight into the parent's join
+    /// table **without re-running** the child (reload-not-reissue — no double side effects); its carve
+    /// gets no `UNWINDING` broadcast (nothing to unwind). `None` for a still-running child (re-attached
+    /// + rewound on thaw). Mirrors [`FrozenVCpu::completed_result`] for `thread.spawn` children.
+    pub completed_result: Option<i64>,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -4831,7 +4950,7 @@ impl FiberRegistry {
         }
         // Generation check (recycling step 1/3): reject a handle whose generation doesn't match the
         // slot's current one — a stale handle to a slot's former occupant after the slot was recycled
-        // (`finish` bumped the generation). Compared modulo `2^48` (the handle's field width); a forged
+        // (`finish` bumped the generation). Compared modulo `2^40` (the handle's field width); a forged
         // non-zero generation is rejected, exactly as a forged slot is masked-and-lost.
         if fiber_handle_generation(handle) != (t.gens[slot] & FIBER_GEN_MASK) {
             return Err(Trap::FiberFault);
@@ -4963,7 +5082,7 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
 /// A resolved §14 `Module` grant's pieces, as the eval loop carries them: the child module's
 /// functions, declared window size, and data segments (`Arc`s — spawning shares, never copies).
-type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>, bool);
+type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>, bool, [u8; 32]);
 
 /// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
 /// **awaiting a resume value** — i.e. parked at a `yield` (so the next `resume` delivers its argument
@@ -5852,7 +5971,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let g = {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 let g = hg.resolve_module(mh)?;
-                                (g.funcs.clone(), g.memory_log2, g.data.clone(), g.durable)
+                                (
+                                    g.funcs.clone(),
+                                    g.memory_log2,
+                                    g.data.clone(),
+                                    g.durable,
+                                    g.digest,
+                                )
                             };
                             (
                                 match mop {
@@ -5867,7 +5992,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => (o, None, 0),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _)| f);
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _)| f);
                     match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
@@ -5908,7 +6033,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -5920,7 +6045,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // snapshottable as a unit. A same-module child (`None`) runs the
                             // parent's own (already instrumented) funcs — always admissible.
                             let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d)| *d);
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -5937,7 +6062,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // bounded them to its declared window == the carve). RO protection of
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
-                                if let (Some((_, _, data, _)), Some(m)) = (&child_mod, mem.as_ref())
+                                if let (Some((_, _, data, _, _)), Some(m)) =
+                                    (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
@@ -5977,7 +6103,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 };
                                 let cfuncs = child_mod.as_ref().map_or_else(
                                     || Arc::clone(&funcs),
-                                    |(f, _, _, _)| Arc::clone(f),
+                                    |(f, _, _, _, _)| Arc::clone(f),
                                 );
                                 let csched = sched.clone();
                                 let made = sched.spawn(move |id| {
@@ -6020,7 +6146,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             carve_off: ibase + off,
                                             size_log2: size_log2 as u8,
                                             entry: entry as u32,
-                                            same_module: child_mod.is_none(),
+                                            module_digest: child_mod
+                                                .as_ref()
+                                                .map(|(_, _, _, _, d)| *d),
                                         });
                                         frames[top]
                                             .vals
@@ -6073,7 +6201,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // transparency), exactly as for `instantiate_module`.
                             let mod_ok = child_mod
                                 .as_ref()
-                                .is_none_or(|(_, ml, _, _)| *ml == Some(size_log2 as u8));
+                                .is_none_or(|(_, ml, _, _, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -6081,7 +6209,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // §4 enforcement, exactly as for `instantiate`: a durable domain
                             // admits only freezable (durable-attested) separate-module children.
                             let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d)| *d);
+                                !durable || child_mod.as_ref().is_none_or(|(_, _, _, d, _)| *d);
                             if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -6102,7 +6230,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // in the parent's backing while the child's pages start unmapped — so
                                 // a plugin's data segments are *supplied lazily*, page by page, as it
                                 // first touches them (the §14 parent-as-pager model, for free).
-                                if let (Some((_, _, data, _)), Some(m)) = (&child_mod, mem.as_ref())
+                                if let (Some((_, _, data, _, _)), Some(m)) =
+                                    (&child_mod, mem.as_ref())
                                 {
                                     for d in data.iter() {
                                         if d.offset.saturating_add(d.bytes.len() as u64)
@@ -6122,7 +6251,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let cfuncs = child_mod.as_ref().map_or_else(
                                     || Arc::clone(&funcs),
-                                    |(f, _, _, _)| Arc::clone(f),
+                                    |(f, _, _, _, _)| Arc::clone(f),
                                 );
                                 // A co-fiber child is its own domain → its own dispatch table.
                                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
@@ -9281,6 +9410,28 @@ struct ModuleGrant {
     /// verification). A durable domain refuses to instantiate a grant without this bit, so its
     /// nesting subtree stays snapshottable as a unit.
     durable: bool,
+    /// Content digest of the granted module's semantic image (§4 separate-module nesting): a §14
+    /// **separate-module** child records this in its `FrozenNested` residue so a thaw can resolve it
+    /// against the restore host's re-granted modules (host-supplied at restore, D-scope — the module
+    /// bytes never ride the artifact). Computed by [`module_digest`], shared with the codec's R5 gate.
+    digest: [u8; 32],
+}
+
+/// The §4 nested-child module-identity digest: a content hash of a grant's **semantic image**
+/// (functions, memory, data, exports), computed the same way at freeze-grant and thaw-grant so a
+/// separate-module child re-attaches against the matching re-granted module. Debug info and
+/// (already-resolved) imports are excluded — they don't affect execution, and stripping them keeps
+/// the identity tolerant of a debug-stripped re-grant.
+fn module_digest(m: &Module) -> [u8; 32] {
+    let canon = Module {
+        funcs: m.funcs.clone(),
+        memory: m.memory,
+        data: m.data.clone(),
+        exports: m.exports.clone(),
+        imports: Vec::new(),
+        debug_info: None,
+    };
+    svm_encode::digest256(&svm_encode::encode_module(&canon))
 }
 
 impl Default for Host {
@@ -9922,8 +10073,20 @@ impl Host {
             data: m.data.clone().into(),
             exports: m.exports.clone().into(),
             durable,
+            digest: module_digest(m),
         });
         self.grant(iface::MODULE, Binding::Module(id))
+    }
+
+    /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore
+    /// host re-grants the child's module, and its re-attach residue names it by [`module_digest`].
+    /// Returns the grant's function table, or `None` (a missing / mismatched re-grant ⇒
+    /// the thaw fails closed, the per-child R5 identity gate).
+    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+        self.modules
+            .iter()
+            .find(|g| g.durable && &g.digest == digest)
+            .map(|g| Arc::clone(&g.funcs))
     }
 
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's

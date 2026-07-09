@@ -25,6 +25,25 @@
 //! | 6 | `rename` | `(from_ptr, from_len, to_ptr, to_len)` | 0 |
 //! | 7 | `truncate` | `(fd, new_len, _, _)` | 0 |
 //! | 8 | `sync` | `(fd, _, _, _)` | 0 |
+//! | 9 | `mmap` | `(fd, file_offset, len, win_buf)` | 0 |
+//! | 10 | `msync` | `(win_buf, len, _, _)` | 0 |
+//! | 11 | `munmap` | `(win_buf, _, _, _)` | 0 |
+//! | 12 | `crash_arm` | `(n, _, _, _)` | 0 / `-EINVAL` |
+//!
+//! Op 12 (`crash_arm`) exists **only on the `*_crashy` test variants** (see [`FS_CRASH_ARM`]); the
+//! default [`mem_fs`]/[`host_fs`] return `-EINVAL` for it (unknown op).
+//!
+//! ## The file-backed-mmap surface (`mmap`/`msync`/`munmap`) — the second storage shape
+//!
+//! `mmap` binds a **guest-owned window buffer** (`win_buf`, `len`) to a file region (`fd`,
+//! `file_offset`): the host copies the file bytes *into* the buffer and records the binding. The
+//! guest then reads and writes those bytes with ordinary loads/stores — **zero host calls on the
+//! data-access path** (that is what makes this the memory-mapped shape, distinct from the per-access
+//! `read`/`write` VFS). `msync(win_buf, len)` flushes a sub-range of a mapping back to its file at
+//! `file_offset + (win_buf − mapping.base)`; `munmap` flushes the whole mapping and drops it. This is
+//! coherent for a single mapping of a file (the buffer is the sole authority), exactly what an
+//! `MDB_WRITEMAP`-mode LMDB needs: it writes every page — data and meta — through the map and asks
+//! for durability via `msync`. (Not multi-process shared-memory coherence — that is a later slice.)
 //!
 //! Errors are negative errno values ([`ENOENT`]/[`EBADF`]/[`EINVAL`]/[`EACCES`]/[`EFAULT`]). `flags`
 //! is a bitset ([`O_READ`]/[`O_WRITE`]/[`O_APPEND`]/[`O_TRUNC`]/[`O_CREATE`]) the guest libc derives
@@ -47,6 +66,18 @@ pub const FS_REMOVE: u32 = 5;
 pub const FS_RENAME: u32 = 6;
 pub const FS_TRUNCATE: u32 = 7;
 pub const FS_SYNC: u32 = 8;
+pub const FS_MMAP: u32 = 9;
+pub const FS_MSYNC: u32 = 10;
+pub const FS_MUNMAP: u32 = 11;
+/// `crash_arm(n)` — **test-only** crash injection (§4d of `MMAP_CAPABILITY.md`). Present ONLY on the
+/// `*_crashy` backend variants; the default [`mem_fs`]/[`host_fs`] leave the controller absent so this
+/// op is an unknown op (`-EINVAL`) on a shipping grant. Arms a simulated power loss: after `n` further
+/// durability barriers (`msync`/`sync`) have completed, the *next* barrier "crashes" — from then on
+/// every write to the backing store is silently dropped (the un-synced page cache is lost, as on real
+/// power loss) while **reads keep working** (a dead process's file is still readable on reopen). `n < 0`
+/// disarms. Lets a test sweep the crash point across every sync boundary and prove the mapped store
+/// recovers to its last *committed* state at each one.
+pub const FS_CRASH_ARM: u32 = 12;
 
 pub const O_READ: i64 = 1;
 pub const O_WRITE: i64 = 2;
@@ -92,10 +123,69 @@ struct MemOpen {
     append: bool,
 }
 
+/// Test-only crash-injection controller (the §4d "crash hook"), shared by both backends. Models a
+/// power loss: [`FS_CRASH_ARM`] sets `countdown` to the number of durability barriers
+/// (`msync`/`sync`) that may still complete; each barrier decrements it, and the one that finds it at
+/// zero *trips* — sets `crashed`, and is itself dropped (the crash happened before it reached the
+/// platter). Once `crashed`, every persisting op (`msync`/`sync`/`munmap` flush/`write`/`truncate`)
+/// silently drops its effect, so the backing file is frozen at the last completed barrier; reads are
+/// untouched. Present only on the `*_crashy` variants — a shipping grant has no controller at all.
+#[derive(Default)]
+struct CrashCtl {
+    /// Barriers that may still complete before the crash trips; `None` = disarmed (never crash).
+    countdown: Option<u64>,
+    /// Once set, all persistence is frozen.
+    crashed: bool,
+}
+
+impl CrashCtl {
+    /// Call at each durability barrier (`msync`/`sync`). Returns `true` if this barrier's write must be
+    /// **dropped** — either we have already crashed, or this very barrier trips the crash.
+    fn barrier(&mut self) -> bool {
+        if self.crashed {
+            return true;
+        }
+        match self.countdown {
+            Some(0) => {
+                self.crashed = true;
+                true // the crash struck mid-barrier: its bytes never reach the file
+            }
+            Some(n) => {
+                self.countdown = Some(n - 1);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+/// One live `mmap`: a guest window buffer `[base, base+len)` bound to `data` at `file_off`. The
+/// guest reads/writes the window bytes directly; `msync` copies a sub-range back into `data`.
+struct MemMapping {
+    base: u64,
+    len: u64,
+    data: Arc<Mutex<Vec<u8>>>,
+    file_off: u64,
+}
+
 #[derive(Default)]
 struct MemFsState {
     files: HashMap<String, Arc<Mutex<Vec<u8>>>>,
     open: Vec<Option<MemOpen>>,
+    maps: Vec<MemMapping>,
+    /// `Some` only on the `mem_fs_crashy` variant (test-only crash injection); `None` on `mem_fs`.
+    crash: Option<CrashCtl>,
+}
+
+impl MemFsState {
+    /// A durability barrier (`msync`/`sync`): `true` ⇒ drop this write (crashed or crashing now).
+    fn crash_barrier(&mut self) -> bool {
+        self.crash.as_mut().is_some_and(CrashCtl::barrier)
+    }
+    /// Whether the backing store is frozen by a tripped crash (persisting ops become no-ops).
+    fn crash_frozen(&self) -> bool {
+        self.crash.as_ref().is_some_and(|c| c.crashed)
+    }
 }
 
 impl MemFsState {
@@ -166,6 +256,9 @@ impl MemFsState {
                 n as i64
             }
             FS_WRITE => {
+                if self.crash_frozen() {
+                    return a(2).max(0); // power-loss: the un-synced write is silently dropped
+                }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
                     return -EBADF;
                 };
@@ -254,6 +347,9 @@ impl MemFsState {
                 0
             }
             FS_TRUNCATE => {
+                if self.crash_frozen() {
+                    return 0; // power-loss: the resize never reaches the backing file
+                }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
                     return -EBADF;
                 };
@@ -272,22 +368,143 @@ impl MemFsState {
                 0
             }
             FS_SYNC => {
-                // Memory is always "durable" here — validate the fd, nothing to flush.
+                // Memory is always "durable" here — a durability barrier for crash injection, then
+                // validate the fd (nothing to flush).
+                if self.crash_barrier() {
+                    return 0;
+                }
                 let Some(Some(_)) = self.open.get(a(0) as usize) else {
                     return -EBADF;
                 };
                 0
             }
+            FS_MMAP => {
+                let (fd, foff, len, buf) = (a(0), a(1), a(2), a(3));
+                if foff < 0 || len < 0 || buf < 0 {
+                    return -EINVAL;
+                }
+                let Some(Some(o)) = self.open.get(fd as usize) else {
+                    return -EBADF;
+                };
+                let data = o.data.clone();
+                // Copy the file region into the guest buffer (zero-fill past EOF, like a file-backed
+                // mmap of a hole).
+                let mut region = vec![0u8; len as usize];
+                {
+                    let d = data.lock().unwrap_or_else(|e| e.into_inner());
+                    let start = (foff as usize).min(d.len());
+                    let end = (foff as usize + len as usize).min(d.len());
+                    if end > start {
+                        region[..end - start].copy_from_slice(&d[start..end]);
+                    }
+                }
+                let Some(m) = mem.as_deref_mut() else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(buf as u64, &region).is_none() {
+                    return -EFAULT;
+                }
+                self.maps.push(MemMapping {
+                    base: buf as u64,
+                    len: len as u64,
+                    data,
+                    file_off: foff as u64,
+                });
+                0
+            }
+            FS_MSYNC => {
+                let (buf, len) = (a(0), a(1));
+                if buf < 0 || len < 0 {
+                    return -EINVAL;
+                }
+                let Some(map) = self
+                    .maps
+                    .iter()
+                    .find(|m| buf as u64 >= m.base && (buf as u64) < m.base + m.len)
+                else {
+                    return -EINVAL; // no mapping contains this address
+                };
+                let n = (len as u64).min(map.base + map.len - buf as u64) as usize;
+                let file_pos = map.file_off + (buf as u64 - map.base);
+                let data = map.data.clone(); // end the borrow of `self.maps` before `crash_barrier`
+                let Some(m) = mem.as_deref() else {
+                    return -EFAULT;
+                };
+                let Some(bytes) = m.read_bytes(buf as u64, n as u64) else {
+                    return -EFAULT;
+                };
+                if self.crash_barrier() {
+                    return 0; // power-loss: this msync's bytes never reach the file
+                }
+                let mut d = data.lock().unwrap_or_else(|e| e.into_inner());
+                let end = file_pos as usize + n;
+                if end > d.len() {
+                    d.resize(end, 0);
+                }
+                d[file_pos as usize..end].copy_from_slice(&bytes);
+                0
+            }
+            FS_MUNMAP => {
+                let buf = a(0);
+                // Flush the whole mapping, then drop it (LMDB msyncs explicitly before close, but a
+                // final flush keeps `munmap` self-contained) — unless a crash has frozen the store,
+                // in which case a real `munmap` on a dead process would flush nothing.
+                let Some(idx) = self.maps.iter().position(|m| m.base == buf as u64) else {
+                    return -EINVAL;
+                };
+                let map = self.maps.remove(idx);
+                if !self.crash_frozen() {
+                    if let Some(m) = mem.as_deref() {
+                        if let Some(bytes) = m.read_bytes(map.base, map.len) {
+                            let mut d = map.data.lock().unwrap_or_else(|e| e.into_inner());
+                            let end = (map.file_off + map.len) as usize;
+                            if end > d.len() {
+                                d.resize(end, 0);
+                            }
+                            d[map.file_off as usize..end].copy_from_slice(&bytes);
+                        }
+                    }
+                }
+                0
+            }
+            FS_CRASH_ARM => arm_crash(self.crash.as_mut(), a(0)),
             _ => -EINVAL,
         }
     }
 }
 
+/// [`FS_CRASH_ARM`] handler shared by both backends: `n < 0` disarms, `n >= 0` arms the crash to trip
+/// after `n` further durability barriers. `-EINVAL` when the backend has no controller (the default,
+/// non-`crashy` grants) — so the op simply does not exist on a shipping capability.
+fn arm_crash(ctl: Option<&mut CrashCtl>, n: i64) -> i64 {
+    let Some(c) = ctl else {
+        return -EINVAL;
+    };
+    c.countdown = if n < 0 { None } else { Some(n as u64) };
+    c.crashed = false;
+    0
+}
+
 /// A deterministic **in-memory** filesystem capability (fresh, empty state per host). The hermetic
 /// default for tests and differential runs.
 pub fn mem_fs() -> HostCap {
-    HostCap::host_fn(0, || {
-        let mut st = MemFsState::default();
+    mem_fs_impl(false)
+}
+
+/// Like [`mem_fs`] but with the **test-only crash-injection** controller enabled (the [`FS_CRASH_ARM`]
+/// op becomes live). Used to prove crash-consistency of a mapped store — see `demo_lmdb_crash_recovery`.
+/// Never grant this to a real guest: a tripped crash freezes the store (a self-inflicted DoS on the
+/// holder's own fs, no host effect, but pointless outside a test).
+pub fn mem_fs_crashy() -> HostCap {
+    mem_fs_impl(true)
+}
+
+fn mem_fs_impl(crashy: bool) -> HostCap {
+    HostCap::host_fn(0, move || {
+        let mut st = MemFsState {
+            crash: crashy.then(CrashCtl::default),
+            ..MemFsState::default()
+        };
         Box::new(
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
                 Ok(vec![st.handle(op, args, mem)])
@@ -302,12 +519,33 @@ struct HostOpen {
     writable: bool,
 }
 
+/// A live `mmap` over the real fs: the guest buffer `[base, base+len)` is bound to the open file at
+/// `open_idx`, starting at `file_off`. `msync` `pwrite`s a sub-range back through that file.
+struct HostMapping {
+    base: u64,
+    len: u64,
+    open_idx: usize,
+    file_off: u64,
+}
+
 struct HostFsState {
     root: PathBuf,
     open: Vec<Option<HostOpen>>,
+    maps: Vec<HostMapping>,
+    /// `Some` only on the `host_fs_crashy` variant (test-only crash injection); `None` on `host_fs`.
+    crash: Option<CrashCtl>,
 }
 
 impl HostFsState {
+    /// A durability barrier (`msync`/`sync`): `true` ⇒ drop this write (crashed or crashing now).
+    fn crash_barrier(&mut self) -> bool {
+        self.crash.as_mut().is_some_and(CrashCtl::barrier)
+    }
+    /// Whether the backing store is frozen by a tripped crash (persisting ops become no-ops).
+    fn crash_frozen(&self) -> bool {
+        self.crash.as_ref().is_some_and(|c| c.crashed)
+    }
+
     fn handle(&mut self, op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>) -> i64 {
         let mut mem = mem;
         let a = |i: usize| args.get(i).copied().unwrap_or(0);
@@ -376,6 +614,9 @@ impl HostFsState {
                 n as i64
             }
             FS_WRITE => {
+                if self.crash_frozen() {
+                    return a(2).max(0); // power-loss: the un-synced write is silently dropped
+                }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
                     return -EBADF;
                 };
@@ -443,6 +684,9 @@ impl HostFsState {
                 }
             }
             FS_TRUNCATE => {
+                if self.crash_frozen() {
+                    return 0; // power-loss: the resize never reaches the backing file
+                }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
                     return -EBADF;
                 };
@@ -459,6 +703,10 @@ impl HostFsState {
                 }
             }
             FS_SYNC => {
+                // A durability barrier for crash injection, then the real fsync.
+                if self.crash_barrier() {
+                    return 0;
+                }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
                     return -EBADF;
                 };
@@ -467,6 +715,94 @@ impl HostFsState {
                     Err(e) => -io_errno(&e),
                 }
             }
+            FS_MMAP => {
+                let (fd, foff, len, buf) = (a(0), a(1), a(2), a(3));
+                if foff < 0 || len < 0 || buf < 0 {
+                    return -EINVAL;
+                }
+                let Some(Some(o)) = self.open.get_mut(fd as usize) else {
+                    return -EBADF;
+                };
+                // Copy the file region into the guest buffer (zero-fill past EOF).
+                let mut region = vec![0u8; len as usize];
+                if o.file.seek(SeekFrom::Start(foff as u64)).is_err() {
+                    return -io_errno(&std::io::Error::last_os_error());
+                }
+                let mut got = 0usize;
+                while got < region.len() {
+                    match o.file.read(&mut region[got..]) {
+                        Ok(0) => break, // EOF — rest stays zero
+                        Ok(n) => got += n,
+                        Err(e) => return -io_errno(&e),
+                    }
+                }
+                let Some(m) = mem.as_deref_mut() else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(buf as u64, &region).is_none() {
+                    return -EFAULT;
+                }
+                self.maps.push(HostMapping {
+                    base: buf as u64,
+                    len: len as u64,
+                    open_idx: fd as usize,
+                    file_off: foff as u64,
+                });
+                0
+            }
+            FS_MSYNC => {
+                let (buf, len) = (a(0), a(1));
+                if buf < 0 || len < 0 {
+                    return -EINVAL;
+                }
+                let Some(map) = self
+                    .maps
+                    .iter()
+                    .find(|m| buf as u64 >= m.base && (buf as u64) < m.base + m.len)
+                else {
+                    return -EINVAL;
+                };
+                let n = (len as u64).min(map.base + map.len - buf as u64) as usize;
+                let file_pos = map.file_off + (buf as u64 - map.base);
+                let open_idx = map.open_idx;
+                let Some(m) = mem.as_deref() else {
+                    return -EFAULT;
+                };
+                let Some(bytes) = m.read_bytes(buf as u64, n as u64) else {
+                    return -EFAULT;
+                };
+                if self.crash_barrier() {
+                    return 0; // power-loss: this msync's bytes never reach the file
+                }
+                let Some(Some(o)) = self.open.get_mut(open_idx) else {
+                    return -EBADF; // the mapped fd was closed
+                };
+                if o.file.seek(SeekFrom::Start(file_pos)).is_err() {
+                    return -io_errno(&std::io::Error::last_os_error());
+                }
+                match o.file.write_all(&bytes) {
+                    Ok(()) => 0,
+                    Err(e) => -io_errno(&e),
+                }
+            }
+            FS_MUNMAP => {
+                let buf = a(0);
+                let Some(idx) = self.maps.iter().position(|m| m.base == buf as u64) else {
+                    return -EINVAL;
+                };
+                let map = self.maps.remove(idx);
+                // Final flush of the whole mapping (self-contained munmap) — unless a crash froze the
+                // store, in which case a real munmap on a dead process would flush nothing.
+                if !self.crash_frozen() {
+                    let bytes = mem.as_deref().and_then(|m| m.read_bytes(map.base, map.len));
+                    if let (Some(bytes), Some(Some(o))) = (bytes, self.open.get_mut(map.open_idx)) {
+                        let _ = o.file.seek(SeekFrom::Start(map.file_off));
+                        let _ = o.file.write_all(&bytes);
+                    }
+                }
+                0
+            }
+            FS_CRASH_ARM => arm_crash(self.crash.as_mut(), a(0)),
             _ => -EINVAL,
         }
     }
@@ -479,10 +815,23 @@ fn io_errno(e: &std::io::Error) -> i64 {
 /// The **real** filesystem, attenuated to `root` (relative paths only; `..`/absolute refused). The
 /// guest sees exactly the subtree the embedder granted — nothing else is nameable.
 pub fn host_fs(root: PathBuf) -> HostCap {
+    host_fs_impl(root, false)
+}
+
+/// Like [`host_fs`] but with the **test-only crash-injection** controller enabled (the
+/// [`FS_CRASH_ARM`] op becomes live). Proves crash-consistency of a real on-disk mapped store — see
+/// `demo_lmdb_crash_recovery`. Never grant this to a real guest.
+pub fn host_fs_crashy(root: PathBuf) -> HostCap {
+    host_fs_impl(root, true)
+}
+
+fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
     HostCap::host_fn(0, move || {
         let mut st = HostFsState {
             root: root.clone(),
             open: Vec::new(),
+            maps: Vec::new(),
+            crash: crashy.then(CrashCtl::default),
         };
         Box::new(
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {

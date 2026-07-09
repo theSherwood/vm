@@ -438,7 +438,8 @@ harness+bundles against real libc, exit 0 — including ltests' real `atexit` al
 Support files: `lua_tlib_harness.c` (single-state, ltests' own `lua_newstate(debug_realloc,
 &l_memcontrol)` + `luaL_requiref("T", luaB_opentests)` recipe, plus the sweep harness's require/
 package/knob setup); `lua_tlib_malloc.c` (guest `malloc`/`free`/`realloc` — `debug_realloc` sits on
-plain libc malloc — as segregated free lists over a 56 MiB arena); `lua_tlib_shim.c`
+plain libc malloc — a coalescing explicit-free-list allocator over a 56 MiB arena; see the `all.lua`
+section); `lua_tlib_shim.c`
 (`__assert_fail`/`abort` as loud nonzero exits, the `LUA_COMPAT_MATHLIB` hyperbolics, `strtoul`, a
 real guest `printf` — ltests' reports use `%X`, which the constant-format lowering doesn't carry —
 `sprintf`, string helpers, and the `atexit` note). `loadlib.c` joins the build (`ltests.c`
@@ -456,3 +457,46 @@ Compile CORE + LIBS (+ `loadlib`) **and the harness** with `-DLUA_USER_H='"ltest
 `<tests>/ltests/ltests.c` itself; link with the guest layers above + the files-fixture stdio/time
 layers + trig/snprintf/libm/strtod. `lua_tlib_tests.c` / `lua_tapi_tests.c` embed the two file sets
 (with `tracegc`/`bwcoercion` as sibling modules). Native oracle: same sources on real libc.
+
+# Lua official suite under its own driver — `all.lua` (the capstone)
+
+`lua_all.bc` runs the **unmodified `testes/all.lua`** — the Lua distribution's own test *driver* —
+on the on-ramp. The whole `testes/` tree is embedded (`lua_all_tests.c`) and **seeded onto the
+in-memory Fs** (`fopen`+`fwrite` at startup); `all.lua` then `dofile`s each file through its own
+`loadfile → string.dump → load` round-trip, `require`s sibling modules, tracks memory + timing,
+runs the warning-system tests, and ends at `print("final OK !!!")`. Nothing about the driver is
+modified — it finds and loads every file off the (in-memory) disk via the **real** `luaopen_package`
+(`loadlib.c`), searching `package.path`. This retires the minimal-`require` shim used by the earlier
+fixtures in favor of stock `require`/`package`/`searchpath`/`loadlib`; the ANSI C-library searcher
+returns `"absent"` (no dlopen), which the suite guards for.
+
+Config: the T library (`ltests.c`) active (internal assertions live, failure-injecting
+`debug_realloc`), **one shared `lua_State`** for the whole suite (as the driver intends), and the
+suite's own `_port`/`_soft`/`_nomsg` knobs — under which `all.lua` runs **26 files** (`main.lua`
+early-returns under `_port`; `big.lua` skips under `_soft`): `gc`, `db`, `calls`, `strings`,
+`literals`, `tpack`, `attrib` (the real-`require`/`searchpath`/`package.config` test, asserted
+`== 27`), `gengc`, `locals`, `constructs`, `code`, `cstack`, `nextvar`, `pm`, `utf8`, `api`,
+`events`, `vararg`, `closure`, `coroutine`, `goto`, `errors`, `math`, `sort`, `bitwise`, `verybig`,
+`files`. Test `tests/lua_all.rs` asserts `Returned([I32(0)])` **and** `final OK !!!` on stdout; the
+JIT run gates CI (~20 s), the interpreter runs are `#[ignore]`d full-depth gates. Native oracle:
+same harness+tree on real libc, exit 0 — including ltests' `atexit` all-memory-freed check.
+
+The harness (`lua_package_harness.c`) opens the real `luaopen_package`, points `package.path` at the
+seeded layout, seeds the tree, and runs the entry (skipping a leading `#!` shebang as `loadfile`
+does). It shares the T config with `lua_tlib_harness.c` but drops the custom `require`. The guest
+allocator (`lua_tlib_malloc.c`) is a **coalescing explicit-free-list allocator** (dlmalloc-lite,
+boundary tags): the whole suite in one state peaks ~19 MiB live, and coalescing keeps the arena
+high-water near that (the earlier power-of-two-class allocator fragmented ~3x and overran the
+reference JIT's 64 MiB window). `lua_tlib_shim.c` supplies `__assert_fail`/`abort`, a guest `printf`,
+`strtoul`, `sprintf`, string helpers, the `LUA_COMPAT_MATHLIB` hyperbolics; `loadlib.c` joins the
+build.
+
+## Regenerating (all.lua)
+
+Seed every top-level `testes/*.lua` except `all.lua` as the modules and `all.lua` as the entry (an
+embed generator emitting **full filenames** for `lua_module_names`, since they are seeded as files —
+not the bare module names the other fixtures use). Compile CORE + LIBS + `loadlib` + the harness +
+`ltests.c` with `-DLUA_USER_H='"ltests.h"' -I<tests>/ltests`; link the guest layers
+(`lua_tlib_malloc`/`lua_tlib_shim`/`lua_files_stdio`/`lua_files_time`/`lua_files_shim` +
+trig/snprintf/libm/strtod). Native oracle: same sources on real libc (with `setvbuf(stdout,
+_IONBF)` so ltests' `atexit` abort doesn't eat buffered output).

@@ -79,8 +79,10 @@ extern "C" {
 }
 
 /// Max concurrently-allocated fibers per run (matches the interpreter's `MAX_FIBERS`): an anti-bomb
-/// ceiling so a fiber-bomb traps (`FiberFault`) instead of exhausting host memory.
-const MAX_FIBERS: usize = 1 << 16;
+/// ceiling so a fiber-bomb traps (`FiberFault`) instead of exhausting host memory. `1 << 24` (~16.7M):
+/// the ceiling equals the fiber-handle index width ([`FIBER_GEN_SHIFT`]) now the arena removed the
+/// `vm.max_map_count` VMA wall; the per-run spawn quota (clamped to this) is the tunable policy.
+const MAX_FIBERS: usize = 1 << 24;
 
 /// Per-fiber control-stack size (the out-of-band native stack, guard-paged by `svm-fiber`). 256 KiB:
 /// large enough for deep guest call chains, but small enough that many concurrent fibers stay within
@@ -160,13 +162,14 @@ fn fiber_region_base(slot: usize) -> u64 {
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (recycling step 1). MUST match `svm_interp`'s `FIBER_GEN_SHIFT` — the handle namespace is
-/// cross-backend, so a frozen handle means the same on both. `MAX_FIBERS` bounds a slot to the low 16
-/// bits; the `i64` handle leaves 48 bits for the generation. A handle is
+/// cross-backend, so a frozen handle means the same on both. `MAX_FIBERS` bounds a slot to the low 24
+/// bits; the `i64` handle leaves 40 bits for the generation. A handle is
 /// `(generation << FIBER_GEN_SHIFT) | slot`; a fresh slot's generation is 0, so a non-recycled run's
-/// handle is exactly its slot (byte-identical to before and to the interp).
-const FIBER_GEN_SHIFT: u32 = 16;
+/// handle is exactly its slot (byte-identical to before and to the interp). Widened 16→24 once the
+/// arena removed the VMA wall (see `MAX_FIBERS`).
+const FIBER_GEN_SHIFT: u32 = 24;
 
-/// Encode a fiber guest handle from its registry `slot` and (48-bit-masked) `generation`.
+/// Encode a fiber guest handle from its registry `slot` and (40-bit-masked) `generation`.
 fn fiber_handle(slot: usize, generation: u64) -> i64 {
     (((generation & FIBER_HANDLE_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
 }
@@ -250,18 +253,9 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
 /// `call_indirect`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, trap_out, sp, arg) ->
 /// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).
-/// Under `stack-check` (§2b path B) the entry ABI gains a `stack_limit` param right after `trap_out`,
-/// so this fn-pointer type does too — kept in exact lockstep with `sig_from` / the CLIF trampoline.
-#[cfg(not(feature = "stack-check"))]
-pub(crate) type FiberCallTramp = extern "C" fn(
-    code: u64,
-    mem_base: u64,
-    fn_table_base: u64,
-    trap_out: u64,
-    sp: u64,
-    arg: u64,
-) -> u64;
-#[cfg(feature = "stack-check")]
+/// The entry ABI carries a `stack_limit` param right after `trap_out` (§2b path B — the always-on
+/// software stack guard), so this fn-pointer type does too — kept in exact lockstep with `sig_from` /
+/// the CLIF trampoline.
 pub(crate) type FiberCallTramp = extern "C" fn(
     code: u64,
     mem_base: u64,
@@ -671,8 +665,7 @@ unsafe fn make_fiber(
                 // §2b path B: this fiber runs on its own control stack; pass its low bound as the
                 // stack-limit so the guest's prologue checks trap before overflowing it (per-vCPU by
                 // construction — each fiber supplies its own, threaded on as an ABI param).
-                #[cfg(feature = "stack-check")]
-                let out = call_tramp(
+                call_tramp(
                     (*entry).code(),
                     mem_base,
                     fn_table_base,
@@ -680,10 +673,7 @@ unsafe fn make_fiber(
                     y.stack_low(),
                     sp,
                     arg,
-                );
-                #[cfg(not(feature = "stack-check"))]
-                let out = call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg);
-                out
+                )
             };
             (*current()).yielders.pop();
             result
