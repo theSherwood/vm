@@ -744,6 +744,28 @@ first-class story: promoting the prototype `IoRing`/`Blocking` route vs the dedi
 (this slice used the direct `HostCap` surface). (The SQL-logic-scripts scale follow-up landed —
 slice BK below.)
 
+**Slice BL (DONE) — LMDB: an embedded memory-mapped B-tree in the sandbox (the *second* storage
+shape).** SQLite proved the read/write VFS shape; **LMDB** (OpenLDAP's Lightning MDB — the original
+mmap'd B-tree that libmdbx later hardened; ~12k lines vs libmdbx's 37k and a fraction of its OS
+surface) proves the **memory-mapped** shape, where the data plane *is* the file-backed mapping —
+readers walk the B-tree straight out of the map, no per-access host calls. The Fs capability grew a
+**file-backed-mmap surface** — `FS_MMAP`/`FS_MSYNC`/`FS_MUNMAP` (ops 9/10/11, both backends): `mmap`
+binds a guest window buffer to a file region (copy-in), `msync` flushes a sub-range back, `munmap`
+drops it. A guest shim (`demos/lmdb/lmdb_shim.c`) bridges LMDB's `mmap`/`msync`/`pread`/`open`/… to
+`__vm_cap_resolve("fs")` + `__vm_host_call`, plus single-thread no-op stubs (pthread/sysconf/uname/…)
+for the OS odds-and-ends `MDB_NOLOCK` never exercises — everything else (malloc/mem\*/str\*/printf/…)
+the on-ramp already synthesizes. Opened `MDB_WRITEMAP|MDB_NOLOCK|MDB_NOSUBDIR`, so every page (data +
+meta) lands in the map, making the copy-in/flush-out emulation coherent (the buffer is the sole
+authority). The one on-ramp addition: **`llvm.trap`/`llvm.debugtrap`** (from `__builtin_trap()`) is
+now dropped — clang always follows it with an `unreachable` terminator, which already traps. The
+test (`demo_lmdb_mmap_cap_vs_native`) asserts three directions, as Phase B did: guest (`mem_fs`)
+stdout byte-matches native over fill → delete → reopen → point-lookups + full ordered cursor scan (a
+running checksum over the B-tree walk) + stat; under `host_fs` the guest's `data.mdb` lands on disk
+and **native LMDB reads the capability-written mmap database** byte-identically; and the guest reads
+a native-written one. LMDB is fetched-not-vendored (OpenLDAP license), skips offline. Follow-on: a
+dedicated (non-`HostCap`) file-mmap capability + multi-mapping/shared-memory coherence for a
+crash-torture-grade story.
+
 **Slice BK (DONE) — SQLite's own test corpus in the sandbox (sqllogictest).** A compact
 **sqllogictest runner** as a guest program (`demos/sqlite/sqlite_logictest.c`): record parser
 (statement/query, `skipif`/`onlyif`, `halt`, CRLF-tolerant), **reference-exact value formatting**

@@ -25,6 +25,21 @@
 //! | 6 | `rename` | `(from_ptr, from_len, to_ptr, to_len)` | 0 |
 //! | 7 | `truncate` | `(fd, new_len, _, _)` | 0 |
 //! | 8 | `sync` | `(fd, _, _, _)` | 0 |
+//! | 9 | `mmap` | `(fd, file_offset, len, win_buf)` | 0 |
+//! | 10 | `msync` | `(win_buf, len, _, _)` | 0 |
+//! | 11 | `munmap` | `(win_buf, _, _, _)` | 0 |
+//!
+//! ## The file-backed-mmap surface (`mmap`/`msync`/`munmap`) — the second storage shape
+//!
+//! `mmap` binds a **guest-owned window buffer** (`win_buf`, `len`) to a file region (`fd`,
+//! `file_offset`): the host copies the file bytes *into* the buffer and records the binding. The
+//! guest then reads and writes those bytes with ordinary loads/stores — **zero host calls on the
+//! data-access path** (that is what makes this the memory-mapped shape, distinct from the per-access
+//! `read`/`write` VFS). `msync(win_buf, len)` flushes a sub-range of a mapping back to its file at
+//! `file_offset + (win_buf − mapping.base)`; `munmap` flushes the whole mapping and drops it. This is
+//! coherent for a single mapping of a file (the buffer is the sole authority), exactly what an
+//! `MDB_WRITEMAP`-mode LMDB needs: it writes every page — data and meta — through the map and asks
+//! for durability via `msync`. (Not multi-process shared-memory coherence — that is a later slice.)
 //!
 //! Errors are negative errno values ([`ENOENT`]/[`EBADF`]/[`EINVAL`]/[`EACCES`]/[`EFAULT`]). `flags`
 //! is a bitset ([`O_READ`]/[`O_WRITE`]/[`O_APPEND`]/[`O_TRUNC`]/[`O_CREATE`]) the guest libc derives
@@ -47,6 +62,9 @@ pub const FS_REMOVE: u32 = 5;
 pub const FS_RENAME: u32 = 6;
 pub const FS_TRUNCATE: u32 = 7;
 pub const FS_SYNC: u32 = 8;
+pub const FS_MMAP: u32 = 9;
+pub const FS_MSYNC: u32 = 10;
+pub const FS_MUNMAP: u32 = 11;
 
 pub const O_READ: i64 = 1;
 pub const O_WRITE: i64 = 2;
@@ -92,10 +110,20 @@ struct MemOpen {
     append: bool,
 }
 
+/// One live `mmap`: a guest window buffer `[base, base+len)` bound to `data` at `file_off`. The
+/// guest reads/writes the window bytes directly; `msync` copies a sub-range back into `data`.
+struct MemMapping {
+    base: u64,
+    len: u64,
+    data: Arc<Mutex<Vec<u8>>>,
+    file_off: u64,
+}
+
 #[derive(Default)]
 struct MemFsState {
     files: HashMap<String, Arc<Mutex<Vec<u8>>>>,
     open: Vec<Option<MemOpen>>,
+    maps: Vec<MemMapping>,
 }
 
 impl MemFsState {
@@ -278,6 +306,88 @@ impl MemFsState {
                 };
                 0
             }
+            FS_MMAP => {
+                let (fd, foff, len, buf) = (a(0), a(1), a(2), a(3));
+                if foff < 0 || len < 0 || buf < 0 {
+                    return -EINVAL;
+                }
+                let Some(Some(o)) = self.open.get(fd as usize) else {
+                    return -EBADF;
+                };
+                let data = o.data.clone();
+                // Copy the file region into the guest buffer (zero-fill past EOF, like a file-backed
+                // mmap of a hole).
+                let mut region = vec![0u8; len as usize];
+                {
+                    let d = data.lock().unwrap_or_else(|e| e.into_inner());
+                    let start = (foff as usize).min(d.len());
+                    let end = (foff as usize + len as usize).min(d.len());
+                    if end > start {
+                        region[..end - start].copy_from_slice(&d[start..end]);
+                    }
+                }
+                let Some(m) = mem.as_deref_mut() else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(buf as u64, &region).is_none() {
+                    return -EFAULT;
+                }
+                self.maps.push(MemMapping {
+                    base: buf as u64,
+                    len: len as u64,
+                    data,
+                    file_off: foff as u64,
+                });
+                0
+            }
+            FS_MSYNC => {
+                let (buf, len) = (a(0), a(1));
+                if buf < 0 || len < 0 {
+                    return -EINVAL;
+                }
+                let Some(map) = self
+                    .maps
+                    .iter()
+                    .find(|m| buf as u64 >= m.base && (buf as u64) < m.base + m.len)
+                else {
+                    return -EINVAL; // no mapping contains this address
+                };
+                let n = (len as u64).min(map.base + map.len - buf as u64) as usize;
+                let file_pos = map.file_off + (buf as u64 - map.base);
+                let Some(m) = mem.as_deref() else {
+                    return -EFAULT;
+                };
+                let Some(bytes) = m.read_bytes(buf as u64, n as u64) else {
+                    return -EFAULT;
+                };
+                let mut d = map.data.lock().unwrap_or_else(|e| e.into_inner());
+                let end = file_pos as usize + n;
+                if end > d.len() {
+                    d.resize(end, 0);
+                }
+                d[file_pos as usize..end].copy_from_slice(&bytes);
+                0
+            }
+            FS_MUNMAP => {
+                let buf = a(0);
+                // Flush the whole mapping, then drop it (LMDB msyncs explicitly before close, but a
+                // final flush keeps `munmap` self-contained).
+                let Some(idx) = self.maps.iter().position(|m| m.base == buf as u64) else {
+                    return -EINVAL;
+                };
+                let map = self.maps.remove(idx);
+                if let Some(m) = mem.as_deref() {
+                    if let Some(bytes) = m.read_bytes(map.base, map.len) {
+                        let mut d = map.data.lock().unwrap_or_else(|e| e.into_inner());
+                        let end = (map.file_off + map.len) as usize;
+                        if end > d.len() {
+                            d.resize(end, 0);
+                        }
+                        d[map.file_off as usize..end].copy_from_slice(&bytes);
+                    }
+                }
+                0
+            }
             _ => -EINVAL,
         }
     }
@@ -302,9 +412,19 @@ struct HostOpen {
     writable: bool,
 }
 
+/// A live `mmap` over the real fs: the guest buffer `[base, base+len)` is bound to the open file at
+/// `open_idx`, starting at `file_off`. `msync` `pwrite`s a sub-range back through that file.
+struct HostMapping {
+    base: u64,
+    len: u64,
+    open_idx: usize,
+    file_off: u64,
+}
+
 struct HostFsState {
     root: PathBuf,
     open: Vec<Option<HostOpen>>,
+    maps: Vec<HostMapping>,
 }
 
 impl HostFsState {
@@ -467,6 +587,87 @@ impl HostFsState {
                     Err(e) => -io_errno(&e),
                 }
             }
+            FS_MMAP => {
+                let (fd, foff, len, buf) = (a(0), a(1), a(2), a(3));
+                if foff < 0 || len < 0 || buf < 0 {
+                    return -EINVAL;
+                }
+                let Some(Some(o)) = self.open.get_mut(fd as usize) else {
+                    return -EBADF;
+                };
+                // Copy the file region into the guest buffer (zero-fill past EOF).
+                let mut region = vec![0u8; len as usize];
+                if o.file.seek(SeekFrom::Start(foff as u64)).is_err() {
+                    return -io_errno(&std::io::Error::last_os_error());
+                }
+                let mut got = 0usize;
+                while got < region.len() {
+                    match o.file.read(&mut region[got..]) {
+                        Ok(0) => break, // EOF — rest stays zero
+                        Ok(n) => got += n,
+                        Err(e) => return -io_errno(&e),
+                    }
+                }
+                let Some(m) = mem.as_deref_mut() else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(buf as u64, &region).is_none() {
+                    return -EFAULT;
+                }
+                self.maps.push(HostMapping {
+                    base: buf as u64,
+                    len: len as u64,
+                    open_idx: fd as usize,
+                    file_off: foff as u64,
+                });
+                0
+            }
+            FS_MSYNC => {
+                let (buf, len) = (a(0), a(1));
+                if buf < 0 || len < 0 {
+                    return -EINVAL;
+                }
+                let Some(map) = self
+                    .maps
+                    .iter()
+                    .find(|m| buf as u64 >= m.base && (buf as u64) < m.base + m.len)
+                else {
+                    return -EINVAL;
+                };
+                let n = (len as u64).min(map.base + map.len - buf as u64) as usize;
+                let file_pos = map.file_off + (buf as u64 - map.base);
+                let open_idx = map.open_idx;
+                let Some(m) = mem.as_deref() else {
+                    return -EFAULT;
+                };
+                let Some(bytes) = m.read_bytes(buf as u64, n as u64) else {
+                    return -EFAULT;
+                };
+                let Some(Some(o)) = self.open.get_mut(open_idx) else {
+                    return -EBADF; // the mapped fd was closed
+                };
+                if o.file.seek(SeekFrom::Start(file_pos)).is_err() {
+                    return -io_errno(&std::io::Error::last_os_error());
+                }
+                match o.file.write_all(&bytes) {
+                    Ok(()) => 0,
+                    Err(e) => -io_errno(&e),
+                }
+            }
+            FS_MUNMAP => {
+                let buf = a(0);
+                let Some(idx) = self.maps.iter().position(|m| m.base == buf as u64) else {
+                    return -EINVAL;
+                };
+                let map = self.maps.remove(idx);
+                // Final flush of the whole mapping (self-contained munmap).
+                let bytes = mem.as_deref().and_then(|m| m.read_bytes(map.base, map.len));
+                if let (Some(bytes), Some(Some(o))) = (bytes, self.open.get_mut(map.open_idx)) {
+                    let _ = o.file.seek(SeekFrom::Start(map.file_off));
+                    let _ = o.file.write_all(&bytes);
+                }
+                0
+            }
             _ => -EINVAL,
         }
     }
@@ -483,6 +684,7 @@ pub fn host_fs(root: PathBuf) -> HostCap {
         let mut st = HostFsState {
             root: root.clone(),
             open: Vec::new(),
+            maps: Vec::new(),
         };
         Box::new(
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
