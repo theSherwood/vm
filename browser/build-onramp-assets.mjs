@@ -60,8 +60,10 @@ try {
   console.log(`  ✗ hello_c: ${e.message}`);
 }
 
-// 2) SQLite Phase A — the `:memory:` breadth script printing query results to stdout. Fetch-and-cache
-//    the 3.50.2 amalgamation (same version + cache dir the svm-llvm test harness uses); skip offline.
+// 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
+//    from **stdin** and runs it against an in-memory database, printing each statement's result table.
+//    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +
+//    cache dir the svm-llvm test harness uses); skip offline.
 const CACHE = '/tmp/svm_sqlite_cache';
 const AMALG = join(CACHE, 'sqlite-amalgamation-3500200');
 function ensureAmalgamation() {
@@ -79,13 +81,12 @@ function ensureAmalgamation() {
 }
 if (ensureAmalgamation()) {
   try {
-    buildC('sqlite_demo', join(REPO, 'crates', 'svm-run', 'demos', 'sqlite', 'sqlite_demo.c'),
-      [AMALG], ['-DSVM_GUEST']);
+    buildC('sqlite_repl', join(REPO, 'crates', 'svm-run', 'demos', 'sqlite', 'sqlite_repl.c'), [AMALG]);
   } catch (e) {
-    console.log(`  ✗ sqlite_demo: ${e.message}`);
+    console.log(`  ✗ sqlite_repl: ${e.message}`);
   }
 } else {
-  console.log('  – sqlite_demo skipped (amalgamation fetch failed — offline?)');
+  console.log('  – sqlite_repl skipped (amalgamation fetch failed — offline?)');
 }
 
 // 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math libraries + a guest snprintf, with a

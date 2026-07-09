@@ -32,6 +32,16 @@ The test asserts three directions: guest (`mem_fs`) stdout byte-matches native o
 create → close → reopen → verify; under `host_fs` the guest's `test.db` really lands on disk and
 **native SQLite opens the guest-written file**; and the guest reads a native-written database.
 
+## `sqlite_repl.c` — the interactive SQL editor (test: `demo_sqlite_repl_stdin`)
+
+The browser playground's REPL guest: same amalgamation + deterministic `SQLITE_OS_OTHER` VFS as
+Phase A, but the driver **reads a SQL script from stdin** (the `Stream.read` capability), runs each
+statement against a fresh `:memory:` database, and prints its result table (column headers + rows),
+change count, or error. The page pipes the SQL editor's text in as stdin, so a user writes and runs
+their own SQL client-side; the `.svmb` is built by `browser/build-onramp-assets.mjs` at
+`--host-page 65536`. The test is a differential over a SQL script on stdin — guest stdout
+byte-matches the same file built with `cc`.
+
 ## `sqlite_logictest.c` — SQLite's own test corpus (tests: `demo_sqlite_logictest`, `_full`)
 
 A compact **sqllogictest** runner (https://sqlite.org/sqllogictest/): reads a script from stdin,

@@ -328,13 +328,29 @@ print("sorted:", table.concat(t, ", "))
 print(string.format("pi ~ %.4f, 255 in hex = 0x%X", math.pi, 255))
 `,
   },
-  'SQLite (Phase A, :memory:)': {
+  'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
-    url: './assets/sqlite_demo.svmb',
+    editable: true,
+    url: './assets/sqlite_repl.svmb',
     mode: 'io',
-    desc: 'The SQLite 3.50.2 amalgamation (~257k lines of C) running a 29-statement breadth script ' +
-      'over an in-memory database — DDL, aggregates, GROUP BY, window functions, transactions — its ' +
-      'query output printed to stdout, byte-identical to native. Build via build-onramp-assets.mjs.',
+    desc: 'The unmodified SQLite 3.50.2 amalgamation (~257k lines of C), compiled through the LLVM ' +
+      'on-ramp. Edit the SQL on the left and click Run: it executes against a fresh in-memory ' +
+      'database (each Run starts clean) and prints result tables, change counts, and errors below. ' +
+      'Real SQLite, running client-side in the sandbox.',
+    src: `-- Write SQL here, then click Run. Each Run is a fresh :memory: database.
+CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INT);
+INSERT INTO users(name, age) VALUES ('Ada', 36), ('Alan', 41), ('Grace', 45), ('Edsger', 40);
+
+SELECT name, age FROM users WHERE age >= 40 ORDER BY age DESC;
+
+SELECT count(*) AS n, avg(age) AS avg_age, max(age) AS oldest FROM users;
+
+-- a recursive CTE: the first 10 Fibonacci numbers
+WITH RECURSIVE fib(n, a, b) AS (
+  SELECT 1, 0, 1 UNION ALL SELECT n + 1, b, a + b FROM fib WHERE n < 10
+)
+SELECT n, a AS fib FROM fib;
+`,
   },
 };
 

@@ -2942,6 +2942,51 @@ fn demo_sqlite_vs_native() {
     powerbox_diff_cc_flags("sqlite", &bc, &demo, b"", &[&inc]);
 }
 
+#[test]
+fn demo_sqlite_repl_stdin() {
+    // **The interactive SQL-editor guest** (`sqlite_repl.c`, the browser playground's REPL): the same
+    // unmodified amalgamation + deterministic VFS, but the driver reads a SQL script from **stdin**
+    // (the `Stream.read` capability) and prints each statement's result table / change count / error.
+    // A differential over a SQL script on stdin — DDL, INSERT, a headered SELECT, an aggregate, and a
+    // deliberate error — asserts the guest's stdout is byte-identical to the same file built with `cc`.
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/sqlite/sqlite_repl.c");
+    let bc = std::env::temp_dir().join(format!(
+        "svm_llvm_demo_{}_sqlite_repl.bc",
+        std::process::id()
+    ));
+    let inc = format!("-I{}", amalg.display());
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_repl (clang unavailable)");
+            return;
+        }
+    }
+    const SQL: &[u8] = b"CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);\n\
+        INSERT INTO t(b) VALUES ('x'), ('y'), ('z');\n\
+        SELECT a, upper(b) AS B FROM t WHERE a >= 2 ORDER BY a;\n\
+        SELECT count(*) AS n, group_concat(b) AS all_b FROM t;\n\
+        SELECT * FROM nope;\n";
+    powerbox_diff_cc_flags("sqlite_repl", &bc, &demo, SQL, &[&inc]);
+}
+
 /// Fetch (and cache) sqllogictest script files — SQLite's own SQL Logic Tests corpus
 /// (https://sqlite.org/sqllogictest/), via the long-stable gregrahn GitHub mirror (the fossil
 /// tarball endpoint rate-limits). Returns `(name, path)` pairs for whatever fetched; files that
