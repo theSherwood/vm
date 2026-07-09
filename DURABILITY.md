@@ -243,8 +243,30 @@ serializing (the digest was already captured at instantiate); the §12.6 canonic
 only durable handles, and the module is re-granted after it. Pinned by
 `durable_nesting.rs::{freeze_with_live_separate_module_child_thaws_through_the_codec,
 thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module}`. This completes depth-1
-nesting for **both** module kinds (same- and separate-module) in every child state. Next: deeper nesting and
-JIT parity.
+nesting for **both** module kinds (same- and separate-module) in every child state.
+**Depth-2 (deeper nesting, interp + in-memory).** The subtree freeze now composes to a
+`parent→child→grandchild` chain. `FrozenNested` gains a `parent_task` (the task id of the vCPU that
+instantiated the child; a root's direct child carries `0`, a grandchild carries its parent-child's
+task) — the exact shape by which `thread.spawn`'s `FrozenVCpu::parent_task` already records nested
+spawns. Because a §14 child's capability host is **private** (its own attenuated powerbox), a shared
+**freeze-residue sink** (`VCpu::freeze_sink`, the root host) is threaded down the subtree at
+`instantiate`, so a grandchild's residue coalesces where a thaw reads it instead of being orphaned in
+the child's host — the analog of `thread.spawn`'s *shared* host. A mid-freeze `instantiate` also
+seeds the child's carve `UNWINDING` (inheriting the parent's durable phase, exactly like
+`thread.spawn`'s `child.dstate`), so a child born while its parent unwinds runs its own
+`instantiate`/`join` under `UNWINDING` and records *its* live grandchild before draining — the
+recursion that makes depth composable. Thaw mirrors the `FrozenVCpu` two-phase re-attach: group the
+residue by `parent_task`, re-create parents before children, and rebuild each parent's join table so a
+grandchild's reloaded handle resolves in its *parent-child's* table, not the root's (a record's
+`carve_off` is parent-relative, so a grandchild's absolute offset into the root image is composed down
+the chain). The freeze refusal drops the old `v.nested_child` blocker but keeps every other
+fail-closed case. Pinned by `durable_nesting.rs::freeze_with_live_depth2_grandchild_thaws_and_completes`
+(a same-module 3-level module: root → child → `0..100=4950` grandchild loop; the armed freeze records
+**two** residue records with the right `parent_task` tags; the thaw rewinds both levels and both joins
+deliver 4950 up to the root). **Codec:** depth-2 is interp-only for now — `svm-snapshot::freeze`
+refuses (`FreezeError::NestedTooDeep`) a residue with any non-zero `parent_task` rather than drop it,
+so depth-1 artifacts stay byte-identical (no `FORMAT_VERSION` bump); carrying `parent_task` on the wire
+is the next slice. Next: depth-2 codec (wire `parent_task` + version bump), then JIT parity.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
