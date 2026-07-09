@@ -1530,6 +1530,193 @@ fn fetch_sqlite_amalgamation() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Fetch (and cache) openlibm — the standalone BSD libm (JuliaMath/openlibm) — for the **bundled
+/// guest libm** (Postgres' transcendentals: the SVM has no transcendental op, so `log`/`exp`/`pow`/…
+/// stay guest code, llvm-linked in). Fetched-not-vendored; returns the extracted dir or `None`
+/// (skip) offline. Its C sources carry no inline asm (the asm lives in separate `amd64/`/`i387/`
+/// dirs we don't compile), and the double set translates through the on-ramp with zero gaps.
+fn fetch_openlibm() -> Option<PathBuf> {
+    const VER: &str = "0.8.5";
+    let cache = std::env::temp_dir().join("svm_openlibm_cache");
+    let dir = cache.join(format!("openlibm-{VER}"));
+    if dir.join("src/e_log.c").exists() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    let tgz = cache.join("openlibm.tar.gz");
+    let url = format!("https://github.com/JuliaMath/openlibm/archive/refs/tags/v{VER}.tar.gz");
+    let ok = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(&tgz)
+        .arg(&url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("note: skipping libm (openlibm fetch failed — offline?)");
+        return None;
+    }
+    let ok = Command::new("tar")
+        .arg("xf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&cache)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !dir.join("src/e_log.c").exists() {
+        eprintln!("note: skipping libm (untar failed)");
+        return None;
+    }
+    Some(dir)
+}
+
+/// The openlibm double-precision source set the bundled libm needs — the 18 Postgres transcendentals'
+/// entry points plus their kernels (argument reduction `k_*`/`e_rem_pio2`, `k_exp`, `expm1`, scaling).
+/// `sqrt`/`fabs` the openlibm code calls resolve to on-ramp float ops (so no `e_sqrt` needed).
+const OPENLIBM_SRCS: &[&str] = &[
+    "e_log",
+    "e_log10",
+    "e_log2",
+    "e_exp",
+    "s_exp2",
+    "e_pow",
+    "s_sin",
+    "s_cos",
+    "s_tan",
+    "k_sin",
+    "k_cos",
+    "k_tan",
+    "e_rem_pio2",
+    "k_rem_pio2",
+    "e_asin",
+    "e_acos",
+    "s_atan",
+    "e_atan2",
+    "e_sinh",
+    "e_cosh",
+    "s_tanh",
+    "s_cbrt",
+    "e_fmod",
+    "s_scalbn",
+    "s_copysign",
+    "s_fabs",
+    "k_exp",
+    "s_expm1",
+];
+
+#[test]
+fn libm_bundled_vs_native() {
+    // **Bundle a real guest libm (openlibm) — the Postgres transcendental surface.** The SVM has no
+    // transcendental op, so `log`/`exp`/`pow`/`sin`/… stay **guest code** (the raytrace model, but a
+    // *real* libm, llvm-linked). This proves the on-ramp reproduces openlibm **bit-for-bit** vs
+    // native: both sides link the *same* openlibm (not the system `-lm`), so the differential isolates
+    // the math translation, and the driver (`demos/postgres/libm_probe.c`) FNV-hashes raw IEEE result
+    // bits + prints hex — so float formatting is out of the loop and the test asserts the math itself,
+    // over ~3600 evaluations. Unblocks the Postgres libm externals. Fetched-not-vendored; skips offline.
+    let Some(ol) = fetch_openlibm() else {
+        return;
+    };
+    let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/libm_probe.c");
+    let pid = std::process::id();
+    let incs = [
+        format!("-I{}", ol.display()),
+        format!("-I{}/include", ol.display()),
+        format!("-I{}/src", ol.display()),
+        format!("-I{}/amd64", ol.display()),
+    ];
+    let cflags = [
+        "-O2",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-DASSEMBLER=0",
+    ];
+
+    // Guest: each openlibm source + the driver → bitcode, then `llvm-link` into one module.
+    let mut bcs: Vec<PathBuf> = Vec::new();
+    for name in OPENLIBM_SRCS
+        .iter()
+        .copied()
+        .chain(std::iter::once("__driver"))
+    {
+        let (src, out) = if name == "__driver" {
+            (
+                driver.clone(),
+                std::env::temp_dir().join(format!("olbc_{pid}_driver.bc")),
+            )
+        } else {
+            (
+                ol.join("src").join(format!("{name}.c")),
+                std::env::temp_dir().join(format!("olbc_{pid}_{name}.bc")),
+            )
+        };
+        let mut cmd = Command::new("clang");
+        cmd.args(cflags).args(["-emit-llvm", "-c"]);
+        for i in &incs {
+            cmd.arg(i);
+        }
+        cmd.arg(&src).arg("-o").arg(&out);
+        match cmd.status() {
+            Ok(s) if s.success() => bcs.push(out),
+            _ => {
+                eprintln!("note: skipping libm (clang unavailable / compile failed on {name})");
+                return;
+            }
+        }
+    }
+    let linked = std::env::temp_dir().join(format!("olbc_{pid}_libm.bc"));
+    if !Command::new("llvm-link")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("note: skipping libm (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle: the same driver + openlibm sources, **no `-lm`** (so both sides run openlibm).
+    let exe = std::env::temp_dir().join(format!("olbc_{pid}_native"));
+    let mut cc = Command::new("cc");
+    cc.args(["-O2", "-DASSEMBLER=0"]);
+    for i in &incs {
+        cc.arg(i);
+    }
+    cc.arg(&driver);
+    for name in OPENLIBM_SRCS {
+        cc.arg(ol.join("src").join(format!("{name}.c")));
+    }
+    cc.arg("-o").arg(&exe);
+    match cc.status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping libm (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe).output().expect("run native libm");
+
+    // Guest: translate → resolve caps → verify → run (JIT via the powerbox).
+    let t = svm_llvm::translate_bc_path(&linked).expect("translate bundled libm");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify libm module");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run libm");
+    assert!(
+        !native.stdout.is_empty() && native.status.success(),
+        "native libm oracle produced no output"
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "libm: guest hash {} vs native {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
 /// Like [`check_demo_vs_native`] but threads `extra` clang flags into the **bitcode** compile only
 /// — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
 /// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
