@@ -4315,6 +4315,7 @@ fn unresolved_extern_stub_opt_in() {
     use svm_llvm::TranslateOptions;
     let stub = TranslateOptions {
         stub_unresolved_externs: true,
+        ..TranslateOptions::default()
     };
 
     // (1) A dead undefined extern behind an opaque gate (`gate` is `volatile 0`, so clang can't prove

@@ -221,7 +221,7 @@ pub struct Translated {
 
 /// Opt-in translation knobs. The default is the strict, fail-closed on-ramp — every entry point that
 /// takes no options uses [`TranslateOptions::default`].
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct TranslateOptions {
     /// Lower a call to an **undefined external** — one that no recognizer, synthesized helper, or
     /// capability handles — to a synthesized **trap stub** (a function whose body is `unreachable`,
@@ -232,6 +232,24 @@ pub struct TranslateOptions {
     /// **Off by default** so a typo'd or genuinely-missing callee stays a clean translate-time error
     /// for ordinary programs; opt in only for a bring-up experiment on a large real program.
     pub stub_unresolved_externs: bool,
+    /// The powerbox RO/writable **page-isolation granularity** the layout is built against — the
+    /// per-target knob that makes an artifact portable to a host whose page is larger than the 16 KiB
+    /// [`DEFAULT_STACK_PAGE`]. Pass `65536` when the `.svmb` targets a **wasm** host (64 KiB pages,
+    /// e.g. the browser interpreter), so a read-only global never shares a host page with the writable
+    /// data stack (which would fault under D40). Must be a power of two `≥` [`svm_ir::POWERBOX_ARGS_END`].
+    /// Defaults to [`DEFAULT_STACK_PAGE`] (native). See [`DEFAULT_STACK_PAGE`] for why.
+    pub stack_page: u64,
+}
+
+impl Default for TranslateOptions {
+    fn default() -> Self {
+        // `stack_page` defaults to the native page (not `u64::default()` = 0, which would be invalid),
+        // so `#[derive(Default)]` is replaced by this hand-written impl.
+        Self {
+            stub_unresolved_externs: false,
+            stack_page: DEFAULT_STACK_PAGE,
+        }
+    }
 }
 
 /// Lazily-assigned trap stubs for undefined externals ([`TranslateOptions::stub_unresolved_externs`]).
@@ -296,8 +314,9 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     translate_bc_path_with_options(path, TranslateOptions::default())
 }
 
-/// [`translate_bc_path`] with explicit [`TranslateOptions`] (e.g. `stub_unresolved_externs` for a
-/// large-program bring-up).
+/// [`translate_bc_path`] with explicit [`TranslateOptions`] — e.g. `stub_unresolved_externs` for a
+/// large-program bring-up, or `stack_page` for a wasm target (a `.svmb` whose RO/writable isolation
+/// matches the 64 KiB host page).
 pub fn translate_bc_path_with_options(
     path: impl AsRef<Path>,
     opts: TranslateOptions,
@@ -364,6 +383,16 @@ fn translate_impl(
     ba: Option<&blockaddr::BlockAddrs>,
     opts: TranslateOptions,
 ) -> Result<Translated, Error> {
+    // The RO/writable page-isolation granularity is a per-target knob (native 16 KiB, wasm 64 KiB).
+    // Fail closed on a nonsensical value: it must be a power of two and leave room for the §3e args
+    // buffer below the globals base (`globals_base == stack_page` for a powerbox program).
+    let stack_page = opts.stack_page;
+    if !stack_page.is_power_of_two() || stack_page < svm_ir::POWERBOX_ARGS_END {
+        return Err(Error::Unsupported(format!(
+            "stack_page {stack_page} must be a power of two >= {} (POWERBOX_ARGS_END)",
+            svm_ir::POWERBOX_ARGS_END
+        )));
+    }
     // Pass 0: assign each *defined* function an IR index (its position among defined functions),
     // so a `call` can resolve its target by name. Declaration-only functions (extern/intrinsic
     // prototypes) have no body and are skipped — a call to one needs import support (a later slice).
@@ -556,23 +585,24 @@ fn translate_impl(
     // (page 0, below `STACK_PAGE`), so start the globals one page up (`STACK_PAGE`): a *read-only*
     // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
     // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
-    let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
+    let globals_base = if synth { stack_page } else { DATA_BASE };
     let (globals, mut data, mut globals_end, cstrs, gbytes) =
-        globals_layout(m, &name2idx, globals_base, ba)?;
+        globals_layout(m, &name2idx, globals_base, ba, stack_page)?;
     // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
     // module image** when the program calls the ctype locators (`isalpha`/`isspace`/`tolower`/… lower to
     // `__ctype_b_loc`/`__ctype_tolower_loc`/`__ctype_toupper_loc`, e.g. Embench `slre`). Placed after the
     // globals (and below the data stack) so a `run`-only module needs no `_start` to initialize them.
-    let ctype = build_ctype_data(m, &defined_names, &mut data, &mut globals_end);
+    let ctype = build_ctype_data(m, &defined_names, &mut data, &mut globals_end, stack_page);
     // Synthesize the C-locale `lconv` struct (+ its `"."`/`""` strings) as read-only module data when
     // the program calls `localeconv` (Lua's locale-aware number parsing reads `decimal_point`). Placed
     // after the globals like the ctype tables — no `_start` needed. `Some(addr)` of the struct.
-    let locale_addr = build_locale_data(m, &defined_names, &mut data, &mut globals_end);
+    let locale_addr = build_locale_data(m, &defined_names, &mut data, &mut globals_end, stack_page);
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
-    // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
-    // writable global sharing a page is a separate latent issue — page-isolating those is a follow-up.)
-    let entry_sp = globals_end.div_ceil(STACK_PAGE) * STACK_PAGE;
+    // fault). `stack_page` is the *target host's* page (16 KiB native, 64 KiB wasm), so the isolation
+    // holds on whatever host runs this artifact. (A read-only and a writable global sharing a page is
+    // a separate latent issue — page-isolating those is a follow-up.)
+    let entry_sp = globals_end.div_ceil(stack_page) * stack_page;
 
     // Synthesized helpers (mem-loop `memset`/`memcpy`, the `malloc` allocator) sit after the defined
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
@@ -814,6 +844,7 @@ fn translate_impl(
             heap_base,
             &ctors,
             wants_envp,
+            stack_page,
         );
         funcs.insert(0, start);
     }
@@ -826,7 +857,7 @@ fn translate_impl(
         funcs.push(synth_memcpy());
     }
     if need_malloc {
-        funcs.push(synth_malloc(caps["vm_map"]));
+        funcs.push(synth_malloc(caps["vm_map"], stack_page));
     }
     if need_printf || need_snprintf {
         funcs.push(synth_utoa());
@@ -1024,17 +1055,27 @@ fn translate_impl(
 
 /// The low window offset where globals begin (kept off a null-like 0).
 const DATA_BASE: u64 = 16;
-/// The page granularity the data stack is aligned to above the globals (≥ the largest OS page so
-/// a stack write never lands in a read-only global's protected page, D40). For a powerbox program
-/// this is also the globals base, so `[0, STACK_PAGE)` is the reserved low scratch — the handle
-/// stash, allocator/format state, and the §3e args buffer all live there. The powerbox layout is a
-/// public ABI ([`svm_ir::POWERBOX_STACK_PAGE`]), shared with the frontend-independent
+/// The **default** page granularity the data stack is aligned to above the globals (≥ the largest OS
+/// page so a stack write never lands in a read-only global's protected page, D40). For a powerbox
+/// program this is also the globals base, so `[0, stack_page)` is the reserved low scratch — the
+/// handle stash, allocator/format state, and the §3e args buffer all live there. The powerbox layout
+/// is a public ABI ([`svm_ir::POWERBOX_STACK_PAGE`]), shared with the frontend-independent
 /// [`svm_ir::synth_powerbox_start`] so the two `_start` synthesizers stay byte-identical.
-const STACK_PAGE: u64 = svm_ir::POWERBOX_STACK_PAGE;
+///
+/// This is only the **default**: the actual granularity is a per-translation parameter (see
+/// [`translate_bc_path_with_page`]). The isolation must be `≥` the *host* page the artifact will run
+/// on — 16 KiB covers every native OS page, but a **wasm** host has 64 KiB pages, so an artifact
+/// destined for the browser is translated with a 64 KiB `stack_page` (otherwise a read-only global
+/// and the writable data stack share one 64 KiB host page and the stack write faults under D40). It
+/// is a *frontend* choice (+0 escape-TCB): only the layout the on-ramp bakes changes.
+const DEFAULT_STACK_PAGE: u64 = svm_ir::POWERBOX_STACK_PAGE;
 // The §3e powerbox args buffer (`svm_ir::POWERBOX_ARGS_BASE..POWERBOX_ARGS_END`) must sit *above*
-// the frontend's format/scratch region and *below* the globals base, so it never overlaps either.
+// the frontend's format/scratch region and (at or) *below* the globals base, so it never overlaps
+// either. A larger `stack_page` only pushes the globals base up (extra unused low scratch), so the
+// invariant is `POWERBOX_ARGS_END <= stack_page` — checked per-call in `translate_impl` against the
+// default here (`==`) and any override (`<=`).
 const _: () = assert!(svm_ir::POWERBOX_ARGS_BASE >= FMT_BUF_END);
-const _: () = assert!(svm_ir::POWERBOX_ARGS_END == STACK_PAGE);
+const _: () = assert!(svm_ir::POWERBOX_ARGS_END == DEFAULT_STACK_PAGE);
 /// The data-stack reserve (bytes) above the entry SP before the guard region — a stack overflow
 /// past this faults rather than escaping the window ([`svm_ir::POWERBOX_STACK_RESERVE`]).
 const STACK_RESERVE: u64 = svm_ir::POWERBOX_STACK_RESERVE;
@@ -1358,6 +1399,7 @@ fn globals_layout(
     name2idx: &HashMap<String, u32>,
     base: u64,
     ba: Option<&blockaddr::BlockAddrs>,
+    stack_page: u64,
 ) -> Result<Globals, Error> {
     // Phase A: assign every global a window address (from its declared type size), so a relocation
     // in any initializer can resolve a forward/backward reference to another global in phase B.
@@ -1401,7 +1443,7 @@ fn globals_layout(
     place(&mut off, &mut addr, false)?; // writable + BSS globals
     let any_const = m.global_vars.iter().any(|g| g.is_constant);
     if any_const && off > base {
-        off = off.div_ceil(STACK_PAGE) * STACK_PAGE; // page-isolate the read-only region
+        off = off.div_ceil(stack_page) * stack_page; // page-isolate the read-only region
     }
     place(&mut off, &mut addr, true)?; // read-only (constant) globals
                                        // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
@@ -1537,6 +1579,7 @@ fn build_ctype_data(
     defined: &HashMap<String, u32>,
     data: &mut Vec<svm_ir::Data>,
     end: &mut u64,
+    stack_page: u64,
 ) -> CtypeAddrs {
     let need_b = calls_external(m, defined, "__ctype_b_loc");
     let need_tl = calls_external(m, defined, "__ctype_tolower_loc");
@@ -1545,7 +1588,7 @@ fn build_ctype_data(
         return CtypeAddrs::default();
     }
     // Read-only region — page-isolate from any preceding writable global (D40).
-    *end = end.div_ceil(STACK_PAGE) * STACK_PAGE;
+    *end = end.div_ceil(stack_page) * stack_page;
 
     // Append a read-only `elem`-byte-per-entry table + its indirection pointer cell (which holds
     // `table + 128*elem`, the index-0 base a signed/unsigned char offsets from); return the cell address.
@@ -1611,12 +1654,13 @@ fn build_locale_data(
     defined: &HashMap<String, u32>,
     data: &mut Vec<svm_ir::Data>,
     end: &mut u64,
+    stack_page: u64,
 ) -> Option<u64> {
     if !calls_external(m, defined, "localeconv") {
         return None;
     }
     // Read-only region — page-isolate from any preceding writable global (D40), like `build_ctype_data`.
-    *end = end.div_ceil(STACK_PAGE) * STACK_PAGE;
+    *end = end.div_ceil(stack_page) * stack_page;
     // The `"."` and `""` strings.
     let dot = *end;
     data.push(svm_ir::Data {
@@ -3148,7 +3192,7 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
 /// `main(void)`) and [`synth_start_argv`] (`main(int, char**)`): `(main_idx, main_results, entry_sp,
 /// n_handles, heap_base, ctors) -> Func`. A `type` alias so the dispatch can pick one by function
 /// pointer without tripping `clippy::type_complexity`.
-type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32], bool) -> Func;
+type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32], bool, u64) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
@@ -3157,6 +3201,7 @@ type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32], bool) -
 /// slot (offset `i*4`) so every capability call site can reload its handle, then calls the C
 /// `main(sp)` at the page-aligned data-stack base and returns its exit code. The runner grants
 /// exactly `n_handles` (a contiguous prefix, by declared arity — `run_powerbox`).
+#[allow(clippy::too_many_arguments)] // shares the StartBuilder shape with synth_start_argv (8 params)
 fn synth_start(
     main_idx: u32,
     main_results: &[ValType],
@@ -3165,6 +3210,9 @@ fn synth_start(
     heap_base: Option<u64>,
     ctors: &[u32],
     _wants_envp: bool,
+    // The plain `main(void)` entry bakes the already-page-aligned `entry_sp` directly, so it needs no
+    // page granularity of its own; the param exists only to share [`StartBuilder`] with the argv entry.
+    _stack_page: u64,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
@@ -3248,6 +3296,7 @@ fn synth_start(
 /// `main(main_sp, argc, argv[, envp])` with `main`'s frame parked one page above the array(s). This is
 /// the only place the C `char**` convention exists — the powerbox ABI itself only delivers the
 /// neutral byte blob.
+#[allow(clippy::too_many_arguments)] // the argv `_start` threads sp + handles + ctors + page (8 params)
 fn synth_start_argv(
     main_idx: u32,
     main_results: &[ValType],
@@ -3256,10 +3305,13 @@ fn synth_start_argv(
     heap_base: Option<u64>,
     ctors: &[u32],
     wants_envp: bool,
+    // The host page granularity `main`'s frame is aligned to above the argv/env arrays (so the frame
+    // never shares a read-only global's page under D40) — 16 KiB native, 64 KiB wasm.
+    stack_page: u64,
 ) -> Func {
     use svm_ir::{LoadOp, StoreOp};
     let args_base = svm_ir::POWERBOX_ARGS_BASE as i64;
-    let page = STACK_PAGE as i64;
+    let page = stack_page as i64;
     let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
         ty: IntTy::I64,
         op: BinOp::Add,
@@ -3664,7 +3716,7 @@ fn synth_start_argv(
 /// ```
 /// The header is written in `commit` (not `block0`) because on the first `malloc` `brk` is an
 /// *uncommitted* reserved page — only `grow` (or the prior commit) maps it.
-fn synth_malloc(vm_map_import: u32) -> Func {
+fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
     use svm_ir::{LoadOp, StoreOp};
     let i64add = |a: ValIdx, b: ValIdx| Inst::IntBin {
         ty: IntTy::I64,
@@ -3725,7 +3777,7 @@ fn synth_malloc(vm_map_import: u32) -> Func {
     };
 
     // grow(brk=0, size=1, new=2, top=3): commit [top, page_up(new)) via vm_map, update HEAP_TOP.
-    let page = STACK_PAGE as i64; // commit in ≥-OS-page units (16 KiB covers any real page)
+    let page = stack_page as i64; // commit in host-page units (16 KiB native, 64 KiB wasm)
     let g = Block {
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64], // brk, size, new, top
         insts: vec![

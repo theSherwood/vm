@@ -28,11 +28,17 @@ fn try_main() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: svm-llvm-translate <input.bc> -o <out> [--emit-syms <file>] [--binary]\n\
+            "usage: svm-llvm-translate <input.bc> -o <out> [--emit-syms <file>] [--binary] [--host-page <bytes>] [--stub-externs]\n\
              \n  Translates legalized LLVM-18 bitcode to an SVM-IR module written to <out>:\n\
              \n    text (.svm) by default, binary (.svmb) when -o ends in .svmb or --binary.\n\
              \n  --emit-syms <file> writes the export map (one `name idx` line per exported\n\
-             \n  function) so a program can link against the module via svm_ir::link."
+             \n  function) so a program can link against the module via svm_ir::link.\n\
+             \n  --host-page <bytes> sets the powerbox RO/writable page-isolation granularity\n\
+             \n  (default 16384). Pass 65536 when the .svmb targets a wasm host (64 KiB pages) —\n\
+             \n  e.g. the browser interpreter — so read-only globals never share a host page with\n\
+             \n  the writable data stack (which would fault under D40).\n\
+             \n  --stub-externs lowers undefined externals to trap-if-called stubs instead of\n\
+             \n  failing translation (large-program bring-up, e.g. Postgres)."
         );
         return Err("no input file".into());
     }
@@ -41,6 +47,7 @@ fn try_main() -> Result<(), String> {
     let mut out: Option<String> = None;
     let mut syms: Option<String> = None;
     let mut binary = false;
+    let mut host_page: u64 = svm_ir::POWERBOX_STACK_PAGE;
     let mut stub_externs = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -54,6 +61,13 @@ fn try_main() -> Result<(), String> {
                 )
             }
             "--binary" => binary = true,
+            "--host-page" => {
+                host_page = it
+                    .next()
+                    .ok_or("--host-page needs a byte-count argument")?
+                    .parse()
+                    .map_err(|e| format!("--host-page: {e}"))?
+            }
             // Lower undefined externals to trap-if-called stubs instead of failing translation — for a
             // large-program bring-up (Postgres) where most externals are dead on the exercised path.
             "--stub-externs" => stub_externs = true,
@@ -73,6 +87,7 @@ fn try_main() -> Result<(), String> {
     // Translate the bitcode. `Error` is `Debug`-only (no `Display`), so render it that way.
     let opts = svm_llvm::TranslateOptions {
         stub_unresolved_externs: stub_externs,
+        stack_page: host_page,
     };
     let translated = svm_llvm::translate_bc_path_with_options(&input, opts)
         .map_err(|e| format!("translate `{input}`: {e:?}"))?;

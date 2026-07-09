@@ -5,7 +5,7 @@
 // a §14 root `Instantiator` (sandboxed children on their own Workers). The page services no
 // authority either way — all of it is Rust-side, in shared linear memory.
 
-import { loadEngine, makeRunner, readParStdout } from '/web/par.js';
+import { loadEngine, makeRunner, readParStdout } from './par.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -289,6 +289,26 @@ block0(v0: i64):
 }
 `,
   },
+
+  // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
+  //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
+  //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
+  'hello (C → SVM)': {
+    kind: 'module',
+    url: './assets/hello_c.svmb',
+    mode: 'io',
+    desc: 'crates/svm-run/demos/hello.c — a C program compiled with stock clang, translated by the ' +
+      'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
+      'below is the guest’s real stdout.',
+  },
+  'SQLite (Phase A, :memory:)': {
+    kind: 'module',
+    url: './assets/sqlite_demo.svmb',
+    mode: 'io',
+    desc: 'The SQLite 3.50.2 amalgamation (~257k lines of C) running a 29-statement breadth script ' +
+      'over an in-memory database — DDL, aggregates, GROUP BY, window functions, transactions — its ' +
+      'query output printed to stdout, byte-identical to native. Build via build-onramp-assets.mjs.',
+  },
 };
 
 // Size the run's shared window from the source's `memory N` declaration (64 KiB minimum — the wasm
@@ -303,13 +323,79 @@ let eng, run, aborter = null, broken = false;
 
 function loadExample(name) {
   const ex = EXAMPLES[name];
-  $('src').value = ex.src;
   $('mode').value = ex.mode;
   $('desc').textContent = ex.desc;
+  if (ex.kind === 'module') {
+    // A pre-built on-ramp module: the "source" is binary, not editable SVM text. Show a note.
+    $('src').value =
+      `// ${name}\n// A pre-built on-ramp module: ${ex.url}\n// Click Run — it executes as a real ` +
+      `C/C++ guest via svm_run_onramp,\n// and its stdout appears in the pane on the right.`;
+    $('src').readOnly = true;
+  } else {
+    $('src').value = ex.src;
+    $('src').readOnly = false;
+  }
+}
+
+// Fetched `.svmb` bytes, cached (a 6 MB SQLite module is worth not re-downloading on every Run).
+const moduleCache = new Map();
+async function fetchModule(url) {
+  if (moduleCache.has(url)) return moduleCache.get(url);
+  // Resolve module URLs relative to this script (not the document), so they work under any base path
+  // (origin root locally, `/<repo>/` on GitHub Pages).
+  const resolved = new URL(url, import.meta.url);
+  const r = await fetch(resolved);
+  if (!r.ok) throw new Error(`fetch ${url}: ${r.status}`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  moduleCache.set(url, bytes);
+  return bytes;
+}
+
+// Run a pre-built on-ramp module single-shot on the main engine: alloc a buffer, copy the module in,
+// `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read the captured stdout.
+// No Workers (these guests are single-threaded), so it never touches the par.js shared-window path.
+async function runModule(ex) {
+  setState('running', 'fetching module…');
+  $('result').textContent = '';
+  $('stdout').textContent = '';
+  let bytes;
+  try {
+    bytes = await fetchModule(ex.url);
+  } catch (e) {
+    setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    log(`fetch failed: ${e.message}`);
+    return;
+  }
+  log(`fetched ${ex.url}: ${bytes.length}B module`);
+  const u8 = () => new Uint8Array(eng.memory.buffer);
+  const p = eng.ex.svm_alloc(bytes.length);
+  u8().set(bytes, p); // re-fetch the view: svm_alloc may have grown (detached) the old buffer
+  setState('running', 'running…');
+  const t0 = performance.now();
+  const rv = eng.ex.svm_run_onramp(p, bytes.length, 0, 0);
+  const status = eng.ex.svm_status();
+  const sp = eng.ex.svm_stdout_ptr();
+  const sl = eng.ex.svm_stdout_len();
+  const stdout = new TextDecoder().decode(u8().slice(sp, sp + sl));
+  eng.ex.svm_dealloc(p, bytes.length);
+  const ms = (performance.now() - t0).toFixed(0);
+  $('stdout').textContent = stdout;
+  $('result').textContent = `${rv}`;
+  // 0 = OK, 5 = clean Exit; anything else is a decode error / trap / unsupported.
+  if (status === 0 || status === 5) {
+    setState('done', `done · status ${status} · ${ms}ms`);
+    log(`svm_run_onramp → ${rv} (status ${status}) in ${ms}ms`);
+  } else {
+    setState('error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
+    log(`svm_run_onramp status ${status}`);
+  }
 }
 
 async function doRun() {
   if (broken) return;
+  // A pre-built on-ramp module runs single-shot via svm_run_onramp — no in-browser parse, no Workers.
+  const selected = EXAMPLES[$('example').value];
+  if (selected?.kind === 'module') return runModule(selected);
   // Leave the terminal states synchronously on click, so an observer (the Playwright smoke) that
   // clicks Run and polls for done/error never reads the PREVIOUS run's state.
   setState('running', 'parsing…');
