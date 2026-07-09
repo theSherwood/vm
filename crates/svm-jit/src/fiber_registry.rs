@@ -65,12 +65,14 @@ const STATE_BITS: u64 = 2;
 const STATE_MASK: u64 = (1 << STATE_BITS) - 1;
 
 /// Generation bits a fiber **guest handle** carries (recycling step 1): the handle is
-/// `(generation << 16) | slot` and a slot fits in the low 16 bits (`MAX_FIBERS = 1<<16`), so an `i64`
-/// handle conveys the low **48** bits of the slot's full word generation. [`Ownership::claim_gen`]
+/// `(generation << 24) | slot` and a slot fits in the low 24 bits (`MAX_FIBERS = 1<<24`), so an `i64`
+/// handle conveys the low **40** bits of the slot's full word generation. [`Ownership::claim_gen`]
 /// validates a handle against `gen_of(word) & FIBER_HANDLE_GEN_MASK`, so the cross-backend handle
-/// namespace (shared with `svm_interp`, whose `FIBER_GEN_SHIFT` is likewise 16) matches. 48 bits puts
-/// wraparound at 2^48 recycles — unreachable in practice, so the ABA guard never silently re-matches.
-pub(crate) const FIBER_HANDLE_GEN_MASK: u64 = (1 << 48) - 1;
+/// namespace (shared with `svm_interp`, whose `FIBER_GEN_SHIFT` is likewise 24) matches. 40 bits puts
+/// wraparound at 2^40 recycles — unreachable in practice, so the ABA guard never silently re-matches.
+/// (Index widened 16→24 once the arena removed the `vm.max_map_count` VMA wall; the generation field
+/// narrowed 48→40 to keep the `i64` handle budget.)
+pub(crate) const FIBER_HANDLE_GEN_MASK: u64 = (1 << 40) - 1;
 
 #[inline]
 fn pack(generation: u64, state: u64) -> u64 {
