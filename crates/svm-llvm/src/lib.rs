@@ -641,8 +641,10 @@ fn translate_impl(
     // Synthesized helpers (mem-loop `memset`/`memcpy`, the `malloc` allocator) sit after the defined
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
-    let (need_memset, need_memcpy0, need_memmove) = needs_mem_helpers(m);
-    let need_memcpy = need_memcpy0 || need_realloc || need_snprintf || uses_fmt_float; // realloc/snprintf/__vm_fmt copy via `__svm_memcpy`
+    // Intrinsic `llvm.memcpy`/`memmove`/`memset` now lower to the bulk-memory ops (D62), not to
+    // byte-loop helpers. `__svm_memcpy` is still synthesized for realloc/snprintf/__vm_fmt (which copy
+    // through it); the memset/memmove helpers had no other caller and are gone.
+    let need_memcpy = need_realloc || need_snprintf || uses_fmt_float;
                                                                                        // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
                                                                                        // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
@@ -658,8 +660,7 @@ fn translate_impl(
     // i128 `udiv`/`sdiv`/`urem`/`srem` lower to the synthesized 128÷128 long-division helper.
     let need_idiv128 = uses_i128_divrem(m);
     // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
-    // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
-    // order below must match.
+    // memcpy, malloc, utoa, realloc — each present only if needed. The append order below must match.
     let mut next_helper = base + defined.len() as u32;
     let mut take = |needed: bool| {
         needed.then(|| {
@@ -682,7 +683,6 @@ fn translate_impl(
         b
     });
     let helpers = Helpers {
-        memset: take(need_memset),
         memcpy: take(need_memcpy),
         malloc: take(need_malloc),
         utoa: take(need_printf || need_snprintf),
@@ -690,7 +690,6 @@ fn translate_impl(
         // `strlen` call also routes here — `need_strlen` covers both (see above).
         strlen: take(need_strlen),
         realloc: take(need_realloc),
-        memmove: take(need_memmove),
         getenv: take(need_getenv),
         big_zero: take(need_dtoa),
         big_copy: take(need_dtoa),
@@ -892,11 +891,8 @@ fn translate_impl(
         );
         funcs.insert(0, start);
     }
-    // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
-    // matching the indices assigned above.
-    if need_memset {
-        funcs.push(synth_memset());
-    }
+    // Append the synthesized helpers in index order (memcpy, malloc, utoa, realloc) — matching the
+    // indices assigned above.
     if need_memcpy {
         funcs.push(synth_memcpy());
     }
@@ -914,9 +910,6 @@ fn translate_impl(
             helpers.malloc.expect("realloc needs malloc"),
             helpers.memcpy.expect("realloc needs memcpy"),
         ));
-    }
-    if need_memmove {
-        funcs.push(synth_memmove());
     }
     if need_getenv {
         funcs.push(synth_getenv());
@@ -3885,9 +3878,9 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
 /// helpers take no data-SP (they touch only the passed window addresses). `None` when not needed.
 #[derive(Clone, Default)]
 struct Helpers {
-    /// `__svm_memset(dst:i64, byte:i32, len:i64)` — fill `len` bytes at `dst` with `byte`'s low byte.
-    memset: Option<u32>,
     /// `__svm_memcpy(dst:i64, src:i64, len:i64)` — copy `len` bytes `src`→`dst` (forward; no overlap).
+    /// Still synthesized for realloc/snprintf/__vm_fmt; the `llvm.memcpy` *intrinsic* lowers to
+    /// [`Inst::MemCopy`] (D62), not to this helper.
     memcpy: Option<u32>,
     /// `__svm_malloc(size:i64) -> i64` — the `vm_map`-growing bump allocator (`malloc`/`calloc`).
     malloc: Option<u32>,
@@ -3947,8 +3940,6 @@ struct Helpers {
     snprintf_rt: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
-    /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
-    memmove: Option<u32>,
     /// `__svm_memcmp(a:i64, b:i64, len:i64) -> i32` — compare `len` bytes as unsigned; `0` if equal,
     /// else the signed first-mismatch difference (`a[i] - b[i]`). Backs `memcmp` *and* `bcmp` (Rust's
     /// `[u8]`/slice equality and `BTreeMap` key ordering emit these).
@@ -4219,35 +4210,6 @@ fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
     calls_external(m, defined, "malloc") || calls_external(m, defined, "calloc")
 }
 
-/// Does any mem intrinsic need a runtime helper — a **non-constant** length, or a constant one too
-/// large to unroll inline? Returns `(needs_memset, needs_memcpy, needs_memmove)`.
-fn needs_mem_helpers(m: &LModule) -> (bool, bool, bool) {
-    let (mut set, mut cpy, mut mov) = (false, false, false);
-    for f in &m.functions {
-        for bb in &f.basic_blocks {
-            for instr in &bb.instrs {
-                let Instruction::Call(c) = instr else {
-                    continue;
-                };
-                let Some(name) = callee_name(c) else { continue };
-                let big = |c: &crate::ll::ast::Call| {
-                    c.arguments
-                        .get(2)
-                        .is_some_and(|(a, _)| const_int(a).is_none_or(|n| n > MAX_MEM_UNROLL))
-                };
-                if name.starts_with("llvm.memset") && big(c) {
-                    set = true;
-                } else if name.starts_with("llvm.memcpy") && big(c) {
-                    cpy = true;
-                } else if name.starts_with("llvm.memmove") && big(c) {
-                    mov = true;
-                }
-            }
-        }
-    }
-    (set, cpy, mov)
-}
-
 /// Synthesize `__svm_realloc(p:i64, n:i64) -> i64`: `realloc` over the header-bearing bump allocator.
 /// `realloc(NULL, n)` ≡ `malloc(n)`; otherwise allocate `n`, copy `min(old, n)` bytes (the old size
 /// is the 16-byte header at `p-16`), and return the new pointer (the old block is leaked — `free` is
@@ -4483,81 +4445,6 @@ fn synth_eh_unwind() -> Func {
         params: vec![ValType::I64],
         results: vec![],
         blocks: vec![entry, terminate, unwind],
-    }
-}
-
-/// Synthesize `__svm_memset(dst:i64, byte:i32, len:i64)`: a counted byte loop
-/// `for (i=0; i<len; i++) dst[i] = byte`. Four blocks — entry, the `i<len` test, the body, and the
-/// return — threading `(dst, byte, len, i)` as block params (the SSA → block-arg form, hand-built).
-fn synth_memset() -> Func {
-    use svm_ir::StoreOp;
-    let params = vec![ValType::I64, ValType::I32, ValType::I64];
-    // block0(dst=0, byte=1, len=2): i = 0; br loop(dst, byte, len, i)
-    let entry = Block {
-        params: params.clone(),
-        insts: vec![Inst::ConstI64(0)],
-        term: Terminator::Br {
-            target: 1,
-            args: vec![0, 1, 2, 3],
-        },
-    };
-    // loop(dst=0, byte=1, len=2, i=3): cond = i <u len; br_if cond body(..) done()
-    let loop_params = vec![ValType::I64, ValType::I32, ValType::I64, ValType::I64];
-    let test = Block {
-        params: loop_params.clone(),
-        insts: vec![Inst::IntCmp {
-            ty: IntTy::I64,
-            op: CmpOp::LtU,
-            a: 3,
-            b: 2,
-        }],
-        term: Terminator::BrIf {
-            cond: 4,
-            then_blk: 2,
-            then_args: vec![0, 1, 2, 3],
-            else_blk: 3,
-            else_args: vec![],
-        },
-    };
-    // body(dst=0, byte=1, len=2, i=3): dst[i] = byte; br loop(dst, byte, len, i+1)
-    let body = Block {
-        params: loop_params,
-        insts: vec![
-            Inst::IntBin {
-                ty: IntTy::I64,
-                op: BinOp::Add,
-                a: 0,
-                b: 3,
-            }, // v4 = dst + i
-            Inst::Store {
-                op: StoreOp::I32_8,
-                addr: 4,
-                value: 1,
-                offset: 0,
-                align: 0,
-            },
-            Inst::ConstI64(1), // v5
-            Inst::IntBin {
-                ty: IntTy::I64,
-                op: BinOp::Add,
-                a: 3,
-                b: 5,
-            }, // v6 = i + 1
-        ],
-        term: Terminator::Br {
-            target: 1,
-            args: vec![0, 1, 2, 6],
-        },
-    };
-    let done = Block {
-        params: vec![],
-        insts: vec![],
-        term: Terminator::Return(vec![]),
-    };
-    Func {
-        params,
-        results: vec![],
-        blocks: vec![entry, test, body, done],
     }
 }
 
@@ -4852,153 +4739,6 @@ fn synth_memchr() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, test, body, found, notfound],
-    }
-}
-
-/// Synthesize `__svm_memmove(dst:i64, src:i64, len:i64)`: an **overlap-safe** byte copy — forward
-/// when `dst <= src`, backward otherwise (the direction `memcpy` can't do). 8 blocks: the direction
-/// branch, then a forward and a backward counted byte loop sharing the `done` return.
-fn synth_memmove() -> Func {
-    use svm_ir::{LoadOp, StoreOp};
-    let p3 = || vec![ValType::I64, ValType::I64, ValType::I64]; // dst, src, len
-    let p4 = || vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64]; // + i
-    let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::Add,
-        a,
-        b,
-    };
-    let load8 = |addr: ValIdx| Inst::Load {
-        op: LoadOp::I32_8U,
-        addr,
-        offset: 0,
-        align: 0,
-    };
-    let store8 = |addr: ValIdx, value: ValIdx| Inst::Store {
-        op: StoreOp::I32_8,
-        addr,
-        value,
-        offset: 0,
-        align: 0,
-    };
-    // block0(dst=0,src=1,len=2): dst <=u src ? forward : backward.
-    let b0 = Block {
-        params: p3(),
-        insts: vec![Inst::IntCmp {
-            ty: IntTy::I64,
-            op: CmpOp::LeU,
-            a: 0,
-            b: 1,
-        }], // v3
-        term: Terminator::BrIf {
-            cond: 3,
-            then_blk: 1, // fwd
-            then_args: vec![0, 1, 2],
-            else_blk: 4, // bwd
-            else_args: vec![0, 1, 2],
-        },
-    };
-    // fwd(dst,src,len): i = 0; → floop.
-    let fwd = Block {
-        params: p3(),
-        insts: vec![Inst::ConstI64(0)], // v3 = i
-        term: Terminator::Br {
-            target: 2,
-            args: vec![0, 1, 2, 3],
-        },
-    };
-    // floop(dst,src,len,i): i <u len ? fbody : done.
-    let floop = Block {
-        params: p4(),
-        insts: vec![Inst::IntCmp {
-            ty: IntTy::I64,
-            op: CmpOp::LtU,
-            a: 3,
-            b: 2,
-        }], // v4
-        term: Terminator::BrIf {
-            cond: 4,
-            then_blk: 3,
-            then_args: vec![0, 1, 2, 3],
-            else_blk: 7,
-            else_args: vec![],
-        },
-    };
-    // fbody(dst,src,len,i): dst[i] = src[i]; i++ → floop.
-    let fbody = Block {
-        params: p4(),
-        insts: vec![
-            add(1, 3),         // v4 = src + i
-            load8(4),          // v5 = src[i]
-            add(0, 3),         // v6 = dst + i
-            store8(6, 5),      // dst[i] = src[i]
-            Inst::ConstI64(1), // v7
-            add(3, 7),         // v8 = i + 1
-        ],
-        term: Terminator::Br {
-            target: 2,
-            args: vec![0, 1, 2, 8],
-        },
-    };
-    // bwd(dst,src,len): i = len; → bloop.
-    let bwd = Block {
-        params: p3(),
-        insts: vec![],
-        term: Terminator::Br {
-            target: 5,
-            args: vec![0, 1, 2, 2], // i = len
-        },
-    };
-    // bloop(dst,src,len,i): i >u 0 ? bbody : done.
-    let bloop = Block {
-        params: p4(),
-        insts: vec![
-            Inst::ConstI64(0), // v4
-            Inst::IntCmp {
-                ty: IntTy::I64,
-                op: CmpOp::GtU,
-                a: 3,
-                b: 4,
-            }, // v5 = i > 0
-        ],
-        term: Terminator::BrIf {
-            cond: 5,
-            then_blk: 6,
-            then_args: vec![0, 1, 2, 3],
-            else_blk: 7,
-            else_args: vec![],
-        },
-    };
-    // bbody(dst,src,len,i): i--; dst[i] = src[i]; → bloop.
-    let bbody = Block {
-        params: p4(),
-        insts: vec![
-            Inst::ConstI64(1), // v4
-            Inst::IntBin {
-                ty: IntTy::I64,
-                op: BinOp::Sub,
-                a: 3,
-                b: 4,
-            }, // v5 = i - 1
-            add(1, 5),         // v6 = src + (i-1)
-            load8(6),          // v7 = src[i-1]
-            add(0, 5),         // v8 = dst + (i-1)
-            store8(8, 7),      // dst[i-1] = src[i-1]
-        ],
-        term: Terminator::Br {
-            target: 5,
-            args: vec![0, 1, 2, 5], // loop with i-1
-        },
-    };
-    let done = Block {
-        params: vec![],
-        insts: vec![],
-        term: Terminator::Return(vec![]),
-    };
-    Func {
-        params: p3(),
-        results: vec![],
-        blocks: vec![b0, fwd, floop, fbody, bwd, bloop, bbody, done],
     }
 }
 
@@ -12915,47 +12655,6 @@ fn emit_printf_int_field(
     )
 }
 
-/// The largest constant byte length we unroll a `memcpy`/`memset` into chunked load/stores; a
-/// larger one would need a runtime loop (synthetic blocks), a later slice. clang's struct/array
-/// bulk ops carry small constant sizes.
-const MAX_MEM_UNROLL: u64 = 4096;
-
-/// Split `len` bytes into `(offset, width)` chunks, widest first (8/4/2/1) — the same unroll plan
-/// `svm-wasm` uses for `memory.copy`/`fill`.
-fn mem_chunks(len: u64) -> Vec<(u64, u8)> {
-    let mut out = Vec::new();
-    let mut off = 0u64;
-    let mut rem = len;
-    for w in [8u64, 4, 2, 1] {
-        while rem >= w {
-            out.push((off, w as u8));
-            off += w;
-            rem -= w;
-        }
-    }
-    out
-}
-
-fn load_w(w: u8) -> svm_ir::LoadOp {
-    use svm_ir::LoadOp as L;
-    match w {
-        8 => L::I64,
-        4 => L::I32,
-        2 => L::I32_16U,
-        _ => L::I32_8U,
-    }
-}
-
-fn store_w(w: u8) -> svm_ir::StoreOp {
-    use svm_ir::StoreOp as S;
-    match w {
-        8 => S::I64,
-        4 => S::I32,
-        2 => S::I32_16,
-        _ => S::I32_8,
-    }
-}
-
 /// The constant integer value of an operand, if it is one.
 fn const_int(op: &Operand) -> Option<u64> {
     match op {
@@ -13995,105 +13694,26 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<b
         return Ok(false);
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
-    // A non-constant length — or a constant too large to unroll inline — calls the synthesized
-    // runtime loop helper (`__svm_memset`/`__svm_memcpy`/`__svm_memmove`). Variable-length `memmove`
-    // routes to the overlap-safe (direction-aware) `__svm_memmove`.
-    let len = match const_int(args[2]) {
-        Some(n) if n <= MAX_MEM_UNROLL => n,
-        _ => {
-            let len = ctx.operand(args[2])?;
-            if is_set {
-                let f = ctx.helpers.memset.expect("memset helper synthesized");
-                let dst = ctx.operand(args[0])?;
-                let byte = ctx.operand(args[1])?;
-                ctx.push_effect(Inst::Call {
-                    func: f,
-                    args: vec![dst, byte, len],
-                });
-            } else if name.starts_with("llvm.memcpy") {
-                let f = ctx.helpers.memcpy.expect("memcpy helper synthesized");
-                let dst = ctx.operand(args[0])?;
-                let src = ctx.operand(args[1])?;
-                ctx.push_effect(Inst::Call {
-                    func: f,
-                    args: vec![dst, src, len],
-                });
-            } else {
-                let f = ctx.helpers.memmove.expect("memmove helper synthesized");
-                let dst = ctx.operand(args[0])?;
-                let src = ctx.operand(args[1])?;
-                ctx.push_effect(Inst::Call {
-                    func: f,
-                    args: vec![dst, src, len],
-                });
-            }
-            return Ok(true);
-        }
-    };
-    if len == 0 {
+    // Emit a single bulk-memory op (D62): the JIT confines each span once (range check + base clamp)
+    // and lowers the copy/fill to the platform `memcpy`/`memmove`/`memset` libcall, and the interp
+    // does a checked span copy — instead of the old per-chunk *masked* load/store unroll (or the
+    // byte-loop `__svm_memcpy` helper for oversized/variable lengths), which paid one confinement
+    // check per 8-byte chunk. A statically-zero length is a no-op, so emit nothing.
+    if matches!(const_int(args[2]), Some(0)) {
         return Ok(true);
     }
-    let chunks = mem_chunks(len);
-    if is_copy {
-        let dst = ctx.operand(args[0])?;
-        let src = ctx.operand(args[1])?;
-        // Load every chunk first (overlap-safe), then store them all.
-        let loaded: Vec<(u64, u8, ValIdx)> = chunks
-            .iter()
-            .map(|&(off, w)| {
-                let v = ctx.push(Inst::Load {
-                    op: load_w(w),
-                    addr: src,
-                    offset: off,
-                    align: 0,
-                });
-                (off, w, v)
-            })
-            .collect();
-        for (off, w, v) in loaded {
-            ctx.push_effect(Inst::Store {
-                op: store_w(w),
-                addr: dst,
-                value: v,
-                offset: off,
-                align: 0,
-            });
-        }
-    } else {
-        let dst = ctx.operand(args[0])?;
+    let dst = ctx.operand_i64(args[0])?;
+    let len = ctx.operand_i64(args[2])?; // size_t; widened to i64 if the intrinsic overload is .i32
+    if is_set {
         let val = ctx.operand(args[1])?; // i8 fill, carried as i32
-                                         // rep64 = (val & 0xFF) * 0x0101010101010101 — the fill byte replicated across 8 bytes.
-        let mask = ctx.push(Inst::ConstI32(0xFF));
-        let vb = ctx.push(Inst::IntBin {
-            ty: IntTy::I32,
-            op: BinOp::And,
-            a: val,
-            b: mask,
-        });
-        let vb64 = ctx.push(Inst::Convert {
-            op: ConvOp::ExtendI32U,
-            a: vb,
-        });
-        let magic = ctx.push(Inst::ConstI64(0x0101_0101_0101_0101u64 as i64));
-        let rep64 = ctx.push(Inst::IntBin {
-            ty: IntTy::I64,
-            op: BinOp::Mul,
-            a: vb64,
-            b: magic,
-        });
-        let rep32 = ctx.push(Inst::Convert {
-            op: ConvOp::WrapI64,
-            a: rep64,
-        });
-        for &(off, w) in &chunks {
-            let value = if w == 8 { rep64 } else { rep32 };
-            ctx.push_effect(Inst::Store {
-                op: store_w(w),
-                addr: dst,
-                value,
-                offset: off,
-                align: 0,
-            });
+        ctx.push_effect(Inst::MemFill { dst, val, len });
+    } else {
+        let src = ctx.operand_i64(args[1])?;
+        // `llvm.memmove` may overlap → overlap-safe `MemMove`; `llvm.memcpy` is non-overlapping.
+        if name.starts_with("llvm.memmove") {
+            ctx.push_effect(Inst::MemMove { dst, src, len });
+        } else {
+            ctx.push_effect(Inst::MemCopy { dst, src, len });
         }
     }
     Ok(true)

@@ -7443,6 +7443,23 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             m.store(a, *offset, *op, Value::I64(get(vals, *value)?.i64()))?;
             return Ok(None);
         }
+        // Bulk-memory ops (D62): both `MemCopy` and `MemMove` route to the overlap-safe `mem_copy`.
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let d = get_i64(vals, *dst)? as u64;
+            let s = get_i64(vals, *src)? as u64;
+            let n = get_i64(vals, *len)? as u64;
+            m.mem_copy(d, s, n)?;
+            return Ok(None);
+        }
+        Inst::MemFill { dst, val, len } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let d = get_i64(vals, *dst)? as u64;
+            let v = get(vals, *val)?.i32() as u8;
+            let n = get_i64(vals, *len)? as u64;
+            m.mem_fill(d, v, n)?;
+            return Ok(None);
+        }
         Inst::AtomicStore {
             ty,
             addr,
@@ -11926,6 +11943,96 @@ impl Mem {
         self.check_prot(base, width, true)?;
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
+        self.writes += 1;
+        Ok(())
+    }
+
+    /// Bounds-check a whole `[addr, addr+len)` span against the reserved domain `[0, reserved)` — the
+    /// `len: u64` bulk analogue of [`Self::confine_checked`], a *single* range check for the entire
+    /// span (bulk-memory ops, D62). Returns the absolute base. Callers early-out on `len == 0` before
+    /// calling, so this always sees `len >= 1` (matching the JIT's `len != 0`-guarded check).
+    fn confine_span(&self, addr: u64, len: u64) -> Result<u64, Trap> {
+        self.last_fault.store(NO_FAULT, Ordering::Relaxed);
+        match addr.checked_add(len) {
+            Some(end) if end <= self.window.reserved() => Ok(self.window.confine(addr, 0)),
+            _ => Err(Trap::MemoryFault),
+        }
+    }
+
+    /// Per-page committed-ness / RO enforcement over a whole span — the `len: u64` analogue of
+    /// [`Self::check_prot`]. `len >= 1` (see [`Self::confine_span`]).
+    fn check_prot_span(&self, base: u64, len: u64, write: bool) -> Result<(), Trap> {
+        let rel = base.wrapping_sub(self.window.base());
+        let last = rel + (len - 1);
+        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+            return Ok(());
+        }
+        let space = self.space_read();
+        if space.prot.is_empty() && last < self.window.mapped() {
+            return Ok(());
+        }
+        for page in (rel / self.page)..=(last / self.page) {
+            match self.page_access(&space.prot, page) {
+                None => return Err(self.page_fault(base)),
+                Some(false) if write => return Err(self.page_fault(base)),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Overlap-safe byte copy of a confined span (source snapshotted before any write). The interpreter
+    /// is the differential oracle, not the fast path, so a snapshot `Vec` keeps `MemCopy`/`MemMove`
+    /// byte-identical (both correct even under overlap) without direction-analysis subtlety.
+    fn copy_span(&self, dbase: u64, sbase: u64, len: u64) {
+        let n = len as usize;
+        if !self.has_regions.load(Ordering::Relaxed) {
+            let mut buf = vec![0u8; n];
+            self.back.read_into(sbase, &mut buf);
+            for (k, b) in buf.iter().enumerate() {
+                self.back.set_byte(dbase + k as u64, *b);
+            }
+        } else {
+            let buf: Vec<u8> = (0..len).map(|k| self.byte(sbase + k)).collect();
+            for (k, b) in buf.iter().enumerate() {
+                self.set_byte(dbase + k as u64, *b);
+            }
+        }
+    }
+
+    /// `Inst::MemCopy`/`MemMove` — copy `len` bytes `src`→`dst`, each span confined as a whole to
+    /// `[0, reserved)` (fault before any write if either span escapes). Overlap-safe (so it serves both
+    /// the non-overlapping `memcpy` and the overlapping `memmove`).
+    fn mem_copy(&mut self, dst: u64, src: u64, len: u64) -> Result<(), Trap> {
+        if len == 0 {
+            return Ok(());
+        }
+        let sbase = self.confine_span(src, len)?;
+        let dbase = self.confine_span(dst, len)?;
+        self.check_prot_span(sbase, len, false)?;
+        self.check_prot_span(dbase, len, true)?;
+        self.copy_span(dbase, sbase, len);
+        self.writes += 1;
+        Ok(())
+    }
+
+    /// `Inst::MemFill` — set `len` bytes at `dst` to `val`, the span confined as a whole to
+    /// `[0, reserved)` (fault before any write if it escapes).
+    fn mem_fill(&mut self, dst: u64, val: u8, len: u64) -> Result<(), Trap> {
+        if len == 0 {
+            return Ok(());
+        }
+        let base = self.confine_span(dst, len)?;
+        self.check_prot_span(base, len, true)?;
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..len {
+                self.back.set_byte(base + k, val);
+            }
+        } else {
+            for k in 0..len {
+                self.set_byte(base + k, val);
+            }
+        }
         self.writes += 1;
         Ok(())
     }
