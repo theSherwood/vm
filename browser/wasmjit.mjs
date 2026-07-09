@@ -107,9 +107,10 @@ block0(v0: i64):
   unreachable
 }`;
 
-// Mixed-tier (slice 3c): an integer caller (JITted) sums a FLOAT leaf f(i)=floor(i·2i) over 0..n.
-// The leaf (f64 internally, memory-free) runs on the bytecode interpreter via env.call_interp; the
-// whole-guest interp oracle (svm_run) must agree.
+// Mixed-tier (slice 3c): an integer caller (JITted) sums a SIMD leaf f(i)=2i over 0..n. The leaf
+// (v128 internally → out of subset, memory-free) runs on the bytecode interpreter via
+// env.call_interp; the whole-guest interp oracle (svm_run) must agree. (Floats are now in-subset,
+// so a float leaf would be JITted directly rather than crossing tiers.)
 const MIXED = `
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -130,11 +131,10 @@ block3(v14: i64):
 }
 func (i64) -> (i64) {
 block0(v0: i64):
-  v1 = f64.convert_i64_s v0
-  v2 = f64.add v1 v1
-  v3 = f64.mul v1 v2
-  v4 = i64.trunc_sat_f64_s v3
-  return v4
+  v1 = i64x2.splat v0
+  v2 = i64x2.add v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
 }`;
 
 async function main() {
@@ -166,7 +166,7 @@ async function main() {
     report('trap parity (unreachable)', st === 3 && trapped, `interp status=${st}, jit trapped=${trapped}`);
   }
 
-  // --- mixed-tier (slice 3c): JITted integer caller + interp float leaf via env.call_interp ---
+  // --- mixed-tier (slice 3c): JITted integer caller + interp SIMD leaf via env.call_interp ---
   {
     const bytes = encode(MIXED);
     const jit = await compileJit(ex, bytes, { memory });
@@ -179,7 +179,7 @@ async function main() {
         allEq = false; console.log(`    mixed(${arg}): jit != interp ${r}`); break;
       }
     }
-    report(`mixed-tier equality (JITted caller + interp float leaf over ${sweep.length} args)`, allEq);
+    report(`mixed-tier equality (JITted caller + interp SIMD leaf over ${sweep.length} args)`, allEq);
   }
 
   // --- speedup: the whole point. Time a heavy alu loop on both tiers. ---
