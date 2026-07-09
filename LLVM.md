@@ -927,6 +927,36 @@ poly approximations, `llvm-link`ed into the module. Findings + deliverable:
   transcendentals; the next undefined external is `strchrnul` (the "other libc" category — a synthesized
   string helper).
 
+**Slice BR (DONE) — the fail-closed extern-stub mechanism: the module clears the *entire* external
+surface.** The high-leverage lever from slice BP's map. Postgres has ~250 declared externals, but the
+vast majority are **dead on the `--single` query path** (network `accept`/`connect`/`epoll_*`, `fork`/
+`exec`/`pipe`, `dlopen`, `syslog`, `backtrace`, …) — yet the strict on-ramp fail-closes at *translate*
+time on the first one it doesn't handle, so clearing them one-by-one would be ~200 whack-a-mole helpers
+for functions that never run. Instead, an **opt-in** `TranslateOptions { stub_unresolved_externs }`
+lowers a call to a genuinely-undefined external (one no recognizer/synthesizer/capability handled — i.e.
+that *falls through to the fallback* at the direct-call site, so the classification is correct by
+construction, no fragile name predicate) to a synthesized **trap stub**: a function whose body is a
+single `unreachable`, which traps. This defers the fail-closed from **translate time to run time** —
+the whole-program module translates + verifies, and a stub only traps if actually *called* (never an
+escape: it is ordinary re-verified IR, §2a). Off by default (a typo'd callee stays a clean
+translate-time error for ordinary programs); opt in via `translate_bc_path_with_options` / the
+`--stub-externs` CLI flag for a large-program bring-up.
+- **Design.** Stubs are minted lazily into a shared `RefCell<StubTable>` threaded through the
+  translation (one per distinct name, keyed by name, using the first signature seen — the SVM sig is
+  the threaded data-SP + the call's fixed params, matching the `args=[sp,…]` the site builds) and
+  appended to `funcs` **last**, after `_start` + defined + helpers, so each lands at its assigned
+  `stub_base + ordinal` index. Reuses the existing `synth_trap_stub`. A later mismatched-signature call
+  to the same name surfaces as a clean `svm-verify` type-id error, not an escape.
+- **Test** `unresolved_extern_stub_opt_in`: strict default fail-closes on `mystery`; opt-in translates
+  + verifies + runs to a **clean exit** with the stub gated off (a dead stub is inert); and a *called*
+  stub **traps** (`run_powerbox` errors). **283 translate tests green, fmt + clippy clean.**
+- **Effect on the capstone — a milestone:** with `--stub-externs`, the full Postgres module (backend +
+  libm) translates past the **entire ~250-external OS/libc surface** in one lever. The next gap is no
+  longer an external at all — it is the **SIMD vector tail** (~9 per-lane, non-constant-splat vector
+  shifts: `ashr <16 x i32>`, `lshr <4 x i64>`/`<4 x i32>`, from explicit SSE/AVX SIMD, dead at runtime
+  under the `cpuid`→0 stub but still compiled). That vector category (#4) is the next slice — either
+  per-lane scalarization in the on-ramp, or a config lever compiling the SIMD fast-paths out.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

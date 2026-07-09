@@ -41,6 +41,7 @@ fn try_main() -> Result<(), String> {
     let mut out: Option<String> = None;
     let mut syms: Option<String> = None;
     let mut binary = false;
+    let mut stub_externs = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -53,6 +54,9 @@ fn try_main() -> Result<(), String> {
                 )
             }
             "--binary" => binary = true,
+            // Lower undefined externals to trap-if-called stubs instead of failing translation — for a
+            // large-program bring-up (Postgres) where most externals are dead on the exercised path.
+            "--stub-externs" => stub_externs = true,
             _ if a.starts_with('-') => return Err(format!("unknown flag `{a}`")),
             _ => {
                 if input.replace(a.clone()).is_some() {
@@ -67,8 +71,11 @@ fn try_main() -> Result<(), String> {
     let binary = binary || Path::new(&out).extension().is_some_and(|e| e == "svmb");
 
     // Translate the bitcode. `Error` is `Debug`-only (no `Display`), so render it that way.
-    let translated =
-        svm_llvm::translate_bc_path(&input).map_err(|e| format!("translate `{input}`: {e:?}"))?;
+    let opts = svm_llvm::TranslateOptions {
+        stub_unresolved_externs: stub_externs,
+    };
+    let translated = svm_llvm::translate_bc_path_with_options(&input, opts)
+        .map_err(|e| format!("translate `{input}`: {e:?}"))?;
 
     let module_bytes = if binary {
         svm_encode::encode_module(&translated.module)
