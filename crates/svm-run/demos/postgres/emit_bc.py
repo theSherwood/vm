@@ -25,11 +25,18 @@ def find_objs():
 
 def compile_cmd(obj):
     d, base = os.path.dirname(obj), os.path.basename(obj)
-    # Remove the up-to-date .o so `make -n` (no -B, so no config.status recheck) prints the rule.
-    try:
-        os.remove(obj)
-    except OSError:
-        pass
+    # Force `make -n` (no -B, so no config.status recheck) to print the rebuild rule *without*
+    # destroying the native .o: bump the source's mtime so the .o looks stale. Idempotent — the
+    # native tree stays intact and re-runs are safe (deleting the .o, as an earlier version did, left
+    # a half-built tree whose stale SUBSYS.o timestamps then blocked `make` from regenerating it).
+    src = obj[:-2] + ".c"
+    if os.path.exists(src):
+        os.utime(src, None)
+    else:
+        try:
+            os.remove(obj)  # fallback: no same-name source (unusual) — force via removal
+        except OSError:
+            pass
     out = subprocess.run(["make", "-n", base], cwd=d, capture_output=True, text=True, timeout=120).stdout
     line = next((l.strip() for l in out.splitlines()
                  if l.strip().startswith("clang ") and " -c " in l and (" -o " + base) in l), None)

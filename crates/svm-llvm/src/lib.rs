@@ -3816,6 +3816,22 @@ fn uses_narrow_atomic(m: &LModule) -> bool {
             Instruction::AtomicRMW(r) => narrow(&r.value),
             Instruction::CmpXchg(cx) => narrow(&cx.expected),
             Instruction::Store(st) => st.atomicity.is_some() && narrow(&st.value),
+            // A narrow (i8/i16) x86 atomic **inline-asm** call (`xchgb`/`xaddw`/`cmpxchg…`, the
+            // `arch-x86.h`/`s_lock.h` TAS) lowers through the same narrow helper (see `lower_inline_asm`);
+            // the width-carrying operand is arg 1 (value / expected). `cpuid` shares the `xchg` mnemonic
+            // but isn't atomic, so it's excluded.
+            Instruction::Call(c) => c
+                .function
+                .as_ref()
+                .left()
+                .map(|asm| {
+                    let d = crate::ll::lex::unescape(&asm.template);
+                    let t = String::from_utf8_lossy(&d);
+                    let atomic = !t.contains("cpuid")
+                        && (t.contains("xchg") || t.contains("xadd") || t.contains("cmpxchg"));
+                    atomic && c.arguments.get(1).map(|(a, _)| narrow(a)).unwrap_or(false)
+                })
+                .unwrap_or(false),
             _ => false,
         })
     })
@@ -12806,10 +12822,18 @@ fn lower_inline_asm(
         }
         return Ok(true);
     }
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let bind = |ctx: &mut BlockCtx, idx: ValIdx| {
+        if let Some(dest) = &c.dest {
+            if let Some(&vid) = ctx.s.name2id.get(dest) {
+                ctx.idx_of.insert(vid, idx);
+            }
+        }
+    };
     // `popcntq $1,$0` / `popcntl $1,$0`: population count of the one input operand → `Popcnt`, whose
     // width follows the operand (`i64`/`i32`), matching the `.ll` result type the dest expects.
+    // (Guarded away from `cpuid`, whose template also mentions no popcnt — order-independent here.)
     if t.contains("popcnt") {
-        let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
         if args.len() != 1 {
             return unsup(format!("inline `popcnt` asm with {} operands", args.len()));
         }
@@ -12820,9 +12844,101 @@ fn lower_inline_asm(
             op: IntUnOp::Popcnt,
             a,
         });
+        bind(ctx, idx);
+        return Ok(true);
+    }
+    // **CPUID** (`xchgq %rbx; cpuid; xchgq %rbx`, `pg_bitutils`/`pg_crc32c` feature probe): return an
+    // all-zero `{eax,ebx,ecx,edx}` so Postgres' runtime dispatch sees *no* POPCNT/SSE4.2 and takes its
+    // portable software paths — which compute the **same** popcount/CRC as the hardware ones, so the
+    // guest still matches native byte-for-byte (checked ahead of the `xchg` atomics, whose mnemonic it
+    // shares). §17 note: this sidesteps the hardware fast-paths entirely rather than modeling CPUID.
+    if t.contains("cpuid") {
+        let zero = ctx.push(Inst::ConstI32(0));
         if let Some(dest) = &c.dest {
             if let Some(&vid) = ctx.s.name2id.get(dest) {
-                ctx.idx_of.insert(vid, idx);
+                // The `{i32,i32,i32,i32}` result — all four leaves zeroed.
+                ctx.agg.insert(vid, vec![zero, zero, zero, zero]);
+            }
+        }
+        return Ok(true);
+    }
+    // **x86 atomic RMW / CAS** (`arch-x86.h`'s `pg_atomic_*` + `s_lock.h` TAS). These lower to the SAME
+    // runtime atomic ops the on-ramp emits for `atomicrmw`/`cmpxchg` **instructions** (`AtomicRmw`/
+    // `AtomicCmpxchg` for i32/i64, the narrow helpers for i8/i16) — so they are *genuinely atomic*, not
+    // a racy load-op-store, and need no single-threaded gate. The operand roles are pinned by asserting
+    // the exact constraint signature (fail-closed otherwise), so positional binding is safe on LLVM 18.
+    //
+    // TAS/exchange (`xchg{b,w,l,q} $0,$1`) and fetch-add (`xadd{b,w,l,q} $0,$1`): `(ptr, value, ptr)`,
+    // constraints `=q,=*m,0,*m,…`; the result is the **old** value.
+    if !t.contains("cmpxchg") && (t.contains("xchg") || t.contains("xadd")) {
+        if !asm.constraints.starts_with("=q,=*m,0,*m") || args.len() != 3 {
+            return unsup(format!("inline atomic asm with unexpected shape: {t:?}"));
+        }
+        let addr = ctx.operand(args[0])?;
+        let value = ctx.operand(args[1])?;
+        let is_add = t.contains("xadd");
+        let old = match atom_width(args[1].get_type(types).as_ref())? {
+            AtomWidth::Wide(ty) => ctx.push(Inst::AtomicRmw {
+                ty,
+                op: if is_add {
+                    AtomicRmwOp::Add
+                } else {
+                    AtomicRmwOp::Xchg
+                },
+                addr,
+                value,
+                offset: 0,
+                order: Ordering::SeqCst,
+            }),
+            AtomWidth::Narrow(w) => {
+                let opcode = if is_add {
+                    NARROW_RMW_ADD
+                } else {
+                    NARROW_RMW_XCHG
+                };
+                lower_narrow_atomic_rmw(ctx, addr, value, w, opcode)?
+            }
+        };
+        bind(ctx, old);
+        return Ok(true);
+    }
+    // Compare-exchange (`cmpxchg{l,q} $4,$5; setz $2`): `(ptr, expected, desired, ptr)`, constraints
+    // `={ax},=*m,=q,{ax},r,*m,…`; the result is `{ iN old, i8 setz }` (`setz` = `old == expected`),
+    // the same `{old, success}` aggregate the `cmpxchg` **instruction** yields.
+    if t.contains("cmpxchg") {
+        if !asm.constraints.starts_with("={ax},=*m,=q,{ax},r,*m") || args.len() != 4 {
+            return unsup(format!("inline cmpxchg asm with unexpected shape: {t:?}"));
+        }
+        let addr = ctx.operand(args[0])?;
+        let expected = ctx.operand(args[1])?;
+        let replacement = ctx.operand(args[2])?;
+        let (old, exp_cmp, cmp_ty) = match atom_width(args[1].get_type(types).as_ref())? {
+            AtomWidth::Wide(ty) => {
+                let old = ctx.push(Inst::AtomicCmpxchg {
+                    ty,
+                    addr,
+                    expected,
+                    replacement,
+                    offset: 0,
+                    order: Ordering::SeqCst,
+                });
+                (old, expected, ty)
+            }
+            AtomWidth::Narrow(w) => {
+                let (old, masked_exp) =
+                    lower_narrow_atomic_cas(ctx, addr, expected, replacement, w)?;
+                (old, masked_exp, IntTy::I32)
+            }
+        };
+        let success = ctx.push(Inst::IntCmp {
+            ty: cmp_ty,
+            op: CmpOp::Eq,
+            a: old,
+            b: exp_cmp,
+        });
+        if let Some(dest) = &c.dest {
+            if let Some(&vid) = ctx.s.name2id.get(dest) {
+                ctx.agg.insert(vid, vec![old, success]);
             }
         }
         return Ok(true);

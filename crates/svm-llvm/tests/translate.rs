@@ -1623,6 +1623,33 @@ fn inline_asm_popcnt_lowers() {
 }
 
 #[test]
+fn inline_asm_x86_atomics() {
+    // Inline-asm recognizer — the x86 atomic templates from Postgres' `arch-x86.h` (`pg_atomic_*`) and
+    // `s_lock.h` (TAS): `xchgb` (test-and-set), `xaddl` (fetch-add), `cmpxchgl; setz` (compare-exchange).
+    // Each lowers to the on-ramp's real atomic op (`AtomicRmw`/`AtomicCmpxchg`) — the identical IR the
+    // `atomicrmw`/`cmpxchg` *instructions* produce — so results match native byte-for-byte. Exercised
+    // single-threaded (deterministic), but the lowering is genuinely atomic (not a racy load-op-store).
+    let src = "#include <stdio.h>\n\
+        static inline char tas(volatile char *lock){ char _res = 1; \
+          __asm__ __volatile__(\"lock\\n\\txchgb %0,%1\\n\" : \"+q\"(_res), \"+m\"(*lock) :: \"memory\"); \
+          return _res; } \
+        static inline int xadd(volatile int *p, int add_){ int res; \
+          __asm__ __volatile__(\"lock\\n\\txaddl %0,%1\\n\" : \"=q\"(res), \"=m\"(*p) : \"0\"(add_), \"m\"(*p) : \"memory\",\"cc\"); \
+          return res; } \
+        static inline int cas(volatile int *p, int *expected, int newval){ char ret; \
+          __asm__ __volatile__(\"lock\\n\\tcmpxchgl %4,%5\\n   setz\\t%2\\n\" \
+            : \"=a\"(*expected), \"=m\"(*p), \"=q\"(ret) : \"a\"(*expected), \"r\"(newval), \"m\"(*p) : \"memory\",\"cc\"); \
+          return (int)ret; } \
+        int main(void){ \
+          char lock = 0; int a1 = tas(&lock); int a2 = tas(&lock); \
+          int cnt = 100; int o1 = xadd(&cnt, 5); int o2 = xadd(&cnt, -3); \
+          int v = 102, exp = 102; int ok = cas(&v, &exp, 999); \
+          int exp2 = 5; int ok2 = cas(&v, &exp2, 7); \
+          printf(\"%d %d %d %d %d %d %d %d %d\\n\", a1, a2, o1, o2, cnt, ok, v, ok2, exp2); return 0; }";
+    check_powerbox_vs_native("asm_atomics", src, b"");
+}
+
+#[test]
 fn inline_asm_unrecognized_is_fail_closed() {
     // The asm allowlist is **closed**: a template that is not a recognized barrier/`popcnt`/… must be
     // a clean `Unsupported`, never silently dropped or mis-lowered. This is the §2a chokepoint —
