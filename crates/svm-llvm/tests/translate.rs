@@ -2313,6 +2313,34 @@ fn varargs_many_and_copy() {
 }
 
 #[test]
+fn varargs_indirect_call() {
+    // A `(...)` function invoked through a **function pointer** (not a named callee). The variadic
+    // args must marshal into the caller's overflow scratch exactly as for a direct varargs call — the
+    // only difference is the call lowers to `call_indirect` (with an §3c type-id check against the
+    // `(sp, fixed-params…)` callee signature) rather than `call`. The pointer is chosen by a
+    // `volatile` index so clang can't devirtualize it back to a direct call, and clang emits it as a
+    // `tail call`, which also exercises the `return_call_indirect` tail path. Found as the Postgres
+    // `manifest_process_version` gap. `run(1)`: index 1 → `vmul(4, 2,3,4,5)` = 120, +1 = 121.
+    let src = "#include <stdarg.h>\n\
+        typedef long long (*vfn)(int, ...);\n\
+        static long long vsum(int n, ...);\n\
+        static long long vmul(int n, ...);\n\
+        int run(int seed){\n\
+          vfn arr[2] = { vsum, vmul };\n\
+          volatile int i = seed & 1;\n\
+          long long r = arr[i](4, 2, 3, 4, 5);\n\
+          return (int)((r + seed) & 0xff); }\n\
+        __attribute__((noinline)) static long long vsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int k=0;k<n;k++) s+=va_arg(ap,int); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static long long vmul(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=1;\n\
+          for(int k=0;k<n;k++) s*=va_arg(ap,int); va_end(ap); return s; }\n\
+        int main(void){ return run(1); }";
+    check_run_byte_vs_native("varargs_indirect", src, 1);
+}
+
+#[test]
 fn libc_strcmp_strchr_strcoll() {
     // The synthesized `__svm_strcmp`/`__svm_strchr` byte loops (libc batch). The string pointers are
     // read through `volatile` so clang's `-O2` cannot constant-fold the calls away — the helpers are

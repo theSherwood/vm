@@ -1055,6 +1055,27 @@ diagnosis from BU was "teach the on-ramp AVX-512"; the reality on inspection was
   at the first **indirect varargs call** (`manifest_process_version` — a `(...)` function pointer; the
   on-ramp marshals *direct* varargs but rejects indirect), the next slice.
 
+**Slice BW (DONE) — indirect varargs call (a `(...)` function pointer).** The on-ramp already
+marshaled a *direct* `(...)` call's variadic arguments into the caller's overflow scratch (one 8-byte
+slot each) and deposited the area pointer at the callee's frame-0 slot for `va_start`; the only thing
+missing for an **indirect** varargs callee was that three spots each special-cased "direct" and bailed
+on the pointer form. All three now treat the two callee shapes identically — the marshaling is
+byte-for-byte the same, only the call instruction differs:
+- **`vararg_call_extra`** (frame-layout pass) dropped its `callee_name(c)?` early-return, so an
+  indirect `(...)` call also reserves `VARARG_SCRATCH` (else "varargs call without reserved scratch").
+- **The marshaling `fixed` match** dropped its `callee_name(c).is_some()` guard, so the variadic args
+  are stored to scratch (not pushed as IR args) and the area pointer is deposited at `callee_sp + 0`,
+  for an indirect callee too.
+- **`indirect_sig`** stopped rejecting `is_var_arg`: a `(...)` callee's SVM signature is
+  `(sp, fixed-params…)` — `param_types` are exactly the fixed params — which is the *same* shape a
+  defined `(...)` function lowers to (§varargs), so the `call_indirect` §3c type-id check matches.
+- Found as the Postgres `manifest_process_version` gap. Test `varargs_indirect_call`: a `(...)` helper
+  reached through a `volatile`-indexed function pointer (so clang can't devirtualize) — byte-identical
+  to native on interp + bytecode + JIT, and clang emits it `tail`, exercising `return_call_indirect`
+  too. **291 translate tests green, fmt + clippy clean.** Effect: the module translates past the
+  varargs category and now stops at an **SSA-liveness** gap in `sqrt_var` (numeric.c's
+  arbitrary-precision sqrt — a `value … not available in block`), the next slice.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
