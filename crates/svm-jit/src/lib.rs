@@ -3883,6 +3883,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Cast { .. }
                 | Inst::Load { .. }
                 | Inst::Store { .. }
+                | Inst::MemCopy { .. }
+                | Inst::MemMove { .. }
+                | Inst::MemFill { .. }
                 | Inst::AtomicLoad { .. }
                 | Inst::AtomicStore { .. }
                 | Inst::AtomicRmw { .. }
@@ -4149,6 +4152,9 @@ struct Lower<'a> {
     /// adds it to every confined address so the child lands in `[mem_base+base, …+reserved)`.
     /// `0` for an ordinary top-level window — the add is elided.
     sub_base: u64,
+    /// The target's frontend config (pointer width + default call conv), for the Cranelift
+    /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
+    frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
     fn_table_mask: u64,
     /// The host `cap.call` thunk + ctx (constant addresses).
@@ -4331,6 +4337,7 @@ fn build_clif(
         mask,
         mapped,
         sub_base,
+        frontend_config: module.target_config(),
         fn_table_mask,
         cap,
         fiber,
@@ -5684,6 +5691,31 @@ fn lower_block(
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
+            // Bulk-memory ops (D62). Each span is confined once (single range check + base clamp),
+            // then the copy/fill is the platform libcall — `memory.copy`-class lowering, not a
+            // per-byte confined loop. `MemCopy`/`MemMove` differ only in the libcall (overlap safety).
+            Inst::MemCopy { dst, src, len } => {
+                let n = get(&vals, *len)?;
+                let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
+                let sphys = confine_span(b, lower, get(&vals, *src)?, n);
+                b.call_memcpy(lower.frontend_config, dphys, sphys, n);
+                continue;
+            }
+            Inst::MemMove { dst, src, len } => {
+                let n = get(&vals, *len)?;
+                let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
+                let sphys = confine_span(b, lower, get(&vals, *src)?, n);
+                b.call_memmove(lower.frontend_config, dphys, sphys, n);
+                continue;
+            }
+            Inst::MemFill { dst, val, len } => {
+                let n = get(&vals, *len)?;
+                let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
+                // `call_memset` uextends the fill byte to i32, so hand it the low byte (i8).
+                let v8 = b.ins().ireduce(I8, get(&vals, *val)?);
+                b.call_memset(lower.frontend_config, dphys, v8, n);
+                continue;
+            }
             // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
             // address traps — `atomic_*` require alignment, and it matches the interpreter), then a
             // hardware atomic. Elision uses the same upper-bound analysis.
@@ -6627,6 +6659,45 @@ fn mask_addr(
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)
+}
+
+/// Confine a **dynamic-length span** `[ptr, ptr+len)` to the reserved domain `[0, reserved)` and
+/// return its physical base `mem_base + (ptr & mask) + sub_base` — the bulk-memory hinge (D62). Where
+/// [`mask_addr`] confines one fixed-width access, this confines a whole span with a *single* range
+/// check: it traps [`TrapKind::MemoryFault`] (native `trapnz`) when `len != 0 && (len > reserved ||
+/// ptr > reserved − len)`, i.e. any byte of the span would fall outside `[0, reserved)`. The two
+/// sub-checks avoid overflow: `len > reserved` catches an oversized (or negative-as-u64) length before
+/// the `reserved − len` subtraction can wrap. `len == 0` is a no-op span that never faults (matching
+/// the interpreter and C `memcpy(_,_,0)`), so a 0-length op on a wild pointer is inert.
+///
+/// The returned base is then Spectre-clamped (`& mask`) exactly as in [`mask_addr`]: architecturally a
+/// no-op (the check proved `ptr < reserved`), but on a *mispredicted* path it pins the copy's base
+/// inside `[0, reserved)`. As with `mask_addr`, this matches Wasmtime's bounds-checked `memory.copy`
+/// posture ("as secure as wasm", DESIGN.md §1a): the length is checked, the base is confined, and the
+/// bulk copy itself is a libcall the CPU does not speculate byte-by-byte — so no per-byte clamp is
+/// needed. Callers pass the **same** `len` to the copy, so both spans (dst and src) are checked.
+fn confine_span(b: &mut FunctionBuilder, lower: &Lower, ptr: Value, len: Value) -> Value {
+    let reserved = lower.mask.wrapping_add(1);
+    let resv = b.ins().iconst(I64, reserved as i64);
+    let oob_len = b.ins().icmp(IntCC::UnsignedGreaterThan, len, resv);
+    let rem = b.ins().isub(resv, len); // reserved − len; meaningful only when !oob_len
+    let oob_ptr = b.ins().icmp(IntCC::UnsignedGreaterThan, ptr, rem);
+    let oob_span = b.ins().bor(oob_len, oob_ptr);
+    let zero = b.ins().iconst(I64, 0);
+    let nonzero = b.ins().icmp(IntCC::NotEqual, len, zero);
+    let oob = b.ins().band(nonzero, oob_span);
+    b.ins()
+        .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+    let m = b.ins().iconst(I64, lower.mask as i64);
+    let clamped = b.ins().band(ptr, m);
+    let shifted = if lower.sub_base == 0 {
+        clamped
+    } else {
+        let sb = b.ins().iconst(I64, lower.sub_base as i64);
+        b.ins().iadd(clamped, sb)
+    };
+    let base = b.use_var(lower.mem_var);
+    b.ins().iadd(base, shifted)
 }
 
 /// Unknown upper bound — the value may be anything (so its accesses must be masked).

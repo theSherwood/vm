@@ -169,6 +169,22 @@ enum Op {
         op: StoreOp,
         offset: u64,
     },
+    // Bulk-memory ops (D62). `MemCopy`/`MemMove` share the overlap-safe `Mem::mem_copy`.
+    MemCopy {
+        dst: u32,
+        src: u32,
+        len: u32,
+    },
+    MemMove {
+        dst: u32,
+        src: u32,
+        len: u32,
+    },
+    MemFill {
+        dst: u32,
+        val: u32,
+        len: u32,
+    },
     AtomicLoad {
         dst: u32,
         addr: u32,
@@ -1007,6 +1023,21 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             value: g(*value),
             op: *op,
             offset: *offset,
+        },
+        Inst::MemCopy { dst, src, len } => Op::MemCopy {
+            dst: g(*dst),
+            src: g(*src),
+            len: g(*len),
+        },
+        Inst::MemMove { dst, src, len } => Op::MemMove {
+            dst: g(*dst),
+            src: g(*src),
+            len: g(*len),
+        },
+        Inst::MemFill { dst, val, len } => Op::MemFill {
+            dst: g(*dst),
+            val: g(*val),
+            len: g(*len),
         },
         Inst::AtomicLoad {
             ty, addr, offset, ..
@@ -6069,6 +6100,21 @@ impl Vm {
                     mem.as_mut()
                         .ok_or(Trap::Malformed)?
                         .store_scalar(a, *offset, *op, lo)?;
+                    pc += 1;
+                }
+                // Bulk-memory ops (D62): both `MemCopy` and `MemMove` use the overlap-safe `mem_copy`.
+                Op::MemCopy { dst, src, len } | Op::MemMove { dst, src, len } => {
+                    let d = r!(*dst).i64() as u64;
+                    let s = r!(*src).i64() as u64;
+                    let n = r!(*len).i64() as u64;
+                    mem.as_mut().ok_or(Trap::Malformed)?.mem_copy(d, s, n)?;
+                    pc += 1;
+                }
+                Op::MemFill { dst, val, len } => {
+                    let d = r!(*dst).i64() as u64;
+                    let v = r!(*val).i32() as u8;
+                    let n = r!(*len).i64() as u64;
+                    mem.as_mut().ok_or(Trap::Malformed)?.mem_fill(d, v, n)?;
                     pc += 1;
                 }
                 Op::AtomicLoad {

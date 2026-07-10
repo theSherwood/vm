@@ -497,6 +497,32 @@ fn check_inst(
         cx.expect(*value, op.info().1)?;
         return Ok(None);
     }
+    // Bulk-memory ops (from `llvm.memcpy`/`memmove`/`memset`) — no-result, whole-span confined.
+    // `dst`/`src`/`len` are `i64`; `MemFill`'s `val` is the `i32` fill byte.
+    if let Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*dst, ValType::I64)?;
+        cx.expect(*src, ValType::I64)?;
+        cx.expect(*len, ValType::I64)?;
+        return Ok(None);
+    }
+    if let Inst::MemFill { dst, val, len } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*dst, ValType::I64)?;
+        cx.expect(*val, ValType::I32)?;
+        cx.expect(*len, ValType::I64)?;
+        return Ok(None);
+    }
     // §12 atomic store — the other no-result memory op.
     if let Inst::AtomicStore {
         ty,
@@ -1064,6 +1090,9 @@ fn check_inst(
 
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
+        | Inst::MemCopy { .. }
+        | Inst::MemMove { .. }
+        | Inst::MemFill { .. }
         | Inst::AtomicStore { .. }
         | Inst::V128Store { .. }
         | Inst::Call { .. }

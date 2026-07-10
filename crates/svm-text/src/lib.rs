@@ -311,6 +311,10 @@ fn print_inst(inst: &Inst) -> String {
             op.info().0,
             memarg(*offset, *align)
         ),
+        // Bulk-memory ops (D62).
+        Inst::MemCopy { dst, src, len } => format!("mem.copy v{dst} v{src} v{len}"),
+        Inst::MemMove { dst, src, len } => format!("mem.move v{dst} v{src} v{len}"),
+        Inst::MemFill { dst, val, len } => format!("mem.fill v{dst} v{val} v{len}"),
         // §12 atomics: `<ty>.atomic.<op>[.<order>]`, naturally aligned (no `align=`, only `offset=`).
         // The default `seqcst` ordering is omitted, so seq-cst atomics round-trip unchanged.
         Inst::AtomicLoad {
@@ -1819,6 +1823,23 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::PtrAdd { a, b });
+        }
+        // Bulk-memory ops (D62): `mem.copy`/`mem.move`/`mem.fill` v{dst} v{src|val} v{len}.
+        if op == "mem.copy" || op == "mem.move" {
+            let dst = self.value(names)?;
+            let src = self.value(names)?;
+            let len = self.value(names)?;
+            return Ok(if op == "mem.copy" {
+                Inst::MemCopy { dst, src, len }
+            } else {
+                Inst::MemMove { dst, src, len }
+            });
+        }
+        if op == "mem.fill" {
+            let dst = self.value(names)?;
+            let val = self.value(names)?;
+            let len = self.value(names)?;
+            return Ok(Inst::MemFill { dst, val, len });
         }
         // §12 fibers (stack switching).
         if op == "cont.new" {

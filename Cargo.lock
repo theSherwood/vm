@@ -703,8 +703,10 @@ dependencies = [
  "libc",
  "loom",
  "svm-fiber",
+ "svm-interp",
  "svm-ir",
  "svm-text",
+ "svm-verify",
  "windows-sys 0.59.0",
 ]
 

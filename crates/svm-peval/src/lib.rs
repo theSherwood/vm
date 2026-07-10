@@ -1888,6 +1888,17 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
             *a = f(*a);
             *b = f(*b);
         }
+        // Bulk-memory ops (D62): dst, src/val, len — all value operands.
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
+            *dst = f(*dst);
+            *src = f(*src);
+            *len = f(*len);
+        }
+        Inst::MemFill { dst, val, len } => {
+            *dst = f(*dst);
+            *val = f(*val);
+            *len = f(*len);
+        }
         Inst::Bitselect { a, b, mask } => {
             *a = f(*a);
             *b = f(*b);

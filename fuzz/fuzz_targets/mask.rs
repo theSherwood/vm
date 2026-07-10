@@ -60,6 +60,24 @@ fn check(w: Window, addr: u64, offset: u64, width: u32) {
     }
 }
 
+/// Fuzz the **bulk-memory span confinement** predicate (D62): the JIT's `confine_span` traps a copy
+/// unless the whole span `[ptr, ptr+len)` lies in `[0, reserved)`, computed *without* overflowing via
+/// the two sub-checks `len > reserved` (before the `reserved - len` subtraction can wrap) and
+/// `ptr > reserved - len`, gated by `len != 0` (a zero-length op is an in-bounds no-op). This asserts
+/// that overflow-avoiding formula matches a clean `u128` oracle for every input — the arithmetic is
+/// the subtle, security-critical part (a wrong subcheck would admit an out-of-window bulk copy).
+fn check_span(ptr: u64, len: u64, reserved: u64) {
+    // The exact formula emitted by `svm_jit::confine_span` (kept in sync with it).
+    let jit_oob = len != 0 && (len > reserved || ptr > reserved.wrapping_sub(len));
+    // Independent oracle in u128 (cannot overflow): the span escapes iff it is non-empty and its end
+    // exceeds the reservation.
+    let oracle_oob = len != 0 && (ptr as u128 + len as u128) > reserved as u128;
+    assert_eq!(
+        jit_oob, oracle_oob,
+        "span-confinement OOB mismatch: ptr={ptr} len={len} reserved={reserved}"
+    );
+}
+
 fuzz_target!(|data: &[u8]| {
     // Derive the inputs from the fuzz bytes (pad short inputs with zeros).
     let mut b = [0u8; 34];
@@ -83,4 +101,12 @@ fuzz_target!(|data: &[u8]| {
     check(Window::new(reserved_log2), addr, offset, width);
     check(Window::with_mapped(reserved_log2, mapped), addr, offset, width);
     check(Window::sub(base, reserved_log2, mapped), addr, offset, width);
+
+    // Bulk-memory span confinement (D62): drive the same reservation the scalar check uses. `reserved`
+    // is a power of two ≤ 2^63; `offset` doubles as the second span length so both a small and a large
+    // length are exercised against `addr`.
+    let reserved = Window::new(reserved_log2).reserved();
+    check_span(addr, mapped, reserved);
+    check_span(addr, offset, reserved);
+    check_span(offset, addr, reserved);
 });
