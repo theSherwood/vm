@@ -645,8 +645,8 @@ fn translate_impl(
     // byte-loop helpers. `__svm_memcpy` is still synthesized for realloc/snprintf/__vm_fmt (which copy
     // through it); the memset/memmove helpers had no other caller and are gone.
     let need_memcpy = need_realloc || need_snprintf || uses_fmt_float;
-                                                                                       // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
-                                                                                       // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
+    // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__svm_memcmp`.
+    // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
         calls_external(m, &defined_names, "memcmp") || calls_external(m, &defined_names, "bcmp");
     // `memchr(s, c, n)` (string/buffer scans — e.g. Embench `slre`) → the synthesized `__svm_memchr`
