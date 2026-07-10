@@ -285,11 +285,15 @@ codec — is **interpreter-only**. The JIT's durable `instantiate`/`coro_spawn` 
 common bottom of every run entry, `set_durable`), and `FrozenNested` has no JIT analog. Parity re-walks
 the interpreter's own arc, each slice **differential** against it — a byte-identical durable reserve is
 the all-or-nothing oracle (D-notes, §18):
-1. **Run.** Drop the fail-closed for a durable child: durable-*transform* the child before
-   `compile_child_and_run` (§4 already requires a durable domain to nest only freezable children, so
-   the child carries the transform), and seed its **own** durable control words (state + per-context
-   shadow-SP, §12.8 4A.5) into its carve so a later freeze can unwind it. Same-module first, then
-   separate-module (the host-supplied-module path, as the interp got in v11).
+1. **Run (LANDED, same-module).** Admit a durable **same-module** child: its funcs are the parent's
+   own (already-instrumented) funcs, so no separate transform is needed. A *runnable* same-module child
+   on the JIT is a pure-compute (non-may-suspend) func — no poll sites, so it runs atomically to
+   completion in its carve with no durable control-word setup (a would-be *instrumented* child hits a
+   `cap.call` against its empty powerbox → `CapFault`, never reaching an unwind, so it is unreachable
+   here, not unsound). Only the `instantiate` guard changed: `durable && mod_mem.is_some()` still fails
+   closed (separate-module), everything else runs. The carve-seeding + child powerbox arrive with the
+   freeze slice, where an instrumented child actually reads them. Next: **separate-module** run (the
+   host-supplied-module path, as the interp got in v11).
 2. **Freeze.** When the parent unwinds, the child runs under `UNWINDING` too (subtree STW — the JIT
    analog of the interp's mid-freeze `instantiate` seeding the child's carve `UNWINDING`) and flattens
    into its carve; the JIT **exports a `FrozenNested`** residue (slot, carve geometry, entry,
@@ -304,9 +308,10 @@ the all-or-nothing oracle (D-notes, §18):
 access masked to its carve `[base+off, base+off+child_size)`, and the child's durable reserve (control
 words + shadow stack) lives *inside* that carve, so the same mask confines it — no escape surface
 beyond flat-durable + non-durable nesting, both already masked. Fuzz the child-carve masking as its own
-unit. The current fail-closed boundary is pinned by `durable_nesting_jit.rs` (interp admits a durable
-same-module `instantiate`; the JIT returns `-EINVAL`), which flips to a positive byte-identical
-differential as slice 1 lands.
+unit. Slice 1 (same-module run) is pinned by `durable_nesting_jit.rs`: a durable same-module
+`instantiate`+`join` returns the nested child's total (4950) on **both** backends — the JIT now runs
+the durable child instead of failing closed. The freeze slice upgrades this to a byte-identical durable
+reserve differential.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
