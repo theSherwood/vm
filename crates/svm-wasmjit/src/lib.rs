@@ -1016,6 +1016,73 @@ pub fn compile_module_mixed_entry(
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
 }
 
+/// Compile a **tier-up** module for the browser threads tier (`BROWSER.md` § "wasm-JIT tier",
+/// per-Worker JIT). Unlike [`compile_module_mixed_entry`], eligibility is **not** rooted at one
+/// entry: the guest keeps running on the resumable interpreter (which drives `thread.spawn`/`join`,
+/// atomics, `memory.wait`), and a direct `Call` to any emitted function surfaces as a *tier-up* the
+/// host runs on the emitted region — so a pure compute leaf reachable **only** through
+/// `thread.spawn` still emits, even though its caller (a concurrency orchestrator) never JITs.
+///
+/// Returns the emitted wasm plus the per-function eligibility bitmap: `eligible[i]` ⇒ `f{i}` is
+/// exported and safe for the host to call. A function is emitted iff it is in-subset, and every
+/// direct callee is itself emitted or a cross-tier interp leaf — a monotone fixpoint (start from
+/// "every in-subset function", drop any whose emitted body would carry an unroutable `Call`). A
+/// function that uses `call_indirect` is emitted only when the **whole** module is in-subset (so
+/// every identity-table slot resolves to an emitted target); otherwise it is dropped, keeping the
+/// emitted module table-free. [`Error::Unsupported`] only if the assembler itself rejects the set
+/// (it never should, by construction) — an empty eligible set is a success with no `f{i}` exports.
+pub fn compile_module_tierup(
+    m: &Module,
+    shared_memory: bool,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    let n = m.funcs.len();
+    let in_subset: Vec<bool> = m.funcs.iter().map(|f| func_in_subset(m, f)).collect();
+    let leaf: Vec<bool> = (0..n)
+        .map(|i| !in_subset[i] && interp_leaf(&m.funcs[i]))
+        .collect();
+    let all_in_subset = in_subset.iter().all(|&s| s);
+
+    // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to any
+    // identity-table slot, so a function that uses one is only safe to emit when every function is
+    // in-subset (all slots resolve); otherwise drop it (and the emitted module needs no table).
+    let mut emit: Vec<bool> = (0..n)
+        .map(|i| in_subset[i] && (all_in_subset || !func_uses_indirect(&m.funcs[i])))
+        .collect();
+    // Fixpoint: drop any candidate that directly calls a function which is neither still a candidate
+    // nor a cross-tier leaf — its emitted body would have an unroutable `Call`. Monotone (only
+    // removes), so it converges in ≤ n passes.
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if !emit[i] {
+                continue;
+            }
+            for c in func_callees(&m.funcs[i]) {
+                let c = c as usize;
+                if c >= n || (!emit[c] && !leaf[c]) {
+                    emit[i] = false;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+    let mut emitted: Vec<usize> = Vec::new();
+    for (i, e) in emit.iter().enumerate() {
+        if *e {
+            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+            emitted.push(i);
+        }
+    }
+    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf)?;
+    Ok((wasm, emit))
+}
+
 /// Assemble the wasm module: emit the functions listed in `emitted` (SVM indices, in the order they
 /// take wasm indices), routing each `Call` via `wasm_of` (a direct wasm call) or, for an interp
 /// leaf, through `env.call_interp`. See the module docs for the emitted shape.

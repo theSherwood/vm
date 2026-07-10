@@ -1662,6 +1662,13 @@ pub enum VcpuEvent {
     Done(Vec<Value>),
     /// The vCPU trapped (a child-join trap propagates here too).
     Trapped(Trap),
+    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): the interpreter reached a direct `Call`
+    /// to the eligible function `func` (see [`Vcpu::with_jit_eligible`]). The host runs the emitted
+    /// `f{func}(win, env, ...argv)` region on its Worker — a **top-level** call, so a guest trap is a
+    /// catchable `RuntimeError` and never corrupts the engine — then calls [`Vcpu::deliver_tierup`]
+    /// with the results, or [`Vcpu::deliver_tierup_trap`] if the region trapped. `argv` is the
+    /// marshalled arguments as raw i64 slots (the host reads them per `func`'s signature).
+    TierUp { func: u32, argv: Box<[i64]> },
     /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_handle`] with the
     /// handle the guest will `join` it by (the host assigns handles densely per spawner: 0, 1, …).
     Spawn { func: u32, sp: i64, arg: i64 },
@@ -1782,6 +1789,18 @@ pub struct Vcpu<'p> {
     pending_jit: Option<PendingJit>,
     /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
     trap: Option<Trap>,
+    /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
+    /// means function `f`'s whole reachable region is JIT-compilable and suspension-free, so a direct
+    /// `Call` to it is surfaced as a [`VcpuEvent::TierUp`] — the host runs the emitted `f{f}` on the
+    /// Worker (top-level caller, so a guest trap is a catchable `RuntimeError`) and delivers the
+    /// result back via [`deliver_tierup`](Vcpu::deliver_tierup). `None` ⇒ everything interprets, as
+    /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
+    /// embedder computes it (e.g. from `svm_wasmjit::analyze`).
+    jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame-relative
+    /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
+    /// slots — the caller's window base is the one the spill persisted).
+    pending_tierup: Option<(usize, Box<[ValType]>)>,
 }
 
 impl<'p> Vcpu<'p> {
@@ -1865,6 +1884,8 @@ impl<'p> Vcpu<'p> {
             pending: None,
             pending_jit: None,
             trap: None,
+            jit_eligible: None,
+            pending_tierup: None,
         })
     }
 
@@ -1936,6 +1957,8 @@ impl<'p> Vcpu<'p> {
             pending: None,
             pending_jit: None,
             trap: None,
+            jit_eligible: None,
+            pending_tierup: None,
         })
     }
 
@@ -1947,6 +1970,17 @@ impl<'p> Vcpu<'p> {
     /// its state (e.g. `stdout`) after; per-call serialization is the documented 4c-host model.
     pub fn with_shared_host(mut self, host: &'p std::sync::Mutex<Host>) -> Vcpu<'p> {
         self.shared_host = Some(host);
+        self
+    }
+
+    /// Attach the **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice, builder-style). A
+    /// direct `Call` to a function `f` with `eligible[f] == true` then surfaces as
+    /// [`VcpuEvent::TierUp`] instead of interpreting `f` — the host runs the emitted region and
+    /// `deliver_tierup`s the result. `eligible.len()` should cover the primary module's functions;
+    /// an out-of-range index is treated as not-eligible (interprets).
+    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> Vcpu<'p> {
+        self.vt.active.jit_eligible = Some(std::sync::Arc::clone(&eligible));
+        self.jit_eligible = Some(eligible);
         self
     }
 
@@ -1990,6 +2024,15 @@ impl<'p> Vcpu<'p> {
             match stop {
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
+                Ok(VcpuStop::TierUp {
+                    func,
+                    argv,
+                    dst,
+                    results,
+                }) => {
+                    self.pending_tierup = Some((dst, results));
+                    return VcpuEvent::TierUp { func, argv };
+                }
                 Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
                     if func as usize >= dom.source.primary().progs.len() {
                         return VcpuEvent::Trapped(Trap::Malformed);
@@ -2511,6 +2554,34 @@ impl<'p> Vcpu<'p> {
             }
             Err(t) => self.trap = Some(t),
         }
+    }
+
+    /// Deliver the results of a [`VcpuEvent::TierUp`]: the emitted region returned `vals` (raw i64
+    /// result slots, one per the callee's result type). Re-tag each into the awaiting `dst` slot(s) of
+    /// the caller's window and resume — the tier-up call then looks exactly like an interpreted call
+    /// that returned. Too few results is a `Malformed` trap (a mis-marshalled host reply).
+    pub fn deliver_tierup(&mut self, vals: &[i64]) {
+        let Some((dst, results)) = self.pending_tierup.take() else {
+            panic!("deliver_tierup with no pending tier-up");
+        };
+        if vals.len() < results.len() {
+            self.trap = Some(Trap::Malformed);
+            return;
+        }
+        for (i, ty) in results.iter().enumerate() {
+            self.vt.active.set(
+                dst as u32 + i as u32,
+                Reg::from_value(slot_to_val(*ty, vals[i])),
+            );
+        }
+    }
+
+    /// Deliver a **trap** from a [`VcpuEvent::TierUp`] region (the emitted `f{func}` hit a guest
+    /// `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a catchable
+    /// `RuntimeError`). The vCPU traps on its next `run`, exactly as if the interpreted call had.
+    pub fn deliver_tierup_trap(&mut self, trap: Trap) {
+        self.pending_tierup = None;
+        self.trap = Some(trap);
     }
 
     /// Snapshot this vCPU's window (its `[0, prefix_len)` span) after it finishes — the root's image
@@ -3109,6 +3180,15 @@ fn run(
 enum Outcome {
     Done(Vec<Value>),
     Suspended,
+    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible module-0
+    /// function. The host runs the emitted `f{func}` region and delivers its `n_results` results to
+    /// the absolute register slot `dst`. `argv` is the marshalled arguments (raw i64 slots).
+    TierUp {
+        func: u32,
+        argv: Box<[i64]>,
+        dst: usize,
+        results: Box<[ValType]>,
+    },
     /// `cont.new`: register a fiber for `(funcref, sp)`, write its handle to `dst`, continue.
     ContNew {
         funcref: i32,
@@ -3602,6 +3682,14 @@ fn run_invoke(
 /// here — `step_vcpu` handles them against the vCPU's own registry.
 enum VcpuStop {
     Done(Vec<Value>),
+    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
+    /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
+    TierUp {
+        func: u32,
+        argv: Box<[i64]>,
+        dst: usize,
+        results: Box<[ValType]>,
+    },
     Spawn {
         func: u32,
         sp: i64,
@@ -3866,6 +3954,19 @@ fn step_vcpu(
                 vt.active_id = rid;
                 vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
                 vt.active.set(rdst + 1, Reg::from_i64(value));
+            }
+            Outcome::TierUp {
+                func,
+                argv,
+                dst,
+                results,
+            } => {
+                return Ok(VcpuStop::TierUp {
+                    func,
+                    argv,
+                    dst,
+                    results,
+                })
             }
             Outcome::ThreadSpawn { func, sp, arg, dst } => {
                 return Ok(VcpuStop::Spawn { func, sp, arg, dst })
@@ -4342,6 +4443,9 @@ fn drive(
         match stop {
             Err(trap) => complete(&mut tasks, ti, Err(trap)),
             Ok(VcpuStop::Done(vals)) => complete(&mut tasks, ti, Ok(vals)),
+            // wasm-JIT tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`);
+            // the native drivers never set the eligibility bitmap, so it cannot occur here.
+            Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
                 if func as usize >= dom.source.primary().progs.len() {
                     complete(&mut tasks, ti, Err(Trap::Malformed));
@@ -5117,6 +5221,8 @@ fn run_vcpu_parallel<'scope, 'env>(
         match stop {
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
+            // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
+            Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
                 if func as usize >= dom.source.primary().progs.len() {
                     return (Err(Trap::Malformed), mem);
@@ -5716,6 +5822,11 @@ struct Vm {
     /// per-context SP word. The root's is context 0 (`SHADOW_BASE`); a fiber's its `slot + 1`. Set when
     /// the Vm is created (fiber) / activated; unused on a non-durable run.
     durable_region_base: u64,
+    /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for module-0 functions only. Set
+    /// on the root Vm via [`Vcpu::with_jit_eligible`]; a direct `Call` in module 0 to an eligible
+    /// function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers, invoked units,
+    /// non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never a correctness gate.
+    jit_eligible: Option<std::sync::Arc<[bool]>>,
 }
 
 impl Vm {
@@ -5738,6 +5849,7 @@ impl Vm {
             scratch: Vec::new(),
             setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
+            jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
         })
     }
 
@@ -6084,6 +6196,32 @@ impl Vm {
                 }
                 Op::Call { callee, args, dst } => {
                     let callee = *callee as usize;
+                    // wasm-JIT tier-up: a module-0 direct call to an eligible function surfaces to the
+                    // host, which runs the emitted region and delivers the results. `argv` is the raw
+                    // i64 arg slots; the host reads them per the callee's signature. Suspension-free by
+                    // construction (`mixed_ok`), so this is a plain "fast call": spill past the op and
+                    // resume with the results in `dst` (`deliver_tierup`), exactly like an interp call.
+                    if module == 0
+                        && self
+                            .jit_eligible
+                            .as_ref()
+                            .is_some_and(|e| e.get(callee).copied().unwrap_or(false))
+                    {
+                        let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
+                        let results: Box<[ValType]> = c.result_types[callee].clone().into();
+                        // Spill past the call with the caller's window intact (no callee frame pushed);
+                        // `deliver_tierup` writes the results into `dst` relative to this base.
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        return Ok(Outcome::TierUp {
+                            func: callee as u32,
+                            argv,
+                            dst: *dst as usize,
+                            results,
+                        });
+                    }
                     // A direct call stays in the current module.
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + c.progs[callee].nslots as usize;

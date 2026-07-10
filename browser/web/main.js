@@ -298,6 +298,28 @@ block0(v0: i64):
   } catch (e) {
     set('wasmjit', 'fail', `wasmjit: error ${e}`);
   }
+
+  // --- 7) wasm-JIT tier-up **across real Web Workers** (BROWSER.md § "wasm-JIT tier", per-Worker JIT) --
+  // The flagship: the 4000 counter kernel where each spawned worker's compute leaf tiers up onto
+  // emitted wasm on *its own* Worker (`compile_module_tierup` emits the leaf even though it's reachable
+  // only through `thread.spawn`), while the guest keeps running on the interpreter for spawn/join +
+  // atomics. Run it BOTH ways over real Workers: plain (all-interp) and tier-up. Both must return 4000,
+  // and the tier-up run must actually fire the seam (counter > 0) — a result match alone couldn't
+  // distinguish tiered-up from silently-interpreted.
+  try {
+    const guest = await fetchBytes('/corpus/threads_tierup.svmbc');
+    const t0 = performance.now();
+    const plain = await run(guest);
+    const tiered = await run(guest, { tierup: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = plain.value === 4000n && tiered.value === 4000n && tiered.tierups > 0;
+    set('tierup', ok ? 'pass' : 'fail',
+      `tierup: ${tiered.started} Workers · plain → ${plain.value} · tier-up → ${tiered.value} ` +
+      `(want 4000, ${tiered.tierups} regions ran on emitted wasm) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`tierup → plain ${plain.value} / tier-up ${tiered.value} with ${tiered.tierups} tier-ups across ${tiered.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('tierup', 'fail', `tierup: error ${e}`);
+  }
 }
 
 main().catch((e) => { log(`fatal: ${e}\n${e.stack ?? ''}`); set('threads', 'fail', `fatal: ${e}`); });

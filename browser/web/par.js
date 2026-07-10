@@ -50,7 +50,7 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, inst = false, io = false, unit = null, winSize = 1 << 16, signal = null } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, inst = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null } = {}) {
     const gptr = ex.svm_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
@@ -70,6 +70,11 @@ export function makeRunner({ module, memory, ex }) {
         throw new Error('svm_par_powerbox_inst failed');
       }
     }
+
+    // wasm-JIT tier-up: a shared i32 cell every Worker atomically bumps on each tier-up, so the
+    // caller can prove the seam actually fired (a result match alone can't tell "tiered up" from
+    // "silently interpreted"). Read back after the run.
+    const tierupCell = tierup ? ex.svm_par_alloc(4) : 0;
 
     const workers = new Set();
     let started = 0;
@@ -97,7 +102,9 @@ export function makeRunner({ module, memory, ex }) {
             }
           };
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
-          w.postMessage({ module, memory, prog, win, winSize, ...cfg });
+          // `tierup` + the guest bytes (kept live at `gptr` for the run) let each Worker JIT-compile
+          // the guest locally and run eligible compute regions on the emitted wasm (threads slice).
+          w.postMessage({ module, memory, prog, win, winSize, tierup, gptr, glen: guest.length, tierupCell, ...cfg });
         };
         // The root vCPU runs on its own Worker (the page can't Atomics.wait).
         const rootSlot = ex.svm_par_alloc(SLOT);
@@ -105,7 +112,8 @@ export function makeRunner({ module, memory, ex }) {
         const rootTlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
         startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
       });
-      return { value, started };
+      const tierups = tierup ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
+      return { value, started, tierups };
     } finally {
       for (const w of workers) w.terminate();
     }
