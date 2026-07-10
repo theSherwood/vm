@@ -43,14 +43,17 @@ unprivileged user if invoked as root.
 | 3 | **`i128`** (numeric/aggregate widening) | 252 | on-ramp already lowers i128 div/rem; general i128 arith is tier-3'd — verify on demand |
 | 4 | **libm** (`log`/`exp`/`pow`/trig) | 18 | **DONE** (slice BQ): openlibm's double funcs bundled as guest code, llvm-linked; on-ramp reproduces them bit-for-bit vs native (`libm_bundled_vs_native`) |
 | 5 | **the whole external surface (~250)** — file/OS syscalls, proc/time/signal, other libc | ~250 | **DONE at translate time** (slice BR): opt-in `--stub-externs` lowers every undefined external to a trap-if-called stub, so the ~200 dead on the `--single` path don't block. Only the ~50 the query path *calls* need real impls (fs cap / stubs) for the **runtime** |
-| 6 | **SIMD vector ops** (from SSE/AVX code) | — | **in progress** (slices BS/BT/BU): per-lane shifts, mask bitwise, `freeze`-of-aggregate, vector `ctpop`, wide/2-lane `reduce` done; next is AVX-512 (`pg_popcount_avx512`, dead code) — remove via a build-config lever |
-| 7 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap — the ~50 *live* externals resolve here |
+| 6 | **SIMD vector ops** | — | **DONE (slice BV) via two build-config levers.** Most of the "SIMD tail" was never real Postgres SIMD — it was clang **auto-vectorizing** scalar C loops (`<2 x i32>` loads → `<2 x ptr>` gather-GEPs). `emit_bc.py` passed `-fno-vectorize -fno-slp-vectorize` but *before* the recovered `-O2`, which re-enabled it (last flag wins); appending the flags after `-O2` disables it for real, and the whole auto-vectorized tail vanishes. The residual **explicit** SIMD (SSE4.2 `_mm_crc32`, 128-bit float vectors) already translates via slices Y/BS/BT/BU. **AVX-512** (`pg_popcount_avx512`, `<64 x i1>`) is dead under the `cpuid`→0 stub and is dropped at the source by the second lever: `configure` is told the AVX-512 popcount autodetect is "no", so `USE_AVX512_POPCNT_WITH_RUNTIME_CHECK` is never defined and `PG_POPCNT_OBJS` is empty |
+| 7 | **indirect varargs call** (`manifest_process_version`) | — | **next**: the on-ramp marshals a *direct* `(...)` call's variadic args through a scratch area but rejects an **indirect** varargs call (a `(...)` function pointer). A defined function, so `--stub-externs` can't skip it — the on-ramp must lower it |
+| 8 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap — the ~50 *live* externals resolve here |
 
-**Where it stands:** the complete module (834 modules / 14 730 functions) translates past the **entire
-921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals (bundled openlibm, BQ), and —
-with `--stub-externs` (BR) — the **entire ~250-external OS/libc surface** (the ~200 dead on the query
-path become trap-if-called stubs). Translation now stops at the **SIMD vector tail** (~9 per-lane
-vector shifts from explicit SSE/AVX). Remaining before it fully translates + verifies: that vector
-category; then the **runtime** (initdb data dir, storage manager, WAL, single-process shmem, catalog
+**Where it stands:** the complete module (832 modules / ~14 700 functions) translates past the **entire
+921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals (bundled openlibm, BQ), the
+**entire ~250-external OS/libc surface** with `--stub-externs` (BR), and — after slice BV's two
+build-config levers — the **whole SIMD tail** (loop auto-vectorization disabled at the source; AVX-512
+popcount compiled out; the residual explicit SSE/128-bit-float SIMD rides the on-ramp's existing
+vector support). Translation now stops at the first **indirect varargs call** (`manifest_process_version`,
+gap #7). Remaining before it fully translates + verifies: that varargs category (and whatever surfaces
+behind it); then the **runtime** (initdb data dir, storage manager, WAL, single-process shmem, catalog
 bootstrap) with real impls for the ~50 externals the query path actually calls. See `LLVM.md` slices
-BM–BR.
+BM–BV.

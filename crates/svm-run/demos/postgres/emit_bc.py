@@ -50,7 +50,12 @@ def compile_cmd(obj):
         if t == "-ftree-vectorize":
             i += 1; continue
         out_toks.append(t); i += 1
-    out_toks[1:1] = EXTRA
+    # EXTRA must come *after* the recovered `-O2`: for the vectorizer knobs, the LAST occurrence on
+    # the clang command line wins, and `-O2` turns the loop/SLP vectorizers back on. Inserting the
+    # `-fno-*vectorize` flags before `-O2` (an earlier bug) silently left auto-vectorization enabled,
+    # so scalar C loops still emitted `<2 x i32>`/`<2 x ptr>` gather-GEPs that the on-ramp must then
+    # scalarize. Appending here makes `-fno-vectorize -fno-slp-vectorize` actually take effect.
+    out_toks.extend(EXTRA)
     return (obj, (d, out_toks, bc))
 
 

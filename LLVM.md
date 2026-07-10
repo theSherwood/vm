@@ -1028,6 +1028,33 @@ functions, plus a diagnostics win:
   **build-config lever** (compile Postgres without the AVX-512 popcount fast-path) rather than teaching
   the on-ramp the whole AVX-512 surface — the next slice.
 
+**Slice BV (DONE) — the SIMD tail closes via two build-config levers (no on-ramp change).** The
+diagnosis from BU was "teach the on-ramp AVX-512"; the reality on inspection was better — almost the
+*entire* Postgres SIMD surface is **incidental**, and closes at the source:
+- **The flag-ordering bug (the big one).** `emit_bc.py` passed `-fno-vectorize -fno-slp-vectorize` to
+  disable clang auto-vectorization — but inserted them *before* the recovered `-O2`. For the
+  vectorizer knobs the **last** flag on the line wins, and `-O2` turns the loop/SLP vectorizers back
+  on, so auto-vectorization was silently **never disabled**. Scalar C loops (e.g. `gistextractpage`'s
+  offset-array copy) were emitted as `<2 x i32>` loads → `zext <2 x i64>` → `getelementptr <2 x i64>`
+  gather-GEPs → `<2 x ptr>` stores — the "SIMD tail" that motivated BS/BT/BU. Appending the flags
+  *after* `-O2` (`out_toks.extend(EXTRA)`) makes them take effect; the whole auto-vectorized tail
+  vanishes (the module's `<N x …>` occurrences drop by ~40%, and the first gap jumps from
+  `gistextractpage`'s vector GEP clear across the vector category). The residual **explicit** SIMD
+  (SSE4.2 `_mm_crc32`, 128-bit float vectors) still translates via the on-ramp's existing vector
+  support (Y/BS/BT/BU) — those slices earn their keep on the real SIMD, just not on the phantom tail.
+- **AVX-512 popcount off.** Independent of vectorization (it is explicit `_mm512_*` intrinsic code in
+  `pg_popcount_avx512.c`, gated by `USE_AVX512_POPCNT_WITH_RUNTIME_CHECK`). The `configure` autodetect
+  is forced to "no" via its own cache vars (`pgac_cv_avx512_popcnt_intrinsics_=no` and the
+  `_mavx512vpopcntdq_mavx512bw` variant) — exactly the config a host without AVX-512 produces — so the
+  macro is never defined, `PG_POPCNT_OBJS` is empty, and `pg_popcount_avx512` / its `<64 x i1>` body
+  leave the link set. Dead anyway under the guest `cpuid`→0 (`pg_popcount_avx512_available()` is
+  false, scalar popcount is always chosen), so the native oracle stays a valid differential target.
+- **No translator code changed** (so the 289 translate tests are untouched and still green); the
+  deliverable is the two demo-build fixes (`build_bitcode.sh` configure args + `emit_bc.py` flag
+  order) plus this log. **Effect:** the module clears the entire SIMD + AVX-512 surface and now stops
+  at the first **indirect varargs call** (`manifest_process_version` — a `(...)` function pointer; the
+  on-ramp marshals *direct* varargs but rejects indirect), the next slice.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
