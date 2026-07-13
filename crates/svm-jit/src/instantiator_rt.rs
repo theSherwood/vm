@@ -342,17 +342,25 @@ pub(crate) unsafe extern "C" fn instantiate(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
-    // §4 (DURABILITY.md): a durable run fails nesting closed — this runner can't run a durable
-    // child (see the `Nursery::durable` field). Guest-reachable errno, like a bad carve.
-    if rt.durable.load(Ordering::Acquire) {
-        return EINVAL as i32;
-    }
+    let durable = rt.durable.load(Ordering::Acquire);
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
     let Some((child_funcs, mod_mem, child_data)) = rt.resolve_child(module, trap_out) else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
+    // §4 (DURABILITY.md, "JIT parity" slice 1): a durable run may now nest a **same-module** child.
+    // Its funcs are the parent's own instrumented funcs; a runnable same-module child on the JIT is a
+    // pure-compute (non-may-suspend) func — it has no poll sites, so it runs atomically to completion
+    // in its carve with no durable control-word setup needed (a would-be *instrumented* child hits a
+    // `cap.call` against its empty powerbox → `CapFault`, so it never reaches an unwind). Freezing a
+    // *live* nested child on the JIT — which needs the carve's ctx-0 control words + shadow base seeded
+    // to match the interpreter — is the next slice. A durable **separate-module** child (`mod_mem =
+    // Some`) stays fail-closed (host-supplied module identity + freeze residue are a later slice), as
+    // does `coro_spawn`. Guest-reachable errno, like a bad carve.
+    if durable && mod_mem.is_some() {
+        return EINVAL as i32;
+    }
 
     // The carve must be a power-of-two-aligned sub-window within `[0, size)` — a child can only get
     // what the holder sub-allocates (§14/D19) — and a module child's carve must equal its declared
