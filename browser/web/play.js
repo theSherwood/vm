@@ -306,10 +306,10 @@ block0(v0: i64):
     editable: true,
     url: './assets/lua_eval.svmb',
     mode: 'io',
-    desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math ' +
-      'libraries, compiled through the LLVM on-ramp. Edit the Lua on the left and click Run: your ' +
-      'code is piped to the guest as stdin, evaluated, and its print() output appears below. Real ' +
-      'Lua, running client-side in the sandbox.',
+    desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math/' +
+      'coroutine/io/os libraries, compiled through the LLVM on-ramp. Edit the Lua on the left and ' +
+      'click Run: your code is piped to the guest as stdin, evaluated, and its output appears below. ' +
+      'Real Lua, running client-side in the sandbox.',
     src: `-- Write Lua here, then click Run.
 print("Hello from " .. _VERSION)
 
@@ -326,6 +326,21 @@ print("sorted:", table.concat(t, ", "))
 
 -- string.format + math
 print(string.format("pi ~ %.4f, 255 in hex = 0x%X", math.pi, 255))
+
+-- io.write (stdout via the Stream capability — no trailing newline)
+io.write("counting: ")
+for i = 1, 5 do io.write(i, " ") end
+io.write("\\n")
+
+-- coroutines: a lazy generator
+local function squares(n)
+  return coroutine.wrap(function()
+    for i = 1, n do coroutine.yield(i * i) end
+  end)
+end
+local sq = {}
+for v in squares(6) do sq[#sq + 1] = v end
+print("squares:", table.concat(sq, " "))
 `,
   },
   'SQLite (:memory: — write & run SQL)': {

@@ -1,6 +1,9 @@
 /* Lua eval harness: read a Lua chunk from **stdin**, run it, print its output (and any error) to
  * stdout. This is the interactive-playground guest — the page pipes the editor's text in as stdin.
- * Opens base+string+table+math; print()/io.write go to stdout via lua_writestring -> Stream.write.
+ * Opens base+string+table+math+coroutine+io+os over the lua_files guest layers (stdio/time/shim):
+ * print()/io.write go to stdout via the Stream capability; os.time/date/clock ride the guest time
+ * layer; coroutines are pure (setjmp/longjmp). File I/O (io.open) degrades gracefully — the stdio
+ * layer resolves the `fs` capability lazily and this editor grants none, so io.open returns nil.
  * Arena allocator (no host malloc). string.format works (guest snprintf linked, like lua_fmt). */
 #include "lua.h"
 #include "lauxlib.h"
@@ -36,8 +39,10 @@ int main(void) {
   lua_State *L = lua_newstate(l_alloc, (void *)0);
   if (!L) return 1;
   static const luaL_Reg libs[] = {
-    {LUA_GNAME, luaopen_base}, {LUA_STRLIBNAME, luaopen_string},
-    {LUA_TABLIBNAME, luaopen_table}, {LUA_MATHLIBNAME, luaopen_math}, {(void *)0, (void *)0},
+    {LUA_GNAME, luaopen_base},          {LUA_STRLIBNAME, luaopen_string},
+    {LUA_TABLIBNAME, luaopen_table},    {LUA_MATHLIBNAME, luaopen_math},
+    {LUA_COLIBNAME, luaopen_coroutine}, {LUA_IOLIBNAME, luaopen_io},
+    {LUA_OSLIBNAME, luaopen_os},        {(void *)0, (void *)0},
   };
   for (const luaL_Reg *lib = libs; lib->func; lib++) { luaL_requiref(L, lib->name, lib->func, 1); lua_pop(L, 1); }
 

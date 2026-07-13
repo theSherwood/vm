@@ -154,33 +154,41 @@ against a native build of the identical sources (guest `snprintf`/shim/strtod sh
 
 # Lua eval-from-stdin fixture (the interactive playground guest)
 
-`lua_eval.bc` is the same build as `lua_fmt` (Lua 5.4.7 core + base/`string`/`table`/`math` +
-`lua_stdlib_shim` + the guest `snprintf` + guest libm + guest `strtod`), but the harness
-(`lua_eval_harness.c`) **reads a Lua chunk from `stdin`** (`extern long read(int, void *, long)` — the
-`Stream.read` capability, like `sqlite_logictest.c`), `luaL_loadbuffer`s + `lua_pcall`s it, and prints
-any error to stdout. This is the guest the **browser playground** (`browser/web/play.js`) pipes the
-editor's text into as stdin, so a user can write and run their own Lua client-side. Test
-`tests/lua_eval.rs` seeds a small script via `RunConfig::stdin` and asserts the exact stdout on all
-three engines (identical to native). The `.svmb` for the page is built by `browser/build-onramp-assets.mjs`
-at `--host-page 65536`.
+`lua_eval.bc` opens the **full editor lib set** — base/`string`/`table`/`math`/`coroutine`/`io`/`os` —
+over the `lua_files` guest layers (`lua_files_stdio.c` + `lua_files_time.c` + `lua_files_shim.c`) plus
+the `lua_fmt` guest `snprintf`/libm/`strtod`/trig. The harness (`lua_eval_harness.c`) **reads a Lua
+chunk from `stdin`** (`extern long read(int, void *, long)` — the `Stream.read` capability, like
+`sqlite_logictest.c`), `luaL_loadbuffer`s + `lua_pcall`s it, and prints any error to stdout. This is
+the guest the **browser playground** (`browser/web/play.js`) pipes the editor's text into as stdin, so
+a user can write and run their own Lua client-side. `print`/`io.write` reach stdout through the
+`Stream` capability; `os.time`/`date`/`clock` ride the guest time layer; coroutines are pure. **File
+I/O degrades gracefully**: the editor grants no `fs` capability, so `io.open` returns `nil` (the `hc`
+guard in `lua_files_stdio.c` fails the op instead of `cap.call`ing a forged handle). Test
+`tests/lua_eval.rs` seeds a script (print, string.format, table.sort, io.write, coroutine) via
+`RunConfig::stdin` and asserts the exact stdout on all three engines. The `.svmb` for the page is built
+by `browser/build-onramp-assets.mjs` at `--host-page 65536`.
 
 ## Regenerating (eval)
 
-Identical to the `string.format` recipe, but the harness is `lua_eval_harness.c` (no embedded script):
+The `files.lua` recipe minus `debug`, with `lua_eval_harness.c` (no embedded script). **Do not glob
+`*.bc`** for the link — it would re-link the output; list the components:
 
 ```sh
 NV="-fno-vectorize -fno-slp-vectorize"
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"
-LIBS="lbaselib lstrlib ltablib lmathlib lauxlib"
+LIBS="lbaselib lstrlib ltablib lmathlib lauxlib lcorolib liolib loslib"
 for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -c -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.bc; done
 clang -O2 $NV              -emit-llvm -c -Ilua-5.4.7/src lua_eval_harness.c   -o harness.bc
-clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_stdlib_shim.c    -o guest_shim.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_files_stdio.c   -o guest_stdio.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_files_time.c    -o guest_time.bc
+clang -O2 $NV -fno-builtin -emit-llvm -c -Ilua-5.4.7/src lua_files_shim.c    -o guest_shim.bc
+clang -O2 $NV -fno-builtin -fno-strict-aliasing -emit-llvm -c lua_testsuite_trig.c -o guest_trig.bc
 clang -O2 $NV -fno-builtin -emit-llvm -c                 lua_fmt_snprintf.c   -o guest_snprintf.bc
 clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/libm/libm.c               -o guest_libm.bc
 clang -O2 $NV -fno-builtin -emit-llvm -c .../demos/strtod/strtod.c           -o guest_strtod.bc
-llvm-link $CORE.bc $LIBS.bc harness.bc guest_shim.bc guest_snprintf.bc guest_libm.bc \
-          guest_strtod.bc -o lua_eval.bc   # (expand globs; do NOT glob *.bc — it re-links outputs)
+llvm-link $CORE.bc $LIBS.bc harness.bc guest_stdio.bc guest_time.bc guest_shim.bc guest_trig.bc \
+          guest_snprintf.bc guest_libm.bc guest_strtod.bc -o lua_eval.bc   # (expand globs)
 ```
 
 # Lua test-suite fixture

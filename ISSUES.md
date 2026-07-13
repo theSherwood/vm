@@ -203,6 +203,46 @@ keeps tripping unrelated PRs, the cheap unblock is the I4-style mitigation (or m
 
 ---
 
+### I22 — Rare `real-browser` (Chromium/Playwright) flake: an on-page check trips an out-of-bounds memory access (S4)
+
+**Where:** the `real-browser (Chromium via Playwright)` CI job — `browser/browser-test.mjs` driving
+`web/index.html` + `web/play.html` in a headless Chromium under COOP/COEP. The wasm module is the
+shared-memory THREADS build (`-Z build-std`, `+atomics`, imported/shared `WebAssembly.Memory`), so
+every on-page check runs real vCPUs across Web Workers over one shared linear memory.
+
+**Symptom:** intermittently one on-page assertion fails with a wasm **out-of-bounds memory access**
+(a `RuntimeError` surfaced via the page's `pageerror`/`console` hooks) instead of its expected
+result, so `browser-test.mjs` exits non-zero and the job goes red. Observed on **PR #229** (the
+on-ramp-in-playground work, run 29048631247): the diff added editable-module plumbing and page
+assets and could not touch the shared-window/Worker path the failing check exercises. It **passed
+locally** on the same commit, every other lane was green, and it **cleared on a plain re-run**
+(`rerun_failed_jobs`) — the classic flake signature. The exact trap site/offset was **not
+captured**: the attempt-1 logs rolled off once the passing re-run replaced them, so which of the
+`powerbox`/`threads`/`jit`/`inst`/`capio`/`wasmjit` (or `play/*`) checks tripped is not yet pinned.
+
+**Why a flake, not a regression:** a shared `WebAssembly.Memory` grown (detached) by one Worker
+while another holds a stale typed-array **view** is a known Chromium-timing hazard on this stack —
+an `svm_alloc` that grows the memory invalidates every previously-taken `Uint8Array(buffer)` view,
+and a Worker reading through a stale view (or racing the grow) reads past the new bounds. Under a
+loaded CI runner the interleaving that exposes it is rare and non-deterministic; local single-machine
+runs and re-runs almost never hit it. This is the browser analogue of the I3/I4 "shared-runner load
+makes a rare interleaving surface" family, not a codegen or verifier defect.
+
+**Fix sketch (deferred — re-run clears it):**
+1. **Capture first.** Make `browser-test.mjs` dump, on any `pageerror`, the failing check id + the
+   `RuntimeError` message/stack and (if reachable) the memory `byteLength` at failure, so the next
+   recurrence self-identifies which check and whether a grow/detach preceded it — today we can't tell
+   which assertion tripped.
+2. **Harden the view discipline** in the page glue (`play.js`, `par.js`): take a **fresh**
+   `new Uint8Array(eng.memory.buffer)` after *every* call that can grow memory (`svm_alloc`, run
+   entry), never cache a view across an alloc — `runModule` already does this for the single-shot
+   path; audit the Worker/`par.js` shared-window path for a cached view held across a grow.
+3. If it keeps tripping unrelated PRs before root-cause, treat a wasm OOB in `real-browser` that
+   passes locally as a flake and re-run the job; consider making `real-browser` non-gating only as a
+   last resort (it is the sole real-Chromium proof, so keep it gating if at all possible).
+
+---
+
 ### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
 
 **Where:** the trap-time backtrace capture sites — `crates/svm-jit/src/trap_shim.c` (the SIGSEGV/BUS

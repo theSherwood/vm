@@ -89,9 +89,11 @@ if (ensureAmalgamation()) {
   console.log('  – sqlite_repl skipped (amalgamation fetch failed — offline?)');
 }
 
-// 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math libraries + a guest snprintf, with a
-//    harness that reads a Lua chunk from **stdin** and runs it. The page pipes the editor's text in as
-//    stdin, so the user writes and runs their own Lua. Committed golden fixture (no Lua source needed).
+// 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math/coroutine/io/os libraries + a guest
+//    snprintf, with a harness that reads a Lua chunk from **stdin** and runs it. The page pipes the
+//    editor's text in as stdin, so the user writes and runs their own Lua. io.write/os.date/coroutine
+//    all work; file I/O (io.open) degrades to nil (no fs cap granted). Committed golden fixture
+//    (`lua_eval.bc`; no Lua source needed).
 try {
   buildBc('lua_eval', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_eval.bc'));
 } catch (e) {
