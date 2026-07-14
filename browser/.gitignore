@@ -17,3 +17,4 @@ patched*.wasm
 /web/assets/*.bc
 /web/assets/*.svmb
 !/web/assets/hello_c.svmb
+!/web/assets/gradient.svmb

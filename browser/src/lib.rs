@@ -24,9 +24,9 @@
 
 use std::alloc::Layout;
 
-use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
 #[cfg(feature = "live")]
 use svm_interp::HostFn;
+use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
 
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
 
@@ -555,7 +555,10 @@ fn first_i64(vals: &[Value]) -> i64 {
 /// Compile the module at `[mod_ptr, mod_len)` into a shareable [`bytecode::VcpuProgram`], returned as a
 /// leaked pointer (lives for the run; shared read-only across Workers). Null on decode/unsupported.
 #[no_mangle]
-pub extern "C" fn svm_par_compile(mod_ptr: *const u8, mod_len: usize) -> *mut bytecode::VcpuProgram {
+pub extern "C" fn svm_par_compile(
+    mod_ptr: *const u8,
+    mod_len: usize,
+) -> *mut bytecode::VcpuProgram {
     // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let Ok(m) = svm_encode::decode_module(bytes) else {
@@ -920,9 +923,8 @@ pub extern "C" fn svm_par_child_confined(
     }
     // SAFETY: the host guarantees the carve is inside the parent's live window (the engine validated
     // it before surfacing the event); aliasing views of the shared memory are the §13 data plane.
-    let back = std::sync::Arc::new(unsafe {
-        svm_interp::Region::shared(carve_ptr, 1u64 << size_log2)
-    });
+    let back =
+        std::sync::Arc::new(unsafe { svm_interp::Region::shared(carve_ptr, 1u64 << size_log2) });
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     // (No shared-host attach: a §14 confined child's powerbox is its own attenuated one, built
     // in-engine — its capability set never includes the run's I/O grants.)
@@ -1068,7 +1070,9 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             // installs / invokes against the shared `Domain`, then we loop. Without a powerbox (a
             // non-JIT run) a JIT op is fail-closed, exactly as before this seam existed.
             bytecode::VcpuEvent::JitInstall { handle, code } => match par_pb() {
-                Some(pb) => v.inner.deliver_jit_install(par_resolve_unit(pb, handle, code)),
+                Some(pb) => v
+                    .inner
+                    .deliver_jit_install(par_resolve_unit(pb, handle, code)),
                 None => return PAR_TRAP,
             },
             bytecode::VcpuEvent::JitUninstall { handle, .. } => match par_pb() {
@@ -1077,10 +1081,10 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                     .deliver_jit_uninstall(pb.host.resolve_jit_domain(handle).map(|_| ())),
                 None => return PAR_TRAP,
             },
-            bytecode::VcpuEvent::JitInvoke {
-                handle, code, ..
-            } => match par_pb() {
-                Some(pb) => v.inner.deliver_jit_invoke(par_resolve_unit(pb, handle, code)),
+            bytecode::VcpuEvent::JitInvoke { handle, code, .. } => match par_pb() {
+                Some(pb) => v
+                    .inner
+                    .deliver_jit_invoke(par_resolve_unit(pb, handle, code)),
                 None => return PAR_TRAP,
             },
             // §14 confined executor child (THREADS.md 4c-domain §14-D2): all authority-bearing work
@@ -1202,15 +1206,27 @@ pub extern "C" fn svm_par_free(v: *mut ParVcpu) {
 /// The guest called `Exit.exit(code)` (a non-error trap); read the code via [`svm_exit_code`].
 pub const STATUS_EXIT: i32 = 5;
 
+/// A captured RGBA framebuffer a guest presented through the `display` capability: `width`×`height`
+/// pixels, `rgba` exactly `width*height*4` bytes (R,G,B,A per pixel, row-major, top row first — the
+/// `<canvas>` `ImageData` layout, so the browser blits it with a single `putImageData`). This is the
+/// foundation of the graphical demos (the framebuffer output path Doom rides).
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 /// Outcome of a [`powerbox_exec`] run: the status (a `STATUS_*` code), the `i64`-widened return value
-/// (when `STATUS_OK`), the exit code (when `STATUS_EXIT`), and the bytes the guest wrote to its
-/// stdout / stderr streams.
+/// (when `STATUS_OK`), the exit code (when `STATUS_EXIT`), the bytes the guest wrote to its stdout /
+/// stderr streams, and the last framebuffer it presented via the `display` capability (`None` if it
+/// presented none — the common case; only the graphical on-ramp guests use it).
 pub struct PbOutcome {
     pub status: i32,
     pub value: i64,
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub framebuffer: Option<Frame>,
 }
 
 /// The canonical names of the browser powerbox's capabilities, in grant order — the vocabulary a
@@ -1281,6 +1297,7 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         exit_code,
         stdout: host.stdout,
         stderr: host.stderr,
+        framebuffer: None, // the browser-corpus powerbox grants no `display` cap
     }
 }
 
@@ -1333,6 +1350,7 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         exit_code: 0,
         stdout: Vec::new(),
         stderr: Vec::new(),
+        framebuffer: None,
     };
     // Lower the on-ramp's §7 named imports (`write`/`read`/`exit`/`vm_*`) to concrete `cap.call`s
     // before running — the step `svm-run::instantiate` does via `resolve_capability_imports`. Without
@@ -1370,6 +1388,40 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
             host.register_cap_name(name, *handle);
         }
     }
+    // The `display` capability (F-note: the framebuffer output waist) — a §7 by-name `HostFn`, like
+    // `fs`, granted to every on-ramp run and reached via `__vm_cap_resolve("display")`. `op 0` =
+    // `present(ptr, w, h)`: copy `w*h*4` RGBA bytes out of the guest window into the last-frame cell.
+    // A guest that never resolves it (the common case) never presents, so `framebuffer` stays `None`.
+    let frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let frame = std::sync::Arc::clone(&frame);
+        let handle = host.grant_host_fn(Box::new(move |op, args, mem| {
+            if op != 0 {
+                return Ok(vec![-1]); // only present(0) is defined
+            }
+            let ptr = args.first().copied().unwrap_or(0);
+            let w = args.get(1).copied().unwrap_or(0);
+            let h = args.get(2).copied().unwrap_or(0);
+            // Bound the dimensions so a bad (or hostile) call can't ask us to read/allocate wildly.
+            if !(1..=8192).contains(&w) || !(1..=8192).contains(&h) {
+                return Ok(vec![-1]);
+            }
+            let n = (w as u64) * (h as u64) * 4;
+            match mem.and_then(|m| m.read_bytes(ptr as u64, n)) {
+                Some(rgba) => {
+                    *frame.lock().unwrap() = Some(Frame {
+                        width: w as u32,
+                        height: h as u32,
+                        rgba,
+                    });
+                    Ok(vec![0])
+                }
+                None => Ok(vec![-1]), // ptr/len outside the window
+            }
+        }));
+        host.register_cap_name("display", handle);
+    }
     let mut fuel = u64::MAX;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host) {
@@ -1382,12 +1434,14 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
                 _ => (STATUS_BAD_RESULT, 0, 0),
             },
         };
+    let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
         status,
         value,
         exit_code,
         stdout: host.stdout,
         stderr: host.stderr,
+        framebuffer,
     }
 }
 
@@ -1460,6 +1514,13 @@ static mut EXIT_CODE: i32 = 0;
 /// Captured final window image of the most recent [`svm_run_capture`] (same cdylib-managed lifetime
 /// as `OUT`/`ERR`: valid until the next `svm_run_capture`).
 static mut SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+/// Captured framebuffer (RGBA) the most recent [`svm_run_onramp`] guest presented via the `display`
+/// capability, plus its dimensions. `(null, 0)` / `0`×`0` when the guest presented no frame. Same
+/// cdylib-managed lifetime as `OUT` (valid until the next `svm_run_onramp`; the host reads it via the
+/// `svm_framebuffer_*` exports and never frees it).
+static mut FB: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+static mut FB_W: u32 = 0;
+static mut FB_H: u32 = 0;
 
 /// Replace the capture in `slot` with `data`, freeing the previous allocation. Empty `data` stores
 /// `(null, 0)`. The stored allocation is a boxed slice — exactly `len` bytes, alignment 1 — so it is
@@ -1551,13 +1612,40 @@ pub extern "C" fn svm_run_onramp(
     };
     let out = onramp_exec(&m, stdin);
     set(out.status);
+    let (fb_rgba, fb_w, fb_h) = match out.framebuffer {
+        Some(f) => (f.rgba, f.width, f.height),
+        None => (Vec::new(), 0, 0),
+    };
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
+        FB_W = fb_w;
+        FB_H = fb_h;
         EXIT_CODE = out.exit_code;
     }
     out.value
+}
+
+/// Pointer / length of the RGBA framebuffer the most recent [`svm_run_onramp`] guest presented via
+/// the `display` capability (`(null, 0)` if none). `svm_framebuffer_width`/`_height` give its
+/// dimensions; `len` is `width*height*4`. Valid until the next `svm_run_onramp`; do not `svm_dealloc`.
+#[no_mangle]
+pub extern "C" fn svm_framebuffer_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(FB)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_framebuffer_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(FB)).1 }
+}
+#[no_mangle]
+pub extern "C" fn svm_framebuffer_width() -> u32 {
+    unsafe { FB_W }
+}
+#[no_mangle]
+pub extern "C" fn svm_framebuffer_height() -> u32 {
+    unsafe { FB_H }
 }
 
 /// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next
@@ -1893,7 +1981,9 @@ fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, u32, u32)>> {
     while i < bytes.len() {
         let len = *bytes.get(i)? as usize;
         i += 1;
-        let name = core::str::from_utf8(bytes.get(i..i + len)?).ok()?.to_string();
+        let name = core::str::from_utf8(bytes.get(i..i + len)?)
+            .ok()?
+            .to_string();
         i += len;
         let type_id = u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?);
         i += 4;
@@ -1973,7 +2063,12 @@ pub fn jit_exec(m: &svm_ir::Module) -> (i32, i64) {
         Ok(Ok(c)) => c.handle,
         _ => return (STATUS_TRAP, 0),
     };
-    let args = [Value::I32(jit), Value::I32(code), Value::I32(6), Value::I32(7)];
+    let args = [
+        Value::I32(jit),
+        Value::I32(code),
+        Value::I32(6),
+        Value::I32(7),
+    ];
     let mut fuel = 50_000_000u64;
     match bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut host) {
         None => (STATUS_UNSUPPORTED, 0),
@@ -2253,7 +2348,11 @@ block0(v0: i32, v1: i32, v2: i32):
     };
     let h = powerbox_exec(&hm, &[]);
     let e = powerbox_exec(&em, &[]);
-    if h.status == STATUS_OK && h.stdout == b"hello, powerbox!\n" && e.status == STATUS_EXIT && e.exit_code == 42 {
+    if h.status == STATUS_OK
+        && h.stdout == b"hello, powerbox!\n"
+        && e.status == STATUS_EXIT
+        && e.exit_code == 42
+    {
         h.stdout.len() as i64
     } else {
         -1
@@ -2732,12 +2831,13 @@ pub mod live {
             if op != 1 {
                 return Ok(vec![EINVAL]);
             }
-            let (Some(&stream), Some(&ptr), Some(&n)) =
-                (args.first(), args.get(1), args.get(2))
+            let (Some(&stream), Some(&ptr), Some(&n)) = (args.first(), args.get(1), args.get(2))
             else {
                 return Ok(vec![EINVAL]);
             };
-            let Some(m) = mem else { return Ok(vec![EFAULT]) };
+            let Some(m) = mem else {
+                return Ok(vec![EFAULT]);
+            };
             match m.read_bytes(ptr as u64, n as u64) {
                 // The copied bytes live on this module's wasm heap; hand their pointer to the host.
                 Some(buf) => {

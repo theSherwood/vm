@@ -301,6 +301,15 @@ block0(v0: i64):
       'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
       'below is the guest’s real stdout.',
   },
+  'gradient (C → framebuffer)': {
+    kind: 'module',
+    url: './assets/gradient.svmb',
+    mode: 'io',
+    desc: 'crates/svm-run/demos/display/gradient.c — a C guest renders a 128×128 RGBA image and ' +
+      'presents one frame through the `display` capability (resolved by name, like Lua’s io / ' +
+      'SQLite’s VFS). The host reads the frame out of guest memory and blits it to the canvas on the ' +
+      'right. This is the framebuffer output path the graphical demos (Doom) ride.',
+  },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
     editable: true,
@@ -410,6 +419,23 @@ async function fetchModule(url) {
   return bytes;
 }
 
+// Blit the framebuffer the last run presented (via the `display` capability) to the canvas. w/h of 0
+// ⇒ the guest presented no frame: hide the canvas. Copies the RGBA out of wasm memory into a fresh
+// Uint8ClampedArray (putImageData rejects a SharedArrayBuffer-backed view, and a later alloc could
+// detach the buffer). The canvas' intrinsic size is the frame's; CSS scales it up (pixelated).
+function presentFrame(w, h) {
+  const canvas = $('canvas');
+  if (!w || !h) { canvas.style.display = 'none'; return; }
+  const sp = eng.ex.svm_framebuffer_ptr();
+  const sl = eng.ex.svm_framebuffer_len();
+  const rgba = new Uint8ClampedArray(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
+  canvas.style.display = 'block';
+  log(`presented a ${w}×${h} frame (${sl}B RGBA) to the canvas`);
+}
+
 // Run a pre-built on-ramp module single-shot on the main engine: alloc a buffer, copy the module in,
 // `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read the captured stdout.
 // No Workers (these guests are single-threaded), so it never touches the par.js shared-window path.
@@ -417,6 +443,7 @@ async function runModule(ex) {
   setState('running', 'fetching module…');
   $('result').textContent = '';
   $('stdout').textContent = '';
+  $('canvas').style.display = 'none';
   let bytes;
   try {
     bytes = await fetchModule(ex.url);
@@ -448,6 +475,12 @@ async function runModule(ex) {
   const sp = eng.ex.svm_stdout_ptr();
   const sl = eng.ex.svm_stdout_len();
   const stdout = new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
+  // A framebuffer the guest presented through the `display` capability (0×0 ⇒ none): blit it to the
+  // canvas. Read the RGBA out of wasm memory into a fresh copy — putImageData needs a non-shared
+  // Uint8ClampedArray, and the slice also guards against the buffer detaching on a later alloc.
+  const fbW = eng.ex.svm_framebuffer_width();
+  const fbH = eng.ex.svm_framebuffer_height();
+  presentFrame(fbW, fbH);
   eng.ex.svm_dealloc(p, bytes.length);
   if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
   const ms = (performance.now() - t0).toFixed(0);
@@ -475,6 +508,7 @@ async function doRun() {
   const mode = $('mode').value;
   $('result').textContent = '';
   $('stdout').textContent = '';
+  $('canvas').style.display = 'none';
 
   // 1) front end, inside the sandbox: SVM text → parse → verify → encoded module bytes.
   const u8 = () => new Uint8Array(eng.memory.buffer);
