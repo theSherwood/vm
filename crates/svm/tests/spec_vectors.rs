@@ -21,6 +21,7 @@ fn to_value(v: SpecVal) -> Value {
         SpecVal::I64(x) => Value::I64(x),
         SpecVal::F32(b) => Value::F32(f32::from_bits(b)),
         SpecVal::F64(b) => Value::F64(f64::from_bits(b)),
+        SpecVal::V128(_) => unreachable!("no scalar row takes a v128"),
     }
 }
 
@@ -32,6 +33,7 @@ fn to_slot(v: SpecVal) -> i64 {
         SpecVal::I64(x) => x,
         SpecVal::F32(b) => b as i64,
         SpecVal::F64(b) => b as i64,
+        SpecVal::V128(_) => unreachable!("no scalar row takes a v128"),
     }
 }
 
@@ -80,6 +82,7 @@ fn slot_matches(expected: SpecVal, slot: i64) -> bool {
         SpecVal::F64(e) => {
             e == slot as u64 || (f64::from_bits(e).is_nan() && f64::from_bits(slot as u64).is_nan())
         }
+        SpecVal::V128(_) => unreachable!("no scalar row yields a v128"),
     }
 }
 
