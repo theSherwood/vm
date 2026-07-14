@@ -380,6 +380,27 @@ from a stack-precise fix". Compiles natively under `-D warnings`; **not** yet ex
 threads build (same validation path as the first step). The hook is alloc-free (formats into a stack
 buffer); the accessors are read-only.
 
+**Sighting update (2026-07-14, post-diagnostics) — the first recurrence since the two diagnostic steps
+landed.** run **29337399591** att1 (Jul 14, PR #255, `claude/peaceful-lamport-vuz65e`) — `[pageerror]
+unreachable`, then the harness dumped `[timeout] items still pending: tierup, jitcodegen, instcodegen`
+before the 30 s `waitForFunction` timeout; att2 green on the unchanged commit. Two notes:
+- **Fifth PR-side occurrence, and the second `unreachable` variant** (first on a PR — previously only
+  the Jul 12 nightly), reconfirming "any guest trap surfaced via `pageerror`", not OOB-only.
+- **Partial validation of the 2026-07-14 fixes.** The `browser-test.mjs` **pending-items dump (step b)
+  fired** — this is the first recurrence to *name* the stuck checks (`tierup`/`jitcodegen`/`instcodegen`,
+  the index-page JIT items). But the `worker.js` guard + panic-hook did **not** surface a named
+  `fail | panic: FILE:LINE` — the symptom is still a bare `[pageerror] unreachable` with those items
+  merely *pending*, not `fail`. So the wedge is not a caught trap in the guarded `svm_par_run` compute
+  path; the next capture pass should check whether the diagnostics build was actually in this run's
+  base and, if so, why the tier-up/codegen items hang without routing through the guard (a Worker
+  promise that rejects on a path the guard doesn't wrap would still leave the page item `pending`).
+- **Immediately reconfirmed — sixth occurrence, on a *docs-only* PR** (run **29343104313** att1, Jul 14,
+  PR #260, `claude/peaceful-lamport-vuz65e` — this very entry): `[pageerror] unreachable`, pending items
+  `jitcodegen, instcodegen`; att2 green. A change touching only `ISSUES.md` cannot affect the browser
+  build, so this is **diff-independent beyond any doubt**. Across the two `unreachable` sightings the
+  stuck items are consistently the **codegen** checks (`jitcodegen`/`instcodegen`, `tierup` in one),
+  narrowing the Worker wedge to the JIT **codegen** path.
+
 ---
 
 ### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
