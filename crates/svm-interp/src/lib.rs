@@ -4050,6 +4050,15 @@ impl SchedRef {
             SchedRef::Det(d) => d.lock().results.remove(&id),
         }
     }
+    /// PROCESS.md S3 — non-destructive lifecycle probe for `poll`: `None` if `id` is still running,
+    /// `Some(true)` if it returned cleanly, `Some(false)` if it trapped. Leaves the result in place so
+    /// a later `join`/`take_result` still gets it.
+    fn poll_status(&self, id: TaskId) -> Option<bool> {
+        match self {
+            SchedRef::Real(s) => s.lock().results.get(&id).map(|o| o.result.is_ok()),
+            SchedRef::Det(d) => d.lock().results.get(&id).map(|o| o.result.is_ok()),
+        }
+    }
     /// Whether `id` has already completed (result posted, unjoined) — a non-destructive probe the
     /// §14 subtree freeze uses to tell a **live** child (broadcast + residue) from a
     /// **completed-but-unjoined** one (refused fail-closed until completed-result residue lands).
@@ -6564,6 +6573,38 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                                 Err(t) => return Err(t), // a child trap propagates to the parent
                             }
+                        }
+                        // poll(child) -> 0 running | 1 returned | 2 trapped (PROCESS.md S3). Never
+                        // parks — the reap probe a shell loops for `WNOHANG` / `SIGCHLD`.
+                        // **Non-destructive**: the join-table slot and the child's stashed result are
+                        // left in place, so a later `join` still delivers it. A forged / already-joined
+                        // / detached handle is a `ThreadFault`, exactly like `join`.
+                        9 => {
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
+                            let slot = resolve_thread(threads, ch)?;
+                            let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                            let status = match sched.poll_status(child) {
+                                None => 0,        // still running
+                                Some(true) => 1,  // returned cleanly
+                                Some(false) => 2, // trapped
+                            };
+                            frames[top].vals.push(Reg::from_i32(status));
+                        }
+                        // detach(child) -> 0 (PROCESS.md S3): drop the parent's join claim. The child
+                        // keeps running to completion (detach is not kill); its result is reaped now if
+                        // it already finished, else discarded when the run tears down — never joinable
+                        // again. A forged / already-joined handle is a `ThreadFault`. (Auto-reap of a
+                        // still-running detached child's eventual result — vs. run-end cleanup — is a
+                        // follow-up, as is `kill`, which needs a per-child §5 interrupt.)
+                        10 => {
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
+                            let slot = resolve_thread(threads, ch)?;
+                            let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                            threads[slot] = None; // no longer joinable
+                            let _ = sched.take_result(child); // reap if already finished
+                            frames[top].vals.push(Reg::from_i32(0));
                         }
                         _ => return Err(Trap::CapFault),
                     }
