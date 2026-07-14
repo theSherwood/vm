@@ -1825,6 +1825,8 @@ pub struct OnrampReactor {
     tick: svm_ir::FuncIdx,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
+    /// The `Debug` string of the last frame's trap (diagnostic; `None` until a `tick` traps).
+    last_trap: Option<String>,
 }
 
 impl OnrampReactor {
@@ -1877,6 +1879,7 @@ impl OnrampReactor {
             tick,
             frame,
             keys,
+            last_trap: None,
         })
     }
 
@@ -1891,10 +1894,18 @@ impl OnrampReactor {
         let status = match self.inst.call(self.tick, &args, &mut fuel, &mut self.host) {
             Ok(_) => STATUS_OK,
             Err(Trap::Exit(_)) => STATUS_EXIT,
-            Err(_) => STATUS_TRAP,
+            Err(t) => {
+                self.last_trap = Some(format!("{t:?}"));
+                STATUS_TRAP
+            }
         };
         let delta = self.host.stdout[stdout_before..].to_vec();
         (status, delta)
+    }
+
+    /// The `Debug` string of the last frame's trap (diagnostic), or `""` if none.
+    pub fn last_trap(&self) -> &str {
+        self.last_trap.as_deref().unwrap_or("")
     }
 
     /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
@@ -2235,6 +2246,20 @@ pub extern "C" fn svm_onramp_key(keycode: i32, pressed: i32) {
 pub extern "C" fn svm_onramp_close() {
     // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
     unsafe { *core::ptr::addr_of_mut!(REACTOR) = None };
+}
+
+/// Diagnostic: stash the open reactor's last-trap `Debug` string into [`OUT`] and return its length
+/// (`0` if no reactor / no trap). Read the bytes via [`svm_stdout_ptr`]. Lets the page surface *why* a
+/// reactor `tick` trapped (the `Trap` variant), not just the `STATUS_TRAP` code.
+#[no_mangle]
+pub extern "C" fn svm_onramp_trap_len() -> usize {
+    // SAFETY: single-threaded wasm; shared read of the reactor.
+    let s = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.map_or("", |r| r.last_trap());
+    let bytes = s.as_bytes().to_vec();
+    let len = bytes.len();
+    // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
 }
 
 /// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next

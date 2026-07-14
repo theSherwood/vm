@@ -16,6 +16,7 @@ patched*.wasm
 # guests (Lua/SQLite) are built on demand / by the Pages pipeline.
 /web/assets/*.bc
 /web/assets/*.svmb
+/web/assets/*.wad
 !/web/assets/hello_c.svmb
 !/web/assets/gradient.svmb
 !/web/assets/bounce.svmb
