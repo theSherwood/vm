@@ -414,8 +414,19 @@ children (`parent_task == 0`); a **shared** counter assigns task ids in DFS re-a
 the freeze-time ids so each grandchild's `parent_task` resolves to its re-attached parent-child. Pinned
 by `durable_nesting_jit.rs::jit_depth2_freeze_thaw_round_trips` — a 3-level module's freeze→thaw delivers
 the uninterrupted 4950 (**depth-2 freeze→thaw ≡ uninterrupted**). This completes same-module §14
-freeze/thaw parity on the JIT to depth-2; **separate-module** and **completed-result** children remain.
-Powerbox (1) was the gating prerequisite; the synchronous model needed no redesign.
+freeze/thaw parity on the JIT to depth-2. Powerbox (1) was the gating prerequisite; the synchronous
+model needed no redesign.
+
+**Completed children need no separate residue on the JIT.** The interp records a `completed_result` for
+a completed-but-unjoined §14 child (delivers its `thread.join` result on thaw *without* re-running, so a
+*side-effecting* child's effects aren't doubled). The JIT needs no analog: a nested child there has an
+**empty/`Instantiator`-only powerbox** (no host caps), so its only effects are **idempotent window
+writes**, and — because a pure-compute child born `UNWINDING` runs to completion but leaves its carve's
+seeded `UNWINDING` state word untouched — the freeze already **records it** (via `window_is_unwinding`)
+and thaw simply **re-runs** it to the same result. Record-and-re-run subsumes the completed case; pinned
+by `jit_pure_child_freeze_thaw_round_trips`. **Separate-module** children (the durable path's guard still
+fails closed on `mod_mem = Some`; needs the module resolver wired onto `_durable_nested` + a per-child
+module digest for a host-supplied re-grant at thaw) are the remaining §14 gap.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the

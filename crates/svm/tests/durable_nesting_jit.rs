@@ -15,7 +15,10 @@
 //!   child *and* grandchild coalesces both `FrozenNested` records at the root via a shared residue sink;
 //! * **depth-2 thaw / round-trip** (`jit_depth2_freeze_thaw_round_trips`): a thaw recursively
 //!   re-attaches the grandchild under its re-attached parent-child, so depth-2 freeze→thaw ≡
-//!   uninterrupted (delivers 4950).
+//!   uninterrupted (delivers 4950);
+//! * **pure/completed child** (`jit_pure_child_freeze_thaw_round_trips`): a non-instrumented child
+//!   *completes* under a freeze (rather than unwinding) yet still records + thaws by re-run — so the
+//!   JIT needs no separate `completed_result` residue.
 //!
 //! Separate-module durable children and `coro_spawn` are follow-ups.
 
@@ -629,6 +632,73 @@ fn jit_depth2_freeze_thaw_round_trips() {
     assert!(
         matches!(ot, JitOutcome::Returned(ref s) if s == &[4950]),
         "depth-2 thaw delivers the uninterrupted total (freeze→thaw ≡ uninterrupted): {ot:?}"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// A **pure-compute (non-instrumented) child** freeze→thaw round-trips too — a distinct path from the
+/// instrumented-child tests. Born `UNWINDING` under a freeze, `PARENT_SELF_LOOP`'s func 1 has no poll
+/// site, so it **runs to completion** in its carve (4950) rather than unwinding, yet its carve is left
+/// `UNWINDING` (the seeded state word is never cleared), so the freeze still records it as a re-attach
+/// record; thaw **re-runs** it (safe — a JIT nested child has no host caps, only idempotent window
+/// writes) and delivers the same total. So the JIT needs no separate `completed_result` residue (the
+/// interp's, for a *side-effecting* completed-but-unjoined child): record-and-re-run subsumes it here.
+#[test]
+fn jit_pure_child_freeze_thaw_round_trips() {
+    if !svm_jit::fiber_supported() {
+        return;
+    }
+    let inst = instrument(PARENT_SELF_LOOP);
+
+    // Freeze-from-start: the pure child completes (4950) but its carve stays `UNWINDING`, so it rides
+    // as one re-attach record.
+    let mut hf = Host::new();
+    hf.set_durable(true);
+    let ihf = hf.grant_instantiator(0, WINDOW as u64);
+    let mut fwin = init_durable_window(WINDOW);
+    write_state(&mut fwin, STATE_UNWINDING);
+    let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
+        &inst,
+        0,
+        &[ihf as i64],
+        &fwin,
+        &[],
+        &[],
+        &[],
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut hf as *mut Host as *mut c_void,
+    )
+    .expect("freeze compiles");
+    assert_eq!(read_state(&artifact), STATE_UNWINDING, "artifact frozen");
+    assert_eq!(
+        nested.len(),
+        1,
+        "the pure child rides as one re-attach record"
+    );
+
+    // Thaw: re-run the child → 4950, the parent's join resolves, round-trip ≡ uninterrupted.
+    let mut twin = artifact.clone();
+    begin_thaw(&mut twin, 0);
+    let mut ht = Host::new();
+    ht.set_durable(true);
+    let iht = ht.grant_instantiator(0, WINDOW as u64);
+    let (ot, tsnap, _ft, _nt) = compile_and_run_capture_reserved_with_host_durable_nested(
+        &inst,
+        0,
+        &[iht as i64],
+        &twin,
+        &[],
+        &[],
+        &nested,
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut ht as *mut Host as *mut c_void,
+    )
+    .expect("thaw compiles");
+    assert!(
+        matches!(ot, JitOutcome::Returned(ref s) if s == &[4950]),
+        "pure-child freeze→thaw ≡ uninterrupted (4950): {ot:?}"
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
