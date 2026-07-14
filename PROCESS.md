@@ -222,6 +222,64 @@ reply(serve_end, caller, result)  -> 0 | -errno            (resume that caller)
   runtime rendezvous only where the library measurably can't reach (cross-domain futex
   keys — the O2 spike, promoted to first in the tracker).
 
+### S0 spike results — the library-endpoint path is viable  [DONE]
+
+The go/no-go for "endpoints as a library over shared memory + futex" was: does futex
+`wait`/`notify` rendezvous *across domains* on shared backing? Findings, grounded in the
+code and pinned by `crates/svm/tests/futex_cross_domain.rs`:
+
+- **Nested (parent ↔ child): confirmed, by construction.** The §12 futex key is the
+  *confined absolute* backing address (`Mem::confine_checked` → `window.base() + offset`),
+  the scheduler queues waiters under that exact key (`Scheduler::notify` /
+  `wait_waiters`), and a nested child shares the parent's backing `Arc`
+  (`Mem::nested_view`) and executor. So a parent at `carve_off + a` and its child at `a`
+  name the **same** key and rendezvous. Pinned both directions (deterministic
+  parent-parks/child-notifies; racy inverse accepting both futex-legal outcomes). This is
+  the load-bearing case — a parent implementing a personality for its children — and it
+  works with **zero new runtime machinery**.
+- **Sibling (region-aliased): value-coherent, but wakeup needs canonical keys.** Two
+  siblings aliasing one §13 `SharedRegion` share *bytes* fine (backed-page reads/writes
+  route through the shared `back` region — already proven cross-domain by
+  `region_grant.rs`), so a ring buffer's **data plane** works sibling↔sibling today. But
+  each sibling maps the region at its *own* window offset, so the same region byte has a
+  *different* absolute address in each — hence a *different* futex key, and a `notify` on
+  one alias won't wake a waiter parked on the other. The `wait`/`notify` **wakeup** is the
+  only gap. Fix (scoped to S9, not the spike): when the waited/notified page is `Backed`,
+  key on `(backing identity, region offset)` instead of the window-absolute address — the
+  exact distinction Linux draws between `FUTEX_PRIVATE` (VA-keyed) and shared futexes
+  (page-keyed). A small, localized change in `prepare_wait`/`confine_for_notify` + the
+  scheduler key type; **no confinement-hinge contact** (a futex key is a rendezvous
+  coordinate, not a bounds check — a wrong key misses a wakeup, it cannot escape).
+
+**Conclusion:** library-first endpoints are viable now for the nested (personality) case;
+the sibling case is data-plane-ready and needs only the canonical-key wakeup, folded into
+S9. No runtime rendezvous engine is required for either — the D56-shaped outcome the
+design hoped for.
+
+### F6 — endpoint RTT budget (model; measured numbers land with S9)
+
+An endpoint is *guest-served*, so a call costs a rendezvous, not a trampoline. The
+ordering — and it must be stated so it never silently contradicts §1a's host-call speed
+pitch:
+
+| path | crossing cost (model) | notes |
+|---|---|---|
+| host `cap.call` | 1 trampoline, **0 fiber switches** | the §1a fast path; a host handler runs on the caller's stack |
+| guest-served endpoint RTT (nested) | **≥ 2 fiber switches + 1 futex rendezvous** | caller parks → servicer wakes, runs, replies → caller wakes |
+| guest-served endpoint RTT (sibling) | as nested, once canonical keys land | + the region-map setup, one-time |
+| Linux syscall (reference) | ~0.1–1 µs | the thing personalities are compared against |
+
+Order of magnitude, not a promise: the full nested rendezvous cycle in the S0 test
+(parent parks on `wait` → child `notify` → wake → `join`) completes in **well under a
+millisecond** (both spike tests report `0.00s` run time) — i.e. endpoint syscalls sit in
+the sub-microsecond-to-microsecond regime, fine for **shell-frequency** control calls
+(`fork`/`wait`/`open`), and decisively the **wrong** structure for per-byte pipe
+throughput (that rides `SharedRegion` bulk data, not per-byte endpoint calls). The
+standing mitigation is §14's **pay-for-what-you-virtualize**: a pass-through capability is
+a host `cap.call` (top row) — you only pay the endpoint RTT for capabilities a parent
+*chooses* to interpose. Real measured figures (endpoint RTT vs `cap.call` vs syscall, all
+three engines) are produced with the S9 endpoint implementation and replace this model.
+
 ---
 
 ## 5. Window sources & `Budget` — visibility and accounting as arguments  [PROPOSED]
@@ -410,7 +468,7 @@ Frictions, named rather than hidden:
 | F3 | D19 bundles window+caps+quota in `Instantiator`; substrate factors them | generalization, not contradiction — invariants kept; ops 0–7 remain as the nested recipe |
 | F4 | "protection from hostile hosts" overpromises at tier 0/1 (Spectre, §2) | attest reports tier; distrust still means tier 3 — no new claim |
 | F5 | prime directive vs. abstraction-before-demand | build only what the POSIX personality needs; the factoring is naming/placement, not speculative code |
-| F6 | guest-*served* calls are ≥2 fiber switches — much slower than host cap calls; must not silently contradict §1a's host-call speed pitch | publish an endpoint-RTT budget table (vs host `cap.call` vs Linux syscall) with the first implementation; pass-through — don't virtualize what you don't need — is the §14-priced mitigation |
+| F6 | guest-*served* calls are ≥2 fiber switches — much slower than host cap calls; must not silently contradict §1a's host-call speed pitch | **RTT budget model delivered (§4 S0 results)**: nested rendezvous is sub-ms, endpoint syscalls sit at shell-frequency scale, per-byte pipe throughput rides `SharedRegion` bulk data not endpoint calls; pass-through (don't virtualize what you don't need) keeps un-interposed caps at host-`cap.call` speed. Measured figures land with S9 |
 | F7 | endpoints re-enter the risk class D56 removed (cross-domain fiber rendezvous, the project's highest-risk unsafe) | library-first implementation over SharedRegion+futex (§4); runtime rendezvous only where the library measurably can't reach |
 
 ---
@@ -558,7 +616,7 @@ Unchanged in substance from v1, restated against the substrate:
 
 | # | Slice | Depends on | Status |
 |---|---|---|---|
-| S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | in progress — nested-case futex **confirmed** (`futex_cross_domain.rs`); sibling-alias keying + RTT table remain |
+| S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | **done** — nested futex confirmed (`futex_cross_domain.rs`); sibling wakeup-key gap characterized + fix scoped to S9; F6 RTT model in §4 |
 | S1 | JIT async children (park-only-calling-fiber) + per-carve compile cache | — | todo |
 | S2 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
 | S3 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S1 | todo |
@@ -567,7 +625,7 @@ Unchanged in substance from v1, restated against the substrate:
 | S6 | `cap.self.attest` incl. freeze authority (+ the §14 amendment PR into DESIGN.md) | S5 | todo |
 | S7 | BusyBox port; stage-1/2 demo gates (**endpoint-free**) | S3,S4 | todo |
 | S8 | Bash stage-0 port (interpreter-only; autoconf cross-config, `--noediting`) | fs ops | todo |
-| S9 | `Endpoint` v1 — library over SharedRegion+futex if S0 allows, runtime rendezvous only where it can't reach; kill-safe cancel; FIFO | S0,S3 | todo |
+| S9 | `Endpoint` v1 — library over SharedRegion+futex (S0: viable); **incl. region-canonical futex keys for sibling wakeup**; kill-safe cancel; FIFO | S0,S3 | todo |
 | S10 | **Interposition gate** (stage 2.5): guest-implemented virtualizing-fs personality runs the BusyBox suite unmodified | S9 | todo |
 | S11 | R8 closure (`call_indirect` durable coverage); `clone` of parked domains (full-copy) + fork endpoint with duplicated reply token | S9, durable | todo |
 | S12 | Bash stage-3; suite subset as CI gate | S8,S11 | todo |
@@ -579,7 +637,7 @@ Unchanged in substance from v1, restated against the substrate:
 | # | Risk / question | Where | Status |
 |---|---|---|---|
 | O1 | Endpoint servicer DoS (never replies): callers park forever. v1 answer: your servicer is in your grant chain — you trusted it; a personality may add timeouts. Is that acceptable for cross-*sibling* endpoints? | §4 | open |
-| O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable). **Spike result: cross-domain futex rendezvous works today for parent↔nested-child** — the §12 futex key is the confined *absolute* backing address (`Mem::confine_checked`) and a nested child shares the parent's backing + executor; pinned both directions by `crates/svm/tests/futex_cross_domain.rs`. Remaining: the **sibling** case — two domains aliasing one `SharedRegion` at different window offsets key on *different* absolute alias addresses, so sibling library-pipes need key canonicalization (region-canonical keys) or a nested relay | §9 | nested: confirmed; sibling: open |
+| O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable). **Spike done (§4 S0 results):** nested futex rendezvous works today (pinned by `futex_cross_domain.rs`); sibling aliases are value-coherent but need region-canonical futex keys for wakeup (Linux shared-futex analogue) — fix scoped to S9, no confinement-hinge contact | §9 | resolved — nested confirmed; sibling fix folded into S9 |
 | O3 | JIT compile-cache key: (module digest, carve base, size_log2) — hit rates under a real shell; detached-standard-geometry as the mitigation | §5, gap 4 | open |
 | O4 | Detached windows on the browser/wasm32 host: pool sizing inside one wasm memory | §5 | open |
 | O5 | `attest` provenance granularity: report authority *set* or just tier + platform-only bit? Smaller is better (F2) | §6 | open |
