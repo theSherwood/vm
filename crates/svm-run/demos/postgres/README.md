@@ -56,8 +56,9 @@ unprivileged user if invoked as root.
 | 11f | **stream `FILE*` + fd-dispatch** | — | **DONE (slice CE):** `stdout`/`stderr`/`stdin` must reach the powerbox **Stream** cap while `fopen`'d files reach the **fs** cap — but a guest that defines `write`/`read` (the syscall shim) shadows the on-ramp's Stream recognizer. Two new on-ramp builtins `__vm_stream_write`/`__vm_stream_read` (a `cap_spec` with `drop_args: 0` + import registration) give the shim direct Stream access; `os_shim.c`'s `write`/`read` **fd-dispatch** fds 0/1/2 to them and everything else to the fs cap; and the `fs` cap now **reserves fds 0/1/2** (`alloc_fd`) so a file fd (≥3) never collides with a stream fd. `stdio_shim.c` defines the `stdin`/`stdout`/`stderr` `FILE*` globals. Differential `demo_pg_stream_vs_native` (write to `stdout` FILE* *and* a real file; byte-exact over `mem_fs` + `host_fs`) |
 | 11g | **first boot: the module runs** | — | **DONE (slice CF):** with all the shims linked in (`link_shims.sh`), the whole Postgres module **translates, verifies, AND runs** — fast (~24 s incl. translate) — executing real backend startup. The first live fault was a `MemoryFault` in `save_ps_display_args` walking an undefined **`environ`**; defining it (empty) cleared it. Added the early-startup libc surface: `environ`, `setlocale`/`newlocale`/`localeconv`/`nl_langinfo` (C-locale constants), the wide-ctype `iswX`/`towX` family (differential-tested, `demo_pg_wctype_vs_native`), `getopt`, `strsignal`. Postgres now boots past `save_ps_display_args` into deeper startup. See "Booting" below |
 | 11h | **boot diagnostic: output on trap** | — | **DONE (slice CG):** the `Unreachable`/`MemoryFault` traps carried no name, so the boot chase was blind. `run_with_caps` now folds the guest's captured stdout/stderr into the trap error (`trap_err_with_output`) — a trapped program names its own failure. First payoff: the boot trap now reads `LOG:  could not find a "postgres" to execute` (Postgres's `find_my_exec` can't resolve its own binary path — `readlink("/proc/self/exe")`/argv[0]). Test `trap_error_surfaces_guest_output` |
-| 11i | **boot: drive it forward** | — | resolve `find_my_exec` (a `my_exec_path` the guest accepts) → the next trap, and repeat — now legible via #11h — through the storage manager / WAL / single-process shmem (`mmap`/`shmget`) / catalog bootstrap and the ~50 *live* externals, plus the varargs `scanf` **input** engine. `strerror_r` (GNU/POSIX signature split) needs an isolated `_GNU_SOURCE` TU |
+| 11i | **boot: past `find_my_exec` + the IPC collapses** | — | **DONE (slice CI):** `find_my_exec` succeeds with a slashed `argv[0]` (`./postgres`) + an executable `postgres` in the data dir (its `validate_exec` is `stat` + `access(X_OK)`, both shimmed), so Postgres advances into shared-memory/semaphore setup. `ipc_shim.c` gives the single-process collapses: `mmap(MAP_ANONYMOUS)` → zeroed writable memory (one address space — **differential-tested** `demo_pg_mmap_vs_native`), `munmap`/`madvise`/`posix_fadvise` no-ops, POSIX `sem_*` uncontended no-ops, System-V `shmget`/`shmat` forced onto the anonymous-mmap path. Postgres now runs *past* exec resolution into early init |
 | 11j | **guest libc: varargs `printf` engine** | — | **DONE (slice CH):** `printf_shim.c` provides the runtime `printf`/`fprintf`/`vfprintf`/`vprintf`/`snprintf`/`sprintf` family Postgres formats results + `elog`/`ereport` log lines with (a query result builds its directives at runtime — the on-ramp's constant-format engine can't lower that). The byte-exact-vs-glibc formatter (integers/strings/chars/`%p`/`%a` in C; `%f`/`%e`/`%g` via the bignum `__vm_fmt_*` dtoa) formats into a buffer and `fwrite`s it, composing with #11f's stream/file fd-dispatch. Linked into the boot via `pg_shims.c`. Differential `demo_pg_fprintf_vs_native` (format family to `stdout` + a real file + `stderr`, byte-exact on all three engines over `mem_fs` + `host_fs`) |
+| 11k | **boot: name the silent traps, then forward** | — | the boot now traps **silently** (no output) in early init — the CG output-diagnostic only helps once Postgres has *printed*. Make stub-traps **self-naming** (the trap error carries the missing extern's name) — an on-ramp diagnostic that ends the guessing — then drive the now-legible boot through the storage manager / WAL / catalog bootstrap to the first `SELECT`, plus the varargs `scanf` **input** engine and `strerror_r` (`_GNU_SOURCE` TU) |
 
 **Where it stands:** ★★ **the complete module (832 modules / 14 985 functions) now translates AND
 verifies** — past the **entire 921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals
@@ -76,9 +77,17 @@ And **the module now boots** (gap #11g, slice CF): linked with all the shims it 
 and *runs* real backend startup, past `save_ps_display_args` (the `environ` fix) into deeper init.
 The remaining stub-traps are now **legible** (gap #11h, slice CG: `run_with_caps` folds the guest's
 captured output into the trap error) — the first boot trap reads `LOG:  could not find a "postgres"
-to execute`. Still ahead (gap #11i): drive the boot forward from there (resolve `find_my_exec`, then
-the storage manager, WAL, single-process shmem, catalog bootstrap, and the varargs `fprintf`/`scanf`
-engines). See `LLVM.md` slices BM–CG, and "Booting" below.
+to execute`. Slice CI clears that (gap #11i): a slashed `argv[0]` (`./postgres`) + an executable
+`postgres` in the data dir lets `find_my_exec`'s `stat`/`access(X_OK)` succeed, and the
+**single-process IPC collapses** (`ipc_shim.c`) carry the boot into shared-memory/semaphore init —
+anonymous `mmap` is just `malloc`+zero (differential-tested `demo_pg_mmap_vs_native`), `shmat` forces
+that path, and the unnamed semaphores are uncontended no-ops. The runtime **varargs `printf` engine**
+(gap #11j, slice CH: `printf_shim.c` — the byte-exact-vs-glibc formatter Postgres builds its result +
+`elog` output with, composing with the #11f fd-dispatch) is in place for when the boot reaches its
+first printed output. The boot now traps **silently** in early init (no printed output for CG to
+surface), so still ahead (gap #11k): make stub-traps **self-naming** to name the silent trap, then
+drive on through the storage manager, WAL, catalog bootstrap, and the varargs `scanf` **input** engine.
+See `LLVM.md` slices BM–CI, and "Booting" below.
 
 ## Booting
 

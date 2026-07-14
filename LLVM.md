@@ -1312,6 +1312,28 @@ lower. **Guest code, no translator change** (the CA–CG shim model):
   `-D warnings`).** Next (the format tail): the `fscanf`/`sscanf`/`vsscanf` **input** engine (gap #11i's
   remaining half), then the boot's storage manager / WAL / single-process shmem / catalog bootstrap.
 
+**Slice CI (DONE) — past `find_my_exec` + the single-process IPC collapses.** The CG diagnostic named the
+first gap (`could not find a "postgres" to execute`); this slice clears it and the shared-memory setup
+right behind it. **`find_my_exec`:** Postgres resolves its own binary from `argv[0]` — with a slash it
+`stat`s/`access(X_OK)`es that path directly (both already shimmed over the fs cap), without one it searches
+`$PATH`. Driving the boot with a slashed `argv[0]` (`./postgres`) and an executable `postgres` file in the
+data dir lets `validate_exec` succeed, and the boot advances past it. **The IPC collapses (`ipc_shim.c`):**
+`postgres --single` still stands up its shared-memory segment (buffer pool, lock tables, …) and semaphores
+in early startup — but in *one* process there is nothing to *share*. So shared memory is just anonymous
+memory (`mmap(MAP_ANONYMOUS)` → `malloc` + zero; `munmap` → `free`), `shmat` returns `(void *)-1` to force
+Postgres onto that anonymous-mmap path, and the unnamed POSIX semaphores are uncontended no-ops
+(`sem_init`/`post`/`wait`/… → `0`). `madvise`/`mlock`/`posix_fadvise`/`posix_fallocate` are no-ops; the
+System V and `shm_open` surfaces collapse likewise. The one collapse with observable behavior — anonymous
+`mmap` must return **zeroed, writable, byte-stable** memory — is differential-tested: `mmap_probe.c` +
+`demo_pg_mmap_vs_native` map 4 KiB, assert freshly zeroed, write `i*7+3`, read it back, `munmap`, and the
+guest output must byte-match native (`mmap_ok=1 zeroed=1 held=1 munmap=0`). The `sem_*`/`shm*` no-ops have
+no observable output, so they're exercised by the boot rather than a differential. **Boot state:** past
+`find_my_exec` and into shared-memory/semaphore init; the next fault is a **silent** `Unreachable` (no
+guest output before it), which the CG diagnostic can't name because nothing was printed — so gap #11k is
+**self-naming stub-traps** (make the `--stub-externs` trap carry the missing extern's name) to make the
+remaining silent traps legible, then forward through the storage manager / WAL / catalog bootstrap.
+**svm-llvm lane green (fmt + clippy `-D warnings`; 9 `demo_pg_*` tests).**
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
