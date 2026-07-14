@@ -1168,6 +1168,24 @@ empty afterward (the probe self-cleans), proving real files through real syscall
 (fmt + clippy `-D warnings` + the new test).** Next (gap #11c): proc/time/signal stubs, then the ~180
 pure-libc externs byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
 
+**Slice CB (DONE) — the guest pure-libc shim begins with ctype.** Companion to `os_shim.c` (syscalls):
+`libc_shim.c` (`crates/svm-run/demos/postgres/`) holds the *pure* libc surface — no capability, just
+deterministic computation. First inhabitant: **ctype**. glibc's `<ctype.h>` `isalpha`/`isdigit`/… macros
+expand to `(*__ctype_b_loc())[c] & _ISbit`, a direct index into a locale table reached through
+`__ctype_b_loc`/`__ctype_tolower_loc`/`__ctype_toupper_loc` — undefined externals in the guest, and
+Postgres's scanner/parser classify *every* input byte this way, so the SQL front end is dead without
+them. The shim provides the **C/POSIX-locale** tables (the locale Postgres bootstraps in) as **static
+compile-time literals** — element 128 is code point 0, so `ptr[c]` is valid across glibc's `[-128, 255]`
+index range, and there is no runtime initializer to mis-fire (the first cut used lazy init; the guest
+read a still-null table pointer and printed garbage — the differential caught it, and precomputed
+literals removed the failure mode). Differential `demo_pg_ctype_vs_native`: `ctype_probe.c` prints all
+twelve classifications + `tolower`/`toupper` (read straight from the `*_loc` tables, the form Postgres
+uses — not the `tolower()` *function*, whose non-constant-`int` path is a separate surface) for every
+byte 0..255, and the guest byte-matches the native glibc oracle over the whole range — which pins every
+bit of every table. Pure computation, runs on the bare powerbox. **svm-llvm lane green.** Next (gap
+#11d): proc/time/signal stubs, then the rest of the pure-libc surface (stdio `FILE*`, locale,
+`strtod`/`snprintf`) byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
