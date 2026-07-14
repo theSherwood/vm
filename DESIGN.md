@@ -447,7 +447,9 @@ security — UB in a sandbox IR would void the escape guarantee.
 ### Instruction set (MVP)
 - **Constants:** `i32.const i64.const f32.const f64.const`.
 - **Integer arithmetic** (i32/i64): `add sub mul` (two's-complement **wrap**),
-  `div_s div_u rem_s rem_u` (**trap** on /0; `div_s`/`rem_s` trap on INT_MIN/−1),
+  `div_s div_u rem_s rem_u` (**trap** on /0; `div_s` traps on INT_MIN/−1 — `rem_s`
+  does **not**: only the quotient overflows there, the remainder 0 is representable,
+  so it returns 0, wasm-identical — as both backends and `svm-spec` pin),
   `and or xor shl shr_s shr_u rotl rotr` (shift amount mod bitwidth), `clz ctz
   popcnt`.
 - **Integer compare** (→ i32 0/1): `eq ne lt_s lt_u le_s le_u gt_s gt_u ge_s ge_u
