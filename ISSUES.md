@@ -355,6 +355,12 @@ before the 30 s `waitForFunction` timeout; att2 green on the unchanged commit. T
   path; the next capture pass should check whether the diagnostics build was actually in this run's
   base and, if so, why the tier-up/codegen items hang without routing through the guard (a Worker
   promise that rejects on a path the guard doesn't wrap would still leave the page item `pending`).
+- **Immediately reconfirmed — sixth occurrence, on a *docs-only* PR** (run **29343104313** att1, Jul 14,
+  PR #260, `claude/peaceful-lamport-vuz65e` — this very entry): `[pageerror] unreachable`, pending items
+  `jitcodegen, instcodegen`; att2 green. A change touching only `ISSUES.md` cannot affect the browser
+  build, so this is **diff-independent beyond any doubt**. Across the two `unreachable` sightings the
+  stuck items are consistently the **codegen** checks (`jitcodegen`/`instcodegen`, `tierup` in one),
+  narrowing the Worker wedge to the JIT **codegen** path.
 
 ---
 
