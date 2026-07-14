@@ -10,7 +10,8 @@
 //!
 //! Landed slices (SPEC.md implementation plan): the scalar integer core (slice 1),
 //! scalar floats + conversions (slice 2), the restated opcode byte map (slice 3,
-//! [`OpRow::encoding`]), and the reference verifier (slice 4, [`verify`]).
+//! [`OpRow::encoding`]), the reference verifier (slice 4, [`verify`]), and the
+//! memory window model + load/store/bulk rows (slice 5, [`mem_rows`]).
 
 #![forbid(unsafe_code)]
 
@@ -55,6 +56,7 @@ pub enum SpecTrap {
     DivByZero,
     IntOverflow,
     BadConversion,
+    MemoryFault,
 }
 
 /// The op's semantic class (SPEC.md). Drives which suites cover it: `Pure`/`Trapping`
@@ -1272,6 +1274,374 @@ pub fn module_for(row: &OpRow, vector: &[SpecVal]) -> Module {
     }
 }
 
+// --- the memory window model (SPEC.md slice 5) ----------------------------------------
+//
+// Trap-confinement semantics per DESIGN.md §4 / TRAP_CONFINEMENT.md / the `svm-mask`
+// contract, restated independently: a `width`-byte access at `addr` with immediate
+// `offset` is admitted iff the whole span `[addr+offset, addr+offset+width)` — computed
+// **without wraparound** — lies within `[0, mapped)`; anything else (including a
+// wrapping effective address) raises `MemoryFault` at the access. No masking, no
+// aliasing. Memory is little-endian (§3b). The spec window is fully mapped
+// (`mapped == reserved`); the decoupled reserved-tail model rides the existing
+// escape-oracle differential.
+
+/// The spec window: 4 KiB, fully mapped.
+pub const MEM_LOG2: u8 = 12;
+pub const MEM_SIZE: u64 = 1 << MEM_LOG2;
+
+/// Admit a scalar access, returning the effective address as a window index.
+fn admit(addr: u64, offset: u64, width: u32, mapped: u64) -> Result<usize, SpecTrap> {
+    match addr
+        .checked_add(offset)
+        .and_then(|ea| ea.checked_add(width as u64))
+    {
+        Some(end) if end <= mapped => Ok((end - width as u64) as usize),
+        _ => Err(SpecTrap::MemoryFault),
+    }
+}
+
+/// Admit a bulk span `[ptr, ptr+len)` (D62): checked as a whole, overflow-free; a
+/// zero-length op is a no-op even at a wild pointer.
+fn admit_span(ptr: u64, len: u64, mapped: u64) -> Result<(), SpecTrap> {
+    if len == 0 {
+        return Ok(());
+    }
+    match ptr.checked_add(len) {
+        Some(end) if end <= mapped => Ok(()),
+        _ => Err(SpecTrap::MemoryFault),
+    }
+}
+
+/// The little-endian bit pattern a store writes (the value's low `width` bytes).
+fn store_bits(v: SpecVal) -> u64 {
+    match v {
+        SpecVal::I32(x) => x as u32 as u64,
+        SpecVal::I64(x) => x as u64,
+        SpecVal::F32(b) => b as u64,
+        SpecVal::F64(b) => b,
+    }
+}
+
+fn load_eval(op: LoadOp, addr: u64, offset: u64, win: &[u8]) -> Result<SpecVal, SpecTrap> {
+    let (_, _, width, _) = op.info();
+    let ea = admit(addr, offset, width, win.len() as u64)?;
+    let mut raw = [0u8; 8];
+    raw[..width as usize].copy_from_slice(&win[ea..ea + width as usize]);
+    let u = u64::from_le_bytes(raw);
+    Ok(match op {
+        LoadOp::I32 => SpecVal::I32(u as u32 as i32),
+        LoadOp::I64 => SpecVal::I64(u as i64),
+        LoadOp::F32 => SpecVal::F32(u as u32),
+        LoadOp::F64 => SpecVal::F64(u),
+        LoadOp::I32_8S => SpecVal::I32(u as u8 as i8 as i32),
+        LoadOp::I32_8U => SpecVal::I32(u as u8 as i32),
+        LoadOp::I32_16S => SpecVal::I32(u as u16 as i16 as i32),
+        LoadOp::I32_16U => SpecVal::I32(u as u16 as i32),
+        LoadOp::I64_8S => SpecVal::I64(u as u8 as i8 as i64),
+        LoadOp::I64_8U => SpecVal::I64(u as u8 as i64),
+        LoadOp::I64_16S => SpecVal::I64(u as u16 as i16 as i64),
+        LoadOp::I64_16U => SpecVal::I64(u as u16 as i64),
+        LoadOp::I64_32S => SpecVal::I64(u as u32 as i32 as i64),
+        LoadOp::I64_32U => SpecVal::I64(u as u32 as i64),
+    })
+}
+
+fn store_eval(
+    op: StoreOp,
+    addr: u64,
+    offset: u64,
+    value: SpecVal,
+    win: &mut [u8],
+) -> Result<(), SpecTrap> {
+    let (_, _, width) = op.info();
+    let ea = admit(addr, offset, width, win.len() as u64)?;
+    let bytes = store_bits(value).to_le_bytes();
+    win[ea..ea + width as usize].copy_from_slice(&bytes[..width as usize]);
+    Ok(())
+}
+
+/// A memory-op row: like [`OpRow`] but observed through the **final window** (plus a
+/// result for loads), evaluated against the spec window model. `Load`/`Store` carry an
+/// immediate `offset`, so each `(row, offset)` pair is its own module.
+pub struct MemRow {
+    pub id: String,
+    /// SSA operand types, fed as function parameters (addresses/lengths are `i64`).
+    pub operands: Vec<ValType>,
+    /// The loaded value's type; `None` for stores and bulk ops.
+    pub result: Option<ValType>,
+    pub encoding: Enc,
+    /// Per-operand input pools, aligned with `operands` (addresses and lengths get
+    /// window-boundary pools, store values get bit-pattern pools).
+    pub pools: Vec<Vec<SpecVal>>,
+    /// Whether the op takes an immediate offset (`Load`/`Store`; bulk ops don't).
+    pub has_offset: bool,
+    /// Construct the op over operand value indices plus the immediate offset.
+    #[allow(clippy::type_complexity)]
+    pub build: Box<dyn Fn(&[ValIdx], u64) -> Inst>,
+    /// Evaluate against the model window: mutates `win`, returns the loaded value (if
+    /// any) or the trap. A trapping access mutates nothing (checked before access).
+    #[allow(clippy::type_complexity)]
+    pub eval: Box<dyn Fn(&[SpecVal], u64, &mut [u8]) -> Result<Option<SpecVal>, SpecTrap>>,
+}
+
+/// Addresses (as `i64` params) biased to the window-boundary lattice: in-window,
+/// exactly-fitting, one-past, far-past, and wrap-around values.
+fn addr_pool() -> Vec<SpecVal> {
+    [
+        0,
+        1,
+        2,
+        7,
+        8,
+        64,
+        0xabc,
+        MEM_SIZE - 8,
+        MEM_SIZE - 4,
+        MEM_SIZE - 2,
+        MEM_SIZE - 1,
+        MEM_SIZE,
+        MEM_SIZE + 1,
+        u64::MAX,     // wrap-around: must fault, never alias
+        u64::MAX - 6, // wraps for width 8, faults for width ≤ 6 by span, too
+        1 << 63,
+        (1 << 63) - 4,
+    ]
+    .into_iter()
+    .map(|a| SpecVal::I64(a as i64))
+    .collect()
+}
+
+/// Bulk-op lengths: zero (a no-op even at a wild pointer, D62), small, page-sized,
+/// one-past, and overflowing.
+fn len_pool() -> Vec<SpecVal> {
+    [0, 1, 5, 16, 256, MEM_SIZE, MEM_SIZE + 1, u64::MAX]
+        .into_iter()
+        .map(|l| SpecVal::I64(l as i64))
+        .collect()
+}
+
+/// Store-value bit patterns per type (moves only — no arithmetic — so these pin
+/// bit-exact round-trips through the window, NaNs included).
+fn store_val_pool(t: ValType) -> Vec<SpecVal> {
+    match t {
+        ValType::I32 => [0, -1, 0x0102_0304, 0x80]
+            .into_iter()
+            .map(SpecVal::I32)
+            .collect(),
+        ValType::I64 => [0, -1, 0x0102_0304_0506_0708, 0x80]
+            .into_iter()
+            .map(SpecVal::I64)
+            .collect(),
+        ValType::F32 => [0x3f80_0000, 0x7fc0_0000, 0x8000_0001]
+            .into_iter()
+            .map(SpecVal::F32)
+            .collect(),
+        ValType::F64 => [
+            0x3ff0_0000_0000_0000,
+            0x7ff8_0000_0000_0001,
+            0x8000_0000_0000_0001,
+        ]
+        .into_iter()
+        .map(SpecVal::F64)
+        .collect(),
+        ValType::V128 | ValType::Ref => unreachable!("no slice-5 store of {t:?}"),
+    }
+}
+
+fn as_u64(v: SpecVal) -> u64 {
+    as_i64(v) as u64
+}
+
+/// The slice-5 rows: the 14 loads, 9 stores, and the 3 bulk ops.
+pub fn mem_rows() -> Vec<MemRow> {
+    let mut rows: Vec<MemRow> = Vec::new();
+
+    for (i, op) in LoadOp::ALL.into_iter().enumerate() {
+        let (name, result, _, _) = op.info();
+        rows.push(MemRow {
+            id: name.into(),
+            operands: vec![ValType::I64],
+            result: Some(result),
+            encoding: Enc::Byte(0xF0 + i as u8),
+            pools: vec![addr_pool()],
+            has_offset: true,
+            build: Box::new(move |v, off| Inst::Load {
+                op,
+                addr: v[0],
+                offset: off,
+                align: 0,
+            }),
+            eval: Box::new(move |x, off, win| load_eval(op, as_u64(x[0]), off, win).map(Some)),
+        });
+    }
+
+    for (i, op) in StoreOp::ALL.into_iter().enumerate() {
+        let (name, value_ty, _) = op.info();
+        rows.push(MemRow {
+            id: name.into(),
+            operands: vec![ValType::I64, value_ty],
+            result: None,
+            encoding: Enc::Byte(0x84 + i as u8),
+            pools: vec![addr_pool(), store_val_pool(value_ty)],
+            has_offset: true,
+            build: Box::new(move |v, off| Inst::Store {
+                op,
+                addr: v[0],
+                value: v[1],
+                offset: off,
+                align: 0,
+            }),
+            eval: Box::new(move |x, off, win| {
+                store_eval(op, as_u64(x[0]), off, x[1], win).map(|()| None)
+            }),
+        });
+    }
+
+    // mem.copy — defined for **non-overlapping** spans (§3b/D62; the vector generator
+    // filters overlap out, see `mem_vectors_for`). Both spans admitted as a whole
+    // before any byte moves.
+    rows.push(MemRow {
+        id: "mem.copy".into(),
+        operands: vec![ValType::I64; 3],
+        result: None,
+        encoding: Enc::Byte(0x8D),
+        pools: vec![addr_pool(), addr_pool(), len_pool()],
+        has_offset: false,
+        build: Box::new(|v, _| Inst::MemCopy {
+            dst: v[0],
+            src: v[1],
+            len: v[2],
+        }),
+        eval: Box::new(|x, _, win| {
+            let (dst, src, len) = (as_u64(x[0]), as_u64(x[1]), as_u64(x[2]));
+            admit_span(dst, len, win.len() as u64)?;
+            admit_span(src, len, win.len() as u64)?;
+            if len == 0 {
+                return Ok(None); // a no-op even at a wild pointer (D62)
+            }
+            let snap = win[src as usize..(src + len) as usize].to_vec();
+            win[dst as usize..(dst + len) as usize].copy_from_slice(&snap);
+            Ok(None)
+        }),
+    });
+    // mem.move — overlap-safe (as-if through a snapshot).
+    rows.push(MemRow {
+        id: "mem.move".into(),
+        operands: vec![ValType::I64; 3],
+        result: None,
+        encoding: Enc::Byte(0x8E),
+        pools: vec![addr_pool(), addr_pool(), len_pool()],
+        has_offset: false,
+        build: Box::new(|v, _| Inst::MemMove {
+            dst: v[0],
+            src: v[1],
+            len: v[2],
+        }),
+        eval: Box::new(|x, _, win| {
+            let (dst, src, len) = (as_u64(x[0]), as_u64(x[1]), as_u64(x[2]));
+            admit_span(dst, len, win.len() as u64)?;
+            admit_span(src, len, win.len() as u64)?;
+            if len == 0 {
+                return Ok(None); // a no-op even at a wild pointer (D62)
+            }
+            let snap = win[src as usize..(src + len) as usize].to_vec();
+            win[dst as usize..(dst + len) as usize].copy_from_slice(&snap);
+            Ok(None)
+        }),
+    });
+    // mem.fill — writes the fill value's low byte across the span.
+    rows.push(MemRow {
+        id: "mem.fill".into(),
+        operands: vec![ValType::I64, ValType::I32, ValType::I64],
+        result: None,
+        encoding: Enc::Byte(0x8F),
+        pools: vec![addr_pool(), store_val_pool(ValType::I32), len_pool()],
+        has_offset: false,
+        build: Box::new(|v, _| Inst::MemFill {
+            dst: v[0],
+            val: v[1],
+            len: v[2],
+        }),
+        eval: Box::new(|x, _, win| {
+            let (dst, val, len) = (as_u64(x[0]), as_i32(x[1]), as_u64(x[2]));
+            admit_span(dst, len, win.len() as u64)?;
+            if len == 0 {
+                return Ok(None); // a no-op even at a wild pointer (D62)
+            }
+            win[dst as usize..(dst + len) as usize].fill(val as u8);
+            Ok(None)
+        }),
+    });
+
+    rows
+}
+
+/// Load/store immediate-offset pool: each distinct offset is its own module (the
+/// offset is an instruction immediate, not an operand).
+pub const MEM_OFFSETS: &[u64] = &[0, 1, 8, MEM_SIZE - 8, MEM_SIZE, u64::MAX];
+
+/// Deterministic strided cross product of the row's operand pools (shared shape with
+/// [`vectors_for`]). `mem.copy` vectors with genuinely-overlapping spans are filtered
+/// out — the IR defines `mem.copy` for non-overlapping spans only (its overlap
+/// behavior is deliberately unpinned; `mem.move` is the overlap-safe op).
+pub fn mem_vectors_for(row: &MemRow) -> Vec<Vec<SpecVal>> {
+    let total: usize = row.pools.iter().map(|p| p.len()).product();
+    let stride = total.div_ceil(VECTOR_CAP).max(1);
+    (0..total)
+        .step_by(stride)
+        .map(|i| {
+            let mut rest = i;
+            row.pools
+                .iter()
+                .map(|p| {
+                    let v = p[rest % p.len()];
+                    rest /= p.len();
+                    v
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| {
+            if row.id != "mem.copy" {
+                return true;
+            }
+            // Keep only vectors where the admitted spans cannot overlap: either the
+            // copy faults (span check fails — still a valid vector) or dst/src are
+            // disjoint.
+            let (dst, src, len) = (as_u64(v[0]), as_u64(v[1]), as_u64(v[2]));
+            let faults =
+                admit_span(dst, len, MEM_SIZE).is_err() || admit_span(src, len, MEM_SIZE).is_err();
+            faults || len == 0 || dst + len <= src || src + len <= dst
+        })
+        .collect()
+}
+
+/// The single-op module for a memory row at one immediate `offset`: declares the 4 KiB
+/// spec window, takes the operands as params, returns the loaded value (if any).
+pub fn module_for_mem(row: &MemRow, offset: u64) -> Module {
+    let params = row.operands.clone();
+    let idx: Vec<ValIdx> = (0..params.len() as ValIdx).collect();
+    let inst = (row.build)(&idx, offset);
+    let term = match row.result {
+        Some(_) => Terminator::Return(vec![params.len() as ValIdx]),
+        None => Terminator::Return(vec![]),
+    };
+    Module {
+        funcs: vec![Func {
+            params: params.clone(),
+            results: row.result.into_iter().collect(),
+            blocks: vec![Block {
+                params,
+                insts: vec![inst],
+                term,
+            }],
+        }],
+        memory: Some(Memory {
+            size_log2: MEM_LOG2,
+        }),
+        ..Default::default()
+    }
+}
+
 // --- coverage: the compile-time completeness hook -------------------------------------
 
 /// Classify every instruction — **exhaustively, no wildcard** (SPEC.md "drift
@@ -1506,6 +1876,61 @@ mod tests {
             trunc_sat(FToI::F32I64U, SpecVal::F32(0x5f80_0000)), // 2^64
             SpecVal::I64(-1)                                     // u64::MAX
         );
+    }
+
+    /// The window-model definitional lattice (§4 / TRAP_CONFINEMENT.md): the whole
+    /// span within `[0, mapped)`, computed without wraparound — a wrapping effective
+    /// address faults, never aliases; zero-length bulk ops are no-ops at wild
+    /// pointers; a faulting access mutates nothing.
+    #[test]
+    fn window_model_lattice() {
+        // Scalar admission boundaries.
+        assert_eq!(
+            admit(MEM_SIZE - 4, 0, 4, MEM_SIZE),
+            Ok((MEM_SIZE - 4) as usize)
+        );
+        assert_eq!(
+            admit(MEM_SIZE - 3, 0, 4, MEM_SIZE),
+            Err(SpecTrap::MemoryFault)
+        );
+        assert_eq!(admit(MEM_SIZE, 0, 1, MEM_SIZE), Err(SpecTrap::MemoryFault));
+        assert_eq!(
+            admit(0, MEM_SIZE - 8, 8, MEM_SIZE),
+            Ok((MEM_SIZE - 8) as usize)
+        );
+        // Wrap-around faults — the mathematical sum is out of range even though the
+        // wrapped u64 would land in-window.
+        assert_eq!(admit(u64::MAX, 2, 1, MEM_SIZE), Err(SpecTrap::MemoryFault));
+        assert_eq!(admit(2, u64::MAX, 1, MEM_SIZE), Err(SpecTrap::MemoryFault));
+        assert_eq!(admit(u64::MAX, 0, 8, MEM_SIZE), Err(SpecTrap::MemoryFault));
+        // Bulk spans: zero length is inert anywhere; oversized/overflowing lengths fault.
+        assert_eq!(admit_span(u64::MAX, 0, MEM_SIZE), Ok(()));
+        assert_eq!(admit_span(0, MEM_SIZE, MEM_SIZE), Ok(()));
+        assert_eq!(
+            admit_span(0, MEM_SIZE + 1, MEM_SIZE),
+            Err(SpecTrap::MemoryFault)
+        );
+        assert_eq!(
+            admit_span(1, u64::MAX, MEM_SIZE),
+            Err(SpecTrap::MemoryFault)
+        );
+        // Loads sign/zero-extend per op; stores write the low bytes little-endian.
+        let mut win = vec![0u8; MEM_SIZE as usize];
+        win[8] = 0x80;
+        assert_eq!(
+            load_eval(LoadOp::I32_8S, 8, 0, &win),
+            Ok(SpecVal::I32(-128))
+        );
+        assert_eq!(load_eval(LoadOp::I32_8U, 8, 0, &win), Ok(SpecVal::I32(128)));
+        store_eval(StoreOp::I64_32, 0, 0, SpecVal::I64(-1), &mut win).unwrap();
+        assert_eq!(&win[0..5], &[0xff, 0xff, 0xff, 0xff, 0x00]);
+        // A faulting store mutates nothing.
+        let before = win.clone();
+        assert_eq!(
+            store_eval(StoreOp::I64, MEM_SIZE - 4, 0, SpecVal::I64(-1), &mut win),
+            Err(SpecTrap::MemoryFault)
+        );
+        assert_eq!(win, before);
     }
 
     /// Table invariants: unique ids, one result each, every row's class agrees with

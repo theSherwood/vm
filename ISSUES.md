@@ -13,6 +13,45 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I21 — JIT bulk-memory ops diverge from the interpreter on spans overrunning `mapped` inside the reservation (S2) — found by the SPEC.md slice-5 window-model suite (2026-07-14)
+
+**Where:** `svm-jit`'s D62 bulk lowering — `confine_span` + the `memcpy`/`memmove`/`memset`
+libcall path — vs the interpreter's `Mem::mem_copy`/`mem_fill` (`confine_span` **then**
+`check_prot_span` before any write).
+
+**Symptom (probed on a 4 KiB `mapped` window under the default large reservation):**
+
+| case | interp/bytecode | JIT |
+|---|---|---|
+| `mem.copy`/`mem.move` `dst==src`, `len` overruns `mapped` | `MemoryFault`, window untouched | **`Returned`** — the trap is lost |
+| `mem.fill`/`mem.copy`, `dst` span overruns `mapped` | `MemoryFault`, window untouched | `MemoryFault`, but with **partial writes** (the in-`mapped` prefix is modified) |
+
+**Root cause.** D62's explicit span check bounds against **`reserved`** (`len > reserved ||
+ptr > reserved − len`), delegating the `[mapped, reserved)` distinction to the guard region via
+the libcall's own accesses. That works only if the libcall actually touches the overrunning
+bytes: (1) libc `memcpy`/`memmove` **short-circuit `dst == src`**, so a self-copy whose span
+overruns `mapped` never faults at all — a guest-visible interp↔JIT divergence in *which inputs
+trap* (the §18 escape-oracle observable; the existing generative differential misses it because
+its memory oracle only byte-compares **completing** runs, and `irgen` rarely lands `dst == src`
+with an only-just-oversized `len`). (2) The libcall writes a prefix before hitting the guard,
+so the faulting-run window differs from the interpreter's fault-before-any-write.
+
+**Not an escape:** every access stays within `[0, reserved)`; production guard pages still
+confine. This is a parity/totality break (§3 "three backends, one observable behavior"), not a
+confinement break.
+
+**Fix sketch (needs a design decision — this is the confinement hinge, AGENTS.md):** either
+(a) have the bulk lowering validate the span against the **current backed extent** before the
+libcall (the interp's `check_prot_span` analogue — e.g. a page-stride touch loop or a runtime
+helper; costs the D62 hot path something, could be gated on the rare `dst == src` case for
+(1) only), or (b) declare the interp's semantics authoritative and re-lower bulk ops through a
+checked runtime helper, or (c) amend §3b/D62 to define bulk-op traps as
+"fault-at-first-untouchable-byte with unspecified prefix writes" and make the interpreter match
+(then `dst == src` still needs (a)'s narrow fix — losing the trap outright can't be spec'd
+away). Until fixed, the slice-5 spec suite (`crates/svm/tests/spec_mem.rs`) pins interp +
+bytecode fully and **skips only the JIT leg** of bulk vectors whose span falls in the
+`(mapped, reserved]` guard hole — grep `I21` there.
+
 ### I3 — Windows CI memory-pressure aborts under `cargo test --workspace` (S3) — **FIX LANDED & MERGED** (audit PRs, 2026-07-08); **holding** — green on all 6 post-fix nightlies (Jul 9–14), not yet proven eliminated (see Confirmation below)
 
 **Where:** `crates/svm/tests/durable_jit.rs::freeze_thaw_cross_backend_over_generated_modules`
