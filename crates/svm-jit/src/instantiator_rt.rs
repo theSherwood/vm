@@ -15,9 +15,19 @@
 
 use crate::{mem, CapThunk, TrapKind};
 use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use svm_ir::{Data, Func, FuncIdx, ValType};
+
+/// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
+/// [`crate::ChildCode`] depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
+/// for the whole run per the [`crate::ModuleResolver`] contract — a held grant's storage outlives the
+/// run and distinct live modules have distinct storage, so a stale-pointer collision cannot happen
+/// within a run; the worst case of any mismatch is a miss, never wrong code). `entry` picks the
+/// trampolined function; `size_log2` picks the baked window mask. The carve **base** is deliberately
+/// absent — it is a runtime arg, so one entry serves every offset.
+type ChildCodeKey = (usize, usize, u32, u8);
 
 /// Negative-errno an out-of-range carve returns (matches the interpreter's `EINVAL`, §3e D42).
 const EINVAL: i64 = -22;
@@ -104,6 +114,16 @@ pub(crate) struct Nursery {
     /// parent-child's nursery — coalesces at the **root**, where the top-level run drains it
     /// (`take_frozen_nested`). The JIT analog of the interpreter's `VCpu::freeze_sink`.
     frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
+    /// PROCESS.md S1: **per-carve compile cache** for non-durable children. Keyed by
+    /// [`ChildCodeKey`], each entry is a compiled [`crate::ChildCode`] reused across spawns — so a
+    /// shell respawning the same applet (any offset, same size) recompiles nothing. Held behind the
+    /// nursery, alive for the run; the durable / nesting child bypasses it (its baked per-child
+    /// nursery makes its code un-shareable). `Rc` so a lookup can drop the lock before the run:
+    /// today's children run **synchronously on the calling thread** (the same single-thread contract
+    /// the `unsafe impl Send`/`Sync` below documents), so `Rc` is correct and `ChildCode` need not be
+    /// `Send`/`Sync` yet. S1c (OS-thread children) is where cross-thread sharing — `Rc` → `Arc` plus
+    /// a proven `ChildCode: Send + Sync` — actually lands and gets tested.
+    child_code: Mutex<HashMap<ChildCodeKey, std::rc::Rc<crate::ChildCode>>>,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -238,6 +258,7 @@ impl Nursery {
             my_task,
             task_counter,
             frozen_nested_sink,
+            child_code: Mutex::new(HashMap::new()),
         }
     }
 
@@ -486,36 +507,82 @@ pub(crate) unsafe extern "C" fn instantiate(
     let nargs = child_funcs[entry as usize].params.len();
     let args = vec![0i64; nargs];
 
-    // §4 depth-2: reserve this child's subtree-unique domain task id (shared counter, instantiate
-    // order), stamped as its nursery's `my_task` so a grandchild it records carries a non-zero
-    // `parent_task`. The child inherits the **shared** residue sink + counter, so its descendants'
-    // freeze residue coalesces at the root.
-    let child_task = rt.next_child_task();
-    // Re-compile the child as a top-level guest over its own window, seeded from the parent's
-    // sub-region `[base+off, … + child_size)` and copied back on completion (the §14 superset).
-    let outcome = crate::compile_child_and_run(
-        child_funcs,
-        entry as FuncIdx,
-        base + off,
-        size_log2 as u8,
-        mem_base as *mut u8,
-        &args,
-        rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
-        durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
-        false, // not a thaw re-attach — a live `instantiate` (seed fresh / inherit the parent phase)
-        child_task,
-        rt.nested_sink(),
-        rt.task_counter(),
-        &[], // a live `instantiate` re-attaches no frozen residue (that is the thaw path)
-    );
-    let (result, trap, unwound) = match outcome {
-        Ok(rt) => rt,
-        Err(_) => {
-            // A child we cannot compile (fibers/threads, or a backend error) is a CapFault, not a
-            // silent success — the guest learns its nesting request was refused.
-            *trap_out = TrapKind::CapFault as i64;
-            return 0;
+    let (result, trap, unwound) = if durable {
+        // §4 depth-2: reserve this child's subtree-unique domain task id (shared counter, instantiate
+        // order), stamped as its nursery's `my_task` so a grandchild it records carries a non-zero
+        // `parent_task`. The child inherits the **shared** residue sink + counter, so its descendants'
+        // freeze residue coalesces at the root. Durable children are **not** cached (their baked
+        // per-child nursery makes the code un-shareable) — they keep the per-call compile+run path.
+        let child_task = rt.next_child_task();
+        // Re-compile the child as a top-level guest over its own window, seeded from the parent's
+        // sub-region `[base+off, … + child_size)` and copied back on completion (the §14 superset).
+        match crate::compile_child_and_run(
+            child_funcs,
+            entry as FuncIdx,
+            base + off,
+            size_log2 as u8,
+            mem_base as *mut u8,
+            &args,
+            rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
+            durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
+            false, // not a thaw re-attach — a live `instantiate` (seed fresh / inherit the parent phase)
+            child_task,
+            rt.nested_sink(),
+            rt.task_counter(),
+            &[], // a live `instantiate` re-attaches no frozen residue (that is the thaw path)
+        ) {
+            Ok(rt) => rt,
+            Err(_) => {
+                // A child we cannot compile (fibers/threads, or a backend error) is a CapFault, not a
+                // silent success — the guest learns its nesting request was refused.
+                *trap_out = TrapKind::CapFault as i64;
+                return 0;
+            }
         }
+    } else {
+        // PROCESS.md S1: the common (non-durable) path — compile once per `(module, entry, size)`,
+        // cache the position-independent code, and run it in the carve. A repeat spawn of the same
+        // child (any offset) hits the cache and skips the whole Cranelift compile.
+        let key: ChildCodeKey = (
+            child_funcs.as_ptr() as usize,
+            child_funcs.len(),
+            entry as u32,
+            size_log2 as u8,
+        );
+        let code = {
+            let mut cache = rt.child_code.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = cache.get(&key) {
+                std::rc::Rc::clone(c)
+            } else {
+                match crate::compile_nondurable_child(
+                    child_funcs,
+                    entry as FuncIdx,
+                    size_log2 as u8,
+                    rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
+                ) {
+                    Ok(cc) => {
+                        let a = std::rc::Rc::new(cc);
+                        cache.insert(key, std::rc::Rc::clone(&a));
+                        a
+                    }
+                    Err(_) => {
+                        // Un-compilable child (fibers/threads/setjmp, or a backend error) → CapFault.
+                        *trap_out = TrapKind::CapFault as i64;
+                        return 0;
+                    }
+                }
+            }
+        };
+        let n_results = child_funcs[entry as usize].results.len();
+        let (r, t) = crate::run_child_code(
+            &code,
+            base + off,
+            size_log2 as u8,
+            mem_base as *mut u8,
+            &args,
+            n_results,
+        );
+        (r, t, false) // non-durable never unwinds under a freeze
     };
 
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
