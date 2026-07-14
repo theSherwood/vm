@@ -1132,6 +1132,24 @@ before the fix). **294 translate tests green, fmt + clippy clean.**
 remains is purely the **runtime** — `initdb` (natively) exposed via the `fs` cap; storage manager, WAL,
 single-process shmem, catalog bootstrap; real impls for the ~50 externals the query path calls.
 
+**Slice BZ (DONE) — the `fs` capability's metadata + directory surface; the runtime begins.** The
+translate/verify frontier is closed, so the work turns to *running* the module — and the first blocker is
+that the `fs` cap (`crates/svm-run/src/fs.rs`) could open/read/write/seek **files** but had no way to
+**walk a tree**: no `stat`, `mkdir`, `rmdir`, `opendir`/`readdir`. A natively-`initdb`'d cluster is a deep
+directory tree (`base/<db>/…`, `global/…`, `pg_wal/…`), and Postgres `stat`s and scans it pervasively at
+startup before it can open a single relation. Added ops 14–19: `stat` fills a fixed 72-byte little-endian
+`StatBuf` (the `S_IF*` type bits + size + mtime + ino/dev) with **lstat** semantics — a symlink is never
+followed, so it can't be used to probe the *type* of something outside the granted root; `mkdir`/`rmdir`;
+`opendir` snapshots a directory's immediate entries and `readdir` yields them **sorted**, one per call
+(`0` at exhaustion), `closedir` drops the handle. Both backends stay at protocol parity — `mem_fs` models
+directories over its flat name table (a path is a directory if it was `mkdir`'d or is a strict prefix of a
+file key), `host_fs` walks the real tree — so a differential runs identically on either. Tests
+`os_metadata_ops_parity_mem_vs_host` (the same scripted walk returns the same rc sequence + type bits +
+size on both backends) and `readdir_is_sorted_and_bounded` (sorted iteration; a too-small buffer fails
+closed without consuming the entry). **svm-run suite green, fmt + clippy clean.** Next (gap #11b): a guest
+OS-shim binding the file syscalls + proc/time to this cap, then the ~180 remaining pure-libc externs
+(stdio `FILE*`, locale, ctype, `strtod`/`snprintf`) byte-exact vs the native oracle.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
