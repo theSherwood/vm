@@ -1,5 +1,16 @@
 # Executable ISA spec & generated conformance tests (`svm-spec`)
 
+> Status: **slice 1 landed** — `crates/svm-spec` (the op table: 80 scalar rows with
+> reference `eval` closures, the exhaustive [`coverage`] walk over all of `Inst`) +
+> `crates/svm/tests/spec_vectors.rs` (suite 1: ~48k boundary vectors × three backends,
+> <5 s). First findings, both fixed with the slice: (1) DESIGN.md §3b prose claimed
+> `rem_s` traps on INT_MIN/−1 — both backends (correctly, wasm-identically) return 0;
+> the prose is corrected. (2) The JIT had **no lowering for `ptr.add`/`ptr.to_int`/
+> `ptr.from_int`** — and because the differential harness skips `Unsupported` modules,
+> every `irgen`-generated module containing a ptr op was silently dropped from the
+> interp↔JIT differential; the (trivial, pure-arithmetic) lowering is added and the
+> ptr ops now ride both the spec vectors and the 4000-seed differential.
+
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier
 crate** and *generates* three conformance suites: per-op semantic vectors run on all
@@ -160,10 +171,11 @@ must implement, at the same three-backend level as every other vector.
 Slices, each landing green with its tests (AGENTS.md: tests from the first
 commit). Ordered so every slice delivers a standing suite:
 
-1. **Skeleton + scalar integers.** `crates/svm-spec` with the table schema, rows
-   + `eval` for consts, `IntBin`/`IntCmp`/`IntUn`/`Eqz`/`Convert`/`Select`,
-   `Cast`, `PtrAdd`/`PtrCast`; suite-1 harness running all three backends.
-   *Exit: every i32/i64 op has passing boundary vectors on interp, bytecode, JIT.*
+1. **Skeleton + scalar integers** — **done** (see Status). `crates/svm-spec` with
+   the table schema, rows + `eval` for consts, `IntBin`/`IntCmp`/`IntUn`/`Eqz`/
+   `Convert`/`Select`, `Cast`, `PtrAdd`/`PtrCast`; suite-1 harness running all
+   three backends.
+   *Exit: every i32/i64 op has passing boundary vectors on interp, bytecode, JIT.* ✅
 2. **Floats + conversions.** `FBin`/`FUn`/`Fma`/`FCmp`, `FToISat`/`FToITrap`/
    `IToFConv`, reinterpret casts; NaN policy wired. *Exit: the trapping and
    saturating conversion boundary lattices pass on all backends.*

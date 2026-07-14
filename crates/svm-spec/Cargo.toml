@@ -1,0 +1,13 @@
+[package]
+name = "svm-spec"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Test-tier only (SPEC.md): the library depends on svm-ir alone, and nothing on the
+# runtime path may ever depend on this crate — it cross-examines the TCB, it does
+# not feed it.
+[dependencies]
+svm-ir.workspace = true
