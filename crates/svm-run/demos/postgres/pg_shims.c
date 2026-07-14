@@ -7,3 +7,5 @@
 #include "ipc_shim.c"
 #include "stdio_shim.c"
 #include "printf_shim.c"
+#include "../strtod/strtod.c" /* real correctly-rounded strtod (the on-ramp's is a trap stub) */
+#include "scanf_shim.c"

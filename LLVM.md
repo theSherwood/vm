@@ -1334,6 +1334,31 @@ guest output before it), which the CG diagnostic can't name because nothing was 
 remaining silent traps legible, then forward through the storage manager / WAL / catalog bootstrap.
 **svm-llvm lane green (fmt + clippy `-D warnings`; 9 `demo_pg_*` tests).**
 
+**Slice CJ (DONE) — the varargs `scanf` engine + a real `strtod` (gap #11l).** The *input* twin of CH:
+the runtime `sscanf`/`vsscanf`/`fscanf`/`vfscanf`/`scanf`/`vscanf` family Postgres parses config values,
+version strings, and numbers with (a format built at runtime — no translate-time analog). **Guest code,
+no translator change:**
+- **`scanf_shim.c`** (new) drives one **char-source abstraction** — a string (`sscanf`) or a `FILE*`
+  (`fscanf`, via `fgetc`/`ungetc`, so it composes with the CE stream/file fd-dispatch) with a single
+  pushback slot (scanf only ever un-reads the one char that ended a conversion). Conversions: `d`/`i`/`u`/
+  `o`/`x`/`X`, `c`, `s`, `f`/`e`/`g` (+ `a` hex-float), `[scanset]` (with `a-z`/`0-9` **range** expansion),
+  `n`, `p`, `%%`, with assignment-suppression `*`, field width, and `h`/`hh`/`l`/`ll`/`L`/`j`/`z`/`t`
+  length modifiers; the return value is the assigned-item count (EOF before the first conversion) — glibc
+  semantics. Integers accumulate inline (every `va_arg` in the `va_list`-owning function — passing a
+  `va_list *` to a helper trips the on-ramp's varargs ABI, the one gotcha this shook out, shared with
+  `printf_shim.c`).
+- **A real `strtod` for `%f`/`%lf`/`%g`.** The on-ramp's `strtod` is a **trap stub** (it was never a real
+  impl — a latent gap this slice surfaced, and one `float8in` hits at boot too), so the guest brings the
+  correctly-rounded **bignum `strtod.c`** (`demos/strtod/`, already used by float Lua) — a guest
+  definition shadows the stub. `scanf`'s float conversions collect a token and hand it to `strtod`.
+- Both are linked into the whole-module boot via `pg_shims.c` (`#include "../strtod/strtod.c"` +
+  `"scanf_shim.c"`), so Postgres' own `sscanf`/`strtod` become real there.
+- **Differential** `demo_pg_sscanf_vs_native` (`sscanf_probe.c`): the conversions **and** the return-count
+  semantics (a scanf differential must check the count, not just the values — partial-match/EOF cases
+  included), plus an `fscanf`-from-`stdin` half, byte-identical to native glibc on **all three engines**.
+  **svm-llvm lane green (10 `demo_pg_*` tests, fmt + clippy `-D warnings`).** Next: the boot's storage
+  manager / WAL / single-process shmem / catalog bootstrap (the `llvm-postgres` thread, past slice CI).
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
