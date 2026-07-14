@@ -298,22 +298,60 @@ per-child nursery makes the code un-shareable) — a small, deliberate exclusion
 This also *helps* async children: cached code is read-only executable, so the same blob
 can back N concurrent OS-thread children.
 
-### S1 remaining — async children ride the existing OS-thread executor  [design]
+### S1 remaining — async children: the architecture, corrected by integration  [design]
 
 The JIT already has a **1:1 OS-thread executor** (`os_thread_rt.rs`, D56/§12): each
-`thread.spawn` is a real OS thread over the shared window with hardware atomics, and the
-§5 kill-path already reaches parked siblings (`KILL_RECHECK`). "Async children" is
-therefore *not* new concurrency machinery — it is: `instantiate` spawns the (cached) child
-entry on its own OS thread confined to the carve, instead of running it inline to
-completion; `join` parks the calling fiber on the child's completion cell (as
-`thread.join` already does). This is what makes a pipeline work — child A can block on a
-pipe/futex while child B (another thread) unblocks it — where the synchronous-at-instantiate
-model deadlocks (the parent is stuck inside `instantiate(A)` and never reaches
-`instantiate(B)`). Sequential spawn/wait (stage 1) works on the synchronous path today, so
-this is sequenced *before* stage-2 pipelines, not stage-1. The one genuinely new bit is
-that a §14 child is *separately-compiled code over a sub-window*, not the same-code
-same-window shape `thread.spawn` assumes — so the executor integration (cross-thread
-child window ownership, per-child kill cell, join wiring) is the focused next increment.
+`thread.spawn` is a real OS thread over the shared window with hardware atomics, and the §5
+kill-path reaches parked siblings (`KILL_RECHECK`). So "async children" reuses that, not new
+concurrency machinery: `instantiate` spawns the (cached) child on its own OS thread and
+returns; `join` parks the calling fiber on the child's completion cell (as `thread.join`
+does). This is what makes a pipeline work — child A blocks on a pipe/futex while child B
+(another thread) unblocks it — where synchronous-at-`instantiate` deadlocks (the parent is
+stuck inside `instantiate(A)` and never reaches `instantiate(B)`). Sequential spawn/wait
+(stage 1) works on the synchronous path today, so this precedes stage-2 pipelines, not
+stage-1.
+
+**The load-bearing finding (why the obvious design is a confinement bug).** The tempting
+shortcut — since S1 proved child code is position-independent — is to run the child
+*in-place in the parent's window* (base = `parent_base + carve_off`), so parent and child
+share bytes live and the S0 futex rendezvous "just works" on the JIT too. **It does not, and
+it is unsafe.** JIT confinement is D38 *check + clamp* (`& (reserved−1)`), and the clamp
+confines the **offset** to `[0, child_size)` — but a width-`w` access at the top of the carve
+reaches up to `base + child_size + (w−1)`, which the separate-window model catches with a
+**trailing guard page**. Densely-packed carves have *no* guard page between them, so an
+in-place child could write up to `w−1` bytes past its carve into the **neighbouring carve or
+the parent** — a real break of carve isolation (not a host escape — still inside the parent
+window — but it destroys sibling mutual-invisibility and the detached/confidential model).
+**This is exactly why the JIT runs each child in its own separately-guarded window**, and it
+stands: implicit carve-superset sharing is a *nested-synchronous convenience* (seed argv,
+read results at `join`), **never** the concurrency channel.
+
+**So the concurrency & communication plane is explicit `SharedRegion` + canonical-key
+futex — the same mechanism as siblings (S0), for the same reason.** A JIT child runs in its
+own guarded window, so parent↔child *live* rendezvous can't ride implicit carve addresses
+(different allocations) any more than two siblings can; both go through a `SharedRegion`
+mapped into each, with the futex keyed on the region's canonical `(backing, region_off)` —
+not the window-absolute address. The interpreter's `PageProt::Backed { region, region_off }`
+already carries that identity; the work is keying the scheduler's futex map (and the JIT's)
+on it without colliding with anonymous absolute-address keys — a **cross-backend futex
+key-space change** (S9's canonical-key item), which this finding **promotes onto the async
+critical path**: it gates JIT concurrent parent↔child, not just sibling pipes.
+
+**Revised async-children plan (own-window + explicit channels):**
+1. **Canonical-key futex** (was S9): key `Backed` pages on `(backing, region_off)` on both
+   backends. Unblocks the comm plane for siblings *and* JIT concurrency. Testable by
+   extending `futex_cross_domain.rs` to two siblings sharing a region.
+2. **OS-thread children on the JIT**: `instantiate` spawns the cached child in its **own
+   guarded window** (safe — keeps the trailing guard) on an `os_thread_rt` thread; `join`
+   parks on the completion cell; the child polls the parent's epoch cell (kill-path already
+   wired). Copy-in seeds argv at spawn; the child's live channel is a granted `SharedRegion`,
+   not the copied carve.
+3. **Interp parity check**: the interpreter's parent↔child futex already works via shared
+   backing (S0) — but that is the *nested-synchronous* superset, not a portable channel; the
+   portable (backend-agnostic) pipe rides the `SharedRegion` path from step 1 on both engines.
+
+The one thing the corrected model does **not** need is any change to the D38 confinement
+lowering — the security hinge stays untouched; children keep their own guarded windows.
 
 ---
 
@@ -652,7 +690,9 @@ Unchanged in substance from v1, restated against the substrate:
 | # | Slice | Depends on | Status |
 |---|---|---|---|
 | S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | **done** — nested futex confirmed (`futex_cross_domain.rs`); sibling wakeup-key gap characterized + fix scoped to S9; F6 RTT model in §4 |
-| S1 | JIT async children (park-only-calling-fiber) + per-carve compile cache | — | **in progress** — per-carve compile cache **done** (`jit_instantiate_cache.rs`; position-independent, one compile per `(module,entry,size)`); async children next (rides the existing `os_thread_rt` 1:1 executor) |
+| S1a | JIT per-carve compile cache | — | **done** (`jit_instantiate_cache.rs`; position-independent, one compile per `(module,entry,size)`) |
+| S1b | Canonical-key futex — key `Backed` pages on `(backing, region_off)`, both backends (was S9's sibling item; integration promoted it onto the async critical path — gates JIT concurrent parent↔child, not just sibling pipes) | — | todo — **next** |
+| S1c | OS-thread children on the JIT: `instantiate` spawns the cached child in its **own guarded window** (keeps the trailing guard — in-place would break carve isolation), `join` parks on the completion cell; live channel is a granted `SharedRegion`, not the copied carve | S1b | todo |
 | S2 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
 | S3 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S1 | todo |
 | S4 | fs dir ops; POSIX personality lib: fd table, **host-served** pipe, proc ABI | S2 | todo |
@@ -660,7 +700,7 @@ Unchanged in substance from v1, restated against the substrate:
 | S6 | `cap.self.attest` incl. freeze authority (+ the §14 amendment PR into DESIGN.md) | S5 | todo |
 | S7 | BusyBox port; stage-1/2 demo gates (**endpoint-free**) | S3,S4 | todo |
 | S8 | Bash stage-0 port (interpreter-only; autoconf cross-config, `--noediting`) | fs ops | todo |
-| S9 | `Endpoint` v1 — library over SharedRegion+futex (S0: viable); **incl. region-canonical futex keys for sibling wakeup**; kill-safe cancel; FIFO | S0,S3 | todo |
+| S9 | `Endpoint` v1 — library over SharedRegion+futex (S0: viable); canonical-key futex now lands earlier (S1b); kill-safe cancel; FIFO | S0,S1b,S3 | todo |
 | S10 | **Interposition gate** (stage 2.5): guest-implemented virtualizing-fs personality runs the BusyBox suite unmodified | S9 | todo |
 | S11 | R8 closure (`call_indirect` durable coverage); `clone` of parked domains (full-copy) + fork endpoint with duplicated reply token | S9, durable | todo |
 | S12 | Bash stage-3; suite subset as CI gate | S8,S11 | todo |
@@ -672,8 +712,9 @@ Unchanged in substance from v1, restated against the substrate:
 | # | Risk / question | Where | Status |
 |---|---|---|---|
 | O1 | Endpoint servicer DoS (never replies): callers park forever. v1 answer: your servicer is in your grant chain — you trusted it; a personality may add timeouts. Is that acceptable for cross-*sibling* endpoints? | §4 | open |
-| O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable). **Spike done (§4 S0 results):** nested futex rendezvous works today (pinned by `futex_cross_domain.rs`); sibling aliases are value-coherent but need region-canonical futex keys for wakeup (Linux shared-futex analogue) — fix scoped to S9, no confinement-hinge contact | §9 | resolved — nested confirmed; sibling fix folded into S9 |
+| O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable). **Spike done (§4 S0 results):** nested futex rendezvous works today (pinned by `futex_cross_domain.rs`); sibling aliases are value-coherent but need region-canonical futex keys for wakeup (Linux shared-futex analogue) — no confinement-hinge contact. Integration (O15) promoted this to **S1b** (it also gates JIT concurrent parent↔child) | §9 | resolved — nested confirmed; sibling/JIT fix is S1b |
 | O3 | JIT compile-cache: **built** with key `(funcs ptr, n_funcs, entry, size_log2)` — carve base is *absent* (position-independent reuse), so it hits across offsets, not just repeated same-slot spawns. Residual: a robust separate-module identity (a digest would beat the funcs pointer, though the run-lifetime grant contract makes a stale-pointer collision impossible within a run); cache eviction if a long shell session accumulates many distinct applets | §4, §5 | mostly resolved |
+| O15 | **In-place shared-window children are unsafe** (§4 S1 finding): D38 clamp confines the *offset*, but a width-`w` access at a carve's top reaches `w−1` bytes past it — caught by the per-window trailing guard page, which densely-packed carves lack. So a concurrent JIT child must keep its **own guarded window**; the live parent↔child channel is a `SharedRegion` + canonical-key futex (S1b), never implicit carve addresses. No D38 change. Decided; the alternative (per-carve guard pages) is rejected as wasteful and layout-invasive | §4 | resolved (own-window + SharedRegion) |
 | O4 | Detached windows on the browser/wasm32 host: pool sizing inside one wasm memory | §5 | open |
 | O5 | `attest` provenance granularity: report authority *set* or just tier + platform-only bit? Smaller is better (F2) | §6 | open |
 | O6 | Multi-window (detached) subtree freeze: consistent cut across windows — interacts with `DURABILITY.md` R4 | §5, §11 | open |
