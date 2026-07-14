@@ -13,6 +13,38 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I23 — svm-jit miscompiles some rustc-emitted bitcode: an in-bounds heap `Vec` access faults / returns garbage (S2) — found by the `bench/rustbench` real-program harness (2026-07-14)
+
+**Where:** the LLVM on-ramp + `svm-jit` on **rustc**-produced bitcode (rustc 1.81, LLVM 18 — the
+version the on-ramp's `llvm-dis` reads). Not seen on any `clang`-produced module; the five other
+`rustbench` workloads (hashmap/vm/sort/parse/base64) cross-check identical to native and Wasmtime.
+
+**Symptom.** A tiny, fully in-bounds program traps with `MemoryFault` where native returns the right
+answer — the confinement faults on a *legitimate* access (so a bad address computation, not an
+overrun). Minimal reproducer (prepend `bench/rustbench/prelude.rs` for the bump allocator/panic
+handler):
+
+```rust
+#[no_mangle]
+pub extern "C" fn run(n: i64) -> i64 {
+    reset_arena();
+    let v = vec![3i32; 100];          // 400 bytes in a 32 MiB arena — nowhere near the guard
+    let mut h = 0i64;
+    for _ in 0..n { for &d in v.iter() { h = h.wrapping_add(d as i64); } }
+    h
+}
+// native run(3) = 900 ; svm-jit run(10) = Trapped(MemoryFault)
+```
+
+Independent of element type (`u8`/`i32`/`i64` all fault) and opt level (`-O0`..`-O2`). The `bfs`
+workload (kept in `workloads/bfs.rs`, disabled in the driver's `WORKLOADS` — grep `I23`) hits a
+variant that **returns garbage** (`8160438656660` vs `881260`) instead of trapping. **Distinct from
+I21**: that is a bulk-op span *overrunning* `mapped`; this is a small in-bounds access.
+
+**Not yet root-caused.** Next step: `SVM_JIT_DUMP_CLIF=1` on the reproducer to find the bad
+address/bounds computation (svm-llvm mistranslation vs svm-jit lowering). The five shipping workloads
+avoid the trigger, so `rustbench` runs green; re-enable `bfs` once fixed.
+
 ### I21 — JIT bulk-memory ops diverge from the interpreter on spans overrunning `mapped` inside the reservation (S2) — found by the SPEC.md slice-5 window-model suite (2026-07-14)
 
 **Where:** `svm-jit`'s D62 bulk lowering — `confine_span` + the `memcpy`/`memmove`/`memset`
