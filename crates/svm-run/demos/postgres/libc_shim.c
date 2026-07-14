@@ -143,6 +143,7 @@ const int **__ctype_toupper_loc(void) { return &shim_ctype_toupper_ptr; }
 #include <locale.h>
 #include <stddef.h>
 #include <stdlib.h> /* malloc, for strdup */
+#include <string.h> /* strchr (used by getopt); the shim's own str* match these declarations */
 
 static size_t shim_strlen(const char *s) {
   const char *p = s;
@@ -361,6 +362,12 @@ size_t mbstowcs(wchar_t *dst, const char *src, size_t n) {
   }
   return i; /* filled n wide chars without hitting NUL */
 }
+/* The C environment vector. The powerbox passes env via the §3e args buffer, not the C `environ`
+ * global that libc `getenv` and code like Postgres's `save_ps_display_args` walk — so provide one.
+ * Empty (a lone NULL terminator) is a valid, minimal environment. */
+static char *shim_environ[1] = {(char *)0};
+char **environ = shim_environ;
+
 size_t wcstombs(char *dst, const wchar_t *src, size_t n) {
   size_t i = 0;
   if (!dst) {
@@ -372,4 +379,57 @@ size_t wcstombs(char *dst, const wchar_t *src, size_t n) {
     if (!src[i]) return i;
   }
   return i;
+}
+
+/* ============================================================================================== *
+ * getopt (+ strsignal). `strerror_r` lives in locale_shim.c — its GNU/POSIX signature split needs
+ * `_GNU_SOURCE`, which the boot TU sets but the standalone probes don't.
+ * ============================================================================================== */
+
+char *strsignal(int sig) {
+  (void)sig;
+  return (char *)"Signal";
+}
+
+/* Standard `getopt` (no `getopt_long`) + its globals — Postgres's `--single` arg parsing uses it. */
+char *optarg = (char *)0;
+int optind = 1, opterr = 1, optopt = 0;
+static int shim_optpos = 1;
+int getopt(int argc, char *const argv[], const char *optstring) {
+  if (optind >= argc || !argv[optind] || argv[optind][0] != '-' || argv[optind][1] == 0) return -1;
+  if (argv[optind][1] == '-' && argv[optind][2] == 0) { /* "--" ends option parsing */
+    optind++;
+    return -1;
+  }
+  int c = (unsigned char)argv[optind][shim_optpos];
+  const char *p = (c == ':') ? (char *)0 : strchr(optstring, c);
+  if (!p) {
+    optopt = c;
+    if (argv[optind][++shim_optpos] == 0) {
+      optind++;
+      shim_optpos = 1;
+    }
+    return '?';
+  }
+  if (p[1] == ':') { /* option takes an argument */
+    if (argv[optind][shim_optpos + 1] != 0) {
+      optarg = (char *)&argv[optind][shim_optpos + 1];
+      optind++;
+    } else if (optind + 1 < argc) {
+      optarg = argv[optind + 1];
+      optind += 2;
+    } else {
+      optopt = c;
+      optind++;
+      shim_optpos = 1;
+      return optstring[0] == ':' ? ':' : '?';
+    }
+    shim_optpos = 1;
+    return c;
+  }
+  if (argv[optind][++shim_optpos] == 0) {
+    optind++;
+    shim_optpos = 1;
+  }
+  return c;
 }

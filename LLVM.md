@@ -1251,6 +1251,28 @@ on-ramp change is regression-free. Next (gap #11g): the varargs `fprintf`/`scanf
 storage/WAL/shmem/catalog subsystems, then the first real **boot** (relink the shims into the Postgres
 bitcode and drive `postgres --single` to its first live trap).
 
+**Slice CF (DONE) — ★ the first boot: the module RUNS.** With all the guest shims `llvm-link`ed into the
+whole-program module (`link_shims.sh` builds `postgres_shimmed.bc`; `pg_shims.c` is the combined TU),
+Postgres **translates, verifies, and executes real backend startup** — the whole thing runs in ~24 s
+(translate included) on the bytecode engine, no JIT-of-15k-functions wall. Driving it (`translate_bc_path_
+with_options` with `stub_unresolved_externs: true` → `instantiate` → `run_with_caps` with the `fs` cap on
+the natively-`initdb`'d data dir + `SELECT 1+1;` on stdin) surfaced the first **live** fault: a
+`MemoryFault` in `save_ps_display_args`, which walks the C **`environ`** global — undefined in the guest
+(the powerbox passes env via the §3e args buffer, not the C `environ` vector). Defining `environ` (empty)
+cleared it, and the fault advanced to `Unreachable` stub-traps deeper in init. Added the early-startup
+libc surface the boot needs: **`environ`**; the C-locale stubs **`setlocale`** (→ `"C"`) / `newlocale` /
+`uselocale` / `duplocale` / `freelocale` / **`localeconv`** / **`nl_langinfo`** (`locale_shim.c`); the
+**wide-ctype** `iswX`/`towX` family (ASCII classification, C locale — differential-tested
+`demo_pg_wctype_vs_native` over every byte 0..255, the `iswX_l` variants forwarding to it); **`getopt`**
+(+ its `optarg`/`optind`/… globals); and **`strsignal`**. The differential-clean parts (wctype) are
+CI-tested; the rest are boot-support stubs validated by the boot advancing (the boot itself isn't a CI
+test — it needs the cached, fetched Postgres bitcode). **svm-llvm lane green (fmt + clippy `-D warnings`;
+8 `demo_pg_*` tests).** Next (gap #11h): a **trap-identifying** diagnostic (self-naming stubs or
+partial-output-on-trap — the `Unreachable`/`MemoryFault` traps carry no name today, which makes the
+remaining chase slow) so each stub-trap is legible, then the storage manager / WAL / single-process
+shmem (`mmap`/`shmget`) / catalog bootstrap, plus the varargs `fprintf`/`scanf` engines. `strerror_r`
+(GNU `char *` vs POSIX `int`) needs its own `_GNU_SOURCE`-isolated TU, deferred.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

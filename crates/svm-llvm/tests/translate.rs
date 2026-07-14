@@ -4175,6 +4175,20 @@ fn demo_pg_ctype_vs_native() {
 }
 
 #[test]
+fn demo_pg_wctype_vs_native() {
+    // **The guest wide-ctype shim** (slice CF, gap #11g). `locale_shim.c`'s C/POSIX-locale iswX/towX
+    // family is ASCII classification; `wctype_probe.c` prints all twelve classes + case mapping for
+    // every code point 0..255 and the guest byte-matches native glibc (pinning the table; the iswX_l
+    // variants forward to these). Pure — runs on the bare powerbox.
+    check_demo_vs_native_flags(
+        "pg_wctype",
+        "postgres/wctype_probe.c",
+        b"",
+        &["-DSVM_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
 fn demo_pg_string_vs_native() {
     // **The guest string + integer-parsing shim** (slice CC, gap #11d). `libc_shim.c` adds the
     // `<string.h>`/`<stdlib.h>` members Postgres uses that the on-ramp does not already synthesize —
