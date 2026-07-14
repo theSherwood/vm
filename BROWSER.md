@@ -622,6 +622,31 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `out_of_fuel` differential), surfacing as a vCPU trap the host can restart or abandon.
 5. **§22 + §14 as real codegen.** Guest `jit_compile`/`install` emits wasm (validator-gated) — the
    guest-JIT ops become an actual JIT; `instantiate_module` units compile on push.
+   **[landed — §22 `Jit.invoke`]** A guest's `Jit.invoke` now runs the submitted unit on **emitted
+   wasm** in the browser instead of the interpreter. The seam mirrors the threads tier-up: the
+   resumable `Vcpu` already surfaces `VcpuEvent::JitInvoke { code, argv, params, results }` (the
+   host, not the engine, runs the unit), so the only new engine surface is
+   `Vcpu::deliver_jit_invoke_vals(&[i64])` / `deliver_jit_invoke_trap` — the alternative to
+   `deliver_jit_invoke` (which interprets the unit) for a host that ran it on wasm. In the browser
+   the run's single §22 unit is emitted once (`compile_module_mixed_entry`, shared memory) at
+   `svm_par_powerbox_jit_codegen` setup and each Worker instantiates its own instance
+   (`svm_par_enable_jit_codegen`, per-instance — the emitted bytes aren't a reliably-shared static
+   across Workers, same reason each Worker computes its own tier-up bitmap); `svm_par_run` surfaces
+   `PAR_JIT_INVOKE` (codegen on, all-i64 unit sig — the marshalling ABI restriction tier-up also
+   holds) and the Worker runs the emitted `f{entry}(win, env, …args)` over the shared window. **This
+   is Model A** (the unit is reached through the host, never installed in the shared `call_indirect`
+   table, so the Spectre-safe table mask never moves — DESIGN.md §22). Authority still resolves
+   through the powerbox before the invoke surfaces (a forged/cross-domain handle traps identically).
+   Proofs: `crates/svm/tests/vcpu_jit_codegen.rs` (the external-result seam on the resumable `Vcpu`,
+   value + trap parity vs the interpreter), `browser/jitcodegen.mjs` (single-vCPU FFI + emitted-unit
+   path, interp vs codegen both 142), the Node twin `threads-spawn.mjs SVM_JIT_CODEGEN=1` (8 Workers
+   each `Jit.invoke` on emitted wasm → 1136, = interp, non-vacuity-counted), and the **Chromium**
+   `#jitcodegen` page item (same across real Web Workers → 1136, 8 units ran on emitted wasm).
+   **Deferred (documented):** `install` + `call_indirect` (Model B2 — an installed unit *is* a
+   funcref old code dispatches to; needs cross-instance wasm-table population), guest-**compiled**
+   units (the guest builds IR at runtime — needs the emitted bytes to cross Workers with the code
+   handle, a shared registry with synchronization), i32/float unit signatures (JS type marshalling),
+   and §14 `instantiate_module` compile-on-push.
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

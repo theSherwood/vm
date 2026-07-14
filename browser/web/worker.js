@@ -12,11 +12,11 @@ const STACK = 1 << 20; // per-Worker stack
 const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 // Event codes — must match browser/src/lib.rs PAR_*.
-const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7;
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8;
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell } = e.data;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen } = e.data;
   const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -51,6 +51,27 @@ self.onmessage = async (e) => {
     });
     emitted = emod.exports;
     envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes())); // fuel counter + cross-tier scratch
+  }
+
+  // §22 guest-JIT real codegen (BROWSER.md slice 5): the run's single §22 unit was emitted + stashed
+  // once at powerbox setup (svm_par_powerbox_jit_codegen); every Worker instantiates its own instance
+  // against the ONE shared memory. On PAR_JIT_INVOKE this Worker runs the emitted `f0(win, env, args)`
+  // instead of the interpreter. A `new WebAssembly.Module`/`Instance` here is synchronous (the unit is
+  // small) so it needs no await inside the event loop.
+  let jitUnit = null, jitEnvCell = 0;
+  if (jitCodegen && ex.svm_par_enable_jit_codegen() === 1 && ex.svm_par_jit_unit_wasm_len() > 0) {
+    const wptr = Number(ex.svm_par_jit_unit_wasm_ptr()), wlen = ex.svm_par_jit_unit_wasm_len();
+    const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    const umod = new WebAssembly.Module(bytes);
+    const uinst = new WebAssembly.Instance(umod, {
+      env: {
+        memory,
+        trap: () => {},
+        call_interp: (f, argsPtr) => { if (ex.svm_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
+      },
+    });
+    jitUnit = uinst.exports;
+    jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
   }
 
   const v = role === 'root'
@@ -183,6 +204,26 @@ self.onmessage = async (e) => {
         ex.svm_par_deliver_tierup(v, rptr, rets.length);
       } catch {
         ex.svm_par_deliver_tierup_trap(v);
+      }
+      continue;
+    }
+    if (evc === JIT_INVOKE) {
+      // §22 guest-JIT real codegen: the guest `Jit.invoke`d a unit — run the emitted unit's
+      // `f0(win, env, ...i64 args)` over the shared window instead of the interpreter, then deliver
+      // its i64 result slots. A trap throws and surfaces as a vCPU trap (as an interp invoke would).
+      const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
+      const args = [];
+      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
+      new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
+      if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted invokes (non-vacuity)
+      try {
+        const ret = jitUnit['f0'](win, jitEnvCell, ...args);
+        const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+        const rptr = Number(ex.svm_par_alloc(Math.max(1, rets.length) * 8));
+        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+        ex.svm_par_deliver_jit_invoke(v, rptr, rets.length);
+      } catch {
+        ex.svm_par_deliver_jit_invoke_trap(v);
       }
       continue;
     }
