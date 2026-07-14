@@ -1093,6 +1093,24 @@ membership) pinned it immediately.
   digest write — the on-ramp scalarizes vector `ctpop`/min/max but not yet vector `bswap`), the next
   slice.
 
+**Slice BX (DONE) — vector `llvm.bswap`; the Postgres module now translates end-to-end.** A 128-bit
+vector byte-swap (`<4 x i32>`) reverses the bytes **within each lane** (element-wise, not across the
+register). There is no native vector byte-swap op, so scalarize exactly like vector `ctpop`: explode the
+lanes, reverse each with the scalar `emit_bswap`, repack via `build_v128_from_lanes`. One arm in the
+vector-intrinsic dispatch (an `i8x16` shape is the identity, but `emit_bswap(nbytes=1)` handles it
+harmlessly). Test `vector_bswap_128`: a hand `.ll` (a `-O2` bswap loop over-vectorizes to `<16 x i32>`,
+which is a *separate* wide-vector-type gap) whose inputs `0x0N000000` byte-swap to lane `N`, folded
+`e0*1000 + e1*100 + e2*10 + e3` = 1234 (asymmetric — a swapped byte or lane order fails); 1234 on interp
++ JIT. **293 translate tests green, fmt + clippy clean.**
+
+**★ Milestone:** this was the *last translate gap*. The whole Postgres backend — **832 modules /
+14 985 functions** — now translates through the on-ramp with `--stub-externs`, no fail-closed. The
+remaining step to a *verified* module: after `svm_ir::resolve_imports` binds the 4 powerbox caps
+(`read`/`write`/`exit`/`vm_map` → `cap.call`), `svm-verify` reports one **`TypeMismatch`** (an `i32` fed
+where `i64` is expected) in `ExecRenameStmt` — a translator correctness bug, the next slice. (Before
+that resolve step a raw `CallImport` is expected and correctly rejected by the verifier §7.) Then the
+**runtime** (initdb data dir + `fs` cap, storage manager, WAL, single-process shmem, catalog bootstrap).
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

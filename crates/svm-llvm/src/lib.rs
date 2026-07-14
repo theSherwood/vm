@@ -13057,12 +13057,27 @@ fn lower_int_intrinsic(
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
         }
+        // Per-lane byte-swap. A vector `bswap` reverses the bytes **within each lane** (element-wise,
+        // not across the whole register), and there is no native vector op, so scalarize: explode the
+        // lanes, reverse each with the scalar `emit_bswap`, repack. Found in Postgres' `pg_sha256_final`
+        // (the big-endian digest write). An `i8x16` shape is the identity (1-byte lanes) — clang never
+        // emits it — but `emit_bswap(nbytes=1)` handles it harmlessly.
+        if base == "llvm.bswap" {
+            let lane_ty = int_ty(shape.lane_val())?;
+            let lane_bytes = shape.lane_bytes() as u64;
+            let lanes = vec_explode(ctx, args[0], types, false)?;
+            let mut out = Vec::with_capacity(lanes.len());
+            for &l in &lanes {
+                out.push(emit_bswap(ctx, l, lane_ty, lane_bytes));
+            }
+            return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
+        }
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
             "llvm.smin" => svm_ir::VIntBinOp::MinS,
             "llvm.umax" => svm_ir::VIntBinOp::MaxU,
             "llvm.umin" => svm_ir::VIntBinOp::MinU,
-            other => return unsup(format!("vector `{other}` (only min/max or ctpop)")),
+            other => return unsup(format!("vector `{other}` (only min/max, ctpop, or bswap)")),
         };
         let a = ctx.operand(args[0])?;
         let b = ctx.operand(args[1])?;
