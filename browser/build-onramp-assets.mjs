@@ -77,6 +77,15 @@ try {
   console.log(`  ✗ bounce: ${e.message}`);
 }
 
+// 1d) life — Conway's Game of Life over a malloc heap ABOVE the mapped window: the reactor must
+//     persist the guest's whole memory (heap included) between frames or the glider freezes. The
+//     heap-persistence proof Doom's zone allocator needs.
+try {
+  buildC('life', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'life.c'));
+} catch (e) {
+  console.log(`  ✗ life: ${e.message}`);
+}
+
 // 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
 //    from **stdin** and runs it against an in-memory database, printing each statement's result table.
 //    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +

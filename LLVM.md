@@ -2067,13 +2067,26 @@ phases, both worth doing:
      First guest: `crates/svm-run/demos/display/bounce.c` (a box you steer with the arrow keys).
      Verified deterministically (`browser/tests/reactor.rs`, exact per-pixel box positions + input
      response across frames) and end-to-end in real Chromium (`browser-test.mjs`: the box animates and
-     the arrow keys steer it). **Caveat carried to slices 3–4:** persistence covers only the low
-     `SNAP_CAP` window (globals/BSS); a grown `malloc` heap above it is **not** persisted yet — the
-     same slice-1 reactor scope as `svm-run`, and the reason Doom (heavy zone-malloc + a ~256 KB
-     320×200 framebuffer) needs the heap-persistence follow-on before it can hold state across frames.
-  3. **doomgeneric headless differential** — doomgeneric + shareware WAD (via the `fs` cap) through
+     the arrow keys steer it). (Slice 2 persisted only the low `SNAP_CAP` window — see slice 3a, which
+     lifted that limit.)
+  3a. **Full-window reactor persistence** — **DONE (slice BP).** Slice 2's snapshot round-trip
+     persisted only the low 256 KiB (`SNAP_CAP`) and — decisively — `Mem::seed` clamps writes to the
+     `mapped` boundary, so a `vm_map`-grown heap (which lives *above* `mapped`, where Doom's zone
+     allocator sits) could **never** be round-tripped back. Fixed with a genuinely persistent instance:
+     **`bytecode::Reactor`** (`crates/svm-interp/src/bytecode.rs`) holds the guest `Mem` **live** across
+     calls — globals, BSS, **and** the grown heap all persist for free because the window is never torn
+     down. It calls the private `run` per frame with a cheap fresh `Domain` over the shared compiled
+     source (an `Arc` clone); host caps are serviced inline, so I/O guests work. `OnrampReactor` now
+     wraps it (the `snap` round-trip is gone). Proof: `crates/svm-run/demos/display/life.c` — Conway's
+     Game of Life with its grid in the **malloc heap above the mapped window**; the glider only advances
+     if that heap persists. Deterministic (5 live cells throughout, translating (+1,+1) every 4
+     generations) — asserted in `browser/tests/reactor.rs` + a `svm-interp` unit test
+     (`tests/reactor.rs`, a counter at 293 KiB climbing across calls) + real Chromium (`browser-test.mjs`
+     watches the glider advance). This unblocks Doom's memory footprint.
+  3b. **doomgeneric headless differential** — doomgeneric + shareware WAD (via the `fs` cap) through
      the on-ramp; run headless with a frame-hashing sink, byte-exact vs native `cc` over the first N
-     frames. The correctness proof before browser wiring.
+     frames. The correctness proof before browser wiring. (Now standing on a reactor that holds Doom's
+     full memory.)
   4. **Doom in the playground** — wire `doomgeneric.svmb` + `doom1.wad` + canvas + keyboard into
      `play.js`; build/deploy via `pages.yml`.
 - **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust

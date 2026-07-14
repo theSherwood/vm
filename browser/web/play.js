@@ -320,6 +320,16 @@ block0(v0: i64):
       'blitting the frame it presents through `display`. State persists between frames. This is the ' +
       'interactive per-frame loop + input path Doom rides. Click Stop to end the loop.',
   },
+  'life (Conway — heap persistence)': {
+    kind: 'reactor',
+    url: './assets/life.svmb',
+    mode: 'io',
+    desc: 'crates/svm-run/demos/display/life.c — Conway’s Game of Life. Its cell grid lives in the ' +
+      'malloc heap (which the on-ramp grows above the mapped window — exactly where Doom’s allocator ' +
+      'will sit). Each tick computes the next generation from the current one, so the glider only ' +
+      'advances if the reactor persists the guest’s whole memory (heap included) between frames. ' +
+      'Click Run to watch it evolve; Stop to end. This is the heap-persistence proof Doom needs.',
+  },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
     editable: true,
