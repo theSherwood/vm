@@ -44,15 +44,35 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 let failed = false;
 try {
   const page = await browser.newPage();
+  // Keep the pageerror texts (not just print them): I22 is a rare flake where a worker vCPU's
+  // `svm_par_run` takes an uncaught host wasm trap (`memory access out of bounds`, or `unreachable`
+  // from a panic=abort engine panic). The rejection never reaches the page, so the item hangs
+  // `pending` and the wait below times out — with no clue which check tripped. On timeout we dump
+  // both the still-`pending` items and these captured messages so the next recurrence self-identifies.
+  const pageErrors = [];
   page.on('console', (m) => console.log(`  [page] ${m.text()}`));
-  page.on('pageerror', (e) => console.log(`  [pageerror] ${e.message}`));
+  page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
+  const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup'];
   // Wait until every work item leaves 'pending' (or time out).
-  await page.waitForFunction(
-    () => ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup'].every((id) => document.getElementById(id).dataset.status !== 'pending'),
-    { timeout: 30_000 },
-  );
+  try {
+    await page.waitForFunction(
+      (ids) => ids.every((id) => document.getElementById(id).dataset.status !== 'pending'),
+      WORK_IDS, { timeout: 30_000 },
+    );
+  } catch (e) {
+    // Timed out ⇒ ≥1 item never left 'pending' (the I22 hang signature). Report which, plus the
+    // uncaught pageerror(s) that most likely caused it, before re-throwing into the outer handler.
+    const statuses = await page.evaluate(
+      (ids) => ids.map((id) => ({ id, status: document.getElementById(id)?.dataset.status ?? 'missing' })),
+      WORK_IDS,
+    );
+    const stuck = statuses.filter((s) => s.status === 'pending').map((s) => s.id);
+    console.log(`  [timeout] items still pending: ${stuck.join(', ') || '(none)'}`);
+    console.log(`  [timeout] uncaught pageerror(s): ${pageErrors.length ? pageErrors.join(' | ') : '(none captured)'}`);
+    throw e;
+  }
 
   const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
   const isolated = await read('isolated');

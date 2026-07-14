@@ -63,7 +63,35 @@ self.onmessage = async (e) => {
   const handles = []; // local spawn handle (index) → child completion slot ptr
 
   for (;;) {
-    const evc = ex.svm_par_run(v);
+    // I22 hang site. A host wasm trap escaping `svm_par_run` — `memory access out of bounds`, or
+    // `unreachable` from a panic=abort engine panic — unwinds into this async `onmessage`, rejecting
+    // it. A Worker's unhandled rejection does NOT fire `Worker.onerror` on the page, so par.js's
+    // promise would never settle: the vCPU's DOM item would sit `pending` until the harness's 30s
+    // `waitForFunction` times out (the silent-flake signature). Convert it into a structured failure —
+    // wake any joiner (a non-root vCPU's completion slot) so a parent's `Atomics.wait` doesn't
+    // cascade-hang, then report `fail` with the trap text so the page/harness self-identifies.
+    let evc;
+    try {
+      evc = ex.svm_par_run(v);
+    } catch (err) {
+      if (role !== 'root') {
+        const iv = new Int32Array(memory.buffer);
+        Atomics.store(iv, slot >> 2, 2); // 2 = trapped
+        Atomics.notify(iv, slot >> 2);
+      }
+      let why = `vcpu ${role} host trap: ${err && err.message ? err.message : err}`;
+      // If the trap was a panic=abort engine panic (surfaces as `unreachable`), the Rust panic hook
+      // stashed FILE:LINE + message; the trap left memory intact, so read it back here (I22 (a)).
+      try {
+        const plen = ex.svm_par_last_panic_len ? ex.svm_par_last_panic_len() : 0;
+        if (plen > 0) {
+          const p = Number(ex.svm_par_last_panic_ptr());
+          why += ` | panic: ${new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + plen))}`;
+        }
+      } catch { /* accessor absent (older build) or read failed — the trap text alone still ships */ }
+      self.postMessage({ kind: 'fail', why });
+      return; // don't svm_par_free(v): the instance just trapped; the page terminates this Worker
+    }
     if (evc === DONE) {
       const value = ex.svm_par_ev_a(v); // i64 → BigInt
       i64()[(slot + 8) >> 3] = value; // publish result...

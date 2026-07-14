@@ -241,6 +241,96 @@ makes a rare interleaving surface" family, not a codegen or verifier defect.
    passes locally as a flake and re-run the job; consider making `real-browser` non-gating only as a
    last resort (it is the sole real-Chromium proof, so keep it gating if at all possible).
 
+**Sighting update (2026-07-13 CI-flakiness detection, runs Jul 2–13).** This is the **most frequent
+flake in the window** — **4 occurrences in 5 days** (Jul 8–12), all on the `real-browser` job's
+"Build threads module + run in Chromium" step, each a `[pageerror] …` followed by `FAIL:
+page.waitForFunction: Timeout 30000ms exceeded` (exit 1). Three were PR re-runs that **failed on
+attempt 1 and passed unchanged on attempt 2** — the textbook flake signature — and one struck the
+nightly `schedule` lane (which is never re-run, so it just sat red):
+
+- run **28973194295** att1 (Jul 8, PR, `claude/charming-johnson-pmlsnr`) — `memory access out of bounds`; att2 green.
+- run **29042617187** att1 (Jul 9, PR, `claude/peaceful-lamport-vuz65e`) — `memory access out of bounds`; att2 green.
+- run **29048631247** att1 (Jul 9, PR #229, above) — `memory access out of bounds`; att2 green.
+- run **29186787532** (Jul 12, **nightly on `main`**) — **`[pageerror] unreachable`**, same timeout; sat red (nightly is not re-run). `real-browser` was green on the Jul 9/10/11/13 nightlies, so this is non-deterministic, not a regression.
+
+**New information vs. the original report:** (a) the page-error is **not OOB-only** — the Jul 12
+nightly tripped a wasm **`unreachable`** trap with the identical downstream symptom, so the entry's
+"out-of-bounds" framing should be read as *"any guest trap surfaced via `pageerror`"* (consistent
+with the stale-view/grow-detach hypothesis: a Worker reading through a detached view can land on any
+trap, not just OOB). (b) It now hits the **nightly `main` lane**, not just PRs. (c) Frequency is high
+enough (3 of the window's PR-blocking re-runs, plus a red nightly) that although each incident is
+S4, `real-browser` is now a **recurring gating-flake** worth prioritising fix-sketch step 1 (capture
+the failing check id + `RuntimeError` on `pageerror`) — the attempt-1 diagnostics are still rolling
+off before anyone can pin the check, exactly as noted above, so we still cannot say which on-page
+assertion trips.
+
+**Investigation (2026-07-14): the failure mechanism, and why we can't tell which check.** Traced the
+page glue. Two facts pin the mechanism:
+- Every one of the 7 index-page items (`web/main.js`) runs inside a `try { … } catch { set(id,
+  'fail', …) }`, so a trap on the **page** thread produces a clean `fail`, never a `pending` timeout.
+  The observed symptom is always a **timeout** (an item stuck `pending`) ⇒ the trap is in a **Worker**.
+- In `web/worker.js` the vCPU event loop called `ex.svm_par_run(v)` with **no guard**. A host-level
+  wasm trap there — `memory access out of bounds`, or `unreachable` (which is what a `panic=abort`
+  engine panic lowers to, matching the Jul 12 `[pageerror] unreachable` variant) — unwinds into the
+  `async onmessage`, rejecting it. **A Worker's unhandled promise rejection does not fire
+  `Worker.onerror` on the page**, so `par.js`'s per-vCPU promise never settles: `main.js`'s `await
+  run(...)` hangs, the item sits `pending`, and the harness's 30 s `waitForFunction` times out with
+  only a bare `[pageerror]` and no check id. (The tier-up call one branch over *is* already
+  `try/catch`-wrapped → `svm_par_deliver_tierup_trap`, which is why tier-up traps report cleanly —
+  confirming the unguarded `svm_par_run` as the escape.)
+
+So I22 is **two problems**: (a) a rare shared-memory race in the engine that makes `svm_par_run`
+occasionally trap/panic under a loaded runner (the deep root cause — still open, needs a captured
+instance), and (b) a **diagnostics/robustness gap** that turns (a) into a silent, unattributable 30 s
+hang — which is precisely why the fix-sketch's "capture first" has never had anything to capture.
+
+**Landed (2026-07-14, first step — targets (b), the capture gap; low-risk, glue-only, no TCB):**
+- `web/worker.js`: guard the `svm_par_run(v)` call. On a host trap, wake any joiner (store `2`=trapped
+  into a non-root vCPU's completion slot + `Atomics.notify`, so a parent's `Atomics.wait` doesn't
+  cascade-hang) and `postMessage({kind:'fail', why})`. `par.js` already maps `fail` → promise reject
+  → `main.js` marks the item `fail` **with the trap text**, converting the silent hang into a named,
+  diagnosable failure.
+- `browser-test.mjs`: retain the `pageerror` texts and, on the first `waitForFunction` timeout, dump
+  **which items are still `pending`** plus the captured pageerror(s) before failing — so even a hang
+  that slips past the guard self-identifies the stuck check.
+
+These do not change the passing path and cannot fix the underlying race; they make the **next**
+recurrence name the check + carry the `RuntimeError`, which is the prerequisite for root-causing (a).
+Not yet exercised in a real browser here (needs the `-Z build-std` threads wasm + Chromium); the
+next CI `real-browser` failure — or a local threads build — is the validation.
+
+**Root-cause (a) — investigation so far (2026-07-14).** Working the engine side (`browser/src/lib.rs`):
+
+- **The `unreachable` variant is an engine *panic*, not a masked guest trap.** The crate is
+  `panic = "abort"` (`browser/Cargo.toml`), which lowers every Rust panic to a wasm `unreachable`.
+  So the Jul 12 nightly's `[pageerror] unreachable` is an engine-internal invariant violation
+  (`unwrap`/slice-index/`debug_assert`) hit under a concurrent interleaving — a *different, more
+  informative* signal than the `memory access out of bounds` variant (a corrupted/racy pointer or
+  index producing an actual OOB linear-memory access). Both point at **shared mutable engine state**
+  touched by `svm_par_run` while other Worker vCPUs run over the one shared memory.
+- **The shared allocator is a *deprioritised* lead.** `svm_par_alloc` is just the Rust global
+  allocator (`std::alloc::alloc_zeroed`, 16-aligned), whose dlmalloc control block lives in the
+  shared linear memory — so concurrent allocs from different Worker instances *could* race. But
+  THREADS.md 4b explicitly states "the thread-safe shared allocator was de-risked by 4b", and the
+  demo passes thousands of times, so this is not the prime suspect without evidence. Candidate shared
+  state to audit first is the cross-Worker engine bookkeeping reached from `svm_par_run`: the §22
+  `Domain`/`ModuleSource`, the 4d `Mutex<Host>` powerbox, the completion-slot/join protocol, and the
+  tier-up cross-instance state — anywhere a rare ordering leaves an index/pointer inconsistent.
+- **Can't go further without a captured instance.** The precise panic site / OOB offset has never
+  been captured (attempt-1 logs roll off; a bare `unreachable` carries no location). That is the gate.
+
+**Landed (2026-07-14, second step — the capture enabler for (a); diagnostic-only, native-compiled):**
+`browser/src/lib.rs` installs a **panic hook** (once, wasm-only via `cfg(target_arch = "wasm32")`, so
+native/`#[should_panic]` test output is untouched) that formats the panic's `FILE:LINE:COL` + message
+into a static buffer in linear memory, exposed by `svm_par_last_panic_ptr()`/`svm_par_last_panic_len()`.
+A wasm `unreachable` unwinds to the host but leaves memory intact, so `worker.js`'s new trap handler
+reads the buffer **after** catching the trap and appends `| panic: panicked at FILE:LINE: MESSAGE` to
+the `fail` reason. Net effect: the next `unreachable` recurrence reports the **exact Rust source
+location** instead of a bare `unreachable`, turning (a) from "unobservable" into "one recurrence away
+from a stack-precise fix". Compiles natively under `-D warnings`; **not** yet exercised on the wasm
+threads build (same validation path as the first step). The hook is alloc-free (formats into a stack
+buffer); the accessors are read-only.
+
 ---
 
 ### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
@@ -639,6 +729,28 @@ machine-portable signal the baseline header itself calls the tracked one) still 
 pending:** regenerate `baseline.txt` on the designated bench machine so the five MISSING kernels
 (`simd`, `float`, `calli`, `cache`, `irreducible`) get rows — MISSING never gated, but those
 kernels currently have no regression tracking at all.
+
+**Follow-up (2026-07-13 CI-flakiness detection): the bench lane is now red for a *different*,
+deterministic reason — the `--tol` landing above never runs.** Since the Jul 10 nightly the `bench`
+job fails **before executing any benchmark**, at the `cargo run` invocation itself:
+
+```
+error: `cargo run` could not determine which binary to run. Use the `--bin` option to specify a
+binary, or the `default-run` manifest key.
+available binaries: bench-vs-wasmtime, confine
+```
+
+Observed every night Jul 10–13 (runs 29086218690, 29146664268, 29186787532, 29242756076). Root
+cause: PR #225 (`bench: reliable confinement-cost harness`, merged Jul 9) added a **second** binary
+`bench/src/bin/confine.rs` alongside the existing `[[bin]] bench-vs-wasmtime` (`src/main.rs`). The
+`ci.yml` bench step runs a bare `cargo run --release -- --check baseline.txt --tol 0.4` with no
+`--bin`, and the crate has no `default-run`, so cargo now refuses. This is **deterministic, not a
+flake** — but it fully **masks I17**: the lane dies before it can print any ratio, so neither the
+cold/wasmtime info-only rows nor the gating compute ratios are produced (the Jul 9 nightly, the last
+before #225, was the window's only fully-green nightly). Non-gating (`continue-on-error`), so it
+doesn't block merges, but the nightly perf signal is currently dead. **Fix (one line):** add
+`default-run = "bench-vs-wasmtime"` to `bench/Cargo.toml`'s `[package]`, or pass
+`--bin bench-vs-wasmtime` in the `ci.yml` bench step.
 
 ---
 
