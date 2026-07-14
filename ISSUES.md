@@ -45,45 +45,6 @@ I21**: that is a bulk-op span *overrunning* `mapped`; this is a small in-bounds 
 address/bounds computation (svm-llvm mistranslation vs svm-jit lowering). The five shipping workloads
 avoid the trigger, so `rustbench` runs green; re-enable `bfs` once fixed.
 
-### I21 — JIT bulk-memory ops diverge from the interpreter on spans overrunning `mapped` inside the reservation (S2) — found by the SPEC.md slice-5 window-model suite (2026-07-14)
-
-**Where:** `svm-jit`'s D62 bulk lowering — `confine_span` + the `memcpy`/`memmove`/`memset`
-libcall path — vs the interpreter's `Mem::mem_copy`/`mem_fill` (`confine_span` **then**
-`check_prot_span` before any write).
-
-**Symptom (probed on a page-aligned `mapped` window under the default large reservation):**
-
-| case | interp/bytecode | JIT |
-|---|---|---|
-| `mem.copy`/`mem.move` `dst==src`, `len` overruns `mapped` | `MemoryFault`, window untouched | **`Returned`** — the trap is lost |
-| `mem.fill`/`mem.copy`, `dst` span overruns `mapped` | `MemoryFault`, window untouched | `MemoryFault`, but with **partial writes** (the in-`mapped` prefix is modified) |
-
-**Root cause.** D62's explicit span check bounds against **`reserved`** (`len > reserved ||
-ptr > reserved − len`), delegating the `[mapped, reserved)` distinction to the guard region via
-the libcall's own accesses. That works only if the libcall actually touches the overrunning
-bytes: (1) libc `memcpy`/`memmove` **short-circuit `dst == src`**, so a self-copy whose span
-overruns `mapped` never faults at all — a guest-visible interp↔JIT divergence in *which inputs
-trap* (the §18 escape-oracle observable; the existing generative differential misses it because
-its memory oracle only byte-compares **completing** runs, and `irgen` rarely lands `dst == src`
-with an only-just-oversized `len`). (2) The libcall writes a prefix before hitting the guard,
-so the faulting-run window differs from the interpreter's fault-before-any-write.
-
-**Not an escape:** every access stays within `[0, reserved)`; production guard pages still
-confine. This is a parity/totality break (§3 "three backends, one observable behavior"), not a
-confinement break.
-
-**Fix sketch (needs a design decision — this is the confinement hinge, AGENTS.md):** either
-(a) have the bulk lowering validate the span against the **current backed extent** before the
-libcall (the interp's `check_prot_span` analogue — e.g. a page-stride touch loop or a runtime
-helper; costs the D62 hot path something, could be gated on the rare `dst == src` case for
-(1) only), or (b) declare the interp's semantics authoritative and re-lower bulk ops through a
-checked runtime helper, or (c) amend §3b/D62 to define bulk-op traps as
-"fault-at-first-untouchable-byte with unspecified prefix writes" and make the interpreter match
-(then `dst == src` still needs (a)'s narrow fix — losing the trap outright can't be spec'd
-away). Until fixed, the slice-5 spec suite (`crates/svm/tests/spec_mem.rs`) pins interp +
-bytecode fully and **skips only the JIT leg** of bulk vectors whose span falls in the
-`(mapped, reserved]` guard hole — grep `I21` there.
-
 ### I3 — Windows CI memory-pressure aborts under `cargo test --workspace` (S3) — **FIX LANDED & MERGED** (audit PRs, 2026-07-08); **holding** — green on all 6 post-fix nightlies (Jul 9–14), not yet proven eliminated (see Confirmation below)
 
 **Where:** `crates/svm/tests/durable_jit.rs::freeze_thaw_cross_backend_over_generated_modules`
@@ -265,7 +226,12 @@ likely-resolved. Downgrade to close only after a longer clean window (or a captu
 
 ---
 
-### I21 — Rare macOS-CI `Bus error: 10` (SIGBUS) at a test-binary launch under `cargo test --workspace` (S4)
+### I24 — Rare macOS-CI `Bus error: 10` (SIGBUS) at a test-binary launch under `cargo test --workspace` (S4)
+
+<!-- Renumbered from I21 → I24 (2026-07-15): the I21 number was already held by the
+     bulk-memory divergence (now Resolved, below), and I23 is the rustc-bitcode
+     miscompile above; this entry collided, so it takes the next free id, I24. -->
+
 
 **Where:** `build · test (macos-latest)`. Observed on PR #202 (run 28986379444, a durable
 nested-freeze `svm-interp`/`svm-snapshot` change): after `tests/c_frontend.rs` passed 71/71, the
@@ -1079,6 +1045,35 @@ should be lifted; until then this is what Windows/macOS are **not** testing.
 ---
 
 ## Resolved
+
+### I21 — JIT bulk-memory ops diverge from the interpreter on spans overrunning `mapped` inside the reservation (S2) — **fixed** (2026-07-15) — found by the SPEC.md slice-5 window-model suite
+
+**Was:** `svm-jit`'s D62 bulk lowering (`confine_span` + the `memcpy`/`memmove`/`memset` libcall)
+only bounded the span against **`reserved`**, delegating the `[mapped, reserved)` guard hole to
+the libcall's own accesses. That leaked two interp↔JIT divergences (§3 parity, **not** an escape —
+every byte stayed in `[0, reserved)`): (1) libc `memcpy`/`memmove` **short-circuit `dst == src`**,
+so a self-copy overrunning `mapped` never faulted (the trap was *lost*); (2) the libcall wrote a
+prefix before hitting the guard, so a faulting run differed from the interpreter's
+fault-before-any-write. The interpreter's `Mem::check_prot_span` validates every page up front, so
+it faulted correctly in both cases.
+
+**Fix (`probe_span`, `svm-jit`):** before each bulk libcall, emit a guarded 1-byte read of each
+span's **last** byte (`confine_span` base `+ len − 1`, guarded by `len != 0`). It faults
+`MemoryFault` on the `PROT_NONE` guard exactly where the interpreter faults — **up front** (no
+partial write) and **independent of the `dst == src` short-circuit**. The probe reads the *live*
+page tables (a guard-page access), so it honors guest `grow` — unlike the compile-time
+`Lower::mapped`, an explicit compare against which would over-fault a grown window. For the
+contiguous backed prefix (the production model + the spec window) last-byte-in-bounds ⟺
+whole-span-in-bounds, matching the interpreter's own `last < mapped` fast path. The slice-5 spec
+suite (`crates/svm/tests/spec_mem.rs`) drops its JIT-leg carve-out and now pins the JIT window on
+**faulting** runs too (untouched), byte-identical to the interpreters across the full boundary
+lattice.
+
+**Residual (documented, narrow):** a bulk op whose span straddles a guest-created **interior**
+hole (`unmap`) or a read-only page mid-span is not caught by a last-byte *read* probe — the same
+contiguity boundary the interpreter's fast path assumes. Left to a per-page probe loop if a real
+workload ever needs bulk ops over a deliberately-punched window; not reachable from the spec
+window or any current corpus.
 
 ### I5 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — **resolved** (windows-latest confirmed green)
 
