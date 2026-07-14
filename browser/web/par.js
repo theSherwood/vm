@@ -50,13 +50,16 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, inst = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, inst = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null } = {}) {
     const gptr = ex.svm_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
+    // §22 real-codegen run: like `jit`, but the host-compiled unit's wasm is emitted + stashed, and a
+    // guest `Jit.invoke` runs it on emitted wasm (each Worker instantiates the unit — see worker.js).
+    if (jitCodegen && ex.svm_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox_jit_codegen failed');
     if (io && ex.svm_par_powerbox_io() !== 1) throw new Error('svm_par_powerbox_io failed');
-    if (!jit && !io && !inst) ex.svm_par_powerbox_none();
-    const prog = jit ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
+    if (!jit && !jitCodegen && !io && !inst) ex.svm_par_powerbox_none();
+    const prog = (jit || jitCodegen) ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
     if (prog === 0) throw new Error('module unsupported on the parallel driver (svm_par_compile null)');
     const win = ex.svm_par_alloc(winSize);
     if (inst) {
@@ -104,7 +107,7 @@ export function makeRunner({ module, memory, ex }) {
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
           // `tierup` + the guest bytes (kept live at `gptr` for the run) let each Worker JIT-compile
           // the guest locally and run eligible compute regions on the emitted wasm (threads slice).
-          w.postMessage({ module, memory, prog, win, winSize, tierup, gptr, glen: guest.length, tierupCell, ...cfg });
+          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, gptr, glen: guest.length, tierupCell, ...cfg });
         };
         // The root vCPU runs on its own Worker (the page can't Atomics.wait).
         const rootSlot = ex.svm_par_alloc(SLOT);
