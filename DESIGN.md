@@ -458,13 +458,18 @@ security — UB in a sandbox IR would void the escape guarantee.
 ### Instruction set (MVP)
 - **Constants:** `i32.const i64.const f32.const f64.const`.
 - **Integer arithmetic** (i32/i64): `add sub mul` (two's-complement **wrap**),
-  `div_s div_u rem_s rem_u` (**trap** on /0; `div_s`/`rem_s` trap on INT_MIN/−1),
+  `div_s div_u rem_s rem_u` (**trap** on /0; `div_s` traps on INT_MIN/−1 — `rem_s`
+  does **not**: only the quotient overflows there, the remainder 0 is representable,
+  so it returns 0, wasm-identical — as both backends and `svm-spec` pin),
   `and or xor shl shr_s shr_u rotl rotr` (shift amount mod bitwidth), `clz ctz
   popcnt`.
 - **Integer compare** (→ i32 0/1): `eq ne lt_s lt_u le_s le_u gt_s gt_u ge_s ge_u
   eqz`.
 - **Float arithmetic** (f32/f64, IEEE 754, no traps): `add sub mul div sqrt min max
-  abs neg ceil floor trunc nearest copysign`.
+  abs neg ceil floor trunc nearest copysign fma` (`min`/`max` are wasm-identical:
+  NaN-propagating, with `-0 < +0` — *not* IEEE minNum; `nearest` rounds ties to
+  even; `fma` is the correctly-rounded fused multiply-add; `abs`/`neg`/`copysign`
+  are pure sign-bit ops, defined on NaN too — all pinned by `svm-spec`).
 - **Float compare** (→ i32): `eq ne lt le gt ge`.
 - **Conversions:** `i64.extend_i32_s/u`, `i32.wrap_i64`, `extend8_s/extend16_s/
   extend32_s` (the narrow sign-extends — *defined here + in `svm-ir`, the interpreter, **and the JIT**

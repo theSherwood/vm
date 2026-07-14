@@ -320,6 +320,52 @@ block0(v0: i64):
   } catch (e) {
     set('tierup', 'fail', `tierup: error ${e}`);
   }
+
+  // --- 8) §22 guest-JIT **real codegen** across real Web Workers (BROWSER.md § "wasm-JIT tier", slice 5) --
+  // The guest holds a `Jit` cap + a host-compiled unit and `cap.call`s invoke; each worker runs the
+  // submitted unit on EMITTED WASM on its own Worker (`svm_par_powerbox_jit_codegen` emits it at setup)
+  // instead of the interpreter. Run the all-i64 invoke kernel BOTH ways: interp (`jit: true`) and
+  // codegen (`jitCodegen: true`). Both must return 1136, and codegen must actually run the emitted unit
+  // (counter > 0) — the §22 analogue of the tier-up proof, one tier deeper (guest-loaded code, not a
+  // static function). `install`/`call_indirect` (Model B2) + guest-compiled units stay on the interp.
+  try {
+    const guest = await fetchBytes('/corpus/threads_jit_invoke_i64.svmbc');
+    const t0 = performance.now();
+    const codegen = await run(guest, { jitCodegen: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    // Ground truth 1136 (= the interpreter, differential-checked in the Node twin threads-spawn.mjs
+    // SVM_JIT vs SVM_JIT_CODEGEN); here we also require the seam actually fired (units ran on wasm).
+    const ok = codegen.value === 1136n && codegen.tierups > 0;
+    set('jitcodegen', ok ? 'pass' : 'fail',
+      `jitcodegen: ${codegen.started} Workers each Jit.invoke a unit on emitted wasm → ${codegen.value} ` +
+      `(want 1136, ${codegen.tierups} units ran on emitted wasm) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`jitcodegen → ${codegen.value} with ${codegen.tierups} emitted invokes across ${codegen.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('jitcodegen', 'fail', `jitcodegen: error ${e}`);
+  }
+
+  // --- 9) §14 instantiate_module **real codegen** across real Web Workers (BROWSER.md slice 5) ------
+  // The root `instantiate_module`s a granted unit 8× as confined children (each its own Worker + carve).
+  // With codegen, a child whose unit entry is fully in-subset runs it on EMITTED WASM (the unit
+  // "compiles on push") instead of a confined vCPU — reading the "K"=75 the parent materialized into its
+  // carve → 8 × 75 = 600. Run it BOTH ways: interp (`inst`) and codegen (`instCodegen`); both 600, and
+  // codegen must actually run children on wasm. Cap-using unit entries (nested instantiate) stay interp.
+  try {
+    const guest = await fetchBytes('/corpus/threads_inst_mod.svmbc');
+    const unit = await fetchBytes('/corpus/threads_inst_unit.svmbc');
+    const opt = { unit, winSize: 1 << 20 };
+    const t0 = performance.now();
+    const interp = await run(guest, { ...opt, inst: true });
+    const codegen = await run(guest, { ...opt, instCodegen: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = interp.value === 600n && codegen.value === 600n && codegen.tierups > 0;
+    set('instcodegen', ok ? 'pass' : 'fail',
+      `instcodegen: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
+      `(want 600, ${codegen.tierups} children ran on emitted wasm) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`instcodegen → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted children across ${codegen.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('instcodegen', 'fail', `instcodegen: error ${e}`);
+  }
 }
 
 main().catch((e) => { log(`fatal: ${e}\n${e.stack ?? ''}`); set('threads', 'fail', `fatal: ${e}`); });

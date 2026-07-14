@@ -1684,6 +1684,61 @@ impl VcpuProgram {
     }
 }
 
+/// A persistent, single-vCPU **reactor instance** — the "instantiate once, call exports many times"
+/// shape with **full-memory** fidelity. Unlike the snapshot reactors (`svm-run`'s `Session`, the
+/// browser `OnrampReactor`), which round-trip only a fixed low prefix and so lose a `vm_map`-grown
+/// heap between calls, a `Reactor` keeps the guest's linear-memory window **live** across calls:
+/// globals, BSS, **and** the grown heap all persist frame-to-frame because the window is never torn
+/// down. Host capabilities are serviced inline (the [`run`]-to-completion model, identical to
+/// [`compile_and_run_with_host`]), so I/O guests work — `stdout`, and the `display`/`keyboard` caps
+/// the interactive playground guests (the Doom path) use.
+///
+/// Single-vCPU: a guest that `thread.spawn`s is out of scope (the live window is not shared with other
+/// vCPUs — use the multi-worker `drive` path for those). The usual shape is `open` → `call(0, …)` to
+/// run the on-ramp `_start` bootstrap once, then `call(tick, …)` once per frame.
+pub struct Reactor {
+    /// The compiled program, shared (an `Arc` clone seeds each call's throwaway `Domain`).
+    source: std::sync::Arc<ModuleSource>,
+    n_funcs: usize,
+    /// The live guest window — retained across calls (this is the whole point). `None` for a
+    /// memory-less module.
+    mem: Option<Mem>,
+}
+
+impl Reactor {
+    /// Open a reactor over a freshly compiled `m` (`None` if `m` uses an op outside the engine's
+    /// subset): build the guest window once (its data segments applied) and keep it live.
+    pub fn open(m: &Module) -> Option<Reactor> {
+        let c = compile_module(&m.funcs)?;
+        let n_funcs = c.progs.len();
+        Some(Reactor {
+            source: std::sync::Arc::new(ModuleSource::new(c)),
+            n_funcs,
+            mem: build_mem(m),
+        })
+    }
+
+    /// Call `func(args)` on the **live** window, servicing host caps inline; the window (including a
+    /// grown heap) persists after the call. `Err` on a trap (an `Exit` surfaces as `Trap::Exit`), or
+    /// `Trap::Malformed` if `func` is out of range.
+    pub fn call(
+        &mut self,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: &mut u64,
+        host: &mut Host,
+    ) -> Result<Vec<Value>, Trap> {
+        if func as usize >= self.n_funcs {
+            return Err(Trap::Malformed);
+        }
+        // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
+        // slot vector) — there is no §22 install state to carry between frames, so a natural table each
+        // call is correct. `run` consumes the `Domain`; the persistent `mem` carries state across calls.
+        let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
+        run(dom, func, args, fuel, &mut self.mem, host)
+    }
+}
+
 /// A host-serviced pause point of a [`Vcpu`]. Everything the engine can't do alone on one thread
 /// becomes one of these; the host performs the effect (spawn a Worker, futex-wait, …) and resumes the
 /// vCPU with the result. Mirrors the cooperative `drive`'s `VcpuStop` arms, but handed to an external
@@ -2585,6 +2640,37 @@ impl<'p> Vcpu<'p> {
             }
             Err(t) => self.trap = Some(t),
         }
+    }
+
+    /// Deliver the **results** of a [`VcpuEvent::JitInvoke`] the host ran on **emitted wasm** (the
+    /// browser's real-codegen §22 tier) instead of the engine interpreting the unit. Writes the raw
+    /// i64 result slots into the awaiting `dst` and resumes — the invoke then looks exactly like the
+    /// interpreted [`deliver_jit_invoke`](Vcpu::deliver_jit_invoke) that ran the unit itself. This is
+    /// the alternative to that method: a host that emits wasm for the unit (`f{entry}(win, env,
+    /// args)`) calls this with the emitted region's results; a host that interprets calls the other.
+    /// Too few results is a `Malformed` trap (a mis-marshalled host reply).
+    pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
+        let Some(PendingJit::Invoke { results, dst, .. }) = self.pending_jit.take() else {
+            panic!("deliver_jit_invoke_vals with no pending invoke");
+        };
+        if vals.len() < results.len() {
+            self.trap = Some(Trap::Malformed);
+            return;
+        }
+        for (i, ty) in results.iter().enumerate() {
+            self.vt
+                .active
+                .set(dst + i as u32, Reg::from_value(slot_to_val(*ty, vals[i])));
+        }
+    }
+
+    /// Deliver a **trap** from a host-run [`VcpuEvent::JitInvoke`] unit (the emitted region hit a
+    /// guest `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a
+    /// catchable `RuntimeError`). The vCPU traps on its next `run`, exactly as an interpreted invoke
+    /// trap would (`deliver_jit_invoke` sets `self.trap` on the unit's `Err`).
+    pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
+        self.pending_jit = None;
+        self.trap = Some(trap);
     }
 
     /// Deliver the results of a [`VcpuEvent::TierUp`]: the emitted region returned `vals` (raw i64

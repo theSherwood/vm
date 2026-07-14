@@ -323,7 +323,23 @@ shadow stack and **returns a placeholder up its own call stack** — exactly as 
 run does today (`durable_backedge_jit`: a freeze returns a placeholder and the window holds the
 continuation). So the child unwinds *within* `compile_child_and_run` and returns; the synchronous model
 expresses subtree freeze directly (child unwinds first, then the parent), with no concurrent scheduler
-needed. Concretely:
+needed.
+
+**Refinement (from the freeze-export investigation): only an *instrumented* child is JIT-freezable, and
+the child shape must be chosen to match the interpreter.** The interpreter freezes a depth-1 *pure-
+compute* child (e.g. `PARENT_SELF_LOOP`'s func 1, a loop with no `cap.call` → not may-suspend → **no
+poll sites**) by *never scheduling it*: the parent, already `UNWINDING`, executes `instantiate` (which
+only enqueues the child) then spills at its trailing poll before the child's vCPU ever runs; the child
+rides as `FrozenNested { completed_result: None }` and is re-run from entry on thaw (interp map,
+`svm-interp` lines ~6243/6278/3844). The **JIT cannot reproduce that**: it runs the child *synchronously
+inside* `instantiate`, and a non-instrumented child has nothing to unwind at — it runs to completion
+where the interpreter froze it at entry, so the two diverge. JIT freeze-export therefore targets an
+**instrumented** child that unwinds at a poll *both* backends hit identically — a loop that is
+may-suspend (so its header gets Phase-4 loop-header polls) and, born `UNWINDING`, spills at its **first
+loop-header poll** with the loop not yet entered (continuation = loop start, `completed_result: None`).
+The differential test must verify the interpreter schedules+runs such an instrumented child to that same
+first poll (not freeze-at-entry); if the freeze points can't be made to coincide byte-for-byte, the pin
+falls back to a freeze→thaw→result round-trip rather than a byte-identical carve. Concretely:
 
 - **Detect unwound-vs-completed.** After the child run, `instantiate` reads the child carve's state
   word: `NORMAL` ⇒ completed (stash the result for `join`, as slice 1 does); `UNWINDING` ⇒ a **live
@@ -354,10 +370,34 @@ child `Nursery` over its funcs), plus the ctx-0 carve control-word seeding it ne
 guest. `compile_child` gained the `InstEnv` param (was hard-`null`); `compile_child_and_run` builds the
 boxed nursery + seeds. Pinned by `durable_nesting_jit.rs::jit_durable_depth2_grandchild_matches_interp`
 (a same-module root→child→grandchild chain returns 4950 on both backends in `NORMAL`). `AddressSpace`
-and separate-module children are follow-ups. (2) **freeze export** —
-the unwound-vs-completed detection + `FrozenNested`, byte-identical carve to the interp; (3) **thaw**
-re-attach + `REWINDING`; (4) depth-2, separate-module, and completed-result parity. Powerbox (1) is the
-gating prerequisite; the synchronous model needs no redesign.
+and separate-module children are follow-ups. (2) **freeze export — LANDED.** A freeze-from-start
+(window `UNWINDING`) now captures a live §14 child on the JIT: `compile_child_and_run` seeds the
+child's carve with the **parent's** phase (read from the parent window's ctx-0 state word) so an
+instrumented child is born unwinding; after the run it reads the carve's state word
+(`window_is_unwinding`) and reports "unwound"; `instantiate` records a `svm_jit::FrozenNested`
+(parent_task, slot, carve geometry, entry) into the run's `Nursery`; the top-level run drains it into
+`frozen_nested_out`, returned by a new `_durable_nested` entry (a separate entry, so the many `_durable`
+callers are untouched). Pinned by `durable_nesting_jit.rs::jit_freeze_captures_live_nested_child_matching_interp`.
+**Model-divergence finding (empirical):** the two backends freeze a *different child body* to produce a
+live residue — the interpreter freezes a **pure-compute** child by never scheduling it (frozen at
+entry), while the synchronous JIT runs the child inline in `instantiate`, so it needs an **instrumented**
+child that unwinds mid-run (a pure child runs to completion). But because both use the identical
+`instantiate` call, the `FrozenNested` **record** (the re-attach geometry a thaw consumes) is byte-for-byte
+identical — so the differential is on the *record*, not the frozen continuation. A byte-identical
+*carve* would require the freeze points to coincide; that (and the true correctness proof) is the
+**freeze→thaw→result round-trip** — the thaw slice below. (3) **thaw — LANDED (round-trip closed).**
+`compile_child_and_run` gains a thaw mode: it prepares the child's restored carve to **rewind** as
+`svm-durable::begin_thaw` does (global state `NORMAL`, ctx-0 thaw word `REWINDING`, SP word + shadow
+stack **preserved** — the frozen continuation the rewind replays). Before the parent re-enters, a new
+`run_inner` hook (mirroring the multi-vCPU `thaw_reattach_and_run`) re-runs each `frozen_nested_seed`
+child over its carve in thaw mode and publishes the result at its join slot (`Nursery::seed_child_result`);
+the parent then rewinds, reloads its `instantiate` handle, and its re-executed `join` resolves to the
+child's total. The seed rides a new `frozen_nested_seed` input on the `_durable_nested` entry. Pinned by
+`durable_nesting_jit.rs::jit_nested_freeze_thaw_round_trips` — freeze→thaw of a §14 child delivers the
+uninterrupted 4950 (**freeze→thaw ≡ uninterrupted**, the correctness proof the freeze-export record
+differential deferred). (4) depth-2 (a grandchild's residue coalescing at the root via a shared sink),
+separate-module, and completed-result parity remain. Powerbox (1) was the gating prerequisite; the
+synchronous model needs no redesign.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the

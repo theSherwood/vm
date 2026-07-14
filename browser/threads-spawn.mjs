@@ -24,12 +24,12 @@ const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 // Event codes (must match browser/src/lib.rs PAR_*).
-const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7;
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8;
 
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell } = workerData;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, instCodegen } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -60,6 +60,53 @@ async function worker() {
     });
     emitted = emod.exports;
     envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+  }
+
+  // §22 guest-JIT real codegen: the run's single §22 unit was emitted + stashed once at powerbox
+  // setup; each Worker instantiates its own instance and runs `f0(win, env, args)` on JIT_INVOKE.
+  let jitUnit = null, jitEnvCell = 0;
+  if (jitCodegen && ex.svm_par_enable_jit_codegen() === 1 && ex.svm_par_jit_unit_wasm_len() > 0) {
+    const wptr = Number(ex.svm_par_jit_unit_wasm_ptr()), wlen = ex.svm_par_jit_unit_wasm_len();
+    const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+      env: {
+        memory,
+        trap: () => {},
+        call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+      },
+    });
+    jitUnit = uinst.exports;
+    jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+  }
+
+  // §14 instantiate real codegen: a confined child whose granted-unit entry is in-subset runs it on
+  // emitted wasm here and fills the completion slot the parent joins (no vCPU). Cap-using entries
+  // aren't eligible → interpreter.
+  if (role === 'confined' && instCodegen && ex.svm_par_enable_inst_codegen() === 1
+      && ex.svm_par_inst_eligible(entry) === 1) {
+    const wptr = Number(ex.svm_par_inst_unit_wasm_ptr()), wlen = ex.svm_par_inst_unit_wasm_len();
+    const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+      env: {
+        memory,
+        trap: () => {},
+        call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+      },
+    });
+    const envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+    new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+    const args = new Array(Number(ex.svm_par_inst_nparams(entry))).fill(0n);
+    if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1);
+    try {
+      const ret = uinst.exports['f' + entry](win, envCell, ...args);
+      i64()[(slot + 8) >> 3] = BigInt(ret);
+      Atomics.store(i32(), slot >> 2, 1);
+      Atomics.notify(i32(), slot >> 2);
+    } catch {
+      Atomics.store(i32(), slot >> 2, 2);
+      Atomics.notify(i32(), slot >> 2);
+    }
+    return;
   }
 
   // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
@@ -172,6 +219,25 @@ async function worker() {
       }
       continue;
     }
+    if (ev === JIT_INVOKE) {
+      // §22 guest-JIT real codegen: run the emitted unit's `f0(win, env, ...i64 args)` instead of
+      // the interpreter, then deliver its i64 result slots. A trap surfaces as a vCPU trap.
+      const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
+      const args = [];
+      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
+      new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
+      if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // reuse the counter (non-vacuity)
+      try {
+        const ret = jitUnit['f0'](win, jitEnvCell, ...args);
+        const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+        const rptr = Number(ex.svm_par_alloc(Math.max(1, rets.length) * 8));
+        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+        ex.svm_par_deliver_jit_invoke(v, rptr, rets.length);
+      } catch {
+        ex.svm_par_deliver_jit_invoke_trap(v);
+      }
+      continue;
+    }
   }
 }
 
@@ -198,7 +264,13 @@ async function main() {
   if (jitMode && ex.svm_par_powerbox(gptr, guest.length) !== 1) {
     console.log('FAIL: svm_par_powerbox returned 0 (powerbox build failed)'); process.exit(1);
   }
-  const prog = jitMode ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
+  // §22 real-codegen mode (SVM_JIT_CODEGEN=1): the host-compiled unit's wasm is emitted + stashed, and
+  // each worker's `Jit.invoke` runs it on emitted wasm (the JIT_INVOKE handler above).
+  const jitCodegen = process.env.SVM_JIT_CODEGEN === '1';
+  if (jitCodegen && ex.svm_par_powerbox_jit_codegen(gptr, guest.length) !== 1) {
+    console.log('FAIL: svm_par_powerbox_jit_codegen returned 0'); process.exit(1);
+  }
+  const prog = (jitMode || jitCodegen) ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
   if (prog === 0) { console.log('FAIL: svm_par_compile returned null (decode/unsupported)'); process.exit(1); }
 
   // The one shared guest window every vCPU runs over (SVM_WIN sizes it — the §14 kernels declare a
@@ -215,7 +287,10 @@ async function main() {
   // §14 mode (SVM_INST=1): publish the run recipe — the root's `Instantiator` spans the window, plus
   // the optional granted module (SVM_INST_UNIT) for `instantiate_module`. The root vCPU builds its own
   // powerbox from it (svm_par_root); confined children build theirs in-engine.
-  if (process.env.SVM_INST === '1') {
+  // §14 real-codegen mode (SVM_INST_CODEGEN=1): same recipe as SVM_INST, but each confined child whose
+  // granted-unit entry is in-subset runs it on emitted wasm (the confined-child block in worker()).
+  const instCodegen = process.env.SVM_INST_CODEGEN === '1';
+  if (process.env.SVM_INST === '1' || instCodegen) {
     let uptr = 0, ulen = 0;
     if (process.env.SVM_INST_UNIT) {
       const unit = readFileSync(process.env.SVM_INST_UNIT);
@@ -235,9 +310,10 @@ async function main() {
   // (kept live at `gptr`) and runs eligible compute regions on emitted wasm. The guest still runs on
   // the interpreter — only direct calls to emitted pure leaves tier up.
   const tierup = process.env.SVM_TIERUP === '1';
-  // A shared i32 cell every Worker atomically bumps on each tier-up — proves the seam actually fired
-  // (a result match alone couldn't distinguish "tiered up" from "silently interpreted").
-  const tierupCell = tierup ? ex.svm_par_alloc(4) : 0;
+  // A shared i32 cell every Worker atomically bumps on each tier-up / JIT-codegen invoke — proves the
+  // seam actually fired (a result match alone couldn't distinguish "ran emitted wasm" from "silently
+  // interpreted"). Shared by the tier-up and §22-codegen paths (they never run in the same run).
+  const tierupCell = (tierup || jitCodegen || instCodegen) ? ex.svm_par_alloc(4) : 0;
 
   const workers = new Set();
   let started = 0;
@@ -246,7 +322,7 @@ async function main() {
   const startVcpu = (cfg) => {
     started++;
     const w = new Worker(new URL(import.meta.url), {
-      workerData: { module, memory, prog, win, winSize, tierup, gptr, glen: guest.length, tierupCell, ...cfg },
+      workerData: { module, memory, prog, win, winSize, tierup, jitCodegen, instCodegen, gptr, glen: guest.length, tierupCell, ...cfg },
     });
     workers.add(w);
     w.on('message', (m) => {
@@ -275,12 +351,14 @@ async function main() {
     console.log(`  vCPUs started: ${started} (1 root + ${started - 1} spawned), ${ms.toFixed(0)} ms`);
     if (err) console.log(`  error: ${err}`);
     else console.log(`  root returned ${value}  expect ${EXPECT}  ${ok ? '✓' : '✗'}`);
-    // Tier-up non-vacuity: with SVM_TIERUP the workers must have actually run emitted regions.
-    if (tierup) {
-      const tiered = Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2);
-      const tieredOk = tiered > 0;
-      console.log(`  tier-ups fired: ${tiered}  ${tieredOk ? '✓ (ran emitted wasm)' : '✗ (vacuous — never tiered up)'}`);
-      ok = ok && tieredOk;
+    // Non-vacuity: with SVM_TIERUP / SVM_JIT_CODEGEN / SVM_INST_CODEGEN the workers must have actually
+    // run emitted wasm.
+    if (tierup || jitCodegen || instCodegen) {
+      const ran = Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2);
+      const ranOk = ran > 0;
+      const label = jitCodegen ? 'JIT-codegen invokes' : instCodegen ? 'inst-codegen children' : 'tier-ups';
+      console.log(`  ${label} fired: ${ran}  ${ranOk ? '✓ (ran emitted wasm)' : '✗ (vacuous — never ran emitted wasm)'}`);
+      ok = ok && ranOk;
     }
     // 4d I/O mode: read the shared powerbox's accumulated stdout back and check the expected
     // schedule-independent bytes ("tick\n" × SVM_IO_LINES, default 8).

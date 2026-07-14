@@ -623,6 +623,7 @@ dependencies = [
  "svm-jit",
  "svm-run",
  "svm-snapshot",
+ "svm-spec",
  "svm-text",
  "svm-verify",
  "svm-wasm",
@@ -758,6 +759,13 @@ dependencies = [
  "svm-ir",
  "svm-text",
  "svm-verify",
+]
+
+[[package]]
+name = "svm-spec"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
 ]
 
 [[package]]

@@ -27,6 +27,9 @@ path = "src/bin/bench.rs"
 # out of the umbrella crate's normal build and the auditable dependency-free core.
 [dev-dependencies]
 svm-jit.workspace = true
+# The executable ISA spec (SPEC.md) — the op table + reference eval closures driving
+# the spec_* conformance suites (test-tier only; never a runtime dependency).
+svm-spec.workspace = true
 # The hand-rolled DWARF readers (`dwarf_line`/`dwarf_info`), reused to round-trip the JIT's DWARF
 # *emitter* (W5 JIT/DWARF tier) — emit in svm-jit, parse back here, assert they reconstruct.
 svm-wasm = { path = "../svm-wasm" }

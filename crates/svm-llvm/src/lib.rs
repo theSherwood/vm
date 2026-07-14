@@ -19946,6 +19946,14 @@ fn block_param_types(param_ids: &[ValueId], s: &Scan) -> Vec<ValType> {
             for _ in 0..layout.tail_lanes {
                 types.push(lane);
             }
+        } else if let Some(ftys) = s.agg_layout.get(&vid) {
+            // An aggregate (a flat struct / i128 `(lo,hi)` / `<N x i1>` mask) fans out into one param
+            // per field — exactly as `block_params` and `branch_args` expand it. Omitting this made a
+            // threaded aggregate contribute one placeholder type here while `branch_args` supplied `K`
+            // args, desyncing the `zip` in `lower_sparse_switch` (every threaded value after the
+            // aggregate got mistyped → a verifier `TypeMismatch`, e.g. Postgres `ExecRenameStmt`'s
+            // `switch` threading a by-value `{i64,i32}` struct).
+            types.extend_from_slice(ftys);
         } else {
             types.push(if vid == SP { ValType::I64 } else { s.ty[vid] });
         }

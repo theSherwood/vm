@@ -1111,6 +1111,45 @@ where `i64` is expected) in `ExecRenameStmt` — a translator correctness bug, t
 that resolve step a raw `CallImport` is expected and correctly rejected by the verifier §7.) Then the
 **runtime** (initdb data dir + `fs` cap, storage manager, WAL, single-process shmem, catalog bootstrap).
 
+**Slice BY (DONE) — aggregate fan-out in the sparse-`switch` chain; the Postgres module now *verifies*.**
+The single `svm-verify` error across all 14 985 functions, in `ExecRenameStmt`. Root cause: three places
+expand a threaded block param — `block_params` (the param vids), `branch_args` (the args), and
+`block_param_types` (the param *types* a synthetic compare-chain block gets in `lower_sparse_switch`) —
+and the first two fan out **both** wide vectors *and* aggregates (a flat struct / i128 `(lo,hi)` /
+`<N x i1>` mask → one slot per field), but `block_param_types` fanned out only wide vectors. So when
+`ExecRenameStmt`'s sparse `switch` threaded a by-value `{i64,i32}` struct through its compare chain,
+`block_param_types` contributed **one** placeholder type while `branch_args` supplied **two** args; the
+`zip` that types the chain block desynced right after the struct and mistyped every threaded value behind
+it → a `TypeMismatch`. One-branch fix: `block_param_types` now fans aggregates out too
+(`types.extend_from_slice(ftys)`), matching the other two. Found by driving translate → `resolve_imports`
+→ `svm-verify` and bisecting the failing edge with the verifier's own `func_value_types`. Test
+`switch_sparse_threads_aggregate` (hand `.ll` — clang's SROA scalarizes a struct before it can be
+threaded, so C can't isolate it — verifies + runs; the same `.ll` fails `svm-verify` with a `TypeMismatch`
+before the fix). **294 translate tests green, fmt + clippy clean.**
+
+**★★ Milestone:** the whole Postgres backend — **832 modules / 14 985 functions** — now **translates
+*and* verifies**: after `resolve_imports` binds the 4 powerbox caps, `svm-verify` passes clean. What
+remains is purely the **runtime** — `initdb` (natively) exposed via the `fs` cap; storage manager, WAL,
+single-process shmem, catalog bootstrap; real impls for the ~50 externals the query path calls.
+
+**Slice BZ (DONE) — the `fs` capability's metadata + directory surface; the runtime begins.** The
+translate/verify frontier is closed, so the work turns to *running* the module — and the first blocker is
+that the `fs` cap (`crates/svm-run/src/fs.rs`) could open/read/write/seek **files** but had no way to
+**walk a tree**: no `stat`, `mkdir`, `rmdir`, `opendir`/`readdir`. A natively-`initdb`'d cluster is a deep
+directory tree (`base/<db>/…`, `global/…`, `pg_wal/…`), and Postgres `stat`s and scans it pervasively at
+startup before it can open a single relation. Added ops 14–19: `stat` fills a fixed 72-byte little-endian
+`StatBuf` (the `S_IF*` type bits + size + mtime + ino/dev) with **lstat** semantics — a symlink is never
+followed, so it can't be used to probe the *type* of something outside the granted root; `mkdir`/`rmdir`;
+`opendir` snapshots a directory's immediate entries and `readdir` yields them **sorted**, one per call
+(`0` at exhaustion), `closedir` drops the handle. Both backends stay at protocol parity — `mem_fs` models
+directories over its flat name table (a path is a directory if it was `mkdir`'d or is a strict prefix of a
+file key), `host_fs` walks the real tree — so a differential runs identically on either. Tests
+`os_metadata_ops_parity_mem_vs_host` (the same scripted walk returns the same rc sequence + type bits +
+size on both backends) and `readdir_is_sorted_and_bounded` (sorted iteration; a too-small buffer fails
+closed without consuming the entry). **svm-run suite green, fmt + clippy clean.** Next (gap #11b): a guest
+OS-shim binding the file syscalls + proc/time to this cap, then the ~180 remaining pure-libc externs
+(stdio `FILE*`, locale, ctype, `strtod`/`snprintf`) byte-exact vs the native oracle.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
@@ -2067,13 +2106,40 @@ phases, both worth doing:
      First guest: `crates/svm-run/demos/display/bounce.c` (a box you steer with the arrow keys).
      Verified deterministically (`browser/tests/reactor.rs`, exact per-pixel box positions + input
      response across frames) and end-to-end in real Chromium (`browser-test.mjs`: the box animates and
-     the arrow keys steer it). **Caveat carried to slices 3–4:** persistence covers only the low
-     `SNAP_CAP` window (globals/BSS); a grown `malloc` heap above it is **not** persisted yet — the
-     same slice-1 reactor scope as `svm-run`, and the reason Doom (heavy zone-malloc + a ~256 KB
-     320×200 framebuffer) needs the heap-persistence follow-on before it can hold state across frames.
-  3. **doomgeneric headless differential** — doomgeneric + shareware WAD (via the `fs` cap) through
-     the on-ramp; run headless with a frame-hashing sink, byte-exact vs native `cc` over the first N
-     frames. The correctness proof before browser wiring.
+     the arrow keys steer it). (Slice 2 persisted only the low `SNAP_CAP` window — see slice 3a, which
+     lifted that limit.)
+  3a. **Full-window reactor persistence** — **DONE (slice BP).** Slice 2's snapshot round-trip
+     persisted only the low 256 KiB (`SNAP_CAP`) and — decisively — `Mem::seed` clamps writes to the
+     `mapped` boundary, so a `vm_map`-grown heap (which lives *above* `mapped`, where Doom's zone
+     allocator sits) could **never** be round-tripped back. Fixed with a genuinely persistent instance:
+     **`bytecode::Reactor`** (`crates/svm-interp/src/bytecode.rs`) holds the guest `Mem` **live** across
+     calls — globals, BSS, **and** the grown heap all persist for free because the window is never torn
+     down. It calls the private `run` per frame with a cheap fresh `Domain` over the shared compiled
+     source (an `Arc` clone); host caps are serviced inline, so I/O guests work. `OnrampReactor` now
+     wraps it (the `snap` round-trip is gone). Proof: `crates/svm-run/demos/display/life.c` — Conway's
+     Game of Life with its grid in the **malloc heap above the mapped window**; the glider only advances
+     if that heap persists. Deterministic (5 live cells throughout, translating (+1,+1) every 4
+     generations) — asserted in `browser/tests/reactor.rs` + a `svm-interp` unit test
+     (`tests/reactor.rs`, a counter at 293 KiB climbing across calls) + real Chromium (`browser-test.mjs`
+     watches the glider advance). This unblocks Doom's memory footprint.
+  3b. **doomgeneric translates + boots in the sandbox** — **DONE (slice BR)**;
+     `crates/svm-run/demos/doom/`. The platform layer (`doomgeneric_svm.c`, `DG_*` onto the
+     `display`/`keyboard` caps + a deterministic frame clock), the reactor entry (`main.c`:
+     `doomgeneric_Create` once, `tick` = `doomgeneric_Tick`), a **complete libc shim** (`doom_libc.c`
+     for string/ctype/stdlib/`sscanf`/stubs + the reused Lua `lua_files_stdio.c` `fs`-FILE layer and
+     `lua_fmt_snprintf.c` printf engine), and `fetch.sh`/`build.sh`. Results: all **79** Doom TUs
+     compile clean and `svm-llvm-translate` produces a **797 KB `doom.svmb`** (`main`/`tick` exported)
+     with **zero unsupported IR constructs** — no SIMD/`i128`/inline-asm/vector-memory walls, and the
+     on-ramp already lowers indirect calls through unprototyped `void (...)` (K&R) function pointers
+     (an earlier spike using a *stale* translator binary misreported that as a gap). Driven through the
+     slice-3a persistent reactor with the powerbox + `display`/`keyboard`/`fs` (the shareware
+     `doom1.wad`), `_start`→`doomgeneric_Create` runs Doom's **entire init** on the bytecode
+     interpreter — the real startup log (`Z_Init`… `W_Init: adding doom1.wad`… `DOOM Shareware`…
+     `R_Init`… `ST_Init`), reaching the main loop. So the libc shim is correct end-to-end (WAD
+     `fread`/`fseek`, `sscanf` config, `printf`, the `malloc` zone, the string set) — **"Doom runs
+     sandboxed through the LLVM on-ramp" is proven at the init level.** Remaining: a rendered frame +
+     the byte-exact frame-hash differential vs native `cc` — a full 640×400 software render is billions
+     of instructions/frame, so it wants the **JIT** for speed (the next slice).
   4. **Doom in the playground** — wire `doomgeneric.svmb` + `doom1.wad` + canvas + keyboard into
      `play.js`; build/deploy via `pages.yml`.
 - **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust
