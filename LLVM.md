@@ -1111,6 +1111,27 @@ where `i64` is expected) in `ExecRenameStmt` — a translator correctness bug, t
 that resolve step a raw `CallImport` is expected and correctly rejected by the verifier §7.) Then the
 **runtime** (initdb data dir + `fs` cap, storage manager, WAL, single-process shmem, catalog bootstrap).
 
+**Slice BY (DONE) — aggregate fan-out in the sparse-`switch` chain; the Postgres module now *verifies*.**
+The single `svm-verify` error across all 14 985 functions, in `ExecRenameStmt`. Root cause: three places
+expand a threaded block param — `block_params` (the param vids), `branch_args` (the args), and
+`block_param_types` (the param *types* a synthetic compare-chain block gets in `lower_sparse_switch`) —
+and the first two fan out **both** wide vectors *and* aggregates (a flat struct / i128 `(lo,hi)` /
+`<N x i1>` mask → one slot per field), but `block_param_types` fanned out only wide vectors. So when
+`ExecRenameStmt`'s sparse `switch` threaded a by-value `{i64,i32}` struct through its compare chain,
+`block_param_types` contributed **one** placeholder type while `branch_args` supplied **two** args; the
+`zip` that types the chain block desynced right after the struct and mistyped every threaded value behind
+it → a `TypeMismatch`. One-branch fix: `block_param_types` now fans aggregates out too
+(`types.extend_from_slice(ftys)`), matching the other two. Found by driving translate → `resolve_imports`
+→ `svm-verify` and bisecting the failing edge with the verifier's own `func_value_types`. Test
+`switch_sparse_threads_aggregate` (hand `.ll` — clang's SROA scalarizes a struct before it can be
+threaded, so C can't isolate it — verifies + runs; the same `.ll` fails `svm-verify` with a `TypeMismatch`
+before the fix). **294 translate tests green, fmt + clippy clean.**
+
+**★★ Milestone:** the whole Postgres backend — **832 modules / 14 985 functions** — now **translates
+*and* verifies**: after `resolve_imports` binds the 4 powerbox caps, `svm-verify` passes clean. What
+remains is purely the **runtime** — `initdb` (natively) exposed via the `fs` cap; storage manager, WAL,
+single-process shmem, catalog bootstrap; real impls for the ~50 externals the query path calls.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
