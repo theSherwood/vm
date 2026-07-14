@@ -1,0 +1,7 @@
+#define SVM_GUEST 1
+#include "os_shim.c"
+#include "libc_shim.c"
+#include "locale_shim.c"
+#include "time_shim.c"
+#include "proc_shim.c"
+#include "stdio_shim.c"

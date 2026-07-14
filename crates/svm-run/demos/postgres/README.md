@@ -54,7 +54,8 @@ unprivileged user if invoked as root.
 | 11d | **guest libc: string + integer parsing + proc/time/signal** | — | **DONE (slice CC):** `libc_shim.c` adds the `<string.h>`/`<stdlib.h>` members the on-ramp doesn't already synthesize — `strcat`/`strncpy`/`strnlen`/`strstr`/`strchrnul`/`strdup`/`strlcpy`/`strlcat`/`strtok`/`strxfrm`/`strcoll_l` and `strtol`/`strtoul`/`atoi` (`__isoc23_*` aliases too; `strtod`/`snprintf`/`getenv` were already synthesized), plus a shared `errno` cell (`shim_errno.h`). `proc_shim.c` returns the deterministic process/time/signal values a single-user sandbox backend needs — constant non-root identity (so Postgres's root guard passes), a frozen clock, inert signal masks, no-op sleeps. Tests: `demo_pg_string_vs_native` (byte-exact over signs/bases/prefixes/endptr/ERANGE + bounded copies vs glibc) and `demo_pg_procstub` (guest stub values) |
 | 11e | **guest libc: file stdio + time + wide-char** | — | **DONE (slice CD):** `stdio_shim.c` layers the buffered `FILE*` surface Postgres declares (`fopen`/`freopen`/`fclose`/`fread`/`fwrite`/`fgetc`/`getc`/`fgets`/`fputc`/`fseek`/`fseeko`/`ftell`/`feof`/`ferror`/`clearerr`/`fflush`/`fileno`/`setvbuf`/`ungetc`) on `os_shim.c`'s fs-cap syscalls — its config reader `guc-file.l` uses `fopen`/`fgets`. `time_shim.c` adds `gmtime`/`localtime` (UTC calendar math) + a `strftime` format engine; `libc_shim.c` the C-locale `mbstowcs`/`wcstombs`. Differentials `demo_pg_stdio_vs_native` (write→reopen→read-back over `mem_fs` + `host_fs`) and `demo_pg_time_vs_native` (epochs incl. leap days + wide-char round-trip) |
 | 11f | **stream `FILE*` + fd-dispatch** | — | **DONE (slice CE):** `stdout`/`stderr`/`stdin` must reach the powerbox **Stream** cap while `fopen`'d files reach the **fs** cap — but a guest that defines `write`/`read` (the syscall shim) shadows the on-ramp's Stream recognizer. Two new on-ramp builtins `__vm_stream_write`/`__vm_stream_read` (a `cap_spec` with `drop_args: 0` + import registration) give the shim direct Stream access; `os_shim.c`'s `write`/`read` **fd-dispatch** fds 0/1/2 to them and everything else to the fs cap; and the `fs` cap now **reserves fds 0/1/2** (`alloc_fd`) so a file fd (≥3) never collides with a stream fd. `stdio_shim.c` defines the `stdin`/`stdout`/`stderr` `FILE*` globals. Differential `demo_pg_stream_vs_native` (write to `stdout` FILE* *and* a real file; byte-exact over `mem_fs` + `host_fs`) |
-| 11g | **data dir + the rest of the runtime** | — | `initdb` natively → grant the dir through the `fs` cap; the varargs `fprintf`/`scanf` format engines; storage manager, WAL, single-process shmem, catalog bootstrap — then **boot**: relink the shims into the real Postgres bitcode and drive `postgres --single` to its first live trap. The ~50 *live* externals resolve here |
+| 11g | **first boot: the module runs** | — | **DONE (slice CF):** with all the shims linked in (`link_shims.sh`), the whole Postgres module **translates, verifies, AND runs** — fast (~24 s incl. translate) — executing real backend startup. The first live fault was a `MemoryFault` in `save_ps_display_args` walking an undefined **`environ`**; defining it (empty) cleared it. Added the early-startup libc surface: `environ`, `setlocale`/`newlocale`/`localeconv`/`nl_langinfo` (C-locale constants), the wide-ctype `iswX`/`towX` family (differential-tested, `demo_pg_wctype_vs_native`), `getopt`, `strsignal`. Postgres now boots past `save_ps_display_args` into deeper startup. See "Booting" below |
+| 11h | **boot: the remaining live surface** | — | drive the boot forward from its current trap: a **trap-identifying** diagnostic (self-naming stubs / partial-output-on-trap) to make the remaining `Unreachable` stub-traps legible, then the storage manager / WAL / single-process shmem (`mmap`/`shmget`) / catalog bootstrap and the ~50 *live* externals the query path reaches, plus the varargs `fprintf`/`scanf` engines and `strerror_r` (its GNU/POSIX signature split needs an isolated `_GNU_SOURCE` TU) |
 
 **Where it stands:** ★★ **the complete module (832 modules / 14 985 functions) now translates AND
 verifies** — past the **entire 921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals
@@ -69,6 +70,17 @@ native glibc oracle — and `libc_shim.c`/`proc_shim.c` (gaps #11c–#11e) cover
 far: the C-locale **ctype** tables, the **string + integer-parsing** members, the deterministic
 **process/time/signal** stubs, the file-backed **stdio `FILE*`**, **time + wide-char**, and the
 **stream `FILE*`** (`stdout`/`stderr`/`stdin` → the powerbox Stream via the CE on-ramp fd-dispatch).
-Still ahead (gap #11g): the varargs `fprintf`/`scanf` format engines, then the storage manager, WAL,
-single-process shmem, and catalog bootstrap — and then the first real **boot**. See `LLVM.md` slices
-BM–CE.
+And **the module now boots** (gap #11g, slice CF): linked with all the shims it translates, verifies,
+and *runs* real backend startup, past `save_ps_display_args` (the `environ` fix) into deeper init.
+Still ahead (gap #11h): a trap-identifying diagnostic to make the remaining stub-traps legible, then
+the storage manager, WAL, single-process shmem, and catalog bootstrap (plus the varargs `fprintf`/
+`scanf` engines). See `LLVM.md` slices BM–CF, and "Booting" below.
+
+## Booting
+
+`build_bitcode.sh` produces `postgres_libm.bc` (the whole-program module + openlibm). `link_shims.sh`
+then `llvm-link`s the guest shims (`pg_shims.c` = os/libc/locale/time/proc/stdio) into it →
+`postgres_shimmed.bc`. A driver `translate_bc_path_with_options(…, stub_unresolved_externs: true)` →
+`instantiate` → `run_with_caps(Backend::Bytecode, {stdin: SQL, args: ["postgres","--single","-D",".",…]},
+[("fs", host_fs(datadir))])` runs it. As of slice CF the module executes real startup and traps deeper
+in init; driving it to the first `SELECT` is gap #11h.
