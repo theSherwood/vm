@@ -19,48 +19,63 @@ capability for the WAD, and a persistent multi-MB heap for Doom's zone allocator
 - **`main.c`** — the reactor entry: `main()` runs `doomgeneric_Create(-iwad doom1.wad)` once at
   `_start` (reading the WAD via `fs`); the exported `tick()` calls `doomgeneric_Tick()` once per frame
   over the persistent window (slice 3a keeps the zone heap alive between frames).
+- **`doom_libc.c`** — the freestanding libc the on-ramp doesn't synthesize and the reused Lua shims
+  don't already cover: the string/ctype set, `stdlib` (`atoi`/`strtol`/`strtod`/`abs`/`system`/
+  `mkdir`), `printf`/`puts`/`vfprintf`, a single-integer `sscanf` (Doom's config only uses `%d`/`%i`/
+  `%x`/`%o`), and the two netgame stubs (`drone`, `net_client_connected`).
+- **`build.sh`** — compile the fetched sources + platform + shim, link, and translate to `doom.svmb`.
 - **`fetch.sh`** — fetch-and-cache doomgeneric's sources (not vendored — id Software's Doom source
   under the Doom Source License; ~1 MB). CI uses the GitHub archive; a `raw.githubusercontent.com`
   per-file fallback works where the archive host is unavailable.
 
-## Spike findings — Doom is a libc shim + ONE translator feature away
+The reused Lua guest shims (`crates/svm-llvm/tests/fixtures/lua/`) do the heavy lifting:
+`lua_files_stdio.c` is the `FILE`-over-`fs`-capability layer (fopen/fread/fseek/ftell/fclose/fprintf/
+errno/std streams — the WAD read path), and `lua_fmt_snprintf.c` is the printf format engine
+(snprintf/vsnprintf, with the on-ramp's `__vm_fmt_*` Dragon4 float formatters).
 
-Reproduced with the fetched sources + the platform here (`fetch.sh` documents the exact commands):
+## Status — Doom translates and BOOTS in the sandbox
 
-1. **Compiles clean.** All 79 Doom translation units build to LLVM-18 bitcode with stock
-   `clang -O2 -emit-llvm -c -fno-vectorize -fno-slp-vectorize -DNORMALUNIX -DLINUX` — 79/79, zero
-   compile errors. (The X11 platform `doomgeneric_xlib.c` is replaced by `doomgeneric_svm.c`.)
-2. **Links** into one ~900 KB module (`llvm-link`).
-3. **Translates the whole program** under `svm-llvm-translate --stub-externs` (libc stubbed) except
-   for **one** unsupported IR construct — no SIMD / `i128` / inline-asm / vector-memory walls like the
-   Postgres spike hit:
-   - **Indirect calls through an unprototyped (`void (...)`, K&R-style) function pointer.** Doom
-     declares several callback pointers with empty parens — `d_think.h`'s `actionf_v` (`typedef void
-     (*actionf_v)()`), `d_loop.c`'s `loop_interface_t`, and `m_menu.c`'s menu `routine`s — which LLVM
-     types as `void (...)`. They are called with **concrete** args (0 here), never true varargs; the
-     on-ramp currently rejects them (`Unsupported("indirect varargs call")`, first seen in
-     `@NetUpdate`/`@TryRunTics`/`@M_Drawer`).
-4. **Memory.** The framebuffer is 640×400×4 ≈ 1 MB and Doom's zone allocator takes several MB — all in
-   the `malloc` heap **above** the mapped window, which the slice-3a persistent reactor now keeps live
-   across frames. This is exactly why slice 3a came first.
+Reproduced with `sh fetch.sh && sh build.sh` (the on-ramp translator built first):
 
-## Remaining work (the next sub-slices)
+1. **Compiles clean.** All 79 Doom TUs build to LLVM-18 bitcode with stock `clang -O2 -emit-llvm`
+   (79/79, zero errors; the X11 platform is replaced by `doomgeneric_svm.c`).
+2. **Translates whole-program — no IR gaps.** `llvm-link` → one ~900 KB module → `svm-llvm-translate`
+   produces a **797 KB `doom.svmb`** with `main`/`tick` exported. There are **no unsupported IR
+   constructs** — no SIMD / `i128` / inline-asm / vector-memory walls (unlike the Postgres spike), and
+   the on-ramp already handles indirect calls through unprototyped (`void (...)`, K&R) function
+   pointers (Doom's `actionf_v`/`loop_interface_t`/menu callbacks). *(An earlier spike using a stale
+   translator binary reported that as a gap; a current build translates it.)* Every remaining
+   unresolved symbol is on-ramp-provided (`malloc`/`calloc`/`realloc`/`free`, `read`/`write`/`exit`,
+   `__vm_*`).
+3. **Boots.** Driven through a reactor (the slice-3a persistent instance) with the powerbox + a
+   `display` cap + a `keyboard` cap + an `fs` cap serving the shareware `doom1.wad`, `_start` →
+   `doomgeneric_Create` runs Doom's **entire** initialization on the bytecode interpreter — the real
+   startup log:
 
-- **Translator feature** *(the one IR gap)*: lower an indirect call through a `void (...)` /
-  unprototyped function-pointer type using the **call site's concrete signature** (these are never
-  true varargs in Doom). Well-scoped, and it generally unblocks K&R-style callbacks. This is the
-  single blocker to translating Doom with a stubbed libc.
-- **libc shim** (~35 functions, modeled on the Lua/SQLite guest shims): the string/ctype set
-  (`strlen`/`strcmp`/`strncmp`/`strncpy`/`strrchr`/`strstr`/`memchr`/`bcmp`/`strcasecmp`/
-  `strncasecmp`/`strdup`/`__ctype_toupper_loc`); `stdlib` (`exit`/`strtol`/`strtod`/`atoi`); the
-  `printf` family (`printf`/`fprintf`/`snprintf`/`vsnprintf`/`vfprintf` → the `lua_fmt_snprintf.c`
-  format-engine model + stdout via `Stream`); file I/O (`fopen`/`fread`/`fseek`/`ftell`/`fclose`/
-  `fwrite` → the `fs` capability, the `lua_files_stdio.c` model, for the WAD); `sscanf` (config
-  parsing); and two netgame stubs (`drone`, `net_client_connected`). `malloc`/`calloc`/`realloc`/
-  `free`/`memcpy`/`memset` are synthesized by the on-ramp already.
-- **The WAD** (`doom1.wad`, freely distributable shareware) served through the `fs` capability, and a
-  **headless differential**: run N frames of the guest and a native `cc` build with the same
-  deterministic clock + input script, and assert the per-frame framebuffer hashes match byte-for-byte
-  (the interpreter-is-the-oracle contract, §18).
-- **Playground wiring** (slice 4): the `.svmb` + WAD as assets, the reactor loop + keyboard already in
-  `play.js`.
+   ```
+   Z_Init: Init zone memory allocation daemon.
+   zone memory: 0x4fa050, 600000 allocated for zone
+   W_Init: Init WADfiles.  /  adding doom1.wad
+                               DOOM Shareware
+   I_Init / M_Init / R_Init: Init DOOM refresh daemon - ...
+   P_Init / S_Init / D_CheckNetGame / HU_Init / ST_Init
+   ```
+
+   The WAD is parsed (through the `fs` cap), the zone allocator runs in the persistent heap, the
+   renderer builds its data (`R_Init`), and the game reaches the main loop — so the libc shim is
+   correct end to end (`fread`/`fseek` on the WAD, `sscanf` config parsing, `printf`, the `malloc`
+   zone, the string set). This proves the "Doom runs sandboxed through the LLVM on-ramp" thesis.
+
+4. **Memory.** The 640×400×4 ≈ 1 MB framebuffer + the multi-MB zone live in the `malloc` heap **above**
+   the mapped window, which the slice-3a persistent reactor keeps live across frames — why 3a came
+   first.
+
+## Remaining work (next sub-slices)
+
+- **A rendered frame + the headless differential.** A full 640×400 software-rendered frame is billions
+  of instructions; on the **bytecode interpreter** that's ~minutes/frame (`_start` alone burned 20 B
+  instructions reaching the main loop). The frame render + a byte-exact differential vs a native `cc`
+  build (same deterministic clock + input script, per-frame framebuffer hashes — the §18 oracle) want
+  the **JIT** for speed. That's the substance of the next slice.
+- **Playground wiring** (slice 4): the `.svmb` + WAD as assets; grant the `fs` cap (with the WAD) in
+  the browser reactor; the reactor loop + `keyboard` are already in `play.js`.

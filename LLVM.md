@@ -2122,20 +2122,24 @@ phases, both worth doing:
      generations) — asserted in `browser/tests/reactor.rs` + a `svm-interp` unit test
      (`tests/reactor.rs`, a counter at 293 KiB climbing across calls) + real Chromium (`browser-test.mjs`
      watches the glider advance). This unblocks Doom's memory footprint.
-  3b. **doomgeneric headless differential** — doomgeneric + shareware WAD (via the `fs` cap) through
-     the on-ramp; run headless with a frame-hashing sink, byte-exact vs native `cc`. **SPIKE DONE
-     (slice BQ)** — `crates/svm-run/demos/doom/`: the platform layer (`doomgeneric_svm.c`, `DG_*` onto
-     the `display`/`keyboard` caps + a deterministic frame clock), the reactor entry (`main.c`:
-     `doomgeneric_Create` once, `tick` = `doomgeneric_Tick`), and `fetch.sh` (fetch-and-cache; not
-     vendored). Feasibility quantified: all **79** Doom TUs compile to LLVM-18 bitcode clean, link into
-     one ~900 KB module, and under `--stub-externs` translate the **whole program** save for **one** IR
-     gap — indirect calls through an unprototyped (`void (...)`, K&R) function pointer (Doom's
-     `actionf_v` / `loop_interface_t` / menu `routine` callbacks, called with concrete args, never true
-     varargs). **No SIMD/`i128`/inline-asm/vector-memory walls** (unlike the Postgres spike). Remaining:
-     (a) the one translator feature — lower a `void (...)` indirect call by the call-site's concrete
-     signature; (b) a ~35-function libc shim (string/ctype/stdio-format/`fs`-file-I/O + 2 netgame
-     stubs) modeled on the Lua/SQLite guest shims; (c) the WAD via `fs` + the frame-hash differential.
-     See the demo README for the exact gap list + repro.
+  3b. **doomgeneric translates + boots in the sandbox** — **DONE (slice BR)**;
+     `crates/svm-run/demos/doom/`. The platform layer (`doomgeneric_svm.c`, `DG_*` onto the
+     `display`/`keyboard` caps + a deterministic frame clock), the reactor entry (`main.c`:
+     `doomgeneric_Create` once, `tick` = `doomgeneric_Tick`), a **complete libc shim** (`doom_libc.c`
+     for string/ctype/stdlib/`sscanf`/stubs + the reused Lua `lua_files_stdio.c` `fs`-FILE layer and
+     `lua_fmt_snprintf.c` printf engine), and `fetch.sh`/`build.sh`. Results: all **79** Doom TUs
+     compile clean and `svm-llvm-translate` produces a **797 KB `doom.svmb`** (`main`/`tick` exported)
+     with **zero unsupported IR constructs** — no SIMD/`i128`/inline-asm/vector-memory walls, and the
+     on-ramp already lowers indirect calls through unprototyped `void (...)` (K&R) function pointers
+     (an earlier spike using a *stale* translator binary misreported that as a gap). Driven through the
+     slice-3a persistent reactor with the powerbox + `display`/`keyboard`/`fs` (the shareware
+     `doom1.wad`), `_start`→`doomgeneric_Create` runs Doom's **entire init** on the bytecode
+     interpreter — the real startup log (`Z_Init`… `W_Init: adding doom1.wad`… `DOOM Shareware`…
+     `R_Init`… `ST_Init`), reaching the main loop. So the libc shim is correct end-to-end (WAD
+     `fread`/`fseek`, `sscanf` config, `printf`, the `malloc` zone, the string set) — **"Doom runs
+     sandboxed through the LLVM on-ramp" is proven at the init level.** Remaining: a rendered frame +
+     the byte-exact frame-hash differential vs native `cc` — a full 640×400 software render is billions
+     of instructions/frame, so it wants the **JIT** for speed (the next slice).
   4. **Doom in the playground** — wire `doomgeneric.svmb` + `doom1.wad` + canvas + keyboard into
      `play.js`; build/deploy via `pages.yml`.
 - **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust
