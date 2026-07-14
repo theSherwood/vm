@@ -5,7 +5,7 @@
 // a §14 root `Instantiator` (sandboxed children on their own Workers). The page services no
 // authority either way — all of it is Rust-side, in shared linear memory.
 
-import { loadEngine, makeRunner, readParStdout } from '/web/par.js';
+import { loadEngine, makeRunner, readParStdout } from './par.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -289,6 +289,84 @@ block0(v0: i64):
 }
 `,
   },
+
+  // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
+  //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
+  //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
+  'hello (C → SVM)': {
+    kind: 'module',
+    url: './assets/hello_c.svmb',
+    mode: 'io',
+    desc: 'crates/svm-run/demos/hello.c — a C program compiled with stock clang, translated by the ' +
+      'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
+      'below is the guest’s real stdout.',
+  },
+  'Lua (5.4.7 — write & run)': {
+    kind: 'module',
+    editable: true,
+    url: './assets/lua_eval.svmb',
+    mode: 'io',
+    desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math/' +
+      'coroutine/io/os libraries, compiled through the LLVM on-ramp. Edit the Lua on the left and ' +
+      'click Run: your code is piped to the guest as stdin, evaluated, and its output appears below. ' +
+      'Real Lua, running client-side in the sandbox.',
+    src: `-- Write Lua here, then click Run.
+print("Hello from " .. _VERSION)
+
+-- recursion
+local function fib(n) return n < 2 and n or fib(n - 1) + fib(n - 2) end
+local out = {}
+for i = 1, 10 do out[i] = fib(i) end
+print("fib(1..10):", table.concat(out, " "))
+
+-- tables + sort
+local t = { 5, 3, 8, 1, 9, 2, 7 }
+table.sort(t)
+print("sorted:", table.concat(t, ", "))
+
+-- string.format + math
+print(string.format("pi ~ %.4f, 255 in hex = 0x%X", math.pi, 255))
+
+-- io.write (stdout via the Stream capability — no trailing newline)
+io.write("counting: ")
+for i = 1, 5 do io.write(i, " ") end
+io.write("\\n")
+
+-- coroutines: a lazy generator
+local function squares(n)
+  return coroutine.wrap(function()
+    for i = 1, n do coroutine.yield(i * i) end
+  end)
+end
+local sq = {}
+for v in squares(6) do sq[#sq + 1] = v end
+print("squares:", table.concat(sq, " "))
+`,
+  },
+  'SQLite (:memory: — write & run SQL)': {
+    kind: 'module',
+    editable: true,
+    url: './assets/sqlite_repl.svmb',
+    mode: 'io',
+    desc: 'The unmodified SQLite 3.50.2 amalgamation (~257k lines of C), compiled through the LLVM ' +
+      'on-ramp. Edit the SQL on the left and click Run: it executes against a fresh in-memory ' +
+      'database (each Run starts clean) and prints result tables, change counts, and errors below. ' +
+      'Real SQLite, running client-side in the sandbox.',
+    src: `-- Write SQL here, then click Run. Each Run is a fresh :memory: database.
+CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INT);
+INSERT INTO users(name, age) VALUES ('Ada', 36), ('Alan', 41), ('Grace', 45), ('Edsger', 40);
+
+SELECT name, age FROM users WHERE age >= 40 ORDER BY age DESC;
+
+SELECT count(*) AS n, avg(age) AS avg_age, max(age) AS oldest FROM users;
+
+-- a recursive CTE: the first 10 Fibonacci numbers
+WITH RECURSIVE fib(n, a, b) AS (
+  SELECT 1, 0, 1 UNION ALL SELECT n + 1, b, a + b FROM fib WHERE n < 10
+)
+SELECT n, a AS fib FROM fib;
+`,
+  },
 };
 
 // Size the run's shared window from the source's `memory N` declaration (64 KiB minimum — the wasm
@@ -303,13 +381,93 @@ let eng, run, aborter = null, broken = false;
 
 function loadExample(name) {
   const ex = EXAMPLES[name];
-  $('src').value = ex.src;
   $('mode').value = ex.mode;
   $('desc').textContent = ex.desc;
+  if (ex.kind === 'module' && !ex.editable) {
+    // A pre-built on-ramp module with a fixed program: the "source" is binary, not editable. Show a note.
+    $('src').value =
+      `// ${name}\n// A pre-built on-ramp module: ${ex.url}\n// Click Run — it executes as a real ` +
+      `C/C++ guest via svm_run_onramp,\n// and its stdout appears in the pane on the right.`;
+    $('src').readOnly = true;
+  } else {
+    // Text examples, and **editable** modules (whose source is fed to the guest as stdin), stay editable.
+    $('src').value = ex.src;
+    $('src').readOnly = false;
+  }
+}
+
+// Fetched `.svmb` bytes, cached (a 6 MB SQLite module is worth not re-downloading on every Run).
+const moduleCache = new Map();
+async function fetchModule(url) {
+  if (moduleCache.has(url)) return moduleCache.get(url);
+  // Resolve module URLs relative to this script (not the document), so they work under any base path
+  // (origin root locally, `/<repo>/` on GitHub Pages).
+  const resolved = new URL(url, import.meta.url);
+  const r = await fetch(resolved);
+  if (!r.ok) throw new Error(`fetch ${url}: ${r.status}`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  moduleCache.set(url, bytes);
+  return bytes;
+}
+
+// Run a pre-built on-ramp module single-shot on the main engine: alloc a buffer, copy the module in,
+// `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read the captured stdout.
+// No Workers (these guests are single-threaded), so it never touches the par.js shared-window path.
+async function runModule(ex) {
+  setState('running', 'fetching module…');
+  $('result').textContent = '';
+  $('stdout').textContent = '';
+  let bytes;
+  try {
+    bytes = await fetchModule(ex.url);
+  } catch (e) {
+    setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    log(`fetch failed: ${e.message}`);
+    return;
+  }
+  log(`fetched ${ex.url}: ${bytes.length}B module`);
+  const p = eng.ex.svm_alloc(bytes.length);
+  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua). Alloc
+  // both buffers *before* filling: svm_alloc may grow (detach) the linear memory, so take one fresh
+  // view after all allocations and write into it.
+  let stdinP = 0, stdinLen = 0, stdinBytes = null;
+  if (ex.editable) {
+    stdinBytes = new TextEncoder().encode($('src').value);
+    if (stdinBytes.length > 0) {
+      stdinP = eng.ex.svm_alloc(stdinBytes.length);
+      stdinLen = stdinBytes.length;
+    }
+  }
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(bytes, p);
+  if (stdinP) view.set(stdinBytes, stdinP);
+  setState('running', 'running…');
+  const t0 = performance.now();
+  const rv = eng.ex.svm_run_onramp(p, bytes.length, stdinP, stdinLen);
+  const status = eng.ex.svm_status();
+  const sp = eng.ex.svm_stdout_ptr();
+  const sl = eng.ex.svm_stdout_len();
+  const stdout = new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
+  eng.ex.svm_dealloc(p, bytes.length);
+  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  const ms = (performance.now() - t0).toFixed(0);
+  $('stdout').textContent = stdout;
+  $('result').textContent = `${rv}`;
+  // 0 = OK, 5 = clean Exit; anything else is a decode error / trap / unsupported.
+  if (status === 0 || status === 5) {
+    setState('done', `done · status ${status} · ${ms}ms`);
+    log(`svm_run_onramp → ${rv} (status ${status}) in ${ms}ms`);
+  } else {
+    setState('error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
+    log(`svm_run_onramp status ${status}`);
+  }
 }
 
 async function doRun() {
   if (broken) return;
+  // A pre-built on-ramp module runs single-shot via svm_run_onramp — no in-browser parse, no Workers.
+  const selected = EXAMPLES[$('example').value];
+  if (selected?.kind === 'module') return runModule(selected);
   // Leave the terminal states synchronously on click, so an observer (the Playwright smoke) that
   // clicks Run and polls for done/error never reads the PREVIOUS run's state.
   setState('running', 'parsing…');

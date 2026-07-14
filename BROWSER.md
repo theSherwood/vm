@@ -586,8 +586,40 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    until a later slice** brings `cap.call` into the JIT subset — an eligible guest can't call a
    domain-mutating cap today (it's out-of-subset → the guest isn't eligible → it stays on the
    interpreter), so there is nothing to deopt yet; the analysis/fallback substrate is what landed.
-4. **Threads.** Per-Worker registration over `SharedSlots`; the proven schedule-independent kernels
-   (4000 / futex / io) run with compute regions JITted, differential vs the interp path.
+4. **[landed] Threads — per-Worker JIT tier-up.** A guest keeps running on the resumable
+   interpreter (which drives `thread.spawn`/`join`, atomics, `memory.wait` — a JITted frame can't
+   unwind across a suspension), and a direct `Call` to an eligible pure region **tiers up** onto
+   emitted wasm on that vCPU's own Worker. The seam is an **event on the resumable `Vcpu`**, not a
+   Rust-side transmuted fn-pointer: when a vCPU carries a JIT-eligibility bitmap
+   (`Vcpu::with_jit_eligible`), an eligible module-0 `Call` surfaces as `VcpuEvent::TierUp { func,
+   argv }` (spilling the caller frame like any host-serviced event); the Worker runs the emitted
+   `f{func}(win, env, …i64 args)` and calls `deliver_tierup(results)` / `deliver_tierup_trap()` to
+   resume. Because the Worker's JS — not a Rust engine frame — is the top-level caller of `f{func}`,
+   a guest trap's `unreachable` surfaces as a catchable `RuntimeError` (the slice-1/2/3 trap model),
+   so no emitter trap-return protocol is needed. The eligibility set comes from a new emitter entry
+   **`compile_module_tierup(m, shared) → (wasm, eligible[])`**: unlike `compile_module_mixed_entry`
+   (rooted at one entry, so it can't emit a leaf reachable only through `thread.spawn`), it emits
+   **every** in-subset function whose calls all route — a monotone fixpoint starting from "every
+   in-subset function", dropping any whose emitted body would carry an unroutable `Call` (a callee
+   that is neither emitted nor a cross-tier interp leaf), and dropping `call_indirect` users unless
+   the whole module is in-subset. So the 4000 kernel's worker compute leaf (reachable only via
+   spawn, its caller using atomics) still emits + tier-ups, while the concurrency orchestrator stays
+   on the interpreter. Eligibility for the browser ABI additionally requires an **all-i64** signature
+   (the emitted `WebAssembly.Module` doesn't expose per-param types to JS). Each Worker computes its
+   own bitmap locally from the shared guest bytes (`svm_par_enable_jit` — an `Arc<[bool]>` can't
+   cross Worker instances) and instantiates its own emitted module against the **one** shared memory
+   (wasm tables aren't shareable across Workers). Proofs: `crates/svm-wasmjit/tests/tierup.rs` (4
+   differential cases pinning the emit set — spawn-only leaf, transitive leaves, a dropped
+   unroutable caller, all-in-subset — each emitted `f{i}` matched to the bytecode oracle over an arg
+   sweep); the native `crates/svm-interp/tests/vcpu_tierup.rs` (the `TierUp` seam on the resumable
+   `Vcpu`, value + trap parity vs pure interp); the single-vCPU Node FFI harness `browser/tierup.mjs`
+   (the real emitted-call + deliver path over shared memory, compute + trap); the multi-Worker Node
+   twin `threads-spawn.mjs` (`SVM_TIERUP=1`: the 4000 kernel across 9 `worker_threads`, 8 tier-ups
+   fired, result identical to the all-interp run); and the **Chromium** `#tierup` page item (the same
+   kernel across real Web Workers, plain vs tier-up both → 4000, counter proving 8 regions ran on
+   emitted wasm). Preemption reuses the fuel cell: a concurrent writer storing a negative fuel value
+   makes the emitted region's next fuel-debit trap out-of-fuel (the same mechanism as the emitter's
+   `out_of_fuel` differential), surfacing as a vCPU trap the host can restart or abandon.
 5. **§22 + §14 as real codegen.** Guest `jit_compile`/`install` emits wasm (validator-gated) — the
    guest-JIT ops become an actual JIT; `instantiate_module` units compile on push.
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
@@ -614,10 +646,27 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    in-subset when a reachable function makes one (fail-closed otherwise); cross-tier indirect (a
    trampoline routing null slots to `env.call_interp`) is a later refinement. Proven by three
    differential kernels (parity dispatch, null-slot trap, signature-mismatch trap) vs the bytecode
-   oracle, two `analyze` tests, and the Node + Chromium browser proofs. *(No cross-engine bench row:
-   that bench bundles every kernel — including SIMD/`fma` — into one module, so the whole-module
-   indirect requirement fails closed there; a dedicated all-in-subset dispatch kernel carries the
-   browser proof instead.)* Remaining for the slice: SIMD/v128 (mostly 1:1); a playground toggle.
+   oracle, two `analyze` tests, and the Node + Chromium browser proofs. *(The cross-engine
+   `call_indirect` row was blocked while that bench's bundled module still held an out-of-subset
+   SIMD kernel; it lights up once `v128` moves in-subset — see below.)*
+   **§17 SIMD (`v128`) now in-subset:** the emitter lowers the core `v128` lane ops to their fixed
+   `0xFD`-prefixed core-wasm opcodes — `const`/`splat`/`extract`/`replace_lane`, integer & float
+   lane arithmetic / compares / shifts / unary, saturating add-sub + `avgr` + `popcnt`, whole-vector
+   bitwise + `bitselect` + `any/all_true` + `bitmask`, `pmin`/`pmax`, `shuffle`/`swizzle`, the
+   int↔float lane conversions, and `v128.load`/`store` through the **same** trap-confinement path as
+   scalar memory (the one 16-byte widened masked access — §17/D58). A follow-up increment added the
+   **widening / reduction family** (`extend`/`narrow`/`extmul`/`extadd_pairwise`/`dot`/`q15mulr`), so
+   the only SIMD left interpreter-tier is **relaxed** SIMD (`VFma`/`VDotI8` — no core-wasm opcode);
+   that `dot_i8` is now the out-of-subset exemplar for the cross-tier/analysis tests. Because wasm
+   leaves the sign/payload of a *generated* NaN nondeterministic, the emitter is correct but the
+   differential canonicalizes NaN for float-bit kernels (finite results stay exact). Proven by 15
+   `tests/simd.rs` differential kernels vs the bytecode oracle (every opcode helper exercised — a
+   wrong `0xFD` number fails wasmi validation or diverges) — the wasmi dev-dep moved to 0.47 for its
+   `simd` feature — plus the Node + Chromium browser proofs. With `v128` in-subset the cross-engine
+   bench's **whole** bundled module is now emittable, so **every** kernel gets an `svm-wasmjit` row —
+   `vadd` at **~0.3 ns/iter** (~108× over interpreter-in-wasm, ~3× off native Cranelift SIMD), and
+   `call_indirect` too (its whole-module requirement finally met).
+   Remaining for the slice: a playground toggle.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);

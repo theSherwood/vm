@@ -1,0 +1,103 @@
+// Build the playground's **on-ramp `.svmb` assets** — real C/C++ guests (Lua, SQLite) compiled
+// through `clang -O2 -emit-llvm` and translated by `svm-llvm-translate` into SVM-IR modules the
+// browser engine runs via `svm_run_onramp` (see `web/play.js`).
+//
+// Every asset is translated with **`--host-page 65536`**: a wasm host has 64 KiB pages, so a
+// read-only global must not share a host page with the writable data stack (it would fault under
+// D40). The native default (16 KiB) is wrong for the browser — see the `svm-llvm` stack-page commit.
+//
+// Usage:  node build-onramp-assets.mjs           (builds whatever the toolchain + caches allow)
+// Needs `clang`/`llvm-dis` on PATH. SQLite/Lua sources are fetched-and-cached (skipped offline).
+// Outputs to `web/assets/*.svmb` (gitignored except the tiny committed `hello_c.svmb`).
+
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, existsSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = join(HERE, '..');
+const ASSETS = join(HERE, 'web', 'assets');
+const HOST_PAGE = '65536';
+mkdirSync(ASSETS, { recursive: true });
+
+// Build the translator once (release), reuse its path.
+const TR = join(REPO, 'crates', 'svm-llvm', 'target', 'release', 'svm-llvm-translate');
+function ensureTranslator() {
+  if (existsSync(TR)) return;
+  console.log('building svm-llvm-translate…');
+  execFileSync('cargo', ['build', '--release', '--bin', 'svm-llvm-translate'], {
+    cwd: join(REPO, 'crates', 'svm-llvm'), stdio: 'inherit',
+  });
+}
+
+// clang a C source to bitcode, then translate to a 64 KiB-page `.svmb`. Extra clang flags per guest.
+function buildC(name, src, includes = [], defines = []) {
+  const bc = join(ASSETS, `${name}.bc`);
+  const svmb = join(ASSETS, `${name}.svmb`);
+  const flags = ['-O2', '-emit-llvm', '-c', '-fno-vectorize', '-fno-slp-vectorize'];
+  execFileSync('clang', [...flags, ...defines, ...includes.map((i) => `-I${i}`), src, '-o', bc], { stdio: 'inherit' });
+  execFileSync(TR, [bc, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
+  console.log(`  ✓ ${name}.svmb (${size} B)`);
+}
+
+// Translate an **already-committed** `.bc` fixture to a 64 KiB-page `.svmb` (no clang step — the
+// bitcode is a golden input in the tree, e.g. the Lua test fixtures).
+function buildBc(name, bcPath) {
+  const svmb = join(ASSETS, `${name}.svmb`);
+  execFileSync(TR, [bcPath, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
+  console.log(`  ✓ ${name}.svmb (${size} B)`);
+}
+
+ensureTranslator();
+
+// 1) hello — the tiny always-present example (also committed so the playground works out of the box).
+try {
+  buildC('hello_c', join(REPO, 'crates', 'svm-run', 'demos', 'hello.c'));
+} catch (e) {
+  console.log(`  ✗ hello_c: ${e.message}`);
+}
+
+// 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
+//    from **stdin** and runs it against an in-memory database, printing each statement's result table.
+//    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +
+//    cache dir the svm-llvm test harness uses); skip offline.
+const CACHE = '/tmp/svm_sqlite_cache';
+const AMALG = join(CACHE, 'sqlite-amalgamation-3500200');
+function ensureAmalgamation() {
+  if (existsSync(join(AMALG, 'sqlite3.c'))) return true;
+  mkdirSync(CACHE, { recursive: true });
+  const zip = join(CACHE, 'amalgamation.zip');
+  try {
+    execFileSync('curl', ['-sfL', '--max-time', '120', '-o', zip,
+      'https://sqlite.org/2025/sqlite-amalgamation-3500200.zip'], { stdio: 'inherit' });
+    execFileSync('unzip', ['-o', '-q', zip, '-d', CACHE], { stdio: 'inherit' });
+    return existsSync(join(AMALG, 'sqlite3.c'));
+  } catch {
+    return false;
+  }
+}
+if (ensureAmalgamation()) {
+  try {
+    buildC('sqlite_repl', join(REPO, 'crates', 'svm-run', 'demos', 'sqlite', 'sqlite_repl.c'), [AMALG]);
+  } catch (e) {
+    console.log(`  ✗ sqlite_repl: ${e.message}`);
+  }
+} else {
+  console.log('  – sqlite_repl skipped (amalgamation fetch failed — offline?)');
+}
+
+// 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math/coroutine/io/os libraries + a guest
+//    snprintf, with a harness that reads a Lua chunk from **stdin** and runs it. The page pipes the
+//    editor's text in as stdin, so the user writes and runs their own Lua. io.write/os.date/coroutine
+//    all work; file I/O (io.open) degrades to nil (no fs cap granted). Committed golden fixture
+//    (`lua_eval.bc`; no Lua source needed).
+try {
+  buildBc('lua_eval', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_eval.bc'));
+} catch (e) {
+  console.log(`  ✗ lua_eval: ${e.message}`);
+}
+
+console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');

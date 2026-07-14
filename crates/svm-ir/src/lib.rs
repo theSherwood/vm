@@ -1590,6 +1590,33 @@ pub enum Inst {
         offset: u64,
         align: u8,
     },
+    /// Bulk copy `len` bytes from the confined span `[src, src+len)` to `[dst, dst+len)`
+    /// (**non-overlapping**; lowered from `llvm.memcpy`). Both spans are confined **as a whole**
+    /// to `[0, reserved)` — a *single* range check instead of one per byte — then a bulk copy
+    /// (JIT: the platform `memcpy` libcall; interp: a checked span copy). The security hinge for
+    /// memory-copy-dense kernels (D62): identical confinement to per-byte `Store` (the whole span
+    /// is proven in-bounds before any access), checked once. All operands `i64`; no SSA result.
+    MemCopy {
+        dst: ValIdx,
+        src: ValIdx,
+        len: ValIdx,
+    },
+    /// Overlap-safe bulk copy (lowered from `llvm.memmove`): the source span is fully read before
+    /// the destination is written, so overlapping `[src, src+len)`/`[dst, dst+len)` are correct.
+    /// Same whole-span confinement as [`Inst::MemCopy`]. All operands `i64`; no SSA result.
+    MemMove {
+        dst: ValIdx,
+        src: ValIdx,
+        len: ValIdx,
+    },
+    /// Fill the confined span `[dst, dst+len)` with `val`'s low byte (lowered from `llvm.memset`).
+    /// `val` is an `i32` (the fill byte, carried zero/sign-extended). Same whole-span confinement
+    /// as [`Inst::MemCopy`]. No SSA result.
+    MemFill {
+        dst: ValIdx,
+        val: ValIdx,
+        len: ValIdx,
+    },
     /// §12 atomic load — a naturally-aligned read of `ty` from the confined effective address
     /// `addr + offset`; a misaligned effective address **traps**. Single-threaded value semantics
     /// equal a plain [`Inst::Load`]; the distinct op makes the JIT emit a hardware atomic
@@ -2158,6 +2185,9 @@ impl Inst {
     pub fn result_count(&self, fn_results: &[usize]) -> usize {
         match self {
             Inst::Store { .. }
+            | Inst::MemCopy { .. }
+            | Inst::MemMove { .. }
+            | Inst::MemFill { .. }
             | Inst::AtomicStore { .. }
             | Inst::AtomicFence { .. }
             | Inst::VcpuTlsSet { .. }

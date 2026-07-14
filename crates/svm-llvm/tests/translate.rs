@@ -2313,6 +2313,34 @@ fn varargs_many_and_copy() {
 }
 
 #[test]
+fn varargs_indirect_call() {
+    // A `(...)` function invoked through a **function pointer** (not a named callee). The variadic
+    // args must marshal into the caller's overflow scratch exactly as for a direct varargs call — the
+    // only difference is the call lowers to `call_indirect` (with an §3c type-id check against the
+    // `(sp, fixed-params…)` callee signature) rather than `call`. The pointer is chosen by a
+    // `volatile` index so clang can't devirtualize it back to a direct call, and clang emits it as a
+    // `tail call`, which also exercises the `return_call_indirect` tail path. Found as the Postgres
+    // `manifest_process_version` gap. `run(1)`: index 1 → `vmul(4, 2,3,4,5)` = 120, +1 = 121.
+    let src = "#include <stdarg.h>\n\
+        typedef long long (*vfn)(int, ...);\n\
+        static long long vsum(int n, ...);\n\
+        static long long vmul(int n, ...);\n\
+        int run(int seed){\n\
+          vfn arr[2] = { vsum, vmul };\n\
+          volatile int i = seed & 1;\n\
+          long long r = arr[i](4, 2, 3, 4, 5);\n\
+          return (int)((r + seed) & 0xff); }\n\
+        __attribute__((noinline)) static long long vsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int k=0;k<n;k++) s+=va_arg(ap,int); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static long long vmul(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=1;\n\
+          for(int k=0;k<n;k++) s*=va_arg(ap,int); va_end(ap); return s; }\n\
+        int main(void){ return run(1); }";
+    check_run_byte_vs_native("varargs_indirect", src, 1);
+}
+
+#[test]
 fn libc_strcmp_strchr_strcoll() {
     // The synthesized `__svm_strcmp`/`__svm_strchr` byte loops (libc batch). The string pointers are
     // read through `volatile` so clang's `-O2` cannot constant-fold the calls away — the helpers are
@@ -2940,6 +2968,51 @@ fn demo_sqlite_vs_native() {
         }
     }
     powerbox_diff_cc_flags("sqlite", &bc, &demo, b"", &[&inc]);
+}
+
+#[test]
+fn demo_sqlite_repl_stdin() {
+    // **The interactive SQL-editor guest** (`sqlite_repl.c`, the browser playground's REPL): the same
+    // unmodified amalgamation + deterministic VFS, but the driver reads a SQL script from **stdin**
+    // (the `Stream.read` capability) and prints each statement's result table / change count / error.
+    // A differential over a SQL script on stdin — DDL, INSERT, a headered SELECT, an aggregate, and a
+    // deliberate error — asserts the guest's stdout is byte-identical to the same file built with `cc`.
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/sqlite/sqlite_repl.c");
+    let bc = std::env::temp_dir().join(format!(
+        "svm_llvm_demo_{}_sqlite_repl.bc",
+        std::process::id()
+    ));
+    let inc = format!("-I{}", amalg.display());
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_repl (clang unavailable)");
+            return;
+        }
+    }
+    const SQL: &[u8] = b"CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);\n\
+        INSERT INTO t(b) VALUES ('x'), ('y'), ('z');\n\
+        SELECT a, upper(b) AS B FROM t WHERE a >= 2 ORDER BY a;\n\
+        SELECT count(*) AS n, group_concat(b) AS all_b FROM t;\n\
+        SELECT * FROM nope;\n";
+    powerbox_diff_cc_flags("sqlite_repl", &bc, &demo, SQL, &[&inc]);
 }
 
 /// Fetch (and cache) sqllogictest script files — SQLite's own SQL Logic Tests corpus
@@ -3652,6 +3725,114 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
 }
 
 #[test]
+fn demo_ring_buffer_magic_mapping_vs_native() {
+    // **The magic-ring-buffer primitive through the capability** (MMAP_CAPABILITY.md §4e, the
+    // two-window-offsets case). A guest maps ONE file-backed region at two adjacent window offsets
+    // (`FS_MAP_REGION` + two `SharedRegion.map`s via `__vm_region_call`), so a span running off the
+    // end of the ring wraps seamlessly to the start — a single `memcpy` crosses the boundary. The
+    // `Mem`-level aliasing is unit-tested (`shared_region_aliases_two_window_offsets`); this proves a
+    // real guest program *uses* the primitive end-to-end on **both backends** and matches the OS one
+    // byte-for-byte: the native oracle double-maps a `memfd` with raw `mmap(MAP_SHARED|MAP_FIXED)`,
+    // and the JIT does the same real double-mapping over its window (the interpreter models it in
+    // software) — so `native == interp == jit`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/ring/ring_demo.c");
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode (single translation unit — no llvm-link; the on-ramp synthesizes libc).
+    let bc = tmp.join(format!("svm_ring_{pid}.bc"));
+    let bc_ok = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !bc_ok {
+        eprintln!("note: skipping ring buffer (clang unavailable)");
+        return;
+    }
+
+    // Native oracle.
+    let exe = tmp.join(format!("svm_ring_nat_{pid}"));
+    let native_ok = Command::new("cc")
+        .arg("-O2")
+        .arg(&demo)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !native_ok {
+        eprintln!("note: skipping ring buffer (cc unavailable)");
+        return;
+    }
+    let native = Command::new(&exe).output().expect("native ring run");
+    assert!(native.status.success(), "native ring run failed");
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate ring guest");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+    };
+
+    // Run on BOTH backends. The interpreter models the alias in software (loads/stores route through
+    // the backing's read_byte/write_byte); the JIT does the REAL hardware double-mapping — two
+    // `mmap(MAP_SHARED | MAP_FIXED)` of the file's fd over the window sub-ranges
+    // (`MprotectWindow::map_region`), exactly like the native oracle. Both must match native
+    // byte-for-byte, so `native == interp == jit`. The region must be file-backed, so each run gets a
+    // fresh `host_fs_mmap` over its own temp dir.
+    for (backend, tag) in [
+        (svm_run::Backend::Bytecode, "interp"),
+        (svm_run::Backend::Jit, "jit"),
+    ] {
+        let root = tmp.join(format!("svm-ring-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("ring root");
+        let out = inst
+            .run_with_caps(
+                backend,
+                &config,
+                &[("fs", svm_run::fs::host_fs_mmap(root.clone()))],
+            )
+            .unwrap_or_else(|e| panic!("guest ring run ({tag}) failed: {e:?}"));
+        let guest_stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            guest_stdout,
+            String::from_utf8_lossy(&native.stdout),
+            "ring buffer: guest ({tag}, double-mapped region) vs native (double-mapped memfd)"
+        );
+        // Non-vacuous: the alias must have physically wrapped (a broken alias leaves offset 0 zeroed).
+        assert!(
+            guest_stdout.contains("wrap-alias: RAPWRAP"),
+            "the wrap overflow must be visible at offset 0 via the second mapping ({tag}): {guest_stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    let _ = std::fs::remove_file(&bc);
+    let _ = std::fs::remove_file(&exe);
+}
+
+#[test]
 fn demo_sqlite_fs_cap_vs_native() {
     // **SQLite Phase B — disk-backed persistence through the Fs capability** (LLVM.md §8, the
     // north star's second half). Same amalgamation as Phase A, but the database is a real *file*:
@@ -4302,6 +4483,204 @@ fn atomics_wide_lowers_and_runs() {
     svm_verify::verify_module(&module).expect("verify translated IR");
     let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
     assert_eq!(run.stdout, b"10 100 1 0 99 1000000000001\n");
+}
+
+#[test]
+fn unresolved_extern_stub_opt_in() {
+    // The opt-in `stub_unresolved_externs` (TranslateOptions): a call to a genuinely undefined external
+    // (no recognizer/helper/capability handles it) lowers to a trap stub instead of failing
+    // translation — deferring the fail-closed from translate time to run time. This is what lets a
+    // whole-program module (Postgres) with hundreds of externals *dead on the exercised path* translate
+    // + verify. The stub is ordinary re-verified IR: a *called* stub traps cleanly (never an escape), a
+    // dead one is inert. Three checks below pin exactly that.
+    use svm_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+
+    // (1) A dead undefined extern behind an opaque gate (`gate` is `volatile 0`, so clang can't prove
+    // the branch dead and keeps the `call @mystery` in the IR — yet it is never taken at runtime).
+    let Some(bc) = compile_to_bc(
+        "extern_stub_dead",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         volatile int gate = 0;\n\
+         int main(void){ int r = 7; if (gate) r = mystery(42); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    // Strict default: a clean, fail-closed translate-time error.
+    match svm_llvm::translate_bc_path(&bc) {
+        Err(svm_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
+        other => panic!("strict default should fail closed on `mystery`, got {other:?}"),
+    }
+    // Opt-in: translates + verifies, and runs to a clean exit — the dead stub never executes.
+    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify stubbed module");
+    let run = svm_run::run_powerbox(&module, b"").expect("run (dead stub inert)");
+    assert_eq!(
+        run.stdout, b"7\n",
+        "the gated-off stub must not perturb the run"
+    );
+
+    // (2) The same extern, now on the *taken* path: the called stub must trap (run errors), never
+    // silently return or escape.
+    let Some(bc2) = compile_to_bc(
+        "extern_stub_called",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         int main(void){ int r = mystery(1); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    let t2 = svm_llvm::translate_bc_path_with_options(&bc2, stub).expect("stub translate 2");
+    let module2 = svm_run::resolve_capability_imports(t2.module).expect("resolve caps 2");
+    svm_verify::verify_module(&module2).expect("verify stubbed module 2");
+    assert!(
+        svm_run::run_powerbox(&module2, b"").is_err(),
+        "a called stub must trap (fail-closed at run time)"
+    );
+}
+
+#[test]
+fn vector_mask_bitwise_any_match() {
+    // The SIMD "**any lane matches**" idiom (Postgres' `simd.h`): several `<N x i1>` comparison masks
+    // combined with `or`/`and`, then `sext` to a full-width vector. clang `-O2` folds
+    // `sext(m1)|sext(m2)|sext(m3)` into `or <4 x i1>` masks + one `sext <4 x i1> to <4 x i32>` — the
+    // exact construct that blocked Postgres. The on-ramp now lowers mask-mask bitwise ops lane-wise
+    // (`sext` of a mask was already handled). Runtime `volatile` seed so nothing constant-folds; the
+    // 0/-1 result lanes fold to one `%u`. Byte-identical to native.
+    let src = "#include <stdio.h>\n\
+        typedef int v4i __attribute__((vector_size(16)));\n\
+        volatile int SEED = 7;\n\
+        int main(void){\n\
+          int s = SEED;\n\
+          v4i a = {s, s*2, s+5, s^3};\n\
+          v4i t1 = {7, 99, 12, 4}, t2 = {14, 8, 12, 100}, t3 = {0, 14, 3, 4};\n\
+          v4i any = (a == t1) | (a == t2) | (a == t3);\n\
+          v4i all = (a != t1) & (a != t2);\n\
+          unsigned acc = 0;\n\
+          for (int i=0;i<4;i++) acc = acc*131u + (unsigned)any[i] + 7u*(unsigned)all[i];\n\
+          printf(\"%u\\n\", acc); return 0; }";
+    check_powerbox_vs_native("vmask_any", src, b"");
+}
+
+#[test]
+fn unresolved_extern_funcptr_stub() {
+    // The **address-taken** counterpart to `unresolved_extern_stub_opt_in`: a *function pointer* to an
+    // undefined external (e.g. a comparator/dispatch-table entry — what blocked Postgres on `@memcmp`)
+    // resolves to the trap stub's funcref index. The undefined extern's signature comes from its
+    // `declare` prototype (the reference site carries only an opaque `ptr`). Under strict default this
+    // is a clean translate-time error; opt-in, the funcref is inert unless the pointer is *called*.
+    use svm_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+    // `gate ? mystery : other` takes the address of the undefined `mystery`; with `gate` a volatile 0
+    // the live target is `other`, so the run is clean and the `mystery` funcref (a stub) is never
+    // selected — proving an address-taken stub is inert until actually invoked.
+    let Some(bc) = compile_to_bc(
+        "extern_funcptr",
+        "#include <stdio.h>\n\
+         extern int mystery(int, int);\n\
+         static int other(int a, int b){ return a + b; }\n\
+         volatile int gate = 0;\n\
+         int main(void){ int (*p)(int,int) = gate ? mystery : other; \
+           printf(\"%d\\n\", p(3, 4)); return 0; }",
+    ) else {
+        return;
+    };
+    match svm_llvm::translate_bc_path(&bc) {
+        Err(svm_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
+        other => {
+            panic!("strict default should fail closed on address-taken `mystery`, got {other:?}")
+        }
+    }
+    let t = svm_llvm::translate_bc_path_with_options(&bc, stub).expect("stub translate");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve caps");
+    svm_verify::verify_module(&module).expect("verify funcptr-stub module");
+    let run = svm_run::run_powerbox(&module, b"").expect("run (funcref stub inert)");
+    assert_eq!(
+        run.stdout, b"7\n",
+        "the unselected funcref stub must not perturb the run"
+    );
+}
+
+#[test]
+fn vector_ctpop_and_wide_reduce() {
+    // Two SIMD gaps from Postgres' `pg_popcount_*`, in one vectorizable loop: (1) `llvm.ctpop.vNiM` on
+    // a non-`i8x16` lane width (`pg_popcount_slow`'s `<2 x i64>`) — only `i8x16` has a native vector
+    // `ctpop`, so the on-ramp scalarizes any other width; (2) a **wide** `llvm.vector.reduce.add` over
+    // a >128-bit accumulator (`pg_popcount_avx512`'s `reduce.add.v8i64`) — folded across every chunk
+    // lane. A popcount-sum loop vectorizes at `-O2` into exactly this; the count matches native
+    // (hardware `popcnt`) on interp + JIT. `seed` is the runtime `main` arg so nothing constant-folds.
+    let src = "int main(int seed){\n\
+        unsigned long long arr[32];\n\
+        for (int i=0;i<32;i++) arr[i] = (unsigned long long)(i+seed) * 0x0102040810204080ULL ^ (0x5555ULL*(i+1));\n\
+        int c = 0;\n\
+        for (int i=0;i<32;i++) c += __builtin_popcountll(arr[i]);\n\
+        return c & 0x7f; }";
+    check_vs_native("vctpop", src, 1);
+}
+
+#[test]
+fn freeze_of_aggregate() {
+    // `freeze` of an **aggregate** value (a small by-value struct held field-wise in `agg` — e.g. the
+    // `{i32,i32,i32,i32}` a `cpuid`/multi-result call yields, which blocked Postgres' `pg_popcount_*`
+    // dispatch) is the identity: rebind the fields. A hand-written `.ll` (`insertvalue` → `freeze` →
+    // `extractvalue`) exercises exactly that path (clang rarely emits an aggregate `freeze` from C).
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %s0 = insertvalue {i32, i32} undef, i32 7, 0\n  \
+        %s1 = insertvalue {i32, i32} %s0, i32 35, 1\n  \
+        %f = freeze {i32, i32} %s1\n  \
+        %x = extractvalue {i32, i32} %f, 1\n  \
+        ret i32 %x\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate freeze-agg .ll");
+    svm_verify::verify_module(&t.module).expect("verify freeze-agg");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run freeze-agg");
+    assert_eq!(
+        r,
+        vec![Value::I32(35)],
+        "freeze of {{7,35}} then extractvalue 1 = 35"
+    );
+}
+
+#[test]
+fn vector_shift_per_lane_amount() {
+    // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
+    // Postgres' `simd.h`). svm-ir's `VShift` takes one scalar count for all lanes, so the on-ramp
+    // scalarizes: shift each lane by its own amount and repack. Exercises 128-bit (`<4 x i32>`
+    // shl/lshr/ashr, `<2 x i64>` shl/lshr) and **wide** (`<8 x i32>` lshr/shl, 256-bit → the chunked
+    // i32x4 wide path). The seed + shift amounts are runtime (`volatile`), so clang can't constant-fold
+    // the shifts, and every result lane is folded into one `%u` (no wide-int printf). Byte-identical to
+    // native — the scalarized lanes must match the hardware vector shift.
+    let src = "#include <stdio.h>\n\
+        typedef unsigned int v4u __attribute__((vector_size(16)));\n\
+        typedef int v4i __attribute__((vector_size(16)));\n\
+        typedef unsigned long long v2u __attribute__((vector_size(16)));\n\
+        typedef unsigned int v8u __attribute__((vector_size(32)));\n\
+        volatile unsigned SEED = 7;\n\
+        int main(void){\n\
+          unsigned s = SEED;\n\
+          v4u a = {s, s*85u, s<<16, 0x80000000u|s}, shu = {s&3u, (s+1u)&7u, 3u, 2u};\n\
+          v4u rl = a << shu, rr = a >> shu;\n\
+          v4i sv = {-(int)s, 100, -1, 65536}, ra = sv >> (v4i){1, 2, 3, (int)(s&7u)};\n\
+          v2u b = {(unsigned long long)s, ((unsigned long long)s)<<32}, shb = {s&31u, 33u};\n\
+          v2u rb = b << shb, rb2 = b >> (v2u){1u, s&15u};\n\
+          v8u c = {s, 2u*s, s<<8, 0xFF00u^s, s|0x10000u, 5u*s, s>>1, 3u*s};\n\
+          v8u rc = c >> (v8u){3u,10u,s&7u,4u,1u,2u,s&15u,7u}, rc2 = c << (v8u){1u,2u,s&3u,4u,0u,1u,2u,3u};\n\
+          unsigned acc = 0;\n\
+          for (int i=0;i<4;i++){ acc = acc*131u + rl[i]; acc = acc*131u + rr[i]; acc = acc*131u + (unsigned)ra[i]; }\n\
+          for (int i=0;i<2;i++){ acc = acc*131u + (unsigned)rb[i] + (unsigned)(rb[i]>>32) + (unsigned)rb2[i]; }\n\
+          for (int i=0;i<8;i++){ acc = acc*131u + rc[i] + rc2[i]; }\n\
+          printf(\"%u\\n\", acc); return 0; }";
+    check_powerbox_vs_native("vshift_per_lane", src, b"");
 }
 
 #[test]
@@ -8988,6 +9367,52 @@ fn i128_small_constant_still_runs() {
             &[Value::I64(n as i64)],
             &[Value::I64(want as i64)],
         );
+    }
+}
+
+#[test]
+fn i128_select_and_store_roundtrip() {
+    // Two i128 op lowerings the Postgres numeric path needs, both of which clang refuses to emit from
+    // simple C (it always *branches* a `? :` on a 128-bit value): `select i128` (numeric `sqrt_var`'s
+    // Newton's-method loop) and `store i128` (numeric `int2_accum`'s `sumX2` accumulator). A hand `.ll`
+    // (mirroring the `freeze_of_aggregate` approach) selects between two i128 values, stores the winner
+    // to an `alloca`, loads it back, and folds `lo - hi` — an **asymmetric** fold, so a swapped
+    // store/load half or a mis-picked select changes the result. a = (7<<64)|300, b = (2<<64)|100;
+    // a >u b so the select picks a → lo = 300, hi = 7 → 300 - 7 = 293.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %p = alloca i128, align 16\n  \
+        %ah = shl i128 7, 64\n  \
+        %a = or i128 %ah, 300\n  \
+        %bh = shl i128 2, 64\n  \
+        %b = or i128 %bh, 100\n  \
+        %c = icmp ugt i128 %a, %b\n  \
+        %s = select i1 %c, i128 %a, i128 %b\n  \
+        store i128 %s, ptr %p, align 16\n  \
+        %r = load i128, ptr %p, align 16\n  \
+        %lo = trunc i128 %r to i64\n  \
+        %rsh = lshr i128 %r, 64\n  \
+        %hi = trunc i128 %rsh to i64\n  \
+        %d = sub i64 %lo, %hi\n  \
+        %d32 = trunc i64 %d to i32\n  \
+        ret i32 %d32\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate i128 select/store .ll");
+    svm_verify::verify_module(&t.module).expect("verify i128 select/store");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run i128 select/store");
+    assert_eq!(
+        r,
+        vec![Value::I32(293)],
+        "select picks a=(7<<64)|300; stored+reloaded; lo-hi = 300-7 = 293"
+    );
+    // JIT parity — this path genuinely *runs* i128 select + i128 store/load (not a decline).
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            assert_eq!(s[0] as i32, 293, "JIT i128 select/store = 293")
+        }
+        other => panic!("JIT i128 select/store: unexpected {other:?}"),
     }
 }
 

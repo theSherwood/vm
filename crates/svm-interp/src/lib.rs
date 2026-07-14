@@ -2029,21 +2029,50 @@ fn drive(
             }
         }
         // §4 subtree thaw (DURABILITY.md): re-attach the §14 nested children a subtree freeze
-        // recorded. Each child's whole state — window, durable reserve, unwound continuation —
-        // is already in the restored image (its carve is a sub-range of the root's window); this
-        // re-creates the child *domain* around it: a nested view of the carve, a fresh attenuated
-        // powerbox (the same grants, in the same order, as `instantiate` minted — so the child's
-        // reloaded handle values still resolve), and a `REWINDING` re-entry from the extent its
-        // carve's own shadow-SP word holds. The root's join table is rebuilt at each recorded
-        // slot, so the root's reloaded child handle resolves; the root's re-executed `join` then
-        // parks until the rewound child completes, exactly as pre-freeze.
+        // recorded — now to **arbitrary depth** (parent→child→grandchild, …). Each child's whole
+        // state — window, durable reserve, unwound continuation — is already in the restored image
+        // (its carve is a sub-range of the *root's* window, at any nesting depth); this re-creates
+        // each child *domain* around it: a nested view of the carve, a fresh attenuated powerbox
+        // (the same grants, in the same order, as `instantiate` minted — so the child's reloaded
+        // handle values still resolve), and a `REWINDING` re-entry from the extent its carve's own
+        // shadow-SP word holds. Mirrors the `thread.spawn` [`FrozenVCpu`] two-phase re-attach
+        // (above): the residue is grouped by `parent_task` so each child's handle is rebuilt into
+        // **its own parent's** join table (the root for a direct child, a re-created child for a
+        // grandchild) — so every re-executed `join` (root's *and* a child's) resolves and parks
+        // until its rewound child completes, exactly as pre-freeze.
         {
             let mut nseed: Vec<FrozenNested> = thaw_nested;
-            nseed.sort_by_key(|n| n.slot);
+            // Sort by `parent_task` then `slot`: a parent's task id is always < its children's (it
+            // was instantiated first), so this re-attaches **parents before their grandchildren** —
+            // a parent-child VCpu exists before any of its children attach to it. `slot` is the
+            // deterministic tiebreak (the freeze's canonical order). The subtree freeze reproduces
+            // the same dense task ids as the freeze (root = 0, then the sorted-order children get
+            // 1, 2, …), so a grandchild's recorded `parent_task` equals its parent-child's fresh cid
+            // here — the key `children` is stored under.
+            nseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+            // Re-created child domains, held by their fresh cid so a grandchild can attach to its
+            // (already re-created) parent-child; the root is mutated directly. `BTreeMap` keeps the
+            // enqueue order ascending-cid (parents first).
+            let mut children: std::collections::BTreeMap<TaskId, Box<VCpu>> =
+                std::collections::BTreeMap::new();
+            // Each re-created child's **absolute** (root-window-relative) carve offset. A record's
+            // `carve_off` is relative to *its parent's* window (the parent's Instantiator base is 0
+            // in its own view), so a grandchild's offset into the root image is its parent-child's
+            // absolute base + its own recorded offset — accumulated down the chain here.
+            let mut abs_off: std::collections::BTreeMap<TaskId, u64> =
+                std::collections::BTreeMap::new();
             for fnr in nseed {
+                let parent = fnr.parent_task as TaskId;
+                // The parent-child's absolute carve base (0 for a direct child of the root).
+                let parent_base = if parent == id {
+                    0
+                } else {
+                    abs_off.get(&parent).copied().unwrap_or(0)
+                };
+                let abs_carve = parent_base + fnr.carve_off;
                 // A **completed** child is not re-created (reload-not-reissue): its result is posted
-                // straight into the scheduler and mapped to the parent's join slot, so the parent's
-                // re-executed `thread.join` delivers it without re-running the child.
+                // straight into the scheduler and mapped to the recording parent's join slot, so the
+                // parent's re-executed `thread.join` delivers it without re-running the child.
                 if let Some(r) = fnr.completed_result {
                     let cid = s.next_task;
                     s.next_task += 1;
@@ -2057,17 +2086,25 @@ fn drive(
                             trap_fiber: None,
                         },
                     );
-                    while root.threads.len() <= fnr.slot {
-                        root.threads.push(None);
+                    if parent == id {
+                        while root.threads.len() <= fnr.slot {
+                            root.threads.push(None);
+                        }
+                        root.threads[fnr.slot] = Some(cid);
+                    } else if let Some(p) = children.get_mut(&parent) {
+                        while p.threads.len() <= fnr.slot {
+                            p.threads.push(None);
+                        }
+                        p.threads[fnr.slot] = Some(cid);
                     }
-                    root.threads[fnr.slot] = Some(cid);
+                    abs_off.insert(cid, abs_carve);
                     continue;
                 }
                 let csize = 1u64 << fnr.size_log2;
                 // Resolve the child's function table: the parent's own for a same-module child, or a
                 // re-granted **separate module** matched by content digest (host-supplied at restore).
-                // A missing / mismatched re-grant leaves the join slot empty, so the parent's
-                // re-executed `thread.join` fails closed — the per-child R5 identity gate.
+                // A missing / mismatched re-grant leaves the join slot empty, so the recording
+                // parent's re-executed `thread.join` fails closed — the per-child R5 identity gate.
                 let cfuncs = match fnr.module_digest {
                     None => Some(Arc::clone(&funcs)),
                     Some(d) => host_shared
@@ -2076,29 +2113,42 @@ fn drive(
                         .module_by_digest(&d),
                 };
                 let Some(cfuncs) = cfuncs else {
-                    while root.threads.len() <= fnr.slot {
-                        root.threads.push(None);
+                    if parent == id {
+                        while root.threads.len() <= fnr.slot {
+                            root.threads.push(None);
+                        }
+                    } else if let Some(p) = children.get_mut(&parent) {
+                        while p.threads.len() <= fnr.slot {
+                            p.threads.push(None);
+                        }
                     }
                     continue;
                 };
                 // Flip the child's carve from its frozen phase to a thaw: clear its own global
-                // freeze word and set its context-0 thaw word — `begin_thaw`, carve-relative.
+                // freeze word and set its context-0 thaw word — `begin_thaw`, at the **absolute**
+                // carve offset (the carve rides the root image at any depth).
                 if let Some(m) = root.mem.as_mut() {
-                    let _ = m.write_bytes(fnr.carve_off + STATE_OFF, &STATE_NORMAL.to_le_bytes());
+                    let _ = m.write_bytes(abs_carve + STATE_OFF, &STATE_NORMAL.to_le_bytes());
                     let _ = m.write_bytes(
-                        fnr.carve_off + thaw_state_off(0),
+                        abs_carve + thaw_state_off(0),
                         &STATE_REWINDING.to_le_bytes(),
                     );
                 }
+                // The child's flattened extent: a nested child is a single-vCPU durable domain in
+                // its carve (`vcpu_ctx == 0`), so its shadow-SP word sits at its context-0 **region
+                // base** (`DurableShadowBase`, where the transform reads/writes it) — *not* the old
+                // fixed global `SHADOW_SP_OFF`. A leaf child re-runs idempotently from base, so the
+                // read location was immaterial before; a **depth-2 middle child** reloads its
+                // `instantiate` checkpoint on rewind, so it must resume from the true drained extent.
                 let child_extent = root
                     .mem
                     .as_ref()
-                    .map(|m| m.durable_get_sp(fnr.carve_off + SHADOW_SP_OFF))
-                    .unwrap_or(SHADOW_BASE);
+                    .map(|m| m.durable_get_sp(abs_carve + shadow_region_base(0)))
+                    .unwrap_or_else(|| shadow_frame_base(0));
                 let child_mem = root
                     .mem
                     .as_ref()
-                    .map(|m| m.nested_view(m.window.base() + fnr.carve_off, fnr.size_log2));
+                    .map(|m| m.nested_view(m.window.base() + abs_carve, fnr.size_log2));
                 let mut ch = Host::new();
                 ch.set_durable(true);
                 let cinst = ch.grant_instantiator(0, csize);
@@ -2114,6 +2164,13 @@ fn drive(
                 let cid = s.next_task;
                 s.next_task += 1;
                 s.live += 1;
+                // True nesting depth: a direct child of the root is depth 1; a grandchild is its
+                // parent-child's depth + 1 (the parent is already in `children`, built first).
+                let cdepth = if parent == id {
+                    1
+                } else {
+                    children.get(&parent).map(|p| p.depth + 1).unwrap_or(1)
+                };
                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&cfuncs),
@@ -2122,7 +2179,7 @@ fn drive(
                     child_mem,
                     Arc::new(Mutex::new(ch)),
                     *fuel,
-                    1, // depth: a nested child (depth-1 covered shape)
+                    cdepth,
                     cid,
                     SchedRef::Real(Arc::clone(&sched)),
                     quota,
@@ -2132,17 +2189,37 @@ fn drive(
                 child.nested_child = true;
                 child.dstate = STATE_REWINDING;
                 child.root_shadow_sp = child_extent;
-                while root.threads.len() <= fnr.slot {
-                    root.threads.push(None);
-                }
-                root.threads[fnr.slot] = Some(cid);
-                root.nested_children.push(NestedChildInfo {
+                child.parent_task = parent;
+                // §4 depth-2+: a great-grandchild's residue coalesces in the root host too (the same
+                // shared sink the freeze used), so re-freezing a thawed deep subtree stays canonical.
+                child.freeze_sink = Some(Arc::clone(&host_shared));
+                let info = NestedChildInfo {
                     slot: fnr.slot,
                     carve_off: fnr.carve_off,
                     size_log2: fnr.size_log2,
                     entry: fnr.entry,
                     module_digest: fnr.module_digest,
-                });
+                };
+                // Rebuild the recording parent's join table + nested-child record at the recorded
+                // slot (the root for a direct child, a re-created child for a grandchild).
+                if parent == id {
+                    while root.threads.len() <= fnr.slot {
+                        root.threads.push(None);
+                    }
+                    root.threads[fnr.slot] = Some(cid);
+                    root.nested_children.push(info);
+                } else if let Some(p) = children.get_mut(&parent) {
+                    while p.threads.len() <= fnr.slot {
+                        p.threads.push(None);
+                    }
+                    p.threads[fnr.slot] = Some(cid);
+                    p.nested_children.push(info);
+                }
+                abs_off.insert(cid, abs_carve);
+                children.insert(cid, child);
+            }
+            // Enqueue every re-created child, parents first (ascending cid via the `BTreeMap`).
+            for (_, child) in children {
                 s.runnable.push_back(child);
             }
         }
@@ -3691,18 +3768,24 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
             // drive trap (out-of-scope module) surfaces as the run's result.
             // §4 subtree freeze (DURABILITY.md): handle this vCPU's live §14 children before its
-            // own residue is recorded. The **covered** shape — depth-1, same-module, still-running
-            // children of a non-nested parent, no unjoined `thread.spawn` siblings — is frozen for
-            // real: broadcast `UNWINDING` into each live child's carve state word (the subtree STW;
-            // the child self-unwinds into its carve's own durable reserve, which is inside this
-            // window's image, at its next poll) and record it as [`FrozenNested`] re-attach residue.
-            // A **completed-but-unjoined** child rides via `completed_result` (its result taken from
+            // own residue is recorded. The **covered** shape — same-module, still-running children,
+            // no unjoined `thread.spawn` siblings — is frozen for real: broadcast `UNWINDING` into
+            // each live child's carve state word (the subtree STW; the child self-unwinds into its
+            // carve's own durable reserve, which is inside this window's image, at its next poll) and
+            // record it as [`FrozenNested`] re-attach residue, tagged with **this** vCPU's task id as
+            // its `parent_task`. Depth is now covered to **arbitrary nesting** (parent→child→
+            // grandchild, …): a §14 child records its *own* live children (its grandchildren of the
+            // root) into the subtree's shared freeze-residue **sink** — the root host, reached via
+            // [`VCpu::freeze_sink`] since the child's own powerbox is private — so the whole subtree's
+            // residue coalesces where a thaw reads it, disambiguated by `parent_task` (the exact
+            // shape by which `thread.spawn`'s shared host coalesces [`FrozenVCpu`]). A
+            // **completed-but-unjoined** child rides via `completed_result` (its result taken from
             // the scheduler; no `UNWINDING` broadcast — nothing to unwind). Everything else stays
             // **fail-closed** (`ThreadFault`, like the join-deadlock): a suspended coroutine
             // (host-side native continuation), a separate-module child (its module identity can't ride
-            // the artifact yet), a completed child that **trapped** (its trap can't ride yet),
-            // nested-in-nested, and mixing with unjoined `thread.spawn` children (the two thaw seedings
-            // would contend for the join table).
+            // the artifact yet), a completed child that **trapped** (its trap can't ride yet), and
+            // mixing with unjoined `thread.spawn` children (the two thaw seedings would contend for
+            // the join table).
             let nested_refused = froze && {
                 let live: Vec<NestedChildInfo> = v
                     .nested_children
@@ -3714,14 +3797,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     true
                 } else if live.is_empty() {
                     false
-                } else if v.nested_child
-                    || v.threads.iter().enumerate().any(|(slot, t)| {
-                        t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
-                    })
-                    || v.mem.is_none()
+                } else if v.threads.iter().enumerate().any(|(slot, t)| {
+                    // A live `thread.spawn` sibling (a `threads` slot not backed by a
+                    // `nested_children` entry): its thaw seeding and the §14 seeding would contend
+                    // for the join table — fail closed.
+                    t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
+                }) || v.mem.is_none()
                 {
                     true // uncovered shape / malformed durable freeze
                 } else {
+                    // NB: a nested child (`v.nested_child`) is **no longer** refused here — a §14
+                    // child may record its own live children (grandchildren), tagged with this
+                    // vCPU's task id and pushed to the subtree's shared sink (depth-2+, §4).
                     let mut refuse = false;
                     for c in &live {
                         let cid = v.threads[c.slot].expect("filtered to Some");
@@ -3749,11 +3836,17 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             }
                             None
                         };
-                        v.host
-                            .lock()
+                        // §4 depth-2: push to the subtree's **effective sink** (the root host for a
+                        // nested child, our own host for the root), tagged with our own task id as
+                        // the child's `parent_task`, so the whole nesting subtree's residue coalesces
+                        // where a thaw reads it — the root records its child with `parent_task = 0`,
+                        // a child records its grandchild with `parent_task = <child's task>`.
+                        let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                        sink.lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .frozen_nested
                             .push(FrozenNested {
+                                parent_task: v.id as usize,
                                 slot: c.slot,
                                 carve_off: c.carve_off,
                                 size_log2: c.size_log2,
@@ -4710,6 +4803,16 @@ struct NestedChildInfo {
 /// snapshot codec's Section 2 from `FORMAT_VERSION` v8.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrozenNested {
+    /// The task id of the vCPU that **instantiated** this child (DURABILITY.md §4, depth-2 nesting).
+    /// A root's direct child carries the root's id (`0`); a grandchild carries its parent-child's
+    /// task. Mirrors [`FrozenVCpu::parent_task`] for `thread.spawn`: the whole §14 nesting subtree
+    /// coalesces its residue in the *root* host (the §14 child's own capability host is private, so
+    /// a shared **freeze-residue sink** is threaded down the subtree — see [`VCpu::freeze_sink`]),
+    /// and thaw groups by this to rebuild the per-parent join table, re-attaching parents before
+    /// children so a grandchild's reloaded handle resolves in its *parent-child's* table, not the
+    /// root's. Depth-1 residue carries `0` and is byte-identical over the codec (not yet on the
+    /// wire — a depth-2 artifact is refused at freeze; see `svm-snapshot`).
+    pub parent_task: usize,
     /// The parent's join-table slot for this child (the guest-held handle value).
     pub slot: usize,
     /// The carve's window-relative base.
@@ -5160,6 +5263,14 @@ struct VCpu {
     /// in any thread and I/O from any thread reaches the same sink (matching the JIT, whose `cap.call`s
     /// all hit the one host ctx). Locked briefly per `cap.call`.
     host: Arc<Mutex<Host>>,
+    /// The residue sink for a §14 subtree freeze (DURABILITY.md §4) — where this vCPU's
+    /// [`FrozenNested`] records are pushed. `None` = use `self.host` (the root, or a `thread.spawn`
+    /// domain that shares its host). A §14 nested child, whose capability host is **private** (its
+    /// own attenuated powerbox), inherits its parent's *effective* sink so a whole nesting subtree's
+    /// residue coalesces in the root host — mirroring how `thread.spawn`'s shared host coalesces
+    /// [`FrozenVCpu`] residue. Without this a grandchild's [`FrozenNested`] would be orphaned in the
+    /// child's private host and lost to the snapshot.
+    freeze_sink: Option<Arc<Mutex<Host>>>,
     /// Remaining fuel (metering, §5).
     fuel: u64,
     /// This vCPU's spawned children, by `thread.join` handle (slot) ⇒ child [`TaskId`]; `None` once
@@ -5281,6 +5392,7 @@ impl VCpu {
             dstate: STATE_NORMAL,
             mem,
             host,
+            freeze_sink: None,
             fuel,
             threads: Vec::new(),
             nested_children: Vec::new(),
@@ -5348,6 +5460,7 @@ impl VCpu {
             dstate: STATE_NORMAL,
             mem,
             host,
+            freeze_sink: None,
             fuel,
             threads: Vec::new(),
             nested_children: Vec::new(),
@@ -5691,6 +5804,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         mem,
         host,
+        freeze_sink, // §4: the effective sink a §14 child inherits so its residue reaches the root host
         fuel,
         threads,
         nested_children,
@@ -6106,6 +6220,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     |(f, _, _, _, _)| Arc::clone(f),
                                 );
                                 let csched = sched.clone();
+                                // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
+                                // residue must reach the **root** host, not the child's private
+                                // powerbox. Compute our *effective* sink — our inherited one, or our
+                                // own host if we are the root/a shared-host domain — and hand it down;
+                                // the child (and transitively any grandchild) pushes there, so a whole
+                                // nesting subtree's residue coalesces where a thaw reads it (mirrors how
+                                // `thread.spawn`'s shared host coalesces [`FrozenVCpu`]).
+                                let residue_sink =
+                                    freeze_sink.clone().unwrap_or_else(|| Arc::clone(host));
+                                // §4 subtree STW (DURABILITY.md): the child inherits our **current
+                                // durable phase** (its own carve's, which is `UNWINDING` when we are
+                                // instantiating it mid-freeze), exactly as `thread.spawn` seeds
+                                // `child.dstate = child_state`. Without this the child's first
+                                // dispatch would store its default `NORMAL` over the freeze driver's
+                                // `UNWINDING` broadcast into the carve — clobbering the STW — so a
+                                // grandchild-of-the-root would never be driven to self-unwind (and
+                                // its residue would be lost). With it, a child instantiated while its
+                                // parent is unwinding is born unwinding: it runs its own
+                                // `instantiate`/`join` under `UNWINDING`, recording *its* live
+                                // children before it drains — the recursion that makes depth-2+ work.
+                                let child_dstate = mem
+                                    .as_ref()
+                                    .map(|m| m.durable_state())
+                                    .unwrap_or(STATE_NORMAL);
                                 let made = sched.spawn(move |id| {
                                     // A nested child is its **own** domain (own host/window/program),
                                     // so it gets its own dispatch table, not the parent's.
@@ -6131,6 +6269,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // Its freeze-unwind is carve-self-describing: record no
                                     // host-side extent (see `VCpu::nested_child`).
                                     child.nested_child = true;
+                                    // §4 depth-2: the child pushes its own [`FrozenNested`] residue
+                                    // (for any grandchild) into the subtree's shared sink, so it
+                                    // coalesces in the root host rather than the child's private one.
+                                    child.freeze_sink = Some(residue_sink);
+                                    // §4 subtree STW: inherit the parent's freeze phase (see above),
+                                    // so a mid-freeze instantiate composes recursively.
+                                    child.dstate = child_dstate;
                                     Box::new(child)
                                 });
                                 match made {
@@ -7296,6 +7441,23 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
             let a = get_i64(vals, *addr)? as u64;
             m.store(a, *offset, *op, Value::I64(get(vals, *value)?.i64()))?;
+            return Ok(None);
+        }
+        // Bulk-memory ops (D62): both `MemCopy` and `MemMove` route to the overlap-safe `mem_copy`.
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let d = get_i64(vals, *dst)? as u64;
+            let s = get_i64(vals, *src)? as u64;
+            let n = get_i64(vals, *len)? as u64;
+            m.mem_copy(d, s, n)?;
+            return Ok(None);
+        }
+        Inst::MemFill { dst, val, len } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let d = get_i64(vals, *dst)? as u64;
+            let v = get(vals, *val)?.i32() as u8;
+            let n = get_i64(vals, *len)? as u64;
+            m.mem_fill(d, v, n)?;
             return Ok(None);
         }
         Inst::AtomicStore {
@@ -11781,6 +11943,96 @@ impl Mem {
         self.check_prot(base, width, true)?;
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
+        self.writes += 1;
+        Ok(())
+    }
+
+    /// Bounds-check a whole `[addr, addr+len)` span against the reserved domain `[0, reserved)` — the
+    /// `len: u64` bulk analogue of [`Self::confine_checked`], a *single* range check for the entire
+    /// span (bulk-memory ops, D62). Returns the absolute base. Callers early-out on `len == 0` before
+    /// calling, so this always sees `len >= 1` (matching the JIT's `len != 0`-guarded check).
+    fn confine_span(&self, addr: u64, len: u64) -> Result<u64, Trap> {
+        self.last_fault.store(NO_FAULT, Ordering::Relaxed);
+        match addr.checked_add(len) {
+            Some(end) if end <= self.window.reserved() => Ok(self.window.confine(addr, 0)),
+            _ => Err(Trap::MemoryFault),
+        }
+    }
+
+    /// Per-page committed-ness / RO enforcement over a whole span — the `len: u64` analogue of
+    /// [`Self::check_prot`]. `len >= 1` (see [`Self::confine_span`]).
+    fn check_prot_span(&self, base: u64, len: u64, write: bool) -> Result<(), Trap> {
+        let rel = base.wrapping_sub(self.window.base());
+        let last = rel + (len - 1);
+        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+            return Ok(());
+        }
+        let space = self.space_read();
+        if space.prot.is_empty() && last < self.window.mapped() {
+            return Ok(());
+        }
+        for page in (rel / self.page)..=(last / self.page) {
+            match self.page_access(&space.prot, page) {
+                None => return Err(self.page_fault(base)),
+                Some(false) if write => return Err(self.page_fault(base)),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Overlap-safe byte copy of a confined span (source snapshotted before any write). The interpreter
+    /// is the differential oracle, not the fast path, so a snapshot `Vec` keeps `MemCopy`/`MemMove`
+    /// byte-identical (both correct even under overlap) without direction-analysis subtlety.
+    fn copy_span(&self, dbase: u64, sbase: u64, len: u64) {
+        let n = len as usize;
+        if !self.has_regions.load(Ordering::Relaxed) {
+            let mut buf = vec![0u8; n];
+            self.back.read_into(sbase, &mut buf);
+            for (k, b) in buf.iter().enumerate() {
+                self.back.set_byte(dbase + k as u64, *b);
+            }
+        } else {
+            let buf: Vec<u8> = (0..len).map(|k| self.byte(sbase + k)).collect();
+            for (k, b) in buf.iter().enumerate() {
+                self.set_byte(dbase + k as u64, *b);
+            }
+        }
+    }
+
+    /// `Inst::MemCopy`/`MemMove` — copy `len` bytes `src`→`dst`, each span confined as a whole to
+    /// `[0, reserved)` (fault before any write if either span escapes). Overlap-safe (so it serves both
+    /// the non-overlapping `memcpy` and the overlapping `memmove`).
+    fn mem_copy(&mut self, dst: u64, src: u64, len: u64) -> Result<(), Trap> {
+        if len == 0 {
+            return Ok(());
+        }
+        let sbase = self.confine_span(src, len)?;
+        let dbase = self.confine_span(dst, len)?;
+        self.check_prot_span(sbase, len, false)?;
+        self.check_prot_span(dbase, len, true)?;
+        self.copy_span(dbase, sbase, len);
+        self.writes += 1;
+        Ok(())
+    }
+
+    /// `Inst::MemFill` — set `len` bytes at `dst` to `val`, the span confined as a whole to
+    /// `[0, reserved)` (fault before any write if it escapes).
+    fn mem_fill(&mut self, dst: u64, val: u8, len: u64) -> Result<(), Trap> {
+        if len == 0 {
+            return Ok(());
+        }
+        let base = self.confine_span(dst, len)?;
+        self.check_prot_span(base, len, true)?;
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..len {
+                self.back.set_byte(base + k, val);
+            }
+        } else {
+            for k in 0..len {
+                self.set_byte(base + k, val);
+            }
+        }
         self.writes += 1;
         Ok(())
     }

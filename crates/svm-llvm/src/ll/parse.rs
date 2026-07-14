@@ -807,13 +807,22 @@ impl Parser {
         };
         let (parameters, is_var_arg) = self.param_list()?;
         self.symbols.insert(
-            name,
+            name.clone(),
             TypeRef::new(Type::FuncType {
-                result_type: return_type,
+                result_type: return_type.clone(),
                 param_types: parameters.iter().map(|p| p.ty.clone()).collect(),
                 is_var_arg,
             }),
         );
+        // Record the prototype so the translator can recover an **external** function's signature — for
+        // an address-taken undefined extern (a function pointer), whose reference site carries only an
+        // opaque `ptr` type (used by `stub_unresolved_externs`). Body-less; type only.
+        self.module.func_declarations.push(FunctionDeclaration {
+            name,
+            parameters,
+            is_var_arg,
+            return_type,
+        });
         // Trailing attribute groups (`#N`) / `, !meta` — skip only these, not the next item.
         while matches!(self.peek(), Some(Token::Word(w)) if w.starts_with('#')) {
             self.pos += 1;

@@ -70,7 +70,7 @@ fn wasm_run(m: &svm_ir::Module, wasm: &[u8], args: &[Value], fuel: u64) -> Outco
     let mut store: Store<i32> = Store::new(&engine, 0);
     // Window size ≤ 64 KiB in these kernels: 2 pages (env page + window page) always suffice.
     let pages = 2 + m.memory.map_or(0, |mc| (mc.size() >> 16) as u32);
-    let memory = Memory::new(&mut store, MemoryType::new(pages, None).unwrap()).unwrap();
+    let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
     memory
         .write(&mut store, ENV_PTR as usize, &(fuel as i64).to_le_bytes())
         .unwrap();
@@ -758,10 +758,10 @@ fn call_indirect_badsig_trap() {
 fn fail_closed() {
     for (name, src) in [
         (
-            // `v128` (SIMD) is not in the subset yet — a later slice. (Scalar floats now ARE, so
-            // this exemplar switched from float to SIMD.)
-            "simd",
-            "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64x2.splat v0\n  v2 = i64x2.extract_lane 0 v1\n  return v2\n}\n",
+            // The core v128 lane ops are now in-subset; the *deferred* SIMD family
+            // (widening/reduction — here `i16x8.dot_i8x16_s`) is what still fails closed.
+            "simd_dot",
+            "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64x2.splat v0\n  v2 = i16x8.dot_i8x16_s v1 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}\n",
         ),
         (
             // scalar `fma` has no core-wasm opcode (relaxed-SIMD only), so it stays interpreter-tier.

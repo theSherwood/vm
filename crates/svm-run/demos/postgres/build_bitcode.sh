@@ -20,11 +20,20 @@ TB="postgresql-$VER.tar.bz2"
   "https://ftp.postgresql.org/pub/source/v$VER/$TB" || { echo "FETCH FAILED"; exit 11; }
 [ -d "$SRC" ] || tar xf "$TB"
 
-echo "=== [2/6] configure (minimal, clang) ==="
+echo "=== [2/6] configure (minimal, clang; AVX-512 popcount off) ==="
 cd "$SRC"
+# Build-config lever (slice BV): force the AVX-512 popcount autodetect to "no" so configure
+# leaves PG_POPCNT_OBJS empty and never defines USE_AVX512_POPCNT_WITH_RUNTIME_CHECK — i.e. the
+# exact config a host lacking AVX-512 would produce. This drops `pg_popcount_avx512` /
+# `pg_popcount_masked_avx512` (and their `<64 x i1>` AVX-512 vector bodies) from the link set at
+# the source. On the guest these fast paths are *dead* anyway — the runtime `cpuid`→0 makes
+# `pg_popcount_avx512_available()` false, so the scalar popcount is always chosen; numeric
+# behavior is identical, so the native oracle stays a valid differential target.
 [ -f config.status ] || ./configure CC=clang --prefix="$PREFIX" \
   --without-icu --without-readline --without-zlib --without-zstd --without-lz4 \
-  --without-libxml --without-gssapi --disable-nls 2>&1 | tail -5
+  --without-libxml --without-gssapi --disable-nls \
+  pgac_cv_avx512_popcnt_intrinsics_=no \
+  pgac_cv_avx512_popcnt_intrinsics__mavx512vpopcntdq__mavx512bw=no 2>&1 | tail -5
 [ -f config.status ] || { echo "CONFIGURE FAILED"; exit 12; }
 
 echo "=== [3/6] native oracle build ==="

@@ -25,6 +25,10 @@ stack-check = []
 [dev-dependencies]
 # Parse hand-written text IR in the `stack-check` guard test (svm-text → svm-ir; no dep cycle).
 svm-text = { path = "../svm-text" }
+# The bulk-memory differential test (`bulk_mem.rs`) cross-checks the JIT against both interpreters and
+# the verifier. None of these depend on svm-jit, so there is no cycle.
+svm-interp = { path = "../svm-interp" }
+svm-verify = { path = "../svm-verify" }
 
 [dependencies]
 cranelift-codegen = "0.132.0"

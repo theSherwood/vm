@@ -444,6 +444,10 @@ pub const PAR_JOIN: i32 = 3;
 pub const PAR_WAIT: i32 = 4;
 pub const PAR_NOTIFY: i32 = 5;
 pub const PAR_INSTANTIATE: i32 = 6;
+/// wasm-JIT tier-up (browser wasm-JIT threads slice): the vCPU reached a `Call` to a JIT-eligible
+/// function. `svm_par_ev_a` = the func index; `svm_par_tierup_argv_ptr`/`_len` give the marshalled
+/// i64 args. The Worker runs the emitted `f{func}` and calls `svm_par_deliver_tierup`/`_trap`.
+pub const PAR_TIERUP: i32 = 7;
 
 /// A boxed resumable vCPU plus the operands of its last [`svm_par_run`] event (flattened to four
 /// `i64`s the host reads via [`svm_par_ev_a`]–[`svm_par_ev_d`]).
@@ -453,6 +457,91 @@ pub struct ParVcpu {
     b: i64,
     c: i64,
     d: i64,
+    /// The marshalled arguments of a pending [`PAR_TIERUP`] event (raw i64 slots) — read by the
+    /// Worker via [`svm_par_tierup_argv_ptr`]/[`svm_par_tierup_argv_len`] to call the emitted region.
+    tierup_argv: Vec<i64>,
+}
+
+/// Box a freshly-built vCPU as a [`ParVcpu`] (event operands zeroed, no pending tier-up args).
+fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
+    Box::into_raw(Box::new(ParVcpu {
+        inner,
+        a: 0,
+        b: 0,
+        c: 0,
+        d: 0,
+        tierup_argv: Vec::new(),
+    }))
+}
+
+/// Attach the tier-up bitmap (if published) — only the **plain compute paths** (root / `thread.spawn`
+/// child over the primary module + window) tier up; §14/§22 orchestration roots and confined children
+/// run different modules/windows, so they stay on the interpreter.
+fn with_tierup(inner: bytecode::Vcpu<'static>) -> bytecode::Vcpu<'static> {
+    match par_jit_eligible() {
+        Some(e) => inner.with_jit_eligible(e),
+        None => inner,
+    }
+}
+
+/// The JIT tier-up eligibility bitmap for this instance's guest (per-Worker: each computes its own
+/// from the module bytes via [`svm_par_enable_jit`], since an `Arc` can't cross Worker instances).
+static mut PAR_JIT_ELIGIBLE: Option<std::sync::Arc<[bool]>> = None;
+
+/// Clone the published tier-up bitmap, if any.
+fn par_jit_eligible() -> Option<std::sync::Arc<[bool]>> {
+    // SAFETY: single-threaded per instance (the page, or one Worker) — same access model as `WASMJIT_MOD`.
+    unsafe { (*core::ptr::addr_of!(PAR_JIT_ELIGIBLE)).clone() }
+}
+
+/// Enable wasm-JIT **tier-up** for the module at `[mod_ptr, mod_len)` (`BROWSER.md` § "wasm-JIT
+/// tier", per-Worker JIT): emit the tier-up module and compute which functions the interpreter
+/// should surface as [`PAR_TIERUP`] (the browser then runs the emitted `f{func}` on the Worker
+/// instead of interpreting). Unlike the whole-module `svm_wasmjit_compile`, this does **not** need
+/// the guest's func 0 to be JITtable — the guest keeps running on the resumable interpreter (which
+/// drives `thread.spawn`/`join`, atomics, `memory.wait`), and only a direct `Call` to an emitted
+/// pure region tiers up. So a compute leaf reachable **only** through `thread.spawn` still tiers up,
+/// which is the whole point of the threads tier ([`svm_wasmjit::compile_module_tierup`]).
+///
+/// A function is eligible iff it is **emitted** (in-subset, all its calls route) **and** has an
+/// **all-i64** signature — so the Worker passes every arg / reads every result as a plain `BigInt`
+/// i64 slot with no per-param type info (which the emitted `WebAssembly.Module` doesn't expose to
+/// JS). Non-i64 scalar params (i32, floats) are a later refinement. On success this stashes the
+/// emitted wasm (read via [`svm_wasmjit_ptr`]/[`svm_wasmjit_len`]) and the decoded module (for the
+/// cross-tier [`svm_wasmjit_call_interp`]), so the Worker needs only this one call — no separate
+/// `svm_wasmjit_compile`. Returns `1` when at least one function tier-ups, else `0` (everything
+/// interprets). Call on **every** instance (page + each Worker) before building vCPUs, same bytes.
+#[no_mangle]
+pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return 0;
+    };
+    // Emit the tier-up module against the shared linear memory (the browser threads build) and take
+    // its per-function emit set. `Err` only if the assembler itself rejects the set — treat as "no
+    // tier-up" (fail-closed: the guest keeps interpreting).
+    let Ok((wasm, emit)) = svm_wasmjit::compile_module_tierup(&m, true) else {
+        return 0;
+    };
+    let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
+    let eligible: Vec<bool> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
+        .collect();
+    if !eligible.iter().any(|&e| e) {
+        return 0; // nothing safely tier-up-able → leave everything on the interpreter
+    }
+    // SAFETY: single-threaded per instance (the page, or one Worker); set once before the run's
+    // vCPUs are built — the same single-reader stash model as `svm_wasmjit_compile`.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm);
+        *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m);
+        *core::ptr::addr_of_mut!(PAR_JIT_ELIGIBLE) = Some(std::sync::Arc::from(eligible));
+    }
+    1
 }
 
 fn first_i64(vals: &[Value]) -> i64 {
@@ -748,13 +837,7 @@ pub extern "C" fn svm_par_root(
             &[],
             host,
         ) {
-            Ok(inner) => Box::into_raw(Box::new(ParVcpu {
-                inner,
-                a: 0,
-                b: 0,
-                c: 0,
-                d: 0,
-            })),
+            Ok(inner) => par_box(inner),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -773,13 +856,7 @@ pub extern "C" fn svm_par_root(
                 Some(io) => inner.with_shared_host(&io.host),
                 None => inner,
             };
-            Box::into_raw(Box::new(ParVcpu {
-                inner,
-                a: 0,
-                b: 0,
-                c: 0,
-                d: 0,
-            }))
+            par_box(with_tierup(inner))
         }
         Err(_) => {
             par_vcpu_retire();
@@ -813,13 +890,7 @@ pub extern "C" fn svm_par_child(
                 Some(io) => inner.with_shared_host(&io.host),
                 None => inner,
             };
-            Box::into_raw(Box::new(ParVcpu {
-                inner,
-                a: 0,
-                b: 0,
-                c: 0,
-                d: 0,
-            }))
+            par_box(with_tierup(inner))
         }
         Err(_) => {
             par_vcpu_retire();
@@ -863,13 +934,7 @@ pub extern "C" fn svm_par_child_confined(
         size_log2 as u8,
         fuel as u64,
     ) {
-        Ok(inner) => Box::into_raw(Box::new(ParVcpu {
-            inner,
-            a: 0,
-            b: 0,
-            c: 0,
-            d: 0,
-        })),
+        Ok(inner) => par_box(inner),
         Err(_) => {
             par_vcpu_retire();
             core::ptr::null_mut()
@@ -917,6 +982,13 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 return PAR_DONE;
             }
             bytecode::VcpuEvent::Trapped(_) => return PAR_TRAP,
+            // wasm-JIT tier-up: hand the func index + marshalled args to the Worker, which runs the
+            // emitted `f{func}` and delivers the results (`svm_par_deliver_tierup`) or a trap.
+            bytecode::VcpuEvent::TierUp { func, argv } => {
+                v.a = func as i64;
+                v.tierup_argv = argv.into_vec();
+                return PAR_TIERUP;
+            }
             bytecode::VcpuEvent::Spawn { func, sp, arg } => {
                 v.a = func as i64;
                 v.b = sp;
@@ -1027,6 +1099,39 @@ pub extern "C" fn svm_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) 
     }
 }
 
+/// Pointer to the marshalled tier-up args (raw i64 slots) after a [`PAR_TIERUP`] event — the Worker
+/// reads `svm_par_tierup_argv_len` of them to call the emitted `f{func}`.
+#[no_mangle]
+pub extern "C" fn svm_par_tierup_argv_ptr(v: *mut ParVcpu) -> *const i64 {
+    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
+    unsafe { (*v).tierup_argv.as_ptr() }
+}
+
+/// Number of tier-up args (see [`svm_par_tierup_argv_ptr`]).
+#[no_mangle]
+pub extern "C" fn svm_par_tierup_argv_len(v: *mut ParVcpu) -> usize {
+    // SAFETY: `v` is a live `ParVcpu`.
+    unsafe { (*v).tierup_argv.len() }
+}
+
+/// Deliver the results of a tier-up region (after `PAR_TIERUP`): `[results_ptr, n)` are the emitted
+/// `f{func}`'s i64 result slots. The vCPU resumes with them in the awaiting call's dst.
+#[no_mangle]
+pub extern "C" fn svm_par_deliver_tierup(v: *mut ParVcpu, results_ptr: *const i64, n: usize) {
+    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery; `[results_ptr, n)` is a live host buffer.
+    let v = unsafe { &mut *v };
+    let results = unsafe { core::slice::from_raw_parts(results_ptr, n) };
+    v.inner.deliver_tierup(results);
+}
+
+/// Deliver a **trap** from a tier-up region (the emitted `f{func}` threw — memory fault / fuel /
+/// div-by-zero / `unreachable`). The vCPU traps on its next `svm_par_run`, as if interp had trapped.
+#[no_mangle]
+pub extern "C" fn svm_par_deliver_tierup_trap(v: *mut ParVcpu) {
+    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
+    unsafe { (*v).inner.deliver_tierup_trap(Trap::Unreachable) };
+}
+
 /// Free a finished vCPU.
 #[no_mangle]
 pub extern "C" fn svm_par_free(v: *mut ParVcpu) {
@@ -1107,6 +1212,113 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     // browser stays a faithful twin. Names parallel the grant order above; only the `arity` actually
     // granted are registered.
     for (name, slot) in POWERBOX_CAP_NAMES.iter().zip(&slots) {
+        if let Value::I32(handle) = slot {
+            host.register_cap_name(name, *handle);
+        }
+    }
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) =
+        match bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host) {
+            None => (STATUS_UNSUPPORTED, 0, 0),
+            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
+            Some(Err(_)) => (STATUS_TRAP, 0, 0),
+            Some(Ok(vals)) => match vals.first() {
+                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+                _ => (STATUS_BAD_RESULT, 0, 0),
+            },
+        };
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: host.stdout,
+        stderr: host.stderr,
+    }
+}
+
+/// The canonical names of the **on-ramp** powerbox prefix, in grant order — the fixed §3e `VM_CAP_*`
+/// vocabulary the LLVM on-ramp's synthesized `_start` expects (and `svm-run` grants). This differs
+/// from [`POWERBOX_CAP_NAMES`] after slot 3: the hand-written browser corpus uses `(stderr, clock)`
+/// at slots 4/5, but an on-ramp guest wants `(memory, addrspace)` there — `memory` is what `malloc`
+/// grows the heap through, so Lua/SQLite need it. See `LLVM.md` §N (the powerbox on-ramp).
+const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrspace"];
+
+/// The reference host's §7 capability-import name policy — a browser-side twin of `svm-run`'s
+/// `default_cap_resolver`. The on-ramp emits `call.import "<name>"` for each libc→capability shim
+/// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `cap.call`
+/// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
+/// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
+fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
+    use svm_interp::iface;
+    let (type_id, op): (u32, u32) = match name {
+        "write" => (iface::STREAM, 1),
+        "read" => (iface::STREAM, 0),
+        "exit" => (iface::EXIT, 0),
+        "vm_map" => (iface::MEMORY, 0),
+        "vm_unmap" => (iface::MEMORY, 1),
+        "vm_protect" => (iface::MEMORY, 2),
+        "vm_page_size" => (iface::MEMORY, 3),
+        "vm_region_create" => (iface::ADDRESS_SPACE, 5),
+        "vm_region_map" => (iface::SHARED_REGION, 0),
+        "vm_region_unmap" => (iface::SHARED_REGION, 1),
+        "vm_region_page_size" => (iface::SHARED_REGION, 3),
+        _ => return None,
+    };
+    Some(svm_ir::ResolvedCap { type_id, op })
+}
+
+/// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `svm-llvm`'s synthesized `_start`
+/// expects, so a `.svmb` straight off `svm-llvm-translate` (Lua, SQLite, …) runs unchanged. This is
+/// the twin of [`powerbox_exec`] with the fixed §3e `VM_CAP_*` grant prefix instead of the browser
+/// corpus's `(…, stderr, clock)` set: capabilities are granted by the entry's **arity**, in the
+/// canonical order `stdout, stdin, exit, memory, addrspace` (mirroring `svm-run`'s
+/// `grant_powerbox_prefix`), and each is registered under its name for `cap.self.resolve`.
+///
+/// Slots 6–8 (`ioring`/`blocking`/`jit`) need region/JIT wiring the browser powerbox doesn't carry
+/// yet, so an entry with arity > 5 is **fail-closed** (`STATUS_UNSUPPORTED`) rather than mis-granted.
+/// The `fs` capability (SQLite Phase B, Lua `files.lua`) is a `host_fn` resolved by name — a Stage-1
+/// follow-on, not part of this fixed prefix.
+pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    let unsupported = || PbOutcome {
+        status: STATUS_UNSUPPORTED,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    // Lower the on-ramp's §7 named imports (`write`/`read`/`exit`/`vm_*`) to concrete `cap.call`s
+    // before running — the step `svm-run::instantiate` does via `resolve_capability_imports`. Without
+    // it the engine sees unbound imports and fail-closes. A no-op for an import-free module.
+    let resolved = match svm_ir::resolve_imports(m, onramp_cap_resolver) {
+        Ok(r) => r,
+        Err(_) => return unsupported(),
+    };
+    let m = &resolved;
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    if arity > 5 {
+        return unsupported();
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    let mut slots: Vec<Value> = Vec::new();
+    if arity >= 1 {
+        slots.push(Value::I32(host.grant_stream(StreamRole::Out)));
+    }
+    if arity >= 2 {
+        slots.push(Value::I32(host.grant_stream(StreamRole::In)));
+    }
+    if arity >= 3 {
+        slots.push(Value::I32(host.grant_exit()));
+    }
+    if arity >= 4 {
+        slots.push(Value::I32(host.grant_memory()));
+    }
+    if arity >= 5 {
+        slots.push(Value::I32(host.grant_address_space(0, win)));
+    }
+    for (name, slot) in ONRAMP_CAP_NAMES.iter().zip(&slots) {
         if let Value::I32(handle) = slot {
             host.register_cap_name(name, *handle);
         }
@@ -1250,6 +1462,47 @@ pub extern "C" fn svm_run_pb(
         }
     };
     let out = powerbox_exec(&m, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **on-ramp powerbox** (see
+/// [`onramp_exec`]) — the ABI a `.svmb` off `svm-llvm-translate` expects, so real C/C++ guests (Lua,
+/// SQLite) run unchanged. Same capture/accessor contract as [`svm_run_pb`]: seed stdin from
+/// `[stdin_ptr, stdin_len)` (null / zero-length ⇒ empty), read the streams via
+/// `svm_stdout_ptr`+`svm_stdout_len` / `svm_stderr_ptr`+`svm_stderr_len`, the exit code via
+/// [`svm_exit_code`], and the status via [`svm_status`]. Returns the guest's `i64` result. The
+/// captures share `OUT`/`ERR`/`EXIT_CODE` with `svm_run_pb` — read them before the next call either
+/// export makes.
+#[no_mangle]
+pub extern "C" fn svm_run_onramp(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let out = onramp_exec(&m, stdin);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {

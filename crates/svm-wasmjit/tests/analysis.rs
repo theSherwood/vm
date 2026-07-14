@@ -25,10 +25,11 @@ block0(v0: i64):
     assert!(a.mixed_ok);
 }
 
-/// An integer caller with a **SIMD leaf** (integer signature — takes/returns i64 — but uses `v128`
-/// internally, which is out of subset): the caller is in-subset, the leaf is interp-callable, the
-/// guest is mixed_ok. This is the motivating mixed-tier shape. (Floats are now in-subset, so the
-/// out-of-subset exemplar is `v128`.)
+/// An integer caller with an **out-of-subset SIMD leaf** (integer signature — takes/returns i64 —
+/// but uses a *deferred* v128 op, `i16x8.dot_i8x16_s`, which this slice doesn't emit): the caller is
+/// in-subset, the leaf is interp-callable, the guest is mixed_ok. This is the motivating mixed-tier
+/// shape. (The core v128 lane ops are now in-subset, so the out-of-subset exemplar is the deferred
+/// widening/reduction family — here the `dot` reduction.)
 #[test]
 fn integer_caller_simd_leaf() {
     let a = analyze(&m(r#"
@@ -40,7 +41,7 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.add v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }"#));
@@ -53,16 +54,17 @@ block0(v0: i64):
     );
 }
 
-/// Func 0 itself is SIMD → not in-subset → the JIT can't take the entry → not mixed_ok (the whole
-/// guest stays on the interpreter).
+/// Func 0 itself uses a deferred SIMD op → not in-subset → the JIT can't take the entry → not
+/// mixed_ok (the whole guest stays on the interpreter).
 #[test]
 fn simd_entry_not_mixed() {
     let a = analyze(&m(r#"
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.extract_lane 0 v1
-  return v2
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
 }"#));
     assert_eq!(a.in_subset, vec![false]);
     assert!(!a.mixed_ok);
@@ -82,10 +84,11 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.extract_lane 0 v1
-  v3 = i64.const 0
-  i64.store v3 v2
-  return v2
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  v4 = i64.const 0
+  i64.store v4 v3
+  return v3
 }"#));
     assert_eq!(a.in_subset, vec![true, false]);
     assert_eq!(
@@ -109,9 +112,10 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.extract_lane 0 v1
-  v3 = call 2 (v2)
-  return v3
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  v4 = call 2 (v3)
+  return v4
 }
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -178,10 +182,10 @@ block0(v0: i64):
     assert!(a.mixed_ok, "all-in-subset indirect dispatch is mixed_ok");
 }
 
-/// With a `call_indirect` present, an out-of-subset (SIMD) function anywhere in the module blocks
-/// mixed_ok — even though no *direct* edge reaches it — because the indirect call could select it,
-/// and its table slot has no emitted target. The conservative first-increment rule (all indirect
-/// targets must be in-subset) fails closed to the interpreter.
+/// With a `call_indirect` present, an out-of-subset (deferred-SIMD) function anywhere in the module
+/// blocks mixed_ok — even though no *direct* edge reaches it — because the indirect call could
+/// select it, and its table slot has no emitted target. The conservative first-increment rule (all
+/// indirect targets must be in-subset) fails closed to the interpreter.
 #[test]
 fn indirect_with_simd_func_not_mixed() {
     let a = analyze(&m(r#"
@@ -195,8 +199,9 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.extract_lane 0 v1
-  return v2
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
 }"#));
     assert_eq!(a.in_subset, vec![true, false]);
     assert!(

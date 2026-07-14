@@ -13,9 +13,10 @@ svm-ir.workspace = true
 
 # Dev-only: the differential harness runs emitted wasm on `wasmi` (a pure-Rust wasm interpreter —
 # far lighter than Wasmtime, which stays out of the workspace per the bench/ precedent) against the
-# bytecode-engine oracle.
+# bytecode-engine oracle. The `simd` feature (added in wasmi 0.47) enables the §17 v128 differential;
+# `tests/simd.rs` builds its engine with `Config::wasm_simd(true)`.
 [dev-dependencies]
 svm-text.workspace = true
 svm-verify.workspace = true
 svm-interp.workspace = true
-wasmi = "0.40"
+wasmi = { version = "0.47", features = ["simd"] }

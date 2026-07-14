@@ -112,8 +112,9 @@ fn valtype_byte(t: ValType) -> Result<u8, Error> {
         ValType::I64 => Ok(0x7e),
         ValType::F32 => Ok(0x7d),
         ValType::F64 => Ok(0x7c),
-        // v128/ref are interpreter-tier for now (SIMD is a later slice).
-        _ => Err(Error::Unsupported("v128/ref value type")),
+        ValType::V128 => Ok(0x7b),
+        // ref types are interpreter-tier (no funcref/externref values in the emitted subset).
+        _ => Err(Error::Unsupported("ref value type")),
     }
 }
 
@@ -332,6 +333,344 @@ fn store_op(op: StoreOp) -> Result<(u8, u64), Error> {
     })
 }
 
+// ---- §17 SIMD (v128) opcodes -------------------------------------------------------------------
+//
+// Every core-wasm SIMD op is the `0xFD` prefix + a uleb128 subopcode (many are ≥128, so 2 bytes).
+// These helpers return the subopcode; [`emit_simd`] writes the prefix + uleb. The numbers are the
+// finalized (fixed-128, non-relaxed) wasm SIMD assignments; the exhaustive `tests/simd.rs`
+// differential re-derives every one against the bytecode oracle, so a wrong number can't slip
+// through (wasmi rejects an invalid encoding, or the lane result diverges).
+//
+// Deferred to a later increment (fail-closed here → the module stays on the interpreter): the
+// widening / reduction family (`extend`/`narrow`/`extmul`/`extadd_pairwise`/`dot`/`q15mulr`) and
+// **relaxed** SIMD (`VFma`, `VDotI8` — no core-wasm opcode, like scalar `Fma`).
+
+use svm_ir::{
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp,
+};
+
+const OP_SIMD_PREFIX: u8 = 0xfd;
+
+/// Write a SIMD instruction: the `0xFD` prefix + the uleb subopcode.
+fn emit_simd(code: &mut Vec<u8>, sub: u32) {
+    code.push(OP_SIMD_PREFIX);
+    uleb(code, sub as u64);
+}
+
+/// `<shape>.splat` subopcode.
+fn vsplat_sub(shape: VShape) -> u32 {
+    match shape {
+        VShape::I8x16 => 15,
+        VShape::I16x8 => 16,
+        VShape::I32x4 => 17,
+        VShape::I64x2 => 18,
+        VShape::F32x4 => 19,
+        VShape::F64x2 => 20,
+    }
+}
+
+/// `<shape>.extract_lane[_s/_u]` subopcode (narrow int shapes carry the sign choice).
+fn vextract_sub(shape: VShape, signed: bool) -> u32 {
+    match shape {
+        VShape::I8x16 => {
+            if signed {
+                21
+            } else {
+                22
+            }
+        }
+        VShape::I16x8 => {
+            if signed {
+                24
+            } else {
+                25
+            }
+        }
+        VShape::I32x4 => 27,
+        VShape::I64x2 => 29,
+        VShape::F32x4 => 31,
+        VShape::F64x2 => 33,
+    }
+}
+
+/// `<shape>.replace_lane` subopcode.
+fn vreplace_sub(shape: VShape) -> u32 {
+    match shape {
+        VShape::I8x16 => 23,
+        VShape::I16x8 => 26,
+        VShape::I32x4 => 28,
+        VShape::I64x2 => 30,
+        VShape::F32x4 => 32,
+        VShape::F64x2 => 34,
+    }
+}
+
+/// Lane-wise integer binary op subopcode (`None` for the holes wasm omits: `i8x16.mul`, `i64x2`
+/// min/max).
+fn vintbin_sub(shape: VShape, op: VIntBinOp) -> Option<u32> {
+    use VIntBinOp::*;
+    Some(match (shape, op) {
+        (VShape::I8x16, Add) => 110,
+        (VShape::I8x16, Sub) => 113,
+        (VShape::I8x16, MinS) => 118,
+        (VShape::I8x16, MinU) => 119,
+        (VShape::I8x16, MaxS) => 120,
+        (VShape::I8x16, MaxU) => 121,
+        (VShape::I16x8, Add) => 142,
+        (VShape::I16x8, Sub) => 145,
+        (VShape::I16x8, Mul) => 149,
+        (VShape::I16x8, MinS) => 150,
+        (VShape::I16x8, MinU) => 151,
+        (VShape::I16x8, MaxS) => 152,
+        (VShape::I16x8, MaxU) => 153,
+        (VShape::I32x4, Add) => 174,
+        (VShape::I32x4, Sub) => 177,
+        (VShape::I32x4, Mul) => 181,
+        (VShape::I32x4, MinS) => 182,
+        (VShape::I32x4, MinU) => 183,
+        (VShape::I32x4, MaxS) => 184,
+        (VShape::I32x4, MaxU) => 185,
+        (VShape::I64x2, Add) => 206,
+        (VShape::I64x2, Sub) => 209,
+        (VShape::I64x2, Mul) => 213,
+        // i8x16.mul and i64x2 min/max have no wasm opcode.
+        _ => return None,
+    })
+}
+
+/// Lane-wise integer comparison subopcode (`i64x2` has only signed `eq`/`ne`/`lt`/`gt`/`le`/`ge`).
+fn vintcmp_sub(shape: VShape, op: VICmpOp) -> Option<u32> {
+    use VICmpOp::*;
+    let base = match shape {
+        VShape::I8x16 => 35,
+        VShape::I16x8 => 45,
+        VShape::I32x4 => 55,
+        VShape::I64x2 => {
+            return Some(match op {
+                Eq => 214,
+                Ne => 215,
+                LtS => 216,
+                GtS => 217,
+                LeS => 218,
+                GeS => 219,
+                // i64x2 has no unsigned lane compares in wasm.
+                LtU | GtU | LeU | GeU => return None,
+            });
+        }
+        VShape::F32x4 | VShape::F64x2 => return None,
+    };
+    Some(base + op.index() as u32)
+}
+
+/// Lane-wise float comparison subopcode.
+fn vfloatcmp_sub(shape: VShape, op: VFCmpOp) -> Option<u32> {
+    let base = match shape {
+        VShape::F32x4 => 65,
+        VShape::F64x2 => 71,
+        _ => return None,
+    };
+    Some(base + op.index() as u32)
+}
+
+/// Lane-wise integer shift subopcode (integer shapes only).
+fn vshift_sub(shape: VShape, op: VShiftOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I8x16 => 107,
+        VShape::I16x8 => 139,
+        VShape::I32x4 => 171,
+        VShape::I64x2 => 203,
+        _ => return None,
+    };
+    Some(base + op.index() as u32)
+}
+
+/// Lane-wise unary integer op subopcode (`abs`/`neg`, every integer shape).
+fn vintun_sub(shape: VShape, op: VIntUnOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I8x16 => 96,
+        VShape::I16x8 => 128,
+        VShape::I32x4 => 160,
+        VShape::I64x2 => 192,
+        _ => return None,
+    };
+    Some(base + op.index() as u32) // Abs=+0, Neg=+1
+}
+
+/// Saturating add/sub subopcode (`i8x16`/`i16x8` only).
+fn vsatbin_sub(shape: VShape, op: VSatBinOp) -> Option<u32> {
+    use VSatBinOp::*;
+    Some(match (shape, op) {
+        (VShape::I8x16, AddS) => 111,
+        (VShape::I8x16, AddU) => 112,
+        (VShape::I8x16, SubS) => 114,
+        (VShape::I8x16, SubU) => 115,
+        (VShape::I16x8, AddS) => 143,
+        (VShape::I16x8, AddU) => 144,
+        (VShape::I16x8, SubS) => 146,
+        (VShape::I16x8, SubU) => 147,
+        _ => return None,
+    })
+}
+
+/// `<shape>.avgr_u` subopcode (`i8x16`/`i16x8` only).
+fn vavgr_sub(shape: VShape) -> Option<u32> {
+    match shape {
+        VShape::I8x16 => Some(123),
+        VShape::I16x8 => Some(155),
+        _ => None,
+    }
+}
+
+/// `<shape>.all_true` subopcode (integer shapes).
+fn valltrue_sub(shape: VShape) -> Option<u32> {
+    match shape {
+        VShape::I8x16 => Some(99),
+        VShape::I16x8 => Some(131),
+        VShape::I32x4 => Some(163),
+        VShape::I64x2 => Some(195),
+        _ => None,
+    }
+}
+
+/// `<shape>.bitmask` subopcode (integer shapes).
+fn vbitmask_sub(shape: VShape) -> Option<u32> {
+    match shape {
+        VShape::I8x16 => Some(100),
+        VShape::I16x8 => Some(132),
+        VShape::I32x4 => Some(164),
+        VShape::I64x2 => Some(196),
+        _ => None,
+    }
+}
+
+/// Lane-wise binary float op subopcode.
+fn vfloatbin_sub(shape: VShape, op: VFloatBinOp) -> Option<u32> {
+    let base = match shape {
+        VShape::F32x4 => 228,
+        VShape::F64x2 => 240,
+        _ => return None,
+    };
+    Some(base + op.index() as u32) // Add..Max contiguous
+}
+
+/// Lane-wise unary float op subopcode (abs/neg/sqrt regular; ceil/floor/trunc/nearest scattered).
+fn vfloatun_sub(shape: VShape, op: VFloatUnOp) -> Option<u32> {
+    use VFloatUnOp::*;
+    Some(match (shape, op) {
+        (VShape::F32x4, Abs) => 224,
+        (VShape::F32x4, Neg) => 225,
+        (VShape::F32x4, Sqrt) => 227,
+        (VShape::F32x4, Ceil) => 103,
+        (VShape::F32x4, Floor) => 104,
+        (VShape::F32x4, Trunc) => 105,
+        (VShape::F32x4, Nearest) => 106,
+        (VShape::F64x2, Abs) => 236,
+        (VShape::F64x2, Neg) => 237,
+        (VShape::F64x2, Sqrt) => 239,
+        (VShape::F64x2, Ceil) => 116,
+        (VShape::F64x2, Floor) => 117,
+        (VShape::F64x2, Trunc) => 122,
+        (VShape::F64x2, Nearest) => 148,
+        _ => return None,
+    })
+}
+
+/// Lane-wise pseudo-min/max subopcode (float shapes).
+fn vpminmax_sub(shape: VShape, op: VPMinMaxOp) -> Option<u32> {
+    use VPMinMaxOp::*;
+    Some(match (shape, op) {
+        (VShape::F32x4, Pmin) => 234,
+        (VShape::F32x4, Pmax) => 235,
+        (VShape::F64x2, Pmin) => 246,
+        (VShape::F64x2, Pmax) => 247,
+        _ => return None,
+    })
+}
+
+/// Whole-vector bitwise binary op subopcode.
+fn vbitbin_sub(op: svm_ir::VBitBinOp) -> u32 {
+    use svm_ir::VBitBinOp::*;
+    match op {
+        And => 78,
+        Or => 80,
+        Xor => 81,
+        AndNot => 79,
+    }
+}
+
+/// Int↔float / float↔float lane conversion subopcode (all in-subset).
+fn vconvert_sub(op: svm_ir::VCvtOp) -> u32 {
+    use svm_ir::VCvtOp::*;
+    match op {
+        F32x4ConvertI32x4S => 250,
+        F32x4ConvertI32x4U => 251,
+        I32x4TruncSatF32x4S => 248,
+        I32x4TruncSatF32x4U => 249,
+        F32x4DemoteF64x2Zero => 94,
+        F64x2PromoteLowF32x4 => 95,
+        F64x2ConvertLowI32x4S => 254,
+        F64x2ConvertLowI32x4U => 255,
+        I32x4TruncSatF64x2SZero => 252,
+        I32x4TruncSatF64x2UZero => 253,
+    }
+}
+
+// ---- deferred SIMD family (widening / reduction) — added in the simd2 slice ---------------------
+//
+// wasm lays these out as `{low_s, high_s, low_u, high_u}` contiguously per result shape (a different
+// order than [`VWidenOp`]'s `{LowS, LowU, HighS, HighU}`), so map the op to that lane-order offset.
+fn widen_lane_offset(op: VWidenOp) -> u32 {
+    match op {
+        VWidenOp::LowS => 0,
+        VWidenOp::HighS => 1,
+        VWidenOp::LowU => 2,
+        VWidenOp::HighU => 3,
+    }
+}
+
+/// Lane **widen** (`extend_low/high_<src>_s/u`) subopcode; `shape` is the wider **result** shape.
+fn vwiden_sub(shape: VShape, op: VWidenOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I16x8 => 135, // from i8x16
+        VShape::I32x4 => 167, // from i16x8
+        VShape::I64x2 => 199, // from i32x4
+        _ => return None,
+    };
+    Some(base + widen_lane_offset(op))
+}
+
+/// Lane **narrow** (`narrow_<src>_s/u`) subopcode; `shape` is the narrow **result** shape.
+fn vnarrow_sub(shape: VShape, op: VNarrowOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I8x16 => 101, // from i16x8
+        VShape::I16x8 => 133, // from i32x4
+        _ => return None,
+    };
+    Some(base + op.index() as u32) // S=+0, U=+1
+}
+
+/// Extended (widening) multiply (`extmul_low/high_<src>_s/u`) subopcode; `shape` is the wide result.
+fn vextmul_sub(shape: VShape, op: VWidenOp) -> Option<u32> {
+    let base = match shape {
+        VShape::I16x8 => 156, // from i8x16
+        VShape::I32x4 => 188, // from i16x8
+        VShape::I64x2 => 220, // from i32x4
+        _ => return None,
+    };
+    Some(base + widen_lane_offset(op))
+}
+
+/// Extended pairwise add (`extadd_pairwise_<src>_s/u`) subopcode; `shape` is the wide result.
+fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
+    let base = match shape {
+        VShape::I16x8 => 124, // from i8x16
+        VShape::I32x4 => 126, // from i16x8
+        _ => return None,
+    };
+    Some(base + if signed { 0 } else { 1 })
+}
+
 // ---- per-function value typing (mirrors the verifier's block-scoped numbering) -------------------
 
 /// The types of one block's value list: params first, then each instruction's results in order.
@@ -375,6 +714,49 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
             Inst::RefFunc { .. } => tys.push(ValType::I32),
             // Indirect call: results come from the call site's own signature immediate.
             Inst::CallIndirect { ty, .. } => tys.extend(ty.results.iter().copied()),
+            // ---- §17 SIMD (v128): the in-subset core lane ops (see the opcode helpers above). Each
+            // yields a `v128`, except lane-extract (the shape's scalar), the reductions
+            // any/all_true/bitmask (`i32`), and `simd.width_bytes` (`i32`). The verifier already
+            // typed these, so the emit-side opcode helpers (which return `None`/`Err` for the
+            // shape holes wasm omits) are what actually gate a bogus lowering — here we only need
+            // the result type. The deferred widening/reduction/relaxed ops fall through to the
+            // `_` arm (Unsupported → the module stays on the interpreter).
+            Inst::ConstV128(_)
+            | Inst::V128Load { .. }
+            | Inst::Splat { .. }
+            | Inst::ReplaceLane { .. }
+            | Inst::VIntBin { .. }
+            | Inst::VIntCmp { .. }
+            | Inst::VFloatCmp { .. }
+            | Inst::VShift { .. }
+            | Inst::VIntUn { .. }
+            | Inst::VSatBin { .. }
+            | Inst::VConvert { .. }
+            | Inst::VPMinMax { .. }
+            | Inst::VPopcnt { .. }
+            | Inst::VAvgr { .. }
+            | Inst::VFloatBin { .. }
+            | Inst::VFloatUn { .. }
+            | Inst::VBitBin { .. }
+            | Inst::VNot { .. }
+            | Inst::Bitselect { .. }
+            | Inst::Shuffle { .. }
+            | Inst::Swizzle { .. }
+            // simd2: the widening / reduction family (all yield a `v128`). The two **relaxed** ops
+            // (`VFma`/`VDotI8`) have no core-wasm opcode, so they fall through to the `_` arm and stay
+            // interpreter-tier.
+            | Inst::VWiden { .. }
+            | Inst::VNarrow { .. }
+            | Inst::VExtMul { .. }
+            | Inst::VExtAddPairwise { .. }
+            | Inst::VDot { .. }
+            | Inst::VQ15MulrSat { .. } => tys.push(ValType::V128),
+            Inst::V128Store { .. } => {}
+            Inst::ExtractLane { shape, .. } => tys.push(shape.lane_val()),
+            Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {
+                tys.push(ValType::I32)
+            }
+            Inst::SimdWidthBytes => tys.push(ValType::I32),
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }
     }
@@ -632,6 +1014,73 @@ pub fn compile_module_mixed_entry(
         }
     }
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
+}
+
+/// Compile a **tier-up** module for the browser threads tier (`BROWSER.md` § "wasm-JIT tier",
+/// per-Worker JIT). Unlike [`compile_module_mixed_entry`], eligibility is **not** rooted at one
+/// entry: the guest keeps running on the resumable interpreter (which drives `thread.spawn`/`join`,
+/// atomics, `memory.wait`), and a direct `Call` to any emitted function surfaces as a *tier-up* the
+/// host runs on the emitted region — so a pure compute leaf reachable **only** through
+/// `thread.spawn` still emits, even though its caller (a concurrency orchestrator) never JITs.
+///
+/// Returns the emitted wasm plus the per-function eligibility bitmap: `eligible[i]` ⇒ `f{i}` is
+/// exported and safe for the host to call. A function is emitted iff it is in-subset, and every
+/// direct callee is itself emitted or a cross-tier interp leaf — a monotone fixpoint (start from
+/// "every in-subset function", drop any whose emitted body would carry an unroutable `Call`). A
+/// function that uses `call_indirect` is emitted only when the **whole** module is in-subset (so
+/// every identity-table slot resolves to an emitted target); otherwise it is dropped, keeping the
+/// emitted module table-free. [`Error::Unsupported`] only if the assembler itself rejects the set
+/// (it never should, by construction) — an empty eligible set is a success with no `f{i}` exports.
+pub fn compile_module_tierup(
+    m: &Module,
+    shared_memory: bool,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    let n = m.funcs.len();
+    let in_subset: Vec<bool> = m.funcs.iter().map(|f| func_in_subset(m, f)).collect();
+    let leaf: Vec<bool> = (0..n)
+        .map(|i| !in_subset[i] && interp_leaf(&m.funcs[i]))
+        .collect();
+    let all_in_subset = in_subset.iter().all(|&s| s);
+
+    // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to any
+    // identity-table slot, so a function that uses one is only safe to emit when every function is
+    // in-subset (all slots resolve); otherwise drop it (and the emitted module needs no table).
+    let mut emit: Vec<bool> = (0..n)
+        .map(|i| in_subset[i] && (all_in_subset || !func_uses_indirect(&m.funcs[i])))
+        .collect();
+    // Fixpoint: drop any candidate that directly calls a function which is neither still a candidate
+    // nor a cross-tier leaf — its emitted body would have an unroutable `Call`. Monotone (only
+    // removes), so it converges in ≤ n passes.
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if !emit[i] {
+                continue;
+            }
+            for c in func_callees(&m.funcs[i]) {
+                let c = c as usize;
+                if c >= n || (!emit[c] && !leaf[c]) {
+                    emit[i] = false;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+    let mut emitted: Vec<usize> = Vec::new();
+    for (i, e) in emit.iter().enumerate() {
+        if *e {
+            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+            emitted.push(i);
+        }
+    }
+    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf)?;
+    Ok((wasm, emit))
 }
 
 /// Assemble the wasm module: emit the functions listed in `emitted` (SVM indices, in the order they
@@ -1353,6 +1802,269 @@ fn emit_block_body(
                     uleb(code, cx.local_of[k][next_val + i] as u64);
                 }
                 next_val += n_results;
+            }
+            // ---- §17 SIMD (v128) — the in-subset core lane ops (opcode helpers above) ----
+            Inst::ConstV128(bytes) => {
+                emit_simd(code, 12); // v128.const
+                code.extend_from_slice(bytes);
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::V128Load { addr, offset, .. } => {
+                emit_confine(
+                    cx,
+                    code,
+                    cx.local_of[k][*addr as usize],
+                    *offset,
+                    16,
+                    mapped,
+                );
+                emit_simd(code, 0); // v128.load
+                code.extend_from_slice(&[0x00, 0x00]); // align=1, offset=0 (offset folded in)
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::V128Store {
+                addr,
+                value,
+                offset,
+                ..
+            } => {
+                emit_confine(
+                    cx,
+                    code,
+                    cx.local_of[k][*addr as usize],
+                    *offset,
+                    16,
+                    mapped,
+                );
+                get(code, cx, *value);
+                emit_simd(code, 11); // v128.store
+                code.extend_from_slice(&[0x00, 0x00]);
+            }
+            Inst::Splat { shape, a } => {
+                get(code, cx, *a);
+                emit_simd(code, vsplat_sub(*shape));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::ExtractLane {
+                shape,
+                lane,
+                signed,
+                a,
+            } => {
+                get(code, cx, *a);
+                emit_simd(code, vextract_sub(*shape, *signed));
+                code.push(*lane); // lane immediate
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::ReplaceLane { shape, lane, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, vreplace_sub(*shape));
+                code.push(*lane);
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VIntBin { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vintbin_sub(*shape, *op).ok_or(Error::Unsupported("v128 int bin shape/op"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VIntCmp { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vintcmp_sub(*shape, *op).ok_or(Error::Unsupported("v128 int cmp shape/op"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VFloatCmp { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vfloatcmp_sub(*shape, *op).ok_or(Error::Unsupported("v128 float cmp shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VShift { shape, op, a, amt } => {
+                get(code, cx, *a);
+                get(code, cx, *amt);
+                emit_simd(
+                    code,
+                    vshift_sub(*shape, *op).ok_or(Error::Unsupported("v128 shift shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VIntUn { shape, op, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    vintun_sub(*shape, *op).ok_or(Error::Unsupported("v128 int un shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VSatBin { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vsatbin_sub(*shape, *op).ok_or(Error::Unsupported("v128 sat shape/op"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VAvgr { shape, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vavgr_sub(*shape).ok_or(Error::Unsupported("v128 avgr shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VPopcnt { a } => {
+                get(code, cx, *a);
+                emit_simd(code, 98); // i8x16.popcnt
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VConvert { op, a } => {
+                get(code, cx, *a);
+                emit_simd(code, vconvert_sub(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VPMinMax { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vpminmax_sub(*shape, *op).ok_or(Error::Unsupported("v128 pminmax shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VFloatBin { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vfloatbin_sub(*shape, *op).ok_or(Error::Unsupported("v128 float bin shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VFloatUn { shape, op, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    vfloatun_sub(*shape, *op).ok_or(Error::Unsupported("v128 float un shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VBitBin { op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, vbitbin_sub(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VNot { a } => {
+                get(code, cx, *a);
+                emit_simd(code, 77); // v128.not
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::Bitselect { a, b, mask } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                get(code, cx, *mask);
+                emit_simd(code, 82); // v128.bitselect
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VAnyTrue { a } => {
+                get(code, cx, *a);
+                emit_simd(code, 83); // v128.any_true
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VAllTrue { shape, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    valltrue_sub(*shape).ok_or(Error::Unsupported("v128 all_true shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VBitmask { shape, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    vbitmask_sub(*shape).ok_or(Error::Unsupported("v128 bitmask shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::Shuffle { lanes, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, 13); // i8x16.shuffle
+                code.extend_from_slice(lanes); // 16 lane-index immediates
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::Swizzle { a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, 14); // i8x16.swizzle
+                set_result(cx, code, k, &mut next_val);
+            }
+            // ---- simd2: the widening / reduction family ----
+            Inst::VWiden { shape, op, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    vwiden_sub(*shape, *op).ok_or(Error::Unsupported("v128 widen shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VNarrow { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vnarrow_sub(*shape, *op).ok_or(Error::Unsupported("v128 narrow shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VExtMul { shape, op, a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(
+                    code,
+                    vextmul_sub(*shape, *op).ok_or(Error::Unsupported("v128 extmul shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VExtAddPairwise { shape, signed, a } => {
+                get(code, cx, *a);
+                emit_simd(
+                    code,
+                    vextadd_sub(*shape, *signed).ok_or(Error::Unsupported("v128 extadd shape"))?,
+                );
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VDot { a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, 186); // i32x4.dot_i16x8_s
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::VQ15MulrSat { a, b } => {
+                get(code, cx, *a);
+                get(code, cx, *b);
+                emit_simd(code, 130); // i16x8.q15mulr_sat_s
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::SimdWidthBytes => {
+                // Fixed-128 MVP: the constant 16 on every backend (deterministic across the oracle).
+                code.push(OP_I32_CONST);
+                sleb32(code, 16);
+                set_result(cx, code, k, &mut next_val);
             }
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }

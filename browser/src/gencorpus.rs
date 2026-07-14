@@ -168,6 +168,80 @@ block2():
 }
 "#;
 
+// Threads **tier-up** (BROWSER.md § "wasm-JIT tier", per-Worker JIT): the 4000 counter kernel, but
+// each worker adds `leaf(500)` computed in a pure i64 leaf (func 2) — a hot compute loop counting to
+// 500. The guest keeps running on the resumable interpreter (it drives `thread.spawn`/`join` +
+// atomics), and each worker's direct `call 2` *tiers up* onto the emitted `f2` on its own Worker.
+// func 2 is reachable **only** through `thread.spawn`, so `compile_module_tierup` (not the func-0
+// whole-module path) is what emits it. Result 4000 on every interleaving (asserted in the JS host,
+// like the plain threads kernel); tiers up once per worker (8×).
+const THREADS_TIERUP: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 block2(v1) block3()
+block2(v4: i64):
+  v5 = i64.const 500
+  v6 = thread.spawn 1 v5 v5
+  v7 = i64.const 4
+  v8 = i64.mul v4 v7
+  v9 = i64.const 16
+  v10 = i64.add v9 v8
+  i32.store v10 v6
+  v11 = i64.const 1
+  v12 = i64.add v4 v11
+  br block1(v12)
+block3():
+  v13 = i64.const 0
+  br block4(v13)
+block4(v14: i64):
+  v15 = i64.const 8
+  v16 = i64.lt_u v14 v15
+  br_if v16 block5(v14) block6()
+block5(v17: i64):
+  v18 = i64.const 4
+  v19 = i64.mul v17 v18
+  v20 = i64.const 16
+  v21 = i64.add v20 v19
+  v22 = i32.load v21
+  v23 = thread.join v22
+  v24 = i64.const 1
+  v25 = i64.add v17 v24
+  br block4(v25)
+block6():
+  v26 = i64.const 0
+  v27 = i64.atomic.load v26
+  return v27
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
+  v1 = call 2 (v0)
+  v2 = i64.const 0
+  v3 = i64.atomic.rmw.add v2 v1
+  v4 = i64.const 0
+  return v4
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  br block1(v0, v1)
+block1(v2: i64, v3: i64):
+  v4 = i64.lt_s v3 v2
+  br_if v4 block2(v2, v3) block3(v3)
+block2(v5: i64, v6: i64):
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br block1(v5, v8)
+block3(v9: i64):
+  return v9
+}
+"#;
+
 // Futex handoff: the root spawns a producer, then `memory.wait`s on the flag at mem[0]; the producer
 // writes the payload at mem[8], sets the flag, and `memory.notify`s it. The root then reads the
 // payload → 987654 on every interleaving. Exercises the wasm parallel driver's wait/notify path
@@ -1681,6 +1755,9 @@ fn main() {
     emit("threads_inst_unit", THREADS_INST_UNIT);
     // 4d host I/O across Workers — ground truth (result 8, stdout "tick\n"×8) asserted in JS.
     emit("threads_io", THREADS_IO);
+    // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
+    // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
+    emit("threads_tierup", THREADS_TIERUP);
     // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
     // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
     {

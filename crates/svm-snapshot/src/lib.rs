@@ -87,8 +87,14 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// nested record gains a 32-byte **module digest** (a content hash of the child's granted module,
 /// emitted only for a separate-module child — one `uleb` `0` for a same-module child, else `1` + the
 /// 32 bytes), so the thaw resolves the child against the restore host's re-granted modules. One extra
-/// `uleb` (0) per same-module nested record otherwise, so a v10 nested record mis-parses.
-const FORMAT_VERSION: u16 = 11;
+/// `uleb` (0) per same-module nested record otherwise, so a v10 nested record mis-parses. v12 (§4
+/// depth-2+ nesting): each nested record gains a `parent_task` `uleb` (the task that instantiated the
+/// child) right after `slot`, so the format represents nesting to **arbitrary depth** — a grandchild's
+/// `parent_task` is its parent-child's task, not `0`. The interp thaw reconstructs the subtree
+/// topologically from it (parents before children). One extra `uleb` per nested record (0 for a
+/// depth-1 direct child of the root), so a v11 nested record mis-parses; retires the v11 freeze-time
+/// refusal that fail-closed on any non-zero `parent_task`.
+const FORMAT_VERSION: u16 = 12;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -231,10 +237,16 @@ pub fn freeze_with_prots(
     // shared active-SP word holds only the last child's extent at freeze end).
     let mut vcpus = host.frozen_vcpus().to_vec();
     vcpus.sort_by_key(|v| v.task);
-    // The §14 nested-child residue (DURABILITY.md §4, v8), canonical = ascending slot. Each child's
-    // continuation is in its own carve inside the window image; this is the re-attach record.
+    // The §14 nested-child residue (DURABILITY.md §4, v8). Each child's continuation is in its own
+    // carve inside the window image; this is the re-attach record. v12 carries each record's
+    // `parent_task` on the wire (see the encode below), so the format now represents nesting to
+    // **arbitrary depth** and the interp thaw reconstructs the subtree topologically from it. Canonical
+    // order is `(parent_task, slot)` — `slot` is only unique *within* a parent's namespace (the root's
+    // first child and that child's first grandchild are both `slot 0`), so the parent tag is the
+    // primary key. This matches the interp thaw's own sort (parents before children). For a depth-1
+    // artifact (every `parent_task == 0`) this reduces to ascending slot, as in v8–v11.
     let mut nested = host.frozen_nested().to_vec();
-    nested.sort_by_key(|n| n.slot);
+    nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
     let digest = digest256(&encode_module(module));
     let reserved_log2 = window.len().trailing_zeros() as u8;
@@ -327,6 +339,10 @@ pub fn freeze_with_prots(
                 write_uleb(b, nested.len() as u64);
                 for n in &nested {
                     write_uleb(b, n.slot as u64);
+                    // v12: the task that instantiated this child (depth-2+ nesting). `0` for a direct
+                    // child of the root; a grandchild carries its parent-child's task. The interp thaw
+                    // groups the residue by this to re-attach parents before their children.
+                    write_uleb(b, n.parent_task as u64);
                     write_uleb(b, n.carve_off);
                     write_uleb(b, n.size_log2 as u64);
                     write_uleb(b, n.entry as u64);
@@ -593,17 +609,24 @@ fn decode_control(
         root_sp = cr.uleb()?;
     }
     // §4 subtree freeze (v8): the optional nested-child residue trails the section; its presence is
-    // exactly "bytes remain" (canonical: absent when empty, ascending slot).
+    // exactly "bytes remain" (canonical: absent when empty, ascending `(parent_task, slot)` — `slot`
+    // is only unique within a parent's namespace, so the parent tag is the primary key; v12).
     let mut nested = Vec::new();
     if !cr.at_end() {
         let nn = cr.uleb()?;
-        let mut last: Option<u64> = None;
+        let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
         for _ in 0..nn {
             let slot = cr.uleb()?;
-            if last.is_some_and(|p| slot <= p) {
-                return Err(RestoreError::Malformed); // non-canonical: slots must ascend
+            // v12: the task that instantiated this child (depth-2+ nesting); `0` for a direct child of
+            // the root. The interp thaw reconstructs the subtree topologically from it.
+            let parent_task_raw = cr.uleb()?;
+            let key = (parent_task_raw, slot);
+            if last.is_some_and(|p| key <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: (parent_task, slot) must ascend
             }
-            last = Some(slot);
+            last = Some(key);
+            let parent_task =
+                usize::try_from(parent_task_raw).map_err(|_| RestoreError::Malformed)?;
             let carve_off = cr.uleb()?;
             let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
@@ -622,6 +645,9 @@ fn decode_control(
                 _ => Some(cr.uleb()? as i64),
             };
             nested.push(FrozenNested {
+                // v12: carried on the wire (above), so a restored subtree reconstructs to arbitrary
+                // depth — a grandchild's `parent_task` is its parent-child's task, not `0`.
+                parent_task,
                 slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
                 carve_off,
                 size_log2,

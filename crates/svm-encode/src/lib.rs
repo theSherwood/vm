@@ -113,6 +113,10 @@ mod op {
     // immediate uleb offset, and an alignment-hint byte.
     pub const STORE: u8 = 0x84; // + StoreOp index (0..=8) -> 0x84..=0x8C
     pub const STORE_END: u8 = 0x8C;
+    // Bulk-memory ops (D62): dst, src/val, len operand idxs (uleb). No sub-index.
+    pub const MEM_COPY: u8 = 0x8D; // dst, src, len
+    pub const MEM_MOVE: u8 = 0x8E; // dst, src, len
+    pub const MEM_FILL: u8 = 0x8F; // dst, val, len
     pub const LOAD: u8 = 0xF0; // + LoadOp index (0..=13) -> 0xF0..=0xFD
     pub const LOAD_END: u8 = 0xFD;
 
@@ -648,6 +652,24 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
             out.push(*align);
+        }
+        Inst::MemCopy { dst, src, len } => {
+            out.push(op::MEM_COPY);
+            write_uleb(out, *dst as u64);
+            write_uleb(out, *src as u64);
+            write_uleb(out, *len as u64);
+        }
+        Inst::MemMove { dst, src, len } => {
+            out.push(op::MEM_MOVE);
+            write_uleb(out, *dst as u64);
+            write_uleb(out, *src as u64);
+            write_uleb(out, *len as u64);
+        }
+        Inst::MemFill { dst, val, len } => {
+            out.push(op::MEM_FILL);
+            write_uleb(out, *dst as u64);
+            write_uleb(out, *val as u64);
+            write_uleb(out, *len as u64);
         }
         Inst::AtomicLoad {
             ty,
@@ -1920,6 +1942,21 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             value: c.idx()?,
             offset: c.uleb()?,
             align: c.byte()?,
+        },
+        op::MEM_COPY => Inst::MemCopy {
+            dst: c.idx()?,
+            src: c.idx()?,
+            len: c.idx()?,
+        },
+        op::MEM_MOVE => Inst::MemMove {
+            dst: c.idx()?,
+            src: c.idx()?,
+            len: c.idx()?,
+        },
+        op::MEM_FILL => Inst::MemFill {
+            dst: c.idx()?,
+            val: c.idx()?,
+            len: c.idx()?,
         },
 
         op::ATOMIC_LOAD => Inst::AtomicLoad {

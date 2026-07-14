@@ -927,6 +927,172 @@ poly approximations, `llvm-link`ed into the module. Findings + deliverable:
   transcendentals; the next undefined external is `strchrnul` (the "other libc" category — a synthesized
   string helper).
 
+**Slice BR (DONE) — the fail-closed extern-stub mechanism: the module clears the *entire* external
+surface.** The high-leverage lever from slice BP's map. Postgres has ~250 declared externals, but the
+vast majority are **dead on the `--single` query path** (network `accept`/`connect`/`epoll_*`, `fork`/
+`exec`/`pipe`, `dlopen`, `syslog`, `backtrace`, …) — yet the strict on-ramp fail-closes at *translate*
+time on the first one it doesn't handle, so clearing them one-by-one would be ~200 whack-a-mole helpers
+for functions that never run. Instead, an **opt-in** `TranslateOptions { stub_unresolved_externs }`
+lowers a call to a genuinely-undefined external (one no recognizer/synthesizer/capability handled — i.e.
+that *falls through to the fallback* at the direct-call site, so the classification is correct by
+construction, no fragile name predicate) to a synthesized **trap stub**: a function whose body is a
+single `unreachable`, which traps. This defers the fail-closed from **translate time to run time** —
+the whole-program module translates + verifies, and a stub only traps if actually *called* (never an
+escape: it is ordinary re-verified IR, §2a). Off by default (a typo'd callee stays a clean
+translate-time error for ordinary programs); opt in via `translate_bc_path_with_options` / the
+`--stub-externs` CLI flag for a large-program bring-up.
+- **Design.** Stubs are minted lazily into a shared `RefCell<StubTable>` threaded through the
+  translation (one per distinct name, keyed by name, using the first signature seen — the SVM sig is
+  the threaded data-SP + the call's fixed params, matching the `args=[sp,…]` the site builds) and
+  appended to `funcs` **last**, after `_start` + defined + helpers, so each lands at its assigned
+  `stub_base + ordinal` index. Reuses the existing `synth_trap_stub`. A later mismatched-signature call
+  to the same name surfaces as a clean `svm-verify` type-id error, not an escape.
+- **Test** `unresolved_extern_stub_opt_in`: strict default fail-closes on `mystery`; opt-in translates
+  + verifies + runs to a **clean exit** with the stub gated off (a dead stub is inert); and a *called*
+  stub **traps** (`run_powerbox` errors). **283 translate tests green, fmt + clippy clean.**
+- **Effect on the capstone — a milestone:** with `--stub-externs`, the full Postgres module (backend +
+  libm) translates past the **entire ~250-external OS/libc surface** in one lever. The next gap is no
+  longer an external at all — it is the **SIMD vector tail** (~9 per-lane, non-constant-splat vector
+  shifts: `ashr <16 x i32>`, `lshr <4 x i64>`/`<4 x i32>`, from explicit SSE/AVX SIMD, dead at runtime
+  under the `cpuid`→0 stub but still compiled). That vector category (#4) is the next slice — either
+  per-lane scalarization in the on-ramp, or a config lever compiling the SIMD fast-paths out.
+
+**Slice BS (DONE) — per-lane vector shifts + address-taken extern stubs (two Postgres-tail slices).**
+Two independent gaps the module hit after BR, each a clean, tested advance:
+- **Per-lane (non-constant-splat) vector shifts.** `VShift` (§17) takes one scalar count for *all*
+  lanes; clang's usual constant-splat amount maps directly, but real SSE/AVX SIMD (Postgres' `simd.h`)
+  emits **per-lane** amounts (`lshr <4 x i32> %a, %amt`, `ashr <16 x i32>`, …). The on-ramp now
+  **scalarizes** those: `v128_lane_shift` extracts each lane + its own count (`ExtractLane`), shifts in
+  the lane's integer type (`IntBin`), and repacks (`build_v128_from_lanes`) — the shift analog of the
+  existing vector funnel-shift path. Wired into **both** the 128-bit `bin` path (`<4 x i32>`/`<2 x i64>`)
+  and the wide `wide_int_shift` path (per-`v128`-chunk, e.g. `<8 x i32>`). Restricted to full-width
+  lanes (`I32x4`/`I64x2`); a narrow (`i8`/`i16`) variable shift stays fail-closed (clang keeps those as
+  constant splats — the native `VShift` handles them). Test `vector_shift_per_lane_amount` (runtime
+  `volatile` seed + amounts so nothing constant-folds; all result lanes folded to one `%u`) is
+  byte-identical to native across 128-bit + wide shapes.
+- **Address-taken extern stubs.** BR stubbed undefined externals at *call sites*; a **function pointer**
+  to an undefined extern (a comparator/dispatch-table entry — what blocked Postgres on `@memcmp`, e.g.
+  `select …, ptr @string_compare, ptr @memcmp`) reaches the operand resolver as an opaque `ptr` with no
+  call to derive a signature from. Fixed: the parser now records each `declare` prototype in
+  `func_declarations` (it previously kept the type only in the internal `symbols` map), so
+  `StubTable::get_or_insert_extern` recovers the declared signature and mints the funcref stub; the
+  `@global` operand resolver returns its index (the address-of counterpart to the call-site path).
+  `None` for an undefined *data* global (no funcref — stays fail-closed). Test
+  `unresolved_extern_funcptr_stub`: strict fail-closes on the address-taken `mystery`; opt-in resolves
+  the funcref and runs clean when the pointer's live target is the real function (an unselected stub is
+  inert). **286 translate tests green, fmt + clippy clean.**
+- **Effect on the capstone:** the Postgres module now translates past the vector-shift wall **and** the
+  address-taken `@memcmp`; the next gap is the **`<4 x i1>` mask type** (`type <4 x i1> (Milestone 1+)`)
+  — the SIMD vector tail continues (mask legalization next), then `<4 x i64>` wide-type support.
+
+**Slice BT (DONE) — mask-mask bitwise (`and`/`or`/`xor <N x i1>`): the SIMD "any-match" idiom.** The
+`<4 x i1>` blocker from BS. `lower_mask` already scalarized vector compares/select/extract/insert/
+shuffle/movemask/`freeze` and (via `lower_vec_int_convert`) `sext`/`zext` of a mask, but **not** the
+bitwise *combination* of masks — `or <4 x i1> %m1, %m2`, which is how SIMD folds several comparison
+masks into one ("does any of these lanes match?", then `sext` to a full-width vector; Postgres'
+`simd.h`). Those `or`/`and`/`xor <N x i1>` fell through `lower_mask` to the scalar `bin` path →
+`val_type(<4 x i1>)` → the `type <4 x i1> (Milestone 1+)` error. Now lowered lane-wise
+(`lower_mask_bitwise`: `IntBin` per `0`/`1` lane, result bound as scalarized mask lanes) — the mask
+analog of the vector int binop. Cross-block-safe for free: the scan classifies *any* `<N x i1>`-typed
+value into its `[i32; N]` fan-out `agg_layout`, so a mask combined in one block and consumed in another
+threads through block params like any mask. Test `vector_mask_bitwise_any_match` (the `(a==t1) |
+(a==t2) | (a==t3)` idiom clang `-O2` folds to `or <4 x i1>` + one `sext` — verified present in the
+bitcode) is byte-identical to native. Also repairs a **pre-existing `main` break**: the upstream
+`TranslateOptions { stack_page }` addition left one test's struct literal un-reconciled (missing the
+field), so the svm-llvm lane didn't compile — fixed with `..Default::default()`. **287 translate tests
+green, fmt + clippy clean.** Effect: the Postgres module now translates past the mask type; the next
+gap is an unrelated SSA-liveness corner (`value … not available in block`) in a later function.
+
+**Slice BU (DONE) — `freeze` of an aggregate + vector `ctpop`/`reduce` scalarization (the popcount
+dispatch tail).** Three small on-ramp fixes that carry the Postgres module through its `pg_popcount_*`
+functions, plus a diagnostics win:
+- **Function-named errors.** A whole-program error is now prefixed `in `@fn`: …` (a bare "value N not
+  available" is opaque across 14 k functions). This is what isolated the liveness gap below.
+- **`freeze` of an aggregate.** The BT liveness error (`value … not available in block`, in
+  `pg_popcount_masked_choose`) was a `freeze { i32, i32, i32, i32 }` — the `cpuid` result the recognizer
+  binds *field-wise* in the `agg` table. The scalar `freeze` arm `ctx.operand`-ed it as a scalar and
+  failed. `freeze` of an aggregate is the identity (its fields are already defined, §3c) → rebind the
+  same fields. Test `freeze_of_aggregate` (a hand `.ll` `insertvalue`→`freeze`→`extractvalue`, since
+  clang rarely emits an aggregate `freeze` from C).
+- **Vector `ctpop` on any width.** Only `i8x16` had a native vector `ctpop`; `pg_popcount_slow`'s
+  `llvm.ctpop.v2i64` now scalarizes (extract lane → `Popcnt` → repack — zero-extension leaves a
+  popcount unchanged, so it is correct for every width).
+- **Wide / 2-lane `vector.reduce`.** The horizontal reduce was 128-bit-only; it now also folds a
+  **wide** (>128-bit) accumulator lane-wise across chunks (`pg_popcount_avx512`'s `reduce.add.v8i64`)
+  and a **2-lane** packed `<2 x i32>` (via `vec_explode`, which covers both non-wide reps).
+- Test `vector_ctpop_and_wide_reduce` (a popcount-sum loop clang `-O2` vectorizes into vector `ctpop`
+  + a wide reduce) is byte-identical to native on interp + JIT. **289 translate tests green, fmt +
+  clippy clean.** Effect: the module now translates past the popcount dispatch; the next gap is
+  `pg_popcount_avx512` proper — full AVX-512 (`<64 x i1>` mask registers, `<8 x i64>`,
+  `llvm.masked.load`), which is **dead at runtime** under the `cpuid`→0 stub and is best removed by a
+  **build-config lever** (compile Postgres without the AVX-512 popcount fast-path) rather than teaching
+  the on-ramp the whole AVX-512 surface — the next slice.
+
+**Slice BV (DONE) — the SIMD tail closes via two build-config levers (no on-ramp change).** The
+diagnosis from BU was "teach the on-ramp AVX-512"; the reality on inspection was better — almost the
+*entire* Postgres SIMD surface is **incidental**, and closes at the source:
+- **The flag-ordering bug (the big one).** `emit_bc.py` passed `-fno-vectorize -fno-slp-vectorize` to
+  disable clang auto-vectorization — but inserted them *before* the recovered `-O2`. For the
+  vectorizer knobs the **last** flag on the line wins, and `-O2` turns the loop/SLP vectorizers back
+  on, so auto-vectorization was silently **never disabled**. Scalar C loops (e.g. `gistextractpage`'s
+  offset-array copy) were emitted as `<2 x i32>` loads → `zext <2 x i64>` → `getelementptr <2 x i64>`
+  gather-GEPs → `<2 x ptr>` stores — the "SIMD tail" that motivated BS/BT/BU. Appending the flags
+  *after* `-O2` (`out_toks.extend(EXTRA)`) makes them take effect; the whole auto-vectorized tail
+  vanishes (the module's `<N x …>` occurrences drop by ~40%, and the first gap jumps from
+  `gistextractpage`'s vector GEP clear across the vector category). The residual **explicit** SIMD
+  (SSE4.2 `_mm_crc32`, 128-bit float vectors) still translates via the on-ramp's existing vector
+  support (Y/BS/BT/BU) — those slices earn their keep on the real SIMD, just not on the phantom tail.
+- **AVX-512 popcount off.** Independent of vectorization (it is explicit `_mm512_*` intrinsic code in
+  `pg_popcount_avx512.c`, gated by `USE_AVX512_POPCNT_WITH_RUNTIME_CHECK`). The `configure` autodetect
+  is forced to "no" via its own cache vars (`pgac_cv_avx512_popcnt_intrinsics_=no` and the
+  `_mavx512vpopcntdq_mavx512bw` variant) — exactly the config a host without AVX-512 produces — so the
+  macro is never defined, `PG_POPCNT_OBJS` is empty, and `pg_popcount_avx512` / its `<64 x i1>` body
+  leave the link set. Dead anyway under the guest `cpuid`→0 (`pg_popcount_avx512_available()` is
+  false, scalar popcount is always chosen), so the native oracle stays a valid differential target.
+- **No translator code changed** (so the 289 translate tests are untouched and still green); the
+  deliverable is the two demo-build fixes (`build_bitcode.sh` configure args + `emit_bc.py` flag
+  order) plus this log. **Effect:** the module clears the entire SIMD + AVX-512 surface and now stops
+  at the first **indirect varargs call** (`manifest_process_version` — a `(...)` function pointer; the
+  on-ramp marshals *direct* varargs but rejects indirect), the next slice.
+
+**Slice BW (DONE) — indirect varargs call (a `(...)` function pointer).** The on-ramp already
+marshaled a *direct* `(...)` call's variadic arguments into the caller's overflow scratch (one 8-byte
+slot each) and deposited the area pointer at the callee's frame-0 slot for `va_start`; the only thing
+missing for an **indirect** varargs callee was that three spots each special-cased "direct" and bailed
+on the pointer form. All three now treat the two callee shapes identically — the marshaling is
+byte-for-byte the same, only the call instruction differs:
+- **`vararg_call_extra`** (frame-layout pass) dropped its `callee_name(c)?` early-return, so an
+  indirect `(...)` call also reserves `VARARG_SCRATCH` (else "varargs call without reserved scratch").
+- **The marshaling `fixed` match** dropped its `callee_name(c).is_some()` guard, so the variadic args
+  are stored to scratch (not pushed as IR args) and the area pointer is deposited at `callee_sp + 0`,
+  for an indirect callee too.
+- **`indirect_sig`** stopped rejecting `is_var_arg`: a `(...)` callee's SVM signature is
+  `(sp, fixed-params…)` — `param_types` are exactly the fixed params — which is the *same* shape a
+  defined `(...)` function lowers to (§varargs), so the `call_indirect` §3c type-id check matches.
+- Found as the Postgres `manifest_process_version` gap. Test `varargs_indirect_call`: a `(...)` helper
+  reached through a `volatile`-indexed function pointer (so clang can't devirtualize) — byte-identical
+  to native on interp + bytecode + JIT, and clang emits it `tail`, exercising `return_call_indirect`
+  too.
+
+Two **i128 op lowerings** landed in the same slice (the next two gaps, both the *same* root cause).
+The reported `value … not available in block` in `sqrt_var` looked like a liveness bug but was not:
+`lower_i128` was missing the op, so the **generic scalar** handler `ctx.operand`-ed an i128 value —
+which lives as an `agg` `(lo, hi)` pair, not in `idx_of` — and failed. The `id()` diagnostic (agg/wide
+membership) pinned it immediately.
+- **`select i128`** — a per-word `Select` on the `(lo, hi)` pairs (clang emits it from a `? :` on a
+  128-bit quantity; numeric `sqrt_var`'s Newton's-method inner loop). Without it the generic scalar
+  `Select` mishandled the pair.
+- **`store i128`** — two i64 stores, lo at the base and hi at base+8, mirroring the existing `load i128`
+  layout (numeric `int2_accum`'s `sumX2` accumulator). Added inside the Store effect-arm before the
+  scalar `ctx.operand`, so an i128 value never takes the scalar path.
+- Test `i128_select_and_store_roundtrip`: a hand `.ll` (clang won't emit `select i128` from simple C —
+  it always branches) that selects between two i128s, stores the winner to an `alloca`, loads it back,
+  and folds `lo - hi` (asymmetric — catches a swapped half or a mis-picked select); 293 on interp + JIT.
+- **292 translate tests green, fmt + clippy clean.** Effect: the module translates past `sqrt_var` and
+  `int2_accum` and now stops at a **vector `llvm.bswap`** in `pg_sha256_final` (SHA-256's big-endian
+  digest write — the on-ramp scalarizes vector `ctpop`/min/max but not yet vector `bswap`), the next
+  slice.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

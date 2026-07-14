@@ -43,7 +43,7 @@ fn mixed(m: &svm_ir::Module, arg: i64) -> Result<i64, ()> {
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("emitted wasm validates");
     let mut store: Store<i32> = Store::new(&engine, 0);
-    let memory = Memory::new(&mut store, MemoryType::new(2, None).unwrap()).unwrap();
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
     // A large POSITIVE i64 fuel budget (the emitted fuel check traps when the i64 counter goes < 0).
     memory
         .write(
@@ -163,9 +163,10 @@ fn env_layout_fits() {
 
 const ARGS: &[i64] = &[0, 1, 2, 5, 20, 100, -1, -5, 1000];
 
-/// Integer caller sums a **SIMD leaf** `f(i) = 2i` (`i64x2.splat`/`add`/`extract_lane`) over `0..n`.
-/// The caller is emitted; the leaf (v128 internally → out of subset, i64 signature, memory-free)
-/// runs via `env.call_interp`.
+/// Integer caller sums a **deferred-SIMD leaf** over `0..n`. The caller is emitted; the leaf (a
+/// `i16x8.dot_i8x16_s` reduction — out of the emitter's subset, i64 signature, memory-free) runs via
+/// `env.call_interp`. (The core v128 lane ops are now in-subset, so the cross-tier exemplar is the
+/// deferred `dot` reduction — whatever it computes, the mixed run and the whole-interp oracle agree.)
 const SUM_FLOAT_LEAF: &str = r#"
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -187,7 +188,7 @@ block3(v14: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.add v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i64x2.extract_lane 0 v2
   return v3
 }
@@ -230,7 +231,7 @@ block3(v16: i64):
 func (i32) -> (i32) {
 block0(v0: i32):
   v1 = i32x4.splat v0
-  v2 = i32x4.add v1 v1
+  v2 = i16x8.dot_i8x16_s v1 v1
   v3 = i32x4.extract_lane 0 v2
   return v3
 }
@@ -248,11 +249,12 @@ fn sum_i32_leaf() {
     }
 }
 
-/// **Trap propagation across the tier boundary.** The leaf (v128-gated so it stays out of subset →
-/// cross-tier) computes `100 / arg`, which traps (div-by-zero) exactly when `arg == 0`. The mixed
-/// run must trap iff the full-interpreter oracle traps — proving the `env.call_interp` callback's
-/// trap path (it traps the wasm, which unwinds to the top-level `f0` caller, like the browser's JS
-/// import throwing).
+/// **Trap propagation across the tier boundary.** The leaf is deferred-SIMD-gated (a
+/// `i16x8.dot_i8x16_s` keeps it out of subset → cross-tier) and computes `100 / arg`, which traps
+/// (div-by-zero) exactly when `arg == 0` — the dot result is folded in *after* the divide, so the
+/// trap is purely arg-driven. The mixed run must trap iff the full-interpreter oracle traps —
+/// proving the `env.call_interp` callback's trap path (it traps the wasm, which unwinds to the
+/// top-level `f0` caller, like the browser's JS import throwing).
 const TRAPPING_LEAF: &str = r#"
 func (i64) -> (i64) {
 block0(v0: i64):
@@ -262,10 +264,13 @@ block0(v0: i64):
 func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64x2.splat v0
-  v2 = i64x2.extract_lane 0 v1
-  v3 = i64.const 100
-  v4 = i64.div_s v3 v2
-  return v4
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v1
+  v4 = i64.const 100
+  v5 = i64.div_s v4 v3
+  v6 = i64x2.extract_lane 0 v2
+  v7 = i64.add v5 v6
+  return v7
 }
 "#;
 

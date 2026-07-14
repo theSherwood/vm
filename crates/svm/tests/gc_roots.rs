@@ -239,6 +239,109 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
     );
 }
 
+/// **`gc.roots` captures caller roots parked in callee-saved registers** — the register-flush path
+/// (`fiber_rt::svm_gc_roots_flush`). The Tail ABI preserves the callee-saved registers, so under
+/// register pressure Cranelift keeps some values live-across-a-call in them rather than spilling. The
+/// scan walks *memory*, not registers, so without the flush trampoline — which spills the callee-saved
+/// set before scanning — those roots would be missed.
+///
+/// The fiber **loads** `N = 16` distinct in-window pointers from memory (loads can't be rematerialized
+/// across the `gc.roots` call, unlike constants) and folds all of them *after* the call, so all 16 are
+/// live across it. With 16 live values and ~15 GPRs, regalloc must park several in callee-saved
+/// registers; the flush guarantees they land in the scanned stack region. Expected roots: `heap_lo`
+/// plus the 16 loaded pointers = 17. (A/B-verified: bypassing the flush drops the count below 17.)
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
+    use svm_jit::{compile_and_run, JitOutcome};
+    const N: usize = 16;
+    // Layout (memory 16 = 64 KiB): the N pointer *values* 0x6008.. are pre-stored at 0x100.. so the
+    // fiber can load them (a load's result can't be rematerialized across the call). Root window
+    // [0x6000, 0x6100) covers heap_lo + all N pointers. gc.roots buffer at 0x200, cap 32. The fold sum
+    // is stored at 0x1000 (out of window) purely to keep the loads live past the call.
+    let mut root = String::from("memory 16\nfunc () -> (i64) {\nblock0():\n");
+    let mut k = 0usize;
+    for i in 0..N {
+        let (val, off) = (0x6008 + i * 8, 0x100 + i * 8);
+        root.push_str(&format!("  v{k} = i64.const {val}\n"));
+        let vval = k;
+        k += 1;
+        root.push_str(&format!("  v{k} = i64.const {off}\n"));
+        let voff = k;
+        k += 1;
+        root.push_str(&format!("  i64.store v{voff} v{vval}\n"));
+    }
+    root.push_str(&format!("  v{k} = ref.func 1\n"));
+    let vf = k;
+    k += 1;
+    root.push_str(&format!("  v{k} = i64.const 4096\n"));
+    let vsz = k;
+    k += 1;
+    root.push_str(&format!("  v{k} = cont.new v{vf} v{vsz}\n"));
+    let vc = k;
+    k += 1;
+    root.push_str(&format!("  v{k} = i64.const 0\n"));
+    let va = k;
+    k += 1;
+    root.push_str(&format!("  v{k}, v{} = cont.resume v{vc} v{va}\n", k + 1));
+    let vres = k + 1;
+    root.push_str(&format!("  return v{vres}\n}}\n"));
+
+    let mut f = String::from("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+    let mut fk = 2usize;
+    let mut loaded = Vec::new();
+    for i in 0..N {
+        let off = 0x100 + i * 8;
+        f.push_str(&format!("  v{fk} = i64.const {off}\n"));
+        let voff = fk;
+        fk += 1;
+        f.push_str(&format!("  v{fk} = i64.load v{voff}\n"));
+        loaded.push(fk);
+        fk += 1;
+    }
+    // heap_lo=0x6000, heap_hi=0x6100, buf=0x200, cap=32 — emitted in order at fk..fk+3.
+    for val in [24576, 24832, 512, 32] {
+        f.push_str(&format!("  v{fk} = i64.const {val}\n"));
+        fk += 1;
+    }
+    let (vlo, vhi, vbuf, vcap) = (fk - 4, fk - 3, fk - 2, fk - 1);
+    f.push_str(&format!("  v{fk} = i64.const -1\n"));
+    let vmask = fk;
+    fk += 1;
+    f.push_str(&format!(
+        "  v{fk} = gc.roots v{vlo} v{vhi} v{vmask} v{vbuf} v{vcap}\n"
+    ));
+    let vcount = fk;
+    fk += 1;
+    let mut acc = loaded[0];
+    for &l in &loaded[1..] {
+        f.push_str(&format!("  v{fk} = i64.add v{acc} v{l}\n"));
+        acc = fk;
+        fk += 1;
+    }
+    f.push_str(&format!("  v{fk} = i64.const 4096\n"));
+    let vsaddr = fk;
+    f.push_str(&format!("  i64.store v{vsaddr} v{acc}\n"));
+    f.push_str(&format!("  return v{vcount}\n}}\n"));
+
+    let src = format!("{root}{f}");
+    let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+    verify_module(&m).expect("verify");
+    let count = match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Returned(s) => s[0],
+        other => panic!("jit did not return: {other:?}"),
+    };
+    assert!(
+        count >= (N as i64 + 1),
+        "all {N} loaded pointers (+ heap_lo) must be enumerated across the call; got {count} — a \
+         callee-saved-register root was missed (the flush trampoline regressed)"
+    );
+}
+
 /// **`gc.roots` scans a running *ancestor* fiber** — the path the tight running-scan
 /// (`fiber_rt::gc_roots`; STACK_GUARD_FLIP.md #4) validates. Chain: root → A → B, all RUNNING; B calls
 /// `gc.roots`. B is the innermost (scanned via `current_sp`); A is a running *ancestor* (scanned via
