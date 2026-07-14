@@ -324,12 +324,12 @@ block0(v0: i64):
   // --- 8) §22 guest-JIT **real codegen** across real Web Workers (BROWSER.md § "wasm-JIT tier", slice 5) --
   // The guest holds a `Jit` cap + a host-compiled unit and `cap.call`s invoke; each worker runs the
   // submitted unit on EMITTED WASM on its own Worker (`svm_par_powerbox_jit_codegen` emits it at setup)
-  // instead of the interpreter. Run the all-i64 invoke kernel BOTH ways: interp (`jit: true`) and
-  // codegen (`jitCodegen: true`). Both must return 1136, and codegen must actually run the emitted unit
-  // (counter > 0) — the §22 analogue of the tier-up proof, one tier deeper (guest-loaded code, not a
-  // static function). `install`/`call_indirect` (Model B2) + guest-compiled units stay on the interp.
+  // instead of the interpreter. Runs the **same i32 kernel the interp `jit` item runs** (the unit
+  // `service` is `(i32,i32)->(i32)` — the Worker marshals args by type, this slice's generalization),
+  // so codegen → 1136 = interp; the counter proves the emitted unit ran. `install`/`call_indirect`
+  // (Model B2) + guest-compiled units stay on the interp.
   try {
-    const guest = await fetchBytes('/corpus/threads_jit_invoke_i64.svmbc');
+    const guest = await fetchBytes('/corpus/threads_jit_invoke.svmbc');
     const t0 = performance.now();
     const codegen = await run(guest, { jitCodegen: true });
     const ms = (performance.now() - t0).toFixed(0);

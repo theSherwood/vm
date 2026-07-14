@@ -632,8 +632,12 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `svm_par_powerbox_jit_codegen` setup and each Worker instantiates its own instance
    (`svm_par_enable_jit_codegen`, per-instance — the emitted bytes aren't a reliably-shared static
    across Workers, same reason each Worker computes its own tier-up bitmap); `svm_par_run` surfaces
-   `PAR_JIT_INVOKE` (codegen on, all-i64 unit sig — the marshalling ABI restriction tier-up also
-   holds) and the Worker runs the emitted `f{entry}(win, env, …args)` over the shared window. **This
+   `PAR_JIT_INVOKE` (codegen on, a **scalar-integer** unit sig — i32 or i64) and the Worker runs the
+   emitted `f{entry}(win, env, …args)` over the shared window, **marshalling each arg by its declared
+   type** (`svm_par_jit_param_types_ptr`: an i32 arg is a JS `Number`, an i64 a `BigInt`; results go
+   back uniformly as `BigInt(ret)`, which the engine re-tags by the result's type) — so a unit need
+   not be all-i64. The `#jitcodegen` proof runs the **same i32 `service(a,b)=a*b+100` kernel the
+   interpreter `#jit` item runs**. **This
    is Model A** (the unit is reached through the host, never installed in the shared `call_indirect`
    table, so the Spectre-safe table mask never moves — DESIGN.md §22). Authority still resolves
    through the powerbox before the invoke surfaces (a forged/cross-domain handle traps identically).
@@ -663,8 +667,9 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    **Deferred (documented):** §22 `install` + `call_indirect` (Model B2 — an installed unit *is* a
    funcref old code dispatches to; needs cross-instance wasm-table population), guest-**compiled**
    units (the guest builds IR at runtime — needs the emitted bytes to cross Workers with the code
-   handle, a shared registry with synchronization), i32/float unit signatures (JS type marshalling),
-   and §14 units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on wasm).
+   handle, a shared registry with synchronization), **float** (f32/f64) unit signatures (JS bit
+   reinterpretation via `DataView` — scalar **integer** i32/i64 sigs now marshal by type), and §14
+   units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on wasm).
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

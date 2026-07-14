@@ -13,17 +13,20 @@ const WASM = fileURLToPath(new URL('./target/wasm32-unknown-unknown/release/svm_
 const PAR_DONE = 0, PAR_TRAP = 1, PAR_JIT_INVOKE = 8;
 const STACK = 1 << 20;
 
-// Guest `(jit, code) -> (i64)`: invoke the unit with (6, 7) and return its result. Single vCPU — no
-// threads; the invoke is the only host event. `service(6,7) = 142`.
+// Guest `(jit, code) -> (i64)`: invoke the unit with i32 args (6, 7) and return its result. Single
+// vCPU — no threads; the invoke is the only host event. The unit `service` is `(i32,i32)->(i32)`, so
+// the Worker marshals the args as i32 (JS Numbers) — the ABI generalization this slice adds.
+// `service(6,7) = 142`.
 const GUEST = `
 memory 16
 func (i32, i32) -> (i64) {
 block0(vjit: i32, vcode: i32):
   vc = i64.extend_i32_u vcode
-  va = i64.const 6
-  vb = i64.const 7
-  vr = cap.call 11 1 (i64, i64, i64) -> (i64) vjit (vc, va, vb)
-  return vr
+  va = i32.const 6
+  vb = i32.const 7
+  vr = cap.call 11 1 (i64, i32, i32) -> (i32) vjit (vc, va, vb)
+  vr64 = i64.extend_i32_u vr
+  return vr64
 }
 `;
 
@@ -81,8 +84,12 @@ async function main() {
       if (evc === PAR_JIT_INVOKE) {
         invokes++;
         const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
+        const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
         const args = [];
-        for (let i = 0; i < n; i++) args.push(new BigInt64Array(memory.buffer)[(argvPtr >> 3) + i]);
+        for (let i = 0; i < n; i++) {
+          const slot = new BigInt64Array(memory.buffer)[(argvPtr >> 3) + i];
+          args.push(ptypes[i] === 0 ? Number(BigInt.asIntN(32, slot)) : slot); // 0 = i32, 1 = i64
+        }
         new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel
         try {
           const ret = f['f0'](win, envCell, ...args);

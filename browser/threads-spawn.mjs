@@ -220,11 +220,15 @@ async function worker() {
       continue;
     }
     if (ev === JIT_INVOKE) {
-      // §22 guest-JIT real codegen: run the emitted unit's `f0(win, env, ...i64 args)` instead of
-      // the interpreter, then deliver its i64 result slots. A trap surfaces as a vCPU trap.
+      // §22 guest-JIT real codegen: run the emitted unit's `f0(win, env, ...args)` instead of the
+      // interpreter, then deliver its result slots. Args marshal by type (i32 → Number, i64 → BigInt).
       const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
+      const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
       const args = [];
-      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
+      for (let i = 0; i < n; i++) {
+        const slot = i64()[(argvPtr >> 3) + i];
+        args.push(ptypes[i] === 0 ? Number(BigInt.asIntN(32, slot)) : slot);
+      }
       new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // reuse the counter (non-vacuity)
       try {

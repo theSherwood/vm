@@ -241,11 +241,17 @@ self.onmessage = async (e) => {
     }
     if (evc === JIT_INVOKE) {
       // §22 guest-JIT real codegen: the guest `Jit.invoke`d a unit — run the emitted unit's
-      // `f0(win, env, ...i64 args)` over the shared window instead of the interpreter, then deliver
-      // its i64 result slots. A trap throws and surfaces as a vCPU trap (as an interp invoke would).
+      // `f0(win, env, ...args)` over the shared window instead of the interpreter, then deliver its
+      // result slots. Args marshal by declared type (i32 → JS Number, i64 → BigInt) so a unit need not
+      // be all-i64; results go back as `BigInt(ret)` (the engine re-tags by result type). A trap
+      // throws and surfaces as a vCPU trap (as an interp invoke would).
       const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
+      const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
       const args = [];
-      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
+      for (let i = 0; i < n; i++) {
+        const slot = i64()[(argvPtr >> 3) + i];
+        args.push(ptypes[i] === 0 ? Number(BigInt.asIntN(32, slot)) : slot); // 0 = i32, 1 = i64
+      }
       new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted invokes (non-vacuity)
       try {
