@@ -13,7 +13,7 @@
 
 use svm_interp::{bytecode, run, Trap, Value};
 use svm_jit::{compile, CompiledModule, JitOutcome, TrapKind};
-use svm_spec::{module_for, scalar_rows, vectors_for, OpRow, Shape, SpecTrap, SpecVal};
+use svm_spec::{all_rows, module_for, vectors_for, OpRow, Shape, SpecTrap, SpecVal};
 
 fn to_value(v: SpecVal) -> Value {
     match v {
@@ -138,7 +138,7 @@ fn check_vector(row: &OpRow, m: &svm_ir::Module, cm: &mut CompiledModule, vector
 #[test]
 fn spec_vectors_match_all_backends() {
     let mut vectors_run = 0usize;
-    for row in scalar_rows() {
+    for row in all_rows() {
         match row.shape {
             Shape::Operands => {
                 // Input-independent module: verify + JIT-compile once, run every vector.

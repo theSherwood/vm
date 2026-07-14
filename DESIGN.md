@@ -455,7 +455,10 @@ security — UB in a sandbox IR would void the escape guarantee.
 - **Integer compare** (→ i32 0/1): `eq ne lt_s lt_u le_s le_u gt_s gt_u ge_s ge_u
   eqz`.
 - **Float arithmetic** (f32/f64, IEEE 754, no traps): `add sub mul div sqrt min max
-  abs neg ceil floor trunc nearest copysign`.
+  abs neg ceil floor trunc nearest copysign fma` (`min`/`max` are wasm-identical:
+  NaN-propagating, with `-0 < +0` — *not* IEEE minNum; `nearest` rounds ties to
+  even; `fma` is the correctly-rounded fused multiply-add; `abs`/`neg`/`copysign`
+  are pure sign-bit ops, defined on NaN too — all pinned by `svm-spec`).
 - **Float compare** (→ i32): `eq ne lt le gt ge`.
 - **Conversions:** `i64.extend_i32_s/u`, `i32.wrap_i64`, `extend8_s/extend16_s/
   extend32_s` (the narrow sign-extends — *defined here + in `svm-ir`, the interpreter, **and the JIT**

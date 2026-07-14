@@ -10,6 +10,13 @@
 > every `irgen`-generated module containing a ptr op was silently dropped from the
 > interp↔JIT differential; the (trivial, pure-arithmetic) lowering is added and the
 > ptr ops now ride both the spec vectors and the 4000-seed differential.
+>
+> **Slice 2 landed** — the scalar float rows (70: consts, `FBin`/`FUn`/`Fma`/`FCmp`,
+> saturating + trapping float→int with the exact boundary lattice, int→float, float
+> `select`), taking the table to 150 rows / ~100k vectors × three backends (<8 s).
+> No backend findings this time; the yield is precision — the §3b prose was silent on
+> `min`/`max` NaN/zero semantics, `nearest` tie-breaking, and the trunc trap bounds,
+> which are now pinned executable definitions (prose clarified in place).
 
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier
@@ -176,9 +183,9 @@ commit). Ordered so every slice delivers a standing suite:
    `Convert`/`Select`, `Cast`, `PtrAdd`/`PtrCast`; suite-1 harness running all
    three backends.
    *Exit: every i32/i64 op has passing boundary vectors on interp, bytecode, JIT.* ✅
-2. **Floats + conversions.** `FBin`/`FUn`/`Fma`/`FCmp`, `FToISat`/`FToITrap`/
-   `IToFConv`, reinterpret casts; NaN policy wired. *Exit: the trapping and
-   saturating conversion boundary lattices pass on all backends.*
+2. **Floats + conversions** — **done** (see Status). `FBin`/`FUn`/`Fma`/`FCmp`,
+   `FToISat`/`FToITrap`/`IToFConv`, reinterpret casts; NaN policy wired. *Exit: the
+   trapping and saturating conversion boundary lattices pass on all backends.* ✅
 3. **Encoding conformance.** Suite 3 over all rows so far + the completeness
    walk over sub-enum `index()` ranges. *Exit: every specced op's byte is
    pinned; adding an op without a row fails the build.*
