@@ -264,6 +264,41 @@ the failing check id + `RuntimeError` on `pageerror`) — the attempt-1 diagnost
 off before anyone can pin the check, exactly as noted above, so we still cannot say which on-page
 assertion trips.
 
+**Investigation (2026-07-14): the failure mechanism, and why we can't tell which check.** Traced the
+page glue. Two facts pin the mechanism:
+- Every one of the 7 index-page items (`web/main.js`) runs inside a `try { … } catch { set(id,
+  'fail', …) }`, so a trap on the **page** thread produces a clean `fail`, never a `pending` timeout.
+  The observed symptom is always a **timeout** (an item stuck `pending`) ⇒ the trap is in a **Worker**.
+- In `web/worker.js` the vCPU event loop called `ex.svm_par_run(v)` with **no guard**. A host-level
+  wasm trap there — `memory access out of bounds`, or `unreachable` (which is what a `panic=abort`
+  engine panic lowers to, matching the Jul 12 `[pageerror] unreachable` variant) — unwinds into the
+  `async onmessage`, rejecting it. **A Worker's unhandled promise rejection does not fire
+  `Worker.onerror` on the page**, so `par.js`'s per-vCPU promise never settles: `main.js`'s `await
+  run(...)` hangs, the item sits `pending`, and the harness's 30 s `waitForFunction` times out with
+  only a bare `[pageerror]` and no check id. (The tier-up call one branch over *is* already
+  `try/catch`-wrapped → `svm_par_deliver_tierup_trap`, which is why tier-up traps report cleanly —
+  confirming the unguarded `svm_par_run` as the escape.)
+
+So I22 is **two problems**: (a) a rare shared-memory race in the engine that makes `svm_par_run`
+occasionally trap/panic under a loaded runner (the deep root cause — still open, needs a captured
+instance), and (b) a **diagnostics/robustness gap** that turns (a) into a silent, unattributable 30 s
+hang — which is precisely why the fix-sketch's "capture first" has never had anything to capture.
+
+**Landed (2026-07-14, first step — targets (b), the capture gap; low-risk, glue-only, no TCB):**
+- `web/worker.js`: guard the `svm_par_run(v)` call. On a host trap, wake any joiner (store `2`=trapped
+  into a non-root vCPU's completion slot + `Atomics.notify`, so a parent's `Atomics.wait` doesn't
+  cascade-hang) and `postMessage({kind:'fail', why})`. `par.js` already maps `fail` → promise reject
+  → `main.js` marks the item `fail` **with the trap text**, converting the silent hang into a named,
+  diagnosable failure.
+- `browser-test.mjs`: retain the `pageerror` texts and, on the first `waitForFunction` timeout, dump
+  **which items are still `pending`** plus the captured pageerror(s) before failing — so even a hang
+  that slips past the guard self-identifies the stuck check.
+
+These do not change the passing path and cannot fix the underlying race; they make the **next**
+recurrence name the check + carry the `RuntimeError`, which is the prerequisite for root-causing (a).
+Not yet exercised in a real browser here (needs the `-Z build-std` threads wasm + Chromium); the
+next CI `real-browser` failure — or a local threads build — is the validation.
+
 ---
 
 ### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
