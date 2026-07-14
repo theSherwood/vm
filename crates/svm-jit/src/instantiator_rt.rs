@@ -88,6 +88,12 @@ pub(crate) struct Nursery {
     /// the domain closed over its nesting subtree". The interpreter is the reference for durable
     /// nesting; JIT parity is a follow-up.
     durable: AtomicBool,
+    /// §4 freeze export: the §14 nested-child re-attach residue captured during a durable freeze — one
+    /// [`crate::FrozenNested`] per child that unwound into its carve (`instantiate` records it when
+    /// `compile_child_and_run` reports the child left `UNWINDING`). Drained by the top-level run after
+    /// the freeze (`take_frozen_nested`). Depth-1 (root's direct child) for now; a grandchild's residue
+    /// coalescing at the root (a shared sink) is a follow-up.
+    frozen_nested_out: Mutex<Vec<crate::FrozenNested>>,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -215,7 +221,19 @@ impl Nursery {
             children: Mutex::new(Vec::new()),
             coros: Mutex::new(Vec::new()),
             durable: AtomicBool::new(false),
+            frozen_nested_out: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Drain the §14 nested-child freeze residue captured during a durable freeze (see
+    /// [`Nursery::frozen_nested_out`]). Called by the top-level run after the root unwinds.
+    pub(crate) fn take_frozen_nested(&self) -> Vec<crate::FrozenNested> {
+        std::mem::take(
+            &mut self
+                .frozen_nested_out
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field: the nesting
@@ -404,7 +422,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
         durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
     );
-    let (result, trap) = match outcome {
+    let (result, trap, unwound) = match outcome {
         Ok(rt) => rt,
         Err(_) => {
             // A child we cannot compile (fibers/threads, or a backend error) is a CapFault, not a
@@ -415,12 +433,30 @@ pub(crate) unsafe extern "C" fn instantiate(
     };
 
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = children.len();
     children.push(Child {
         result,
         trap,
         joined: false,
     });
-    (children.len() - 1) as i32
+    // §4 freeze export: the child left its carve `UNWINDING` — it unwound mid-run under a freeze
+    // instead of completing. Record its re-attach residue (depth-1: a direct child of the root, so
+    // `parent_task = 0`). Its continuation lives in the carve (the frozen window image); this is what a
+    // thaw needs to re-create the child domain. The `slot` is the child's join-table index — the
+    // handle the guest holds — so a thaw resolves the reloaded handle to the re-attached child.
+    if unwound {
+        rt.frozen_nested_out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(crate::FrozenNested {
+                parent_task: 0,
+                slot,
+                carve_off: base + off,
+                size_log2: size_log2 as u8,
+                entry: entry as u32,
+            });
+    }
+    slot as i32
 }
 
 /// `join(child_handle) -> result` — block on the child's completion (it already ran synchronously at

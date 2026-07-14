@@ -370,10 +370,25 @@ child `Nursery` over its funcs), plus the ctx-0 carve control-word seeding it ne
 guest. `compile_child` gained the `InstEnv` param (was hard-`null`); `compile_child_and_run` builds the
 boxed nursery + seeds. Pinned by `durable_nesting_jit.rs::jit_durable_depth2_grandchild_matches_interp`
 (a same-module root→child→grandchild chain returns 4950 on both backends in `NORMAL`). `AddressSpace`
-and separate-module children are follow-ups. (2) **freeze export** —
-the unwound-vs-completed detection + `FrozenNested`, byte-identical carve to the interp; (3) **thaw**
-re-attach + `REWINDING`; (4) depth-2, separate-module, and completed-result parity. Powerbox (1) is the
-gating prerequisite; the synchronous model needs no redesign.
+and separate-module children are follow-ups. (2) **freeze export — LANDED.** A freeze-from-start
+(window `UNWINDING`) now captures a live §14 child on the JIT: `compile_child_and_run` seeds the
+child's carve with the **parent's** phase (read from the parent window's ctx-0 state word) so an
+instrumented child is born unwinding; after the run it reads the carve's state word
+(`window_is_unwinding`) and reports "unwound"; `instantiate` records a `svm_jit::FrozenNested`
+(parent_task, slot, carve geometry, entry) into the run's `Nursery`; the top-level run drains it into
+`frozen_nested_out`, returned by a new `_durable_nested` entry (a separate entry, so the many `_durable`
+callers are untouched). Pinned by `durable_nesting_jit.rs::jit_freeze_captures_live_nested_child_matching_interp`.
+**Model-divergence finding (empirical):** the two backends freeze a *different child body* to produce a
+live residue — the interpreter freezes a **pure-compute** child by never scheduling it (frozen at
+entry), while the synchronous JIT runs the child inline in `instantiate`, so it needs an **instrumented**
+child that unwinds mid-run (a pure child runs to completion). But because both use the identical
+`instantiate` call, the `FrozenNested` **record** (the re-attach geometry a thaw consumes) is byte-for-byte
+identical — so the differential is on the *record*, not the frozen continuation. A byte-identical
+*carve* would require the freeze points to coincide; that (and the true correctness proof) is the
+**freeze→thaw→result round-trip**, which is the thaw slice. (3) **thaw** re-attach + `REWINDING`
+(also closes the round-trip pin); (4) depth-2 (a grandchild's residue coalescing at the root via a
+shared sink), separate-module, and completed-result parity. Powerbox (1) was the gating prerequisite;
+the synchronous model needs no redesign.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the

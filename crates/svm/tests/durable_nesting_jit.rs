@@ -1,22 +1,27 @@
-//! JIT durable-nesting parity — slice 1: a durable **same-module** nested child runs on the JIT,
-//! matching the interpreter (DURABILITY.md §4, "JIT parity").
+//! JIT durable-nesting parity (DURABILITY.md §4, "JIT parity") — the interpreter is the oracle.
 //!
-//! Until this slice the JIT's durable `instantiate` failed closed entirely (`instantiator_rt.rs`,
-//! `-EINVAL`). Slice 1 admits a same-module durable child: its funcs are the parent's own funcs, run
-//! in the carve as an ordinary top-level guest. A *runnable* same-module child on the JIT is a
-//! pure-compute (non-may-suspend) func — it has no poll sites, so it runs atomically to completion
-//! with no durable control-word setup (a would-be *instrumented* child hits a `cap.call` against its
-//! empty powerbox → `CapFault`, so it never reaches an unwind). The child here sums 0..100 = 4950;
-//! both backends must return it.
+//! Three slices, in order:
+//! * **run** (`jit_durable_same_module_child_matches_interp`): a durable same-module child runs on the
+//!   JIT (was fail-closed `-EINVAL`); a runnable one is pure-compute (an instrumented child hits a
+//!   `cap.call` against its empty powerbox → `CapFault`);
+//! * **powerbox** (`jit_durable_depth2_grandchild_matches_interp`): a durable child gets a
+//!   one-capability `Instantiator` powerbox and nests a grandchild (depth-2, `NORMAL`);
+//! * **freeze export** (`jit_freeze_captures_live_nested_child_matching_interp`): a freeze catches a
+//!   live nested child and captures a `FrozenNested` re-attach record whose geometry matches the
+//!   interpreter's.
 //!
-//! Freezing a *live* nested child on the JIT — which needs the carve's ctx-0 control words + shadow
-//! base seeded to match the interpreter, plus a child powerbox — is the next slice; separate-module
-//! durable children and `coro_spawn` stay fail-closed.
+//! Thaw (re-attaching a frozen nested child on the JIT), separate-module durable children, and
+//! `coro_spawn` are follow-ups.
 
 use core::ffi::c_void;
-use svm_durable::{init_durable_window, transform_module};
+use svm_durable::{
+    init_durable_window, read_state, transform_module, write_state, STATE_UNWINDING,
+};
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
-use svm_jit::{compile_and_run_capture_reserved_with_host_durable, JitOutcome};
+use svm_jit::{
+    compile_and_run_capture_reserved_with_host_durable,
+    compile_and_run_capture_reserved_with_host_durable_nested, JitOutcome,
+};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -218,4 +223,125 @@ fn jit_durable_depth2_grandchild_matches_interp() {
         matches!(jo, JitOutcome::Returned(ref s) if s == &[4950]),
         "JIT runs the durable depth-2 chain (child powerbox nests the grandchild): {jo:?}"
     );
+}
+
+/// A durable parent that instantiates + joins an **instrumented** child (func 1). Func 1 is a
+/// may-suspend loop — its `block3` (loop exit) holds a `cap.call` (never reached under a freeze), so
+/// the transform makes it may-suspend and prepends a **loop-header poll** at `block1`. Born
+/// `UNWINDING`, the child spills at that first poll (loop not yet entered) instead of completing — the
+/// live child a freeze must capture. (A *pure-compute* loop like `PARENT_SELF_LOOP`'s child has no
+/// poll site, so the synchronous JIT would run it to completion; only an instrumented child unwinds
+/// mid-run — see DURABILITY.md §4 "Freeze model".)
+const FREEZE_PARENT: &str = "memory 18
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  br block1(v1, v1)
+block1(v2: i64, v3: i64):
+  v4 = i64.const 100
+  v5 = i64.lt_s v2 v4
+  br_if v5 block2(v2, v3) block3(v3)
+block2(v6: i64, v7: i64):
+  v8 = i64.add v7 v6
+  v9 = i64.const 1
+  v10 = i64.add v6 v9
+  br block1(v10, v8)
+block3(v11: i64):
+  v12 = i32.const 256
+  v13 = cap.call 6 1 (i32) -> (i64) v12 (v12)
+  return v13
+}
+";
+
+/// Freeze export — the first nested-freeze artifact on the JIT: a freeze-from-start (window
+/// `UNWINDING`) that catches a **live** §14 child captures a `FrozenNested` re-attach record whose
+/// geometry matches the interpreter's.
+///
+/// A subtlety of the synchronous model (DURABILITY.md §4 "Freeze model"): the two backends freeze a
+/// **different child body** to produce a *live* residue, but the record is the same. The interpreter
+/// freezes a *pure-compute* child (`PARENT_SELF_LOOP`'s func 1) by **never scheduling it** — the
+/// parent, already `UNWINDING`, executes `instantiate` (enqueue only) then spills at its trailing poll.
+/// The synchronous JIT runs the child *inline* in `instantiate`, so a pure child would run to
+/// completion; it needs an **instrumented** child (`FREEZE_PARENT`'s func 1 — a may-suspend loop) that
+/// unwinds at its first loop-header poll. **Both parents make the identical `instantiate` call**
+/// (off = 131072, size_log2 = 17, entry = 1), so the `FrozenNested` — carve geometry + slot, the data
+/// a thaw re-attaches — is identical regardless of the child body. We assert the JIT's captured record
+/// equals the interpreter's. (Freeze→thaw→result round-trip parity is the thaw slice; the records can
+/// coincide here even though the frozen continuations differ.)
+#[test]
+fn jit_freeze_captures_live_nested_child_matching_interp() {
+    // Interp: freeze `PARENT_SELF_LOOP` (its pure-compute child frozen at entry → one residue record).
+    let iinst = instrument(PARENT_SELF_LOOP);
+    let mut hi = Host::new();
+    hi.set_durable(true);
+    let ih = hi.grant_instantiator(0, WINDOW as u64);
+    let mut iwin = init_durable_window(WINDOW);
+    write_state(&mut iwin, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (ir, isnap) = run_capture_reserved_with_host(
+        &iinst,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &iwin,
+        SIZE_LOG2,
+        &mut hi,
+    );
+    assert!(
+        ir.is_ok(),
+        "interp subtree freeze returns a placeholder: {ir:?}"
+    );
+    assert_eq!(
+        read_state(&isnap),
+        STATE_UNWINDING,
+        "interp artifact frozen"
+    );
+    let ires = hi.frozen_nested().to_vec();
+    assert_eq!(ires.len(), 1, "interp captured one live nested child");
+
+    // JIT: freeze `FREEZE_PARENT` (its instrumented child unwinds inline → one residue record). Same
+    // `instantiate` call, so the same re-attach geometry.
+    if !svm_jit::fiber_supported() {
+        return;
+    }
+    let jinst = instrument(FREEZE_PARENT);
+    let mut hj = Host::new();
+    hj.set_durable(true);
+    let jh = hj.grant_instantiator(0, WINDOW as u64);
+    let mut jwin = init_durable_window(WINDOW);
+    write_state(&mut jwin, STATE_UNWINDING);
+    let (jo, jsnap, _fibers, jnested) = compile_and_run_capture_reserved_with_host_durable_nested(
+        &jinst,
+        0,
+        &[jh as i64],
+        &jwin,
+        &[],
+        &[],
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("durable freeze run compiles");
+    assert_eq!(read_state(&jsnap), STATE_UNWINDING, "JIT artifact frozen");
+    assert_eq!(
+        jnested.len(),
+        1,
+        "JIT captured one live nested child: {jo:?}"
+    );
+    // Record match: the child's re-attach geometry (identical `instantiate` call on both parents).
+    assert_eq!(jnested[0].parent_task, ires[0].parent_task, "parent_task");
+    assert_eq!(jnested[0].slot, ires[0].slot, "slot");
+    assert_eq!(jnested[0].carve_off, ires[0].carve_off, "carve_off");
+    assert_eq!(jnested[0].size_log2, ires[0].size_log2, "size_log2");
+    assert_eq!(jnested[0].entry, ires[0].entry, "entry");
 }
