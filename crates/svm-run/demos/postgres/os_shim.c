@@ -39,9 +39,9 @@ enum {
 enum { FS_O_READ = 1, FS_O_WRITE = 2, FS_O_APPEND = 4, FS_O_TRUNC = 8, FS_O_CREATE = 16 };
 #define FS_STATBUF_LEN 72
 
-/* errno: glibc's `errno` macro expands to `*__errno_location()`; define the accessor + storage. */
-static int g_errno;
-int *__errno_location(void) { return &g_errno; }
+/* errno: glibc's `errno` macro expands to `*__errno_location()`. The accessor + storage live in a
+ * shared, include-guarded header so a driver that pulls in several shims defines them exactly once. */
+#include "shim_errno.h"
 
 /* Resolve the `fs` cap once (lazily), then every call rides the cached handle. */
 static int g_fs = -2; /* -2 = not yet resolved */
@@ -51,7 +51,7 @@ static long fscall(int op, long a, long b, long c, long d) {
 }
 
 /* Every wrapper turns a negative cap return (`-errno`) into the POSIX `-1` + `errno`. */
-static long fail(long rc) { g_errno = (int)(-rc); return -1; }
+static long fail(long rc) { shim_errno = (int)(-rc); return -1; }
 
 /* ---- little-endian readers for the 72-byte StatBuf the FS_STAT op fills ---------------------- */
 static unsigned ld_u32(const unsigned char *p) {
@@ -223,7 +223,7 @@ int chdir(const char *path) {
 }
 char *getcwd(char *buf, size_t size) {
   if (!buf || size < 2) {
-    g_errno = 34; /* ERANGE */
+    shim_errno = 34; /* ERANGE */
     return (char *)0;
   }
   buf[0] = '.';
