@@ -5,6 +5,12 @@ name = "svm-bench-vs-wasmtime"
 version = "0.0.0"
 edition = "2021"
 publish = false
+# Two binaries now live here (`bench-vs-wasmtime` = the `--check` harness, `confine` = the
+# confinement-cost probe), so a bare `cargo run` is ambiguous. Name the harness the default so the
+# documented `cargo run --release -- --check …` (and the nightly `bench` CI job) resolves to it;
+# the probe is `cargo run --bin confine`. (Without this the nightly bench lane died every night
+# since Jul 10 with "could not determine which binary to run" — ISSUES.md I17 follow-up.)
+default-run = "bench-vs-wasmtime"
 
 [[bin]]
 name = "bench-vs-wasmtime"

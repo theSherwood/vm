@@ -752,6 +752,17 @@ doesn't block merges, but the nightly perf signal is currently dead. **Fix (one 
 `default-run = "bench-vs-wasmtime"` to `bench/Cargo.toml`'s `[package]`, or pass
 `--bin bench-vs-wasmtime` in the `ci.yml` bench step.
 
+**Fixed (2026-07-14):** added `default-run = "bench-vs-wasmtime"` to `bench/Cargo.toml`. Chose the
+manifest key over an `--bin` in `ci.yml` because it repairs the **documented bare `cargo run`**
+everywhere (the crate header + local workflow, not just the one CI line) and leaves `ci.yml` untouched
+(bot pushes lack `workflow` scope — see I18). The confinement probe stays reachable as `cargo run
+--bin confine`. Verified locally: the bare `cargo run --release -- --check …` that previously errored
+instantly now resolves to the harness and proceeds to build (`cargo metadata` reports
+`default_run = bench-vs-wasmtime`). The nightly `bench` lane will again reach the `--check` compare —
+so I17's *actual* signal (the same-run compute ratios) resumes gating, and the cold/wasmtime info-only
+drift resumes printing. The remaining I17 item is unchanged: regenerate `baseline.txt` so the five
+MISSING kernels regain rows.
+
 ---
 
 ### I18 — CI transients: crates.io network resets and rolling-nightly toolchain breakage (S4)
