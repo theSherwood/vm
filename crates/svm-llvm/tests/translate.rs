@@ -4157,6 +4157,24 @@ fn demo_pg_oscap_vs_native() {
 }
 
 #[test]
+fn demo_pg_ctype_vs_native() {
+    // **The guest ctype tables** (slice CB, Postgres runtime gap #11c). glibc's `<ctype.h>`
+    // `isalpha`/`isdigit`/`tolower`/… macros index locale tables reached through `__ctype_b_loc`/
+    // `__ctype_tolower_loc`/`__ctype_toupper_loc` — undefined externals in the guest, and the whole
+    // SQL scanner/parser classifies input through them. `demos/postgres/libc_shim.c` provides the
+    // C/POSIX-locale tables; `ctype_probe.c` prints all twelve classifications + tolower/toupper for
+    // every byte 0..255, and the guest must byte-match the native glibc build over the whole range
+    // (which pins every bit of the table). Pure computation — no capability, runs on the bare
+    // powerbox.
+    check_demo_vs_native_flags(
+        "pg_ctype",
+        "postgres/ctype_probe.c",
+        b"",
+        &["-DSVM_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
