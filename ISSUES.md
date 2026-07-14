@@ -241,6 +241,29 @@ makes a rare interleaving surface" family, not a codegen or verifier defect.
    passes locally as a flake and re-run the job; consider making `real-browser` non-gating only as a
    last resort (it is the sole real-Chromium proof, so keep it gating if at all possible).
 
+**Sighting update (2026-07-13 CI-flakiness detection, runs Jul 2–13).** This is the **most frequent
+flake in the window** — **4 occurrences in 5 days** (Jul 8–12), all on the `real-browser` job's
+"Build threads module + run in Chromium" step, each a `[pageerror] …` followed by `FAIL:
+page.waitForFunction: Timeout 30000ms exceeded` (exit 1). Three were PR re-runs that **failed on
+attempt 1 and passed unchanged on attempt 2** — the textbook flake signature — and one struck the
+nightly `schedule` lane (which is never re-run, so it just sat red):
+
+- run **28973194295** att1 (Jul 8, PR, `claude/charming-johnson-pmlsnr`) — `memory access out of bounds`; att2 green.
+- run **29042617187** att1 (Jul 9, PR, `claude/peaceful-lamport-vuz65e`) — `memory access out of bounds`; att2 green.
+- run **29048631247** att1 (Jul 9, PR #229, above) — `memory access out of bounds`; att2 green.
+- run **29186787532** (Jul 12, **nightly on `main`**) — **`[pageerror] unreachable`**, same timeout; sat red (nightly is not re-run). `real-browser` was green on the Jul 9/10/11/13 nightlies, so this is non-deterministic, not a regression.
+
+**New information vs. the original report:** (a) the page-error is **not OOB-only** — the Jul 12
+nightly tripped a wasm **`unreachable`** trap with the identical downstream symptom, so the entry's
+"out-of-bounds" framing should be read as *"any guest trap surfaced via `pageerror`"* (consistent
+with the stale-view/grow-detach hypothesis: a Worker reading through a detached view can land on any
+trap, not just OOB). (b) It now hits the **nightly `main` lane**, not just PRs. (c) Frequency is high
+enough (3 of the window's PR-blocking re-runs, plus a red nightly) that although each incident is
+S4, `real-browser` is now a **recurring gating-flake** worth prioritising fix-sketch step 1 (capture
+the failing check id + `RuntimeError` on `pageerror`) — the attempt-1 diagnostics are still rolling
+off before anyone can pin the check, exactly as noted above, so we still cannot say which on-page
+assertion trips.
+
 ---
 
 ### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
@@ -639,6 +662,28 @@ machine-portable signal the baseline header itself calls the tracked one) still 
 pending:** regenerate `baseline.txt` on the designated bench machine so the five MISSING kernels
 (`simd`, `float`, `calli`, `cache`, `irreducible`) get rows — MISSING never gated, but those
 kernels currently have no regression tracking at all.
+
+**Follow-up (2026-07-13 CI-flakiness detection): the bench lane is now red for a *different*,
+deterministic reason — the `--tol` landing above never runs.** Since the Jul 10 nightly the `bench`
+job fails **before executing any benchmark**, at the `cargo run` invocation itself:
+
+```
+error: `cargo run` could not determine which binary to run. Use the `--bin` option to specify a
+binary, or the `default-run` manifest key.
+available binaries: bench-vs-wasmtime, confine
+```
+
+Observed every night Jul 10–13 (runs 29086218690, 29146664268, 29186787532, 29242756076). Root
+cause: PR #225 (`bench: reliable confinement-cost harness`, merged Jul 9) added a **second** binary
+`bench/src/bin/confine.rs` alongside the existing `[[bin]] bench-vs-wasmtime` (`src/main.rs`). The
+`ci.yml` bench step runs a bare `cargo run --release -- --check baseline.txt --tol 0.4` with no
+`--bin`, and the crate has no `default-run`, so cargo now refuses. This is **deterministic, not a
+flake** — but it fully **masks I17**: the lane dies before it can print any ratio, so neither the
+cold/wasmtime info-only rows nor the gating compute ratios are produced (the Jul 9 nightly, the last
+before #225, was the window's only fully-green nightly). Non-gating (`continue-on-error`), so it
+doesn't block merges, but the nightly perf signal is currently dead. **Fix (one line):** add
+`default-run = "bench-vs-wasmtime"` to `bench/Cargo.toml`'s `[package]`, or pass
+`--bin bench-vs-wasmtime` in the `ci.yml` bench step.
 
 ---
 
