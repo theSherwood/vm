@@ -134,6 +134,26 @@ try {
   // SVM text), which would trip the `page.fill` in the parse-reject check above.
   check('hello (C → SVM, on-ramp module)', await runPlay('hello (C → SVM)'), '0', 'hello, sandbox!\n');
 
+  // The framebuffer output path (the `display` capability): the gradient guest presents a 128×128
+  // RGBA frame, which play.js blits to the canvas. Assert the canvas got the right dimensions and a
+  // pixel matching the guest's analytic gradient — R ramps across X, G down Y (top-left ≈ black).
+  {
+    const grad = await runPlay('gradient (C → framebuffer)');
+    const canvas = await play.evaluate(() => {
+      const c = document.getElementById('canvas');
+      if (c.style.display === 'none' || !c.width || !c.height) return null;
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      const px = (x, y) => Array.from(d.slice((y * c.width + x) * 4, (y * c.width + x) * 4 + 4));
+      return { w: c.width, h: c.height, topLeft: px(0, 0), bottomRight: px(c.width - 1, c.height - 1) };
+    });
+    const gradOk = grad.state === 'done' && canvas && canvas.w === 128 && canvas.h === 128 &&
+      canvas.topLeft[0] === 0 && canvas.topLeft[1] === 0 && canvas.topLeft[3] === 255 &&
+      canvas.bottomRight[0] === 255 && canvas.bottomRight[1] === 255 && canvas.bottomRight[3] === 255;
+    checks.push(gradOk);
+    console.log(`  play/gradient-canvas: state=${grad.state} canvas=${JSON.stringify(canvas)} ` +
+      `${gradOk ? 'PASS' : 'FAIL'}`);
+  }
+
   const ok = pageOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: SVM runs in a real browser — powerbox + genuine multi-Worker ` +

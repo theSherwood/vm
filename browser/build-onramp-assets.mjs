@@ -60,6 +60,14 @@ try {
   console.log(`  ✗ hello_c: ${e.message}`);
 }
 
+// 1b) gradient — the framebuffer demo: a C guest renders an RGBA image and presents one frame through
+//     the `display` capability; the page blits it to a <canvas>. The output waist Doom will ride.
+try {
+  buildC('gradient', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'gradient.c'));
+} catch (e) {
+  console.log(`  ✗ gradient: ${e.message}`);
+}
+
 // 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
 //    from **stdin** and runs it against an in-memory database, printing each statement's result table.
 //    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +

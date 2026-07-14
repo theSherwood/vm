@@ -1988,9 +1988,26 @@ phases, both worth doing:
     socket hooks (`CURLOPT_OPENSOCKETFUNCTION`/multi) wire cleanly to a cap. **git/libgit2** splits:
     local object-store/packfile/diff/merge is File-cap only (zlib + SHA-1/256 + diff, self-validating
     against a fixture repo); network clone wants the same socket cap.
-- **The "wow" milestone (later):** **Doom** (shareware) — fixed-point-heavy real app; needs a stubbed
-  framebuffer + an in-memory WAD, but "Doom runs sandboxed through the LLVM on-ramp" is a strong
-  external signal. (Graphical apps proper ride the **WebGPU capability** — its own section below.)
+- **The "wow" milestone (in progress):** **Doom** (shareware) — fixed-point-heavy real app; needs a
+  stubbed framebuffer + an in-memory WAD, but "Doom runs sandboxed through the LLVM on-ramp, in a
+  browser tab" is a strong external signal. (Graphical apps proper ride the **WebGPU capability** —
+  its own section below.) **Sequenced into four slices** (each a self-contained PR):
+  1. **Framebuffer output capability + canvas** — **DONE (slice BN).** A §7 by-name `HostFn`
+     capability `display`, resolved like `fs`/`io`: `op 0 = present(ptr, w, h)` copies `w*h*4` RGBA
+     bytes out of the guest window. `svm-browser`'s `onramp_exec` captures the last frame into
+     `PbOutcome::framebuffer`; the wasm `svm_run_onramp` export exposes it via `svm_framebuffer_{ptr,
+     len,width,height}`; `play.js` blits it to a `<canvas>` with one `putImageData`. First guest:
+     `crates/svm-run/demos/display/gradient.c` (a deterministic 128×128 RGBA gradient). Proven
+     byte-exact natively (`browser/tests/display.rs`, full-frame) and end-to-end in real Chromium
+     (`browser-test.mjs` reads the canvas back). The 324 B `gradient.svmb` is committed as a web asset.
+  2. **Interactive frame loop + input capability** — a per-frame run model (the guest yields to the
+     browser event loop each frame via `requestAnimationFrame`, beyond `onramp_exec`'s
+     run-to-completion) + a `keyboard` `HostFn` cap (page keydown/keyup → guest poll).
+  3. **doomgeneric headless differential** — doomgeneric + shareware WAD (via the `fs` cap) through
+     the on-ramp; run headless with a frame-hashing sink, byte-exact vs native `cc` over the first N
+     frames. The correctness proof before browser wiring.
+  4. **Doom in the playground** — wire `doomgeneric.svmb` + `doom1.wad` + canvas + keyboard into
+     `play.js`; build/deploy via `pages.yml`.
 - **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust
   crate (`regex`/`ryu`/`serde_json` `no_std`), a Zig program, a Swift `-enable-experimental-feature
   Embedded` TU — each is "another frontend, no translator change beyond what the corpus proved."

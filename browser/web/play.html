@@ -18,6 +18,10 @@
                  white-space: pre; box-sizing: border-box; }
       pre { background: #f4f4f4; padding: 0.5rem; margin: 0; overflow: auto; min-height: 1.2rem; }
       #stdout { min-height: 6rem; max-height: 14rem; }
+      /* The framebuffer pane (the `display` capability): crisp upscaling of small guest frames,
+         hidden until a guest presents one. */
+      #canvas { display: none; image-rendering: pixelated; width: 100%; max-width: 24rem;
+                height: auto; background: #000; border: 1px solid #ccc; }
       #desc { color: #555; font-size: 0.9rem; margin: 0; }
       #state[data-state="error"] { color: #b00020; }
       #state[data-state="done"] { color: #1a7f37; }
@@ -56,6 +60,7 @@
       <div class="pane">
         <strong>result</strong>
         <pre id="result"></pre>
+        <canvas id="canvas" width="1" height="1"></canvas>
         <strong>stdout</strong>
         <pre id="stdout"></pre>
         <strong>log</strong>
