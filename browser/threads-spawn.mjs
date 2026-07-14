@@ -65,7 +65,7 @@ async function worker() {
   // §22 guest-JIT real codegen: the run's single §22 unit was emitted + stashed once at powerbox
   // setup; each Worker instantiates its own instance and runs `f0(win, env, args)` on JIT_INVOKE.
   let jitUnit = null, jitEnvCell = 0;
-  if (jitCodegen && ex.svm_par_jit_unit_wasm_len() > 0) {
+  if (jitCodegen && ex.svm_par_enable_jit_codegen() === 1 && ex.svm_par_jit_unit_wasm_len() > 0) {
     const wptr = Number(ex.svm_par_jit_unit_wasm_ptr()), wlen = ex.svm_par_jit_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {

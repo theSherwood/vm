@@ -74,10 +74,10 @@ export function makeRunner({ module, memory, ex }) {
       }
     }
 
-    // wasm-JIT tier-up: a shared i32 cell every Worker atomically bumps on each tier-up, so the
-    // caller can prove the seam actually fired (a result match alone can't tell "tiered up" from
-    // "silently interpreted"). Read back after the run.
-    const tierupCell = tierup ? ex.svm_par_alloc(4) : 0;
+    // A shared i32 cell every Worker atomically bumps each time it runs an emitted region (a tier-up
+    // or a §22 JIT-codegen invoke), so the caller can prove the seam actually fired (a result match
+    // alone can't tell "ran emitted wasm" from "silently interpreted"). Read back after the run.
+    const tierupCell = (tierup || jitCodegen) ? ex.svm_par_alloc(4) : 0;
 
     const workers = new Set();
     let started = 0;
@@ -115,7 +115,7 @@ export function makeRunner({ module, memory, ex }) {
         const rootTlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
         startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
       });
-      const tierups = tierup ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
+      const tierups = (tierup || jitCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
       return { value, started, tierups };
     } finally {
       for (const w of workers) w.terminate();

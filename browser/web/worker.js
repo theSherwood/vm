@@ -59,7 +59,7 @@ self.onmessage = async (e) => {
   // instead of the interpreter. A `new WebAssembly.Module`/`Instance` here is synchronous (the unit is
   // small) so it needs no await inside the event loop.
   let jitUnit = null, jitEnvCell = 0;
-  if (jitCodegen && ex.svm_par_jit_unit_wasm_len() > 0) {
+  if (jitCodegen && ex.svm_par_enable_jit_codegen() === 1 && ex.svm_par_jit_unit_wasm_len() > 0) {
     const wptr = Number(ex.svm_par_jit_unit_wasm_ptr()), wlen = ex.svm_par_jit_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const umod = new WebAssembly.Module(bytes);
@@ -215,6 +215,7 @@ self.onmessage = async (e) => {
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
       new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
+      if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted invokes (non-vacuity)
       try {
         const ret = jitUnit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];

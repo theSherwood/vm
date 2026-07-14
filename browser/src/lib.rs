@@ -644,6 +644,7 @@ pub extern "C" fn svm_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i3
     // Last-published run recipe wins (a page runs several kinds back to back).
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT_CODEGEN.store(false, std::sync::atomic::Ordering::Release); // this is the interp JIT path
     1
 }
 
@@ -681,6 +682,26 @@ pub extern "C" fn svm_par_jit_set_codegen(on: i32) {
     PAR_JIT_CODEGEN.store(on != 0, std::sync::atomic::Ordering::Release);
 }
 
+/// Enable §22 real codegen **on this instance**: emit the run's unit ([`JIT_SERVICE_I64`]) into this
+/// instance's [`JIT_UNIT_WASM`] stash and set codegen mode. Every Worker calls this in its own
+/// instance (like [`svm_par_enable_jit`] for tier-up) — the emitted wasm bytes are per-instance, not
+/// shared across Workers, so a page-side stash isn't reliably visible; each Worker emits its own copy
+/// from the same constant. Returns `1` on success, `0` if the unit is outside the emitter subset.
+#[no_mangle]
+pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
+    let Ok(service_m) = svm_text::parse_module(JIT_SERVICE_I64) else {
+        return 0;
+    };
+    let Ok(wasm) = svm_wasmjit::compile_module_mixed_entry(&service_m, 0, true) else {
+        return 0;
+    };
+    // SAFETY: single-threaded per instance (the page, or one Worker); set once in this Worker's setup
+    // before the run's vCPU is built — same single-reader stash model as `svm_par_enable_jit`.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(JIT_UNIT_WASM), wasm) };
+    PAR_JIT_CODEGEN.store(true, std::sync::atomic::Ordering::Release);
+    1
+}
+
 /// Build the **shared powerbox** for a §22 **real-codegen** run: like [`svm_par_powerbox`] but the
 /// host-compiled unit is the all-i64 [`JIT_SERVICE_I64`], and its wasm is emitted (via
 /// [`svm_wasmjit::compile_module_mixed_entry`], shared memory) + stashed so a guest `Jit.invoke`
@@ -697,11 +718,6 @@ pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: 
     let Ok(service_m) = svm_text::parse_module(JIT_SERVICE_I64) else {
         return 0;
     };
-    // Emit the unit's wasm up front (it is immutable for the run). Fail-closed if it is out of the
-    // emitter subset — then there is nothing to run on wasm.
-    let Ok(wasm) = svm_wasmjit::compile_module_mixed_entry(&service_m, 0, true) else {
-        return 0;
-    };
     let service = svm_encode::encode_module(&service_m);
     let mut host = Host::new();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
@@ -710,12 +726,14 @@ pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: 
         Ok(Ok(c)) => c.handle,
         _ => return 0,
     };
-    // SAFETY: single-threaded setup on the main thread, before any Worker starts; the stash then
-    // stays immutable for the run (Workers only read it).
-    unsafe { stash(&mut *core::ptr::addr_of_mut!(JIT_UNIT_WASM), wasm) };
+    // Emit the unit wasm on **this** (page) instance too, so a single-vCPU run driven on the page
+    // works; each Worker emits its own copy via [`svm_par_enable_jit_codegen`] (per-instance stash).
+    // Fail-closed if the unit is outside the emitter subset — then there is nothing to run on wasm.
+    if svm_par_enable_jit_codegen() != 1 {
+        return 0;
+    }
     let pb = Box::into_raw(Box::new(ParPowerbox { host, jit, code }));
     PAR_PB.store(pb as usize, std::sync::atomic::Ordering::Release);
-    PAR_JIT_CODEGEN.store(true, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
     1
@@ -850,6 +868,7 @@ pub extern "C" fn svm_par_powerbox_none() {
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT_CODEGEN.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Borrow the published I/O powerbox (`None` until [`svm_par_powerbox_io`] ran). Leaked; interior
