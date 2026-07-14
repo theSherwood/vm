@@ -9,8 +9,8 @@
 //! Sole test in its own binary so the process-wide compile counter is stable (cargo runs each test
 //! binary in its own process; a lone test rules out interference from siblings in the same binary).
 
-use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
 use svm_interp::Host;
+use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 

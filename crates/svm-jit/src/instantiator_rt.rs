@@ -15,8 +15,8 @@
 
 use crate::{mem, CapThunk, TrapKind};
 use std::cell::{Cell, UnsafeCell};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use svm_ir::{Data, Func, FuncIdx, ValType};
 
@@ -118,8 +118,12 @@ pub(crate) struct Nursery {
     /// [`ChildCodeKey`], each entry is a compiled [`crate::ChildCode`] reused across spawns — so a
     /// shell respawning the same applet (any offset, same size) recompiles nothing. Held behind the
     /// nursery, alive for the run; the durable / nesting child bypasses it (its baked per-child
-    /// nursery makes its code un-shareable). `Arc` so a lookup can drop the lock before the run.
-    child_code: Mutex<HashMap<ChildCodeKey, std::sync::Arc<crate::ChildCode>>>,
+    /// nursery makes its code un-shareable). `Rc` so a lookup can drop the lock before the run:
+    /// today's children run **synchronously on the calling thread** (the same single-thread contract
+    /// the `unsafe impl Send`/`Sync` below documents), so `Rc` is correct and `ChildCode` need not be
+    /// `Send`/`Sync` yet. S1c (OS-thread children) is where cross-thread sharing — `Rc` → `Arc` plus
+    /// a proven `ChildCode: Send + Sync` — actually lands and gets tested.
+    child_code: Mutex<HashMap<ChildCodeKey, std::rc::Rc<crate::ChildCode>>>,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -548,7 +552,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         let code = {
             let mut cache = rt.child_code.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = cache.get(&key) {
-                std::sync::Arc::clone(c)
+                std::rc::Rc::clone(c)
             } else {
                 match crate::compile_nondurable_child(
                     child_funcs,
@@ -557,8 +561,8 @@ pub(crate) unsafe extern "C" fn instantiate(
                     rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
                 ) {
                     Ok(cc) => {
-                        let a = std::sync::Arc::new(cc);
-                        cache.insert(key, std::sync::Arc::clone(&a));
+                        let a = std::rc::Rc::new(cc);
+                        cache.insert(key, std::rc::Rc::clone(&a));
                         a
                     }
                     Err(_) => {
