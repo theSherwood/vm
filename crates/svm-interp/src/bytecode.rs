@@ -2587,6 +2587,37 @@ impl<'p> Vcpu<'p> {
         }
     }
 
+    /// Deliver the **results** of a [`VcpuEvent::JitInvoke`] the host ran on **emitted wasm** (the
+    /// browser's real-codegen §22 tier) instead of the engine interpreting the unit. Writes the raw
+    /// i64 result slots into the awaiting `dst` and resumes — the invoke then looks exactly like the
+    /// interpreted [`deliver_jit_invoke`](Vcpu::deliver_jit_invoke) that ran the unit itself. This is
+    /// the alternative to that method: a host that emits wasm for the unit (`f{entry}(win, env,
+    /// args)`) calls this with the emitted region's results; a host that interprets calls the other.
+    /// Too few results is a `Malformed` trap (a mis-marshalled host reply).
+    pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
+        let Some(PendingJit::Invoke { results, dst, .. }) = self.pending_jit.take() else {
+            panic!("deliver_jit_invoke_vals with no pending invoke");
+        };
+        if vals.len() < results.len() {
+            self.trap = Some(Trap::Malformed);
+            return;
+        }
+        for (i, ty) in results.iter().enumerate() {
+            self.vt
+                .active
+                .set(dst + i as u32, Reg::from_value(slot_to_val(*ty, vals[i])));
+        }
+    }
+
+    /// Deliver a **trap** from a host-run [`VcpuEvent::JitInvoke`] unit (the emitted region hit a
+    /// guest `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a
+    /// catchable `RuntimeError`). The vCPU traps on its next `run`, exactly as an interpreted invoke
+    /// trap would (`deliver_jit_invoke` sets `self.trap` on the unit's `Err`).
+    pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
+        self.pending_jit = None;
+        self.trap = Some(trap);
+    }
+
     /// Deliver the results of a [`VcpuEvent::TierUp`]: the emitted region returned `vals` (raw i64
     /// result slots, one per the callee's result type). Re-tag each into the awaiting `dst` slot(s) of
     /// the caller's window and resume — the tier-up call then looks exactly like an interpreted call
