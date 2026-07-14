@@ -222,6 +222,15 @@ if it recurs *serialized*, capture the core/backtrace per the next-step note abo
 also make it vanish outright: I3's code-arena leak fix (memory pressure was one suspected trigger)
 and the serialization itself (scheduler contention was the other).
 
+**No recurrence since serialization (2026-07-14 audit).** Swept **60 main + 30 PR CI runs** spanning
+2026-07-09 → 07-14 (the full window since the `serial()` mitigation landed 07-08): **zero** occurrences
+of the I4 signature (macOS `SIGABRT` in `imports.rs`) on any lane. The only failures in that window
+were unrelated — a browser-lane flake (**I22**), a review branch's own WIP breakage (`escape_oracle` +
+`fmt`), and cancelled duplicate-trigger runs. Encouraging but not proof-of-cure: I4 was always
+low-frequency (~8 sightings over *weeks*), so a clean ~6-day window is consistent with both "fixed by
+serialization + I3's memory fix" and "hasn't rolled the dice enough." Keep open with a watch; treat as
+likely-resolved. Downgrade to close only after a longer clean window (or a captured core if it recurs).
+
 ---
 
 ### I21 — Rare macOS-CI `Bus error: 10` (SIGBUS) at a test-binary launch under `cargo test --workspace` (S4)
