@@ -823,12 +823,12 @@ block0(vsp: i64, vp: i64):
 }
 "#;
 
-// §22 real-codegen variant (BROWSER.md § "wasm-JIT tier", slice 5): the same 8-worker invoke kernel,
-// but the invoke sig is **all-i64** so the emitted unit's args/results marshal as plain `BigInt`
-// slots to JS (the browser codegen ABI). Run under `svm_par_powerbox_jit_codegen`, each worker's
-// `Jit.invoke` runs the emitted `service(6,7) = 142` on wasm; 8 × 142 = 1136, identical to the
-// interpreter (`threads_jit_invoke`). Root func 0 is identical; only the worker's invoke sig differs.
-const THREADS_JIT_INVOKE_I64: &str = r#"memory 16
+// §22 real-codegen **float** variant (BROWSER.md slice 5): the same 8-worker invoke kernel, but the
+// unit is the f64 `fservice(6.0,7.0)=142.0` — so the Worker marshals the args' slot bits to JS
+// Numbers and the f64 result back to its bits (the float ABI path). Each worker truncates 142.0 → 142
+// and folds; 8 × 142 = 1136, identical to the interpreter. Run with the f64 codegen service selected
+// (`svm_par_jit_codegen_service(1)`). Root func 0 is identical; only the worker's invoke sig differs.
+const THREADS_JIT_INVOKE_F64: &str = r#"memory 16
 func (i32, i32) -> (i64) {
 block0(v0: i32, v1: i32):
   vje = i64.extend_i32_u v0
@@ -882,11 +882,12 @@ block0(vsp: i64, vp: i64):
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  va = i64.const 6
-  vb = i64.const 7
-  vr = cap.call 11 1 (i64, i64, i64) -> (i64) vjit (vcode, va, vb)
+  va = f64.const 6.0
+  vb = f64.const 7.0
+  vr = cap.call 11 1 (i64, f64, f64) -> (f64) vjit (vcode, va, vb)
+  vr64 = i64.trunc_f64_s vr
   vc8 = i64.const 8
-  vold = i64.atomic.rmw.add vc8 vr
+  vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
 }
@@ -1815,9 +1816,8 @@ fn main() {
     // asserted in the JS host (like the threads kernel's 4000), not the corpus JSON: they need the
     // multi-Worker shared powerbox the single-vCPU corpus differential doesn't set up.
     emit("threads_jit_invoke", THREADS_JIT_INVOKE);
-    // §22 real-codegen: the all-i64 invoke kernel run on emitted wasm (BROWSER.md slice 5). Ground
-    // truth 1136 (= interp), asserted in the JS host like the other threaded-JIT kernels.
-    emit("threads_jit_invoke_i64", THREADS_JIT_INVOKE_I64);
+    // §22 real-codegen float variant — the f64 invoke kernel (svm_par_jit_codegen_service(1)) → 1136.
+    emit("threads_jit_invoke_f64", THREADS_JIT_INVOKE_F64);
     emit("threads_jit_install", THREADS_JIT_INSTALL);
     // §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) — the confined-executor-child
     // kernels + the granted module for op 5. Ground truths (40 / 72 / 600) asserted in the JS host.

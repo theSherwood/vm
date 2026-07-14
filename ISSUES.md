@@ -409,6 +409,12 @@ before the 30 s `waitForFunction` timeout; att2 green on the unchanged commit. T
   build, so this is **diff-independent beyond any doubt**. Across the two `unreachable` sightings the
   stuck items are consistently the **codegen** checks (`jitcodegen`/`instcodegen`, `tierup` in one),
   narrowing the Worker wedge to the JIT **codegen** path.
+- **Seventh occurrence (2026-07-14, on the §22 float-codegen PR #256).** Same signature again:
+  `[pageerror] unreachable`, pending `jitcodegen, instcodegen`, 30 s timeout; att2 green on the
+  unchanged commit, local Chromium green repeatedly (i32 → 1136, f64 → 1136, both on emitted wasm).
+  The added f64 codegen item churns more Workers per run, so the codegen-path race surfaced a touch
+  more often — the same double-free wedge diagnosed below, not a float-path bug. (PR #256 now carries
+  the root-cause fix directly, via the merge of the 2026-07-15 worker.js full-body guard.)
 
 **ROOT CAUSE FOUND (2026-07-15) — a double-free race on the shared codegen stashes** — which answers
 the sighting update's open question (why the codegen items hang without routing through the guard) and

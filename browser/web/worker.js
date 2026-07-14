@@ -14,9 +14,23 @@ const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 // Event codes — must match browser/src/lib.rs PAR_*.
 const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8;
 
+// §22 codegen arg/result marshalling by scalar type code (0=i32, 1=i64, 2=f32, 3=f64): the engine
+// carries every arg/result as a raw i64 slot; the Worker converts to/from the JS value the emitted
+// wasm function uses (an integer's value, a float's bits reinterpreted). A tiny scratch DataView does
+// the float bit-casts.
+const _sdv = new DataView(new ArrayBuffer(8));
+const jitArg = (slot, tc) => tc === 0 ? Number(BigInt.asIntN(32, slot)) // i32 → Number
+  : tc === 1 ? slot // i64 → BigInt
+  : tc === 2 ? (_sdv.setInt32(0, Number(BigInt.asIntN(32, slot)), true), _sdv.getFloat32(0, true)) // f32
+  : (_sdv.setBigInt64(0, slot, true), _sdv.getFloat64(0, true)); // f64
+const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
+  : tc === 1 ? ret // i64
+  : tc === 2 ? (_sdv.setFloat32(0, ret, true), BigInt(_sdv.getUint32(0, true))) // f32 bits (zero-ext)
+  : (_sdv.setFloat64(0, ret, true), _sdv.getBigInt64(0, true)); // f64 bits
+
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, instCodegen } = e.data;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen } = e.data;
   // I22 liveness backstop. The `svm_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, svm_par_enable_jit / _jit_codegen /
   // _inst_codegen, svm_par_child*) are the ones a rare shared-memory race actually trips (a double-free
@@ -69,6 +83,7 @@ self.onmessage = async (e) => {
   // instead of the interpreter. A `new WebAssembly.Module`/`Instance` here is synchronous (the unit is
   // small) so it needs no await inside the event loop.
   let jitUnit = null, jitEnvCell = 0;
+  if (jitCodegen) ex.svm_par_jit_codegen_service(jitService | 0); // 0=i32, 1=f64 service (per-instance)
   if (jitCodegen && ex.svm_par_enable_jit_codegen() === 1 && ex.svm_par_jit_unit_wasm_len() > 0) {
     const wptr = Number(ex.svm_par_jit_unit_wasm_ptr()), wlen = ex.svm_par_jit_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
@@ -251,18 +266,23 @@ self.onmessage = async (e) => {
     }
     if (evc === JIT_INVOKE) {
       // §22 guest-JIT real codegen: the guest `Jit.invoke`d a unit — run the emitted unit's
-      // `f0(win, env, ...i64 args)` over the shared window instead of the interpreter, then deliver
-      // its i64 result slots. A trap throws and surfaces as a vCPU trap (as an interp invoke would).
+      // `f0(win, env, ...args)` over the shared window instead of the interpreter, then deliver its
+      // result slots. Args marshal by declared type (i32 → JS Number, i64 → BigInt) so a unit need not
+      // be all-i64; results go back as `BigInt(ret)` (the engine re-tags by result type). A trap
+      // throws and surfaces as a vCPU trap (as an interp invoke would).
       const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
+      const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
       const args = [];
-      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
+      for (let i = 0; i < n; i++) args.push(jitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
       new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted invokes (non-vacuity)
       try {
         const ret = jitUnit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+        const rn = Number(ex.svm_par_jit_result_types_len(v));
+        const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_result_types_ptr(v)), rn);
         const rptr = Number(ex.svm_par_alloc(Math.max(1, rets.length) * 8));
-        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = jitRes(rets[i], rtypes[i]);
         ex.svm_par_deliver_jit_invoke(v, rptr, rets.length);
       } catch {
         ex.svm_par_deliver_jit_invoke_trap(v);
