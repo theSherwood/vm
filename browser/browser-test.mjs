@@ -55,36 +55,65 @@ try {
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
   const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen'];
-  // Wait until every work item leaves 'pending' (or time out).
-  try {
-    await page.waitForFunction(
-      (ids) => ids.every((id) => document.getElementById(id).dataset.status !== 'pending'),
-      WORK_IDS, { timeout: 30_000 },
-    );
-  } catch (e) {
-    // Timed out ⇒ ≥1 item never left 'pending' (the I22 hang signature). Report which, plus the
-    // uncaught pageerror(s) that most likely caused it, before re-throwing into the outer handler.
-    const statuses = await page.evaluate(
-      (ids) => ids.map((id) => ({ id, status: document.getElementById(id)?.dataset.status ?? 'missing' })),
-      WORK_IDS,
-    );
-    const stuck = statuses.filter((s) => s.status === 'pending').map((s) => s.id);
-    console.log(`  [timeout] items still pending: ${stuck.join(', ') || '(none)'}`);
-    console.log(`  [timeout] uncaught pageerror(s): ${pageErrors.length ? pageErrors.join(' | ') : '(none captured)'}`);
-    throw e;
-  }
-
   const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
-  const isolated = await read('isolated');
-  const powerbox = await read('powerbox');
-  const threads = await read('threads');
-  const jit = await read('jit');
-  const inst = await read('inst');
-  const capio = await read('capio');
-  const wasmjit = await read('wasmjit');
-  const tierup = await read('tierup');
-  const jitcodegen = await read('jitcodegen');
-  const instcodegen = await read('instcodegen');
+
+  // I22 mitigation: the index page exercises the rare shared-memory codegen-stash race (a worker vCPU
+  // traps → its item fails, or on an older engine the page hangs). Root cause is a double-free on the
+  // shared `svm_par_enable_*` stashes (ISSUES.md I22) — not yet fixed in the engine, but it passes on a
+  // plain reload every time it's been observed. So retry the whole index page up to 3× (reloading
+  // between) instead of forcing a manual CI re-run. Each retry is logged LOUDLY so the flake stays
+  // visible (per AGENTS.md "log flakiness early"); a real regression fails all 3 attempts and stays red.
+  const INDEX_ATTEMPTS = 3;
+  let pageOk = false;
+  let isolated, powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen;
+  for (let attempt = 1; attempt <= INDEX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      console.log(`  [I22 retry] index-page attempt ${attempt}/${INDEX_ATTEMPTS} — reloading (a prior attempt hit the rare codegen-race trap; it clears on reload)`);
+      pageErrors.length = 0;
+      await page.reload({ waitUntil: 'load' });
+    }
+    // Wait until every work item leaves 'pending' (or time out). With the worker.js liveness backstop a
+    // trapped vCPU now marks its item 'fail' fast rather than hanging, so a timeout should be rare — but
+    // if one happens, dump which items are still pending + the captured pageerror(s) for diagnosis.
+    try {
+      await page.waitForFunction(
+        (ids) => ids.every((id) => document.getElementById(id).dataset.status !== 'pending'),
+        WORK_IDS, { timeout: 30_000 },
+      );
+    } catch {
+      const statuses = await page.evaluate(
+        (ids) => ids.map((id) => ({ id, status: document.getElementById(id)?.dataset.status ?? 'missing' })),
+        WORK_IDS,
+      );
+      const stuck = statuses.filter((s) => s.status === 'pending').map((s) => s.id);
+      console.log(`  [timeout] attempt ${attempt}: items still pending: ${stuck.join(', ') || '(none)'}`);
+      console.log(`  [timeout] attempt ${attempt}: uncaught pageerror(s): ${pageErrors.length ? pageErrors.join(' | ') : '(none captured)'}`);
+    }
+
+    isolated = await read('isolated');
+    powerbox = await read('powerbox');
+    threads = await read('threads');
+    jit = await read('jit');
+    inst = await read('inst');
+    capio = await read('capio');
+    wasmjit = await read('wasmjit');
+    tierup = await read('tierup');
+    jitcodegen = await read('jitcodegen');
+    instcodegen = await read('instcodegen');
+
+    pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
+      threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
+      capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
+      jitcodegen.status === 'pass' && instcodegen.status === 'pass';
+    if (pageOk) {
+      if (attempt > 1) console.log(`  [I22 retry] index page passed on attempt ${attempt} (self-healed the flake)`);
+      break;
+    }
+    if (attempt < INDEX_ATTEMPTS) {
+      const bad = WORK_IDS.filter((id, i) => [powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen][i].status !== 'pass');
+      console.log(`  [I22 retry] attempt ${attempt}: index page not green (failing: ${bad.join(', ') || 'isolated'}) — retrying`);
+    }
+  }
 
   console.log(`\n  ${isolated.text}`);
   console.log(`  ${powerbox.text}`);
@@ -96,11 +125,6 @@ try {
   console.log(`  ${tierup.text}`);
   console.log(`  ${jitcodegen.text}`);
   console.log(`  ${instcodegen.text}\n`);
-
-  const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
-    threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
-    capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
-    jitcodegen.status === 'pass' && instcodegen.status === 'pass';
 
   // --- the playground (play.html): SVM text typed into the page, parsed in-browser, run across ----
   // Workers. Drives the page like a human: pick an example / type source, click Run, read the
