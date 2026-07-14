@@ -18,3 +18,4 @@ patched*.wasm
 /web/assets/*.svmb
 !/web/assets/hello_c.svmb
 !/web/assets/gradient.svmb
+!/web/assets/bounce.svmb
