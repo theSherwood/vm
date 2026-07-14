@@ -4244,6 +4244,104 @@ sigprocmask=0 kill=0 raise=0
 }
 
 #[test]
+fn demo_pg_time_vs_native() {
+    // **The guest time + wide-char shims** (slice CD, gap #11e). `time_shim.c` provides gmtime/
+    // localtime (UTC calendar math) + a strftime format engine; `libc_shim.c` the C-locale
+    // mbstowcs/wcstombs. `time_probe.c` formats several epochs (incl. leap days) through
+    // TZ-independent conversions and round-trips wide chars; the guest byte-matches native glibc.
+    // Pure — runs on the bare powerbox.
+    check_demo_vs_native_flags(
+        "pg_time",
+        "postgres/time_probe.c",
+        b"",
+        &["-DSVM_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_pg_stdio_vs_native() {
+    // **The guest file-backed stdio shim** (slice CD, gap #11e). `stdio_shim.c` layers the buffered
+    // `FILE*` surface Postgres declares (fopen/fread/fwrite/fgets/fgetc/ungetc/fseek/ftell/feof/…)
+    // on os_shim.c's fs-cap syscalls. `stdio_probe.c` writes a file, reopens it, and reads it back
+    // every which way; the guest byte-matches the native glibc oracle over `mem_fs` and `host_fs`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/stdio_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stdio.bc"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stdio (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{pid}_pg_stdio"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stdio (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("svm-pg-stdio-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_stdio bitcode");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = || svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+    };
+    for (label, cap) in [
+        ("mem_fs", svm_run::fs::mem_fs()),
+        ("host_fs", {
+            let root = std::env::temp_dir().join(format!("svm-pg-stdio-guest-{pid}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("guest root");
+            svm_run::fs::host_fs(root)
+        }),
+    ] {
+        let out = inst
+            .run_with_caps(svm_run::Backend::Bytecode, &config(), &[("fs", cap)])
+            .unwrap_or_else(|e| panic!("pg_stdio guest run ({label}): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_stdio: guest ({label}) stdout vs native"
+        );
+    }
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("svm-pg-stdio-guest-{pid}")));
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
