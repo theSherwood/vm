@@ -11,7 +11,7 @@
 // Outputs to `web/assets/*.svmb` (gitignored except the tiny committed `hello_c.svmb`).
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdirSync, existsSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -124,6 +124,57 @@ try {
   buildBc('lua_eval', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_eval.bc'));
 } catch (e) {
   console.log(`  ✗ lua_eval: ${e.message}`);
+}
+
+// 4) Doom (interactive reactor) — doomgeneric through the on-ramp, driven one `tick` per frame over
+//    the persistent window; `_start` reads the shareware IWAD through the `fs` capability. Two assets:
+//    the module (`demos/doom/{fetch,build}.sh` — id Software's Doom source is fetched-and-built, not
+//    vendored) and the freely-distributable shareware `doom1.wad`. The page opens the reactor over the
+//    WAD via `svm_onramp_open_fs`. Both are skipped (the playground just omits the example) if the
+//    toolchain or a fetch is unavailable — same fail-soft as SQLite offline.
+const DOOM = join(REPO, 'crates', 'svm-run', 'demos', 'doom');
+const DCACHE = '/tmp/doomgeneric_cache';
+
+// Build doom.svmb via the demo scripts (fetch the sources, then compile+link+translate). Returns the
+// built module path, or null if the fetch/build failed (offline, or no clang/llvm-link).
+function ensureDoomModule() {
+  const built = join(DCACHE, 'bc', 'doom.svmb');
+  if (existsSync(built)) return built;
+  try {
+    execFileSync('sh', [join(DOOM, 'fetch.sh')], { stdio: 'inherit' });
+    execFileSync('sh', [join(DOOM, 'build.sh')], { stdio: 'inherit' });
+    return existsSync(built) ? built : null;
+  } catch (e) {
+    console.log(`  ✗ doom build: ${e.message}`);
+    return null;
+  }
+}
+
+// Fetch the shareware doom1.wad (freely redistributable). Returns its path, or null if unavailable.
+// Verifies the IWAD magic so a captive-portal HTML page can't masquerade as the WAD.
+function ensureWad() {
+  const wad = join(DCACHE, 'doom1.wad');
+  const ok = (p) => existsSync(p) && readFileSync(p).subarray(0, 4).toString('latin1') === 'IWAD';
+  if (ok(wad)) return wad;
+  mkdirSync(DCACHE, { recursive: true });
+  for (const url of ['https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad']) {
+    try {
+      execFileSync('curl', ['-sfL', '--max-time', '180', '-o', wad, url], { stdio: 'inherit' });
+      if (ok(wad)) return wad;
+    } catch { /* try the next mirror */ }
+  }
+  return null;
+}
+
+const doomSvmb = ensureDoomModule();
+const doomWad = ensureWad();
+if (doomSvmb && doomWad) {
+  copyFileSync(doomSvmb, join(ASSETS, 'doom.svmb'));
+  copyFileSync(doomWad, join(ASSETS, 'doom1.wad'));
+  const mb = (n) => (readFileSync(n).length / (1024 * 1024)).toFixed(2);
+  console.log(`  ✓ doom.svmb (${mb(doomSvmb)} MB) + doom1.wad (${mb(doomWad)} MB)`);
+} else {
+  console.log('  – doom skipped (no toolchain, or the source/WAD fetch failed — offline?)');
 }
 
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');

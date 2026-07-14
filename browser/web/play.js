@@ -330,6 +330,20 @@ block0(v0: i64):
       'advances if the reactor persists the guest’s whole memory (heap included) between frames. ' +
       'Click Run to watch it evolve; Stop to end. This is the heap-persistence proof Doom needs.',
   },
+  'DOOM (1993 — arrow keys, Ctrl fires)': {
+    kind: 'reactor',
+    url: './assets/doom.svmb',
+    wad: './assets/doom1.wad',
+    mode: 'io',
+    desc: 'Shareware DOOM (via doomgeneric), compiled from id Software’s C through the LLVM on-ramp ' +
+      'and run in the sandbox. Click Run: _start reads the IWAD through the `fs` capability and boots ' +
+      'Doom’s whole engine, then the page calls the guest’s tick() once per animation frame (the ' +
+      'reactor loop), blitting each 640×400 frame it presents through `display`. Arrow keys move, ' +
+      'Ctrl fires, Space uses doors/switches, Esc/Enter drive the menus. The zone heap persists in ' +
+      'the guest window between frames (slice 3a). Boot takes a few seconds on the wasm interpreter — ' +
+      'the renderer is byte-exact to a native build (the §18 differential); a JIT tier would smooth ' +
+      'the frame rate. Click Stop to end.',
+  },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
     editable: true,
@@ -550,11 +564,40 @@ async function runReactor(ex) {
     setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     return;
   }
-  // Open the reactor: alloc, copy the module in, svm_onramp_open (decode + grant powerbox + run _start).
-  const p = eng.ex.svm_alloc(bytes.length);
-  new Uint8Array(eng.memory.buffer).set(bytes, p);
-  const opened = eng.ex.svm_onramp_open(p, bytes.length);
-  eng.ex.svm_dealloc(p, bytes.length);
+  // Open the reactor: alloc, copy the module in, run _start (decode + grant powerbox). A guest that
+  // needs a served file (Doom reads its WAD at _start) is opened with svm_onramp_open_fs, which grants
+  // the `fs` capability over the fetched blob; every other reactor guest uses plain svm_onramp_open.
+  let opened;
+  if (ex.wad) {
+    let wad;
+    try {
+      wad = await fetchModule(ex.wad);
+    } catch (e) {
+      setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the WAD`);
+      return;
+    }
+    log(`fetched ${ex.wad}: ${wad.length}B file (served through the fs capability)`);
+    setState('running', 'booting DOOM… (reading the WAD, building the renderer — a few seconds)');
+    const nameBytes = new TextEncoder().encode('doom1.wad');
+    // Alloc all three buffers BEFORE filling any: svm_alloc may grow (detach) linear memory, so take
+    // one fresh view after the last alloc and write into that.
+    const modP = eng.ex.svm_alloc(bytes.length);
+    const nameP = eng.ex.svm_alloc(nameBytes.length);
+    const wadP = eng.ex.svm_alloc(wad.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(bytes, modP);
+    view.set(nameBytes, nameP);
+    view.set(wad, wadP);
+    opened = eng.ex.svm_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
+    eng.ex.svm_dealloc(modP, bytes.length);
+    eng.ex.svm_dealloc(nameP, nameBytes.length);
+    eng.ex.svm_dealloc(wadP, wad.length);
+  } else {
+    const p = eng.ex.svm_alloc(bytes.length);
+    new Uint8Array(eng.memory.buffer).set(bytes, p);
+    opened = eng.ex.svm_onramp_open(p, bytes.length);
+    eng.ex.svm_dealloc(p, bytes.length);
+  }
   if (opened !== 0) {
     setState('error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
     log(`svm_onramp_open failed: ${opened}`);
@@ -576,13 +619,24 @@ async function runReactor(ex) {
       return;
     }
     reactorRAF = null;
+    // On a trap, read the Trap variant (the diagnostic export stashes it into the stdout buffer) BEFORE
+    // close() frees the reactor, so the log says *why* it stopped, not just the status code.
+    let trapDetail = '';
+    if (status !== 0 && status !== 5) {
+      const n = eng.ex.svm_onramp_trap_len();
+      if (n > 0) {
+        trapDetail = new TextDecoder().decode(
+          new Uint8Array(eng.memory.buffer).slice(eng.ex.svm_stdout_ptr(), eng.ex.svm_stdout_ptr() + n));
+      }
+    }
     eng.ex.svm_onramp_close();
     $('run').disabled = broken;
     $('stop').disabled = true;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     setState(status === 5 ? 'done' : 'error',
-      status === 5 ? `guest exited after ${frames} frames · ${secs}s` : `reactor trapped: status ${status}`);
-    log(`reactor stopped: status ${status} after ${frames} frames in ${secs}s`);
+      status === 5 ? `guest exited after ${frames} frames · ${secs}s`
+        : `reactor trapped: status ${status}${trapDetail ? ` (${trapDetail})` : ''}`);
+    log(`reactor stopped: status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
   };
   reactorRAF = requestAnimationFrame(loop);
 }
@@ -683,14 +737,19 @@ async function main() {
       aborter?.abort();
     }
   });
-  // Forward the arrow keys to a running reactor guest through the `keyboard` capability (JS keyCodes
-  // 37/38/39/40 = Left/Up/Right/Down — the codes bounce.c steers on). Only while a loop is running.
-  const ARROWS = new Set([37, 38, 39, 40]);
+  // Forward keys to a running reactor guest through the `keyboard` capability (as JS keyCodes — the
+  // guest maps them: bounce steers on the arrows; Doom adds Ctrl fire / Space use / Enter·Esc·Tab
+  // menus / Shift run / the letter keys y·n·etc.). Only while a loop is running. `preventDefault` is
+  // limited to the keys whose default would disrupt play (arrows/Space/Tab scroll or move focus), and
+  // never fires for a browser shortcut (Ctrl/Meta + a letter — e.g. Ctrl+R), so reload etc. still work.
+  const REACTOR_KEYS = new Set([37, 38, 39, 40, 17, 32, 13, 27, 9, 16]); // arrows + Ctrl/Space/Enter/Esc/Tab/Shift
+  for (let c = 65; c <= 90; c++) REACTOR_KEYS.add(c); // A–Z (Doom uses y/n and cheat/menu letters)
+  const SWALLOW = new Set([37, 38, 39, 40, 32, 9]); // keys whose default (scroll/focus) must be suppressed
   const forward = (pressed) => (e) => {
-    if (reactorRAF !== null && ARROWS.has(e.keyCode)) {
-      eng.ex.svm_onramp_key(e.keyCode, pressed);
-      e.preventDefault();
-    }
+    if (reactorRAF === null || !REACTOR_KEYS.has(e.keyCode)) return;
+    eng.ex.svm_onramp_key(e.keyCode, pressed);
+    const shortcut = (e.ctrlKey || e.metaKey) && e.keyCode !== 17; // leave Ctrl+R etc. to the browser
+    if (SWALLOW.has(e.keyCode) && !shortcut) e.preventDefault();
   };
   window.addEventListener('keydown', forward(1));
   window.addEventListener('keyup', forward(0));

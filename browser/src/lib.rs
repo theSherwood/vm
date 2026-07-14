@@ -1793,6 +1793,7 @@ type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>
 fn grant_onramp_caps(
     host: &mut Host,
     m: &svm_ir::Module,
+    fs: Option<(String, Vec<u8>)>,
 ) -> (
     Vec<Value>,
     std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
@@ -1869,6 +1870,58 @@ fn grant_onramp_caps(
         }));
         host.register_cap_name("keyboard", handle);
     }
+    // `fs` — a read-only in-memory file (Doom slice 4: the WAD read path). Granted only when the host
+    // supplies one file; a guest that resolves no `fs` cap (bounce/life) is unaffected. The op
+    // protocol mirrors the native `doom_diff` differential's in-memory WAD server (and the reused
+    // `lua_files_stdio.c` FILE shim): 0 open(nameptr,namelen,flags)→fd|-2(ENOENT), 1 read(fd,buf,len)
+    // →n, 3 seek(fd,whence,off)→pos (whence 0=SET/1=CUR/2=END), 2 write(fd,…)→len (discard-accept),
+    // 4 close→0. `fd` indexes a per-open cursor, so a guest that opens the file more than once is fine.
+    if let Some((name, data)) = fs {
+        let mut cursors: Vec<u64> = Vec::new();
+        let handle = host.grant_host_fn(Box::new(move |op, args, mem| match op {
+            0 => {
+                let requested = mem
+                    .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
+                    .unwrap_or_default();
+                if String::from_utf8_lossy(&requested).contains(name.as_str()) {
+                    cursors.push(0);
+                    Ok(vec![(cursors.len() - 1) as i64]) // fd = index into `cursors`
+                } else {
+                    Ok(vec![-2]) // ENOENT → the guest's fopen returns NULL (defaults/skips)
+                }
+            }
+            1 => {
+                let (buf, want) = (args[1] as u64, args[2] as u64);
+                let Some(&cur) = cursors.get(args[0] as usize) else {
+                    return Ok(vec![-1]);
+                };
+                let end = (cur + want).min(data.len() as u64);
+                if end > cur {
+                    if let Some(mem) = mem {
+                        let _ = mem.write_bytes(buf, &data[cur as usize..end as usize]);
+                    }
+                }
+                cursors[args[0] as usize] = end;
+                Ok(vec![(end - cur) as i64])
+            }
+            3 => {
+                let (whence, off) = (args[1], args[2]);
+                let Some(cur) = cursors.get(args[0] as usize).copied() else {
+                    return Ok(vec![-1]);
+                };
+                let base = match whence {
+                    1 => cur as i64,
+                    2 => data.len() as i64,
+                    _ => 0,
+                };
+                cursors[args[0] as usize] = (base + off).max(0) as u64;
+                Ok(vec![cursors[args[0] as usize] as i64])
+            }
+            2 => Ok(vec![args.get(2).copied().unwrap_or(0)]), // write: discard-accept
+            _ => Ok(vec![0]),                                 // close et al.
+        }));
+        host.register_cap_name("fs", handle);
+    }
     (slots, frame, keys)
 }
 
@@ -1908,7 +1961,8 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     host.stdin = stdin.to_vec();
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
-    let (slots, frame, _keys) = grant_onramp_caps(&mut host, m);
+    // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
+    let (slots, frame, _keys) = grant_onramp_caps(&mut host, m, None);
     let mut fuel = u64::MAX;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host) {
@@ -1951,6 +2005,8 @@ pub struct OnrampReactor {
     tick: svm_ir::FuncIdx,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
+    /// The `Debug` string of the last frame's trap (diagnostic; `None` until a `tick` traps).
+    last_trap: Option<String>,
 }
 
 impl OnrampReactor {
@@ -1960,6 +2016,23 @@ impl OnrampReactor {
     /// range, there is no exported `tick`, the module is outside the engine's subset, or `_start`
     /// traps.
     pub fn open(m: &svm_ir::Module) -> Result<OnrampReactor, i32> {
+        Self::open_inner(m, None)
+    }
+
+    /// Like [`open`](Self::open) but also grant an `fs` capability serving one read-only file `data`
+    /// under the name `name` (matched as a substring of the guest's `open` path, like the native
+    /// `doom_diff` differential). This is the WAD read path: Doom's `_start` (`doomgeneric_Create`)
+    /// reads its IWAD through the `fs` cap during init, so the file must be served before `_start`
+    /// runs — which this does, since [`grant_onramp_caps`] grants it ahead of the `_start` call.
+    pub fn open_with_fs(
+        m: &svm_ir::Module,
+        name: String,
+        data: Vec<u8>,
+    ) -> Result<OnrampReactor, i32> {
+        Self::open_inner(m, Some((name, data)))
+    }
+
+    fn open_inner(m: &svm_ir::Module, fs: Option<(String, Vec<u8>)>) -> Result<OnrampReactor, i32> {
         let module =
             svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
         let arity = module.funcs.first().map_or(0, |f| f.params.len());
@@ -1970,7 +2043,7 @@ impl OnrampReactor {
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = svm_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module);
+        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module, fs);
         let mut inst = bytecode::Reactor::open(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Run `_start` (func 0) once on the live window: stash the granted handles + run the C
         // initializer. The window (globals/BSS/heap) then persists for every `tick`.
@@ -1986,6 +2059,7 @@ impl OnrampReactor {
             tick,
             frame,
             keys,
+            last_trap: None,
         })
     }
 
@@ -2000,10 +2074,18 @@ impl OnrampReactor {
         let status = match self.inst.call(self.tick, &args, &mut fuel, &mut self.host) {
             Ok(_) => STATUS_OK,
             Err(Trap::Exit(_)) => STATUS_EXIT,
-            Err(_) => STATUS_TRAP,
+            Err(t) => {
+                self.last_trap = Some(format!("{t:?}"));
+                STATUS_TRAP
+            }
         };
         let delta = self.host.stdout[stdout_before..].to_vec();
         (status, delta)
+    }
+
+    /// The `Debug` string of the last frame's trap (diagnostic), or `""` if none.
+    pub fn last_trap(&self) -> &str {
+        self.last_trap.as_deref().unwrap_or("")
     }
 
     /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
@@ -2259,6 +2341,47 @@ pub extern "C" fn svm_onramp_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
     }
 }
 
+/// Like [`svm_onramp_open`] but also grant an `fs` capability serving one read-only file — the bytes
+/// at `[data_ptr, data_len)` under the name at `[name_ptr, name_len)` (the WAD read path Doom needs:
+/// its `_start` reads the IWAD through `fs`). The host `svm_alloc`s and fills both buffers before the
+/// call and frees them after (the file bytes are copied into the reactor's `fs` server). Returns `0`
+/// on success, else a negative `STATUS_*`; also sets [`LAST_STATUS`]. Replaces any prior reactor.
+#[no_mangle]
+pub extern "C" fn svm_onramp_open_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each `[ptr, len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    let name = String::from_utf8_lossy(name).into_owned();
+    match OnrampReactor::open_with_fs(&m, name, data.to_vec()) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(REACTOR) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
 /// Advance the open reactor by one frame: call the guest's `tick`, stash the presented frame (read
 /// via `svm_framebuffer_*`) and any stdout delta (read via `svm_stdout_*`), and return the frame
 /// status (`0` = keep going, [`STATUS_EXIT`] = the guest exited, else a trap). Returns
@@ -2303,6 +2426,20 @@ pub extern "C" fn svm_onramp_key(keycode: i32, pressed: i32) {
 pub extern "C" fn svm_onramp_close() {
     // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
     unsafe { *core::ptr::addr_of_mut!(REACTOR) = None };
+}
+
+/// Diagnostic: stash the open reactor's last-trap `Debug` string into [`OUT`] and return its length
+/// (`0` if no reactor / no trap). Read the bytes via [`svm_stdout_ptr`]. Lets the page surface *why* a
+/// reactor `tick` trapped (the `Trap` variant), not just the `STATUS_TRAP` code.
+#[no_mangle]
+pub extern "C" fn svm_onramp_trap_len() -> usize {
+    // SAFETY: single-threaded wasm; shared read of the reactor.
+    let s = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.map_or("", |r| r.last_trap());
+    let bytes = s.as_bytes().to_vec();
+    let len = bytes.len();
+    // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
 }
 
 /// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next

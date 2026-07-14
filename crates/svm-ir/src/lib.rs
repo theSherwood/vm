@@ -2374,6 +2374,17 @@ pub const POWERBOX_HEAP_TOP: u64 = 40;
 /// live at/above this page — a read-only global never shares page 0 with the writable stash, and
 /// `_start`'s handle stores never fault on a read-only page (D40 page isolation).
 pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
+/// The alignment of the powerbox **data-stack base** ([`powerbox_entry_sp`]). It must be **≥ the
+/// largest host page any artifact may run on** — 64 KiB (the wasm linear-memory page) — because the
+/// D40 read-only const-segment protection is applied at *host-page* granularity: the runtime rounds a
+/// read-only segment's end **up to the host page**, so a stack base that shared that page with the
+/// read-only region would have its first store faulted. A guest large enough that its data end lands
+/// in the same 64 KiB page as its read-only globals (Doom) hit exactly this on a 64 KiB host while a
+/// finer host page (4 KiB native) masked it. Aligning the stack base to 64 KiB guarantees it begins on
+/// a fresh host page **above** the read-only region on every host — the `_start` layout (`svm-llvm`'s
+/// `stack_page`, 64 KiB for wasm builds) already does this; this keeps the reactor's per-frame `tick`
+/// `sp` consistent with it. Over-alignment is free (a few KiB of window) and only ever adds clearance.
+pub const POWERBOX_STACK_ALIGN: u64 = 65536;
 /// The data-stack reserve [`synth_powerbox_start`] leaves above the globals when sizing the window
 /// (matches `svm-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
 pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
@@ -2446,10 +2457,14 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
         .map(|d| d.offset + d.bytes.len() as u64)
         .max()
         .unwrap_or(0);
+    // Align to [`POWERBOX_STACK_ALIGN`] (64 KiB, the max host page), not merely `POWERBOX_STACK_PAGE`
+    // (16 KiB): the D40 read-only protection rounds a const segment's end up to the *host* page, so the
+    // stack base must start on a fresh 64 KiB page above the read-only region or its first store faults
+    // on a 64 KiB host (the Doom-in-the-browser bug — a finer native page masked it).
     data_end
-        .max(POWERBOX_STACK_PAGE)
-        .div_ceil(POWERBOX_STACK_PAGE)
-        * POWERBOX_STACK_PAGE
+        .max(POWERBOX_STACK_ALIGN)
+        .div_ceil(POWERBOX_STACK_ALIGN)
+        * POWERBOX_STACK_ALIGN
 }
 
 /// Prepend the powerbox bootstrap `_start` (the new function 0) to an already-linked, possibly
