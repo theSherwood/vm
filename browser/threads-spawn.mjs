@@ -26,10 +26,21 @@ const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 // Event codes (must match browser/src/lib.rs PAR_*).
 const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8;
 
+// §22 codegen arg/result marshalling by scalar type code (0=i32, 1=i64, 2=f32, 3=f64) — see worker.js.
+const _sdv = new DataView(new ArrayBuffer(8));
+const jitArg = (slot, tc) => tc === 0 ? Number(BigInt.asIntN(32, slot))
+  : tc === 1 ? slot
+  : tc === 2 ? (_sdv.setInt32(0, Number(BigInt.asIntN(32, slot)), true), _sdv.getFloat32(0, true))
+  : (_sdv.setBigInt64(0, slot, true), _sdv.getFloat64(0, true));
+const jitRes = (ret, tc) => tc === 0 ? BigInt(ret)
+  : tc === 1 ? ret
+  : tc === 2 ? (_sdv.setFloat32(0, ret, true), BigInt(_sdv.getUint32(0, true)))
+  : (_sdv.setFloat64(0, ret, true), _sdv.getBigInt64(0, true));
+
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, instCodegen } = workerData;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -65,6 +76,7 @@ async function worker() {
   // §22 guest-JIT real codegen: the run's single §22 unit was emitted + stashed once at powerbox
   // setup; each Worker instantiates its own instance and runs `f0(win, env, args)` on JIT_INVOKE.
   let jitUnit = null, jitEnvCell = 0;
+  if (jitCodegen) ex.svm_par_jit_codegen_service(jitService | 0); // 0=i32, 1=f64 service (per-instance)
   if (jitCodegen && ex.svm_par_enable_jit_codegen() === 1 && ex.svm_par_jit_unit_wasm_len() > 0) {
     const wptr = Number(ex.svm_par_jit_unit_wasm_ptr()), wlen = ex.svm_par_jit_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
@@ -225,17 +237,16 @@ async function worker() {
       const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
       const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
       const args = [];
-      for (let i = 0; i < n; i++) {
-        const slot = i64()[(argvPtr >> 3) + i];
-        args.push(ptypes[i] === 0 ? Number(BigInt.asIntN(32, slot)) : slot);
-      }
+      for (let i = 0; i < n; i++) args.push(jitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
       new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // reuse the counter (non-vacuity)
       try {
         const ret = jitUnit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+        const rn = Number(ex.svm_par_jit_result_types_len(v));
+        const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_result_types_ptr(v)), rn);
         const rptr = Number(ex.svm_par_alloc(Math.max(1, rets.length) * 8));
-        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = jitRes(rets[i], rtypes[i]);
         ex.svm_par_deliver_jit_invoke(v, rptr, rets.length);
       } catch {
         ex.svm_par_deliver_jit_invoke_trap(v);
@@ -271,6 +282,8 @@ async function main() {
   // §22 real-codegen mode (SVM_JIT_CODEGEN=1): the host-compiled unit's wasm is emitted + stashed, and
   // each worker's `Jit.invoke` runs it on emitted wasm (the JIT_INVOKE handler above).
   const jitCodegen = process.env.SVM_JIT_CODEGEN === '1';
+  const jitService = Number(process.env.SVM_JIT_SERVICE ?? 0); // 0 = i32 service, 1 = f64 service
+  if (jitCodegen) ex.svm_par_jit_codegen_service(jitService);
   if (jitCodegen && ex.svm_par_powerbox_jit_codegen(gptr, guest.length) !== 1) {
     console.log('FAIL: svm_par_powerbox_jit_codegen returned 0'); process.exit(1);
   }
@@ -326,7 +339,7 @@ async function main() {
   const startVcpu = (cfg) => {
     started++;
     const w = new Worker(new URL(import.meta.url), {
-      workerData: { module, memory, prog, win, winSize, tierup, jitCodegen, instCodegen, gptr, glen: guest.length, tierupCell, ...cfg },
+      workerData: { module, memory, prog, win, winSize, tierup, jitCodegen, instCodegen, jitService, gptr, glen: guest.length, tierupCell, ...cfg },
     });
     workers.add(w);
     w.on('message', (m) => {

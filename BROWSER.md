@@ -632,18 +632,20 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `svm_par_powerbox_jit_codegen` setup and each Worker instantiates its own instance
    (`svm_par_enable_jit_codegen`, per-instance — the emitted bytes aren't a reliably-shared static
    across Workers, same reason each Worker computes its own tier-up bitmap); `svm_par_run` surfaces
-   `PAR_JIT_INVOKE` (codegen on, a **scalar-integer** unit sig — i32 or i64) and the Worker runs the
-   emitted `f{entry}(win, env, …args)` over the shared window, **marshalling each arg by its declared
-   type** (`svm_par_jit_param_types_ptr`: an i32 arg is a JS `Number`, an i64 a `BigInt`; results go
-   back uniformly as `BigInt(ret)`, which the engine re-tags by the result's type) — so a unit need
-   not be all-i64. The `#jitcodegen` proof runs the **same i32 `service(a,b)=a*b+100` kernel the
-   interpreter `#jit` item runs**. **This
+   `PAR_JIT_INVOKE` (codegen on, any **scalar** unit sig — i32/i64/f32/f64) and the Worker runs the
+   emitted `f{entry}(win, env, …args)` over the shared window, **marshalling each arg / result by its
+   declared type** (`svm_par_jit_param_types_ptr`/`svm_par_jit_result_types_ptr`, codes 0–3): an
+   integer arg is a JS `Number`/`BigInt`, a float the *value* its slot bits reinterpret to (a scratch
+   `DataView` does the bit-cast); results marshal back the same way — so a unit need not be all-i64.
+   The `#jitcodegen` proof runs **both** the i32 `service(a,b)=a*b+100` kernel the interpreter `#jit`
+   item runs **and** an f64 `fservice(6.0,7.0)=142.0` kernel, each → 1136. **This
    is Model A** (the unit is reached through the host, never installed in the shared `call_indirect`
    table, so the Spectre-safe table mask never moves — DESIGN.md §22). Authority still resolves
    through the powerbox before the invoke surfaces (a forged/cross-domain handle traps identically).
    Proofs: `crates/svm/tests/vcpu_jit_codegen.rs` (the external-result seam on the resumable `Vcpu`,
    value + trap parity vs the interpreter), `browser/jitcodegen.mjs` (single-vCPU FFI + emitted-unit
-   path, interp vs codegen both 142), the Node twin `threads-spawn.mjs SVM_JIT_CODEGEN=1` (8 Workers
+   path, interp vs codegen both 142 for i32 **and** f64), the Node twin `threads-spawn.mjs
+   SVM_JIT_CODEGEN=1` (`SVM_JIT_SERVICE=1` for the f64 kernel) (8 Workers
    each `Jit.invoke` on emitted wasm → 1136, = interp, non-vacuity-counted), and the **Chromium**
    `#jitcodegen` page item (same across real Web Workers → 1136, 8 units ran on emitted wasm).
    **[landed — §14 `instantiate_module` compile-on-push]** A confined executor child whose granted
@@ -667,9 +669,9 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    **Deferred (documented):** §22 `install` + `call_indirect` (Model B2 — an installed unit *is* a
    funcref old code dispatches to; needs cross-instance wasm-table population), guest-**compiled**
    units (the guest builds IR at runtime — needs the emitted bytes to cross Workers with the code
-   handle, a shared registry with synchronization), **float** (f32/f64) unit signatures (JS bit
-   reinterpretation via `DataView` — scalar **integer** i32/i64 sigs now marshal by type), and §14
-   units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on wasm).
+   handle, a shared registry with synchronization) and §14 units whose entry **uses** its
+   instantiator/address-space caps (nested VM-in-VM on wasm). *(All scalar unit signatures —
+   i32/i64/f32/f64 — now marshal by type; **v128** unit sigs stay on the interpreter.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

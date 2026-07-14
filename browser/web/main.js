@@ -329,17 +329,19 @@ block0(v0: i64):
   // so codegen → 1136 = interp; the counter proves the emitted unit ran. `install`/`call_indirect`
   // (Model B2) + guest-compiled units stay on the interp.
   try {
-    const guest = await fetchBytes('/corpus/threads_jit_invoke.svmbc');
     const t0 = performance.now();
-    const codegen = await run(guest, { jitCodegen: true });
+    // i32 unit sig — the same kernel the interp #jit item runs.
+    const i32 = await run(await fetchBytes('/corpus/threads_jit_invoke.svmbc'), { jitCodegen: true, jitService: 0 });
+    // f64 unit sig — args' slot bits ↔ JS Numbers, result ↔ bits (the float ABI path).
+    const f64 = await run(await fetchBytes('/corpus/threads_jit_invoke_f64.svmbc'), { jitCodegen: true, jitService: 1 });
     const ms = (performance.now() - t0).toFixed(0);
-    // Ground truth 1136 (= the interpreter, differential-checked in the Node twin threads-spawn.mjs
-    // SVM_JIT vs SVM_JIT_CODEGEN); here we also require the seam actually fired (units ran on wasm).
-    const ok = codegen.value === 1136n && codegen.tierups > 0;
+    // Ground truth 1136 (= the interpreter, differential-checked in the Node twin threads-spawn.mjs);
+    // here we also require the seam actually fired (units ran on wasm) for each sig.
+    const ok = i32.value === 1136n && i32.tierups > 0 && f64.value === 1136n && f64.tierups > 0;
     set('jitcodegen', ok ? 'pass' : 'fail',
-      `jitcodegen: ${codegen.started} Workers each Jit.invoke a unit on emitted wasm → ${codegen.value} ` +
-      `(want 1136, ${codegen.tierups} units ran on emitted wasm) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
-    log(`jitcodegen → ${codegen.value} with ${codegen.tierups} emitted invokes across ${codegen.started} Workers in ${ms}ms`);
+      `jitcodegen: ${i32.started} Workers each Jit.invoke a unit on emitted wasm · i32 → ${i32.value} ` +
+      `(${i32.tierups} units) · f64 → ${f64.value} (${f64.tierups} units) (want 1136) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`jitcodegen → i32 ${i32.value}/${i32.tierups} · f64 ${f64.value}/${f64.tierups} across ${i32.started} Workers in ${ms}ms`);
   } catch (e) {
     set('jitcodegen', 'fail', `jitcodegen: error ${e}`);
   }

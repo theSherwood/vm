@@ -50,12 +50,14 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, inst = false, instCodegen = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null } = {}) {
     const gptr = ex.svm_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
     // §22 real-codegen run: like `jit`, but the host-compiled unit's wasm is emitted + stashed, and a
     // guest `Jit.invoke` runs it on emitted wasm (each Worker instantiates the unit — see worker.js).
+    // `jitService` selects the codegen unit (0 = i32 `service`, 1 = f64 `fservice`).
+    if (jitCodegen) ex.svm_par_jit_codegen_service(jitService);
     if (jitCodegen && ex.svm_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox_jit_codegen failed');
     if (io && ex.svm_par_powerbox_io() !== 1) throw new Error('svm_par_powerbox_io failed');
     if (!jit && !jitCodegen && !io && !inst && !instCodegen) ex.svm_par_powerbox_none();
@@ -109,7 +111,7 @@ export function makeRunner({ module, memory, ex }) {
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
           // `tierup` + the guest bytes (kept live at `gptr` for the run) let each Worker JIT-compile
           // the guest locally and run eligible compute regions on the emitted wasm (threads slice).
-          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, instCodegen, gptr, glen: guest.length, tierupCell, ...cfg });
+          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, jitService, instCodegen, gptr, glen: guest.length, tierupCell, ...cfg });
         };
         // The root vCPU runs on its own Worker (the page can't Atomics.wait).
         const rootSlot = ex.svm_par_alloc(SLOT);

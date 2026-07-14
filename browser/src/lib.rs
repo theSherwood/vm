@@ -473,20 +473,23 @@ pub struct ParVcpu {
     jit_argv: Vec<i64>,
     /// The code handle of a pending [`PAR_JIT_INVOKE`] (the Worker caches one emitted instance per unit).
     jit_code: i32,
-    /// Per-arg **type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` = i64) so the Worker
-    /// marshals each i64 slot to the wasm type the emitted `f{entry}` expects (an i32 arg is a JS
-    /// `Number`, an i64 a `BigInt`) — a §22 unit need not be all-i64. Read via
-    /// [`svm_par_jit_param_types_ptr`]. (Results marshal back uniformly as `BigInt(ret)`, which the
-    /// engine's `slot_to_val` re-tags by the result's declared type, so no result-type channel is
-    /// needed.)
+    /// Per-arg / per-result **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` =
+    /// i64, `2` = f32, `3` = f64) so the Worker marshals each i64 slot to/from the wasm type the
+    /// emitted `f{entry}` uses: an i32 arg is a JS `Number`, an i64 a `BigInt`, a float the *value*
+    /// the slot's bits reinterpret to. Read via [`svm_par_jit_param_types_ptr`] /
+    /// [`svm_par_jit_result_types_ptr`] — a §22 unit need not be all-i64.
     jit_param_types: Vec<u8>,
+    jit_result_types: Vec<u8>,
 }
 
-/// SVM scalar-integer `ValType` → the Worker's marshalling type code (`0` = i32, `1` = i64).
-fn int_type_code(t: svm_ir::ValType) -> Option<u8> {
+/// SVM scalar `ValType` → the Worker's marshalling type code (`0` = i32, `1` = i64, `2` = f32, `3` =
+/// f64). `None` for `v128` (the Worker has no lane marshalling — such a unit stays on the interp).
+fn scalar_type_code(t: svm_ir::ValType) -> Option<u8> {
     match t {
         svm_ir::ValType::I32 => Some(0),
         svm_ir::ValType::I64 => Some(1),
+        svm_ir::ValType::F32 => Some(2),
+        svm_ir::ValType::F64 => Some(3),
         _ => None,
     }
 }
@@ -503,6 +506,7 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
         jit_argv: Vec::new(),
         jit_code: 0,
         jit_param_types: Vec::new(),
+        jit_result_types: Vec::new(),
     }))
 }
 
@@ -677,6 +681,39 @@ fn par_jit_codegen() -> bool {
     PAR_JIT_CODEGEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// A **float** §22 unit for the real-codegen proof: `fservice(a, b) = a*b + 100.0`, all `f64` — so
+/// the Worker marshals args from the slot bits to JS `Number`s and the `f64` result back to its bits
+/// (the ABI generalization to floats). `fservice(6.0, 7.0) = 142.0`.
+const JIT_SERVICE_FLOAT: &str = r#"memory 16
+func (f64, f64) -> (f64) {
+block0(v0: f64, v1: f64):
+  v2 = f64.mul v0 v1
+  v3 = f64.const 100.0
+  v4 = f64.add v2 v3
+  return v4
+}
+"#;
+
+/// Which §22 unit the codegen powerbox host-compiles + emits: `0` = the i32 [`JIT_SERVICE`] (the
+/// default, matching the interp `#jit` item), `1` = the f64 [`JIT_SERVICE_FLOAT`]. The JS host sets
+/// this (via [`svm_par_jit_codegen_service`]) before the run to exercise int vs float marshalling.
+static PAR_JIT_SERVICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Select the codegen unit for the next run (`0` = i32 service, `1` = f64 service). Set on every
+/// instance (page + each Worker) before enabling codegen, with the same value.
+#[no_mangle]
+pub extern "C" fn svm_par_jit_codegen_service(kind: i32) {
+    PAR_JIT_SERVICE.store(kind, std::sync::atomic::Ordering::Release);
+}
+
+fn codegen_service_src() -> &'static str {
+    if PAR_JIT_SERVICE.load(std::sync::atomic::Ordering::Acquire) == 1 {
+        JIT_SERVICE_FLOAT
+    } else {
+        JIT_SERVICE
+    }
+}
+
 /// Toggle codegen mode on the current §22 powerbox (`on != 0` ⇒ `Jit.invoke` runs on emitted wasm;
 /// `0` ⇒ the interpreter services it in-Rust). Lets a host run the **same** guest + unit both ways
 /// for a differential (the emitted region must match the interpreter). Set by
@@ -693,7 +730,7 @@ pub extern "C" fn svm_par_jit_set_codegen(on: i32) {
 /// from the same constant. Returns `1` on success, `0` if the unit is outside the emitter subset.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
-    let Ok(service_m) = svm_text::parse_module(JIT_SERVICE) else {
+    let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
         return 0;
     };
     let Ok(wasm) = svm_wasmjit::compile_module_mixed_entry(&service_m, 0, true) else {
@@ -719,7 +756,7 @@ pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: 
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return 0;
     };
-    let Ok(service_m) = svm_text::parse_module(JIT_SERVICE) else {
+    let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
         return 0;
     };
     let service = svm_encode::encode_module(&service_m);
@@ -1284,13 +1321,13 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 None => return PAR_TRAP,
                 Some(pb) => {
                     // Real-codegen path (slice 5): codegen mode on, the unit is emitted, and every
-                    // arg/result is a **scalar integer** (i32/i64) — the Worker marshals each i64 slot
-                    // to the wasm type the emitted `f{entry}` expects (the type codes travel via
+                    // arg/result is a **scalar** (i32/i64/f32/f64) — the Worker marshals each i64 slot
+                    // to/from the wasm type the emitted `f{entry}` uses (the type codes travel via
                     // `jit_param_types`/`jit_result_types`). Authority still resolves through the
                     // powerbox — a forged / cross-domain handle must trap identically — then the invoke
-                    // surfaces to JS. Anything else (codegen off, a v128/float unit sig, no emitted
-                    // wasm) stays on the interpreter.
-                    let codes = |ts: &[svm_ir::ValType]| ts.iter().map(|t| int_type_code(*t)).collect::<Option<Vec<u8>>>();
+                    // surfaces to JS. Anything else (codegen off, a v128 unit sig, no emitted wasm)
+                    // stays on the interpreter.
+                    let codes = |ts: &[svm_ir::ValType]| ts.iter().map(|t| scalar_type_code(*t)).collect::<Option<Vec<u8>>>();
                     let (ptypes, rtypes) = (codes(&params), codes(&results));
                     let codegen = par_jit_codegen()
                         && svm_par_jit_unit_wasm_len() > 0
@@ -1302,6 +1339,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                                 v.jit_argv = argv.into_vec();
                                 v.jit_code = code;
                                 v.jit_param_types = ptypes.unwrap();
+                                v.jit_result_types = rtypes.unwrap();
                                 return PAR_JIT_INVOKE;
                             }
                             // Forged/cross-domain handle: deliver the trap on the interpreter path
@@ -1432,13 +1470,29 @@ pub extern "C" fn svm_par_jit_argv_len(v: *mut ParVcpu) -> usize {
     unsafe { (*v).jit_argv.len() }
 }
 
-/// Per-arg **type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` = i64), one byte per arg —
-/// the Worker reads them to marshal each i64 slot to the wasm type the emitted `f{entry}` expects (an
-/// i32 arg passed as a JS `Number`, an i64 as a `BigInt`). Length equals [`svm_par_jit_argv_len`].
+/// Per-arg **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` = i64, `2` = f32,
+/// `3` = f64), one byte per arg — the Worker reads them to marshal each i64 slot to the wasm type the
+/// emitted `f{entry}` uses. Length equals [`svm_par_jit_argv_len`].
 #[no_mangle]
 pub extern "C" fn svm_par_jit_param_types_ptr(v: *mut ParVcpu) -> *const u8 {
     // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
     unsafe { (*v).jit_param_types.as_ptr() }
+}
+
+/// Per-result **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (same encoding as
+/// [`svm_par_jit_param_types_ptr`]) — the Worker marshals each emitted-`f{entry}` result back to its
+/// i64 result slot (a float's *bits*, an integer's value) for [`svm_par_deliver_jit_invoke`].
+#[no_mangle]
+pub extern "C" fn svm_par_jit_result_types_ptr(v: *mut ParVcpu) -> *const u8 {
+    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
+    unsafe { (*v).jit_result_types.as_ptr() }
+}
+
+/// Number of §22 invoke results (see [`svm_par_jit_result_types_ptr`]).
+#[no_mangle]
+pub extern "C" fn svm_par_jit_result_types_len(v: *mut ParVcpu) -> usize {
+    // SAFETY: `v` is a live `ParVcpu`.
+    unsafe { (*v).jit_result_types.len() }
 }
 
 
