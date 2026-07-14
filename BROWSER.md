@@ -642,11 +642,29 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    path, interp vs codegen both 142), the Node twin `threads-spawn.mjs SVM_JIT_CODEGEN=1` (8 Workers
    each `Jit.invoke` on emitted wasm → 1136, = interp, non-vacuity-counted), and the **Chromium**
    `#jitcodegen` page item (same across real Web Workers → 1136, 8 units ran on emitted wasm).
-   **Deferred (documented):** `install` + `call_indirect` (Model B2 — an installed unit *is* a
+   **[landed — §14 `instantiate_module` compile-on-push]** A confined executor child whose granted
+   module is fully **in-subset** runs its entry on **emitted wasm** on its own Worker (the unit
+   "compiles on push") instead of a confined vCPU. This needs **no engine change**: the host already
+   decides how to run the child, so the Worker instantiates the emitted unit, runs `f{entry}(win =
+   carve base, env, …cap-handle args)`, and fills the **same completion slot** the parent `join`s —
+   the parent reads the result exactly as from an interpreted child. The unit's data segments are
+   materialized into the carve by the parent *before* the `Instantiate` event (the spawn hand-off is
+   the happens-before), so the emitted code reads them. Each Worker emits its own copy of the granted
+   unit from the shared recipe (`svm_par_enable_inst_codegen`, via `compile_module_tierup` — the
+   per-instance-stash pattern), and only an entry whose function is in the emitter subset is eligible
+   (`svm_par_inst_eligible`); a child entry that uses a `cap.call` — a **nested** `instantiate`, an
+   address-space op — is not in-subset, so it stays on the interpreter (fail-closed). Proofs: the Node
+   twin `threads-spawn.mjs SVM_INST_CODEGEN=1` (8 confined children each run their unit —
+   `mem[0] = "K" = 75` read from the carve — on emitted wasm → 600, = interp, non-vacuity-counted)
+   and the **Chromium** `#instcodegen` page item (interp vs codegen both → 600 across real Web
+   Workers, 8 children on wasm). Correctness rests on the emitter's existing load-op differential
+   (`differential.rs`) plus this end-to-end orchestration differential — §14's established proof mode
+   (ground truths asserted in the JS host).
+   **Deferred (documented):** §22 `install` + `call_indirect` (Model B2 — an installed unit *is* a
    funcref old code dispatches to; needs cross-instance wasm-table population), guest-**compiled**
    units (the guest builds IR at runtime — needs the emitted bytes to cross Workers with the code
    handle, a shared registry with synchronization), i32/float unit signatures (JS type marshalling),
-   and §14 `instantiate_module` compile-on-push.
+   and §14 units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on wasm).
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

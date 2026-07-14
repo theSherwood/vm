@@ -54,7 +54,7 @@ try {
   page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
-  const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup', 'jitcodegen'];
+  const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen'];
   // Wait until every work item leaves 'pending' (or time out).
   try {
     await page.waitForFunction(
@@ -84,6 +84,7 @@ try {
   const wasmjit = await read('wasmjit');
   const tierup = await read('tierup');
   const jitcodegen = await read('jitcodegen');
+  const instcodegen = await read('instcodegen');
 
   console.log(`\n  ${isolated.text}`);
   console.log(`  ${powerbox.text}`);
@@ -93,12 +94,13 @@ try {
   console.log(`  ${capio.text}`);
   console.log(`  ${wasmjit.text}`);
   console.log(`  ${tierup.text}`);
-  console.log(`  ${jitcodegen.text}\n`);
+  console.log(`  ${jitcodegen.text}`);
+  console.log(`  ${instcodegen.text}\n`);
 
   const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
     threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
     capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
-    jitcodegen.status === 'pass';
+    jitcodegen.status === 'pass' && instcodegen.status === 'pass';
 
   // --- the playground (play.html): SVM text typed into the page, parsed in-browser, run across ----
   // Workers. Drives the page like a human: pick an example / type source, click Run, read the
@@ -229,8 +231,9 @@ try {
     `in-browser via svm_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
     `(SVM IR compiled to wasm in-browser, f0 called directly, matching the interpreter) — including ` +
     `per-Worker JIT tier-up (a threaded guest's compute leaves run on emitted wasm on their own ` +
-    `Workers) and §22 guest-JIT real codegen (a guest's Jit.invoke runs the submitted unit on ` +
-    `emitted wasm per-Worker over the shared memory), both byte-identical to the interpreter`);
+    `Workers), §22 guest-JIT real codegen (a guest's Jit.invoke runs the submitted unit on ` +
+    `emitted wasm per-Worker), and §14 instantiate_module real codegen (a confined child runs its ` +
+    `granted unit on emitted wasm — the unit compiles on push), all byte-identical to the interpreter`);
 } catch (e) {
   failed = true;
   console.log(`FAIL: ${e.message}`);
