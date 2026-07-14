@@ -231,10 +231,24 @@ fn v8_lane(run_mjs: &Path, wasm: &Path, small: i64, large: i64) -> Option<(f64, 
 }
 
 /// Compile `kernel.c` to LP64 bitcode and translate to SVM IR; return `(module, entry_sp, run idx)`.
+///
+/// On-ramp target: `-march=x86-64-v3 -mprefer-vector-width=128`. The svm-jit on-ramp consumes *host*
+/// bitcode, so unlike wasm (capped at the portable simd128 op set) it can target the real CPU's richer
+/// 128-bit SIMD. `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM ops simd128 has but the
+/// SSE2 baseline lacks (`i32x4.mul`, wider widening muls, …); `-mprefer-vector-width=128` keeps LLVM at
+/// 128-bit so Cranelift (no YMM/ZMM regclass, D58) never has to split a 256-bit vector. Together this
+/// flips the vectorizable-kernel gap to parity-or-faster than Wasmtime-w64 (matmul 1.42x→0.89x), at
+/// +0 escape-TCB (more `v128` ops are value-only; the verifier re-checks). See DESIGN.md D64.
 fn translate(cfile: &Path) -> Option<(svm_ir::Module, i64, u32)> {
     let bc = std::env::temp_dir().join(format!("confine_{}.bc", std::process::id()));
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args([
+            "-O2",
+            "-march=x86-64-v3",
+            "-mprefer-vector-width=128",
+            "-emit-llvm",
+            "-c",
+        ])
         .arg(cfile)
         .arg("-o")
         .arg(&bc)
