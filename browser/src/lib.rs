@@ -549,6 +549,7 @@ fn par_jit_eligible() -> Option<std::sync::Arc<[bool]>> {
 /// interprets). Call on **every** instance (page + each Worker) before building vCPUs, same bytes.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let Ok(m) = svm_encode::decode_module(bytes) else {
@@ -723,13 +724,15 @@ pub extern "C" fn svm_par_jit_set_codegen(on: i32) {
     PAR_JIT_CODEGEN.store(on != 0, std::sync::atomic::Ordering::Release);
 }
 
-/// Enable §22 real codegen **on this instance**: emit the run's unit ([`JIT_SERVICE_I64`]) into this
+/// Enable §22 real codegen **on this instance**: emit the run's unit (the scalar service selected by
+/// [`codegen_service_src`] — i32 [`JIT_SERVICE`] or f64 [`JIT_SERVICE_FLOAT`]) into this
 /// instance's [`JIT_UNIT_WASM`] stash and set codegen mode. Every Worker calls this in its own
 /// instance (like [`svm_par_enable_jit`] for tier-up) — the emitted wasm bytes are per-instance, not
 /// shared across Workers, so a page-side stash isn't reliably visible; each Worker emits its own copy
 /// from the same constant. Returns `1` on success, `0` if the unit is outside the emitter subset.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
+    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
         return 0;
     };
@@ -744,7 +747,8 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
 }
 
 /// Build the **shared powerbox** for a §22 **real-codegen** run: like [`svm_par_powerbox`] but the
-/// host-compiled unit is the all-i64 [`JIT_SERVICE_I64`], and its wasm is emitted (via
+/// host-compiled unit is the scalar service selected by [`codegen_service_src`] (i32 [`JIT_SERVICE`]
+/// or f64 [`JIT_SERVICE_FLOAT`]), and its wasm is emitted (via
 /// [`svm_wasmjit::compile_module_mixed_entry`], shared memory) + stashed so a guest `Jit.invoke`
 /// runs the emitted region on the Worker instead of the interpreter. Returns `1` on success, `0` on
 /// decode/parse/compile/emit failure (fail-closed: the caller keeps the interpreter). Call **once**
@@ -883,6 +887,7 @@ static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 /// `1` on success, `0` if there is no granted module or it is outside the emitter subset.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
+    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     let Some(cfg) = par_inst() else {
         return 0;
     };

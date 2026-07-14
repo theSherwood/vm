@@ -252,7 +252,7 @@ keeps tripping unrelated PRs, the cheap unblock is the I4-style mitigation (or m
 
 ---
 
-### I22 — Rare `real-browser` (Chromium/Playwright) flake: an on-page check trips an out-of-bounds memory access (S4)
+### I22 — Rare `real-browser` (Chromium/Playwright) flake: a worker vCPU traps (OOB / `unreachable` panic) (S4) — **ROOT CAUSE FOUND (2026-07-15): double-free race on shared codegen stashes; MITIGATION LANDED (retry + liveness backstop), engine fix deferred (needs browser verification)**
 
 **Where:** the `real-browser (Chromium via Playwright)` CI job — `browser/browser-test.mjs` driving
 `web/index.html` + `web/play.html` in a headless Chromium under COOP/COEP. The wasm module is the
@@ -400,20 +400,63 @@ before the 30 s `waitForFunction` timeout; att2 green on the unchanged commit. T
   build, so this is **diff-independent beyond any doubt**. Across the two `unreachable` sightings the
   stuck items are consistently the **codegen** checks (`jitcodegen`/`instcodegen`, `tierup` in one),
   narrowing the Worker wedge to the JIT **codegen** path.
-- **Seventh occurrence + a harness-level retry (2026-07-14, on the §22 float-codegen PR #256).** Same
-  signature again: `[pageerror] unreachable`, pending `jitcodegen, instcodegen`, 30 s timeout; att2
-  green on the unchanged commit, and the local Chromium run passes repeatedly (i32 → 1136, f64 → 1136,
-  both on emitted wasm) — the added f64 codegen item just churns more Workers per run, so the same
-  codegen-path race surfaces a touch more often. Since the diagnostics keep confirming this is a
-  known, diff-independent flake that clears on re-run, `browser-test.mjs` now **retries its main-page
-  proof once** on the hang: the proof is factored into a `pageProof()` helper that throws a tagged
-  `PENDING_TIMEOUT` when an item never leaves `pending`; the caller retries exactly that (a fresh
-  page) once and rethrows any non-timeout error unchanged, so a known flake no longer reds a PR while
-  a genuine regression hangs both attempts. (In the harness, not `ci.yml` — the branch push token
-  lacks `workflow` scope, and re-running only the flaky page proof — not the whole Chromium launch +
-  playground suite — is the better granularity.) This is a red-CI mitigation, **not** a fix:
-  root-cause (a), the codegen-path shared-memory race, remains open, and the named-`fail` capture the
-  guard/panic-hook were meant to produce still hasn't fired.
+- **Seventh occurrence (2026-07-14, on the §22 float-codegen PR #256).** Same signature again:
+  `[pageerror] unreachable`, pending `jitcodegen, instcodegen`, 30 s timeout; att2 green on the
+  unchanged commit, local Chromium green repeatedly (i32 → 1136, f64 → 1136, both on emitted wasm).
+  The added f64 codegen item churns more Workers per run, so the codegen-path race surfaced a touch
+  more often — the same double-free wedge diagnosed below, not a float-path bug. (PR #256 now carries
+  the root-cause fix directly, via the merge of the 2026-07-15 worker.js full-body guard.)
+
+**ROOT CAUSE FOUND (2026-07-15) — a double-free race on the shared codegen stashes** — which answers
+the sighting update's open question (why the codegen items hang without routing through the guard) and
+is fixed by wrapping the *whole* worker handler, not just `svm_par_run`. The diagnostics paid off. Four `real-browser` re-runs on Jul 14 PR CI (runs 29346033162, 29343104313, 29337767633,
+29337399591 — all att1 fail → att2 pass) now self-identify the stuck check (main.js runs items
+sequentially, so the **first** still-`pending` item is the culprit; the rest never start):
+
+| run | `[pageerror]` | first stuck item |
+|---|---|---|
+| 87129853255 | `memory access out of bounds` | **`inst`** (§14 confined children) |
+| 87119735304 | `unreachable` (panic) | **`jitcodegen`** (§22 guest-JIT real codegen) |
+| 87100018744 | `unreachable` (panic) | **`tierup`** (wasm-JIT tier-up) |
+
+Those three items are exactly the three that call a per-Worker `svm_par_enable_*` setup function —
+`svm_par_enable_jit` (tierup), `svm_par_enable_jit_codegen` (jitcodegen), `svm_par_enable_inst_codegen`
+(inst/instcodegen). Each **emits wasm and `stash()`es it into a `static mut`** (`JIT_UNIT_WASM`,
+`INST_UNIT_WASM` / `INST_ELIGIBLE`, and the tier-up stash). `stash()` (`lib.rs`) does
+`std::alloc::dealloc(old_ptr)` then `Box::into_raw(new)`. The SAFETY comments call these stashes
+"single-threaded per instance" — **that is the bug**: a plain (non-`#[thread_local]`) Rust `static`
+lives in the **shared** linear memory at one fixed address, so every Worker instance sees the *same*
+stash. Each Worker runs `svm_par_enable_*` in its own setup, concurrently, over one shared memory ⇒
+two Workers read the same `old_ptr` and both `dealloc` it ⇒ **double-free / use-after-free** on the
+shared allocator ⇒ heap corruption ⇒ a later `memory access out of bounds`, or a Rust panic
+(`unreachable`) — matching both observed variants. Rare because the window (two Workers in
+`enable_*` at once) is narrow; load-dependent for the same reason. The allocator being thread-safe
+(THREADS.md 4b) does not help — a double-free of the *same pointer* is a logic error above any
+allocator.
+
+**Mitigation LANDED (2026-07-15) — stops the PR bleeding + guarantees diagnosability; engine fix
+deferred (needs a real-browser build to verify, which this environment can't run):**
+1. `browser-test.mjs`: retry the index page up to **3×** (reload between), logging every retry loudly
+   (`[I22 retry] …`) so the flake stays visible per AGENTS.md. It clears on reload every time it's been
+   seen, so this self-heals CI without a manual `rerun_failed_jobs`; a *real* regression fails all 3
+   and stays red.
+2. `browser/web/worker.js`: wrap the **whole** vCPU handler in a liveness backstop (not just the
+   already-guarded `svm_par_run` loop) so a trap in the `enable_*`/instantiate/`svm_par_child*` setup
+   can never silently hang the page — it wakes any joiner (fills the completion slot the parent
+   `Atomics.wait`s on) and reports `fail` with the captured panic location.
+3. `browser/src/lib.rs`: install the panic-capture hook at the top of the three `svm_par_enable_*`
+   functions too (not only `svm_par_run`), so a *setup-time* panic reports its `FILE:LINE` instead of a
+   bare `unreachable`.
+
+**Recommended engine fix (follow-up, verify in a real browser):** stop the per-Worker re-emit race.
+Either (a) emit each unit **once on the page** (single-threaded, before spawning Workers) and have the
+Workers *read* the shared stash behind an `Acquire` that pairs with the page's `Release` — the
+"per-instance" premise is false, so the page's stash is already visible to every Worker; or (b) guard
+each `enable_*` emit+stash with a lock so the dealloc/realloc is serialized (each pointer freed once).
+`#[thread_local]` would be the natural expression of the original intent but is **not** available: the
+`wasm32-differential` CI job builds this crate on **stable**, so a `#![feature(thread_local)]` would
+break it. Not landing an unverified change to this shared-memory/confinement-adjacent code (AGENTS.md:
+"the most sensitive code in the tree").
 
 ---
 

@@ -50,6 +50,31 @@
 > boundary the model pins therefore holds only at page-aligned window sizes; the spec
 > window is 64 KiB (the same choice `irgen` already made for the same reason), and
 > the constraint is now recorded on `MEM_LOG2` as part of the executable definition.
+>
+> **Slice 6 landed** — the SIMD rows (`svm_spec::simd`, ~250 concrete op×shape rows
+> covering every §17 `v128` value op) with independently-written lane semantics from
+> the `svm-ir` op documentation, run on all three backends (`spec_simd.rs`, ~10k
+> vectors, <4 s). Since `v128` can't cross the JIT entry ABI, inputs are baked as
+> `v128.const` and results observed as two `i64x2.extract_lane`s, batched
+> many-per-module to amortize compiles. `v128.load`/`store` get the 16-byte
+> window-boundary lattice (the one escape-TCB delta SIMD adds, D58). Lane-NaN policy
+> per D58: computed float lanes compare NaN-class, masks and moves bit-exact. One
+> carve-out honored (not a finding): `i64x2.{min,max}_{s,u}` are a **documented** JIT
+> `Unsupported` bail (no legalizable Cranelift lowering; wasm never emits them) — the
+> interpreters stay fully pinned there. All SIMD rows also ride the encoding suite
+> (the `0xFE` prefix + sub-opcode pins) and both verifiers.
+>
+> **Slice 7 landed — the plan is complete.** The completeness closure
+> (`svm_spec::structural`, 36 typing+encoding rows: the 4 atomics + fence + 2 `v128`
+> memory ops, the calls + `ref.func`, the 6 host ops, the 7 concurrency ops, the misc
+> control ops, and all 7 terminators) homes every remaining op — each with a minimal
+> **verifiable witness module** (accepted by both verifiers, except `call_import`, the
+> un-verifiable pre-resolution import form), `decode∘encode` round-trip, and an opcode
+> byte pin (`spec_structural.rs`). These carry no `eval` (host/interleaving-dependent —
+> the SPEC.md scope fence). A new exhaustive `row_home()` match (the third forcing
+> function, with `coverage()` and the reference verifier's `check_inst`) maps **every**
+> one of the 86 `Inst` variants to its owning slice, so adding any op is a compile
+> error until the spec homes it. The executable spec now covers the entire ISA.
 
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier
@@ -233,11 +258,13 @@ commit). Ordered so every slice delivers a standing suite:
    model + `Load`/`Store`/bulk rows + the OOB boundary lattice. *Exit:
    trap-confinement boundary vectors pass on all three backends.* ✅ (JIT leg of
    the bulk guard-hole trap vectors excepted — ISSUES.md I21.)
-6. **SIMD.** The `v128` families (lane typing already total, §17/D58); `eval`
-   per lane op is mechanical. *Exit: parity with slices 1–2 for vector ops.*
-7. **Coverage closure.** Typing + encoding rows for the remaining control /
-   host / concurrency ops (no `eval`); cross-link this doc from `DESIGN.md`
-   §3b/§18. *Exit: the completeness walk covers all of `Inst`.*
+6. **SIMD** — **done** (see Status). The `v128` families (lane typing already
+   total, §17/D58); `eval` per lane op is mechanical. *Exit: parity with slices
+   1–2 for vector ops.* ✅ (`i64x2` min/max JIT leg excepted — a documented
+   backend bail, not a spec gap.)
+7. **Coverage closure** — **done** (see Status). Typing + encoding rows for the remaining control /
+   host / concurrency ops (no `eval`), plus the exhaustive `row_home()` walk.
+   *Exit: the completeness walk covers all of `Inst`.* ✅
 
 Per §18's taxonomy this is agent-fast volume work (data entry + harness); the
 risk concentrates exactly where it should — writing `eval` closures honestly

@@ -31,7 +31,17 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen } = e.data;
-  const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
+  // I22 liveness backstop. The `svm_par_run` loop below already catches host traps, but the SETUP +
+  // codegen calls before it (WebAssembly.instantiate, svm_par_enable_jit / _jit_codegen /
+  // _inst_codegen, svm_par_child*) are the ones a rare shared-memory race actually trips (a double-free
+  // in the shared codegen stash → `memory access out of bounds` or a panic=abort `unreachable`). An
+  // uncaught trap there rejects this async onmessage, and a Worker's unhandled rejection does NOT fire
+  // `Worker.onerror` on the page — so a child that dies here never fills its completion slot and the
+  // root's join `Atomics.wait` hangs the whole page (the 30s-timeout flake). Wrap the entire body so
+  // ANY trap becomes a clean vCPU trap: wake any joiner, and report `fail` with the captured panic site.
+  let ex;
+  try {
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW
@@ -279,5 +289,26 @@ self.onmessage = async (e) => {
       }
       continue;
     }
+  }
+  } catch (err) {
+    // Liveness backstop (see the note at the top): a trap escaped the setup/codegen path above.
+    // Wake any joiner so the parent's `Atomics.wait` on our completion slot doesn't cascade-hang,
+    // then report a structured failure carrying the Rust panic location the hook stashed.
+    try {
+      if (role !== 'root' && slot !== undefined) {
+        const iv = new Int32Array(memory.buffer);
+        Atomics.store(iv, slot >> 2, 2); // 2 = trapped → the parent's deliver_join sees a trap
+        Atomics.notify(iv, slot >> 2);
+      }
+    } catch { /* memory unusable — nothing more we can do */ }
+    let why = `vcpu ${role} setup/host trap: ${err && err.message ? err.message : err}`;
+    try {
+      const plen = ex && ex.svm_par_last_panic_len ? ex.svm_par_last_panic_len() : 0;
+      if (plen > 0) {
+        const p = Number(ex.svm_par_last_panic_ptr());
+        why += ` | panic: ${new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + plen))}`;
+      }
+    } catch { /* accessor absent or memory unusable — the trap text alone still ships */ }
+    self.postMessage({ kind: 'fail', why });
   }
 };
