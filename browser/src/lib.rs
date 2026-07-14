@@ -527,6 +527,7 @@ fn par_jit_eligible() -> Option<std::sync::Arc<[bool]>> {
 /// interprets). Call on **every** instance (page + each Worker) before building vCPUs, same bytes.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let Ok(m) = svm_encode::decode_module(bytes) else {
@@ -689,6 +690,7 @@ pub extern "C" fn svm_par_jit_set_codegen(on: i32) {
 /// from the same constant. Returns `1` on success, `0` if the unit is outside the emitter subset.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
+    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     let Ok(service_m) = svm_text::parse_module(JIT_SERVICE_I64) else {
         return 0;
     };
@@ -842,6 +844,7 @@ static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 /// `1` on success, `0` if there is no granted module or it is outside the emitter subset.
 #[no_mangle]
 pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
+    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     let Some(cfg) = par_inst() else {
         return 0;
     };
