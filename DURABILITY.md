@@ -395,9 +395,27 @@ the parent then rewinds, reloads its `instantiate` handle, and its re-executed `
 child's total. The seed rides a new `frozen_nested_seed` input on the `_durable_nested` entry. Pinned by
 `durable_nesting_jit.rs::jit_nested_freeze_thaw_round_trips` — freeze→thaw of a §14 child delivers the
 uninterrupted 4950 (**freeze→thaw ≡ uninterrupted**, the correctness proof the freeze-export record
-differential deferred). (4) depth-2 (a grandchild's residue coalescing at the root via a shared sink),
-separate-module, and completed-result parity remain. Powerbox (1) was the gating prerequisite; the
-synchronous model needs no redesign.
+differential deferred). (4) **depth-2 freeze — LANDED (shared sink).** A freeze catching a live child
+*and* grandchild now coalesces **both** `FrozenNested` records at the **root**. The `Nursery` gains a
+`my_task` id (root = 0), a **shared** subtree residue sink (`Arc<Mutex<Vec<FrozenNested>>>`), and a
+**shared** task counter (`Arc<AtomicUsize>`), all threaded down at each `instantiate` — so a grandchild
+recorded by its parent-child's nursery pushes to the *root's* sink (the JIT analog of the interpreter's
+`VCpu::freeze_sink`), and `instantiate` stamps the recorded child's `parent_task` with the recording
+nursery's `my_task` (0 for the root's direct child, the child's id for a grandchild). Pinned by
+`durable_nesting_jit.rs::jit_depth2_freeze_coalesces_grandchild_at_root` (freeze-from-start of a 3-level
+module where both nested levels are instrumented → two records at the root, `parent_task` 0 and 1).
+**Depth-2 thaw — LANDED (round-trip closed).** `compile_child_and_run`'s thaw path, after building the
+child's window + nursery and **before** the child runs, recursively re-attaches **its own** grandchildren
+(residue tagged `parent_task == my_task`) over the *child's* window and publishes each result at its
+slot in the child's nursery — so the rewinding child's re-executed `join(grandchild)` resolves without
+re-running it (parents-before-children, one level down; the grandchild's `carve_off` is child-window-
+relative, so it re-runs over the child's base). The top-level hook re-attaches only the root's direct
+children (`parent_task == 0`); a **shared** counter assigns task ids in DFS re-attach order, reproducing
+the freeze-time ids so each grandchild's `parent_task` resolves to its re-attached parent-child. Pinned
+by `durable_nesting_jit.rs::jit_depth2_freeze_thaw_round_trips` — a 3-level module's freeze→thaw delivers
+the uninterrupted 4950 (**depth-2 freeze→thaw ≡ uninterrupted**). This completes same-module §14
+freeze/thaw parity on the JIT to depth-2; **separate-module** and **completed-result** children remain.
+Powerbox (1) was the gating prerequisite; the synchronous model needed no redesign.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the

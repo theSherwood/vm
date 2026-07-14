@@ -2350,6 +2350,9 @@ impl CompiledModule {
                 cap_ctx,
                 resolve_module,
                 epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
+                0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
             )))
         } else {
             None
@@ -3140,15 +3143,24 @@ impl CompiledModule {
         // re-enters, so its re-executed `join` resolves to each child's (rewound) result. Unlike a
         // `thread.spawn` child (a peer vCPU, above), a §14 child is a nested *domain* re-run over its
         // carve in thaw mode (rewind from the carve's frozen continuation, not a fresh start); the
-        // result is published at the child's join slot for the parent's `join`. Depth-1 (root's direct
-        // children) for now.
+        // result is published at the child's join slot for the parent's `join`. Depth-2: re-attach only
+        // the **root's direct children** (`parent_task == 0`) here — each re-runs in thaw mode, and
+        // `compile_child_and_run` recursively re-attaches *its* grandchildren before it runs. A **shared**
+        // counter assigns task ids in DFS re-attach order, reproducing the freeze-time ids so a
+        // grandchild's `parent_task` resolves to its re-attached parent-child.
         #[cfg(fiber_rt)]
         if (*this).durable && !(*this).frozen_nested_seed.is_empty() {
             let seed = std::mem::take(&mut (*this).frozen_nested_seed);
             if let Some(n) = &(*this)._nursery {
                 let funcs = n.funcs();
                 let epoch = n.epoch_addr();
-                for rec in &seed {
+                let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+                let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new())); // thaw captures none
+                let mut roots: Vec<&FrozenNested> =
+                    seed.iter().filter(|s| s.parent_task == 0).collect();
+                roots.sort_by_key(|s| s.slot);
+                for rec in roots {
+                    let my_task = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let entry = rec.entry as FuncIdx;
                     let nargs = funcs
                         .get(entry as usize)
@@ -3168,6 +3180,10 @@ impl CompiledModule {
                         epoch,
                         true, // durable
                         true, // thaw: rewind from the carve's frozen continuation
+                        my_task,
+                        std::sync::Arc::clone(&sink),
+                        std::sync::Arc::clone(&counter),
+                        &seed, // the full subtree residue — each level re-attaches its own children
                     ) {
                         Ok((result, trap, _)) => n.seed_child_result(rec.slot, result, trap),
                         Err(_) => n.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
@@ -3667,6 +3683,10 @@ pub(crate) unsafe fn compile_child_and_run(
     epoch_addr: usize,
     durable: bool,
     thaw: bool,
+    my_task: usize,
+    nested_sink: std::sync::Arc<std::sync::Mutex<Vec<FrozenNested>>>,
+    task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    nested_seeds: &[FrozenNested],
 ) -> Result<(i64, i64, bool), JitError> {
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
 
@@ -3696,6 +3716,9 @@ pub(crate) unsafe fn compile_child_and_run(
             &*child_win_size as *const u64 as *mut core::ffi::c_void,
             None, // same-module grandchildren only (separate-module is a later slice)
             epoch_addr,
+            my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
+            std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
+            std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
         ));
         n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
         Some(n)
@@ -3775,6 +3798,51 @@ pub(crate) unsafe fn compile_child_and_run(
             w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
             w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
             // ctx-0 SP
+        }
+    }
+
+    // §4 depth-2 thaw: before the child runs, recursively re-attach + rewind **its own** grandchildren
+    // (residue tagged `parent_task == my_task`) over the **child's** window, and publish each result at
+    // its slot in the child's nursery — so when the rewinding child re-executes its `join(grandchild)`
+    // it resolves without re-running the grandchild (parents-before-children, one level down). The
+    // grandchild's `carve_off` is child-window-relative (its `instantiate` resolved the child's own
+    // window to `base 0`), so it re-runs over `child_base`. DFS via the shared `task_counter` reproduces
+    // the freeze-time task ids, so a grandchild's `parent_task` resolves to this re-attached child.
+    if thaw && durable {
+        if let Some(cn) = &child_nursery {
+            let mut gkids: Vec<&FrozenNested> = nested_seeds
+                .iter()
+                .filter(|s| s.parent_task == my_task)
+                .collect();
+            gkids.sort_by_key(|s| s.slot);
+            for rec in gkids {
+                let gc_task = task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let gc_entry = rec.entry as FuncIdx;
+                let gc_nargs = funcs
+                    .get(gc_entry as usize)
+                    .map(|f| f.params.len())
+                    .unwrap_or(0);
+                let gc_args = vec![0i64; gc_nargs];
+                let out = compile_child_and_run(
+                    funcs,
+                    gc_entry,
+                    rec.carve_off,
+                    rec.size_log2,
+                    child_base,
+                    &gc_args,
+                    epoch_addr,
+                    true, // durable
+                    true, // thaw
+                    gc_task,
+                    std::sync::Arc::clone(&nested_sink),
+                    std::sync::Arc::clone(&task_counter),
+                    nested_seeds,
+                );
+                match out {
+                    Ok((r, t, _)) => cn.seed_child_result(rec.slot, r, t),
+                    Err(_) => cn.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
+                }
+            }
         }
     }
 

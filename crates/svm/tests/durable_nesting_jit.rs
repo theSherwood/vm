@@ -10,10 +10,14 @@
 //!   live nested child and captures a `FrozenNested` re-attach record whose geometry matches the
 //!   interpreter's;
 //! * **thaw / round-trip** (`jit_nested_freeze_thaw_round_trips`): a thaw re-attaches + rewinds the
-//!   frozen nested child so freeze→thaw ≡ uninterrupted (delivers 4950) — the correctness proof.
+//!   frozen nested child so freeze→thaw ≡ uninterrupted (delivers 4950) — the correctness proof;
+//! * **depth-2 freeze** (`jit_depth2_freeze_coalesces_grandchild_at_root`): a freeze catching a live
+//!   child *and* grandchild coalesces both `FrozenNested` records at the root via a shared residue sink;
+//! * **depth-2 thaw / round-trip** (`jit_depth2_freeze_thaw_round_trips`): a thaw recursively
+//!   re-attaches the grandchild under its re-attached parent-child, so depth-2 freeze→thaw ≡
+//!   uninterrupted (delivers 4950).
 //!
-//! Depth-2 freeze/thaw (a grandchild's residue coalescing at the root), separate-module durable
-//! children, and `coro_spawn` are follow-ups.
+//! Separate-module durable children and `coro_spawn` are follow-ups.
 
 use core::ffi::c_void;
 use svm_durable::{
@@ -435,6 +439,196 @@ fn jit_nested_freeze_thaw_round_trips() {
     assert!(
         matches!(ot, JitOutcome::Returned(ref s) if s == &[4950]),
         "thaw delivers the uninterrupted total (freeze→thaw ≡ uninterrupted): {ot:?}"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// A durable **depth-2** chain where **both** nested levels are instrumented and unwind under a freeze:
+/// root (func 0) → child (func 1, instrumented — it `instantiate`s the grandchild) → grandchild
+/// (func 2, an instrumented dead-branch loop like `FREEZE_PARENT`'s child). Born `UNWINDING`, the child
+/// executes `instantiate(grandchild)` then spills at its trailing poll, and the grandchild spills at its
+/// first loop-header poll — so a freeze captures **two** live `FrozenNested` records.
+const FREEZE_DEPTH2: &str = "memory 19
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 262144
+  v3 = i64.const 18
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.const 256
+  v2 = i64.const 2
+  v3 = i64.const 131072
+  v4 = i64.const 17
+  v5 = i64.const 0
+  v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
+  return v7
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  br block1(v1, v1)
+block1(v2: i64, v3: i64):
+  v4 = i64.const 100
+  v5 = i64.lt_s v2 v4
+  br_if v5 block2(v2, v3) block3(v3)
+block2(v6: i64, v7: i64):
+  v8 = i64.add v7 v6
+  v9 = i64.const 1
+  v10 = i64.add v6 v9
+  br block1(v10, v8)
+block3(v11: i64):
+  v12 = i32.const 0
+  br_if v12 block4(v11) block5(v11)
+block4(v13: i64):
+  v14 = i32.const 256
+  v15 = cap.call 6 1 (i32) -> (i64) v14 (v14)
+  return v15
+block5(v16: i64):
+  return v16
+}
+";
+
+/// Depth-2 freeze — the shared residue sink: a freeze catching a live **child and grandchild** captures
+/// **both** `FrozenNested` records at the root, tagged `parent_task 0` (the root's direct child) and
+/// `parent_task 1` (the grandchild, recorded by the child's nursery and coalesced at the root via the
+/// shared sink). Without the sink the grandchild's record would be orphaned in the child's nursery and
+/// the root would see only one. (Thaw of a depth-2 subtree is a follow-up.)
+#[test]
+fn jit_depth2_freeze_coalesces_grandchild_at_root() {
+    if !svm_jit::fiber_supported() {
+        return;
+    }
+    let inst = instrument(FREEZE_DEPTH2);
+    let mut hj = Host::new();
+    hj.set_durable(true);
+    let jh = hj.grant_instantiator(0, D2_WINDOW as u64);
+    let mut jwin = init_durable_window(D2_WINDOW);
+    write_state(&mut jwin, STATE_UNWINDING);
+    let (jo, jsnap, _fibers, jnested) = compile_and_run_capture_reserved_with_host_durable_nested(
+        &inst,
+        0,
+        &[jh as i64],
+        &jwin,
+        &[], // init_prots
+        &[], // fiber seed
+        &[], // nested seed (freeze)
+        D2_SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("depth-2 durable freeze compiles");
+    assert_eq!(read_state(&jsnap), STATE_UNWINDING, "artifact frozen");
+    assert_eq!(
+        jnested.len(),
+        2,
+        "both the child and grandchild coalesced at the root: {jo:?}"
+    );
+    // The child: the root's direct child (`parent_task 0`), carve at the root-relative 256 KiB.
+    let child = jnested
+        .iter()
+        .find(|n| n.parent_task == 0)
+        .expect("a root-child record (parent_task 0)");
+    assert_eq!(
+        child.carve_off, 262144,
+        "child carve is root-relative 256 KiB"
+    );
+    assert_eq!(child.entry, 1, "child entry is func 1");
+    // The grandchild: recorded by the child's nursery (`parent_task 1`) — the shared sink coalesced it
+    // at the root rather than orphaning it in the child's nursery.
+    let gchild = jnested
+        .iter()
+        .find(|n| n.parent_task == 1)
+        .expect("a grandchild record (parent_task 1) — coalesced via the shared sink");
+    assert_eq!(gchild.entry, 2, "grandchild entry is func 2");
+}
+
+/// Depth-2 thaw — the round-trip: **freeze → thaw → result** for a live child *and* grandchild delivers
+/// the uninterrupted total (4950). On thaw the root re-attaches its direct child (rewind), and
+/// `compile_child_and_run` recursively re-attaches the grandchild over the *child's* window before the
+/// child runs — so the rewinding child's `join(grandchild)` resolves and the child completes, whose
+/// result the root's `join` in turn resolves.
+#[test]
+fn jit_depth2_freeze_thaw_round_trips() {
+    if !svm_jit::fiber_supported() {
+        return;
+    }
+    let inst = instrument(FREEZE_DEPTH2);
+
+    // (0) Uninterrupted baseline: the whole chain returns 4950 (the grandchild's dead branch is never
+    // taken, so no `CapFault`).
+    let mut h0 = Host::new();
+    h0.set_durable(true);
+    let ih0 = h0.grant_instantiator(0, D2_WINDOW as u64);
+    let (o0, _w0, _f0, _n0) = compile_and_run_capture_reserved_with_host_durable_nested(
+        &inst,
+        0,
+        &[ih0 as i64],
+        &init_durable_window(D2_WINDOW),
+        &[],
+        &[],
+        &[],
+        D2_SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut h0 as *mut Host as *mut c_void,
+    )
+    .expect("uninterrupted compiles");
+    assert!(
+        matches!(o0, JitOutcome::Returned(ref s) if s == &[4950]),
+        "depth-2 uninterrupted total is 4950: {o0:?}"
+    );
+
+    // (1) Freeze-from-start: capture the artifact + the two nested-child records.
+    let mut hf = Host::new();
+    hf.set_durable(true);
+    let ihf = hf.grant_instantiator(0, D2_WINDOW as u64);
+    let mut fwin = init_durable_window(D2_WINDOW);
+    write_state(&mut fwin, STATE_UNWINDING);
+    let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
+        &inst,
+        0,
+        &[ihf as i64],
+        &fwin,
+        &[],
+        &[],
+        &[],
+        D2_SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut hf as *mut Host as *mut c_void,
+    )
+    .expect("freeze compiles");
+    assert_eq!(read_state(&artifact), STATE_UNWINDING, "artifact frozen");
+    assert_eq!(nested.len(), 2, "child + grandchild captured");
+
+    // (2) Thaw with the nested seed: the child rewinds, the grandchild is recursively re-attached under
+    // it, both joins resolve, and the round-trip delivers the uninterrupted total.
+    let mut twin = artifact.clone();
+    begin_thaw(&mut twin, 0);
+    let mut ht = Host::new();
+    ht.set_durable(true);
+    let iht = ht.grant_instantiator(0, D2_WINDOW as u64);
+    let (ot, tsnap, _ft, _nt) = compile_and_run_capture_reserved_with_host_durable_nested(
+        &inst,
+        0,
+        &[iht as i64],
+        &twin,
+        &[],
+        &[],
+        &nested,
+        D2_SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut ht as *mut Host as *mut c_void,
+    )
+    .expect("thaw compiles");
+    assert!(
+        matches!(ot, JitOutcome::Returned(ref s) if s == &[4950]),
+        "depth-2 thaw delivers the uninterrupted total (freeze→thaw ≡ uninterrupted): {ot:?}"
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
