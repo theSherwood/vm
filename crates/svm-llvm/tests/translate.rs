@@ -4049,6 +4049,114 @@ fn demo_sqlite_fs_cap_vs_native() {
 }
 
 #[test]
+fn demo_pg_oscap_vs_native() {
+    // **The guest OS-shim** (slice CA, Postgres runtime gap #11b). Postgres calls the libc syscall
+    // wrappers directly (`open`/`read`/`pread`/`stat`/`fstat`/`opendir`/`readdir`/`mkdir`/…) — in
+    // the whole-program bitcode those are undefined externals. `demos/postgres/os_shim.c` defines
+    // them for a guest build, bridging each to `__vm_cap_resolve("fs")` + `__vm_host_call` (the
+    // fs cap, now with the slice-BZ metadata/directory surface). `os_probe.c` drives a deterministic
+    // file+directory sequence; the guest (over `mem_fs` *and* `host_fs`) must byte-match the native
+    // oracle (real glibc over a real temp dir) — the shim reproduces libc's semantics over the cap.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/os_probe.c");
+    let pid = std::process::id();
+
+    // Guest bitcode: os_probe.c `#include`s os_shim.c under -DSVM_GUEST (single TU, no llvm-link).
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_oscap.bc"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_oscap (clang unavailable)");
+            return;
+        }
+    }
+    // Native oracle: plain cc, real glibc.
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{pid}_pg_oscap"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_oscap (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("svm-pg-oscap-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_oscap bitcode");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = || svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+    };
+
+    // 1. mem_fs: hermetic, byte-identical to the native oracle.
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(),
+            &[("fs", svm_run::fs::mem_fs())],
+        )
+        .expect("guest run (mem_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle.stdout),
+        "pg_oscap: guest (mem_fs) stdout vs native"
+    );
+
+    // 2. host_fs: the same walk over a real temp dir, still byte-identical — and self-cleaning (the
+    //    probe rmdir's `d` and unlinks `t`), so the root is empty afterward: real files, real syscalls.
+    let guest_root = std::env::temp_dir().join(format!("svm-pg-oscap-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(),
+            &[("fs", svm_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle.stdout),
+        "pg_oscap: guest (host_fs) stdout vs native"
+    );
+    assert_eq!(
+        std::fs::read_dir(&guest_root).unwrap().count(),
+        0,
+        "the probe cleans up: the granted root is empty after the run"
+    );
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
