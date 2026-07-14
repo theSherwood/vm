@@ -1739,6 +1739,111 @@ impl Reactor {
     }
 }
 
+/// A persistent single-vCPU reactor driven through the **resumable [`Vcpu`]** — the vehicle the
+/// browser wasm-JIT **tier-up** rides (BROWSER.md § "wasm-JIT tier"). Like [`Reactor`], it keeps the
+/// guest window live across frames (globals, BSS, and the `vm_map`-grown heap, with its address-space
+/// commit state), but each frame runs on a `Vcpu` instead of the one-shot [`run`]: a direct `Call` to
+/// a [`with_jit_eligible`](Vcpu::with_jit_eligible) function surfaces as a [`VcpuEvent::TierUp`] the
+/// caller services (the browser runs the emitted `f{func}` on the raw window; a native driver runs the
+/// callee on the interpreter) instead of interpreting it. With no eligibility set it is a faithful,
+/// interpreter-only substitute for [`Reactor`] — the differential the reactor tests assert.
+///
+/// The window lives in the caller-provided `back` [`Region`] (a `Region::shared` over the host's
+/// linear memory in the browser; a leaked buffer natively), sized to hold the guest's grown heap. The
+/// `Host` is shared (a `Mutex<Host>`) so its capabilities — `display`/`keyboard`/`fs`, stdout —
+/// persist across frames and are serviced inline during each frame's `cap.call`s.
+pub struct VcpuReactor {
+    prog: VcpuProgram,
+    /// The live window, carried across per-frame vCPUs via [`Vcpu::take_mem`]. `None` only for a
+    /// memory-less module.
+    mem: Option<Mem>,
+    /// The tier-up eligibility bitmap (`None` ⇒ everything interprets — the pure-substitute mode).
+    eligible: Option<std::sync::Arc<[bool]>>,
+}
+
+impl VcpuReactor {
+    /// Open over the persistent window `back`: compile `m`, then run `_start` (func 0) once over a
+    /// freshly seeded + data-initialised window to bootstrap the guest, keeping the window live for
+    /// the per-frame [`frame`](VcpuReactor::frame) calls. `cap.call`s in `_start` (e.g. Doom's WAD
+    /// read through `fs`) are serviced inline against `host`. `Err` if `m` is outside the engine's
+    /// subset (`Malformed`) or `_start` traps.
+    pub fn open(
+        m: &Module,
+        back: std::sync::Arc<super::Region>,
+        host: &std::sync::Mutex<Host>,
+        start_args: &[Value],
+    ) -> Result<VcpuReactor, Trap> {
+        let prog = VcpuProgram::compile(m).ok_or(Trap::Malformed)?;
+        let mem;
+        {
+            let mut vcpu = Vcpu::new_root(&prog, 0, start_args, back, &[])?.with_shared_host(host);
+            // `_start` runs to completion in one `run`: `cap.call`s are serviced inline (shared host),
+            // and a reactor is single-vCPU with no tier-up during open — so no spawn/join/wait/JIT/
+            // tier-up event can occur (a `thread.spawn`ing guest is out of scope).
+            match vcpu.run() {
+                VcpuEvent::Done(_) => {}
+                VcpuEvent::Trapped(t) => return Err(t),
+                _ => return Err(Trap::Malformed),
+            }
+            mem = vcpu.take_mem();
+        }
+        Ok(VcpuReactor {
+            prog,
+            mem,
+            eligible: None,
+        })
+    }
+
+    /// Enable wasm-JIT tier-up: a direct `Call` to a function `f` with `eligible[f] == true` surfaces
+    /// as [`VcpuEvent::TierUp`] for the `frame` caller to service. `None` (the default) interprets
+    /// everything — the faithful [`Reactor`] substitute.
+    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> VcpuReactor {
+        self.eligible = Some(eligible);
+        self
+    }
+
+    /// Run `func(args)` on the live window for one frame, servicing host caps inline against `host`.
+    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv)` — return the callee's i64 result
+    /// slots (or an `Err(Trap)` to propagate the emitted region's trap). With no eligibility set,
+    /// `service` is never called. The window persists after the call (reclaimed for the next frame).
+    pub fn frame<F>(
+        &mut self,
+        func: FuncIdx,
+        args: &[Value],
+        host: &std::sync::Mutex<Host>,
+        mut service: F,
+    ) -> Result<Vec<Value>, Trap>
+    where
+        F: FnMut(u32, &[i64]) -> Result<Vec<i64>, Trap>,
+    {
+        let mem = self.mem.take();
+        let result;
+        let reclaimed;
+        {
+            let mut vcpu =
+                Vcpu::with_mem(&self.prog, func, args, mem, Host::new())?.with_shared_host(host);
+            if let Some(e) = &self.eligible {
+                vcpu = vcpu.with_jit_eligible(e.clone());
+            }
+            result = loop {
+                match vcpu.run() {
+                    VcpuEvent::Done(v) => break Ok(v),
+                    VcpuEvent::Trapped(t) => break Err(t),
+                    VcpuEvent::TierUp { func, argv } => match service(func, &argv) {
+                        Ok(vals) => vcpu.deliver_tierup(&vals),
+                        Err(t) => vcpu.deliver_tierup_trap(t),
+                    },
+                    // Single-vCPU reactor: no spawn/join/wait/JIT-install events.
+                    _ => break Err(Trap::Malformed),
+                }
+            };
+            reclaimed = vcpu.take_mem();
+        }
+        self.mem = reclaimed;
+        result
+    }
+}
+
 /// A host-serviced pause point of a [`Vcpu`]. Everything the engine can't do alone on one thread
 /// becomes one of these; the host performs the effect (spawn a Worker, futex-wait, …) and resumes the
 /// vCPU with the result. Mirrors the cooperative `drive`'s `VcpuStop` arms, but handed to an external
@@ -2068,6 +2173,15 @@ impl<'p> Vcpu<'p> {
         self.vt.active.jit_eligible = Some(std::sync::Arc::clone(&eligible));
         self.jit_eligible = Some(eligible);
         self
+    }
+
+    /// Reclaim this vCPU's live guest window after it finishes — the seam a **reactor** uses to keep
+    /// the window (globals, BSS, and the `vm_map`-grown heap, with its address-space commit state)
+    /// alive across per-frame vCPUs: build a vCPU over the persistent [`Mem`] with
+    /// [`with_mem`](Vcpu::with_mem), run one frame to `Done`, then `take_mem` it back for the next
+    /// frame. `None` for a memory-less module (or if already taken).
+    pub(crate) fn take_mem(&mut self) -> Option<Mem> {
+        self.mem.take()
     }
 
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
