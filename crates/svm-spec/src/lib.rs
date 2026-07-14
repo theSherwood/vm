@@ -8,10 +8,13 @@
 //! one of them, not a tautology. Test-tier only: nothing on the runtime path depends
 //! on this crate.
 //!
-//! Slice 1 (SPEC.md implementation plan): the scalar integer core — consts,
-//! `IntBin`/`IntCmp`/`IntUn`/`Eqz`/`Convert`/`Select`, `Cast`, `PtrAdd`/`PtrCast`.
+//! Landed slices (SPEC.md implementation plan): the scalar integer core (slice 1),
+//! scalar floats + conversions (slice 2), the restated opcode byte map (slice 3,
+//! [`OpRow::encoding`]), and the reference verifier (slice 4, [`verify`]).
 
 #![forbid(unsafe_code)]
+
+pub mod verify;
 
 use svm_ir::*;
 
@@ -78,6 +81,14 @@ pub enum Shape {
     Immediate,
 }
 
+/// The wire encoding of an op (SPEC.md suite 3): its primary opcode byte, or the SIMD
+/// escape prefix plus sub-opcode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Enc {
+    Byte(u8),
+    Prefixed(u8, u8),
+}
+
 /// Constructor of a row's op over operand value indices (plus the immediate vector for
 /// `Shape::Immediate` rows).
 pub type BuildFn = Box<dyn Fn(&[ValIdx], &[SpecVal]) -> Inst>;
@@ -95,6 +106,8 @@ pub struct OpRow {
     pub result: ValType,
     pub class: Class,
     pub shape: Shape,
+    /// The op's wire encoding, restated independently of `svm-encode` (suite 3).
+    pub encoding: Enc,
     /// Construct the op over operand value indices (in `operands` order); an
     /// `Immediate` row reads its immediate from the vector instead.
     pub build: BuildFn,
@@ -471,6 +484,171 @@ pub fn itof(op: IToF, x: SpecVal) -> SpecVal {
     }
 }
 
+// --- the byte map, restated (SPEC.md suite 3) -----------------------------------------
+//
+// A second, independent statement of `svm-encode`'s `mod op` opcode map, written as
+// **explicit per-op bytes** — NOT `base + op.index()`. Sharing the encoder's own
+// `index()` would let a sub-enum reorder shift both sides in lockstep, which is
+// exactly the silent format break suite 3 exists to catch. Every match is exhaustive,
+// so a new sub-op forces a conscious byte assignment here.
+
+fn enc_int_bin(ty: IntTy, op: BinOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x20,
+        IntTy::I64 => 0x40,
+    };
+    let off: u8 = match op {
+        BinOp::Add => 0,
+        BinOp::Sub => 1,
+        BinOp::Mul => 2,
+        BinOp::DivS => 3,
+        BinOp::DivU => 4,
+        BinOp::RemS => 5,
+        BinOp::RemU => 6,
+        BinOp::And => 7,
+        BinOp::Or => 8,
+        BinOp::Xor => 9,
+        BinOp::Shl => 10,
+        BinOp::ShrS => 11,
+        BinOp::ShrU => 12,
+        BinOp::Rotl => 13,
+        BinOp::Rotr => 14,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_int_cmp(ty: IntTy, op: CmpOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x31,
+        IntTy::I64 => 0x51,
+    };
+    let off: u8 = match op {
+        CmpOp::Eq => 0,
+        CmpOp::Ne => 1,
+        CmpOp::LtS => 2,
+        CmpOp::LtU => 3,
+        CmpOp::LeS => 4,
+        CmpOp::LeU => 5,
+        CmpOp::GtS => 6,
+        CmpOp::GtU => 7,
+        CmpOp::GeS => 8,
+        CmpOp::GeU => 9,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_int_un(ty: IntTy, op: IntUnOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x14,
+        IntTy::I64 => 0x1A,
+    };
+    let off: u8 = match op {
+        IntUnOp::Clz => 0,
+        IntUnOp::Ctz => 1,
+        IntUnOp::Popcnt => 2,
+        IntUnOp::Extend8S => 3,
+        IntUnOp::Extend16S => 4,
+        IntUnOp::Extend32S => 5,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_convert(op: ConvOp) -> Enc {
+    Enc::Byte(match op {
+        ConvOp::ExtendI32S => 0x60,
+        ConvOp::ExtendI32U => 0x61,
+        ConvOp::WrapI64 => 0x62,
+    })
+}
+
+fn enc_cast(op: CastOp) -> Enc {
+    Enc::Byte(match op {
+        CastOp::Demote => 0xC0,
+        CastOp::Promote => 0xC1,
+        CastOp::ReinterpI32F32 => 0xC2,
+        CastOp::ReinterpF32I32 => 0xC3,
+        CastOp::ReinterpI64F64 => 0xC4,
+        CastOp::ReinterpF64I64 => 0xC5,
+    })
+}
+
+fn enc_fbin(ty: FloatTy, op: FBinOp) -> Enc {
+    let base: u8 = match ty {
+        FloatTy::F32 => 0x90,
+        FloatTy::F64 => 0xA0,
+    };
+    let off: u8 = match op {
+        FBinOp::Add => 0,
+        FBinOp::Sub => 1,
+        FBinOp::Mul => 2,
+        FBinOp::Div => 3,
+        FBinOp::Min => 4,
+        FBinOp::Max => 5,
+        FBinOp::Copysign => 6,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_fun(ty: FloatTy, op: FUnOp) -> Enc {
+    let base: u8 = match ty {
+        FloatTy::F32 => 0x98,
+        FloatTy::F64 => 0xA8,
+    };
+    let off: u8 = match op {
+        FUnOp::Abs => 0,
+        FUnOp::Neg => 1,
+        FUnOp::Sqrt => 2,
+        FUnOp::Ceil => 3,
+        FUnOp::Floor => 4,
+        FUnOp::Trunc => 5,
+        FUnOp::Nearest => 6,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_fcmp(ty: FloatTy, op: FCmpOp) -> Enc {
+    let base: u8 = match ty {
+        FloatTy::F32 => 0xB0,
+        FloatTy::F64 => 0xB8,
+    };
+    let off: u8 = match op {
+        FCmpOp::Eq => 0,
+        FCmpOp::Ne => 1,
+        FCmpOp::Lt => 2,
+        FCmpOp::Le => 3,
+        FCmpOp::Gt => 4,
+        FCmpOp::Ge => 5,
+    };
+    Enc::Byte(base + off)
+}
+
+/// Offset shared by the saturating (`0xD0+`) and trapping (`0xD8+`) families.
+fn ftoi_off(op: FToI) -> u8 {
+    match op {
+        FToI::F32I32S => 0,
+        FToI::F32I32U => 1,
+        FToI::F32I64S => 2,
+        FToI::F32I64U => 3,
+        FToI::F64I32S => 4,
+        FToI::F64I32U => 5,
+        FToI::F64I64S => 6,
+        FToI::F64I64U => 7,
+    }
+}
+
+fn enc_itof(op: IToF) -> Enc {
+    Enc::Byte(match op {
+        IToF::I32F32S => 0xE0,
+        IToF::I32F32U => 0xE1,
+        IToF::I64F32S => 0xE2,
+        IToF::I64F32U => 0xE3,
+        IToF::I32F64S => 0xE4,
+        IToF::I32F64U => 0xE5,
+        IToF::I64F64S => 0xE6,
+        IToF::I64F64U => 0xE7,
+    })
+}
+
 // --- the op table -------------------------------------------------------------------
 
 /// Slice-1 rows: the scalar integer core plus `Cast` and the pointer ops. Later slices
@@ -486,6 +664,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
         result: ValType::I32,
         class: Class::Pure,
         shape: Shape::Immediate,
+        encoding: Enc::Byte(0x10),
         build: Box::new(|_, imm| Inst::ConstI32(as_i32(imm[0]))),
         eval: Box::new(|x| Ok(x[0])),
     });
@@ -495,6 +674,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
         result: ValType::I64,
         class: Class::Pure,
         shape: Shape::Immediate,
+        encoding: Enc::Byte(0x11),
         build: Box::new(|_, imm| Inst::ConstI64(as_i64(imm[0]))),
         eval: Box::new(|x| Ok(x[0])),
     });
@@ -513,6 +693,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
                 result: vt,
                 class,
                 shape: Shape::Operands,
+                encoding: enc_int_bin(ty, op),
                 build: Box::new(move |v, _| Inst::IntBin {
                     ty,
                     op,
@@ -535,6 +716,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
                 result: ValType::I32,
                 class: Class::Pure,
                 shape: Shape::Operands,
+                encoding: enc_int_cmp(ty, op),
                 build: Box::new(move |v, _| Inst::IntCmp {
                     ty,
                     op,
@@ -557,6 +739,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
                 result: vt,
                 class: Class::Pure,
                 shape: Shape::Operands,
+                encoding: enc_int_un(ty, op),
                 build: Box::new(move |v, _| Inst::IntUn { ty, op, a: v[0] }),
                 eval: Box::new(move |x| {
                     Ok(match ty {
@@ -573,6 +756,10 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: ValType::I32,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(match ty {
+                IntTy::I32 => 0x30,
+                IntTy::I64 => 0x50,
+            }),
             build: Box::new(move |v, _| Inst::Eqz { ty, a: v[0] }),
             eval: Box::new(move |x| {
                 let zero = match ty {
@@ -591,6 +778,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: vt,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(0x70),
             build: Box::new(|v, _| Inst::Select {
                 cond: v[0],
                 a: v[1],
@@ -608,6 +796,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: to,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: enc_convert(op),
             build: Box::new(move |v, _| Inst::Convert { op, a: v[0] }),
             eval: Box::new(move |x| {
                 Ok(match op {
@@ -627,6 +816,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: to,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: enc_cast(op),
             build: Box::new(move |v, _| Inst::Cast { op, a: v[0] }),
             eval: Box::new(move |x| Ok(cast(op, x[0]))),
         });
@@ -640,6 +830,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
         result: ValType::I64,
         class: Class::Pure,
         shape: Shape::Operands,
+        encoding: Enc::Byte(0x78),
         build: Box::new(|v, _| Inst::PtrAdd { a: v[0], b: v[1] }),
         eval: Box::new(|x| Ok(SpecVal::I64(as_i64(x[0]).wrapping_add(as_i64(x[1]))))),
     });
@@ -650,6 +841,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: ValType::I64,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(if to_int { 0x77 } else { 0x76 }),
             build: Box::new(move |v, _| Inst::PtrCast { to_int, a: v[0] }),
             eval: Box::new(|x| Ok(x[0])),
         });
@@ -670,6 +862,7 @@ pub fn float_rows() -> Vec<OpRow> {
         result: ValType::F32,
         class: Class::Pure,
         shape: Shape::Immediate,
+        encoding: Enc::Byte(0x12),
         build: Box::new(|_, imm| match imm[0] {
             SpecVal::F32(b) => Inst::ConstF32(b),
             _ => unreachable!("spec row fed a non-f32 immediate"),
@@ -682,6 +875,7 @@ pub fn float_rows() -> Vec<OpRow> {
         result: ValType::F64,
         class: Class::Pure,
         shape: Shape::Immediate,
+        encoding: Enc::Byte(0x13),
         build: Box::new(|_, imm| match imm[0] {
             SpecVal::F64(b) => Inst::ConstF64(b),
             _ => unreachable!("spec row fed a non-f64 immediate"),
@@ -699,6 +893,7 @@ pub fn float_rows() -> Vec<OpRow> {
                 result: vt,
                 class: Class::Pure,
                 shape: Shape::Operands,
+                encoding: enc_fbin(ty, op),
                 build: Box::new(move |v, _| Inst::FBin {
                     ty,
                     op,
@@ -725,6 +920,7 @@ pub fn float_rows() -> Vec<OpRow> {
                 result: vt,
                 class: Class::Pure,
                 shape: Shape::Operands,
+                encoding: enc_fun(ty, op),
                 build: Box::new(move |v, _| Inst::FUn { ty, op, a: v[0] }),
                 eval: Box::new(move |x| {
                     Ok(match ty {
@@ -743,6 +939,7 @@ pub fn float_rows() -> Vec<OpRow> {
             result: vt,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(0x7D),
             build: Box::new(move |v, _| Inst::Fma {
                 ty,
                 a: v[0],
@@ -768,6 +965,7 @@ pub fn float_rows() -> Vec<OpRow> {
                 result: ValType::I32,
                 class: Class::Pure,
                 shape: Shape::Operands,
+                encoding: enc_fcmp(ty, op),
                 build: Box::new(move |v, _| Inst::FCmp {
                     ty,
                     op,
@@ -792,6 +990,7 @@ pub fn float_rows() -> Vec<OpRow> {
             result: vt,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(0x70),
             build: Box::new(|v, _| Inst::Select {
                 cond: v[0],
                 a: v[1],
@@ -809,6 +1008,7 @@ pub fn float_rows() -> Vec<OpRow> {
             result: to.val(),
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(0xD0 + ftoi_off(op)),
             build: Box::new(move |v, _| Inst::FToISat { op, a: v[0] }),
             eval: Box::new(move |x| Ok(trunc_sat(op, x[0]))),
         });
@@ -818,6 +1018,7 @@ pub fn float_rows() -> Vec<OpRow> {
             result: to.val(),
             class: Class::Trapping,
             shape: Shape::Operands,
+            encoding: Enc::Byte(0xD8 + ftoi_off(op)),
             build: Box::new(move |v, _| Inst::FToITrap { op, a: v[0] }),
             eval: Box::new(move |x| trunc_trap(op, x[0])),
         });
@@ -831,6 +1032,7 @@ pub fn float_rows() -> Vec<OpRow> {
             result: to.val(),
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: enc_itof(op),
             build: Box::new(move |v, _| Inst::IToFConv { op, a: v[0] }),
             eval: Box::new(move |x| Ok(itof(op, x[0]))),
         });

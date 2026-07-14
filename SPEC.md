@@ -17,6 +17,16 @@
 > No backend findings this time; the yield is precision — the §3b prose was silent on
 > `min`/`max` NaN/zero semantics, `nearest` tie-breaking, and the trunc trap bounds,
 > which are now pinned executable definitions (prose clarified in place).
+>
+> **Slices 3 + 4 landed** — `spec_encode.rs` pins every row's opcode byte against the
+> spec's independently-restated byte map (explicit per-op bytes, not `base+index()`)
+> plus per-op `decode∘encode` identity; `svm_spec::verify` is the **reference
+> verifier** (an independent full second implementation of the §3b/§3c rules, all 86
+> `Inst` variants), and `spec_verify.rs` holds it in agreement with `svm-verify` over
+> every row module, ~300 generic per-row mutations (wrong operand type / undefined
+> operand, each pinned to its `VerifyError` variant), ~20 directed per-rule rejects,
+> and an `irgen` sweep (300 modules × 6 structural mutations, accept/reject
+> agreement). The verifier's accept direction now has an independent check.
 
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier
@@ -186,13 +196,16 @@ commit). Ordered so every slice delivers a standing suite:
 2. **Floats + conversions** — **done** (see Status). `FBin`/`FUn`/`Fma`/`FCmp`,
    `FToISat`/`FToITrap`/`IToFConv`, reinterpret casts; NaN policy wired. *Exit: the
    trapping and saturating conversion boundary lattices pass on all backends.* ✅
-3. **Encoding conformance.** Suite 3 over all rows so far + the completeness
-   walk over sub-enum `index()` ranges. *Exit: every specced op's byte is
-   pinned; adding an op without a row fails the build.*
-4. **Verifier conformance.** The reference verifier + suite 2 (accept/reject
-   mutation pairs keyed to `VerifyError`) + the accept/reject differential over
-   an `irgen` sweep. *Exit: `svm-verify` and `svm-spec` agree on every module in
-   the corpus; each typing rule has a directed reject test.*
+3. **Encoding conformance** — **done** (see Status). Suite 3 over all rows so far;
+   the completeness walk is the exhaustive per-op encoding matches themselves (a
+   new sub-op is a compile error until it gets a conscious byte assignment).
+   *Exit: every specced op's byte is pinned; adding an op without a row fails the
+   build.* ✅
+4. **Verifier conformance** — **done** (see Status). The reference verifier +
+   suite 2 (accept/reject mutation pairs keyed to `VerifyError`) + the
+   accept/reject differential over an `irgen` sweep. *Exit: `svm-verify` and
+   `svm-spec` agree on every module in the corpus; each typing rule has a
+   directed reject test.* ✅
 5. **Memory ops.** The spec window model + `Load`/`Store`/bulk rows + the OOB
    boundary lattice. *Exit: trap-confinement boundary vectors pass on all three
    backends.*
