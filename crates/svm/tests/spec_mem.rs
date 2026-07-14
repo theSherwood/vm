@@ -10,12 +10,11 @@
 //! address faults rather than aliasing; zero-length bulk ops are no-ops even at wild
 //! pointers; a faulting access mutates nothing.
 //!
-//! Window bytes are compared on **completing** runs. On faulting runs the trap kind is
-//! pinned on all three backends, and the interpreters' windows must additionally match
-//! the model (untouched) — the JIT is exempt from the faulting-window comparison
-//! because a faulting bulk *libcall* may have written a prefix before the fault
-//! (checked against `reserved`, backed only to `mapped` — see D62); whether that
-//! partial write should be pinned is an open SPEC.md question.
+//! Window bytes are compared on every run — completing *and* faulting — on all three
+//! backends: a faulting access mutates nothing (the model, the interpreters, and now
+//! the JIT, whose bulk ops fault up-front via the `probe_span` guard read before the
+//! libcall, ISSUES.md I21). The JIT window is compared over the backed `mapped` prefix
+//! (its reservation is larger, §4).
 
 use svm_interp::{bytecode, run_capture_reserved, Host, Trap, Value};
 use svm_jit::{compile, JitOutcome, TrapKind};
@@ -156,25 +155,10 @@ fn check_vector(
         win_ctx("bytecode", &bmem, model)
     );
 
-    // Cranelift JIT — except the ISSUES.md **I21** carve-out: a *bulk* op whose span
-    // overruns `mapped` but stays inside the reservation reaches the libcall, where
-    // the trap depends on the libcall touching the overrun (lost entirely for
-    // `dst == src`, partial-write-y otherwise). Interp/bytecode above stay fully
-    // pinned on these vectors; the JIT leg is skipped until I21 is fixed.
-    if expected == Err(SpecTrap::MemoryFault) && !row.has_offset {
-        let reserved = 1u64 << svm_ir::DEFAULT_RESERVED_LOG2;
-        let in_reserved = |ptr: SpecVal, len: SpecVal| {
-            let (p, l) = (to_slot(ptr) as u64, to_slot(len) as u64);
-            l == 0 || (l <= reserved && p <= reserved - l)
-        };
-        let reaches_libcall = match row.id.as_str() {
-            "mem.fill" => in_reserved(vector[0], vector[2]),
-            _ => in_reserved(vector[0], vector[2]) && in_reserved(vector[1], vector[2]),
-        };
-        if reaches_libcall {
-            return;
-        }
-    }
+    // Cranelift JIT. Bulk ops that overrun `mapped` inside the reservation now fault
+    // up-front via the `probe_span` guard read (ISSUES.md I21, fixed) — including
+    // `dst == src` and with no partial writes — so the JIT leg is pinned exactly like
+    // the interpreters, no carve-out.
     let slots: Vec<i64> = vector.iter().copied().map(to_slot).collect();
     let (out, jmem) = cm
         .run(&slots, Some(init), None, None)
@@ -185,9 +169,11 @@ fn check_vector(
         (Err(t), JitOutcome::Trapped(k)) if *k == jit_trap(*t) => {}
         _ => panic!("{}", ctx("jit", &out)),
     }
-    // Window pinned on completing runs; see the module comment for the faulting-run
-    // exemption (bulk-libcall partial writes are not yet pinned).
-    if mutates && expected.is_ok() {
+    // Window pinned over the backed `mapped` prefix on BOTH completing and faulting
+    // runs: a store row's completing run must match the model, and a faulting run must
+    // leave the window untouched (the model buffer equals `init` on a trap) — the JIT
+    // now faults bulk ops before any write (I21), so it matches the interpreters here.
+    if mutates {
         assert!(
             jmem[..model.len()] == model[..],
             "{}",

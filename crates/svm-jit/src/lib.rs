@@ -6144,6 +6144,9 @@ fn lower_block(
                 let n = get(&vals, *len)?;
                 let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
                 let sphys = confine_span(b, lower, get(&vals, *src)?, n);
+                // I21: fault an overrun before the libcall (no partial write; catches `dst==src`).
+                probe_span(b, dphys, n);
+                probe_span(b, sphys, n);
                 b.call_memcpy(lower.frontend_config, dphys, sphys, n);
                 continue;
             }
@@ -6151,12 +6154,15 @@ fn lower_block(
                 let n = get(&vals, *len)?;
                 let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
                 let sphys = confine_span(b, lower, get(&vals, *src)?, n);
+                probe_span(b, dphys, n);
+                probe_span(b, sphys, n);
                 b.call_memmove(lower.frontend_config, dphys, sphys, n);
                 continue;
             }
             Inst::MemFill { dst, val, len } => {
                 let n = get(&vals, *len)?;
                 let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
+                probe_span(b, dphys, n);
                 // `call_memset` uextends the fill byte to i32, so hand it the low byte (i8).
                 let v8 = b.ins().ireduce(I8, get(&vals, *val)?);
                 b.call_memset(lower.frontend_config, dphys, v8, n);
@@ -7124,6 +7130,48 @@ fn mask_addr(
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)
+}
+
+/// **Bulk-span backed-extent probe (ISSUES.md I21).** Fault a bulk span that overruns the
+/// currently-*backed* region **before** the libcall runs. [`confine_span`] only bounds the span
+/// against `reserved`, delegating the `[mapped, reserved)` guard hole to the libcall's own accesses
+/// — but that leaks in two ways the interpreter (`Mem::check_prot_span`, which validates every page
+/// up front) does not: (1) libc `memcpy`/`memmove` **short-circuit `dst == src`**, so a self-copy
+/// overrunning `mapped` never faults; (2) the libcall writes a prefix before hitting the guard, so a
+/// faulting run diverges from the interpreter's fault-before-any-write. Both are interp↔JIT
+/// divergences (§3 parity), not escapes (every byte stays in `[0, reserved)`).
+///
+/// The fix is a guarded 1-byte read of the span's **last** byte (`phys + len − 1`, where `phys` is
+/// [`confine_span`]'s confined base). It faults [`TrapKind::MemoryFault`] on the `PROT_NONE` guard
+/// exactly where the interpreter faults — **consulting the live page tables**, so it honors guest
+/// `grow` (unlike the compile-time `Lower::mapped`, which would over-fault a grown window). For the
+/// contiguous backed prefix (the production model + the spec window), last-byte-in-bounds ⟺
+/// whole-span-in-bounds, matching the interpreter's own `last < mapped` fast path. Emitted per span
+/// (`dst` and `src`) before the copy, so no partial write survives. `len == 0` skips the probe
+/// entirely (a branch on `len != 0`), keeping a zero-length op inert even at a wild pointer (D62).
+///
+/// Residual (documented, not silently dropped): a bulk op whose span straddles a guest-created
+/// **interior** hole (`unmap`) or a read-only page mid-span is not caught by a last-byte read probe
+/// — the same boundary the interpreter's contiguous fast path assumes away. Left to a per-page probe
+/// loop if a real workload needs bulk ops over a deliberately-punched window.
+fn probe_span(b: &mut FunctionBuilder, phys: Value, len: Value) {
+    let do_probe = b.create_block();
+    let after = b.create_block();
+    let nonzero = b.ins().icmp_imm(IntCC::NotEqual, len, 0);
+    b.ins().brif(nonzero, do_probe, &[], after, &[]);
+
+    b.switch_to_block(do_probe);
+    b.seal_block(do_probe);
+    let one = b.ins().iconst(I64, 1);
+    let last_off = b.ins().isub(len, one);
+    let last = b.ins().iadd(phys, last_off);
+    // A may-trap load: it faults `MemoryFault` on the guard page if the span overruns the backed
+    // region. The result is unused, but the load is preserved because it can trap (side-effecting).
+    b.ins().load(I8, mem_flags(), last, 0);
+    b.ins().jump(after, &[]);
+
+    b.switch_to_block(after);
+    b.seal_block(after);
 }
 
 /// Confine a **dynamic-length span** `[ptr, ptr+len)` to the reserved domain `[0, reserved)` and

@@ -155,3 +155,84 @@ block0():
 ";
     assert_eq!(run_all(src), Err(()));
 }
+
+// --- ISSUES.md I21 regressions: bulk spans overrunning `mapped` inside the reservation ---
+//
+// `memory 16` backs `mapped = 64 KiB` while the JIT reserves a far larger window, so a span past
+// 64 KiB lands in the `(mapped, reserved]` guard hole. Before the `probe_span` fix the JIT (1) lost
+// the trap on a `dst == src` self-copy (libc short-circuits it) and (2) partial-wrote before the
+// libcall faulted — both interp↔JIT divergences `run_all` panics on. Each case must now agree on a
+// fault across all three engines.
+
+/// I21(1): a `dst == src` self-copy whose span overruns `mapped` must fault (not silently return).
+/// The pre-fix JIT returned here while both interpreters trapped.
+#[test]
+fn self_copy_overrunning_mapped_faults() {
+    let src = "\
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.const 65537
+  mem.copy v0 v0 v1
+  v2 = i64.const 0
+  return v2
+}
+";
+    assert_eq!(run_all(src), Err(()));
+}
+
+/// I21: same, for `mem.move` (also libc-short-circuited on `dst == src`).
+#[test]
+fn self_move_overrunning_mapped_faults() {
+    let src = "\
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.const 65537
+  mem.move v0 v0 v1
+  v2 = i64.const 0
+  return v2
+}
+";
+    assert_eq!(run_all(src), Err(()));
+}
+
+/// I21: a copy whose `src` span starts in-window but overruns `mapped` faults (distinct-pointer
+/// case — guards the read side of the span probe).
+#[test]
+fn copy_src_overrunning_mapped_faults() {
+    let src = "\
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.const 63000
+  v2 = i64.const 4096
+  mem.copy v0 v1 v2
+  v3 = i64.const 0
+  return v3
+}
+";
+    assert_eq!(run_all(src), Err(()));
+}
+
+/// I21: a `mem.fill` overrunning `mapped` (but within the reservation) faults up-front. The pre-fix
+/// JIT faulted only after partial-writing the in-`mapped` prefix.
+#[test]
+fn fill_overrunning_mapped_faults() {
+    let src = "\
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 63000
+  v1 = i32.const 65
+  v2 = i64.const 4096
+  mem.fill v0 v1 v2
+  v3 = i64.const 0
+  return v3
+}
+";
+    assert_eq!(run_all(src), Err(()));
+}
