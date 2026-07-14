@@ -1,0 +1,16 @@
+# Template project for the honest wasm64 (memory64, LP64) lane: the rustbench driver writes the
+# composed workload into src/lib.rs and runs `cargo +nightly build -Z build-std=core,alloc
+# --target wasm64-unknown-unknown --release` (wasm64 is a tier-3 target, so it needs build-std).
+[package]
+name = "rustbench-w64"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+
+[workspace]
