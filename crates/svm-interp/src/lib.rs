@@ -6100,7 +6100,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // only instantiate modules it was given). Resolve the grant here, shift the
                     // remaining args by one, and fold into the shared op logic below; `join`/`resume`
                     // (ops 1/3) serve both kinds unchanged. A forged module handle is a `CapFault`.
-                    let (op, child_mod, askip): (u32, Option<ModArc>, usize) = match *op {
+                    let (op, child_mod, askip, grant): (
+                        u32,
+                        Option<ModArc>,
+                        usize,
+                        Option<(u32, Binding)>,
+                    ) = match *op {
                         mop @ 5..=7 => {
                             // The module handle crosses as an i64 arg (the slot ABI); low 32 bits.
                             let mh =
@@ -6125,9 +6130,27 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 },
                                 Some(g),
                                 1,
+                                None,
                             )
                         }
-                        o => (o, None, 0),
+                        // §14 `instantiate_granted(grant_handle, entry, off, size_log2, quota)`
+                        // (PROCESS.md S2): exactly `instantiate` (op 0), except the first arg is a
+                        // handle to one of the parent's own coordinate-free capabilities (`Stream` /
+                        // `Exit` / `Clock`) that is **re-granted into the child's powerbox**, so a
+                        // child can do I/O instead of being born destitute. The child receives its
+                        // handle as a **third** entry arg (after `Instantiator`, `AddressSpace`); a
+                        // forged / non-copyable handle is a `CapFault`.
+                        8 => {
+                            let gh =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as i32;
+                            let g = {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                hg.resolve_copyable(gh)?
+                            };
+                            (0, None, 1, Some(g))
+                        }
+                        o => (o, None, 0, None),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
                     let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _)| f);
@@ -6147,17 +6170,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let off = argn(1)? as u64;
                             let size_log2 = argn(2)?;
                             let quota = argn(3)?;
-                            // The child entry returns one `i64` and takes either one `i64` (its
-                            // `Instantiator`) or two (its `Instantiator`, its `AddressSpace`) — its
-                            // starter capabilities, both over its own window. A missing/mistyped entry
-                            // is rejected, not run.
-                            let want_as = cfs
-                                .get(entry as usize)
-                                .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
+                            // The child entry returns one `i64` and takes its starter capabilities as
+                            // `i64` args, in order: `Instantiator`, then (if 2+ params) `AddressSpace`,
+                            // then (S2 `instantiate_granted`, 3 params) the re-granted `Stream`/`Exit`/
+                            // `Clock`. A missing/mistyped entry is rejected, not run. When a grant is
+                            // supplied the entry **must** be the 3-arg form (so the child actually
+                            // receives the handle); without one, 1- or 2-arg as before.
+                            let want_as =
+                                cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
                             let ok_entry = cfs.get(entry as usize).is_some_and(|f| {
                                 f.results == [ValType::I64]
-                                    && (f.params == [ValType::I64]
-                                        || f.params == [ValType::I64, ValType::I64])
+                                    && f.params.iter().all(|p| *p == ValType::I64)
+                                    && if grant.is_some() {
+                                        f.params.len() == 3
+                                    } else {
+                                        f.params.len() == 1 || f.params.len() == 2
+                                    }
                             });
                             // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
                             // — a child can only get what the holder sub-allocates (§14/D19). A
@@ -6227,12 +6255,42 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ch.set_durable(durable);
                                 let cinst = ch.grant_instantiator(0, child_size);
                                 let cas = ch.grant_address_space(0, child_size);
+                                // S2: re-grant a parent capability (`Stream`/`Exit`/`Clock`) into the
+                                // child's fresh powerbox. Its handle is guest-visible data the child
+                                // receives as its third entry arg, so grant it before sealing `ch`. For
+                                // a stdout/stderr `Stream`, point the child's sink at the parent's
+                                // shared buffer so the child's output reaches the granting embedder
+                                // (stdio inheritance) rather than the child's discarded host buffer.
+                                let cgrant = grant.map(|(tid, b)| {
+                                    if let Binding::Stream(
+                                        r @ (StreamRole::Out | StreamRole::Err),
+                                    ) = b
+                                    {
+                                        let sink = {
+                                            let mut hg =
+                                                host.lock().unwrap_or_else(|e| e.into_inner());
+                                            if r == StreamRole::Out {
+                                                hg.shared_stdout()
+                                            } else {
+                                                hg.shared_stderr()
+                                            }
+                                        };
+                                        if r == StreamRole::Out {
+                                            ch.out_sink = Some(sink);
+                                        } else {
+                                            ch.err_sink = Some(sink);
+                                        }
+                                    }
+                                    ch.grant(tid, b)
+                                });
                                 let child_host = Arc::new(Mutex::new(ch));
-                                let child_args = if want_as {
-                                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                                } else {
-                                    vec![Value::I64(cinst as i64)]
-                                };
+                                let mut child_args = vec![Value::I64(cinst as i64)];
+                                if want_as {
+                                    child_args.push(Value::I64(cas as i64));
+                                }
+                                if let Some(cg) = cgrant {
+                                    child_args.push(Value::I64(cg as i64));
+                                }
                                 // Quota: the child's fuel, sub-allocated from (and capped by) ours.
                                 let child_fuel = if quota <= 0 {
                                     *fuel
@@ -9471,6 +9529,14 @@ pub struct Host {
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// PROCESS.md S2: optional **shared** stdout/stderr sinks. `None` (default) ⇒ writes go to the
+    /// local `stdout`/`stderr` Vec (the existing public API — untouched for hosts that never share).
+    /// `Some` ⇒ writes go to the shared buffer instead — set on a **child** host whose stdout/stderr
+    /// was re-granted from a parent (`instantiate_granted`), so the child's output reaches the same
+    /// buffer the granting embedder observes (POSIX stdio inheritance). Promoted lazily by
+    /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
+    out_sink: Option<Arc<Mutex<Vec<u8>>>>,
+    err_sink: Option<Arc<Mutex<Vec<u8>>>>,
     /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
     /// so reads are deterministic and strictly increasing.
     pub clock_ns: i64,
@@ -9685,6 +9751,8 @@ impl Host {
             stdin_pos: 0,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            out_sink: None,
+            err_sink: None,
             clock_ns: 0,
             regions: Vec::new(),
             modules: Vec::new(),
@@ -10196,6 +10264,45 @@ impl Host {
     pub fn grant_stream(&mut self, role: StreamRole) -> i32 {
         self.grant(iface::STREAM, Binding::Stream(role))
     }
+
+    /// PROCESS.md S2 — promote `stdout` to a **shared** sink and return a handle to it, so a child
+    /// host can be pointed at the same buffer (stdio inheritance via `instantiate_granted`).
+    /// Idempotent (a second call returns the same sink). After promotion, new writes go to the sink;
+    /// read the effective bytes via [`Host::stdout_bytes`] (`stdout` itself no longer receives them).
+    pub fn shared_stdout(&mut self) -> Arc<Mutex<Vec<u8>>> {
+        if self.out_sink.is_none() {
+            let taken = std::mem::take(&mut self.stdout);
+            self.out_sink = Some(Arc::new(Mutex::new(taken)));
+        }
+        Arc::clone(self.out_sink.as_ref().unwrap())
+    }
+
+    /// S2 — the stderr analogue of [`Host::shared_stdout`].
+    pub fn shared_stderr(&mut self) -> Arc<Mutex<Vec<u8>>> {
+        if self.err_sink.is_none() {
+            let taken = std::mem::take(&mut self.stderr);
+            self.err_sink = Some(Arc::new(Mutex::new(taken)));
+        }
+        Arc::clone(self.err_sink.as_ref().unwrap())
+    }
+
+    /// S2 — the effective stdout: the shared sink's bytes if it was promoted (child stdio shared in),
+    /// else the local `stdout` Vec. Use this instead of reading `stdout` directly when a child may
+    /// have inherited this host's stdout.
+    pub fn stdout_bytes(&self) -> Vec<u8> {
+        match &self.out_sink {
+            Some(s) => s.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            None => self.stdout.clone(),
+        }
+    }
+
+    /// S2 — the stderr analogue of [`Host::stdout_bytes`].
+    pub fn stderr_bytes(&self) -> Vec<u8> {
+        match &self.err_sink {
+            Some(s) => s.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            None => self.stderr.clone(),
+        }
+    }
     pub fn grant_exit(&mut self) -> i32 {
         self.grant(iface::EXIT, Binding::Exit)
     }
@@ -10684,6 +10791,30 @@ impl Host {
             // Compare the generation masked to the bits a handle actually carries (`GEN_BITS`), so a
             // slot recycles cleanly when the full-width counter wraps instead of dying permanently.
             Some(b) if s.type_id == type_id && (s.generation & GEN_MASK) == gen => Ok(b),
+            _ => Err(Trap::CapFault),
+        }
+    }
+
+    /// PROCESS.md S2 — resolve `handle` to its `(type_id, binding)` for **re-granting into a child**
+    /// (`Instantiator.instantiate_granted`), so a §14 child is not born destitute. Only a
+    /// **coordinate-free, self-contained** capability qualifies — one a fresh child `Host` can hold
+    /// as-is: `Stream` (stdio), `Exit`, `Clock`. Refused (`CapFault`), deliberately:
+    /// - **index-carrying** caps (`SharedRegion`/`Module`/`IoRing`/`Blocking`/`HostFn*`) whose index
+    ///   names a slot in *this* Host's side tables — a child needs those installed by their own
+    ///   deep-copy path (e.g. the SharedRegion grant), not a raw binding copy; and
+    /// - **window-coordinate** caps (`AddressSpace`/`Instantiator`, `Memory`) whose `{base,size}` are
+    ///   in the holder's coordinates — the child already gets fresh ones over *its own* window, and
+    ///   copying the parent's would confer authority in the wrong coordinate space.
+    fn resolve_copyable(&self, handle: i32) -> Result<(u32, Binding), Trap> {
+        let h = handle as u32;
+        let slot = (h as usize) & (CAP - 1);
+        let gen = h >> CAP_LOG2;
+        let s = &self.table[slot];
+        match s.entry {
+            Some(b) if (s.generation & GEN_MASK) == gen => match b {
+                Binding::Stream(_) | Binding::Exit | Binding::Clock => Ok((s.type_id, b)),
+                _ => Err(Trap::CapFault),
+            },
             _ => Err(Trap::CapFault),
         }
     }
@@ -11538,23 +11669,33 @@ impl Host {
             }
             1 => {
                 // write(buf, len) -> bytes written (>=0) or -errno; stdin is not writable.
-                let sink = match role {
-                    StreamRole::Out => &mut self.stdout,
-                    StreamRole::Err => &mut self.stderr,
-                    StreamRole::In => return ret(EINVAL),
-                };
+                if role == StreamRole::In {
+                    return ret(EINVAL);
+                }
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
                 let Some(m) = mem else {
                     return ret(EFAULT);
                 };
-                match m.read_bytes(ptr, len) {
-                    Some(bytes) => {
-                        sink.extend_from_slice(&bytes);
-                        ret(len as i64)
-                    }
-                    None => ret(EFAULT),
+                let Some(bytes) = m.read_bytes(ptr, len) else {
+                    return ret(EFAULT);
+                };
+                // S2: a re-granted stdout/stderr routes to a shared sink (so a child's output reaches
+                // the embedder that granted it); otherwise to this host's local buffer.
+                let sink = if role == StreamRole::Out {
+                    &self.out_sink
+                } else {
+                    &self.err_sink
+                };
+                match sink {
+                    Some(s) => s
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&bytes),
+                    None if role == StreamRole::Out => self.stdout.extend_from_slice(&bytes),
+                    None => self.stderr.extend_from_slice(&bytes),
                 }
+                ret(len as i64)
             }
             2 => ret(0), // close: no-op in the MVP (exit reclaims all)
             _ => ret(EINVAL),

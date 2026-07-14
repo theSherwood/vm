@@ -693,9 +693,9 @@ Unchanged in substance from v1, restated against the substrate:
 | S1a | JIT per-carve compile cache | — | **done** (`jit_instantiate_cache.rs`; position-independent, one compile per `(module,entry,size)`) |
 | S1b | Canonical-key futex — key `Backed` pages on `(backing, region_off)` | — | **interp done** (`futex_region_canonical.rs`, negative-checked; `FutexKey::{Anon,Region}` in both schedulers). JIT half lands with S1c (JIT threads share one window today, so no aliasing gap until concurrent §14 children exist) |
 | S1c | OS-thread children on the JIT: `instantiate` spawns the cached child in its **own guarded window** (keeps the trailing guard — in-place would break carve isolation), `join` parks on the completion cell; live channel is a granted `SharedRegion`, not the copied carve | S1b | todo |
-| S2 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
+| S2 | Grant a parent capability into a child's powerbox so it can do I/O ("children born destitute" fix). **First increment done** (interp): `Instantiator.instantiate_granted` (op 8) re-grants a coordinate-free cap (`Stream`/`Exit`/`Clock`) into a §14 child, passed as its 3rd entry arg; stdout/stderr `Stream` grants share the parent's sink (stdio inheritance); non-copyable caps refused (`CapFault`). `instantiate_granted.rs`. Remaining: multi-cap grant list + `cap.self.resolve` names + create-suspended/start split + teardown/refcount + JIT parity | — | **in progress** |
 | S3 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S1 | todo |
-| S4 | fs dir ops; POSIX personality lib: fd table, **host-served** pipe, proc ABI | S2 | todo |
+| S4 | fs dir ops (**done** — landed with the Postgres `initdb` work: `FS_STAT`/`MKDIR`/`RMDIR`/`OPENDIR`/`READDIR`/`CLOSEDIR`); POSIX personality lib: fd table, **host-served** pipe, proc ABI | S2 | fs ops done; personality lib todo |
 | S5 | `Budget` split/read; detached window minter behind a granted authority | S2 | todo |
 | S6 | `cap.self.attest` incl. freeze authority (+ the §14 amendment PR into DESIGN.md) | S5 | todo |
 | S7 | BusyBox port; stage-1/2 demo gates (**endpoint-free**) | S3,S4 | todo |
