@@ -13,7 +13,7 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I3 — Windows CI memory-pressure aborts under `cargo test --workspace` (S3) — **ROOT CAUSE FOUND + FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (pending windows-lane confirmation)
+### I3 — Windows CI memory-pressure aborts under `cargo test --workspace` (S3) — **FIX LANDED & MERGED** (audit PRs, 2026-07-08); **holding** — green on all 6 post-fix nightlies (Jul 9–14), not yet proven eliminated (see Confirmation below)
 
 **Where:** `crates/svm/tests/durable_jit.rs::freeze_thaw_cross_backend_over_generated_modules`
 (the no-nightly cross-backend freeze/thaw driver), via `support/durjit.rs::fuzz_one_xbackend` →
@@ -114,6 +114,16 @@ address-space distance between arenas). Watch whether I15 (`pal::release` fragme
 `jit_diff` thread stack overflows disappear with the pressure gone. Also watch the nightly ASan
 lane: freeing on drop turns any latent stale-pointer use (previously masked by the leak) into a
 reported use-after-free instead of silent luck.
+
+**Confirmation (2026-07-14, follow-up detection).** The fix merged to `main` 2026-07-08 (audit PRs
+#172/#179/#181/#185). The **last observed I3 abort was the Jul 2 nightly** (28575211654): `build ·
+test (windows-latest)` died at `jit_fuzz-…​.exe (exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN)`
+— the canonical signature. Since the fix, the `windows-latest` lane has been **green on all six
+nightlies (Jul 9–14)** and there were **no `windows-latest` re-runs** across the sampled PR/push runs
+(Jul 2–13; the only re-runs in-window were I22 `real-browser`). Consistent with the fix holding — but
+I3 was ~14 % intermittent (15/104 PR runs), and a single nightly/day is weak coverage, so this is
+**"holding, not proven eliminated."** Keep watching before lifting the Windows mitigation caps below;
+downgrade S3→resolved only after a wider clean sample (e.g. a few weeks of PR windows lanes).
 
 ---
 
@@ -658,7 +668,7 @@ fail-closed, never miscompile).
 
 ---
 
-### I16 — libFuzzer `diff` target crashes on 1–4-byte inputs (S2 until triaged) — **TRIAGED: harness-level, not an escape; FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (pending nightly confirmation)
+### I16 — libFuzzer `diff` target crashes on 1–4-byte inputs (S2 until triaged) — **TRIAGED: harness-level, not an escape; FIX LANDED & MERGED (2026-07-08); CONFIRMED** (green on 6 post-fix nightlies Jul 9–14 + deterministic replay)
 
 **Where:** nightly `cargo-fuzz (escape-TCB targets)` job, target `diff`
 (`fuzz/fuzz_targets/diff.rs`).
@@ -700,6 +710,15 @@ value accounting for the (dead) rest of the block. All six recorded inputs are p
 `jit_fuzz.rs::DIFF_REGRESSIONS`, so the stable CI sweep replays them on every PR and the nightly
 stops re-discovering them. Confirm by watching the next few nightly `fuzz(diff)` runs stay green.
 
+**Confirmation (2026-07-14, follow-up detection).** Fix merged to `main` 2026-07-08 (`dd370eb`, audit
+PR #172). The **last `fuzz(diff)` failure was Jul 4** (28701938264, `[0x00,0x71,0x04,0x1C]`) — before
+the fix. Since the merge the `cargo-fuzz (diff)` lane has been **green on all six nightlies
+(Jul 9–14)**. Stronger than fuzzing luck: the root cause (a compile-time rejection of a
+verifier-valid `cap.call` shape) is *fixed*, and all six historical inputs are pinned in
+`DIFF_REGRESSIONS` so the stable per-PR sweep now covers them deterministically. **Treating I16 as
+confirmed resolved** — the S2 escape concern was already retired at triage; the residual JIT/interp
+parity fix now has 6 clean nightlies + deterministic replay behind it.
+
 ---
 
 ### I17 — nightly bench lane red ~every night: cold/wasmtime rows drift past any tolerance (S4) — **FIX LANDED** on `claude/ci-flakiness-audit-fw9023` (cold row now info-only; baseline regen still pending)
@@ -729,6 +748,12 @@ machine-portable signal the baseline header itself calls the tracked one) still 
 pending:** regenerate `baseline.txt` on the designated bench machine so the five MISSING kernels
 (`simd`, `float`, `calli`, `cache`, `irreducible`) get rows — MISSING never gated, but those
 kernels currently have no regression tracking at all.
+
+**Info-only half confirmed (2026-07-14 follow-up detection):** the fix merged 2026-07-08 12:59; the
+Jul 8 nightly ran at 09:30 (before the merge) and still failed on the cold/wasmtime rows, but the
+**Jul 9 nightly (29011551854) was fully green** — the first all-green nightly in the history and
+direct proof the info-only change stopped the cold/wasmtime rows from gating. (Jul 10–14 bench reds
+are the *unrelated* ambiguous-binary break below, not a tolerance failure.)
 
 **Follow-up (2026-07-13 CI-flakiness detection): the bench lane is now red for a *different*,
 deterministic reason — the `--tol` landing above never runs.** Since the Jul 10 nightly the `bench`
