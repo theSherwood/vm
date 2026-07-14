@@ -2046,11 +2046,14 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    `ldexp`/`scalbn` synthesized as `__svm_ldexp` (the musl `scalbn` two-step-scale algorithm,
    bit-exact to libc incl. overflow→±inf and gradual underflow) — test `libc_ldexp_bit_exact` folds a
    grid of `x`×`n` (extremes included) into a checksum, identical to native on all three engines.
-   **Remaining:** `fmod` `pow` `frexp` (float math — `frexp` is exact bit ops; `fmod`/`pow` need
-   careful IEEE-exact synthesis — no `frem` op exists), `localeconv` (a static C-locale struct:
-   `decimal_point="."`), `__errno_location` (a fixed window slot — `strtod` sets `ERANGE`),
-   `time`→stub/`Clock` cap (RNG seed in `lstate` `makeseed`). Already covered: `_setjmp`/`longjmp`,
-   `free`(no-op), `realloc`, `bcmp`→`memcmp`, `strlen`.
+   `fmod`/`frexp` synthesized bit-exact (no `frem` op exists): `__svm_fmod` via musl's exact 64-bit
+   long-division remainder loop, `__svm_frexp` the mantissa∈[0.5,1)/exponent split writing `*exp` —
+   tests `libc_fmod_bit_exact`/`libc_frexp_bit_exact`, all three engines == native.
+   **Remaining:** `pow` (a **deliberate** fail-closed trap stub — bit-exact vs native needs the
+   host-libm decision, §8; a program bringing its own `pow` shadows the stub), `localeconv` (a static
+   C-locale struct: `decimal_point="."`), `__errno_location` (a fixed window slot — `strtod` sets
+   `ERANGE`), `time`→stub/`Clock` cap (RNG seed in `lstate` `makeseed`). Already covered:
+   `_setjmp`/`longjmp`, `free`(no-op), `realloc`, `bcmp`→`memcmp`, `strlen`.
 
    *Varargs bug found via Lua (fixed):* a `(...)` call with **zero** variadic args (Lua's
    `lua_gc(L, what)`) triggered marshaling but `frame_layout` reserved no scratch (0 slots) →
