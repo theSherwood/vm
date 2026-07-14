@@ -1274,15 +1274,13 @@ fn const_eval(
 }
 
 /// The constant byte offset of a **constexpr** `getelementptr` (all indices constant), walking the
-/// pointee type (carried by the base `GlobalReference`) exactly as [`translate_gep`] does for the
-/// instruction form: index 0 strides by the whole pointee, later indices descend array elements /
-/// struct fields.
+/// **source element type** exactly as [`translate_gep`] does for the instruction form: index 0
+/// strides by that type, later indices descend array elements / struct fields. The source element
+/// type is the GEP's own (`getelementptr (<srcty>, ptr @g, …)`), *not* `@g`'s pointee — with opaque
+/// pointers they differ (e.g. `getelementptr (i8, ptr @HEAP, i64 8)` strides by `i8`, giving +8, not
+/// by `@HEAP`'s 32 MiB array type).
 fn const_gep_offset(g: &crate::ll::ast::ConstGetElementPtr, types: &Types) -> Result<i64, Error> {
-    // The pointee type the GEP indexes from — a `GlobalReference` carries it directly.
-    let mut cur = match g.address.as_ref() {
-        Constant::GlobalReference { ty, .. } => ty.clone(),
-        other => return unsup(format!("constexpr GEP base {other:?}")),
-    };
+    let mut cur = g.source_element_type.clone();
     let idx_val = |c: &Constant| -> Result<i64, Error> {
         match c {
             Constant::Int { value, .. } => Ok(*value as i64),
@@ -13245,6 +13243,38 @@ fn lower_int_intrinsic(
         let a = ctx.operand(args[0])?;
         let b = ctx.operand(args[1])?;
         return Ok(Some(ctx.push(Inst::VIntBin { shape, op, a, b })));
+    }
+    // A **2-lane 32-bit** integer vector (`<2 x i32>`, packed into an `i64` — §V) has no 128-bit
+    // `VShape`, so it skipped the lane-wise `VIntBin` path above. Its min/max is still **per-lane**:
+    // letting the packed `i64` fall through to the scalar path below would compare the whole 64-bit
+    // word — a silent miscompile, e.g. `smax(<i32 -1, i32 3>, 0)` keeps the `-1` lane because the
+    // packed word `0x0000_0003_FFFF_FFFF` is positive. Explode to the two lanes, min/max each, repack.
+    // Found via the auto-vectorized `if d > 0 { h += d }` clamp reduction (LLVM emits `smax(d, 0)`).
+    if vec2_lane_ty(args[0].get_type(types).as_ref()) == Some(ValType::I32) {
+        let (cmp, signed) = match base {
+            "llvm.smax" => (CmpOp::GtS, true),
+            "llvm.smin" => (CmpOp::LtS, true),
+            "llvm.umax" => (CmpOp::GtU, false),
+            "llvm.umin" => (CmpOp::LtU, false),
+            other => return unsup(format!("2-lane vector `{other}` (only min/max)")),
+        };
+        let a = vec_explode(ctx, args[0], types, signed)?;
+        let b = vec_explode(ctx, args[1], types, signed)?;
+        let mut lanes = Vec::with_capacity(a.len());
+        for (&la, &lb) in a.iter().zip(&b) {
+            let cond = ctx.push(Inst::IntCmp {
+                ty: IntTy::I32,
+                op: cmp,
+                a: la,
+                b: lb,
+            });
+            lanes.push(ctx.push(Inst::Select {
+                cond,
+                a: la,
+                b: lb,
+            }));
+        }
+        return Ok(Some(ctx.vec_pack(lanes[0], lanes[1], ValType::I32)));
     }
     let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
     // A **narrow** (< i32) operand sits in an i32 container whose high bits are unspecified — e.g. a

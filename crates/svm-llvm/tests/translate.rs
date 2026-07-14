@@ -5102,6 +5102,83 @@ fn vector_bswap_128() {
 }
 
 #[test]
+fn vec2_minmax_per_lane() {
+    // A **2-lane 32-bit** integer min/max (`<2 x i32>`, packed into an `i64` — §V). It has no 128-bit
+    // `VShape`, so it must be scalarized **per lane**: comparing the whole packed `i64` is a silent
+    // miscompile (`smax(<-1, 3>, 0)` keeps the `-1` lane because the packed word `0x3_FFFFFFFF` is
+    // positive). Found via the auto-vectorized `if d > 0 { h += d as i64 }` clamp reduction over an
+    // `i32` slice with negatives (rustbench `bfs`, ISSUES.md I23). Mixed-sign lanes catch the bug:
+    //   smax(<-1, 3>, <0,0>)       = <0, 3>   (per-lane; packed-scalar would keep <-1, 3>)
+    //   umin(<-1, 3>, <5, 5>)      = <5, 3>   (unsigned: min(0xFFFFFFFF,5)=5, min(3,5)=3)
+    // fold s0*1000 + s1*100 + u0*10 + u1 = 0 + 300 + 50 + 3 = 353.
+    let ll = "declare <2 x i32> @llvm.smax.v2i32(<2 x i32>, <2 x i32>)\n\
+        declare <2 x i32> @llvm.umin.v2i32(<2 x i32>, <2 x i32>)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %s = call <2 x i32> @llvm.smax.v2i32(<2 x i32> <i32 -1, i32 3>, <2 x i32> zeroinitializer)\n  \
+        %s0 = extractelement <2 x i32> %s, i32 0\n  \
+        %s1 = extractelement <2 x i32> %s, i32 1\n  \
+        %u = call <2 x i32> @llvm.umin.v2i32(<2 x i32> <i32 -1, i32 3>, <2 x i32> <i32 5, i32 5>)\n  \
+        %u0 = extractelement <2 x i32> %u, i32 0\n  \
+        %u1 = extractelement <2 x i32> %u, i32 1\n  \
+        %a = mul i32 %s0, 1000\n  \
+        %b = mul i32 %s1, 100\n  \
+        %c = mul i32 %u0, 10\n  \
+        %ab = add i32 %a, %b\n  \
+        %cd = add i32 %c, %u1\n  \
+        %r = add i32 %ab, %cd\n  \
+        ret i32 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate vec2-minmax .ll");
+    svm_verify::verify_module(&t.module).expect("verify vec2-minmax");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec2-minmax");
+    assert_eq!(
+        r,
+        vec![Value::I32(353)],
+        "per-lane smax/umin: <0,3>/<5,3> ⇒ 0*1000+3*100+5*10+3 = 353"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 353, "JIT vec2-minmax = 353"),
+        other => panic!("JIT vec2-minmax: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn constexpr_gep_i8_element_stride() {
+    // A **constexpr** `getelementptr (i8, ptr @g, i64 K)` strides by its **source element type** (`i8`
+    // ⇒ K bytes), *not* by `@g`'s pointee type. With opaque pointers the two differ — `@g` here is a
+    // `[8 x i32]`, so a naive evaluator scaling K by `sizeof([8 x i32])` (32) would land 8×/20× out of
+    // bounds (a fault or garbage). Found via a bump-allocator `HEAP` global whose `vec` accesses folded
+    // to `getelementptr (i8, ptr @HEAP, i64 8/16/…)` (rustbench, ISSUES.md I23):
+    //   byte 8  = &g[2] = 102,  byte 20 = &g[5] = 105,  sum = 207.
+    let ll = "@g = internal constant [8 x i32] \
+        [i32 100, i32 101, i32 102, i32 103, i32 104, i32 105, i32 106, i32 107]\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %a = load i32, ptr getelementptr (i8, ptr @g, i64 8)\n  \
+        %b = load i32, ptr getelementptr (i8, ptr @g, i64 20)\n  \
+        %r = add i32 %a, %b\n  \
+        ret i32 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate constexpr-gep .ll");
+    svm_verify::verify_module(&t.module).expect("verify constexpr-gep");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run constexpr-gep");
+    assert_eq!(
+        r,
+        vec![Value::I32(207)],
+        "i8-strided constexpr GEP: g[2]+g[5] = 102+105 = 207"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 207, "JIT constexpr-gep = 207"),
+        other => panic!("JIT constexpr-gep: unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn freeze_of_aggregate() {
     // `freeze` of an **aggregate** value (a small by-value struct held field-wise in `agg` — e.g. the
     // `{i32,i32,i32,i32}` a `cpuid`/multi-result call yields, which blocked Postgres' `pg_popcount_*`

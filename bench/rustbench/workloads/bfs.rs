@@ -1,5 +1,3 @@
-// DISABLED in the driver: svm-jit miscompiles this (returns garbage) — see ISSUES.md I23.
-// Kept as the reproducer + a ready graph-traversal workload; re-enable in WORKLOADS once I23 is fixed.
 // Breadth-first search over a fixed grid graph — traversal, queue, pointer-chasing (the shape of
 // pathfinding/reachability). Runs BFS from a corner `n` times over a fixed pseudo-random-walled grid,
 // summing distances. The `dist`/queue buffers are allocated once and cleared per iteration (the bump

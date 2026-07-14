@@ -1448,9 +1448,10 @@ impl Parser {
         }))
     }
 
-    /// A constant-expression `getelementptr [inbounds] ( <srcty>, ptr <addr>, <ity> <idx>, … )`. The
-    /// source element type is parsed but dropped (`ConstGetElementPtr` doesn't carry it, matching the
-    /// bitcode reader's shim).
+    /// A constant-expression `getelementptr [inbounds] ( <srcty>, ptr <addr>, <ity> <idx>, … )`.
+    /// `<srcty>` is the **source element type** index 0 strides by (opaque pointers) — it is *not*
+    /// necessarily `<addr>`'s pointee, so it must be carried, not dropped (see
+    /// [`ConstGetElementPtr::source_element_type`]).
     fn const_gep(&mut self) -> PResult<Constant> {
         self.pos += 1; // `getelementptr`
         let in_bounds = self.eat_word("inbounds");
@@ -1458,7 +1459,7 @@ impl Parser {
             self.pos += 1;
         }
         self.expect(&Token::LParen)?;
-        let _src = self.type_()?;
+        let source_element_type = self.type_()?;
         self.expect(&Token::Comma)?;
         let addr_ty = self.type_()?;
         let address = self.constant(&addr_ty)?;
@@ -1470,6 +1471,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         Ok(Constant::GetElementPtr(ConstGetElementPtr {
             address,
+            source_element_type,
             indices,
             in_bounds,
         }))

@@ -3,7 +3,7 @@
 Diverse `no_std` Rust workloads (a real program each) run on **svm-jit** vs **Wasmtime-w64** vs
 **native**, timed by the large/small-`n` subtraction (min over reps) — the `confine` methodology, but
 on real programs (hash-table churn, a bytecode interpreter, a batch sort, a recursive-descent parser,
-base64 encode; plus a BFS held back by a bug — see below) instead of confinement micro-kernels.
+base64 encode, a grid BFS) instead of confinement micro-kernels.
 Driver: `bench/src/bin/rustbench.rs`.
 
 **Why Rust.** A `no_std` + `alloc` program has *zero libc surface* (a bump `#[global_allocator]`
@@ -53,10 +53,12 @@ svm-jit lands within ~±20% of Wasmtime-w64 across the five — competitive/pari
 ## Correctness (the harness earns its keep)
 
 Every lane's `run(small)` is cross-checked against svm-jit before timing — a MISCOMPILE aborts. Adding
-these workloads immediately surfaced a real **svm-jit correctness bug** on rustc-emitted bitcode: a
-sixth workload, `workloads/bfs.rs` (grid BFS), returns garbage on svm-jit while native/Wasmtime agree.
-It is filed as **ISSUES.md I23** (with a one-screen reproducer) and held out of the active `WORKLOADS`
-list until fixed — re-enable it then.
+these workloads immediately surfaced two real **svm-llvm translation bugs** on rustc-emitted bitcode
+(opaque-pointer / auto-vectorizer patterns clang didn't happen to emit): `workloads/bfs.rs` (grid BFS)
+faulted, then returned garbage, while native/Wasmtime agreed. Root-caused and fixed — a constexpr-GEP
+stride that ignored the source element type, and a 2-lane (`<2 x i32>`) min/max that compared the
+packed word instead of per lane; see **ISSUES.md I23** (with reproducers). `bfs` is back in the active
+`WORKLOADS` and cross-checks byte-identical to native.
 
 ## Adding a workload
 

@@ -41,9 +41,30 @@ workload (kept in `workloads/bfs.rs`, disabled in the driver's `WORKLOADS` — g
 variant that **returns garbage** (`8160438656660` vs `881260`) instead of trapping. **Distinct from
 I21**: that is a bulk-op span *overrunning* `mapped`; this is a small in-bounds access.
 
-**Not yet root-caused.** Next step: `SVM_JIT_DUMP_CLIF=1` on the reproducer to find the bad
-address/bounds computation (svm-llvm mistranslation vs svm-jit lowering). The five shipping workloads
-avoid the trigger, so `rustbench` runs green; re-enable `bfs` once fixed. **In progress** (2026-07-15).
+**Root cause — two distinct `svm-llvm` *translation* bugs** (not svm-jit codegen: all three backends —
+tree-walker, bytecode, JIT — reproduced identically, so the IR itself was wrong). Both are
+opaque-pointer / auto-vectorizer patterns that clang happened not to emit but rustc does:
+
+1. **Constexpr-GEP stride ignored the source element type** (the *fault*). `const_gep_offset` strode
+   index 0 by the *pointee* type of the base `GlobalReference` instead of the GEP's own source element
+   type. With opaque pointers `getelementptr (i8, ptr @HEAP, i64 8)` strides by `i8` (⇒ +8), but the
+   evaluator scaled 8 by `sizeof(@HEAP)` (the 32 MiB `[33554432 x i8]`) ⇒ a 256 MiB offset, far past
+   the window ⇒ `MemoryFault`. Fix: `ConstGetElementPtr` now carries `source_element_type` (parsed,
+   previously dropped) and `const_gep_offset` strides by it — mirroring the instruction-form
+   `translate_gep`.
+
+2. **2-lane vector min/max compared the packed word, not per lane** (the *garbage*). A `<2 x i32>`
+   packs into a scalar `i64` (lane 0 low). `llvm.smax`/`smin`/`umax`/`umin` on it fell through to the
+   *scalar* i64 min/max path, comparing the whole 64-bit word: `smax(<-1, 3>, 0)` kept the `-1` lane
+   because `0x0000_0003_FFFF_FFFF` is positive, and `zext`ing that lane gave `4294967295` — the source
+   of the huge sums. LLVM produces this from the auto-vectorized `if d > 0 { h += d }` clamp
+   reduction (`smax(d, 0)` over an `i32` slice with negatives). Fix: the intrinsic lowering now
+   scalarizes a 2-lane operand per lane (explode → scalar min/max → repack), like the 128-bit path.
+
+**Resolved (2026-07-16).** Both fixed in `crates/svm-llvm`; regression tests
+`vec2_minmax_per_lane` + `constexpr_gep_i8_element_stride` (hand-`.ll`, interp+JIT) added. The `bfs`
+workload now cross-checks byte-identical to native (`881260`) on all three backends and is **re-enabled**
+in the driver's `WORKLOADS`.
 
 ### I24 — the LLVM on-ramp is pinned to LLVM 18, so it cannot read bitcode from current rustc/clang (LLVM 19–21) (S3) — surfaced building `bench/rustbench` (2026-07-15)
 

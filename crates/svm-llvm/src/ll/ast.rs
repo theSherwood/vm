@@ -483,6 +483,11 @@ pub struct ConstBinaryOp {
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct ConstGetElementPtr {
     pub address: ConstantRef,
+    /// The GEP's explicit **source element type** — the type index 0 strides by (opaque-pointer
+    /// LLVM: `getelementptr (<srcty>, ptr @g, …)`). Distinct from `@g`'s pointee type, which is
+    /// what a naive evaluator would wrongly use (e.g. `getelementptr (i8, ptr @HEAP, i64 8)` strides
+    /// by `i8`, not by `@HEAP`'s 32 MiB array type).
+    pub source_element_type: TypeRef,
     pub indices: Vec<ConstantRef>,
     pub in_bounds: bool,
 }
