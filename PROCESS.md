@@ -263,6 +263,34 @@ the child calls a **spawn endpoint the parent serves**, and the parent creates t
 against its own budget — its consent is that it services the call. Genode's quota-transfer
 model, reached via two primitives we need anyway.
 
+### Faults — the security trap is terminal; the memory fault is a capability event
+
+Two different things surface as "SIGSEGV" and the design splits them:
+
+- **Confinement violations (out-of-window)** — the D38/§4/§5 path (guard page or
+  explicit check → cold trap → detect-and-kill). **Terminal, always**: making this
+  resumable would put feature pressure on the most security-sensitive lowering in the
+  tree, for the benefit of a guest probing its confinement. Post-mortem observation is
+  covered (trap kind + backtrace to the parent — `jit_trap_backtrace`).
+- **In-window memory-management faults (unmapped / protected page)** — already a
+  *resumable event* on both backends: a demand-paged child's fault suspends the fiber
+  with the fault address (`SUSP_FAULT`, interp + `instantiator_rt.rs`), the pager
+  supplies the page, and **resume retries the access**. Retry-on-resume is the trick:
+  precise fault handling with no per-access deoptimization metadata — the tax that
+  makes in-band SIGSEGV handlers expensive in a JIT, and which Cranelift won't sell
+  cheaply.
+
+The substrate generalization: **pager authority over a region is a grantable
+capability** — to the parent (built today), to a sibling service, or to a designated
+fiber of the *same domain* (self-paging: the faulting fiber suspends, the handler fiber
+maps/protects via its own `AddressSpace`, the faulted fiber resumes and retries; the
+handler fiber must not fault on the region it pages — the discipline POSIX handlers
+already need, here enforced by structure). That covers the legitimate SIGSEGV-handler
+uses — lazy mapping, GC write barriers over `PageProt`, guard-page stack growth — in
+capability style. Not offered: a handler that runs *on the faulting context* and mutates
+it (`ucontext` fiddling, `siglongjmp` out of a handler) — the deopt-metadata case stays
+out. Core wasm has no pager events at all; this is a place the design is strictly ahead.
+
 ---
 
 ## 6. `cap.self.attest` — the trust anchor  [PROPOSED — amends one §14 sentence]
@@ -404,8 +432,7 @@ Guest libc + a capability recipe set; the substrate never learns any of it:
   workflows, optional for a coreutils shell.
 - **wait/`$?`/signals**: `join`/`poll` + exit flattening; `kill` for SIGKILL; a reserved
   doorbell word (guest memory + futex) for cooperative `trap` checks between commands —
-  matching how shells actually poll traps. Catchable async signals stay out until a real
-  script demands them.
+  matching how shells actually poll traps. The full delivery ladder is below.
 - **fork**: §7. BusyBox `ash`/`hush` (fork-less NOMMU designs) before Bash.
 
 ### POSIX process-model coverage — an honest census
@@ -433,8 +460,11 @@ What the substrate can recreate, graded. "Faithful" = a program using it cannot 
 | POSIX | caveat |
 |---|---|
 | `fork` proper | clone-of-parked via the fork endpoint: needs a durable-instrumented build (R8 on the critical path), full window copy until CoW, and clones **all** vCPUs (forkall) where POSIX forks only the calling thread — benign in practice, since POSIX itself restricts post-fork threaded code to async-signal-safe calls |
-| shell `trap` (INT/TERM/EXIT) | doorbell word checked at command boundaries — the *same* delivery points Bash itself uses; but compute-bound code is never interrupted short of `kill` |
-| `SIGCHLD` | reap-by-`poll`; no async delivery |
+| shell `trap` (INT/TERM/EXIT) | doorbell word checked at command boundaries — the *same* delivery points Bash itself uses (L0 below); compute-bound code waits on L2 |
+| `SIGCHLD` | reap-by-`poll` (L1/L2 below add async delivery when built) |
+| `EINTR` / signals while blocked | interruptible parks — wake-with-interrupted-status; a small runtime slice (L1 below), not yet built |
+| async handlers (`SIGTERM`, `setitimer`) | safepoint-injected delivery (L2 below): poll-granularity latency, bounded once Phase-4 back-edge polls land (`DURABILITY.md` R6) — the JVM/Go/wasmtime-epoch norm |
+| catching memory faults | in-window unmapped/protected-page faults are **pager events with retry precision** (§5 faults) — *stronger* than wasm, where every trap is terminal; confinement faults stay terminal by design |
 | `getpid`, pid files | personality-local pids; no cross-tree pid meaning |
 | job control (`fg`/`bg`/`kill %1`) | personality bookkeeping over held handles; see the SIGSTOP gap below |
 | `exec` in place | spawn + transfer the pid label + exit — observable only to a peer inspecting window identity |
@@ -444,18 +474,48 @@ What the substrate can recreate, graded. "Faithful" = a program using it cannot 
 
 | POSIX | why |
 |---|---|
-| `SIGSTOP`/`SIGCONT` (Ctrl-Z) | no stop/continue op; freeze can pause a domain but is heavyweight — open O12 |
-| preemptive async signals, `setitimer`, `EINTR` | parked calls are uninterruptible short of kill — hurts daemons far more than shells (wasm shares this) |
-| catching `SIGSEGV` etc. | traps are terminal (wasm shares this) |
+| `SIGSTOP`/`SIGCONT` (Ctrl-Z) | no stop/continue op yet; the L2 safepoint machinery is the natural carrier (stop = park at the next poll) — open O12 |
+| instruction-granularity signal delivery | the one thing never offered: interrupting arbitrary compute between two instructions — the part of POSIX signals POSIX itself fences off behind async-signal-safety |
+| handler mutates the faulting context | `ucontext` fiddling / `siglongjmp` out of a fault handler — needs per-access deopt metadata in the JIT; the §5 retry-on-resume pager model covers the legitimate uses instead |
 | ambient `kill(pid)` / `pkill` / global `ps` | refused on purpose — you kill what you hold; enumeration is §15's own-subtree-only |
 | uids, setuid, permission bits | replaced by capability attenuation; uid-checking programs get stubs |
 | CoW-fork efficiency (the Redis-BGSAVE pattern) | until Phase-4 CoW clone |
 
 Bottom line: for the shell / coreutils / build-tool corpus this is on the order of ~90%
-of the process model *as actually used*, with the misses concentrated in preemptive
-signal delivery (a real limitation, shared with wasm) and ambient authority (refused
-deliberately). Calibration: Cygwin ran Bash for decades on strictly worse primitives —
-fork by re-exec-and-copy over Win32; everything here is cleaner than that.
+of the process model *as actually used*. With the signals ladder below, the true misses
+shrink to instruction-granularity delivery and handler-mutates-context — both things
+managed runtimes universally dropped — plus ambient authority, refused deliberately.
+Calibration: Cygwin ran Bash for decades on strictly worse primitives (fork by
+re-exec-and-copy over Win32); everything here is cleaner than that. On signals and
+faults the design lands *stronger* than wasm, where traps are terminal and there are no
+pager events at all.
+
+### Signals — the delivery ladder
+
+"No preemptive signals" is imprecise. The VM has interruption points that exist for
+other reasons — the §5 kill poll, fuel slices, the durable async-STW redirect, every
+park — and signal delivery is only a question of which action fires at them:
+
+- **L0 — doorbell (guest convention, ships with the shell).** A word the guest checks at
+  its own boundaries. Bash's `trap` is *natively* this model (traps are delivered at
+  command boundaries), so shell semantics are exact, not approximated. Zero VM change.
+- **L1 — interruptible parks (small runtime slice).** A parked call (`join`, endpoint,
+  pipe) wakes with an interrupted status instead of its result; the libc runs pending
+  handlers and re-issues, or returns `EINTR`. Parks are runtime state that already
+  delivers several outcome kinds — this is the signals-while-blocked half of POSIX.
+- **L2 — safepoint-injected handlers (rides existing polls).** At a kill-poll / fuel
+  check, the slow path redirects the fiber into a registered guest handler, then resumes
+  at the poll site — the same interrupt-at-safepoint pattern the §5 kill path and the
+  durable async STW already use, with a non-lethal action. The hot path pays nothing
+  new. Latency = poll granularity, and the bound is exactly `DURABILITY.md` R6 (tight
+  direct-call loops are poll-free until Phase-4 back-edge polls) — signals inherit the
+  kill/freeze latency work for free. This is the JVM-safepoint / Go-preemption /
+  wasmtime-epoch consensus: handlers run only at consistent states, a *saner* contract
+  than POSIX's async-signal-safety minefield, not a weaker one.
+- **Never — instruction-granularity interruption** of arbitrary compute. The residue is
+  the part of POSIX that POSIX itself fences off.
+
+L0 ships with the shell; L1/L2 are parked (S13) until a personality claims a consumer.
 
 ## 10. The validation ladder
 
@@ -511,7 +571,7 @@ Unchanged in substance from v1, restated against the substrate:
 | S10 | **Interposition gate** (stage 2.5): guest-implemented virtualizing-fs personality runs the BusyBox suite unmodified | S9 | todo |
 | S11 | R8 closure (`call_indirect` durable coverage); `clone` of parked domains (full-copy) + fork endpoint with duplicated reply token | S9, durable | todo |
 | S12 | Bash stage-3; suite subset as CI gate | S8,S11 | todo |
-| S13 | CoW clone; detached-subtree freeze; `ModuleLoader`; async endpoints over IoRing; stop/continue op (O12) | S11 | parked |
+| S13 | CoW clone; detached-subtree freeze; `ModuleLoader`; async endpoints over IoRing; signals L1 (interruptible parks) + L2 (safepoint handlers, rides Phase-4 back-edge polls) + stop/continue (O12); pager-authority generalization incl. self-paging | S11 | parked |
 | S14 | Second personality (actor-model sketch) — the design-for-two check, build only when wanted | S9,S5 | parked |
 
 ## 13. Risk register / open questions
@@ -529,8 +589,8 @@ Unchanged in substance from v1, restated against the substrate:
 | O9 | Durable instrumentation overhead on a shell-sized module (`DURABILITY.md` R7) — fork's tax, measured on Bash | §7 | open |
 | O10 | Endpoint × freeze consistent cut: a frozen domain parked on a call whose servicer is *outside* the cut — the pending call is neither host state (D-scope re-supply) nor captured guest state. v1 rule: freeze-boundary calls are **re-issued** on thaw; idempotence is the personality's problem. Validate against reload-not-reissue (R8/R11 machinery) | §4, §11 | open |
 | O11 | `clone` captures all vCPUs (forkall) vs POSIX calling-thread-only fork — benign for shells (POSIX post-fork threaded code is async-signal-safe-only anyway); pin the divergence in the personality doc | §7 | open |
-| O12 | No stop/continue (SIGSTOP / Ctrl-Z): freeze can pause a domain but is heavyweight — is a cheap park-at-next-fuel-check worth an op? | §9 | open |
-| O13 | No EINTR / preemptive signal delivery: parked calls are uninterruptible short of kill — fine for shells, disqualifying for some daemons; scope the POSIX personality's claims accordingly | §9 | open |
+| O12 | No stop/continue (SIGSTOP / Ctrl-Z): the L2 safepoint redirect is the natural carrier (stop = park at the next poll instead of running a handler) — fold into the signals ladder rather than mint a bespoke op? | §9 | open |
+| O13 | Signals L1/L2 are designed, not built: until they land, parked calls are uninterruptible short of kill and compute-bound code sees no delivery — scope the POSIX personality's claims to L0 meanwhile | §9 | open |
 | O14 | Attest's `freeze_authority` field requires freeze authority to be *explicit* — today subtree-freeze authority is implicit in nesting; plumbing needed before the report can be truthful | §6 | open |
 
 ---
