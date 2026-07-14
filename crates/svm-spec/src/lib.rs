@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod simd;
 pub mod verify;
 
 use svm_ir::*;
@@ -27,6 +28,8 @@ pub enum SpecVal {
     I64(i64),
     F32(u32),
     F64(u64),
+    /// 16 little-endian bytes (§17: the shape lives on the op, never the value).
+    V128([u8; 16]),
 }
 
 impl SpecVal {
@@ -36,10 +39,12 @@ impl SpecVal {
             SpecVal::I64(_) => ValType::I64,
             SpecVal::F32(_) => ValType::F32,
             SpecVal::F64(_) => ValType::F64,
+            SpecVal::V128(_) => ValType::V128,
         }
     }
     /// True for a float value whose bit pattern the IR does *not* pin (§3b: NaN bits are
     /// host-defined in default mode) — conformance compares these as "is a NaN", not bits.
+    /// (A `v128`'s float-lane NaNs are handled lane-wise by the SIMD suite instead.)
     pub fn is_unpinned_nan(self) -> bool {
         match self {
             SpecVal::F32(b) => f32::from_bits(b).is_nan(),
@@ -1324,6 +1329,7 @@ fn store_bits(v: SpecVal) -> u64 {
         SpecVal::I64(x) => x as u64,
         SpecVal::F32(b) => b as u64,
         SpecVal::F64(b) => b,
+        SpecVal::V128(_) => unreachable!("scalar stores never take a v128"),
     }
 }
 
