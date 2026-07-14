@@ -4175,6 +4175,46 @@ fn demo_pg_ctype_vs_native() {
 }
 
 #[test]
+fn trap_error_surfaces_guest_output() {
+    // Trap diagnostic (slice CG): a guest writes a marker, then calls an undefined extern — a
+    // `--stub-externs` trap stub (`unreachable`). `run_with_caps` must fold the guest's captured
+    // output into the trap error, so a trapped program names its own failure. This is what let the
+    // Postgres boot report `LOG:  could not find a "postgres" to execute` instead of a blank trap.
+    let src = "#include <unistd.h>\n\
+               extern void svm_no_such_extern(void);\n\
+               int main(void){ write(1, \"BOOT-MARKER\\n\", 11); svm_no_such_extern(); return 0; }";
+    let Some(bc) = compile_to_bc("trap_output", src) else {
+        return;
+    };
+    let opts = svm_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = svm_llvm::translate_bc_path_with_options(&bc, opts).expect("translate");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+    };
+    let err = inst
+        .run_with_caps(svm_run::Backend::Bytecode, &config, &[])
+        .expect_err("the guest must trap on the undefined-extern stub");
+    assert!(err.contains("Unreachable"), "expected a trap: {err}");
+    assert!(
+        err.contains("BOOT-MARKER"),
+        "the trap error must carry the guest's captured output: {err}"
+    );
+}
+
+#[test]
 fn demo_pg_wctype_vs_native() {
     // **The guest wide-ctype shim** (slice CF, gap #11g). `locale_shim.c`'s C/POSIX-locale iswX/towX
     // family is ASCII classification; `wctype_probe.c` prints all twelve classes + case mapping for

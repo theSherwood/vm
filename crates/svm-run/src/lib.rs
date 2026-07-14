@@ -2783,6 +2783,28 @@ fn diff_outcome(
 /// Fold an interpreter result (`TreeWalk`/`Bytecode`) into an [`Outcome`]: a clean return, an
 /// `Exit(code)`, or a trap (detect-and-kill, surfaced as `Err`). The interpreter already returns typed
 /// [`Value`]s, so no result-type table is needed (unlike [`outcome_from_jit`]).
+/// Append the guest's captured `stdout`/`stderr` (each tail-bounded) to a trap error message. A
+/// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
+/// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
+/// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
+fn trap_err_with_output(msg: String, stdout: &[u8], stderr: &[u8]) -> String {
+    const TAIL: usize = 8192; // last N bytes — a runaway guest can produce a lot; the tail is the useful part
+    let tail = |b: &[u8]| -> String {
+        let start = b.len().saturating_sub(TAIL);
+        String::from_utf8_lossy(&b[start..]).into_owned()
+    };
+    let mut out = msg;
+    if !stdout.is_empty() {
+        out.push_str("\n--- guest stdout (tail) ---\n");
+        out.push_str(&tail(stdout));
+    }
+    if !stderr.is_empty() {
+        out.push_str("\n--- guest stderr (tail) ---\n");
+        out.push_str(&tail(stderr));
+    }
+    out
+}
+
 fn outcome_from_interp(r: Result<Vec<Value>, Trap>) -> Result<Outcome, String> {
     match r {
         Ok(v) => Ok(Outcome::Returned(v)),
@@ -3370,7 +3392,7 @@ impl Instance {
             host.register_cap_name(name, handle);
         }
 
-        let outcome = match backend {
+        let folded = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
                 let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
                 let r = run_interp(
@@ -3382,13 +3404,22 @@ impl Instance {
                     init_mem.as_deref(),
                     &mut host,
                 );
-                outcome_from_interp(r)?
+                outcome_from_interp(r)
             }
             Backend::Jit => {
                 let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-                let jit = run_jit(m, &slots, &mut host, &config.limits, init_mem.as_deref())?;
-                outcome_from_jit(&m.funcs[0].results, jit)?
+                match run_jit(m, &slots, &mut host, &config.limits, init_mem.as_deref()) {
+                    Ok(jit) => outcome_from_jit(&m.funcs[0].results, jit),
+                    Err(e) => Err(e),
+                }
             }
+        };
+        // On a trap, the guest's captured output is the single most useful diagnostic (a program that
+        // wrote a progress line / an error message before dying names its own problem) — but the plain
+        // `?` used to drop it with the `Host`. Fold it into the error instead.
+        let outcome = match folded {
+            Ok(o) => o,
+            Err(e) => return Err(trap_err_with_output(e, &host.stdout, &host.stderr)),
         };
         Ok(Run {
             outcome,
