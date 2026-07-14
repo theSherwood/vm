@@ -402,6 +402,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         mem_base as *mut u8,
         &args,
         rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
+        durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
     );
     let (result, trap) = match outcome {
         Ok(rt) => rt,
@@ -501,6 +502,41 @@ unsafe extern "C" fn coro_cap_thunk(
     }
 }
 
+/// A durable §14 child's baked `cap.call` thunk (DURABILITY.md §4, "JIT parity"): its powerbox holds
+/// exactly one capability — an `Instantiator` over the child's **own full window** `[0, child_size)`,
+/// so the child can carve and run a grandchild of its own. `Nursery::resolve` calls this with iface-6
+/// op-0 to read the holder's `[base, size]`; the child is confined to its window by the masking
+/// lowering and can forge no other cap, so any handle resolves to `[0, child_size]` (full authority
+/// over its own window, and nothing beyond). Anything else is an inert `CapFault`, matching the
+/// interpreter's single-binding child powerbox (`grant_instantiator(0, child_size)`).
+///
+/// # Safety
+/// `ctx` points at a live `u64` (the child's window size) for the call; `results`/`trap_out` are the
+/// call-site slot buffers (`Nursery::resolve` / the `cap.call` lowering guarantee them).
+pub(crate) unsafe extern "C" fn child_instantiator_thunk(
+    ctx: *mut core::ffi::c_void,
+    _mem_base: *mut u8,
+    _mem_size: u64,
+    _mem_reserved: u64,
+    type_id: u32,
+    op: u32,
+    _handle: i32,
+    _args: *const i64,
+    _n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    if type_id == svm_ir_iface_instantiator() && op == 0 && n_results >= 2 {
+        let child_size = *(ctx as *const u64);
+        *results = 0; // base, window-relative — the child's own window starts at 0
+        *results.add(1) = child_size as i64; // size
+        *trap_out = 0;
+    } else {
+        *trap_out = TrapKind::CapFault as i64;
+    }
+}
+
 /// `spawn_coroutine(handle, entry, off, size_log2, fuel)` (Instantiator op 2; op 4 sets `demand`) —
 /// compile the child confined to its own `2^size_log2` window and park it as a **suspended native
 /// continuation** (a fiber that has not yet run), to be driven by [`coro_resume`]. Validation matches
@@ -590,6 +626,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         coro_cap_thunk,
         &*shared as *const CoroShared as *mut core::ffi::c_void,
         rt.epoch_addr, // §5: the co-fiber child polls the parent's kill-path cell
+        crate::InstEnv::null(), // a co-fiber child cannot itself nest (its Instantiator → CapFault)
     ) {
         Ok(c) => c,
         Err(_) => {

@@ -292,8 +292,9 @@ the all-or-nothing oracle (D-notes, §18):
    `cap.call` against its empty powerbox → `CapFault`, never reaching an unwind, so it is unreachable
    here, not unsound). Only the `instantiate` guard changed: `durable && mod_mem.is_some()` still fails
    closed (separate-module), everything else runs. The carve-seeding + child powerbox arrive with the
-   freeze slice, where an instrumented child actually reads them. Next: **separate-module** run (the
-   host-supplied-module path, as the interp got in v11).
+   freeze slice, where an instrumented child actually reads them (see **Freeze model** below). Next is
+   the freeze path, gated on the **child powerbox** (below); **separate-module** run (the
+   host-supplied-module path, as the interp got in v11) is an independent follow-up.
 2. **Freeze.** When the parent unwinds, the child runs under `UNWINDING` too (subtree STW — the JIT
    analog of the interp's mid-freeze `instantiate` seeding the child's carve `UNWINDING`) and flattens
    into its carve; the JIT **exports a `FrozenNested`** residue (slot, carve geometry, entry,
@@ -312,6 +313,51 @@ unit. Slice 1 (same-module run) is pinned by `durable_nesting_jit.rs`: a durable
 `instantiate`+`join` returns the nested child's total (4950) on **both** backends — the JIT now runs
 the durable child instead of failing closed. The freeze slice upgrades this to a byte-identical durable
 reserve differential.
+
+**Freeze model (design; the slice-2 crux).** The open worry was the model mismatch: the JIT runs a
+child **synchronously** inside `instantiate` (blocking the parent to completion), while the interpreter
+runs children as **concurrent peer vCPUs** — so *is there a "live child" to freeze at all?* Resolved:
+the durable **unwind is a normal return, not a preemption**. When a freeze flips the child's phase to
+`UNWINDING`, the child's next instrumented back-edge poll spills its continuation into its carve's
+shadow stack and **returns a placeholder up its own call stack** — exactly as a top-level JIT durable
+run does today (`durable_backedge_jit`: a freeze returns a placeholder and the window holds the
+continuation). So the child unwinds *within* `compile_child_and_run` and returns; the synchronous model
+expresses subtree freeze directly (child unwinds first, then the parent), with no concurrent scheduler
+needed. Concretely:
+
+- **Detect unwound-vs-completed.** After the child run, `instantiate` reads the child carve's state
+  word: `NORMAL` ⇒ completed (stash the result for `join`, as slice 1 does); `UNWINDING` ⇒ a **live
+  residue** — the carve holds the unwound continuation, so `instantiate` **exports a `FrozenNested`**
+  (slot, carve geometry, entry, `parent_task`) and signals "unwound" so the parent's own next poll
+  unwinds too — the subtree STW propagates up the synchronous call chain. `instantiate`'s current
+  `(result, trap)` contract gains this third arm.
+- **Powerbox prerequisite.** A child that can be *live* (mid-computation) is instrumented ⇒ it reached
+  a `cap.call` ⇒ it needs a non-empty powerbox (today it gets `empty_cap_thunk` — inert, `CapFault`).
+  Mint an **attenuated child powerbox**: its own `Instantiator` (over its carve, so it can nest
+  grandchildren) + `AddressSpace`, wired exactly as the coroutine child's `coro_cap_thunk`/`CoroShared`
+  already routes a child's single `Yielder` cap — a `cap_thunk` + boxed ctx that routes the child's
+  `cap.call`s to a nested nursery. There is a proven in-tree pattern; this is the one real new
+  mechanism the freeze slice needs.
+- **Carve seeding.** Seed the child carve's ctx-0 control words to the parent's durable phase before
+  the run (the `svm-interp` layout from the slice-1 map: state word `@0`, ctx-0 thaw word `@72`, ctx-0
+  shadow-SP word `@64` = `shadow_frame_base(0)` = 80). Under a freeze the seeded phase is `UNWINDING`,
+  so the child unwinds at its first poll — the JIT analog of the interp's mid-freeze `instantiate`
+  seeding the child's carve `UNWINDING`.
+- **Thaw.** Re-attach from the carve under the JIT's re-entrant nested guard, `REWINDING` from the
+  carve's shadow-SP, grouped by `parent_task` — the `FrozenNested` decode + the interp thaw's two-phase
+  re-attach, on the JIT.
+
+**Staged impl (each differential vs. the interpreter):** (1) **child powerbox — LANDED
+(Instantiator).** A durable JIT child now gets a one-capability powerbox — an `Instantiator` over its
+**own** window (`child_instantiator_thunk`, ctx = the boxed window size) baked as its `InstEnv` (a
+child `Nursery` over its funcs), plus the ctx-0 carve control-word seeding it needs as an instrumented
+guest. `compile_child` gained the `InstEnv` param (was hard-`null`); `compile_child_and_run` builds the
+boxed nursery + seeds. Pinned by `durable_nesting_jit.rs::jit_durable_depth2_grandchild_matches_interp`
+(a same-module root→child→grandchild chain returns 4950 on both backends in `NORMAL`). `AddressSpace`
+and separate-module children are follow-ups. (2) **freeze export** —
+the unwound-vs-completed detection + `FrozenNested`, byte-identical carve to the interp; (3) **thaw**
+re-attach + `REWINDING`; (4) depth-2, separate-module, and completed-result parity. Powerbox (1) is the
+gating prerequisite; the synchronous model needs no redesign.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
