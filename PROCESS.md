@@ -1,6 +1,6 @@
 # Process substrate & OS personalities — processes over domains
 
-> **Status: PROPOSED — design draft v2, nothing built.** Working tracker for a **process
+> **Status: PROPOSED — design draft v2 (red-team findings folded in), nothing built.** Working tracker for a **process
 > abstraction** over the machinery that already exists (§14 nesting, §12 concurrency
 > primitives, §13 shared regions, §7 host-extensible capabilities, `DURABILITY.md`
 > snapshot/clone). v2 supersedes the earlier POSIX-flavored draft on this branch: the
@@ -171,7 +171,7 @@ Notes:
 
 ## 4. `Endpoint` — the one communication primitive  [PROPOSED]
 
-A guest-servicedable capability interface: the general form of the `Yielder`, and the
+A guest-serviceable capability interface: the general form of the `Yielder`, and the
 keystone of self-similarity (requirement 2). Whoever holds the **serve end** implements
 the interface; whoever holds a **client handle** just sees an ordinary capability.
 
@@ -195,8 +195,32 @@ reply(serve_end, caller, result)  -> 0 | -errno            (resume that caller)
   `reply` is inert (generation-checked, like every stale handle). Kill of a *servicer* →
   parked clients fail with an errno (see §3 teardown). No reply forwarding, no call
   timeouts, no priority — deferred until a personality demonstrably needs them.
-- Bulk data rides `SharedRegion`s granted alongside; the endpoint carries scalars
-  (D42 borrow-only discipline unchanged).
+- **Wire discipline — scalars only; the data plane is explicit.** D42's borrow-only
+  `(ptr,len)` args assume the handler is the *host* (validated trampoline into any guest
+  window); a **guest** servicer cannot dereference a detached caller's window at all.
+  Nested parent↔child gets the data plane free (§14 superset); detached/sibling endpoints
+  carry scalars and move bulk data through a `SharedRegion` established at grant time.
+  Runtime copy-in/copy-out is **rejected**: it would reintroduce exactly the lift/lower
+  marshalling tax §1a defines this VM against. Consequence, stated: sibling IPC is the
+  identical *interface*, not the identical *data plane*.
+- **Budget flow: the servicer pays** for servicing fuel (a caller pays only its own call
+  overhead). Named consequence: a client can spend its servicer's fuel by calling in a
+  loop — a *liveness* exposure inside an existing trust relationship, bounded by the
+  caller's own fuel and by personality-level rate limits; never an isolation break.
+  (Fuel donation à la seL4 MCS is deliberately not attempted.)
+- **Rendezvous order is fixed FIFO.** One pinned, non-configurable policy — required for
+  the deterministic oracle to mean anything. ("No policy in the substrate" is precisely:
+  no *configurable* policy.)
+- **Deadlock is unowned in v1.** Call cycles across the grant graph (A→B→C→A) wedge all
+  parties; there are no timeouts (the L4 lesson: timeouts are their own tar pit). The
+  escape hatch is `kill` plus a supervisor reading §15 meters (fuel flatline = wedge).
+  Timeouts, if ever, are personality policy.
+- **Implementation direction — library first (the D56 lesson).** D56 removed the in-VM
+  M:N executor as the project's highest-risk unsafe; cross-domain fiber rendezvous is the
+  same risk class. So the first build is an endpoint **library** over `SharedRegion` +
+  futex (both exist), with runtime support only for handle transfer — falling back to
+  runtime rendezvous only where the library measurably can't reach (cross-domain futex
+  keys — the O2 spike, promoted to first in the tracker).
 
 ---
 
@@ -252,21 +276,38 @@ construction. Add one read-only op:
 
 ```
 cap.self.attest() -> { isolation_tier,                      (§2: 0 / 1 / 3)
-                       window_provenance }                   (which authorities hold
+                       window_provenance,                    (which authorities hold
                                                               map/read/pager rights over
                                                               my backing: platform-only,
                                                               or ancestor-held)
+                       freeze_authority }                    (who may snapshot me —
+                                                              a snapshot IS a read)
 ```
 
 - **Read-only report, no negotiation.** A domain that dislikes the answer exits before
   touching secrets. Fits D46's `cap.self` contract exactly: reflection confers nothing,
   adds no grant-graph edge, and extends the stated "no deniable grants" transparency
   principle from *authority* to *exposure*.
+- **Durability and confidentiality are in direct tension — a per-domain choice.**
+  Transparent freeze means a domain *cannot observe* being snapshotted, and the artifact
+  is a complete read of its window. So "no ancestor can read my memory" is false for any
+  domain an ancestor can freeze — which is every nested durable child today. Hence
+  `freeze_authority` in the report, and the rule: a domain may be **confidential**
+  (freezable by nobody below the platform) or **ancestor-durable**, not both. Pick per
+  domain.
+- **Attest covers computation, not provisioning.** Every capability a domain holds came
+  through its (possibly hostile) creator, so "fetch my secret over my secure channel" is
+  MITM-able regardless of a clean report — the classic TEE lesson. v1 deliberately claims
+  only: *confidentiality of computation over data the domain was created with or
+  derives*. Attested secret provisioning (a platform-terminated channel) would grow the
+  non-interposable surface and is explicitly out of scope until a real consumer forces
+  the argument.
 - **Honest limits, recorded**: attest cannot protect you from your creator having chosen
-  your initial state (nothing can); and per §2, tiers 0/1 are never a Spectre boundary —
-  a domain requiring protection from a *distrusted* host must see `tier 3` in the report
-  or refuse, which is exactly §14's "a tier-3 child requires the host to grant a real
-  process."
+  your initial state or code (nothing can); and per §2, tiers 0/1 are never a Spectre
+  boundary — a domain requiring protection from a *distrusted* host must see `tier 3` in
+  the report or refuse, which is exactly §14's "a tier-3 child requires the host to grant
+  a real process." Timing side channels (scheduling, fuel drip, a granted — hence fakeable
+  — clock) remain the host's.
 - **The friction, named**: §14 currently says *"There is no 'am I nested?' query by
   default."* Attest is deliberately such a query (provenance reveals nesting). Proposed
   amendment: the default stands — no ambient nesting query, and a virtualized capability
@@ -275,8 +316,10 @@ cap.self.attest() -> { isolation_tier,                      (§2: 0 / 1 / 3)
   without a trust anchor. This is a change to settled §14 text and is called out for
   exactly that reason (change settled things only with a reason — this is the reason).
   The carve-out must stay **tiny**: every op added to the non-interposable namespace
-  erodes the self-similarity the rest of the design exists to provide. `attest` and the
-  existing reflection are the whole list.
+  erodes the self-similarity the rest of the design exists to provide. The growth
+  criterion, pinned now so future pressure has a rule to argue against: the namespace
+  admits only **facts the platform mechanically enforces** — never services, never
+  channels. `attest` and the existing reflection are the whole list.
 
 ---
 
@@ -293,16 +336,20 @@ clones a *child*): **every endpoint call is a park at a durable suspension point
 - **POSIX `fork` is personality sugar**: the libc's `fork()` is a call on a spawn/fork
   endpoint the domain's personality-provider serves; the servicer clones the parked
   caller and replies differently to each copy. Fork-returns-twice is a *reply value*,
-  not a substrate concept. The supervisor pattern (shell runs under a tiny init domain)
-  falls out of "someone serves your fork endpoint" — no special architecture.
+  not a substrate concept. Mechanically this needs one endpoint feature beyond §4's v1:
+  `clone` of a caller parked on a pending call **duplicates the pending call** and hands
+  the servicer a second reply token, so it replies once per copy. The supervisor pattern
+  (shell runs under a tiny init domain) falls out of "someone serves your fork endpoint"
+  — no special architecture.
 - **Cost/coverage, honestly**: v1 clone is a full window copy (CoW rides `DURABILITY.md`
   Phase 4, not blocked on). The caller must be durable-instrumented, and the transform
   today treats `call_indirect` to may-suspend targets as out of scope (R8) — Bash
-  dispatches builtins through function-pointer tables, so **R8 closure is fork's real
-  dependency**, tracked as its own slice. Fallback worth keeping alive: **replay-fork** —
-  the cooperative engine is deterministic, so a clone can be produced by re-executing
-  from `create` with recorded inputs up to the park; zero snapshot machinery, O(execution)
-  cost, no instrumentation requirement. Personalities that never fork (most) pay nothing.
+  dispatches builtins through function-pointer tables, so **R8 closure is on fork's
+  critical path**, tracked as its own slice. **Replay-fork** (deterministically re-execute
+  from `create` with recorded inputs up to the park) is kept only as a *niche* option for
+  short-lived deterministic domains — for a long-lived interactive shell it is O(session)
+  with full input recording, so it is **not** a credible R8 escape hatch. Personalities
+  that never fork (most) pay nothing.
 
 ---
 
@@ -335,6 +382,8 @@ Frictions, named rather than hidden:
 | F3 | D19 bundles window+caps+quota in `Instantiator`; substrate factors them | generalization, not contradiction — invariants kept; ops 0–7 remain as the nested recipe |
 | F4 | "protection from hostile hosts" overpromises at tier 0/1 (Spectre, §2) | attest reports tier; distrust still means tier 3 — no new claim |
 | F5 | prime directive vs. abstraction-before-demand | build only what the POSIX personality needs; the factoring is naming/placement, not speculative code |
+| F6 | guest-*served* calls are ≥2 fiber switches — much slower than host cap calls; must not silently contradict §1a's host-call speed pitch | publish an endpoint-RTT budget table (vs host `cap.call` vs Linux syscall) with the first implementation; pass-through — don't virtualize what you don't need — is the §14-priced mitigation |
+| F7 | endpoints re-enter the risk class D56 removed (cross-domain fiber rendezvous, the project's highest-risk unsafe) | library-first implementation over SharedRegion+futex (§4); runtime rendezvous only where the library measurably can't reach |
 
 ---
 
@@ -359,6 +408,55 @@ Guest libc + a capability recipe set; the substrate never learns any of it:
   script demands them.
 - **fork**: §7. BusyBox `ash`/`hush` (fork-less NOMMU designs) before Bash.
 
+### POSIX process-model coverage — an honest census
+
+What the substrate can recreate, graded. "Faithful" = a program using it cannot tell.
+
+**Faithful:**
+
+| POSIX | realization |
+|---|---|
+| `posix_spawn` / the `fork`+`exec` pattern | `create`/`grant`/seed/`start` — covers the large majority of real-world fork sites |
+| `waitpid` (blocking + `WNOHANG`), exit codes | `join`/`poll` + `$?` flattening |
+| `kill(pid, SIGKILL)` | `kill` on a held handle |
+| argv / environ / cwd | proc ABI |
+| pipes, `dup2`, redirection, here-docs | fd table + pipe cap |
+| fd inheritance | explicit grants — i.e. `O_CLOEXEC`-by-default, the modern best practice |
+| rlimits (`CPU`/`AS`/`NPROC`) | fuel / memory / spawn budgets |
+| zombies & reaping | `join`/`detach` with auto-reap — leak-free by construction |
+| `mmap(MAP_SHARED)`, SysV/POSIX shm + semaphores | `SharedRegion` + futex (personality lib) |
+| orphan reparenting to init | supervisor personality |
+| `ptrace` / `strace` | nested-window visibility (`svm-dap` exists) + endpoint interposition of the cap set — *stronger* than POSIX |
+
+**Faithful with caveats:**
+
+| POSIX | caveat |
+|---|---|
+| `fork` proper | clone-of-parked via the fork endpoint: needs a durable-instrumented build (R8 on the critical path), full window copy until CoW, and clones **all** vCPUs (forkall) where POSIX forks only the calling thread — benign in practice, since POSIX itself restricts post-fork threaded code to async-signal-safe calls |
+| shell `trap` (INT/TERM/EXIT) | doorbell word checked at command boundaries — the *same* delivery points Bash itself uses; but compute-bound code is never interrupted short of `kill` |
+| `SIGCHLD` | reap-by-`poll`; no async delivery |
+| `getpid`, pid files | personality-local pids; no cross-tree pid meaning |
+| job control (`fg`/`bg`/`kill %1`) | personality bookkeeping over held handles; see the SIGSTOP gap below |
+| `exec` in place | spawn + transfer the pid label + exit — observable only to a peer inspecting window identity |
+| `select`/`poll`/`epoll` | needs one readiness convention across channel caps (futex word / `IoRing` completions) — design work, feasible |
+
+**Absent (deliberate, or genuinely hard):**
+
+| POSIX | why |
+|---|---|
+| `SIGSTOP`/`SIGCONT` (Ctrl-Z) | no stop/continue op; freeze can pause a domain but is heavyweight — open O12 |
+| preemptive async signals, `setitimer`, `EINTR` | parked calls are uninterruptible short of kill — hurts daemons far more than shells (wasm shares this) |
+| catching `SIGSEGV` etc. | traps are terminal (wasm shares this) |
+| ambient `kill(pid)` / `pkill` / global `ps` | refused on purpose — you kill what you hold; enumeration is §15's own-subtree-only |
+| uids, setuid, permission bits | replaced by capability attenuation; uid-checking programs get stubs |
+| CoW-fork efficiency (the Redis-BGSAVE pattern) | until Phase-4 CoW clone |
+
+Bottom line: for the shell / coreutils / build-tool corpus this is on the order of ~90%
+of the process model *as actually used*, with the misses concentrated in preemptive
+signal delivery (a real limitation, shared with wasm) and ambient authority (refused
+deliberately). Calibration: Cygwin ran Bash for decades on strictly worse primitives —
+fork by re-exec-and-copy over Win32; everything here is cleaner than that.
+
 ## 10. The validation ladder
 
 Unchanged in substance from v1, restated against the substrate:
@@ -368,10 +466,15 @@ Unchanged in substance from v1, restated against the substrate:
   extension) + the existing port model. Proves nothing about this file; unblocks demos.
 - **Stage 1 — spawn/wait/exec**: `Domain` create/grant/start/join/poll/kill + BusyBox
   applets as `Module` grants. Prerequisites: JIT async children + compile cache.
-- **Stage 2 — pipes/IPC**: `Endpoint` v1 + the personality pipe + fd table.
+- **Stage 2 — pipes/IPC**: **host-served** pipe cap + fd table — **no endpoints
+  required** (red-team: the shell must not be hostage to the hardest machinery).
   `ls | grep x > out` byte-identical to native on all three engines.
-- **Stage 3 — fork**: §7 clone (R8 closure or replay-fork). Full Bash: subshells,
-  `$( )`, `&`. The capstone — and the demo wasm needed a spec fork (WASIX) to approximate.
+- **Stage 2.5 — the interposition gate**: the BusyBox suite passes **unmodified** under
+  a *guest-implemented* virtualizing-fs personality (a parent serves the child's `fs`
+  via endpoints). This is the self-similarity thesis made a CI gate — the keystone
+  primitive ships with a real consumer, not just synthetic tests.
+- **Stage 3 — fork**: §7 clone (R8 closure). Full Bash: subshells, `$( )`, `&`. The
+  capstone — the demo wasm needed a spec fork (WASIX) to approximate.
 
 ## 11. Testing
 
@@ -395,19 +498,21 @@ Unchanged in substance from v1, restated against the substrate:
 
 | # | Slice | Depends on | Status |
 |---|---|---|---|
-| S0 | JIT async children (park-only-calling-fiber) + per-carve compile cache | — | todo |
-| S1 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
-| S2 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S0 | todo |
-| S3 | `Endpoint` v1 (mint/serve/reply, sync rendezvous, kill-safe cancel) on all three engines | S0 | todo |
-| S4 | `Budget` split/read; detached window minter behind a granted authority | S1 | todo |
-| S5 | `cap.self.attest` (+ the §14 amendment PR into DESIGN.md) | S4 | todo |
-| S6 | fs dir ops; POSIX personality lib: fd table, pipe (decide via O2), proc ABI | S1,S3 | todo |
-| S7 | BusyBox port; stage-1/2 demo gates | S2,S6 | todo |
-| S8 | Bash stage-0 port (interpreter-only) | fs ops | todo |
-| S9 | `clone` of parked domains (full-copy) + fork endpoint pattern; R8 closure **or** replay-fork spike | S3, durable | todo |
-| S10 | Bash stage-3; suite subset as CI gate | S8,S9 | todo |
-| S11 | CoW clone; detached-subtree freeze; `ModuleLoader`; async endpoints over IoRing | S9 | parked |
-| S12 | Second personality (actor-model sketch) — the design-for-two check, build only when wanted | S3,S4 | parked |
+| S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | todo |
+| S1 | JIT async children (park-only-calling-fiber) + per-carve compile cache | — | todo |
+| S2 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
+| S3 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S1 | todo |
+| S4 | fs dir ops; POSIX personality lib: fd table, **host-served** pipe, proc ABI | S2 | todo |
+| S5 | `Budget` split/read; detached window minter behind a granted authority | S2 | todo |
+| S6 | `cap.self.attest` incl. freeze authority (+ the §14 amendment PR into DESIGN.md) | S5 | todo |
+| S7 | BusyBox port; stage-1/2 demo gates (**endpoint-free**) | S3,S4 | todo |
+| S8 | Bash stage-0 port (interpreter-only; autoconf cross-config, `--noediting`) | fs ops | todo |
+| S9 | `Endpoint` v1 — library over SharedRegion+futex if S0 allows, runtime rendezvous only where it can't reach; kill-safe cancel; FIFO | S0,S3 | todo |
+| S10 | **Interposition gate** (stage 2.5): guest-implemented virtualizing-fs personality runs the BusyBox suite unmodified | S9 | todo |
+| S11 | R8 closure (`call_indirect` durable coverage); `clone` of parked domains (full-copy) + fork endpoint with duplicated reply token | S9, durable | todo |
+| S12 | Bash stage-3; suite subset as CI gate | S8,S11 | todo |
+| S13 | CoW clone; detached-subtree freeze; `ModuleLoader`; async endpoints over IoRing; stop/continue op (O12) | S11 | parked |
+| S14 | Second personality (actor-model sketch) — the design-for-two check, build only when wanted | S9,S5 | parked |
 
 ## 13. Risk register / open questions
 
@@ -422,6 +527,11 @@ Unchanged in substance from v1, restated against the substrate:
 | O7 | Replay-fork viability: input recording cost for a real shell; where the determinism boundary sits (host caps replayed vs re-run) | §7 | open — cheap spike |
 | O8 | Budget resource vector: fuel + mem + spawn now; handle-table slots? endpoint count? Keep the vector short | §5 | open |
 | O9 | Durable instrumentation overhead on a shell-sized module (`DURABILITY.md` R7) — fork's tax, measured on Bash | §7 | open |
+| O10 | Endpoint × freeze consistent cut: a frozen domain parked on a call whose servicer is *outside* the cut — the pending call is neither host state (D-scope re-supply) nor captured guest state. v1 rule: freeze-boundary calls are **re-issued** on thaw; idempotence is the personality's problem. Validate against reload-not-reissue (R8/R11 machinery) | §4, §11 | open |
+| O11 | `clone` captures all vCPUs (forkall) vs POSIX calling-thread-only fork — benign for shells (POSIX post-fork threaded code is async-signal-safe-only anyway); pin the divergence in the personality doc | §7 | open |
+| O12 | No stop/continue (SIGSTOP / Ctrl-Z): freeze can pause a domain but is heavyweight — is a cheap park-at-next-fuel-check worth an op? | §9 | open |
+| O13 | No EINTR / preemptive signal delivery: parked calls are uninterruptible short of kill — fine for shells, disqualifying for some daemons; scope the POSIX personality's claims accordingly | §9 | open |
+| O14 | Attest's `freeze_authority` field requires freeze authority to be *explicit* — today subtree-freeze authority is implicit in nesting; plumbing needed before the report can be truthful | §6 | open |
 
 ---
 
