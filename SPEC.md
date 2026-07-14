@@ -27,6 +27,29 @@
 > operand, each pinned to its `VerifyError` variant), ~20 directed per-rule rejects,
 > and an `irgen` sweep (300 modules × 6 structural mutations, accept/reject
 > agreement). The verifier's accept direction now has an independent check.
+>
+> **Slice 5 landed** — the spec **window model** (trap-confinement restated from the
+> `svm-mask` contract: whole span in `[0, mapped)` computed without wraparound — a
+> wrapping effective address faults, never aliases; zero-length bulk ops inert at wild
+> pointers; a faulting access mutates nothing) + 26 memory rows (14 loads, 9 stores,
+> the 3 bulk ops) with window-boundary vector lattices, run on all three backends with
+> **model-computed final-window comparison** (`spec_mem.rs`) — plus their encoding
+> pins and per-row verifier rejects (no-window / i32-address / undefined-operand).
+> **Finding: ISSUES.md I21** — the JIT's D62 bulk lowering bounds its span check
+> against `reserved` and relies on the libcall touching the guard for the
+> `(mapped, reserved]` part, so (1) `mem.copy`/`mem.move` with `dst == src` and an
+> oversized span **lose the trap entirely** (libc short-circuits the self-copy) —
+> both interpreters trap — and (2) faulting bulk ops leave partial writes where the
+> interpreter faults before any write. Not an escape (everything stays inside the
+> reservation), but a §3 parity break. The suite pins interp + bytecode fully and
+> skips only the JIT leg of the guard-hole trap vectors (grep I21) until the fix —
+> which touches the confinement hinge and needs a reviewed design decision.
+> A second, smaller precision catch (macOS CI): the `mapped` boundary is
+> **host-page-granular** — a 4 KiB window on a 16 KiB-page host (macOS ARM) is backed
+> by one whole page, so accesses just past `mapped` succeed there. The byte-exact
+> boundary the model pins therefore holds only at page-aligned window sizes; the spec
+> window is 64 KiB (the same choice `irgen` already made for the same reason), and
+> the constraint is now recorded on `MEM_LOG2` as part of the executable definition.
 
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier
@@ -206,9 +229,10 @@ commit). Ordered so every slice delivers a standing suite:
    accept/reject differential over an `irgen` sweep. *Exit: `svm-verify` and
    `svm-spec` agree on every module in the corpus; each typing rule has a
    directed reject test.* ✅
-5. **Memory ops.** The spec window model + `Load`/`Store`/bulk rows + the OOB
-   boundary lattice. *Exit: trap-confinement boundary vectors pass on all three
-   backends.*
+5. **Memory ops** — **done** (see Status; one open carve-out). The spec window
+   model + `Load`/`Store`/bulk rows + the OOB boundary lattice. *Exit:
+   trap-confinement boundary vectors pass on all three backends.* ✅ (JIT leg of
+   the bulk guard-hole trap vectors excepted — ISSUES.md I21.)
 6. **SIMD.** The `v128` families (lane typing already total, §17/D58); `eval`
    per lane op is mechanical. *Exit: parity with slices 1–2 for vector ops.*
 7. **Coverage closure.** Typing + encoding rows for the remaining control /

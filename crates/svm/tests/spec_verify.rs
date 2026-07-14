@@ -19,7 +19,7 @@ mod irgen;
 use irgen::Gen;
 use svm::verify::{verify_module, VerifyError};
 use svm_ir::*;
-use svm_spec::{all_rows, module_for, vectors_for, Shape};
+use svm_spec::{all_rows, mem_rows, module_for, module_for_mem, vectors_for, Shape};
 
 /// Assert both verifiers reject `m`, the production one matching `pat`.
 #[track_caller]
@@ -74,6 +74,30 @@ fn spec_row_modules_verify_under_both() {
             }
         };
         accept(&m, &row.id);
+    }
+    for row in mem_rows() {
+        let m = module_for_mem(&row, 0);
+        accept(&m, &row.id);
+
+        // Per-row directed rejects: every memory op needs a declared window, an `i64`
+        // address, and defined operands.
+        let mut no_mem = m.clone();
+        no_mem.memory = None;
+        reject(&no_mem, &format!("{} without memory", row.id), |e| {
+            matches!(e, VerifyError::MemoryNotDeclared { .. })
+        });
+        let mut wrong_addr = m.clone();
+        wrong_addr.funcs[0].params[0] = ValType::I32;
+        wrong_addr.funcs[0].blocks[0].params[0] = ValType::I32;
+        reject(&wrong_addr, &format!("{} i32 address", row.id), |e| {
+            matches!(e, VerifyError::TypeMismatch { .. })
+        });
+        let mut oob = m.clone();
+        let idx: Vec<ValIdx> = row.operands.iter().map(|_| 100).collect();
+        oob.funcs[0].blocks[0].insts[0] = (row.build)(&idx, 0);
+        reject(&oob, &format!("{} undefined operand", row.id), |e| {
+            matches!(e, VerifyError::ValueOutOfRange { .. })
+        });
     }
 }
 

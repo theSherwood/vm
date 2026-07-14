@@ -40,6 +40,7 @@ fn interp_trap(t: SpecTrap) -> Trap {
         SpecTrap::DivByZero => Trap::DivByZero,
         SpecTrap::IntOverflow => Trap::IntOverflow,
         SpecTrap::BadConversion => Trap::BadConversion,
+        SpecTrap::MemoryFault => Trap::MemoryFault,
     }
 }
 
@@ -48,6 +49,7 @@ fn jit_trap(t: SpecTrap) -> TrapKind {
         SpecTrap::DivByZero => TrapKind::DivByZero,
         SpecTrap::IntOverflow => TrapKind::IntOverflow,
         SpecTrap::BadConversion => TrapKind::BadConversion,
+        SpecTrap::MemoryFault => TrapKind::MemoryFault,
     }
 }
 

@@ -11,8 +11,52 @@
 //! up to the instruction's first byte — the first divergent byte IS the opcode.
 
 use svm::encode::{decode_module, encode_module};
-use svm_ir::Inst;
-use svm_spec::{all_rows, module_for, vectors_for, Enc, Shape};
+use svm_ir::{Inst, Module};
+use svm_spec::{all_rows, mem_rows, module_for, module_for_mem, vectors_for, Enc, Shape};
+
+/// Round-trip `m` and pin its single instruction's opcode byte to `encoding`.
+#[track_caller]
+fn check(id: &str, encoding: Enc, m: &Module) {
+    // (1) Round-trip identity.
+    let bytes = encode_module(m);
+    let back = decode_module(&bytes).unwrap_or_else(|e| panic!("decode failed for {id}: {e:?}"));
+    assert_eq!(back, *m, "decode∘encode changed the IR for {id}");
+
+    // (2) Opcode pin by first divergence against a const baseline (a different const
+    // for the const rows themselves).
+    let mut base = m.clone();
+    base.funcs[0].blocks[0].insts[0] = if encoding == Enc::Byte(0x10) {
+        Inst::ConstI64(0)
+    } else {
+        Inst::ConstI32(0)
+    };
+    let base_bytes = encode_module(&base);
+    let i = bytes
+        .iter()
+        .zip(&base_bytes)
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| panic!("no divergence vs const baseline for {id}"));
+    match encoding {
+        Enc::Byte(b) => assert_eq!(
+            bytes[i], b,
+            "opcode byte for {id}: spec says {b:#04x}, encoder wrote {:#04x}",
+            bytes[i]
+        ),
+        Enc::Prefixed(p, s) => {
+            assert_eq!(
+                bytes[i], p,
+                "escape prefix for {id}: spec says {p:#04x}, encoder wrote {:#04x}",
+                bytes[i]
+            );
+            assert_eq!(
+                bytes[i + 1],
+                s,
+                "sub-opcode for {id}: spec says {s:#04x}, encoder wrote {:#04x}",
+                bytes[i + 1]
+            );
+        }
+    }
+}
 
 #[test]
 fn spec_encoding_conformance() {
@@ -27,46 +71,15 @@ fn spec_encoding_conformance() {
                 module_for(&row, &sample)
             }
         };
-
-        // (1) Round-trip identity.
-        let bytes = encode_module(&m);
-        let back =
-            decode_module(&bytes).unwrap_or_else(|e| panic!("decode failed for {}: {e:?}", row.id));
-        assert_eq!(back, m, "decode∘encode changed the IR for {}", row.id);
-
-        // (2) Opcode pin by first divergence against a const baseline (a different
-        // const for the const rows themselves).
-        let mut base = m.clone();
-        base.funcs[0].blocks[0].insts[0] = if row.encoding == Enc::Byte(0x10) {
-            Inst::ConstI64(0)
-        } else {
-            Inst::ConstI32(0)
-        };
-        let base_bytes = encode_module(&base);
-        let i = bytes
-            .iter()
-            .zip(&base_bytes)
-            .position(|(a, b)| a != b)
-            .unwrap_or_else(|| panic!("no divergence vs const baseline for {}", row.id));
-        match row.encoding {
-            Enc::Byte(b) => assert_eq!(
-                bytes[i], b,
-                "opcode byte for {}: spec says {b:#04x}, encoder wrote {:#04x}",
-                row.id, bytes[i]
-            ),
-            Enc::Prefixed(p, s) => {
-                assert_eq!(
-                    bytes[i], p,
-                    "escape prefix for {}: spec says {p:#04x}, encoder wrote {:#04x}",
-                    row.id, bytes[i]
-                );
-                assert_eq!(
-                    bytes[i + 1],
-                    s,
-                    "sub-opcode for {}: spec says {s:#04x}, encoder wrote {:#04x}",
-                    row.id,
-                    bytes[i + 1]
-                );
+        check(&row.id, row.encoding, &m);
+    }
+    // Memory rows, at a couple of immediate offsets (the offset is a uleb payload
+    // after the opcode byte, so the pin is offset-independent — checked at both).
+    for row in mem_rows() {
+        for offset in [0u64, 0x123] {
+            check(&row.id, row.encoding, &module_for_mem(&row, offset));
+            if !row.has_offset {
+                break;
             }
         }
     }
