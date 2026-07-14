@@ -6109,11 +6109,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // only instantiate modules it was given). Resolve the grant here, shift the
                     // remaining args by one, and fold into the shared op logic below; `join`/`resume`
                     // (ops 1/3) serve both kinds unchanged. A forged module handle is a `CapFault`.
-                    let (op, child_mod, askip, grant): (
+                    #[allow(clippy::type_complexity)]
+                    let (op, child_mod, askip, grant, named): (
                         u32,
                         Option<ModArc>,
                         usize,
                         Option<(u32, Binding)>,
+                        Vec<(String, u32, Binding)>,
                     ) = match *op {
                         mop @ 5..=7 => {
                             // The module handle crosses as an i64 arg (the slot ABI); low 32 bits.
@@ -6140,6 +6142,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 Some(g),
                                 1,
                                 None,
+                                Vec::new(),
                             )
                         }
                         // §14 `instantiate_granted(grant_handle, entry, off, size_log2, quota)`
@@ -6157,9 +6160,45 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 hg.resolve_copyable(gh)?
                             };
-                            (0, None, 1, Some(g))
+                            (0, None, 1, Some(g), Vec::new())
                         }
-                        o => (o, None, 0, None),
+                        // §14 `instantiate_named(grants_ptr, grants_n, entry, off, size_log2, quota)`
+                        // (PROCESS.md S2): `instantiate` (op 0) plus a **grant list** — `grants_n`
+                        // 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
+                        // window-relative `grants_ptr`. Each record's `handle` (one of the parent's own
+                        // coordinate-free caps) is re-granted into the child's powerbox **under its
+                        // name**, so the child discovers it by `cap.self.resolve(name)` — the general
+                        // multi-cap, name-based form of op 8 (no fixed arg-slot coupling). A forged /
+                        // non-copyable handle, an out-of-window record/name, or non-UTF-8 name fails the
+                        // whole spawn closed (`CapFault` / `MemoryFault`); `flags` is reserved-zero.
+                        11 => {
+                            let grants_ptr =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            let grants_n =
+                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                            let mut list: Vec<(String, u32, Binding)> = Vec::new();
+                            for i in 0..grants_n {
+                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                                let name_off =
+                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                                let name_len =
+                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                                let name_bytes = m.read_window(name_off, name_len)?;
+                                let name =
+                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                                let g = {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.resolve_copyable(handle)?
+                                };
+                                list.push((name, g.0, g.1));
+                            }
+                            (0, None, 2, None, list)
+                        }
+                        o => (o, None, 0, None, Vec::new()),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
                     let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _, _, _)| f);
@@ -6292,6 +6331,33 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     }
                                     ch.grant(tid, b)
                                 });
+                                // S2 named grant list (op 11): install each re-granted cap into the
+                                // child **under its name** (so the child resolves it by
+                                // `cap.self.resolve`), sharing stdout/stderr sinks as the positional
+                                // path does. Empty for every other op.
+                                for (name, tid, b) in &named {
+                                    if let Binding::Stream(
+                                        r @ (StreamRole::Out | StreamRole::Err),
+                                    ) = *b
+                                    {
+                                        let sink = {
+                                            let mut hg =
+                                                host.lock().unwrap_or_else(|e| e.into_inner());
+                                            if r == StreamRole::Out {
+                                                hg.shared_stdout()
+                                            } else {
+                                                hg.shared_stderr()
+                                            }
+                                        };
+                                        if r == StreamRole::Out {
+                                            ch.out_sink = Some(sink);
+                                        } else {
+                                            ch.err_sink = Some(sink);
+                                        }
+                                    }
+                                    let cg = ch.grant(*tid, *b);
+                                    ch.register_cap_name(name, cg);
+                                }
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let mut child_args = vec![Value::I64(cinst as i64)];
                                 if want_as {
