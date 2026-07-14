@@ -1229,6 +1229,28 @@ TZ-independent conversions, + a wide-char round-trip; pure, on the bare powerbox
 on-ramp fd-dispatch) and the varargs `fprintf`/`scanf` engines, then storage manager / WAL / shmem /
 catalog bootstrap.
 
+**Slice CE (DONE) — stream `FILE*` + the `write`/`read` fd-dispatch (a small on-ramp change).** The
+runtime's fd-multiplexing seam: `stdout`/`stderr`/`stdin` must reach the powerbox **`Stream`** cap while
+`fopen`'d files reach the **fs** cap — but a guest that *defines* `write`/`read` (the syscall shim must,
+to serve file fds) shadows the on-ramp's `Stream` recognizer, and `__vm_host_call` only reaches
+`HOST_FN` caps, so the guest had no way to reach the streams. Fix, three coordinated pieces: **(1)
+on-ramp** — two new builtins `__vm_stream_write`/`__vm_stream_read`, added as `cap_spec` entries with
+`drop_args: 0` (so `lower_io_call` emits the same `Stream.write`/`read` `CallImport` on the stashed
+stdout/stdin handle that the `write`/`read` recognizers do, but taking the `(buf, len)` slice as-is), plus
+a `register_vm_stream_imports` scan that registers the `write`/`read` imports *even when the guest defines
+`write`/`read`* (the reserved builtin names are never shadowed). Purely additive — touches neither the
+verifier nor the confinement masking. **(2) guest** — `os_shim.c`'s `write`/`read` fd-dispatch: fds
+1/2 → `__vm_stream_write`, fd 0 → `__vm_stream_read`, everything else → the fs cap; `stdio_shim.c` defines
+the `stdin`/`stdout`/`stderr` `FILE*` globals (fds 0/1/2). **(3) the collision** — the fs cap allocated
+fds from 0, overlapping the stream fds, so a file could land on fd 1 and its writes misroute to stdout;
+`alloc_fd` now **reserves 0/1/2** and files start at 3, making the two fd namespaces disjoint (a small
+`fs.rs` change, transparent to SQLite/LMDB which treat the fd opaquely). Test `demo_pg_stream_vs_native`:
+`stream_probe.c` writes to `stdout` (FILE*) *and* a real file and the guest byte-matches native glibc over
+`mem_fs` + `host_fs`. **All 301 translate tests green + svm-run suite + clippy/fmt on both crates** — the
+on-ramp change is regression-free. Next (gap #11g): the varargs `fprintf`/`scanf` engines, then the
+storage/WAL/shmem/catalog subsystems, then the first real **boot** (relink the shims into the Postgres
+bitcode and drive `postgres --single` to its first live trap).
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

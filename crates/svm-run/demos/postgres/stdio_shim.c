@@ -180,6 +180,16 @@ void clearerr(FILE *stream) {
 }
 int fileno(FILE *stream) { return ((ShimFile *)stream)->fd; }
 
+/* The three standard streams: `FILE`s wrapping fds 0/1/2. `os_shim.c`'s `read`/`write` fd-dispatch
+ * those fds to the powerbox Stream cap (not the fs cap), so `fwrite(…, stdout)` / `fgets(…, stdin)`
+ * reach the real streams. (glibc declares these as `extern FILE *`; here they are the definitions.) */
+static ShimFile shim_stdin_f = {0, 0, 0, 1, 0, -1};
+static ShimFile shim_stdout_f = {1, 0, 0, 0, 1, -1};
+static ShimFile shim_stderr_f = {2, 0, 0, 0, 1, -1};
+FILE *stdin = (FILE *)&shim_stdin_f;
+FILE *stdout = (FILE *)&shim_stdout_f;
+FILE *stderr = (FILE *)&shim_stderr_f;
+
 /* Unbuffered (the cap is the boundary): buffering controls are inert, and there is nothing to flush. */
 int fflush(FILE *stream) { (void)stream; return 0; }
 int setvbuf(FILE *stream, char *buf, int mode, size_t size) {

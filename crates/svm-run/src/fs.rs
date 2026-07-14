@@ -207,6 +207,24 @@ fn read_path(mem: Option<&dyn GuestMem>, ptr: i64, len: i64) -> Result<String, i
     Ok(path)
 }
 
+/// Allocate a file descriptor, **reserving 0/1/2** (the POSIX stdin/stdout/stderr slots) so files
+/// always start at 3. A guest libc that routes fds 0/1/2 to the powerbox `Stream` cap (stdout/stderr/
+/// stdin) and everything else to this fs cap then never confuses a file fd with a stream fd — the two
+/// namespaces are disjoint. The reserved slots stay permanently vacant (an op on fd 0/1/2 is `-EBADF`).
+fn alloc_fd<T>(open: &mut Vec<Option<T>>) -> usize {
+    const RESERVED: usize = 3;
+    while open.len() < RESERVED {
+        open.push(None);
+    }
+    match open.iter().skip(RESERVED).position(Option::is_none) {
+        Some(off) => RESERVED + off,
+        None => {
+            open.push(None);
+            open.len() - 1
+        }
+    }
+}
+
 /// One open file: a shared byte buffer (kept alive independently of the name table, so a `remove`
 /// of an open file behaves POSIX-like — the data survives until the last close) + cursor + mode.
 struct MemOpen {
@@ -369,10 +387,7 @@ impl MemFsState {
                     writable: flags & (O_WRITE | O_APPEND) != 0,
                     append: flags & O_APPEND != 0,
                 };
-                let fd = self.open.iter().position(|s| s.is_none()).unwrap_or({
-                    self.open.push(None);
-                    self.open.len() - 1
-                });
+                let fd = alloc_fd(&mut self.open);
                 self.open[fd] = Some(o);
                 fd as i64
             }
@@ -845,10 +860,7 @@ impl HostFsState {
                     readable: flags & O_READ != 0,
                     writable: flags & (O_WRITE | O_APPEND) != 0,
                 };
-                let fd = self.open.iter().position(|s| s.is_none()).unwrap_or({
-                    self.open.push(None);
-                    self.open.len() - 1
-                });
+                let fd = alloc_fd(&mut self.open);
                 self.open[fd] = Some(o);
                 fd as i64
             }

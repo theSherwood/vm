@@ -29,6 +29,11 @@
 /* §7 host-defined-capability surface (the same ABI SQLite's cap VFS uses). */
 extern int __vm_cap_resolve(const char *name, long len);
 extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
+/* Direct powerbox-stream access (on-ramp builtins): the fds the sandbox owns — 0 = stdin, 1 = stdout,
+ * 2 = stderr — reach the Stream cap, not the fs cap. `write`/`read` below fd-dispatch to these so the
+ * shim can serve *file* fds through the capability while stdout/stderr/stdin stay the real streams. */
+extern long __vm_stream_write(long buf, long len);
+extern long __vm_stream_read(long buf, long len);
 
 /* The `fs` op protocol — crates/svm-run/src/fs.rs. */
 enum {
@@ -96,10 +101,12 @@ int openat(int dirfd, const char *path, int flags, ...) {
   return open(path, flags);
 }
 ssize_t read(int fd, void *buf, size_t n) {
+  if (fd == 0) return __vm_stream_read((long)buf, (long)n); /* stdin → powerbox Stream */
   long rc = fscall(FS_READ, fd, (long)buf, (long)n, 0);
   return rc < 0 ? fail(rc) : rc;
 }
 ssize_t write(int fd, const void *buf, size_t n) {
+  if (fd == 1 || fd == 2) return __vm_stream_write((long)buf, (long)n); /* stdout/stderr → Stream */
   long rc = fscall(FS_WRITE, fd, (long)buf, (long)n, 0);
   return rc < 0 ? fail(rc) : rc;
 }
