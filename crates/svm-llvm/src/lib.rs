@@ -13268,11 +13268,7 @@ fn lower_int_intrinsic(
                 a: la,
                 b: lb,
             });
-            lanes.push(ctx.push(Inst::Select {
-                cond,
-                a: la,
-                b: lb,
-            }));
+            lanes.push(ctx.push(Inst::Select { cond, a: la, b: lb }));
         }
         return Ok(Some(ctx.vec_pack(lanes[0], lanes[1], ValType::I32)));
     }
