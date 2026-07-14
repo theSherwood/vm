@@ -4018,11 +4018,119 @@ fn compile_child(
         .collect();
 
     let code = module.get_finalized_function(tramp);
+    // PROCESS.md S1: a child module was actually JIT-compiled (as opposed to served from the
+    // per-carve cache). Counting successful compiles is what lets a test prove the cache hits.
+    CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
     Ok(ChildCode {
         fn_table,
         code,
         module: OwnedJit::new(module),
     })
+}
+
+/// PROCESS.md S1: process-wide count of §14 child modules JIT-compiled. `instantiator_rt`'s
+/// per-carve compile cache serves repeat spawns of the same `(module, entry, size)` from one
+/// compilation — so a shell spawning the same applet N times compiles it once. Monotone; the
+/// public [`child_compiles`] reads it (a real metric, and the cache-hit test's observable).
+#[cfg(fiber_rt)]
+pub(crate) static CHILD_COMPILES: AtomicU64 = AtomicU64::new(0);
+
+/// PROCESS.md S1: how many §14 child modules this process has JIT-compiled (0 where nesting is
+/// unsupported — no child ever compiles). A repeat spawn of a cached `(module, entry, size)` does
+/// **not** advance this; the metric is the compile-cache's observable.
+pub fn child_compiles() -> u64 {
+    #[cfg(fiber_rt)]
+    {
+        CHILD_COMPILES.load(Ordering::Relaxed)
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        0
+    }
+}
+
+/// PROCESS.md S1: compile a **non-durable** §14 child — the cacheable case. Its powerbox is empty
+/// (an inert `cap.call` → `CapFault`) and it has no nesting `InstEnv`, so the compiled code depends
+/// only on `(funcs, entry, size_log2, epoch_addr)` — nothing per-spawn — which is what makes it
+/// safe to cache and reuse across carves (the base is a runtime arg to [`run_child_code`], not
+/// baked). The durable / nesting child keeps the per-call [`compile_child_and_run`] path (its baked
+/// per-child nursery makes its code un-shareable).
+#[cfg(fiber_rt)]
+pub(crate) fn compile_nondurable_child(
+    funcs: &[Func],
+    child_entry: FuncIdx,
+    child_size_log2: u8,
+    epoch_addr: usize,
+) -> Result<ChildCode, JitError> {
+    compile_child(
+        funcs,
+        child_entry,
+        child_size_log2,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+        epoch_addr,
+        InstEnv::null(),
+    )
+}
+
+/// PROCESS.md S1: run an already-compiled non-durable §14 child confined to the carve
+/// `[parent_mem_base + sub_base, … + 2^size_log2)`. Because [`compile_child`] bakes only the size
+/// mask and the window **base is a runtime arg** to `run_guarded`, one [`ChildCode`] runs at *any*
+/// carve offset — the property the compile cache relies on. Allocates the child's own fresh guarded
+/// window, seeds it from the carve (the §14 data plane is shared memory), runs under the re-entrant
+/// detect-and-kill guard, and copies the result window back into the carve (the parent is the
+/// superset). Non-durable only: no ctx-0 / shadow seeding and no freeze-unwind export (a non-durable
+/// run never freezes), so this is the `compile_child_and_run` body minus all its durable branches.
+///
+/// # Safety
+/// `code` is a live compiled child (kept alive by the cache for the call). `[parent_mem_base +
+/// sub_base, … + child_size)` is committed parent-window memory (the `Instantiator` bounded the
+/// carve to the holder's range). `args` matches the entry's arity.
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn run_child_code(
+    code: &ChildCode,
+    sub_base: u64,
+    child_size_log2: u8,
+    parent_mem_base: *mut u8,
+    args: &[i64],
+    n_results: usize,
+) -> (i64, i64) {
+    let child_size = 1u64 << child_size_log2;
+    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
+    let child_base = child_window.base();
+    {
+        // SAFETY: the carve is committed parent memory (Instantiator-bounded), size = child_size.
+        let src =
+            std::slice::from_raw_parts(parent_mem_base.add(sub_base as usize), child_size as usize);
+        child_window.rw_mut().copy_from_slice(src);
+    }
+    let mut results = vec![0i64; n_results];
+    let mut trap_cell: i64 = 0;
+    // SAFETY: `code` honours the `Entry` ABI and accesses only its own window (baked size mask; a
+    // width-overrun hits this window's guard page); the guard is re-entrant so a child fault is
+    // caught here, not propagated to the parent's frame.
+    let faulted = mem::run_guarded(
+        &child_window,
+        code.code,
+        args.as_ptr(),
+        results.as_mut_ptr(),
+        child_base,
+        code.fn_table.as_ptr() as *const core::ffi::c_void,
+        &mut trap_cell,
+    );
+    if faulted {
+        trap_cell = mem::FAULT_TRAP;
+    }
+    child_window.restore_rw();
+    {
+        // The parent (superset) now sees the child's writes: copy the carve back.
+        let dst = std::slice::from_raw_parts_mut(
+            parent_mem_base.add(sub_base as usize),
+            child_size as usize,
+        );
+        dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
+    }
+    (results.first().copied().unwrap_or(0), trap_cell)
 }
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)

@@ -54,9 +54,11 @@ Named gaps (each already a "follow-up" in code comments or docs):
 3. **No lifecycle ops** — no poll, no parent-initiated kill (§15 names the design), no
    detach.
 4. **JIT children run synchronously at `instantiate`** (`instantiator_rt.rs` header;
-   park-only-the-calling-fiber is its named follow-up), and the JIT **recompiles the
-   child per carve geometry** (mask/`sub_base` baked into code) — spawn cost on the JIT
-   is a module compile unless cached.
+   park-only-the-calling-fiber is its named follow-up). Spawn cost was a full Cranelift
+   recompile per spawn — **now cached** (S1, done): `compile_child` bakes only the *size*
+   mask and the window **base is a runtime arg**, so one compiled child is
+   position-independent and a per-carve cache reuses it across offsets (my earlier note
+   that the JIT "bakes `sub_base` into code" was wrong — corrected).
 5. **No clone entry point**; no dynamic module loading (bytes → verified `Module`); `fs`
    cap has no directory ops.
 
@@ -280,6 +282,39 @@ a host `cap.call` (top row) — you only pay the endpoint RTT for capabilities a
 *chooses* to interpose. Real measured figures (endpoint RTT vs `cap.call` vs syscall, all
 three engines) are produced with the S9 endpoint implementation and replace this model.
 
+### S1 spike results — JIT children are position-independent  [compile cache DONE]
+
+The JIT re-compiles a §14 child as a top-level guest over its own window; the open worry
+(F6/gap-4) was that this bakes the carve into the code, so every spawn recompiles. It
+does **not**: `compile_child` bakes only the *size* mask (`& (2^size_log2 − 1)`) and the
+window **base is a runtime argument** to `run_guarded`. So one compiled child runs at
+**any** carve offset, and a per-carve compile cache reuses it across offsets — not merely
+across repeated same-slot spawns. Built and pinned by `crates/svm/tests/jit_instantiate_cache.rs`:
+the same `(module, entry, size)` spawned at two different offsets JIT-compiles **once**
+(`svm_jit::child_compiles()` advances by 1), and each spawn still runs correctly confined
+to its carve. Scope: **non-durable** children (the shell-applet common case) are cached;
+durable/nesting children keep the per-call `compile_child_and_run` path (their baked
+per-child nursery makes the code un-shareable) — a small, deliberate exclusion, not a gap.
+This also *helps* async children: cached code is read-only executable, so the same blob
+can back N concurrent OS-thread children.
+
+### S1 remaining — async children ride the existing OS-thread executor  [design]
+
+The JIT already has a **1:1 OS-thread executor** (`os_thread_rt.rs`, D56/§12): each
+`thread.spawn` is a real OS thread over the shared window with hardware atomics, and the
+§5 kill-path already reaches parked siblings (`KILL_RECHECK`). "Async children" is
+therefore *not* new concurrency machinery — it is: `instantiate` spawns the (cached) child
+entry on its own OS thread confined to the carve, instead of running it inline to
+completion; `join` parks the calling fiber on the child's completion cell (as
+`thread.join` already does). This is what makes a pipeline work — child A can block on a
+pipe/futex while child B (another thread) unblocks it — where the synchronous-at-instantiate
+model deadlocks (the parent is stuck inside `instantiate(A)` and never reaches
+`instantiate(B)`). Sequential spawn/wait (stage 1) works on the synchronous path today, so
+this is sequenced *before* stage-2 pipelines, not stage-1. The one genuinely new bit is
+that a §14 child is *separately-compiled code over a sub-window*, not the same-code
+same-window shape `thread.spawn` assumes — so the executor integration (cross-thread
+child window ownership, per-child kill cell, join wiring) is the focused next increment.
+
 ---
 
 ## 5. Window sources & `Budget` — visibility and accounting as arguments  [PROPOSED]
@@ -293,17 +328,17 @@ object, and *who holds authority over its backing* is the whole visibility story
 - **Detached**: a window minted by a **platform window-minter capability** — an ordinary
   granted authority (the D46 `Resolver`-shaped acquisition pattern: you can mint detached
   windows only if someone granted you that). No ancestor below the minter holds read
-  authority. Numeric quota, host-enforced at mint. Standard geometry also makes the JIT's
-  per-carve compile cache actually hit (gap 4 in §0).
+  authority. Numeric quota, host-enforced at mint.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.
 
 Trade-offs stated once, honestly: detached subtrees make freeze/clone a **multi-window
 snapshot** — new `DURABILITY.md` work (nested subtrees freeze today); nested carves
-subdivide parent VA (real in the browser's wasm32 window) and vary carve geometry (JIT
-compile cache pressure). Projects choose per child; a shell would plausibly run coreutils
-detached and its own helper coroutines nested.
+subdivide parent VA (real in the browser's wasm32 window). Projects choose per child; a
+shell would plausibly run coreutils detached and its own helper coroutines nested.
+(Carve *geometry* no longer costs the JIT recompiles — S1's cache is position-independent,
+§4 S1 results — so JIT compile-cache pressure is no longer a reason to prefer detached.)
 
 **Accounting = budget lineage.** `Budget` is §15's principle — "every meterable resource
 is already a capability with a quota" — promoted to a passable, splittable object:
@@ -617,7 +652,7 @@ Unchanged in substance from v1, restated against the substrate:
 | # | Slice | Depends on | Status |
 |---|---|---|---|
 | S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | **done** — nested futex confirmed (`futex_cross_domain.rs`); sibling wakeup-key gap characterized + fix scoped to S9; F6 RTT model in §4 |
-| S1 | JIT async children (park-only-calling-fiber) + per-carve compile cache | — | todo |
+| S1 | JIT async children (park-only-calling-fiber) + per-carve compile cache | — | **in progress** — per-carve compile cache **done** (`jit_instantiate_cache.rs`; position-independent, one compile per `(module,entry,size)`); async children next (rides the existing `os_thread_rt` 1:1 executor) |
 | S2 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
 | S3 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S1 | todo |
 | S4 | fs dir ops; POSIX personality lib: fd table, **host-served** pipe, proc ABI | S2 | todo |
@@ -638,7 +673,7 @@ Unchanged in substance from v1, restated against the substrate:
 |---|---|---|---|
 | O1 | Endpoint servicer DoS (never replies): callers park forever. v1 answer: your servicer is in your grant chain — you trusted it; a personality may add timeouts. Is that acceptable for cross-*sibling* endpoints? | §4 | open |
 | O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable). **Spike done (§4 S0 results):** nested futex rendezvous works today (pinned by `futex_cross_domain.rs`); sibling aliases are value-coherent but need region-canonical futex keys for wakeup (Linux shared-futex analogue) — fix scoped to S9, no confinement-hinge contact | §9 | resolved — nested confirmed; sibling fix folded into S9 |
-| O3 | JIT compile-cache key: (module digest, carve base, size_log2) — hit rates under a real shell; detached-standard-geometry as the mitigation | §5, gap 4 | open |
+| O3 | JIT compile-cache: **built** with key `(funcs ptr, n_funcs, entry, size_log2)` — carve base is *absent* (position-independent reuse), so it hits across offsets, not just repeated same-slot spawns. Residual: a robust separate-module identity (a digest would beat the funcs pointer, though the run-lifetime grant contract makes a stale-pointer collision impossible within a run); cache eviction if a long shell session accumulates many distinct applets | §4, §5 | mostly resolved |
 | O4 | Detached windows on the browser/wasm32 host: pool sizing inside one wasm memory | §5 | open |
 | O5 | `attest` provenance granularity: report authority *set* or just tier + platform-only bit? Smaller is better (F2) | §6 | open |
 | O6 | Multi-window (detached) subtree freeze: consistent cut across windows — interacts with `DURABILITY.md` R4 | §5, §11 | open |
