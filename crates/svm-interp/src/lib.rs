@@ -1887,7 +1887,9 @@ fn drive(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_async_notify(Arc::new(move |key, count| {
-                sched_for_notify.notify(key, count);
+                // The async-ring completion counter is always a normal anonymous window page
+                // (`async_counter_impl` rejects backed pages), so its rendezvous key is `Anon` (S1b).
+                sched_for_notify.notify(FutexKey::Anon(key), count);
             }));
     }
     let root_id = {
@@ -3479,17 +3481,36 @@ fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
         .collect()
 }
 
+/// A futex wait/notify rendezvous coordinate (PROCESS.md S1b). The wait-queue is keyed by this, **not**
+/// by the raw window address, so two aliases of one §13 `SharedRegion` (mapped at different window
+/// offsets — in the same or different domains) rendezvous. The Linux distinction, exactly: a private
+/// page keys on its virtual address (`FUTEX_PRIVATE`), a shared page on its backing identity + offset.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum FutexKey {
+    /// A normal (anonymous) window page — keyed by confined absolute address. Anonymous pages are never
+    /// aliased across domains, so the address is a sound identity.
+    Anon(u64),
+    /// A §13 `SharedRegion`-aliased page — keyed by `(region id, byte offset within the region)`, so
+    /// every alias of the same region byte maps to the same key regardless of which window (or offset)
+    /// names it. This is what lets a sibling/parent↔child pipe ring on shared memory wake its peer.
+    Region(u32, u64),
+}
+
 /// Why a vCPU yielded its worker (returned by [`VCpu::run`]).
 enum Blocked {
     /// Blocked in `thread.join` on child task `child` (the join handle's table slot is recorded in the
     /// vCPU's `pending`, set before it parks).
     Join { child: TaskId },
-    /// Blocked in `atomic.wait` on confined address `key`, to wake on a matching `notify` or after
-    /// `timeout_ns` (already `MAX_WAIT`-clamped). `expected`/`width` let the driver re-check the value
-    /// under its lock (the futex compare-and-park atomicity). The driver turns `timeout_ns` into a
-    /// deadline on *its* clock — wall-clock for the real pool, a logical clock for the explorer.
+    /// Blocked in `atomic.wait`. `key` is the canonical rendezvous coordinate the wait-queue and
+    /// `notify` match on (region-canonical for aliased pages — S1b); `addr` is the confined absolute
+    /// address the driver re-reads to compare against `expected` under its lock (the futex
+    /// compare-and-park atomicity — the value lives at a real address, the queue at a canonical key).
+    /// Woken by a matching `notify` or after `timeout_ns` (already `MAX_WAIT`-clamped). The driver
+    /// turns `timeout_ns` into a deadline on *its* clock — wall-clock for the real pool, a logical
+    /// clock for the explorer.
     Wait {
-        key: u64,
+        key: FutexKey,
+        addr: u64,
         expected: u64,
         width: u32,
         timeout_ns: u64,
@@ -3565,10 +3586,10 @@ struct Sched {
     results: BTreeMap<TaskId, Outcome>,
     /// A vCPU parked in `join`, keyed by the child it awaits.
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
-    /// vCPUs parked in `wait`, keyed by confined address; each tagged with a waiter id.
-    wait_waiters: BTreeMap<u64, Vec<(u64, Box<VCpu>)>>,
-    /// Min-heap of `(deadline, waiter id, address)` for timing out `wait`s.
-    timers: BinaryHeap<Reverse<(Instant, u64, u64)>>,
+    /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
+    wait_waiters: BTreeMap<FutexKey, Vec<(u64, Box<VCpu>)>>,
+    /// Min-heap of `(deadline, waiter id, futex key)` for timing out `wait`s.
+    timers: BinaryHeap<Reverse<(Instant, u64, FutexKey)>>,
     /// OS-thread handles of spawned workers (joined by `drive` at the end).
     handles: Vec<std::thread::JoinHandle<()>>,
     /// vCPUs not yet finished (running + queued + parked). The run ends when this hits 0.
@@ -3627,7 +3648,7 @@ impl Scheduler {
     }
 
     /// Wake up to `count` vCPUs parked on `key`; return how many were woken.
-    fn notify(&self, key: u64, count: u32) -> u32 {
+    fn notify(&self, key: FutexKey, count: u32) -> u32 {
         let mut s = self.lock();
         let mut woken: Vec<Box<VCpu>> = Vec::new();
         if let Some(q) = s.wait_waiters.get_mut(&key) {
@@ -3969,6 +3990,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         }
         Step::Park(Blocked::Wait {
             key,
+            addr,
             expected,
             width,
             timeout_ns,
@@ -3976,7 +3998,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
             let mut s = sched.lock();
             // Re-read the value **under the lock** so the compare-and-park is atomic vs. `notify`.
-            if v.atomic_value(key, width) != expected {
+            // The value lives at the absolute `addr`; the queue/timer key is the canonical `key` (S1b).
+            if v.atomic_value(addr, width) != expected {
                 v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
                 s.runnable.push_back(v);
                 sched.work.notify_one();
@@ -4014,7 +4037,7 @@ impl SchedRef {
             SchedRef::Det(d) => d.spawn(make),
         }
     }
-    fn notify(&self, key: u64, count: u32) -> u32 {
+    fn notify(&self, key: FutexKey, count: u32) -> u32 {
         match self {
             SchedRef::Real(s) => s.notify(key, count),
             SchedRef::Det(d) => d.notify(key, count),
@@ -4055,7 +4078,7 @@ struct DetSched {
 }
 
 struct DetWaiter {
-    key: u64,
+    key: FutexKey,
     deadline: u64, // logical ns
     vcpu: Box<VCpu>,
 }
@@ -4189,7 +4212,7 @@ impl DetSched {
     }
 
     /// Wake up to `count` vCPUs waiting on `key`, in deterministic (insertion) order.
-    fn notify(&self, key: u64, count: u32) -> u32 {
+    fn notify(&self, key: FutexKey, count: u32) -> u32 {
         let mut s = self.lock();
         let mut woken = 0u32;
         let mut i = 0;
@@ -4416,12 +4439,13 @@ impl SchedDriver {
                 }
                 Step::Park(Blocked::Wait {
                     key,
+                    addr,
                     expected,
                     width,
                     timeout_ns,
                 }) => {
                     let mut s = det.lock();
-                    if v.atomic_value(key, width) != expected {
+                    if v.atomic_value(addr, width) != expected {
                         v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
                         s.runnable.push(v);
                     } else {
@@ -7044,13 +7068,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let to_ns = get_i64(&frames[top].vals, *timeout)?;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.prepare_wait(a, *ty)?;
+                    // S1b: the wait-queue key is region-canonical for an aliased page (so peers on the
+                    // same `SharedRegion` byte rendezvous), while `addr` stays the absolute address the
+                    // driver re-reads for the compare-and-park.
+                    let key = m.futex_key(base);
                     let wait = if to_ns < 0 {
                         MAX_WAIT
                     } else {
                         Duration::from_nanos(to_ns as u64).min(MAX_WAIT)
                     };
                     return Ok(Inner::Park(Blocked::Wait {
-                        key: base,
+                        key,
+                        addr: base,
                         expected: exp,
                         width,
                         timeout_ns: wait.as_nanos() as u64,
@@ -7065,9 +7094,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let n = get_i32(&frames[top].vals, *count)? as u32;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.confine_for_notify(a)?;
+                    // S1b: notify on the same canonical key the waiter enqueued under.
+                    let key = m.futex_key(base);
                     frames[top]
                         .vals
-                        .push(Reg::from_i32(sched.notify(base, n) as i32));
+                        .push(Reg::from_i32(sched.notify(key, n) as i32));
                 }
                 // Fast paths for the **pure** value ops (no memory, no SIMD): dispatch here and
                 // push the result directly, instead of through the `eval_inst` call (and its
@@ -12172,6 +12203,25 @@ impl Mem {
     /// bounds confinement applies (no alignment or protection check). (§12 futex)
     fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
         self.confine_checked(addr, 0, 1)
+    }
+
+    /// The canonical futex rendezvous key for a confined absolute address (PROCESS.md S1b). A §13
+    /// `SharedRegion`-aliased (`Backed`) page keys on `(region, byte offset within the region)`, so two
+    /// aliases of the same region byte — mapped at different window offsets, in the same or different
+    /// domains — produce the **same** key and rendezvous. A normal anonymous page keys on its absolute
+    /// address (never aliased across domains). This is the wait-queue/`notify` key; the value compare
+    /// still uses the absolute address.
+    fn futex_key(&self, base: u64) -> FutexKey {
+        if self.has_regions.load(Ordering::Relaxed) {
+            let rel = base.wrapping_sub(self.window.base());
+            if let Some(PageProt::Backed {
+                region, region_off, ..
+            }) = self.space_read().prot.get(&(rel / self.page))
+            {
+                return FutexKey::Region(*region, region_off + rel % self.page);
+            }
+        }
+        FutexKey::Anon(base)
     }
 
     fn atomic_load(&self, addr: u64, offset: u64, ty: IntTy) -> Result<Value, Trap> {
