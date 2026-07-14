@@ -454,3 +454,24 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test -p svm-jit --features stack-check,arena-stacks
       - run: cargo test -p svm-fiber --features arena-stacks
+
+  rustbench:
+    name: rustbench (real-program perf · svm-jit vs Wasmtime-w64)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - name: install workload toolchains
+        run: |
+          rustup toolchain install 1.81.0 --profile minimal
+          rustup +1.81.0 target add wasm32-unknown-unknown
+          rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: bench }
+      - name: rustbench
+        working-directory: bench
+        run: cargo run --release --bin rustbench
+
