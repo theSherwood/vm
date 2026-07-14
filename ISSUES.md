@@ -43,7 +43,31 @@ I21**: that is a bulk-op span *overrunning* `mapped`; this is a small in-bounds 
 
 **Not yet root-caused.** Next step: `SVM_JIT_DUMP_CLIF=1` on the reproducer to find the bad
 address/bounds computation (svm-llvm mistranslation vs svm-jit lowering). The five shipping workloads
-avoid the trigger, so `rustbench` runs green; re-enable `bfs` once fixed.
+avoid the trigger, so `rustbench` runs green; re-enable `bfs` once fixed. **In progress** (2026-07-15).
+
+### I24 — the LLVM on-ramp is pinned to LLVM 18, so it cannot read bitcode from current rustc/clang (LLVM 19–21) (S3) — surfaced building `bench/rustbench` (2026-07-15)
+
+**Where:** `svm_llvm::translate_bc_path` reads a module by shelling `llvm-dis` (LLVM **18** — the CI
+`svm-llvm` job installs `llvm-18`/`clang-18`) to disassemble `.bc` → textual `.ll`, then parses the
+`.ll` with the in-house reader.
+
+**Symptom.** Bitcode from any LLVM ≥ 19 producer fails at disassembly, e.g. from current stable rustc
+(1.94 → LLVM 21): `llvm-dis: error: Unknown attribute kind (102) (Producer: 'LLVM21.1.8-rust-1.94.1'
+Reader: 'LLVM 18.1.3')`. So the on-ramp only consumes LLVM-18-or-older bitcode. This is why `rustbench`
+pins **rustc 1.81** (the last LLVM-18 Rust release) for its svm-jit lane, and why any consumer must be
+held to an LLVM-18 toolchain.
+
+**Impact.** A maintenance drag that worsens as LLVM advances: new Rust/clang can't feed the on-ramp
+without an old-toolchain pin, and the pin ages out of support. Not a correctness or escape issue —
+purely which producers the frontend accepts.
+
+**Fix sketch.** Options, cheapest first: (a) bump the on-ramp's build tools to a newer LLVM
+(`llvm-dis`/`clang`) and confirm the `.ll` reader parses the newer textual IR — the reader is
+in-house, so the surface to re-check is the new attributes/opcodes, not a libLLVM link; (b) make the
+`.ll` reader forward-tolerant (skip unknown function/param attributes, which are semantically inert
+for the subset we translate) so it survives minor IR drift; (c) if staying on 18, document the pin
+prominently (a `translate_bc_path` version check with a clear error beats a raw `llvm-dis` failure).
+Track the LLVM version as an explicit, bumped dependency rather than an implicit `apt` default.
 
 ### I21 — JIT bulk-memory ops diverge from the interpreter on spans overrunning `mapped` inside the reservation (S2) — found by the SPEC.md slice-5 window-model suite (2026-07-14)
 
