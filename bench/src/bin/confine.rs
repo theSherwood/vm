@@ -155,14 +155,24 @@ fn svmbc_lane(cfile: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
 }
 
 /// Build `kernel.c` to a wasm module at the given target (`wasm32`/`wasm64`), matching the embench
-/// build's `-mbulk-memory` (so `memcpy`/`memset` lower to `memory.copy`/`fill`, not undefined libc
-/// symbols). Returns the module path.
+/// build's `-msimd128 -mbulk-memory` (so the wasm side auto-vectorizes to `v128` and `memcpy`/`memset`
+/// lower to `memory.copy`/`fill`, not undefined libc symbols).
+///
+/// SIMD caveat: enabling `-msimd128` is the honest, embench-matching posture (both sides get their
+/// frontend's SIMD), but it does NOT make vectorizable kernels a clean codegen comparison. The svm-jit
+/// lane consumes **host** LP64 bitcode (x86 SSE2 baseline) while this lane targets **wasm simd128** —
+/// different SIMD ISAs (e.g. wasm has `i64x2.mul`, x86-128 doesn't), so LLVM vectorizes each
+/// differently. A vectorizable kernel's ratio can swing ±40% on this flag alone (matmul: 0.93x without
+/// → 1.4x with), reflecting frontend vectorization + ISA, not just backend codegen. The clean signal
+/// is the **scalar** kernels (bytes ≈ parity) and kernels whose ratio is stable across the flag (edn).
+/// Returns the module path.
 fn build_wasm(cfile: &Path, target: &str) -> Option<PathBuf> {
     let wasm = std::env::temp_dir().join(format!("confine_{}.{target}.wasm", std::process::id()));
     let ok = Command::new("clang")
         .args([
             &format!("--target={target}"),
             "-O2",
+            "-msimd128",
             "-mbulk-memory",
             "-nostdlib",
             "-Wl,--no-entry",

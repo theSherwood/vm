@@ -1,5 +1,5 @@
-matmul 1.1401
-matmul_eb 1.0689
-edn 1.3900
-fir 0.3583
-bytes 0.9977
+matmul 1.4282
+matmul_eb 1.1459
+edn 1.3742
+fir 0.5626
+bytes 1.0050
