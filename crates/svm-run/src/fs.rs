@@ -1246,8 +1246,23 @@ fn host_stat_bytes(md: &std::fs::Metadata) -> [u8; STATBUF_LEN] {
     }
 }
 
+/// Map a host `io::Error` to the protocol's canonical (Linux) errno. The wire protocol must be
+/// **host-OS-independent** — both backends have to return the same value for the same failure, and
+/// on a differential a `host_fs` run has to match a `mem_fs` run — but the raw OS error code is not
+/// portable: `ENOTEMPTY` is 39 on Linux and 66 on macOS, and Windows codes are not errno at all. So
+/// canonicalize through the portable `io::ErrorKind`, falling back to the raw errno (already the
+/// canonical value on Linux, the differential's reference host) for kinds without a fixed mapping.
 fn io_errno(e: &std::io::Error) -> i64 {
-    e.raw_os_error().map(|c| c as i64).unwrap_or(EINVAL)
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => ENOENT,
+        ErrorKind::PermissionDenied => EACCES,
+        ErrorKind::AlreadyExists => EEXIST,
+        ErrorKind::DirectoryNotEmpty => ENOTEMPTY,
+        ErrorKind::NotADirectory => ENOTDIR,
+        ErrorKind::InvalidInput => EINVAL,
+        _ => e.raw_os_error().map(|c| c as i64).unwrap_or(EINVAL),
+    }
 }
 
 /// The **real** filesystem, attenuated to `root` (relative paths only; `..`/absolute refused). The
