@@ -30,10 +30,29 @@
 //! | 11 | `munmap` | `(win_buf, _, _, _)` | 0 |
 //! | 12 | `crash_arm` | `(n, _, _, _)` | 0 / `-EINVAL` |
 //! | 13 | `map_region` | `(fd, file_offset, len, _)` | region handle / `-errno` |
+//! | 14 | `stat` | `(path_ptr, path_len, statbuf_ptr, statbuf_cap)` | 0 / `-errno` |
+//! | 15 | `mkdir` | `(path_ptr, path_len, _, _)` | 0 / `-errno` |
+//! | 16 | `rmdir` | `(path_ptr, path_len, _, _)` | 0 / `-errno` |
+//! | 17 | `opendir` | `(path_ptr, path_len, _, _)` | dir handle ≥ 0 / `-errno` |
+//! | 18 | `readdir` | `(dh, name_ptr, name_cap, _)` | name length > 0, `0` = end, `-errno` |
+//! | 19 | `closedir` | `(dh, _, _, _)` | 0 / `-errno` |
 //!
 //! Op 12 (`crash_arm`) exists **only on the `*_crashy` test variants** (see [`FS_CRASH_ARM`]); op 13
 //! (`map_region`, the §4b zero-copy path — see [`FS_MAP_REGION`]) exists **only on [`host_fs_mmap`]**.
 //! The default [`mem_fs`]/[`host_fs`] return `-EINVAL` for both (unknown op / no minting authority).
+//!
+//! ## The metadata + directory surface (`stat`/`mkdir`/`rmdir`/`opendir`/`readdir`/`closedir`)
+//!
+//! The per-access VFS above names *files*; a real data tree (a natively-`initdb`'d Postgres cluster,
+//! say) also needs to be **walked**. `stat` fills a fixed 72-byte little-endian [`StatBuf`] (mode with
+//! the `S_IF*` type bits, size, mtime, ino/dev, …) so the guest libc can tell a directory from a file
+//! and read a size without opening; `mkdir`/`rmdir` create and remove directories; `opendir` snapshots
+//! a directory's immediate entries and `readdir` yields their names one per call (`0` when exhausted),
+//! `closedir` drops the handle. `stat` uses **lstat** semantics (does not follow symlinks) so a symlink
+//! in the tree cannot be used to probe the file *type* of something outside the granted root. Both
+//! backends implement the identical protocol; [`mem_fs`] models directories over its flat name table
+//! (a path is a directory if it was `mkdir`'d or is a strict prefix of an existing file), so a
+//! differential still runs identically on `mem_fs` and `host_fs`.
 //!
 //! ## The file-backed-mmap surface (`mmap`/`msync`/`munmap`) — the second storage shape
 //!
@@ -88,6 +107,37 @@ pub const FS_MAP_REGION: u32 = 13;
 /// recovers to its last *committed* state at each one.
 pub const FS_CRASH_ARM: u32 = 12;
 
+/// `stat(path_ptr, path_len, statbuf_ptr, statbuf_cap)` — fill a fixed [`StatBuf`] (72 bytes,
+/// little-endian) for `path` with **lstat** semantics (symlinks are not followed). `statbuf_cap`
+/// must be ≥ [`STATBUF_LEN`]. Returns `0` / `-errno`.
+pub const FS_STAT: u32 = 14;
+/// `mkdir(path_ptr, path_len)` — create a directory. `-EEXIST` if it already exists. (The `mode`
+/// argument a guest `mkdir(2)` would pass is ignored: the granted root's umask governs.)
+pub const FS_MKDIR: u32 = 15;
+/// `rmdir(path_ptr, path_len)` — remove an empty directory (`-ENOTEMPTY` otherwise).
+pub const FS_RMDIR: u32 = 16;
+/// `opendir(path_ptr, path_len)` — open a directory for iteration; returns a **dir handle** (a small
+/// non-negative integer, a separate namespace from file `fd`s) or `-errno`. The directory's immediate
+/// entries are snapshotted at this call, so a concurrent create/remove does not perturb the walk
+/// (matches a typical libc `readdir` buffering the getdents stream).
+pub const FS_OPENDIR: u32 = 17;
+/// `readdir(dh, name_ptr, name_cap)` — write the next entry's name (no trailing NUL) into the guest
+/// buffer and return its byte length; `0` when the directory is exhausted; `-errno` on a bad handle
+/// or `-EINVAL` if `name_cap` is too small for the next name. `.` and `..` are **not** yielded (the
+/// guest libc synthesizes them if it wants them), matching what Postgres's `ReadDir` filters anyway.
+pub const FS_READDIR: u32 = 18;
+/// `closedir(dh)` — drop a dir handle opened by [`FS_OPENDIR`].
+pub const FS_CLOSEDIR: u32 = 19;
+
+/// Byte length of the fixed [`StatBuf`] the [`FS_STAT`] op writes.
+pub const STATBUF_LEN: usize = 72;
+/// `S_IFMT` mask and the two `S_IF*` type values the guest libc needs to tell files from directories
+/// (Linux ABI values, so the guest shim can copy `mode` straight into a `struct stat`).
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFLNK: u32 = 0o120000;
+
 pub const O_READ: i64 = 1;
 pub const O_WRITE: i64 = 2;
 pub const O_APPEND: i64 = 4;
@@ -98,7 +148,42 @@ pub const ENOENT: i64 = 2;
 pub const EBADF: i64 = 9;
 pub const EACCES: i64 = 13;
 pub const EFAULT: i64 = 14;
+pub const EEXIST: i64 = 17;
+pub const ENOTDIR: i64 = 20;
 pub const EINVAL: i64 = 22;
+pub const ENOTEMPTY: i64 = 39;
+
+/// Build the fixed 72-byte little-endian [`StatBuf`] payload from the fields the guest libc reads.
+/// Layout (offset: field): `0:mode(u32) 4:nlink(u32) 8:size(i64) 16:mtime_sec(i64) 24:mtime_nsec(i64)
+/// 32:ino(u64) 40:dev(u64) 48:uid(u32) 52:gid(u32) 56:blksize(i64) 64:blocks(i64)`.
+#[allow(clippy::too_many_arguments)]
+fn stat_bytes(
+    mode: u32,
+    nlink: u32,
+    size: i64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ino: u64,
+    dev: u64,
+    uid: u32,
+    gid: u32,
+    blksize: i64,
+    blocks: i64,
+) -> [u8; STATBUF_LEN] {
+    let mut b = [0u8; STATBUF_LEN];
+    b[0..4].copy_from_slice(&mode.to_le_bytes());
+    b[4..8].copy_from_slice(&nlink.to_le_bytes());
+    b[8..16].copy_from_slice(&size.to_le_bytes());
+    b[16..24].copy_from_slice(&mtime_sec.to_le_bytes());
+    b[24..32].copy_from_slice(&mtime_nsec.to_le_bytes());
+    b[32..40].copy_from_slice(&ino.to_le_bytes());
+    b[40..48].copy_from_slice(&dev.to_le_bytes());
+    b[48..52].copy_from_slice(&uid.to_le_bytes());
+    b[52..56].copy_from_slice(&gid.to_le_bytes());
+    b[56..64].copy_from_slice(&blksize.to_le_bytes());
+    b[64..72].copy_from_slice(&blocks.to_le_bytes());
+    b
+}
 
 /// Read a guest path (window `ptr`/`len`) as UTF-8. `-EFAULT` on an out-of-window range, `-EINVAL`
 /// on non-UTF-8 or an unreasonable length, `-EACCES` on a path that could name anything outside the
@@ -180,10 +265,63 @@ struct MemMapping {
 #[derive(Default)]
 struct MemFsState {
     files: HashMap<String, Arc<Mutex<Vec<u8>>>>,
+    /// Explicitly-`mkdir`'d directories (normalized keys). A path is *also* treated as a directory
+    /// when it is a strict prefix of an existing file key, so `initdb`-style trees created purely by
+    /// writing files still walk correctly; `dirs` records the empty ones a walk would otherwise miss.
+    dirs: std::collections::BTreeSet<String>,
     open: Vec<Option<MemOpen>>,
+    /// Snapshots taken by [`FS_OPENDIR`]: `opendirs[dh]` is the remaining child names to yield.
+    opendirs: Vec<Option<Vec<String>>>,
     maps: Vec<MemMapping>,
     /// `Some` only on the `mem_fs_crashy` variant (test-only crash injection); `None` on `mem_fs`.
     crash: Option<CrashCtl>,
+}
+
+/// Normalize a vetted relative path to a canonical key: drop `.`/empty segments, join with `/`.
+/// The root (`.` or the effect of stripping everything) maps to `""`.
+fn norm(p: &str) -> String {
+    p.split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+impl MemFsState {
+    /// Is `key` (already normalized) a directory in this flat store?
+    fn is_dir(&self, key: &str) -> bool {
+        key.is_empty() || self.dirs.contains(key) || {
+            let prefix = format!("{key}/");
+            self.files.keys().any(|k| k.starts_with(&prefix))
+                || self.dirs.iter().any(|d| d.starts_with(&prefix))
+        }
+    }
+    /// Immediate child names of directory `key` (normalized), deduplicated, sorted for determinism.
+    fn children_of(&self, key: &str) -> Vec<String> {
+        let prefix = if key.is_empty() {
+            String::new()
+        } else {
+            format!("{key}/")
+        };
+        let mut set = std::collections::BTreeSet::new();
+        let child = |full: &str| -> Option<String> {
+            let rest = full.strip_prefix(&prefix)?;
+            if rest.is_empty() {
+                return None;
+            }
+            Some(rest.split('/').next().unwrap().to_string())
+        };
+        for k in self.files.keys() {
+            if let Some(c) = child(k) {
+                set.insert(c);
+            }
+        }
+        for d in &self.dirs {
+            if let Some(c) = child(d) {
+                set.insert(c);
+            }
+        }
+        set.into_iter().collect()
+    }
 }
 
 impl MemFsState {
@@ -477,6 +615,115 @@ impl MemFsState {
                 0
             }
             FS_CRASH_ARM => arm_crash(self.crash.as_mut(), a(0)),
+            FS_STAT => {
+                let key = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
+                    Ok(k) => k,
+                    Err(e) => return e,
+                };
+                // A file name wins over a same-named implicit dir prefix (there can't be both).
+                let (mode, size) = if let Some(d) = self.files.get(&key) {
+                    let len = d.lock().unwrap_or_else(|e| e.into_inner()).len() as i64;
+                    (S_IFREG | 0o644, len)
+                } else if self.is_dir(&key) {
+                    (S_IFDIR | 0o755, 0)
+                } else {
+                    return -ENOENT;
+                };
+                // A stable synthetic identity: mtime 0, one link, a hash-free ino of 0 (Postgres uses
+                // st_ino/st_dev only for cross-file identity, which a fresh per-run store never needs).
+                let buf = stat_bytes(mode, 1, size, 0, 0, 0, 0, 0, 0, 4096, (size + 511) / 512);
+                if a(2) < 0 || a(3) < STATBUF_LEN as i64 {
+                    return -EINVAL;
+                }
+                let Some(m) = mem.as_deref_mut() else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(a(2) as u64, &buf).is_some() {
+                    0
+                } else {
+                    -EFAULT
+                }
+            }
+            FS_MKDIR => {
+                let key = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
+                    Ok(k) => k,
+                    Err(e) => return e,
+                };
+                if key.is_empty() || self.is_dir(&key) || self.files.contains_key(&key) {
+                    return -EEXIST;
+                }
+                self.dirs.insert(key);
+                0
+            }
+            FS_RMDIR => {
+                let key = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
+                    Ok(k) => k,
+                    Err(e) => return e,
+                };
+                if self.files.contains_key(&key) {
+                    return -ENOTDIR;
+                }
+                if !self.is_dir(&key) {
+                    return -ENOENT;
+                }
+                if !self.children_of(&key).is_empty() {
+                    return -ENOTEMPTY;
+                }
+                if !self.dirs.remove(&key) {
+                    return -ENOENT; // an implicit (non-empty) dir has no explicit entry to remove
+                }
+                0
+            }
+            FS_OPENDIR => {
+                let key = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
+                    Ok(k) => k,
+                    Err(e) => return e,
+                };
+                if self.files.contains_key(&key) {
+                    return -ENOTDIR;
+                }
+                if !self.is_dir(&key) {
+                    return -ENOENT;
+                }
+                let mut kids = self.children_of(&key);
+                kids.reverse(); // pop() yields them in sorted order
+                let dh = self.opendirs.iter().position(|s| s.is_none()).unwrap_or({
+                    self.opendirs.push(None);
+                    self.opendirs.len() - 1
+                });
+                self.opendirs[dh] = Some(kids);
+                dh as i64
+            }
+            FS_READDIR => {
+                let Some(Some(entries)) = self.opendirs.get_mut(a(0) as usize) else {
+                    return -EBADF;
+                };
+                let Some(name) = entries.pop() else {
+                    return 0; // exhausted
+                };
+                let (ptr, cap) = (a(1), a(2));
+                if ptr < 0 || cap < name.len() as i64 {
+                    entries.push(name); // leave the walk where it was
+                    return -EINVAL;
+                }
+                let Some(m) = mem else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(ptr as u64, name.as_bytes()).is_some() {
+                    name.len() as i64
+                } else {
+                    -EFAULT
+                }
+            }
+            FS_CLOSEDIR => {
+                let Some(slot) = self.opendirs.get_mut(a(0) as usize) else {
+                    return -EBADF;
+                };
+                if slot.take().is_none() {
+                    return -EBADF;
+                }
+                0
+            }
             _ => -EINVAL,
         }
     }
@@ -540,6 +787,9 @@ struct HostMapping {
 struct HostFsState {
     root: PathBuf,
     open: Vec<Option<HostOpen>>,
+    /// Snapshots taken by [`FS_OPENDIR`]: `opendirs[dh]` is the remaining child names to yield
+    /// (sorted, so a walk is deterministic and matches `mem_fs`).
+    opendirs: Vec<Option<Vec<String>>>,
     maps: Vec<HostMapping>,
     /// `Some` only on the `host_fs_crashy` variant (test-only crash injection); `None` on `host_fs`.
     crash: Option<CrashCtl>,
@@ -852,8 +1102,147 @@ impl HostFsState {
                     -EINVAL
                 }
             }
+            FS_STAT => {
+                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                // lstat semantics (symlink_metadata): a symlink is reported as a symlink and never
+                // followed, so its type can't be confused with a target outside the granted root.
+                let md = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) => return -io_errno(&e),
+                };
+                let buf = host_stat_bytes(&md);
+                if a(2) < 0 || a(3) < STATBUF_LEN as i64 {
+                    return -EINVAL;
+                }
+                let Some(m) = mem.as_deref_mut() else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(a(2) as u64, &buf).is_some() {
+                    0
+                } else {
+                    -EFAULT
+                }
+            }
+            FS_MKDIR => {
+                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                match std::fs::create_dir(path) {
+                    Ok(()) => 0,
+                    Err(e) => -io_errno(&e),
+                }
+            }
+            FS_RMDIR => {
+                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                match std::fs::remove_dir(path) {
+                    Ok(()) => 0,
+                    Err(e) => -io_errno(&e),
+                }
+            }
+            FS_OPENDIR => {
+                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                let rd = match std::fs::read_dir(&path) {
+                    Ok(r) => r,
+                    Err(e) => return -io_errno(&e),
+                };
+                let mut names = Vec::new();
+                for ent in rd {
+                    match ent {
+                        Ok(e) => {
+                            // Names are OS strings; a non-UTF-8 entry can't round-trip through the
+                            // guest's UTF-8 path protocol, so skip it (it was never nameable anyway).
+                            if let Some(s) = e.file_name().to_str() {
+                                names.push(s.to_string());
+                            }
+                        }
+                        Err(e) => return -io_errno(&e),
+                    }
+                }
+                names.sort();
+                names.reverse(); // pop() yields sorted order
+                let dh = self.opendirs.iter().position(|s| s.is_none()).unwrap_or({
+                    self.opendirs.push(None);
+                    self.opendirs.len() - 1
+                });
+                self.opendirs[dh] = Some(names);
+                dh as i64
+            }
+            FS_READDIR => {
+                let Some(Some(entries)) = self.opendirs.get_mut(a(0) as usize) else {
+                    return -EBADF;
+                };
+                let Some(name) = entries.pop() else {
+                    return 0; // exhausted
+                };
+                let (ptr, cap) = (a(1), a(2));
+                if ptr < 0 || cap < name.len() as i64 {
+                    entries.push(name);
+                    return -EINVAL;
+                }
+                let Some(m) = mem else {
+                    return -EFAULT;
+                };
+                if m.write_bytes(ptr as u64, name.as_bytes()).is_some() {
+                    name.len() as i64
+                } else {
+                    -EFAULT
+                }
+            }
+            FS_CLOSEDIR => {
+                let Some(slot) = self.opendirs.get_mut(a(0) as usize) else {
+                    return -EBADF;
+                };
+                if slot.take().is_none() {
+                    return -EBADF;
+                }
+                0
+            }
             _ => -EINVAL,
         }
+    }
+}
+
+/// Fill a [`StatBuf`] from real-fs metadata. On unix the `st_*` fields come straight from the
+/// `stat(2)` the OS already did; elsewhere the portable `Metadata` fills type + size and the rest
+/// stays zero (the guest libc only ever needs type + size + mtime to walk an `initdb` tree).
+fn host_stat_bytes(md: &std::fs::Metadata) -> [u8; STATBUF_LEN] {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        stat_bytes(
+            md.mode(),
+            md.nlink() as u32,
+            md.size() as i64,
+            md.mtime(),
+            md.mtime_nsec(),
+            md.ino(),
+            md.dev(),
+            md.uid(),
+            md.gid(),
+            md.blksize() as i64,
+            md.blocks() as i64,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let ty = if md.is_dir() {
+            S_IFDIR | 0o755
+        } else if md.file_type().is_symlink() {
+            S_IFLNK | 0o777
+        } else {
+            S_IFREG | 0o644
+        };
+        stat_bytes(ty, 1, md.len() as i64, 0, 0, 0, 0, 0, 0, 4096, 0)
     }
 }
 
@@ -883,6 +1272,7 @@ pub fn host_fs_mmap(root: PathBuf) -> HostCap {
         let mut st = HostFsState {
             root: root.clone(),
             open: Vec::new(),
+            opendirs: Vec::new(),
             maps: Vec::new(),
             crash: None,
         };
@@ -902,6 +1292,7 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
         let mut st = HostFsState {
             root: root.clone(),
             open: Vec::new(),
+            opendirs: Vec::new(),
             maps: Vec::new(),
             crash: crashy.then(CrashCtl::default),
         };
@@ -1007,5 +1398,212 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The metadata + directory surface (`stat`/`mkdir`/`rmdir`/`opendir`/`readdir`/`closedir`) is
+    /// protocol-identical on both backends: the *same* scripted walk returns the *same* rc sequence,
+    /// the same file/dir type bits, and the same size on `mem_fs` (flat-map dirs) and `host_fs` (real
+    /// dirs). This is the invariant a Postgres differential relies on — the guest can't tell which
+    /// backend it walks.
+    #[test]
+    fn os_metadata_ops_parity_mem_vs_host() {
+        use super::*;
+        use svm_interp::{iface, Host, WindowMem};
+
+        // Window layout: [0..64) path A, [64..128) path B, [256..328) statbuf, [512..576) name buf.
+        const PA: usize = 0;
+        const PB: usize = 64;
+        const SB: usize = 256;
+        const NB: usize = 512;
+
+        // Drive one op over a fresh window view; `win` persists between calls (paths stay put).
+        fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
+            let n = win.len();
+            let mut wm = WindowMem::new(win, n as u64);
+            host.cap_dispatch_slots(iface::HOST_FN, op, h, args, Some(&mut wm))
+                .unwrap()[0]
+        }
+        fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
+            win[at..at + s.len()].copy_from_slice(s.as_bytes());
+            (at as i64, s.len() as i64)
+        }
+
+        // The scripted walk: returns (rc-sequence, stat-of-dir mode&S_IFMT, stat-of-file (mode,size),
+        // readdir name). Run identically against whatever cap is granted.
+        fn walk(host: &mut Host, h: i32, win: &mut [u8]) -> (Vec<i64>, u32, (u32, i64), String) {
+            let mut rc = Vec::new();
+            let (dp, dl) = put(win, PA, "d");
+            rc.push(call(host, h, win, FS_MKDIR, &[dp, dl, 0, 0])); // 0
+            rc.push(call(host, h, win, FS_MKDIR, &[dp, dl, 0, 0])); // -EEXIST
+            rc.push(call(
+                host,
+                h,
+                win,
+                FS_STAT,
+                &[dp, dl, SB as i64, STATBUF_LEN as i64],
+            )); // 0
+            let dir_mode = u32::from_le_bytes(win[SB..SB + 4].try_into().unwrap()) & S_IFMT;
+
+            let (fp, fl) = put(win, PB, "d/f");
+            let fd = call(host, h, win, FS_OPEN, &[fp, fl, O_CREATE | O_WRITE, 0]);
+            rc.push((fd >= 0) as i64); // 1 (fd is backend-specific; normalize to a bool)
+            let (bp, bl) = put(win, NB, "hello");
+            rc.push(call(host, h, win, FS_WRITE, &[fd, bp, bl, 0])); // 5
+            rc.push(call(host, h, win, FS_CLOSE, &[fd, 0, 0, 0])); // 0
+
+            // re-put the path (the write clobbered NB, not PB, but keep it explicit)
+            let (fp, fl) = put(win, PB, "d/f");
+            rc.push(call(
+                host,
+                h,
+                win,
+                FS_STAT,
+                &[fp, fl, SB as i64, STATBUF_LEN as i64],
+            )); // 0
+            let f_mode = u32::from_le_bytes(win[SB..SB + 4].try_into().unwrap()) & S_IFMT;
+            let f_size = i64::from_le_bytes(win[SB + 8..SB + 16].try_into().unwrap());
+
+            let (np, nl) = put(win, PA, "d/nope");
+            rc.push(call(
+                host,
+                h,
+                win,
+                FS_STAT,
+                &[np, nl, SB as i64, STATBUF_LEN as i64],
+            )); // -ENOENT
+
+            let (dp, dl) = put(win, PA, "d");
+            let dh = call(host, h, win, FS_OPENDIR, &[dp, dl, 0, 0]);
+            rc.push((dh >= 0) as i64); // 1
+            let got = call(host, h, win, FS_READDIR, &[dh, NB as i64, 64, 0]);
+            rc.push(got); // 1 (len of "f")
+            let name = String::from_utf8(win[NB..NB + got.max(0) as usize].to_vec()).unwrap();
+            rc.push(call(host, h, win, FS_READDIR, &[dh, NB as i64, 64, 0])); // 0 (exhausted)
+            rc.push(call(host, h, win, FS_CLOSEDIR, &[dh, 0, 0, 0])); // 0
+
+            rc.push(call(host, h, win, FS_RMDIR, &[dp, dl, 0, 0])); // -ENOTEMPTY
+            let (fp, fl) = put(win, PB, "d/f");
+            rc.push(call(host, h, win, FS_REMOVE, &[fp, fl, 0, 0])); // 0
+            rc.push(call(host, h, win, FS_RMDIR, &[dp, dl, 0, 0])); // 0
+            rc.push(call(
+                host,
+                h,
+                win,
+                FS_STAT,
+                &[dp, dl, SB as i64, STATBUF_LEN as i64],
+            )); // -ENOENT
+            (rc, dir_mode, (f_mode, f_size), name)
+        }
+
+        // mem_fs
+        let (mem_rc, mem_dir, mem_file, mem_name) = {
+            let mut host = Host::new();
+            let cap = mem_fs();
+            let h = (cap.grant)(&mut host, 0);
+            let mut win = vec![0u8; 4096];
+            walk(&mut host, h, &mut win)
+        };
+
+        // host_fs over a fresh temp root
+        let root = std::env::temp_dir().join(format!("svm_fs_osmeta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (host_rc, host_dir, host_file, host_name) = {
+            let mut host = Host::new();
+            let cap = host_fs(root.clone());
+            let h = (cap.grant)(&mut host, 0);
+            let mut win = vec![0u8; 4096];
+            walk(&mut host, h, &mut win)
+        };
+        let _ = std::fs::remove_dir_all(&root);
+
+        let expected: Vec<i64> = vec![
+            0, -EEXIST, 0, 1, 5, 0, 0, -ENOENT, 1, 1, 0, 0, -ENOTEMPTY, 0, 0, -ENOENT,
+        ];
+        assert_eq!(mem_rc, expected, "mem_fs rc sequence");
+        assert_eq!(host_rc, expected, "host_fs rc sequence (must match mem_fs)");
+        assert_eq!(mem_dir, S_IFDIR, "mem_fs: 'd' is a directory");
+        assert_eq!(host_dir, S_IFDIR, "host_fs: 'd' is a directory");
+        assert_eq!(
+            mem_file,
+            (S_IFREG, 5),
+            "mem_fs: 'd/f' is a 5-byte regular file"
+        );
+        assert_eq!(
+            host_file,
+            (S_IFREG, 5),
+            "host_fs: 'd/f' is a 5-byte regular file"
+        );
+        assert_eq!(mem_name, "f");
+        assert_eq!(host_name, "f");
+    }
+
+    /// `opendir` snapshots entries and `readdir` yields them **sorted**, deterministically, across
+    /// several files and a nested directory — and a too-small `readdir` buffer fails closed
+    /// (`-EINVAL`) without consuming the entry.
+    #[test]
+    fn readdir_is_sorted_and_bounded() {
+        use super::*;
+        use svm_interp::{iface, Host, WindowMem};
+
+        fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
+            let n = win.len();
+            let mut wm = WindowMem::new(win, n as u64);
+            host.cap_dispatch_slots(iface::HOST_FN, op, h, args, Some(&mut wm))
+                .unwrap()[0]
+        }
+        fn names(host: &mut Host, h: i32, win: &mut [u8]) -> Vec<String> {
+            // opendir "." (the root) and drain it.
+            win[0] = b'.';
+            let dh = call(host, h, win, FS_OPENDIR, &[0, 1, 0, 0]);
+            assert!(dh >= 0, "opendir . : {dh}");
+            let mut out = Vec::new();
+            loop {
+                let n = call(host, h, win, FS_READDIR, &[dh, 512, 64, 0]);
+                if n == 0 {
+                    break;
+                }
+                assert!(n > 0, "readdir: {n}");
+                out.push(String::from_utf8(win[512..512 + n as usize].to_vec()).unwrap());
+            }
+            call(host, h, win, FS_CLOSEDIR, &[dh, 0, 0, 0]);
+            out
+        }
+
+        // Build "beta", "alpha", "gamma/x" (gamma implicit) on mem_fs; expect sorted [alpha,beta,gamma].
+        let mut host = Host::new();
+        let cap = mem_fs();
+        let h = (cap.grant)(&mut host, 0);
+        let mut win = vec![0u8; 4096];
+        for f in ["beta", "alpha", "gamma/x"] {
+            win[100..100 + f.len()].copy_from_slice(f.as_bytes());
+            let fd = call(
+                &mut host,
+                h,
+                &mut win,
+                FS_OPEN,
+                &[100, f.len() as i64, O_CREATE | O_WRITE, 0],
+            );
+            assert!(fd >= 0);
+            call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]);
+        }
+        assert_eq!(
+            names(&mut host, h, &mut win),
+            vec!["alpha", "beta", "gamma"]
+        );
+
+        // A readdir into a 2-byte buffer can't hold "alpha" (5) → -EINVAL, entry not consumed.
+        win[0] = b'.';
+        let dh = call(&mut host, h, &mut win, FS_OPENDIR, &[0, 1, 0, 0]);
+        assert_eq!(
+            call(&mut host, h, &mut win, FS_READDIR, &[dh, 512, 2, 0]),
+            -EINVAL,
+            "a too-small readdir buffer fails closed"
+        );
+        // The entry survived: a full-size read still returns it.
+        assert_eq!(
+            call(&mut host, h, &mut win, FS_READDIR, &[dh, 512, 64, 0]),
+            5
+        );
     }
 }
