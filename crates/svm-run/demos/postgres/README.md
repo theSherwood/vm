@@ -47,16 +47,15 @@ unprivileged user if invoked as root.
 | 7 | **indirect varargs call** (`manifest_process_version`) | — | **DONE (slice BW):** the on-ramp already marshaled a *direct* `(...)` call's variadic args into overflow scratch; three coordinated edits extend the exact same marshaling to an **indirect** `(...)` callee (a function pointer), which then lowers to `call_indirect` with a §3c type-id check against the `(sp, fixed-params…)` signature a defined `(...)` function uses. Test `varargs_indirect_call` (interp + bytecode + JIT vs native, incl. the `return_call_indirect` tail path) |
 | 8 | **two missing i128 op lowerings** (`sqrt_var`, `int2_accum`) | — | **DONE (slice BW):** the reported `value … not available in block` was not a liveness bug — it was `lower_i128` missing two arms, so the *generic scalar* handler resolved an i128 (which lives as an `agg` `(lo,hi)` pair, not in `idx_of`) and failed. Added **`select i128`** (per-word `Select` on the pairs — numeric `sqrt_var`'s Newton loop) and **`store i128`** (two i64 stores, lo at base / hi at base+8, mirroring `load i128` — numeric `int2_accum`'s `sumX2`). Test `i128_select_and_store_roundtrip` (hand `.ll`; interp + JIT) |
 | 9 | **vector `llvm.bswap`** (`pg_sha256_final`) | — | **DONE (slice BX):** a 128-bit vector byte-swap (`<4 x i32>`, SHA-256's big-endian digest write) — reverse the bytes *within each lane*, scalarized per lane through the existing scalar `emit_bswap` (mirrors vector `ctpop`). Test `vector_bswap_128` (hand `.ll`; interp + JIT). **This was the last translate gap** — the whole module (14 985 funcs) now translates end-to-end |
-| 10 | **verify: `TypeMismatch` in `ExecRenameStmt`** | — | **next**: with the module fully translating, `resolve_imports` (bind the 4 powerbox caps) + `svm-verify` surfaces one `TypeMismatch` (I32 fed where I64 expected) in `ExecRenameStmt` — a translator correctness bug to fix before the module verifies clean |
+| 10 | **verify: aggregate fan-out in the sparse-`switch` chain** (`ExecRenameStmt`) | — | **DONE (slice BY):** the sole verify error across all 14 985 functions. `block_param_types` (which types a synthetic compare-chain block's params) fanned out **wide vectors** but not **aggregates**, while `block_params`/`branch_args` fan out both — so a by-value `{i64,i32}` struct threaded through `ExecRenameStmt`'s sparse `switch` contributed one placeholder type there vs two args, desyncing the `zip` and mistyping every value behind it. One-branch fix (fan aggregates out too). Test `switch_sparse_threads_aggregate` (hand `.ll`; translate + verify + interp) |
 | 11 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap — the ~50 *live* externals resolve here |
 
-**Where it stands:** ★ **the complete module (832 modules / 14 985 functions) now translates end-to-end** —
-past the **entire 921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals (bundled
-openlibm, BQ), the **entire ~250-external OS/libc surface** with `--stub-externs` (BR), the **whole SIMD
-tail** (slice BV's two build-config levers), the **indirect varargs call** + two **i128** op lowerings
-(slice BW), and the final **vector `llvm.bswap`** (slice BX). The remaining gap to a *verified* module:
-after `resolve_imports` binds the 4 powerbox caps (`read`/`write`/`exit`/`vm_map`), `svm-verify` reports
-one **`TypeMismatch`** (I32 vs I64) in `ExecRenameStmt` (gap #10) — a translator bug to fix. Then the
-**runtime** (initdb data dir, storage manager, WAL, single-process shmem, catalog bootstrap) with real
-impls for the ~50 externals the query path actually calls. See `LLVM.md`
-slices BM–BX.
+**Where it stands:** ★★ **the complete module (832 modules / 14 985 functions) now translates AND
+verifies** — past the **entire 921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals
+(BQ), the **entire ~250-external OS/libc surface** with `--stub-externs` (BR), the **whole SIMD tail**
+(BV), the **indirect varargs call** + two **i128** op lowerings (BW), the final **vector `llvm.bswap`**
+(BX), and — after `resolve_imports` binds the 4 powerbox caps (`read`/`write`/`exit`/`vm_map` →
+`cap.call`) — a **clean `svm-verify` pass** (BY fixed the one remaining `TypeMismatch`). What's left is
+purely the **runtime**: `initdb` (a data dir, natively) exposed through the `fs` cap; the storage
+manager, WAL, single-process shmem, and catalog bootstrap; and real impls for the ~50 externals the
+query path actually calls (the rest stay trap-if-called stubs). See `LLVM.md` slices BM–BY.

@@ -779,6 +779,62 @@ fn switch_sparse_threads_live_ins_and_phi() {
 }
 
 #[test]
+fn switch_sparse_threads_aggregate() {
+    // A sparse `switch` whose compare-chain threads an **aggregate** live-in (a by-value `{i64,i32}`
+    // struct held field-wise in the `agg` table) *alongside* scalar live-ins. `block_param_types` (the
+    // chain block's param typing) must fan the aggregate out into one type per field — exactly as
+    // `block_params`/`branch_args` do — or the `zip` in `lower_sparse_switch` desyncs after the struct
+    // and mistypes every threaded value behind it (a `svm-verify` `TypeMismatch`). This was the sole
+    // verify error in the whole Postgres backend (`ExecRenameStmt`'s `switch` over a `{i64,i32}`
+    // struct). Hand `.ll` because clang's SROA usually scalarizes a struct before it can be threaded.
+    let ll = "define i64 @f(i32 %sel, i64 %p, i32 %q) {\n\
+      entry:\n  \
+        %a0 = insertvalue {i64, i32} undef, i64 %p, 0\n  \
+        %agg = insertvalue {i64, i32} %a0, i32 %q, 1\n  \
+        %u = add i64 %p, 1\n  \
+        %w = add i32 %q, 2\n  \
+        switch i32 %sel, label %def [ i32 0, label %c0\n                                    i32 100000, label %c1\n                                    i32 200000, label %c2 ]\n\
+      c0:\n  \
+        %x0 = extractvalue {i64, i32} %agg, 0\n  \
+        %w0 = zext i32 %w to i64\n  \
+        %r0 = add i64 %x0, %u\n  \
+        %s0 = add i64 %r0, %w0\n  \
+        ret i64 %s0\n\
+      c1:\n  \
+        %x1 = extractvalue {i64, i32} %agg, 1\n  \
+        %z1 = zext i32 %x1 to i64\n  \
+        %w1 = zext i32 %w to i64\n  \
+        %r1 = add i64 %z1, %u\n  \
+        %s1 = add i64 %r1, %w1\n  \
+        ret i64 %s1\n\
+      c2:\n  \
+        %x2 = extractvalue {i64, i32} %agg, 0\n  \
+        %y2 = extractvalue {i64, i32} %agg, 1\n  \
+        %z2 = zext i32 %y2 to i64\n  \
+        %r2 = add i64 %x2, %z2\n  \
+        %s2 = add i64 %r2, %u\n  \
+        ret i64 %s2\n\
+      def:\n  \
+        %wd = zext i32 %w to i64\n  \
+        %rd = add i64 %u, %wd\n  \
+        ret i64 %rd\n }";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate sparse-switch-aggregate .ll");
+    svm_verify::verify_module(&t.module).expect("verify sparse-switch-aggregate");
+    // f(sel, p=100, q=7): u=101, w=9. c0: 100+101+9=210; c1: 7+101+9=117; c2: 100+7+101=208; def: 101+9=110.
+    for (sel, want) in [(0i32, 210i64), (100000, 117), (200000, 208), (5, 110)] {
+        let full = vec![
+            Value::I64(t.entry_sp as i64),
+            Value::I32(sel),
+            Value::I64(100),
+            Value::I32(7),
+        ];
+        let mut fuel = 1_000_000u64;
+        let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run");
+        assert_eq!(r, vec![Value::I64(want)], "sel={sel}");
+    }
+}
+
+#[test]
 fn switch_sparse_long_chain() {
     // A six-case sparse switch → a five-block compare chain: stresses the synthetic-block indexing
     // (each chain block branches to the next, the last to the default).
