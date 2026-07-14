@@ -236,6 +236,35 @@ impl Nursery {
         )
     }
 
+    /// The module's functions (for a thaw to re-run a frozen §14 **same-module** child over its carve).
+    pub(crate) fn funcs(&self) -> std::sync::Arc<[Func]> {
+        std::sync::Arc::clone(&self.funcs)
+    }
+
+    /// The parent run's §5 kill-path interrupt cell (a re-attached thaw child polls the same cell).
+    pub(crate) fn epoch_addr(&self) -> usize {
+        self.epoch_addr
+    }
+
+    /// §4 thaw: publish a re-attached child's (rewound) result at its join-table `slot`, so the
+    /// parent's re-executed `join` resolves without re-running the child. The freeze recorded slots in
+    /// ascending order; pad any gap with an inert placeholder to keep the index alignment.
+    pub(crate) fn seed_child_result(&self, slot: usize, result: i64, trap: i64) {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        while children.len() <= slot {
+            children.push(Child {
+                result: 0,
+                trap: 0,
+                joined: false,
+            });
+        }
+        children[slot] = Child {
+            result,
+            trap,
+            joined: false,
+        };
+    }
+
     /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field: the nesting
     /// thunks then fail closed. Called at run entry (`run_code_raw`), after the entry wrappers
     /// have applied the compile-side durable flag.
@@ -421,6 +450,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         &args,
         rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
         durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
+        false, // not a thaw re-attach — a live `instantiate` (seed fresh / inherit the parent phase)
     );
     let (result, trap, unwound) = match outcome {
         Ok(rt) => rt,

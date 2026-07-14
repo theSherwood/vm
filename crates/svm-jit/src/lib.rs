@@ -1189,6 +1189,7 @@ pub fn compile_and_run_capture_reserved_with_host_durable_nested(
     init_mem: &[u8],
     init_prots: &[WindowProt],
     seed: &[FrozenFiber],
+    nested_seed: &[FrozenNested],
     reserved_log2: u8,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
@@ -1208,6 +1209,7 @@ pub fn compile_and_run_capture_reserved_with_host_durable_nested(
     )?;
     cm.restore_prots = init_prots.to_vec();
     cm.frozen_seed = seed.to_vec();
+    cm.frozen_nested_seed = nested_seed.to_vec();
     cm.durable = true;
     let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
     Ok((
@@ -1808,6 +1810,9 @@ pub struct CompiledModule {
     /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
     /// under `REWINDING`. Empty for a freeze / ordinary run.
     frozen_vcpu_seed: Vec<FrozenVCpu>,
+    /// Durable **thaw** seed (§4 "JIT parity"): the §14 **nested children** to re-attach + rewind before
+    /// the parent re-enters under `REWINDING`, so its re-executed `join` resolves. Empty otherwise.
+    frozen_nested_seed: Vec<FrozenNested>,
     /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
     /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
     thaw_root_sp: u64,
@@ -2731,6 +2736,7 @@ impl CompiledModule {
             frozen_nested_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
+            frozen_nested_seed: Vec::new(),
             thaw_root_sp: DURABLE_SHADOW_BASE + 8, // §12.8 4A.5: empty root extent = frame base (past the SP word)
             freeze_ctl: None,
             #[cfg(fiber_rt)]
@@ -3127,6 +3133,46 @@ impl CompiledModule {
             let root_sp = (*this).thaw_root_sp;
             if let Some(d) = &(*this).domain {
                 d.thaw_reattach_and_run(&seed, root_sp);
+            }
+        }
+
+        // §4 nested thaw (JIT parity): re-attach + **rewind** the frozen §14 children before the parent
+        // re-enters, so its re-executed `join` resolves to each child's (rewound) result. Unlike a
+        // `thread.spawn` child (a peer vCPU, above), a §14 child is a nested *domain* re-run over its
+        // carve in thaw mode (rewind from the carve's frozen continuation, not a fresh start); the
+        // result is published at the child's join slot for the parent's `join`. Depth-1 (root's direct
+        // children) for now.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !(*this).frozen_nested_seed.is_empty() {
+            let seed = std::mem::take(&mut (*this).frozen_nested_seed);
+            if let Some(n) = &(*this)._nursery {
+                let funcs = n.funcs();
+                let epoch = n.epoch_addr();
+                for rec in &seed {
+                    let entry = rec.entry as FuncIdx;
+                    let nargs = funcs
+                        .get(entry as usize)
+                        .map(|f| f.params.len())
+                        .unwrap_or(0);
+                    let args = vec![0i64; nargs];
+                    // SAFETY: the carve `[carve_off, carve_off + 2^size_log2)` is committed in the
+                    // restored window at `mem_base` (it rode the artifact); `compile_child_and_run`
+                    // copies it into the child's own guarded window, rewinds it, and copies it back.
+                    match compile_child_and_run(
+                        &funcs,
+                        entry,
+                        rec.carve_off,
+                        rec.size_log2,
+                        mem_base,
+                        &args,
+                        epoch,
+                        true, // durable
+                        true, // thaw: rewind from the carve's frozen continuation
+                    ) {
+                        Ok((result, trap, _)) => n.seed_child_result(rec.slot, result, trap),
+                        Err(_) => n.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
+                    }
+                }
             }
         }
 
@@ -3620,6 +3666,7 @@ pub(crate) unsafe fn compile_child_and_run(
     args: &[i64],
     epoch_addr: usize,
     durable: bool,
+    thaw: bool,
 ) -> Result<(i64, i64, bool), JitError> {
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
 
@@ -3705,19 +3752,30 @@ pub(crate) unsafe fn compile_child_and_run(
     const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0) = 72
     if durable && (child_size as usize) >= CTX0_THAW_OFF + 4 {
         const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0) = 80
-                                                               // §4 freeze: the child inherits the **parent's** durable phase (the interp seeds
-                                                               // `child.dstate = parent.durable_state()`). Under a freeze the parent window is `UNWINDING`, so
-                                                               // an instrumented child is born unwinding and unwinds at its first poll; under `NORMAL` it runs
-                                                               // to completion. Read the parent window's ctx-0 state word (`STATE_OFF` = 0 of `parent_mem_base`).
-        let parent_phase = {
-            let p = std::slice::from_raw_parts(parent_mem_base, 4);
-            i32::from_le_bytes([p[0], p[1], p[2], p[3]])
-        };
+        const STATE_REWINDING: i32 = 2;
         let w = child_window.rw_mut();
-        w[0..4].copy_from_slice(&parent_phase.to_le_bytes()); // global state word = parent's phase
-        w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
-        w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
-        // ctx-0 SP word
+        if thaw {
+            // §4 thaw: the carve (from the restored artifact) holds the child's frozen continuation —
+            // its spilled shadow stack + the ctx-0 SP word pointing at the top of it. Prepare it to
+            // **rewind** exactly as `svm-durable::begin_thaw` does for a context: global state word →
+            // `NORMAL`, ctx-0 thaw word → `REWINDING`, and **preserve** the SP word + shadow stack (the
+            // continuation the rewind replays). The child then dispatches on the thaw word and reloads.
+            w[0..4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
+            w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&STATE_REWINDING.to_le_bytes());
+        } else {
+            // §4 freeze/normal: the child inherits the **parent's** durable phase (the interp seeds
+            // `child.dstate = parent.durable_state()`). Under a freeze the parent window is `UNWINDING`,
+            // so an instrumented child is born unwinding and unwinds at its first poll; under `NORMAL`
+            // it runs to completion. Read the parent window's ctx-0 state word (`STATE_OFF` = 0).
+            let parent_phase = {
+                let p = std::slice::from_raw_parts(parent_mem_base, 4);
+                i32::from_le_bytes([p[0], p[1], p[2], p[3]])
+            };
+            w[0..4].copy_from_slice(&parent_phase.to_le_bytes()); // global state word = parent's phase
+            w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
+            w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
+            // ctx-0 SP
+        }
     }
 
     let mut results = vec![0i64; n_results];

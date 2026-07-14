@@ -385,10 +385,19 @@ child that unwinds mid-run (a pure child runs to completion). But because both u
 `instantiate` call, the `FrozenNested` **record** (the re-attach geometry a thaw consumes) is byte-for-byte
 identical — so the differential is on the *record*, not the frozen continuation. A byte-identical
 *carve* would require the freeze points to coincide; that (and the true correctness proof) is the
-**freeze→thaw→result round-trip**, which is the thaw slice. (3) **thaw** re-attach + `REWINDING`
-(also closes the round-trip pin); (4) depth-2 (a grandchild's residue coalescing at the root via a
-shared sink), separate-module, and completed-result parity. Powerbox (1) was the gating prerequisite;
-the synchronous model needs no redesign.
+**freeze→thaw→result round-trip** — the thaw slice below. (3) **thaw — LANDED (round-trip closed).**
+`compile_child_and_run` gains a thaw mode: it prepares the child's restored carve to **rewind** as
+`svm-durable::begin_thaw` does (global state `NORMAL`, ctx-0 thaw word `REWINDING`, SP word + shadow
+stack **preserved** — the frozen continuation the rewind replays). Before the parent re-enters, a new
+`run_inner` hook (mirroring the multi-vCPU `thaw_reattach_and_run`) re-runs each `frozen_nested_seed`
+child over its carve in thaw mode and publishes the result at its join slot (`Nursery::seed_child_result`);
+the parent then rewinds, reloads its `instantiate` handle, and its re-executed `join` resolves to the
+child's total. The seed rides a new `frozen_nested_seed` input on the `_durable_nested` entry. Pinned by
+`durable_nesting_jit.rs::jit_nested_freeze_thaw_round_trips` — freeze→thaw of a §14 child delivers the
+uninterrupted 4950 (**freeze→thaw ≡ uninterrupted**, the correctness proof the freeze-export record
+differential deferred). (4) depth-2 (a grandchild's residue coalescing at the root via a shared sink),
+separate-module, and completed-result parity remain. Powerbox (1) was the gating prerequisite; the
+synchronous model needs no redesign.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
