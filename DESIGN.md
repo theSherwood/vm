@@ -69,34 +69,45 @@ is spent *around* compute, where wasm is weak:
   inlinable to ~free; batched async rings (§9, §13).
   *This is the strongest, most defensible win.*
 - **64-bit address space:** a clean 64-bit window with **no 32-bit index type**.
-  Against wasm32, confinement is **"guard-when-bounded, check-and-clamp-when-not"**
-  (trap-confinement, D38): where the effective address is *provably bounded* (the
-  common indexed-array case — `(i & K)*W`), everything elides and we approach
-  wasm32's free guarded access (bench: ~1.2–1.4× wasm32). Where the base is an
-  **unbounded value** — notably the threaded data-SP in C-frontend locals
-  (`sp + (i & 255)*8`) — we emit a bounds check + cold trap for the architectural
-  fault, plus a `& (reserved−1)` clamp on the address feeding the access for
-  Spectre-v1 confinement (§4). The clamp AND sits on the load's address-latency
-  path (as the old wrap-confinement mask did), so per-access cost ≈ the old mask
-  model; the raw check-only lowering measured faster on memory-bound kernels
-  (edn −9%, picojpeg −8%, JIT-only spike) but that win is deliberately spent on
-  keeping speculative confinement — see the §4 Spectre-v1 note. The residual
-  per-loop cost on unbounded-base loops (`matmult +5%`, `cache +6.7%`) is the
-  target of the staged **guard-relying base-hoist** (§4, D61 — proposed): hoist
-  one check+clamp of the invariant base to the preheader and elide the per-access
-  ones, gated on a `trusted_reach ≤ guard_size` invariant. Against wasm64 we
-  still win: Wasmtime's bounds-checked heaps pay a `cmp→cmov` Spectre guard on the
-  same path, one op more than our AND. Closing the wasm32 gap entirely would need
-  wasm32-style **32-bit window addressing**; we keep the clean 64-bit model (D50).
+  Confinement is **"guard-when-bounded, branchless-check-when-not"**
+  (trap-confinement, D63 — supersedes D38's `trapnz`+AND-clamp): where the
+  effective address is *provably bounded* (the common indexed-array case —
+  `(i & K)*W`), everything elides and we approach wasm32's free guarded access
+  (bench: ~1.2–1.4× wasm32). Where the base is an **unbounded value** — notably
+  the threaded data-SP in C-frontend locals (`sp + (i & 255)*8`) — the non-elided
+  access lowers to `cmp; select_spectre_guard(oob, guard, addr); load`: an
+  out-of-bounds address is redirected **branchlessly (cmov) to the window's guard
+  page**, so it faults there for the architectural trap *and* a misspeculated OOB
+  access lands on the guard for Spectre-v1 (§4). This is the **identical Cranelift
+  primitive Wasmtime uses**, so against wasm64 the per-access confinement is at
+  **parity** — not the "one op more than our AND" the D38 analysis claimed (the
+  40-bit reservation mask was not an x86 immediate, so the AND was a RIP-relative
+  *load* per access, and the `trapnz` added a per-access branch; D63's A/B found
+  removing the branch is the win, reaching matmul parity/faster). The old
+  unbounded-base regression (`matmult +5%`, `cache +6.7%`) that motivated the
+  staged **guard-relying base-hoist** (D61) is thus **closed by D63's branch
+  removal**, so D61 is deferred-as-moot rather than the active plan. Closing the
+  wasm32 gap entirely would need wasm32-style **32-bit window addressing**; we keep
+  the clean 64-bit model (D50).
+- **Vectorizable array compute:** faster — the LLVM on-ramp consumes **host** LP64
+  bitcode, so it targets the *actual* CPU's 128-bit SIMD, which is **richer than
+  wasm's portable `simd128`** (D64: compile guest C for `x86-64-v3` at 128-bit
+  width). This pulls array kernels to **parity-or-faster than Wasmtime-w64** and
+  the embench geomean **ahead** (svm-jit 1.96× vs wt64 2.00× ×native). Residual:
+  svm-jit scalarizes vector integer *width-conversions* (`edn`, ~1.4×) — the next
+  evidence-driven `v128` widen/narrow op-set slice (D58).
 - **Startup / JIT latency:** faster — SSA on the wire (no SSA reconstruction);
   decls-before-bodies ⇒ parallel per-function verify+JIT (§3a).
 - **Irregular control flow:** marginally faster — native irreducible CFG avoids
   relooper-introduced blocks/branches (§3).
 
-So "faster than wasm" is **interface + 64-bit-memory + startup + control-flow
-shape**, *not* raw compute. If raw-compute wins were ever required, the design has
-no mechanism for them without changing the backend (losing the security
-inheritance) or adding an unsafe mask-elided tier — neither is on the table.
+So "faster than wasm" is **interface + 64-bit-memory + host-native SIMD + startup +
+control-flow shape**. *Scalar* compute is **parity by construction** — sharing
+Cranelift, we cannot out-run the same backend on a tight scalar inner loop, and the
+design has no mechanism to without changing the backend (losing the security
+inheritance) or adding an unsafe mask-elided tier — neither is on the table. The
+compute win is confined to where the host on-ramp reaches an ISA wasm can't (richer
+128-bit SIMD, D64), not the scalar core.
 
 **Interface: the clearest win.** Simpler than WASI + component model + WIT +
 lift/lower (ours is scalars + `(ptr,len)` own/borrow buffers + handles, no IDL,
@@ -2945,4 +2956,5 @@ as open-ended, not a byproduct of the build.
 | D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`svm-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`svm-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |
 | D61 | **Guard-relying base-hoist elision to claw back trap-confinement's load-dense-loop cost (§4).** Hoist one check+clamp of a loop-invariant unbounded base into the preheader, then elide the per-access check+clamp for accesses of proven reach `B`. Architecturally sound with the existing guard; the risk is the **speculative overshoot** `base_clamped + off_i ∈ [0, reserved + B)`, which binds the JIT elision analysis to the allocator by the invariant **`trusted_reach ≤ guard_size`** (a wrong bound = *speculative* escape). Blocker found: `mem.rs` reserves only **one** trailing guard page, capping safe reach at 4 KiB (Scope A, zero allocator change — captures the C stack-locals case) unless the guard is enlarged (Scope B — captures `dot`/`matmult`/`cache`, changes escape-TCB allocation). | **Proposed — design only; no escape-TCB code until the invariant is signed off** | The one measured trap-confinement regression is load-dense loops over an unbounded base (§1a `matmult +5%`, `cache +6.7%`); this is the staged wasm32-style guard-relying win (§4), deferred not on value but because its speculative-overshoot correctness turns on a coupled security-hinge invariant with no expert reviewer (§18). Verification: escape oracle (architectural) + a new `trusted_reach ≤ guard_size` fuzz probe (speculative) |
 | D62 | **Bulk-memory IR ops (`mem.copy`/`mem.move`/`mem.fill`) confined once per span, not per byte (§4).** New no-result ops lower `llvm.memcpy`/`memmove`/`memset` to a *single* whole-span range check (`[ptr, ptr+len) ⊆ [0, reserved)`, computed overflow-free via the `len > reserved` sub-check that guards the `reserved − len` subtraction, gated by `len != 0`) plus a base Spectre-clamp, then the platform `memcpy`/`memmove`/`memset` **libcall** (Cranelift `call_memcpy`/…, resolved by the JIT's `default_libcall_names`). Replaces svm-llvm's old lowering — a per-8-byte-chunk *masked* load/store unroll (≤ 4 KiB) or a byte-at-a-time `__svm_memcpy`/`memset`/`memmove` helper (larger/variable) — which paid one confinement check per chunk/byte. The interpreters mirror it with a checked span copy/fill (overlap-safe snapshot). | **Settled (built — svm-ir/verify/interp/bytecode/encode/text/peval/jit/llvm; `memcpy` helper retained only for realloc/snprintf/`__vm_fmt`)** | Isolated as the dominant array-copy gap to Wasmtime-w64 (`confine` harness: the faithful `matmul_eb` kernel's memcpy was the whole difference from parity `matmul`); the bulk primitive is the `memory.copy`-class lowering Wasmtime uses — same confinement guarantee (whole span proven in-bounds before any access), checked once. Same "as secure as wasm" speculative posture as a bounds-checked `memory.copy` (§1a): the length is checked, the base clamped, the copy a non-speculated libcall — so no per-byte clamp. Measured: `matmul_eb` svm÷wt64 **1.264→1.202** (control `matmul` flat), all 19 embench kernels `verify=1`. Verification: a JIT↔both-interpreters differential (`svm-jit/tests/bulk_mem.rs` — fill/copy, overlapping move, zero-length-wild-pointer no-op, OOB + oversized-length fault) + the span-OOB-formula fuzz probe in `fuzz/mask` (JIT formula vs a `u128` oracle) |
+| D64 | **On-ramp SIMD target: compile guest C for a rich-128-bit profile (`-march=x86-64-v3 -mprefer-vector-width=128` on x86; NEON on ARM), not the `x86-64` baseline.** The LLVM on-ramp consumes **host** LP64 bitcode, so — unlike wasm, which is capped at the portable `simd128` op set for portability — svm-jit can target the *actual* CPU's richer 128-bit SIMD. The `x86-64` baseline (SSE2) is **poorer** than `simd128` (no `i32x4.mul`/`pmulld`, no wide widening muls), which under-vectorized guest code and made svm-jit look behind on array kernels; `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM the ops `simd128` has, and `-mprefer-vector-width=128` keeps LLVM at 128-bit so **Cranelift never has to split a 256/512-bit vector** (it has no YMM/ZMM register class — D58). This is the axis where the host on-ramp *should* beat wasm (§1a's 64-bit/host-native advantage); the two frontend flags realize it. **+0 escape-TCB:** richer auto-vectorization only emits more **value-only** `v128` ops (verifier re-checks; D58); the confinement path is untouched. Cranelift still feature-detects the running CPU, so `x86-64-v3` bitcode **runs and verifies on any x64 host** (a rarer non-AVX2 host lowers the 128-bit ops via baseline encodings — correct, just slower). Also landed alongside: **fuse `sext(narrow load)` → a signed load** (`movsx (mem)` instead of `movzx`+register `movsx`) in svm-llvm's §3b load discipline — a correct scalar-signed-`short`/`char` win, +0 escape-TCB. | Settled (built — `bench/confine` svm lane + `embench` svm build on the target; signed-load fusion in svm-llvm) | The `confine` "parity/faster" reads (D63) were partly an artifact of the harness building the **wasm lanes without `-msimd128`** — comparing svm-jit-vectorized against Wasmtime-*scalar*. With SIMD on both sides the honest gap appeared (matmul 1.42×, edn 1.37×). Root-caused via A/B: the svm lane was under-targeting (SSE2), not a backend-codegen deficit — retargeting to `x86-64-v3` (128-wide) flips the vectorizable kernels to **parity-or-faster** (matmul 1.42→**0.91×**, matmul_eb 1.15→**1.04×**, fir 0.56→0.38×) and pulls the **embench geomean ahead of Wasmtime-w64 for the first time: svm-jit 1.96× vs wt64 2.00×** (was 2.12× vs 2.04×), all 19 kernels still `verify=1`. **Residual — `edn` stays ~1.43× at every frontend target** (not vectorization-availability): its codegen is **534 lane insert/extract ops (`vpinsr`/`vpextr`) vs 40 real `vpmulld`** — svm-jit lowers vector **integer width-conversions** (`<8×i16>`→`<8×i32>`→i64, edn's short→int→long DSP) by exploding to scalar lanes + repacking (`vec_explode`/`vec_implode`) instead of native SIMD widen/narrow (`vpmovsxwd`/`vpackssdw`). **Next SIMD slice** = native `v128` widen/narrow ops (D58 grows the op set evidence-driven; `edn` is the evidence), +0 escape-TCB. Caveat: baking a target into bitcode trades that artifact's portability (AVX2-compiled bitcode assumes AVX2) — wasm's portability/perf tradeoff, inverted in our favor for a JIT-per-host system (compile for the deployment baseline, or per-host). |
 | D63 | **Branchless per-access confinement (`select_spectre_guard`), superseding D38's `trapnz` + AND clamp — uniform for top-level *and* §14 nested windows.** A non-elided access lowers to `cmp; select_spectre_guard(oob, guard_offset, sub_base + addr+offset); load` — an out-of-bounds address is redirected (branchlessly, via cmov) to `guard_offset = round_up(win_reserved, page)`, the offset of the enclosing window's trailing guard page, so the access itself faults there (`MemoryFault`). Same architectural fault and same clear-fault-at-the-offending-access property as D38; same Spectre-v1 confinement (`select_spectre_guard` is a speculation barrier — a misspeculated OOB access also lands on the guard), via the **identical Cranelift primitive Wasmtime uses**. A **nested** sub-window redirects to the *parent's* guard (its own slice has committed parent memory on both sides, so redirecting to the child's `reserved` could alias the parent — a child→parent escape); redirecting the whole physical offset past `+ sub_base` lands an out-of-child access on the parent guard, never in the parent. In-process nesting is defense-in-depth, not a promised Spectre boundary (§2a). | Settled (supersedes D38's per-access shape; D38's escape-oracle contract unchanged) | The A/B (`confine` harness) refuted D38's "1-op AND beats Wasmtime's cmp→cmov" claim: the 40-bit reservation mask is not an x86 immediate, so the AND was a **RIP-relative load per access**, and the `trapnz` added a per-access **branch** — together ~1.06×/1.34× behind Wasmtime-w64 on `matmul`/`matmul_eb`. Branchless cmov-to-guard hoists the guard offset into a register and removes the branch, reaching **0.94×/0.97×** (parity/faster), with **nested windows on the same fast path** (no penalty). A `trapnz`-keeping cmov variant (clamp only) regressed (1.23×/1.55×) — the branch removal, not the cmov, is the win. **Guard target = `round_up(win_reserved, page)`, not `reserved`**: a sub-page window commits its prefix page-granularly, so only the page-aligned offset is `PROT_NONE` (caught by the escape oracle). Verification: OOB→`MemoryFault` + sub-window escape oracle (out-of-child faults, parent untouched) + `fuzz/mask` (the OOB predicate is unchanged) + escape oracle (§18) |

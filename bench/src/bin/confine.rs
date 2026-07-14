@@ -50,6 +50,7 @@ const BC_REPS: u32 = 5;
 const KERNELS: &[(&str, i64, i64)] = &[
     ("matmul", 100, 20_000),
     ("matmul_eb", 100, 20_000),
+    ("edn", 100, 40_000),
     ("fir", 1_000, 12_000_000),
     ("bytes", 1_000, 12_000_000),
 ];
@@ -154,14 +155,24 @@ fn svmbc_lane(cfile: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
 }
 
 /// Build `kernel.c` to a wasm module at the given target (`wasm32`/`wasm64`), matching the embench
-/// build's `-mbulk-memory` (so `memcpy`/`memset` lower to `memory.copy`/`fill`, not undefined libc
-/// symbols). Returns the module path.
+/// build's `-msimd128 -mbulk-memory` (so the wasm side auto-vectorizes to `v128` and `memcpy`/`memset`
+/// lower to `memory.copy`/`fill`, not undefined libc symbols).
+///
+/// SIMD caveat: enabling `-msimd128` is the honest, embench-matching posture (both sides get their
+/// frontend's SIMD), but it does NOT make vectorizable kernels a clean codegen comparison. The svm-jit
+/// lane consumes **host** LP64 bitcode (x86 SSE2 baseline) while this lane targets **wasm simd128** —
+/// different SIMD ISAs (e.g. wasm has `i64x2.mul`, x86-128 doesn't), so LLVM vectorizes each
+/// differently. A vectorizable kernel's ratio can swing ±40% on this flag alone (matmul: 0.93x without
+/// → 1.4x with), reflecting frontend vectorization + ISA, not just backend codegen. The clean signal
+/// is the **scalar** kernels (bytes ≈ parity) and kernels whose ratio is stable across the flag (edn).
+/// Returns the module path.
 fn build_wasm(cfile: &Path, target: &str) -> Option<PathBuf> {
     let wasm = std::env::temp_dir().join(format!("confine_{}.{target}.wasm", std::process::id()));
     let ok = Command::new("clang")
         .args([
             &format!("--target={target}"),
             "-O2",
+            "-msimd128",
             "-mbulk-memory",
             "-nostdlib",
             "-Wl,--no-entry",
@@ -220,10 +231,24 @@ fn v8_lane(run_mjs: &Path, wasm: &Path, small: i64, large: i64) -> Option<(f64, 
 }
 
 /// Compile `kernel.c` to LP64 bitcode and translate to SVM IR; return `(module, entry_sp, run idx)`.
+///
+/// On-ramp target: `-march=x86-64-v3 -mprefer-vector-width=128`. The svm-jit on-ramp consumes *host*
+/// bitcode, so unlike wasm (capped at the portable simd128 op set) it can target the real CPU's richer
+/// 128-bit SIMD. `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM ops simd128 has but the
+/// SSE2 baseline lacks (`i32x4.mul`, wider widening muls, …); `-mprefer-vector-width=128` keeps LLVM at
+/// 128-bit so Cranelift (no YMM/ZMM regclass, D58) never has to split a 256-bit vector. Together this
+/// flips the vectorizable-kernel gap to parity-or-faster than Wasmtime-w64 (matmul 1.42x→0.89x), at
+/// +0 escape-TCB (more `v128` ops are value-only; the verifier re-checks). See DESIGN.md D64.
 fn translate(cfile: &Path) -> Option<(svm_ir::Module, i64, u32)> {
     let bc = std::env::temp_dir().join(format!("confine_{}.bc", std::process::id()));
     let ok = Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c"])
+        .args([
+            "-O2",
+            "-march=x86-64-v3",
+            "-mprefer-vector-width=128",
+            "-emit-llvm",
+            "-c",
+        ])
         .arg(cfile)
         .arg("-o")
         .arg(&bc)

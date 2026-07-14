@@ -293,7 +293,15 @@ fn main() {
         let bc = dir.join(format!("emb_{name}.bc"));
         let mut sc = Command::new("clang");
         common(&mut sc);
+        // On-ramp SIMD target (D64): svm-jit consumes *host* bitcode, so unlike wasm (capped at the
+        // portable simd128 op set) it targets the real CPU's richer 128-bit SIMD. `x86-64-v3` (AVX2,
+        // universal on x86 since ~2013) gives LLVM ops simd128 has that SSE2 lacks; `prefer-width=128`
+        // keeps LLVM at 128-bit so Cranelift (no YMM/ZMM regclass, D58) never splits a wide vector.
+        // This is what pulls the array-kernel geomean to parity-or-faster vs Wasmtime-w64. Cranelift
+        // still feature-detects the actual CPU, so the bitcode runs (and verifies) on any x64 runner.
         sc.args([
+            "-march=x86-64-v3",
+            "-mprefer-vector-width=128",
             "-emit-llvm",
             "-c",
             "-DSVM_BUILD",
