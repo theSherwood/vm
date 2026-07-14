@@ -44,6 +44,12 @@
 > reservation), but a §3 parity break. The suite pins interp + bytecode fully and
 > skips only the JIT leg of the guard-hole trap vectors (grep I21) until the fix —
 > which touches the confinement hinge and needs a reviewed design decision.
+> A second, smaller precision catch (macOS CI): the `mapped` boundary is
+> **host-page-granular** — a 4 KiB window on a 16 KiB-page host (macOS ARM) is backed
+> by one whole page, so accesses just past `mapped` succeed there. The byte-exact
+> boundary the model pins therefore holds only at page-aligned window sizes; the spec
+> window is 64 KiB (the same choice `irgen` already made for the same reason), and
+> the constraint is now recorded on `MEM_LOG2` as part of the executable definition.
 
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier

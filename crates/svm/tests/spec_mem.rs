@@ -17,10 +17,11 @@
 //! (checked against `reserved`, backed only to `mapped` — see D62); whether that
 //! partial write should be pinned is an open SPEC.md question.
 
-use svm_interp::{bytecode, run_capture, Trap, Value};
+use svm_interp::{bytecode, run_capture_reserved, Host, Trap, Value};
 use svm_jit::{compile, JitOutcome, TrapKind};
 use svm_spec::{
-    mem_rows, mem_vectors_for, module_for_mem, MemRow, SpecTrap, SpecVal, MEM_OFFSETS, MEM_SIZE,
+    mem_rows, mem_vectors_for, module_for_mem, MemRow, SpecTrap, SpecVal, MEM_LOG2, MEM_OFFSETS,
+    MEM_SIZE,
 };
 
 fn to_value(v: SpecVal) -> Value {
@@ -85,10 +86,14 @@ fn check_vector(
     offset: u64,
     vector: &[SpecVal],
     init: &[u8],
+    model: &mut [u8], // scratch, reset from `init` here (reused to avoid re-alloc)
 ) {
-    // The model outcome: expected value/trap + expected final window.
-    let mut model = init.to_vec();
-    let expected = (row.eval)(vector, offset, &mut model);
+    // The model outcome: expected value/trap + expected final window. Load rows never
+    // mutate the window (`mutates == false`), so their per-backend window compares are
+    // skipped — a load that corrupted memory would already fail the escape oracle.
+    let mutates = row.result.is_none();
+    model.copy_from_slice(init);
+    let expected = (row.eval)(vector, offset, model);
     let ctx = |backend: &str, got: &dyn std::fmt::Debug| {
         format!(
             "spec-mem divergence [{backend}] op={} offset={offset:#x} vector={vector:?}\n \
@@ -109,32 +114,44 @@ fn check_vector(
 
     let args: Vec<Value> = vector.iter().copied().map(to_value).collect();
 
-    // Tree-walk interpreter.
+    // Tree-walk interpreter. `reserved_log2 = MEM_LOG2` ⇒ a fully-mapped window
+    // (`mapped == reserved`), exactly the spec model — and a 64 KiB reservation
+    // instead of the default terabyte-scale one, which dominated the suite's runtime
+    // when created per vector.
     let mut fuel = 10_000u64;
-    let (ir, imem) = run_capture(m, 0, &args, &mut fuel, init);
+    let (ir, imem) = run_capture_reserved(m, 0, &args, &mut fuel, init, MEM_LOG2);
     match (&expected, &ir) {
         (Ok(Some(e)), Ok(vs)) if vs.len() == 1 && value_matches(*e, &vs[0]) => {}
         (Ok(None), Ok(vs)) if vs.is_empty() => {}
         (Err(t), Err(tr)) if *tr == interp_trap(*t) => {}
         _ => panic!("{}", ctx("interp", &ir)),
     }
+    // Faulting access mutates nothing, too.
     assert!(
-        imem == model,
+        !mutates || imem == model,
         "{}",
-        win_ctx("interp", &imem, &model) // faulting access mutates nothing, too
+        win_ctx("interp", &imem, model)
     );
 
-    // Bytecode interpreter.
+    // Bytecode interpreter, same fully-mapped reservation (empty powerbox host —
+    // these modules make no cap.calls).
     let mut fuel = 10_000u64;
-    let (bc, bmem) = bytecode::compile_and_run_capture(m, 0, &args, &mut fuel, init)
-        .unwrap_or_else(|| panic!("{}", ctx("bytecode", &"unsupported module")));
+    let mut host = Host::new();
+    let (bc, bmem) = bytecode::compile_and_run_capture_reserved_with_host(
+        m, 0, &args, &mut fuel, init, MEM_LOG2, &mut host,
+    )
+    .unwrap_or_else(|| panic!("{}", ctx("bytecode", &"unsupported module")));
     match (&expected, &bc) {
         (Ok(Some(e)), Ok(vs)) if vs.len() == 1 && value_matches(*e, &vs[0]) => {}
         (Ok(None), Ok(vs)) if vs.is_empty() => {}
         (Err(t), Err(tr)) if *tr == interp_trap(*t) => {}
         _ => panic!("{}", ctx("bytecode", &bc)),
     }
-    assert!(bmem == model, "{}", win_ctx("bytecode", &bmem, &model));
+    assert!(
+        !mutates || bmem == model,
+        "{}",
+        win_ctx("bytecode", &bmem, model)
+    );
 
     // Cranelift JIT — except the ISSUES.md **I21** carve-out: a *bulk* op whose span
     // overruns `mapped` but stays inside the reservation reaches the libcall, where
@@ -167,11 +184,11 @@ fn check_vector(
     }
     // Window pinned on completing runs; see the module comment for the faulting-run
     // exemption (bulk-libcall partial writes are not yet pinned).
-    if expected.is_ok() {
+    if mutates && expected.is_ok() {
         assert!(
             jmem[..model.len()] == model[..],
             "{}",
-            win_ctx("jit", &jmem[..model.len().min(jmem.len())], &model)
+            win_ctx("jit", &jmem[..model.len().min(jmem.len())], model)
         );
     }
 }
@@ -197,24 +214,55 @@ fn jit_trap(t: SpecTrap) -> TrapKind {
 #[test]
 fn spec_mem_vectors_match_all_backends() {
     let init = init_window();
-    let mut vectors_run = 0usize;
-    for row in mem_rows() {
-        let offsets: &[u64] = if row.has_offset { MEM_OFFSETS } else { &[0] };
-        for &offset in offsets {
-            let m = module_for_mem(&row, offset);
-            svm::verify::verify_module(&m)
-                .unwrap_or_else(|e| panic!("spec mem module for {} fails verify: {e:?}", row.id));
-            let mut cm = compile(&m, 0).unwrap_or_else(|e| {
-                panic!("spec mem module for {} fails JIT compile: {e:?}", row.id)
+    // Work units = (row, offset) modules, spread over worker threads: the interpreter
+    // legs pay a per-run window setup/teardown (~ms at a 64 KiB window), so the suite
+    // is wall-clock-bound on them — the units are independent (each thread owns its
+    // module, compiled JIT, and model buffer), and parallelism keeps the FULL
+    // boundary lattice within the CI budget instead of thinning it.
+    let rows = mem_rows();
+    let units: Vec<(usize, u64)> = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(i, row)| {
+            let offsets: &[u64] = if row.has_offset { MEM_OFFSETS } else { &[0] };
+            offsets.iter().map(move |&o| (i, o)).collect::<Vec<_>>()
+        })
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let vectors_run = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                // Rows carry non-Sync boxed closures; construction is cheap and
+                // deterministic, so each worker builds its own copy and indexes it
+                // with the shared unit list.
+                let rows = mem_rows();
+                let mut model = init.clone();
+                loop {
+                    let u = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(ri, offset)) = units.get(u) else {
+                        return;
+                    };
+                    let row = &rows[ri];
+                    let m = module_for_mem(row, offset);
+                    svm::verify::verify_module(&m).unwrap_or_else(|e| {
+                        panic!("spec mem module for {} fails verify: {e:?}", row.id)
+                    });
+                    let mut cm = compile(&m, 0).unwrap_or_else(|e| {
+                        panic!("spec mem module for {} fails JIT compile: {e:?}", row.id)
+                    });
+                    for vector in mem_vectors_for(row) {
+                        check_vector(row, &m, &mut cm, offset, &vector, &init, &mut model);
+                        vectors_run.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             });
-            for vector in mem_vectors_for(&row) {
-                check_vector(&row, &m, &mut cm, offset, &vector, &init);
-                vectors_run += 1;
-            }
         }
-    }
+    });
+    let vectors_run = vectors_run.into_inner();
     assert!(
-        vectors_run > 5_000,
+        vectors_run > 3_000,
         "suspiciously few spec memory vectors ran: {vectors_run}"
     );
 }

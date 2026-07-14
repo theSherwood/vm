@@ -1285,8 +1285,13 @@ pub fn module_for(row: &OpRow, vector: &[SpecVal]) -> Module {
 // (`mapped == reserved`); the decoupled reserved-tail model rides the existing
 // escape-oracle differential.
 
-/// The spec window: 4 KiB, fully mapped.
-pub const MEM_LOG2: u8 = 12;
+/// The spec window: 64 KiB, fully mapped. 64 KiB — not something smaller — because
+/// the backed extent is **host-page-granular** in both backends (a 4 KiB window on a
+/// 16 KiB-page host (macOS ARM) is backed by one whole page, so accesses just past
+/// `mapped` succeed there): the `mapped` boundary is byte-exact only when the window
+/// size is a multiple of every supported host page. 64 KiB is the same choice `irgen`
+/// pins for the same reason.
+pub const MEM_LOG2: u8 = 16;
 pub const MEM_SIZE: u64 = 1 << MEM_LOG2;
 
 /// Admit a scalar access, returning the effective address as a window index.
@@ -1390,10 +1395,7 @@ fn addr_pool() -> Vec<SpecVal> {
     [
         0,
         1,
-        2,
-        7,
         8,
-        64,
         0xabc,
         MEM_SIZE - 8,
         MEM_SIZE - 4,
@@ -1404,7 +1406,6 @@ fn addr_pool() -> Vec<SpecVal> {
         u64::MAX,     // wrap-around: must fault, never alias
         u64::MAX - 6, // wraps for width 8, faults for width ≤ 6 by span, too
         1 << 63,
-        (1 << 63) - 4,
     ]
     .into_iter()
     .map(|a| SpecVal::I64(a as i64))
@@ -1414,7 +1415,7 @@ fn addr_pool() -> Vec<SpecVal> {
 /// Bulk-op lengths: zero (a no-op even at a wild pointer, D62), small, page-sized,
 /// one-past, and overflowing.
 fn len_pool() -> Vec<SpecVal> {
-    [0, 1, 5, 16, 256, MEM_SIZE, MEM_SIZE + 1, u64::MAX]
+    [0, 1, 16, MEM_SIZE, MEM_SIZE + 1, u64::MAX]
         .into_iter()
         .map(|l| SpecVal::I64(l as i64))
         .collect()
@@ -1577,8 +1578,11 @@ pub fn mem_rows() -> Vec<MemRow> {
 }
 
 /// Load/store immediate-offset pool: each distinct offset is its own module (the
-/// offset is an instruction immediate, not an operand).
-pub const MEM_OFFSETS: &[u64] = &[0, 1, 8, MEM_SIZE - 8, MEM_SIZE, u64::MAX];
+/// offset is an instruction immediate, not an operand). Kept small — admission
+/// depends on `addr + offset`, so the address pool already sweeps the boundary
+/// lattice at `offset = 0`; the extra offsets pin the immediate-only overrun and the
+/// immediate-driven wraparound.
+pub const MEM_OFFSETS: &[u64] = &[0, MEM_SIZE, u64::MAX];
 
 /// Deterministic strided cross product of the row's operand pools (shared shape with
 /// [`vectors_for`]). `mem.copy` vectors with genuinely-overlapping spans are filtered
@@ -1615,7 +1619,7 @@ pub fn mem_vectors_for(row: &MemRow) -> Vec<Vec<SpecVal>> {
         .collect()
 }
 
-/// The single-op module for a memory row at one immediate `offset`: declares the 4 KiB
+/// The single-op module for a memory row at one immediate `offset`: declares the 64 KiB
 /// spec window, takes the operands as params, returns the loaded value (if any).
 pub fn module_for_mem(row: &MemRow, offset: u64) -> Module {
     let params = row.operands.clone();

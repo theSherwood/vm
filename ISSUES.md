@@ -19,7 +19,7 @@ robustness/quality · **S4** cosmetic/flake.
 libcall path — vs the interpreter's `Mem::mem_copy`/`mem_fill` (`confine_span` **then**
 `check_prot_span` before any write).
 
-**Symptom (probed on a 4 KiB `mapped` window under the default large reservation):**
+**Symptom (probed on a page-aligned `mapped` window under the default large reservation):**
 
 | case | interp/bytecode | JIT |
 |---|---|---|
