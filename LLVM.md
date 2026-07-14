@@ -1150,6 +1150,24 @@ closed without consuming the entry). **svm-run suite green, fmt + clippy clean.*
 OS-shim binding the file syscalls + proc/time to this cap, then the ~180 remaining pure-libc externs
 (stdio `FILE*`, locale, ctype, `strtod`/`snprintf`) byte-exact vs the native oracle.
 
+**Slice CA (DONE) — the guest OS-shim: the file + directory syscalls over the `fs` cap.** Unlike SQLite
+(one `sqlite3_vfs` seam), Postgres calls the libc syscall wrappers *directly* all over `fd.c`/`md.c`/
+`xlog.c` — `open`/`read`/`pread`/`write`/`pwrite`/`lseek`/`stat`/`fstat`/`lstat`/`access`/`unlink`/
+`rename`/`mkdir`/`rmdir`/`ftruncate`/`fsync`/`opendir`/`readdir`/`closedir`/`chdir`/`getcwd` — and in the
+whole-program bitcode every one is an undefined external (the guest links no libc). `os_shim.c`
+(`crates/svm-run/demos/postgres/`) **defines** them for a guest build, bridging each to
+`__vm_cap_resolve("fs")` + `__vm_host_call` (the slice-BZ cap), mapping the C `open` flag bits to the
+cap's `FS_O_*`, and filling glibc's `struct stat`/`struct dirent` **by field** (the shim is compiled with
+the same headers as the caller, so offsets agree) from the 72-byte `StatBuf` the `FS_STAT` op returns.
+`fstat` (no fstat-by-fd op yet) reports an open fd as a regular file sized by `SEEK_END`; `readdir` hands
+back `DT_UNKNOWN` so callers `stat` for the type; `chdir`/`getcwd` treat the rooted cap as the working
+directory. Differential `demo_pg_oscap_vs_native`: `os_probe.c` drives a deterministic file+dir sequence
+(create/write/`stat`/`pread`/sorted dotfile-filtered `readdir`/`rename`/`rmdir`/`ftruncate`) and the guest
+byte-matches the native glibc oracle over **both** `mem_fs` and `host_fs` — and the `host_fs` root is
+empty afterward (the probe self-cleans), proving real files through real syscalls. **svm-llvm lane green
+(fmt + clippy `-D warnings` + the new test).** Next (gap #11c): proc/time/signal stubs, then the ~180
+pure-libc externs byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
