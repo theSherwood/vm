@@ -966,11 +966,58 @@ pub extern "C" fn svm_par_stdout_ptr() -> *const u8 {
 /// The stashed 4d stdout snapshot (`svm_par_stdout_len` fills it; `_ptr` reads it).
 static mut PAR_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
+// ---- I22 diagnostics: capture a Rust panic's location+message ----------------------------------
+// `panic = "abort"` lowers a Rust panic to a wasm `unreachable`, which reaches the JS host as a bare
+// `[pageerror] unreachable` with no location — the exact signature of the Jul 12 nightly `real-browser`
+// flake (ISSUES.md I22). A `unreachable` trap unwinds to the host but leaves the instance's memory
+// intact, so a panic hook can stash the message here and the worker.js trap handler reads it back
+// AFTER the trap via the accessors below. No new wasm import needed (the threads build instantiates
+// with only `env.memory`). Alloc-free in the hook (formats into a stack buffer); the one heap alloc is
+// the `Box`ed closure at install, once.
+const PAR_PANIC_CAP: usize = 512;
+static mut PAR_PANIC_BUF: [u8; PAR_PANIC_CAP] = [0; PAR_PANIC_CAP];
+static PAR_PANIC_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_arch = "wasm32")]
+static PAR_PANIC_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Install the panic-capture hook once per shared-memory image. wasm-only: on native this is a no-op
+/// so the default hook (backtraces, `#[should_panic]` test output) is untouched.
+fn par_install_panic_capture() {
+    #[cfg(target_arch = "wasm32")]
+    PAR_PANIC_ONCE.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            use std::io::Write;
+            let mut buf = [0u8; PAR_PANIC_CAP];
+            let mut cur = std::io::Cursor::new(&mut buf[..]);
+            let _ = write!(cur, "{info}"); // Display = "panicked at FILE:LINE:COL:\nMESSAGE"; truncates on overflow
+            let n = cur.position() as usize;
+            // SAFETY: fixed static buffer. A concurrent double-panic may interleave bytes, but we only
+            // need one legible message; publish `len` last (Release) so a reader sees a written prefix.
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), core::ptr::addr_of_mut!(PAR_PANIC_BUF) as *mut u8, n);
+            }
+            PAR_PANIC_LEN.store(n, std::sync::atomic::Ordering::Release);
+        }));
+    });
+}
+
+/// Pointer to the captured-panic buffer (read `svm_par_last_panic_len` bytes). Valid after any trap.
+#[no_mangle]
+pub extern "C" fn svm_par_last_panic_ptr() -> *const u8 {
+    core::ptr::addr_of!(PAR_PANIC_BUF) as *const u8
+}
+/// Length of the last captured panic message (0 = none captured this image).
+#[no_mangle]
+pub extern "C" fn svm_par_last_panic_len() -> usize {
+    PAR_PANIC_LEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Advance the vCPU until it finishes, traps, or hits a host-serviced event; returns a `PAR_*` code.
 /// The host reads operands via `svm_par_ev_a`–`d`, services the event, calls the matching `deliver`,
 /// then calls `svm_par_run` again.
 #[no_mangle]
 pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
+    par_install_panic_capture(); // I22: so a mid-run engine panic self-identifies (FILE:LINE) not a bare `unreachable`
     // SAFETY: `v` is a live `ParVcpu` from `svm_par_root`/`svm_par_child`, owned by this Worker.
     let v = unsafe { &mut *v };
     // Loop so §22 JIT events (serviced in-Rust against the shared powerbox) never surface to the JS

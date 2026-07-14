@@ -79,7 +79,17 @@ self.onmessage = async (e) => {
         Atomics.store(iv, slot >> 2, 2); // 2 = trapped
         Atomics.notify(iv, slot >> 2);
       }
-      self.postMessage({ kind: 'fail', why: `vcpu ${role} host trap: ${err && err.message ? err.message : err}` });
+      let why = `vcpu ${role} host trap: ${err && err.message ? err.message : err}`;
+      // If the trap was a panic=abort engine panic (surfaces as `unreachable`), the Rust panic hook
+      // stashed FILE:LINE + message; the trap left memory intact, so read it back here (I22 (a)).
+      try {
+        const plen = ex.svm_par_last_panic_len ? ex.svm_par_last_panic_len() : 0;
+        if (plen > 0) {
+          const p = Number(ex.svm_par_last_panic_ptr());
+          why += ` | panic: ${new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + plen))}`;
+        }
+      } catch { /* accessor absent (older build) or read failed — the trap text alone still ships */ }
+      self.postMessage({ kind: 'fail', why });
       return; // don't svm_par_free(v): the instance just trapped; the page terminates this Worker
     }
     if (evc === DONE) {

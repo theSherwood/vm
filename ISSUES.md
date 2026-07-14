@@ -299,6 +299,38 @@ recurrence name the check + carry the `RuntimeError`, which is the prerequisite 
 Not yet exercised in a real browser here (needs the `-Z build-std` threads wasm + Chromium); the
 next CI `real-browser` failure — or a local threads build — is the validation.
 
+**Root-cause (a) — investigation so far (2026-07-14).** Working the engine side (`browser/src/lib.rs`):
+
+- **The `unreachable` variant is an engine *panic*, not a masked guest trap.** The crate is
+  `panic = "abort"` (`browser/Cargo.toml`), which lowers every Rust panic to a wasm `unreachable`.
+  So the Jul 12 nightly's `[pageerror] unreachable` is an engine-internal invariant violation
+  (`unwrap`/slice-index/`debug_assert`) hit under a concurrent interleaving — a *different, more
+  informative* signal than the `memory access out of bounds` variant (a corrupted/racy pointer or
+  index producing an actual OOB linear-memory access). Both point at **shared mutable engine state**
+  touched by `svm_par_run` while other Worker vCPUs run over the one shared memory.
+- **The shared allocator is a *deprioritised* lead.** `svm_par_alloc` is just the Rust global
+  allocator (`std::alloc::alloc_zeroed`, 16-aligned), whose dlmalloc control block lives in the
+  shared linear memory — so concurrent allocs from different Worker instances *could* race. But
+  THREADS.md 4b explicitly states "the thread-safe shared allocator was de-risked by 4b", and the
+  demo passes thousands of times, so this is not the prime suspect without evidence. Candidate shared
+  state to audit first is the cross-Worker engine bookkeeping reached from `svm_par_run`: the §22
+  `Domain`/`ModuleSource`, the 4d `Mutex<Host>` powerbox, the completion-slot/join protocol, and the
+  tier-up cross-instance state — anywhere a rare ordering leaves an index/pointer inconsistent.
+- **Can't go further without a captured instance.** The precise panic site / OOB offset has never
+  been captured (attempt-1 logs roll off; a bare `unreachable` carries no location). That is the gate.
+
+**Landed (2026-07-14, second step — the capture enabler for (a); diagnostic-only, native-compiled):**
+`browser/src/lib.rs` installs a **panic hook** (once, wasm-only via `cfg(target_arch = "wasm32")`, so
+native/`#[should_panic]` test output is untouched) that formats the panic's `FILE:LINE:COL` + message
+into a static buffer in linear memory, exposed by `svm_par_last_panic_ptr()`/`svm_par_last_panic_len()`.
+A wasm `unreachable` unwinds to the host but leaves memory intact, so `worker.js`'s new trap handler
+reads the buffer **after** catching the trap and appends `| panic: panicked at FILE:LINE: MESSAGE` to
+the `fail` reason. Net effect: the next `unreachable` recurrence reports the **exact Rust source
+location** instead of a bare `unreachable`, turning (a) from "unobservable" into "one recurrence away
+from a stack-precise fix". Compiles natively under `-D warnings`; **not** yet exercised on the wasm
+threads build (same validation path as the first step). The hook is alloc-free (formats into a stack
+buffer); the accessors are read-only.
+
 ---
 
 ### I6 — JIT/interp trap backtraces are not labeled with the trapping fiber (S4) — on `claude/debug-jit-backtrace`
