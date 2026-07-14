@@ -142,6 +142,7 @@ const int **__ctype_toupper_loc(void) { return &shim_ctype_toupper_ptr; }
 
 #include <locale.h>
 #include <stddef.h>
+#include <stdlib.h> /* malloc, for strdup */
 
 static size_t shim_strlen(const char *s) {
   const char *p = s;
@@ -339,3 +340,36 @@ long __isoc23_strtol(const char *s, char **end, int base) { return strtol(s, end
 unsigned long __isoc23_strtoul(const char *s, char **end, int base) { return strtoul(s, end, base); }
 int atoi(const char *s) { return (int)strtol(s, (char **)0, 10); }
 long atol(const char *s) { return strtol(s, (char **)0, 10); }
+
+/* ============================================================================================== *
+ * wchar — the C/POSIX locale is a byte↔wchar identity map (each byte value 0..255 is its own wide
+ * character), so mbstowcs/wcstombs are widening/narrowing copies. That's exactly glibc's C-locale
+ * behavior; Postgres uses them in a few encoding-conversion fallbacks.
+ * ============================================================================================== */
+
+#include <wchar.h>
+
+size_t mbstowcs(wchar_t *dst, const char *src, size_t n) {
+  size_t i = 0;
+  if (!dst) { /* just count (up to the terminating NUL) */
+    while (src[i]) i++;
+    return i;
+  }
+  for (; i < n; i++) {
+    dst[i] = (wchar_t)(unsigned char)src[i];
+    if (!src[i]) return i; /* stop at NUL (which is written but not counted) */
+  }
+  return i; /* filled n wide chars without hitting NUL */
+}
+size_t wcstombs(char *dst, const wchar_t *src, size_t n) {
+  size_t i = 0;
+  if (!dst) {
+    while (src[i]) i++;
+    return i;
+  }
+  for (; i < n; i++) {
+    dst[i] = (char)src[i];
+    if (!src[i]) return i;
+  }
+  return i;
+}

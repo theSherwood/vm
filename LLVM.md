@@ -1208,6 +1208,27 @@ earned its keep again — a missing `__errno_location` (only `os_shim.c` had def
 guest at runtime until the shared `errno` header. Next (gap #11e): stdio `FILE*`, `strftime`, the `scanf`
 family byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
 
+**Slice CD (DONE) — guest libc: file stdio + time + wide-char (a bundle).** **(1) file stdio** —
+`stdio_shim.c` layers the buffered `FILE*` surface Postgres actually declares (`fopen`/`freopen`/`fclose`/
+`fread`/`fwrite`/`fgetc`/`getc`/`fgets`/`fputc`/`fseek`/`fseeko`/`ftell`/`feof`/`ferror`/`clearerr`/
+`fflush`/`fileno`/`setvbuf`/`ungetc`) on `os_shim.c`'s fs-cap syscalls — a `FILE` is just an fd + EOF/
+error flags + a one-byte ungetc slot, so it bottoms out in `open`/`read`/`write`/`lseek`/`close`; no
+buffering of its own (the cap is the boundary, so `fflush`/`setvbuf` are inert). Notably the externs are
+all *file*-oriented — Postgres declares **no** `fprintf`/`fscanf`/`fputs`, so this needs no varargs and
+no `stdout`/`stderr` `FILE*` (those must reach the powerbox Stream cap, deferred). A real bug the
+differential caught: the shim first passed the cap's `FS_O_*` bits to `open()`, which itself re-maps
+`<fcntl.h>` `O_*` → `FS_O_*`, so a `"w"` fopen decoded as `O_RDWR` with no create and every op failed;
+fixed by building real `O_*` flags. **(2) time** — `time_shim.c` provides `gmtime`/`gmtime_r`/`localtime`
+(the sandbox is UTC, so localtime==gmtime) as pure calendar math (Hinnant civil-from-days) + a `strftime`
+format engine (the common `%Y %m %d %e %H %I %M %S %j %w %u %p %a %A %b %B %C` conversions). **(3)
+wide-char** — `libc_shim.c` gains the C-locale byte↔wchar identity `mbstowcs`/`wcstombs`. Differentials:
+`demo_pg_stdio_vs_native` (write→reopen→`fgets`/`fgetc`/`ungetc`/`fread`/`fseek`/`ftell`/`feof`, byte-exact
+over **both** `mem_fs` and `host_fs`) and `demo_pg_time_vs_native` (five epochs incl. two leap days,
+TZ-independent conversions, + a wide-char round-trip; pure, on the bare powerbox). **svm-llvm lane green
+(fmt + clippy `-D warnings` + both tests).** Next (gap #11f): the stream `FILE*` (`stdout`/`stderr` via an
+on-ramp fd-dispatch) and the varargs `fprintf`/`scanf` engines, then storage manager / WAL / shmem /
+catalog bootstrap.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
