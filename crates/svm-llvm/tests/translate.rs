@@ -4175,6 +4175,75 @@ fn demo_pg_ctype_vs_native() {
 }
 
 #[test]
+fn demo_pg_string_vs_native() {
+    // **The guest string + integer-parsing shim** (slice CC, gap #11d). `libc_shim.c` adds the
+    // `<string.h>`/`<stdlib.h>` members Postgres uses that the on-ramp does not already synthesize —
+    // strcat/strncpy/strnlen/strstr/strchrnul/strdup/strlcpy/strlcat/strtok/strxfrm and
+    // strtol/strtoul/atoi (`__isoc23_*` aliases too; `strtod`/`snprintf` are already synthesized).
+    // `str_probe.c` exercises signs, bases, prefixes, endptr, ERANGE overflow, bounded copies, and
+    // tokenizing; the guest must byte-match native glibc over the lot.
+    check_demo_vs_native_flags(
+        "pg_string",
+        "postgres/str_probe.c",
+        b"",
+        &["-DSVM_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_pg_procstub() {
+    // **The guest process/time/signal stubs** (slice CC, gap #11d). `proc_shim.c` returns fixed,
+    // deterministic values for a single-user sandbox backend — constant identity (non-root, so
+    // Postgres's root guard passes), a frozen clock, inert signal masks, no-op sleeps. Not a
+    // differential (a native `getpid`/`time` is nondeterministic): the guest's stdout must equal the
+    // fixed expected report. Pure — runs on the bare powerbox.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/proc_probe.c");
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_pg_proc.bc", std::process::id()));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_proc (clang unavailable)");
+            return;
+        }
+    }
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_proc bitcode");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve imports");
+    svm_verify::verify_module(&module).expect("verify");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    let expected = "\
+pid=1 ppid=0
+uid=1000 euid=1000 gid=1000 egid=1000
+umask=18 setsid=1
+gtod r=0 sec=1000000000 usec=0
+clock r=0 sec=1000000000 nsec=0
+time=1000000000
+nanosleep=0
+rlimit r=0 inf=1
+sigempty=0 sigaction=0
+sigprocmask=0 kill=0 raise=0
+";
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected,
+        "pg_proc: guest stub values"
+    );
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays

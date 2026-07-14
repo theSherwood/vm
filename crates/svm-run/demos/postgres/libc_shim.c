@@ -133,3 +133,209 @@ static const int *shim_ctype_toupper_ptr = shim_ctype_toupper + 128;
 const unsigned short **__ctype_b_loc(void) { return &shim_ctype_b_ptr; }
 const int **__ctype_tolower_loc(void) { return &shim_ctype_tolower_ptr; }
 const int **__ctype_toupper_loc(void) { return &shim_ctype_toupper_ptr; }
+
+/* ============================================================================================== *
+ * string.h — the members Postgres uses that the on-ramp does NOT already synthesize.
+ * (Synthesized already: strlen/strcmp/strcpy/strchr/strrchr/strspn/strcspn/strpbrk/strncmp/
+ * strcoll/memcmp/memchr/bcmp — those are NOT redefined here.)
+ * ============================================================================================== */
+
+#include <locale.h>
+#include <stddef.h>
+
+static size_t shim_strlen(const char *s) {
+  const char *p = s;
+  while (*p) p++;
+  return (size_t)(p - s);
+}
+
+char *strcat(char *dst, const char *src) {
+  char *d = dst + shim_strlen(dst);
+  while ((*d++ = *src++)) {
+  }
+  return dst;
+}
+char *strncat(char *dst, const char *src, size_t n) {
+  char *d = dst + shim_strlen(dst);
+  while (n-- && *src) *d++ = *src++;
+  *d = 0;
+  return dst;
+}
+char *strncpy(char *dst, const char *src, size_t n) {
+  size_t i = 0;
+  for (; i < n && src[i]; i++) dst[i] = src[i];
+  for (; i < n; i++) dst[i] = 0; /* POSIX: NUL-pad the remainder */
+  return dst;
+}
+size_t strnlen(const char *s, size_t n) {
+  size_t i = 0;
+  while (i < n && s[i]) i++;
+  return i;
+}
+char *strstr(const char *hay, const char *needle) {
+  if (!*needle) return (char *)hay;
+  for (; *hay; hay++) {
+    const char *h = hay, *n = needle;
+    while (*h && *n && *h == *n) {
+      h++;
+      n++;
+    }
+    if (!*n) return (char *)hay;
+  }
+  return (char *)0;
+}
+char *strchrnul(const char *s, int c) {
+  while (*s && *s != (char)c) s++;
+  return (char *)s; /* points at the match, or at the terminating NUL */
+}
+char *strdup(const char *s) {
+  size_t n = shim_strlen(s) + 1;
+  char *p = (char *)malloc(n);
+  if (p) {
+    for (size_t i = 0; i < n; i++) p[i] = s[i];
+  }
+  return p;
+}
+/* BSD strlcpy/strlcat: size-bounded, always NUL-terminate, return the length they *tried* to build. */
+size_t strlcpy(char *dst, const char *src, size_t size) {
+  size_t sl = shim_strlen(src);
+  if (size) {
+    size_t n = sl < size - 1 ? sl : size - 1;
+    for (size_t i = 0; i < n; i++) dst[i] = src[i];
+    dst[n] = 0;
+  }
+  return sl;
+}
+size_t strlcat(char *dst, const char *src, size_t size) {
+  size_t dl = 0;
+  while (dl < size && dst[dl]) dl++;
+  size_t sl = shim_strlen(src);
+  if (dl == size) return size + sl; /* dst not NUL-terminated within size */
+  size_t n = sl < size - dl - 1 ? sl : size - dl - 1;
+  for (size_t i = 0; i < n; i++) dst[dl + i] = src[i];
+  dst[dl + n] = 0;
+  return dl + sl;
+}
+char *strtok_r(char *s, const char *delim, char **save) {
+  if (!s) s = *save;
+  /* skip leading delimiters */
+  for (; *s; s++) {
+    const char *d = delim;
+    int hit = 0;
+    for (; *d; d++)
+      if (*s == *d) {
+        hit = 1;
+        break;
+      }
+    if (!hit) break;
+  }
+  if (!*s) {
+    *save = s;
+    return (char *)0;
+  }
+  char *tok = s;
+  for (; *s; s++) {
+    const char *d = delim;
+    for (; *d; d++)
+      if (*s == *d) {
+        *s = 0;
+        *save = s + 1;
+        return tok;
+      }
+  }
+  *save = s;
+  return tok;
+}
+static char *shim_strtok_save;
+char *strtok(char *s, const char *delim) { return strtok_r(s, delim, &shim_strtok_save); }
+/* In the C/POSIX locale collation is byte order and transform is identity, so strxfrm is a bounded
+ * copy returning the source length and strcoll/_l are strcmp. */
+size_t strxfrm(char *dst, const char *src, size_t n) {
+  size_t sl = shim_strlen(src);
+  if (n) {
+    size_t c = sl < n - 1 ? sl : n - 1;
+    for (size_t i = 0; i < c; i++) dst[i] = src[i];
+    dst[c] = 0;
+  }
+  return sl;
+}
+int strcoll_l(const char *a, const char *b, locale_t loc) {
+  (void)loc;
+  for (; *a && *a == *b; a++, b++) {
+  }
+  return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+/* ============================================================================================== *
+ * stdlib.h — integer parsing. `strtod` (float) is already synthesized by the on-ramp; these aren't.
+ * glibc's C23 build renames the callers to `__isoc23_strtol`/`__isoc23_strtoul` (identical
+ * semantics), so both names resolve here.
+ * ============================================================================================== */
+
+#include <errno.h>
+#include <limits.h>
+
+#include "shim_errno.h" /* provides errno's __errno_location (shared with os_shim.c) */
+
+static int shim_digit(int c, int base) {
+  int d;
+  if (c >= '0' && c <= '9')
+    d = c - '0';
+  else if (c >= 'a' && c <= 'z')
+    d = c - 'a' + 10;
+  else if (c >= 'A' && c <= 'Z')
+    d = c - 'A' + 10;
+  else
+    return -1;
+  return d < base ? d : -1;
+}
+/* Shared core: parse [ws][sign][0x/0]digits in `base` (0 = autodetect), honoring endptr and ERANGE.
+ * `is_signed` selects the LONG_MIN/LONG_MAX vs ULONG_MAX clamp; the unsigned path still accepts a
+ * leading '-' and negates modulo 2^64, exactly as C requires. */
+static unsigned long shim_strtox(const char *s, char **end, int base, int is_signed, int *neg_out) {
+  const char *p = s;
+  while (*p == ' ' || (*p >= '\t' && *p <= '\r')) p++; /* isspace, C locale */
+  int neg = 0;
+  if (*p == '+' || *p == '-') neg = (*p++ == '-');
+  if ((base == 0 || base == 16) && p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
+      shim_digit(p[2], 16) >= 0) {
+    p += 2;
+    base = 16;
+  } else if (base == 0 && p[0] == '0') {
+    base = 8;
+  } else if (base == 0) {
+    base = 10;
+  }
+  unsigned long acc = 0;
+  int any = 0, overflow = 0;
+  unsigned long cutoff = is_signed ? (neg ? (unsigned long)LONG_MAX + 1UL : (unsigned long)LONG_MAX)
+                                   : ULONG_MAX;
+  for (int d; (d = shim_digit(*p, base)) >= 0; p++) {
+    any = 1;
+    if (acc > (cutoff - (unsigned long)d) / (unsigned long)base) overflow = 1;
+    acc = acc * (unsigned long)base + (unsigned long)d;
+  }
+  if (end) *end = (char *)(any ? p : s);
+  *neg_out = neg;
+  if (overflow) {
+    errno = ERANGE;
+    if (is_signed) return neg ? (unsigned long)LONG_MIN : (unsigned long)LONG_MAX;
+    return ULONG_MAX;
+  }
+  return acc;
+}
+long strtol(const char *s, char **end, int base) {
+  int neg;
+  unsigned long v = shim_strtox(s, end, base, 1, &neg);
+  if (v == (unsigned long)LONG_MIN || v == (unsigned long)LONG_MAX) return (long)v; /* clamped */
+  return neg ? -(long)v : (long)v;
+}
+unsigned long strtoul(const char *s, char **end, int base) {
+  int neg;
+  unsigned long v = shim_strtox(s, end, base, 0, &neg);
+  return neg ? (unsigned long)(-(long)v) : v;
+}
+long __isoc23_strtol(const char *s, char **end, int base) { return strtol(s, end, base); }
+unsigned long __isoc23_strtoul(const char *s, char **end, int base) { return strtoul(s, end, base); }
+int atoi(const char *s) { return (int)strtol(s, (char **)0, 10); }
+long atol(const char *s) { return strtol(s, (char **)0, 10); }

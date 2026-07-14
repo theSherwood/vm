@@ -525,6 +525,7 @@ pub(crate) unsafe extern "C" fn instantiate(
             child_task,
             rt.nested_sink(),
             rt.task_counter(),
+            &[], // a live `instantiate` re-attaches no frozen residue (that is the thaw path)
         ) {
             Ok(rt) => rt,
             Err(_) => {
