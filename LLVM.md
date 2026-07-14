@@ -1273,6 +1273,22 @@ remaining chase slow) so each stub-trap is legible, then the storage manager / W
 shmem (`mmap`/`shmget`) / catalog bootstrap, plus the varargs `fprintf`/`scanf` engines. `strerror_r`
 (GNU `char *` vs POSIX `int`) needs its own `_GNU_SOURCE`-isolated TU, deferred.
 
+**Slice CG (DONE) — the boot diagnostic: guest output on trap.** Slice CF got Postgres *running* but its
+`Unreachable`/`MemoryFault` traps carry **no name** — "guest trapped (Unreachable)" told me nothing about
+*which* extern or *why*, so the boot chase was blind guessing (I burned real iterations on it). A trapped
+program has usually already said what's wrong (a progress line, an `ereport`, an assertion), but the plain
+`?` in `run_with_caps` dropped the `Host` — and its captured `stdout`/`stderr` — on the trap path.
+`trap_err_with_output` now folds that captured output (tail-bounded) into the trap error, so the trap is
+legible. **First payoff, immediately:** re-running the boot, the trap error now reads
+`LOG:  could not find a "postgres" to execute` — Postgres's `find_my_exec` failing to resolve its own
+binary path (`readlink("/proc/self/exe")` / argv[0]), the concrete gap #11i starts from. A small,
+non-breaking `svm-run` change (the trap still returns `Err`, just an informative one — no `Outcome`
+variant churn, no caller changes). Test `trap_error_surfaces_guest_output`: a guest writes a marker then
+calls an undefined extern (a `--stub-externs` `unreachable` stub), and the trap error must carry the
+marker. **svm-run + svm-llvm suites green, fmt + clippy `-D warnings` on both.** Next (gap #11i): resolve
+`find_my_exec`, then drive the now-legible boot forward — storage manager / WAL / single-process shmem /
+catalog bootstrap, plus the varargs `fprintf`/`scanf` engines.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
