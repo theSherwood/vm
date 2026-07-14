@@ -16628,7 +16628,10 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `agg` pair). The generic path below would `ctx.operand` the i128 value as a scalar and fail
         // ("value … not available in block"). clang emits this from a 16-byte copy or a `? :` /
         // accumulator on a 128-bit quantity — e.g. Postgres numeric `int2_accum`'s `sumX2`.
-        if matches!(st.value.get_type(types).as_ref(), Type::IntegerType { bits: 128 }) {
+        if matches!(
+            st.value.get_type(types).as_ref(),
+            Type::IntegerType { bits: 128 }
+        ) {
             let addr = ctx.operand(&st.address)?;
             let (lo, hi) = i128_parts(ctx, &st.value)?;
             ctx.push_effect(Inst::Store {
