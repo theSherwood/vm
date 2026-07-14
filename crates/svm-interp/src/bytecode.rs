@@ -6065,7 +6065,7 @@ impl Vm {
                 return Ok(Outcome::Suspended);
             }
             budget -= 1;
-            step(fuel)?;
+            step(fuel, None)?;
             match &c.progs[cur].ops[pc] {
                 Op::Const { dst, val } => {
                     r!(*dst) = *val;

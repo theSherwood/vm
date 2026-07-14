@@ -5383,6 +5383,15 @@ struct VCpu {
     /// undebugged run pays a single null check per op and is otherwise byte-identical (S7). Not
     /// inherited across `thread.spawn` (slice 1 debugs single-threaded guests).
     debug: Option<Box<DebugCtx>>,
+    /// PROCESS.md S3 `kill` — `Some` on a §14 child (and, inherited, its `thread.spawn` descendants):
+    /// a shared flag the parent sets via `Instantiator.kill`. Polled at the per-op fuel `step`; when
+    /// set the vCPU traps (`ThreadFault`, which `poll` reports as `2`), so the child's whole subtree
+    /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
+    kill: Option<Arc<AtomicBool>>,
+    /// PROCESS.md S3 `kill` — a parent's map from a §14 child's join-table **slot** to that child's
+    /// kill flag ([`VCpu::kill`]), so `Instantiator.kill(child)` sets it. Sparse (only §14 children,
+    /// not `thread.spawn` threads, which share their §14 ancestor's flag); empty on a leaf vCPU.
+    child_kill: BTreeMap<usize, Arc<AtomicBool>>,
 }
 
 impl VCpu {
@@ -5446,6 +5455,8 @@ impl VCpu {
             units: Vec::new(),
             invoked: None,
             debug: None,
+            kill: None,
+            child_kill: BTreeMap::new(),
         }
     }
 
@@ -5514,6 +5525,8 @@ impl VCpu {
             units: Vec::new(),
             invoked: Some(unit),
             debug: None,
+            kill: None,
+            child_kill: BTreeMap::new(),
         }
     }
 
@@ -5859,6 +5872,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         units,
         invoked,
         debug,
+        kill,
+        child_kill,
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -5965,7 +5980,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 budget -= 1;
             }
             let inst = &block.insts[frames[top].inst];
-            step(fuel)?;
+            step(fuel, kill.as_deref())?;
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
 
             // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
@@ -6401,6 +6416,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     .as_ref()
                                     .map(|m| m.durable_state())
                                     .unwrap_or(STATE_NORMAL);
+                                // S3 `kill`: a fresh flag for this child's subtree; the child (and its
+                                // inherited-flag `thread.spawn` descendants) polls it per op, the
+                                // parent sets it via `Instantiator.kill`.
+                                let kflag = Arc::new(AtomicBool::new(false));
+                                let kflag_child = Arc::clone(&kflag);
                                 let made = sched.spawn(move |id| {
                                     // A nested child is its **own** domain (own host/window/program),
                                     // so it gets its own dispatch table, not the parent's.
@@ -6433,16 +6453,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // §4 subtree STW: inherit the parent's freeze phase (see above),
                                     // so a mid-freeze instantiate composes recursively.
                                     child.dstate = child_dstate;
+                                    child.kill = Some(kflag_child); // S3: parent-settable kill flag
                                     Box::new(child)
                                 });
                                 match made {
                                     Some(child_id) => {
                                         threads.push(Some(child_id));
-                                        // §14 children are tracked apart from `thread.spawn`
-                                        // vCPUs, with their carve geometry: a durable freeze
-                                        // broadcasts into a live child's carve and records it
-                                        // as residue — or fails closed on the un-covered
-                                        // shapes (see `VCpu::nested_children`).
+                                        child_kill.insert(threads.len() - 1, kflag); // S3 kill map
+                                                                                     // §14 children are tracked apart from `thread.spawn`
+                                                                                     // vCPUs, with their carve geometry: a durable freeze
+                                                                                     // broadcasts into a live child's carve and records it
+                                                                                     // as residue — or fails closed on the un-covered
+                                                                                     // shapes (see `VCpu::nested_children`).
                                         nested_children.push(NestedChildInfo {
                                             slot: threads.len() - 1,
                                             carve_off: ibase + off,
@@ -6670,6 +6692,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
                             threads[slot] = None; // no longer joinable
                             let _ = sched.take_result(child); // reap if already finished
+                            frames[top].vals.push(Reg::from_i32(0));
+                        }
+                        // kill(child) -> 0 | -ESRCH (PROCESS.md S3): set the child's subtree kill flag;
+                        // the child (and its `thread.spawn` descendants, which share the flag) traps at
+                        // its next per-op poll (`ThreadFault` → `poll` reports 2). Idempotent; killing an
+                        // already-finished child (no live flag) is a harmless success. The parent must
+                        // then `poll`/`detach` rather than `join` (a `join` would propagate the child's
+                        // trap to the parent). Reliably stops a **running** child; a child parked on a
+                        // futex/join observes the kill when it next wakes (prompt parked-wake is a
+                        // follow-up). A forged/joined handle is a `ThreadFault`.
+                        12 => {
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
+                            let slot = resolve_thread(threads, ch)?;
+                            if let Some(flag) = child_kill.get(&slot) {
+                                flag.store(true, Ordering::Relaxed);
+                            }
                             frames[top].vals.push(Reg::from_i32(0));
                         }
                         _ => return Err(Trap::CapFault),
@@ -7170,6 +7209,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (DEBUGGING.md Milestone B): the child gets its own per-vCPU `DebugCtx` (fresh
                     // logical clock) over the same shared state, so a breakpoint fires in it too.
                     let cdebug = debug.as_ref().map(|d| Arc::clone(&d.shared));
+                    // S3 `kill`: a `thread.spawn` descendant of a §14 child **inherits** its kill
+                    // flag, so killing the §14 child terminates its whole thread subtree; `None` (root
+                    // / top-level thread) stays unkillable.
+                    let kill_inherit = kill.clone();
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
                             cfuncs,
@@ -7196,6 +7239,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
                         child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
+                        child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
                         Box::new(child)
                     });
                     match made {
@@ -7433,7 +7477,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
         }
 
-        step(fuel)?;
+        step(fuel, kill.as_deref())?;
         // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
         // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
         // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
@@ -13423,7 +13467,15 @@ fn cmp64(op: CmpOp, a: i64, b: i64) -> bool {
 }
 
 #[inline]
-fn step(fuel: &mut u64) -> Result<(), Trap> {
+fn step(fuel: &mut u64, kill: Option<&AtomicBool>) -> Result<(), Trap> {
+    // PROCESS.md S3 `kill`: a §14 child (and its inherited-flag descendants) polls its parent-set
+    // kill flag once per op. Set ⇒ the vCPU self-terminates (`ThreadFault`, `poll` → 2). `None` for
+    // the root / top-level threads (a predictable branch, no atomic load) — the undebugged hot path.
+    if let Some(k) = kill {
+        if k.load(Ordering::Relaxed) {
+            return Err(Trap::ThreadFault);
+        }
+    }
     *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
     Ok(())
 }
