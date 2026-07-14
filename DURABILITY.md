@@ -395,9 +395,19 @@ the parent then rewinds, reloads its `instantiate` handle, and its re-executed `
 child's total. The seed rides a new `frozen_nested_seed` input on the `_durable_nested` entry. Pinned by
 `durable_nesting_jit.rs::jit_nested_freeze_thaw_round_trips` — freeze→thaw of a §14 child delivers the
 uninterrupted 4950 (**freeze→thaw ≡ uninterrupted**, the correctness proof the freeze-export record
-differential deferred). (4) depth-2 (a grandchild's residue coalescing at the root via a shared sink),
-separate-module, and completed-result parity remain. Powerbox (1) was the gating prerequisite; the
-synchronous model needs no redesign.
+differential deferred). (4) **depth-2 freeze — LANDED (shared sink).** A freeze catching a live child
+*and* grandchild now coalesces **both** `FrozenNested` records at the **root**. The `Nursery` gains a
+`my_task` id (root = 0), a **shared** subtree residue sink (`Arc<Mutex<Vec<FrozenNested>>>`), and a
+**shared** task counter (`Arc<AtomicUsize>`), all threaded down at each `instantiate` — so a grandchild
+recorded by its parent-child's nursery pushes to the *root's* sink (the JIT analog of the interpreter's
+`VCpu::freeze_sink`), and `instantiate` stamps the recorded child's `parent_task` with the recording
+nursery's `my_task` (0 for the root's direct child, the child's id for a grandchild). Pinned by
+`durable_nesting_jit.rs::jit_depth2_freeze_coalesces_grandchild_at_root` (freeze-from-start of a 3-level
+module where both nested levels are instrumented → two records at the root, `parent_task` 0 and 1).
+Remaining: depth-2 **thaw** (recursively re-attaching a grandchild before its parent-child's `join`
+re-executes — the parent-before-child ordering the interp does via `parent_task` grouping, adapted to
+the JIT's nested re-run), plus separate-module and completed-result parity. Powerbox (1) was the gating
+prerequisite; the synchronous model needs no redesign.
 
 **Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
 durable-sibling comms) forces co-snapshot of the sharing group or journaling at the

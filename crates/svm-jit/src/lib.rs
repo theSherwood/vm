@@ -2350,6 +2350,9 @@ impl CompiledModule {
                 cap_ctx,
                 resolve_module,
                 epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
+                0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
             )))
         } else {
             None
@@ -3166,8 +3169,15 @@ impl CompiledModule {
                         mem_base,
                         &args,
                         epoch,
-                        true, // durable
-                        true, // thaw: rewind from the carve's frozen continuation
+                        true,            // durable
+                        true,            // thaw: rewind from the carve's frozen continuation
+                        rec.parent_task, // this child's task id (from its record)
+                        // A thaw re-run rewinds to completion (no unwind), so it captures no residue —
+                        // throwaway sink/counter. (Depth-2 thaw re-attach of grandchildren is a follow-up.)
+                        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                            rec.parent_task + 1,
+                        )),
                     ) {
                         Ok((result, trap, _)) => n.seed_child_result(rec.slot, result, trap),
                         Err(_) => n.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
@@ -3667,6 +3677,9 @@ pub(crate) unsafe fn compile_child_and_run(
     epoch_addr: usize,
     durable: bool,
     thaw: bool,
+    my_task: usize,
+    nested_sink: std::sync::Arc<std::sync::Mutex<Vec<FrozenNested>>>,
+    task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<(i64, i64, bool), JitError> {
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
 
@@ -3696,6 +3709,9 @@ pub(crate) unsafe fn compile_child_and_run(
             &*child_win_size as *const u64 as *mut core::ffi::c_void,
             None, // same-module grandchildren only (separate-module is a later slice)
             epoch_addr,
+            my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
+            std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
+            std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
         ));
         n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
         Some(n)
