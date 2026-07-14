@@ -1,5 +1,5 @@
 matmul 1.1401
 matmul_eb 1.0689
-edn 1.4260
+edn 1.3900
 fir 0.3583
 bytes 0.9977

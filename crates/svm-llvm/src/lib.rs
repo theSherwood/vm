@@ -2238,6 +2238,12 @@ struct Scan {
     block_idx: HashMap<Name, usize>,
     /// Block index → block name (for looking up φ incoming-by-predecessor).
     block_name: Vec<Name>,
+    /// Narrow-integer `load` result name → `(loaded_bits, sext_to_bits)` for loads whose **only** use
+    /// is a same-block `sext`. Such a load lowers to a *signed* narrow load (`I*_*S`) and the `sext`
+    /// folds to identity, so a signed-`short`/`char` array read is a single sign-extending load
+    /// (`movsx (mem)`) instead of a zero-extending load + a separate register sign-extend. Pure
+    /// value-lowering peephole — confinement/width unchanged, verifier re-checks, +0 escape-TCB.
+    sext_fused: HashMap<Name, (u32, u32)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2486,6 +2492,7 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
         def_block: Vec::new(),
         block_idx: HashMap::new(),
         block_name: Vec::new(),
+        sext_fused: HashMap::new(),
     };
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
         s.block_idx.insert(bb.name.clone(), bi);
@@ -2571,7 +2578,93 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
             }
         }
     }
+    s.sext_fused = compute_sext_fused(f);
     Ok(s)
+}
+
+/// Find narrow-integer loads whose **only** use is a same-block `sext` (to 32 or 64 bits), so the load
+/// can lower to a signed narrow load and the `sext` fold away (see [`Scan::sext_fused`]). Soundness
+/// rests on two conditions: **single use** (no other consumer relies on the load's zero-extended
+/// container form) and **same block** (the value never crosses a block edge, so its recorded
+/// container type — which the signed load widens — is never read for phi/edge fan-out).
+fn compute_sext_fused(f: &Function) -> HashMap<Name, (u32, u32)> {
+    use Instruction as I;
+    // Narrow non-atomic integer load result → (loaded_bits, defining block).
+    let mut loads: HashMap<Name, (u32, usize)> = HashMap::new();
+    for (bi, bb) in f.basic_blocks.iter().enumerate() {
+        for instr in &bb.instrs {
+            if let I::Load(l) = instr {
+                if l.atomicity.is_none() {
+                    if let Type::IntegerType { bits } = l.loaded_ty.as_ref() {
+                        if matches!(*bits, 8 | 16 | 32) {
+                            loads.insert(l.dest.clone(), (*bits, bi));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if loads.is_empty() {
+        return HashMap::new();
+    }
+    // Count *every* use of each value — instruction operands, terminator operands, and φ incomings
+    // (`local_uses` reports φ incomings as edge uses, i.e. none, so count them explicitly).
+    let mut uses: HashMap<Name, u32> = HashMap::new();
+    let mut bump = |n: &Name| *uses.entry(n.clone()).or_insert(0) += 1;
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            if let I::Phi(p) = instr {
+                for (op, _) in &p.incoming_values {
+                    if let Operand::LocalOperand { name, .. } = op {
+                        bump(name);
+                    }
+                }
+            } else if let Ok(names) = local_uses(instr) {
+                for n in &names {
+                    bump(n);
+                }
+            }
+        }
+        if let Ok(names) = term_local_uses(&bb.term) {
+            for n in &names {
+                bump(n);
+            }
+        }
+    }
+    let mut fused = HashMap::new();
+    for (bi, bb) in f.basic_blocks.iter().enumerate() {
+        for instr in &bb.instrs {
+            if let I::SExt(x) = instr {
+                if let Operand::LocalOperand { name, .. } = &x.operand {
+                    if let Some(&(lb, def_bi)) = loads.get(name) {
+                        let to = int_bits(x.to_type.as_ref()).unwrap_or(0);
+                        if def_bi == bi
+                            && uses.get(name).copied() == Some(1)
+                            && (to == 32 || to == 64)
+                            && to > lb
+                        {
+                            fused.insert(name.clone(), (lb, to));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fused
+}
+
+/// The signed narrow [`LoadOp`] for a `(loaded_bits, sext_to_bits)` pair (see [`compute_sext_fused`]).
+fn signed_load_op(loaded: u32, to: u32) -> svm_ir::LoadOp {
+    use svm_ir::LoadOp as L;
+    match (loaded, to) {
+        (8, 32) => L::I32_8S,
+        (8, 64) => L::I64_8S,
+        (16, 32) => L::I32_16S,
+        (16, 64) => L::I64_16S,
+        (32, 64) => L::I64_32S,
+        // `compute_sext_fused` only records these five combinations.
+        _ => unreachable!("signed_load_op({loaded}, {to})"),
+    }
 }
 
 /// The local (non-constant) value operands an instruction *uses*, and — as a side effect — the
@@ -16743,6 +16836,19 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     b: m,
                 });
                 (&l.dest, v)
+            } else if let Some(&(lb, to)) = ctx.s.sext_fused.get(&l.dest) {
+                // Fused signed-narrow load: the result's only use is a same-block `sext`, so emit a
+                // signed load (`movsx (mem)`) directly and let the `sext` fold to identity. The value
+                // is `to`-wide sign-extended; the folded `sext` binds its dest to this same value.
+                (
+                    &l.dest,
+                    ctx.push(Inst::Load {
+                        op: signed_load_op(lb, to),
+                        addr,
+                        offset: 0,
+                        align: 0,
+                    }),
+                )
             } else {
                 let op = load_op(l.loaded_ty.as_ref())?;
                 (
@@ -16986,11 +17092,20 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     types,
                 );
             }
-            let from = src_bits(&x.operand, types)?;
-            let to = int_bits(x.to_type.as_ref())
-                .ok_or_else(|| Error::Unsupported("sext to non-int".into()))?;
-            let v = ctx.operand(&x.operand)?;
-            (&x.dest, emit_ext(ctx, v, from, to, true))
+            // Folded counterpart of the fused signed-narrow load: the producing load already
+            // sign-extended to `to` (see `Scan::sext_fused`), so this `sext` is the identity.
+            let fused = matches!(&x.operand,
+                Operand::LocalOperand { name, .. } if ctx.s.sext_fused.contains_key(name));
+            let idx = if fused {
+                ctx.operand(&x.operand)?
+            } else {
+                let from = src_bits(&x.operand, types)?;
+                let to = int_bits(x.to_type.as_ref())
+                    .ok_or_else(|| Error::Unsupported("sext to non-int".into()))?;
+                let v = ctx.operand(&x.operand)?;
+                emit_ext(ctx, v, from, to, true)
+            };
+            (&x.dest, idx)
         }
         // Floats (f32/f64) — IEEE 754, no traps (§3b). A `<2 x float>` operand goes lane-wise
         // (`fp_binop` unpacks the packed-i64 lanes, applies the op per lane, repacks).
