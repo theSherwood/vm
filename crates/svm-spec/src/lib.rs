@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod simd;
+pub mod structural;
 pub mod verify;
 
 use svm_ir::*;

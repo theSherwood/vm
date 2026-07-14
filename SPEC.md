@@ -63,6 +63,18 @@
 > `Unsupported` bail (no legalizable Cranelift lowering; wasm never emits them) — the
 > interpreters stay fully pinned there. All SIMD rows also ride the encoding suite
 > (the `0xFE` prefix + sub-opcode pins) and both verifiers.
+>
+> **Slice 7 landed — the plan is complete.** The completeness closure
+> (`svm_spec::structural`, 36 typing+encoding rows: the 4 atomics + fence + 2 `v128`
+> memory ops, the calls + `ref.func`, the 6 host ops, the 7 concurrency ops, the misc
+> control ops, and all 7 terminators) homes every remaining op — each with a minimal
+> **verifiable witness module** (accepted by both verifiers, except `call_import`, the
+> un-verifiable pre-resolution import form), `decode∘encode` round-trip, and an opcode
+> byte pin (`spec_structural.rs`). These carry no `eval` (host/interleaving-dependent —
+> the SPEC.md scope fence). A new exhaustive `row_home()` match (the third forcing
+> function, with `coverage()` and the reference verifier's `check_inst`) maps **every**
+> one of the 86 `Inst` variants to its owning slice, so adding any op is a compile
+> error until the spec homes it. The executable spec now covers the entire ISA.
 
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier
@@ -250,9 +262,9 @@ commit). Ordered so every slice delivers a standing suite:
    total, §17/D58); `eval` per lane op is mechanical. *Exit: parity with slices
    1–2 for vector ops.* ✅ (`i64x2` min/max JIT leg excepted — a documented
    backend bail, not a spec gap.)
-7. **Coverage closure.** Typing + encoding rows for the remaining control /
-   host / concurrency ops (no `eval`); cross-link this doc from `DESIGN.md`
-   §3b/§18. *Exit: the completeness walk covers all of `Inst`.*
+7. **Coverage closure** — **done** (see Status). Typing + encoding rows for the remaining control /
+   host / concurrency ops (no `eval`), plus the exhaustive `row_home()` walk.
+   *Exit: the completeness walk covers all of `Inst`.* ✅
 
 Per §18's taxonomy this is agent-fast volume work (data entry + harness); the
 risk concentrates exactly where it should — writing `eval` closures honestly
