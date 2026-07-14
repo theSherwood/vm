@@ -3524,6 +3524,7 @@ impl CompiledModule {
 /// child_size)` committed (the Instantiator checks `sub_base + child_size ≤ holder size`); it must
 /// outlive the call. A guest window must already be installed on this thread (`install_guard`).
 #[cfg(fiber_rt)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn compile_child_and_run(
     funcs: &[Func],
     child_entry: FuncIdx,
@@ -3532,8 +3533,54 @@ pub(crate) unsafe fn compile_child_and_run(
     parent_mem_base: *mut u8,
     args: &[i64],
     epoch_addr: usize,
+    durable: bool,
 ) -> Result<(i64, i64), JitError> {
-    // The synchronous child's powerbox is empty (an inert `cap.call` → `CapFault`).
+    let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
+
+    // §4 (DURABILITY.md, "JIT parity"): a **durable** child gets an attenuated `Instantiator` powerbox
+    // so it can nest a grandchild of its own — the freeze slice's prerequisite (an instrumented child
+    // that can be *live* mid-computation is one that reached a `cap.call`). Build a child `Nursery`
+    // over the child's own funcs, boxed here so its stable address (baked into the child code below)
+    // outlives the run; its `instantiate` re-enters `compile_child_and_run` for the grandchild
+    // (recursion), re-checking the same durable + same-module guard. The child's powerbox holds one
+    // capability — an `Instantiator` over its **own** window (`child_instantiator_thunk`, ctx = the
+    // boxed window size); non-`Instantiator` caps and `AddressSpace` are a follow-up. A non-durable
+    // child keeps the pre-existing `InstEnv::null()` (can't nest) — behavior unchanged. `child_win_size`
+    // is declared before `child_nursery` so it outlives the nursery that borrows it.
+    let child_win_size: Box<u64> = Box::new(child_size);
+    let child_uses_instantiator = funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::CapCall { type_id: 6, .. }))
+        })
+    });
+    let child_nursery: Option<Box<instantiator_rt::Nursery>> = if durable && child_uses_instantiator
+    {
+        let n = Box::new(instantiator_rt::Nursery::new(
+            funcs.to_vec().into(),
+            instantiator_rt::child_instantiator_thunk,
+            &*child_win_size as *const u64 as *mut core::ffi::c_void,
+            None, // same-module grandchildren only (separate-module is a later slice)
+            epoch_addr,
+        ));
+        n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
+        Some(n)
+    } else {
+        None
+    };
+    let child_inst = match &child_nursery {
+        Some(n) => InstEnv {
+            nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
+            instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
+            join_thunk: instantiator_rt::join as *const () as i64,
+            coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
+            coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
+        },
+        None => InstEnv::null(),
+    };
+    // The synchronous child's non-nesting powerbox is empty (an inert `cap.call` → `CapFault`); its
+    // `Instantiator` (if any) is routed by `child_inst` above.
     let child = compile_child(
         funcs,
         child_entry,
@@ -3541,8 +3588,8 @@ pub(crate) unsafe fn compile_child_and_run(
         empty_cap_thunk,
         core::ptr::null_mut(),
         epoch_addr, // §5 kill-path: the child polls the parent's interrupt cell
+        child_inst,
     )?;
-    let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
     let n_results = funcs[child_entry as usize].results.len();
     let code = child.code;
     let fn_table_ptr = child.fn_table.as_ptr();
@@ -3559,12 +3606,42 @@ pub(crate) unsafe fn compile_child_and_run(
         child_window.rw_mut().copy_from_slice(src);
     }
 
+    // §4: a durable child runs its (possibly instrumented) funcs in the carve as **context 0** of its
+    // own window. Seed the ctx-0 durable control words exactly as the interpreter does at the child's
+    // first dispatch (`svm-interp` `durable_store_dstate(0, NORMAL)` + `durable_set_sp`): the global
+    // state word (`STATE_OFF` = 0) and the ctx-0 thaw word to `NORMAL`, and the ctx-0 shadow-SP word
+    // (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the empty frame base `shadow_frame_base(0)`.
+    // So an instrumented child's prologue sees `NORMAL` and its shadow stack starts empty at the right
+    // offset. A valid durable child's window is ≥ `DURABLE_RESERVE` (64 KiB), so these low offsets fit;
+    // the size guard keeps a malformed (too-small) guest-requested carve from panicking the host here —
+    // such a child instead traps at runtime when its instrumented code reaches past its window.
+    const CTX0_SP_OFF: usize = DURABLE_SHADOW_BASE as usize; // shadow_region_base(0) = 64
+    const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0) = 72
+    if durable && (child_size as usize) >= CTX0_THAW_OFF + 4 {
+        const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0) = 80
+        let w = child_window.rw_mut();
+        w[0..4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
+        w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
+        w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
+        // ctx-0 SP word
+    }
+
     let mut results = vec![0i64; n_results];
     let mut trap_cell: i64 = 0;
     // SAFETY: `code` honours the `Entry` ABI; it accesses only its own window `[child_base, …+size)`
     // (baked masking; a width-overrun hits this window's guard page), reads the child `fn_table`, and
     // writes its result/trap slots. The guard is re-entrant, so a child fault is caught here and the
     // parent's recovery state is restored.
+    // §4: while a durable child runs (synchronously, this OS thread), point the per-thread durable
+    // shadow-base register at the child's own ctx-0 region and restore the parent's after. Every
+    // nesting level is ctx 0 of its *own* window, so the value is always `DURABLE_SHADOW_BASE` — the
+    // save/restore is value-neutral here but keeps the register correct if a level ever runs at a
+    // non-zero context.
+    let saved_shadow = durable.then(|| {
+        let s = durable_shadow::get();
+        durable_shadow::seed(DURABLE_SHADOW_BASE);
+        s
+    });
     let faulted = mem::run_guarded(
         &child_window,
         code,
@@ -3574,6 +3651,9 @@ pub(crate) unsafe fn compile_child_and_run(
         fn_table_ptr as *const core::ffi::c_void,
         &mut trap_cell,
     );
+    if let Some(s) = saved_shadow {
+        durable_shadow::seed(s);
+    }
     if faulted {
         trap_cell = mem::FAULT_TRAP;
     }
@@ -3632,6 +3712,7 @@ fn compile_child(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     epoch_addr: usize,
+    inst_env: InstEnv,
 ) -> Result<ChildCode, JitError> {
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
@@ -3710,7 +3791,7 @@ fn compile_child(
             cap,
             FiberEnv::null(),
             ThreadEnv::null(),
-            InstEnv::null(), // a JIT child cannot itself nest yet (its Instantiator cap.call → CapFault)
+            inst_env, // §4: a durable child's baked nested-nursery `InstEnv` (else null — no nesting)
             SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
             &mut ctx.func,
             f,

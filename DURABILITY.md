@@ -347,9 +347,14 @@ needed. Concretely:
   carve's shadow-SP, grouped by `parent_task` — the `FrozenNested` decode + the interp thaw's two-phase
   re-attach, on the JIT.
 
-**Staged impl (each differential vs. the interpreter):** (1) **child powerbox** — an attenuated
-`Instantiator`+`AddressSpace` for a nested durable child, pinned by a same-module child that nests a
-grandchild and computes correctly in `NORMAL` (no freeze) on both backends; (2) **freeze export** —
+**Staged impl (each differential vs. the interpreter):** (1) **child powerbox — LANDED
+(Instantiator).** A durable JIT child now gets a one-capability powerbox — an `Instantiator` over its
+**own** window (`child_instantiator_thunk`, ctx = the boxed window size) baked as its `InstEnv` (a
+child `Nursery` over its funcs), plus the ctx-0 carve control-word seeding it needs as an instrumented
+guest. `compile_child` gained the `InstEnv` param (was hard-`null`); `compile_child_and_run` builds the
+boxed nursery + seeds. Pinned by `durable_nesting_jit.rs::jit_durable_depth2_grandchild_matches_interp`
+(a same-module root→child→grandchild chain returns 4950 on both backends in `NORMAL`). `AddressSpace`
+and separate-module children are follow-ups. (2) **freeze export** —
 the unwound-vs-completed detection + `FrozenNested`, byte-identical carve to the interp; (3) **thaw**
 re-attach + `REWINDING`; (4) depth-2, separate-module, and completed-result parity. Powerbox (1) is the
 gating prerequisite; the synchronous model needs no redesign.

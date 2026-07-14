@@ -117,3 +117,105 @@ fn jit_durable_same_module_child_matches_interp() {
         "JIT runs the durable same-module nested child, matching the interp's 4950: {jo:?}"
     );
 }
+
+const D2_SIZE_LOG2: u8 = 19;
+const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
+
+/// A durable **same-module depth-2** chain: root (func 0) instantiates a child (func 1) which itself
+/// instantiates a grandchild (func 2, the 0..100 = 4950 loop) and joins it. The child is *instrumented*
+/// (it does a `cap.call`), so this exercises the child's **Instantiator powerbox** (it resolves its own
+/// window and carves the grandchild) and the carve control-word seeding. All `NORMAL` (no freeze).
+/// (Identical in shape to `durable_nesting.rs::PARENT_DEPTH2`.)
+const PARENT_DEPTH2: &str = "memory 19
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 262144
+  v3 = i64.const 18
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.const 256
+  v2 = i64.const 2
+  v3 = i64.const 131072
+  v4 = i64.const 17
+  v5 = i64.const 0
+  v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
+  return v7
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v1, v2)
+block1(v3: i64, v4: i64):
+  v5 = i64.const 100
+  v6 = i64.lt_s v3 v5
+  br_if v6 block2(v3, v4) block3(v4)
+block2(v7: i64, v8: i64):
+  v9 = i64.add v8 v7
+  v10 = i64.const 1
+  v11 = i64.add v7 v10
+  br block1(v11, v9)
+block3(v12: i64):
+  return v12
+}
+";
+
+/// The child powerbox slice: a durable depth-2 same-module chain (root → child → grandchild) returns
+/// the grandchild's total (4950) on **both** backends. The JIT child now carries an Instantiator
+/// powerbox, so its own `instantiate` of the grandchild resolves and runs instead of failing closed.
+#[test]
+fn jit_durable_depth2_grandchild_matches_interp() {
+    let inst = instrument(PARENT_DEPTH2);
+
+    // Interp: the durable chain runs; the grandchild's 4950 propagates up through both joins.
+    let mut hi = Host::new();
+    hi.set_durable(true);
+    let ih = hi.grant_instantiator(0, D2_WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (ir, _imem) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init_durable_window(D2_WINDOW),
+        D2_SIZE_LOG2,
+        &mut hi,
+    );
+    assert_eq!(
+        ir.expect("interp durable depth-2 run ok"),
+        vec![Value::I64(4950)],
+        "interp runs the durable depth-2 chain"
+    );
+
+    // JIT: the child's Instantiator powerbox lets it carve + run the grandchild, so 4950 comes back.
+    if !svm_jit::fiber_supported() {
+        return;
+    }
+    let mut hj = Host::new();
+    hj.set_durable(true);
+    let jh = hj.grant_instantiator(0, D2_WINDOW as u64);
+    let win = init_durable_window(D2_WINDOW);
+    let (jo, _jmem, _residue) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[jh as i64],
+        &win,
+        &[],
+        &[],
+        D2_SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("durable depth-2 run compiles");
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[4950]),
+        "JIT runs the durable depth-2 chain (child powerbox nests the grandchild): {jo:?}"
+    );
+}
