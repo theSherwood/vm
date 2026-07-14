@@ -6641,7 +6641,15 @@ fn mask_addr(
         // access property of §4/D38 is preserved — only the mechanism (guard-page fault vs `ud2`)
         // differs.
         if lower.sub_base == 0 {
-            let guard = b.ins().iconst(I64, reserved as i64);
+            // Redirect target = the window's trailing guard page, at `round_up(reserved, page)` — **not**
+            // `reserved`. `GuestWindow` commits the backed prefix at page granularity, so for a sub-page
+            // reservation (`reserved < page`) the bytes `[reserved, page)` are committed RW and only
+            // `[round_up(reserved, page), …)` is `PROT_NONE`; redirecting to a page-aligned guard offset
+            // faults for every window size. (For the common `reserved ≥ page` power-of-two window this is
+            // exactly `reserved`, so hot-loop codegen is unchanged.)
+            let page = mem::page_size() as u64;
+            let guard_off = (reserved + page - 1) & !(page - 1);
+            let guard = b.ins().iconst(I64, guard_off as i64);
             let eff = b.ins().select_spectre_guard(oob, guard, eff);
             let base = b.use_var(lower.mem_var);
             return b.ins().iadd(base, eff);

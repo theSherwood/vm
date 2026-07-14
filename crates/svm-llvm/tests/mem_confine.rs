@@ -25,10 +25,19 @@ long sum16(long n){ for (int i=0;i<16;i++) A[i]=i*3+1; return A[n]; }
 long poke(long n){ A[n]=7; return A[0]; }
 "#;
 
+/// Per-call unique suffix so the three tests (run in parallel by the default harness) never share a
+/// temp path — `process::id()` alone collides across threads.
+static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn build() -> Option<svm_llvm::Translated> {
     let dir = std::env::temp_dir();
-    let c = dir.join(format!("svm_confine_{}.c", std::process::id()));
-    let bc = dir.join(format!("svm_confine_{}.bc", std::process::id()));
+    let uniq = format!(
+        "{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let c = dir.join(format!("svm_confine_{uniq}.c"));
+    let bc = dir.join(format!("svm_confine_{uniq}.bc"));
     std::fs::write(&c, SRC).expect("write .c");
     let ok = Command::new("clang")
         .args(["-O2", "-emit-llvm", "-c"])
