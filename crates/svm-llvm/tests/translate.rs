@@ -4482,6 +4482,105 @@ fn demo_pg_stream_vs_native() {
 }
 
 #[test]
+fn demo_pg_fprintf_vs_native() {
+    // **The guest varargs printf engine** (slice CH, Postgres runtime gap #11g). `printf_shim.c`
+    // provides the runtime `printf`/`fprintf`/`vfprintf`/`snprintf` family (the Lua `string.format`
+    // formatter — byte-exact vs glibc; floats via the bignum `__vm_fmt_*` dtoa), composing with the
+    // slice-CE stream/file fd-dispatch. `fprintf_probe.c` formats to `stdout`, a real **file** (fs
+    // cap, read back and echoed), and `stderr` — byte-identical to the native glibc oracle (which
+    // folds `stderr` into `stdout` unbuffered to match the guest's single write-through Stream) on
+    // all three engines, over `mem_fs` and `host_fs`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/fprintf_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_fprintf.bc"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_fprintf (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{pid}_pg_fprintf"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_fprintf (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("svm-pg-fprintf-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_fprintf bitcode");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = || svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+    };
+    // All three engines over mem_fs; then host_fs (a real temp dir) once, to prove the fs-cap file
+    // path is backend-agnostic. Each must byte-match native.
+    for backend in [
+        svm_run::Backend::TreeWalk,
+        svm_run::Backend::Bytecode,
+        svm_run::Backend::Jit,
+    ] {
+        let out = inst
+            .run_with_caps(backend, &config(), &[("fs", svm_run::fs::mem_fs())])
+            .unwrap_or_else(|e| panic!("pg_fprintf guest run ({backend:?}, mem_fs): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_fprintf: guest ({backend:?}, mem_fs) stdout vs native"
+        );
+    }
+    let guest_root = std::env::temp_dir().join(format!("svm-pg-fprintf-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            svm_run::Backend::Bytecode,
+            &config(),
+            &[("fs", svm_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("pg_fprintf guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle.stdout),
+        "pg_fprintf: guest (host_fs) stdout vs native"
+    );
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays

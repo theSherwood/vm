@@ -5,3 +5,4 @@
 #include "time_shim.c"
 #include "proc_shim.c"
 #include "stdio_shim.c"
+#include "printf_shim.c"

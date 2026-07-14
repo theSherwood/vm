@@ -1289,6 +1289,29 @@ marker. **svm-run + svm-llvm suites green, fmt + clippy `-D warnings` on both.**
 `find_my_exec`, then drive the now-legible boot forward — storage manager / WAL / single-process shmem /
 catalog bootstrap, plus the varargs `fprintf`/`scanf` engines.
 
+**Slice CH (DONE) — the varargs `printf` engine (gap #11g/#11j).** The *output* half of the boot's
+remaining format surface (the `scanf` input half stays deferred). Slice CE gave the on-ramp the
+stream/file fd-dispatch (`stdout`/`stderr` → the powerbox out-`Stream`, `fopen`'d files → the fs cap,
+disjoint fd namespaces); this slice adds the runtime `printf`/`fprintf`/`vfprintf`/`vprintf`/`snprintf`/
+`sprintf` family Postgres formats its query results and `elog`/`ereport` log lines with — a query result
+builds its directives *at runtime*, the path the on-ramp's translate-time *constant*-format engine can't
+lower. **Guest code, no translator change** (the CA–CG shim model):
+- **`printf_shim.c`** (new) is the runtime `vsnprintf` engine — the exact byte-for-byte-vs-glibc
+  formatter from the Lua `string.format` fixture (`lua_fmt_snprintf.c`): integers/strings/chars/pointers/
+  `%a` hex-float formatted in C; `%f`/`%e`/`%g` delegate to the on-ramp's correctly-rounded **bignum
+  `__vm_fmt_{fix,sci,gen}` dtoa**; full width/precision/flag/length-modifier support. The stream variants
+  format into a buffer (heap for >1 KiB output) and `fwrite` it, so they **compose** with slice CE's
+  fd-dispatch: `fprintf(stdout/stderr, …)` → the out-`Stream`, `fprintf(file, …)` → the fs cap. Defining
+  these **shadows** the on-ramp's constant-format `printf`/`snprintf` synthesis — deliberate: one runtime
+  engine, all formats. Linked into the whole-module boot via `pg_shims.c` (`#include "printf_shim.c"`).
+- **Differential** `demo_pg_fprintf_vs_native` (`fprintf_probe.c`): the format family across
+  `%d`/`%u`/`%x`/`%c`/`%s`/`%f`/`%e`/`%g` + width/precision/flags to **three targets** — `stdout`, a real
+  **file** (fs cap, read back and echoed), and `stderr` — byte-identical to the native glibc oracle (which
+  folds `stderr` into `stdout` unbuffered to match the guest's single write-through Stream) on **all three
+  engines**, over `mem_fs` and `host_fs`. **svm-llvm lane green (9 `demo_pg_*` tests, fmt + clippy
+  `-D warnings`).** Next (the format tail): the `fscanf`/`sscanf`/`vsscanf` **input** engine (gap #11i's
+  remaining half), then the boot's storage manager / WAL / single-process shmem / catalog bootstrap.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
