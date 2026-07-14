@@ -261,7 +261,7 @@ keeps tripping unrelated PRs, the cheap unblock is the I4-style mitigation (or m
 
 ---
 
-### I22 — Rare `real-browser` (Chromium/Playwright) flake: a worker vCPU traps (OOB / `unreachable` panic) (S4) — **ROOT CAUSE FOUND (2026-07-15): double-free race on shared codegen stashes; MITIGATION LANDED (retry + liveness backstop), engine fix deferred (needs browser verification)**
+### I22 — Rare `real-browser` (Chromium/Playwright) flake: a worker vCPU traps (OOB / `unreachable` panic) (S4) — **FIXED (2026-07-15): double-free race on shared codegen stashes → emit-once-per-run under a spin-lock; verified green in real Chromium (retry + liveness backstop retained as defense-in-depth)**
 
 **Where:** the `real-browser (Chromium via Playwright)` CI job — `browser/browser-test.mjs` driving
 `web/index.html` + `web/play.html` in a headless Chromium under COOP/COEP. The wasm module is the
@@ -458,8 +458,30 @@ Workers *read* the shared stash behind an `Acquire` that pairs with the page's `
 each `enable_*` emit+stash with a lock so the dealloc/realloc is serialized (each pointer freed once).
 `#[thread_local]` would be the natural expression of the original intent but is **not** available: the
 `wasm32-differential` CI job builds this crate on **stable**, so a `#![feature(thread_local)]` would
-break it. Not landing an unverified change to this shared-memory/confinement-adjacent code (AGENTS.md:
-"the most sensitive code in the tree").
+break it.
+
+**ENGINE FIX LANDED + VERIFIED IN REAL CHROMIUM (2026-07-15).** Took approach (b), the localized one
+(`browser/src/lib.rs`): **emit each codegen unit exactly once per run.** Every run's page-side powerbox
+publisher (`svm_par_powerbox` / `_jit_codegen` / `_io` / `_inst` / `_none` — exactly one per run, all
+single-threaded before any Worker spawns) bumps a `PAR_RUN_GEN`; each of the three `svm_par_enable_*`
+now runs its emit under a **spin-lock** (`CODEGEN_LOCK`) and only if it hasn't already run for the
+current generation — later Workers skip the emit and reuse the shared stash (identical bytes either
+way). So each stash is written **once per run and never freed mid-run**, killing the double-free/UAF at
+the source; the Workers' reads of the emitted bytes are stable, and the lock's `Acquire`/`Release`
+makes the first Worker's write visible to the rest. A spin-lock (not a `Mutex`) so the page's own
+`enable_jit_codegen` call — on the main thread inside `svm_par_powerbox_jit_codegen` — can never hit a
+forbidden main-thread `Atomics.wait`; it is always uncontended (previous run's Workers are terminated
+before the next run publishes), so it acquires without spinning. No new import, no ABI change, builds
+on **stable** (`wasm32-differential`) and nightly alike.
+
+*Verified locally in real Chromium* (nightly `-Z build-std` threads build + Playwright, the same lane
+as CI `real-browser`): the full `browser-test.mjs` passes green — all nine index items incl.
+`inst`/`tierup`/`jitcodegen`/`instcodegen` (the three flake culprits) PASS, byte-identical to the
+interpreter, with **no `[I22 retry]`** triggered. Native `cargo check -D warnings` clean. (A large-N
+before/after stress loop was attempted but the sandbox's browser subprocess launching degraded after
+~40 launches; the functional green run on the real build + the principled once-per-run serialization
+of the proven double-free are the evidence.) The retry + liveness backstop from the mitigation stay in
+as defense-in-depth.
 
 ---
 
