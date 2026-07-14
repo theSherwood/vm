@@ -452,6 +452,10 @@ fn translate_impl(
     // imports; `__vm_blocking_handle` only reads the stashed `Blocking` handle (no import). Together
     // they raise the powerbox arity to grant the `IoRing`/`Blocking` handles.
     let uses_vm_io = register_vm_io_imports(m, &defined_names, &mut imports, &mut caps);
+    // Direct-stream builtins (`__vm_stream_write`/`__vm_stream_read`): register the `write`/`read`
+    // `Stream` imports so a guest that defines its own `write`/`read` (an fs-cap syscall shim) can
+    // still reach stdout/stdin. Registered unconditionally (the names are reserved, never shadowed).
+    let _uses_vm_stream = register_vm_stream_imports(m, &mut imports, &mut caps);
     let uses_blocking = calls_external(m, &defined_names, "__vm_blocking_handle") && has_main;
     // §22 guest-driven-JIT builtins (`__vm_jit_*`): register their `Jit` imports; the program then
     // needs the full 8-handle powerbox (the `Jit` handle is the last `VM_CAP_*` index).
@@ -2986,6 +2990,24 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
             handle: HandleSlot::Exit,
             drop_args: 0,
         },
+        // Direct guest access to the powerbox streams: `long __vm_stream_write(long buf, long len)` /
+        // `__vm_stream_read(...)`. Unlike the `write`/`read` recognizers (which drop a `fd` the handle
+        // subsumes), these take the `(buf, len)` slice as-is (`drop_args: 0`). A guest that *defines*
+        // `write`/`read` (e.g. an fs-cap syscall shim that must serve file fds) uses these to reach
+        // stdout/stdin/stderr for the fds the powerbox owns — fd-dispatch the shim can't otherwise do,
+        // since a defined `write` shadows the recognizer.
+        "__vm_stream_write" => CapSpec {
+            name: "write",
+            sig: ft(vec![I64, I64], vec![I64]),
+            handle: HandleSlot::Stdout,
+            drop_args: 0,
+        },
+        "__vm_stream_read" => CapSpec {
+            name: "read",
+            sig: ft(vec![I64, I64], vec![I64]),
+            handle: HandleSlot::Stdin,
+            drop_args: 0,
+        },
         _ => return None,
     })
 }
@@ -3161,6 +3183,54 @@ fn register_vm_io_imports(
                     continue;
                 }
                 if let Some(import) = vm_io_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
+/// The §7 import the direct-stream builtins need (`__vm_stream_write` → `write`, `__vm_stream_read`
+/// → `read`), or `None`. Both reach the powerbox `Stream` (stdout slot 0 / stdin slot 1). Unlike the
+/// libc `write`/`read` recognizers, these are registered *even when the guest defines `write`/`read`
+/// itself* (an fs-cap syscall shim does) — that's the whole point: the shim serves file fds through
+/// its own `write`/`read` and reaches the powerbox streams through these.
+fn vm_stream_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_stream_write" => "write",
+        "__vm_stream_read" => "read",
+        _ => return None,
+    })
+}
+
+/// Scan for the direct-stream builtins (`__vm_stream_write`/`__vm_stream_read`), registering the
+/// `write`/`read` §7 imports so the `cap_spec` lowering's `import_of` resolves them. Returns whether
+/// any were used (the signal that `_start` must be granted the stdout/stdin handles). These names are
+/// reserved (a guest never defines them), so — unlike the other `register_*` scans — a guest
+/// definition does not shadow them.
+fn register_vm_stream_imports(
+    m: &LModule,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if let Some(import) = vm_stream_builtin_import(&name) {
                     used = true;
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;

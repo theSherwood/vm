@@ -4342,6 +4342,92 @@ fn demo_pg_stdio_vs_native() {
 }
 
 #[test]
+fn demo_pg_stream_vs_native() {
+    // **The stdout/stderr stream `FILE*` path + the fs-cap file path coexisting** (slice CE, gap
+    // #11f). The on-ramp gained `__vm_stream_write`/`__vm_stream_read` builtins; os_shim.c's
+    // `write`/`read` fd-dispatch fds 0/1/2 to the powerbox Stream cap and everything else to the fs
+    // cap, and the fs cap now reserves fds 0/1/2 so a file fd (≥3) never collides with a stream fd.
+    // `stream_probe.c` writes to `stdout` (FILE*) *and* a real file; the guest byte-matches native
+    // glibc over `mem_fs` and `host_fs`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/stream_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_stream.bc"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stream (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{pid}_pg_stream"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stream (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("svm-pg-stream-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_stream bitcode");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = || svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+    };
+    for (label, cap) in [
+        ("mem_fs", svm_run::fs::mem_fs()),
+        ("host_fs", {
+            let root = std::env::temp_dir().join(format!("svm-pg-stream-guest-{pid}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("guest root");
+            svm_run::fs::host_fs(root)
+        }),
+    ] {
+        let out = inst
+            .run_with_caps(svm_run::Backend::Bytecode, &config(), &[("fs", cap)])
+            .unwrap_or_else(|e| panic!("pg_stream guest run ({label}): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_stream: guest ({label}) stdout vs native"
+        );
+    }
+    let _ =
+        std::fs::remove_dir_all(std::env::temp_dir().join(format!("svm-pg-stream-guest-{pid}")));
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
