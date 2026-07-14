@@ -2,8 +2,9 @@
 
 Diverse `no_std` Rust workloads (a real program each) run on **svm-jit** vs **Wasmtime-w64** vs
 **native**, timed by the large/small-`n` subtraction (min over reps) — the `confine` methodology, but
-on real programs (a hash-table churn, a bytecode interpreter, a batch sort) instead of confinement
-micro-kernels. Driver: `bench/src/bin/rustbench.rs`.
+on real programs (hash-table churn, a bytecode interpreter, a batch sort, a recursive-descent parser,
+base64 encode; plus a BFS held back by a bug — see below) instead of confinement micro-kernels.
+Driver: `bench/src/bin/rustbench.rs`.
 
 **Why Rust.** A `no_std` + `alloc` program has *zero libc surface* (a bump `#[global_allocator]`
 supplies the heap), so it compiles cleanly to every lane with no shim assembly — what made standing up
@@ -38,14 +39,24 @@ Sample (this machine, ×native; `svm÷wt64` lower = svm-jit faster):
 
 ```
 workload    native(ns)   svm-jit    wt/w64    wt/w32   svm÷wt64
-hashmap            3.6     2.0x      1.8x      1.3x     ~1.10x
-vm                47       2.7x      2.3x      1.3x     ~1.21x
-sort             920       2.0x      2.3x      1.4x     ~0.90x
+hashmap            3.6     1.9x      1.8x      1.3x     ~1.05x
+vm                46       2.9x      2.3x      1.3x     ~1.22x
+sort             920       2.0x      2.2x      1.3x     ~0.90x
+parse            148       2.4x      2.0x      1.5x     ~1.23x
+base64            84       3.1x      3.6x      1.6x     ~0.87x
 ```
 
-svm-jit lands within ~±20% of Wasmtime-w64 across the three — competitive/parity, workload-dependent
-(faster on `sort`, a bit behind on the branchy interpreter), consistent with the "as fast as wasm"
-goal on real programs.
+svm-jit lands within ~±20% of Wasmtime-w64 across the five — competitive/parity, workload-dependent
+(faster on `sort`/`base64`, a bit behind on the branchy interpreter and parser), consistent with the
+"as fast as wasm" goal on real programs.
+
+## Correctness (the harness earns its keep)
+
+Every lane's `run(small)` is cross-checked against svm-jit before timing — a MISCOMPILE aborts. Adding
+these workloads immediately surfaced a real **svm-jit correctness bug** on rustc-emitted bitcode: a
+sixth workload, `workloads/bfs.rs` (grid BFS), returns garbage on svm-jit while native/Wasmtime agree.
+It is filed as **ISSUES.md I23** (with a one-screen reproducer) and held out of the active `WORKLOADS`
+list until fixed — re-enable it then.
 
 ## Adding a workload
 

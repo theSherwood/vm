@@ -36,6 +36,10 @@ const WORKLOADS: &[(&str, i64, i64)] = &[
     ("hashmap", 1_000, 4_000_000),
     ("vm", 1_000, 8_000_000),
     ("sort", 100, 400_000),
+    ("parse", 1_000, 2_000_000),
+    ("base64", 1_000, 1_000_000),
+    // ("bfs", 10, 5_000),  // DISABLED: svm-jit miscompiles it (returns garbage) — ISSUES.md I23,
+    // a real bug this harness caught. The workload is kept at workloads/bfs.rs; re-enable once fixed.
 ];
 
 fn rb_dir() -> PathBuf {
@@ -54,7 +58,7 @@ fn compose(name: &str) -> Option<String> {
 
 fn rustc_ok() -> bool {
     Command::new("rustc")
-        .args([RUSTC, "--version"])
+        .args([RUSTC, "--edition", "2021", "--version"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -91,7 +95,14 @@ fn parse_ns_chk(out: &[u8]) -> Option<(f64, i64)> {
 fn native_lane(src: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
     let lib = tmp("native.a");
     let ok = Command::new("rustc")
-        .args([RUSTC, "-O", "-Cpanic=abort", "--crate-type=staticlib"])
+        .args([
+            RUSTC,
+            "--edition",
+            "2021",
+            "-O",
+            "-Cpanic=abort",
+            "--crate-type=staticlib",
+        ])
         .arg(src)
         .arg("-o")
         .arg(&lib)
@@ -128,6 +139,8 @@ fn svmjit_runner(src: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)
     let ok = Command::new("rustc")
         .args([
             RUSTC,
+            "--edition",
+            "2021",
             "-O",
             "-Cpanic=abort",
             "--emit=llvm-bc",
@@ -187,6 +200,8 @@ fn build_wasm32(src: &Path) -> Option<PathBuf> {
     Command::new("rustc")
         .args([
             RUSTC,
+            "--edition",
+            "2021",
             "-O",
             "-Cpanic=abort",
             "--crate-type=cdylib",
