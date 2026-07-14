@@ -88,12 +88,22 @@ pub(crate) struct Nursery {
     /// the domain closed over its nesting subtree". The interpreter is the reference for durable
     /// nesting; JIT parity is a follow-up.
     durable: AtomicBool,
+    /// This nursery's own §14 domain **task id** — `0` for the root, and a subtree-unique id (from
+    /// [`Nursery::task_counter`]) for each nested child's nursery. `instantiate` stamps it as the
+    /// recorded child's `parent_task` (DURABILITY.md §4 depth-2), so a thaw can group residue by parent
+    /// (the root's direct child carries `0`; a grandchild carries its parent-child's id).
+    my_task: usize,
+    /// §4 depth-2: the **shared** subtree task-id counter — the next id to hand a nested child's
+    /// nursery. Threaded down the subtree (every nursery in one freeze shares the `Arc`) so ids are
+    /// assigned in instantiate order across all levels, matching the interpreter's dense scheme.
+    task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// §4 freeze export: the §14 nested-child re-attach residue captured during a durable freeze — one
     /// [`crate::FrozenNested`] per child that unwound into its carve (`instantiate` records it when
-    /// `compile_child_and_run` reports the child left `UNWINDING`). Drained by the top-level run after
-    /// the freeze (`take_frozen_nested`). Depth-1 (root's direct child) for now; a grandchild's residue
-    /// coalescing at the root (a shared sink) is a follow-up.
-    frozen_nested_out: Mutex<Vec<crate::FrozenNested>>,
+    /// `compile_child_and_run` reports the child left `UNWINDING`). This is the **shared** subtree sink
+    /// (every nursery in one freeze holds the same `Arc`), so a grandchild's residue — recorded by its
+    /// parent-child's nursery — coalesces at the **root**, where the top-level run drains it
+    /// (`take_frozen_nested`). The JIT analog of the interpreter's `VCpu::freeze_sink`.
+    frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -205,12 +215,16 @@ unsafe impl Send for Nursery {}
 unsafe impl Sync for Nursery {}
 
 impl Nursery {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         funcs: std::sync::Arc<[Func]>,
         cap_thunk: CapThunk,
         cap_ctx: *mut core::ffi::c_void,
         resolve_module: Option<crate::ModuleResolver>,
         epoch_addr: usize,
+        my_task: usize,
+        task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
     ) -> Nursery {
         Nursery {
             funcs,
@@ -221,16 +235,49 @@ impl Nursery {
             children: Mutex::new(Vec::new()),
             coros: Mutex::new(Vec::new()),
             durable: AtomicBool::new(false),
-            frozen_nested_out: Mutex::new(Vec::new()),
+            my_task,
+            task_counter,
+            frozen_nested_sink,
         }
     }
 
+    /// This nursery's §14 domain task id (`0` = root) — `instantiate` records it as a child's
+    /// `parent_task` (depth-2 grouping).
+    pub(crate) fn my_task(&self) -> usize {
+        self.my_task
+    }
+
+    /// Reserve the next subtree-unique task id for a nested child's nursery (shared counter).
+    pub(crate) fn next_child_task(&self) -> usize {
+        self.task_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A clone of the shared subtree residue sink + task counter, to hand to a nested child's nursery
+    /// so its (and its descendants') freeze residue coalesces at the root.
+    pub(crate) fn nested_sink(&self) -> std::sync::Arc<Mutex<Vec<crate::FrozenNested>>> {
+        std::sync::Arc::clone(&self.frozen_nested_sink)
+    }
+    pub(crate) fn task_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.task_counter)
+    }
+
+    /// Push a captured §14 nested-child re-attach record into the **shared** subtree sink (coalesces at
+    /// the root). `instantiate` calls this when a child left its carve `UNWINDING`.
+    pub(crate) fn push_frozen_nested(&self, rec: crate::FrozenNested) {
+        self.frozen_nested_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(rec);
+    }
+
     /// Drain the §14 nested-child freeze residue captured during a durable freeze (see
-    /// [`Nursery::frozen_nested_out`]). Called by the top-level run after the root unwinds.
+    /// [`Nursery::frozen_nested_sink`]). Called by the top-level run after the root unwinds; drains the
+    /// whole subtree's residue (it coalesced here via the shared sink).
     pub(crate) fn take_frozen_nested(&self) -> Vec<crate::FrozenNested> {
         std::mem::take(
             &mut self
-                .frozen_nested_out
+                .frozen_nested_sink
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         )
@@ -439,6 +486,11 @@ pub(crate) unsafe extern "C" fn instantiate(
     let nargs = child_funcs[entry as usize].params.len();
     let args = vec![0i64; nargs];
 
+    // §4 depth-2: reserve this child's subtree-unique domain task id (shared counter, instantiate
+    // order), stamped as its nursery's `my_task` so a grandchild it records carries a non-zero
+    // `parent_task`. The child inherits the **shared** residue sink + counter, so its descendants'
+    // freeze residue coalesces at the root.
+    let child_task = rt.next_child_task();
     // Re-compile the child as a top-level guest over its own window, seeded from the parent's
     // sub-region `[base+off, … + child_size)` and copied back on completion (the §14 superset).
     let outcome = crate::compile_child_and_run(
@@ -451,6 +503,9 @@ pub(crate) unsafe extern "C" fn instantiate(
         rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
         durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
         false, // not a thaw re-attach — a live `instantiate` (seed fresh / inherit the parent phase)
+        child_task,
+        rt.nested_sink(),
+        rt.task_counter(),
     );
     let (result, trap, unwound) = match outcome {
         Ok(rt) => rt,
@@ -470,21 +525,20 @@ pub(crate) unsafe extern "C" fn instantiate(
         joined: false,
     });
     // §4 freeze export: the child left its carve `UNWINDING` — it unwound mid-run under a freeze
-    // instead of completing. Record its re-attach residue (depth-1: a direct child of the root, so
-    // `parent_task = 0`). Its continuation lives in the carve (the frozen window image); this is what a
-    // thaw needs to re-create the child domain. The `slot` is the child's join-table index — the
-    // handle the guest holds — so a thaw resolves the reloaded handle to the re-attached child.
+    // instead of completing. Record its re-attach residue into the **shared** subtree sink, tagged with
+    // **this** nursery's task (`my_task`) as `parent_task` (`0` for the root's direct child; a
+    // grandchild recorded here by the child's nursery carries the child's id). Its continuation lives in
+    // the carve (the frozen window image); this is what a thaw needs to re-create the child domain. The
+    // `slot` is the child's join-table index — the handle the guest holds — so a thaw resolves the
+    // reloaded handle to the re-attached child.
     if unwound {
-        rt.frozen_nested_out
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(crate::FrozenNested {
-                parent_task: 0,
-                slot,
-                carve_off: base + off,
-                size_log2: size_log2 as u8,
-                entry: entry as u32,
-            });
+        rt.push_frozen_nested(crate::FrozenNested {
+            parent_task: rt.my_task(),
+            slot,
+            carve_off: base + off,
+            size_log2: size_log2 as u8,
+            entry: entry as u32,
+        });
     }
     slot as i32
 }
