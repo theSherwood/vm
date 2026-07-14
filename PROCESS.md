@@ -691,7 +691,7 @@ Unchanged in substance from v1, restated against the substrate:
 |---|---|---|---|
 | S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | **done** — nested futex confirmed (`futex_cross_domain.rs`); sibling wakeup-key gap characterized + fix scoped to S9; F6 RTT model in §4 |
 | S1a | JIT per-carve compile cache | — | **done** (`jit_instantiate_cache.rs`; position-independent, one compile per `(module,entry,size)`) |
-| S1b | Canonical-key futex — key `Backed` pages on `(backing, region_off)`, both backends (was S9's sibling item; integration promoted it onto the async critical path — gates JIT concurrent parent↔child, not just sibling pipes) | — | todo — **next** |
+| S1b | Canonical-key futex — key `Backed` pages on `(backing, region_off)` | — | **interp done** (`futex_region_canonical.rs`, negative-checked; `FutexKey::{Anon,Region}` in both schedulers). JIT half lands with S1c (JIT threads share one window today, so no aliasing gap until concurrent §14 children exist) |
 | S1c | OS-thread children on the JIT: `instantiate` spawns the cached child in its **own guarded window** (keeps the trailing guard — in-place would break carve isolation), `join` parks on the completion cell; live channel is a granted `SharedRegion`, not the copied carve | S1b | todo |
 | S2 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
 | S3 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S1 | todo |
