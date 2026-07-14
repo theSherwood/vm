@@ -1072,9 +1072,26 @@ byte-for-byte the same, only the call instruction differs:
 - Found as the Postgres `manifest_process_version` gap. Test `varargs_indirect_call`: a `(...)` helper
   reached through a `volatile`-indexed function pointer (so clang can't devirtualize) — byte-identical
   to native on interp + bytecode + JIT, and clang emits it `tail`, exercising `return_call_indirect`
-  too. **291 translate tests green, fmt + clippy clean.** Effect: the module translates past the
-  varargs category and now stops at an **SSA-liveness** gap in `sqrt_var` (numeric.c's
-  arbitrary-precision sqrt — a `value … not available in block`), the next slice.
+  too.
+
+Two **i128 op lowerings** landed in the same slice (the next two gaps, both the *same* root cause).
+The reported `value … not available in block` in `sqrt_var` looked like a liveness bug but was not:
+`lower_i128` was missing the op, so the **generic scalar** handler `ctx.operand`-ed an i128 value —
+which lives as an `agg` `(lo, hi)` pair, not in `idx_of` — and failed. The `id()` diagnostic (agg/wide
+membership) pinned it immediately.
+- **`select i128`** — a per-word `Select` on the `(lo, hi)` pairs (clang emits it from a `? :` on a
+  128-bit quantity; numeric `sqrt_var`'s Newton's-method inner loop). Without it the generic scalar
+  `Select` mishandled the pair.
+- **`store i128`** — two i64 stores, lo at the base and hi at base+8, mirroring the existing `load i128`
+  layout (numeric `int2_accum`'s `sumX2` accumulator). Added inside the Store effect-arm before the
+  scalar `ctx.operand`, so an i128 value never takes the scalar path.
+- Test `i128_select_and_store_roundtrip`: a hand `.ll` (clang won't emit `select i128` from simple C —
+  it always branches) that selects between two i128s, stores the winner to an `alloca`, loads it back,
+  and folds `lo - hi` (asymmetric — catches a swapped half or a mis-picked select); 293 on interp + JIT.
+- **292 translate tests green, fmt + clippy clean.** Effect: the module translates past `sqrt_var` and
+  `int2_accum` and now stops at a **vector `llvm.bswap`** in `pg_sha256_final` (SHA-256's big-endian
+  digest write — the on-ramp scalarizes vector `ctpop`/min/max but not yet vector `bswap`), the next
+  slice.
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for

@@ -45,14 +45,16 @@ unprivileged user if invoked as root.
 | 5 | **the whole external surface (~250)** — file/OS syscalls, proc/time/signal, other libc | ~250 | **DONE at translate time** (slice BR): opt-in `--stub-externs` lowers every undefined external to a trap-if-called stub, so the ~200 dead on the `--single` path don't block. Only the ~50 the query path *calls* need real impls (fs cap / stubs) for the **runtime** |
 | 6 | **SIMD vector ops** | — | **DONE (slice BV) via two build-config levers.** Most of the "SIMD tail" was never real Postgres SIMD — it was clang **auto-vectorizing** scalar C loops (`<2 x i32>` loads → `<2 x ptr>` gather-GEPs). `emit_bc.py` passed `-fno-vectorize -fno-slp-vectorize` but *before* the recovered `-O2`, which re-enabled it (last flag wins); appending the flags after `-O2` disables it for real, and the whole auto-vectorized tail vanishes. The residual **explicit** SIMD (SSE4.2 `_mm_crc32`, 128-bit float vectors) already translates via slices Y/BS/BT/BU. **AVX-512** (`pg_popcount_avx512`, `<64 x i1>`) is dead under the `cpuid`→0 stub and is dropped at the source by the second lever: `configure` is told the AVX-512 popcount autodetect is "no", so `USE_AVX512_POPCNT_WITH_RUNTIME_CHECK` is never defined and `PG_POPCNT_OBJS` is empty |
 | 7 | **indirect varargs call** (`manifest_process_version`) | — | **DONE (slice BW):** the on-ramp already marshaled a *direct* `(...)` call's variadic args into overflow scratch; three coordinated edits extend the exact same marshaling to an **indirect** `(...)` callee (a function pointer), which then lowers to `call_indirect` with a §3c type-id check against the `(sp, fixed-params…)` signature a defined `(...)` function uses. Test `varargs_indirect_call` (interp + bytecode + JIT vs native, incl. the `return_call_indirect` tail path) |
-| 8 | **SSA liveness** (`sqrt_var`) | — | **next**: a `value … not available in block` in the arbitrary-precision `sqrt_var` (numeric.c) — a value used on an edge whose def doesn't reach it through the block-param threading (same *category* as the BU freeze-of-aggregate liveness fix, different root cause) |
-| 9 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap — the ~50 *live* externals resolve here |
+| 8 | **two missing i128 op lowerings** (`sqrt_var`, `int2_accum`) | — | **DONE (slice BW):** the reported `value … not available in block` was not a liveness bug — it was `lower_i128` missing two arms, so the *generic scalar* handler resolved an i128 (which lives as an `agg` `(lo,hi)` pair, not in `idx_of`) and failed. Added **`select i128`** (per-word `Select` on the pairs — numeric `sqrt_var`'s Newton loop) and **`store i128`** (two i64 stores, lo at base / hi at base+8, mirroring `load i128` — numeric `int2_accum`'s `sumX2`). Test `i128_select_and_store_roundtrip` (hand `.ll`; interp + JIT) |
+| 9 | **vector `llvm.bswap`** (`pg_sha256_final`) | — | **next**: a *vector* byte-swap intrinsic (SHA-256's big-endian digest write); the on-ramp scalarizes vector `ctpop`/min/max but not yet vector `bswap` — scalarize per lane through the existing scalar `emit_bswap` |
+| 10 | **data dir + runtime** | — | `initdb` natively → expose via the `fs` cap; storage manager, WAL, single-process shmem, catalog bootstrap — the ~50 *live* externals resolve here |
 
 **Where it stands:** the complete module (832 modules / ~14 700 functions) translates past the **entire
 921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals (bundled openlibm, BQ), the
 **entire ~250-external OS/libc surface** with `--stub-externs` (BR), the **whole SIMD tail** (slice BV's
-two build-config levers), and the first **indirect varargs call** (slice BW). Translation now stops at
-an **SSA-liveness** gap in `sqrt_var` (gap #8). Remaining before it fully translates + verifies: that
-liveness fix (and whatever surfaces behind it); then the **runtime** (initdb data dir, storage manager,
-WAL, single-process shmem, catalog bootstrap) with real impls for the ~50 externals the query path
-actually calls. See `LLVM.md` slices BM–BW.
+two build-config levers), the first **indirect varargs call**, and two missing **i128** op lowerings
+(`select`/`store`) — all slice BW. Translation now stops at a **vector `llvm.bswap`** in `pg_sha256_final`
+(gap #9). Remaining before it fully translates + verifies: that vector-bswap scalarization (and whatever
+surfaces behind it); then the **runtime** (initdb data dir, storage manager, WAL, single-process shmem,
+catalog bootstrap) with real impls for the ~50 externals the query path actually calls. See `LLVM.md`
+slices BM–BW.

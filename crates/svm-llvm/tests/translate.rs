@@ -9370,6 +9370,52 @@ fn i128_small_constant_still_runs() {
     }
 }
 
+#[test]
+fn i128_select_and_store_roundtrip() {
+    // Two i128 op lowerings the Postgres numeric path needs, both of which clang refuses to emit from
+    // simple C (it always *branches* a `? :` on a 128-bit value): `select i128` (numeric `sqrt_var`'s
+    // Newton's-method loop) and `store i128` (numeric `int2_accum`'s `sumX2` accumulator). A hand `.ll`
+    // (mirroring the `freeze_of_aggregate` approach) selects between two i128 values, stores the winner
+    // to an `alloca`, loads it back, and folds `lo - hi` — an **asymmetric** fold, so a swapped
+    // store/load half or a mis-picked select changes the result. a = (7<<64)|300, b = (2<<64)|100;
+    // a >u b so the select picks a → lo = 300, hi = 7 → 300 - 7 = 293.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %p = alloca i128, align 16\n  \
+        %ah = shl i128 7, 64\n  \
+        %a = or i128 %ah, 300\n  \
+        %bh = shl i128 2, 64\n  \
+        %b = or i128 %bh, 100\n  \
+        %c = icmp ugt i128 %a, %b\n  \
+        %s = select i1 %c, i128 %a, i128 %b\n  \
+        store i128 %s, ptr %p, align 16\n  \
+        %r = load i128, ptr %p, align 16\n  \
+        %lo = trunc i128 %r to i64\n  \
+        %rsh = lshr i128 %r, 64\n  \
+        %hi = trunc i128 %rsh to i64\n  \
+        %d = sub i64 %lo, %hi\n  \
+        %d32 = trunc i64 %d to i32\n  \
+        ret i32 %d32\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate i128 select/store .ll");
+    svm_verify::verify_module(&t.module).expect("verify i128 select/store");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run i128 select/store");
+    assert_eq!(
+        r,
+        vec![Value::I32(293)],
+        "select picks a=(7<<64)|300; stored+reloaded; lo-hi = 300-7 = 293"
+    );
+    // JIT parity — this path genuinely *runs* i128 select + i128 store/load (not a decline).
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            assert_eq!(s[0] as i32, 293, "JIT i128 select/store = 293")
+        }
+        other => panic!("JIT i128 select/store: unexpected {other:?}"),
+    }
+}
+
 // ---- Textual `.ll` reader: differential parity vs the bitcode reader (LLVM.md §8 Q1b) -----------
 //
 // The migration's gate: the *same* C, compiled to **both** `.bc` and `.ll`, must translate to
