@@ -217,6 +217,43 @@ try {
       `${bounceOk ? 'PASS' : 'FAIL'}`);
   }
 
+  // Heap persistence (Doom slice 3): Conway's Game of Life runs its grid in the malloc heap above the
+  // mapped window. The glider only advances if the reactor persists the whole guest memory frame to
+  // frame — so a moving glider in the browser is the end-to-end heap-persistence proof. Sample the
+  // glider's bounding-box top-left: 5 live cells always, position advancing over generations.
+  {
+    // {count, minX, minY} of the amber live cells (255,200,40) on the canvas.
+    const cells = () => play.evaluate(() => {
+      const c = document.getElementById('canvas');
+      if (!c.width || !c.height) return null;
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let n = 0, minx = 1e9, miny = 1e9;
+      for (let y = 0; y < c.height; y++)
+        for (let x = 0; x < c.width; x++) {
+          const i = (y * c.width + x) * 4;
+          if (d[i] === 255 && d[i + 1] === 200 && d[i + 2] === 40) { n++; minx = Math.min(minx, x); miny = Math.min(miny, y); }
+        }
+      return { w: c.width, h: c.height, n, minx, miny };
+    });
+    await play.selectOption('#example', 'life (Conway — heap persistence)');
+    await play.click('#run');
+    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'running',
+      { timeout: 30_000 });
+    await play.waitForFunction(() => document.getElementById('canvas').width === 96, { timeout: 5000 });
+    const a = await cells();
+    await play.waitForTimeout(300);
+    const b = await cells();
+    await play.click('#stop');
+    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'stopped',
+      { timeout: 5000 });
+    // 5 live cells (a glider) throughout, and the bounding-box top-left advanced (heap persisted).
+    const lifeOk = a && b && a.w === 96 && a.h === 64 && a.n === 5 && b.n === 5 &&
+      (b.minx > a.minx || b.miny > a.miny);
+    checks.push(lifeOk);
+    console.log(`  play/life-reactor: ${a?.w}×${a?.h} glider a=(${a?.minx},${a?.miny}) ` +
+      `b=(${b?.minx},${b?.miny}) live=${a?.n}/${b?.n} ${lifeOk ? 'PASS' : 'FAIL'}`);
+  }
+
   const ok = pageOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: SVM runs in a real browser — powerbox + genuine multi-Worker ` +

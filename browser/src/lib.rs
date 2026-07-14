@@ -1504,10 +1504,10 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// grown `malloc` heap above the window is **not** persisted yet — the same slice-1 reactor scope as
 /// `svm-run`, and the reason Doom itself needs the heap-persistence follow-on).
 pub struct OnrampReactor {
-    module: svm_ir::Module,
+    /// The persistent single-vCPU instance — its guest window (globals, BSS, **and** the grown heap)
+    /// stays live between frames, so heavy-heap guests (Life, eventually Doom) keep their state.
+    inst: bytecode::Reactor,
     host: Host,
-    /// The persisted window image (low `SNAP_CAP` bytes), round-tripped each `frame`.
-    snap: Vec<u8>,
     /// The reactor calling convention's data-stack base (`powerbox_entry_sp`), passed to each `tick`.
     entry_sp: u64,
     tick: svm_ir::FuncIdx,
@@ -1517,9 +1517,10 @@ pub struct OnrampReactor {
 
 impl OnrampReactor {
     /// Open a reactor over `m`: lower its §7 imports, grant the powerbox (prefix + `display`/
-    /// `keyboard`), and run `_start` once (stash handles + init), keeping the window + host live.
-    /// `Err(status)` if imports don't resolve, the entry arity is out of range, there is no exported
-    /// `tick`, or `_start` traps.
+    /// `keyboard`), and run `_start` once (stash handles + init) over a **live** window kept for the
+    /// per-frame `tick` calls. `Err(status)` if imports don't resolve, the entry arity is out of
+    /// range, there is no exported `tick`, the module is outside the engine's subset, or `_start`
+    /// traps.
     pub fn open(m: &svm_ir::Module) -> Result<OnrampReactor, i32> {
         let module =
             svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
@@ -1532,26 +1533,17 @@ impl OnrampReactor {
         let entry_sp = svm_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
         let (slots, frame, keys) = grant_onramp_caps(&mut host, &module);
-        // Run `_start` (func 0) once: stash the granted handles + run the initializer; capture the
-        // window image as the reactor's persistent state (seeded from empty — `m.data` fills globals).
+        let mut inst = bytecode::Reactor::open(&module).ok_or(STATUS_UNSUPPORTED)?;
+        // Run `_start` (func 0) once on the live window: stash the granted handles + run the C
+        // initializer. The window (globals/BSS/heap) then persists for every `tick`.
         let mut fuel = u64::MAX;
-        let snap = match bytecode::compile_and_run_capture_reserved_with_host(
-            &module,
-            0,
-            &slots,
-            &mut fuel,
-            &[],
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            &mut host,
-        ) {
-            Some((Ok(_), snap)) => snap,
-            Some((Err(_), _)) => return Err(STATUS_TRAP),
-            None => return Err(STATUS_UNSUPPORTED),
-        };
+        match inst.call(0, &slots, &mut fuel, &mut host) {
+            Ok(_) => {}
+            Err(_) => return Err(STATUS_TRAP),
+        }
         Ok(OnrampReactor {
-            module,
+            inst,
             host,
-            snap,
             entry_sp,
             tick,
             frame,
@@ -1559,33 +1551,18 @@ impl OnrampReactor {
         })
     }
 
-    /// Run one frame: call the guest's `tick` (window seeded from the last snapshot, re-snapshotted
-    /// after), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT` = the guest
-    /// called `Exit`; `STATUS_TRAP`/`STATUS_UNSUPPORTED` = stop. The presented frame (if any) is read
-    /// via [`take_frame`](Self::take_frame).
+    /// Run one frame: call the guest's `tick` on the **live** window (all prior-frame state — globals,
+    /// BSS, heap — intact), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT`
+    /// = the guest called `Exit`; `STATUS_TRAP` = a trap. The presented frame (if any) is read via
+    /// [`take_frame`](Self::take_frame).
     pub fn frame(&mut self) -> (i32, Vec<u8>) {
         let stdout_before = self.host.stdout.len();
         let args = [Value::I64(self.entry_sp as i64)];
         let mut fuel = u64::MAX;
-        let status = match bytecode::compile_and_run_capture_reserved_with_host(
-            &self.module,
-            self.tick,
-            &args,
-            &mut fuel,
-            &self.snap,
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            &mut self.host,
-        ) {
-            Some((Ok(_), snap)) => {
-                self.snap = snap;
-                STATUS_OK
-            }
-            Some((Err(Trap::Exit(_)), snap)) => {
-                self.snap = snap;
-                STATUS_EXIT
-            }
-            Some((Err(_), _)) => STATUS_TRAP,
-            None => STATUS_UNSUPPORTED,
+        let status = match self.inst.call(self.tick, &args, &mut fuel, &mut self.host) {
+            Ok(_) => STATUS_OK,
+            Err(Trap::Exit(_)) => STATUS_EXIT,
+            Err(_) => STATUS_TRAP,
         };
         let delta = self.host.stdout[stdout_before..].to_vec();
         (status, delta)
