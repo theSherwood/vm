@@ -822,6 +822,74 @@ fn par_inst() -> Option<&'static ParInstCfg> {
     unsafe { p.as_ref() }
 }
 
+// ---- §14 instantiate_module **real codegen** (BROWSER.md § "wasm-JIT tier", slice 5) -------------
+// A confined executor child whose granted module is fully in-subset runs its entry on **emitted
+// wasm** on its own Worker (the module "compiles on push") instead of the bytecode interpreter — the
+// child fills the same completion slot the parent `join`s, so no engine change is needed. The granted
+// module is emitted once per instance (each Worker computes its own copy from the shared recipe, like
+// the tier-up bitmap); a child entry that uses a `cap.call` (a nested `instantiate`, an address-space
+// op) is **not** in-subset, so it stays on the interpreter (fail-closed).
+
+/// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
+static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+/// The granted unit's per-function tier-up eligibility (`compile_module_tierup`): `f{i}` is emitted
+/// + safe to call. A confined child whose entry is eligible runs on wasm; else it interprets.
+static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
+
+/// Enable §14 real codegen **on this instance**: emit the granted unit ([`ParInstCfg::module`]) to
+/// wasm and stash it + the per-function eligibility. Called by each Worker before it builds a
+/// confined child (like [`svm_par_enable_jit_codegen`] — the emitted bytes are per-instance). Returns
+/// `1` on success, `0` if there is no granted module or it is outside the emitter subset.
+#[no_mangle]
+pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
+    let Some(cfg) = par_inst() else {
+        return 0;
+    };
+    let Some(m) = &cfg.module else {
+        return 0;
+    };
+    let Ok((wasm, eligible)) = svm_wasmjit::compile_module_tierup(m, true) else {
+        return 0;
+    };
+    // SAFETY: single-threaded per instance; set once in this Worker's setup before the child runs.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(INST_UNIT_WASM), wasm);
+        *core::ptr::addr_of_mut!(INST_ELIGIBLE) = Some(eligible);
+    }
+    1
+}
+
+/// Pointer / length of this instance's emitted §14 unit wasm (see [`svm_par_enable_inst_codegen`]).
+#[no_mangle]
+pub extern "C" fn svm_par_inst_unit_wasm_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_par_inst_unit_wasm_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).1 }
+}
+
+/// Whether the granted unit's function `entry` is emitted (safe to run `f{entry}` on wasm). `0` when
+/// codegen isn't enabled, `entry` is out of range, or that function is out of the emitter subset.
+#[no_mangle]
+pub extern "C" fn svm_par_inst_eligible(entry: u32) -> i32 {
+    // SAFETY: single-reader per instance; set by `svm_par_enable_inst_codegen`.
+    let e = unsafe { (*core::ptr::addr_of!(INST_ELIGIBLE)).as_ref() };
+    e.and_then(|v| v.get(entry as usize))
+        .copied()
+        .map_or(0, |b| b as i32)
+}
+
+/// The granted unit's `entry` param count (1 or 2 — the instantiator/address-space cap handles a pure
+/// unit ignores). The Worker passes this many `0` args to the emitted `f{entry}`. `0` if no recipe.
+#[no_mangle]
+pub extern "C" fn svm_par_inst_nparams(entry: u32) -> usize {
+    par_inst()
+        .and_then(|c| c.module.as_ref())
+        .and_then(|m| m.funcs.get(entry as usize))
+        .map_or(0, |f| f.params.len())
+}
+
 // ---- 4d: host I/O across Workers — the run's shared powerbox ------------------------------------
 // THREADS.md 4d: one `Mutex<Host>`, leaked into the shared linear memory (the same cross-Worker
 // sharing as `PAR_PB`/`PAR_INST`), attached to **every** vCPU of the run

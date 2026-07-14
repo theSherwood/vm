@@ -16,7 +16,7 @@ const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen } = e.data;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, instCodegen } = e.data;
   const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -72,6 +72,38 @@ self.onmessage = async (e) => {
     });
     jitUnit = uinst.exports;
     jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+  }
+
+  // §14 instantiate real codegen (BROWSER.md slice 5): a confined child whose granted-unit entry is
+  // fully in-subset runs it on EMITTED WASM here and fills the completion slot the parent joins — no
+  // vCPU. The unit's data segments were materialized into the carve by the parent before this event,
+  // so `f{entry}(win=carveBase, env, …cap-handle args a pure unit ignores)` reads them. A cap-using
+  // entry isn't in-subset (`svm_par_inst_eligible` is 0), so it falls through to the interpreter.
+  if (role === 'confined' && instCodegen && ex.svm_par_enable_inst_codegen() === 1
+      && ex.svm_par_inst_eligible(entry) === 1) {
+    const wptr = Number(ex.svm_par_inst_unit_wasm_ptr()), wlen = ex.svm_par_inst_unit_wasm_len();
+    const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+      env: {
+        memory,
+        trap: () => {},
+        call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+      },
+    });
+    const envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+    new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel
+    const args = new Array(Number(ex.svm_par_inst_nparams(entry))).fill(0n); // cap handles, ignored
+    if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted children (non-vacuity)
+    try {
+      const ret = uinst.exports['f' + entry](win, envCell, ...args);
+      i64()[(slot + 8) >> 3] = BigInt(ret); // publish result...
+      Atomics.store(i32(), slot >> 2, 1); // ...set done flag...
+      Atomics.notify(i32(), slot >> 2); // ...and wake the joiner
+    } catch {
+      Atomics.store(i32(), slot >> 2, 2); // 2 = trapped (the joiner traps on deliver_join)
+      Atomics.notify(i32(), slot >> 2);
+    }
+    return;
   }
 
   const v = role === 'root'
