@@ -558,7 +558,7 @@ Unchanged in substance from v1, restated against the substrate:
 
 | # | Slice | Depends on | Status |
 |---|---|---|---|
-| S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | todo |
+| S0 | **Spikes first**: cross-domain futex on shared backing (O2) → library-endpoint feasibility; endpoint-RTT budget table (F6) | — | in progress — nested-case futex **confirmed** (`futex_cross_domain.rs`); sibling-alias keying + RTT table remain |
 | S1 | JIT async children (park-only-calling-fiber) + per-carve compile cache | — | todo |
 | S2 | `Domain.grant` + create-suspended/start split; child `cap.self.resolve` names; teardown/refcount rules | — | todo |
 | S3 | Lifecycle: `poll`/`kill`/`detach` (+ per-child kill cell on JIT) | S1 | todo |
@@ -579,7 +579,7 @@ Unchanged in substance from v1, restated against the substrate:
 | # | Risk / question | Where | Status |
 |---|---|---|---|
 | O1 | Endpoint servicer DoS (never replies): callers park forever. v1 answer: your servicer is in your grant chain — you trusted it; a personality may add timeouts. Is that acceptable for cross-*sibling* endpoints? | §4 | open |
-| O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable, needs cross-domain futex on shared backing — verify keys work) | §9 | open — spike early |
+| O2 | Pipe substrate: host-served (simple, buffers lost on freeze) vs guest ring + futex (durable). **Spike result: cross-domain futex rendezvous works today for parent↔nested-child** — the §12 futex key is the confined *absolute* backing address (`Mem::confine_checked`) and a nested child shares the parent's backing + executor; pinned both directions by `crates/svm/tests/futex_cross_domain.rs`. Remaining: the **sibling** case — two domains aliasing one `SharedRegion` at different window offsets key on *different* absolute alias addresses, so sibling library-pipes need key canonicalization (region-canonical keys) or a nested relay | §9 | nested: confirmed; sibling: open |
 | O3 | JIT compile-cache key: (module digest, carve base, size_log2) — hit rates under a real shell; detached-standard-geometry as the mitigation | §5, gap 4 | open |
 | O4 | Detached windows on the browser/wasm32 host: pool sizing inside one wasm memory | §5 | open |
 | O5 | `attest` provenance granularity: report authority *set* or just tier + platform-only bit? Smaller is better (F2) | §6 | open |
