@@ -6510,14 +6510,17 @@ fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {
     vals.get(i as usize).copied().ok_or(JitError::Malformed)
 }
 
-/// The §4 confinement lowering (invariant I1, trap-confinement): bounds-check the final
-/// effective address `addr + offset` against `[0, reserved − width]` (cold `MemoryFault`
-/// trap on failure — the architectural fault, mirroring `svm_mask::Window::checked`), then
-/// compute the physical address `mem_base + sub_base + ((addr + offset) & mask)`. The
-/// `& mask` clamp is architecturally a no-op (every access past the check satisfies
-/// `addr+offset < reserved = mask+1`) but is a data dependency on the *speculative* path,
-/// confining misspeculated OOB accesses to `[0, reserved)` — the Spectre-v1 hardening
-/// (§4, D38).
+/// The §4 confinement lowering (invariant I1, **branchless confinement**, D63): bounds-test the
+/// final effective address `addr + offset` against `reserved − offset − width`, then — for a
+/// top-level window — `select_spectre_guard(oob, reserved, addr + offset)` and add the base, giving
+/// the physical address `mem_base + (oob ? reserved : addr + offset)`. An out-of-bounds access is
+/// redirected to `reserved` — the first byte of the trailing guard page — so the access *itself*
+/// faults there (`MemoryFault`, the architectural fault, mirroring `svm_mask::Window::checked`),
+/// with no per-access branch. The `select_spectre_guard` is also a speculation barrier: a
+/// misspeculated OOB access likewise receives `reserved`, confining it to the guard — the Spectre-v1
+/// hardening (§4, D63; supersedes the D38 `trapnz` + `& mask` clamp). A nested §14 sub-window
+/// (`sub_base != 0`) instead keeps the explicit `trapnz` + `mem_base + sub_base + ((addr+offset) &
+/// mask)`, since it has no guard page at the child boundary (see the emission site).
 ///
 /// When `elide` is set the check and clamp are both dropped — but **only** the caller's
 /// [`in_window`] proof (the address is provably `< size`) may set it, so the unclamped
@@ -6566,51 +6569,55 @@ fn mask_addr(
         // `reserved = mask + 1` (a power of two ≤ 2^63); the reservation this window is confined to.
         let reserved = lower.mask.wrapping_add(1);
         let need = (width as u64).saturating_add(offset);
+        // Out-of-bounds test: `addr > reserved − offset − width` ⇒ some byte of the access falls
+        // outside `[0, reserved)`. The compare is against a compile-time constant, so it never itself
+        // overflows.
         let oob = match reserved.checked_sub(need) {
             Some(limit) => {
                 let lim = b.ins().iconst(I64, limit as i64);
                 b.ins().icmp(IntCC::UnsignedGreaterThan, addr, lim)
             }
-            // `offset + width` alone exceeds the reservation ⇒ no `addr` is in-bounds; always trap.
+            // `offset + width` alone exceeds the reservation ⇒ no `addr` is in-bounds; always fault.
             None => b.ins().iconst(I8, 1),
         };
-        // Confine via a **native Cranelift conditional trap** (`trapnz`) rather than an explicit
-        // `brif` to a cold return-based trap block: one inline instruction, no per-access block
-        // split, and Cranelift out-of-lines the trap (`ud2`/`udf`) to a shared sink. This avoids the
-        // CFG fragmentation + spilling that a per-access cont/trap block pair caused in check-dense
-        // unrolled loops (matmul VCODE 1333→613 lines, register spills 708→310; see the trap-lowering
-        // note in DESIGN.md §4/§5). The `ud2`/`udf` raises SIGILL (unix) / STATUS_ILLEGAL_INSTRUCTION
-        // (windows); the guard handler (`trap_shim.c` / the windows VEH in `mem.rs`) recognises an
-        // illegal instruction inside an armed guarded call as this memory-fault trap and unwinds to
-        // `run_guarded` exactly like a guard-page fault — reporting [`TrapKind::MemoryFault`] through
-        // the same `faulted ⇒ FAULT_TRAP` path. Semantically identical to the old brif+return trap
-        // (a clear `MemoryFault` at the offending access); only the lowering differs.
+        // **Branchless confinement** for a top-level window (`sub_base == 0` — the common/hot case),
+        // matching Wasmtime's spectre-guarded heap (invariant I1, D63). No `trapnz`:
+        // `select_spectre_guard(oob, reserved, eff)` redirects an out-of-bounds access to `reserved` —
+        // the first byte of the trailing guard page — so the load/store *itself* faults there
+        // (SIGSEGV → `MemoryFault`, unwound by the guard handler exactly like any in-window guard
+        // fault). This is sound because `GuestWindow` maps `[mapped, round_up(reserved)+page)` as
+        // `PROT_NONE`, so *every* address in `[reserved, reserved+width)` is inaccessible. Crucially
+        // `select_spectre_guard` is a **speculation barrier** (a data-dependent cmov, not a predicted
+        // branch): a *misspeculated* OOB access also receives `reserved`, so it can never speculatively
+        // read past the window — the same Spectre-v1 confinement the AND mask provided, via the
+        // identical primitive Wasmtime uses. Dropping the per-access branch **and** the memory-operand
+        // AND (a 40-bit mask is not an x86 immediate, so it was a RIP-relative load each access) closes
+        // the residual array-kernel gap to Wasmtime-w64 (matmul 1.06→0.94, matmul_eb 1.34→1.01 svm÷wt64;
+        // see the `confine` harness / TRAP_CONFINEMENT.md). The clear-`MemoryFault`-at-the-offending-
+        // access property of §4/D38 is preserved — only the mechanism (guard-page fault vs `ud2`)
+        // differs.
+        if lower.sub_base == 0 {
+            let guard = b.ins().iconst(I64, reserved as i64);
+            let eff = b.ins().select_spectre_guard(oob, guard, eff);
+            let base = b.use_var(lower.mem_var);
+            return b.ins().iadd(base, eff);
+        }
+        // Nested §14 sub-window (`sub_base != 0`): keep the explicit `trapnz` + AND clamp. The child is a
+        // logical slice of the parent's single reservation, so there is **no guard page at the child
+        // boundary** — redirecting an OOB child access to `reserved` could land in valid parent memory
+        // (a child→parent confinement escape). The architectural trap fires before any address is
+        // formed, keeping the child confined; this path is off the hot loop.
         b.ins()
             .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
-        // Spectre-v1 clamp (§4, D38): AND the address feeding the access with `reserved−1`.
-        // Architecturally a no-op — every access that reaches here passed the bounds check,
-        // so `addr+offset < reserved` and the AND changes nothing. On the *speculative* path
-        // it is a data dependency the CPU cannot skip: a misspeculated OOB access is confined
-        // to `[0, reserved)` (the window + its own guard) exactly as under the old
-        // wrap-confinement mask, and can never speculatively read a neighbouring window or
-        // host memory. Same role as Wasmtime's `heap_access_spectre_mitigation` cmov-clamp
-        // for bounds-checked heaps, one op cheaper — the power-of-two reservation makes a
-        // 1-op AND sufficient where Wasmtime needs `cmp→cmov` (measured 20–50% cheaper on
-        // confinement-dense kernels; see TRAP_CONFINEMENT.md).
         let m = b.ins().iconst(I64, lower.mask as i64);
         let eff = b.ins().band(eff, m);
-        // The bounds check proved `addr+offset+width <= mapped`, so `eff` is in `[0, mapped)`; shift it
-        // into the §14 sub-window slice (`+ sub_base`) before adding the window base — elided for a
-        // top-level window so ordinary codegen is byte-identical to before nesting existed.
-        let shifted = if lower.sub_base == 0 {
-            eff
-        } else {
-            let sb = b.ins().iconst(I64, lower.sub_base as i64);
-            b.ins().iadd(eff, sb)
-        };
+        let sb = b.ins().iconst(I64, lower.sub_base as i64);
+        let shifted = b.ins().iadd(eff, sb);
         let base = b.use_var(lower.mem_var);
         return b.ins().iadd(base, shifted);
     }
+    // Elided (proven in-window) or the degenerate `mask == 0` (memoryless) path: no bounds check, and
+    // the mask kept only for `mask == 0`.
     let confined = if elide {
         eff
     } else {
