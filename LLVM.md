@@ -1186,6 +1186,28 @@ bit of every table. Pure computation, runs on the bare powerbox. **svm-llvm lane
 #11d): proc/time/signal stubs, then the rest of the pure-libc surface (stdio `FILE*`, locale,
 `strtod`/`snprintf`) byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
 
+**Slice CC (DONE) — guest libc: string + integer parsing + proc/time/signal (a bundle).** Three related
+groups of the guest runtime, in one PR. **(1) string** — `libc_shim.c` adds the `<string.h>` members the
+on-ramp doesn't already synthesize (synthesized already: `strlen`/`strcmp`/`strcpy`/`strchr`/`strrchr`/
+`strspn`/`strcspn`/`strpbrk`/`strncmp`/`strcoll`/`memcmp`/`memchr`/`bcmp`): `strcat`/`strncat`/`strncpy`/
+`strnlen`/`strstr`/`strchrnul`/`strdup`/`strlcpy`/`strlcat`/`strtok`(`_r`)/`strxfrm`/`strcoll_l`. **(2)
+integer parsing** — `strtol`/`strtoul` (+ the glibc-C23 `__isoc23_*` aliases) / `atoi`/`atol` over a
+shared core handling sign, base 0-autodetect (`0x`/`0`), whitespace, `endptr`, and `ERANGE` clamp to
+`LONG_MAX`/`MIN`/`ULONG_MAX`; `strtod`/`snprintf`/`getenv` were **already** synthesized, so they're not
+re-done. **(3) proc/time/signal** — `proc_shim.c` returns the deterministic values a single-user sandbox
+backend needs: constant **non-root** identity (`geteuid()==1000`, so Postgres's root guard passes), a
+frozen clock (`gettimeofday`/`clock_gettime`/`time` at a fixed epoch), inert signal masks
+(`sigaction`/`sigprocmask`/… all succeed and track nothing), no-op `nanosleep`/`setitimer`, unlimited
+`getrlimit`, and `abort`/`__assert_fail` → `_exit(134)`. A shared, include-guarded `shim_errno.h` holds
+the one `errno` cell all shims write (glibc's `errno` is `*__errno_location()`), so the eventual
+all-shims-in-one-TU Postgres build has a single definition. Tests: `demo_pg_string_vs_native` (byte-exact
+vs glibc over signs/bases/prefixes/endptr/ERANGE, bounded copies, tokenizing — `(int)`-printed so the
+64-bit results and their truncation agree even on the clamped cases) and `demo_pg_procstub` (the guest's
+fixed stub report). **svm-llvm lane green (fmt + clippy `-D warnings` + both tests).** The differential
+earned its keep again — a missing `__errno_location` (only `os_shim.c` had defined it) trapped the string
+guest at runtime until the shared `errno` header. Next (gap #11e): stdio `FILE*`, `strftime`, the `scanf`
+family byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
