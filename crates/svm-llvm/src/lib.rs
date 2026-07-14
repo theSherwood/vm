@@ -2457,11 +2457,12 @@ fn frame_layout(
     Ok((frame, off.div_ceil(16) * 16))
 }
 
-/// The count of **variadic** (beyond-the-fixed) arguments of a direct call to a `(...)` function,
-/// or `None` if `c` is not a direct varargs call. The fixed-parameter count comes from the call's
-/// declared function type (`param_types`); the variadic arguments are `arguments[fixed..]`.
+/// The count of **variadic** (beyond-the-fixed) arguments of a call to a `(...)` function — direct
+/// or **indirect** (a `(...)` function pointer) — or `None` if `c` is not a varargs call. The
+/// fixed-parameter count comes from the call's declared function type (`param_types`); the variadic
+/// arguments are `arguments[fixed..]`. Both callee shapes marshal their variadics into the same
+/// per-frame overflow scratch, so both must be counted here for `frame_layout` to reserve it.
 fn vararg_call_extra(c: &crate::ll::ast::Call) -> Option<usize> {
-    callee_name(c)?; // indirect varargs calls are rejected separately
     if let Type::FuncType {
         param_types,
         is_var_arg: true,
@@ -2682,11 +2683,12 @@ fn indirect_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<svm_ir::FuncT
         Type::FuncType {
             result_type,
             param_types,
-            is_var_arg,
+            // For a `(...)` callee, `param_types` are the *fixed* params; the variadics are marshaled
+            // into caller scratch (not IR args), so the SVM signature is `(sp, fixed-params…)` — the
+            // exact shape a defined `(...)` function lowers to, so the §3c runtime type-id check
+            // matches. So a varargs callee needs no special handling here.
+            is_var_arg: _,
         } => {
-            if *is_var_arg {
-                return unsup("indirect varargs call");
-            }
             let mut params = vec![ValType::I64]; // the prepended data-SP
             for p in param_types {
                 params.push(val_type(p.as_ref())?);
@@ -15956,6 +15958,28 @@ fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             set_i128(ctx, &x.dest, lo, hi);
             Ok(true)
         }
+        // `select i1 c, i128 a, i128 b` → a per-word `Select` on the `(lo, hi)` pairs. Without this
+        // arm the generic scalar `Select` `ctx.operand`s an i128 value as a scalar and fails ("value …
+        // not available in block", since an i128 lives in the `agg` side-table, not `idx_of`). clang
+        // emits this from a `? :` on a 128-bit quantity — e.g. Postgres numeric `sqrt_var`'s
+        // Newton's-method inner loop.
+        I::Select(x) if is_i128(&x.true_value) => {
+            let cond = ctx.operand(&x.condition)?;
+            let (alo, ahi) = i128_parts(ctx, &x.true_value)?;
+            let (blo, bhi) = i128_parts(ctx, &x.false_value)?;
+            let lo = ctx.push(Inst::Select {
+                cond,
+                a: alo,
+                b: blo,
+            });
+            let hi = ctx.push(Inst::Select {
+                cond,
+                a: ahi,
+                b: bhi,
+            });
+            set_i128(ctx, &x.dest, lo, hi);
+            Ok(true)
+        }
         I::And(x) if is_i128(&x.operand0) => {
             i128_bitwise(ctx, &x.operand0, &x.operand1, &x.dest, BinOp::And)
         }
@@ -16219,6 +16243,35 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
             return Ok(());
         }
+        // `store i128`: write the `(lo, hi)` pair as two i64 stores — lo at the base, hi at base+8 —
+        // mirroring the `load i128` layout below (svm-IR has no 128-bit type; an i128 lives as an
+        // `agg` pair). The generic path below would `ctx.operand` the i128 value as a scalar and fail
+        // ("value … not available in block"). clang emits this from a 16-byte copy or a `? :` /
+        // accumulator on a 128-bit quantity — e.g. Postgres numeric `int2_accum`'s `sumX2`.
+        if matches!(
+            st.value.get_type(types).as_ref(),
+            Type::IntegerType { bits: 128 }
+        ) {
+            let addr = ctx.operand(&st.address)?;
+            let (lo, hi) = i128_parts(ctx, &st.value)?;
+            ctx.push_effect(Inst::Store {
+                op: svm_ir::StoreOp::I64,
+                addr,
+                value: lo,
+                offset: 0,
+                align: 0,
+            });
+            let c8 = ctx.const_i64(8);
+            let hi_addr = ctx.add_i64(addr, c8);
+            ctx.push_effect(Inst::Store {
+                op: svm_ir::StoreOp::I64,
+                addr: hi_addr,
+                value: hi,
+                offset: 0,
+                align: 0,
+            });
+            return Ok(());
+        }
         let addr = ctx.operand(&st.address)?;
         let value = ctx.operand(&st.value)?;
         // A 128-bit vector store is a 16-byte `v128.store`; everything else is a width-tagged `store`.
@@ -16409,16 +16462,19 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         let fs = ctx.const_i64(ctx.frame_size as i64);
         let callee_sp = ctx.add_i64(sp, fs);
         let mut args = vec![callee_sp];
-        // A direct call to a `(...)` function (§varargs): only the fixed parameters are IR arguments;
-        // the variadic arguments are marshaled into this frame's scratch (one 8-byte slot each, the
-        // overflow-area layout clang's lowered `va_arg` reads), and a pointer to that scratch is
-        // deposited at the callee's reserved frame slot (`callee_sp + 0`) for its `va_start`.
+        // A call to a `(...)` function (§varargs) — direct or **indirect** (a `(...)` function
+        // pointer): only the fixed parameters are IR arguments; the variadic arguments are marshaled
+        // into this frame's scratch (one 8-byte slot each, the overflow-area layout clang's lowered
+        // `va_arg` reads), and a pointer to that scratch is deposited at the callee's reserved frame
+        // slot (`callee_sp + 0`) for its `va_start`. The indirect callee (a defined `(...)` function
+        // reached through a pointer) reads `va_start` from the same frame-0 slot, so the marshaling is
+        // identical — only the call inst differs (`call_indirect` vs `call`), decided below.
         let fixed = match c.function_ty.as_ref() {
             Type::FuncType {
                 param_types,
                 is_var_arg: true,
                 ..
-            } if callee_name(c).is_some() => Some(param_types.len()),
+            } => Some(param_types.len()),
             _ => None,
         };
         if let Some(fixed) = fixed {

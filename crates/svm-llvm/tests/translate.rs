@@ -2313,6 +2313,34 @@ fn varargs_many_and_copy() {
 }
 
 #[test]
+fn varargs_indirect_call() {
+    // A `(...)` function invoked through a **function pointer** (not a named callee). The variadic
+    // args must marshal into the caller's overflow scratch exactly as for a direct varargs call — the
+    // only difference is the call lowers to `call_indirect` (with an §3c type-id check against the
+    // `(sp, fixed-params…)` callee signature) rather than `call`. The pointer is chosen by a
+    // `volatile` index so clang can't devirtualize it back to a direct call, and clang emits it as a
+    // `tail call`, which also exercises the `return_call_indirect` tail path. Found as the Postgres
+    // `manifest_process_version` gap. `run(1)`: index 1 → `vmul(4, 2,3,4,5)` = 120, +1 = 121.
+    let src = "#include <stdarg.h>\n\
+        typedef long long (*vfn)(int, ...);\n\
+        static long long vsum(int n, ...);\n\
+        static long long vmul(int n, ...);\n\
+        int run(int seed){\n\
+          vfn arr[2] = { vsum, vmul };\n\
+          volatile int i = seed & 1;\n\
+          long long r = arr[i](4, 2, 3, 4, 5);\n\
+          return (int)((r + seed) & 0xff); }\n\
+        __attribute__((noinline)) static long long vsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int k=0;k<n;k++) s+=va_arg(ap,int); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static long long vmul(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=1;\n\
+          for(int k=0;k<n;k++) s*=va_arg(ap,int); va_end(ap); return s; }\n\
+        int main(void){ return run(1); }";
+    check_run_byte_vs_native("varargs_indirect", src, 1);
+}
+
+#[test]
 fn libc_strcmp_strchr_strcoll() {
     // The synthesized `__svm_strcmp`/`__svm_strchr` byte loops (libc batch). The string pointers are
     // read through `volatile` so clang's `-O2` cannot constant-fold the calls away — the helpers are
@@ -9339,6 +9367,52 @@ fn i128_small_constant_still_runs() {
             &[Value::I64(n as i64)],
             &[Value::I64(want as i64)],
         );
+    }
+}
+
+#[test]
+fn i128_select_and_store_roundtrip() {
+    // Two i128 op lowerings the Postgres numeric path needs, both of which clang refuses to emit from
+    // simple C (it always *branches* a `? :` on a 128-bit value): `select i128` (numeric `sqrt_var`'s
+    // Newton's-method loop) and `store i128` (numeric `int2_accum`'s `sumX2` accumulator). A hand `.ll`
+    // (mirroring the `freeze_of_aggregate` approach) selects between two i128 values, stores the winner
+    // to an `alloca`, loads it back, and folds `lo - hi` — an **asymmetric** fold, so a swapped
+    // store/load half or a mis-picked select changes the result. a = (7<<64)|300, b = (2<<64)|100;
+    // a >u b so the select picks a → lo = 300, hi = 7 → 300 - 7 = 293.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %p = alloca i128, align 16\n  \
+        %ah = shl i128 7, 64\n  \
+        %a = or i128 %ah, 300\n  \
+        %bh = shl i128 2, 64\n  \
+        %b = or i128 %bh, 100\n  \
+        %c = icmp ugt i128 %a, %b\n  \
+        %s = select i1 %c, i128 %a, i128 %b\n  \
+        store i128 %s, ptr %p, align 16\n  \
+        %r = load i128, ptr %p, align 16\n  \
+        %lo = trunc i128 %r to i64\n  \
+        %rsh = lshr i128 %r, 64\n  \
+        %hi = trunc i128 %rsh to i64\n  \
+        %d = sub i64 %lo, %hi\n  \
+        %d32 = trunc i64 %d to i32\n  \
+        ret i32 %d32\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate i128 select/store .ll");
+    svm_verify::verify_module(&t.module).expect("verify i128 select/store");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run i128 select/store");
+    assert_eq!(
+        r,
+        vec![Value::I32(293)],
+        "select picks a=(7<<64)|300; stored+reloaded; lo-hi = 300-7 = 293"
+    );
+    // JIT parity — this path genuinely *runs* i128 select + i128 store/load (not a decline).
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            assert_eq!(s[0] as i32, 293, "JIT i128 select/store = 293")
+        }
+        other => panic!("JIT i128 select/store: unexpected {other:?}"),
     }
 }
 

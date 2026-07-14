@@ -1055,6 +1055,44 @@ diagnosis from BU was "teach the on-ramp AVX-512"; the reality on inspection was
   at the first **indirect varargs call** (`manifest_process_version` — a `(...)` function pointer; the
   on-ramp marshals *direct* varargs but rejects indirect), the next slice.
 
+**Slice BW (DONE) — indirect varargs call (a `(...)` function pointer).** The on-ramp already
+marshaled a *direct* `(...)` call's variadic arguments into the caller's overflow scratch (one 8-byte
+slot each) and deposited the area pointer at the callee's frame-0 slot for `va_start`; the only thing
+missing for an **indirect** varargs callee was that three spots each special-cased "direct" and bailed
+on the pointer form. All three now treat the two callee shapes identically — the marshaling is
+byte-for-byte the same, only the call instruction differs:
+- **`vararg_call_extra`** (frame-layout pass) dropped its `callee_name(c)?` early-return, so an
+  indirect `(...)` call also reserves `VARARG_SCRATCH` (else "varargs call without reserved scratch").
+- **The marshaling `fixed` match** dropped its `callee_name(c).is_some()` guard, so the variadic args
+  are stored to scratch (not pushed as IR args) and the area pointer is deposited at `callee_sp + 0`,
+  for an indirect callee too.
+- **`indirect_sig`** stopped rejecting `is_var_arg`: a `(...)` callee's SVM signature is
+  `(sp, fixed-params…)` — `param_types` are exactly the fixed params — which is the *same* shape a
+  defined `(...)` function lowers to (§varargs), so the `call_indirect` §3c type-id check matches.
+- Found as the Postgres `manifest_process_version` gap. Test `varargs_indirect_call`: a `(...)` helper
+  reached through a `volatile`-indexed function pointer (so clang can't devirtualize) — byte-identical
+  to native on interp + bytecode + JIT, and clang emits it `tail`, exercising `return_call_indirect`
+  too.
+
+Two **i128 op lowerings** landed in the same slice (the next two gaps, both the *same* root cause).
+The reported `value … not available in block` in `sqrt_var` looked like a liveness bug but was not:
+`lower_i128` was missing the op, so the **generic scalar** handler `ctx.operand`-ed an i128 value —
+which lives as an `agg` `(lo, hi)` pair, not in `idx_of` — and failed. The `id()` diagnostic (agg/wide
+membership) pinned it immediately.
+- **`select i128`** — a per-word `Select` on the `(lo, hi)` pairs (clang emits it from a `? :` on a
+  128-bit quantity; numeric `sqrt_var`'s Newton's-method inner loop). Without it the generic scalar
+  `Select` mishandled the pair.
+- **`store i128`** — two i64 stores, lo at the base and hi at base+8, mirroring the existing `load i128`
+  layout (numeric `int2_accum`'s `sumX2` accumulator). Added inside the Store effect-arm before the
+  scalar `ctx.operand`, so an i128 value never takes the scalar path.
+- Test `i128_select_and_store_roundtrip`: a hand `.ll` (clang won't emit `select i128` from simple C —
+  it always branches) that selects between two i128s, stores the winner to an `alloca`, loads it back,
+  and folds `lo - hi` (asymmetric — catches a swapped half or a mis-picked select); 293 on interp + JIT.
+- **292 translate tests green, fmt + clippy clean.** Effect: the module translates past `sqrt_var` and
+  `int2_accum` and now stops at a **vector `llvm.bswap`** in `pg_sha256_final` (SHA-256's big-endian
+  digest write — the on-ramp scalarizes vector `ctpop`/min/max but not yet vector `bswap`), the next
+  slice.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
