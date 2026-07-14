@@ -389,6 +389,30 @@ pub struct FrozenVCpu {
     pub completed_result: Option<i64>,
 }
 
+/// A §14 **nested-child** re-attach record captured by a durable freeze (DURABILITY.md §4, "JIT
+/// parity") — the JIT mirror of `svm_interp::FrozenNested`. Unlike a `thread.spawn` child
+/// ([`FrozenVCpu`], its own vCPU with an entry+args to re-spawn), a §14 child is a nested *domain*
+/// whose whole continuation lives in its **carve** — a `2^size_log2` sub-window of the parent's window
+/// at `carve_off` (already inside the frozen window image). This carries only what a thaw needs to
+/// re-create the child domain around that carve and re-enter it under `REWINDING`. Same-module +
+/// still-running only for now (the freeze-export slice); a separate-module child's module digest and a
+/// completed-but-unjoined child's join result are follow-ups (see the interp's fuller record).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FrozenNested {
+    /// The task that **instantiated** this child — `0` for the root's direct child; a grandchild
+    /// carries its parent-child's task (depth-2, a follow-up). Mirror of [`FrozenVCpu::parent_task`];
+    /// a thaw groups by it to re-attach parents before children.
+    pub parent_task: usize,
+    /// The parent's join-table slot for this child (the guest-held handle value).
+    pub slot: usize,
+    /// The carve's window-relative base (`sub_base`), inside the frozen window image.
+    pub carve_off: u64,
+    /// The carve's (= the child window's) size, `log2`.
+    pub size_log2: u8,
+    /// The child's entry function index into the parent's own table (same-module).
+    pub entry: u32,
+}
+
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
 /// `svm-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
 /// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host

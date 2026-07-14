@@ -323,7 +323,23 @@ shadow stack and **returns a placeholder up its own call stack** — exactly as 
 run does today (`durable_backedge_jit`: a freeze returns a placeholder and the window holds the
 continuation). So the child unwinds *within* `compile_child_and_run` and returns; the synchronous model
 expresses subtree freeze directly (child unwinds first, then the parent), with no concurrent scheduler
-needed. Concretely:
+needed.
+
+**Refinement (from the freeze-export investigation): only an *instrumented* child is JIT-freezable, and
+the child shape must be chosen to match the interpreter.** The interpreter freezes a depth-1 *pure-
+compute* child (e.g. `PARENT_SELF_LOOP`'s func 1, a loop with no `cap.call` → not may-suspend → **no
+poll sites**) by *never scheduling it*: the parent, already `UNWINDING`, executes `instantiate` (which
+only enqueues the child) then spills at its trailing poll before the child's vCPU ever runs; the child
+rides as `FrozenNested { completed_result: None }` and is re-run from entry on thaw (interp map,
+`svm-interp` lines ~6243/6278/3844). The **JIT cannot reproduce that**: it runs the child *synchronously
+inside* `instantiate`, and a non-instrumented child has nothing to unwind at — it runs to completion
+where the interpreter froze it at entry, so the two diverge. JIT freeze-export therefore targets an
+**instrumented** child that unwinds at a poll *both* backends hit identically — a loop that is
+may-suspend (so its header gets Phase-4 loop-header polls) and, born `UNWINDING`, spills at its **first
+loop-header poll** with the loop not yet entered (continuation = loop start, `completed_result: None`).
+The differential test must verify the interpreter schedules+runs such an instrumented child to that same
+first poll (not freeze-at-entry); if the freeze points can't be made to coincide byte-for-byte, the pin
+falls back to a freeze→thaw→result round-trip rather than a byte-identical carve. Concretely:
 
 - **Detect unwound-vs-completed.** After the child run, `instantiate` reads the child carve's state
   word: `NORMAL` ⇒ completed (stash the result for `join`, as slice 1 does); `UNWINDING` ⇒ a **live
