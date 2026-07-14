@@ -400,6 +400,20 @@ before the 30 s `waitForFunction` timeout; att2 green on the unchanged commit. T
   build, so this is **diff-independent beyond any doubt**. Across the two `unreachable` sightings the
   stuck items are consistently the **codegen** checks (`jitcodegen`/`instcodegen`, `tierup` in one),
   narrowing the Worker wedge to the JIT **codegen** path.
+- **Seventh occurrence + a harness-level retry (2026-07-14, on the §22 float-codegen PR #256).** Same
+  signature again: `[pageerror] unreachable`, pending `jitcodegen, instcodegen`, 30 s timeout; att2
+  green on the unchanged commit, and the local Chromium run passes repeatedly (i32 → 1136, f64 → 1136,
+  both on emitted wasm) — the added f64 codegen item just churns more Workers per run, so the same
+  codegen-path race surfaces a touch more often. Since the diagnostics keep confirming this is a
+  known, diff-independent flake that clears on re-run, `browser-test.mjs` now **retries its main-page
+  proof once** on the hang: the proof is factored into a `pageProof()` helper that throws a tagged
+  `PENDING_TIMEOUT` when an item never leaves `pending`; the caller retries exactly that (a fresh
+  page) once and rethrows any non-timeout error unchanged, so a known flake no longer reds a PR while
+  a genuine regression hangs both attempts. (In the harness, not `ci.yml` — the branch push token
+  lacks `workflow` scope, and re-running only the flaky page proof — not the whole Chromium launch +
+  playground suite — is the better granularity.) This is a red-CI mitigation, **not** a fix:
+  root-cause (a), the codegen-path shared-memory race, remains open, and the named-`fail` capture the
+  guard/panic-hook were meant to produce still hasn't fired.
 
 ---
 

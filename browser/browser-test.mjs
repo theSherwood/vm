@@ -43,64 +43,83 @@ const { server, port } = await startServer(ROOT);
 const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] : [] });
 let failed = false;
 try {
-  const page = await browser.newPage();
-  // Keep the pageerror texts (not just print them): I22 is a rare flake where a worker vCPU's
-  // `svm_par_run` takes an uncaught host wasm trap (`memory access out of bounds`, or `unreachable`
-  // from a panic=abort engine panic). The rejection never reaches the page, so the item hangs
-  // `pending` and the wait below times out — with no clue which check tripped. On timeout we dump
-  // both the still-`pending` items and these captured messages so the next recurrence self-identifies.
-  const pageErrors = [];
-  page.on('console', (m) => console.log(`  [page] ${m.text()}`));
-  page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
-  await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
-
   const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen'];
-  // Wait until every work item leaves 'pending' (or time out).
-  try {
-    await page.waitForFunction(
-      (ids) => ids.every((id) => document.getElementById(id).dataset.status !== 'pending'),
-      WORK_IDS, { timeout: 30_000 },
-    );
-  } catch (e) {
-    // Timed out ⇒ ≥1 item never left 'pending' (the I22 hang signature). Report which, plus the
-    // uncaught pageerror(s) that most likely caused it, before re-throwing into the outer handler.
-    const statuses = await page.evaluate(
-      (ids) => ids.map((id) => ({ id, status: document.getElementById(id)?.dataset.status ?? 'missing' })),
-      WORK_IDS,
-    );
-    const stuck = statuses.filter((s) => s.status === 'pending').map((s) => s.id);
-    console.log(`  [timeout] items still pending: ${stuck.join(', ') || '(none)'}`);
-    console.log(`  [timeout] uncaught pageerror(s): ${pageErrors.length ? pageErrors.join(' | ') : '(none captured)'}`);
-    throw e;
+
+  // The main-page proof, factored out so we can retry it once on the I22 hang. I22 is a rare,
+  // CI-only flake where a worker vCPU's `svm_par_run` (or a page-side codegen call) takes an
+  // uncaught host wasm trap (`memory access out of bounds`, or `unreachable` from a panic=abort
+  // engine panic). The rejection never settles par.js's promise, so the item hangs `pending` and
+  // the wait times out — never reproduces on re-run, never on Node (see ISSUES.md I22). We keep the
+  // pageerror texts (not just print them) and, on timeout, dump both the still-`pending` items and
+  // the captured messages before throwing `PENDING_TIMEOUT` so the caller can self-identify + retry.
+  async function pageProof() {
+    const page = await browser.newPage();
+    const pageErrors = [];
+    page.on('console', (m) => console.log(`  [page] ${m.text()}`));
+    page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
+    try {
+      await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
+      // Wait until every work item leaves 'pending' (or time out).
+      try {
+        await page.waitForFunction(
+          (ids) => ids.every((id) => document.getElementById(id).dataset.status !== 'pending'),
+          WORK_IDS, { timeout: 30_000 },
+        );
+      } catch (e) {
+        // Timed out ⇒ ≥1 item never left 'pending' (the I22 hang signature). Report which, plus the
+        // uncaught pageerror(s) that most likely caused it, then throw a tagged error to trigger a retry.
+        const statuses = await page.evaluate(
+          (ids) => ids.map((id) => ({ id, status: document.getElementById(id)?.dataset.status ?? 'missing' })),
+          WORK_IDS,
+        );
+        const stuck = statuses.filter((s) => s.status === 'pending').map((s) => s.id);
+        console.log(`  [timeout] items still pending: ${stuck.join(', ') || '(none)'}`);
+        console.log(`  [timeout] uncaught pageerror(s): ${pageErrors.length ? pageErrors.join(' | ') : '(none captured)'}`);
+        const err = new Error(`items still pending: ${stuck.join(', ') || '(none)'}`);
+        err.code = 'PENDING_TIMEOUT';
+        throw err;
+      }
+
+      const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
+      const isolated = await read('isolated');
+      const powerbox = await read('powerbox');
+      const threads = await read('threads');
+      const jit = await read('jit');
+      const inst = await read('inst');
+      const capio = await read('capio');
+      const wasmjit = await read('wasmjit');
+      const tierup = await read('tierup');
+      const jitcodegen = await read('jitcodegen');
+      const instcodegen = await read('instcodegen');
+
+      console.log(`\n  ${isolated.text}`);
+      console.log(`  ${powerbox.text}`);
+      console.log(`  ${threads.text}`);
+      console.log(`  ${jit.text}`);
+      console.log(`  ${inst.text}`);
+      console.log(`  ${capio.text}`);
+      console.log(`  ${wasmjit.text}`);
+      console.log(`  ${tierup.text}`);
+      console.log(`  ${jitcodegen.text}`);
+      console.log(`  ${instcodegen.text}\n`);
+
+      return isolated.status === 'true' && powerbox.status === 'pass' &&
+        threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
+        capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
+        jitcodegen.status === 'pass' && instcodegen.status === 'pass';
+    } finally {
+      await page.close();
+    }
   }
 
-  const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
-  const isolated = await read('isolated');
-  const powerbox = await read('powerbox');
-  const threads = await read('threads');
-  const jit = await read('jit');
-  const inst = await read('inst');
-  const capio = await read('capio');
-  const wasmjit = await read('wasmjit');
-  const tierup = await read('tierup');
-  const jitcodegen = await read('jitcodegen');
-  const instcodegen = await read('instcodegen');
-
-  console.log(`\n  ${isolated.text}`);
-  console.log(`  ${powerbox.text}`);
-  console.log(`  ${threads.text}`);
-  console.log(`  ${jit.text}`);
-  console.log(`  ${inst.text}`);
-  console.log(`  ${capio.text}`);
-  console.log(`  ${wasmjit.text}`);
-  console.log(`  ${tierup.text}`);
-  console.log(`  ${jitcodegen.text}`);
-  console.log(`  ${instcodegen.text}\n`);
-
-  const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
-    threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
-    capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
-    jitcodegen.status === 'pass' && instcodegen.status === 'pass';
+  let pageOk;
+  try {
+    pageOk = await pageProof();
+  } catch (e) {
+    if (e.code !== 'PENDING_TIMEOUT') throw e; // a real failure — don't paper over it
+    console.log(`  [retry] main-page proof hung (I22 flake) — retrying once on a fresh page`);
+    pageOk = await pageProof(); // a genuine regression hangs both attempts; the flake clears on retry
+  }
 
   // --- the playground (play.html): SVM text typed into the page, parsed in-browser, run across ----
   // Workers. Drives the page like a human: pick an example / type source, click Run, read the
