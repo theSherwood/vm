@@ -389,6 +389,30 @@ pub struct FrozenVCpu {
     pub completed_result: Option<i64>,
 }
 
+/// A §14 **nested-child** re-attach record captured by a durable freeze (DURABILITY.md §4, "JIT
+/// parity") — the JIT mirror of `svm_interp::FrozenNested`. Unlike a `thread.spawn` child
+/// ([`FrozenVCpu`], its own vCPU with an entry+args to re-spawn), a §14 child is a nested *domain*
+/// whose whole continuation lives in its **carve** — a `2^size_log2` sub-window of the parent's window
+/// at `carve_off` (already inside the frozen window image). This carries only what a thaw needs to
+/// re-create the child domain around that carve and re-enter it under `REWINDING`. Same-module +
+/// still-running only for now (the freeze-export slice); a separate-module child's module digest and a
+/// completed-but-unjoined child's join result are follow-ups (see the interp's fuller record).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FrozenNested {
+    /// The task that **instantiated** this child — `0` for the root's direct child; a grandchild
+    /// carries its parent-child's task (depth-2, a follow-up). Mirror of [`FrozenVCpu::parent_task`];
+    /// a thaw groups by it to re-attach parents before children.
+    pub parent_task: usize,
+    /// The parent's join-table slot for this child (the guest-held handle value).
+    pub slot: usize,
+    /// The carve's window-relative base (`sub_base`), inside the frozen window image.
+    pub carve_off: u64,
+    /// The carve's (= the child window's) size, `log2`.
+    pub size_log2: u8,
+    /// The child's entry function index into the parent's own table (same-module).
+    pub entry: u32,
+}
+
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
 /// `svm-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
 /// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host
@@ -1146,6 +1170,56 @@ pub fn compile_and_run_capture_reserved_with_host_durable(
     Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
 }
 
+/// The durable-nested freeze/thaw entry's return: outcome, window, flattened fibers, and the §14
+/// **nested-child** freeze residue (each a [`FrozenNested`]).
+pub type DurableNestedOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenNested>);
+
+/// [`compile_and_run_capture_reserved_with_host_durable`] that ALSO returns the §14 **nested-child**
+/// freeze residue (DURABILITY.md §4 "JIT parity") — one [`FrozenNested`] per child that unwound into
+/// its carve under the freeze. Use for a durable domain that nests §14 children; the extra residue is
+/// what a thaw re-attaches. A separate entry so the existing `_durable` callers are unaffected.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_nested(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    nested_seed: &[FrozenNested],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<DurableNestedOutcome, JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.frozen_nested_seed = nested_seed.to_vec();
+    cm.durable = true;
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((
+        outcome,
+        win,
+        std::mem::take(&mut cm.frozen_out),
+        std::mem::take(&mut cm.frozen_nested_out),
+    ))
+}
+
 /// [`compile_and_run_capture_reserved_with_host_durable`] wired for an **async freeze** (Phase-4
 /// Slice A, 4A.3): publishes the live window base into `freeze` so a controller thread can
 /// [`FreezeController::request_freeze`] mid-run — the real bounded-latency stop-the-world trigger for
@@ -1722,6 +1796,11 @@ pub struct CompiledModule {
     /// run inline single-worker by `thread.spawn`). Drained from the `Domain` after the root unwinds,
     /// read back by the durable entry point. Empty unless a freeze caught a live child.
     frozen_vcpus_out: Vec<FrozenVCpu>,
+    /// Durable **freeze** residue (§4 "JIT parity"): the §14 **nested children** that unwound under the
+    /// freeze, each a [`FrozenNested`] re-attach record. Drained from the run's `Nursery` after the root
+    /// unwinds, read back by the durable-nested entry point. Empty unless a freeze caught a live §14
+    /// child.
+    frozen_nested_out: Vec<FrozenNested>,
     /// Durable **freeze** residue (slice 3.3): the **root** vCPU's flattened shadow-SP extent, captured
     /// after the freeze driver (before the children overwrite the shared active-SP word). The root's
     /// continuation rides in the window image like everyone's, but the active-SP word ends at the last
@@ -1731,6 +1810,9 @@ pub struct CompiledModule {
     /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
     /// under `REWINDING`. Empty for a freeze / ordinary run.
     frozen_vcpu_seed: Vec<FrozenVCpu>,
+    /// Durable **thaw** seed (§4 "JIT parity"): the §14 **nested children** to re-attach + rewind before
+    /// the parent re-enters under `REWINDING`, so its re-executed `join` resolves. Empty otherwise.
+    frozen_nested_seed: Vec<FrozenNested>,
     /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
     /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
     thaw_root_sp: u64,
@@ -2651,8 +2733,10 @@ impl CompiledModule {
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
+            frozen_nested_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
+            frozen_nested_seed: Vec::new(),
             thaw_root_sp: DURABLE_SHADOW_BASE + 8, // §12.8 4A.5: empty root extent = frame base (past the SP word)
             freeze_ctl: None,
             #[cfg(fiber_rt)]
@@ -3052,6 +3136,46 @@ impl CompiledModule {
             }
         }
 
+        // §4 nested thaw (JIT parity): re-attach + **rewind** the frozen §14 children before the parent
+        // re-enters, so its re-executed `join` resolves to each child's (rewound) result. Unlike a
+        // `thread.spawn` child (a peer vCPU, above), a §14 child is a nested *domain* re-run over its
+        // carve in thaw mode (rewind from the carve's frozen continuation, not a fresh start); the
+        // result is published at the child's join slot for the parent's `join`. Depth-1 (root's direct
+        // children) for now.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !(*this).frozen_nested_seed.is_empty() {
+            let seed = std::mem::take(&mut (*this).frozen_nested_seed);
+            if let Some(n) = &(*this)._nursery {
+                let funcs = n.funcs();
+                let epoch = n.epoch_addr();
+                for rec in &seed {
+                    let entry = rec.entry as FuncIdx;
+                    let nargs = funcs
+                        .get(entry as usize)
+                        .map(|f| f.params.len())
+                        .unwrap_or(0);
+                    let args = vec![0i64; nargs];
+                    // SAFETY: the carve `[carve_off, carve_off + 2^size_log2)` is committed in the
+                    // restored window at `mem_base` (it rode the artifact); `compile_child_and_run`
+                    // copies it into the child's own guarded window, rewinds it, and copies it back.
+                    match compile_child_and_run(
+                        &funcs,
+                        entry,
+                        rec.carve_off,
+                        rec.size_log2,
+                        mem_base,
+                        &args,
+                        epoch,
+                        true, // durable
+                        true, // thaw: rewind from the carve's frozen continuation
+                    ) {
+                        Ok((result, trap, _)) => n.seed_child_result(rec.slot, result, trap),
+                        Err(_) => n.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
+                    }
+                }
+            }
+        }
+
         // Publish the live window's fault range so a mid-run `invoke_extra` (from a cap.call
         // handler) can arm its nested recovery against this run's window.
         (*this).live_fault_range = Some(window.fault_range());
@@ -3153,6 +3277,12 @@ impl CompiledModule {
                 // the run residue alongside the root's. Sort-by-slot at serialize is canonical, so the
                 // append order doesn't affect the artifact.
                 (*this).frozen_out.extend(d.take_frozen_fibers());
+            }
+            // §4 freeze export: the §14 nested children that unwound under the freeze recorded their
+            // `FrozenNested` residue into the run's `Nursery`; drain it now that the root has unwound,
+            // read back by the durable-nested entry point.
+            if let Some(n) = &(*this)._nursery {
+                (*this).frozen_nested_out = n.take_frozen_nested();
             }
         }
 
@@ -3536,7 +3666,8 @@ pub(crate) unsafe fn compile_child_and_run(
     args: &[i64],
     epoch_addr: usize,
     durable: bool,
-) -> Result<(i64, i64), JitError> {
+    thaw: bool,
+) -> Result<(i64, i64, bool), JitError> {
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
 
     // §4 (DURABILITY.md, "JIT parity"): a **durable** child gets an attenuated `Instantiator` powerbox
@@ -3621,11 +3752,30 @@ pub(crate) unsafe fn compile_child_and_run(
     const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0) = 72
     if durable && (child_size as usize) >= CTX0_THAW_OFF + 4 {
         const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0) = 80
+        const STATE_REWINDING: i32 = 2;
         let w = child_window.rw_mut();
-        w[0..4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
-        w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
-        w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
-        // ctx-0 SP word
+        if thaw {
+            // §4 thaw: the carve (from the restored artifact) holds the child's frozen continuation —
+            // its spilled shadow stack + the ctx-0 SP word pointing at the top of it. Prepare it to
+            // **rewind** exactly as `svm-durable::begin_thaw` does for a context: global state word →
+            // `NORMAL`, ctx-0 thaw word → `REWINDING`, and **preserve** the SP word + shadow stack (the
+            // continuation the rewind replays). The child then dispatches on the thaw word and reloads.
+            w[0..4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
+            w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&STATE_REWINDING.to_le_bytes());
+        } else {
+            // §4 freeze/normal: the child inherits the **parent's** durable phase (the interp seeds
+            // `child.dstate = parent.durable_state()`). Under a freeze the parent window is `UNWINDING`,
+            // so an instrumented child is born unwinding and unwinds at its first poll; under `NORMAL`
+            // it runs to completion. Read the parent window's ctx-0 state word (`STATE_OFF` = 0).
+            let parent_phase = {
+                let p = std::slice::from_raw_parts(parent_mem_base, 4);
+                i32::from_le_bytes([p[0], p[1], p[2], p[3]])
+            };
+            w[0..4].copy_from_slice(&parent_phase.to_le_bytes()); // global state word = parent's phase
+            w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
+            w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
+            // ctx-0 SP
+        }
     }
 
     let mut results = vec![0i64; n_results];
@@ -3662,6 +3812,11 @@ pub(crate) unsafe fn compile_child_and_run(
     // Copy the child's final window back into the parent's sub-region — the parent (the superset) now
     // sees the child's writes (materialized at `instantiate`-completion for a synchronous child). A
     // guest with no Memory cap leaves every page mapped; `restore_rw` is defensive.
+    // §4 freeze export: a durable child that left its carve `UNWINDING` unwound mid-run under a freeze
+    // (spilled its continuation into the carve + returned a placeholder) instead of completing. Detect
+    // it from the carve's state word before the copy-back carries the carve into the parent window.
+    // The caller (`instantiate`) turns this into a `FrozenNested` re-attach record.
+    let unwound = durable && !faulted && fiber_rt::window_is_unwinding(child_base as u64);
     child_window.restore_rw();
     {
         let dst = std::slice::from_raw_parts_mut(
@@ -3672,7 +3827,7 @@ pub(crate) unsafe fn compile_child_and_run(
     }
     drop(child_window);
     drop(child); // frees the child's executable memory now the call has returned
-    Ok((results.first().copied().unwrap_or(0), trap_cell))
+    Ok((results.first().copied().unwrap_or(0), trap_cell, unwound))
 }
 
 /// A compiled §14 child: the owning [`JITModule`] (executable memory lives until drop), its
