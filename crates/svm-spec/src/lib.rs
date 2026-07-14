@@ -8,10 +8,13 @@
 //! one of them, not a tautology. Test-tier only: nothing on the runtime path depends
 //! on this crate.
 //!
-//! Slice 1 (SPEC.md implementation plan): the scalar integer core — consts,
-//! `IntBin`/`IntCmp`/`IntUn`/`Eqz`/`Convert`/`Select`, `Cast`, `PtrAdd`/`PtrCast`.
+//! Landed slices (SPEC.md implementation plan): the scalar integer core (slice 1),
+//! scalar floats + conversions (slice 2), the restated opcode byte map (slice 3,
+//! [`OpRow::encoding`]), and the reference verifier (slice 4, [`verify`]).
 
 #![forbid(unsafe_code)]
+
+pub mod verify;
 
 use svm_ir::*;
 
@@ -78,6 +81,14 @@ pub enum Shape {
     Immediate,
 }
 
+/// The wire encoding of an op (SPEC.md suite 3): its primary opcode byte, or the SIMD
+/// escape prefix plus sub-opcode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Enc {
+    Byte(u8),
+    Prefixed(u8, u8),
+}
+
 /// Constructor of a row's op over operand value indices (plus the immediate vector for
 /// `Shape::Immediate` rows).
 pub type BuildFn = Box<dyn Fn(&[ValIdx], &[SpecVal]) -> Inst>;
@@ -95,6 +106,8 @@ pub struct OpRow {
     pub result: ValType,
     pub class: Class,
     pub shape: Shape,
+    /// The op's wire encoding, restated independently of `svm-encode` (suite 3).
+    pub encoding: Enc,
     /// Construct the op over operand value indices (in `operands` order); an
     /// `Immediate` row reads its immediate from the vector instead.
     pub build: BuildFn,
@@ -305,6 +318,337 @@ pub fn cast(op: CastOp, x: SpecVal) -> SpecVal {
     }
 }
 
+// --- float reference semantics (slice 2) ---------------------------------------------
+//
+// DESIGN.md §3b: IEEE 754, round-to-nearest-even, no traps (results go to inf/NaN);
+// NaN result bit patterns are unpinned (compared as "is NaN"). Where the prose is
+// terse the spec pins the intended (wasm-identical) semantics precisely: `min`/`max`
+// propagate NaN and order `-0 < +0`; `nearest` rounds ties to even; `fma` is the
+// correctly-rounded fused multiply-add; `abs`/`neg`/`copysign` are pure sign-bit
+// operations (defined on NaN too).
+
+/// NaN-propagating minimum with `-0 < +0` (wasm `fmin`; NOT Rust's `f32::min`, which
+/// is IEEE minNum — it drops NaN and can't tell the zeros apart).
+fn fmin(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        // Equal compares include -0 == +0: pick the negative-signed one.
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// NaN-propagating maximum with `-0 < +0` (wasm `fmax`); see [`fmin`].
+fn fmax(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_positive() {
+            a
+        } else {
+            b
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn fbin_f32(op: FBinOp, a: f32, b: f32) -> f32 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b, // /0 → ±inf, 0/0 → NaN — floats never trap (§3b)
+        FBinOp::Min => fmin(a as f64, b as f64) as f32, // exact: f32 ⊂ f64, order-only
+        FBinOp::Max => fmax(a as f64, b as f64) as f32,
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+
+pub fn fbin_f64(op: FBinOp, a: f64, b: f64) -> f64 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b,
+        FBinOp::Min => fmin(a, b),
+        FBinOp::Max => fmax(a, b),
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+
+pub fn fun_f32(op: FUnOp, a: f32) -> f32 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(), // IEEE correctly-rounded; sqrt(neg) → NaN
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+
+pub fn fun_f64(op: FUnOp, a: f64) -> f64 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(),
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+
+/// IEEE partial-order comparison: any comparison with a NaN is false, so `ne` (the
+/// negation of `eq`) is *true* on NaN.
+pub fn fcmp(op: FCmpOp, a: f64, b: f64) -> i32 {
+    let r = match op {
+        FCmpOp::Eq => a == b,
+        FCmpOp::Ne => a != b,
+        FCmpOp::Lt => a < b,
+        FCmpOp::Le => a <= b,
+        FCmpOp::Gt => a > b,
+        FCmpOp::Ge => a >= b,
+    };
+    r as i32
+}
+
+/// Saturating float→int (`trunc_sat`, the §3b default): truncate toward zero; NaN → 0;
+/// out-of-range saturates to the target's MIN/MAX. (Rust's float→int `as` implements
+/// exactly this definition.)
+pub fn trunc_sat(op: FToI, x: SpecVal) -> SpecVal {
+    // Promoting f32 → f64 is exact, so the eight cases collapse to four on f64.
+    let f: f64 = match op.parts().0 {
+        FloatTy::F32 => as_f32(x) as f64,
+        FloatTy::F64 => as_f64(x),
+    };
+    match op.parts() {
+        (_, IntTy::I32, true) => SpecVal::I32(f as i32),
+        (_, IntTy::I32, false) => SpecVal::I32(f as u32 as i32),
+        (_, IntTy::I64, true) => SpecVal::I64(f as i64),
+        (_, IntTy::I64, false) => SpecVal::I64(f as u64 as i64),
+    }
+}
+
+/// Trapping float→int (`trunc`): NaN and out-of-range trap `BadConversion` instead of
+/// saturating. In range ⇔ the truncation toward zero is representable — i.e. `x` lies
+/// strictly inside `(MIN−1, MAX+1)`, stated with the exact float boundary constants
+/// (`2^31`, `2^32`, `2^63`, `2^64` and their negatives are all exact in f64; the i64
+/// signed lower bound is closed because `−2^63−1` is not representable in f64).
+pub fn trunc_trap(op: FToI, x: SpecVal) -> Result<SpecVal, SpecTrap> {
+    let f: f64 = match op.parts().0 {
+        FloatTy::F32 => as_f32(x) as f64,
+        FloatTy::F64 => as_f64(x),
+    };
+    if f.is_nan() {
+        return Err(SpecTrap::BadConversion);
+    }
+    let in_range = match op.parts() {
+        (_, IntTy::I32, true) => f > -2_147_483_649.0 && f < 2_147_483_648.0,
+        (_, IntTy::I32, false) => f > -1.0 && f < 4_294_967_296.0,
+        (_, IntTy::I64, true) => {
+            (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f)
+        }
+        (_, IntTy::I64, false) => f > -1.0 && f < 18_446_744_073_709_551_616.0,
+    };
+    if !in_range {
+        return Err(SpecTrap::BadConversion);
+    }
+    Ok(trunc_sat(op, x)) // in range, so saturation never engages — plain truncation
+}
+
+/// Int→float (`convert`): round-to-nearest-even to the target width (Rust's int→float
+/// `as` implements exactly this).
+pub fn itof(op: IToF, x: SpecVal) -> SpecVal {
+    match op.parts() {
+        (IntTy::I32, FloatTy::F32, true) => SpecVal::F32((as_i32(x) as f32).to_bits()),
+        (IntTy::I32, FloatTy::F32, false) => SpecVal::F32((as_i32(x) as u32 as f32).to_bits()),
+        (IntTy::I64, FloatTy::F32, true) => SpecVal::F32((as_i64(x) as f32).to_bits()),
+        (IntTy::I64, FloatTy::F32, false) => SpecVal::F32((as_i64(x) as u64 as f32).to_bits()),
+        (IntTy::I32, FloatTy::F64, true) => SpecVal::F64((as_i32(x) as f64).to_bits()),
+        (IntTy::I32, FloatTy::F64, false) => SpecVal::F64((as_i32(x) as u32 as f64).to_bits()),
+        (IntTy::I64, FloatTy::F64, true) => SpecVal::F64((as_i64(x) as f64).to_bits()),
+        (IntTy::I64, FloatTy::F64, false) => SpecVal::F64((as_i64(x) as u64 as f64).to_bits()),
+    }
+}
+
+// --- the byte map, restated (SPEC.md suite 3) -----------------------------------------
+//
+// A second, independent statement of `svm-encode`'s `mod op` opcode map, written as
+// **explicit per-op bytes** — NOT `base + op.index()`. Sharing the encoder's own
+// `index()` would let a sub-enum reorder shift both sides in lockstep, which is
+// exactly the silent format break suite 3 exists to catch. Every match is exhaustive,
+// so a new sub-op forces a conscious byte assignment here.
+
+fn enc_int_bin(ty: IntTy, op: BinOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x20,
+        IntTy::I64 => 0x40,
+    };
+    let off: u8 = match op {
+        BinOp::Add => 0,
+        BinOp::Sub => 1,
+        BinOp::Mul => 2,
+        BinOp::DivS => 3,
+        BinOp::DivU => 4,
+        BinOp::RemS => 5,
+        BinOp::RemU => 6,
+        BinOp::And => 7,
+        BinOp::Or => 8,
+        BinOp::Xor => 9,
+        BinOp::Shl => 10,
+        BinOp::ShrS => 11,
+        BinOp::ShrU => 12,
+        BinOp::Rotl => 13,
+        BinOp::Rotr => 14,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_int_cmp(ty: IntTy, op: CmpOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x31,
+        IntTy::I64 => 0x51,
+    };
+    let off: u8 = match op {
+        CmpOp::Eq => 0,
+        CmpOp::Ne => 1,
+        CmpOp::LtS => 2,
+        CmpOp::LtU => 3,
+        CmpOp::LeS => 4,
+        CmpOp::LeU => 5,
+        CmpOp::GtS => 6,
+        CmpOp::GtU => 7,
+        CmpOp::GeS => 8,
+        CmpOp::GeU => 9,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_int_un(ty: IntTy, op: IntUnOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x14,
+        IntTy::I64 => 0x1A,
+    };
+    let off: u8 = match op {
+        IntUnOp::Clz => 0,
+        IntUnOp::Ctz => 1,
+        IntUnOp::Popcnt => 2,
+        IntUnOp::Extend8S => 3,
+        IntUnOp::Extend16S => 4,
+        IntUnOp::Extend32S => 5,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_convert(op: ConvOp) -> Enc {
+    Enc::Byte(match op {
+        ConvOp::ExtendI32S => 0x60,
+        ConvOp::ExtendI32U => 0x61,
+        ConvOp::WrapI64 => 0x62,
+    })
+}
+
+fn enc_cast(op: CastOp) -> Enc {
+    Enc::Byte(match op {
+        CastOp::Demote => 0xC0,
+        CastOp::Promote => 0xC1,
+        CastOp::ReinterpI32F32 => 0xC2,
+        CastOp::ReinterpF32I32 => 0xC3,
+        CastOp::ReinterpI64F64 => 0xC4,
+        CastOp::ReinterpF64I64 => 0xC5,
+    })
+}
+
+fn enc_fbin(ty: FloatTy, op: FBinOp) -> Enc {
+    let base: u8 = match ty {
+        FloatTy::F32 => 0x90,
+        FloatTy::F64 => 0xA0,
+    };
+    let off: u8 = match op {
+        FBinOp::Add => 0,
+        FBinOp::Sub => 1,
+        FBinOp::Mul => 2,
+        FBinOp::Div => 3,
+        FBinOp::Min => 4,
+        FBinOp::Max => 5,
+        FBinOp::Copysign => 6,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_fun(ty: FloatTy, op: FUnOp) -> Enc {
+    let base: u8 = match ty {
+        FloatTy::F32 => 0x98,
+        FloatTy::F64 => 0xA8,
+    };
+    let off: u8 = match op {
+        FUnOp::Abs => 0,
+        FUnOp::Neg => 1,
+        FUnOp::Sqrt => 2,
+        FUnOp::Ceil => 3,
+        FUnOp::Floor => 4,
+        FUnOp::Trunc => 5,
+        FUnOp::Nearest => 6,
+    };
+    Enc::Byte(base + off)
+}
+
+fn enc_fcmp(ty: FloatTy, op: FCmpOp) -> Enc {
+    let base: u8 = match ty {
+        FloatTy::F32 => 0xB0,
+        FloatTy::F64 => 0xB8,
+    };
+    let off: u8 = match op {
+        FCmpOp::Eq => 0,
+        FCmpOp::Ne => 1,
+        FCmpOp::Lt => 2,
+        FCmpOp::Le => 3,
+        FCmpOp::Gt => 4,
+        FCmpOp::Ge => 5,
+    };
+    Enc::Byte(base + off)
+}
+
+/// Offset shared by the saturating (`0xD0+`) and trapping (`0xD8+`) families.
+fn ftoi_off(op: FToI) -> u8 {
+    match op {
+        FToI::F32I32S => 0,
+        FToI::F32I32U => 1,
+        FToI::F32I64S => 2,
+        FToI::F32I64U => 3,
+        FToI::F64I32S => 4,
+        FToI::F64I32U => 5,
+        FToI::F64I64S => 6,
+        FToI::F64I64U => 7,
+    }
+}
+
+fn enc_itof(op: IToF) -> Enc {
+    Enc::Byte(match op {
+        IToF::I32F32S => 0xE0,
+        IToF::I32F32U => 0xE1,
+        IToF::I64F32S => 0xE2,
+        IToF::I64F32U => 0xE3,
+        IToF::I32F64S => 0xE4,
+        IToF::I32F64U => 0xE5,
+        IToF::I64F64S => 0xE6,
+        IToF::I64F64U => 0xE7,
+    })
+}
+
 // --- the op table -------------------------------------------------------------------
 
 /// Slice-1 rows: the scalar integer core plus `Cast` and the pointer ops. Later slices
@@ -320,6 +664,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
         result: ValType::I32,
         class: Class::Pure,
         shape: Shape::Immediate,
+        encoding: Enc::Byte(0x10),
         build: Box::new(|_, imm| Inst::ConstI32(as_i32(imm[0]))),
         eval: Box::new(|x| Ok(x[0])),
     });
@@ -329,6 +674,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
         result: ValType::I64,
         class: Class::Pure,
         shape: Shape::Immediate,
+        encoding: Enc::Byte(0x11),
         build: Box::new(|_, imm| Inst::ConstI64(as_i64(imm[0]))),
         eval: Box::new(|x| Ok(x[0])),
     });
@@ -347,6 +693,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
                 result: vt,
                 class,
                 shape: Shape::Operands,
+                encoding: enc_int_bin(ty, op),
                 build: Box::new(move |v, _| Inst::IntBin {
                     ty,
                     op,
@@ -369,6 +716,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
                 result: ValType::I32,
                 class: Class::Pure,
                 shape: Shape::Operands,
+                encoding: enc_int_cmp(ty, op),
                 build: Box::new(move |v, _| Inst::IntCmp {
                     ty,
                     op,
@@ -391,6 +739,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
                 result: vt,
                 class: Class::Pure,
                 shape: Shape::Operands,
+                encoding: enc_int_un(ty, op),
                 build: Box::new(move |v, _| Inst::IntUn { ty, op, a: v[0] }),
                 eval: Box::new(move |x| {
                     Ok(match ty {
@@ -407,6 +756,10 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: ValType::I32,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(match ty {
+                IntTy::I32 => 0x30,
+                IntTy::I64 => 0x50,
+            }),
             build: Box::new(move |v, _| Inst::Eqz { ty, a: v[0] }),
             eval: Box::new(move |x| {
                 let zero = match ty {
@@ -425,6 +778,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: vt,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(0x70),
             build: Box::new(|v, _| Inst::Select {
                 cond: v[0],
                 a: v[1],
@@ -442,6 +796,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: to,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: enc_convert(op),
             build: Box::new(move |v, _| Inst::Convert { op, a: v[0] }),
             eval: Box::new(move |x| {
                 Ok(match op {
@@ -461,6 +816,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: to,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: enc_cast(op),
             build: Box::new(move |v, _| Inst::Cast { op, a: v[0] }),
             eval: Box::new(move |x| Ok(cast(op, x[0]))),
         });
@@ -474,6 +830,7 @@ pub fn scalar_rows() -> Vec<OpRow> {
         result: ValType::I64,
         class: Class::Pure,
         shape: Shape::Operands,
+        encoding: Enc::Byte(0x78),
         build: Box::new(|v, _| Inst::PtrAdd { a: v[0], b: v[1] }),
         eval: Box::new(|x| Ok(SpecVal::I64(as_i64(x[0]).wrapping_add(as_i64(x[1]))))),
     });
@@ -484,11 +841,210 @@ pub fn scalar_rows() -> Vec<OpRow> {
             result: ValType::I64,
             class: Class::Pure,
             shape: Shape::Operands,
+            encoding: Enc::Byte(if to_int { 0x77 } else { 0x76 }),
             build: Box::new(move |v, _| Inst::PtrCast { to_int, a: v[0] }),
             eval: Box::new(|x| Ok(x[0])),
         });
     }
 
+    rows
+}
+
+/// Slice-2 rows: scalar floats — consts, `FBin`/`FUn`/`Fma`/`FCmp`, the saturating and
+/// trapping float→int conversions, int→float, and the float `select` instantiations.
+pub fn float_rows() -> Vec<OpRow> {
+    let mut rows: Vec<OpRow> = Vec::new();
+    let mut push = |row: OpRow| rows.push(row);
+
+    push(OpRow {
+        id: "f32.const".into(),
+        operands: vec![],
+        result: ValType::F32,
+        class: Class::Pure,
+        shape: Shape::Immediate,
+        encoding: Enc::Byte(0x12),
+        build: Box::new(|_, imm| match imm[0] {
+            SpecVal::F32(b) => Inst::ConstF32(b),
+            _ => unreachable!("spec row fed a non-f32 immediate"),
+        }),
+        eval: Box::new(|x| Ok(x[0])),
+    });
+    push(OpRow {
+        id: "f64.const".into(),
+        operands: vec![],
+        result: ValType::F64,
+        class: Class::Pure,
+        shape: Shape::Immediate,
+        encoding: Enc::Byte(0x13),
+        build: Box::new(|_, imm| match imm[0] {
+            SpecVal::F64(b) => Inst::ConstF64(b),
+            _ => unreachable!("spec row fed a non-f64 immediate"),
+        }),
+        eval: Box::new(|x| Ok(x[0])),
+    });
+
+    for ty in [FloatTy::F32, FloatTy::F64] {
+        let vt = ty.val();
+
+        for op in FBinOp::ALL {
+            push(OpRow {
+                id: format!("{}.{}", ty.prefix(), op.name()),
+                operands: vec![vt, vt],
+                result: vt,
+                class: Class::Pure,
+                shape: Shape::Operands,
+                encoding: enc_fbin(ty, op),
+                build: Box::new(move |v, _| Inst::FBin {
+                    ty,
+                    op,
+                    a: v[0],
+                    b: v[1],
+                }),
+                eval: Box::new(move |x| {
+                    Ok(match ty {
+                        FloatTy::F32 => {
+                            SpecVal::F32(fbin_f32(op, as_f32(x[0]), as_f32(x[1])).to_bits())
+                        }
+                        FloatTy::F64 => {
+                            SpecVal::F64(fbin_f64(op, as_f64(x[0]), as_f64(x[1])).to_bits())
+                        }
+                    })
+                }),
+            });
+        }
+
+        for op in FUnOp::ALL {
+            push(OpRow {
+                id: format!("{}.{}", ty.prefix(), op.name()),
+                operands: vec![vt],
+                result: vt,
+                class: Class::Pure,
+                shape: Shape::Operands,
+                encoding: enc_fun(ty, op),
+                build: Box::new(move |v, _| Inst::FUn { ty, op, a: v[0] }),
+                eval: Box::new(move |x| {
+                    Ok(match ty {
+                        FloatTy::F32 => SpecVal::F32(fun_f32(op, as_f32(x[0])).to_bits()),
+                        FloatTy::F64 => SpecVal::F64(fun_f64(op, as_f64(x[0])).to_bits()),
+                    })
+                }),
+            });
+        }
+
+        // Fused multiply-add: a·b + c with a single rounding (§3b — the correctly-
+        // rounded FMA, not mul-then-add).
+        push(OpRow {
+            id: format!("{}.fma", ty.prefix()),
+            operands: vec![vt, vt, vt],
+            result: vt,
+            class: Class::Pure,
+            shape: Shape::Operands,
+            encoding: Enc::Byte(0x7D),
+            build: Box::new(move |v, _| Inst::Fma {
+                ty,
+                a: v[0],
+                b: v[1],
+                c: v[2],
+            }),
+            eval: Box::new(move |x| {
+                Ok(match ty {
+                    FloatTy::F32 => {
+                        SpecVal::F32(as_f32(x[0]).mul_add(as_f32(x[1]), as_f32(x[2])).to_bits())
+                    }
+                    FloatTy::F64 => {
+                        SpecVal::F64(as_f64(x[0]).mul_add(as_f64(x[1]), as_f64(x[2])).to_bits())
+                    }
+                })
+            }),
+        });
+
+        for op in FCmpOp::ALL {
+            push(OpRow {
+                id: format!("{}.{}", ty.prefix(), op.name()),
+                operands: vec![vt, vt],
+                result: ValType::I32,
+                class: Class::Pure,
+                shape: Shape::Operands,
+                encoding: enc_fcmp(ty, op),
+                build: Box::new(move |v, _| Inst::FCmp {
+                    ty,
+                    op,
+                    a: v[0],
+                    b: v[1],
+                }),
+                eval: Box::new(move |x| {
+                    // Promoting f32 → f64 is exact and order-preserving, so one f64
+                    // comparison covers both widths.
+                    let (a, b) = match ty {
+                        FloatTy::F32 => (as_f32(x[0]) as f64, as_f32(x[1]) as f64),
+                        FloatTy::F64 => (as_f64(x[0]), as_f64(x[1])),
+                    };
+                    Ok(SpecVal::I32(fcmp(op, a, b)))
+                }),
+            });
+        }
+
+        push(OpRow {
+            id: format!("select ({})", ty.prefix()),
+            operands: vec![ValType::I32, vt, vt],
+            result: vt,
+            class: Class::Pure,
+            shape: Shape::Operands,
+            encoding: Enc::Byte(0x70),
+            build: Box::new(|v, _| Inst::Select {
+                cond: v[0],
+                a: v[1],
+                b: v[2],
+            }),
+            eval: Box::new(|x| Ok(if as_i32(x[0]) != 0 { x[1] } else { x[2] })),
+        });
+    }
+
+    for op in FToI::ALL {
+        let (from, to, _) = op.parts();
+        push(OpRow {
+            id: op.name().into(),
+            operands: vec![from.val()],
+            result: to.val(),
+            class: Class::Pure,
+            shape: Shape::Operands,
+            encoding: Enc::Byte(0xD0 + ftoi_off(op)),
+            build: Box::new(move |v, _| Inst::FToISat { op, a: v[0] }),
+            eval: Box::new(move |x| Ok(trunc_sat(op, x[0]))),
+        });
+        push(OpRow {
+            id: op.trap_name().into(),
+            operands: vec![from.val()],
+            result: to.val(),
+            class: Class::Trapping,
+            shape: Shape::Operands,
+            encoding: Enc::Byte(0xD8 + ftoi_off(op)),
+            build: Box::new(move |v, _| Inst::FToITrap { op, a: v[0] }),
+            eval: Box::new(move |x| trunc_trap(op, x[0])),
+        });
+    }
+
+    for op in IToF::ALL {
+        let (from, to, _) = op.parts();
+        push(OpRow {
+            id: op.name().into(),
+            operands: vec![from.val()],
+            result: to.val(),
+            class: Class::Pure,
+            shape: Shape::Operands,
+            encoding: enc_itof(op),
+            build: Box::new(move |v, _| Inst::IToFConv { op, a: v[0] }),
+            eval: Box::new(move |x| Ok(itof(op, x[0]))),
+        });
+    }
+
+    rows
+}
+
+/// Every specced row (grows slice by slice until [`coverage`] is fully realized).
+pub fn all_rows() -> Vec<OpRow> {
+    let mut rows = scalar_rows();
+    rows.extend(float_rows());
     rows
 }
 
@@ -586,8 +1142,24 @@ pub const F32_INPUTS: &[u32] = &[
     0xffc0_0001, // negative qNaN with payload
     0x7f80_0001, // sNaN
     0x4b00_0000, // 2^23 (integer-precision boundary)
-    0x4f00_0000, // 2^31
-    0x5f00_0000, // 2^63
+    // Float→int trap/saturation boundaries (§3b `trunc` vs `trunc_sat`): the largest
+    // representable f32 on the fitting side of each bound, the exact bound, and one
+    // step past it.
+    0x4eff_ffff, // 2147483520 — largest f32 < 2^31 (fits i32 signed)
+    0x4f00_0000, // 2^31 (traps i32 signed)
+    0xcf00_0000, // -2^31 exactly (fits i32 signed)
+    0xcf00_0001, // one f32 below -2^31 (traps)
+    0x4f7f_ffff, // largest f32 < 2^32 (fits u32)
+    0x4f80_0000, // 2^32 (traps u32)
+    0x5eff_ffff, // largest f32 < 2^63 (fits i64 signed)
+    0x5f00_0000, // 2^63 (traps i64 signed; fits u64)
+    0xdf00_0000, // -2^63 exactly (fits i64 signed)
+    0xdf00_0001, // one f32 below -2^63 (traps)
+    0x5f7f_ffff, // largest f32 < 2^64 (fits u64)
+    0x5f80_0000, // 2^64 (traps u64)
+    0xbf00_0000, // -0.5 (truncation -0 fits every unsigned target)
+    0xbf7f_ffff, // just above -1.0 (still fits unsigned)
+    0x4049_0fdb, // π
 ];
 
 /// `f64` inputs as raw bits — same families as [`F32_INPUTS`], plus demote-rounding
@@ -614,7 +1186,25 @@ pub const F64_INPUTS: &[u64] = &[
     0x3ff0_0000_3000_0000, // 1 + 3·2^-24: demote ties-to-even → 1 + 2^-22
     0x47f0_0000_0000_0000, // 2^128: demote overflows → +inf
     0x4340_0000_0000_0000, // 2^53 (integer-precision boundary)
-    0x43e0_0000_0000_0000, // 2^63
+    // Float→int trap/saturation boundaries, as in `F32_INPUTS` but at f64 precision
+    // (2^31−1 and fractional neighbors of the bounds are exact here).
+    0x41df_ffff_ffc0_0000, // 2147483647.0 = i32::MAX exactly
+    0x41df_ffff_ffe0_0000, // 2147483647.5 (truncates to i32::MAX — fits signed)
+    0x41e0_0000_0000_0000, // 2147483648.0 = 2^31 (traps i32 signed)
+    0xc1e0_0000_0000_0000, // -2^31 exactly (fits i32 signed)
+    0xc1e0_0000_0010_0000, // -2147483648.5 (truncates to i32::MIN — fits)
+    0xc1e0_0000_0020_0000, // -2147483649.0 (traps i32 signed)
+    0x41ef_ffff_ffff_ffff, // 4294967295.999… (truncates to u32::MAX — fits unsigned)
+    0x41f0_0000_0000_0000, // 2^32 (traps u32)
+    0x43df_ffff_ffff_ffff, // largest f64 < 2^63 (fits i64 signed)
+    0x43e0_0000_0000_0000, // 2^63 (traps i64 signed; fits u64)
+    0xc3e0_0000_0000_0000, // -2^63 exactly (fits i64 signed)
+    0xc3e0_0000_0000_0001, // one f64 below -2^63 (traps)
+    0x43ef_ffff_ffff_ffff, // largest f64 < 2^64 (fits u64)
+    0x43f0_0000_0000_0000, // 2^64 (traps u64)
+    0xbfe0_0000_0000_0000, // -0.5 (fits every unsigned target)
+    0xbfef_ffff_ffff_ffff, // just above -1.0 (still fits unsigned)
+    0x4009_21fb_5444_2d18, // π
 ];
 
 /// Deterministic cap on a row's vector count. Chosen so every unary and binary pool
@@ -864,12 +1454,68 @@ mod tests {
         );
     }
 
+    /// The float definitional cases the prose is terse about, pinned as spec-internal
+    /// expectations: min/max NaN propagation and zero ordering, nearest ties-to-even,
+    /// and the exact trapping-conversion boundary lattice.
+    #[test]
+    fn float_definitional_cases() {
+        // min/max propagate NaN (wasm fmin/fmax, NOT IEEE minNum) and order -0 < +0.
+        assert!(fbin_f32(FBinOp::Min, f32::NAN, 5.0).is_nan());
+        assert!(fbin_f64(FBinOp::Max, 5.0, f64::NAN).is_nan());
+        assert_eq!(fbin_f32(FBinOp::Min, 0.0, -0.0).to_bits(), 0x8000_0000);
+        assert_eq!(fbin_f32(FBinOp::Max, -0.0, 0.0).to_bits(), 0x0000_0000);
+        // nearest = round ties to even.
+        assert_eq!(fun_f32(FUnOp::Nearest, 2.5), 2.0);
+        assert_eq!(fun_f32(FUnOp::Nearest, 3.5), 4.0);
+        assert_eq!(fun_f64(FUnOp::Nearest, -0.5).to_bits(), (-0.0f64).to_bits());
+        // ne is the negation of eq, so it is TRUE on NaN.
+        assert_eq!(fcmp(FCmpOp::Ne, f64::NAN, f64::NAN), 1);
+        assert_eq!(fcmp(FCmpOp::Eq, f64::NAN, f64::NAN), 0);
+        // Trapping conversion bounds: exact float boundaries, strict on the open side.
+        let f64v = SpecVal::F64;
+        assert_eq!(
+            trunc_trap(FToI::F64I32S, f64v(0x41df_ffff_ffe0_0000)), // 2147483647.5
+            Ok(SpecVal::I32(i32::MAX))
+        );
+        assert_eq!(
+            trunc_trap(FToI::F64I32S, f64v(0x41e0_0000_0000_0000)), // 2^31
+            Err(SpecTrap::BadConversion)
+        );
+        assert_eq!(
+            trunc_trap(FToI::F64I64S, f64v(0xc3e0_0000_0000_0000)), // -2^63 exact
+            Ok(SpecVal::I64(i64::MIN))
+        );
+        assert_eq!(
+            trunc_trap(FToI::F64I32U, f64v((-0.5f64).to_bits())),
+            Ok(SpecVal::I32(0)) // trunc(-0.5) = -0 → 0 fits unsigned
+        );
+        assert_eq!(
+            trunc_trap(FToI::F64I32U, f64v((-1.0f64).to_bits())),
+            Err(SpecTrap::BadConversion)
+        );
+        // Saturating: NaN → 0, out-of-range clamps.
+        assert_eq!(
+            trunc_sat(FToI::F32I32S, SpecVal::F32(0x7fc0_0000)),
+            SpecVal::I32(0)
+        );
+        assert_eq!(
+            trunc_sat(FToI::F32I32S, SpecVal::F32(0xff80_0000)), // -inf
+            SpecVal::I32(i32::MIN)
+        );
+        assert_eq!(
+            trunc_sat(FToI::F32I64U, SpecVal::F32(0x5f80_0000)), // 2^64
+            SpecVal::I64(-1)                                     // u64::MAX
+        );
+    }
+
     /// Table invariants: unique ids, one result each, every row's class agrees with
-    /// [`coverage`] on the instruction it builds, and slice 1 has the expected shape.
+    /// [`coverage`] on the instruction it builds, and the landed slices have the
+    /// expected shape.
     #[test]
     fn table_invariants() {
-        let rows = scalar_rows();
-        assert_eq!(rows.len(), 80, "slice-1 row count (update on new rows)");
+        assert_eq!(scalar_rows().len(), 80, "slice-1 row count");
+        assert_eq!(float_rows().len(), 70, "slice-2 row count");
+        let rows = all_rows();
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -892,7 +1538,7 @@ mod tests {
     /// reserved for wider arities (see `VECTOR_CAP`).
     #[test]
     fn no_striding_below_ternary() {
-        for row in scalar_rows() {
+        for row in all_rows() {
             let n: usize = row.inputs().iter().map(|t| pool(*t).len()).product();
             if row.inputs().len() <= 2 {
                 assert_eq!(vectors_for(&row).len(), n, "strided binary row {}", row.id);
