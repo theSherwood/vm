@@ -461,7 +461,7 @@ function presentFrame(w, h) {
   canvas.height = h;
   canvas.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
   canvas.style.display = 'block';
-  log(`presented a ${w}×${h} frame (${sl}B RGBA) to the canvas`);
+  // No per-frame logging: the reactor loop calls this ~60×/second, which would flood the log pane.
 }
 
 // Run a pre-built on-ramp module single-shot on the main engine: alloc a buffer, copy the module in,
