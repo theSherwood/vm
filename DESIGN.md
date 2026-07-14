@@ -69,34 +69,45 @@ is spent *around* compute, where wasm is weak:
   inlinable to ~free; batched async rings (§9, §13).
   *This is the strongest, most defensible win.*
 - **64-bit address space:** a clean 64-bit window with **no 32-bit index type**.
-  Against wasm32, confinement is **"guard-when-bounded, check-and-clamp-when-not"**
-  (trap-confinement, D38): where the effective address is *provably bounded* (the
-  common indexed-array case — `(i & K)*W`), everything elides and we approach
-  wasm32's free guarded access (bench: ~1.2–1.4× wasm32). Where the base is an
-  **unbounded value** — notably the threaded data-SP in C-frontend locals
-  (`sp + (i & 255)*8`) — we emit a bounds check + cold trap for the architectural
-  fault, plus a `& (reserved−1)` clamp on the address feeding the access for
-  Spectre-v1 confinement (§4). The clamp AND sits on the load's address-latency
-  path (as the old wrap-confinement mask did), so per-access cost ≈ the old mask
-  model; the raw check-only lowering measured faster on memory-bound kernels
-  (edn −9%, picojpeg −8%, JIT-only spike) but that win is deliberately spent on
-  keeping speculative confinement — see the §4 Spectre-v1 note. The residual
-  per-loop cost on unbounded-base loops (`matmult +5%`, `cache +6.7%`) is the
-  target of the staged **guard-relying base-hoist** (§4, D61 — proposed): hoist
-  one check+clamp of the invariant base to the preheader and elide the per-access
-  ones, gated on a `trusted_reach ≤ guard_size` invariant. Against wasm64 we
-  still win: Wasmtime's bounds-checked heaps pay a `cmp→cmov` Spectre guard on the
-  same path, one op more than our AND. Closing the wasm32 gap entirely would need
-  wasm32-style **32-bit window addressing**; we keep the clean 64-bit model (D50).
+  Confinement is **"guard-when-bounded, branchless-check-when-not"**
+  (trap-confinement, D63 — supersedes D38's `trapnz`+AND-clamp): where the
+  effective address is *provably bounded* (the common indexed-array case —
+  `(i & K)*W`), everything elides and we approach wasm32's free guarded access
+  (bench: ~1.2–1.4× wasm32). Where the base is an **unbounded value** — notably
+  the threaded data-SP in C-frontend locals (`sp + (i & 255)*8`) — the non-elided
+  access lowers to `cmp; select_spectre_guard(oob, guard, addr); load`: an
+  out-of-bounds address is redirected **branchlessly (cmov) to the window's guard
+  page**, so it faults there for the architectural trap *and* a misspeculated OOB
+  access lands on the guard for Spectre-v1 (§4). This is the **identical Cranelift
+  primitive Wasmtime uses**, so against wasm64 the per-access confinement is at
+  **parity** — not the "one op more than our AND" the D38 analysis claimed (the
+  40-bit reservation mask was not an x86 immediate, so the AND was a RIP-relative
+  *load* per access, and the `trapnz` added a per-access branch; D63's A/B found
+  removing the branch is the win, reaching matmul parity/faster). The old
+  unbounded-base regression (`matmult +5%`, `cache +6.7%`) that motivated the
+  staged **guard-relying base-hoist** (D61) is thus **closed by D63's branch
+  removal**, so D61 is deferred-as-moot rather than the active plan. Closing the
+  wasm32 gap entirely would need wasm32-style **32-bit window addressing**; we keep
+  the clean 64-bit model (D50).
+- **Vectorizable array compute:** faster — the LLVM on-ramp consumes **host** LP64
+  bitcode, so it targets the *actual* CPU's 128-bit SIMD, which is **richer than
+  wasm's portable `simd128`** (D64: compile guest C for `x86-64-v3` at 128-bit
+  width). This pulls array kernels to **parity-or-faster than Wasmtime-w64** and
+  the embench geomean **ahead** (svm-jit 1.96× vs wt64 2.00× ×native). Residual:
+  svm-jit scalarizes vector integer *width-conversions* (`edn`, ~1.4×) — the next
+  evidence-driven `v128` widen/narrow op-set slice (D58).
 - **Startup / JIT latency:** faster — SSA on the wire (no SSA reconstruction);
   decls-before-bodies ⇒ parallel per-function verify+JIT (§3a).
 - **Irregular control flow:** marginally faster — native irreducible CFG avoids
   relooper-introduced blocks/branches (§3).
 
-So "faster than wasm" is **interface + 64-bit-memory + startup + control-flow
-shape**, *not* raw compute. If raw-compute wins were ever required, the design has
-no mechanism for them without changing the backend (losing the security
-inheritance) or adding an unsafe mask-elided tier — neither is on the table.
+So "faster than wasm" is **interface + 64-bit-memory + host-native SIMD + startup +
+control-flow shape**. *Scalar* compute is **parity by construction** — sharing
+Cranelift, we cannot out-run the same backend on a tight scalar inner loop, and the
+design has no mechanism to without changing the backend (losing the security
+inheritance) or adding an unsafe mask-elided tier — neither is on the table. The
+compute win is confined to where the host on-ramp reaches an ISA wasm can't (richer
+128-bit SIMD, D64), not the scalar core.
 
 **Interface: the clearest win.** Simpler than WASI + component model + WIT +
 lift/lower (ours is scalars + `(ptr,len)` own/borrow buffers + handles, no IDL,
