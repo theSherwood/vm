@@ -48,7 +48,10 @@ void DG_DrawFrame(void) {
     __vm_host_call(g_disp, 0, (long)rgba, DOOMGENERIC_RESX, DOOMGENERIC_RESY, 0);
 }
 
-void DG_SleepMs(uint32_t ms) { (void)ms; /* the host paces frames */ }
+/* Advance the virtual clock instead of sleeping. Doom's TryRunTics busy-waits (`I_Sleep(1)`) until the
+ * clock reaches the next tic; the host paces frames (rAF), so a real sleep is wrong, but a *no-op*
+ * spins forever on a frozen clock. Advancing here lets the wait loop make deterministic progress. */
+void DG_SleepMs(uint32_t ms) { g_ticks += ms ? ms : 1; }
 
 uint32_t DG_GetTicksMs(void) { return g_ticks; }
 

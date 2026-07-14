@@ -2155,11 +2155,23 @@ phases, both worth doing:
      interpreter — the real startup log (`Z_Init`… `W_Init: adding doom1.wad`… `DOOM Shareware`…
      `R_Init`… `ST_Init`), reaching the main loop. So the libc shim is correct end-to-end (WAD
      `fread`/`fseek`, `sscanf` config, `printf`, the `malloc` zone, the string set) — **"Doom runs
-     sandboxed through the LLVM on-ramp" is proven at the init level.** Remaining: a rendered frame +
-     the byte-exact frame-hash differential vs native `cc` — a full 640×400 software render is billions
-     of instructions/frame, so it wants the **JIT** for speed (the next slice).
-  4. **Doom in the playground** — wire `doomgeneric.svmb` + `doom1.wad` + canvas + keyboard into
-     `play.js`; build/deploy via `pages.yml`.
+     sandboxed through the LLVM on-ramp" is proven at the init level.**
+  3c. **doomgeneric renders — byte-exact frame-hash differential** — **DONE (slice BS)**. `doom_diff.c`
+     is a headless platform whose `DG_DrawFrame` prints an FNV hash of each framebuffer; compiled BOTH
+     as the guest (through the on-ramp) and native `cc`, it makes the rendered output a comparable
+     frame-hash stream (the §18 oracle, like the SQLite stdout differential). The `svm-run` test
+     `doom_diff` runs the guest over an in-memory WAD and asserts its hashes equal native's
+     byte-for-byte. Over **200 frames** — the static title *and* the auto-played **demo1 (E1M1)
+     gameplay** (64 unique hashes: live BSP/wall/floor/sprite/palette rendering + player movement) —
+     guest == native **exactly**, so Doom's whole fixed-point renderer is correct through the on-ramp.
+     Key fix: `DG_SleepMs` must *advance the virtual clock* (Doom's `TryRunTics` busy-waits on the
+     clock; a no-op spins forever — that spin, not real work, was the earlier "20 B instructions to
+     boot"). With it, init + 200 frames run in **~24 s on the release bytecode interpreter, no JIT**.
+     (`crates/svm-run/demos/doom/{doom_diff.c,diff.sh}`, `crates/svm-run/tests/doom_diff.rs`.)
+  4. **Doom in the playground** — wire the reactor `.svmb` + `doom1.wad` as browser assets, grant the
+     `fs` cap in the browser `OnrampReactor`, and drive the reactor loop in `play.js` (loop + keyboard
+     already there); build/deploy via `pages.yml`. Correctness is already proven byte-exact (3c); this
+     is the visible payoff (the wasm-JIT tier may be wanted for a smooth frame rate).
 - **Other-language runtimes** (the breadth thesis, building on the C++/Rust slices AG–AM): a real Rust
   crate (`regex`/`ryu`/`serde_json` `no_std`), a Zig program, a Swift `-enable-experimental-feature
   Embedded` TU — each is "another frontend, no translator change beyond what the corpus proved."
