@@ -68,6 +68,15 @@ try {
   console.log(`  ✗ gradient: ${e.message}`);
 }
 
+// 1c) bounce — the interactive reactor demo: a C guest whose exported `tick()` the page calls once per
+//     requestAnimationFrame, steering a bouncing box with the arrow keys (the `keyboard` cap in, the
+//     `display` cap out). The per-frame run model + input waist Doom rides.
+try {
+  buildC('bounce', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'bounce.c'));
+} catch (e) {
+  console.log(`  ✗ bounce: ${e.message}`);
+}
+
 // 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
 //    from **stdin** and runs it against an in-memory database, printing each statement's result table.
 //    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +

@@ -310,6 +310,16 @@ block0(v0: i64):
       'SQLite’s VFS). The host reads the frame out of guest memory and blits it to the canvas on the ' +
       'right. This is the framebuffer output path the graphical demos (Doom) ride.',
   },
+  'bounce (interactive — arrow keys)': {
+    kind: 'reactor',
+    url: './assets/bounce.svmb',
+    mode: 'io',
+    desc: 'crates/svm-run/demos/display/bounce.c — a C guest whose exported tick() runs one frame. ' +
+      'Click Run, then steer the box with the arrow keys: the page calls tick() once per animation ' +
+      'frame (the reactor run model), feeding key events in through the `keyboard` capability and ' +
+      'blitting the frame it presents through `display`. State persists between frames. This is the ' +
+      'interactive per-frame loop + input path Doom rides. Click Stop to end the loop.',
+  },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
     editable: true,
@@ -389,10 +399,18 @@ function winSizeOf(src) {
 let eng, run, aborter = null, broken = false;
 
 function loadExample(name) {
+  stopReactor(); // switching examples ends any running reactor loop
   const ex = EXAMPLES[name];
   $('mode').value = ex.mode;
   $('desc').textContent = ex.desc;
-  if (ex.kind === 'module' && !ex.editable) {
+  if (ex.kind === 'reactor') {
+    // A per-frame reactor module: the "source" is binary; click Run to start the loop, arrow keys steer.
+    $('src').value =
+      `// ${name}\n// A pre-built on-ramp reactor module: ${ex.url}\n// Click Run — the page calls the ` +
+      `guest's tick() once per animation frame\n// (svm_onramp_open/frame), and the arrow keys steer ` +
+      `it via the keyboard capability.`;
+    $('src').readOnly = true;
+  } else if (ex.kind === 'module' && !ex.editable) {
     // A pre-built on-ramp module with a fixed program: the "source" is binary, not editable. Show a note.
     $('src').value =
       `// ${name}\n// A pre-built on-ramp module: ${ex.url}\n// Click Run — it executes as a real ` +
@@ -496,10 +514,75 @@ async function runModule(ex) {
   }
 }
 
+// ---- the reactor run model (interactive per-frame guests: bounce, eventually Doom) ----------------
+// Open a reactor module once, then drive it one `tick` per requestAnimationFrame: each frame the
+// guest runs, presents a frame (blitted to the canvas), and drains the key events we forwarded.
+let reactorRAF = null; // the pending requestAnimationFrame id while a reactor loop runs (else null)
+
+// Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
+function stopReactor() {
+  if (reactorRAF === null) return;
+  cancelAnimationFrame(reactorRAF);
+  reactorRAF = null;
+  eng.ex.svm_onramp_close();
+}
+
+async function runReactor(ex) {
+  stopReactor();
+  setState('running', 'fetching module…');
+  $('result').textContent = '';
+  $('stdout').textContent = '';
+  $('canvas').style.display = 'none';
+  let bytes;
+  try {
+    bytes = await fetchModule(ex.url);
+  } catch (e) {
+    setState('error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    return;
+  }
+  // Open the reactor: alloc, copy the module in, svm_onramp_open (decode + grant powerbox + run _start).
+  const p = eng.ex.svm_alloc(bytes.length);
+  new Uint8Array(eng.memory.buffer).set(bytes, p);
+  const opened = eng.ex.svm_onramp_open(p, bytes.length);
+  eng.ex.svm_dealloc(p, bytes.length);
+  if (opened !== 0) {
+    setState('error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
+    log(`svm_onramp_open failed: ${opened}`);
+    return;
+  }
+  log(`reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
+  setState('running', 'running — arrow keys to steer, Stop to end');
+  $('run').disabled = true;
+  $('stop').disabled = false;
+  let frames = 0;
+  const t0 = performance.now();
+  const loop = () => {
+    // svm_onramp_frame: run one tick. 0 = keep going, 5 = the guest exited, else a trap.
+    const status = eng.ex.svm_onramp_frame();
+    presentFrame(eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
+    frames++;
+    if (status === 0) {
+      reactorRAF = requestAnimationFrame(loop);
+      return;
+    }
+    reactorRAF = null;
+    eng.ex.svm_onramp_close();
+    $('run').disabled = broken;
+    $('stop').disabled = true;
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    setState(status === 5 ? 'done' : 'error',
+      status === 5 ? `guest exited after ${frames} frames · ${secs}s` : `reactor trapped: status ${status}`);
+    log(`reactor stopped: status ${status} after ${frames} frames in ${secs}s`);
+  };
+  reactorRAF = requestAnimationFrame(loop);
+}
+
 async function doRun() {
   if (broken) return;
+  stopReactor(); // a fresh Run supersedes any running reactor loop
   // A pre-built on-ramp module runs single-shot via svm_run_onramp — no in-browser parse, no Workers.
   const selected = EXAMPLES[$('example').value];
+  if (selected?.kind === 'reactor') return runReactor(selected);
   if (selected?.kind === 'module') return runModule(selected);
   // Leave the terminal states synchronously on click, so an observer (the Playwright smoke) that
   // clicks Run and polls for done/error never reads the PREVIOUS run's state.
@@ -580,7 +663,27 @@ async function main() {
   loadExample('hello');
   $('example').addEventListener('change', () => loadExample($('example').value));
   $('run').addEventListener('click', doRun);
-  $('stop').addEventListener('click', () => aborter?.abort());
+  $('stop').addEventListener('click', () => {
+    if (reactorRAF !== null) {
+      stopReactor();
+      $('run').disabled = broken;
+      $('stop').disabled = true;
+      setState('stopped', 'stopped');
+    } else {
+      aborter?.abort();
+    }
+  });
+  // Forward the arrow keys to a running reactor guest through the `keyboard` capability (JS keyCodes
+  // 37/38/39/40 = Left/Up/Right/Down — the codes bounce.c steers on). Only while a loop is running.
+  const ARROWS = new Set([37, 38, 39, 40]);
+  const forward = (pressed) => (e) => {
+    if (reactorRAF !== null && ARROWS.has(e.keyCode)) {
+      eng.ex.svm_onramp_key(e.keyCode, pressed);
+      e.preventDefault();
+    }
+  };
+  window.addEventListener('keydown', forward(1));
+  window.addEventListener('keyup', forward(0));
 
   if (!self.crossOriginIsolated) {
     setState('error', 'no cross-origin isolation (SharedArrayBuffer unavailable) — serve via serve.mjs');

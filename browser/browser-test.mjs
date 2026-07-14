@@ -174,6 +174,49 @@ try {
       `${gradOk ? 'PASS' : 'FAIL'}`);
   }
 
+  // The reactor run model + `keyboard` capability (Doom slice 2): the bounce guest's exported tick()
+  // runs once per requestAnimationFrame — it animates (the box moves frame to frame) and accepts arrow
+  // keys through the keyboard capability without trapping. (The exact input→motion mapping is pinned
+  // deterministically by the native `reactor.rs` test; here we prove the loop runs in a real browser.)
+  {
+    // Leftmost x of the amber box (255,220,40) on the canvas, or -1 if not found / no frame yet.
+    const boxX = () => play.evaluate(() => {
+      const c = document.getElementById('canvas');
+      if (!c.width || !c.height) return -1;
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      for (let x = 0; x < c.width; x++)
+        for (let y = 0; y < c.height; y++) {
+          const i = (y * c.width + x) * 4;
+          if (d[i] === 255 && d[i + 1] === 220 && d[i + 2] === 40) return x;
+        }
+      return -1;
+    });
+    await play.selectOption('#example', 'bounce (interactive — arrow keys)');
+    await play.click('#run');
+    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'running',
+      { timeout: 30_000 });
+    // Wait for the first frame (canvas sized to the guest's 160×120), then sample across ~200ms.
+    await play.waitForFunction(() => document.getElementById('canvas').width === 160, { timeout: 5000 });
+    const w = await play.$eval('#canvas', (c) => c.width);
+    const h = await play.$eval('#canvas', (c) => c.height);
+    const a = await boxX();
+    await play.waitForTimeout(200);
+    const b = await boxX();
+    // Deliver arrow keys — the guest must poll them and keep running (no trap).
+    for (let i = 0; i < 6; i++) await play.keyboard.press('ArrowLeft');
+    await play.waitForTimeout(150);
+    const c = await boxX();
+    const stateRunning = await play.$eval('#state', (e) => e.dataset.state);
+    await play.click('#stop');
+    await play.waitForFunction(() => document.getElementById('state').dataset.state === 'stopped',
+      { timeout: 5000 });
+    const bounceOk = w === 160 && h === 120 && a >= 0 && b >= 0 && c >= 0 && a !== b &&
+      stateRunning === 'running';
+    checks.push(bounceOk);
+    console.log(`  play/bounce-reactor: ${w}×${h} boxX a=${a} b=${b} c=${c} (animates=${a !== b}) ` +
+      `${bounceOk ? 'PASS' : 'FAIL'}`);
+  }
+
   const ok = pageOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: SVM runs in a real browser — powerbox + genuine multi-Worker ` +

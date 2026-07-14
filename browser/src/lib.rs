@@ -996,7 +996,11 @@ fn par_install_panic_capture() {
             // SAFETY: fixed static buffer. A concurrent double-panic may interleave bytes, but we only
             // need one legible message; publish `len` last (Release) so a reader sees a written prefix.
             unsafe {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), core::ptr::addr_of_mut!(PAR_PANIC_BUF) as *mut u8, n);
+                core::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    core::ptr::addr_of_mut!(PAR_PANIC_BUF) as *mut u8,
+                    n,
+                );
             }
             PAR_PANIC_LEN.store(n, std::sync::atomic::Ordering::Release);
         }));
@@ -1020,7 +1024,7 @@ pub extern "C" fn svm_par_last_panic_len() -> usize {
 #[no_mangle]
 pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
     par_install_panic_capture(); // I22: so a mid-run engine panic self-identifies (FILE:LINE) not a bare `unreachable`
-    // SAFETY: `v` is a live `ParVcpu` from `svm_par_root`/`svm_par_child`, owned by this Worker.
+                                 // SAFETY: `v` is a live `ParVcpu` from `svm_par_root`/`svm_par_child`, owned by this Worker.
     let v = unsafe { &mut *v };
     // Loop so §22 JIT events (serviced in-Rust against the shared powerbox) never surface to the JS
     // host — it only ever sees the multi-vCPU events `spawn`/`join`/`wait`/`notify` (+ `done`/`trap`).
@@ -1332,41 +1336,32 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     Some(svm_ir::ResolvedCap { type_id, op })
 }
 
-/// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `svm-llvm`'s synthesized `_start`
-/// expects, so a `.svmb` straight off `svm-llvm-translate` (Lua, SQLite, …) runs unchanged. This is
-/// the twin of [`powerbox_exec`] with the fixed §3e `VM_CAP_*` grant prefix instead of the browser
-/// corpus's `(…, stderr, clock)` set: capabilities are granted by the entry's **arity**, in the
-/// canonical order `stdout, stdin, exit, memory, addrspace` (mirroring `svm-run`'s
-/// `grant_powerbox_prefix`), and each is registered under its name for `cap.self.resolve`.
-///
-/// Slots 6–8 (`ioring`/`blocking`/`jit`) need region/JIT wiring the browser powerbox doesn't carry
-/// yet, so an entry with arity > 5 is **fail-closed** (`STATUS_UNSUPPORTED`) rather than mis-granted.
-/// The `fs` capability (SQLite Phase B, Lua `files.lua`) is a `host_fn` resolved by name — a Stage-1
-/// follow-on, not part of this fixed prefix.
-pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
-    let unsupported = || PbOutcome {
-        status: STATUS_UNSUPPORTED,
-        value: 0,
-        exit_code: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        framebuffer: None,
-    };
-    // Lower the on-ramp's §7 named imports (`write`/`read`/`exit`/`vm_*`) to concrete `cap.call`s
-    // before running — the step `svm-run::instantiate` does via `resolve_capability_imports`. Without
-    // it the engine sees unbound imports and fail-closes. A no-op for an import-free module.
-    let resolved = match svm_ir::resolve_imports(m, onramp_cap_resolver) {
-        Ok(r) => r,
-        Err(_) => return unsupported(),
-    };
-    let m = &resolved;
+/// A shared **keyboard event queue** (the `keyboard` capability's backing): the host pushes packed
+/// key events, the guest drains them via `__vm_cap_resolve("keyboard")` + `poll`. `Arc<Mutex<…>>` so
+/// the cap's `HostFn` closure and the host/reactor driver share one queue. Packed event layout:
+/// `(pressed << 16) | (keycode & 0xffff)` — `pressed` is 1 (down) / 0 (up); `poll` returns `-1` when
+/// empty (the doomgeneric `DG_GetKey` shape: pump until empty each frame).
+type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>>;
+
+/// Grant the **on-ramp powerbox** onto `host` for module `m`: the arity-selected §3e prefix
+/// (`stdout, stdin, exit, memory, addrspace`), each registered under its `cap.self.resolve` name,
+/// plus the two by-name graphical `HostFn` capabilities every on-ramp run carries — `display` (op 0 =
+/// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
+/// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`). Returns
+/// the entry `slots` (the prefix handles, passed to `_start`/func 0) plus the frame cell and key queue
+/// the host side reads/writes. A guest that resolves neither graphical cap is unaffected (single-shot
+/// `onramp_exec` guests: the queue stays empty, the frame cell `None`). Shared by [`onramp_exec`] and
+/// the per-frame [`OnrampReactor`], so both grant the identical powerbox.
+fn grant_onramp_caps(
+    host: &mut Host,
+    m: &svm_ir::Module,
+) -> (
+    Vec<Value>,
+    std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    KeyQueue,
+) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
-    if arity > 5 {
-        return unsupported();
-    }
-    let mut host = Host::new();
-    host.stdin = stdin.to_vec();
     let mut slots: Vec<Value> = Vec::new();
     if arity >= 1 {
         slots.push(Value::I32(host.grant_stream(StreamRole::Out)));
@@ -1388,10 +1383,7 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
             host.register_cap_name(name, *handle);
         }
     }
-    // The `display` capability (F-note: the framebuffer output waist) — a §7 by-name `HostFn`, like
-    // `fs`, granted to every on-ramp run and reached via `__vm_cap_resolve("display")`. `op 0` =
-    // `present(ptr, w, h)`: copy `w*h*4` RGBA bytes out of the guest window into the last-frame cell.
-    // A guest that never resolves it (the common case) never presents, so `framebuffer` stays `None`.
+    // `display` — the framebuffer output waist (Doom slice 1). `present(ptr, w, h)` copies the frame out.
     let frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     {
@@ -1422,6 +1414,63 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         }));
         host.register_cap_name("display", handle);
     }
+    // `keyboard` — the input waist (Doom slice 2). `poll()` dequeues one packed event, or `-1` if empty.
+    let keys: KeyQueue =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    {
+        let keys = std::sync::Arc::clone(&keys);
+        let handle = host.grant_host_fn(Box::new(move |op, _args, _mem| {
+            if op != 0 {
+                return Ok(vec![-1]); // only poll(0) is defined
+            }
+            Ok(vec![keys
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map_or(-1, |e| e as i64)])
+        }));
+        host.register_cap_name("keyboard", handle);
+    }
+    (slots, frame, keys)
+}
+
+/// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `svm-llvm`'s synthesized `_start`
+/// expects, so a `.svmb` straight off `svm-llvm-translate` (Lua, SQLite, …) runs unchanged. This is
+/// the twin of [`powerbox_exec`] with the fixed §3e `VM_CAP_*` grant prefix instead of the browser
+/// corpus's `(…, stderr, clock)` set: capabilities are granted by the entry's **arity**, in the
+/// canonical order `stdout, stdin, exit, memory, addrspace` (mirroring `svm-run`'s
+/// `grant_powerbox_prefix`), and each is registered under its name for `cap.self.resolve`.
+///
+/// Slots 6–8 (`ioring`/`blocking`/`jit`) need region/JIT wiring the browser powerbox doesn't carry
+/// yet, so an entry with arity > 5 is **fail-closed** (`STATUS_UNSUPPORTED`) rather than mis-granted.
+/// The `fs` capability (SQLite Phase B, Lua `files.lua`) is a `host_fn` resolved by name — a Stage-1
+/// follow-on, not part of this fixed prefix.
+pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    let unsupported = || PbOutcome {
+        status: STATUS_UNSUPPORTED,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    // Lower the on-ramp's §7 named imports (`write`/`read`/`exit`/`vm_*`) to concrete `cap.call`s
+    // before running — the step `svm-run::instantiate` does via `resolve_capability_imports`. Without
+    // it the engine sees unbound imports and fail-closes. A no-op for an import-free module.
+    let resolved = match svm_ir::resolve_imports(m, onramp_cap_resolver) {
+        Ok(r) => r,
+        Err(_) => return unsupported(),
+    };
+    let m = &resolved;
+    let arity = m.funcs.first().map_or(0, |f| f.params.len());
+    if arity > 5 {
+        return unsupported();
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
+    // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
+    let (slots, frame, _keys) = grant_onramp_caps(&mut host, m);
     let mut fuel = u64::MAX;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host) {
@@ -1442,6 +1491,118 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         stdout: host.stdout,
         stderr: host.stderr,
         framebuffer,
+    }
+}
+
+/// A live per-frame **reactor** over an on-ramp guest — the interactive/graphical run model (the path
+/// Doom rides), the browser twin of `svm-run`'s reactor `Session`. Instantiate once: run `_start`
+/// (func 0) to stash the granted handles and run the C initializer, then call the guest's exported
+/// `tick` once per host-driven frame. State (globals/BSS within the 256 KiB `SNAP_CAP` window)
+/// **persists** between frames via the snapshot round-trip. Each `tick` presents a frame through the
+/// `display` capability (captured into `frame`) and drains input through the `keyboard` capability
+/// (`keys`, fed by the host). Single-threaded; the guest keeps its per-frame state in globals/BSS (a
+/// grown `malloc` heap above the window is **not** persisted yet — the same slice-1 reactor scope as
+/// `svm-run`, and the reason Doom itself needs the heap-persistence follow-on).
+pub struct OnrampReactor {
+    module: svm_ir::Module,
+    host: Host,
+    /// The persisted window image (low `SNAP_CAP` bytes), round-tripped each `frame`.
+    snap: Vec<u8>,
+    /// The reactor calling convention's data-stack base (`powerbox_entry_sp`), passed to each `tick`.
+    entry_sp: u64,
+    tick: svm_ir::FuncIdx,
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    keys: KeyQueue,
+}
+
+impl OnrampReactor {
+    /// Open a reactor over `m`: lower its §7 imports, grant the powerbox (prefix + `display`/
+    /// `keyboard`), and run `_start` once (stash handles + init), keeping the window + host live.
+    /// `Err(status)` if imports don't resolve, the entry arity is out of range, there is no exported
+    /// `tick`, or `_start` traps.
+    pub fn open(m: &svm_ir::Module) -> Result<OnrampReactor, i32> {
+        let module =
+            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+        let arity = module.funcs.first().map_or(0, |f| f.params.len());
+        if arity > 5 {
+            return Err(STATUS_UNSUPPORTED);
+        }
+        // The per-frame entry: the guest's exported `tick` (reactor convention `(sp) -> …`).
+        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+        let mut host = Host::new();
+        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module);
+        // Run `_start` (func 0) once: stash the granted handles + run the initializer; capture the
+        // window image as the reactor's persistent state (seeded from empty — `m.data` fills globals).
+        let mut fuel = u64::MAX;
+        let snap = match bytecode::compile_and_run_capture_reserved_with_host(
+            &module,
+            0,
+            &slots,
+            &mut fuel,
+            &[],
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            &mut host,
+        ) {
+            Some((Ok(_), snap)) => snap,
+            Some((Err(_), _)) => return Err(STATUS_TRAP),
+            None => return Err(STATUS_UNSUPPORTED),
+        };
+        Ok(OnrampReactor {
+            module,
+            host,
+            snap,
+            entry_sp,
+            tick,
+            frame,
+            keys,
+        })
+    }
+
+    /// Run one frame: call the guest's `tick` (window seeded from the last snapshot, re-snapshotted
+    /// after), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT` = the guest
+    /// called `Exit`; `STATUS_TRAP`/`STATUS_UNSUPPORTED` = stop. The presented frame (if any) is read
+    /// via [`take_frame`](Self::take_frame).
+    pub fn frame(&mut self) -> (i32, Vec<u8>) {
+        let stdout_before = self.host.stdout.len();
+        let args = [Value::I64(self.entry_sp as i64)];
+        let mut fuel = u64::MAX;
+        let status = match bytecode::compile_and_run_capture_reserved_with_host(
+            &self.module,
+            self.tick,
+            &args,
+            &mut fuel,
+            &self.snap,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            &mut self.host,
+        ) {
+            Some((Ok(_), snap)) => {
+                self.snap = snap;
+                STATUS_OK
+            }
+            Some((Err(Trap::Exit(_)), snap)) => {
+                self.snap = snap;
+                STATUS_EXIT
+            }
+            Some((Err(_), _)) => STATUS_TRAP,
+            None => STATUS_UNSUPPORTED,
+        };
+        let delta = self.host.stdout[stdout_before..].to_vec();
+        (status, delta)
+    }
+
+    /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.frame.lock().unwrap().take()
+    }
+
+    /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
+    /// `pressed` is 1 (down) / 0 (up); `keycode` is the platform key id (e.g. a JS `keyCode`).
+    pub fn push_key(&self, keycode: i32, pressed: i32) {
+        self.keys
+            .lock()
+            .unwrap()
+            .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
     }
 }
 
@@ -1646,6 +1807,87 @@ pub extern "C" fn svm_framebuffer_width() -> u32 {
 #[no_mangle]
 pub extern "C" fn svm_framebuffer_height() -> u32 {
     unsafe { FB_H }
+}
+
+/// The live per-frame [`OnrampReactor`] (interactive/graphical guests: bounce, eventually Doom).
+/// `None` until [`svm_onramp_open`]; single-threaded wasm, so a plain static is sound.
+static mut REACTOR: Option<OnrampReactor> = None;
+
+/// Open a per-frame **reactor** over the on-ramp module at `[mod_ptr, mod_len)` (an interactive guest
+/// exporting `tick`): decode, grant the powerbox, run `_start`. Returns `0` on success, else a
+/// negative `STATUS_*`; also sets [`LAST_STATUS`]. Replaces any prior reactor. Drive it with
+/// [`svm_onramp_frame`], feed input with [`svm_onramp_key`], and read each frame via the
+/// `svm_framebuffer_*` exports; close with [`svm_onramp_close`].
+#[no_mangle]
+pub extern "C" fn svm_onramp_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    match OnrampReactor::open(&m) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(REACTOR) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// Advance the open reactor by one frame: call the guest's `tick`, stash the presented frame (read
+/// via `svm_framebuffer_*`) and any stdout delta (read via `svm_stdout_*`), and return the frame
+/// status (`0` = keep going, [`STATUS_EXIT`] = the guest exited, else a trap). Returns
+/// [`STATUS_UNSUPPORTED`] if no reactor is open. Sets [`LAST_STATUS`].
+#[no_mangle]
+pub extern "C" fn svm_onramp_frame() -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
+    let reactor = unsafe { (*core::ptr::addr_of_mut!(REACTOR)).as_mut() };
+    let Some(reactor) = reactor else {
+        set(STATUS_UNSUPPORTED);
+        return STATUS_UNSUPPORTED;
+    };
+    let (status, stdout_delta) = reactor.frame();
+    let (fb_rgba, fb_w, fb_h) = match reactor.take_frame() {
+        Some(f) => (f.rgba, f.width, f.height),
+        None => (Vec::new(), 0, 0),
+    };
+    set(status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
+        FB_W = fb_w;
+        FB_H = fb_h;
+        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout_delta);
+    }
+    status
+}
+
+/// Enqueue a key event for the open reactor's guest to `poll` next frame (`pressed`: 1 = down,
+/// 0 = up; `keycode`: the platform key id, e.g. a JS `keyCode`). No-op if no reactor is open.
+#[no_mangle]
+pub extern "C" fn svm_onramp_key(keycode: i32, pressed: i32) {
+    // SAFETY: single-threaded wasm; shared read of the reactor's key queue.
+    if let Some(reactor) = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() } {
+        reactor.push_key(keycode, pressed);
+    }
+}
+
+/// Close the open reactor, freeing its instance. Idempotent.
+#[no_mangle]
+pub extern "C" fn svm_onramp_close() {
+    // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
+    unsafe { *core::ptr::addr_of_mut!(REACTOR) = None };
 }
 
 /// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next

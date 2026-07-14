@@ -2038,9 +2038,21 @@ phases, both worth doing:
      `crates/svm-run/demos/display/gradient.c` (a deterministic 128×128 RGBA gradient). Proven
      byte-exact natively (`browser/tests/display.rs`, full-frame) and end-to-end in real Chromium
      (`browser-test.mjs` reads the canvas back). The 324 B `gradient.svmb` is committed as a web asset.
-  2. **Interactive frame loop + input capability** — a per-frame run model (the guest yields to the
-     browser event loop each frame via `requestAnimationFrame`, beyond `onramp_exec`'s
-     run-to-completion) + a `keyboard` `HostFn` cap (page keydown/keyup → guest poll).
+  2. **Interactive frame loop + input capability** — **DONE (slice BO).** The **reactor** run model:
+     instead of running `main` to completion, the host instantiates once (`svm_onramp_open` runs
+     `_start`) and calls the guest's exported `tick` **once per `requestAnimationFrame`**
+     (`svm_onramp_frame`), with globals/BSS persisting between frames via the 256 KiB `SNAP_CAP`
+     snapshot round-trip — `OnrampReactor` in `browser/src/lib.rs`, the browser twin of `svm-run`'s
+     reactor `Session` over `bytecode::compile_and_run_capture_reserved_with_host`. Input rides a new
+     by-name `keyboard` `HostFn` cap (`op 0 = poll()` → a packed `(pressed<<16)|keycode` event or
+     `-1`; the doomgeneric `DG_GetKey` shape), fed by `svm_onramp_key` from the page's keydown/keyup.
+     First guest: `crates/svm-run/demos/display/bounce.c` (a box you steer with the arrow keys).
+     Verified deterministically (`browser/tests/reactor.rs`, exact per-pixel box positions + input
+     response across frames) and end-to-end in real Chromium (`browser-test.mjs`: the box animates and
+     the arrow keys steer it). **Caveat carried to slices 3–4:** persistence covers only the low
+     `SNAP_CAP` window (globals/BSS); a grown `malloc` heap above it is **not** persisted yet — the
+     same slice-1 reactor scope as `svm-run`, and the reason Doom (heavy zone-malloc + a ~256 KB
+     320×200 framebuffer) needs the heap-persistence follow-on before it can hold state across frames.
   3. **doomgeneric headless differential** — doomgeneric + shareware WAD (via the `fs` cap) through
      the on-ramp; run headless with a frame-hashing sink, byte-exact vs native `cc` over the first N
      frames. The correctness proof before browser wiring.
