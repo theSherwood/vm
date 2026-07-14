@@ -4627,6 +4627,46 @@ fn vector_ctpop_and_wide_reduce() {
 }
 
 #[test]
+fn vector_bswap_128() {
+    // A 128-bit vector `llvm.bswap` (`<4 x i32>`) — reverses the bytes **within each lane**
+    // (element-wise, not across the register). No native vector op, so the on-ramp scalarizes: explode
+    // the lanes, `emit_bswap` each, repack (mirrors vector `ctpop`). Found in Postgres' `pg_sha256_final`
+    // (the big-endian digest write). A hand `.ll` (a `-O2` bswap loop over-vectorizes to `<16 x i32>`,
+    // a separate wide-vector-type gap): inputs `0x0N000000` byte-swap to lane `N`, folded
+    // `e0*1000 + e1*100 + e2*10 + e3` = 1234 — asymmetric, so a swapped byte or lane order is caught.
+    let ll = "declare <4 x i32> @llvm.bswap.v4i32(<4 x i32>)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %v = call <4 x i32> @llvm.bswap.v4i32(<4 x i32> <i32 16777216, i32 33554432, i32 50331648, i32 67108864>)\n  \
+        %e0 = extractelement <4 x i32> %v, i32 0\n  \
+        %e1 = extractelement <4 x i32> %v, i32 1\n  \
+        %e2 = extractelement <4 x i32> %v, i32 2\n  \
+        %e3 = extractelement <4 x i32> %v, i32 3\n  \
+        %a = mul i32 %e0, 1000\n  \
+        %b = mul i32 %e1, 100\n  \
+        %c = mul i32 %e2, 10\n  \
+        %ab = add i32 %a, %b\n  \
+        %cd = add i32 %c, %e3\n  \
+        %r = add i32 %ab, %cd\n  \
+        ret i32 %r\n}";
+    let t = svm_llvm::translate_ll_str(ll).expect("translate vector-bswap .ll");
+    svm_verify::verify_module(&t.module).expect("verify vector-bswap");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = svm_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vector-bswap");
+    assert_eq!(
+        r,
+        vec![Value::I32(1234)],
+        "bswap lanes → [1,2,3,4]; 1*1000+2*100+3*10+4 = 1234"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 1234, "JIT vector-bswap = 1234"),
+        other => panic!("JIT vector-bswap: unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn freeze_of_aggregate() {
     // `freeze` of an **aggregate** value (a small by-value struct held field-wise in `agg` — e.g. the
     // `{i32,i32,i32,i32}` a `cpuid`/multi-result call yields, which blocked Postgres' `pg_popcount_*`
