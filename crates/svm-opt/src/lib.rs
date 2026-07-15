@@ -286,7 +286,20 @@ pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
             // operand known (or `a == b`): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0.
             fold_absorbing(ty, op, a, b, known)
         }
-        Inst::IntCmp { ty, op, a, b } => fold_int_cmp(ty, op, get(known, a)?, get(known, b)?),
+        Inst::IntCmp { ty, op, a, b } => {
+            // Self-comparison folds without knowing the value: `x == x`/`x <= x`/`x >= x` are 1,
+            // `x != x`/`x < x`/`x > x` are 0. Integer only — this is unsound for floats (NaN), but
+            // float compares are `FCmp`, never here. (The other self-ops — `x-x`, `x^x`, `x&x`,
+            // `x|x` — are handled by `fold_absorbing` / `forward_to_operand`.)
+            if a == b {
+                let is_true = matches!(
+                    op,
+                    CmpOp::Eq | CmpOp::LeS | CmpOp::LeU | CmpOp::GeS | CmpOp::GeU
+                );
+                return Some(Known::I32(is_true as i32));
+            }
+            fold_int_cmp(ty, op, get(known, a)?, get(known, b)?)
+        }
         Inst::IntUn { ty, op, a } => fold_int_un(ty, op, get(known, a)?),
         Inst::Eqz { ty, a } => {
             let zero = match ty {
