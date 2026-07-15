@@ -176,6 +176,13 @@ tracked enhancement, not a blocker.
     loads at a join **not** deduped, and a 600-case randomized branchy-DAG differential (behavior
     preserved + optimizer demonstrably firing); also covered by the `opt_sccp` fuzz target (whole
     pipeline).
+  - [x] **Branch & select simplification** (in `resolve_term` / `forward_to_operand`): a
+    `br_if`/`br_table` whose targets all coincide (same block *and* args) becomes an unconditional
+    `br` (the selector computation dies for DCE, and the now-single-predecessor target merges); a
+    `select` with equal arms folds to a copy. Both are no-renumber and compound with SCCP/GVN, which
+    routinely emit such degenerate branches/selects. Tests (`tests/simplify.rs`): coincident
+    `br_if`→`br` (+ dead condition removed + block merged), coincident `br_table`→`br`, equal-arm
+    `select`→copy.
   - [ ] instcombine-style rules + strength reduction, jump threading, LICM for pure non-trapping ops.
     Each with differential + fuzz.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
