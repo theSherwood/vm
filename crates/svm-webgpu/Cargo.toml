@@ -22,3 +22,5 @@ pollster = "0.4"
 [dev-dependencies]
 svm-llvm = { path = "../svm-llvm" }
 svm-verify = { path = "../svm-verify" }
+# Encode the guest-rendered RGBA into a PNG (demo 3 artifact) in the test.
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -2559,7 +2559,16 @@ WebGPU does the validation for you (guest-authored WGSL is safe by construction)
 2. **Offscreen render-to-texture → read pixels → hash** — "hello triangle" / a rotating cube to an
    offscreen attachment, pixels compared to a reference image. Proves the render pipeline headlessly.
 3. **Compute image filter / Mandelbrot / a Shadertoy-style shader → PNG** (written via the File cap) —
-   visually compelling, deterministic, self-validating by pixel hash; a great screenshot artifact.
+   visually compelling, deterministic, self-validating; a great screenshot artifact. — **DONE.**
+   `demos/webgpu/mandelbrot.c`: a WGSL compute shader renders a Mandelbrot into an RGBA buffer, the
+   guest reads it back and writes the raw pixels out through the granted **`fs` cap** (compute + fs caps
+   **together**), and the host test encodes the PNG. Self-validated **without a fragile hardcoded hash**:
+   the imaginary-axis mapping is *center-relative* (`y0 = (py − 119.5)·scale`), so mirrored rows are
+   exact IEEE negatives and Mandelbrot conjugate symmetry makes row `py` equal row `H−1−py`
+   **bit-for-bit** — a float-implementation-independent invariant — plus an in-set/escaped sanity pair.
+   Test `demo_webgpu_mandelbrot` runs it through the on-ramp on **all three engines**, asserts the
+   self-check, and encodes the guest-written RGBA to a PNG. (A latent finding: computing `y0` from
+   `(py+0.5)/H·range−offset` is *not* bit-symmetric under f32 rounding — the center-relative form is.)
 4. **On-screen presentation (a `Surface`/swapchain capability) — defer.** Presenting to a host window is
    the OS-coupled part and a later capability; the **safe-access** narrative is fully told headless.
 
