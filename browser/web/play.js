@@ -330,6 +330,18 @@ block0(v0: i64):
       'advances if the reactor persists the guest’s whole memory (heap included) between frames. ' +
       'Click Run to watch it evolve; Stop to end. This is the heap-persistence proof Doom needs.',
   },
+  'Mandelbrot zoom (interactive — arrow keys)': {
+    kind: 'reactor',
+    url: './assets/mandelzoom.svmb',
+    mode: 'io',
+    desc: 'crates/svm-run/demos/display/mandelzoom.c — a C guest whose exported tick() computes a ' +
+      'full double-precision Mandelbrot for the current view (in the sandbox, on the CPU — no GPU) ' +
+      'and presents the RGBA frame through the `display` capability. Click Run: it auto-zooms toward ' +
+      'a seahorse valley with a cycling rainbow palette; steer the zoom target with the arrow keys. ' +
+      'Every frame is a fresh ~43k-pixel escape-time render on the wasm interpreter, so it runs at a ' +
+      'few FPS (like Doom) — the compute is all guest code, only the finished frame crosses the ' +
+      'capability boundary. Click Stop to end.',
+  },
   'DOOM (1993 — arrow keys, Ctrl fires)': {
     kind: 'reactor',
     url: './assets/doom.svmb',

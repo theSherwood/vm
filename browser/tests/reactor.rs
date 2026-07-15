@@ -150,3 +150,44 @@ fn reactor_persists_the_malloc_heap_across_frames() {
         "glider translated another (+1,+1) — deterministic across periods"
     );
 }
+
+/// Open the interactive Mandelbrot-zoom reactor (`display/mandelzoom.c`).
+fn open_mandel() -> OnrampReactor {
+    let bytes = include_bytes!("fixtures/mandelzoom.svmb");
+    let m = svm_encode::decode_module(bytes).expect("decode mandelzoom.svmb");
+    OnrampReactor::open(&m).expect("open the mandelzoom reactor")
+}
+
+/// (in-set black pixels, escaped colored pixels) of a frame.
+fn set_split(f: &Frame) -> (usize, usize) {
+    let (mut black, mut colored) = (0usize, 0usize);
+    for px in f.rgba.chunks(4) {
+        if px[0] == 0 && px[1] == 0 && px[2] == 0 {
+            black += 1;
+        } else {
+            colored += 1;
+        }
+    }
+    (black, colored)
+}
+
+#[test]
+fn reactor_mandelzoom_renders_and_animates() {
+    // A playground framebuffer demo: each `tick` computes a full Mandelbrot for the current (zooming)
+    // view on the CPU in-guest and presents it through `display`. A valid frame has both in-set
+    // (black) and escaped (colored) pixels, and — because the view zooms and the palette cycles every
+    // frame — consecutive frames differ, i.e. it animates.
+    let mut r = open_mandel();
+    let f1 = step(&mut r);
+    assert_eq!((f1.width, f1.height), (240, 180), "frame size");
+    let (black, colored) = set_split(&f1);
+    assert!(
+        black > 500 && colored > 500,
+        "a Mandelbrot frame has both in-set and escaped regions: black={black} colored={colored}"
+    );
+    let f2 = step(&mut r);
+    assert_ne!(
+        f1.rgba, f2.rgba,
+        "the view zooms / the palette cycles → the frame animates between ticks"
+    );
+}

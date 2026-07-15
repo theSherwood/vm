@@ -86,6 +86,15 @@ try {
   console.log(`  ✗ life: ${e.message}`);
 }
 
+// 1e) mandelzoom — an interactive Mandelbrot zoom: each reactor `tick()` computes a full
+//     double-precision Mandelbrot for the current (auto-zooming, arrow-steerable) view on the CPU
+//     in-guest and presents it through `display`. Pure f64 + an integer palette — no libm bundled.
+try {
+  buildC('mandelzoom', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'mandelzoom.c'));
+} catch (e) {
+  console.log(`  ✗ mandelzoom: ${e.message}`);
+}
+
 // 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
 //    from **stdin** and runs it against an in-memory database, printing each statement's result table.
 //    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +
