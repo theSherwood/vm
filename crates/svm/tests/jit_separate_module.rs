@@ -76,6 +76,7 @@ fn both(parent_src: &str) -> BothOut {
         svm_run::cap_thunk,
         &mut hj as *mut Host as *mut core::ffi::c_void,
         Some(svm_run::module_resolver),
+        None,
     )
     .expect("jit");
     (ir, imem, jo, jmem)
@@ -148,6 +149,7 @@ fn both_named(parent_src: &str) -> BothOut {
         svm_run::cap_thunk,
         &mut hj as *mut Host as *mut core::ffi::c_void,
         Some(svm_run::module_resolver),
+        None,
     )
     .expect("jit");
     (ir, imem, jo, jmem)

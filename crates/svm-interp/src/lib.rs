@@ -10970,6 +10970,43 @@ impl Host {
         }
     }
 
+    /// PROCESS.md S2 (JIT parity) — build a §14 **granted child** powerbox: a fresh `Host` holding an
+    /// `Instantiator` + `AddressSpace` over its own window `[0, child_size)` and the parent's
+    /// re-granted coordinate-free capability `grant_handle` (`Stream`/`Exit`/`Clock`). Returns the
+    /// child `Host` and its three entry-arg handles `(instantiator, address_space, grant)`, or `None`
+    /// for a forged / non-copyable handle ([`Self::resolve_copyable`]). A stdout/stderr `Stream` grant
+    /// points the child's sink at the parent's shared buffer (stdio inheritance), so the child's output
+    /// reaches the granting embedder rather than the child's discarded host buffer.
+    ///
+    /// This is the child-host construction the interpreter's own `instantiate_granted` (op 8) inlines,
+    /// factored out so the **JIT** backend can build the *same* child powerbox host-side (via
+    /// `svm_run::grant_child_build`) and keep both backends in differential lockstep — the child sees an
+    /// identical set of handles and the same shared sink.
+    pub fn spawn_granted_child(
+        &mut self,
+        grant_handle: i32,
+        child_size: u64,
+    ) -> Option<(Host, i32, i32, i32)> {
+        let (tid, binding) = self.resolve_copyable(grant_handle).ok()?;
+        let mut ch = Host::new();
+        let cinst = ch.grant_instantiator(0, child_size);
+        let cas = ch.grant_address_space(0, child_size);
+        if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
+            let sink = if r == StreamRole::Out {
+                self.shared_stdout()
+            } else {
+                self.shared_stderr()
+            };
+            if r == StreamRole::Out {
+                ch.out_sink = Some(sink);
+            } else {
+                ch.err_sink = Some(sink);
+            }
+        }
+        let cg = ch.grant(tid, binding);
+        Some((ch, cinst, cas, cg))
+    }
+
     /// **D45 allocation-free fast path for `Clock.now()`** (ISSUES.md I12). The generic
     /// [`Self::cap_dispatch_slots`] path is dominated, for a cheap cap, by the per-call `Vec` result
     /// allocation and the W1 record/replay gate — not by the work (a field read). This does the

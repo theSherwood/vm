@@ -1310,6 +1310,53 @@ pub unsafe extern "C" fn module_resolver(
     }
 }
 
+/// PROCESS.md S2 (JIT parity) — the §14 **granted-child builder** for `instantiate_granted` (op 8):
+/// re-grant one of the parent's coordinate-free capabilities (`Stream`/`Exit`/`Clock`, named by
+/// `grant_handle`) into a fresh child powerbox `Host` confined to `[0, child_size)`, so a JIT child
+/// can do I/O instead of being born destitute. The child `Host` is heap-`Box`ed and returned as the
+/// opaque `ctx` the JIT compiles the child against (`svm_run::cap_thunk` with this host), together with
+/// the three entry-arg handles (`Instantiator`, `AddressSpace`, grant). Frees nothing — the paired
+/// [`grant_child_release`] does, after the child runs. Returns `0` (an inert `CapFault`) for a forged /
+/// non-copyable handle. The grant logic lives on [`Host::spawn_granted_child`] so the interpreter and
+/// JIT build the *same* child powerbox (differential lockstep).
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the same as the cap thunk's parent host); `out` is a writable
+/// [`svm_jit::GrantChild`]. The returned `ctx` must be released with [`grant_child_release`].
+pub unsafe extern "C" fn grant_child_build(
+    ctx: *mut c_void,
+    grant_handle: i32,
+    child_size: u64,
+    out: *mut svm_jit::GrantChild,
+) -> i32 {
+    let parent = &mut *(ctx as *mut Host);
+    match parent.spawn_granted_child(grant_handle, child_size) {
+        Some((child, inst_handle, as_handle, cg)) => {
+            let boxed = Box::into_raw(Box::new(child));
+            *out = svm_jit::GrantChild {
+                ctx: boxed as *mut c_void,
+                inst_handle,
+                as_handle,
+                grant_handle: cg,
+            };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Free a child `Host` built by [`grant_child_build`] — the paired [`svm_jit::GrantChildReleaser`],
+/// called once after the granted child has run.
+///
+/// # Safety
+/// `ctx` is a [`svm_jit::GrantChild::ctx`] a `grant_child_build` returned and that has not yet been
+/// released.
+pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
+    if !ctx.is_null() {
+        drop(Box::from_raw(ctx as *mut Host));
+    }
+}
+
 /// The **host** page size: the protection granularity for `map`/`unmap`/`protect`, matching the
 /// interpreter (`svm_interp`) and the JIT (`svm-jit`) on the same host so all three agree
 /// page-for-page (§4 "pin page size", host-page default). `sysconf(_SC_PAGESIZE)` on unix,
