@@ -18,9 +18,13 @@ default = ["libm-floats"]
 libm-floats = ["dep:libm"]
 
 [dependencies]
-# The IR definition this pass transforms — the only dependency (keeps the crate translatable to
-# svm-IR for the in-sandbox build, and its review surface tiny).
+# The IR definition this pass transforms.
 svm-ir.workspace = true
+# Per-SSA-value types (`func_value_types`) — needed by GVN to declare correctly-typed block
+# parameters when it threads a value across blocks. Reusing the verifier's own typing keeps the
+# threaded types exactly what re-verification expects. `svm-verify` is itself `no_std` + svm-ir-only
+# (peval already depends on it), so this preserves the in-sandbox translatability.
+svm-verify.workspace = true
 # `sqrt`/`ceil`/`floor`/`trunc`/round-ties-even/`fma` are not in `core` (std-only); the float folds use
 # libm for them. Optional (see the `libm-floats` feature): the in-svm svm-IR build drops it because
 # libm's `fma` brings untranslatable x86 inline-asm + i128. Correctly-rounded, so bit-identical to the

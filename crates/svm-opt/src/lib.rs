@@ -81,6 +81,7 @@ use svm_ir::{
 };
 
 pub mod cfg;
+pub mod gvn;
 pub mod sccp;
 pub mod ssa;
 
@@ -157,11 +158,19 @@ impl Known {
 /// stale once we fold instructions and drop blocks (it is strippable and untrusted for escape, §3a).
 pub fn optimize_module(m: &Module) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let has_memory = m.memory.is_some();
     Module {
         funcs: m
             .funcs
             .iter()
-            .map(|f| optimize_func(f, &fn_results))
+            .map(|f| {
+                // Global value numbering (OPT.md Phase 2) runs before the per-function cleanup: it
+                // eliminates cross-block redundant pure computations (threading the dominating value
+                // through block params), then `optimize_func` (SCCP + fixpoint) DCEs the dead
+                // duplicates and drops any parameter left unused.
+                let g = gvn::gvn(f, &m.funcs, has_memory);
+                optimize_func(&g, &fn_results)
+            })
             .collect(),
         memory: m.memory,
         data: m.data.clone(),

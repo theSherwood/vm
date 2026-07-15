@@ -164,9 +164,20 @@ tracked enhancement, not a blocker.
     so the earlier def trivially dominates, no param threading. Tests (`tests/cse.rs`): redundant add
     deduped, nested equal subexpressions, and identical loads **not** deduped. Covered by the
     `opt_sccp` fuzz target (now exercises the whole `optimize_module` pipeline).
-  - [ ] **Global GVN** (dominator-based, across blocks) — brings the cross-block-use param-threading
-    lowering in `from_ssa` (its first consumer). Then instcombine-style rules + strength reduction,
-    jump threading, LICM for pure non-trapping ops. Each with differential + fuzz.
+  - [x] **Global GVN** (`svm_opt::gvn`): value-number **congruence** (a block parameter is congruent
+    to the value passed to it when every predecessor agrees), iterated to a fixpoint, so a
+    recomputation at a **multi-predecessor join** is recognized as redundant even though its operands
+    are fresh parameters — the case `merge_blocks` + `local_cse` cannot reach. A congruent value whose
+    definition **dominates** the redundant one is threaded to it by adding block parameters + edge args
+    along the intervening edges (the internal SSA form's first cross-block-use lowering); new params
+    are typed via the verifier's `func_value_types`, so the threaded IR re-verifies. Only pure ops get
+    a shared number (loads/atomics/calls stay unique). Runs before the per-function cleanup. Tests
+    (`tests/gvn.rs`): diamond-join redundancy, a derived two-level expression across a diamond, impure
+    loads at a join **not** deduped, and a 600-case randomized branchy-DAG differential (behavior
+    preserved + optimizer demonstrably firing); also covered by the `opt_sccp` fuzz target (whole
+    pipeline).
+  - [ ] instcombine-style rules + strength reduction, jump threading, LICM for pure non-trapping ops.
+    Each with differential + fuzz.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).
