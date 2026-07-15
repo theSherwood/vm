@@ -372,12 +372,15 @@ impl MemFsState {
                         d.clone()
                     }
                     None => {
-                        // Opening a **directory** (no matching file, but a known dir) — e.g. Postgres
-                        // `fsync`s directories at checkpoint via `open(dir, O_RDONLY)` + `fsync`. Return
-                        // a read-only fd over an empty buffer: `sync`/`close` succeed, reads yield EOF,
-                        // writes are refused (matches a real directory fd). Checked before `O_CREATE` so
-                        // a create over an existing dir name doesn't shadow it with a file.
-                        if self.is_dir(&path) {
+                        // A **read-only** open of an explicitly-tracked directory (`mkdir`'d or seeded)
+                        // — e.g. Postgres `fsync`s directories at checkpoint via `open(dir, O_RDONLY)` +
+                        // `fsync`. Return a read-only fd over an empty buffer: `sync`/`close` succeed,
+                        // reads yield EOF, writes are refused (matches a real directory fd). Narrow by
+                        // design: only a read-only open (a write/create never resolves to a dir), and
+                        // only `dirs` (not the `""` root or a mere file-key prefix), so an ordinary
+                        // `open(name, "w")` that happens to prefix another file still creates a file.
+                        let write_intent = flags & (O_CREATE | O_WRITE | O_APPEND | O_TRUNC) != 0;
+                        if !write_intent && self.dirs.contains(&path) {
                             let o = MemOpen {
                                 data: Arc::new(Mutex::new(Vec::new())),
                                 pos: 0,
@@ -1715,6 +1718,32 @@ mod tests {
         let mode = u32::from_le_bytes(win[SB..SB + 4].try_into().unwrap());
         assert_eq!(mode & S_IFMT, S_IFDIR, "seeded 'sub' is a directory");
         assert_eq!(mode & 0o777, 0o700, "in-memory dir reports owner-only 0700");
+
+        // The directory-open path is deliberately narrow: a read-only open of a name that is neither a
+        // file nor a *tracked* directory is still `-ENOENT` — it must not resolve arbitrary paths to a
+        // directory fd (the over-broad `is_dir` version silently opened file-key prefixes and the root,
+        // which broke ordinary `open`s on the general in-memory fs).
+        let (np, nl) = put(&mut win, PA, "sub/nope");
+        assert_eq!(
+            call(&mut host, h, &mut win, FS_OPEN, &[np, nl, O_READ, 0]),
+            -ENOENT,
+            "read-only open of a non-file, non-tracked-dir path is ENOENT (dir-open stays narrow)"
+        );
+        // And a create still makes a *file* even where a dir subtree exists alongside (write intent
+        // never resolves to a directory fd).
+        let (cp, cl) = put(&mut win, PA, "sub/new");
+        let cfd = call(
+            &mut host,
+            h,
+            &mut win,
+            FS_OPEN,
+            &[cp, cl, O_CREATE | O_WRITE, 0],
+        );
+        assert!(
+            cfd >= 0,
+            "create under a seeded subtree opens a writable file"
+        );
+        call(&mut host, h, &mut win, FS_CLOSE, &[cfd, 0, 0, 0]);
     }
 
     /// `opendir` snapshots entries and `readdir` yields them **sorted**, deterministically, across
