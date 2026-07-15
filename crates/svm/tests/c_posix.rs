@@ -96,6 +96,9 @@ fn resolve(name: &str) -> Option<ResolvedCap> {
         "px_write" => svm_posix::OP_WRITE,
         "px_read" => svm_posix::OP_READ,
         "lseek" => svm_posix::OP_LSEEK,
+        "getcwd" => svm_posix::OP_GETCWD,
+        "chdir" => svm_posix::OP_CHDIR,
+        "getenv" => svm_posix::OP_GETENV,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -144,8 +147,10 @@ fn to_slot(v: Value) -> i64 {
 
 /// Compile + resolve (through [`resolve`]) + verify a C program, then run `_start` on **both**
 /// backends under identical personalities and return each backend's observable effects for the
-/// caller to compare. Panics with the IR on a parse/verify/trap so failures are legible.
-fn run_both(src: &str) -> (Effects, Effects) {
+/// caller to compare. `prep` stages each backend's personality identically before the run (seed the
+/// environment / memfs); pass a no-op when there is nothing to stage. Panics with the IR on a
+/// parse/verify/trap so failures are legible.
+fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     let ir = c_to_ir(src);
     let raw = parse_module_raw(&ir)
         .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
@@ -157,6 +162,7 @@ fn run_both(src: &str) -> (Effects, Effects) {
     // Interpreter.
     let mut ih = Host::new();
     let (iargs, iposix) = setup(&mut ih, win);
+    prep(&iposix);
     let mut fuel = 50_000_000u64;
     let ires = run_with_host(&m, 0, &iargs, &mut fuel, &mut ih)
         .unwrap_or_else(|e| panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"));
@@ -169,6 +175,7 @@ fn run_both(src: &str) -> (Effects, Effects) {
     // JIT.
     let mut jh = Host::new();
     let (jargs, jposix) = setup(&mut jh, win);
+    prep(&jposix);
     let slots: Vec<i64> = jargs.iter().copied().map(to_slot).collect();
     let jout = compile_and_run_with_host(
         &m,
@@ -205,6 +212,9 @@ long open(int h, long path, long len, long flags);
 long px_write(int h, long fd, long buf, long len);
 long px_read(int h, long fd, long buf, long len);
 long lseek(int h, long fd, long off, long whence);
+long getcwd(int h, long buf, long size);
+long chdir(int h, long path, long len);
+long getenv(int h, long name, long len);
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 "#;
@@ -233,7 +243,7 @@ int main() {{\n\
   return (int)fd;                          /* the first file fd is 3 */\n\
 }}\n"
     );
-    let (interp, jit) = run_both(&src);
+    let (interp, jit) = run_both(&src, |_| {});
 
     // Interpreter reference: first file fd is 3; stdout got "hi\n" twice; the memfs file holds "hi\n".
     assert_eq!(
@@ -252,4 +262,39 @@ int main() {{\n\
     assert_eq!(jit.result, vec![Value::I64(3)], "jit: fd must match interp");
     assert_eq!(jit.stdout, interp.stdout, "jit: stdout must match interp");
     assert_eq!(jit.file_f, interp.file_f, "jit: memfs must match interp");
+}
+
+/// The **environment + cwd** surface from compiled C: `getenv` a variable the embedder staged, echo
+/// its value; then `chdir` and read the new directory back with `getcwd`, echo that. Proves the
+/// host-side env map and cwd (POSIX.md §3) are reachable through the same named-import path — the
+/// pieces a shell needs for `$PATH` / `cd` / `pwd`. Both backends must agree on the echoed bytes.
+#[test]
+fn c_reads_env_and_cwd_through_the_personality() {
+    let src = format!(
+        "{SHIM}\n\
+int main() {{\n\
+  int h = __vm_cap({POSIX_SLOT});\n\
+  long p = getenv(h, (long)\"PATH\", 4);   /* staged host-side as \"/bin\" */\n\
+  if (p) px_write(h, 1, p, 4);            /* -> \"/bin\" */\n\
+  chdir(h, (long)\"/tmp\", 4);\n\
+  char *buf = (char *)malloc(h, 64);\n\
+  getcwd(h, (long)buf, 64);               /* NUL-terminated new cwd */\n\
+  px_write(h, 1, (long)buf, slen(buf));   /* -> \"/tmp\" */\n\
+  return 0;\n\
+}}\n"
+    );
+    // Stage `PATH=/bin` in each backend's personality before the run (the embedder's environment).
+    let (interp, jit) = run_both(&src, |px| px.set_env("PATH", "/bin"));
+
+    assert_eq!(interp.result, vec![Value::I32(0)], "interp: main returns 0");
+    assert_eq!(
+        interp.stdout, b"/bin/tmp",
+        "interp: getenv(PATH) then getcwd after chdir"
+    );
+    assert_eq!(
+        jit.result,
+        vec![Value::I64(0)],
+        "jit: result must match interp"
+    );
+    assert_eq!(jit.stdout, interp.stdout, "jit: stdout must match interp");
 }
