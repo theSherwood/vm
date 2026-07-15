@@ -349,4 +349,94 @@ block0(vph: i32):\n\
             "unknown libc name fails closed"
         );
     }
+
+    /// The **real linking path**: a module that *imports* the libc names `malloc`/`write` (never
+    /// hand-writes a `cap.call`), exactly what a chibicc/`svm-llvm` frontend emits for unresolved libc
+    /// symbols. `svm_ir::resolve_imports` binds each name through [`resolve`] and lowers every
+    /// `call.import` to a `cap.call` on the personality's handle — the same program, now import-free,
+    /// runs identically on both backends. Semantically identical to `MALLOC_WRITE` (→ `2_004096`, `"hi"`),
+    /// so it proves the *binding*, not new behavior.
+    const IMPORT_MALLOC_WRITE: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block0(vph: i32):\n\
+  vsz = i64.const 2\n\
+  vptr = call.import \"malloc\" (i64) -> (i64) vph (vsz)\n\
+  vh = i32.const 104\n\
+  i32.store8 vptr vh\n\
+  vone = i64.const 1\n\
+  vp1 = i64.add vptr vone\n\
+  vi = i32.const 105\n\
+  i32.store8 vp1 vi\n\
+  vfd = i64.const 1\n\
+  vn = call.import \"write\" (i64, i64, i64) -> (i64) vph (vfd, vptr, vsz)\n\
+  vk = i64.const 1000000\n\
+  vt = i64.mul vn vk\n\
+  vr = i64.add vt vptr\n\
+  return vr\n\
+}\n";
+
+    #[test]
+    fn named_imports_bind_through_resolve_and_run() {
+        let m = parse_module(IMPORT_MALLOC_WRITE).expect("parse");
+        assert_eq!(
+            m.imports
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            ["malloc", "write"],
+            "the module declares the libc names it imports"
+        );
+        // §7 late binding: bind each import name through the personality's resolver, lowering
+        // `call.import` → `cap.call` on the handle operand. Fails closed on an unknown name.
+        let resolved = svm_ir::resolve_imports(&m, resolve).expect("all libc imports resolve");
+        assert!(
+            resolved.imports.is_empty(),
+            "resolution drops the import section — the result is import-free"
+        );
+        verify_module(&resolved).expect("verify the resolved module");
+
+        // Run the resolved (import-free) module on both backends with the personality granted.
+        let mut ih = Host::new();
+        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, Vec::new());
+        let mut fuel = 5_000_000u64;
+        let ir = run_capture_reserved_with_host(
+            &resolved,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[0u8; WIN],
+            0,
+            &mut ih,
+        )
+        .0;
+        let mut jh = Host::new();
+        let (jh_handle, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
+        let jo = compile_and_run_capture_reserved_with_host(
+            &resolved,
+            0,
+            &[jh_handle as i64],
+            &[0u8; WIN],
+            0,
+            svm_run::cap_thunk,
+            &mut jh as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit")
+        .0;
+
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(2_004_096)]),
+            "interp: malloc+write through bound imports"
+        );
+        assert_eq!(
+            iposix.stdout(),
+            b"hi",
+            "interp: personality captured the write"
+        );
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[2_004_096]),
+            "jit: bound-import run must match interp, got {jo:?}"
+        );
+        assert_eq!(jposix.stdout(), b"hi", "jit: stdout must match interp");
+    }
 }
