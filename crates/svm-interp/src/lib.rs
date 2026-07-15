@@ -9309,6 +9309,15 @@ pub enum StreamRole {
 #[derive(Clone, Copy, Debug)]
 enum Binding {
     Stream(StreamRole),
+    /// A **host-served pipe** end (§4/S4, the personality's byte IPC): resolves under iface `STREAM`
+    /// (a pipe end *is* a stream — the personality treats it as an fd), carrying the index of its FIFO
+    /// in [`Host::pipes`] and which half it is. `write = true` appends to the FIFO (op 1), `false`
+    /// drains it (op 0) — non-blocking: a read of an empty pipe returns `0`. Index-carrying, so
+    /// non-durable and non-copyable, like [`Binding::SharedRegion`].
+    PipeEnd {
+        pipe: u32,
+        write: bool,
+    },
     Exit,
     Clock,
     Memory,
@@ -9480,6 +9489,7 @@ pub enum NonDurableKind {
     JitCode,
     HostFn,
     Budget,
+    Pipe,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -9790,6 +9800,10 @@ pub struct Host {
     /// remaining resource-quota vector; `split` moves quota from a parent's entry into a fresh child
     /// entry (append-only, like `regions` — a split budget's index stays valid for the run).
     budgets: Vec<BudgetState>,
+    /// §4 / S4 **host-served pipe** FIFOs, indexed by the id a [`Binding::PipeEnd`] carries. Each is a
+    /// byte queue a `write` end appends to and a `read` end drains — the personality's intra-domain byte
+    /// IPC. Append-only vector (a pipe's index stays valid for the run), like `regions`/`budgets`.
+    pipes: Vec<std::collections::VecDeque<u8>>,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `cap.self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -10007,6 +10021,7 @@ impl Host {
             clock_ns: 0,
             regions: Vec::new(),
             budgets: Vec::new(),
+            pipes: Vec::new(),
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -10409,6 +10424,7 @@ impl Host {
                     return Err(self.non_durable(slot, NonDurableKind::HostFn))
                 }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
+                Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -10461,6 +10477,7 @@ impl Host {
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
                 Binding::Budget(_) => NonDurableKind::Budget,
+                Binding::PipeEnd { .. } => NonDurableKind::Pipe,
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -10521,6 +10538,21 @@ impl Host {
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
     pub fn grant_stream(&mut self, role: StreamRole) -> i32 {
         self.grant(iface::STREAM, Binding::Stream(role))
+    }
+
+    /// §4 / S4 — mint a **host-served pipe** and grant both ends, returning `(write_handle,
+    /// read_handle)`. Both are `Stream`-typed (a pipe end is a stream: read/write/close), backed by one
+    /// FIFO in [`Host::pipes`]: bytes written to the write end are drained by the read end (non-blocking,
+    /// FIFO order). The personality's byte-IPC primitive — a shell wiring `cmd1 | cmd2` grants each side
+    /// one end. (Cross-domain granting of an end into a child is a follow-up — the FIFO would move to a
+    /// shared backing, like `SharedRegion`; today both ends live in the minting domain, e.g. between its
+    /// own fibers.)
+    pub fn grant_pipe(&mut self) -> (i32, i32) {
+        let pipe = self.pipes.len() as u32;
+        self.pipes.push(std::collections::VecDeque::new());
+        let w = self.grant(iface::STREAM, Binding::PipeEnd { pipe, write: true });
+        let r = self.grant(iface::STREAM, Binding::PipeEnd { pipe, write: false });
+        (w, r)
     }
 
     /// PROCESS.md S2 — promote `stdout` to a **shared** sink and return a handle to it, so a child
@@ -11373,6 +11405,7 @@ impl Host {
         }
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
+            Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
             // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
             // then restore it — a panic would only poison this one slot, never the host.
@@ -12144,6 +12177,64 @@ impl Host {
                     None if role == StreamRole::Out => self.stdout.extend_from_slice(&bytes),
                     None => self.stderr.extend_from_slice(&bytes),
                 }
+                ret(len as i64)
+            }
+            2 => ret(0), // close: no-op in the MVP (exit reclaims all)
+            _ => ret(EINVAL),
+        }
+    }
+
+    /// §4 / S4 host-served **pipe** end, dispatched under iface `STREAM` (a pipe end *is* a stream).
+    /// Non-blocking: the `read` half drains bytes the `write` half has queued (op 0), a `read` of an
+    /// empty pipe returns `0`; the `write` half appends (op 1). Wrong-direction ops are `-EINVAL`. Same
+    /// `(buf, len) -> n | -errno` shapes as `stream_op`, so a personality's fd layer treats a pipe end
+    /// and a stdio stream identically.
+    fn pipe_op(
+        &mut self,
+        pipe: u32,
+        write: bool,
+        op: u32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let ret = |v: i64| Ok(vec![v]);
+        let Some(fifo) = self.pipes.get_mut(pipe as usize) else {
+            return ret(EINVAL);
+        };
+        match op {
+            0 => {
+                // read(buf, len) -> n; only the read end is readable.
+                if write {
+                    return ret(EINVAL);
+                }
+                let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+                let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                let n = (len as usize).min(fifo.len());
+                let chunk: Vec<u8> = fifo.drain(..n).collect();
+                let Some(m) = mem else {
+                    return ret(EFAULT);
+                };
+                if m.write_bytes(ptr, &chunk).is_none() {
+                    // The bytes are already drained; a fail-closed buffer is the guest's bug, but keep
+                    // them out of the FIFO rather than re-queue (matches `stream_op`'s stdin semantics).
+                    return ret(EFAULT);
+                }
+                ret(n as i64)
+            }
+            1 => {
+                // write(buf, len) -> n; only the write end is writable.
+                if !write {
+                    return ret(EINVAL);
+                }
+                let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+                let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                let Some(m) = mem else {
+                    return ret(EFAULT);
+                };
+                let Some(bytes) = m.read_bytes(ptr, len) else {
+                    return ret(EFAULT);
+                };
+                fifo.extend(bytes);
                 ret(len as i64)
             }
             2 => ret(0), // close: no-op in the MVP (exit reclaims all)
