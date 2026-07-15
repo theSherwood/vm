@@ -2372,7 +2372,11 @@ phases, both worth doing:
 
 ### Suggested ladder (cheap momentum → the capstones)
 1. **Monocypher KAT** + **stb_image decode** — **DONE** (slices BG + BH): zero-OS, byte-exact; widen the corpus and shook out
-   64-bit/parser bugs fast. (A SAT solver / `perft` slot in here too — pure compute, self-validating.)
+   64-bit/parser bugs fast. A **DPLL SAT solver** now fills the "pure compute, self-validating" slot too —
+   **DONE** (`demos/sat/sat.c`, `demo_sat_vs_native`): backtracking search + unit propagation (a branchy,
+   array/pointer-heavy, deeply-recursive shape unlike the corpus hashers/parsers), self-validating via
+   **planted** random 3-SAT (SAT by construction, the model re-checked against every clause in-guest) and
+   **pigeonhole** PHP(3,2)/(4,3) (the classic UNSAT family); byte-identical to native on all three engines.
 2. **`indirectbr` / `blockaddress` (computed goto)** — DONE (slices AV + AW: global tables + φ-threaded
    operand-position). Robust for real interpreters.
 3. **`setjmp`/`longjmp`** — DONE on the interpreter (slice AX); JIT `longjmp` (native-stack switch) +

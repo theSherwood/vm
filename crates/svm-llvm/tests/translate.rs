@@ -4679,6 +4679,19 @@ fn demo_pg_sscanf_vs_native() {
 }
 
 #[test]
+fn demo_sat_vs_native() {
+    // A **DPLL SAT solver** (`demos/sat/sat.c`) — a self-validating pure-compute correctness
+    // indicator (LLVM.md ladder: "a SAT solver / perft slot in here too"). Backtracking search with
+    // unit propagation is branchy, array/pointer-heavy, and deeply recursive — a different translator
+    // shape from the corpus's hashers/parsers. Self-validating two ways: **planted** random 3-SAT
+    // instances are SAT by construction and the model is re-checked against every clause in-guest
+    // (`verify=OK`); **pigeonhole** PHP(3,2)/(4,3) are the classic UNSAT family. The fixed decision
+    // heuristic (lowest var, true-first) makes the model deterministic, so the on-ramp output is
+    // byte-identical to native `cc` on all three engines.
+    check_demo_vs_native("sat", "sat/sat.c", b"");
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
