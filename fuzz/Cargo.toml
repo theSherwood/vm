@@ -36,6 +36,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "opt_sccp"
+path = "fuzz_targets/opt_sccp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "decode_verify"
 path = "fuzz_targets/decode_verify.rs"
 test = false

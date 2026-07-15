@@ -116,10 +116,9 @@ tracked enhancement, not a blocker.
 
 ## Plan
 
-- [ ] **Phase 0 — carve-out.** Create `crates/svm-opt` (workspace member; `no_std + alloc`,
-  `forbid(unsafe_code)`, optional `libm`); move `optimize_module` + fold/remap machinery out of
-  `svm-peval`; re-point `svm-peval` / `svm-run`; existing optimize/specialize/bench tests stay
-  green. Pure refactor, no behavior change.
+- [x] **Phase 0 — carve-out.** Created `crates/svm-opt` (`no_std + alloc`, `forbid(unsafe_code)`,
+  optional `libm`); moved `optimize_module` + fold/remap machinery out of `svm-peval`; re-pointed
+  `svm-peval` / `svm-run`. Pure refactor, no behavior change; all existing tests green.
 - [ ] **Phase 1 — infrastructure.**
   - [x] **(a) The per-`Inst` effects/trap table in `svm-ir`** ([`Inst::effects`] → [`Effects`]:
     `can_trap` / `reads_mem` / `writes_mem` / `side_effect`; `is_pure` + `removable_if_dead`
@@ -145,9 +144,20 @@ tracked enhancement, not a blocker.
     (no configurability until something concrete demands it), this lands with the first budgeted pass
     (the inliner / unroller), where a size/fuel budget actually bites; adding toggles now, with only
     the always-on cleanup passes, would be speculative surface.
-- [ ] **Phase 2 — global scalar passes.** SCCP (subsumes and globalizes today's fold + branch
-  resolution), GVN/CSE, instcombine-style rules + strength reduction, jump threading, LICM for
-  pure non-trapping ops. Each pass lands with its own differential + fuzz coverage.
+- [ ] **Phase 2 — global scalar passes.**
+  - [x] **SCCP** (`svm_opt::sccp`): sparse conditional constant propagation on the internal SSA
+    form — a `Top ⊒ Const ⊒ Bottom` lattice propagated across the CFG (through block-parameter phis
+    and loops) together with per-edge executability, so a value is only marked varying on account of
+    edges that can actually be taken. The transfer function reuses `try_fold` (interpreter-exact), so
+    a trapping/effectful op is never marked constant; the rewrite materializes constants and resolves
+    constant branches, then the existing fixpoint prunes/DCEs/merges. Runs first in `optimize_func`.
+    Because it only materializes constants, lowering needs no block-param threading. Differential +
+    structural tests (`tests/sccp.rs`: multi-pred const param, cross-block branch resolution,
+    loop-invariant fold, trapping-div-not-folded) and the `opt_sccp` cargo-fuzz target (gen → verify
+    → optimize → **re-verify** + interp differential). The existing optimize/peval harnesses (which
+    now run through SCCP) stay green.
+  - [ ] GVN/CSE (needs the cross-block-use param threading in `from_ssa`), instcombine-style rules +
+    strength reduction, jump threading, LICM for pure non-trapping ops. Each with differential + fuzz.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).

@@ -81,6 +81,7 @@ use svm_ir::{
 };
 
 pub mod cfg;
+pub mod sccp;
 pub mod ssa;
 
 /// A value known to be a constant at optimization time. Tracks scalar integers/floats and `v128`.
@@ -174,6 +175,11 @@ pub fn optimize_module(m: &Module) -> Module {
 /// straight-line chains, drop dead block parameters, and drop dead values — repeating until
 /// nothing changes. Every pass only simplifies, so this terminates; the cap guards pathologies.
 pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
+    // SCCP (OPT.md Phase 2) runs first: it propagates constants *globally* — through block
+    // parameters and around loops, with conditional reachability — folding what the per-block passes
+    // below cannot see. It materializes constants and resolves constant branches; the fixpoint then
+    // prunes the newly-unreachable blocks, DCEs the dead selector code, merges, and re-folds.
+    let f = sccp::sccp(f, fn_results);
     let mut blocks: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
     for _ in 0..1000 {
         let before = blocks.clone();
@@ -235,7 +241,7 @@ fn fold_block(b: &Block, fn_results: &[usize]) -> Block {
 
 /// The constant an instruction *is*, if it is a literal `const` (after folding, every folded
 /// op has become one of these). Other instructions carry no statically-known value.
-fn const_value(inst: &Inst) -> Option<Known> {
+pub(crate) fn const_value(inst: &Inst) -> Option<Known> {
     match *inst {
         Inst::ConstI32(v) => Some(Known::I32(v)),
         Inst::ConstI64(v) => Some(Known::I64(v)),
@@ -247,7 +253,7 @@ fn const_value(inst: &Inst) -> Option<Known> {
 }
 
 /// Read a block-local value as a known constant, if it is one.
-fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
+pub(crate) fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
     known.get(idx as usize).copied().flatten()
 }
 
@@ -255,7 +261,7 @@ fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
 /// an operand is not known, the op is not foldable, or folding it would trap (div/rem by
 /// zero or signed overflow) — in which case the original instruction is kept so the residual
 /// traps identically to the source.
-fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
+pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
     match *inst {
         Inst::IntBin { ty, op, a, b } => {
             // Both operands known: the exact arithmetic fold.
@@ -1576,7 +1582,7 @@ fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
 /// Resolve a conditional terminator to an unconditional `br` when its selector is a known
 /// constant, using the interpreter's exact selection rule. Non-constant selectors (and the
 /// already-unconditional terminators) are returned unchanged.
-fn resolve_term(t: &Terminator, known: &[Option<Known>]) -> Terminator {
+pub(crate) fn resolve_term(t: &Terminator, known: &[Option<Known>]) -> Terminator {
     match t {
         Terminator::BrIf {
             cond,
@@ -1959,7 +1965,7 @@ pub fn map_term_operands(t: &mut Terminator, f: &mut impl FnMut(ValIdx) -> ValId
 
 /// Visit (read-only) every value operand of an instruction. Implemented on a throwaway clone
 /// through [`map_operands`], so there is a single source of truth for "what the operands are".
-fn each_operand(inst: &Inst, mut visit: impl FnMut(ValIdx)) {
+pub(crate) fn each_operand(inst: &Inst, mut visit: impl FnMut(ValIdx)) {
     let mut tmp = inst.clone();
     map_operands(&mut tmp, &mut |v| {
         visit(v);
