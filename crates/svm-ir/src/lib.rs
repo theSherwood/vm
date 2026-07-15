@@ -3795,7 +3795,11 @@ mod effects_tests {
                 a: 0,
                 b: 1,
             },
-            Inst::Select { cond: 0, a: 1, b: 2 },
+            Inst::Select {
+                cond: 0,
+                a: 1,
+                b: 2,
+            },
             Inst::FToISat {
                 op: FToI::F64I32S,
                 a: 0,

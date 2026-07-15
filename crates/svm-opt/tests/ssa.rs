@@ -70,7 +70,7 @@ fn block_params_and_brif_identity() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
-                params: vec![ValType::I32], // v0 = a
+                params: vec![ValType::I32],     // v0 = a
                 insts: vec![Inst::ConstI32(0)], // v1
                 term: Terminator::BrIf {
                     cond: 0,
@@ -98,7 +98,7 @@ fn br_table_and_loop_identity() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
-                params: vec![ValType::I32], // v0 = n
+                params: vec![ValType::I32],     // v0 = n
                 insts: vec![Inst::ConstI32(0)], // v1 = acc0
                 term: Terminator::Br {
                     target: 1,
@@ -124,8 +124,8 @@ fn br_table_and_loop_identity() {
                 ],
                 term: Terminator::BrTable {
                     idx: 0,
-                    targets: vec![(2, vec![2])],       // idx 0 -> exit with acc
-                    default: (1, vec![4, 2]),          // else loop with (i-1, acc)
+                    targets: vec![(2, vec![2])], // idx 0 -> exit with acc
+                    default: (1, vec![4, 2]),    // else loop with (i-1, acc)
                 },
             },
             Block {
@@ -299,7 +299,7 @@ fn random_func(rng: &mut Lcg) -> Func {
             slots += 1; // both ops above append exactly one result
         }
         // A valid local index for edge args (fall back to 0 when the block is empty of slots).
-        let mut arg = |rng: &mut Lcg| if slots == 0 { 0 } else { rng.upto(slots) };
+        let arg = |rng: &mut Lcg| if slots == 0 { 0 } else { rng.upto(slots) };
         let term = match rng.upto(4) {
             0 => Terminator::Return(if slots == 0 { vec![] } else { vec![arg(rng)] }),
             1 => Terminator::Br {

@@ -32,11 +32,13 @@ pub use specialize::{
 // The generic optimizer + remap helpers moved to `svm-opt` (see `OPT.md` Phase 0). Re-exported so
 // existing consumers (`svm-run`, the `svm-llvm` demos, this crate's own tests) keep working through
 // the `svm_peval::` path.
-pub use svm_opt::{is_removable_if_dead, map_operands, map_term_operands, optimize_func, optimize_module};
+pub use svm_opt::{
+    is_removable_if_dead, map_operands, map_term_operands, optimize_func, optimize_module,
+};
 
 // The constant-fold machinery the specializer reuses. `pub(crate)` re-exports keep the specializer's
 // `crate::fold_*` / `crate::Known` paths resolving without widening this crate's public surface.
 pub(crate) use svm_opt::{
-    fold_cast, fold_fbin, fold_fcmp, fold_fma, fold_ftoi_sat, fold_ftoi_trap, fold_fun, fold_int_bin,
-    fold_int_cmp, fold_int_un, fold_itof, fold_simd, Known,
+    fold_cast, fold_fbin, fold_fcmp, fold_fma, fold_ftoi_sat, fold_ftoi_trap, fold_fun,
+    fold_int_bin, fold_int_cmp, fold_int_un, fold_itof, fold_simd, Known,
 };

@@ -2,8 +2,8 @@
 //! irreducible-aware loop headers. `Cfg` reads only terminators, so the blocks are minimal (empty
 //! params/insts) and the branch selectors are placeholders.
 
-use svm_opt::cfg::{successors, Cfg};
 use svm_ir::{Block, Terminator};
+use svm_opt::cfg::{successors, Cfg};
 
 fn blk(term: Terminator) -> Block {
     Block {
