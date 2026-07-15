@@ -1606,6 +1606,62 @@ pub fn compile_and_run_over_shared_with_host(
     Some(run(dom, func, args, fuel, &mut mem, host))
 }
 
+/// A module compiled **once** for repeated runs over a caller-provided shared window — the cached form
+/// of [`compile_and_run_over_shared_with_host`]. The browser wasm-JIT reactor bounces a handful of
+/// interpreter helpers per frame through `env.call_interp`; recompiling the whole module on every bounce
+/// (as the one-shot does) dominates the frame — for Doom, ~6 ms × 3 calls ≈ 19 ms of a 20 ms frame. This
+/// holds the compiled source (a cheap `Arc` clone seeds each run's throwaway [`Domain`]) so a cross-tier
+/// run is just build-window + interpret, like [`Reactor`] but over the caller's shared window.
+pub struct SharedProgram {
+    source: std::sync::Arc<ModuleSource>,
+    n_funcs: usize,
+    mem_size_log2: Option<u8>,
+    data: Vec<super::Data>,
+}
+
+impl SharedProgram {
+    /// Compile `m` once (`None` if it uses an op outside the engine's subset).
+    pub fn compile(m: &Module) -> Option<SharedProgram> {
+        let c = compile_module(&m.funcs)?;
+        let n_funcs = c.progs.len();
+        Some(SharedProgram {
+            source: std::sync::Arc::new(ModuleSource::new(c)),
+            n_funcs,
+            mem_size_log2: m.memory.map(|mc| mc.size_log2),
+            data: m.data.clone(),
+        })
+    }
+
+    /// Run `func(args)` over the shared window `back` with `host`, **without recompiling**. `seed_data`
+    /// applies the module's data segments first — pass `true` exactly once (the initial `_start`), and
+    /// `false` for every per-frame cross-tier callee (the window in `back` is already live). `Err` on a
+    /// trap (`Exit` surfaces as `Trap::Exit`), or `Trap::Malformed` if `func` is out of range.
+    pub fn run_over(
+        &self,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: &mut u64,
+        back: std::sync::Arc<super::Region>,
+        host: &mut Host,
+        seed_data: bool,
+    ) -> Result<Vec<Value>, Trap> {
+        if func as usize >= self.n_funcs {
+            return Err(Trap::Malformed);
+        }
+        // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
+        // slot vector) — the cross-tier reactor carries no §22 install state between calls.
+        let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
+        let mut mem = self.mem_size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            if seed_data {
+                mm.init_data(&self.data);
+            }
+            mm
+        });
+        run(dom, func, args, fuel, &mut mem, host)
+    }
+}
+
 /// THREADS.md step 4c — the **parallel** sibling of [`compile_and_run_capture_over`]: run the guest's
 /// `thread.spawn`ed vCPUs on **separate OS threads** (the native stand-in for per-vCPU wasm Workers)
 /// over the **one** caller-owned shared window, instead of cooperatively multiplexing them onto one
