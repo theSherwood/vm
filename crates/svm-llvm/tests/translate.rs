@@ -4595,6 +4595,90 @@ fn demo_pg_fprintf_vs_native() {
 }
 
 #[test]
+fn demo_pg_sscanf_vs_native() {
+    // **The guest varargs scanf engine + a real `strtod`** (slice CJ, Postgres runtime gap #11l).
+    // `scanf_shim.c` provides the runtime `sscanf`/`vsscanf`/`fscanf`/`scanf` family (the input
+    // twin of the CH `printf_shim.c`); its `%f`/`%lf` conversions need a real `strtod`, and the
+    // on-ramp's is a **trap stub** — so the guest brings the correctly-rounded bignum `strtod.c` (which
+    // shadows the stub; Postgres' `float8in` needs it at boot too). `sscanf_probe.c` drives the
+    // conversions Postgres parses config/version values with (d/i/u/o/x/c/s/f/[scanset]/n/`*`/width),
+    // checking the return count, then drives `fscanf` from the powerbox `stdin` — byte-identical to the
+    // native glibc oracle on all three engines.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos/postgres/sscanf_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{pid}_pg_sscanf.bc"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_sscanf (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{pid}_pg_sscanf"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_sscanf (cc unavailable)");
+            return;
+        }
+    }
+    // A stdin the `fscanf` half consumes: "%d %d %lf %s" then a trailing "%d".
+    let stdin_bytes: &[u8] = b"10 20 3.5 world 99";
+    let mut child = Command::new(&exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn native pg_sscanf");
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(stdin_bytes).ok();
+    let oracle = child.wait_with_output().expect("native pg_sscanf run");
+    assert!(oracle.status.success(), "native oracle failed");
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate pg_sscanf bitcode");
+    let inst = svm_run::instantiate(t.module).expect("instantiate");
+    let config = || svm_run::RunConfig {
+        limits: svm_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: stdin_bytes.to_vec(),
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+    };
+    for backend in [
+        svm_run::Backend::TreeWalk,
+        svm_run::Backend::Bytecode,
+        svm_run::Backend::Jit,
+    ] {
+        let out = inst
+            .run_with_caps(backend, &config(), &[])
+            .unwrap_or_else(|e| panic!("pg_sscanf guest run ({backend:?}): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_sscanf: guest ({backend:?}) stdout vs native"
+        );
+    }
+}
+
+#[test]
 fn demo_regex_vs_native() {
     // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
     // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
