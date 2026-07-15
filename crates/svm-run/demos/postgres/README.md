@@ -61,7 +61,8 @@ unprivileged user if invoked as root.
 | 11k | **boot: name the silent traps** | — | **DONE (slice CK):** the boot trapped **silently** (no printed output for CG to surface) in early init. Under `--stub-externs` the on-ramp now names each stub with its missing extern in the §6 function-name table (`DebugInfo.func_names` — strippable, verifier-ignored), so the trap-time backtrace's innermost frame resolves (via `svm_interp::func_name`) to the extern's name. The stub body stays a pure `Unreachable` (confinement path untouched). Test `stub_trap_names_the_extern`. Turned the boot chase into a tight run → name → fix loop |
 | 11l | **guest libc: varargs `scanf` engine + real `strtod`** | — | **DONE (slice CJ):** `scanf_shim.c` provides the runtime `sscanf`/`vsscanf`/`fscanf`/`vfscanf`/`scanf`/`vscanf` family Postgres parses config/version values with (the input twin of #11j) — d/i/u/o/x/c/s/f/`%[scanset]`/`%n`/`%%` with `*`-suppression, field width, and length modifiers, over one char-source abstraction (a string, or a `FILE*` via `fgetc`/`ungetc`). Its `%f`/`%lf` need a **real `strtod`** — the on-ramp's is a *trap stub* — so the correctly-rounded bignum `strtod.c` (shadows the stub; `float8in` needs it too) is linked in beside it via `pg_shims.c`. Differential `demo_pg_sscanf_vs_native` (the conversions + return-count semantics + an `fscanf`-from-`stdin` half, byte-exact on all three engines) |
 | 11m | **boot: drive the named boot to real logging** | — | **DONE (slice CL):** with every trap self-naming (#11k), a tight run→name→fix loop cleared the run of gaps between `find_my_exec` and Postgres's first log output. One on-ramp fix: **`__sigsetjmp`** (the symbol the `sigsetjmp` macro expands to) joins the setjmp recognizer (test `sigsetjmp_recognized`). Guest shims (each named by the diagnostic): **`realpath`** (canonicalize→absolute over the fs cap), a mutable **environment** (`setenv`/`getenv`/…), **`getpwuid`**/`getpwnam`, deterministic **`random`**/`srandom`, the **event-loop backend** (`event_shim.c`: `signalfd`/`epoll_*`/`eventfd` → fake fds + no-op registration; the single-process `WAIT_USE_EPOLL` latch is never blocked), real **`memcpy`/`memmove`/`memset`** (`mem_shim.c`, so an *address-taken* one resolves to a real function not a funcref stub), **`pow`** (`math_shim.c`, exact for `pow(10,n)`), and **`strerror`** + GNU **`strerror_r`** (its own `_GNU_SOURCE`-isolated TU `strerror_shim.c`). Composes with #11l's `strtod`/`scanf`. The boot now runs real startup through GUC init + config-file processing, emitting timestamped `LOG:`/`FATAL:` lines — no trap, a clean `Exited(1)` |
-| 11n | **boot: provide the timezone data (capability scoping)** | — | the boot stops on a *real* Postgres error: it can't read its **timezone directory** (`…/share/postgresql/timezone`, an absolute path outside the fs-cap root → the cap denies it). Grant Postgres its `share/timezone` (mount the share tree into the cap, or a relative/no-file timezone path), then drive on through the rest of config, the storage manager / WAL / catalog bootstrap to the first `SELECT` |
+| 11n | **★ boot: backend init + shared memory + WAL crash recovery** | — | **DONE (slice CM):** a run→name→fix loop on the *fast* bytecode engine drove real startup to a **recovered cluster**. **The fs-cap root is the guest filesystem root** — `os_shim` maps guest-absolute paths to cap-relative (so Postgres reaches its install `share/` tree; confinement unchanged, `..` still forbidden), and `fill_stat` reports the sandbox identity (uid/gid 1000) so `checkDataDir` passes. Shared memory: the SysV interlock genuinely attaches (`shmat` returns real memory) and DSM routes through a multi-segment SysV table (`dynamic_shared_memory_type=sysv`). **★ Real counting semaphores** — `sem_trywait` must fail at zero or `PGSemaphoreReset`'s drain loop spins forever (the boot's "hang"); differential `demo_pg_sem_vs_native`. Plus `__isoc23_*` scanf aliases and `sync_file_range` (no-op hint). Demo config: `timezone=GMT`, `fsync=off`, small `shared_buffers`/`max_connections`. Postgres now runs `InitPostgres`/relcache and **WAL crash recovery** (`redo starts…`/`redo done`/`checkpoint starting`) |
+| 11o | **boot: the checkpoint `fn0` funcref bug** | — | the end-of-recovery checkpoint (`CheckPointGuts → ProcessSyncRequests → hash_search_with_hash_value`) traps `Unreachable` on a hashtable function pointer that resolves to **index 0** (`fn0`). An address-taken/indirect-call funcref mis-resolution — a real **on-ramp** bug (its own slice), not a shim gap. Fixing it should carry the boot through the checkpoint to `database system is ready`, then the parser/planner/executor for the first `SELECT` |
 
 **Where it stands:** ★★ **the complete module (832 modules / 14 985 functions) now translates AND
 verifies** — past the **entire 921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals
@@ -97,16 +98,38 @@ mutable **environment**, `getpwuid`, deterministic **`random`**, the `signalfd`/
 backend**, real address-taken **`memcpy`/`memmove`/`memset`**, **`pow`**, and **`strerror`**/GNU
 **`strerror_r`** (an isolated `_GNU_SOURCE` TU). **The boot now runs real backend startup through GUC init +
 config-file processing** — emitting fully-formatted, timestamped Postgres log lines (`… GMT [1] LOG: …` /
-`FATAL: configuration file "postgresql.conf" contains errors`), no trap, a clean `Exited(1)`. It stops on a
-*real* error: it can't read its timezone data directory (an absolute path outside the fs-cap root —
-correctly denied). Still ahead (gap #11n): grant Postgres its `share/timezone`, then drive on through the
-storage manager, WAL, and catalog bootstrap. See `LLVM.md` slices BM–CL, and "Booting" below.
+`FATAL: configuration file "postgresql.conf" contains errors`). Slice CM (gap #11n) then drove it far
+deeper — **the fs-cap root is now the guest filesystem root** (`os_shim` maps absolute paths to
+cap-relative, so Postgres reaches its install `share/` tree; confinement unchanged), files report the
+sandbox identity (`checkDataDir` passes), the SysV/DSM shared memory attaches, and — the key fix — a **real
+counting semaphore** (a no-op `sem_trywait` made `PGSemaphoreReset`'s drain loop spin forever, which *was*
+the boot's apparent "hang"; differential `demo_pg_sem_vs_native`). **Postgres now runs backend init, opens
+the catalog, and performs WAL crash recovery** — `database system was not properly shut down; automatic
+recovery in progress` / `redo starts…` / `redo done` / `checkpoint starting: end-of-recovery`. It stops in
+that checkpoint on a **`fn0` funcref** bug (gap #11o: a hashtable function pointer resolving to index 0 — a
+real on-ramp funcref mis-resolution, its own slice). *Boot speed* — a cold 15k-function boot reaches
+recovery in ~74 s on the bytecode engine — is now the gating concern for a browser demo, pointing at
+snapshot/restore of the post-boot state. See `LLVM.md` slices BM–CM, and "Booting" below.
 
 ## Booting
 
 `build_bitcode.sh` produces `postgres_libm.bc` (the whole-program module + openlibm). `link_shims.sh`
-then `llvm-link`s the guest shims (`pg_shims.c` = os/libc/locale/time/proc/stdio) into it →
-`postgres_shimmed.bc`. A driver `translate_bc_path_with_options(…, stub_unresolved_externs: true)` →
-`instantiate` → `run_with_caps(Backend::Bytecode, {stdin: SQL, args: ["postgres","--single","-D",".",…]},
-[("fs", host_fs(datadir))])` runs it. As of slice CF the module executes real startup and traps deeper
-in init; driving it to the first `SELECT` is gap #11h.
+`llvm-link`s the guest shims into it → `postgres_shimmed.bc`: `pg_shims.c` (mem/math/os/libc/locale/
+time/proc/event/ipc/stdio/printf + `../strtod/strtod.c` + `scanf_shim.c`) plus `strerror_shim.c` compiled
+separately with `-D_GNU_SOURCE`. A driver `translate_bc_path_with_options(…, stub_unresolved_externs:
+true)` → `instantiate` → `run_with_caps(Backend::Bytecode, {stdin: SQL, args:
+["./postgres","--single","-D",".","postgres"]}, [("fs", host_fs(datadir))])` runs it — a slashed
+`argv[0]` + an executable `postgres` in the data dir so `find_my_exec` resolves.
+
+**Demo cluster setup** (in the fetched, natively-`initdb`'d data dir — the browser demo would ship a data
+image built this way): the sandbox has one identity and no cross-process IPC, so `postgresql.conf` is set
+to `timezone = GMT` / `log_timezone = GMT` (parsed, no tz-data file), `dynamic_shared_memory_type = sysv`,
+`fsync = off` (skip the startup data-dir sync), and small `shared_buffers = 1MB` / `max_connections = 10`
+(cheap shmem/buffer init on the interpreter). Postgres' install `share/postgresql/` tree is placed where
+the fs cap (rooted at the data dir) can reach it — the guest maps absolute paths to cap-relative, so "/"
+is the cap root.
+
+As of slice CM the module runs real backend init, opens the catalog, and performs **WAL crash recovery**
+(`redo starts…`/`redo done`/`checkpoint starting`) — reaching recovery in ~74 s on the bytecode engine —
+then stops in the end-of-recovery checkpoint on the `fn0` funcref bug (gap #11o). Driving through the
+checkpoint to `database system is ready` and the first `SELECT` is next.

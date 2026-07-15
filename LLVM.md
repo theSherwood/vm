@@ -1396,6 +1396,42 @@ question (gap #11m), not a shim gap. **svm-llvm lane green (fmt + clippy `-D war
 CI-tested — `stub_trap_names_the_extern`, `sigsetjmp_recognized`; the boot-support shims validated by the
 boot advancing; the boot itself isn't a CI test — it needs the fetched Postgres bitcode).**
 
+**Slice CM (DONE) — ★ the boot runs backend init, shared memory, and WAL crash recovery (gap #11n).**
+Past the timezone stop (CL's #11m), a run→name→fix loop — the CK self-naming diagnostic on the *fast*
+bytecode engine — carried the boot all the way through real database startup to a **recovered cluster**:
+
+- **The fs-cap root is the guest filesystem root.** Postgres opens its install tree by *absolute* path
+  (`<prefix>/share/postgresql/timezone`, `…/timezonesets`, …) but the `fs` cap is rooted (rejects
+  absolute + `..`). `os_shim`'s path wrappers now map a guest-absolute path to cap-relative (strip the
+  leading `/`), so "/" *is* the cap root — confinement unchanged (`..` still forbidden), the sandbox just
+  provides the install tree under the root. This is the right model for the eventual browser demo (a
+  virtual sysroot). `fill_stat` reports every file owned by the sandbox identity (uid/gid 1000, matching
+  `proc_shim`'s `geteuid`) so `checkDataDir`'s ownership check passes.
+- **Shared memory + the DSM collapse.** The tiny SysV interlock segment now genuinely attaches (`shmat`
+  returns real zeroed memory, sized by `shmget`), and — with `dynamic_shared_memory_type = sysv` (a single
+  process needs no cross-process POSIX shm) — dynamic-shared-memory segments come through the same
+  multi-segment SysV table; `shm_open` fails cleanly (ENOSYS).
+- **★ Real counting semaphores — the bug that "hung" the boot.** The semaphore shim was a blanket no-op,
+  but Postgres' `PGSemaphoreReset` *drains* with `while (sem_trywait(s) >= 0) ;` — a `sem_trywait` that
+  always succeeds spins forever (the boot's apparent hang was this, in `InitProcess`). Now a real counting
+  semaphore kept in the `sem_t` (`sem_trywait` fails EAGAIN at zero). **Differential** `demo_pg_sem_vs_native`
+  (byte-exact vs glibc's single-process unnamed semaphore).
+- **Startup libc odds and ends:** `__isoc23_*` `scanf` aliases (glibc-C23 — `ValidatePgVersion` reads
+  `PG_VERSION`); `sync_file_range` (a writeback *hint* → no-op).
+- **Demo cluster config** (in the fetched data dir, documented in the demo README): `timezone = GMT`
+  (`tzparse`, no tz-data file), `fsync = off` (skip the startup data-dir sync), `shared_buffers = 1MB` +
+  `max_connections = 10` (so buffer/shmem init is cheap on the interpreter).
+
+**Payoff:** the boot now runs real backend startup, opens the catalog (`InitPostgres`/relcache), and does
+**WAL crash recovery** — its log reads `database system was not properly shut down; automatic recovery in
+progress` / `redo starts at 0/147A9F0` / `redo done` / `checkpoint starting: end-of-recovery`. It stops in
+the end-of-recovery checkpoint (`CheckPointGuts → ProcessSyncRequests`) on a **`fn0` funcref** — a
+hashtable function pointer resolving to index 0 (a real on-ramp funcref bug, not a shim gap — gap #11o,
+its own slice). **svm-llvm lane green (fmt + clippy `-D warnings`; 12 `demo_pg_*` incl. the new
+`demo_pg_sem_vs_native`).** The boot reaches recovery in ~74 s on the bytecode engine — *boot speed* (a
+cold 15k-function boot) is now the gating concern for a browser demo, pointing at snapshot/restore of the
+post-boot state rather than cold-booting each time.
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

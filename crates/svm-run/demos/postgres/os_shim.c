@@ -58,6 +58,20 @@ static long fscall(int op, long a, long b, long c, long d) {
 /* Every wrapper turns a negative cap return (`-errno`) into the POSIX `-1` + `errno`. */
 static long fail(long rc) { shim_errno = (int)(-rc); return -1; }
 
+/* **The fs-cap root is the guest's filesystem root.** The `fs` capability is rooted (it rejects
+ * absolute paths and `..` — the confinement seam in fs.rs), but Postgres opens *absolute* paths for
+ * its install tree (`<prefix>/share/postgresql/timezone`, `…/timezonesets`, …) and derives absolute
+ * paths from `realpath`. So map a guest-absolute path to cap-relative here — strip the leading slashes,
+ * so "/" *is* the cap root. Confinement is unchanged: the cap still forbids `..`, so this can only ever
+ * name something *inside* the granted root (the sandbox provides the install tree there). A path that
+ * collapses to "" (the root itself) becomes ".". Relative paths pass through untouched. */
+static const char *norm(const char *path) {
+  if (!path) return path;
+  const char *p = path;
+  while (*p == '/') p++;
+  return *p ? p : ".";
+}
+
 /* ---- little-endian readers for the 72-byte StatBuf the FS_STAT op fills ---------------------- */
 static unsigned ld_u32(const unsigned char *p) {
   return (unsigned)p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24;
@@ -77,14 +91,20 @@ static void fill_stat(struct stat *st, const unsigned char *b) {
   st->st_mtime = ld_i64(b + 16);
   st->st_ino = (unsigned long)ld_i64(b + 32);
   st->st_dev = (unsigned long)ld_i64(b + 40);
-  st->st_uid = ld_u32(b + 48);
-  st->st_gid = ld_u32(b + 52);
+  /* The sandbox has a single identity and no real file ownership: report every file as owned by the
+   * effective user (1000, matching `proc_shim.c`'s `geteuid`/`getegid`), so Postgres' data-directory
+   * ownership check (`checkDataDir`: `st_uid == geteuid()`) passes. The cap's host `uid`/`gid` (bytes
+   * 48/52) are meaningless inside the sandbox. A literal (not a `geteuid()` call) keeps `os_shim.c`
+   * self-contained — the standalone probes include it without `proc_shim.c`. */
+  st->st_uid = 1000;
+  st->st_gid = 1000;
   st->st_blksize = ld_i64(b + 56);
   st->st_blocks = ld_i64(b + 64);
 }
 
 /* ---- files ----------------------------------------------------------------------------------- */
 int open(const char *path, int flags, ...) {
+  path = norm(path);
   long f = 0;
   int acc = flags & O_ACCMODE;
   if (acc == O_RDONLY || acc == O_RDWR) f |= FS_O_READ;
@@ -133,21 +153,34 @@ int fsync(int fd) {
   return rc < 0 ? (int)fail(rc) : 0;
 }
 int fdatasync(int fd) { return fsync(fd); }
+/* sync_file_range / posix_fadvise / readahead: writeback + access *hints* — advisory only, so a no-op
+ * is a valid implementation (the fs cap already persists on write). `pg_flush_data` calls the first. */
+int sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags) {
+  (void)fd;
+  (void)offset;
+  (void)nbytes;
+  (void)flags;
+  return 0;
+}
 int ftruncate(int fd, off_t len) {
   long rc = fscall(FS_TRUNCATE, fd, (long)len, 0, 0);
   return rc < 0 ? (int)fail(rc) : 0;
 }
 int unlink(const char *path) {
+  path = norm(path);
   long rc = fscall(FS_REMOVE, (long)path, (long)strlen(path), 0, 0);
   return rc < 0 ? (int)fail(rc) : 0;
 }
 int rename(const char *from, const char *to) {
+  from = norm(from);
+  to = norm(to);
   long rc = fscall(FS_RENAME, (long)from, (long)strlen(from), (long)to, (long)strlen(to));
   return rc < 0 ? (int)fail(rc) : 0;
 }
 
 /* ---- metadata -------------------------------------------------------------------------------- */
 int stat(const char *path, struct stat *st) {
+  path = norm(path);
   unsigned char b[FS_STATBUF_LEN];
   long rc = fscall(FS_STAT, (long)path, (long)strlen(path), (long)b, FS_STATBUF_LEN);
   if (rc < 0) return (int)fail(rc);
@@ -173,6 +206,7 @@ int fstat(int fd, struct stat *st) {
 int access(const char *path, int mode) {
   /* Existence only; the rooted cap grants R/W/X uniformly, so mode bits don't gate. */
   (void)mode;
+  path = norm(path);
   unsigned char b[FS_STATBUF_LEN];
   long rc = fscall(FS_STAT, (long)path, (long)strlen(path), (long)b, FS_STATBUF_LEN);
   return rc < 0 ? (int)fail(rc) : 0;
@@ -181,10 +215,12 @@ int access(const char *path, int mode) {
 /* ---- directories ----------------------------------------------------------------------------- */
 int mkdir(const char *path, mode_t mode) {
   (void)mode; /* the granted root's umask governs */
+  path = norm(path);
   long rc = fscall(FS_MKDIR, (long)path, (long)strlen(path), 0, 0);
   return rc < 0 ? (int)fail(rc) : 0;
 }
 int rmdir(const char *path) {
+  path = norm(path);
   long rc = fscall(FS_RMDIR, (long)path, (long)strlen(path), 0, 0);
   return rc < 0 ? (int)fail(rc) : 0;
 }
@@ -196,6 +232,7 @@ typedef struct {
 } ShimDir;
 
 DIR *opendir(const char *path) {
+  path = norm(path);
   long dh = fscall(FS_OPENDIR, (long)path, (long)strlen(path), 0, 0);
   if (dh < 0) {
     fail(dh);
@@ -251,7 +288,8 @@ char *realpath(const char *path, char *resolved) {
     return (char *)0;
   }
   unsigned char sb[FS_STATBUF_LEN];
-  long rc = fscall(FS_STAT, (long)path, (long)strlen(path), (long)sb, FS_STATBUF_LEN);
+  const char *np = norm(path); /* existence check over the cap (rooted); the return stays absolute */
+  long rc = fscall(FS_STAT, (long)np, (long)strlen(np), (long)sb, FS_STATBUF_LEN);
   if (rc < 0) {
     fail(rc);
     return (char *)0;
