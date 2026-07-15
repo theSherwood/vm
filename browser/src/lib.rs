@@ -615,9 +615,9 @@ static INST_CG_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
     use std::sync::atomic::Ordering;
     par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
-    // I22: emit once per run under CODEGEN_LOCK; a later Worker reuses the shared stash (see the
-    // CodegenGuard note above). The shared statics `WASMJIT`/`WASMJIT_MOD`/`PAR_JIT_ELIGIBLE` are a
-    // single copy across Workers, so a concurrent re-emit double-freed the stash.
+                                 // I22: emit once per run under CODEGEN_LOCK; a later Worker reuses the shared stash (see the
+                                 // CodegenGuard note above). The shared statics `WASMJIT`/`WASMJIT_MOD`/`PAR_JIT_ELIGIBLE` are a
+                                 // single copy across Workers, so a concurrent re-emit double-freed the stash.
     let guard = CodegenGuard::acquire();
     let generation = guard.generation();
     if TIERUP_DONE_GEN.load(Ordering::Relaxed) == generation {
@@ -725,7 +725,7 @@ const PAR_JIT_TABLE_LOG2: u8 = 4;
 #[no_mangle]
 pub extern "C" fn svm_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
-    // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+                        // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return 0;
@@ -845,7 +845,7 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
 #[no_mangle]
 pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: usize) -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
-    // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+                        // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return 0;
@@ -1437,7 +1437,11 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                     // powerbox — a forged / cross-domain handle must trap identically — then the invoke
                     // surfaces to JS. Anything else (codegen off, a v128 unit sig, no emitted wasm)
                     // stays on the interpreter.
-                    let codes = |ts: &[svm_ir::ValType]| ts.iter().map(|t| scalar_type_code(*t)).collect::<Option<Vec<u8>>>();
+                    let codes = |ts: &[svm_ir::ValType]| {
+                        ts.iter()
+                            .map(|t| scalar_type_code(*t))
+                            .collect::<Option<Vec<u8>>>()
+                    };
                     let (ptypes, rtypes) = (codes(&params), codes(&results));
                     let codegen = par_jit_codegen()
                         && svm_par_jit_unit_wasm_len() > 0
@@ -1457,7 +1461,8 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                             Err(t) => v.inner.deliver_jit_invoke(Err(t)),
                         }
                     } else {
-                        v.inner.deliver_jit_invoke(par_resolve_unit(pb, handle, code));
+                        v.inner
+                            .deliver_jit_invoke(par_resolve_unit(pb, handle, code));
                     }
                 }
             },
@@ -1604,7 +1609,6 @@ pub extern "C" fn svm_par_jit_result_types_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).jit_result_types.len() }
 }
-
 
 /// Deliver the results of a §22 unit run on emitted wasm (after `PAR_JIT_INVOKE`): `[results_ptr, n)`
 /// are the emitted `f{entry}`'s i64 result slots. The vCPU resumes with them in the invoke's dst —
@@ -2095,6 +2099,168 @@ impl OnrampReactor {
 
     /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
     /// `pressed` is 1 (down) / 0 (up); `keycode` is the platform key id (e.g. a JS `keyCode`).
+    pub fn push_key(&self, keycode: i32, pressed: i32) {
+        self.keys
+            .lock()
+            .unwrap()
+            .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+    }
+}
+
+/// Like [`OnrampReactor`], but the guest window lives in a **caller-provided region of this module's
+/// own linear memory** (a [`Region::shared`](svm_interp::Region::shared) over `[win_ptr, win_size)`)
+/// rather than a window the engine backs internally. That relocation is the substrate the wasm-JIT
+/// **reactor** tier needs (BROWSER.md § "wasm-JIT tier", slice 5b): the emitted `tick` — a JS-compiled
+/// wasm module that imports `env.memory` = *this* cdylib's linear memory — must read and write the same
+/// bytes the interpreter seeds, so `_start` (interpreter), the per-frame `tick`, and any cross-tier
+/// interpreter bounce all operate over **one** window. Backed by the resumable, tier-up-capable
+/// [`bytecode::VcpuReactor`]; with no eligibility set (this slice) every `tick` interprets, so it is a
+/// faithful, **byte-identical** substitute for [`OnrampReactor`] — the differential the reactor tests
+/// assert — with the window merely relocated into shared linear memory. The emitted-`tick` path (slice
+/// 5c) rides the same window and shared host.
+pub struct SharedOnrampReactor {
+    reactor: bytecode::VcpuReactor,
+    /// The powerbox (granted caps + stashed `_start` handles), shared across `open` and every `frame`
+    /// so the `display`/`keyboard`/`fs` caps and their state persist frame-to-frame.
+    host: std::sync::Mutex<Host>,
+    /// Keep-alive for an **owned** backing (the native/test path allocates it here); `None` when the
+    /// window is caller-owned (the FFI path hands in a pointer into this module's linear memory). The
+    /// `Region::shared` in `reactor`/`_back` addresses these bytes, so this must outlive the reactor —
+    /// a `Box<[u8]>`'s heap allocation is stable across moves of the struct.
+    _backing: Option<Box<[u8]>>,
+    /// The shared backing region (kept so its lifetime is tied to the reactor's).
+    _back: std::sync::Arc<svm_interp::Region>,
+    entry_sp: u64,
+    tick: svm_ir::FuncIdx,
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    keys: KeyQueue,
+    last_trap: Option<String>,
+}
+
+impl SharedOnrampReactor {
+    /// Open a shared-window reactor over `m` with an **owned** backing of `1 << win_log2` bytes
+    /// (allocated + kept alive here) — the native/test entry. `win_log2` must be ≥ the module's mapped
+    /// size and large enough for the guest's grown heap. See [`open_shared`](Self::open_shared) for the
+    /// FFI entry that borrows a caller-owned window.
+    pub fn open_owned(m: &svm_ir::Module, win_log2: u8) -> Result<SharedOnrampReactor, i32> {
+        Self::open_owned_inner(m, win_log2, None)
+    }
+
+    /// Like [`open_owned`](Self::open_owned) but also grant an `fs` capability serving one read-only
+    /// file `data` under `name` (the WAD read path — see [`OnrampReactor::open_with_fs`]).
+    pub fn open_owned_with_fs(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        name: String,
+        data: Vec<u8>,
+    ) -> Result<SharedOnrampReactor, i32> {
+        Self::open_owned_inner(m, win_log2, Some((name, data)))
+    }
+
+    fn open_owned_inner(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<SharedOnrampReactor, i32> {
+        let win_size = 1u64 << win_log2;
+        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
+        let ptr = backing.as_mut_ptr();
+        // SAFETY: `backing` (a `Box<[u8]>` of `win_size` bytes) is owned by the returned struct and its
+        // heap allocation is pointer-stable across the struct's moves, so `[ptr, win_size)` stays valid
+        // and exclusively this reactor's window for its whole lifetime.
+        let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(ptr, win_size) });
+        Self::open_over(m, back, Some(backing), fs)
+    }
+
+    /// Open a shared-window reactor over a **caller-owned** window `[win_ptr, win_ptr+win_size)` of this
+    /// module's linear memory — the FFI entry (the host `svm_alloc`s the window and keeps it live for
+    /// the reactor's lifetime).
+    ///
+    /// # Safety
+    /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
+    /// reactor's window and kept valid (not freed, not reused) until the reactor is dropped.
+    pub unsafe fn open_shared(
+        m: &svm_ir::Module,
+        win_ptr: *mut u8,
+        win_size: u64,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<SharedOnrampReactor, i32> {
+        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        Self::open_over(m, back, None, fs)
+    }
+
+    fn open_over(
+        m: &svm_ir::Module,
+        back: std::sync::Arc<svm_interp::Region>,
+        backing: Option<Box<[u8]>>,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<SharedOnrampReactor, i32> {
+        let module =
+            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+        let arity = module.funcs.first().map_or(0, |f| f.params.len());
+        if arity > 5 {
+            return Err(STATUS_UNSUPPORTED);
+        }
+        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+        let mut host = Host::new();
+        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module, fs);
+        // Run `_start` (func 0) once over the shared window: stash the granted handles + run the C
+        // initializer, seeding + data-initialising the window (the once). The window then persists in
+        // the shared backing for every `tick`.
+        let host = std::sync::Mutex::new(host);
+        let reactor = bytecode::VcpuReactor::open(&module, back.clone(), &host, &slots)
+            .map_err(|_| STATUS_TRAP)?;
+        Ok(SharedOnrampReactor {
+            reactor,
+            host,
+            _backing: backing,
+            _back: back,
+            entry_sp,
+            tick,
+            frame,
+            keys,
+            last_trap: None,
+        })
+    }
+
+    /// Run one frame: call the guest's `tick` on the **live** shared window (all prior-frame state
+    /// intact), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT` = the guest
+    /// called `Exit`; `STATUS_TRAP` = a trap. This slice interprets `tick` (no eligibility set), so the
+    /// `service` closure is never invoked. The presented frame (if any) is read via
+    /// [`take_frame`](Self::take_frame).
+    pub fn frame(&mut self) -> (i32, Vec<u8>) {
+        let stdout_before = self.host.lock().unwrap().stdout.len();
+        let args = [Value::I64(self.entry_sp as i64)];
+        // No JIT eligibility set → `service` is unreachable; propagate a trap if one ever surfaced.
+        let result = self
+            .reactor
+            .frame(self.tick, &args, &self.host, |_func, _argv| {
+                Err(Trap::Malformed)
+            });
+        let status = match result {
+            Ok(_) => STATUS_OK,
+            Err(Trap::Exit(_)) => STATUS_EXIT,
+            Err(t) => {
+                self.last_trap = Some(format!("{t:?}"));
+                STATUS_TRAP
+            }
+        };
+        let delta = self.host.lock().unwrap().stdout[stdout_before..].to_vec();
+        (status, delta)
+    }
+
+    /// The `Debug` string of the last frame's trap (diagnostic), or `""` if none.
+    pub fn last_trap(&self) -> &str {
+        self.last_trap.as_deref().unwrap_or("")
+    }
+
+    /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.frame.lock().unwrap().take()
+    }
+
+    /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
     pub fn push_key(&self, keycode: i32, pressed: i32) {
         self.keys
             .lock()
