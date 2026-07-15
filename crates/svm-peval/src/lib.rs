@@ -1794,6 +1794,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::ConstV128(_)
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
+        | Inst::CapSelfAttest
         | Inst::VcpuTlsGet
         | Inst::DurableShadowBase
         | Inst::AtomicFence { .. }

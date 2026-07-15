@@ -1730,6 +1730,7 @@ pub fn coverage(inst: &Inst) -> Class {
         Inst::CapCall { .. }
         | Inst::CallImport { .. }
         | Inst::CapSelfCount
+        | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
         | Inst::CapSelfLabel { .. } => Class::Host,

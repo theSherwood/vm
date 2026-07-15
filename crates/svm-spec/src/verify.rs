@@ -309,6 +309,7 @@ fn check_inst(
         // §7: named imports must be resolved away before verification — fail closed.
         Inst::CallImport { .. } => return Err("unresolved import".into()),
         Inst::CapSelfCount => vec![V::I32],
+        Inst::CapSelfAttest => vec![V::I32],
         Inst::CapSelfGet { idx } => {
             w(*idx, V::I32)?;
             vec![V::I32, V::I32]

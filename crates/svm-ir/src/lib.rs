@@ -1764,6 +1764,23 @@ pub enum Inst {
         buf_ptr: ValIdx,
         buf_cap: ValIdx,
     },
+    /// §6 (PROCESS.md) capability **attestation** (`cap.self.attest`) — the non-interposable **trust
+    /// anchor**. Reports the calling domain's platform-vouched provenance as a packed `i32`:
+    /// `tier (bits 0..8) | (window_exposed << 8) | (freeze_exposed << 9)`.
+    /// - `tier` — the §2 isolation tier (`0`/`1` in-process, `3` separate-process): the strongest
+    ///   isolation the domain can *require* from a distrusted host (tiers 0/1 are never a Spectre
+    ///   boundary; a domain needing that must see `3` or refuse).
+    /// - `window_exposed` — `1` iff an **ancestor** (not just the platform) holds map/read/pager
+    ///   rights over the domain's backing (a §14 nested carve is exposed; a platform-minted or root
+    ///   window is not) — the "who can read my memory" bit (O5: a single bit, not an authority set).
+    /// - `freeze_exposed` — `1` iff an ancestor may **snapshot** the domain (a snapshot *is* a read),
+    ///   so a domain is confidential (freezable by nobody below the platform) or ancestor-durable,
+    ///   never both.
+    ///
+    /// Like the rest of `cap.self`, it is a D46 runtime-resolved **intrinsic** (never a handle-table
+    /// entry), so no parent can interpose it and lie — the one report a hostile nested host cannot
+    /// forge. Read-only, authority-neutral, adds no grant-graph edge. Result is `i32`.
+    CapSelfAttest,
     /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
     /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
     /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
@@ -2200,7 +2217,10 @@ impl Inst {
             // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`resolve`/`label` append
             // one `i32`.
             Inst::CapSelfGet { .. } => 2,
-            Inst::CapSelfCount | Inst::CapSelfResolve { .. } | Inst::CapSelfLabel { .. } => 1,
+            Inst::CapSelfCount
+            | Inst::CapSelfResolve { .. }
+            | Inst::CapSelfLabel { .. }
+            | Inst::CapSelfAttest => 1,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),

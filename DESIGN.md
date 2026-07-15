@@ -1767,7 +1767,17 @@ grant time to either:
   virtualize).
 
 The child cannot tell whether a capability is real or parent-emulated — the
-interface is identical. There is no "am I nested?" query by default.
+interface is identical. There is no "am I nested?" query by default — a
+virtualized capability stays indistinguishable from the real one. A domain may,
+however, **opt in** to one platform-vouched provenance report via
+`cap.self.attest` (§6 of `PROCESS.md`): a `cap.self` intrinsic is a D46
+runtime-resolved primitive, never a handle, so no nested host can interpose or
+forge it — the one report a hostile parent cannot fake. This is the deliberate,
+narrow exception to "no nesting query": self-protection from a hostile nested
+host is impossible without a non-interposable trust anchor, and the anchor
+admits only facts the platform mechanically enforces (isolation tier, whether an
+ancestor can read/snapshot this domain) — never services, never channels. The
+default above still stands for every handle-gated capability.
 
 ### VM-beside-VM (composition / linking)
 - **Intra-domain:** modules share the address space → direct calls + shared

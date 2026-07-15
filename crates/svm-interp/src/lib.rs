@@ -6316,6 +6316,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // reserve shadow state like the parent's (and its own nested
                                 // instantiates re-apply this same admission rule).
                                 ch.set_durable(durable);
+                                // §6: stamp the child's attestation — nested (its carve is a superset
+                                // the parent reads), freezable iff durable, tier inherited from us.
+                                let catt = {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.child_attestation(durable)
+                                };
+                                ch.set_attestation(catt);
                                 let cinst = ch.grant_instantiator(0, child_size);
                                 let cas = ch.grant_address_space(0, child_size);
                                 // S2: re-grant a parent capability (`Stream`/`Exit`/`Clock`) into the
@@ -6571,6 +6578,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // §4: a durable parent's co-fiber child is durable too (see
                                 // `instantiate`); its module admission was enforced above.
                                 ch.set_durable(durable);
+                                // §6: a co-fiber child is nested (window-exposed), freezable iff durable.
+                                let catt = {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.child_attestation(durable)
+                                };
+                                ch.set_attestation(catt);
                                 let cy = ch.grant_yielder(); // the child's handle to suspend back to us
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let cfuncs = child_mod.as_ref().map_or_else(
@@ -6896,6 +6909,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapSelfCount => {
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let r = hg.self_dispatch(0, &[])?;
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                }
+                // §6 attestation (`cap.self.attest`): the domain's platform-vouched provenance, packed
+                // into an `i32` (op 4). Same `self_dispatch` path the JIT thunk takes, so they agree.
+                Inst::CapSelfAttest => {
+                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r = hg.self_dispatch(4, &[])?;
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                 }
                 // §7 reflection (`cap.self.get`): the `idx`-th held capability as `(handle, type_id)`
@@ -7731,6 +7751,7 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
         // (like `cap.call`), never here.
         Inst::CapSelfCount
+        | Inst::CapSelfAttest
         | Inst::CapSelfGet { .. }
         | Inst::CapSelfResolve { .. }
         | Inst::CapSelfLabel { .. } => return Err(Trap::Malformed),
@@ -9365,6 +9386,48 @@ struct BudgetState {
     spawn: i64,
 }
 
+/// §6 (PROCESS.md) — a domain's platform-vouched **attestation**, reported by `cap.self.attest`. The
+/// non-interposable trust anchor: a nested host can virtualize every handle-gated capability, but not
+/// this (it is a D46 `cap.self` intrinsic, never a handle). Kept minimal (O5: a tier + two bits, not an
+/// authority set) so the non-interposable surface stays tiny.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attestation {
+    /// §2 isolation tier — `0`/`1` in-process (defense-in-depth, **not** a Spectre boundary), `3`
+    /// separate-process. The strongest isolation the domain may *require*; a domain needing protection
+    /// from a distrusted host must see `3` or refuse.
+    pub tier: u8,
+    /// `true` iff an **ancestor** (beyond the platform) holds map/read/pager rights over the domain's
+    /// backing — a §14 nested carve is exposed (the parent sees the superset); a platform-minted or
+    /// root window is not.
+    pub window_exposed: bool,
+    /// `true` iff an ancestor may **snapshot** the domain (a snapshot is a complete read). A domain is
+    /// *confidential* (freezable by nobody below the platform) or *ancestor-durable*, never both.
+    pub freeze_exposed: bool,
+}
+
+impl Default for Attestation {
+    /// A **root** domain: in-process (tier 1), platform-only window (no ancestor read), not
+    /// ancestor-freezable. The embedder overrides via [`Host::set_attestation`]; the §14 spawn path
+    /// stamps a nested child's (exposed) report.
+    fn default() -> Attestation {
+        Attestation {
+            tier: 1,
+            window_exposed: false,
+            freeze_exposed: false,
+        }
+    }
+}
+
+impl Attestation {
+    /// Pack into the `i32` `cap.self.attest` returns: `tier | (window_exposed << 8) |
+    /// (freeze_exposed << 9)`.
+    fn packed(self) -> i32 {
+        (self.tier as i32)
+            | ((self.window_exposed as i32) << 8)
+            | ((self.freeze_exposed as i32) << 9)
+    }
+}
+
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
 /// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
 /// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
@@ -9727,6 +9790,10 @@ pub struct Host {
     /// remaining resource-quota vector; `split` moves quota from a parent's entry into a fresh child
     /// entry (append-only, like `regions` — a split budget's index stays valid for the run).
     budgets: Vec<BudgetState>,
+    /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
+    /// `cap.self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
+    /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
+    attestation: Attestation,
     /// §14 instantiable **modules**, indexed by the id a [`Binding::Module`] carries — host-verified
     /// code a guest holding the handle may spawn as a child domain (`Arc`s so a spawned child shares,
     /// not copies). Append-only for the life of the `Host`, so raw views handed to the JIT's nesting
@@ -9940,6 +10007,7 @@ impl Host {
             clock_ns: 0,
             regions: Vec::new(),
             budgets: Vec::new(),
+            attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
             blockings: Vec::new(),
@@ -10279,6 +10347,9 @@ impl Host {
                     .ok_or(Trap::Malformed)?;
                 Ok(vec![handle as i64, type_id as i64])
             }
+            // §6 `cap.self.attest`: the domain's platform-vouched provenance, packed as
+            // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
+            4 => Ok(vec![self.attestation.packed() as i64]),
             _ => Err(Trap::Malformed),
         }
     }
@@ -10696,6 +10767,32 @@ impl Host {
         self.grant(iface::BUDGET, Binding::Budget(id))
     }
 
+    /// Set this domain's §6 [`Attestation`] — what `cap.self.attest` reports. The embedder calls it on
+    /// the **top-level** `Host` to declare the platform-vouched provenance (isolation tier, whether an
+    /// ancestor can read/snapshot it); the §14 spawn path calls it internally to stamp a nested child's
+    /// (exposed) report. The default (a fresh `Host`) is a root domain (tier 1, unexposed).
+    pub fn set_attestation(&mut self, attestation: Attestation) {
+        self.attestation = attestation;
+    }
+
+    /// This domain's current §6 [`Attestation`] (what `cap.self.attest` reports) — the read half of
+    /// [`Self::set_attestation`], for an embedder that inspects a child host it built.
+    pub fn attestation(&self) -> Attestation {
+        self.attestation
+    }
+
+    /// The §6 [`Attestation`] to stamp on a §14 **nested child** this host spawns: the child inherits
+    /// the parent's isolation tier, is always `window_exposed` (the parent sees its carve — the §14
+    /// superset, so an ancestor holds read authority), and is `freeze_exposed` iff spawned into a
+    /// **durable** subtree (an ancestor may snapshot it — a snapshot is a read).
+    fn child_attestation(&self, durable: bool) -> Attestation {
+        Attestation {
+            tier: self.attestation.tier,
+            window_exposed: true,
+            freeze_exposed: durable,
+        }
+    }
+
     /// Install the [`JitValidator`] — the decode+verify gate every `Jit.compile` runs. The
     /// embedder must install the **same** function for the interpreter and JIT runs of a
     /// differential pair (see [`JitValidator`]); without one, every `compile` is `-EINVAL`.
@@ -11036,6 +11133,8 @@ impl Host {
     ) -> Option<(Host, i32, i32, i32)> {
         let (tid, binding) = self.resolve_copyable(grant_handle).ok()?;
         let mut ch = Host::new();
+        // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
+        ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
         if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
@@ -11077,6 +11176,8 @@ impl Host {
             resolved.push((name.as_str(), tid, binding));
         }
         let mut ch = Host::new();
+        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
+        ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
         for (name, tid, binding) in resolved {

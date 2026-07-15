@@ -4445,6 +4445,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
                 Inst::CapSelfCount
+                | Inst::CapSelfAttest
                 | Inst::CapSelfGet { .. }
                 | Inst::CapSelfResolve { .. }
                 | Inst::CapSelfLabel { .. } => {}
@@ -5194,14 +5195,27 @@ fn lower_block(
             ubs.resize(vals.len(), UB_TOP); // cap-call results are unknown
             continue;
         }
-        // §7 capability reflection: lower to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`
-        // (op 0 = count, op 1 = get) — the host services it directly, matching the interpreter. The
-        // handle is unused there, so pass a constant 0.
-        if matches!(inst, Inst::CapSelfCount | Inst::CapSelfGet { .. }) {
+        // §7/§6 capability reflection: lower to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`
+        // (op 0 = count, op 1 = get, op 4 = attest) — the host services it directly, matching the
+        // interpreter. The handle is unused there, so pass a constant 0.
+        if matches!(
+            inst,
+            Inst::CapSelfCount | Inst::CapSelfGet { .. } | Inst::CapSelfAttest
+        ) {
             let h0 = b.ins().iconst(I32, 0);
             let (op, sig, call_args): (u32, FuncType, &[u32]) = match inst {
                 Inst::CapSelfCount => (
                     0,
+                    FuncType {
+                        params: vec![],
+                        results: vec![ValType::I32],
+                    },
+                    &[],
+                ),
+                // §6 `cap.self.attest` — op 4, no args, one packed `i32` (the non-interposable trust
+                // anchor; the child host's provenance the thunk reports).
+                Inst::CapSelfAttest => (
+                    4,
                     FuncType {
                         params: vec![],
                         results: vec![ValType::I32],

@@ -264,6 +264,10 @@ enum Op {
     CapSelfCount {
         dst: u32,
     },
+    /// §6 attestation `cap.self.attest` — the domain's packed provenance (one `i32` result).
+    CapSelfAttest {
+        dst: u32,
+    },
     /// §7 reflection `cap.self.get` — the `idx`-th held cap as `(handle, type_id)` (two `i32`
     /// results in `dst`, `dst+1`).
     CapSelfGet {
@@ -1223,6 +1227,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         // §7 reflection — synchronous self-powerbox queries (no scheduler/fiber); reuse the host's
         // `self_dispatch`, the same path the tree-walker and the JIT thunk take.
         Inst::CapSelfCount => Op::CapSelfCount { dst },
+        Inst::CapSelfAttest => Op::CapSelfAttest { dst },
         Inst::CapSelfGet { idx } => Op::CapSelfGet { idx: g(*idx), dst },
         Inst::CapSelfResolve { name_ptr, name_len } => Op::CapSelfResolve {
             name_ptr: g(*name_ptr),
@@ -6627,6 +6632,12 @@ impl Vm {
                 Op::CapSelfCount { dst } => {
                     // §7 reflection op 0 — same `self_dispatch` the tree-walker uses; one i32 result.
                     let res = host.with(|p| p.self_dispatch(0, &[]))?;
+                    r!(*dst) = Reg::from_i32(res[0] as i32);
+                    pc += 1;
+                }
+                Op::CapSelfAttest { dst } => {
+                    // §6 attestation op 4 — same `self_dispatch` the tree-walker / JIT thunk use.
+                    let res = host.with(|p| p.self_dispatch(4, &[]))?;
                     r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }
