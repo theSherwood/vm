@@ -81,6 +81,7 @@ use svm_ir::{
 };
 
 pub mod cfg;
+pub mod ssa;
 
 /// A value known to be a constant at optimization time. Tracks scalar integers/floats and `v128`.
 /// Floats and `v128` are held as **raw bits/bytes** so equality/hashing are exact and NaN-safe

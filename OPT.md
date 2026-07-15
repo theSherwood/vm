@@ -133,8 +133,14 @@ tracked enhancement, not a blocker.
     iterative (no host-stack recursion) and fuzz-safe (out-of-range targets ignored, not panicked).
     `term_successors` now delegates to `cfg::successors`. Unit-tested incl. an irreducible two-entry
     loop, self-loop, and unreachable block.
-  - [ ] (c) The internal conventional-SSA form + lower-back pass, landed with the no-op round-trip
-    differential fuzz target.
+  - [x] **(c) The internal conventional-SSA form** (`svm_opt::ssa`): `to_ssa` renames block-local
+    operands to a function-global `Value` space (via the exhaustive `map_operands`), tracking each
+    value's `Def` site; `from_ssa` is its exact inverse. The round-trip is the **identity**
+    (`from_ssa(to_ssa(f)) == f`), pinned by hand-built shapes (params/`br_table`/loops/multi-result
+    `call`), an interpreter behavioral check, a 5000-case randomized structural test, and the
+    `opt_ssa_roundtrip` cargo-fuzz target (reuses `irgen` → round-trip identity + interp-vs-JIT
+    differential on the lowered module). Cross-block-use lowering (param threading) is deferred to the
+    first Phase 2 pass that needs it — today every value is used only in its defining block.
   - [ ] (d) `OptConfig` (budgets, pass toggles).
 - [ ] **Phase 2 — global scalar passes.** SCCP (subsumes and globalizes today's fold + branch
   resolution), GVN/CSE, instcombine-style rules + strength reduction, jump threading, LICM for
