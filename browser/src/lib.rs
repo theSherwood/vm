@@ -2269,6 +2269,214 @@ impl SharedOnrampReactor {
     }
 }
 
+/// A **wasm-JIT reactor** over an on-ramp guest (BROWSER.md § "wasm-JIT tier", slice 5c): the guest's
+/// whole `tick` runs on **emitted wasm** each frame instead of the interpreter, over the same shared
+/// window as [`SharedOnrampReactor`]. The host (JS in the browser, `wasmi` in the native differential)
+/// compiles the emitted module ([`emitted_wasm`](Self::emitted_wasm)), instantiates it against *this*
+/// module's linear memory, and calls `f{tick}(win, env, entry_sp)` per frame; the emitted code bounces
+/// each call to a non-emitted (cross-tier) helper back through [`run_cross_tier`](Self::run_cross_tier),
+/// which runs that callee on the interpreter over the shared window **with the powerbox** (so
+/// `display`/`keyboard`/`fs`/`exit` all resolve) — its memory effects landing in the bytes the emitted
+/// code reads.
+///
+/// The mapped window is enlarged at open (`win_log2`) so the guest's heap growth stays **within**
+/// mapped — Doom `vm_map`s its zone heap to ~11 MiB, above its native 4 MiB mapped window; keeping it
+/// inside mapped lets the emitter's static-`mapped` confinement mask cover every emitted access, and
+/// lets a fresh-`Mem` cross-tier run reach the whole live window without committed-page tracking. The
+/// guest stays confined to the (larger, still power-of-two) window.
+pub struct JitOnrampReactor {
+    /// The import-resolved, window-enlarged module — cross-tier callees are interpreted from it.
+    module: svm_ir::Module,
+    /// The powerbox (granted caps + `_start`'s stashed handles), shared across `_start` and every
+    /// per-frame cross-tier callee so caps + their state persist.
+    host: Host,
+    /// Keep-alive for an owned backing (native path); `None` when the window is caller-owned (FFI).
+    _backing: Option<Box<[u8]>>,
+    back: std::sync::Arc<svm_interp::Region>,
+    entry_sp: u64,
+    tick: svm_ir::FuncIdx,
+    /// The emitted wasm for the whole `tick` (the host compiles + runs it) and the per-function emitted
+    /// bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the rest bounce through `run_cross_tier`).
+    emitted_wasm: Vec<u8>,
+    emitted: Vec<bool>,
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    keys: KeyQueue,
+    last_trap: Option<String>,
+}
+
+impl JitOnrampReactor {
+    /// Open a wasm-JIT reactor over `m` with an **owned** backing of `1 << win_log2` bytes (native
+    /// path). `shared_memory` selects the emitted `env.memory` import's shared flag (`true` for the
+    /// browser threads build; `false` for the `wasmi` differential — the codegen is otherwise
+    /// identical). `Err(status)` if imports don't resolve, there is no `tick`, `_start` traps, or the
+    /// `tick` isn't wasm-JIT-emittable (it falls back to [`SharedOnrampReactor`]).
+    pub fn open_owned_jit(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<JitOnrampReactor, i32> {
+        let win_size = 1u64 << win_log2;
+        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
+        let ptr = backing.as_mut_ptr();
+        // SAFETY: `backing` is owned by the returned struct and its heap allocation is pointer-stable
+        // across the struct's moves, so `[ptr, win_size)` stays valid + exclusive for the run.
+        let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(ptr, win_size) });
+        Self::open_over_jit(m, back, Some(backing), win_log2, shared_memory, fs)
+    }
+
+    /// Open a wasm-JIT reactor over a **caller-owned** window `[win_ptr, win_ptr+win_size)` of this
+    /// module's linear memory (the FFI path). `win_size` must equal `1 << win_log2`.
+    ///
+    /// # Safety
+    /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
+    /// reactor's window and kept valid until the reactor is dropped.
+    pub unsafe fn open_shared_jit(
+        m: &svm_ir::Module,
+        win_ptr: *mut u8,
+        win_size: u64,
+        win_log2: u8,
+        shared_memory: bool,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<JitOnrampReactor, i32> {
+        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        Self::open_over_jit(m, back, None, win_log2, shared_memory, fs)
+    }
+
+    fn open_over_jit(
+        m: &svm_ir::Module,
+        back: std::sync::Arc<svm_interp::Region>,
+        backing: Option<Box<[u8]>>,
+        win_log2: u8,
+        shared_memory: bool,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<JitOnrampReactor, i32> {
+        let mut module =
+            svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+        // Enlarge the mapped window to cover the guest's grown heap (see the struct docs).
+        if let Some(mc) = module.memory.as_mut() {
+            if (mc.size_log2 as u32) < win_log2 as u32 {
+                mc.size_log2 = win_log2;
+            }
+        }
+        let arity = module.funcs.first().map_or(0, |f| f.params.len());
+        if arity > 5 {
+            return Err(STATUS_UNSUPPORTED);
+        }
+        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+        let mut host = Host::new();
+        let (slots, frame, keys) = grant_onramp_caps(&mut host, &module, fs);
+        // Run `_start` once over the shared window (seed data + init), servicing `cap.call`s (Doom's
+        // WAD read) inline against the powerbox. The window then persists in `back` for every frame.
+        let mut fuel = u64::MAX;
+        match bytecode::compile_and_run_over_shared_with_host(
+            &module,
+            0,
+            &slots,
+            &mut fuel,
+            back.clone(),
+            &mut host,
+            true,
+        ) {
+            Some(Ok(_)) => {}
+            Some(Err(_)) => return Err(STATUS_TRAP),
+            None => return Err(STATUS_UNSUPPORTED),
+        }
+        // Emit the whole `tick` (cross-tier helpers routed to `env.call_interp`). Fall back if the
+        // guest isn't reactor-emittable (e.g. its `tick` directly makes a cap.call → not in-subset).
+        let (emitted_wasm, emitted) =
+            svm_wasmjit::compile_module_reactor(&module, tick, shared_memory)
+                .map_err(|_| STATUS_UNSUPPORTED)?;
+        Ok(JitOnrampReactor {
+            module,
+            host,
+            _backing: backing,
+            back,
+            entry_sp,
+            tick,
+            emitted_wasm,
+            emitted,
+            frame,
+            keys,
+            last_trap: None,
+        })
+    }
+
+    /// The emitted wasm module for the whole `tick` — the host compiles + instantiates it against this
+    /// module's linear memory and calls the exported `f{tick}(win, env, entry_sp)`.
+    pub fn emitted_wasm(&self) -> &[u8] {
+        &self.emitted_wasm
+    }
+
+    /// The per-function emitted bitmap: `emitted[i]` ⇒ `f{i}` runs on wasm (the rest bounce through
+    /// [`run_cross_tier`](Self::run_cross_tier)).
+    pub fn emitted(&self) -> &[bool] {
+        &self.emitted
+    }
+
+    /// The reactor calling-convention data-stack base, passed as the emitted `f{tick}`'s `sp` argument.
+    pub fn entry_sp(&self) -> u64 {
+        self.entry_sp
+    }
+
+    /// The SVM index of the exported `tick` — the emitted export name is `f{tick}`.
+    pub fn tick(&self) -> svm_ir::FuncIdx {
+        self.tick
+    }
+
+    /// **Cross-tier bounce.** Run non-emitted `func(args)` on the interpreter over the shared window
+    /// with the powerbox — the callback the emitted `tick`'s `env.call_interp` drives. Memory effects
+    /// land in the shared window (the bytes the emitted code reads); `cap.call`s resolve against the
+    /// persistent host (so a `display.present` populates the frame cell, `keyboard.poll` drains input).
+    /// `Err(Trap::Exit)` is the guest's `Exit`; any other `Err` is a trap.
+    pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
+        let mut fuel = u64::MAX;
+        match bytecode::compile_and_run_over_shared_with_host(
+            &self.module,
+            func,
+            args,
+            &mut fuel,
+            self.back.clone(),
+            &mut self.host,
+            false,
+        ) {
+            Some(r) => r,
+            None => Err(Trap::Malformed),
+        }
+    }
+
+    /// The signature of cross-tier `func` (the host marshals `env.call_interp`'s i64 arg/result slots
+    /// per these types).
+    pub fn func_sig(&self, func: u32) -> (&[svm_ir::ValType], &[svm_ir::ValType]) {
+        let f = &self.module.funcs[func as usize];
+        (&f.params, &f.results)
+    }
+
+    /// Record a trap's `Debug` string (diagnostic); returns `""` if none.
+    pub fn last_trap(&self) -> &str {
+        self.last_trap.as_deref().unwrap_or("")
+    }
+
+    /// Set the last-trap diagnostic (the host records the trap that unwound a frame's emitted `tick`).
+    pub fn set_last_trap(&mut self, s: String) {
+        self.last_trap = Some(s);
+    }
+
+    /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.frame.lock().unwrap().take()
+    }
+
+    /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
+    pub fn push_key(&self, keycode: i32, pressed: i32) {
+        self.keys
+            .lock()
+            .unwrap()
+            .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+    }
+}
+
 /// Outcome of a [`capture_exec`] run: the status, the `i64`-widened return value (when `STATUS_OK`),
 /// and the **final window image** — the first `init.len()` bytes of the guest's memory after the run.
 pub struct CapOutcome {

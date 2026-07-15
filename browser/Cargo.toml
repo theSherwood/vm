@@ -46,3 +46,8 @@ svm-wasmjit = { path = "../crates/svm-wasmjit" }
 
 [profile.release]
 panic = "abort"
+
+[dev-dependencies]
+# The native wasm-JIT reactor differential (`tests/jit_reactor.rs`) runs the emitted `tick` on `wasmi`
+# (playing the browser's JS host) against the interpreter reactor oracle. Matches svm-wasmjit's dev-dep.
+wasmi = { version = "0.47", features = ["simd"] }
