@@ -717,6 +717,23 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `vadd` at **~0.3 ns/iter** (~108× over interpreter-in-wasm, ~3× off native Cranelift SIMD), and
    `call_indirect` too (its whole-module requirement finally met).
    Remaining for the slice: a playground toggle.
+7. **[landed] Reactor (whole-`tick`-on-wasm) — DOOM in the playground.** The Doom demo runs its entire
+   per-frame `tick()` on the emitted wasm tier (`svm_onramp_jit_*` FFI + `web/wasmjit-reactor.js`),
+   over the cdylib's shared window, with the ~24 genuine I/O helpers (`cap.call` display/timer,
+   `cap.self_resolve`) relaying through `env.call_interp` to the interpreter. Two increments closed the
+   last gaps: **(a)** `call_indirect` routes to *all* cross-tier functions, not just `ref.func`-taken
+   ones (DOOM's `states[]`/`mobjinfo[]` action pointers live in data segments — PR #314 / I-note),
+   fixing a `~frame-174` trap; **(b)** the **bulk-memory lowering** (`memcpy`/`memset`/`memmove` →
+   `memory.copy`/`memory.fill`, PR #314) dropped DOOM's reachable cross-tier functions **105 → 24**
+   (920/944 now emitted) — the 81 that were cross-tier *only* for a bulk-memory op.
+   **Measured** (`bench_doom_throughput.mjs`, Chromium, warm): the emitted tick runs at **~370 ticks/s
+   (mean ~2.7 ms/frame, p99 ~4 ms, <0.05% of frames over 16.7 ms)** — **4–6× above the 60 fps rAF
+   cap**, so DOOM is **display/vsync-capped, not compute-bound**. Of a warm frame, ~2 cross-tier I/O
+   bounces cost ~1.2 ms (the display/timer `cap.call`s); the `present` blit itself is negligible
+   (~1 µs). So the only remaining per-frame cost is the genuine host I/O — pure headroom while
+   display-capped; trimming it (cached cap resolution) is a *future* lever, not a smoothness fix.
+   Remaining for the slice: a playground toggle **(already present — the "wasm-JIT" checkbox in
+   `play.js`)**.
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);

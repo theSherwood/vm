@@ -17,15 +17,28 @@ try {
     const doom = new Uint8Array(await (await fetch('/web/assets/doom.svmb')).arrayBuffer());
     const wad = new Uint8Array(await (await fetch('/web/assets/doom1.wad')).arrayBuffer());
     const reactor = await openJitReactor(eng.ex, eng.memory, doom, 'doom1.wad', wad);
-    for (let i = 0; i < 20; i++) reactor.frame();               // warm up (V8 tier-up)
-    const t0 = performance.now(); let n = 0;
-    while (performance.now() - t0 < 3000) { reactor.frame(); n++; }
-    const secs = (performance.now() - t0) / 1000;
+    // Warm up past the cold regime: V8 must baseline- then optimizing-compile the ~1000-function
+    // emitted module, and Doom must run its title screen into the attract-mode demo (the heavy 3D
+    // render path). 20 frames is too few — the first Chromium launch can still be in liftoff, which
+    // is what made this bench occasionally report a cold-start fluke; 300 frames is safely warm.
+    for (let i = 0; i < 300; i++) reactor.frame();
+    // Per-frame times over ~10s — long enough to span the title→demo→title cycle, so the tail
+    // captures the expensive render frames, not just the cheap static menu.
+    const times = [];
+    const tEnd = performance.now() + 10000;
+    while (performance.now() < tEnd) { const a = performance.now(); reactor.frame(); times.push(performance.now() - a); }
     reactor.close();
-    return { tps: n / secs };
+    times.sort((x, y) => x - y);
+    const n = times.length;
+    const pct = (p) => times[Math.min(n - 1, Math.floor((p / 100) * n))];
+    const mean = times.reduce((s, t) => s + t, 0) / n;
+    return { tps: n / (times.reduce((s, t) => s + t, 0) / 1000), meanMs: mean, p50: pct(50), p99: pct(99), max: times[n - 1],
+             overVsync: 100 * times.filter((t) => t > 16.7).length / n };
   });
-  console.log(`\n  raw tick throughput (no rAF): ${res.tps.toFixed(0)} ticks/sec  (${(1000 / res.tps).toFixed(1)} ms/frame)`);
-  console.log(res.tps > 60 ? '  → compute exceeds 60 fps; the display loop is vsync-capped (smooth)'
+  console.log(`\n  wasm-JIT tick throughput (no rAF): ${res.tps.toFixed(0)} ticks/sec`);
+  console.log(`  per-frame ms: mean ${res.meanMs.toFixed(2)}  p50 ${res.p50.toFixed(2)}  p99 ${res.p99.toFixed(2)}  max ${res.max.toFixed(1)}`);
+  console.log(`  frames slower than 16.7ms (60fps): ${res.overVsync.toFixed(2)}%`);
+  console.log(res.tps > 60 ? '  → compute far exceeds 60 fps; the display loop is vsync-capped (smooth)'
     : '  → below 60 fps; compute-bound (investigate)');
   process.exitCode = res.tps > 60 ? 0 : 1;
 } finally {
