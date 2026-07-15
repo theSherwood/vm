@@ -27,6 +27,7 @@ svm-mask = { path = "../crates/svm-mask" }
 svm-text = { path = "../crates/svm-text" }
 svm-wasm = { path = "../crates/svm-wasm" } # untrusted core-wasm frontend, fuzzed for fail-closed decode
 svm-opt = { path = "../crates/svm-opt" } # generic IR→IR optimizer, fuzzed for the SSA round-trip identity
+svm-llvm = { path = "../crates/svm-llvm" } # LLVM on-ramp, fuzzed for translation miscompiles (onramp_diff)
 
 [[bin]]
 name = "opt_ssa_roundtrip"
@@ -66,6 +67,13 @@ bench = false
 [[bin]]
 name = "diff"
 path = "fuzz_targets/diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onramp_diff"
+path = "fuzz_targets/onramp_diff.rs"
 test = false
 doc = false
 bench = false

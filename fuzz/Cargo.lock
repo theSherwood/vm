@@ -646,6 +646,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-llvm",
  "svm-mask",
  "svm-opt",
  "svm-run",
@@ -687,6 +688,15 @@ dependencies = [
  "svm-fiber",
  "svm-ir",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "svm-llvm"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-ir",
+ "svm-text",
 ]
 
 [[package]]
