@@ -18,6 +18,7 @@
 //! `math`, …) is **guest code**, not a cap — it needs no authority (POSIX.md §1).
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use svm_interp::{iface, GuestMem, Host, HostFn, Trap};
@@ -46,10 +47,17 @@ struct Inner {
     /// Preloaded standard input; `read(0, …)` drains it from `stdin_pos`.
     stdin: Vec<u8>,
     stdin_pos: usize,
-    /// The window offset the next allocation is handed from, bumped upward, bounded by `heap_end`.
+    /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
     heap_next: u64,
     /// One past the last window byte the allocator may hand out.
     heap_end: u64,
+    /// Live allocations, `ptr → size` — so `free` knows a block's length (the size header lives
+    /// host-side, out of the guest's reach, rather than in a window prefix the guest could clobber).
+    allocated: HashMap<u64, u64>,
+    /// Freed blocks available for reuse (`offset, size`), first-fit. No coalescing yet — adjacent
+    /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
+    /// works regardless.
+    free_list: Vec<(u64, u64)>,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -113,6 +121,8 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         stdin_pos: 0,
         heap_next: heap_base,
         heap_end,
+        allocated: HashMap::new(),
+        free_list: Vec::new(),
     }));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -130,7 +140,10 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_WRITE => st.write(args, mem),
             OP_READ => st.read(args, mem),
             OP_MALLOC => Ok(vec![st.malloc(args)]),
-            OP_FREE => Ok(vec![0]), // bump allocator: free is a no-op (a real free list is a follow-up)
+            OP_FREE => {
+                st.free(args);
+                Ok(vec![0])
+            }
             OP_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
             _ => Err(Trap::CapFault),
         }
@@ -177,21 +190,46 @@ impl Inner {
         Ok(vec![n as i64])
     }
 
-    /// `malloc(size) -> ptr | 0`: hand out an `ALIGN`-aligned window offset from the heap arena,
-    /// bumping the cursor. `0` (the C `NULL`) when the request would overrun `heap_end` — the
-    /// anti-bomb bound. A bump allocator: `free` reclaims nothing yet (POSIX.md §6).
+    /// `malloc(size) -> ptr | 0`: an `ALIGN`-aligned window offset from the heap arena. First-fit
+    /// **reuse** of a freed block (split if larger), else **bump** from the high-water mark. `0` (the
+    /// C `NULL`) when neither can satisfy the request within `heap_end` — the anti-bomb bound.
     fn malloc(&mut self, args: &[i64]) -> i64 {
-        let size = (*args.first().unwrap_or(&0)).max(0) as u64;
-        // A zero-size request still returns a unique, non-null pointer (C leaves it impl-defined; a
-        // fresh aligned cell is the least-surprising choice) — clamp to one alignment unit.
-        let size = size.max(1);
+        // Round the request up to `ALIGN`; a zero-size request still yields a unique non-null cell.
+        let want = ((*args.first().unwrap_or(&0)).max(0) as u64)
+            .max(1)
+            .div_ceil(ALIGN)
+            * ALIGN;
+        // First-fit over the free list: reuse the first block that fits, splitting off any remainder.
+        if let Some(i) = self.free_list.iter().position(|&(_, sz)| sz >= want) {
+            let (off, sz) = self.free_list.swap_remove(i);
+            if sz > want {
+                self.free_list.push((off + want, sz - want));
+            }
+            self.allocated.insert(off, want);
+            return off as i64;
+        }
+        // Bump a fresh block from the high-water mark (already `ALIGN`-aligned by construction).
         let ptr = (self.heap_next + (ALIGN - 1)) & !(ALIGN - 1);
-        match ptr.checked_add(size) {
+        match ptr.checked_add(want) {
             Some(end) if end <= self.heap_end => {
                 self.heap_next = end;
+                self.allocated.insert(ptr, want);
                 ptr as i64
             }
             _ => 0, // out of heap → NULL
+        }
+    }
+
+    /// `free(ptr)`: return `ptr`'s block to the free list for reuse. `free(NULL)` and a double / bogus
+    /// free are no-ops (a bogus free never corrupts the arena — the size table is host-side). No
+    /// coalescing yet (POSIX.md §6).
+    fn free(&mut self, args: &[i64]) {
+        let ptr = *args.first().unwrap_or(&0) as u64;
+        if ptr == 0 {
+            return;
+        }
+        if let Some(size) = self.allocated.remove(&ptr) {
+            self.free_list.push((ptr, size));
         }
     }
 }
@@ -303,6 +341,42 @@ block0(vph: i32):\n\
             "jit: read count must match interp, got {jo:?}"
         );
         assert_eq!(jout, iout, "jit: echoed output must match interp");
+    }
+
+    /// func 0 `(handle) -> i64`: `a = malloc(32)`, `b = malloc(32)`, `free(a)`, `c = malloc(32)`, then
+    /// return `(c - a) * 1_000_000 + (b - a)`. A working free list reuses `a`'s exact block for `c`
+    /// (`c - a == 0`), and `b` sits one 32-byte block above `a` (`b - a == 32`) → `32`. (Without reuse
+    /// `c` would bump fresh to `a + 64`, giving `64_000032` — so the value is non-vacuous.)
+    const MALLOC_FREE_REUSE: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block0(vph: i32):\n\
+  vsz = i64.const 32\n\
+  va = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
+  vb = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
+  vf = cap.call 13 3 (i64) -> (i64) vph (va)\n\
+  vc = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
+  vcva = i64.sub vc va\n\
+  vbva = i64.sub vb va\n\
+  vk = i64.const 1000000\n\
+  vt = i64.mul vcva vk\n\
+  vr = i64.add vt vbva\n\
+  return vr\n\
+}\n";
+
+    #[test]
+    fn free_list_reuses_a_freed_block_on_both() {
+        let (ir, _iout) = run_interp(MALLOC_FREE_REUSE, b"");
+        let (jo, _jout) = run_jit(MALLOC_FREE_REUSE, b"");
+        // c reused a (diff 0); b is 32 bytes above a → 0*1_000_000 + 32 = 32.
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(32)]),
+            "interp: free then malloc reuses the block"
+        );
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[32]),
+            "jit: allocator must match interp, got {jo:?}"
+        );
     }
 
     #[test]
