@@ -315,34 +315,40 @@ block0(v0: i64):
   'bounce (interactive — arrow keys)': {
     kind: 'reactor',
     url: './assets/bounce.svmb',
+    jit: true, // tick() emits after cap-call outlining — toggle "wasm-JIT" to run it near-natively
     mode: 'io',
     desc: 'crates/svm-run/demos/display/bounce.c — a C guest whose exported tick() runs one frame. ' +
       'Click Run, then steer the box with the arrow keys: the page calls tick() once per animation ' +
       'frame (the reactor run model), feeding key events in through the `keyboard` capability and ' +
       'blitting the frame it presents through `display`. State persists between frames. This is the ' +
-      'interactive per-frame loop + input path Doom rides. Click Stop to end the loop.',
+      'interactive per-frame loop + input path Doom rides. Toggle "wasm-JIT" to run the whole tick() ' +
+      'on emitted wasm instead of the interpreter. Click Stop to end the loop.',
   },
   'life (Conway — heap persistence)': {
     kind: 'reactor',
     url: './assets/life.svmb',
+    jit: true, // tick() emits after cap-call outlining — toggle "wasm-JIT" to run it near-natively
     mode: 'io',
     desc: 'crates/svm-run/demos/display/life.c — Conway’s Game of Life. Its cell grid lives in the ' +
       'malloc heap (which the on-ramp grows above the mapped window — exactly where Doom’s allocator ' +
       'will sit). Each tick computes the next generation from the current one, so the glider only ' +
       'advances if the reactor persists the guest’s whole memory (heap included) between frames. ' +
-      'Click Run to watch it evolve; Stop to end. This is the heap-persistence proof Doom needs.',
+      'Click Run to watch it evolve; Stop to end. Toggle "wasm-JIT" to run the whole tick() on ' +
+      'emitted wasm instead of the interpreter. This is the heap-persistence proof Doom needs.',
   },
   'Mandelbrot zoom (interactive — arrow keys)': {
     kind: 'reactor',
     url: './assets/mandelzoom.svmb',
+    jit: true, // f64 tick() emits after cap-call outlining — toggle "wasm-JIT" for a ~24× speedup
     mode: 'io',
     desc: 'crates/svm-run/demos/display/mandelzoom.c — a C guest whose exported tick() computes a ' +
       'full double-precision Mandelbrot for the current view (in the sandbox, on the CPU — no GPU) ' +
       'and presents the RGBA frame through the `display` capability. Click Run: it auto-zooms toward ' +
       'a seahorse valley with a cycling rainbow palette; steer the zoom target with the arrow keys. ' +
-      'Every frame is a fresh ~43k-pixel escape-time render on the wasm interpreter, so it runs at a ' +
-      'few FPS (like Doom) — the compute is all guest code, only the finished frame crosses the ' +
-      'capability boundary. Click Stop to end.',
+      'Every frame is a fresh ~43k-pixel escape-time render; on the wasm interpreter that runs at a ' +
+      'few FPS, so toggle "wasm-JIT" to run the whole tick() on emitted wasm — the f64 escape loop ' +
+      'then runs near-natively (~24× faster here) and the frame rate jumps (shown live). The compute ' +
+      'is all guest code; only the finished frame crosses the capability boundary. Click Stop to end.',
   },
   'GPU: Mandelbrot zoom (WebGPU shader)': {
     kind: 'reactor',
@@ -644,7 +650,7 @@ async function runReactor(ex) {
     // wasm-JIT reactor: the cdylib emits the whole tick(); this JS module compiles + runs it. On any
     // open/emit failure fall back to the interpreter reactor so the demo still plays.
     try {
-      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad);
+      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad); // wad is null for the non-fs reactors
       log(`wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
     } catch (e) {
       jitReactor = null;

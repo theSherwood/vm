@@ -733,7 +733,34 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (~1 µs). So the only remaining per-frame cost is the genuine host I/O — pure headroom while
    display-capped; trimming it (cached cap resolution) is a *future* lever, not a smoothness fix.
    Remaining for the slice: a playground toggle **(already present — the "wasm-JIT" checkbox in
-   `play.js`)**.
+   `play.js`; cap-call outlining below extends it to bounce/life/mandelzoom)**.
+   **Cap-call outlining — emit hot reactor ticks that make inline `cap.call`s.** DOOM emitted because
+   its cap calls already live in helper functions; a simpler reactor whose `tick` makes an inline
+   `cap.call` did not. A `cap.call` is the
+   guest→host boundary (it dispatches into the powerbox, host-side), outside the emitter's compute
+   subset, and emittability is decided per **whole function** — so a reactor whose `tick` interleaves
+   compute with a once-per-frame `display.present` / `keyboard.poll` kept the *entire* function (its
+   hot loop included) on the interpreter. **`svm_wasmjit::outline_cap_calls`** (a JIT pre-pass run after `resolve_imports`,
+   before analyze/emit) hoists each inline `cap.call` into a synthetic single-block wrapper function
+   and rewrites the call site to a plain `Call`. The wrapper has an all-integer signature (a capability
+   handle is `i32`, its op args/results `i64`), so it is a **cross-tier leaf** reached through the
+   *existing* `env.call_interp` bridge — the function that held the cap call becomes pure compute + a
+   `Call` and now emits, while the wrapper bounces to the interpreter (with the powerbox) only at the
+   rare cap site. This is the compiler doing, on the IR, what a guest author would do by hand (moving
+   `__vm_host_call` into a `noinline` shim) — so **unmodified** guests speed up, and the emitted-code
+   security contract is unchanged (emitted functions still do nothing but masked memory + calls). The
+   rewrite is 1:1 (a `Call` to a wrapper appends exactly the cap call's `sig.results`, so block-local
+   value numbering is preserved) and **appends** the wrappers (existing funcidxs / exports / debug locs
+   stay valid). Wired into the browser reactor JIT open path (`open_over_jit`), plus a non-fs
+   `svm_onramp_jit_open` (the reactor analogue of `svm_onramp_open`) so a guest that needs no served
+   file can open a JIT reactor. Measured in Chromium on the **unmodified** playground assets, per frame
+   interpreter → JIT, with **byte-identical** framebuffers over 40 frames on every demo: mandelzoom
+   (f64 escape loop) **488 ms → 20 ms (~24×, ~2 → ~49 FPS, bit-exact)**, life 34×, bounce 7.8×. Proven
+   by `crates/svm-wasmjit/tests/outline_capcalls.rs` (the transform flips emittability and preserves
+   interpreter semantics, and the rewritten module verifies) and the committed
+   `browser/browser-jit-reactor-test.mjs` (each reactor guest renders byte-identically on both tiers in
+   real Chromium). *(This does **not** bring `cap.call` into the emitted subset — the note at slice 3's
+   deopt still holds; it makes cap-call-bearing **functions** emittable by outlining the cap op.)*
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
@@ -755,5 +782,8 @@ partitioning is per-function anyway). Revisit fibers when JSPI / core stack-swit
   isolated, the powerbox prints `"hello, powerbox!"`, one guest's vCPUs run across real Web Workers
   → 4000, and the **playground** (`/web/play.html`) parses typed SVM text in-browser and runs it in
   every powerbox mode, incl. the parse-reject negative. (Build the threads module + `gencorpus`
-  first; see the header of `browser-test.mjs`.)
+  first; see the header of `browser-test.mjs`.) `node browser/browser-jit-reactor-test.mjs` adds the
+  **wasm-JIT reactor differential**: each committed reactor guest (bounce/life/mandelzoom) renders
+  byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining) — the emitter's
+  "verified ⇒ same on both tiers" contract, on real f64 guest code.
 - **Confinement intact:** `svm-mask` property/fuzz tests compile and pass unchanged.
