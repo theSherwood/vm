@@ -9036,6 +9036,16 @@ pub mod iface {
     /// can add capabilities without touching the VM. The handler reads/writes the guest window
     /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
     pub const HOST_FN: u32 = 13;
+    /// §15 / PROCESS.md §5 `Budget` — a passable, **splittable** resource-quota vector (fuel / mem /
+    /// spawn), §15's "every meterable resource is a capability with a quota" promoted to an object.
+    /// op 0 `split(fuel, mem, spawn) -> sub_handle | -errno`: mint a child `Budget` holding those
+    /// amounts, **deducted** from the holder's remaining — attenuation (a child can never exceed the
+    /// parent, D19); a field of `-1` means "all remaining"; asking for more than remains is `-EINVAL`.
+    /// op 1 `read(field) -> remaining | -EINVAL`: report one field's remaining quota (`0` fuel, `1`
+    /// mem, `2` spawn) — the §15 monitoring readout. Charging a domain's consumption against its budget
+    /// (the `create(module, window, budget)` accounting) is the follow-up; this is the passable object
+    /// + attenuation the rest builds on.
+    pub const BUDGET: u32 = 14;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -9335,6 +9345,24 @@ enum Binding {
     /// An mmap-capable host-function capability (§4b): like [`Binding::HostFn`] but its handler in
     /// [`Host::host_fns_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
     HostFnRegion(u32),
+    /// A §15 / PROCESS.md §5 `Budget` handle, carrying the index of its [`BudgetState`] in
+    /// [`Host::budgets`]. Authority over a passable, **splittable** resource-quota vector (fuel / mem /
+    /// spawn): `split` attenuates a sub-budget out of the remaining, `read` reports it. Out-of-line (an
+    /// index, not the state) so `Binding` stays `Copy`, like [`Binding::SharedRegion`].
+    Budget(u32),
+}
+
+/// §15 / PROCESS.md §5 — a `Budget`'s **remaining** resource-quota vector. Three meterable resources
+/// today (fuel / mem / spawn, the anti-bomb dials §15 already tracks); the vector is kept deliberately
+/// short (O8). A field is a non-negative remaining amount. `split` moves quota from a parent entry into
+/// a fresh child entry (never raising a total — attenuation, D19); `read` reports a field. Charging a
+/// domain's live consumption against its budget is the follow-up (the `create(module, window, budget)`
+/// accounting) — this type is the passable, splittable object the accounting will draw down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BudgetState {
+    fuel: i64,
+    mem: i64,
+    spawn: i64,
 }
 
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
@@ -9388,6 +9416,7 @@ pub enum NonDurableKind {
     JitDomain,
     JitCode,
     HostFn,
+    Budget,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -9694,6 +9723,10 @@ pub struct Host {
     /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries. Each is a
     /// shared host buffer; aliasing a region into several window offsets clones this `Rc`.
     regions: Vec<RegionBacking>,
+    /// §15 / PROCESS.md §5 `Budget` states, indexed by the id a [`Binding::Budget`] carries. Each is a
+    /// remaining resource-quota vector; `split` moves quota from a parent's entry into a fresh child
+    /// entry (append-only, like `regions` — a split budget's index stays valid for the run).
+    budgets: Vec<BudgetState>,
     /// §14 instantiable **modules**, indexed by the id a [`Binding::Module`] carries — host-verified
     /// code a guest holding the handle may spawn as a child domain (`Arc`s so a spawned child shares,
     /// not copies). Append-only for the life of the `Host`, so raw views handed to the JIT's nesting
@@ -9906,6 +9939,7 @@ impl Host {
             err_sink: None,
             clock_ns: 0,
             regions: Vec::new(),
+            budgets: Vec::new(),
             modules: Vec::new(),
             region_factory: None,
             blockings: Vec::new(),
@@ -10303,6 +10337,7 @@ impl Host {
                 Binding::HostFn(_) | Binding::HostFnRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::HostFn))
                 }
+                Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -10354,6 +10389,7 @@ impl Host {
                 Binding::JitDomain(_) => NonDurableKind::JitDomain,
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
+                Binding::Budget(_) => NonDurableKind::Budget,
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -10647,6 +10683,17 @@ impl Host {
         let id = self.regions.len() as u32;
         self.regions.push(backing);
         self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
+    }
+
+    /// Grant a §15 / PROCESS.md §5 `Budget` — a splittable resource-quota vector `(fuel, mem, spawn)` —
+    /// returning its handle. The embedder mints the **root** budget with the total resources it lends a
+    /// domain; the guest `split`s sub-budgets out of it (attenuation) and `read`s remaining. A field of
+    /// `-1` means "unbounded" (the anti-bomb ceilings still cap actual consumption; `read` reports it as
+    /// `-1`). Charging live consumption against a budget is the follow-up — this is the passable object.
+    pub fn grant_budget(&mut self, fuel: i64, mem: i64, spawn: i64) -> i32 {
+        let id = self.budgets.len() as u32;
+        self.budgets.push(BudgetState { fuel, mem, spawn });
+        self.grant(iface::BUDGET, Binding::Budget(id))
     }
 
     /// Install the [`JitValidator`] — the decode+verify gate every `Jit.compile` runs. The
@@ -11307,6 +11354,75 @@ impl Host {
                     3 => mem.region_page_size(),
                     _ => EINVAL,
                 }])
+            }
+            Binding::Budget(idx) => {
+                // §15 / PROCESS.md §5: a passable, splittable resource-quota vector.
+                let idx = idx as usize;
+                let Some(&BudgetState { fuel, mem, spawn }) = self.budgets.get(idx) else {
+                    return Ok(vec![EINVAL]);
+                };
+                match op {
+                    0 => {
+                        // split(fuel, mem, spawn) -> sub_handle | -errno. For each field, `-1` = "all
+                        // remaining"; a non-negative amount must be `<=` the holder's remaining
+                        // (attenuation — a child can never exceed the parent, D19). An **unbounded**
+                        // (`-1`) parent field grants any child amount and stays unbounded. Over-asking
+                        // any bounded field is `-EINVAL` — the whole split fails closed, nothing deducted.
+                        // Returns `(child_amount, parent_remaining_after)`.
+                        let split_field = |arg: i64, rem: i64| -> Option<(i64, i64)> {
+                            if arg < 0 {
+                                // "all remaining": bounded parent → child takes it all (parent 0);
+                                // unbounded parent → child unbounded, parent stays unbounded.
+                                Some(if rem < 0 { (-1, -1) } else { (rem, 0) })
+                            } else if rem < 0 {
+                                (arg, -1).into() // unbounded parent, bounded request
+                            } else if arg <= rem {
+                                (arg, rem - arg).into()
+                            } else {
+                                None // over-attenuation of a bounded field
+                            }
+                        };
+                        let (Some((cf, pf)), Some((cm, pm)), Some((cs, ps))) = (
+                            split_field(*args.first().unwrap_or(&0), fuel),
+                            split_field(*args.get(1).unwrap_or(&0), mem),
+                            split_field(*args.get(2).unwrap_or(&0), spawn),
+                        ) else {
+                            return Ok(vec![EINVAL]);
+                        };
+                        // Mint the child budget first; draw down the parent only once the grant
+                        // succeeds, so a full handle table (-EMFILE) leaves the parent's quota intact.
+                        let child = self.budgets.len() as u32;
+                        self.budgets.push(BudgetState {
+                            fuel: cf,
+                            mem: cm,
+                            spawn: cs,
+                        });
+                        Ok(vec![
+                            match self.try_grant(iface::BUDGET, Binding::Budget(child)) {
+                                Some(h) => {
+                                    let b = &mut self.budgets[idx];
+                                    b.fuel = pf;
+                                    b.mem = pm;
+                                    b.spawn = ps;
+                                    h as i64
+                                }
+                                None => {
+                                    self.budgets.pop();
+                                    EMFILE
+                                }
+                            },
+                        ])
+                    }
+                    // read(field) -> remaining | -EINVAL: `0` fuel, `1` mem, `2` spawn (the §15
+                    // monitoring readout). Window-independent — one field per call.
+                    1 => Ok(vec![match *args.first().unwrap_or(&-1) {
+                        0 => fuel,
+                        1 => mem,
+                        2 => spawn,
+                        _ => EINVAL,
+                    }]),
+                    _ => Ok(vec![EINVAL]),
+                }
             }
             Binding::AddressSpace { base, size } => {
                 // §14: every op is confined to this capability's sub-range `[base, base+size)`. Offsets
