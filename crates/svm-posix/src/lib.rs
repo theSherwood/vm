@@ -12,11 +12,12 @@
 //! *bookkeeping* — the allocator's cursor, captured stdout/stderr, the stdin cursor — lives host-side
 //! in [`Inner`], never in the guest's address space, so the guest cannot corrupt it.
 //!
-//! Scope: `write` / `read` / `malloc` / `free` / `exit`, plus `open` / `close` / `lseek` over an
-//! in-memory filesystem (a `path → bytes` memfs) with a host-side fd table. `malloc` is a first-fit
-//! free list over a configured window-heap region. Still to come (POSIX.md §6): `stat`/`readdir`,
-//! signals, and `fork`/`exec`. Pure computation (`strlen`, `snprintf`, `math`, …) is **guest code**,
-//! not a cap — it needs no authority (POSIX.md §1).
+//! Scope: `write` / `read` / `malloc` / `free` / `exit`, plus `open` / `close` / `lseek` / `unlink`
+//! over an in-memory filesystem (a `path → bytes` memfs) with a host-side fd table, and
+//! `getcwd` / `chdir` / `getenv` / `setenv` over a host-side cwd + environment. `malloc` is a
+//! first-fit free list over a configured window-heap region. Still to come (POSIX.md §6):
+//! `stat`/`readdir`, signals, and `fork`/`exec`. Pure computation (`strlen`, `snprintf`, `math`, …)
+//! is **guest code**, not a cap — it needs no authority (POSIX.md §1).
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -35,11 +36,22 @@ pub const OP_OPEN: u32 = 5;
 pub const OP_CLOSE: u32 = 6;
 pub const OP_LSEEK: u32 = 7;
 pub const OP_UNLINK: u32 = 8;
+pub const OP_GETCWD: u32 = 9;
+pub const OP_CHDIR: u32 = 10;
+pub const OP_GETENV: u32 = 11;
+pub const OP_SETENV: u32 = 12;
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT)
 const EBADF: i64 = -9; // an op on an fd this personality does not serve
 const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
+const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
+
+// The ABI is **explicit-length**, syscall-style: a string argument is `(ptr, len)`, not a
+// NUL-terminated `char*`. This avoids an unbounded window scan (safer) and matches `read`/`write`;
+// a thin guest libc adapts C's NUL-terminated conventions to it (POSIX.md §4, "one ABI, two
+// bindings" — the shim is guest code). `getcwd`/`getenv` *write* NUL-terminated results (C's
+// contract) since the caller consumes them as `char*`.
 
 /// `open` flags (Linux `<fcntl.h>` values). The low two bits are the access mode.
 const O_ACCMODE: i64 = 3;
@@ -96,6 +108,18 @@ struct Inner {
     /// The host-side fd table (indexed by fd; `0`/`1`/`2` are always `None` — stdio is handled
     /// specially). `open` allocates the first free slot at [`FIRST_FD`] or above.
     fds: Vec<Option<OpenFile>>,
+    /// The current working directory `getcwd` reports and `chdir` updates. A plain string — the memfs
+    /// is flat (paths are used as-given), so `cwd` is not validated against it; path normalization/
+    /// resolution is a follow-up (POSIX.md §6).
+    cwd: String,
+    /// The environment: `name → value`. `getenv`/`setenv` read and update it; host-side, out of the
+    /// guest's reach, like the rest of the bookkeeping (POSIX.md §3).
+    env: HashMap<String, String>,
+    /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
+    /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
+    /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
+    /// invalidates the entry so the next `getenv` re-materializes the new value.
+    env_ptrs: HashMap<String, u64>,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -141,6 +165,23 @@ impl Posix {
             .get(path)
             .cloned()
     }
+
+    /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
+    /// guest `getenv`s. Invalidates any cached `getenv` pointer for the name.
+    pub fn set_env(&self, name: &str, value: &str) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.env_ptrs.remove(name);
+        st.env.insert(name.to_string(), value.to_string());
+    }
+
+    /// The current working directory — how an embedder/test observes a guest `chdir`.
+    pub fn cwd(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cwd
+            .clone()
+    }
 }
 
 /// The §7 import-name resolver for the POSIX subset: binds libc symbol names to the
@@ -160,6 +201,10 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "close" => OP_CLOSE,
         "lseek" => OP_LSEEK,
         "unlink" | "remove" => OP_UNLINK,
+        "getcwd" => OP_GETCWD,
+        "chdir" => OP_CHDIR,
+        "getenv" => OP_GETENV,
+        "setenv" => OP_SETENV,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -186,6 +231,9 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         free_list: Vec::new(),
         files: HashMap::new(),
         fds: Vec::new(),
+        cwd: "/".to_string(),
+        env: HashMap::new(),
+        env_ptrs: HashMap::new(),
     }));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -212,6 +260,10 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_CLOSE => Ok(vec![st.close(args)]),
             OP_LSEEK => Ok(vec![st.lseek(args)]),
             OP_UNLINK => st.unlink(args, mem),
+            OP_GETCWD => st.getcwd(args, mem),
+            OP_CHDIR => st.chdir(args, mem),
+            OP_GETENV => st.getenv(args, mem),
+            OP_SETENV => st.setenv(args, mem),
             _ => Err(Trap::CapFault),
         }
     })
@@ -416,16 +468,115 @@ impl Inner {
             self.allocated.insert(off, want);
             return off as i64;
         }
-        // Bump a fresh block from the high-water mark (already `ALIGN`-aligned by construction).
-        let ptr = (self.heap_next + (ALIGN - 1)) & !(ALIGN - 1);
-        match ptr.checked_add(want) {
-            Some(end) if end <= self.heap_end => {
-                self.heap_next = end;
+        // Bump a fresh block from the high-water mark and record it as a live allocation.
+        match self.arena_bump(want) {
+            Some(ptr) => {
                 self.allocated.insert(ptr, want);
                 ptr as i64
             }
-            _ => 0, // out of heap → NULL
+            None => 0, // out of heap → NULL
         }
+    }
+
+    /// Bump `n` (already `ALIGN`-aligned) bytes off the heap high-water mark, returning the aligned
+    /// start offset, or `None` if it would pass `heap_end`. The low-level arena primitive `malloc` and
+    /// the `getenv` string cache both grow from — it advances `heap_next` but does **not** record an
+    /// `allocated` entry (the caller decides whether the block is `free`-able).
+    fn arena_bump(&mut self, n: u64) -> Option<u64> {
+        let ptr = (self.heap_next + (ALIGN - 1)) & !(ALIGN - 1);
+        match ptr.checked_add(n) {
+            Some(end) if end <= self.heap_end => {
+                self.heap_next = end;
+                Some(ptr)
+            }
+            _ => None,
+        }
+    }
+
+    /// `getcwd(buf, size) -> buf | 0`: copy the current directory (NUL-terminated, C `getcwd`'s
+    /// contract) into the caller's window buffer; return `buf` on success, `-ERANGE` if the path plus
+    /// its NUL won't fit `size`. `size == 0` with any path is `-EINVAL` (POSIX).
+    fn getcwd(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let buf = *args.first().ok_or(Trap::Malformed)? as u64;
+        let size = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        if size == 0 {
+            return Ok(vec![EINVAL]);
+        }
+        let mut bytes = self.cwd.clone().into_bytes();
+        bytes.push(0); // NUL terminator
+        if bytes.len() as u64 > size {
+            return Ok(vec![ERANGE]);
+        }
+        mem.write_bytes(buf, &bytes).ok_or(Trap::Malformed)?;
+        Ok(vec![buf as i64])
+    }
+
+    /// `chdir(path, len) -> 0 | -errno`: set the working directory. The memfs is flat, so any UTF-8
+    /// path is accepted as-is (no existence check — a follow-up, POSIX.md §6); a non-UTF-8 path is
+    /// `-EINVAL`.
+    fn chdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        self.cwd = path;
+        Ok(vec![0])
+    }
+
+    /// `getenv(name, len) -> ptr | 0`: look up an environment variable and return a **stable** window
+    /// pointer to a NUL-terminated copy of its value (C `getenv`'s `char*` into libc storage), or `0`
+    /// (C `NULL`) if unset. The copy is materialized in the arena once and cached (`env_ptrs`), so a
+    /// repeated lookup returns the same pointer; `0` (out of heap) if the arena can't hold it. A
+    /// non-UTF-8 name is treated as unset (`0`).
+    fn getenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, nlen).ok_or(Trap::Malformed)?;
+        let Ok(name) = String::from_utf8(bytes) else {
+            return Ok(vec![0]); // a name we can't represent can't be set
+        };
+        if let Some(&cached) = self.env_ptrs.get(&name) {
+            return Ok(vec![cached as i64]);
+        }
+        let Some(value) = self.env.get(&name).cloned() else {
+            return Ok(vec![0]); // unset → NULL
+        };
+        let mut vb = value.into_bytes();
+        vb.push(0); // NUL terminator
+        let Some(dst) = self.arena_bump(vb.len() as u64) else {
+            return Ok(vec![0]); // no room → behave as if unset (best effort)
+        };
+        mem.write_bytes(dst, &vb).ok_or(Trap::Malformed)?;
+        self.env_ptrs.insert(name, dst);
+        Ok(vec![dst as i64])
+    }
+
+    /// `setenv(name, nlen, value, vlen, overwrite) -> 0 | -errno`: set (or, when `overwrite == 0` and
+    /// the name already exists, leave) an environment variable. Invalidates any cached `getenv` pointer
+    /// for the name so the next `getenv` materializes the new value. A non-UTF-8 name/value is `-EINVAL`.
+    fn setenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let nptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let vptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
+        let vlen = (*args.get(3).ok_or(Trap::Malformed)?).max(0) as u64;
+        let overwrite = *args.get(4).ok_or(Trap::Malformed)?;
+        let nb = mem.read_bytes(nptr, nlen).ok_or(Trap::Malformed)?;
+        let vb = mem.read_bytes(vptr, vlen).ok_or(Trap::Malformed)?;
+        let (Ok(name), Ok(value)) = (String::from_utf8(nb), String::from_utf8(vb)) else {
+            return Ok(vec![EINVAL]);
+        };
+        if overwrite == 0 && self.env.contains_key(&name) {
+            return Ok(vec![0]); // keep the existing value
+        }
+        self.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
+        self.env.insert(name, value);
+        Ok(vec![0])
     }
 
     /// `free(ptr)`: return `ptr`'s block to the free list for reuse. `free(NULL)` and a double / bogus
@@ -780,6 +931,172 @@ block0(vph: i32):\n\
             "jit: must match interp, got {jo:?}"
         );
         assert_eq!(jposix.read_file("g"), None, "jit: file is gone");
+    }
+
+    /// func 0 `(handle) -> i64`: `getenv("PATH")` (name bytes staged at offset 0 by the harness), then
+    /// `write(1, ptr, 4)` echoing the first 4 bytes of the value to stdout, and return the returned
+    /// pointer. With `PATH=/bin` staged host-side, `getenv` materializes `"/bin\0"` in the arena at the
+    /// heap base (`4096`) and returns it; stdout is `"/bin"`.
+    const GETENV_ECHO: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block0(vph: i32):\n\
+  vp = i64.const 0\n\
+  vP = i32.const 80\n\
+  i32.store8 vp vP\n\
+  vp1 = i64.const 1\n\
+  vA = i32.const 65\n\
+  i32.store8 vp1 vA\n\
+  vp2 = i64.const 2\n\
+  vT = i32.const 84\n\
+  i32.store8 vp2 vT\n\
+  vp3 = i64.const 3\n\
+  vH = i32.const 72\n\
+  i32.store8 vp3 vH\n\
+  vnlen = i64.const 4\n\
+  vptr = cap.call 13 11 (i64, i64) -> (i64) vph (vp, vnlen)\n\
+  vfd1 = i64.const 1\n\
+  vfour = i64.const 4\n\
+  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vptr, vfour)\n\
+  return vptr\n\
+}\n";
+
+    #[test]
+    fn getenv_returns_stable_ptr_and_value_on_both() {
+        let m = parse_module(GETENV_ECHO).expect("parse");
+        verify_module(&m).expect("verify");
+        // Interpreter.
+        let mut ih = Host::new();
+        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, Vec::new());
+        iposix.set_env("PATH", "/bin");
+        let mut fuel = 5_000_000u64;
+        let ir = run_capture_reserved_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[0u8; WIN],
+            0,
+            &mut ih,
+        )
+        .0;
+        // JIT.
+        let mut jh = Host::new();
+        let (jhh, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
+        jposix.set_env("PATH", "/bin");
+        let jo = compile_and_run_capture_reserved_with_host(
+            &m,
+            0,
+            &[jhh as i64],
+            &[0u8; WIN],
+            0,
+            svm_run::cap_thunk,
+            &mut jh as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit")
+        .0;
+        // getenv materializes "/bin\0" at the aligned heap base (4096) and returns it.
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(HEAP_BASE as i64)]),
+            "interp: getenv returns the arena pointer"
+        );
+        assert_eq!(iposix.stdout(), b"/bin", "interp: echoed the env value");
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[HEAP_BASE as i64]),
+            "jit: getenv pointer must match interp, got {jo:?}"
+        );
+        assert_eq!(
+            jposix.stdout(),
+            b"/bin",
+            "jit: echoed value must match interp"
+        );
+    }
+
+    /// func 0 `(handle) -> i64`: `chdir("/tmp")` (path bytes staged at offset 0), then `getcwd(buf, 8)`
+    /// into a scratch window buffer, echo the result (minus its NUL) to stdout, and return
+    /// `chdir_result * 1_000_000 + getcwd_ptr`. A working roundtrip: `chdir` → `0`, `getcwd` writes
+    /// `"/tmp\0"` and returns the buffer offset (32) → `0*1_000_000 + 32 = 32`; stdout is `"/tmp"`.
+    const CHDIR_GETCWD: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block0(vph: i32):\n\
+  vp = i64.const 0\n\
+  vsl = i32.const 47\n\
+  i32.store8 vp vsl\n\
+  vp1 = i64.const 1\n\
+  vt = i32.const 116\n\
+  i32.store8 vp1 vt\n\
+  vp2 = i64.const 2\n\
+  vm = i32.const 109\n\
+  i32.store8 vp2 vm\n\
+  vp3 = i64.const 3\n\
+  vpc = i32.const 112\n\
+  i32.store8 vp3 vpc\n\
+  vplen = i64.const 4\n\
+  vcd = cap.call 13 10 (i64, i64) -> (i64) vph (vp, vplen)\n\
+  vbuf = i64.const 32\n\
+  veight = i64.const 8\n\
+  vgc = cap.call 13 9 (i64, i64) -> (i64) vph (vbuf, veight)\n\
+  vfd1 = i64.const 1\n\
+  vfour = i64.const 4\n\
+  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vfour)\n\
+  vk = i64.const 1000000\n\
+  vtt = i64.mul vcd vk\n\
+  vr = i64.add vtt vgc\n\
+  return vr\n\
+}\n";
+
+    #[test]
+    fn chdir_then_getcwd_roundtrips_on_both() {
+        let (ir, iout) = run_interp(CHDIR_GETCWD, b"");
+        let (jo, jout) = run_jit(CHDIR_GETCWD, b"");
+        // chdir 0, getcwd returns buf (32) → 0*1_000_000 + 32 = 32; stdout "/tmp".
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(32)]),
+            "interp: chdir then getcwd roundtrip"
+        );
+        assert_eq!(iout, b"/tmp", "interp: getcwd wrote the new cwd");
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[32]),
+            "jit: roundtrip must match interp, got {jo:?}"
+        );
+        assert_eq!(jout, iout, "jit: getcwd output must match interp");
+    }
+
+    #[test]
+    fn setenv_updates_and_getenv_repoints_at_the_new_value() {
+        // A host-level unit for the setenv/getenv cache-invalidation contract (no guest module needed):
+        // getenv caches a pointer; setenv must invalidate it so the next getenv reflects the new value.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut st = posix.inner.lock().unwrap();
+        // Stage the name "K" at offset 0 and value "v2" at offset 8 in a scratch window.
+        let mut win = vec![0u8; WIN];
+        win[0] = b'K';
+        win[8] = b'v';
+        win[9] = b'2';
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        // setenv("K", "v1", overwrite=1): name@0 len 1, value staged separately — reuse offset 8 with "v1".
+        st.env.insert("K".to_string(), "v1".to_string());
+        // getenv("K") materializes "v1\0" and caches the pointer.
+        let p1 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
+        assert!(p1 > 0, "getenv returns a non-null arena pointer");
+        // setenv("K", "v2", overwrite=1): name@0 len1, value@8 len2.
+        let r = st.setenv(&[0, 1, 8, 2, 1], Some(&mut mem)).unwrap()[0];
+        assert_eq!(r, 0, "setenv succeeds");
+        // getenv("K") now re-materializes at a *fresh* pointer holding "v2\0".
+        let p2 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
+        assert_ne!(p2, p1, "setenv invalidated the cached getenv pointer");
+        let got = mem.read_bytes(p2 as u64, 3).unwrap();
+        assert_eq!(got, b"v2\0", "getenv reflects the setenv'd value");
+        // overwrite=0 on an existing name is a no-op (keeps "v2").
+        let r0 = st.setenv(&[0, 1, 8, 2, 0], Some(&mut mem)).unwrap()[0];
+        assert_eq!(r0, 0, "setenv(overwrite=0) on existing name returns 0");
+        assert_eq!(
+            st.env.get("K").map(String::as_str),
+            Some("v2"),
+            "overwrite=0 kept the existing value"
+        );
     }
 
     #[test]

@@ -93,8 +93,12 @@ only to mark the boundary.
 | 5 | `open(path, len, flags)` | `-> fd \| -errno` | memfs + host fd table | **done** — `O_CREAT`/`O_TRUNC`/`O_APPEND`, `-ENOENT` |
 | 6 | `close(fd)` | `-> 0 \| -errno` | host fd table | **done** |
 | 7 | `lseek(fd, off, whence)` | `-> pos \| -errno` | host fd table | **done** — `SEEK_SET`/`CUR`/`END` |
-| — | `stat/fstat/readdir/getcwd/chdir/unlink` | / `-errno` | memfs + host fd table | todo |
-| — | `getenv/setenv/environ` | `-> ptr \| 0` | host env map | todo |
+| 8 | `unlink(path, len)` | `-> 0 \| -errno` | memfs | **done** — `-ENOENT` if absent (aka `remove`) |
+| 9 | `getcwd(buf, size)` | `-> buf \| -errno` | host cwd | **done** — NUL-terminated, `-ERANGE`/`-EINVAL` |
+| 10 | `chdir(path, len)` | `-> 0 \| -errno` | host cwd | **done** — flat memfs, no existence check yet |
+| 11 | `getenv(name, len)` | `-> ptr \| 0` | host env map | **done** — stable NUL-terminated `char*` in arena |
+| 12 | `setenv(name, nlen, val, vlen, overwrite)` | `-> 0 \| -errno` | host env map | **done** — invalidates `getenv` cache |
+| — | `stat/fstat/readdir/environ` | / `-errno` | memfs + host fd table | todo |
 | — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
 | — | `pipe/dup/dup2/fcntl` | `-> fd \| -errno` | `Pipe` cap + host fd table | todo |
 | — | `time/clock_gettime` | `-> t` | `Clock` cap | todo |
