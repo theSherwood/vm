@@ -76,7 +76,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [decode_verify, diff, mask, wasm_transpile]
+        target: [decode_verify, diff, mask, wasm_transpile, spec_ops, spec_verify]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Pinned to a dated nightly, unlike the other nightly lanes (ISSUES.md I18): this job's first
