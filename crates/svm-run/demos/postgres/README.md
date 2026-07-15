@@ -62,7 +62,7 @@ unprivileged user if invoked as root.
 | 11l | **guest libc: varargs `scanf` engine + real `strtod`** | — | **DONE (slice CJ):** `scanf_shim.c` provides the runtime `sscanf`/`vsscanf`/`fscanf`/`vfscanf`/`scanf`/`vscanf` family Postgres parses config/version values with (the input twin of #11j) — d/i/u/o/x/c/s/f/`%[scanset]`/`%n`/`%%` with `*`-suppression, field width, and length modifiers, over one char-source abstraction (a string, or a `FILE*` via `fgetc`/`ungetc`). Its `%f`/`%lf` need a **real `strtod`** — the on-ramp's is a *trap stub* — so the correctly-rounded bignum `strtod.c` (shadows the stub; `float8in` needs it too) is linked in beside it via `pg_shims.c`. Differential `demo_pg_sscanf_vs_native` (the conversions + return-count semantics + an `fscanf`-from-`stdin` half, byte-exact on all three engines) |
 | 11m | **boot: drive the named boot to real logging** | — | **DONE (slice CL):** with every trap self-naming (#11k), a tight run→name→fix loop cleared the run of gaps between `find_my_exec` and Postgres's first log output. One on-ramp fix: **`__sigsetjmp`** (the symbol the `sigsetjmp` macro expands to) joins the setjmp recognizer (test `sigsetjmp_recognized`). Guest shims (each named by the diagnostic): **`realpath`** (canonicalize→absolute over the fs cap), a mutable **environment** (`setenv`/`getenv`/…), **`getpwuid`**/`getpwnam`, deterministic **`random`**/`srandom`, the **event-loop backend** (`event_shim.c`: `signalfd`/`epoll_*`/`eventfd` → fake fds + no-op registration; the single-process `WAIT_USE_EPOLL` latch is never blocked), real **`memcpy`/`memmove`/`memset`** (`mem_shim.c`, so an *address-taken* one resolves to a real function not a funcref stub), **`pow`** (`math_shim.c`, exact for `pow(10,n)`), and **`strerror`** + GNU **`strerror_r`** (its own `_GNU_SOURCE`-isolated TU `strerror_shim.c`). Composes with #11l's `strtod`/`scanf`. The boot now runs real startup through GUC init + config-file processing, emitting timestamped `LOG:`/`FATAL:` lines — no trap, a clean `Exited(1)` |
 | 11n | **★ boot: backend init + shared memory + WAL crash recovery** | — | **DONE (slice CM):** a run→name→fix loop on the *fast* bytecode engine drove real startup to a **recovered cluster**. **The fs-cap root is the guest filesystem root** — `os_shim` maps guest-absolute paths to cap-relative (so Postgres reaches its install `share/` tree; confinement unchanged, `..` still forbidden), and `fill_stat` reports the sandbox identity (uid/gid 1000) so `checkDataDir` passes. Shared memory: the SysV interlock genuinely attaches (`shmat` returns real memory) and DSM routes through a multi-segment SysV table (`dynamic_shared_memory_type=sysv`). **★ Real counting semaphores** — `sem_trywait` must fail at zero or `PGSemaphoreReset`'s drain loop spins forever (the boot's "hang"); differential `demo_pg_sem_vs_native`. Plus `__isoc23_*` scanf aliases and `sync_file_range` (no-op hint). Demo config: `timezone=GMT`, `fsync=off`, small `shared_buffers`/`max_connections`. Postgres now runs `InitPostgres`/relcache and **WAL crash recovery** (`redo starts…`/`redo done`/`checkpoint starting`) |
-| 11o | **boot: the checkpoint `fn0` funcref bug** | — | the end-of-recovery checkpoint (`CheckPointGuts → ProcessSyncRequests → hash_search_with_hash_value`) traps `Unreachable` on a hashtable function pointer that resolves to **index 0** (`fn0`). An address-taken/indirect-call funcref mis-resolution — a real **on-ramp** bug (its own slice), not a shim gap. Fixing it should carry the boot through the checkpoint to `database system is ready`, then the parser/planner/executor for the first `SELECT` |
+| 11o | **★★★ `SELECT 1+1` → `2`: the capstone** | — | **DONE (slice CN):** the checkpoint `fn0` trap was an **address-taken `memcmp`** — dynahash's `HASH_BLOBS` table stores `hashp->match = memcmp` and calls it *through the pointer*, but `memcmp` was only synthesized for direct calls, never defined, so its funcref fell to a trap stub (CL had defined `memcpy`/`memmove`/`memset` for this but missed the comparators). `mem_shim.c` now also defines `memcmp`/`strlen`/`strcmp`/`strncmp`; differential `demo_pg_funcptr_vs_native`. With the fix `postgres --single` completes recovery + the checkpoint, reaches the `backend>` prompt, **executes `SELECT 1+1;` and prints `2` (int4)**, then shuts down cleanly (`Exited(0)`). PostgreSQL 17.5 runs a real query on the SVM bytecode engine under the fs + powerbox caps |
 
 **Where it stands:** ★★ **the complete module (832 modules / 14 985 functions) now translates AND
 verifies** — past the **entire 921-site inline-asm surface** (BN/BO), all 18 **libm** transcendentals
@@ -105,11 +105,18 @@ sandbox identity (`checkDataDir` passes), the SysV/DSM shared memory attaches, a
 counting semaphore** (a no-op `sem_trywait` made `PGSemaphoreReset`'s drain loop spin forever, which *was*
 the boot's apparent "hang"; differential `demo_pg_sem_vs_native`). **Postgres now runs backend init, opens
 the catalog, and performs WAL crash recovery** — `database system was not properly shut down; automatic
-recovery in progress` / `redo starts…` / `redo done` / `checkpoint starting: end-of-recovery`. It stops in
-that checkpoint on a **`fn0` funcref** bug (gap #11o: a hashtable function pointer resolving to index 0 — a
-real on-ramp funcref mis-resolution, its own slice). *Boot speed* — a cold 15k-function boot reaches
-recovery in ~74 s on the bytecode engine — is now the gating concern for a browser demo, pointing at
-snapshot/restore of the post-boot state. See `LLVM.md` slices BM–CM, and "Booting" below.
+recovery in progress` / `redo starts…` / `redo done` / `checkpoint starting: end-of-recovery`. That
+end-of-recovery checkpoint was stopping on a **`fn0` funcref** bug — which slice CN (gap #11o) traced to an
+**address-taken `memcmp`**: `dynahash` stores `hashp->match = memcmp` / `keycopy = memcpy` and calls them
+*indirectly*, but the on-ramp only *synthesizes* those builtins for **direct** calls, so the taken address
+resolved to a fail-closed trap stub. Defining `memcmp`/`strlen`/`strcmp`/`strncmp` in `mem_shim.c` (alongside
+the already-defined `memcpy`/`memmove`/`memset`), compiled `-fno-builtin-*` so clang's loop-idiom pass can't
+rewrite the byte loops into self-calls, points the funcref at a real libc-ABI body — direct calls still
+fast-path through the synthesizer. **With that, PostgreSQL 17.5 `--single` boots clean through WAL recovery
+and the checkpoint to the `backend>` prompt, and `SELECT 1+1` returns `2`** (`?column? = "2"`, typeid 23,
+len 4) with a clean `Exited(0)` — the full lifecycle. *Boot speed* — a cold 15k-function boot reaches the
+prompt in ~74 s on the bytecode engine — is now the gating concern for a browser demo, pointing at
+snapshot/restore of the post-boot state. See `LLVM.md` slices BM–CN, and "Booting" below.
 
 ## Booting
 
@@ -129,7 +136,9 @@ to `timezone = GMT` / `log_timezone = GMT` (parsed, no tz-data file), `dynamic_s
 the fs cap (rooted at the data dir) can reach it — the guest maps absolute paths to cap-relative, so "/"
 is the cap root.
 
-As of slice CM the module runs real backend init, opens the catalog, and performs **WAL crash recovery**
-(`redo starts…`/`redo done`/`checkpoint starting`) — reaching recovery in ~74 s on the bytecode engine —
-then stops in the end-of-recovery checkpoint on the `fn0` funcref bug (gap #11o). Driving through the
-checkpoint to `database system is ready` and the first `SELECT` is next.
+As of slice CN the module runs real backend init, opens the catalog, performs **WAL crash recovery**
+(`redo starts…`/`redo done`/`checkpoint starting`), completes the end-of-recovery checkpoint (the `fn0`
+funcref bug of gap #11o was an address-taken `memcmp`, now defined in `mem_shim.c`), and reaches the
+`backend>` prompt — where **`SELECT 1+1` parses, plans, executes, and returns `2`**, then exits `0`. The
+capstone runs end-to-end in ~74 s on the bytecode engine; cutting that boot time (snapshot/restore of the
+post-boot state) is the remaining work for a browser demo.

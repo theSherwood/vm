@@ -1432,6 +1432,34 @@ its own slice). **svm-llvm lane green (fmt + clippy `-D warnings`; 12 `demo_pg_*
 cold 15k-function boot) is now the gating concern for a browser demo, pointing at snapshot/restore of the
 post-boot state rather than cold-booting each time.
 
+**Slice CN (DONE) — ★★★ `SELECT 1+1` → `2`: PostgreSQL runs in the sandbox (gap #11o, the capstone).**
+The end-of-recovery checkpoint trapped on a `fn0` funcref (CM's #11o): `ProcessSyncRequests` →
+`hash_search_with_hash_value` → an indirect call to index 0. **Root cause** (reproduced by a minimal
+*non-devirtualizable* indirect `memcmp` — a runtime-selected + `volatile` funcptr, so clang can't fold the
+call back to a direct one): dynahash's `HASH_BLOBS` table stores `hashp->match = memcmp` and calls it
+*through the pointer*, but `memcmp` is **only synthesized for direct calls, never defined** — so its
+address-taken funcref falls to a fail-closed trap stub. (Slice CL had defined `memcpy`/`memmove`/`memset`
+for exactly this, but missed the comparators.) **Fix:** `mem_shim.c` now also defines `memcmp`, `strlen`,
+`strcmp`, `strncmp` (the string comparators dynahash / string-keyed tables take the address of), so the
+taken address points at a real libc-ABI function; direct calls still fast-path through the synthesizer.
+Differential `demo_pg_funcptr_vs_native` (each builtin called through a `volatile` pointer, byte-exact vs
+glibc). **Payoff — the whole thing runs:** with the fix, `postgres --single` completes WAL recovery, the
+end-of-recovery checkpoint, reaches the interactive `backend>` prompt, **parses + plans + executes
+`SELECT 1+1;` and prints the correct result `2` (type `int4`)**, then shuts down cleanly (`Exited(0)`):
+
+```
+PostgreSQL stand-alone backend 17.5
+backend>  1: ?column? = "2"  (typeid = 23, len = 4, typmod = -1, byval = t)
+```
+
+That is ladder-#7 (`DESIGN.md` §"Suggested ladder") delivered: the full PostgreSQL 17.5 backend — 832
+modules / ~14 985 functions — **translates, verifies, and runs a real query** on the SVM bytecode engine
+under the `fs` + powerbox capabilities, no ambient authority. **svm-llvm lane green (fmt + clippy
+`-D warnings`; 13 `demo_pg_*` incl. the new `demo_pg_funcptr_vs_native`).** Next: *boot speed* — a cold
+boot is ~100 s on the interpreter, so a browser demo wants **snapshot/restore** of the post-recovery state
+(the §durability machinery) rather than a cold boot each time; and widening the SQL surface past the
+constant-folded `SELECT` (real tables, DDL, the `scanf`/`fscanf` input path under load).
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
