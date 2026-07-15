@@ -38,8 +38,8 @@ const WORKLOADS: &[(&str, i64, i64)] = &[
     ("sort", 100, 400_000),
     ("parse", 1_000, 2_000_000),
     ("base64", 1_000, 1_000_000),
-    // ("bfs", 10, 5_000),  // DISABLED: svm-jit miscompiles it (returns garbage) — ISSUES.md I23,
-    // a real bug this harness caught. The workload is kept at workloads/bfs.rs; re-enable once fixed.
+    ("bfs", 10, 5_000),  // grid BFS: traversal, queue, pointer-chasing. Once miscompiled (ISSUES.md
+    // I23) — a real bug this harness caught; two svm-llvm translation bugs, now fixed.
 ];
 
 fn rb_dir() -> PathBuf {
