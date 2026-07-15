@@ -1566,6 +1566,41 @@ pub fn compile_and_run_capture_over(
     Some((r, snap))
 }
 
+/// Run `func(args)` over the caller-provided shared window `back` against a caller-prepared `host`,
+/// returning the typed results (`None` if the module is outside the engine's subset). Unlike
+/// [`compile_and_run_capture_over`] this carries a live `host` (so `cap.call`s execute) and — when
+/// `seed_data` is `false` — it does **not** re-seed or re-apply the module's data segments: the window
+/// in `back` is already live, so re-initialising would clobber the guest's globals/heap.
+///
+/// This is the browser wasm-JIT **reactor** cross-tier seam: the emitted `tick` (run by the host over
+/// this same window) bounces a call to a non-emitted function here — the callee runs on the
+/// interpreter over the shared window, its memory effects landing in the bytes the emitted code reads.
+/// Pass `seed_data = true` exactly once, for the initial `_start`, to data-initialise the window before
+/// the first frame; every per-frame cross-tier callee passes `false`.
+pub fn compile_and_run_over_shared_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    back: std::sync::Arc<super::Region>,
+    host: &mut Host,
+    seed_data: bool,
+) -> Option<Result<Vec<Value>, Trap>> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some(Err(Trap::Malformed));
+    }
+    let dom = Domain::new(c, host.jit_table_log2());
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, mc.size_log2, back);
+        if seed_data {
+            mm.init_data(&m.data);
+        }
+        mm
+    });
+    Some(run(dom, func, args, fuel, &mut mem, host))
+}
+
 /// THREADS.md step 4c — the **parallel** sibling of [`compile_and_run_capture_over`]: run the guest's
 /// `thread.spawn`ed vCPUs on **separate OS threads** (the native stand-in for per-vCPU wasm Workers)
 /// over the **one** caller-owned shared window, instead of cooperatively multiplexing them onto one
