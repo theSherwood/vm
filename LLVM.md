@@ -1359,6 +1359,43 @@ no translator change:**
   **svm-llvm lane green (10 `demo_pg_*` tests, fmt + clippy `-D warnings`).** Next: the boot's storage
   manager / WAL / single-process shmem / catalog bootstrap (the `llvm-postgres` thread, past slice CI).
 
+**Slice CK (DONE) — self-naming stub-traps: the silent trap names itself (gap #11k).** The boot's early-init
+fault was a **silent** `Unreachable` — no printed output, so the CG output-diagnostic couldn't name it, and
+the chase was back to guessing which of ~96 stubbed externs the live path hit. The fix names the stubs so
+the trap names itself, **without touching the confinement path**: under `--stub-externs` the on-ramp now
+records each stub's `(func idx → missing-extern name)` in the §6 **function-name table**
+(`DebugInfo.func_names` — strippable, verifier-ignored, §2a), so the interpreter's trap-time backtrace
+resolves its innermost frame (via `svm_interp::func_name`) to the extern's name. The stub body is
+*unchanged* — a pure `Unreachable`, never a capability call — so nothing in the sensitive lowering moves.
+Test `stub_trap_names_the_extern`: a guest calls an undefined `frobnicate_widget` under `--stub-externs`, a
+traced run traps `Unreachable`, and the innermost backtrace frame must resolve to `frobnicate_widget`.
+**svm-llvm lane green.** This turned the boot chase into a tight run → read the named frame → close the gap
+→ repeat loop, which drove slice CL.
+
+**Slice CL (DONE) — drive the named boot to real logging (a bundle).** With every trap self-naming (CK),
+this slice bundles the whole run of gaps between `find_my_exec` and Postgres's first real log output. **One
+on-ramp fix:** `__sigsetjmp` (the libc symbol the `sigsetjmp` macro expands to — Postgres' `PG_TRY`) joins
+the `setjmp`/`sigsetjmp` recognizer, lowering to the same `SetJmp` core op (test `sigsetjmp_recognized`).
+**The rest are guest shims** (`#include`d into `pg_shims.c`), each named by the diagnostic as the boot
+advanced: **`realpath`** (canonicalize an existing path to absolute over the fs cap); a small mutable
+**environment** (`setenv`/`getenv`/`unsetenv`/`putenv`); **`getpwuid`**/`getpwnam` (the bootstrap
+superuser's name — a fixed non-root identity); a deterministic **`random`**/`srandom`/`rand`/`srand`; the
+**event-loop backend** (`event_shim.c`: `signalfd`/`epoll_*`/`eventfd` → distinct fake fds + no-op
+registration — `latch.c`'s `WAIT_USE_EPOLL` set-up, never blocked in a synchronous single process); real
+**`memcpy`/`memmove`/`memset`** (`mem_shim.c`, `-fno-builtin-mem*`) so an *address-taken* one resolves to a
+real function instead of the funcref trap stub; **`pow`** (`math_shim.c` — exact binary-exponentiation for
+the `pow(10,n)` datetime case); and **`strerror`** + the GNU **`strerror_r`** (the latter in its own
+`_GNU_SOURCE`-isolated TU, `strerror_shim.c`, so its `char *` prototype doesn't perturb `__isoc23_*`/
+`getrlimit` across the shared shim TU — the split earlier slices deferred). Composes with slice CJ's real
+`strtod`/`scanf`. **Payoff:** the boot now runs real backend startup through GUC init and **config-file
+processing**, emitting fully-formatted, timestamped Postgres log lines (`… GMT [1] LOG: …` / `FATAL:
+configuration file "postgresql.conf" contains errors`) — no trap, a clean `Exited(1)`. It stops on a
+legible, *real* Postgres error: it can't read its **timezone data directory** (`…/share/postgresql/timezone`,
+an absolute path outside the fs-cap root → the cap correctly denies it). That's a capability/data-provisioning
+question (gap #11m), not a shim gap. **svm-llvm lane green (fmt + clippy `-D warnings`; the on-ramp changes
+CI-tested — `stub_trap_names_the_extern`, `sigsetjmp_recognized`; the boot-support shims validated by the
+boot advancing; the boot itself isn't a CI test — it needs the fetched Postgres bitcode).**
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads

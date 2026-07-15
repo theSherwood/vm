@@ -12,6 +12,7 @@
  * `#include`d into a driver under `-DSVM_GUEST`, like the other shims.
  */
 
+#include <pwd.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -34,6 +35,24 @@ pid_t setsid(void) { return 1; }
 pid_t getsid(pid_t p) { (void)p; return 1; }
 mode_t umask(mode_t m) { (void)m; return 022; }
 int setpgid(pid_t a, pid_t b) { (void)a; (void)b; return 0; }
+
+/* Password-database lookup: Postgres resolves the OS user name from `getpwuid(geteuid())->pw_name`
+ * (`GetUserName`, for the bootstrap superuser). One process, one fixed identity — return a single
+ * static entry matching the non-root uid/gid above. `getpwnam` mirrors it by name. */
+struct passwd *getpwuid(uid_t uid) {
+  (void)uid;
+  static struct passwd pw = {
+      .pw_name = (char *)"postgres",
+      .pw_passwd = (char *)"x",
+      .pw_uid = 1000,
+      .pw_gid = 1000,
+      .pw_gecos = (char *)"",
+      .pw_dir = (char *)"/",
+      .pw_shell = (char *)"/bin/sh",
+  };
+  return &pw;
+}
+struct passwd *getpwnam(const char *name) { (void)name; return getpwuid(1000); }
 
 /* ---- time (a frozen clock) ------------------------------------------------------------------- */
 int gettimeofday(struct timeval *tv, void *tz) {

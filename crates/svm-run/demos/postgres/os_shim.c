@@ -237,3 +237,47 @@ char *getcwd(char *buf, size_t size) {
   buf[1] = 0;
   return buf;
 }
+
+/* realpath(3), POSIX.1-2008 semantics (what Postgres' `pg_realpath` needs to resolve the executable
+ * path in `find_my_exec`): return a canonical **absolute** path for an existing file. The cap root is
+ * the working directory ("/"), the cap forbids `..`/absolute escapes, and FS_STAT is lstat with no
+ * symlinks to chase — so "canonical" here is the input made absolute and lexically cleaned (strip a
+ * leading "./", collapse "//" and "/./", drop a trailing "/"). Existence is required (realpath fails
+ * ENOENT on a missing path), so we stat first through the cap. `resolved == NULL` mallocs the result
+ * (the POSIX.1-2008 form Postgres calls first); a caller-provided buffer is assumed >= 4096. */
+char *realpath(const char *path, char *resolved) {
+  if (!path || !*path) {
+    shim_errno = 2; /* ENOENT */
+    return (char *)0;
+  }
+  unsigned char sb[FS_STATBUF_LEN];
+  long rc = fscall(FS_STAT, (long)path, (long)strlen(path), (long)sb, FS_STATBUF_LEN);
+  if (rc < 0) {
+    fail(rc);
+    return (char *)0;
+  }
+  char *out = resolved ? resolved : (char *)malloc(4096);
+  if (!out) {
+    shim_errno = 12; /* ENOMEM */
+    return (char *)0;
+  }
+  const char *s = path;
+  while (s[0] == '.' && s[1] == '/') s += 2; /* strip leading "./" segments */
+  while (*s == '/') s++;                      /* and any leading slashes (already rooted) */
+  size_t j = 0;
+  out[j++] = '/'; /* absolute, rooted at the cap root */
+  for (const char *p = s; *p && j < 4094;) {
+    if (p[0] == '/' && p[1] == '/') { /* collapse "//" */
+      p++;
+      continue;
+    }
+    if (p[0] == '/' && p[1] == '.' && (p[2] == '/' || p[2] == 0)) { /* collapse "/./" and trailing "/." */
+      p += 2;
+      continue;
+    }
+    out[j++] = *p++;
+  }
+  if (j > 1 && out[j - 1] == '/') j--; /* drop a trailing slash (but keep the root "/") */
+  out[j] = 0;
+  return out;
+}

@@ -269,9 +269,9 @@ int strcoll_l(const char *a, const char *b, locale_t loc) {
 }
 
 /* ============================================================================================== *
- * stdlib.h — integer parsing. `strtod` (float) is already synthesized by the on-ramp; these aren't.
- * glibc's C23 build renames the callers to `__isoc23_strtol`/`__isoc23_strtoul` (identical
- * semantics), so both names resolve here.
+ * stdlib.h — integer parsing (`strtol`/`strtoul`). The float `strtod`/`strtof`/`atof` are the
+ * correctly-rounded bignum parser in `../strtod/strtod.c` (linked via `pg_shims.c`). glibc's C23 build
+ * renames the callers to `__isoc23_strtol`/`__isoc23_strtoul` (identical semantics), resolved here too.
  * ============================================================================================== */
 
 #include <errno.h>
@@ -362,11 +362,94 @@ size_t mbstowcs(wchar_t *dst, const char *src, size_t n) {
   }
   return i; /* filled n wide chars without hitting NUL */
 }
-/* The C environment vector. The powerbox passes env via the §3e args buffer, not the C `environ`
- * global that libc `getenv` and code like Postgres's `save_ps_display_args` walk — so provide one.
- * Empty (a lone NULL terminator) is a valid, minimal environment. */
-static char *shim_environ[1] = {(char *)0};
+/* The C environment. The powerbox passes no ambient env, so it starts empty — but Postgres both
+ * *reads* it (`getenv`, `save_ps_display_args` walking `environ`) and *writes* it (`setenv` for
+ * locale/service vars in early startup), so provide a small mutable vector with coherent
+ * `getenv`/`setenv`/`unsetenv`/`putenv`. Defining `getenv` here shadows the on-ramp's synthesized
+ * (always-NULL) one so a read sees what a prior write set. Fixed capacity, NULL-terminated; entries
+ * are heap "NAME=VALUE" strings (an overwrite leaks the old — fine for a single boot). */
+#define SHIM_ENV_MAX 64
+static char *shim_environ[SHIM_ENV_MAX + 1] = {(char *)0};
 char **environ = shim_environ;
+
+static int env_find(const char *name, size_t nlen) {
+  for (int i = 0; shim_environ[i]; i++) {
+    if (!strncmp(shim_environ[i], name, nlen) && shim_environ[i][nlen] == '=') return i;
+  }
+  return -1;
+}
+static int env_count(void) {
+  int n = 0;
+  while (shim_environ[n]) n++;
+  return n;
+}
+char *getenv(const char *name) {
+  if (!name) return (char *)0;
+  int i = env_find(name, strlen(name));
+  if (i < 0) return (char *)0;
+  char *eq = strchr(shim_environ[i], '=');
+  return eq ? eq + 1 : (char *)0;
+}
+int setenv(const char *name, const char *value, int overwrite) {
+  if (!name || !*name || strchr(name, '=')) {
+    shim_errno = 22; /* EINVAL */
+    return -1;
+  }
+  size_t nlen = strlen(name), vlen = strlen(value);
+  int i = env_find(name, nlen);
+  if (i >= 0 && !overwrite) return 0;
+  char *entry = (char *)malloc(nlen + 1 + vlen + 1);
+  if (!entry) {
+    shim_errno = 12; /* ENOMEM */
+    return -1;
+  }
+  memcpy(entry, name, nlen);
+  entry[nlen] = '=';
+  memcpy(entry + nlen + 1, value, vlen + 1);
+  if (i >= 0) {
+    shim_environ[i] = entry;
+    return 0;
+  }
+  int n = env_count();
+  if (n >= SHIM_ENV_MAX) {
+    shim_errno = 12;
+    return -1;
+  }
+  shim_environ[n] = entry;
+  shim_environ[n + 1] = (char *)0;
+  return 0;
+}
+int unsetenv(const char *name) {
+  if (!name || !*name || strchr(name, '=')) {
+    shim_errno = 22;
+    return -1;
+  }
+  int i = env_find(name, strlen(name));
+  if (i < 0) return 0;
+  int n = env_count();
+  shim_environ[i] = shim_environ[n - 1]; /* swap the last into the hole */
+  shim_environ[n - 1] = (char *)0;
+  return 0;
+}
+int putenv(char *str) {
+  /* POSIX: `str` becomes part of the environment directly (not copied). */
+  char *eq = strchr(str, '=');
+  if (!eq) return unsetenv(str);
+  size_t nlen = (size_t)(eq - str);
+  int i = env_find(str, nlen);
+  if (i >= 0) {
+    shim_environ[i] = str;
+    return 0;
+  }
+  int n = env_count();
+  if (n >= SHIM_ENV_MAX) {
+    shim_errno = 12;
+    return -1;
+  }
+  shim_environ[n] = str;
+  shim_environ[n + 1] = (char *)0;
+  return 0;
+}
 
 size_t wcstombs(char *dst, const wchar_t *src, size_t n) {
   size_t i = 0;
@@ -381,9 +464,35 @@ size_t wcstombs(char *dst, const wchar_t *src, size_t n) {
   return i;
 }
 
+/* ---- pseudo-random (`srandom`/`random`, `srand`/`rand`) --------------------------------------- *
+ * Postgres seeds `srandom` at startup (e.g. the postmaster's random-seed init) and draws `random()`
+ * for non-cryptographic values (cancel keys, backoff jitter). The exact glibc TYPE_3 sequence isn't
+ * required — only a deterministic, decently-mixed 31-bit stream — so this is a small xorshift over a
+ * 64-bit state, folded to POSIX's `[0, RAND_MAX]`. Deterministic given the seed (sandbox
+ * reproducibility). `initstate`/`setstate` are accepted for completeness. */
+static unsigned long long g_rng = 0x2545F4914F6CDD1DULL;
+void srandom(unsigned int seed) { g_rng = seed ? (unsigned long long)seed : 1ULL; }
+long random(void) {
+  unsigned long long x = g_rng;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  g_rng = x;
+  return (long)((x >> 33) & 0x7fffffffUL); /* top bits, 31-bit range */
+}
+void srand(unsigned int seed) { srandom(seed); }
+int rand(void) { return (int)random(); }
+char *initstate(unsigned int seed, char *state, size_t n) {
+  (void)state;
+  (void)n;
+  srandom(seed);
+  return state;
+}
+char *setstate(char *state) { return state; }
+
 /* ============================================================================================== *
- * getopt (+ strsignal). `strerror_r` lives in locale_shim.c — its GNU/POSIX signature split needs
- * `_GNU_SOURCE`, which the boot TU sets but the standalone probes don't.
+ * getopt (+ strsignal). `strerror` lives in locale_shim.c; the GNU `char *strerror_r` needs its own
+ * `_GNU_SOURCE`-isolated TU (`strerror_shim.c`) so its prototype doesn't clash with the POSIX one here.
  * ============================================================================================== */
 
 char *strsignal(int sig) {
