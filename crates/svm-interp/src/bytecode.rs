@@ -6405,14 +6405,18 @@ impl Vm {
                     let d = r!(*dst).i64() as u64;
                     let s = r!(*src).i64() as u64;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut().ok_or(Trap::Malformed)?.mem_copy_fast(d, s, n)?;
+                    mem.as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .mem_copy_fast(d, s, n)?;
                     pc += 1;
                 }
                 Op::MemFill { dst, val, len } => {
                     let d = r!(*dst).i64() as u64;
                     let v = r!(*val).i32() as u8;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut().ok_or(Trap::Malformed)?.mem_fill_fast(d, v, n)?;
+                    mem.as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .mem_fill_fast(d, v, n)?;
                     pc += 1;
                 }
                 Op::AtomicLoad {

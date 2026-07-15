@@ -1020,11 +1020,11 @@ mod tests {
             v
         };
         let cases = [
-            (0u64, 8u64, 8u64),   // disjoint forward
-            (8, 0, 8),            // disjoint backward
-            (0, 4, 8),            // overlap, dst > src (backward memmove)
-            (4, 0, 8),            // overlap, dst < src (forward memmove)
-            (0, 0, 8),            // self-copy no-op
+            (0u64, 8u64, 8u64), // disjoint forward
+            (8, 0, 8),          // disjoint backward
+            (0, 4, 8),          // overlap, dst > src (backward memmove)
+            (4, 0, 8),          // overlap, dst < src (forward memmove)
+            (0, 0, 8),          // self-copy no-op
         ];
         for (src, dst, len) in cases {
             let seed: Vec<u8> = (0..64u8).collect();
@@ -1035,7 +1035,11 @@ mod tests {
                 r.copy_within(dst, src, len);
                 let want = scalar(src, dst, len, &seed);
                 for (i, b) in want.iter().enumerate() {
-                    assert_eq!(r.byte(i as u64), *b, "case src={src} dst={dst} len={len} at {i}");
+                    assert_eq!(
+                        r.byte(i as u64),
+                        *b,
+                        "case src={src} dst={dst} len={len} at {i}"
+                    );
                 }
             });
         }
