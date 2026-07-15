@@ -122,6 +122,34 @@ int scanf(const char *fmt, ...) {
   return r;
 }
 
+/* glibc's C23 build renames the scanf-family callers to `__isoc23_*` (the C23 `%b`/no-`%'` grouping
+ * semantics — identical for the formats Postgres uses), so a whole-program build references those
+ * names. Forward each to the plain implementation. Postgres' `ValidatePgVersion` reads `PG_VERSION`
+ * with `__isoc23_fscanf`. */
+int __isoc23_vsscanf(const char *str, const char *fmt, va_list ap) { return vsscanf(str, fmt, ap); }
+int __isoc23_sscanf(const char *str, const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  ScanSrc S = {str, NULL, 0, -2};
+  int r = vsscanf_impl(&S, fmt, ap);
+  va_end(ap);
+  return r;
+}
+int __isoc23_vfscanf(FILE *fp, const char *fmt, va_list ap) { return vfscanf(fp, fmt, ap); }
+int __isoc23_fscanf(FILE *fp, const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  ScanSrc S = {NULL, fp, 0, -2};
+  int r = vsscanf_impl(&S, fmt, ap);
+  va_end(ap);
+  return r;
+}
+int __isoc23_vscanf(const char *fmt, va_list ap) { return vfscanf(stdin, fmt, ap); }
+int __isoc23_scanf(const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  int r = vfscanf(stdin, fmt, ap);
+  va_end(ap);
+  return r;
+}
+
 static int vsscanf_impl(ScanSrc *S, const char *fmt, va_list ap) {
   int assigned = 0;   /* successful assignments (the return value) */
   int any_conv = 0;   /* did we reach at least one conversion? (EOF-vs-0 distinction) */

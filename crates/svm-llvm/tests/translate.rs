@@ -4232,6 +4232,46 @@ fn trap_error_surfaces_guest_output() {
 }
 
 #[test]
+fn demo_pg_funcptr_vs_native() {
+    // **Address-taken mem/string builtins** (mem_shim.c). The on-ramp synthesizes memcmp/memcpy/strlen/…
+    // for *direct* calls, but taking their address and calling indirectly (dynahash's `hashp->match =
+    // memcmp`, called via the pointer) resolves to a trap stub unless the function is *defined* — the
+    // exact bug that trapped Postgres' end-of-recovery checkpoint. `mem_shim.c` defines them; this probe
+    // calls each through a `volatile` pointer (no devirtualization) and byte-matches native glibc.
+    check_demo_vs_native_flags(
+        "pg_funcptr",
+        "postgres/funcptr_probe.c",
+        b"",
+        &[
+            "-DSVM_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+            "-fno-builtin-memcpy",
+            "-fno-builtin-memmove",
+            "-fno-builtin-memset",
+            "-fno-builtin-memcmp",
+            "-fno-builtin-strlen",
+            "-fno-builtin-strcmp",
+            "-fno-builtin-strncmp",
+        ],
+    );
+}
+
+#[test]
+fn demo_pg_sem_vs_native() {
+    // **The guest POSIX counting semaphore** (ipc_shim.c). A single-process unnamed semaphore behaves
+    // identically under glibc, so this differential pins the fix for the boot hang: `sem_trywait` must
+    // *fail* (EAGAIN) at zero so `PGSemaphoreReset`'s `while (sem_trywait(s) >= 0);` drain terminates
+    // (a no-op `sem_trywait` spun forever). Init 2 → drain → post → drain; byte-exact vs native.
+    check_demo_vs_native_flags(
+        "pg_sem",
+        "postgres/sem_probe.c",
+        b"",
+        &["-DSVM_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
 fn demo_pg_mmap_vs_native() {
     // **The guest anonymous-mmap shim** (slice CI, gap #11i). `postgres --single` sets up its shared
     // memory via `mmap(MAP_ANONYMOUS)`; in one address space that is just zeroed writable memory.

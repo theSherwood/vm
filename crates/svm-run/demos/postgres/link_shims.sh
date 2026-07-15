@@ -6,7 +6,8 @@ set -euo pipefail
 CACHE="${SVM_PG_CACHE:-/tmp/svm_pg_cache}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 clang -O2 -emit-llvm -c -DSVM_GUEST -fno-vectorize -fno-slp-vectorize \
-  -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memset -fno-builtin-pow -I"$HERE" \
+  -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memset -fno-builtin-memcmp \
+  -fno-builtin-strlen -fno-builtin-strcmp -fno-builtin-strncmp -fno-builtin-pow -I"$HERE" \
   "$HERE/pg_shims.c" -o "$CACHE/pg_shims.bc"
 # `strerror_shim.c` is compiled *alone* with -D_GNU_SOURCE (the GNU `char *strerror_r`), isolated from
 # the shared TU so it doesn't perturb `__isoc23_*`/`getrlimit`/… (see strerror_shim.c).
