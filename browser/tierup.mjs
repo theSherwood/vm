@@ -7,6 +7,7 @@
 // Run: node browser/tierup.mjs
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { engineImports } from './engine-imports.mjs';
 
 const WASM = fileURLToPath(new URL('./target/wasm32-unknown-unknown/release/svm_browser.wasm', import.meta.url));
 const PAR_DONE = 0, PAR_TRAP = 1, PAR_TIERUP = 7;
@@ -70,7 +71,7 @@ async function main() {
     throw new Error('not a threads build (expected imported shared memory)');
   }
   const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-  const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
+  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = Number(ex.svm_par_alloc(STACK)) + STACK;
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(Number(ex.svm_par_alloc(ex.__tls_size.value + ex.__tls_align.value)));
   const u8 = () => new Uint8Array(memory.buffer);

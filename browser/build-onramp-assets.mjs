@@ -95,6 +95,14 @@ try {
   console.log(`  ✗ mandelzoom: ${e.message}`);
 }
 
+// 1f) gpu_shader — the GPU demo: the guest ships a WGSL fragment shader through the `webgpu` capability
+//     and the browser renders it (a Mandelbrot zoom) each frame on the real GPU via navigator.gpu.
+try {
+  buildC('gpu_shader', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'gpu_shader.c'));
+} catch (e) {
+  console.log(`  ✗ gpu_shader: ${e.message}`);
+}
+
 // 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
 //    from **stdin** and runs it against an in-memory database, printing each statement's result table.
 //    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +

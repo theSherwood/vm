@@ -12,6 +12,7 @@
 // loud MISCOMPILE, the emitter's differential in the bench itself).
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
+import { engineImports } from './engine-imports.mjs';
 
 const [wasmPath, kernelPath, funcS, spS, smallS, largeS] = process.argv.slice(2);
 if (!largeS) {
@@ -23,7 +24,7 @@ const sp = BigInt(spS);
 const small = Number(smallS), large = Number(largeS);
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-const ex = (await WebAssembly.instantiate(mod, {})).exports;
+const ex = (await WebAssembly.instantiate(mod, engineImports())).exports;
 if (ex.memory === undefined) {
   console.error('bench_jit expects the plain cdylib (exported, non-shared memory)');
   process.exit(2);

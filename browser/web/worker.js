@@ -41,7 +41,11 @@ self.onmessage = async (e) => {
   // ANY trap becomes a clean vCPU trap: wake any joiner, and report `fail` with the captured panic site.
   let ex;
   try {
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory } }));
+  // The engine imports `svm_host.webgpu_op` (the `webgpu` capability's host seam). A Worker vCPU has
+  // no GPU surface (the playground's GPU reactor runs on the main thread via par.js), so stub it to a
+  // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
+  // fails with "Import svm_host: module is not an object or function".
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, svm_host: { webgpu_op: () => -1n } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW
