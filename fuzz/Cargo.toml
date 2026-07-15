@@ -17,6 +17,7 @@ svm = { path = "../crates/svm" }
 svm-ir = { path = "../crates/svm-ir" }
 svm-encode = { path = "../crates/svm-encode" }
 svm-verify = { path = "../crates/svm-verify" }
+svm-spec = { path = "../crates/svm-spec" } # executable ISA spec — oracle for the spec_* targets
 svm-interp = { path = "../crates/svm-interp" }
 svm-jit = { path = "../crates/svm-jit" }
 svm-durable = { path = "../crates/svm-durable" }
@@ -50,6 +51,20 @@ bench = false
 [[bin]]
 name = "diff"
 path = "fuzz_targets/diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spec_ops"
+path = "fuzz_targets/spec_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spec_verify"
+path = "fuzz_targets/spec_verify.rs"
 test = false
 doc = false
 bench = false
