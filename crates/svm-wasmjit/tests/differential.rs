@@ -358,6 +358,267 @@ fn mem_oob() {
     diff("mem_oob", MEM_OOB, probe, FUEL);
 }
 
+// ---- bulk memory (D62): `mem.fill`/`mem.copy`/`mem.move` → `memory.fill`/`memory.copy` ------------
+// The lowering's whole-span confinement is the security hinge, so these differentials cover both
+// in-window correctness (the fill/copy actually happened, and only the intended bytes) and the
+// out-of-window / zero-length trap agreement (both engines must fault on the SAME spans, §4).
+
+/// `memset(16, arg&0xff, 40)`, then read the first + last filled byte and the byte just past the span
+/// (which must stay 0): proves `memory.fill` wrote exactly `[16, 56)`.
+const MEMFILL: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 16
+  v2 = i32.wrap_i64 v0
+  v3 = i64.const 40
+  mem.fill v1 v2 v3
+  v4 = i64.const 16
+  v5 = i64.load8_u v4
+  v6 = i64.const 55
+  v7 = i64.load8_u v6
+  v8 = i64.const 56
+  v9 = i64.load8_u v8
+  v10 = i64.add v5 v7
+  v11 = i64.add v10 v9
+  return v11
+}
+"#;
+
+#[test]
+fn memfill() {
+    diff("memfill", MEMFILL, ARGS, FUEL);
+}
+
+/// `memcpy(64, 0, 8)` after seeding `mem[0..8] = arg`: the copied i64 read back from the destination
+/// must equal `arg` (non-overlapping copy).
+const MEMCOPY: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  i64.store v1 v0
+  v2 = i64.const 64
+  v3 = i64.const 0
+  v4 = i64.const 8
+  mem.copy v2 v3 v4
+  v5 = i64.load v2
+  return v5
+}
+"#;
+
+#[test]
+fn memcopy() {
+    diff("memcopy", MEMCOPY, ARGS, FUEL);
+}
+
+/// `memmove(4, 0, 16)` over an **overlapping** source/dest (both spans seeded with `arg`): the read-back
+/// must match the overlap-safe result — `memory.copy` and the interpreter's snapshotting copy agree.
+const MEMMOVE: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  i64.store v1 v0
+  v2 = i64.const 8
+  i64.store v2 v0
+  v3 = i64.const 4
+  v4 = i64.const 0
+  v5 = i64.const 16
+  mem.move v3 v4 v5
+  v6 = i64.load v3
+  return v6
+}
+"#;
+
+#[test]
+fn memmove() {
+    diff("memmove", MEMMOVE, ARGS, FUEL);
+}
+
+/// The span boundary for a bulk op: `memset(arg, 0xab, 8)` swept across the window edge. Both engines
+/// must fault on exactly the spans that leave `[0, 65536)` — the whole-span analogue of `mem_oob`.
+const MEMFILL_OOB: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.const 171
+  v2 = i64.const 8
+  mem.fill v0 v1 v2
+  v3 = i64.const 0
+  v4 = i64.load8_u v3
+  return v4
+}
+"#;
+
+/// `memcpy(arg, 0, 8)` — the **destination** span swept across the edge (source fixed in-window).
+const MEMCOPY_OOB_DST: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 8
+  mem.copy v0 v1 v2
+  v3 = i64.load8_u v1
+  return v3
+}
+"#;
+
+/// `memcpy(0, arg, 8)` — the **source** span swept across the edge (dest fixed in-window): the copy
+/// confines both spans, so an escaping source must fault too.
+const MEMCOPY_OOB_SRC: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 8
+  mem.copy v1 v0 v2
+  v3 = i64.load8_u v1
+  return v3
+}
+"#;
+
+/// The span probe: in-window, exactly touching the edge (`[65528, 65536)`), straddling it
+/// (`[65529, 65537)`), and far past — plus negative wraps.
+const SPAN_PROBE: &[i64] = &[
+    0,
+    8,
+    100,
+    65528,
+    65529,
+    65535,
+    65536,
+    65537,
+    1 << 20,
+    (1i64 << 40),
+    -1,
+    -8,
+    i64::MIN,
+];
+
+#[test]
+fn memfill_oob() {
+    diff("memfill_oob", MEMFILL_OOB, SPAN_PROBE, FUEL);
+}
+
+#[test]
+fn memcopy_oob() {
+    diff("memcopy_oob_dst", MEMCOPY_OOB_DST, SPAN_PROBE, FUEL);
+    diff("memcopy_oob_src", MEMCOPY_OOB_SRC, SPAN_PROBE, FUEL);
+}
+
+/// A **zero-length** bulk op touches no byte, so it must be a no-op even at a wild address — never a
+/// fault — matching the interpreter's `len == 0` short-circuit. `arg` (the base) is swept across and
+/// far past the window; both engines must return the sentinel `7` for every base, none trapping.
+const MEMFILL_ZERO: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.const 255
+  v2 = i64.const 0
+  mem.fill v0 v1 v2
+  v3 = i64.const 7
+  return v3
+}
+"#;
+
+/// Same zero-length no-op contract for `memory.copy` (both spans wild, `len == 0`).
+const MEMCOPY_ZERO: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  mem.copy v0 v0 v1
+  v2 = i64.const 7
+  return v2
+}
+"#;
+
+#[test]
+fn bulk_zero_len_never_traps() {
+    diff("memfill_zero", MEMFILL_ZERO, SPAN_PROBE, FUEL);
+    diff("memcopy_zero", MEMCOPY_ZERO, SPAN_PROBE, FUEL);
+}
+
+/// `memset(base, 0xc8, len)` — both the base and the length are function params, so the sweep drives
+/// the span confinement directly.
+const MASK_FILL: &str = r#"
+memory 16
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i32.const 200
+  mem.fill v0 v2 v1
+  v3 = i64.const 12345
+  return v3
+}
+"#;
+
+/// `memcpy(base, base, len)` — exercises the copy's *two* span checks (both anchored at `base`) over
+/// the swept `(base, len)`.
+const MASK_COPY: &str = r#"
+memory 16
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  mem.copy v0 v0 v1
+  v2 = i64.const 12345
+  return v2
+}
+"#;
+
+/// A deterministic pseudo-random sweep of `(base, len)` over the bulk-op **span confinement** — the
+/// security hinge fuzzed as its own unit (CLAUDE.md: "fuzz the confinement-masking lowering as its own
+/// unit — it is the security hinge"). For every span the emitted `memory.fill`/`memory.copy` must
+/// agree with the interpreter oracle: it faults **iff** the interpreter's `confine_span` faults, and
+/// returns the sentinel otherwise. Bases and lengths cluster around the window edge (65536) and cross
+/// it, with far-OOB and wrapped-negative values, so the trap boundary is probed from both sides.
+#[test]
+fn bulk_span_masking_sweep() {
+    let fill = svm_text::parse_module(MASK_FILL).unwrap();
+    svm_verify::verify_module(&fill).unwrap();
+    let fill_wasm = compile_module(&fill).unwrap();
+    let copy = svm_text::parse_module(MASK_COPY).unwrap();
+    svm_verify::verify_module(&copy).unwrap();
+    let copy_wasm = compile_module(&copy).unwrap();
+
+    // Anchor points to jitter around; the backed window is `[0, 65536)`.
+    const ANCHORS: &[i64] = &[
+        0,
+        1,
+        8,
+        4096,
+        32768,
+        65528,
+        65536,
+        65537,
+        1 << 20,
+        1 << 40,
+        -1,
+    ];
+    // xorshift64 — deterministic, no external rng dependency.
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let jitter = |a: i64, r: u64| a.wrapping_add((r % 33) as i64).wrapping_sub(16);
+
+    for _ in 0..3000 {
+        let base = jitter(ANCHORS[next() as usize % ANCHORS.len()], next());
+        let len = jitter(ANCHORS[next() as usize % ANCHORS.len()], next());
+        let args = [Value::I64(base), Value::I64(len)];
+        for (name, m, wasm) in [
+            ("mask_fill", &fill, &fill_wasm),
+            ("mask_copy", &copy, &copy_wasm),
+        ] {
+            let want = oracle(m, &args, FUEL);
+            let got = wasm_run(m, wasm, &args, FUEL);
+            assert_eq!(want, got, "{name}: MISCOMPILE for base={base} len={len}");
+        }
+    }
+}
+
 /// div/rem for both signednesses: /0 traps, INT_MIN/-1 traps div_s but not rem_s.
 const DIVREM: &str = r#"
 func (i64) -> (i64) {

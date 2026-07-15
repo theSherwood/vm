@@ -299,3 +299,59 @@ fn cross_tier_tail_call() {
         );
     }
 }
+
+// **Indirect call to a cross-tier target whose index comes from memory, not a `RefFunc`.** f0 stores
+// the target function index (1) into the window and loads it back — exactly how the frontend bakes a
+// static function-pointer table (Doom's `states[]` action functions) into data, with no `RefFunc`
+// instruction. So the emitter must trampoline f1 anyway: an identity-table slot filled from a `RefFunc`
+// scan alone would leave f1's slot a trap stub and this `call_indirect` would trap ("null function or
+// function signature mismatch") where the interpreter dispatches fine. (Regression: this trapped Doom
+// ~frame 174, when the first monster thinker fires an `A_*` action loaded from `states[]`.)
+const SRC_INDIRECT_DATA_PTR: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v7 = i64.const 7
+  vpre = i64.add v0 v7
+  va8 = i64.const 8
+  i64.store va8 vpre
+  vidxaddr = i64.const 200
+  vone = i64.const 1
+  i64.store vidxaddr vone
+  vidx64 = i64.load vidxaddr
+  vidx = i32.wrap_i64 vidx64
+  vr1 = call_indirect (i64) -> (i64) vidx (v0)
+  vaddr = i64.const 100
+  vr = i64.load vaddr
+  return vr
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  va8 = i64.const 8
+  vread = i64.load va8
+  vaddr = i64.const 100
+  i64.store vaddr vread
+  vs = i64x2.splat v0
+  vd = i16x8.dot_i8x16_s vs vs
+  ve = i64x2.extract_lane 0 vd
+  return ve
+}
+"#;
+
+#[test]
+fn cross_tier_indirect_data_pointer() {
+    let m = parse(SRC_INDIRECT_DATA_PTR);
+    for &arg in &[0i64, 1, 42, 1000, -5] {
+        let got = reactor_run(&m, arg);
+        assert_eq!(
+            got,
+            oracle(&m, arg),
+            "data-ptr indirect mixed != oracle for arg {arg}"
+        );
+        assert_eq!(
+            got,
+            arg + 7,
+            "a call_indirect to a non-RefFunc'd cross-tier target must still route (arg {arg})"
+        );
+    }
+}
