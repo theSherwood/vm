@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { compileJit } from './web/wasmjit.js';
+import { engineImports } from './engine-imports.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/svm_browser.wasm');
@@ -22,7 +23,7 @@ if (!WebAssembly.Module.imports(mod).some((i) => i.kind === 'memory')) {
 }
 // The one shared linear memory both the cdylib and the emitted JIT modules see (matches the page).
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const { exports: ex } = await WebAssembly.instantiate(mod, { env: { memory } });
+const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
 
 // Encode an SVM text module through the cdylib's own front end (svm_parse) so this harness needs no
 // .svmbc fixtures — it produces exactly the bytes `svm_wasmjit_compile` / `svm_run` consume.

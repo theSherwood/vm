@@ -18,6 +18,7 @@
 // subtraction, just as the native bytecode row's per-call compile does).
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
+import { engineImports } from './engine-imports.mjs';
 
 const [wasmPath, kernelPath, funcS, spS, smallS, largeS] = process.argv.slice(2);
 if (!largeS) {
@@ -29,7 +30,7 @@ const sp = BigInt(spS);
 const small = Number(smallS), large = Number(largeS);
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-const ex = (await WebAssembly.instantiate(mod, {})).exports;
+const ex = (await WebAssembly.instantiate(mod, engineImports())).exports;
 
 // Pointers/lengths are usize: i32 (Number) on wasm32, i64 (BigInt) on wasm64. `func` is u32 (Number);
 // `sp`/`n`/result are i64 (BigInt).

@@ -14,6 +14,7 @@
 // Usage:  node threads-spawn.mjs <module.wasm> [guest.svmbc] [expected]
 import { readFileSync } from 'node:fs';
 import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
+import { engineImports } from './engine-imports.mjs';
 
 const WASM = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
 const GUEST = process.argv[3] ?? 'corpus/threads.svmbc';
@@ -41,7 +42,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret)
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
-  const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
+  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: a shared `WebAssembly.Memory` can GROW
@@ -264,7 +265,7 @@ async function main() {
     process.exit(1);
   }
   const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-  const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
+  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 

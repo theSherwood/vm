@@ -26,6 +26,8 @@ const imports = {
       process[stream === 1 ? 'stderr' : 'stdout'].write(text); // live to the host console
     },
     host_now_ns: () => CLOCK_NS,
+    // The `webgpu` capability's host seam — unused by this demo (no GPU surface), so a no-op stub.
+    webgpu_op: () => -1n,
   },
 };
 

@@ -5,12 +5,13 @@
 // (and stdin), passes the `(ptr, len)` in, reads any captured streams, then `svm_dealloc`s — no
 // fixed scratch buffer, so module/stream sizes are unbounded (see the megabyte echo at the end).
 import { readFileSync } from 'node:fs';
+import { engineImports } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
 const corpus = JSON.parse(readFileSync('corpus.json', 'utf8'));
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-const ex = (await WebAssembly.instantiate(mod, {})).exports;
+const ex = (await WebAssembly.instantiate(mod, engineImports())).exports;
 const is64 = ex.svm_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x)); // usize ABI value
 const mem = () => new Uint8Array(ex.memory.buffer); // re-fetch (memory may grow under us)

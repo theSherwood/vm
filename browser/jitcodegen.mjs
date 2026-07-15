@@ -9,6 +9,7 @@
 // Run: node browser/jitcodegen.mjs
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { engineImports } from './engine-imports.mjs';
 
 const WASM = fileURLToPath(new URL('./target/wasm32-unknown-unknown/release/svm_browser.wasm', import.meta.url));
 const PAR_DONE = 0, PAR_TRAP = 1, PAR_JIT_INVOKE = 8;
@@ -56,7 +57,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret)
 async function main() {
   const module = await WebAssembly.compile(readFileSync(WASM));
   const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-  const { exports: ex } = await WebAssembly.instantiate(module, { env: { memory } });
+  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = Number(ex.svm_par_alloc(STACK)) + STACK;
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(Number(ex.svm_par_alloc(ex.__tls_size.value + ex.__tls_align.value)));
   const u8 = () => new Uint8Array(memory.buffer);
