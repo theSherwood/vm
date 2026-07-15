@@ -703,6 +703,9 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
             Inst::Fma { .. } => return Err(Error::Unsupported("scalar fma (no core-wasm op)")),
             Inst::Load { op, .. } => tys.push(load_op(*op)?.2),
             Inst::Store { .. } => {}
+            // Bulk memory (D62): `memcpy`/`memmove`/`memset` → wasm `memory.copy`/`memory.fill` with
+            // whole-span confinement (see the lowering in `emit_block_body`). No SSA result.
+            Inst::MemCopy { .. } | Inst::MemMove { .. } | Inst::MemFill { .. } => {}
             Inst::Call { func, .. } => {
                 let callee = m
                     .funcs
@@ -863,6 +866,9 @@ fn interp_leaf(f: &Func) -> bool {
                 // memory ops (a leaf's fresh window would diverge from the shared one),
                 Inst::Load { .. }
                         | Inst::Store { .. }
+                        | Inst::MemCopy { .. }
+                        | Inst::MemMove { .. }
+                        | Inst::MemFill { .. }
                         | Inst::AtomicLoad { .. }
                         | Inst::AtomicStore { .. }
                         | Inst::AtomicRmw { .. }
@@ -1727,6 +1733,83 @@ fn emit_confine(
     code.push(0x6a); // i32.add → the confined linear-memory address
 }
 
+/// Open `if len != 0 {` for a bulk op — the caller emits the confined op inside and closes with a
+/// matching `OP_END` (`cx.depth -= 1`). A zero-length bulk op is a no-op that must never fault (see
+/// the lowering comment), so the entire span-check + `memory.fill`/`.copy` lives under this guard.
+fn emit_bulk_guard_open(cx: &mut FnCtx, code: &mut Vec<u8>, len_local: u32) {
+    code.push(OP_LOCAL_GET);
+    uleb(code, len_local as u64);
+    code.push(0x50); // i64.eqz → (len == 0)
+    code.push(0x45); // i32.eqz → (len != 0)
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+}
+
+/// **Whole-span confinement** for a bulk op (`memory.copy`/`memory.fill`) — the `len`-is-a-value
+/// analogue of [`emit_confine`], and the security hinge for D62 bulk memory. Traps `MemoryFault` unless
+/// the span `[base, base+len)` lies within `[0, mapped)` — matching the interpreter's `confine_span` +
+/// `check_prot_span` net behaviour over a fresh window (a span above `mapped` is uncommitted → faults),
+/// and keeping every accessed byte inside the physical window (never the adjacent linear memory). The
+/// check is **overflow-safe**: `base > mapped` then `len > mapped - base` (the second computed only
+/// once `base <= mapped`, so `mapped - base` can't underflow and `base + len` can't overflow).
+///
+/// Called **inside an `if len != 0` guard** (see the lowering in `emit_block_body`), so `len >= 1`
+/// here and a passed check guarantees `base < mapped` — which makes [`emit_win_addr`]'s mask a no-op.
+/// Emits nothing to the operand stack; call [`emit_win_addr`] afterwards for each span's confined
+/// address.
+fn emit_span_check(
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    base_local: u32,
+    len_local: u32,
+    mapped: u64,
+) {
+    // trap if base > mapped
+    code.push(OP_LOCAL_GET);
+    uleb(code, base_local as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, mapped as i64);
+    code.push(0x56); // i64.gt_u
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    emit_trap(code, TRAP_MEMORY_FAULT);
+    code.push(OP_END);
+    cx.depth -= 1;
+    // trap if len > mapped - base
+    code.push(OP_LOCAL_GET);
+    uleb(code, len_local as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, mapped as i64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, base_local as u64);
+    code.push(0x7d); // i64.sub → mapped - base (base <= mapped here)
+    code.push(0x56); // i64.gt_u: len > mapped - base
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    emit_trap(code, TRAP_MEMORY_FAULT);
+    code.push(OP_END);
+    cx.depth -= 1;
+}
+
+/// Push the confined linear-memory address `win + (base & MASK)` (an `i32`) for a bulk-op span whose
+/// `base` local has already passed [`emit_span_check`] (so `base < mapped ≤ 2^32` and the `& MASK` is a
+/// no-op clamp, mirroring the scalar path's defense-in-depth). `mapped ≤ 2^32` on wasm32, so the later
+/// `i32.wrap` of a checked `len` is exact.
+fn emit_win_addr(code: &mut Vec<u8>, base_local: u32) {
+    code.push(OP_LOCAL_GET);
+    uleb(code, base_local as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, MASK as i64);
+    code.push(0x83); // i64.and → clamp into the window
+    code.push(0xa7); // i32.wrap_i64
+    code.push(OP_LOCAL_GET);
+    uleb(code, 0); // win
+    code.push(0x6a); // i32.add
+}
+
 /// Push branch args onto the operand stack, then pop them into the target block's param locals in
 /// reverse — stack copies make a param-permuting self-branch safe.
 fn emit_edge(
@@ -1856,6 +1939,46 @@ fn emit_block_body(
                 );
                 get(code, cx, *value);
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
+            }
+            // ---- bulk memory (D62): whole-span confinement, then `memory.fill`/`memory.copy` ----
+            // The security hinge. The whole op runs under `if len != 0`, mirroring the interpreter's
+            // `if len == 0 { return Ok }` short-circuit: a bulk op that touches no byte is an
+            // unconditional no-op — it must NOT fault even at a wild base (and wasm's own
+            // `memory.fill`/`.copy` would otherwise bounds-check the base *before* its `n == 0`
+            // early-out, faulting a masked-but-out-of-linear-memory address). Inside the guard
+            // `emit_span_check` traps unless the whole span is in `[0, mapped)`; then `emit_win_addr`
+            // masks each base into the window (a no-op past the check) — same net confinement as the
+            // per-byte `Store` path, proven once per span. `len` (i64) is `i32.wrap`ped after the
+            // check (exact, since `len <= mapped <= 2^32`); `val` is already the i32 fill byte.
+            Inst::MemFill { dst, val, len } => {
+                let dl = cx.local_of[k][*dst as usize];
+                let ll = cx.local_of[k][*len as usize];
+                emit_bulk_guard_open(cx, code, ll);
+                emit_span_check(cx, code, dl, ll, mapped);
+                emit_win_addr(code, dl); // dest addr (i32)
+                get(code, cx, *val); // fill byte (already i32)
+                get(code, cx, *len);
+                code.push(0xa7); // i32.wrap_i64 → size (i32)
+                code.extend_from_slice(&[0xFC, 0x0B, 0x00]); // memory.fill mem=0
+                code.push(OP_END); // close `if len != 0`
+                cx.depth -= 1;
+            }
+            // `memory.copy` is overlap-safe, so it lowers both `MemCopy` (non-overlapping) and
+            // `MemMove` (overlap-safe) — the stronger op is always a correct refinement.
+            Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
+                let dl = cx.local_of[k][*dst as usize];
+                let sl = cx.local_of[k][*src as usize];
+                let ll = cx.local_of[k][*len as usize];
+                emit_bulk_guard_open(cx, code, ll);
+                emit_span_check(cx, code, dl, ll, mapped);
+                emit_span_check(cx, code, sl, ll, mapped);
+                emit_win_addr(code, dl); // dest addr (i32)
+                emit_win_addr(code, sl); // src addr (i32)
+                get(code, cx, *len);
+                code.push(0xa7); // i32.wrap_i64 → size (i32)
+                code.extend_from_slice(&[0xFC, 0x0A, 0x00, 0x00]); // memory.copy dst=0 src=0
+                code.push(OP_END); // close `if len != 0`
+                cx.depth -= 1;
             }
             // ---- scalar floats (all 1:1 with core wasm) ----
             Inst::ConstF32(bits) => {
