@@ -874,6 +874,16 @@ fn interp_leaf(f: &Func) -> bool {
 }
 
 /// Classify every function of a **verified** `m` for tiering rooted at func 0 (see [`Analysis`]).
+/// Whether `f`'s signature is entirely `i32`/`i64` — the marshalling the cross-tier `env.call_interp`
+/// ABI handles (each arg/result is one i64 scratch slot the callback widens/narrows per the declared
+/// type). A function with a `v128`/float parameter or result cannot be reached cross-tier.
+fn int_sig(f: &Func) -> bool {
+    f.params
+        .iter()
+        .chain(&f.results)
+        .all(|t| matches!(t, ValType::I32 | ValType::I64))
+}
+
 pub fn analyze(m: &Module) -> Analysis {
     analyze_from(m, 0)
 }
@@ -1014,6 +1024,57 @@ pub fn compile_module_mixed_entry(
         }
     }
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
+}
+
+/// Compile a **whole-module reactor** guest with **widened cross-tier calls** (Doom-perf): emit every
+/// reachable in-subset function to wasm and route a **direct** `Call` to any reachable, non-emitted,
+/// **integer-signature** function through `env.call_interp` — not just the strict memory-free/call-free
+/// [`interp_leaf`]s [`compile_module_mixed_entry`] allows. A cross-tier callee here may touch memory,
+/// call other functions, and use capabilities, so the host's `call_interp` callback **must run it over
+/// the SAME (shared) window + host** as the emitted code (a fresh window would lose its memory
+/// effects) — the contract this mode adds over the leaf-only modes, which run leaves over a throwaway
+/// window. This is what lets Doom's hot render path emit while its cold range-check / I/O helpers
+/// (which make capability calls) stay on the interpreter.
+///
+/// Returns the wasm plus a per-function **emitted** bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the
+/// rest are cross-tier). [`Error::Unsupported`] if the entry isn't in-subset, a reachable function has
+/// a non-integer signature (can't be marshalled cross-tier), or the guest uses `call_indirect` without
+/// being wholly in-subset (an indirect call to a cross-tier target needs a trampoline — a later slice).
+pub fn compile_module_reactor(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    let n = m.funcs.len();
+    let a = analyze_from(m, entry);
+    // Cross-tier: reachable, not emitted (not in-subset), and marshallable (integer signature). Runs on
+    // the interpreter over the shared window — so, unlike `interp_leaf`, memory/calls/caps are fine.
+    let cross: Vec<bool> = (0..n)
+        .map(|i| a.reachable[i] && !a.in_subset[i] && int_sig(&m.funcs[i]))
+        .collect();
+    let has_indirect = (0..n).any(|i| a.reachable[i] && func_uses_indirect(&m.funcs[i]));
+    let ok = (entry as usize) < n
+        && a.in_subset[entry as usize]
+        // Every reachable function must be emittable or cross-tier-callable...
+        && (0..n).all(|i| !a.reachable[i] || a.in_subset[i] || cross[i])
+        // ...and until cross-tier indirect (trampolines) lands, a guest that makes an indirect call
+        // must be wholly in-subset (every identity-table slot resolves to an emitted target).
+        && (!has_indirect || (0..n).all(|i| a.in_subset[i]));
+    if !ok {
+        return Err(Error::Unsupported("guest not cross-tier reactor runnable"));
+    }
+    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+    let mut emitted: Vec<usize> = Vec::new();
+    let mut emitted_bitmap = vec![false; n];
+    for i in 0..n {
+        if a.reachable[i] && a.in_subset[i] {
+            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+            emitted.push(i);
+            emitted_bitmap[i] = true;
+        }
+    }
+    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &cross)?;
+    Ok((wasm, emitted_bitmap))
 }
 
 /// Compile a **tier-up** module for the browser threads tier (`BROWSER.md` § "wasm-JIT tier",
