@@ -621,6 +621,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-posix",
  "svm-run",
  "svm-snapshot",
  "svm-spec",
