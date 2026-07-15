@@ -82,6 +82,7 @@ use svm_ir::{
 
 pub mod cfg;
 pub mod gvn;
+pub mod reassociate;
 pub mod sccp;
 pub mod ssa;
 
@@ -189,6 +190,9 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
     // below cannot see. It materializes constants and resolves constant branches; the fixpoint then
     // prunes the newly-unreachable blocks, DCEs the dead selector code, merges, and re-folds.
     let f = sccp::sccp(f, fn_results);
+    // Constant reassociation (OPT.md Phase 2): fold `(x OP c1) OP c2` chains so the fixpoint below
+    // then folds the combined constants and DCEs the dead inner ops.
+    let f = reassociate::reassociate(&f, fn_results);
     let mut blocks: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
     for _ in 0..1000 {
         let before = blocks.clone();

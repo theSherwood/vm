@@ -2,9 +2,18 @@
 //! the reference interpreter and that the targeted op folds away.
 
 use svm_interp::{Trap, Value};
-use svm_ir::{Block, CmpOp, Func, Inst, IntTy, Memory, Module, Terminator, ValType};
+use svm_ir::{BinOp, Block, CmpOp, Func, Inst, IntTy, Memory, Module, Terminator, ValType};
 use svm_opt::optimize_module;
 use svm_verify::verify_module;
+
+fn bin(op: BinOp, a: u32, b: u32) -> Inst {
+    Inst::IntBin {
+        ty: IntTy::I32,
+        op,
+        a,
+        b,
+    }
+}
 
 fn module(f: Func) -> Module {
     Module {
@@ -81,4 +90,95 @@ fn integer_self_comparison_folds_to_a_constant() {
             assert_eq!(run(&opt, &[Value::I32(a)]), Ok(vec![Value::I32(expected)]));
         }
     }
+}
+
+// ---- constant reassociation ----
+
+/// Build `fn(x: i32) -> i32` computing a chain of `x OP c1 OP c2 ...` and return (module, expected
+/// number of surviving IntBin ops after optimization, the closed-form result fn).
+fn reassoc_module(op: BinOp, consts: &[i32]) -> Module {
+    // v0 = x; then for each c: const c, then acc = acc OP c.
+    let mut insts = Vec::new();
+    let mut acc = 0u32; // v0 = x
+    let mut next = 1u32;
+    for &c in consts {
+        insts.push(Inst::ConstI32(c));
+        let cidx = next;
+        next += 1;
+        insts.push(bin(op, acc, cidx));
+        acc = next;
+        next += 1;
+    }
+    module(Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts,
+            term: Terminator::Return(vec![acc]),
+        }],
+    })
+}
+
+#[test]
+fn constant_chain_reassociates_to_a_single_op() {
+    // (((x + 1) + 2) + 3) → x + 6 : three adds collapse to one.
+    for (op, consts) in [
+        (BinOp::Add, &[1, 2, 3][..]),
+        (BinOp::Mul, &[2, 3, 5][..]),
+        (BinOp::And, &[0xF0, 0x3C][..]),
+        (BinOp::Or, &[1, 2, 4][..]),
+        (BinOp::Xor, &[5, 6, 7][..]),
+    ] {
+        let m = reassoc_module(op, consts);
+        verify_module(&m).expect("verifies");
+        let opt = optimize_module(&m);
+        verify_module(&opt).expect("re-verifies");
+        // The whole constant chain folds to `x OP <combined>` — exactly one IntBin remains.
+        assert_eq!(
+            count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+            1,
+            "chain of {op:?} over {consts:?} should collapse to one op"
+        );
+        for x in [0i32, 1, -1, 123, i32::MIN, i32::MAX] {
+            assert_eq!(run(&m, &[Value::I32(x)]), run(&opt, &[Value::I32(x)]));
+        }
+    }
+}
+
+#[test]
+fn reassociation_exposes_cse() {
+    // (x + 4) + 4  and  (x + 6) + 2  both become x + 8, then CSE folds them to one add.
+    // b0(x): a = (x+4)+4 ; b = (x+6)+2 ; return a + b   → 2*(x+8), a single `x+8` shared.
+    let m = module(Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32], // v0 = x
+            insts: vec![
+                Inst::ConstI32(4),     // v1
+                bin(BinOp::Add, 0, 1), // v2 = x+4
+                Inst::ConstI32(4),     // v3
+                bin(BinOp::Add, 2, 3), // v4 = (x+4)+4
+                Inst::ConstI32(6),     // v5
+                bin(BinOp::Add, 0, 5), // v6 = x+6
+                Inst::ConstI32(2),     // v7
+                bin(BinOp::Add, 6, 7), // v8 = (x+6)+2
+                bin(BinOp::Add, 4, 8), // v9 = a + b
+            ],
+            term: Terminator::Return(vec![9]),
+        }],
+    });
+    verify_module(&m).expect("verifies");
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("re-verifies");
+    for x in [0i32, 7, -20, i32::MAX] {
+        assert_eq!(run(&m, &[Value::I32(x)]), run(&opt, &[Value::I32(x)]));
+    }
+    // Both branches reassociate to `x + 8`; CSE shares it, leaving `x+8` and the final sum.
+    assert_eq!(
+        count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+        2,
+        "the two x+8 recomputations should share one op after reassociation + CSE"
+    );
 }
