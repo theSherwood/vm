@@ -14,7 +14,13 @@ OUT="${2:-/tmp/doomgeneric_cache/bc}"
 LUA="$REPO/crates/svm-llvm/tests/fixtures/lua"           # reused fs + printf guest shims
 TR="$REPO/crates/svm-llvm/target/release/svm-llvm-translate"
 mkdir -p "$OUT"; rm -f "$OUT"/*.bc
-FL="-O2 -emit-llvm -c -fno-vectorize -fno-slp-vectorize -DNORMALUNIX -DLINUX"
+# Render at Doom's **native 320x200** (overridable via RESX/RESY). doomgeneric otherwise defaults to
+# 640x400 and upscales the 320x200 engine buffer 2x — that upscale + the XRGB->RGBA swizzle are
+# per-pixel loops that dominate the wasm-JIT reactor's frame time (~1.3M masked pixel ops/frame at 2x).
+# At 1x (fb_scaling=1) they shrink 4x, which is what makes the JIT-tier frame rate smoothly playable.
+RESX="${RESX:-320}"; RESY="${RESY:-200}"
+FL="-O2 -emit-llvm -c -fno-vectorize -fno-slp-vectorize -DNORMALUNIX -DLINUX \
+-DDOOMGENERIC_RESX=$RESX -DDOOMGENERIC_RESY=$RESY"
 
 # All Doom TUs from doomgeneric's Makefile SRC_DOOM, MINUS the X11 platform (doomgeneric_xlib) which
 # `doomgeneric_svm.c` replaces.

@@ -340,7 +340,7 @@ block0(v0: i64):
     desc: 'Shareware DOOM (via doomgeneric), compiled from id Software’s C through the LLVM on-ramp ' +
       'and run in the sandbox. Click Run: _start reads the IWAD through the `fs` capability and boots ' +
       'Doom’s whole engine, then the page calls the guest’s tick() once per animation frame (the ' +
-      'reactor loop), blitting each 640×400 frame it presents through `display`. Arrow keys move, ' +
+      'reactor loop), blitting each 320×200 frame it presents through `display`. Arrow keys move, ' +
       'Ctrl fires, Space uses doors/switches, Esc/Enter drive the menus. The zone heap persists in ' +
       'the guest window between frames (slice 3a). Boot takes a few seconds on the wasm interpreter — ' +
       'the renderer is byte-exact to a native build (the §18 differential). Toggle "wasm-JIT" to run ' +
