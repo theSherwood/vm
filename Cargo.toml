@@ -20,6 +20,7 @@ members = [
     "crates/svm-wasm",
     "crates/svm-wasmjit",
     "crates/svm-wasi",
+    "crates/svm-posix",
     "crates/svm-capi",
 ]
 # `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
