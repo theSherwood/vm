@@ -1036,10 +1036,15 @@ pub fn compile_module_mixed_entry(
 /// window. This is what lets Doom's hot render path emit while its cold range-check / I/O helpers
 /// (which make capability calls) stay on the interpreter.
 ///
+/// A `call_indirect` may dispatch to a cross-tier target: an address-taken (`RefFunc`) function that
+/// isn't emitted gets an identity-table slot holding a **trampoline** (a wasm function with the call
+/// site's env-prepended signature that bounces to `env.call_interp`), so the indirect call reaches the
+/// interpreter over the shared window just like a direct cross-tier call.
+///
 /// Returns the wasm plus a per-function **emitted** bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the
 /// rest are cross-tier). [`Error::Unsupported`] if the entry isn't in-subset, a reachable function has
-/// a non-integer signature (can't be marshalled cross-tier), or the guest uses `call_indirect` without
-/// being wholly in-subset (an indirect call to a cross-tier target needs a trampoline — a later slice).
+/// a non-integer signature (can't be marshalled cross-tier), or an address-taken indirect target is
+/// itself non-integer-signature (can't be trampolined).
 pub fn compile_module_reactor(
     m: &Module,
     entry: u32,
@@ -1053,13 +1058,30 @@ pub fn compile_module_reactor(
         .map(|i| a.reachable[i] && !a.in_subset[i] && int_sig(&m.funcs[i]))
         .collect();
     let has_indirect = (0..n).any(|i| a.reachable[i] && func_uses_indirect(&m.funcs[i]));
+    // Address-taken functions (`RefFunc` targets) are the only legitimate indirect-call targets. When
+    // the guest makes an indirect call, each such target must be emitted or cross-tier-callable — an
+    // emitted table slot resolves to the wasm function, a `cross` one to a trampoline that bounces to
+    // the interpreter. A non-`cross` address-taken target (e.g. a non-integer signature) can't be
+    // marshalled, so the whole module falls back to the interpreter.
+    let indirect_ok = !has_indirect || {
+        let mut addr_taken = vec![false; n];
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let Inst::RefFunc { func } = inst {
+                        addr_taken[*func as usize] = true;
+                    }
+                }
+            }
+        }
+        (0..n).all(|i| !addr_taken[i] || a.in_subset[i] || cross[i])
+    };
     let ok = (entry as usize) < n
         && a.in_subset[entry as usize]
         // Every reachable function must be emittable or cross-tier-callable...
         && (0..n).all(|i| !a.reachable[i] || a.in_subset[i] || cross[i])
-        // ...and until cross-tier indirect (trampolines) lands, a guest that makes an indirect call
-        // must be wholly in-subset (every identity-table slot resolves to an emitted target).
-        && (!has_indirect || (0..n).all(|i| a.in_subset[i]));
+        // ...and every indirect-call target must resolve to an emitted func or a cross-tier trampoline.
+        && indirect_ok;
     if !ok {
         return Err(Error::Unsupported("guest not cross-tier reactor runnable"));
     }
@@ -1214,7 +1236,68 @@ fn emit_module(
     // the lowering reproduces `dispatch_indirect`'s `idx & (len - 1)`.
     let table_size = m.funcs.len().next_power_of_two().max(1) as u32;
 
-    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(emitted.len());
+    // Cross-tier indirect trampolines. A function whose address is taken (`RefFunc`) but which is
+    // *not* emitted still occupies an identity-table slot; an indirect call to it must reach the
+    // interpreter. For each such **cross-tier** (`interp_leaf`) address-taken function we emit a
+    // standalone trampoline — a wasm function with the same env-prepended `call_indirect` signature
+    // that does `env.call_interp` (see [`emit_trampoline`]). Every remaining non-emitted slot gets a
+    // `()->()` trap stub, so a forged/mistyped index fails closed at the signature check. Trampolines
+    // and the trap stub take wasm indices *after* the emitted functions (imports + emitted + these).
+    let mut tramp_of: Vec<Option<u32>> = vec![None; m.funcs.len()];
+    let mut extra_type_idx: Vec<u32> = Vec::new();
+    let mut extra_bodies: Vec<Vec<u8>> = Vec::new();
+    let mut trap_stub_widx: Option<u32> = None;
+    if needs_table {
+        let mut addr_taken = vec![false; m.funcs.len()];
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let Inst::RefFunc { func } = inst {
+                        addr_taken[*func as usize] = true;
+                    }
+                }
+            }
+        }
+        let mut next_widx = IMPORTED_FUNCS + emitted.len() as u32;
+        for fi in 0..m.funcs.len() {
+            if wasm_of[fi].is_none() && addr_taken[fi] && interp_leaf[fi] {
+                let f = &m.funcs[fi];
+                let key = indirect_type_bytes(&FuncType {
+                    params: f.params.clone(),
+                    results: f.results.clone(),
+                })?;
+                let ti = match types.iter().position(|t| *t == key) {
+                    Some(i) => i as u32,
+                    None => {
+                        types.push(key);
+                        (types.len() - 1) as u32
+                    }
+                };
+                extra_type_idx.push(ti);
+                extra_bodies.push(emit_trampoline(f, fi as u32)?);
+                tramp_of[fi] = Some(next_widx);
+                next_widx += 1;
+            }
+        }
+        // Any non-emitted, non-trampoline real slot needs the trap stub (`()->()`).
+        let need_stub =
+            (0..m.funcs.len()).any(|fi| wasm_of[fi].is_none() && tramp_of[fi].is_none());
+        if need_stub {
+            let key = (Vec::new(), Vec::new());
+            let ti = match types.iter().position(|t| *t == key) {
+                Some(i) => i as u32,
+                None => {
+                    types.push(key);
+                    (types.len() - 1) as u32
+                }
+            };
+            extra_type_idx.push(ti);
+            extra_bodies.push(emit_trap_stub());
+            trap_stub_widx = Some(next_widx);
+        }
+    }
+
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(emitted.len() + extra_bodies.len());
     for &fi in emitted {
         bodies.push(emit_func(
             m,
@@ -1226,6 +1309,7 @@ fn emit_module(
             table_size,
         )?);
     }
+    bodies.extend(extra_bodies);
 
     // ---- assemble the module ----
     let mut out = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // \0asm v1
@@ -1265,9 +1349,9 @@ fn emit_module(
     uleb(&mut sec, 1); // type index 1
     section(&mut out, 2, &sec);
 
-    let mut sec = Vec::new(); // function section (3)
-    uleb(&mut sec, emitted.len() as u64);
-    for ti in &fn_type_idx {
+    let mut sec = Vec::new(); // function section (3): emitted, then trampolines + trap stub
+    uleb(&mut sec, (fn_type_idx.len() + extra_type_idx.len()) as u64);
+    for ti in fn_type_idx.iter().chain(&extra_type_idx) {
         uleb(&mut sec, *ti as u64);
     }
     section(&mut out, 3, &sec);
@@ -1293,19 +1377,19 @@ fn emit_module(
     section(&mut out, 7, &sec);
 
     if needs_table {
-        // Element section (9): one active segment filling the identity table `[0, funcs.len())` with
-        // each function's wasm index; padding slots `[funcs.len(), table_size)` stay null (they trap
-        // like the interpreter's `TABLE_EMPTY` slots). Every real slot must be an emitted function —
-        // the `has_indirect` analysis guarantees this (all funcs in-subset when indirect is present).
+        // Element section (9): one active segment filling the identity table `[0, funcs.len())`.
+        // Each real slot resolves to the function's wasm index: an emitted function (`wasm_of`), a
+        // cross-tier **trampoline** (`tramp_of`, an address-taken interp-leaf), or the `()->()` trap
+        // stub (unreachable / non-address-taken cross-tier functions — never a legitimate indirect
+        // target, so their slot fails closed at the call_indirect signature check). Padding slots
+        // `[funcs.len(), table_size)` stay null (they trap like the interpreter's `TABLE_EMPTY`).
         let mut segment = Vec::new();
-        for (fi, slot) in wasm_of.iter().enumerate().take(m.funcs.len()) {
-            match slot {
-                Some(widx) => uleb(&mut segment, *widx as u64),
-                None => {
-                    let _ = fi;
-                    return Err(Error::Unsupported("indirect call target not emitted"));
-                }
-            }
+        for fi in 0..m.funcs.len() {
+            let widx = wasm_of[fi]
+                .or(tramp_of[fi])
+                .or(trap_stub_widx)
+                .ok_or(Error::Unsupported("indirect call target not routable"))?;
+            uleb(&mut segment, widx as u64);
         }
         let mut sec = Vec::new();
         uleb(&mut sec, 1); // one segment
@@ -1327,6 +1411,70 @@ fn emit_module(
     section(&mut out, 10, &sec);
 
     Ok(out)
+}
+
+/// Emit a **cross-tier indirect trampoline** body for SVM function `fi` (its `Func` is `f`): a wasm
+/// function with the env-prepended signature `(win:i32, env:i32, ...params) -> results` that marshals
+/// its params into the env scratch, calls `env.call_interp(fi, args_ptr)`, and returns the result
+/// slots — the same sequence [`emit_func`] uses for a cross-tier *direct* call, packaged as a
+/// standalone function so a cross-tier function whose **address is taken** can fill its funcref-table
+/// slot (an indirect call to it then reaches the interpreter). No locals: params are locals
+/// `2..2+nparams`; results are loaded straight onto the operand stack for the return.
+fn emit_trampoline(f: &Func, fi: u32) -> Result<Vec<u8>, Error> {
+    if f.params.len().max(f.results.len()) > XCALL_MAX_SLOTS {
+        return Err(Error::Unsupported("indirect trampoline arity too large"));
+    }
+    let mut code = Vec::new();
+    uleb(&mut code, 0); // no local declarations
+    for (i, p) in f.params.iter().enumerate() {
+        code.push(OP_LOCAL_GET);
+        uleb(&mut code, 1); // env
+        code.push(OP_I32_CONST);
+        sleb32(&mut code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+        code.push(0x6a); // i32.add → slot addr
+        code.push(OP_LOCAL_GET);
+        uleb(&mut code, (2 + i) as u64); // the i-th SVM param local
+        if *p == ValType::I32 {
+            code.push(0xad); // i64.extend_i32_u
+        }
+        code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8
+    }
+    code.push(OP_I32_CONST);
+    sleb32(&mut code, fi as i32);
+    code.push(OP_LOCAL_GET);
+    uleb(&mut code, 1); // env
+    code.push(OP_I32_CONST);
+    sleb32(&mut code, ENV_SCRATCH_OFF as i32);
+    code.push(0x6a); // i32.add → args_ptr
+    code.push(OP_CALL);
+    uleb(&mut code, 1); // env.call_interp
+    for (i, r) in f.results.iter().enumerate() {
+        code.push(OP_LOCAL_GET);
+        uleb(&mut code, 1); // env
+        code.push(OP_I32_CONST);
+        sleb32(&mut code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+        code.push(0x6a); // i32.add
+        code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8
+        if *r == ValType::I32 {
+            code.push(0xa7); // i32.wrap_i64
+        }
+    }
+    code.push(OP_END);
+    Ok(code)
+}
+
+/// A `() -> ()` **trap stub** body (`unreachable`). Fills funcref-table slots for functions that are
+/// neither emitted nor a cross-tier trampoline (unreachable / non-address-taken cross-tier functions):
+/// a verified guest only forms a funcref via `RefFunc` (an address-taken function), so such a slot is
+/// never legitimately reached; if a forged/mistyped index hits it, `call_indirect`'s type check traps
+/// (the stub's `()->()` type never matches a real `(win,env,…)` call site) — fail-closed, matching the
+/// interpreter's `IndirectCallType`/`TABLE_EMPTY` trap.
+fn emit_trap_stub() -> Vec<u8> {
+    let mut code = Vec::new();
+    uleb(&mut code, 0); // no locals
+    code.push(0x00); // unreachable
+    code.push(OP_END);
+    code
 }
 
 /// The wasm function-type of a `call_indirect` signature: the two prepended env params (`win`,
