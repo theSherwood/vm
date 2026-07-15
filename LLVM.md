@@ -1460,6 +1460,27 @@ boot is ~100 s on the interpreter, so a browser demo wants **snapshot/restore** 
 (the §durability machinery) rather than a cold boot each time; and widening the SQL surface past the
 constant-folded `SELECT` (real tables, DDL, the `scanf`/`fscanf` input path under load).
 
+**Slice CO (DONE) — ★★ a real table round-trip: `CREATE TABLE` / `INSERT` / `SELECT * FROM t` (gap #11p).**
+Widening past the constant-folded capstone to a query over a *real* table. Driving `CREATE TABLE t(x int,
+s text)` + `INSERT`s + `SELECT * FROM t` through the boot got the DDL/DML working immediately (the heap
+read/write/`UPDATE`/`DELETE`/`WHERE` paths all ride the machinery WAL recovery already exercised) — but
+`ORDER BY x DESC` **trapped `Unreachable`** at *planning* time. A traced, name-resolving boot run put the
+innermost frame at an address-taken `fn0` called from `cost_tuplesort` (`cost_sort` → `create_sort_path`
+→ … → `standard_planner`): the planner's sort-cost model computes `N·LOG2(N)` comparisons, and `LOG2(x)`
+is `log(x)/log(2)`. **Root cause: `log` was an undefined external → a fail-closed trap stub.** In fact the
+*entire* transcendental surface (`log`/`exp`/`sin`/`cos`/`pow`/…) was undefined — `postgres_libm.bc` was
+byte-identical to the pre-libm `postgres.linked.bc`; slice BQ built the bundled-openlibm *mechanism* and
+its bit-exact differential (`libm_bundled_vs_native`), but it was **never wired into the boot's link
+step**. The capstone's `SELECT 1+1` simply never reached a transcendental. **Fix:** `link_shims.sh` now
+`llvm-link`s openlibm's double set (the 28-file `OPENLIBM_SRCS` — the 18 transcendentals + kernels) into
+`postgres_shimmed.bc`, so `log`/`exp`/`pow`/… are defined guest code (`sqrt`/`fabs`/`ceil` still lower to
+on-ramp float ops); the hand-written `pow` shim (`math_shim.c`) is retired in favor of openlibm's bit-exact
+`e_pow`. With it the whole round-trip runs clean (`Exited(0)`): `SELECT *`, `count`/`sum`/`avg` (numeric),
+**`ORDER BY … DESC`**, `UPDATE … WHERE`, `DELETE … WHERE`, and `GROUP BY … ORDER BY` all return correct
+rows. openlibm is fetched-not-vendored (BSD); `link_shims.sh` takes a pre-staged tree (`SVM_OPENLIBM_DIR` /
+`/tmp/openlibm`) when github egress is blocked. **svm-llvm lane green (fmt + clippy `-D warnings`; 13
+`demo_pg_*`).** Next: still *boot speed* (snapshot/restore), and wider SQL (joins, indexes, subqueries).
+
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
 `realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
