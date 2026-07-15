@@ -2448,6 +2448,11 @@ impl JitOnrampReactor {
     ) -> Result<JitOnrampReactor, i32> {
         let mut module =
             svm_ir::resolve_imports(m, onramp_cap_resolver).map_err(|_| STATUS_UNSUPPORTED)?;
+        // Hoist inline `cap.call`s into cross-tier wrapper functions so a hot `tick` that interleaves
+        // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
+        // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
+        // emitter reads it below, and `run_cross_tier` runs the wrappers on the interpreter.
+        svm_wasmjit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's grown heap (see the struct docs).
         if let Some(mc) = module.memory.as_mut() {
             if (mc.size_log2 as u32) < win_log2 as u32 {
@@ -2924,6 +2929,40 @@ static mut JIT_REACTOR: Option<JitOnrampReactor> = None;
 /// The JIT reactor's mapped-window log2 — 16 MiB, covering Doom's grown zone heap so the emitter's
 /// static-`mapped` confinement mask holds (see [`JitOnrampReactor`]).
 const JIT_WIN_LOG2: u8 = 24;
+
+/// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)` with **no `fs` file** —
+/// the reactor analogue of [`svm_onramp_open`], with the whole `tick` emitted to wasm (for interactive
+/// guests that need no served file: bounce/life/mandelzoom). Decodes, enlarges the window, runs
+/// `_start` on the interpreter, and emits the whole `tick`. Returns `0` on success, else a negative
+/// `STATUS_*` (also set in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if the `tick` isn't
+/// wasm-JIT-emittable (the page falls back to the interp reactor). Otherwise identical to
+/// [`svm_onramp_jit_open_fs`]; drive/close with the same `svm_onramp_jit_*` exports.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    // The play threads build imports a **shared** memory, so the emitted module must too. No `fs` file.
+    match JitOnrampReactor::open_owned_jit(&m, JIT_WIN_LOG2, true, None) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
 
 /// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)`, granting an `fs`
 /// capability that serves the file `[data_ptr, data_len)` under the name `[name_ptr, name_len)` (Doom's
