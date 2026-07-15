@@ -213,6 +213,23 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
     })
 }
 
+/// The §7 **general-form** resolver (DESIGN.md §7 late binding: a name resolves to "a registered
+/// implementation **+ handle**"): like [`resolve`], but also binds the granted personality `handle`,
+/// so a module's libc imports carry **no handle argument** — each `call.import`'s handle operand is a
+/// `ConstI32` placeholder patched at resolve ([`svm_ir::Resolved::CapBound`]). Pass the closure to
+/// [`svm_ir::resolve_imports_with`] **after** [`grant`] (resolution needs the granted handle — the §7
+/// "binding happens once, at instantiation" ordering). The guest declares plain libc signatures and
+/// never reads a powerbox slot; the import section is its capability manifest.
+pub fn resolve_bound(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
+    move |name| {
+        resolve(name).map(|c| svm_ir::Resolved::CapBound {
+            type_id: c.type_id,
+            op: c.op,
+            handle,
+        })
+    }
+}
+
 /// Grant a POSIX personality on `host`, returning the `HOST_FN` handle and a [`Posix`] handle to its
 /// captured state. `heap_base`/`heap_end` bound the window region `malloc` hands out (both window
 /// offsets, `heap_base <= heap_end`, within the guest window and clear of the guest's static
@@ -1137,6 +1154,82 @@ block0(vph: i32):\n\
   vr = i64.add vt vptr\n\
   return vr\n\
 }\n";
+
+    /// The §7 **general form**: the module's imports carry a `ConstI32` **placeholder** handle
+    /// (`vph = i32.const 0`) and the entry takes **no capability parameters at all** — the granted
+    /// handle arrives by [`resolve_bound`] patching the placeholder at resolve (`Resolved::CapBound`),
+    /// never through an entry argument or a powerbox slot. Same program as `IMPORT_MALLOC_WRITE`
+    /// (→ `2_004096`, `"hi"`), differing only in how the authority binds.
+    const IMPORT_BOUND_MALLOC_WRITE: &str = "memory 17\n\
+func () -> (i64) {\n\
+block0():\n\
+  vph = i32.const 0\n\
+  vsz = i64.const 2\n\
+  vptr = call.import \"malloc\" (i64) -> (i64) vph (vsz)\n\
+  vh = i32.const 104\n\
+  i32.store8 vptr vh\n\
+  vone = i64.const 1\n\
+  vp1 = i64.add vptr vone\n\
+  vi = i32.const 105\n\
+  i32.store8 vp1 vi\n\
+  vph2 = i32.const 0\n\
+  vfd = i64.const 1\n\
+  vn = call.import \"write\" (i64, i64, i64) -> (i64) vph2 (vfd, vptr, vsz)\n\
+  vk = i64.const 1000000\n\
+  vt = i64.mul vn vk\n\
+  vr = i64.add vt vptr\n\
+  return vr\n\
+}\n";
+
+    #[test]
+    fn bound_imports_supply_the_handle_at_resolve() {
+        let m = parse_module(IMPORT_BOUND_MALLOC_WRITE).expect("parse");
+
+        // Grant FIRST (resolution needs the handle), on two identical hosts; deterministic grant
+        // order gives both backends the same handle value, so one resolved module serves both.
+        let mut ih = Host::new();
+        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, Vec::new());
+        let mut jh = Host::new();
+        let (jhh, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
+        assert_eq!(h, jhh, "identical grant order → identical handle");
+
+        let resolved =
+            svm_ir::resolve_imports_with(&m, resolve_bound(h)).expect("bound imports resolve");
+        assert!(resolved.imports.is_empty(), "resolution is import-free");
+        verify_module(&resolved).expect("verify the resolved module");
+
+        // No entry args: the program holds no capability parameters — authority came in at resolve.
+        let mut fuel = 5_000_000u64;
+        let ir =
+            run_capture_reserved_with_host(&resolved, 0, &[], &mut fuel, &[0u8; WIN], 0, &mut ih).0;
+        let jo = compile_and_run_capture_reserved_with_host(
+            &resolved,
+            0,
+            &[],
+            &[0u8; WIN],
+            0,
+            svm_run::cap_thunk,
+            &mut jh as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit")
+        .0;
+
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(2_004_096)]),
+            "interp: bound-handle malloc+write"
+        );
+        assert_eq!(
+            iposix.stdout(),
+            b"hi",
+            "interp: the write reached the personality"
+        );
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[2_004_096]),
+            "jit: must match interp, got {jo:?}"
+        );
+        assert_eq!(jposix.stdout(), b"hi", "jit: stdout must match interp");
+    }
 
     #[test]
     fn named_imports_bind_through_resolve_and_run() {

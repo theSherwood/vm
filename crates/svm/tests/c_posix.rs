@@ -1,17 +1,17 @@
-//! End-to-end C linking against the **POSIX personality** (`svm-posix`) through §7 named imports.
+//! End-to-end C linking against the **POSIX personality** (`svm-posix`) through §7 named imports,
+//! in the **general form**: names resolve to an implementation **and its handle**
+//! ([`svm_ir::Resolved::CapBound`], via [`svm_posix::resolve_bound`]) — DESIGN.md §7 late binding.
 //!
-//! This is POSIX.md §6 step 2 — the "real linking path" — but with *real compiled C* instead of
-//! hand-written IR. A tiny guest libc **shim** (guest code) declares each libc call as an undefined
-//! `extern` whose first argument is a capability handle; chibicc lowers those to `call.import
-//! "<name>"` on the handle (the generic §7 capability-import convention, `gen_builtin_import`). A
-//! resolver binds each name to the personality's `(HOST_FN, op)`, and `resolve_imports` lowers every
-//! `call.import` to a `cap.call` on the shared personality handle — exactly what a linker does for a
-//! shell's libc imports, now driven by the frontend end to end.
-//!
-//! The personality handle is granted into powerbox **slot 7** (the guest-`Jit` slot this test does
-//! not use), so the shim fetches it with `__vm_cap(7)`. Wiring the personality into a first-class
-//! powerbox slot (a durable ABI decision) is a follow-up (POSIX.md §6); this proves the linking path
-//! with zero frontend/runner change.
+//! The module's **import section is its capability manifest** — the discoverable contract between
+//! guest and host. There is no positional agreement anywhere: no powerbox slot for the personality,
+//! no `__vm_cap(n)`, no implicit slot numbering shared out-of-band. A tiny guest libc **shim**
+//! (guest code) gives each libc call its **real C signature** — `open(path, flags)`, `getenv(name)`,
+//! `malloc(n)` — adapting NUL-terminated strings to the personality's explicit-length `(ptr, len)`
+//! ABI (POSIX.md §4), and forwards to a `__px_`-prefixed undefined extern whose first argument is a
+//! literal `0`: the `ConstI32` **placeholder** the resolver patches to the granted handle at
+//! instantiation. Grant happens *before* resolve (the §7 "binding happens once, at instantiation"
+//! ordering); an unknown name fails closed. This is PROCESS.md S15 stage (a) — the fixed 8-slot
+//! `_start` remains only for the legacy powerbox caps until stages (b)–(c) migrate the frontend.
 //!
 //! Each program runs `_start` (function 0) on **both** the interpreter and the JIT under an identical
 //! host, asserting they agree on the result *and* the observable personality state (captured stdout,
@@ -26,17 +26,12 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{iface, run_with_host, Host, StreamRole, Value};
-use svm_ir::ResolvedCap;
+use svm_interp::{run_with_host, Host, StreamRole, Value};
 use svm_jit::{compile_and_run_with_host, JitOutcome};
 use svm_posix::Posix;
 use svm_run::cap_thunk;
 use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
-
-/// Powerbox slot the personality handle is stashed in (`__vm_cap(7)` in the shim). Slot 7 is the
-/// guest-`Jit` handle in the standard powerbox, which none of these programs use.
-const POSIX_SLOT: i32 = 7;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -86,35 +81,25 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
-/// The §7 resolver binding the shim's libc-shaped import names to the POSIX personality's
-/// `(HOST_FN, op)`. The names are the raw libc calls the shim declares as capability externs; each
-/// binds to the matching `svm_posix::OP_*`. Unknown names fail closed (a shim/personality mismatch).
-fn resolve(name: &str) -> Option<ResolvedCap> {
-    let op = match name {
-        "malloc" => svm_posix::OP_MALLOC,
-        "open" => svm_posix::OP_OPEN,
-        "px_write" => svm_posix::OP_WRITE,
-        "px_read" => svm_posix::OP_READ,
-        "lseek" => svm_posix::OP_LSEEK,
-        "getcwd" => svm_posix::OP_GETCWD,
-        "chdir" => svm_posix::OP_CHDIR,
-        "getenv" => svm_posix::OP_GETENV,
-        _ => return None,
-    };
-    Some(ResolvedCap {
-        type_id: iface::HOST_FN,
-        op,
-    })
+/// The §7 general-form resolver for the shim's import names: strip the `__px_` prefix (which keeps
+/// the shim's externs clear of chibicc's builtin names) and bind the bare libc name through
+/// [`svm_posix::resolve_bound`] — `(HOST_FN, op)` **plus the granted handle**, patched into each
+/// import's placeholder. Unknown names fail closed (a shim/personality mismatch).
+fn resolver(handle: i32) -> impl Fn(&str) -> Option<svm_ir::Resolved> {
+    let bound = svm_posix::resolve_bound(handle);
+    move |name| bound(name.strip_prefix("__px_")?)
 }
 
-/// Grant the fixed 8-handle powerbox on `host`, with the POSIX personality at [`POSIX_SLOT`] and a
-/// window-heap region in the upper half of the guest window (clear of chibicc's low data image +
-/// data stack). Returns the entry args and a [`Posix`] handle to the personality's captured state.
-fn setup(host: &mut Host, win: u64) -> ([Value; 8], Posix) {
+/// Grant the fixed 8-handle powerbox on `host` (what the legacy `_start` still expects — PROCESS.md
+/// S15 stages (b)–(c) retire it), then the POSIX personality with a window-heap region in the upper
+/// half of the guest window (clear of chibicc's low data image + data stack). The personality handle
+/// is **not** in the entry args — it binds by name at resolve. Returns the entry args, a [`Posix`]
+/// handle to the personality's captured state, and the granted personality handle for the resolver.
+fn setup(host: &mut Host, win: u64) -> ([Value; 8], Posix, i32) {
     host.set_region_factory(svm_run::new_shared_region);
     host.set_jit_validator(svm_run::jit_blob_validator);
-    let (px, posix) = svm_posix::grant(host, win / 2, win, Vec::new());
-    let mut args = [
+    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
+    let args = [
         Value::I32(host.grant_stream(StreamRole::Out)),
         Value::I32(host.grant_stream(StreamRole::In)),
         Value::I32(host.grant_exit()),
@@ -122,10 +107,10 @@ fn setup(host: &mut Host, win: u64) -> ([Value; 8], Posix) {
         Value::I32(host.grant_address_space(0, win)),
         Value::I32(host.grant_io_ring()),
         Value::I32(host.grant_blocking(std::time::Duration::ZERO, None)),
-        Value::I32(0), // POSIX_SLOT, filled below
+        Value::I32(host.grant_jit(mem_log2)),
     ];
-    args[POSIX_SLOT as usize] = Value::I32(px);
-    (args, posix)
+    let (px, posix) = svm_posix::grant(host, win / 2, win, Vec::new());
+    (args, posix, px)
 }
 
 /// What a program did on one backend: `main`'s returned result values, plus the personality's
@@ -145,24 +130,37 @@ fn to_slot(v: Value) -> i64 {
     }
 }
 
-/// Compile + resolve (through [`resolve`]) + verify a C program, then run `_start` on **both**
-/// backends under identical personalities and return each backend's observable effects for the
-/// caller to compare. `prep` stages each backend's personality identically before the run (seed the
+/// Compile a C program, **grant first** on two identical hosts (resolution needs the granted
+/// handle — the §7 instantiation ordering), resolve its imports through [`resolver`], verify, then
+/// run `_start` on **both** backends and return each backend's observable effects for the caller to
+/// compare. `prep` stages each backend's personality identically before the run (seed the
 /// environment / memfs); pass a no-op when there is nothing to stage. Panics with the IR on a
 /// parse/verify/trap so failures are legible.
 fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     let ir = c_to_ir(src);
     let raw = parse_module_raw(&ir)
         .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
-    let m = svm_ir::resolve_imports(&raw, resolve)
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+
+    // Grant before resolve, identically on both hosts; deterministic grant order gives both
+    // backends the same handle value, so one resolved module serves both.
+    let mut ih = Host::new();
+    let (iargs, iposix, ipx) = setup(&mut ih, win);
+    let mut jh = Host::new();
+    let (jargs, jposix, jpx) = setup(&mut jh, win);
+    assert_eq!(ipx, jpx, "identical grant order → identical handle");
+    prep(&iposix);
+    prep(&jposix);
+
+    let m = svm_ir::resolve_imports_with(&raw, resolver(ipx))
         .unwrap_or_else(|e| panic!("resolve imports: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
-    let win = 1u64 << m.memory.expect("the frontend declares a window").size_log2;
 
     // Interpreter.
-    let mut ih = Host::new();
-    let (iargs, iposix) = setup(&mut ih, win);
-    prep(&iposix);
     let mut fuel = 50_000_000u64;
     let ires = run_with_host(&m, 0, &iargs, &mut fuel, &mut ih)
         .unwrap_or_else(|e| panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"));
@@ -173,9 +171,6 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     };
 
     // JIT.
-    let mut jh = Host::new();
-    let (jargs, jposix) = setup(&mut jh, win);
-    prep(&jposix);
     let slots: Vec<i64> = jargs.iter().copied().map(to_slot).collect();
     let jout = compile_and_run_with_host(
         &m,
@@ -198,25 +193,34 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     (interp, jit)
 }
 
-/// A tiny guest libc shim (guest code) binding C's libc calls to the POSIX personality. Each `extern`
-/// takes the personality **handle** as its first argument (the §7 generic-import convention), which
-/// `main` fetches once with `__vm_cap(POSIX_SLOT)`. The wrappers adapt C's NUL-terminated `char*`
-/// convention to the personality's explicit-length `(ptr, len)` ABI (POSIX.md §4) — the adaptation is
-/// guest code. `write` is a chibicc *builtin* (it lowers to a Stream call, not an import), so the
-/// personality's write is imported under the distinct name `px_write`; `open`/`read`(as `px_read`)/
-/// `lseek`/`malloc` are ordinary undefined externs the resolver binds.
+/// A tiny guest libc shim (guest code) binding C's libc calls to the POSIX personality by **name
+/// only**. Each `__px_` extern's first argument is a literal `0` — the `ConstI32` placeholder the
+/// resolver patches to the granted handle ([`svm_ir::Resolved::CapBound`]); no `__vm_cap`, no slot.
+/// The wrappers expose the **real C signatures** — `open(path, flags)`, `getenv(name)`, `chdir(path)`,
+/// `malloc(n)` — adapting C's NUL-terminated `char*` convention to the personality's explicit-length
+/// `(ptr, len)` ABI (POSIX.md §4); the adaptation is guest code. `write`/`read` wrappers keep the
+/// `px_` prefix only because chibicc still intercepts those *names* as Stream builtins (the S15
+/// stage-(b) frontend migration collapses them to the plain names); `exit` likewise.
 const SHIM: &str = r#"
-int __vm_cap(int i);
-long malloc(int h, long size);
-long open(int h, long path, long len, long flags);
-long px_write(int h, long fd, long buf, long len);
-long px_read(int h, long fd, long buf, long len);
-long lseek(int h, long fd, long off, long whence);
-long getcwd(int h, long buf, long size);
-long chdir(int h, long path, long len);
-long getenv(int h, long name, long len);
+long __px_write(int cap, long fd, long buf, long len);
+long __px_read(int cap, long fd, long buf, long len);
+long __px_malloc(int cap, long size);
+long __px_open(int cap, long path, long len, long flags);
+long __px_lseek(int cap, long fd, long off, long whence);
+long __px_getcwd(int cap, long buf, long size);
+long __px_chdir(int cap, long path, long len);
+long __px_getenv(int cap, long name, long len);
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
+
+void *malloc(long size) { return (void *)__px_malloc(0, size); }
+long open(char *path, long flags) { return __px_open(0, (long)path, slen(path), flags); }
+long px_write(long fd, void *buf, long n) { return __px_write(0, fd, (long)buf, n); }
+long px_read(long fd, void *buf, long n) { return __px_read(0, fd, (long)buf, n); }
+long lseek(long fd, long off, long whence) { return __px_lseek(0, fd, off, whence); }
+char *getcwd(char *buf, long size) { return __px_getcwd(0, (long)buf, size) > 0 ? buf : 0; }
+long chdir(char *path) { return __px_chdir(0, (long)path, slen(path)); }
+char *getenv(char *name) { return (char *)__px_getenv(0, (long)name, slen(name)); }
 "#;
 
 /// The full round-trip: `malloc` a buffer, write it to the personality's **stdout** (fd 1), `open`
@@ -228,19 +232,18 @@ fn c_links_libc_to_posix_personality_roundtrip() {
     let src = format!(
         "{SHIM}\n\
 int main() {{\n\
-  int h = __vm_cap({POSIX_SLOT});\n\
   char *msg = \"hi\\n\";\n\
   long n = slen(msg);\n\
-  char *buf = (char *)malloc(h, 32);\n\
+  char *buf = (char *)malloc(32);\n\
   for (long i = 0; i < n; i = i + 1) buf[i] = msg[i];\n\
-  px_write(h, 1, (long)buf, n);            /* fd 1 -> captured stdout */\n\
-  long fd = open(h, (long)\"f\", 1, 66);   /* O_CREAT|O_RDWR */\n\
-  px_write(h, fd, (long)buf, n);           /* -> memfs file \"f\" */\n\
-  lseek(h, fd, 0, 0);                      /* SEEK_SET 0 */\n\
-  char *buf2 = (char *)malloc(h, 32);\n\
-  long r = px_read(h, fd, (long)buf2, 32); /* read the file back */\n\
-  px_write(h, 1, (long)buf2, r);           /* echo it to stdout again */\n\
-  return (int)fd;                          /* the first file fd is 3 */\n\
+  px_write(1, buf, n);          /* fd 1 -> captured stdout */\n\
+  long fd = open(\"f\", 66);    /* O_CREAT|O_RDWR */\n\
+  px_write(fd, buf, n);         /* -> memfs file \"f\" */\n\
+  lseek(fd, 0, 0);              /* SEEK_SET 0 */\n\
+  char *buf2 = (char *)malloc(32);\n\
+  long r = px_read(fd, buf2, 32); /* read the file back */\n\
+  px_write(1, buf2, r);         /* echo it to stdout again */\n\
+  return (int)fd;               /* the first file fd is 3 */\n\
 }}\n"
     );
     let (interp, jit) = run_both(&src, |_| {});
@@ -273,13 +276,12 @@ fn c_reads_env_and_cwd_through_the_personality() {
     let src = format!(
         "{SHIM}\n\
 int main() {{\n\
-  int h = __vm_cap({POSIX_SLOT});\n\
-  long p = getenv(h, (long)\"PATH\", 4);   /* staged host-side as \"/bin\" */\n\
-  if (p) px_write(h, 1, p, 4);            /* -> \"/bin\" */\n\
-  chdir(h, (long)\"/tmp\", 4);\n\
-  char *buf = (char *)malloc(h, 64);\n\
-  getcwd(h, (long)buf, 64);               /* NUL-terminated new cwd */\n\
-  px_write(h, 1, (long)buf, slen(buf));   /* -> \"/tmp\" */\n\
+  char *p = getenv(\"PATH\");     /* staged host-side as \"/bin\" */\n\
+  if (p) px_write(1, p, slen(p)); /* -> \"/bin\" */\n\
+  chdir(\"/tmp\");\n\
+  char *buf = (char *)malloc(64);\n\
+  getcwd(buf, 64);                /* NUL-terminated new cwd */\n\
+  px_write(1, buf, slen(buf));    /* -> \"/tmp\" */\n\
   return 0;\n\
 }}\n"
     );

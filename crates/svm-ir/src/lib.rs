@@ -2950,6 +2950,17 @@ pub enum Resolved {
     /// The import's handle operand must be a `ConstI32` placeholder — it is patched to `slot` and
     /// reused as the `call_indirect` index (a 1:1 rewrite, no value renumbering).
     Slot(u32),
+    /// A host capability with a **resolver-supplied handle** — the §7 "general form of the powerbox"
+    /// (DESIGN.md §7 late binding: a name resolves to "a registered implementation **+ handle**").
+    /// Like [`Resolved::Cap`], but the import's handle operand must be a `ConstI32` **placeholder**
+    /// (as for [`Resolved::Slot`]), patched to `handle` — the granted handle the host's instantiation
+    /// policy chose for this name. The guest declares the operation by name with its real signature
+    /// and never threads a handle argument or reads a powerbox slot; the authority binds at resolve.
+    /// The natural binding for a per-domain **singleton** (a POSIX personality's shared `HostFn`);
+    /// a capability with many live objects (streams, regions) keeps the handle a call-site operand
+    /// ([`Resolved::Cap`]). Resolution must therefore run **after** grant — per-instantiation, which
+    /// is already the §7 flow ("binding happens once, at instantiation").
+    CapBound { type_id: u32, op: u32, handle: i32 },
 }
 
 impl From<ResolvedCap> for Resolved {
@@ -2966,9 +2977,10 @@ pub enum ImportError {
     Unresolved(String),
     /// A `CallImport` referenced an import index past the module's [`Module::imports`].
     BadImportIndex(u32),
-    /// A [`Resolved::Slot`] binding's import had a handle operand that is **not** a `ConstI32`
-    /// placeholder (the frontend must emit one for a dynamic/slot import, since it is patched to the
-    /// slot and reused as the `call_indirect` index).
+    /// A placeholder-patched binding ([`Resolved::Slot`] / [`Resolved::CapBound`]) had a handle
+    /// operand that is **not** a `ConstI32` placeholder (the frontend must emit one for these
+    /// imports, since resolution patches it — to the `call_indirect` slot index, or to the granted
+    /// handle).
     SlotHandleNotConst,
 }
 
@@ -2987,12 +2999,16 @@ pub fn resolve_imports(
     resolve_imports_with(module, |name| resolve(name).map(Resolved::Cap))
 }
 
-/// The general §7 import-lowering pass: like [`resolve_imports`], but a name may bind to **either**
-/// a host capability ([`Resolved::Cap`] → `cap.call`) **or** another function in the linked module
-/// ([`Resolved::Func`] → a direct `call`). The latter is the compile-time (static) linking step the
-/// in-window loader builds on: a symbol resolved to a concrete function index. Each `CallImport`
-/// rewrites **1:1** (no value renumbering) — a `Func` binding drops the unused handle operand.
-/// Fails closed on an unresolved name. The result is import-free (verifier/both backends accept it).
+/// The general §7 import-lowering pass: like [`resolve_imports`], but a name may bind to a host
+/// capability ([`Resolved::Cap`] → `cap.call`), a capability **with its handle**
+/// ([`Resolved::CapBound`] → `cap.call` on a patched placeholder — the §7 "implementation + handle"
+/// general form), another function in the linked module ([`Resolved::Func`] → a direct `call`), or a
+/// `call_indirect` table slot ([`Resolved::Slot`]). `Func` is the compile-time (static) linking step
+/// the in-window loader builds on. Each `CallImport` rewrites **1:1** (no value renumbering) — a
+/// `Func` binding drops the unused handle operand. Fails closed on an unresolved name. The result is
+/// import-free (verifier/both backends accept it). Note `CapBound` is the one binding that moves a
+/// *handle*, not just `(type_id, op)` immediates — deliberate: it is the host's instantiation policy
+/// granting by name, so resolution must run after grant (and the resolved module is re-verified).
 pub fn resolve_imports_with(
     module: &Module,
     mut resolve: impl FnMut(&str) -> Option<Resolved>,
@@ -3045,18 +3061,26 @@ pub fn resolve_imports_with(
                     // Dynamic-link a function symbol → a `call_indirect` through the table slot: patch
                     // the handle's `ConstI32` placeholder to `slot` and reuse it as the index.
                     Resolved::Slot(slot) => {
-                        let def = def_of
-                            .get(handle as usize)
-                            .copied()
-                            .flatten()
-                            .ok_or(ImportError::SlotHandleNotConst)?;
-                        match &mut b.insts[def] {
-                            Inst::ConstI32(c) => *c = slot as i32,
-                            _ => return Err(ImportError::SlotHandleNotConst),
-                        }
+                        patch_placeholder(&mut b.insts, &def_of, handle, slot as i32)?;
                         Inst::CallIndirect {
                             ty: sig,
                             idx: handle,
+                            args,
+                        }
+                    }
+                    // A capability bound *with* its handle (§7 general form): patch the placeholder
+                    // to the granted handle and lower to an ordinary `cap.call` on it.
+                    Resolved::CapBound {
+                        type_id,
+                        op,
+                        handle: granted,
+                    } => {
+                        patch_placeholder(&mut b.insts, &def_of, handle, granted)?;
+                        Inst::CapCall {
+                            type_id,
+                            op,
+                            sig,
+                            handle,
                             args,
                         }
                     }
@@ -3066,6 +3090,29 @@ pub fn resolve_imports_with(
     }
     out.imports.clear();
     Ok(out)
+}
+
+/// Patch the `ConstI32` placeholder defining value `handle` to `value` — the shared rewrite for the
+/// placeholder-patched bindings ([`Resolved::Slot`] / [`Resolved::CapBound`]). Fails closed if the
+/// operand's defining instruction is not a `ConstI32` in the same block (a block param, or hoisted).
+fn patch_placeholder(
+    insts: &mut [Inst],
+    def_of: &[Option<usize>],
+    handle: u32,
+    value: i32,
+) -> Result<(), ImportError> {
+    let def = def_of
+        .get(handle as usize)
+        .copied()
+        .flatten()
+        .ok_or(ImportError::SlotHandleNotConst)?;
+    match &mut insts[def] {
+        Inst::ConstI32(c) => {
+            *c = value;
+            Ok(())
+        }
+        _ => Err(ImportError::SlotHandleNotConst),
+    }
 }
 
 /// One unit to statically link: a module plus the symbols it **exports** and the **relocations** its
