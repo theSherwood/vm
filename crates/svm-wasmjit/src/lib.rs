@@ -787,7 +787,11 @@ pub struct Analysis {
     pub mixed_ok: bool,
 }
 
-/// A block terminator the emitter lowers (tail calls are not in the v1 subset).
+/// A block terminator the emitter lowers. Tail calls (`return_call`/`return_call_indirect`) are
+/// included: they lower to the ordinary call sequence (direct / cross-tier / indirect) leaving the
+/// callee's results on the stack, followed by `return` — semantically identical, without frame reuse.
+/// (`-O2` produces `return_call` for *any* function whose last statement is a call, so accepting them
+/// keeps those hot functions — e.g. Doom's `I_FinishUpdate` — emittable rather than interpreter-tier.)
 fn term_in_subset(t: &Terminator) -> bool {
     matches!(
         t,
@@ -796,6 +800,8 @@ fn term_in_subset(t: &Terminator) -> bool {
             | Terminator::BrTable { .. }
             | Terminator::Return(_)
             | Terminator::Unreachable
+            | Terminator::ReturnCall { .. }
+            | Terminator::ReturnCallIndirect { .. }
     )
 }
 
@@ -833,6 +839,7 @@ fn func_uses_indirect(f: &Func) -> bool {
         b.insts
             .iter()
             .any(|i| matches!(i, Inst::CallIndirect { .. }))
+            || matches!(b.term, Terminator::ReturnCallIndirect { .. })
     })
 }
 
@@ -1219,13 +1226,24 @@ fn emit_module(
     let mut needs_table = false;
     for &fi in emitted {
         for b in &m.funcs[fi].blocks {
-            for inst in &b.insts {
-                if let Inst::CallIndirect { ty, .. } = inst {
-                    needs_table = true;
-                    let key = indirect_type_bytes(ty)?;
-                    if !types.contains(&key) {
-                        types.push(key);
-                    }
+            // A `call_indirect` type shows up as an instruction; a `return_call_indirect` as the
+            // block terminator — both dispatch through the table and need their signature declared.
+            let indirect_ty = b
+                .insts
+                .iter()
+                .filter_map(|inst| match inst {
+                    Inst::CallIndirect { ty, .. } => Some(ty),
+                    _ => None,
+                })
+                .chain(match &b.term {
+                    Terminator::ReturnCallIndirect { ty, .. } => Some(ty),
+                    _ => None,
+                });
+            for ty in indirect_ty {
+                needs_table = true;
+                let key = indirect_type_bytes(ty)?;
+                if !types.contains(&key) {
+                    types.push(key);
                 }
             }
         }
@@ -2341,8 +2359,93 @@ fn emit_block_body(
         Terminator::Unreachable => {
             code.push(OP_UNREACHABLE);
         }
-        Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. } => {
-            return Err(Error::Unsupported("tail call"));
+        // Tail calls: emit the ordinary call sequence, leaving the callee's results on the operand
+        // stack, then `return`. A tail call's callee results equal the caller's results (the verifier
+        // guarantees it), so the stack matches this emitted function's declared return type. This is a
+        // plain call + return — no wasm frame reuse — which is all the semantics require.
+        Terminator::ReturnCall { func, args } => {
+            let callee = &m.funcs[*func as usize];
+            let n_results = callee.results.len();
+            match wasm_of[*func as usize] {
+                // Same-tier: a direct wasm call to the emitted function (win/env threaded), then return.
+                Some(widx) => {
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 0); // win
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 1); // env
+                    for a in args {
+                        get(code, cx, *a);
+                    }
+                    code.push(OP_CALL);
+                    uleb(code, widx as u64);
+                    code.push(OP_RETURN);
+                }
+                // Cross-tier: marshal args into the env scratch, `env.call_interp`, load results back
+                // onto the stack, then return (the tail-call form of the mid-block cross-tier sequence).
+                None => {
+                    if !interp_leaf[*func as usize] {
+                        return Err(Error::Unsupported(
+                            "tail call to a non-emitted, non-leaf func",
+                        ));
+                    }
+                    if args.len().max(n_results) > XCALL_MAX_SLOTS {
+                        return Err(Error::Unsupported("cross-tier tail-call arity too large"));
+                    }
+                    for (i, a) in args.iter().enumerate() {
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 1); // env
+                        code.push(OP_I32_CONST);
+                        sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                        code.push(0x6a); // i32.add → slot addr
+                        get(code, cx, *a);
+                        if callee.params[i] == ValType::I32 {
+                            code.push(0xad); // i64.extend_i32_u
+                        }
+                        code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8
+                    }
+                    code.push(OP_I32_CONST);
+                    sleb32(code, *func as i32);
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 1); // env
+                    code.push(OP_I32_CONST);
+                    sleb32(code, ENV_SCRATCH_OFF as i32);
+                    code.push(0x6a); // i32.add
+                    code.push(OP_CALL);
+                    uleb(code, 1); // func 1 = env.call_interp
+                    for i in 0..n_results {
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 1); // env
+                        code.push(OP_I32_CONST);
+                        sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                        code.push(0x6a); // i32.add
+                        code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8
+                        if callee.results[i] == ValType::I32 {
+                            code.push(0xa7); // i32.wrap_i64
+                        }
+                    }
+                    code.push(OP_RETURN);
+                }
+            }
+        }
+        // Indirect tail call: push win/env/args, mask the index into the identity table, `call_indirect`
+        // the declared signature (wasm's signature check = the §3c type-id check), then return. A
+        // cross-tier target resolves to its trampoline slot (which itself bounces to `env.call_interp`).
+        Terminator::ReturnCallIndirect { ty, idx, args } => {
+            code.push(OP_LOCAL_GET);
+            uleb(code, 0); // win
+            code.push(OP_LOCAL_GET);
+            uleb(code, 1); // env
+            for a in args {
+                get(code, cx, *a);
+            }
+            get(code, cx, *idx);
+            code.push(OP_I32_CONST);
+            sleb32(code, (table_size - 1) as i32);
+            code.push(0x71); // i32.and → mask into the table
+            code.push(0x11); // call_indirect
+            uleb(code, indirect_type_index(types, ty)? as u64);
+            uleb(code, 0); // table index 0
+            code.push(OP_RETURN);
         }
     }
     let _ = f;

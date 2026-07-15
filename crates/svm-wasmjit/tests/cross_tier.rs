@@ -252,3 +252,50 @@ fn cross_tier_indirect_trampoline() {
         );
     }
 }
+
+// Same shared-window round trip, but f0 reaches f1 through a **`return_call`** (tail call) rather than
+// a direct call: f0 writes mem[8]=x+7 then `return_call 1 (v0)` — its result *is* f1's. f1 is
+// cross-tier (a `v128` op keeps it out of subset) and reads mem[8] back, so the tail call must marshal
+// through `env.call_interp` and return the callee's result over the shared window. This exercises the
+// emitter's cross-tier tail-call lowering (env scratch marshal → call_interp → load results → return).
+const SRC_TAILCALL: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v7 = i64.const 7
+  vpre = i64.add v0 v7
+  va8 = i64.const 8
+  i64.store va8 vpre
+  return_call 1 (v0)
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  va8 = i64.const 8
+  vread = i64.load va8
+  vs = i64x2.splat v0
+  vd = i16x8.dot_i8x16_s vs vs
+  ve = i64x2.extract_lane 0 vd
+  vz = i64.const 0
+  vfold = i64.mul ve vz
+  vout = i64.add vread vfold
+  return vout
+}
+"#;
+
+#[test]
+fn cross_tier_tail_call() {
+    let m = parse(SRC_TAILCALL);
+    for &arg in &[0i64, 1, 42, 1000, -5] {
+        let got = reactor_run(&m, arg);
+        assert_eq!(
+            got,
+            oracle(&m, arg),
+            "tail-call mixed != oracle for arg {arg}"
+        );
+        assert_eq!(
+            got,
+            arg + 7,
+            "the cross-tier tail call must run f1 over f0's window (arg {arg})"
+        );
+    }
+}

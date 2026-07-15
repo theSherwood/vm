@@ -35,6 +35,17 @@ void DG_Init(void) {
   g_kbd = __vm_cap_resolve("keyboard", 8);
 }
 
+/* Present the finished frame through the `display` capability. This is the one cap.call on the
+ * per-frame path, and a cap.call is out of the wasm-JIT subset — so keep it in its own `noinline`
+ * function. Inlined, the cap.call would poison the enclosing DG_DrawFrame (the per-pixel swizzle loop)
+ * out of the subset, dragging it onto the interpreter; isolated, only this O(1) call bounces
+ * cross-tier and the swizzle stays emitted. (Independent of the return_call emitter fix, which is what
+ * keeps I_FinishUpdate — the caller's scale loop — emittable.) */
+static void __attribute__((noinline)) present_frame(const unsigned char *buf, int w, int h) {
+  if (g_disp >= 0)
+    __vm_host_call(g_disp, 0, (long)buf, w, h, 0);
+}
+
 void DG_DrawFrame(void) {
   for (int i = 0; i < NPIX; i++) {
     unsigned int p = DG_ScreenBuffer[i]; /* 0x00RRGGBB */
@@ -44,8 +55,7 @@ void DG_DrawFrame(void) {
     o[2] = (unsigned char)(p);       /* B */
     o[3] = 255;                      /* A */
   }
-  if (g_disp >= 0)
-    __vm_host_call(g_disp, 0, (long)rgba, DOOMGENERIC_RESX, DOOMGENERIC_RESY, 0);
+  present_frame(rgba, DOOMGENERIC_RESX, DOOMGENERIC_RESY);
 }
 
 /* Advance the virtual clock instead of sleeping. Doom's TryRunTics busy-waits (`I_Sleep(1)`) until the

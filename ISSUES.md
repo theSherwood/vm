@@ -1091,6 +1091,30 @@ should be lifted; until then this is what Windows/macOS are **not** testing.
 
 ## Resolved
 
+### I25 — wasm-JIT emitter rejected `return_call` (tail calls), silently dropping tail-call-ending functions to the interpreter (S3) — **fixed** (2026-07-15) — found profiling the Doom wasm-JIT reactor
+
+**Was:** `crates/svm-wasmjit`'s `term_in_subset` accepted only `Br | BrIf | BrTable | Return |
+Unreachable`, so any function whose IR ended in a `return_call` / `return_call_indirect` terminator was
+classified out of the JIT subset — and it, plus its *entire direct-call subtree*, ran on the bytecode
+interpreter instead of emitted wasm. Silent (the fallback is correct, just slow) and pervasive: at
+`-O2` LLVM turns *any* function whose last statement is a call into a `return_call` (sibling-call
+optimization). The Doom reactor measured **~88% of each frame interpreted** because its single hottest
+function, `I_FinishUpdate` (the per-pixel scale + swizzle), ends in a call and was thus fully
+interpreted along with its subtree.
+
+**Fix (`crates/svm-wasmjit/src/lib.rs`):** lower `return_call` / `return_call_indirect` as the ordinary
+call sequence (direct / cross-tier via `env.call_interp` / indirect through the identity table) leaving
+the callee's results on the operand stack, followed by `return`. A tail call's callee results equal the
+caller's results (the verifier guarantees it), so the stack matches the emitted function's declared
+return type — a plain call + return, no wasm frame reuse, which is all the semantics require.
+`term_in_subset` now accepts both; `func_uses_indirect` and the `needs_table`/type scans account for
+`return_call_indirect` (it reuses the trampoline-populated table). Proven by `tests/differential.rs::
+tailcall` (entry tail-calls a helper that tail-**recurses** — same-tier + self) and
+`tests/cross_tier.rs::cross_tier_tail_call` (a `return_call` to a `v128`-gated cross-tier callee over
+the shared window). Measured: Doom's whole `tick` now emits with **no guest changes** — ~7 fps
+(interpreter) → ~47 fps (wasm-JIT), and ~50 fps with the display cap.call also isolated. This retires
+the per-guest `-fno-optimize-sibling-calls` workaround and helps every on-ramp guest.
+
 ### I21 — JIT bulk-memory ops diverge from the interpreter on spans overrunning `mapped` inside the reservation (S2) — **fixed** (2026-07-15) — found by the SPEC.md slice-5 window-model suite
 
 **Was:** `svm-jit`'s D62 bulk lowering (`confine_span` + the `memcpy`/`memmove`/`memset` libcall)

@@ -233,6 +233,37 @@ fn call() {
     diff("call", CALL, ARGS, FUEL);
 }
 
+/// **Tail calls** (`return_call`): the entry tail-calls a helper, which tail-**recurses** — exercising
+/// both a same-tier tail call to another function and a tail call to self. Each lowers to the ordinary
+/// call sequence + `return` (no wasm frame reuse), so the emitted result must equal the interpreter's
+/// `sum(0..=n)`. Positive sweep: a negative/huge `n` would spin the decrement forever (fuel-trap on
+/// both tiers — parity, but vacuous); the positive values exercise the actual computation.
+const TAILCALL: &str = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  vacc = i64.const 0
+  return_call 1 (v0, vacc)
+}
+func (i64, i64) -> (i64) {
+block0(vn: i64, vacc: i64):
+  vz = i64.const 0
+  vcmp = i64.eq vn vz
+  br_if vcmp block1(vacc) block2(vn, vacc)
+block1(vr: i64):
+  return vr
+block2(vn2: i64, vacc2: i64):
+  vsum = i64.add vacc2 vn2
+  vone = i64.const 1
+  vnm1 = i64.sub vn2 vone
+  return_call 1 (vnm1, vsum)
+}
+"#;
+
+#[test]
+fn tailcall() {
+    diff("tailcall", TAILCALL, &[0, 1, 2, 3, 10, 50, 1000], FUEL);
+}
+
 /// Store→load through the confined window every iteration (mask + guard on the hot path).
 const MEM: &str = r#"
 memory 16
@@ -776,10 +807,7 @@ fn fail_closed() {
             "threads",
             "memory 16\nfunc () -> (i64) {\nblock0():\n  v0 = i64.const 0\n  v1 = thread.spawn 1 v0 v0\n  v2 = thread.join v1\n  return v2\n}\nfunc (i64, i64) -> (i64) {\nblock0(vsp: i64, v0: i64):\n  v1 = i64.const 0\n  return v1\n}\n",
         ),
-        (
-            "tailcall",
-            "func (i64) -> (i64) {\nblock0(v0: i64):\n  return_call 1(v0)\n}\nfunc (i64) -> (i64) {\nblock0(v0: i64):\n  return v0\n}\n",
-        ),
+        // (`tailcall` was here — `return_call`/`return_call_indirect` are now lowered; see `fn tailcall`.)
     ] {
         let m = svm_text::parse_module(src).unwrap_or_else(|e| panic!("{name}: {e}"));
         svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
