@@ -75,6 +75,16 @@
 > function, with `coverage()` and the reference verifier's `check_inst`) maps **every**
 > one of the 86 `Inst` variants to its owning slice, so adding any op is a compile
 > error until the spec homes it. The executable spec now covers the entire ISA.
+>
+> **Nightly coverage-guided fuzzing wired (post-plan).** The deterministic boundary
+> lattices now have an unbounded counterpart: two libFuzzer targets (`fuzz/spec_ops`,
+> `fuzz/spec_verify`) driven by a shared `specfuzz` driver — `spec_ops` feeds random
+> operand values through each scalar/float row and checks all three backends against
+> the spec `eval`; `spec_verify` holds `svm-verify` and the reference verifier in
+> accept/reject agreement over generated + mutated modules. Both ride the scheduled
+> `cargo-fuzz` CI matrix and are mirrored on stable by `spec_fuzz_smoke.rs` (so they
+> gate every PR and can't rot), the same nightly-target + stable-mirror pattern as
+> `diff`/`jit_fuzz`.
 
 **Goal.** One **machine-readable description of the ISA** — typing rules, binary
 encoding, and (for the deterministic core) semantics — that lives in a **test-tier

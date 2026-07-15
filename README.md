@@ -272,20 +272,28 @@ run first, is what makes a module safe).
 
 ## Fuzzing
 
-Stable CI runs the smoke fuzz as ordinary tests (`crates/svm/tests/fuzz_smoke.rs`).
-For coverage-guided fuzzing (nightly):
+Stable CI runs the smoke fuzz as ordinary tests (`crates/svm/tests/fuzz_smoke.rs`,
+`spec_fuzz_smoke.rs`). For coverage-guided fuzzing (nightly):
 
 ```sh
 cargo install cargo-fuzz
 cargo +nightly fuzz run decode_verify   # decode/verify/interp never crash
 cargo +nightly fuzz run mask            # the confinement-masking invariant (I1)
 cargo +nightly fuzz run roundtrip       # binary + text round-trip identity
+cargo +nightly fuzz run diff            # interp-vs-JIT differential (§18)
+cargo +nightly fuzz run spec_ops        # every backend matches the executable spec's eval (SPEC.md)
+cargo +nightly fuzz run spec_verify     # svm-verify vs the reference verifier agree (SPEC.md)
 ```
 
 Invariants under test (the security hinge, §2a/§4): on arbitrary bytes, `decode`
 fails closed (never panics/OOMs/hangs), `verify` never panics, any *verified* module
 is safe to interpret, the masking unit confines every access into its window, and
-the formats round-trip without changing the IR.
+the formats round-trip without changing the IR. The two `spec_*` targets extend the
+executable ISA spec (`SPEC.md`) from its deterministic boundary lattices into
+unbounded exploration: `spec_ops` drives random operand values through each op and
+checks all three backends against the spec's reference semantics, and `spec_verify`
+holds the production verifier and the independent reference verifier in accept/reject
+agreement over generated + mutated modules.
 
 ## Example IR (text form)
 
