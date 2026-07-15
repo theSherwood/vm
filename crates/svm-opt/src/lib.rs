@@ -193,6 +193,9 @@ pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
             .iter()
             .map(|b| copy_propagate(b, fn_results))
             .collect();
+        // Common-subexpression elimination: dedup redundant *pure* computations within a block, so
+        // the duplicates become dead for the DCE below.
+        blocks = blocks.iter().map(|b| local_cse(b, fn_results)).collect();
         blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
         // Re-fold: merging brings a constant's definition into the same block as its use, and
         // dropping params can expose new constants — both newly foldable here.
@@ -1566,6 +1569,59 @@ fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
             for _ in 0..rc {
                 repl.push(next);
                 known.push(None);
+                next += 1;
+            }
+        }
+    }
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |o| repl[o as usize]);
+    Block {
+        params: b.params.clone(),
+        insts,
+        term,
+    }
+}
+
+/// Intra-block common-subexpression elimination. Within a block, a **pure** instruction (no trap, no
+/// memory access, no side effect — [`svm_ir::Inst::effects`]) whose operation *and* operands exactly
+/// match an earlier pure instruction computes the very same value, so its uses are rewritten to that
+/// earlier result and the redundant instruction is left dead for the following DCE pass. Operands are
+/// canonicalized to their CSE roots first (exactly as [`copy_propagate`] does), so equal expressions
+/// built from equal subexpressions are caught too. Index-stable (nothing is removed here).
+///
+/// Only pure ops are eligible: purity means the result is a deterministic function of the operands
+/// with no trap or effect, so two matching pure ops are interchangeable. A load/atomic/call (memory
+/// may change between them, they may trap or have effects) is never a CSE candidate — the effects
+/// table draws that line. Restricted to a single block, so the earlier definition trivially dominates
+/// the use and no block-parameter threading is needed (that is the job of the later global GVN).
+fn local_cse(b: &Block, fn_results: &[usize]) -> Block {
+    // `repl[v]` is the value `v` forwards to (its CSE root); params and non-redundant ops map to self.
+    let mut repl: Vec<ValIdx> = (0..b.params.len() as u32).collect();
+    let mut insts = b.insts.clone();
+    let mut next = b.params.len() as u32;
+    // Canonicalized pure instructions seen so far, paired with the value each one defines.
+    let mut seen: Vec<(Inst, ValIdx)> = Vec::new();
+    for inst in insts.iter_mut() {
+        // Compose with prior forwarding first, so operands name their roots before we compare.
+        map_operands(inst, &mut |o| repl[o as usize]);
+        let rc = inst.result_count(fn_results);
+        if rc == 1 {
+            let root = if inst.effects().is_pure() {
+                match seen.iter().find(|(prev, _)| *prev == *inst) {
+                    Some((_, e)) => *e, // a matching earlier pure op — reuse its result
+                    None => {
+                        seen.push((inst.clone(), next));
+                        next
+                    }
+                }
+            } else {
+                next
+            };
+            repl.push(root);
+            next += 1;
+        } else {
+            for _ in 0..rc {
+                repl.push(next);
                 next += 1;
             }
         }

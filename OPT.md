@@ -156,8 +156,17 @@ tracked enhancement, not a blocker.
     loop-invariant fold, trapping-div-not-folded) and the `opt_sccp` cargo-fuzz target (gen → verify
     → optimize → **re-verify** + interp differential). The existing optimize/peval harnesses (which
     now run through SCCP) stay green.
-  - [ ] GVN/CSE (needs the cross-block-use param threading in `from_ssa`), instcombine-style rules +
-    strength reduction, jump threading, LICM for pure non-trapping ops. Each with differential + fuzz.
+  - [x] **Local CSE** (`local_cse` in the `optimize_func` fixpoint): intra-block common-subexpression
+    elimination — a *pure* instruction (per the Phase 1a effects table) whose op and operands match an
+    earlier one is rewritten to that result and left for DCE. Operands are canonicalized to their CSE
+    roots first, so equal expressions from equal subexpressions collapse too. Only pure ops qualify
+    (a load/atomic/call may trap, read changing memory, or have effects — never CSE'd); single-block,
+    so the earlier def trivially dominates, no param threading. Tests (`tests/cse.rs`): redundant add
+    deduped, nested equal subexpressions, and identical loads **not** deduped. Covered by the
+    `opt_sccp` fuzz target (now exercises the whole `optimize_module` pipeline).
+  - [ ] **Global GVN** (dominator-based, across blocks) — brings the cross-block-use param-threading
+    lowering in `from_ssa` (its first consumer). Then instcombine-style rules + strength reduction,
+    jump threading, LICM for pure non-trapping ops. Each with differential + fuzz.
 - [ ] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above).
