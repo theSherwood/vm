@@ -87,9 +87,16 @@ fs-cap-in-wasm boot, i.e. building the demo itself (see "What's left").
 
 ## What's left (to validate the projection / build the demo)
 
-- **Measure the guest boot in wasm directly.** The one number still extrapolated. Needs the `fs` cap
-  backed by an in-wasm virtual filesystem holding the data image, then run the boot through the
-  `svm-browser` cdylib. This is most of the browser demo itself.
+- **✅ Milestone A — Postgres boots on a virtual (in-memory) filesystem.** `mem_fs_from_host_dir`
+  (`crates/svm-run/src/fs.rs`) seeds an in-memory `fs` cap from a data-dir image; Postgres `--single`
+  then runs the full `CREATE TABLE` / `INSERT` / `SELECT` / `ORDER BY` / aggregate round-trip on it and
+  exits cleanly (`Exited(0)`) — **zero real filesystem**, the exact requirement of the browser path.
+  (Getting there needed three `mem_fs` fixes: consistent path normalization across all file ops, a
+  read-only *directory* open so Postgres can `fsync` dirs at checkpoint, and a `0700` data-dir mode.)
+  The seed step (~40 MB image) takes ~35 ms; the guest run ~1.2 s natively.
+- **Measure the guest boot in wasm directly** (the one number still extrapolated). With Milestone A the
+  `fs` cap is now backend-agnostic (pure in-memory), so this is: build a `svm-browser` cdylib entry that
+  mounts a seeded `mem_fs` and streams stdin/stdout, then time the boot on V8.
 - **The demo build + loader.** Emit `{postgres_resolved.svmb, data-image}` from the pipeline; the
   browser loads → `decode → verify → run on the interpreter` (the `svm_run`/`svm_prep_bench` shape
   already in the cdylib) with stdin/stdout streamed and the data image mounted on the `fs` cap.

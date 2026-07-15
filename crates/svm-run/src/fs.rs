@@ -359,7 +359,7 @@ impl MemFsState {
         let a = |i: usize| args.get(i).copied().unwrap_or(0);
         match op {
             FS_OPEN => {
-                let path = match read_path(mem.as_deref(), a(0), a(1)) {
+                let path = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
@@ -372,6 +372,23 @@ impl MemFsState {
                         d.clone()
                     }
                     None => {
+                        // Opening a **directory** (no matching file, but a known dir) — e.g. Postgres
+                        // `fsync`s directories at checkpoint via `open(dir, O_RDONLY)` + `fsync`. Return
+                        // a read-only fd over an empty buffer: `sync`/`close` succeed, reads yield EOF,
+                        // writes are refused (matches a real directory fd). Checked before `O_CREATE` so
+                        // a create over an existing dir name doesn't shadow it with a file.
+                        if self.is_dir(&path) {
+                            let o = MemOpen {
+                                data: Arc::new(Mutex::new(Vec::new())),
+                                pos: 0,
+                                readable: true,
+                                writable: false,
+                                append: false,
+                            };
+                            let fd = alloc_fd(&mut self.open);
+                            self.open[fd] = Some(o);
+                            return fd as i64;
+                        }
                         if flags & O_CREATE == 0 {
                             return -ENOENT;
                         }
@@ -484,7 +501,7 @@ impl MemFsState {
                 0
             }
             FS_REMOVE => {
-                let path = match read_path(mem.as_deref(), a(0), a(1)) {
+                let path = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
@@ -494,11 +511,11 @@ impl MemFsState {
                 0
             }
             FS_RENAME => {
-                let from = match read_path(mem.as_deref(), a(0), a(1)) {
+                let from = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
-                let to = match read_path(mem.as_deref(), a(2), a(3)) {
+                let to = match read_path(mem.as_deref(), a(2), a(3)).map(|p| norm(&p)) {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
@@ -640,7 +657,11 @@ impl MemFsState {
                     let len = d.lock().unwrap_or_else(|e| e.into_inner()).len() as i64;
                     (S_IFREG | 0o644, len)
                 } else if self.is_dir(&key) {
-                    (S_IFDIR | 0o755, 0)
+                    // Owner-only (0700), the natural mode for a hermetic in-memory store — and the mode
+                    // Postgres' `checkDataDir` demands of its data directory (0700 or 0750; a
+                    // world/group-readable data dir is a fatal error). Differential stat tests compare
+                    // only `S_IFMT`, so the perm bits are free to model an owner-private fs.
+                    (S_IFDIR | 0o700, 0)
                 } else {
                     return -ENOENT;
                 };
@@ -782,6 +803,67 @@ fn mem_fs_impl(crashy: bool) -> HostCap {
             },
         ) as HostFn
     })
+}
+
+/// A **pre-seeded** in-memory filesystem: `files` maps a normalized relative path to its contents, and
+/// `dirs` names directories that must exist even with no files under them (empty dirs a walk would
+/// otherwise miss). Each host grant gets a **fresh clone** of the seed, so a run's writes never leak
+/// back into it — re-runs are deterministic. This is how a demo with no real filesystem (e.g. the
+/// browser) mounts a data-dir image on the `fs` cap: build the seed once (`mem_fs_from_host_dir` or a
+/// shipped image), then grant it. Confinement is unchanged — the same rooted, `..`-refusing store as
+/// [`mem_fs`], just non-empty at grant time.
+pub fn mem_fs_seeded(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> HostCap {
+    let files = Arc::new(files);
+    let dirs = Arc::new(dirs);
+    HostCap::host_fn(0, move || {
+        let (files, dirs) = (files.clone(), dirs.clone());
+        let mut st = MemFsState::default();
+        for (p, data) in files.iter() {
+            st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
+        }
+        for d in dirs.iter() {
+            st.dirs.insert(norm(d));
+        }
+        Box::new(
+            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+                Ok(vec![st.handle(op, args, mem)])
+            },
+        ) as HostFn
+    })
+}
+
+/// Walk a host directory into a [`mem_fs_seeded`] capability — every regular file's bytes keyed by its
+/// path relative to `root`, plus every directory (so empty ones survive). Symlinks are followed (a
+/// symlink to a file becomes that file's bytes). For building a demo data image from an on-disk
+/// cluster; the resulting cap has no further tie to the host filesystem.
+pub fn mem_fs_from_host_dir(root: &Path) -> std::io::Result<HostCap> {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    fn walk(
+        base: &Path,
+        cur: &Path,
+        files: &mut Vec<(String, Vec<u8>)>,
+        dirs: &mut Vec<String>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(cur)? {
+            let path = entry?.path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            // `is_dir`/`is_file` follow symlinks, so a symlinked file/dir is captured as its target.
+            if path.is_dir() {
+                dirs.push(rel);
+                walk(base, &path, files, dirs)?;
+            } else if path.is_file() {
+                files.push((rel, std::fs::read(&path)?));
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, &mut files, &mut dirs)?;
+    Ok(mem_fs_seeded(files, dirs))
 }
 
 struct HostOpen {
@@ -1563,6 +1645,76 @@ mod tests {
         );
         assert_eq!(mem_name, "f");
         assert_eq!(host_name, "f");
+    }
+
+    /// A **pre-seeded** in-memory fs ([`mem_fs_seeded`]) exposes its files and empty dirs, tolerates a
+    /// `./` path prefix (all file ops normalize consistently), reports its data-dir-style `0700` dir
+    /// mode, and lets a directory be `open`ed read-only and `sync`ed — the exact surface the Postgres
+    /// demo boot needs from a virtual filesystem (`BOOTSPEED.md` Milestone A).
+    #[test]
+    fn seeded_mem_fs_open_norm_and_dir_fsync() {
+        use super::*;
+        use svm_interp::{iface, Host, WindowMem};
+
+        const PA: usize = 0;
+        const SB: usize = 256;
+        const RB: usize = 512;
+        fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
+            let n = win.len();
+            let mut wm = WindowMem::new(win, n as u64);
+            host.cap_dispatch_slots(iface::HOST_FN, op, h, args, Some(&mut wm))
+                .unwrap()[0]
+        }
+        fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
+            win[at..at + s.len()].copy_from_slice(s.as_bytes());
+            (at as i64, s.len() as i64)
+        }
+
+        // Seed a file under a subdir + an *empty* subdir (the shape of `pg_logical/mappings`).
+        let cap = mem_fs_seeded(
+            vec![("sub/PG_VERSION".into(), b"17\n".to_vec())],
+            vec!["sub/mappings".into()],
+        );
+        let mut host = Host::new();
+        let h = (cap.grant)(&mut host, 0);
+        let mut win = vec![0u8; 4096];
+
+        // Open the seeded file through a `./`-prefixed path — the raw key ("./sub/PG_VERSION") differs
+        // from the normalized seed key, so this fails unless the op normalizes (the bug this guards).
+        let (fp, fl) = put(&mut win, PA, "./sub/PG_VERSION");
+        let fd = call(&mut host, h, &mut win, FS_OPEN, &[fp, fl, O_READ, 0]);
+        assert!(fd >= 0, "open ./sub/PG_VERSION (normalized) succeeds");
+        let n = call(&mut host, h, &mut win, FS_READ, &[fd, RB as i64, 8, 0]);
+        assert_eq!(n, 3, "read the seeded 3 bytes");
+        assert_eq!(&win[RB..RB + 3], b"17\n", "seeded file contents");
+        call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]);
+
+        // Open the *empty* seeded directory read-only and fsync it — Postgres does this at checkpoint.
+        let (dp, dl) = put(&mut win, PA, "sub/mappings");
+        let dfd = call(&mut host, h, &mut win, FS_OPEN, &[dp, dl, O_READ, 0]);
+        assert!(dfd >= 0, "open a directory read-only (for fsync) succeeds");
+        assert_eq!(
+            call(&mut host, h, &mut win, FS_SYNC, &[dfd, 0, 0, 0]),
+            0,
+            "fsync of a directory fd succeeds"
+        );
+        call(&mut host, h, &mut win, FS_CLOSE, &[dfd, 0, 0, 0]);
+
+        // A seeded directory stats as 0700 (Postgres' `checkDataDir` rejects group/other perms).
+        let (sp, sl) = put(&mut win, PA, "sub");
+        assert_eq!(
+            call(
+                &mut host,
+                h,
+                &mut win,
+                FS_STAT,
+                &[sp, sl, SB as i64, STATBUF_LEN as i64]
+            ),
+            0
+        );
+        let mode = u32::from_le_bytes(win[SB..SB + 4].try_into().unwrap());
+        assert_eq!(mode & S_IFMT, S_IFDIR, "seeded 'sub' is a directory");
+        assert_eq!(mode & 0o777, 0o700, "in-memory dir reports owner-only 0700");
     }
 
     /// `opendir` snapshots entries and `readdir` yields them **sorted**, deterministically, across
