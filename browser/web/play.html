@@ -51,6 +51,9 @@
       </label>
       <button id="run" disabled>Run</button>
       <button id="stop" disabled>Stop</button>
+      <label id="jitLabel" title="Run the reactor's tick() on emitted wasm (wasm-JIT tier) instead of the interpreter — smooths DOOM's frame rate" hidden>
+        <input type="checkbox" id="jit" checked> wasm-JIT
+      </label>
       <span id="state" data-state="loading">loading engine…</span>
     </div>
     <div class="panes">

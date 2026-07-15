@@ -2293,6 +2293,9 @@ pub struct JitOnrampReactor {
     /// Keep-alive for an owned backing (native path); `None` when the window is caller-owned (FFI).
     _backing: Option<Box<[u8]>>,
     back: std::sync::Arc<svm_interp::Region>,
+    /// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`
+    /// argument (the address the emitted code masks its accesses against).
+    win_base: usize,
     entry_sp: u64,
     tick: svm_ir::FuncIdx,
     /// The emitted wasm for the whole `tick` (the host compiles + runs it) and the per-function emitted
@@ -2321,8 +2324,17 @@ impl JitOnrampReactor {
         let ptr = backing.as_mut_ptr();
         // SAFETY: `backing` is owned by the returned struct and its heap allocation is pointer-stable
         // across the struct's moves, so `[ptr, win_size)` stays valid + exclusive for the run.
+        let win_base = ptr as usize;
         let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(ptr, win_size) });
-        Self::open_over_jit(m, back, Some(backing), win_log2, shared_memory, fs)
+        Self::open_over_jit(
+            m,
+            back,
+            Some(backing),
+            win_base,
+            win_log2,
+            shared_memory,
+            fs,
+        )
     }
 
     /// Open a wasm-JIT reactor over a **caller-owned** window `[win_ptr, win_ptr+win_size)` of this
@@ -2339,14 +2351,16 @@ impl JitOnrampReactor {
         shared_memory: bool,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<JitOnrampReactor, i32> {
+        let win_base = win_ptr as usize;
         let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
-        Self::open_over_jit(m, back, None, win_log2, shared_memory, fs)
+        Self::open_over_jit(m, back, None, win_base, win_log2, shared_memory, fs)
     }
 
     fn open_over_jit(
         m: &svm_ir::Module,
         back: std::sync::Arc<svm_interp::Region>,
         backing: Option<Box<[u8]>>,
+        win_base: usize,
         win_log2: u8,
         shared_memory: bool,
         fs: Option<(String, Vec<u8>)>,
@@ -2393,6 +2407,7 @@ impl JitOnrampReactor {
             host,
             _backing: backing,
             back,
+            win_base,
             entry_sp,
             tick,
             emitted_wasm,
@@ -2401,6 +2416,11 @@ impl JitOnrampReactor {
             keys,
             last_trap: None,
         })
+    }
+
+    /// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`.
+    pub fn win_base(&self) -> usize {
+        self.win_base
     }
 
     /// The emitted wasm module for the whole `tick` — the host compiles + instantiates it against this
@@ -2814,6 +2834,206 @@ pub extern "C" fn svm_onramp_trap_len() -> usize {
     // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
     len
+}
+
+// ---- the wasm-JIT reactor (Doom's whole `tick` on emitted wasm) — BROWSER.md §"wasm-JIT tier" 5d ---
+//
+// Unlike the interpreter reactor (`svm_onramp_*`), the per-frame `tick` runs as a **JS-compiled**
+// emitted wasm module (`svm_wasmjit`), instantiated by `play.js` against this cdylib's own linear
+// memory. Each frame the page calls the emitted `f{tick}(win, env, sp)` directly; its cross-tier
+// helpers relay `env.call_interp` back to [`svm_onramp_jit_call_interp`], which runs the callee on the
+// interpreter over the same window with the powerbox (so `display`/`keyboard`/`fs`/`exit` resolve).
+// The window lives in a Rust-owned `Box` inside linear memory; the page reads its base
+// ([`svm_onramp_jit_win_ptr`]) for the emitted `win` argument and reads the emitted bytes to compile.
+
+/// The live wasm-JIT reactor. `None` until [`svm_onramp_jit_open_fs`]; single-threaded wasm.
+static mut JIT_REACTOR: Option<JitOnrampReactor> = None;
+
+/// The JIT reactor's mapped-window log2 — 16 MiB, covering Doom's grown zone heap so the emitter's
+/// static-`mapped` confinement mask holds (see [`JitOnrampReactor`]).
+const JIT_WIN_LOG2: u8 = 24;
+
+/// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)`, granting an `fs`
+/// capability that serves the file `[data_ptr, data_len)` under the name `[name_ptr, name_len)` (Doom's
+/// WAD). Decodes, enlarges the window, runs `_start` on the interpreter, and emits the whole `tick`.
+/// Returns `0` on success, else a negative `STATUS_*` (also set in [`LAST_STATUS`]) — notably
+/// [`STATUS_UNSUPPORTED`] if the `tick` isn't wasm-JIT-emittable (the page falls back to the interp
+/// reactor). Replaces any prior JIT reactor. After success, read [`svm_onramp_jit_wasm_ptr`]/`_len`
+/// (emitted bytes), [`svm_onramp_jit_win_ptr`], [`svm_onramp_jit_entry_sp`], [`svm_onramp_jit_tick`],
+/// and [`svm_onramp_jit_env_bytes`] to set up the emitted module; drive it with
+/// [`svm_onramp_jit_call_interp`] + [`svm_onramp_jit_present`]; feed input with
+/// [`svm_onramp_jit_key`]; close with [`svm_onramp_jit_close`].
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_open_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each `[ptr, len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    let name = String::from_utf8_lossy(name).into_owned();
+    // The play threads build imports a **shared** memory, so the emitted module must too.
+    match JitOnrampReactor::open_owned_jit(&m, JIT_WIN_LOG2, true, Some((name, data.to_vec()))) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// Pointer / length of the emitted `tick` wasm bytes (valid until the reactor is replaced/closed; the
+/// page copies them out and `WebAssembly.compile`s them). `(null, 0)` if no reactor is open.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_wasm_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }
+        .map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
+}
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_wasm_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.emitted_wasm().len())
+}
+
+/// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_win_ptr() -> usize {
+    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.win_base())
+}
+/// The reactor calling-convention data-stack base — the emitted `f{tick}`'s `sp` argument.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_entry_sp() -> i64 {
+    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.entry_sp() as i64)
+}
+/// The SVM index of the exported `tick` — the emitted export is `f{tick}`.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_tick() -> u32 {
+    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.tick())
+}
+/// The `env` cell size (fuel counter + cross-tier scratch) the page must `svm_alloc` for the emitted
+/// module's `env` argument.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_env_bytes() -> usize {
+    svm_wasmjit::ENV_CELL_BYTES
+}
+
+/// **Cross-tier bounce** — the emitted `tick`'s `env.call_interp(func, args_ptr)` relays here. Runs
+/// non-emitted `func` on the interpreter over the shared window with the powerbox, marshalling its i64
+/// arg/result slots at `args_ptr` (in linear memory). Returns `0` on success, [`STATUS_EXIT`] if the
+/// callee `Exit`ed, else [`STATUS_TRAP`] — the page throws on any nonzero to unwind the emitted `tick`.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
+    let Some(reactor) = (unsafe { (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() }) else {
+        return STATUS_UNSUPPORTED;
+    };
+    let (params, results) = {
+        let (p, r) = reactor.func_sig(func);
+        (p.to_vec(), r.to_vec())
+    };
+    // SAFETY: the host guarantees `args_ptr` addresses ≥ max(params, results) i64 slots (the env scratch).
+    let read_slot = |i: usize| -> u64 {
+        let mut b = [0u8; 8];
+        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(i * 8), b.as_mut_ptr(), 8) };
+        u64::from_le_bytes(b)
+    };
+    let args: Vec<Value> = params
+        .iter()
+        .enumerate()
+        .map(|(i, t)| match t {
+            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
+            _ => Value::I64(read_slot(i) as i64),
+        })
+        .collect();
+    match reactor.run_cross_tier(func, &args) {
+        Ok(vals) => {
+            for (i, v) in vals.iter().enumerate() {
+                if i >= results.len() {
+                    break;
+                }
+                let raw = match v {
+                    Value::I32(x) => *x as u32 as u64,
+                    Value::I64(x) => *x as u64,
+                    _ => return STATUS_TRAP,
+                };
+                let b = raw.to_le_bytes();
+                // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
+                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
+            }
+            0
+        }
+        Err(Trap::Exit(_)) => STATUS_EXIT,
+        Err(t) => {
+            reactor.set_last_trap(format!("{t:?}"));
+            STATUS_TRAP
+        }
+    }
+}
+
+/// Stash the frame the last emitted `tick` presented through `display` into the `svm_framebuffer_*`
+/// slots (the page blits it after each frame). Returns `1` if a frame was presented, else `0`.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_present() -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the reactor.
+    let frame =
+        unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.take_frame());
+    let (rgba, w, h) = match frame {
+        Some(f) => (f.rgba, f.width, f.height),
+        None => return 0,
+    };
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the `svm_framebuffer_*`.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(FB), rgba);
+        FB_W = w;
+        FB_H = h;
+    }
+    1
+}
+
+/// Enqueue a key event for the JIT reactor's guest to `poll` next frame (`pressed`: 1 = down, 0 = up).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_key(keycode: i32, pressed: i32) {
+    // SAFETY: single-threaded wasm; shared read of the reactor's key queue.
+    if let Some(r) = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() } {
+        r.push_key(keycode, pressed);
+    }
+}
+
+/// Diagnostic: stash the JIT reactor's last-trap string into [`OUT`] and return its length (`0` if
+/// none). Read via [`svm_stdout_ptr`].
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_trap_len() -> usize {
+    // SAFETY: single-threaded wasm; shared read of the reactor.
+    let s = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or("", |r| r.last_trap());
+    let bytes = s.as_bytes().to_vec();
+    let len = bytes.len();
+    // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// Close the open JIT reactor, freeing it (and its window `Box`). Idempotent.
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_close() {
+    // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
+    unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = None };
 }
 
 /// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next

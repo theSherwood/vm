@@ -6,6 +6,7 @@
 // authority either way — all of it is Rust-side, in shared linear memory.
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
+import { openJitReactor } from './wasmjit-reactor.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -334,6 +335,7 @@ block0(v0: i64):
     kind: 'reactor',
     url: './assets/doom.svmb',
     wad: './assets/doom1.wad',
+    jit: true, // the whole tick() is wasm-JIT-emittable — the "wasm-JIT" toggle runs it near-natively
     mode: 'io',
     desc: 'Shareware DOOM (via doomgeneric), compiled from id Software’s C through the LLVM on-ramp ' +
       'and run in the sandbox. Click Run: _start reads the IWAD through the `fs` capability and boots ' +
@@ -341,8 +343,9 @@ block0(v0: i64):
       'reactor loop), blitting each 640×400 frame it presents through `display`. Arrow keys move, ' +
       'Ctrl fires, Space uses doors/switches, Esc/Enter drive the menus. The zone heap persists in ' +
       'the guest window between frames (slice 3a). Boot takes a few seconds on the wasm interpreter — ' +
-      'the renderer is byte-exact to a native build (the §18 differential); a JIT tier would smooth ' +
-      'the frame rate. Click Stop to end.',
+      'the renderer is byte-exact to a native build (the §18 differential). Toggle "wasm-JIT" to run ' +
+      'the whole tick() on emitted wasm (near-native) instead of the interpreter — it multiplies the ' +
+      'frame rate (shown live). Click Stop to end.',
   },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
@@ -427,6 +430,8 @@ function loadExample(name) {
   const ex = EXAMPLES[name];
   $('mode').value = ex.mode;
   $('desc').textContent = ex.desc;
+  // The "wasm-JIT" toggle is only meaningful for a JIT-emittable reactor (Doom): show it there.
+  if ($('jitLabel')) $('jitLabel').hidden = !ex.jit;
   if (ex.kind === 'reactor') {
     // A per-frame reactor module: the "source" is binary; click Run to start the loop, arrow keys steer.
     $('src').value =
@@ -542,13 +547,19 @@ async function runModule(ex) {
 // Open a reactor module once, then drive it one `tick` per requestAnimationFrame: each frame the
 // guest runs, presents a frame (blitted to the canvas), and drains the key events we forwarded.
 let reactorRAF = null; // the pending requestAnimationFrame id while a reactor loop runs (else null)
+let jitReactor = null; // the wasm-JIT reactor driver while a JIT loop runs (else null → interpreter)
 
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
 function stopReactor() {
   if (reactorRAF === null) return;
   cancelAnimationFrame(reactorRAF);
   reactorRAF = null;
-  eng.ex.svm_onramp_close();
+  if (jitReactor) {
+    jitReactor.close();
+    jitReactor = null;
+  } else {
+    eng.ex.svm_onramp_close();
+  }
 }
 
 async function runReactor(ex) {
@@ -557,6 +568,9 @@ async function runReactor(ex) {
   $('result').textContent = '';
   $('stdout').textContent = '';
   $('canvas').style.display = 'none';
+  // The "wasm-JIT" toggle runs an emittable reactor's whole tick() on emitted wasm (near-native) rather
+  // than the interpreter. Only offered for JIT-capable examples (Doom); falls back if the emit fails.
+  const useJit = !!(ex.jit && $('jit') && $('jit').checked);
   let bytes;
   try {
     bytes = await fetchModule(ex.url);
@@ -567,9 +581,8 @@ async function runReactor(ex) {
   // Open the reactor: alloc, copy the module in, run _start (decode + grant powerbox). A guest that
   // needs a served file (Doom reads its WAD at _start) is opened with svm_onramp_open_fs, which grants
   // the `fs` capability over the fetched blob; every other reactor guest uses plain svm_onramp_open.
-  let opened;
+  let wad = null;
   if (ex.wad) {
-    let wad;
     try {
       wad = await fetchModule(ex.wad);
     } catch (e) {
@@ -577,43 +590,74 @@ async function runReactor(ex) {
       return;
     }
     log(`fetched ${ex.wad}: ${wad.length}B file (served through the fs capability)`);
-    setState('running', 'booting DOOM… (reading the WAD, building the renderer — a few seconds)');
-    const nameBytes = new TextEncoder().encode('doom1.wad');
-    // Alloc all three buffers BEFORE filling any: svm_alloc may grow (detach) linear memory, so take
-    // one fresh view after the last alloc and write into that.
-    const modP = eng.ex.svm_alloc(bytes.length);
-    const nameP = eng.ex.svm_alloc(nameBytes.length);
-    const wadP = eng.ex.svm_alloc(wad.length);
-    const view = new Uint8Array(eng.memory.buffer);
-    view.set(bytes, modP);
-    view.set(nameBytes, nameP);
-    view.set(wad, wadP);
-    opened = eng.ex.svm_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
-    eng.ex.svm_dealloc(modP, bytes.length);
-    eng.ex.svm_dealloc(nameP, nameBytes.length);
-    eng.ex.svm_dealloc(wadP, wad.length);
-  } else {
-    const p = eng.ex.svm_alloc(bytes.length);
-    new Uint8Array(eng.memory.buffer).set(bytes, p);
-    opened = eng.ex.svm_onramp_open(p, bytes.length);
-    eng.ex.svm_dealloc(p, bytes.length);
   }
-  if (opened !== 0) {
-    setState('error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
-    log(`svm_onramp_open failed: ${opened}`);
-    return;
+  setState('running',
+    ex.wad ? `booting DOOM… (reading the WAD, building the renderer — a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
+      : 'running…');
+  if (useJit) {
+    // wasm-JIT reactor: the cdylib emits the whole tick(); this JS module compiles + runs it. On any
+    // open/emit failure fall back to the interpreter reactor so the demo still plays.
+    try {
+      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad);
+      log(`wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
+    } catch (e) {
+      jitReactor = null;
+      log(`wasm-JIT reactor unavailable (${e.message}); falling back to the interpreter`);
+    }
   }
-  log(`reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
-  setState('running', 'running — arrow keys to steer, Stop to end');
+  if (!jitReactor) {
+    let opened;
+    if (ex.wad) {
+      const nameBytes = new TextEncoder().encode('doom1.wad');
+      // Alloc all three buffers BEFORE filling any: svm_alloc may grow (detach) linear memory, so take
+      // one fresh view after the last alloc and write into that.
+      const modP = eng.ex.svm_alloc(bytes.length);
+      const nameP = eng.ex.svm_alloc(nameBytes.length);
+      const wadP = eng.ex.svm_alloc(wad.length);
+      const view = new Uint8Array(eng.memory.buffer);
+      view.set(bytes, modP);
+      view.set(nameBytes, nameP);
+      view.set(wad, wadP);
+      opened = eng.ex.svm_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
+      eng.ex.svm_dealloc(modP, bytes.length);
+      eng.ex.svm_dealloc(nameP, nameBytes.length);
+      eng.ex.svm_dealloc(wadP, wad.length);
+    } else {
+      const p = eng.ex.svm_alloc(bytes.length);
+      new Uint8Array(eng.memory.buffer).set(bytes, p);
+      opened = eng.ex.svm_onramp_open(p, bytes.length);
+      eng.ex.svm_dealloc(p, bytes.length);
+    }
+    if (opened !== 0) {
+      setState('error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
+      log(`svm_onramp_open failed: ${opened}`);
+      return;
+    }
+    log(`reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
+  }
+  const tier = jitReactor ? 'wasm-JIT' : 'interpreter';
+  setState('running', `running (${tier}) — arrow keys to steer, Stop to end`);
   $('run').disabled = true;
   $('stop').disabled = false;
   let frames = 0;
   const t0 = performance.now();
+  let fpsFrames = 0;
+  let fpsT0 = t0;
   const loop = () => {
-    // svm_onramp_frame: run one tick. 0 = keep going, 5 = the guest exited, else a trap.
-    const status = eng.ex.svm_onramp_frame();
+    // One tick: 0 = keep going, 5 = the guest exited, else a trap. The JIT driver runs the emitted
+    // tick and stashes the frame; the interpreter path runs it in-Rust — both fill svm_framebuffer_*.
+    const status = jitReactor ? jitReactor.frame() : eng.ex.svm_onramp_frame();
     presentFrame(eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
     frames++;
+    fpsFrames++;
+    // Surface a live FPS reading each second so the tier's frame rate is visible.
+    const now = performance.now();
+    if (now - fpsT0 >= 1000) {
+      const fps = (fpsFrames * 1000 / (now - fpsT0)).toFixed(1);
+      setState('running', `running (${tier}) — ${fps} fps · arrow keys to steer, Stop to end`);
+      fpsFrames = 0;
+      fpsT0 = now;
+    }
     if (status === 0) {
       reactorRAF = requestAnimationFrame(loop);
       return;
@@ -623,20 +667,25 @@ async function runReactor(ex) {
     // close() frees the reactor, so the log says *why* it stopped, not just the status code.
     let trapDetail = '';
     if (status !== 0 && status !== 5) {
-      const n = eng.ex.svm_onramp_trap_len();
+      const n = jitReactor ? eng.ex.svm_onramp_jit_trap_len() : eng.ex.svm_onramp_trap_len();
       if (n > 0) {
         trapDetail = new TextDecoder().decode(
           new Uint8Array(eng.memory.buffer).slice(eng.ex.svm_stdout_ptr(), eng.ex.svm_stdout_ptr() + n));
       }
     }
-    eng.ex.svm_onramp_close();
+    if (jitReactor) {
+      jitReactor.close();
+      jitReactor = null;
+    } else {
+      eng.ex.svm_onramp_close();
+    }
     $('run').disabled = broken;
     $('stop').disabled = true;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     setState(status === 5 ? 'done' : 'error',
       status === 5 ? `guest exited after ${frames} frames · ${secs}s`
         : `reactor trapped: status ${status}${trapDetail ? ` (${trapDetail})` : ''}`);
-    log(`reactor stopped: status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
+    log(`reactor stopped (${tier}): status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
   };
   reactorRAF = requestAnimationFrame(loop);
 }
@@ -747,7 +796,8 @@ async function main() {
   const SWALLOW = new Set([37, 38, 39, 40, 32, 9]); // keys whose default (scroll/focus) must be suppressed
   const forward = (pressed) => (e) => {
     if (reactorRAF === null || !REACTOR_KEYS.has(e.keyCode)) return;
-    eng.ex.svm_onramp_key(e.keyCode, pressed);
+    if (jitReactor) eng.ex.svm_onramp_jit_key(e.keyCode, pressed);
+    else eng.ex.svm_onramp_key(e.keyCode, pressed);
     const shortcut = (e.ctrlKey || e.metaKey) && e.keyCode !== 17; // leave Ctrl+R etc. to the browser
     if (SWALLOW.has(e.keyCode) && !shortcut) e.preventDefault();
   };
