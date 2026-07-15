@@ -26,6 +26,14 @@ svm-run = { path = "../crates/svm-run" } # production cap.call thunk, for irgen'
 svm-mask = { path = "../crates/svm-mask" }
 svm-text = { path = "../crates/svm-text" }
 svm-wasm = { path = "../crates/svm-wasm" } # untrusted core-wasm frontend, fuzzed for fail-closed decode
+svm-opt = { path = "../crates/svm-opt" } # generic IR→IR optimizer, fuzzed for the SSA round-trip identity
+
+[[bin]]
+name = "opt_ssa_roundtrip"
+path = "fuzz_targets/opt_ssa_roundtrip.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "decode_verify"

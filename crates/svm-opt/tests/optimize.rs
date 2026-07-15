@@ -8,7 +8,7 @@ use svm_ir::{
     BinOp, Block, CmpOp, Func, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
     ValType,
 };
-use svm_peval::optimize_module;
+use svm_opt::optimize_module;
 use svm_verify::verify_module;
 
 fn run(m: &Module, args: &[Value]) -> Result<Vec<Value>, Trap> {

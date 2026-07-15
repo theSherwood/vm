@@ -120,11 +120,31 @@ tracked enhancement, not a blocker.
   `forbid(unsafe_code)`, optional `libm`); move `optimize_module` + fold/remap machinery out of
   `svm-peval`; re-point `svm-peval` / `svm-run`; existing optimize/specialize/bench tests stay
   green. Pure refactor, no behavior change.
-- [ ] **Phase 1 — infrastructure.** (a) The per-`Inst` effects/trap table in `svm-ir`, adopted
-  by the existing DVE pass so there is one purity truth. (b) CFG utilities: pred/succ, RPO,
-  loop forest (irreducible-aware). (c) The internal conventional-SSA form + lower-back pass,
-  landed with the no-op round-trip differential fuzz target. (d) `OptConfig` (budgets, pass
-  toggles).
+- [ ] **Phase 1 — infrastructure.**
+  - [x] **(a) The per-`Inst` effects/trap table in `svm-ir`** ([`Inst::effects`] → [`Effects`]:
+    `can_trap` / `reads_mem` / `writes_mem` / `side_effect`; `is_pure` + `removable_if_dead`
+    derived). Exhaustive match, no wildcard, so a new `Inst` variant must be classified to compile.
+    The DVE pass's `is_removable_if_dead` now delegates to it — one purity oracle. Behavior-preserving
+    (the classification reproduces the old whitelist exactly; harness unchanged) and unit-tested by
+    category in `svm-ir`.
+  - [x] **(b) CFG utilities** (`svm_opt::cfg`): `Cfg` (pred/succ adjacency), `postorder`/`rpo`,
+    iterative Cooper–Harvey–Kennedy `dominators` (correct on irreducible CFGs), Tarjan `sccs`, and
+    irreducible-aware `loop_headers` (flags *every* entry of a multi-entry cycle). All traversals are
+    iterative (no host-stack recursion) and fuzz-safe (out-of-range targets ignored, not panicked).
+    `term_successors` now delegates to `cfg::successors`. Unit-tested incl. an irreducible two-entry
+    loop, self-loop, and unreachable block.
+  - [x] **(c) The internal conventional-SSA form** (`svm_opt::ssa`): `to_ssa` renames block-local
+    operands to a function-global `Value` space (via the exhaustive `map_operands`), tracking each
+    value's `Def` site; `from_ssa` is its exact inverse. The round-trip is the **identity**
+    (`from_ssa(to_ssa(f)) == f`), pinned by hand-built shapes (params/`br_table`/loops/multi-result
+    `call`), an interpreter behavioral check, a 5000-case randomized structural test, and the
+    `opt_ssa_roundtrip` cargo-fuzz target (reuses `irgen` → round-trip identity + interp-vs-JIT
+    differential on the lowered module). Cross-block-use lowering (param threading) is deferred to the
+    first Phase 2 pass that needs it — today every value is used only in its defining block.
+  - [ ] (d) `OptConfig` (budgets, pass toggles) — **deferred to Phase 2**. Per the prime directive
+    (no configurability until something concrete demands it), this lands with the first budgeted pass
+    (the inliner / unroller), where a size/fuel budget actually bites; adding toggles now, with only
+    the always-on cleanup passes, would be speculative surface.
 - [ ] **Phase 2 — global scalar passes.** SCCP (subsumes and globalizes today's fold + branch
   resolution), GVN/CSE, instcombine-style rules + strength reduction, jump threading, LICM for
   pure non-trapping ops. Each pass lands with its own differential + fuzz coverage.
@@ -146,8 +166,9 @@ tracked enhancement, not a blocker.
 
 ## Open questions
 
-- Where exactly the effects table lives: `svm-ir` (next to `Inst`, forces classification on new
-  ops — current lean) vs `svm-opt` (keeps `svm-ir` minimal). Decide at Phase 1(a).
+- ~~Where exactly the effects table lives: `svm-ir` vs `svm-opt`.~~ **Resolved (Phase 1a):** it
+  lives in `svm-ir` next to `Inst`, as `Inst::effects() -> Effects`, so the exhaustive match forces
+  every new instruction to be classified before it compiles.
 - Whether `svm-run` grows a standalone optimize-only mode (`decode → optimize → verify →
   encode`, no specialization) for AOT pipelines — cheap, probably Phase 0/2 boundary.
 - How much of the specializer's CFG-cleanup entanglement moves vs stays: `specialize` calls the

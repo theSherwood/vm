@@ -647,6 +647,7 @@ dependencies = [
  "svm-ir",
  "svm-jit",
  "svm-mask",
+ "svm-opt",
  "svm-run",
  "svm-snapshot",
  "svm-spec",
@@ -700,11 +701,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "svm-peval"
+name = "svm-opt"
 version = "0.0.0"
 dependencies = [
  "libm",
  "svm-ir",
+]
+
+[[package]]
+name = "svm-peval"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+ "svm-opt",
  "svm-verify",
 ]
 
@@ -717,6 +726,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-opt",
  "svm-peval",
  "svm-text",
  "svm-verify",
