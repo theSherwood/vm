@@ -12,10 +12,11 @@
 //! *bookkeeping* — the allocator's cursor, captured stdout/stderr, the stdin cursor — lives host-side
 //! in [`Inner`], never in the guest's address space, so the guest cannot corrupt it.
 //!
-//! Scope: the first spike — `write` / `read` / `malloc` / `free` / `exit`. `malloc` is a bump
-//! allocator over a configured heap region (`free` is a no-op); a real free list, the fs + fd table,
-//! signals, and `fork`/`exec` are the roadmap (POSIX.md §6). Pure computation (`strlen`, `snprintf`,
-//! `math`, …) is **guest code**, not a cap — it needs no authority (POSIX.md §1).
+//! Scope: `write` / `read` / `malloc` / `free` / `exit`, plus `open` / `close` / `lseek` over an
+//! in-memory filesystem (a `path → bytes` memfs) with a host-side fd table. `malloc` is a first-fit
+//! free list over a configured window-heap region. Still to come (POSIX.md §6): `stat`/`readdir`,
+//! signals, and `fork`/`exec`. Pure computation (`strlen`, `snprintf`, `math`, …) is **guest code**,
+//! not a cap — it needs no authority (POSIX.md §1).
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -30,9 +31,38 @@ pub const OP_READ: u32 = 1;
 pub const OP_MALLOC: u32 = 2;
 pub const OP_FREE: u32 = 3;
 pub const OP_EXIT: u32 = 4;
+pub const OP_OPEN: u32 = 5;
+pub const OP_CLOSE: u32 = 6;
+pub const OP_LSEEK: u32 = 7;
 
-/// `-EBADF` — a `write`/`read` on an fd this personality does not serve.
-const EBADF: i64 = -9;
+/// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
+const ENOENT: i64 = -2; // no such file (open without O_CREAT)
+const EBADF: i64 = -9; // an op on an fd this personality does not serve
+const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
+
+/// `open` flags (Linux `<fcntl.h>` values). The low two bits are the access mode.
+const O_ACCMODE: i64 = 3;
+const O_WRONLY: i64 = 1;
+const O_RDWR: i64 = 2;
+const O_CREAT: i64 = 0o100;
+const O_TRUNC: i64 = 0o1000;
+const O_APPEND: i64 = 0o2000;
+
+/// `lseek` whence values (`SEEK_SET`/`SEEK_CUR`/`SEEK_END`).
+const SEEK_SET: i64 = 0;
+const SEEK_CUR: i64 = 1;
+const SEEK_END: i64 = 2;
+
+/// The first fd the file table hands out — `0`/`1`/`2` are the reserved stdio streams.
+const FIRST_FD: usize = 3;
+
+/// One entry in the host-side fd table: which memfs file it refers to, the current offset, and whether
+/// it was opened for writing. Independent offsets per fd, shared file contents (POSIX file semantics).
+struct OpenFile {
+    path: String,
+    pos: usize,
+    writable: bool,
+}
 
 /// The allocator's alignment (bytes). 16 covers `max_align_t` (doubles / SIMD) so a `malloc`'d buffer
 /// is suitably aligned for anything the guest stores into it.
@@ -58,6 +88,13 @@ struct Inner {
     /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
     /// works regardless.
     free_list: Vec<(u64, u64)>,
+    /// The **in-memory filesystem**: path → contents. A memfs keeps the personality self-contained and
+    /// deterministic (the playground has no disk); a native embedder routing to a real `fs` cap is a
+    /// follow-up. Shared file bytes; per-fd offsets live in [`Inner::fds`].
+    files: HashMap<String, Vec<u8>>,
+    /// The host-side fd table (indexed by fd; `0`/`1`/`2` are always `None` — stdio is handled
+    /// specially). `open` allocates the first free slot at [`FIRST_FD`] or above.
+    fds: Vec<Option<OpenFile>>,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -84,6 +121,25 @@ impl Posix {
             .stderr
             .clone()
     }
+
+    /// Seed (or overwrite) a memfs file — how an embedder/test stages the filesystem a guest `open`s.
+    pub fn write_file(&self, path: &str, bytes: &[u8]) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// Read a memfs file back — how an embedder/test inspects what the guest wrote.
+    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .get(path)
+            .cloned()
+    }
 }
 
 /// The §7 import-name resolver for the POSIX subset: binds libc symbol names to the
@@ -99,6 +155,9 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "malloc" => OP_MALLOC,
         "free" => OP_FREE,
         "exit" | "_exit" | "_Exit" => OP_EXIT,
+        "open" => OP_OPEN,
+        "close" => OP_CLOSE,
+        "lseek" => OP_LSEEK,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -123,6 +182,8 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         heap_end,
         allocated: HashMap::new(),
         free_list: Vec::new(),
+        files: HashMap::new(),
+        fds: Vec::new(),
     }));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -145,49 +206,175 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
                 Ok(vec![0])
             }
             OP_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
+            OP_OPEN => st.open(args, mem),
+            OP_CLOSE => Ok(vec![st.close(args)]),
+            OP_LSEEK => Ok(vec![st.lseek(args)]),
             _ => Err(Trap::CapFault),
         }
     })
 }
 
 impl Inner {
-    /// `write(fd, buf, len) -> n | -errno`: copy `len` bytes from the window at `buf` to the captured
-    /// `fd` sink (`1` stdout / `2` stderr), returning the count. Other fds are `-EBADF` (the fs fd
-    /// table is a follow-up).
+    /// `write(fd, buf, len) -> n | -errno`: `1`/`2` append to the captured stdout/stderr; an fd `>= 3`
+    /// writes into its memfs file at the fd's offset (extending it), advancing the offset. `0` (stdin)
+    /// and an unopened / read-only fd are `-EBADF`.
     fn write(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let len = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
-        let sink = match fd {
-            1 => &mut self.stdout,
-            2 => &mut self.stderr,
-            _ => return Ok(vec![EBADF]),
-        };
         if len == 0 {
             return Ok(vec![0]);
         }
         let data = mem.read_bytes(buf, len).ok_or(Trap::Malformed)?;
-        sink.extend_from_slice(&data);
+        match fd {
+            1 => self.stdout.extend_from_slice(&data),
+            2 => self.stderr.extend_from_slice(&data),
+            f if f >= FIRST_FD as i64 => return Ok(vec![self.file_write(f as usize, &data)]),
+            _ => return Ok(vec![EBADF]),
+        }
         Ok(vec![len as i64])
     }
 
-    /// `read(fd, buf, len) -> n | -errno`: drain up to `len` bytes of preloaded stdin (`fd` `0`) into
-    /// the window at `buf`, returning the count (`0` at EOF). Other fds are `-EBADF`.
+    /// `read(fd, buf, len) -> n | -errno`: `0` drains preloaded stdin; an fd `>= 3` reads its memfs file
+    /// from the fd's offset, advancing it (`0` at EOF). `1`/`2` and an unopened fd are `-EBADF`.
     fn read(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let len = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as usize;
-        if fd != 0 {
-            return Ok(vec![EBADF]);
-        }
-        let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
-        let n = len.min(avail.len());
-        let chunk = avail[..n].to_vec();
+        let chunk: Vec<u8> = match fd {
+            0 => {
+                let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
+                let n = len.min(avail.len());
+                self.stdin_pos += n;
+                avail[..n].to_vec()
+            }
+            f if f >= FIRST_FD as i64 => match self.file_read(f as usize, len) {
+                Ok(c) => c,
+                Err(e) => return Ok(vec![e]),
+            },
+            _ => return Ok(vec![EBADF]),
+        };
         mem.write_bytes(buf, &chunk).ok_or(Trap::Malformed)?;
-        self.stdin_pos += n;
-        Ok(vec![n as i64])
+        Ok(vec![chunk.len() as i64])
+    }
+
+    /// `open(path_ptr, path_len, flags) -> fd | -errno`: open (or `O_CREAT`) a memfs file, returning a
+    /// fresh fd. `O_TRUNC` clears it, `O_APPEND` seeks to the end; a missing file without `O_CREAT` is
+    /// `-ENOENT`, a non-UTF-8 path `-EINVAL`.
+    fn open(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let flags = *args.get(2).ok_or(Trap::Malformed)?;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        let exists = self.files.contains_key(&path);
+        if !exists && flags & O_CREAT == 0 {
+            return Ok(vec![ENOENT]);
+        }
+        let file = self.files.entry(path.clone()).or_default();
+        if flags & O_TRUNC != 0 {
+            file.clear();
+        }
+        let pos = if flags & O_APPEND != 0 { file.len() } else { 0 };
+        let acc = flags & O_ACCMODE;
+        let writable = acc == O_WRONLY || acc == O_RDWR;
+        Ok(vec![self.alloc_fd(OpenFile {
+            path,
+            pos,
+            writable,
+        })])
+    }
+
+    /// `close(fd) -> 0 | -errno`: release a file fd. stdio / unopened fds are `-EBADF`.
+    fn close(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&-1);
+        if fd >= FIRST_FD as i64 {
+            if let Some(slot @ Some(_)) = self.fds.get_mut(fd as usize) {
+                *slot = None;
+                return 0;
+            }
+        }
+        EBADF
+    }
+
+    /// `lseek(fd, offset, whence) -> new_offset | -errno`: reposition a file fd (`SEEK_SET`/`CUR`/`END`).
+    /// A negative result or bad whence is `-EINVAL`; stdio / unopened fds are `-EBADF`.
+    fn lseek(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&-1);
+        let offset = *args.get(1).unwrap_or(&0);
+        let whence = *args.get(2).unwrap_or(&-1);
+        if fd < FIRST_FD as i64 {
+            return EBADF;
+        }
+        let (path, pos) = match self.fds.get(fd as usize).and_then(|s| s.as_ref()) {
+            Some(of) => (of.path.clone(), of.pos as i64),
+            None => return EBADF,
+        };
+        let size = self.files.get(&path).map_or(0, |f| f.len()) as i64;
+        let newpos = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => pos + offset,
+            SEEK_END => size + offset,
+            _ => return EINVAL,
+        };
+        if newpos < 0 {
+            return EINVAL;
+        }
+        self.fds[fd as usize].as_mut().unwrap().pos = newpos as usize;
+        newpos
+    }
+
+    /// Allocate the first free fd at [`FIRST_FD`] or above for `of`, extending the table if needed.
+    fn alloc_fd(&mut self, of: OpenFile) -> i64 {
+        while self.fds.len() < FIRST_FD {
+            self.fds.push(None);
+        }
+        match (FIRST_FD..self.fds.len()).find(|&i| self.fds[i].is_none()) {
+            Some(i) => {
+                self.fds[i] = Some(of);
+                i as i64
+            }
+            None => {
+                self.fds.push(Some(of));
+                (self.fds.len() - 1) as i64
+            }
+        }
+    }
+
+    /// Write `data` into fd `fd`'s memfs file at its offset (extending with zeros if the offset is
+    /// past the end), advancing the offset. Returns the count, or `-EBADF` for an unopened / read-only fd.
+    fn file_write(&mut self, fd: usize, data: &[u8]) -> i64 {
+        let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
+            Some(of) if of.writable => (of.path.clone(), of.pos),
+            _ => return EBADF,
+        };
+        let file = self.files.entry(path).or_default();
+        let end = pos + data.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[pos..end].copy_from_slice(data);
+        self.fds[fd].as_mut().unwrap().pos = end;
+        data.len() as i64
+    }
+
+    /// Read up to `len` bytes from fd `fd`'s memfs file at its offset, advancing it. `Err(-errno)` for
+    /// an unopened fd.
+    fn file_read(&mut self, fd: usize, len: usize) -> Result<Vec<u8>, i64> {
+        let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
+            Some(of) => (of.path.clone(), of.pos),
+            None => return Err(EBADF),
+        };
+        let file = self.files.get(&path).map(|v| v.as_slice()).unwrap_or(&[]);
+        let n = len.min(file.len().saturating_sub(pos));
+        let chunk = file[pos..pos + n].to_vec();
+        self.fds[fd].as_mut().unwrap().pos = pos + n;
+        Ok(chunk)
     }
 
     /// `malloc(size) -> ptr | 0`: an `ALIGN`-aligned window offset from the heap arena. First-fit
@@ -412,12 +599,111 @@ block0(vph: i32):\n\
         assert_eq!(jout, iout, "jit: stdout must match interp");
     }
 
+    /// func 0 `(handle) -> i64`: `open("f", O_CREAT|O_RDWR)`, `write` "Hi!", `lseek` to 0, `read` it
+    /// back, echo the bytes to stdout. Returns `fd * 1_000_000 + read_count`. The first file fd is `3`
+    /// and 3 bytes round-trip → `3_000003`; stdout and the memfs file `"f"` are both `"Hi!"`.
+    const FILE_ROUNDTRIP: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block0(vph: i32):\n\
+  vpath = i64.const 0\n\
+  vfch = i32.const 102\n\
+  i32.store8 vpath vfch\n\
+  vplen = i64.const 1\n\
+  vflags = i64.const 66\n\
+  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  a16 = i64.const 16\n\
+  cH = i32.const 72\n\
+  i32.store8 a16 cH\n\
+  a17 = i64.const 17\n\
+  ci = i32.const 105\n\
+  i32.store8 a17 ci\n\
+  a18 = i64.const 18\n\
+  cbang = i32.const 33\n\
+  i32.store8 a18 cbang\n\
+  vwlen = i64.const 3\n\
+  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd, a16, vwlen)\n\
+  vzero = i64.const 0\n\
+  vsk = cap.call 13 7 (i64, i64, i64) -> (i64) vph (vfd, vzero, vzero)\n\
+  a32 = i64.const 32\n\
+  veight = i64.const 8\n\
+  vr = cap.call 13 1 (i64, i64, i64) -> (i64) vph (vfd, a32, veight)\n\
+  vfd1 = i64.const 1\n\
+  vso = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, a32, vr)\n\
+  vk = i64.const 1000000\n\
+  vt = i64.mul vfd vk\n\
+  vres = i64.add vt vr\n\
+  return vres\n\
+}\n";
+
+    #[test]
+    fn file_open_write_seek_read_matches_across_backends() {
+        // Interpreter.
+        let mut ih = Host::new();
+        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, Vec::new());
+        let m = parse_module(FILE_ROUNDTRIP).expect("parse");
+        verify_module(&m).expect("verify");
+        let mut fuel = 5_000_000u64;
+        let ir = run_capture_reserved_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[0u8; WIN],
+            0,
+            &mut ih,
+        )
+        .0;
+        // JIT.
+        let mut jh = Host::new();
+        let (jhh, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
+        let jo = compile_and_run_capture_reserved_with_host(
+            &m,
+            0,
+            &[jhh as i64],
+            &[0u8; WIN],
+            0,
+            svm_run::cap_thunk,
+            &mut jh as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit")
+        .0;
+
+        // fd 3, 3 bytes read → 3_000003; the file and the echoed stdout both hold "Hi!".
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(3_000_003)]),
+            "interp: file roundtrip"
+        );
+        assert_eq!(iposix.stdout(), b"Hi!", "interp: echoed the file's bytes");
+        assert_eq!(
+            iposix.read_file("f").as_deref(),
+            Some(&b"Hi!"[..]),
+            "interp: memfs file written"
+        );
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[3_000_003]),
+            "jit: file roundtrip must match interp, got {jo:?}"
+        );
+        assert_eq!(
+            jposix.stdout(),
+            b"Hi!",
+            "jit: echoed bytes must match interp"
+        );
+        assert_eq!(
+            jposix.read_file("f").as_deref(),
+            Some(&b"Hi!"[..]),
+            "jit: memfs file written"
+        );
+    }
+
     #[test]
     fn resolve_binds_libc_names() {
         // The §7 name → (HOST_FN, op) map a linker uses to bind a shell's libc imports.
         assert_eq!(resolve("malloc").map(|c| c.op), Some(OP_MALLOC));
         assert_eq!(resolve("posix.write").map(|c| c.op), Some(OP_WRITE));
         assert_eq!(resolve("_exit").map(|c| c.op), Some(OP_EXIT));
+        assert_eq!(resolve("open").map(|c| c.op), Some(OP_OPEN));
+        assert_eq!(resolve("lseek").map(|c| c.op), Some(OP_LSEEK));
         assert!(
             resolve("dlopen").is_none(),
             "unknown libc name fails closed"

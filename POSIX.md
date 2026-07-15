@@ -59,8 +59,12 @@ The elegant split for the stateful ops (`malloc`, `stdio`, the fd table):
   swappable part; it never enters the guest's address space, so the guest cannot corrupt it.
 
 The allocator manages a **heap region of the guest window** the embedder configures at grant
-(`[heap_base, heap_end)`); today a bump allocator (free is a no-op), a real first-fit free
-list is the follow-up.
+(`[heap_base, heap_end)`): a first-fit **free list** — `malloc` reuses a freed block (splitting
+off any remainder) before bumping the high-water mark, and `free` returns a block for reuse
+(coalescing adjacent frees is a follow-up). The **fs** is an in-memory `path → bytes` map (a
+memfs) with a host-side fd table (`open`/`close`/`read`/`write`/`lseek`); it keeps the
+personality self-contained for the playground, and a native embedder routing to a real `fs`
+cap is a follow-up.
 
 ## 4. One ABI, two bindings — how this unifies with "personality = guest library"
 
@@ -83,10 +87,13 @@ only to mark the boundary.
 |---|----------|-------|-----------|--------|
 | 0 | `write(fd, buf, len)` | `-> n \| -errno` | host sinks / fd table → `Stream`/`Pipe` | **done (spike)** — fd 1/2 → captured stdout/stderr |
 | 1 | `read(fd, buf, len)` | `-> n \| -errno` | host sinks / fd table → `Stream`/`Pipe` | **done (spike)** — fd 0 → preloaded stdin |
-| 2 | `malloc(size)` | `-> ptr \| 0` | window-heap arena (host bookkeeping) | **done (spike)** — bump allocator |
-| 3 | `free(ptr)` | `-> 0` | window-heap arena | **done (spike)** — no-op (bump) |
-| 4 | `exit(code)` | `noreturn` | `Trap::Exit` (→ `Exit` cap) | **done (spike)** |
-| — | `open/close/lseek/stat/readdir/getcwd/chdir` | fd-returning / `-errno` | fs ops + host fd table | todo |
+| 2 | `malloc(size)` | `-> ptr \| 0` | window-heap arena (host bookkeeping) | **done** — first-fit free list |
+| 3 | `free(ptr)` | `-> 0` | window-heap arena | **done** — reclaims for reuse (no coalescing yet) |
+| 4 | `exit(code)` | `noreturn` | `Trap::Exit` (→ `Exit` cap) | **done** |
+| 5 | `open(path, len, flags)` | `-> fd \| -errno` | memfs + host fd table | **done** — `O_CREAT`/`O_TRUNC`/`O_APPEND`, `-ENOENT` |
+| 6 | `close(fd)` | `-> 0 \| -errno` | host fd table | **done** |
+| 7 | `lseek(fd, off, whence)` | `-> pos \| -errno` | host fd table | **done** — `SEEK_SET`/`CUR`/`END` |
+| — | `stat/fstat/readdir/getcwd/chdir/unlink` | / `-errno` | memfs + host fd table | todo |
 | — | `getenv/setenv/environ` | `-> ptr \| 0` | host env map | todo |
 | — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
 | — | `pipe/dup/dup2/fcntl` | `-> fd \| -errno` | `Pipe` cap + host fd table | todo |
