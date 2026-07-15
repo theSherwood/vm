@@ -26,6 +26,33 @@ fn is_reassoc(op: BinOp) -> bool {
     )
 }
 
+/// Negate an integer constant (`-c` mod 2^n), for normalizing `x - c` into `x + (-c)`.
+fn negate(k: Known) -> Option<Known> {
+    match k {
+        Known::I32(v) => Some(Known::I32(v.wrapping_neg())),
+        Known::I64(v) => Some(Known::I64(v.wrapping_neg())),
+        _ => None,
+    }
+}
+
+/// Intern a constant `k` into the block's pending new-constant list, returning its (stable) value id.
+fn intern(
+    kmap: &mut BTreeMap<Known, Value>,
+    new_consts: &mut Vec<Known>,
+    base: Value,
+    k: Known,
+) -> Value {
+    match kmap.get(&k) {
+        Some(&id) => id,
+        None => {
+            let id = base + new_consts.len() as u32;
+            kmap.insert(k, id);
+            new_consts.push(k);
+            id
+        }
+    }
+}
+
 /// Reassociate constant chains in every block of a function.
 pub fn reassociate(f: &Func, fn_results: &[usize]) -> Func {
     let mut s = to_ssa(f, fn_results);
@@ -65,14 +92,22 @@ fn reassociate_block(s: &mut SsaFunc, bi: usize, fn_results: &[usize]) -> bool {
     let base = s.num_values;
     let mut kmap: BTreeMap<Known, Value> = BTreeMap::new();
     let mut new_consts: Vec<Known> = Vec::new();
-    let mut rewrites: BTreeMap<Value, (Value, Value)> = BTreeMap::new(); // outer value → (var, combined-const value)
+    // outer value → (new op, variable operand, combined-const value).
+    let mut rewrites: BTreeMap<Value, (BinOp, Value, Value)> = BTreeMap::new();
     let mut slot = nparams;
     for inst in &s.blocks[bi].insts {
         let rc = inst.result_count(fn_results);
         if rc == 1 {
             let ov = s.values[bi][slot];
             if let &Inst::IntBin { ty, op, a, b } = inst {
-                if is_reassoc(op) {
+                if op == BinOp::Sub {
+                    // Normalize `x - c` → `x + (-c)` so subtraction-by-constant chains reassociate
+                    // through `Add` too (e.g. `p + 16 - 4` collapses).
+                    if let Some(neg) = cst.get(&b).copied().and_then(negate) {
+                        let kv = intern(&mut kmap, &mut new_consts, base, neg);
+                        rewrites.insert(ov, (BinOp::Add, a, kv));
+                    }
+                } else if is_reassoc(op) {
                     // The outer op: one constant operand `c`, one variable `var`.
                     let outer = cst
                         .get(&b)
@@ -94,16 +129,8 @@ fn reassociate_block(s: &mut SsaFunc, bi: usize, fn_results: &[usize]) -> bool {
                                     .or_else(|| cst.get(&ia).map(|&kc| (ib, kc)));
                                 if let Some((ivar, ic)) = inner {
                                     if let Some(k) = fold_int_bin(ty, op, ic, c) {
-                                        let kv = match kmap.get(&k) {
-                                            Some(&id) => id,
-                                            None => {
-                                                let id = base + new_consts.len() as u32;
-                                                kmap.insert(k, id);
-                                                new_consts.push(k);
-                                                id
-                                            }
-                                        };
-                                        rewrites.insert(ov, (ivar, kv));
+                                        let kv = intern(&mut kmap, &mut new_consts, base, k);
+                                        rewrites.insert(ov, (op, ivar, kv));
                                     }
                                 }
                             }
@@ -136,11 +163,11 @@ fn reassociate_block(s: &mut SsaFunc, bi: usize, fn_results: &[usize]) -> bool {
         let ni = if rc == 1 {
             let ov = s.values[bi][slot];
             match rewrites.get(&ov) {
-                Some(&(ivar, kv)) => {
-                    if let Inst::IntBin { ty, op, .. } = inst {
+                Some(&(new_op, ivar, kv)) => {
+                    if let Inst::IntBin { ty, .. } = inst {
                         Inst::IntBin {
                             ty,
-                            op,
+                            op: new_op,
                             a: ivar,
                             b: kv,
                         }

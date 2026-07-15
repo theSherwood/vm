@@ -182,3 +182,39 @@ fn reassociation_exposes_cse() {
         "the two x+8 recomputations should share one op after reassociation + CSE"
     );
 }
+
+#[test]
+fn mixed_add_sub_constant_chain_collapses() {
+    // ((x + 16) - 4) + 8  →  x + 20 : subtraction normalizes to `+ (-4)` and the whole chain folds.
+    let m = module(Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32], // v0 = x
+            insts: vec![
+                Inst::ConstI32(16),
+                bin(BinOp::Add, 0, 1), // x + 16
+                Inst::ConstI32(4),
+                bin(BinOp::Sub, 2, 3), // (x+16) - 4
+                Inst::ConstI32(8),
+                bin(BinOp::Add, 4, 5), // ((x+16)-4) + 8
+            ],
+            term: Terminator::Return(vec![6]),
+        }],
+    });
+    verify_module(&m).expect("verifies");
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("re-verifies");
+    assert_eq!(
+        count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+        1,
+        "the mixed +/- constant chain should collapse to one op"
+    );
+    for x in [0i32, 100, -50, i32::MIN, i32::MAX] {
+        assert_eq!(run(&m, &[Value::I32(x)]), run(&opt, &[Value::I32(x)]));
+        assert_eq!(
+            run(&opt, &[Value::I32(x)]),
+            Ok(vec![Value::I32(x.wrapping_add(20))])
+        );
+    }
+}
